@@ -1,0 +1,46 @@
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <SwitchPreference
+        android:defaultValue="false"
+        android:key="lm_enabled"
+        android:summary="Enable Wifi AP, auto-discovery and connect"
+        android:title="Wifi Mesh" />
+
+    <EditTextPreference
+        android:defaultValue="600"
+        android:inputType="number"
+        android:key="ap_on"
+        android:maxLines="1"
+        android:singleLine="true"
+        android:summary="How long to keep the AP active"
+        android:title="AP active time" />
+
+    <EditTextPreference
+        android:defaultValue="1800"
+        android:inputType="number"
+        android:key="ap_off"
+        android:maxLines="1"
+        android:singleLine="true"
+        android:summary="Will activate AP only if no other AP is available"
+        android:title="AP interval" />
+
+    <!--    <EditTextPreference
+            android:capitalize="words"
+            android:defaultValue=""
+            android:inputType="textCapWords"
+            android:key="ap_group"
+            android:maxLines="1"
+            android:singleLine="true"
+            android:summary="If private group and password are set, create a private mesh."
+            android:title="Private group" />
+
+        <EditTextPreference
+            android:capitalize="words"
+            android:defaultValue=""
+            android:inputType="textCapWords"
+            android:key="ap_group"
+            android:maxLines="1"
+            android:singleLine="true"
+            android:title="Group password" />
+    -->
+</PreferenceScreen>
