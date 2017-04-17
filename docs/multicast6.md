@@ -1,5 +1,23 @@
 The dmesh project relies heavily on IPv6, and link-local multicast in particular.
 
+```
+
+ Device1: 
+ p2p0: 192.168.49.1
+ wlan0: 10.x.x.x -> connected to a real AP
+ 
+ Device2:
+ p2p0: 192.168.49.1
+ wlan0: 192.168.49.2 -> connecte to Device1.p2p0
+ 
+ Device3: 
+ p2p0: 192.168.49.1
+ wlan0: 192.168.49.2 -> connected to Device2.p2p0
+ 
+ and so on...
+
+```
+
 Because DMesh devices act as both Wifi client and Wifi Direct server, the
 same network - 192.168.49.0 - will be set on both wlan0 and p2p interfaces,
 making it impossible to send packets from the p2p interface to clients.
