@@ -46,7 +46,6 @@ public class WifiMesh {
     static final String TAG = "LM-Wifi";
     public static String ssid;
     public static String pass;
-    public static ArrayList<String> ip6;
 
     static WifiMesh sMesh;
 
@@ -98,16 +97,6 @@ public class WifiMesh {
         // TODO: add group to advertisment, use pass to encrypt the Wifi pass.
         // This would allow only specific devices to form a network, similar
         // with closed 802.11s.
-    }
-
-    /**
-     * Called if network info was persisted or obtained out-of-band
-     * (NFC, BT, barcodes)
-     */
-    public void addNetwork(String ssid, String pass, String ip6) {
-        P2PWifiNode n = bySSID(ssid, null);
-        n.pass = pass;
-        n.ip6 = ip6;
     }
 
     // ----------- Events and notifications ------------
@@ -179,6 +168,7 @@ public class WifiMesh {
         return sb;
     }
 
+    Handler h;
     /**
      * Should be called only once, when the app starts. Subsequent calls will
      * return the ssid, ip6 and pass.
@@ -190,16 +180,29 @@ public class WifiMesh {
      *            set. Will be sent back to target when completed.
      */
     public void onStart(Context ctx, Handler h, Message msg) {
+        this.h = h;
         if (ssid != null) {
             if (msg != null) {
                 msg.sendToTarget();
             }
             return;
         }
-        // Make sure Hotspot AP is stopped. Interferes with the scan
+        // Make sure Hotspot AP is stopped. Interferes with the scan/discovery
         new APHotspot(ctx).setState(null, null);
 
         new AP(this, ctx).onStartup(h, msg);
     }
 
+    /**
+     * Network name - defaults to the local SSID. Normally the SSID of the root node.
+     */
+    public String getNet() {
+        if (con.connectedNode != null && con.connectedNode.net != null) {
+            return con.connectedNode.net;
+        }
+        if (con.getCurrentWifiSSID() != null) {
+            return con.getCurrentWifiSSID();
+        }
+        return ssid;
+    }
 }

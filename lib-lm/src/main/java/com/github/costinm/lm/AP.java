@@ -16,14 +16,6 @@ import android.os.SystemClock;
 import android.support.annotation.RequiresApi;
 import android.util.Log;
 
-import java.net.Inet6Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.net.SocketException;
-import java.util.ArrayList;
-import java.util.Enumeration;
-import java.util.HashMap;
-
 /*
 TODO:
 
@@ -34,7 +26,7 @@ TODO:
  devices.
 
 -  accept a 'group id' and 'group pass' - use it for the legacy AP, and include it
-  in the p2p advertisment, encrypting the node with the group pass.
+  in the p2p advertisement, encrypting the node with the group pass.
   Use a different _dms._udp, DMS- for non-open networks.
 */
 
@@ -56,18 +48,18 @@ public class AP {
     static final String SD_SUFFIX_PART = "_dm._udp";
 
     /**
-     *  Time when the AP stopped. 0 if it never started.
+     * Time when the AP stopped. 0 if it never started.
      */
     public static long lastStop;
 
     /**
-     *  Duration of previous AP session.
+     * Duration of previous AP session.
      */
     public static long lastDuration;
 
     /**
-     *  Time of last time the AP started.
-     *  0 if not running.
+     * Time of last time the AP started.
+     * 0 if not running.
      */
     public static long lastStart;
 
@@ -81,6 +73,8 @@ public class AP {
      */
     public static long apRunTime;
 
+    int startupTries;
+
     Context ctx;
     WifiManager mWifiManager;
     WifiP2pManager mP2PManager;
@@ -90,48 +84,10 @@ public class AP {
 
     AP(WifiMesh wifiMesh, Context ctx) {
         dmesh = wifiMesh;
-        this.ctx = ctx;
-        mWifiManager = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
-        mP2PManager = (WifiP2pManager) ctx.getSystemService(Context.WIFI_P2P_SERVICE);
+        this.ctx = ctx.getApplicationContext();
+        mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        mP2PManager = (WifiP2pManager) ctx.getApplicationContext().getSystemService(Context.WIFI_P2P_SERVICE);
     }
-
-    static ArrayList<String> getInterfaceAddress(WifiP2pGroup info) {
-        NetworkInterface iface;
-        try {
-            iface = NetworkInterface.getByName(info.getInterface());
-        } catch (SocketException ex) {
-            Log.w(TAG, "Could not obtain address of network interface "
-                    + info.getInterface(), ex);
-            return null;
-        }
-
-        ArrayList<String> res = new ArrayList<>();
-
-        Enumeration<InetAddress> addrs = iface.getInetAddresses();
-        while (addrs.hasMoreElements()) {
-            InetAddress addr = addrs.nextElement();
-            if (addr instanceof Inet6Address) {
-                Inet6Address i6 = (Inet6Address) addr;
-                if (i6.getAddress()[0] == (byte) 0xf8) {
-                    res.add(0, i6.getHostAddress());
-                } else {
-                    res.add(i6.getHostAddress());
-                }
-            } else {
-                // TODO: if not the expected one, event
-                Log.d(TAG, "IP4: " + addr);
-            }
-        }
-
-        if (res.size() == 0) {
-            Log.w(TAG, "Could not obtain address of network interface "
-                    + info.getInterface() + " because it had no IPv6 addresses.");
-        } else {
-            Log.d(TAG, "IP6: " + res);
-        }
-        return res;
-    }
-
 
     /**
      * Must be called once, at process startup, to get to a stable state
@@ -145,9 +101,9 @@ public class AP {
                 if (group != null && group.isGroupOwner()) {
                     // group created by another app or by us without closing.
                     // We must apSessionStop it - it needs wake lock and a timer to apSessionStop.
-
+                    Log.d(TAG, "Starting up, AP was running at startup !");
                     // This assumes a single enabled 'scan network manager app'
-                    update(group);
+                    // Do not call: update(group);, it may change by the time we need it.
                     stop(null);
                     h.postDelayed(new Runnable() {
                         @Override
@@ -157,8 +113,13 @@ public class AP {
                         }
                     }, 2000);
                 } else {
-                    // TODO: briefly periodic, to verify we have P2P and
-                    // get the SSID/pass/Ipv6 address
+                    Log.d(TAG, "Starting up...");
+                    // Old code: verify we have P2P and get the SSID/pass
+                    // No longer used: the SSID/pass may change before we need them, and
+                    // this slows down startup, and may confuse other nodes since discovery
+                    // is not going to work.
+                    finish(msg, null);
+                    /*
                     mP2PManager.createGroup(getmChannel(), new WifiP2pManager.ActionListener() {
                         @Override
                         public void onSuccess() {
@@ -185,6 +146,17 @@ public class AP {
                                     // May be returned when group already active
                                     lastError = "Group failed: BUSY";
                                     mP2PManager.removeGroup(getmChannel(), null);
+                                    if (startupTries == 0) {
+                                        startupTries++;
+                                        h.postDelayed(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                onStartup(h, msg);
+                                            }
+                                        }, 10000);
+                                        Log.d(TAG, "Retry startup in 10 sec " + startupTries);
+                                        return; // no finish !
+                                    }
                                     break;
                                 case WifiP2pManager.ERROR:
                                     lastError = "Group failed ERROR";
@@ -200,17 +172,18 @@ public class AP {
                             dmesh.event(TAG, "Failed to create AP " + lastError);
                         }
                     });
+                    */
                 }
             }
         });
     }
 
     /**
-     *  Update ssid/pass/ip address after group creation.
+     * Update ssid/pass/ip address after group creation.
      */
     void update(WifiP2pGroup group) {
             /* Example group info:
-     network: DIRECT-mY-costin-n6-main
+     network: DIRECT-mY-...
      isGO: true
      GO:
        Device: deviceAddress: a6:70:d6:00:0a:35
@@ -227,20 +200,29 @@ public class AP {
      networkId: 0
      */
         if (group != null) {
+            if (WifiMesh.ssid != null) {
+                if (!WifiMesh.ssid.equals(group.getNetworkName())) {
+                    Log.d(TAG, "SSID change: " + WifiMesh.ssid + " -> " + group.getNetworkName());
+                }
+                if (!group.getPassphrase().equals(WifiMesh.pass)) {
+                    Log.d(TAG, "PASS change: " + WifiMesh.pass + " -> " + group.getPassphrase());
+                }
+            }
+
             WifiMesh.ssid = group.getNetworkName();
             WifiMesh.pass = group.getPassphrase();
-            WifiMesh.ip6 = getInterfaceAddress(group);
 
             WifiP2pDevice p2pDevice = group.getOwner();
             Log.d(TAG, "Group created info: " +
                     " ssid=" + WifiMesh.ssid +
-                    " ip6=" + WifiMesh.ip6 +
                     " pass=" + WifiMesh.pass +
                     " if=" + group.getInterface() +
                     " devName=" + p2pDevice.deviceName +
                     " devMAC=" + p2pDevice.deviceAddress
             );
-            // client list used for debuggig - no need to complicate code here
+            // client list used for debugging - no need to complicate code here
+        } else {
+            Log.d(TAG, "Start with null group !!");
         }
     }
 
@@ -283,7 +265,7 @@ public class AP {
                 if (group != null && group.isGroupOwner()) {
                     update(group);
                     finish(msg, null);
-                    dmesh.event("wifiDirect", "AP already started " + WifiMesh.ssid + " " + WifiMesh.pass);
+                    dmesh.event("wifiDirect", "Unexpected, AP already started " + WifiMesh.ssid + " " + WifiMesh.pass);
                     dmesh.apRunning = true;
                     apStartTimes++;
                     lastStart = SystemClock.elapsedRealtime();
@@ -304,19 +286,28 @@ public class AP {
         mP2PManager.createGroup(getmChannel(), new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
-                mP2PManager.requestGroupInfo(getmChannel(), new WifiP2pManager.GroupInfoListener() {
+                // It seems to return null if called immediately !!!
+                Log.d(TAG, "CREATE GROUP OK");
+                dmesh.h.postDelayed(new Runnable() {
                     @Override
-                    public void onGroupInfoAvailable(WifiP2pGroup group) {
-                        // mPassphrase, mNetworkName
-                        update(group);
-                        finish(cb, null);
-                        dmesh.event("wifiDirect", "AP started " + WifiMesh.ssid + " " + WifiMesh.pass);
-                        lastStart = SystemClock.elapsedRealtime();
-                        apStartTimes++;
-                        dmesh.apRunning = true;
-                        announce();
+                    public void run() {
+                        mP2PManager.requestGroupInfo(getmChannel(), new WifiP2pManager.GroupInfoListener() {
+                            @Override
+                            public void onGroupInfoAvailable(WifiP2pGroup group) {
+                                // mPassphrase, mNetworkName
+                                Log.d(TAG, "CREATE GROUP OK, GI " + group);
+                                update(group);
+                                finish(cb, null);
+                                dmesh.event("wifiDirect", "AP started " + WifiMesh.ssid + " " + WifiMesh.pass);
+                                lastStart = SystemClock.elapsedRealtime();
+                                apStartTimes++;
+                                dmesh.apRunning = true;
+                                announce();
+                            }
+                        });
+
                     }
-                });
+                }, 2000);
             }
 
             @Override
@@ -364,6 +355,7 @@ public class AP {
                     @Override
                     public void onSuccess() {
                         onApStopped(in);
+                        Log.d(TAG, "Group stopped");
                         dmesh.apRunning = false;
                     }
 
@@ -427,20 +419,25 @@ public class AP {
     private void announce2() {
         // Sometimes only the TXT is visible.
         // We really only care about the dnsSDDomain part in either PTR or TXT
-        HashMap<String, String> map = new HashMap<>();
-        map.put("t", Build.PRODUCT);
+        // The problem with TXT is that Android is using lower case on the domain for the TXT
+        // announce. For now disabling it, to see if it works reliably enough with PTR only.
+        // If needed, will need to b32 or hex encode the password, and possibly send the hash
+        // of the network name. Once PSK/private dmesh is supported, the pass will be encrypted
+        // and will have to be b32 or punycoded.
 
-        String announce2 = "v-" + Build.VERSION.SDK_INT +
-                "." + WifiMesh.ssid + "." + WifiMesh.pass;
+        //HashMap<String, String> map = new HashMap<>();
+        //map.put("t", Build.PRODUCT);
 
-        //Inet6Address ip6 = Sender.getIp6Wifi(true);
-        if (WifiMesh.ip6 != null && WifiMesh.ip6.size() > 0) {
-            // Don't care about the scoped interface for announcement, but good for binding
-            String[] h = WifiMesh.ip6.get(0).split("%");
-            announce2 = "i-" + h[0] + "." + announce2;
+        String net = dmesh.getNet();
+        StringBuilder a = new StringBuilder();
+
+        if (net != null) {
+            a.append("n-").append(net).append('.');
+
         }
+        a.append(WifiMesh.ssid).append('.').append(WifiMesh.pass);
 
-        si = WifiP2pDnsSdServiceInfo.newInstance(announce2, SD_SUFFIX_PART, map);
+        si = WifiP2pDnsSdServiceInfo.newInstance(a.toString(), SD_SUFFIX_PART, null);
 
         mP2PManager.addLocalService(getmChannel(), si,
                 new WifiP2pManager.ActionListener() {

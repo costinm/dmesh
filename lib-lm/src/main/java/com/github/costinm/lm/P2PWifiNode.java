@@ -9,16 +9,13 @@ import android.os.SystemClock;
  * The ssid, pass, ip6 may change over time.
  */
 public class P2PWifiNode {
+    // Network name, set by the root    .
+    public String net;
 
     public String ssid;
 
     // Usually changes when the ssid changes.
     public String pass;
-
-    /**
-     * Local-network IP6 address of the node.
-     */
-    public String ip6;
 
     // A device may use a different mac when
     // connecting from the AP BSSID. The p2p discovery node may also be
@@ -62,6 +59,9 @@ public class P2PWifiNode {
     public long connectedTime;
     public int cmNetworkId;
 
+    private static long e2s(long millis) {
+        return millis + System.currentTimeMillis() - SystemClock.elapsedRealtime();
+    }
 
     public String toString() {
         StringBuilder sb = new StringBuilder();
@@ -100,9 +100,6 @@ public class P2PWifiNode {
         }
         return sb.toString();
 
-    }
-    private static long e2s(long millis) {
-        return millis + System.currentTimeMillis() - SystemClock.elapsedRealtime();
     }
 
     public boolean equals(Object o) {

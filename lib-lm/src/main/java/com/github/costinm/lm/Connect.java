@@ -66,41 +66,35 @@ import static android.net.wifi.WifiManager.EXTRA_WIFI_INFO;
  * 2 ranges, one for 'discovery' - 64 addresses, and the rest allocated
  * for GB. This is only needed/planned for devices without IPv6.
  */
-@SuppressWarnings("unchecked")
+@SuppressWarnings({"unchecked", "TryWithIdenticalCatches"})
 public class Connect {
 
     static final String TAG = "LM-Wifi-Con";
+    /**
+     * Last time we connected to a network (system time)
+     */
+    public static long lastSuccess;
     // Result of last 'onWMStateChanged'.
     // WifiInfo can be obtained directly - it has the netId, state, rssi, speed, freq, ip
     // Also as hidden are the txBad/retries/etc
     public NetworkInfo lastNetInfo;
-    WifiManager mWifiManager;
-    WifiMesh dmesh;
+    // set by wifi state changed events. Null if not connected to any SSID
+    public P2PWifiNode connectedNode;
     // TODO: remove on error !!!
     // TODO: notify after each failure and after all attempts are done.
     // TODO: notify on the status/progress of connection
     // TODO: temp blacklist.
-
-    // set by wifi state changed events. Null if not connected to any SSID
-    public P2PWifiNode currentSsid;
-
+    public int conAttempts;
+    public int conSuccess;
+    WifiManager mWifiManager;
+    WifiMesh dmesh;
     // List of visible APs we can connect. Set by wifi AP periodic events.
     ArrayList<String> configured = new ArrayList<>();
     P2PWifiNode currentCandidateInProgress;
-
-    public int conAttempts;
-    public int conSuccess;
-
-    /**
-     *  Last time we connected to a network (system time)
-     */
-    public static long lastSuccess;
-
     long startTimeE; // 0 if not started
 
-    // If true, will keep attempting to connect to all visible networks, to test
-    // them.
-    boolean testAllMode = false;
+    // For testing only - if set will connect only to this network.
+    public String fixedNetworkOverride;
 
     // Active only while attempting to connect, not interested in wifi events
     // otherwise.
@@ -114,15 +108,16 @@ public class Connect {
     // TODO: could discover 'ACTION_PICK_WIFI_NETWORK' after configuring the visible networks for
     // user preference (with system UI)
     StringBuilder attemptL = new StringBuilder();
+    NetworkInfo.DetailedState lastConnectingState;
     private ArrayList<P2PWifiNode> tryingNow = new ArrayList<>();
     private ArrayList<P2PWifiNode> tryAll = new ArrayList<>();
     private Context ctx;
 
     public Connect(Context ctx, WifiMesh mesh) {
-        this.ctx = ctx;
+        this.ctx = ctx.getApplicationContext();
         dmesh = mesh;
 
-        mWifiManager = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
+        mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
 
         String current = "\"" + getCurrentWifiSSID() + "\"";
 
@@ -139,6 +134,30 @@ public class Connect {
                 }
             }
         }
+    }
+
+    // For debug - v4 address is set as static (to avoid DHCP) - just checking...
+    private static InetAddress toInetAddress(int addr) {
+        try {
+            return InetAddress.getByAddress(new byte[]{(byte) addr, (byte) (addr >>> 8),
+                    (byte) (addr >>> 16), (byte) (addr >>> 24)});
+        } catch (UnknownHostException e) {
+            //should never happen
+            return null;
+        }
+    }
+
+    /**
+     * Remove quotes
+     */
+    public static String cleanSSID(String ssid) {
+        if (ssid == null) {
+            return null;
+        }
+        if (ssid.startsWith("\"")) {
+            ssid = ssid.substring(1, ssid.length() - 1);
+        }
+        return ssid;
     }
 
     /**
@@ -167,67 +186,6 @@ public class Connect {
         return cleanSSID(info.getSSID());
     }
 
-    public List<Inet6Address> getIp6WifiClient() {
-        if (getCurrentWifiSSID() == null) {
-            return null;
-        }
-        WifiInfo info = mWifiManager.getConnectionInfo();
-        InetAddress expIp4 = toInetAddress(info.getIpAddress());
-
-        try {
-            List<Inet6Address> l = new ArrayList<>();
-            Enumeration e = NetworkInterface.getNetworkInterfaces();
-            while (e.hasMoreElements()) {
-                NetworkInterface ni = (NetworkInterface) e.nextElement();
-                if (ni.isLoopback()) {
-                    continue;
-                }
-                if (ni.getName().contains("dummy")) {
-                    continue;
-                }
-                if (!ni.isUp()) {
-                    continue;
-                }
-                Inet4Address ip4 = null;
-                Inet6Address ip6 = null;
-
-                // It gets tricky if connected already to a p2p !
-                for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
-                    InetAddress a = ia.getAddress();
-                    if (a instanceof Inet6Address) {
-                        ip6 = (Inet6Address) a;
-                        if (ip6.getAddress()[0] == (byte) 0xf8) {
-                            l.add(0, ip6);
-                        } else {
-                            l.add(ip6);
-                        }
-                    } else {
-                        ip4 = (Inet4Address) a;
-                    }
-                }
-
-                if (ip4 != null && ip6 != null && ip4.equals(expIp4)) {
-                    return l;
-                }
-            }
-        } catch (SocketException e) {
-            e.printStackTrace();
-        }
-        return null;
-    }
-
-
-    // For debug - v4 address is set as static (to avoid DHCP) - just checking...
-    private static InetAddress toInetAddress(int addr) {
-        try {
-            return InetAddress.getByAddress(new byte[]{(byte) addr, (byte) (addr >>> 8),
-                    (byte) (addr >>> 16), (byte) (addr >>> 24)});
-        } catch (UnknownHostException e) {
-            //should never happen
-            return null;
-        }
-    }
-
     public synchronized StringBuilder dump(Bundle b, StringBuilder sb) {
         if (currentCandidateInProgress != null) {
             b.putString("con.candidate", currentCandidateInProgress.ssid);
@@ -235,8 +193,8 @@ public class Connect {
 //        if (tryingNow.size() > 0) {
 //            b.putParcelableArrayList("con.trying", tryingNow);
 //        }
-//        if (currentSsid != null) {
-//            b.putParcelable("con.connected", currentSsid);
+//        if (connectedNode != null) {
+//            b.putParcelable("con.connected", connectedNode);
 //        }
         if (conAttempts > 0) {
             b.putLong("con.attempts_cnt", conAttempts);
@@ -276,6 +234,13 @@ public class Connect {
         for (P2PWifiNode n : lastScan) {
             if (n.pass == null && n.ssid.startsWith("DIRECT-")) {
                 continue;
+            }
+            if (fixedNetworkOverride != null) {
+                if (!n.ssid.equals(fixedNetworkOverride)) {
+                    // only allow connections to the specified test network,
+                    // ignore all others
+                    continue;
+                }
             }
             tryingNow.add(n);
         }
@@ -327,7 +292,7 @@ public class Connect {
             return;
         }
 
-        final P2PWifiNode currentLocal = candidate;
+        final P2PWifiNode currentCandidate = candidate;
         currentCandidateInProgress = candidate;
 
         // Normal: ~5 sec.
@@ -338,7 +303,7 @@ public class Connect {
         handler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                afterNetworkAttempt(remaining, currentLocal);
+                afterNetworkAttempt(remaining, currentCandidate);
             }
         }, 40000);
 
@@ -361,17 +326,17 @@ public class Connect {
     }
 
     synchronized void afterNetworkAttempt(final ArrayList<P2PWifiNode> remaining,
-                                          final P2PWifiNode currentLocal) {
-        if (currentLocal != currentCandidateInProgress) {
-            Log.e(TAG, "Unexpected change in currentCandidateInProgress " + currentLocal + " " + currentCandidateInProgress);
+                                          final P2PWifiNode currentCandidate) {
+        if (currentCandidate != currentCandidateInProgress) {
+            // Should not happen (unless another bug in scheduling)
+            Log.e(TAG, "Unexpected change in currentCandidateInProgress " + currentCandidate + " " + currentCandidateInProgress);
         }
 
         remaining.remove(currentCandidateInProgress);
 
-        if (currentSsid != null && !testAllMode) {
-
-            if (currentSsid.ssid.equals(currentLocal.ssid)) {
-                Log.e(TAG, "Unexpected change of SSID " + currentLocal + " " + currentCandidateInProgress);
+        if (connectedNode != null) {
+            if (!connectedNode.ssid.equals(currentCandidate.ssid)) {
+                Log.e(TAG, "Unexpected change of SSID " + currentCandidate + " " + currentCandidateInProgress);
             }
             Log.d(TAG, "Successfully connected " + currentCandidateInProgress.ssid + " " + getCurrentWifiSSID());
             currentCandidateInProgress.connectCount++;
@@ -671,7 +636,7 @@ public class Connect {
             case UNKNOWN:
             default:
                 // Log - not very useful
-                Log.d(TAG, "WifiStatex: " + netInfo + " " + currentCandidateInProgress);
+                Log.d(TAG, "WifiState: " + netInfo + " " + currentCandidateInProgress);
         }
 
         if (!netInfo.isConnected()) {
@@ -686,28 +651,28 @@ public class Connect {
                     Log.d(TAG, "OBTAINING_IPADDR " + ssid + " " + netInfo + " " + currentCandidateInProgress);
                 }
                 // Typically this is where it gets stuck
-            } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.SCANNING) {
+//            } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.SCANNING) {
                 // DISCONNECTED / SCANNING
 //                if (ssid != null && !ssid.startsWith("<")) {
 //                    Log.d(TAG, "Scanning to connect " + ssid);
 //                } else {
-//                    Log.d(TAG, "Scanning... " + (currentSsid == null ? currentCandidateInProgress : currentSsid));
+//                    Log.d(TAG, "Scanning... " + (connectedNode == null ? currentCandidateInProgress : connectedNode));
 //                }
-            } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.CONNECTING) {
+//            } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.CONNECTING) {
                 // ignore
             } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.DISCONNECTING) {
-                Log.d(TAG, "Disconnecting... " + currentSsid);
-            } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.DISCONNECTED) {
+                Log.d(TAG, "Disconnecting... " + connectedNode);
+//            } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.DISCONNECTED) {
                 // ignore
             } else {
                 Log.d(TAG, "WifiState: " + netInfo + " " + currentCandidateInProgress);
             }
 
             if (netInfo.getState() == NetworkInfo.State.DISCONNECTED) {
-                if (currentSsid != null) {
-                    dmesh.event(ssid, "Disconnected " + currentSsid);
-                    currentSsid.connectedTime += (System.currentTimeMillis() - currentSsid.lastConnect);
-                    currentSsid = null;
+                if (connectedNode != null) {
+                    dmesh.event(ssid, "Disconnected " + connectedNode);
+                    connectedNode.connectedTime += (System.currentTimeMillis() - connectedNode.lastConnect);
+                    connectedNode = null;
                 }
             }
             return;
@@ -727,28 +692,22 @@ public class Connect {
             return; // <unknown ssid>
         }
 
-        if (currentSsid == null) {
-            currentSsid = dmesh.bySSID(ssid, wifiInfo.getBSSID());
-            currentSsid.connectCount++;
-            currentSsid.lastConnect = System.currentTimeMillis();
+        if (connectedNode == null) {
+            connectedNode = dmesh.bySSID(ssid, wifiInfo.getBSSID());
+            connectedNode.connectCount++;
+            connectedNode.lastConnect = System.currentTimeMillis();
 
             conSuccess++;
             lastSuccess = System.currentTimeMillis();
 
-            dmesh.event(ssid, "Connected " + " ssid=" + currentSsid + " rssi=" + wifiInfo.getRssi() +
-                            " " + currentCandidateInProgress);
+            dmesh.event(ssid, "Connected " + " ssid=" + connectedNode + " rssi=" + wifiInfo.getRssi() +
+                    " " + currentCandidateInProgress);
 
-            String i6 = currentSsid.p2pProp.getString("i");
-            if (i6 != null) {
-                Message m = handler.obtainMessage(what);
-                m.getData().putString("ssid", currentSsid.ssid);
-                m.getData().putString("dmesh.ap6Address", i6);
-                m.getData().putString("if", i6);
-                m.getData().putString("dmesh.localAddress", i6);
-                m.sendToTarget();
-            }
-        } else if (!currentSsid.ssid.equals(ssid)) {
-            dmesh.event(currentSsid.ssid, "Unexpected change in SID " + ssid + " " + currentSsid.ssid);
+            Message m = handler.obtainMessage(what);
+            m.getData().putString("ssid", connectedNode.ssid);
+            m.sendToTarget();
+        } else if (!connectedNode.ssid.equals(ssid)) {
+            dmesh.event(connectedNode.ssid, "Unexpected change in SID " + ssid + " " + connectedNode.ssid);
         }
 
         // Connected 60:e3:27:fb:80:46 SSID: costin, BSSID: 60:e3:27:fb:80:46,
@@ -757,22 +716,6 @@ public class Connect {
         // NetInfo: [type: WIFI[], state: CONNECTED/CONNECTED, extra: "costin", isAvailable: true]
 
     }
-
-    NetworkInfo.DetailedState lastConnectingState;
-
-    /**
-     * Remove quotes
-     */
-    public static String cleanSSID(String ssid) {
-        if (ssid == null) {
-            return null;
-        }
-        if (ssid.startsWith("\"")) {
-            ssid = ssid.substring(1, ssid.length() - 1);
-        }
-        return ssid;
-    }
-
 
     public class Receiver extends BroadcastReceiver {
         @Override

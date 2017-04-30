@@ -19,11 +19,11 @@ import java.util.List;
 /**
  * Helper for wifi scans. Can do a single scan or a periodic scan, and
  * filters 'direct' or 'DM-' connectable networks.
- *
+ * <p>
  * Also filters any network that may need discovery - the caller should
  * decide if it needs to do the expensive discovery, or can connect to
  * a visible network and possibly provision from the net.
- *
+ * <p>
  * Also has a 'periodic' mode - mostly for debug ( TODO: remove it ?)
  */
 public class Scan {
@@ -32,14 +32,14 @@ public class Scan {
     // Last result of mWifiManager.geScanResults().
     public static List<ScanResult> lastScanResult = new ArrayList<>();
 
+    /**
+     * Nodes found on the last scan.
+     */
     public static ArrayList<P2PWifiNode> last = new ArrayList<>();
-    public ArrayList<P2PWifiNode> connectable = new ArrayList<>();
-    public ArrayList<P2PWifiNode> toFind = new ArrayList<>();
 
     // Oldest and latest result in 'last', timestamp
     static long oldestResult;
     static long latestResult;
-
     // stats:
     static int scanRequests;
     // Good to know if the phone updates us in background, without us
@@ -48,20 +48,12 @@ public class Scan {
     static long startScanTime;
     static long lastScanResultsEMs;
     static long scanLatency;
-    static long prevScan;
-
+    final List<Message> pending = new ArrayList<>();
+    public ArrayList<P2PWifiNode> connectable = new ArrayList<>();
+    public ArrayList<P2PWifiNode> toFind = new ArrayList<>();
     WifiMesh mesh;
     WifiManager mWifiManager;
-
-    Runnable periodic = new Runnable() {
-        @Override
-        public void run() {
-
-        }
-    };
-
     List<Periodic> listeners = new ArrayList<>();
-    final List<Message> pending = new ArrayList<>();
     BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -80,9 +72,8 @@ public class Scan {
     // every ~1 min. This may be done by hardware - it seems each result is
     // different, so it may wake up AP on changes only.
     public Scan(Context ctx) {
-        mWifiManager = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
+        mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         mesh = WifiMesh.get(ctx);
-        prevScan = SystemClock.elapsedRealtime();
     }
 
     private void sendMessages() {
@@ -142,14 +133,19 @@ public class Scan {
         Periodic p = new Periodic(this, handler, what, i);
         listeners.add(p);
         mWifiManager.startScan();
+        Log.d(TAG, "Periodic scan " + i);
         return p;
     }
 
     public synchronized void stop(Context ctx, Periodic p) {
+        if (p == null) {
+            return;
+        }
         listeners.remove(p);
         p.stop();
         if (listeners.size() == 0) {
             ctx.unregisterReceiver(mesh.scanner.receiver);
+            Log.d(TAG, "Periodic scan stop");
         }
     }
 
@@ -210,9 +206,6 @@ public class Scan {
 
         last = nodeNow;
 
-        long since = now - prevScan;
-        prevScan = now;
-
         // 1. Update connectivity
         connectable.clear();
         toFind.clear();
@@ -223,20 +216,21 @@ public class Scan {
             }
             connectable.add(n);
         }
+
         updateToFind(last, now);
 
-        if (listeners.size() > 0) {
+        //if (listeners.size() > 0) {
             // we have an active listsener
-            Log.d(TAG, "latency:" + since + " visible:" + scanResults.size() +
-                    " connectable:" + getSSIDs(connectable) +
-                    " toFind:" + getSSIDs(toFind) +
-                    " add:" + getSSIDs(added) + " rm: " + removed);
+//            Log.d(TAG, " visible:" + scanResults.size() + "/" + last.size() +
+//                    " connectable:" + getSSIDs(connectable) +
+//                    " toFind:" + getSSIDs(toFind) +
+//                    " add:" + getSSIDs(added) + " rm: " + removed);
 //        } else { // caller should log (with more context)
 //            Log.d(TAG, "visible:" + scanResults.size() +
 //                    " connectable:" + getSSIDs(connectable) +
 //                    " toFind:" + getSSIDs(toFind) +
 //                    " add:" + getSSIDs(added) + " rm:" + removed);
-        }
+        //}
 
         notifyHandlers();
     }
@@ -246,20 +240,21 @@ public class Scan {
      */
     void updateToFind(ArrayList<P2PWifiNode> lastScan, long now) {
         for (P2PWifiNode n : lastScan) {
-            long since = (now - n.p2pLastDiscoveryAttemptE) / 1000;
             if (!n.ssid.startsWith("DIRECT")) {
                 continue;
             }
+            long since = (now - n.p2pLastDiscoveryAttemptE) / 1000;
             if (n.pass == null) {
                 if (n.p2pDiscoveryAttemptCnt > 5 && n.p2pDiscoveryCnt == 0
                         && since < 3600) {
+                    Log.d(TAG, "Skip node with 5 failed discoveries in last hour " + n.ssid);
                     continue; // ignore bad node
                 }
                 if (since > 600) { // don't try a node for 10 min
                     toFind.add(n);
                 }
-            } else if (since > 6 * 3600) {
-                // Password may have changed
+            } else if (since > 3600) {
+                // Password or net may have changed
                 toFind.add(n);
             }
         }
@@ -273,7 +268,7 @@ public class Scan {
         }
     }
 
-    ArrayList<String> getSSIDs(ArrayList<P2PWifiNode> n) {
+    public static ArrayList<String> getSSIDs(ArrayList<P2PWifiNode> n) {
         ArrayList<String> out = new ArrayList<>();
         for (P2PWifiNode nn : n) {
             out.add(nn.ssid);

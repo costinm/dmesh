@@ -24,12 +24,12 @@ import android.util.Log;
  * devices to connect. It may also be used if an old device has a BT
  * or USB connection that needs to be shared.
  * <p>
- * Another dissadvantage is that it overrides the 'share internet connection' setting,
+ * Another disadvantage is that it overrides the 'share internet connection' setting,
  * replacing it with an open SSID - it should not be called if that is set.
  * <p>
  * One benefit would be that it's faster to connect - no discovery needed.
  * <p>
- * A password seems to be reqired for using static IP address - and without
+ * A password seems to be required for using static IP address - and without
  * static IP address we can't connect if the AP is in doze.
  */
 public class APHotspot {
@@ -59,12 +59,12 @@ wpa_psk=f851c31610...
     WifiConfiguration oldLegacyAp;
 
     public APHotspot(Context ctx) {
-        init(ctx.getApplicationContext());
+        init(ctx);
     }
 
     void init(Context ctx) {
-        this.ctx = ctx;
-        mWifiManager = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
+        this.ctx = ctx.getApplicationContext();
+        mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
     }
 
     /**
@@ -87,7 +87,7 @@ wpa_psk=f851c31610...
     }
 
     boolean createLegacyAp(String ssid, String pass) {
-        /**
+        /*
          * Will replace the 'wifi hotspot' configuration - probably not a good idea.
          * <p/>
          * Will also disconnect from wifi client.

@@ -71,11 +71,10 @@ public class P2PDiscovery {
     WifiMesh dmesh;
     Handler handler;
     int what;
+    int found = 0;
     private long timeToFirstDiscovery;
     private long timeToLastDiscovery;
     private WifiP2pManager.Channel mChannel;
-
-    int found = 0;
 
     public P2PDiscovery(Context ctx) {
         this.ctx = ctx;
@@ -112,12 +111,17 @@ public class P2PDiscovery {
                                       boolean force) {
         long now = SystemClock.elapsedRealtime();
 
-        if (dmesh.apRunning) {
-            // No discovery while AP is running ( will need to switch bands,
-            // buggy ).
+//        if (dmesh.apRunning) {
+//            // No discovery while AP is running ( will need to switch bands,
+//            // buggy ).
+//            return false;
+//        }
+        if (dmesh.con.inProgress()) {
+            Log.d(TAG, "Skip discovery, connection in progress");
             return false;
         }
-        if (dmesh.con.inProgress() || discoveryStarted != 0) {
+        if (discoveryStarted != 0 && (now - discoveryStarted < DISC_TO)) {
+            Log.d(TAG, "Skip discovery, in progress");
             return false;
         }
         if (now - lastDiscovery < DISC_TO) {
@@ -326,19 +330,24 @@ public class P2PDiscovery {
     }
 
     void onFound(String instanceName, WifiP2pDevice srcDevice, Map<String, String> txt) {
+        if (txt != null) {
+            return; // lower case, garbage.
+        }
         if (!srcDevice.isGroupOwner()) {
             // Visible: Samsung/CM, Kindle, NexusOne. TBD: do they use additional power ?
             // Can't be found on nexus7
             Log.d(TAG, "Found PTR non-GO device " +
                     instanceName + " " + // DM-DIRECT-tP-Android_40e9-43i5PYdf._dm._udp.local.
                     srcDevice.deviceAddress + " " +
-                    srcDevice.deviceName);
+                    srcDevice.deviceName +  " " + txt);
         } else {
-            Log.d(TAG, "Found PTR " +
+            Log.d(TAG, "Found " +
                     instanceName + " " +// DM-DIRECT-tP-Android_40e9-43i5PYdf
                     srcDevice.deviceAddress + " " +
-                    srcDevice.deviceName); // from settings !!!
+                    srcDevice.deviceName + " txt=" + txt );
         }
+        // TODO: the txt record is lower-cased - but the password is mixed case. Need to b64, use
+        // compact proto for announcement.
 
         Long now = SystemClock.elapsedRealtime();
         if (timeToFirstDiscovery == 0) {
@@ -361,7 +370,7 @@ public class P2PDiscovery {
                 return;
             }
             String ssid = cmp[cmp.length - 2];
-            String pass = cmp[cmp.length - 1];
+            String pass = cmp[cmp.length - 1]; // TODO: encode, encrypt
             n = dmesh.bySSID(ssid, srcDevice.deviceAddress);
             n.mac = srcDevice.deviceAddress;
             n.pass = pass;
@@ -373,17 +382,17 @@ public class P2PDiscovery {
             //dmesh.notifyNodeUpdate(n);
 
             // Rest are map of properties
-                for (int i = 0; i < cmp.length - 3; i++) {
-                    String sp[] = cmp[i].split("-", 2);
-                    if (sp.length == 2) {
-                        if ("i".equals(sp[0])) {
-                            n.ip6 = sp[1];
-                        } else {
-                            n.p2pProp.putString(sp[0], sp[1]);
-                        }
-                        //Log.d(TAG, "Property " + sp[0] + " " + sp[1] + " " + cmp);
+            for (int i = 0; i < cmp.length - 2; i++) {
+                String sp[] = cmp[i].split("-", 2);
+                if (sp.length == 2) {
+                    if ("n".equals(sp[0])) {
+                        n.net = sp[1];
+                    } else {
+                        n.p2pProp.putString(sp[0], sp[1]);
                     }
+                    //Log.d(TAG, "Property " + sp[0] + " " + sp[1] + " " + cmp);
                 }
+            }
 
             if (n.mac == null || !n.mac.equals(srcDevice.deviceAddress)) {
                 Log.d(TAG, "Missmatched MAC between periodic and P2P DNSSD " +
@@ -448,7 +457,6 @@ public class P2PDiscovery {
         @Override
         public void onDnsSdTxtRecordAvailable(String fullDomainName, Map<String, String> txtRecordMap, WifiP2pDevice srcDevice) {
             onFound(fullDomainName, srcDevice, txtRecordMap);
-            Log.d(TAG, "Found TXT " + fullDomainName + " " + txtRecordMap);
         }
     }
 }
