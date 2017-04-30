@@ -8,6 +8,12 @@
         android:title="Toggle P2P AP" />
 
     <item
+        android:id="@+id/settings"
+        android:icon="@android:drawable/ic_menu_preferences"
+        android:showAsAction="ifRoom"
+        android:title="Settings" />
+
+    <item
         android:id="@+id/discovery"
         android:title="Start manual discovery" />
 
@@ -30,8 +36,16 @@
         android:title="Stop Hotspot AP" />
 
     <item
+        android:id="@+id/periodic_scan"
+        android:title="Scan every 10 sec" />
+
+    <item
         android:id="@+id/exit"
         android:title="Exit (leave in current state)" />
 
+    <item
+        android:id="@+id/suspend"
+        android:title="Freeze"
+        android:checkable="true"/>
 
 </menu>
