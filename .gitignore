@@ -6,7 +6,11 @@
 .DS_Store
 /build
 /captures
-app-matlog/build
-app-matlog/build
+*/build/
 releases bin
 *.iml
+bazel-bin
+bazel-dmesh
+bazel-out
+bazel-testlogs
+bazel-genfiles
