@@ -41,14 +41,12 @@ TODO:
  */
 @TargetApi(Build.VERSION_CODES.JELLY_BEAN)
 public class P2PDiscovery {
-    // TODO: since discovery is so painful, collect all data we find
-    // and save it.
-    public static final String TAG = "LM-Wifi-Disc";
+    static final String TAG = "LM-Wifi-Disc";
     static final long DISC_FAST = 8000;
     static final long DISC_TO = 60000;
     static final String MESH_SUFFIX = "._dm._udp.local.";
 
-    public WifiDiscoveryListener discoveryListener = new WifiDiscoveryListener();
+    WifiDiscoveryListener discoveryListener = new WifiDiscoveryListener();
 
     // It seems the announce goes for longer than expected
     // Set by the receiver on 'p2p_discovery_started' events.
@@ -107,6 +105,20 @@ public class P2PDiscovery {
         return sb;
     }
 
+    /**
+     * Start discovery. Normally happens after a SCAN, which finds visible nodes.
+     *
+     * It'll run for 8 seconds - if it finds at least one DMESH node, will return.
+     * Otherwise, will keep scanning for 60 seconds.
+     *
+     * After either 8 or 60 seconds will post a message.
+     *
+     * @param handler message will be posted on this handler
+     * @param what the what, allowing the caller to customize and use its main handler.
+     * @param force run a discovery even if scanner doesn't return show any DIRECT node.
+     * @return true if a discovery has been started. False if a discovery is already in progress
+     *  or can't be started.
+     */
     public synchronized boolean start(Handler handler, int what,
                                       boolean force) {
         long now = SystemClock.elapsedRealtime();
@@ -140,7 +152,7 @@ public class P2PDiscovery {
                 public void run() {
                     maybeStop();
                 }
-            }, DISC_FAST); // normal apSessionStop is 2 min.
+            }, DISC_FAST); // normal apSessionStop is 2 min - i.e. system will kill it at that point.
 
             return true;
         }
@@ -431,8 +443,7 @@ public class P2PDiscovery {
         n.p2pLastDiscoveredE = SystemClock.elapsedRealtime();
         n.p2pDiscoveryCnt++;
 
-        // Note: MAC address is not very good, it is different in P2P from
-        // periodic.
+        // Note: MAC address is not useful, different from normal MAC in many cases.
 
     }
 

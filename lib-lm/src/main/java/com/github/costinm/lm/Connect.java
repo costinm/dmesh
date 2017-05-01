@@ -220,7 +220,7 @@ public class Connect {
         this.what = what;
 
         if (lastScan == null) {
-            lastScan = Scan.last;
+            lastScan = dmesh.scanner.connectable;
         }
 
         if (currentCandidateInProgress != null) {

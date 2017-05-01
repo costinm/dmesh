@@ -49,6 +49,10 @@ public class Scan {
     static long lastScanResultsEMs;
     static long scanLatency;
     final List<Message> pending = new ArrayList<>();
+    /**
+     * Connectable nodes includes all active AP nodes that can be used by Connect.
+     * Discovery adds nodes to this list.
+     */
     public ArrayList<P2PWifiNode> connectable = new ArrayList<>();
     public ArrayList<P2PWifiNode> toFind = new ArrayList<>();
     WifiMesh mesh;

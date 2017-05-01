@@ -1,12 +1,16 @@
 package com.github.costinm.lm;
 
 import android.content.Context;
-import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Looper;
+import android.os.Message;
 import android.support.test.InstrumentationRegistry;
 import android.support.test.runner.AndroidJUnit4;
 import android.util.Log;
 
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -15,145 +19,114 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 @RunWith(AndroidJUnit4.class)
 public class ApTests {
-    Context ctx;
+    static final String TAG = "LM-TEST";
+    static BlockingQueue<Message> bq = new LinkedBlockingQueue<>();
+    static Handler h;
+    static Context ctx;
+    static WifiMesh lm;
+
+    @BeforeClass
+    public static void setUpHandler() {
+        HandlerThread thread = new HandlerThread("Test");
+        thread.start();
+        Looper l = thread.getLooper();
+        h = new Handler(l) {
+            @Override
+            public void handleMessage(Message msg) {
+                Message clone = Message.obtain();
+                clone.copyFrom(msg);
+                bq.add(clone); // msg will be recycled after handleMessage is done
+            }
+        };
+        ctx = InstrumentationRegistry.getTargetContext();
+
+        lm = WifiMesh.get(ctx);
+
+        // Will make sure AP is stopped
+        lm.onStart(ctx, h, h.obtainMessage(11));
+        try {
+            Message s = bq.poll(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
 
     @Before
     public void setUp() {
-        ctx = InstrumentationRegistry.getTargetContext();
         // tests run in separate package.
-        assertEquals("com.github.costinm.dmap.test", ctx.getPackageName());
+        assertEquals("com.github.costinm.lm.test", ctx.getPackageName());
+        bq.clear();
+    }
+
+    /**
+     * Test scan and discovery. Assumes an environment with at least one DMesh node running
+     * in permanent AP mode, expects to find it.
+     */
+    @Test
+    public void disc() throws Exception {
+        // TODO: make sure AP is stopped, network disconnected.
+
+        boolean bg = lm.scanner.scan(30000, h.obtainMessage(1));
+        if (bg) {
+            Message s = bq.poll(10, TimeUnit.SECONDS);
+            // If connected to a P2P network, scan can be ignored (ex. Nexus10 LMP)
+            // WifiStateMachine L2Connected CMD_START_SCAN source -2 ... ignore because P2P is connected
+            if (s != null) {
+                assertEquals("Unexpected scan result", s.what, 1);
+                assertTrue("No DMesh wifi node, must have an allways on AP for testing",
+                        lm.scanner.last.size() > 0);
+                Log.d(TAG, "SCAN FOUND " + lm.scanner.last);
+            }
+        }
+
+        // TODO: run this ~20 times
+        bg = lm.disc.start(h, 2, true);
+        if (!bg) {
+            fail("Failed to start discovery");
+            return;
+        }
+        Message s = bq.poll(12, TimeUnit.SECONDS); // expect to find in 8 seconds.
+
+        assertEquals("Unexpected discovery result", 2, s.what);
+        assertTrue("Node not discovered",
+                lm.scanner.connectable.size() > 0);
+        Log.d(TAG, "FOUND " + lm.scanner.connectable);
+
+        lm.con.start(ctx, null, h, 3);
+        s = bq.poll(12, TimeUnit.SECONDS); // expect to find in 8 seconds, plus 2 sec safety
 
     }
 
     /**
-     * Tested: 15-ICS (NexusS), 16-JB (NexusS)
-     *
-     * Failed: 10-GB (Droid)
+     * Test starting/stopping the P2P AP.
      */
-    //@Test
-//    public void legacy() throws Exception {
-//        // fixed: JB: Failed to discover soft AP with a running supplicant
-//        //   requires to turn of wifi before starting AP
-//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-//            return;
-//        }
-//        AP ap = new AP(WifiMesh.get(ctx), ctx);
-//
-//        ap.stopLegacyAp();
-//
-//        // NoSuchMethod on N
-////        WifiConfiguration wf = ap.getWifiApConfiguration();
-////        if (wf != null) {
-////            Log.d(AP.TAG, "Got AP Wifi config " + wf.SSID + " " + wf);
-////        }
-//
-//        boolean res = ap.createLegacyAp();
-//        if (!res) {
-//            fail("ap");
-//        }
-//        Thread.sleep(30000);
-//
-//        /*
-//        Droid:
-//
-//        12-05 19:53:20.572 1104-1142/system_process D/Tethering: tiwlan0 is not a tetherable iface, ignoring
-//        12-05 19:53:20.814 1012-1029/? E/SoftapController: SIOCGIPRIV failed: -1
-//        12-05 19:53:20.814 1012-1029/? E/SoftapController: Softap driver apSessionStop - function not supported
-//        12-05 19:53:20.814 1104-1145/system_process E/WifiService: Exception in startAccessPoint()
-//
-//        TODO: wait until callbacks are generated for actual status
-//         */
-//        // Callbacks: discover is (2), 4, 0, 1
-//
-////        wf = ap.getWifiApConfiguration();
-////        Log.d("T", "Wifi: " + wf);
-////
-////        assertTrue(ap.isWifiApEnabled());
-//        ap.stopLegacyAp();
-//
-//        // TODO: 'witness' device to connect to network and ping !
-//    }
-
     @Test
-    public void disc() throws Exception {
-        final BlockingQueue<String> bq= new LinkedBlockingQueue<>();
+    public void ap() throws Exception {
 
+        // TODO: run this ~100 times...
+        lm.ap.start(h.obtainMessage(5)); // 1 min
 
-        P2PDiscovery disc = new P2PDiscovery(ctx) {
-                public void onNewNode(String ssid, String pass, String mac) {
-                    bq.add(ssid);
-                }
-        };
+        Message m = bq.poll(5, TimeUnit.SECONDS);
 
-        disc.discover();
+        assertEquals(m.what, 5);
 
-        for (int i = 0; i < 10; i++) {
-            String s = bq.poll(10, TimeUnit.SECONDS);
-            if (s!= null && s.contains("mY-costin")) {
-                return;
-            }
-            Log.d(AP.TAG, "Ignoring " + s);
-        }
-        fail("Not finding test AP");
-    }
-
-    final BlockingQueue bq = new LinkedBlockingQueue();
-
-    @Test
-    public void p2p() throws Exception {
-        final AP ap = new AP(WifiMesh.get(ctx), ctx);
-//        ap.listener = new ApListener() {
-//            public void onDone() {
-//                Log.d(AP.TAG, "Got onDone");
-//                bq.add(this);
-//            }
-//        };
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN) {
-            return;
-        }
-
-        ap.start(null); // 1 min
-
-        bq.poll(5, TimeUnit.SECONDS);
+        // TODO: Should have a witness device that connects, look for the p2p connected event
+        // to verify
         Thread.sleep(15000);
 
-        //Log.d("T", "Wifi" + ap.dump());
-
-        // TODO: wait for a ping from witness !
+        assertEquals(bq.size(), 0);
 
         bq.clear();
 
-        ap.stop(null);
+        lm.ap.stop(h.obtainMessage(6));
 
-        bq.poll(5, TimeUnit.SECONDS);
+        m = bq.poll(5, TimeUnit.SECONDS);
 
-        //Log.d("T", "Wifi" + ap.dump());
+        assertEquals(m.what, 6);
     }
-
-
-//    @Test
-//    public void scan() throws Exception {
-//        Scan scan = new Scan(ctx) {
-//        };
-//
-//        scan.update();
-//
-//        // check what we have - display
-//
-//        //scan.scan(0);
-//
-//
-//        // Expect a callback
-//
-//        // wait a bit more
-//
-//        // how many callbacks we got ?  Did we find the witness AP ?
-//
-//
-//    }
-
 }
