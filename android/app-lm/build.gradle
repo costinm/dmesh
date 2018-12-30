@@ -1,15 +1,17 @@
 apply plugin: 'com.android.application'
 
 android {
-    compileSdkVersion 24
+    compileSdkVersion 27
     buildToolsVersion ANDROID_BUILD_TOOLS_VERSION
 
     defaultConfig {
         applicationId "com.github.costinm.dmesh.lm"
-        minSdkVersion 16
-        targetSdkVersion 21
-        versionCode 1
-        versionName "1.0"
+        // JB adds required WifiDirect, but seems to start working in KitKat.
+        //minSdkVersion 19
+        minSdkVersion 21
+        targetSdkVersion TARGET_SDK_VERSION
+        versionCode 2
+        versionName "1.1"
 
         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
 
@@ -35,6 +37,6 @@ dependencies {
     androidTestCompile('com.android.support.test.espresso:espresso-core:2.2.2', {
         exclude group: 'com.android.support', module: 'support-annotations'
     })
-    //compile 'com.android.support:support-v4:25.1.0'
+    compile 'com.android.support:support-v4:27.1.0'
     testCompile 'junit:junit:4.12'
 }
