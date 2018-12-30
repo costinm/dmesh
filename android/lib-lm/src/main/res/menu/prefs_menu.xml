@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:tools="http://schemas.android.com/tools"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item
+        android:id="@+id/mesh_start"
+        android:contentDescription="Initiate a mesh"
+        android:icon="@android:drawable/ic_media_play"
+        android:showAsAction="always"
+        android:title="Start mesh" />
+
+    <item
+        android:icon="@android:drawable/ic_menu_view"
+        android:showAsAction="always"
+        android:id="@+id/view"
+        android:title="Mesh Status" />
+
+
+
+    <item
+        android:id="@+id/refresh"
+        android:icon="@android:drawable/ic_popup_sync"
+        android:showAsAction="never"
+        android:title="Refresh" />
+
+    <item
+        android:id="@+id/adv_settings"
+        android:icon="@android:drawable/ic_menu_preferences"
+        android:showAsAction="never"
+        android:title="Advanced Settings" />
+
+    <item
+        android:id="@+id/debug"
+        android:icon="@android:drawable/ic_dialog_alert"
+        android:title="Debug screen" />
+
+</menu>
