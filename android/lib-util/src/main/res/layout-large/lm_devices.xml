@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:paddingBottom="5dp"
+    android:paddingTop="5dp"
+    >
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_weight="50"
+        android:orientation="vertical"
+        android:layout_height="match_parent">
+
+        <LinearLayout android:layout_width="match_parent"
+            android:visibility="gone"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="1dp"
+            android:orientation="horizontal"
+            android:descendantFocusability="beforeDescendants"
+            android:focusableInTouchMode="true"
+            android:paddingTop="0dp">
+
+            <EditText
+                android:id="@+id/editText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ems="2"
+                android:focusedByDefault="false"
+                android:inputType="textPersonName"
+                android:lines="1"
+                android:text="" />
+
+            <ImageButton
+                android:id="@+id/runButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:src="@android:drawable/ic_media_play" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:orientation="horizontal"
+            android:layout_height="wrap_content">
+
+            <TextView
+                android:id="@+id/ap_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_weight="7"
+                android:nestedScrollingEnabled="true"
+                android:layout_margin="5px"
+                android:padding="5px"
+                android:scrollbars="horizontal|vertical"
+                android:text="TextView" />
+
+            <TextView
+                android:id="@+id/connections_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_weight="3"
+                android:layout_margin="5px"
+                android:backgroundTint="@android:color/holo_green_light"
+                android:nestedScrollingEnabled="true"
+                android:padding="5px"
+                android:visibility="invisible"
+                android:scrollbars="horizontal|vertical"
+                android:text="TextView" />
+        </LinearLayout>
+
+        <ListView
+            android:id="@+id/connections_list"
+            android:layout_width="match_parent"
+            android:padding="5px"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="5dp"
+            android:layout_weight="15" />
+
+    </LinearLayout>
+
+    <ListView
+        android:id="@+id/log_list"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:layout_weight="50"
+        />
+
+</LinearLayout>
