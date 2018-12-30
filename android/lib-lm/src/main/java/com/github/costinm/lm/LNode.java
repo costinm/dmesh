@@ -2,17 +2,35 @@ package com.github.costinm.lm;
 
 import android.net.wifi.ScanResult;
 import android.net.wifi.p2p.WifiP2pDevice;
-import android.os.Bundle;
 import android.os.SystemClock;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+
 /**
+ * Info about a lm node. This includes P2P "DIRECT-" nodes and DM- open
+ * networks.
+ *
  * The ssid, pass, ip6 may change over time.
  */
-public class P2PWifiNode {
-    // Network name, set by the root    .
+public class LNode {
+    // Network name - can be the root's wifi net
     public String net;
 
+    // Private mesh, set in user preferences.
+    public String mesh;
+
+    // This is the real SSID extracted from the TXT, should match the scan beacon
+    // The name of the device is the suffix, after DIRECT- and the 2 random chars.
     public String ssid;
+
+    // If it was ever discovered, the 'device name' according to discovery.
+    // Set in ... Wifi/Advanced/P2P
+    public String name;
+
+    // Generated node name.
+    public String meshName;
 
     // Usually changes when the ssid changes.
     public String pass;
@@ -20,12 +38,20 @@ public class P2PWifiNode {
     // A device may use a different mac when
     // connecting from the AP BSSID. The p2p discovery node may also be
     // different. MAC can be reset - usually at boot time.
+    // This is the MAC from discovery - if the device was discovered. It matches the
+    // MAC in the link local address - so could be used to communicate without multicast.
     public String mac;
 
     // What we found in device discovery - full txt or ptr
     // record. For DMesh devices there is only one record, which is
     // extracted into various components.
-    public String dnsSDDomain;
+    public String extraDiscoveryInfo;
+
+    // Time first discovered, scanned or connected to.
+    public long lastChange;
+
+    // Last time the device was scanned or discovered
+    public long lastScan;
 
     // Set on last discovery - contains user-specified name which is not
     // auto-reset.
@@ -46,7 +72,7 @@ public class P2PWifiNode {
     public long p2pLastDiscoveredE;
 
     // Key-value pairs returned in the p2p discovery SD announce.
-    public Bundle p2pProp = new Bundle();
+    public Map<String,String> p2pProp = new HashMap<>();
 
     // Last time a 'connect' was attempted on this node
     public long lastConnectAttempt;
@@ -59,28 +85,55 @@ public class P2PWifiNode {
     public long connectedTime;
     public int cmNetworkId;
 
+    public boolean foreign = false;
+
+    // Advertised build
+    public String build;
+
     private static long e2s(long millis) {
         return millis + System.currentTimeMillis() - SystemClock.elapsedRealtime();
     }
 
+    /**
+     * Used for debugging, return the SSIDs from a list of nodes
+     */
+    static ArrayList<String> getSSIDs(ArrayList<LNode> n) {
+        ArrayList<String> out = new ArrayList<>();
+        for (LNode nn : n) {
+            out.add(nn.ssid);
+        }
+        return out;
+    }
+
+    /**
+     * Serialize the device
+     *
+     * Comma separated list of key : value
+     *
+     * @return
+     */
     public String toString() {
         StringBuilder sb = new StringBuilder();
-        if (device != null) {
-            sb.append("mac:").append(device.deviceAddress).append(",");
-            sb.append("name:").append(device.deviceName).append(",");
-        }
         if (ssid != null) {
             sb.append("ssid:").append(ssid).append(",");
         }
         if (pass != null) {
             sb.append("pass:").append(pass).append(",");
         }
-        if (dnsSDDomain != null) {
-            sb.append("disc:").append(dnsSDDomain).append(",");
+        if (device != null) {
+            sb.append("name:").append(device.deviceName).append(",");
+            sb.append("mac:").append(device.deviceAddress).append(",");
         }
         if (scan != null) {
             sb.append("smac:").append(scan.BSSID).append(",");
             sb.append("pwr:").append(scan.level).append(",");
+            sb.append("f:").append(scan.frequency).append(",");
+        }
+        if (build != null) {
+            sb.append("build:").append(build).append(",");
+        }
+        if (extraDiscoveryInfo != null) {
+            sb.append("disc:").append(extraDiscoveryInfo).append(",");
         }
         if (connectCount > 0) {
             sb.append("con:").append(connectCount).append(",");
@@ -102,29 +155,15 @@ public class P2PWifiNode {
 
     }
 
+    // MAC or SSID
     public boolean equals(Object o) {
-        if (!(o instanceof P2PWifiNode)) {
+        if (!(o instanceof LNode)) {
             return false;
         }
         if (mac != null) {
-            return mac.equals(((P2PWifiNode) o).mac);
+            return mac.equals(((LNode) o).mac);
         }
-        return ssid != null && ssid.equals(((P2PWifiNode) o).ssid);
+        return ssid != null && ssid.equals(((LNode) o).ssid);
 
-    }
-
-    public String getName() {
-        if (device != null) {
-            // 'friendly name' set by user, doesn't change
-            if (device.deviceName != null) {
-                return device.deviceName;
-            }
-        }
-        // last part of ssid is usually constant.
-        // full mac and ssid will change on some devices.
-        if (ssid != null) {
-            return ssid;
-        }
-        return mac;
     }
 }

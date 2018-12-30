@@ -8,13 +8,17 @@ import android.net.wifi.ScanResult;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Message;
 import android.os.SystemClock;
 import android.util.Log;
 
+import com.github.costinm.dmesh.logs.Events;
+
 import java.util.ArrayList;
 import java.util.List;
+
+
+// Note: In pie, scan is deprecated and throttled ( 4 scans in 2 min )
+//
 
 /**
  * Helper for wifi scans. Can do a single scan or a periodic scan, and
@@ -24,69 +28,168 @@ import java.util.List;
  * decide if it needs to do the expensive discovery, or can connect to
  * a visible network and possibly provision from the net.
  * <p>
- * Also has a 'periodic' mode - mostly for debug ( TODO: remove it ?)
+ * Also has a 'periodic' mode - mostly for lm_debug ( TODO: remove it ?)
+ * <p>
+ *     Scan can also happen due to other apps or off-loaded. For example when connected
+ *     to a wifi, scans can be ~3 min, with 1 min when disconnected, and few 10 sec appart
+ *     when location changes.
+ *     If connected to a wifi (internet connectivity), we may skip scans.
+ * </p>
  */
 public class Scan {
-    private static final String TAG = "LM-Wifi-Scan";
+    private static final String TAG = "LM-Scan";
 
-    // Last result of mWifiManager.geScanResults().
+    // Last result of mWifiManager.geScanResults(). Includes unfiltered SSIDs.
     public static List<ScanResult> lastScanResult = new ArrayList<>();
 
     /**
-     * Nodes found on the last scan.
+     * Nodes found on the last scan. Only SSIDs of type DIRECT or DM.
      */
-    public static ArrayList<P2PWifiNode> last = new ArrayList<>();
+    public static ArrayList<LNode> last = new ArrayList<>();
 
-    // Oldest and latest result in 'last', timestamp
+    // Oldest and latest result in 'last', timestamp. Ex. 500ms.
     static long oldestResult;
+
+    //
     static long latestResult;
+
     // stats:
     static int scanRequests;
+
     // Good to know if the phone updates us in background, without us
     // asking. If yes - may not need to call search very often.
     static int receiverCalled = 0;
+
+    // elapsed time of last start scan.
     static long startScanTime;
+
+    // elapsed realtime of last results
     static long lastScanResultsEMs;
+
+    // Time to complete last explicit scan. About 3.5 sec on N6 - should be less than 5
+    // sec deadline.
     static long scanLatency;
-    final List<Message> pending = new ArrayList<>();
-    /**
-     * Connectable nodes includes all active AP nodes that can be used by Connect.
-     * Discovery adds nodes to this list.
-     */
-    public ArrayList<P2PWifiNode> connectable = new ArrayList<>();
-    public ArrayList<P2PWifiNode> toFind = new ArrayList<>();
-    WifiMesh mesh;
+    static long maxScanLatency;
+
     WifiManager mWifiManager;
-    List<Periodic> listeners = new ArrayList<>();
+    IntentFilter f;
+
+    LMesh lm;
+
+    // Time when startScan was called last time by this app, or 0 if
+    // no explicit scan in progress.
+    long scanStart;
+
+    List<LNode> blacklist = new ArrayList<>();
+
+    // Nodes added/removed in the last scan.
+    List<LNode> added = new ArrayList<>();
+    List<LNode> removed = new ArrayList<>();
+
+    // receiver is called either on requested scan or on background scans by system.
     BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             receiverCalled++;
+            Long now = SystemClock.elapsedRealtime();
+            long sinceLast = now - lastScanResultsEMs;
             lastScanResultsEMs = SystemClock.elapsedRealtime();
 
             if (startScanTime > 0) {
                 scanLatency = lastScanResultsEMs - startScanTime;
             }
+            if (sinceLast > maxScanLatency && receiverCalled > 1) {
+                maxScanLatency = sinceLast;
+            }
             update();
-            sendMessages();
+            if (scanStart > 0) { // explicitly requested scan.
+                if (lastScanResult.size() == 0) {
+                    return; // ignore, let timeout happen.
+                }
+                scanStart = 0;
+                LMesh.disStatus.scanEnd = now;
+                lm.event(LMesh.SCAN, "SCAN OK " + scanLatency + " " + scanStatus());
+            } else {
+                // If the device has no wifi, platform scans automatically - on N7/v23 every 15
+                // sec if screen is on.
+                LMesh.disStatus.scanBg++;
+
+                if (added.size() == 0 && removed.size() == 0) {
+                    Log.d(TAG, "Scan BG, nothing added " + sinceLast/1000 + scanStatus());
+                    return;
+                }
+
+                Events.get().add("SCAN", "BG", scanStatus());
+                lm.event(LMesh.SCAN, "SCAN BG " + sinceLast + " " + scanStatus());
+            }
         }
     };
 
     // In M, the periodic seems to be going on continuously (at least while charging),
     // every ~1 min. This may be done by hardware - it seems each result is
     // different, so it may wake up AP on changes only.
-    public Scan(Context ctx) {
+    Scan(Context ctx, LMesh lMesh) {
         mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        mesh = WifiMesh.get(ctx);
+        lm = lMesh;
     }
 
-    private void sendMessages() {
-        synchronized (pending) {
-            for (Message m : pending) {
-                m.sendToTarget();
-            }
-            pending.clear();
+    String scanStatus() {
+        StringBuilder sb = new StringBuilder();
+        long now = SystemClock.elapsedRealtime();
+
+        sb.append("|w:").append(lm.con.getCurrentWifiSSID()).append(" ");
+        sb.append("|a:");
+        if (lm.apRunning) {
+            sb.append(" on ").append((now - AP.lastStart) / 1000);
+        } else {
+            sb.append(" off ").append((now - AP.lastStop) / 1000);
         }
+        sb.append(" ");
+        addScanInfo(sb);
+        return sb.toString();
+    }
+
+    void addScanInfo(StringBuilder sb) {
+        sb.append("|c: ");
+        for (LNode c: lm.connectable) {
+            if (c.scan == null) {
+                sb.append(c.ssid).append(" ");
+                continue;
+            }
+            sb.append(c.ssid).append("/").append(c.scan.BSSID)
+                    .append("/").append(c.scan.frequency)
+                    .append("/").append(c.scan.level).append(" ");
+        }
+        sb.append("|f: ");
+        for (LNode c: lm.toFind) {
+            if (c.scan == null) {
+                sb.append(c.ssid).append(" ");
+                continue;
+            }
+            sb.append(c.ssid).append("/").append(c.scan.BSSID)
+                    .append("/").append(c.scan.frequency)
+                    .append("/").append(c.scan.level).append(" ");
+        }
+        sb.append("|bl: ");
+        for (LNode c: blacklist) {
+            if (c.scan == null) {
+                sb.append(c.ssid).append(" ");
+                continue;
+            }
+            sb.append(c.ssid).append("/").append(c.p2pDiscoveryAttemptCnt)
+                    .append("/").append(SystemClock.elapsedRealtime() - c.p2pLastDiscoveryAttemptE)
+                    .append("/").append(c.p2pDiscoveryCnt)
+                    .append("/").append(c.scan.level).append(" ");
+        }
+        sb.append("|add: ");
+        for (LNode c: added) {
+            sb.append(c.ssid).append(" ");
+        }
+        sb.append("|rm: ");
+        for (LNode c: removed) {
+            sb.append(c.ssid).append(" ");
+        }
+        sb.append("|v: ").append(lastScanResult.size());
     }
 
     /**
@@ -99,57 +202,60 @@ public class Scan {
      *
      * @param maxAgeMs if results are fresh, don't trigger a new periodic.
      */
-    public synchronized boolean scan(int maxAgeMs, Message in) {
+    synchronized boolean scan(int maxAgeMs) {
+        if (maxAgeMs < 5000) {
+            maxAgeMs = 5000;
+        }
         long now = SystemClock.elapsedRealtime();
 
         update();
 
         long since = now - lastScanResultsEMs;
 
-        if ((lastScanResultsEMs == 0 || since > maxAgeMs)
-                && now - startScanTime > 1000) {
+        if ((lastScanResultsEMs == 0 || since > maxAgeMs)) {
             startScanTime = now;
             scanRequests++;
-            synchronized (pending) {
-                pending.add(in);
+
+            boolean started = mWifiManager.startScan();
+            if (!started) {
+                // May happen if wifi is busy. Typically means other app scanning, results may happen
+                // in bg.
+                Log.d(TAG, "startScan failed, waiting for background");
             }
-            mWifiManager.startScan();
+            scanStart = now;
+            LMesh.disStatus.scanStart = now;
+            lm.serviceHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (scanStart > 0) {
+                        update(); // may still have some results
+                        LMesh.disStatus.scanTimeout = true;
+                        LMesh.disStatus.scanEnd = SystemClock.elapsedRealtime();
+                        scanStart = 0;
+                        lm.event(LMesh.SCAN, "SCAN T 0 " + scanStatus());
+                    }
+                }
+            }, 5000);
             return true;
         } else {
-            in.sendToTarget();
+            lm.event(LMesh.SCAN, "SCAN O " + since/1000 + " " + scanStatus());
             return false;
         }
     }
 
-    /**
-     * Run a periodic periodic. Must be called from a service/activity. Stop must
-     * be called.
-     * <p>
-     * Should only be run frequently while not connected.
-     */
-    public synchronized Periodic start(Context ctx, int i, Handler handler, int what) {
-
-        if (listeners.size() == 0) {
-            IntentFilter f = new IntentFilter();
+    public synchronized void registerReceiver(Context ctx) {
+        if (f == null) {
+            f = new IntentFilter();
             f.addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
-            ctx.registerReceiver(mesh.scanner.receiver, f);
+            ctx.registerReceiver(receiver, f);
         }
-        Periodic p = new Periodic(this, handler, what, i);
-        listeners.add(p);
-        mWifiManager.startScan();
-        Log.d(TAG, "Periodic scan " + i);
-        return p;
     }
 
-    public synchronized void stop(Context ctx, Periodic p) {
-        if (p == null) {
-            return;
-        }
-        listeners.remove(p);
-        p.stop();
-        if (listeners.size() == 0) {
-            ctx.unregisterReceiver(mesh.scanner.receiver);
-            Log.d(TAG, "Periodic scan stop");
+    // Can be called to unregister, will not receive background scan results.
+    public synchronized void unregisterReceiver(Context ctx) {
+        if (f != null) {
+            ctx.unregisterReceiver(receiver);
+            f = null;
         }
     }
 
@@ -157,7 +263,7 @@ public class Scan {
      * Read the currently available periodic results - called when we have a result,
      * or after a scan timeout ( when we don't use the listener )
      */
-    public void update() {
+    public synchronized void update() {
         long now = SystemClock.elapsedRealtime();
         List<ScanResult> scanResults = mWifiManager.getScanResults();
         if (scanResults == null) {
@@ -178,31 +284,33 @@ public class Scan {
         lastScanResult = scanResults;
 
         // Detect if anything changed compared with the previous periodic
-        ArrayList<P2PWifiNode> nodeNow = new ArrayList<>();
+        ArrayList<LNode> nodeNow = new ArrayList<>();
         for (ScanResult sr : scanResults) {
             String ssid = sr.SSID;
-            if (!WifiMesh.isLM(ssid)) {
+            if (!LMesh.isLM(ssid)) {
                 continue;
                 // TODO: open networks or known networks should be shown,
                 // since we can connect.
             }
-            // DMesh specific code: update the DIRECT nodes, discover
+            // DMesh specific code: updateSsidAndPass the DIRECT nodes, discover
             // discovery for any unknown node.
-            P2PWifiNode n = mesh.bySSID(sr.SSID, sr.BSSID);
+            LNode n = lm.bySSID(sr.SSID, sr.BSSID);
             n.scan = sr;
             n.ssid = sr.SSID;
             n.mac = sr.BSSID;
+            n.lastChange = now;
+            n.lastScan = now;
             nodeNow.add(n);
         }
 
-        ArrayList<P2PWifiNode> added = new ArrayList<>();
-        ArrayList<P2PWifiNode> removed = new ArrayList<>();
-        for (P2PWifiNode sr : last) {
+        added.clear();
+        removed.clear();
+        for (LNode sr : last) {
             if (!nodeNow.contains(sr)) {
                 removed.add(sr);
             }
         }
-        for (P2PWifiNode sr : nodeNow) {
+        for (LNode sr : nodeNow) {
             if (!last.contains(sr)) {
                 added.add(sr);
             }
@@ -211,116 +319,80 @@ public class Scan {
         last = nodeNow;
 
         // 1. Update connectivity
-        connectable.clear();
-        toFind.clear();
+        LMesh.connectable.clear();
+        LMesh.toFind.clear();
 
-        for (P2PWifiNode n : last) {
-            if (n.pass == null && n.ssid.startsWith("DIRECT-")) {
-                continue;
-            }
-            connectable.add(n);
+        for (LNode n : last) {
+            maybeAddConnectable(n);
         }
 
         updateToFind(last, now);
+    }
 
-        //if (listeners.size() > 0) {
-            // we have an active listsener
-//            Log.d(TAG, " visible:" + scanResults.size() + "/" + last.size() +
-//                    " connectable:" + getSSIDs(connectable) +
-//                    " toFind:" + getSSIDs(toFind) +
-//                    " add:" + getSSIDs(added) + " rm: " + removed);
-//        } else { // caller should log (with more context)
-//            Log.d(TAG, "visible:" + scanResults.size() +
-//                    " connectable:" + getSSIDs(connectable) +
-//                    " toFind:" + getSSIDs(toFind) +
-//                    " add:" + getSSIDs(added) + " rm:" + removed);
-        //}
-
-        notifyHandlers();
+    public void maybeAddConnectable(LNode n) {
+        if (n.pass == null && n.ssid.startsWith("DIRECT-")) {
+            return;
+        }
+        if (LMesh.connectable.contains(n)) {
+            return;
+        }
+        if (lm.privateNet.length() > 0) {
+            if (n.mesh == null || !n.mesh.equals(lm.privateNet)) {
+                return;
+            }
+            Log.d(TAG, "Private net allow " + lm.privateNet + " " + n.mesh);
+        }
+        // TODO: if last discovery is old - drop
+        LMesh.connectable.add(n);
     }
 
     /**
-     * Process the last discovery to see if we can/want to discover any node.
+     * Process the last scan to see if we can/want to discover any node.
      */
-    void updateToFind(ArrayList<P2PWifiNode> lastScan, long now) {
-        for (P2PWifiNode n : lastScan) {
+    void updateToFind(ArrayList<LNode> last, long now) {
+        blacklist.clear();
+
+        for (LNode n : last) {
             if (!n.ssid.startsWith("DIRECT")) {
+                continue;
+            }
+            // DIRECT-XX-
+            if (n.ssid.substring(10).startsWith("HP ")) {
                 continue;
             }
             long since = (now - n.p2pLastDiscoveryAttemptE) / 1000;
             if (n.pass == null) {
+                if (n.foreign) { // advertises, but not .dm - so clear foreign
+                    blacklist.add(n);
+                    continue;
+                }
                 if (n.p2pDiscoveryAttemptCnt > 5 && n.p2pDiscoveryCnt == 0
                         && since < 3600) {
                     Log.d(TAG, "Skip node with 5 failed discoveries in last hour " + n.ssid);
+                    blacklist.add(n);
                     continue; // ignore bad node
                 }
-                if (since > 600) { // don't try a node for 10 min
-                    toFind.add(n);
+                if (since > 5 * 60) { // don't re-try a node for 5 min
+                    LMesh.toFind.add(n);
+                } else {
+                    blacklist.add(n);
                 }
-            } else if (since > 3600) {
+            } else if (((now - n.p2pLastDiscoveredE) / 1000) > 3600) {
                 // Password or net may have changed
-                toFind.add(n);
+                LMesh.toFind.add(n);
             }
         }
     }
 
-
-    public synchronized void notifyHandlers() {
-        for (Periodic h : listeners) {
-            Message m2 = Message.obtain(h.out.obtainMessage(h.what));
-            m2.sendToTarget();
-        }
-    }
-
-    public static ArrayList<String> getSSIDs(ArrayList<P2PWifiNode> n) {
-        ArrayList<String> out = new ArrayList<>();
-        for (P2PWifiNode nn : n) {
-            out.add(nn.ssid);
-        }
-        return out;
-    }
-
-    public void dump(Bundle b, StringBuilder sb) {
+    void dump(Bundle b) {
         long now = SystemClock.elapsedRealtime();
-        b.putLong("periodic.starts_cnt", scanRequests);
-        b.putLong("periodic.events_cnt", receiverCalled);
+        b.putString("scan.starts", scanRequests + "/" + receiverCalled);
         if (scanLatency > 0) {
-            b.putLong("periodic.time_ms", scanLatency);
+            b.putString("scan.time_ms", scanLatency + "/" + maxScanLatency);
         }
         if (oldestResult > 0) {
-            b.putLong("periodic.oldest_ms", now - oldestResult / 1000); // ~15s
-            b.putLong("periodic.newst_ms", now - latestResult / 1000);
+            b.putString("scan.range", (now - oldestResult / 1000) + "/" + (now - latestResult / 1000));
         }
-    }
-
-    public static class Periodic implements Runnable {
-        Scan scan;
-        Handler out;
-        int what;
-        long interval;
-
-
-        Periodic(Scan ctx, Handler handler, int what, int i) {
-            this.what = what;
-            out = handler;
-            scan = ctx;
-            this.interval = i;
-            out.postDelayed(this, interval);
-        }
-
-        void stop() {
-            interval = 0;
-            out.removeCallbacks(this);
-        }
-
-        @Override
-        public void run() {
-            startScanTime = SystemClock.elapsedRealtime();
-            scanRequests++;
-            scan.mWifiManager.startScan();
-            if (interval > 0) {
-                out.postDelayed(this, interval);
-            }
-        }
+        b.putString("scan.last", scanStatus());
     }
 }

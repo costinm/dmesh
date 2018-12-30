@@ -41,7 +41,7 @@ public class Reflect {
         return method.invoke(object, parameterValues);
     }
 
-    static Object callMethod(Object object, String methodName, Class[] parameterClasses, Object[] parameterValues) throws ClassNotFoundException, IllegalAccessException, IllegalArgumentException, InvocationTargetException, NoSuchMethodException {
+    public static Object callMethod(Object object, String methodName, Class[] parameterClasses, Object[] parameterValues) throws ClassNotFoundException, IllegalAccessException, IllegalArgumentException, InvocationTargetException, NoSuchMethodException {
         Method method = object.getClass().getDeclaredMethod(methodName, parameterClasses);
         return method.invoke(object, parameterValues);
     }

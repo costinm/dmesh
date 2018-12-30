@@ -1,10 +1,12 @@
 package com.github.costinm.lm;
 
+import android.annotation.SuppressLint;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.net.NetworkInfo;
+import android.net.ProxyInfo;
 import android.net.wifi.SupplicantState;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiInfo;
@@ -16,16 +18,12 @@ import android.os.Message;
 import android.os.SystemClock;
 import android.util.Log;
 
+import com.github.costinm.dmesh.logs.Events;
+
 import java.lang.reflect.Field;
-import java.net.Inet4Address;
-import java.net.Inet6Address;
 import java.net.InetAddress;
-import java.net.InterfaceAddress;
-import java.net.NetworkInterface;
-import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.List;
 import java.util.Random;
 
@@ -34,6 +32,7 @@ import static android.net.wifi.WifiManager.EXTRA_NETWORK_INFO;
 import static android.net.wifi.WifiManager.EXTRA_NEW_STATE;
 import static android.net.wifi.WifiManager.EXTRA_SUPPLICANT_ERROR;
 import static android.net.wifi.WifiManager.EXTRA_WIFI_INFO;
+import static com.github.costinm.lm.LMesh.UPDATE;
 
 
 /**
@@ -69,6 +68,11 @@ import static android.net.wifi.WifiManager.EXTRA_WIFI_INFO;
 @SuppressWarnings({"unchecked", "TryWithIdenticalCatches"})
 public class Connect {
 
+    // Debug: D/ConnectivityService
+    // D/NetworkMonitor
+    // D/WifiStateMachine
+    //
+
     static final String TAG = "LM-Wifi-Con";
     /**
      * Last time we connected to a network (system time)
@@ -79,7 +83,7 @@ public class Connect {
     // Also as hidden are the txBad/retries/etc
     public NetworkInfo lastNetInfo;
     // set by wifi state changed events. Null if not connected to any SSID
-    public P2PWifiNode connectedNode;
+    public LNode connectedNode;
     // TODO: remove on error !!!
     // TODO: notify after each failure and after all attempts are done.
     // TODO: notify on the status/progress of connection
@@ -87,10 +91,12 @@ public class Connect {
     public int conAttempts;
     public int conSuccess;
     WifiManager mWifiManager;
-    WifiMesh dmesh;
+    LMesh dmesh;
+
     // List of visible APs we can connect. Set by wifi AP periodic events.
     ArrayList<String> configured = new ArrayList<>();
-    P2PWifiNode currentCandidateInProgress;
+
+    LNode currentCandidateInProgress;
     long startTimeE; // 0 if not started
 
     // For testing only - if set will connect only to this network.
@@ -109,15 +115,17 @@ public class Connect {
     // user preference (with system UI)
     StringBuilder attemptL = new StringBuilder();
     NetworkInfo.DetailedState lastConnectingState;
-    private ArrayList<P2PWifiNode> tryingNow = new ArrayList<>();
-    private ArrayList<P2PWifiNode> tryAll = new ArrayList<>();
+    private ArrayList<LNode> tryingNow = new ArrayList<>();
+    private ArrayList<LNode> tryAll = new ArrayList<>();
     private Context ctx;
 
-    public Connect(Context ctx, WifiMesh mesh) {
+    public Connect(Context ctx, LMesh mesh) {
         this.ctx = ctx.getApplicationContext();
         dmesh = mesh;
 
         mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+
+        /*
 
         String current = "\"" + getCurrentWifiSSID() + "\"";
 
@@ -134,9 +142,10 @@ public class Connect {
                 }
             }
         }
+*/
     }
 
-    // For debug - v4 address is set as static (to avoid DHCP) - just checking...
+    // For lm_debug - v4 address is set as static (to avoid DHCP) - just checking...
     private static InetAddress toInetAddress(int addr) {
         try {
             return InetAddress.getByAddress(new byte[]{(byte) addr, (byte) (addr >>> 8),
@@ -161,7 +170,7 @@ public class Connect {
     }
 
     /**
-     * Return the cleaned up S  SID of the client Wifi connection, if we are connected.
+     * Return the cleaned up SSID of the client Wifi connection, if we are connected.
      */
     public String getCurrentWifiSSID() {
         WifiInfo info = mWifiManager.getConnectionInfo();
@@ -186,7 +195,7 @@ public class Connect {
         return cleanSSID(info.getSSID());
     }
 
-    public synchronized StringBuilder dump(Bundle b, StringBuilder sb) {
+    public synchronized void dump(Bundle b) {
         if (currentCandidateInProgress != null) {
             b.putString("con.candidate", currentCandidateInProgress.ssid);
         }
@@ -203,7 +212,6 @@ public class Connect {
             b.putLong("con.success_cnt", conSuccess);
             b.putLong("con.success_time", lastSuccess);
         }
-        return sb;
     }
 
     /**
@@ -212,7 +220,7 @@ public class Connect {
      * @param lastScan - subset of networks to try - typically all visible+connectable networks,
      *                 or recently discovered networks
      */
-    public synchronized boolean start(Context ctx, ArrayList<P2PWifiNode> lastScan, Handler h, int what) {
+    public synchronized boolean start(Context ctx, ArrayList<LNode> lastScan, Handler h, int what) {
         if (startTimeE != 0) {
             return false;
         }
@@ -220,18 +228,18 @@ public class Connect {
         this.what = what;
 
         if (lastScan == null) {
-            lastScan = dmesh.scanner.connectable;
+            lastScan = LMesh.connectable;
         }
 
         if (currentCandidateInProgress != null) {
-            dmesh.event("WifiMesh", "Connect in progress " + currentCandidateInProgress);
+            dmesh.event(UPDATE, "CONNECT " + currentCandidateInProgress);
             return false;
         }
 
         tryingNow.clear();
         tryAll.clear();
 
-        for (P2PWifiNode n : lastScan) {
+        for (LNode n : lastScan) {
             if (n.pass == null && n.ssid.startsWith("DIRECT-")) {
                 continue;
             }
@@ -250,7 +258,6 @@ public class Connect {
         }
 
         IntentFilter f = new IntentFilter();
-        f.addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
         f.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
         f.addAction(WifiManager.SUPPLICANT_CONNECTION_CHANGE_ACTION);
         this.ctx = ctx;
@@ -266,10 +273,10 @@ public class Connect {
         return startTimeE != 0;
     }
 
-    private synchronized void nextNetwork(final ArrayList<P2PWifiNode> remaining) {
+    private synchronized void nextNetwork(final ArrayList<LNode> remaining) {
         currentCandidateInProgress = null;
-        P2PWifiNode candidate = null;
-        for (P2PWifiNode n : tryingNow) {
+        LNode candidate = null;
+        for (LNode n : tryingNow) {
             if (candidate == null) {
                 candidate = n;
                 continue;
@@ -292,7 +299,7 @@ public class Connect {
             return;
         }
 
-        final P2PWifiNode currentCandidate = candidate;
+        final LNode currentCandidate = candidate;
         currentCandidateInProgress = candidate;
 
         // Normal: ~5 sec.
@@ -325,8 +332,8 @@ public class Connect {
         }
     }
 
-    synchronized void afterNetworkAttempt(final ArrayList<P2PWifiNode> remaining,
-                                          final P2PWifiNode currentCandidate) {
+    synchronized void afterNetworkAttempt(final ArrayList<LNode> remaining,
+                                          final LNode currentCandidate) {
         if (currentCandidate != currentCandidateInProgress) {
             // Should not happen (unless another bug in scheduling)
             Log.e(TAG, "Unexpected change in currentCandidateInProgress " + currentCandidate + " " + currentCandidateInProgress);
@@ -360,7 +367,7 @@ public class Connect {
     /**
      * Single node attempt.
      */
-    public void connectToAP(P2PWifiNode n, boolean forceConnect, Message in) {
+    public void connectToAP(LNode n, boolean forceConnect, Message in) {
         long now = System.currentTimeMillis();
 
         // If AP in deep sleep (no dhcp ?):
@@ -373,7 +380,8 @@ public class Connect {
 
         int i = addNetworkToNetworkManager(mWifiManager, n.ssid, n.pass);
         if (i < 0) {
-            dmesh.event(n.ssid, "Failed to add to network manager");
+            Events.get().add("CON", "ERR", "ADD");
+            dmesh.event(UPDATE, "CON_ERR ADD_NM " + n.ssid);
             return;
         }
         n.cmNetworkId = i;
@@ -391,12 +399,13 @@ public class Connect {
 
         boolean ok = mWifiManager.enableNetwork(i, forceConnect);
         if (!ok) {
-            dmesh.event("Connect", "Failed to enableNetwork " + i + " " + n.ssid);
+            Events.get().add("CON", "ERR", "ENABLE");
+            dmesh.event(UPDATE, "CON_ERR ENABLE " + i + " " + n.ssid);
         } else {
             conAttempts++;
-            dmesh.event(n.ssid, "Attempting connection " + n.ssid + "/" + n.pass
-                    + " (last tried: " + ((now - n.lastConnectAttempt) / 1000) + "s ago, " + n.connectAttemptCount + " time, "
-                    + " succeeded " + n.connectCount + " times)");
+            dmesh.event(UPDATE, "CON_START " + n.ssid + " " + n.pass
+                    + " " + ((now - n.lastConnectAttempt) / 1000) + "  " + n.connectAttemptCount + " "
+                    + n.connectCount);
         }
 
         // It can take 2..10 sec to activate.- or fail
@@ -419,7 +428,7 @@ public class Connect {
                 }
                 if (exCfg.SSID.equals(ssid) || exCfg.SSID.equals(ssid2)) {
                     //mWifiManager.updateNetwork(exCfg);
-                    // Not clear we need to update - password should be good, if we fail to
+                    // Not clear we need to updateSsidAndPass - password should be good, if we fail to
                     // connect due to bad pass - we should just delete.
                     Log.d(TAG, "Found network " + exCfg);
                     //return exCfg.networkId;
@@ -433,6 +442,7 @@ public class Connect {
     /**
      * Add a DM node to wifi config.
      */
+    @SuppressLint("NewApi")
     private int addNetworkToNetworkManager(WifiManager mWifiManager, String ssid, String passphrase) {
 
         String ssid2 = '"' + ssid + '"';
@@ -451,7 +461,7 @@ public class Connect {
                 }
                 if (exCfg.SSID.equals(ssid) || exCfg.SSID.equals(ssid2)) {
                     //mWifiManager.updateNetwork(exCfg);
-                    // Not clear we need to update - password should be good, if we fail to
+                    // Not clear we need to updateSsidAndPass - password should be good, if we fail to
                     // connect due to bad pass - we should just delete.
                     Log.d(TAG, "Found network " + exCfg);
                     // TODO: remove on failure
@@ -467,7 +477,8 @@ public class Connect {
 
         // For legacy AP, it seems 192.168.43.1 is used ? And 42 to 49 IP range.
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) { // 21
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+//                && Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             try {
                 // UNASSIGNED doesn't work - is set as DHCP
 
@@ -486,20 +497,30 @@ public class Connect {
 //                            new Object[]{InetAddress.getByName("169.254.49." + i), 24});
 
                 Reflect.setField(staticIpConfig, "ipAddress", linkAddress);
-                Reflect.setField(staticIpConfig, "gateway", InetAddress.getByName("192.168.49.1"));
+                //Reflect.setField(staticIpConfig, "gateway", InetAddress.getByName("192.168.49.1"));
                 Reflect.getField(staticIpConfig, "dnsServers", ArrayList.class).clear();
-                Reflect.getField(staticIpConfig, "dnsServers", ArrayList.class).add(InetAddress.getByName("192.168.49.1"));
+                Reflect.getField(staticIpConfig, "dnsServers", ArrayList.class).add(InetAddress.getByName("1.1.1.1"));
 
                 Reflect.callMethod(cfg, "setStaticIpConfiguration", new String[]{"android.net.StaticIpConfiguration"}, new Object[]{staticIpConfig});
+
+                //setEphemeral(cfg);
+                setNoInternet(cfg);
+
             } catch (Throwable t) {
                 t.printStackTrace();
             }
 
         }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            // does not have permission to modify proxy Settings in Pie
+            // Must have NETWORK_SETTINGS, or be device or profile owner.
+            cfg.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 15004));
+
+        }
+
         //manager.updateNetwork(config);
         //manager.saveConfiguration();
-        //setEphemeral(cfg);
-        setNoInternet(cfg);
+
         if (passphrase == null) {
             cfg.SSID = ssid2;
             cfg.preSharedKey = '"' + "1234567890" + '"';
@@ -510,8 +531,6 @@ public class Connect {
             cfg.SSID = ssid2;
             cfg.preSharedKey = '"' + passphrase + '"';
             cfg.priority = 5;
-
-
         }
 
         int i = mWifiManager.addNetwork(cfg);
@@ -545,8 +564,8 @@ public class Connect {
      */
     private void setNoInternet(WifiConfiguration cfg) {
         try {
-            Field ephemeral = cfg.getClass().getField("noInternetAccessExpected");
-            ephemeral.set(cfg, true);
+            Field f = cfg.getClass().getField("noInternetAccessExpected");
+            f.set(cfg, true);
         } catch (NoSuchFieldException ignored) {
         } catch (IllegalAccessException ignored) {
         }
@@ -596,7 +615,7 @@ public class Connect {
         //  state: DISCONNECTED/DISCONNECTED -> linkProperties(), bssid=MAC
 
         // CONNECTED/CONNECTED, extra=SSID -> wifiInfo(SSID, BSSID, SuplicantState: COMPLETED/ASSOCIATED,
-        //   rssi, link speed/freq, net id, ), bassid=MAC, linkProperties(linkAddress,routes,dns)
+        //   rssi, link speed/freq, net idString, ), bassid=MAC, linkProperties(linkAddress,routes,dns)
 
 
         // DISCONNECTED/SCANNING
@@ -646,7 +665,7 @@ public class Connect {
                 // If it doesn't get to next step - remove the net, discover again
             } else if (netInfo.getDetailedState() == NetworkInfo.DetailedState.OBTAINING_IPADDR) {
                 if (ssid == null) {
-                    Log.d(TAG, "DHCP request timeout " + currentCandidateInProgress);
+                    Log.d(TAG, "OBTAININT_IPADDR " + currentCandidateInProgress);
                 } else {
                     Log.d(TAG, "OBTAINING_IPADDR " + ssid + " " + netInfo + " " + currentCandidateInProgress);
                 }
@@ -670,8 +689,10 @@ public class Connect {
 
             if (netInfo.getState() == NetworkInfo.State.DISCONNECTED) {
                 if (connectedNode != null) {
-                    dmesh.event(ssid, "Disconnected " + connectedNode);
+                    dmesh.event(UPDATE, "CON_DISCONNECT " + connectedNode);
                     connectedNode.connectedTime += (System.currentTimeMillis() - connectedNode.lastConnect);
+                    Events.get().add("CON", "STOP", connectedNode.ssid + " " +
+                            connectedNode.connectedTime/1000);
                     connectedNode = null;
                 }
             }
@@ -700,14 +721,18 @@ public class Connect {
             conSuccess++;
             lastSuccess = System.currentTimeMillis();
 
-            dmesh.event(ssid, "Connected " + " ssid=" + connectedNode + " rssi=" + wifiInfo.getRssi() +
+            dmesh.event(UPDATE, "CONNECTED " + " " + connectedNode + " " + wifiInfo.getRssi() +
                     " " + currentCandidateInProgress);
+            Events.get().add("CON", "START", ssid + " " + wifiInfo.getRssi() +
+                " " + currentCandidateInProgress);
 
             Message m = handler.obtainMessage(what);
             m.getData().putString("ssid", connectedNode.ssid);
             m.sendToTarget();
         } else if (!connectedNode.ssid.equals(ssid)) {
-            dmesh.event(connectedNode.ssid, "Unexpected change in SID " + ssid + " " + connectedNode.ssid);
+            Events.get().add("CON", "START_O", ssid + " " + wifiInfo.getRssi() +
+                    " " + currentCandidateInProgress + " " +connectedNode.ssid);
+            dmesh.event(UPDATE, "CON_ERR SSID " + ssid + " " + connectedNode.ssid);
         }
 
         // Connected 60:e3:27:fb:80:46 SSID: costin, BSSID: 60:e3:27:fb:80:46,
@@ -717,13 +742,37 @@ public class Connect {
 
     }
 
+    // Remove dmesh connections
+    public void cleanup() {
+        List<WifiConfiguration> existing = mWifiManager.getConfiguredNetworks();
+        if (existing != null) {
+            // DIRECT networks change pass and ESSID often, usually at the same time.
+            for (WifiConfiguration exCfg : existing) {
+                if (exCfg.SSID == null) {
+                    Log.d(TAG, "No SSID " + exCfg);
+                    mWifiManager.removeNetwork(exCfg.networkId);
+                    continue;
+                }
+                if (!exCfg.SSID.startsWith("\"DM-AP") &&
+                    !exCfg.SSID.startsWith("\"DIRECT-")) {
+                    return;
+                }
+                //mWifiManager.updateNetwork(exCfg);
+                // Not clear we need to updateSsidAndPass - password should be good, if we fail to
+                // connect due to bad pass - we should just delete.
+                Log.d(TAG, "Found network " + exCfg);
+                //return exCfg.networkId;
+                mWifiManager.removeNetwork(exCfg.networkId);
+            }
+        }
+
+    }
+
     public class Receiver extends BroadcastReceiver {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
-            if (WifiManager.SCAN_RESULTS_AVAILABLE_ACTION.equals(action)) {
-                dmesh.scanner.update();
-            } else if (WifiManager.SUPPLICANT_CONNECTION_CHANGE_ACTION.equals(action)) {
+            if (WifiManager.SUPPLICANT_CONNECTION_CHANGE_ACTION.equals(action)) {
                 onSuplicantStateChanged(context, intent);
             } else if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(action)) {
                 onWMStateChanged(context, intent);

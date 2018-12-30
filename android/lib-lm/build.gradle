@@ -1,13 +1,18 @@
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 24
+    compileSdkVersion 27
     buildToolsVersion ANDROID_BUILD_TOOLS_VERSION
 
     defaultConfig {
-        minSdkVersion 10
+        // Upgrading from 27 to 28 causes the min version to be 14 instead of 10.
+
+        // Vpn and direct could be supported from ICS/14, but not yet.
+        //minSdkVersion 14
+        minSdkVersion 21
+
         //noinspection OldTargetApi
-        targetSdkVersion 21
+        targetSdkVersion TARGET_SDK_VERSION
         versionCode 1
         versionName "1.0"
 
@@ -28,10 +33,12 @@ android {
 }
 
 dependencies {
+    compile project(':lib-util')
     compile fileTree(include: ['*.jar'], dir: 'libs')
     androidTestCompile('com.android.support.test.espresso:espresso-core:2.2.2', {
         exclude group: 'com.android.support', module: 'support-annotations'
     })
     testCompile 'junit:junit:4.12'
     compile ANDROID_SUPPORT_ANNOTATIONS
+    implementation project(':libdmesh')
 }
