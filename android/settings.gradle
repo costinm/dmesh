@@ -1,1 +1,1 @@
-include ':app-lm', ':lib-lm', ':lib-util', ':libdmesh'
+include ':app-lm', ':lib-lm3', ':lib-util', ':libdmesh'
