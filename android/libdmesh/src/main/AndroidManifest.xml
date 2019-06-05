@@ -1,9 +1,27 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.github.costinm.dmesh.libdm">
 
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application
         android:allowBackup="true"
-        android:supportsRtl="true"></application>
+        android:supportsRtl="true">
+
+        <service android:exported="true"
+            android:name="com.github.costinm.dmesh.libdm.vpn.VpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+        <service
+            android:name="com.github.costinm.dmesh.libdm.DMService"
+            android:exported="true"
+             />
+
+
+
+    </application>
 
 </manifest>

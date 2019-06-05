@@ -1,10 +1,19 @@
 package com.github.costinm.dmesh.android.util;
 
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.Uri;
+import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -54,7 +63,16 @@ public class NativeProcess extends Thread {
                 Log.d("DM-N", "Closed");
                 return;
             }
-            Log.d("DM-N", l);
+//            if (l.length() > 20) {
+//                l = l.substring(20);
+//            }
+            // first word == tag-subtag
+            String[] parts = l.split(" ", 2);
+            if (parts.length == 1) {
+                Log.d("DM-N", l);
+            } else {
+                Log.d(parts[0], parts[1]);
+            }
         }
     }
 
@@ -67,12 +85,41 @@ public class NativeProcess extends Thread {
         }
     }
 
+    // Based on the 'exec' base name, try to upgrade by using externals dir or files dir.
+    // Then if the exec is find in files, use it from there.
+    // Last use the bundled exec from lib.Ma
     String getExecutable() {
+        final File srcDir = ctx.getExternalFilesDir(null);
+        File src = new File(srcDir, exec);
+
+        final File f = ctx.getFilesDir();
+        if (!src.exists()) {
+            src = new File(f, exec + ".new");
+        }
+        final File f2 = new File(f, exec);
+
+        if (src.exists()) {
+            try {
+                OutputStream fos = new FileOutputStream(f2);
+                InputStream fis = new FileInputStream(src);
+                copyStream(fis, fos);
+                fis.close();
+                fos.close();
+
+                src.delete();
+                f2.setExecutable(true);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
         File d = ctx.getFilesDir();
         File bin = new File(d, exec);
+
         if (bin.exists() && bin.canExecute()) {
             return bin.getAbsolutePath();
         }
+
         return d.getParent() + "/lib/" + exec;
     }
 
@@ -124,20 +171,34 @@ public class NativeProcess extends Thread {
     }
 
     public void runOnce() {
+        long t0 = SystemClock.elapsedRealtime();
+        String exe = getExecutable();
+        final File filesDir = ctx.getFilesDir();
         try {
-
             InputStream is;
             synchronized (NativeProcess.class) {
-                cmd.set(0, getExecutable());
-                p = new ProcessBuilder().command(cmd).redirectErrorStream(true).start();
+                cmd.set(0, exe);
+                ProcessBuilder pb = new ProcessBuilder().command(cmd)
+                        .redirectErrorStream(true);
+                pb.environment().put("STORAGE", ctx.getExternalFilesDir(null).getAbsolutePath());
+                pb.environment().put("BASE", ctx.getFilesDir().getAbsolutePath());
+                p = pb.start();
                 is = p.getInputStream();
             }
             logStream(is); // will block until process is closed.
         } catch (Throwable t) {
             Log.d("DM-N", "Stopping !!" + t.getMessage());
         } finally {
+
             Log.d("DM-N", "Make sure it is killed !!");
             kill();
+            long since = SystemClock.elapsedRealtime() - t0;
+            if (since < 1000) {
+                if (exe.startsWith(filesDir.getAbsolutePath())) {
+                    Log.d("DM-N", "Bad upgrade !!");
+                    new File(exe).delete();
+                }
+            }
         }
     }
 

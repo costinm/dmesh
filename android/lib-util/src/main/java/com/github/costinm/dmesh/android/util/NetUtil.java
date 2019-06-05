@@ -4,8 +4,13 @@ import android.annotation.TargetApi;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.os.Build;
+import android.os.Bundle;
 import android.util.Log;
 
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -91,4 +96,52 @@ public class NetUtil {
     }
 
 
+    /**
+     * Remove quotes
+     */
+    public static String cleanSSID(String ssid) {
+        if (ssid == null) {
+            return null;
+        }
+        if (ssid.startsWith("\"")) {
+            ssid = ssid.substring(1, ssid.length() - 1);
+        }
+        if (ssid.startsWith("<")) {
+            return null;
+        }
+        return ssid;
+    }
+
+    public static JSONObject toJSON(Bundle b) {
+        JSONObject jso = new JSONObject();
+        for (String k : b.keySet()) {
+            try {
+                Object o1 = b.get(k);
+
+                if (o1 instanceof CharSequence) {
+                    jso.put(k, ((CharSequence) o1).toString());
+                } else if (o1 instanceof Bundle) {
+                    jso.put(k, toJSON((Bundle) o1));
+                } else if (o1 instanceof ArrayList) {
+                    jso.put(k, toJSON((ArrayList) o1));
+                }
+            } catch (JSONException ex) {
+                ex.printStackTrace();
+            }
+        }
+        return jso;
+    }
+
+    public static JSONArray toJSON(ArrayList a) {
+        JSONArray ar = new JSONArray();
+
+        for(Object o: a) {
+            if (o instanceof Bundle) {
+                ar.put(toJSON((Bundle) o));
+            } else if (o instanceof ArrayList) {
+                ar.put(toJSON((ArrayList) o));
+            }
+        }
+        return ar;
+    }
 }

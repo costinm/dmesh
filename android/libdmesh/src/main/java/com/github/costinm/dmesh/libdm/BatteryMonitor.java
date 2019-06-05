@@ -13,7 +13,7 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
 
-import com.github.costinm.dmesh.logs.Events;
+import com.github.costinm.dmesh.android.util.MsgMux;
 
 /**
  * Watch battery state.
@@ -30,7 +30,6 @@ public class BatteryMonitor extends BroadcastReceiver {
     private static final String TAG = "LM-BM";
     public final PowerManager pm;
     final Context ctx;
-    final Handler ctl;
     public long chargingStart = 0;
     public long idleStart = 0;
     public long idleStop = 0;
@@ -41,9 +40,11 @@ public class BatteryMonitor extends BroadcastReceiver {
     int status = -1;
     private int chargePlugExtraPlugged;
 
-    public BatteryMonitor(Context ctx, Handler ctl) {
+    /**
+     * Ctl will receive Messages with what EV_ about battery changes.
+     */
+    public BatteryMonitor(Context ctx) {
         this.ctx = ctx;
-        this.ctl = ctl;
 
         pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
 
@@ -78,36 +79,36 @@ public class BatteryMonitor extends BroadcastReceiver {
         if (PowerManager.ACTION_POWER_SAVE_MODE_CHANGED.equals(action)) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 isPowerSave = pm.isPowerSaveMode();
-                Log.d(TAG, "PowerSave:" + isPowerSave);
                 if (isPowerSave) {
-                    ctl.obtainMessage(EV_BATTERY_PS_ON).sendToTarget();
-                    Events.get().add("BM", "PSON", "Power save on");
+                    MsgMux.broadcast("BM", "PSON", "");
                 } else {
-                    ctl.obtainMessage(EV_BATTERY_PS_OFF).sendToTarget();
-                    Events.get().add("BM", "PSOFF", "Power save off");
+                    MsgMux.broadcast("BM", "PSOFF", "");
                 }
             }
         } else if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(action)) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 boolean isIdle = pm.isDeviceIdleMode();
                 if (isIdle) {
+                    //event("lm", "Starting IDLE/DOZE");
                     if (idleStart == 0) {
-                        //event("lm", "Starting IDLE/DOZE");
                         idleStart = SystemClock.elapsedRealtime();
-                        ctl.obtainMessage(EV_BATTERY_IDLE_ON).sendToTarget();
-                        Log.d(TAG, "Idle: " + (idleStop - idleStart));
-                        Events.get().add("BM", "ION", "" + (idleStop - idleStart));
+                        if (idleStop == 0) {
+                            MsgMux.broadcast("BM", "ION", "");
+                        } else {
+                            MsgMux.broadcast("BM", "ION", "", "timeOn", Long.toString(idleStop - idleStart));
+                        }
                     }
+                    Log.d(TAG, "Idle: " + (idleStop - idleStart));
                 } else {
-                    if (idleStart == 0) {
+                    if (idleStart != 0) {
                         long thisIdle = now - idleStart;
                         idleStop = SystemClock.elapsedRealtime();
                         totalIdleTime += thisIdle;
-                        //event("lm", "Exit IDLE/DOZE " + (now - idleStart));
                         idleStart = 0;
-                        ctl.obtainMessage(EV_BATTERY_IDLE_OFF, thisIdle).sendToTarget();
                         Log.d(TAG, "IdleOff:" + thisIdle + " " + totalIdleTime);
-                        Events.get().add("BM", "IOFF", thisIdle + " " + totalIdleTime);
+                        MsgMux.broadcast("BM", "IOFF", "",
+                                "timeOff", thisIdle + "",
+                                "totalOff", "" + totalIdleTime);
                     }
                 }
             }
@@ -128,21 +129,17 @@ public class BatteryMonitor extends BroadcastReceiver {
             String m = "";
             if (usbCharge || acCharge) {
                 if (chargingStart == 0) {
-                    m = "charging " + (acCharge ? "AC " : "USB ") + level + "/" + scale;
+                    m = "charging " +  + level + "/" + scale;
                     chargingStart = now;
-                    Events.get().add("BM", "BC", m);
+                    MsgMux.broadcast("BM", "BC", "", "charging", (acCharge ? "AC " : "USB "), "level", level + "", "scale", scale + "");
                 }
             } else {
                 if (chargingStart > 0) {
                     m = "not charging " + batteryPct;
                     chargingStart = 0;
-                    Events.get().add("BM", "BNC", m);
+                    MsgMux.broadcast("BM", "BNC", "", "batteryPct", batteryPct + "");
                 }
             }
-            Message msg = ctl.obtainMessage(EV_BATTERY);
-            msg.arg1 = chargePlugExtraPlugged;
-            msg.arg2 = (int) (10000 * batteryPct);
-            msg.sendToTarget();
 
             Log.d(TAG, m);
         }
