@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:android="http://schemas.android.com/apk/res/android">
+
+
+
+    <item
+        android:id="@+id/sddisc"
+        android:title="SD"
+        app:showAsAction="always" />
+
+    <item android:title="NAN">
+        <menu >
+            <item
+                android:id="@+id/nanstart"
+                android:icon="@android:drawable/ic_media_play"
+                android:title="NAN Search"
+                app:showAsAction="never" />
+
+            <item
+                android:id="@+id/nanstop"
+                android:title="NAN Stop"
+                app:showAsAction="ifRoom" />
+
+            <item
+                android:id="@+id/nanping"
+                android:title="NAN Ping"
+                app:showAsAction="ifRoom" />
+        </menu>
+    </item>
+
+    <item
+        android:id="@+id/scan"
+        android:title="Scan"
+        app:showAsAction="always" />
+
+
+    <item
+        android:id="@+id/discoff"
+        android:title="DiscOFF"
+         />
+
+
+    <item android:title="Debug" >
+        <menu>
+            <item
+                android:id="@+id/disc"
+                android:title="Peer discovery (no SD)"
+                />
+
+            <item
+                android:id="@+id/wificaps"
+                android:title="Wifi Info"
+                 />
+
+            <item
+                android:id="@+id/mdnssdon"
+                android:title="DNS-SD ADV On"
+                app:showAsAction="never" />
+
+            <item
+                android:id="@+id/mdnssdoff"
+                android:title="DNS-SD ADV Off"
+                app:showAsAction="never" />
+        </menu>
+
+    </item>
+
+</menu>

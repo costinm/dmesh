@@ -33,7 +33,7 @@ android {
 
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
-    compile project(':lib-util')
+    implementation project(':lib-util')
 
-    compile ANDROID_SUPPORT_ANNOTATIONS
+    implementation ANDROID_SUPPORT_ANNOTATIONS
 }
