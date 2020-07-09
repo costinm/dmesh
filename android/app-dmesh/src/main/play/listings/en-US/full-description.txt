@@ -1,0 +1,5 @@
+Allow device to device communication in areas without internet access by using the P2P Wifi capabilities to create an expanding and automatic mesh.
+
+The app will scan and create P2P groups by alternating the AP role. Communication between devices is encrypted end to end with mTLS. 
+
+If an internet connection exists, the app can extend the reach and communicate with VPN servers.

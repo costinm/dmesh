@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="ap_mode_entries" >
+        <item>On</item>
+        <item>Off</item>
+        <item>Auto</item>
+        <item>On schedule, ignore others</item>
+    </string-array>
+    <string-array name="ap_mode_values" >
+        <item>on</item>
+        <item>off</item>
+        <item>auto</item>
+        <item>schedule</item>
+    </string-array>
+
+    <string-array name="wifi_mode_entries" >
+        <item>Fixed</item>
+        <item>Off (use connection manager)</item>
+        <item>Auto</item>
+    </string-array>
+    <string-array name="wifi_mode_values" >
+        <item>fixed</item>
+        <item>off</item>
+        <item>auto</item>
+    </string-array>
+
+</resources>

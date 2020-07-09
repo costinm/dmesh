@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:tools="http://schemas.android.com/tools"
+    xmlns:android="http://schemas.android.com/apk/res/android">
+
+
+    <item
+        android:id="@+id/view"
+        android:icon="@android:drawable/ic_menu_view"
+        android:showAsAction="always"
+        android:title="View Web UI"
+        tools:ignore="AppCompatResource" />
+
+    <item
+        android:id="@+id/wifi"
+        android:icon="@android:drawable/ic_menu_add"
+        android:title="Start Bluetooth provisioning" />
+
+</menu>

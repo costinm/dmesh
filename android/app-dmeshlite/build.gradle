@@ -1,0 +1,87 @@
+plugins {
+    id("com.android.application")
+    id("com.github.triplet.play") version "2.5.0"
+}
+
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 29
+
+    signingConfigs {
+        release {
+            storeFile file('/home/costin/Private/dmeshlite_key.jks')
+            storePassword 'android'
+            keyAlias = 'key0'
+            keyPassword 'android'
+        }
+    }
+
+    defaultConfig {
+        applicationId 'com.github.costinm.dmesh'
+        // GB10 - it should run on very old devices.
+        // ICS14 - min required by 28 SDK
+        minSdkVersion 10
+        //noinspection OldTargetApi
+        targetSdkVersion TARGET_SDK_VERSION
+        versionCode 5
+        versionName "1.4"
+    }
+    sourceSets {
+        main {
+            jni.srcDirs = []
+            //jniLibs.srcDirs 'src/main/jnigo/'
+        }
+    }
+
+//    signingConfigs {
+//        debug {
+//            keyAlias 'androiddebugkey'
+//            keyPassword 'android'
+//            storeFile file('../debug.keystore')
+//            storePassword 'android'
+//        }
+//    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            debuggable = false
+            signingConfig signingConfigs.release
+        }
+//        debug {
+//            signingConfig signingConfigs.debug
+//        }
+    }
+    testOptions {
+    }
+    productFlavors {
+    }
+    android {
+        lintOptions {
+            abortOnError false
+        }
+    }
+}
+
+play {
+    serviceAccountCredentials = file("/home/costin/Private/playstore.json")
+    // internal alpha beta production
+    track = "production"
+    userFraction = 1
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    // 27.0.0 -> requires ICS14
+    //implementation 'com.android.support:appcompat-v7:27.0.0'
+    implementation 'androidx.annotation:annotation:1.1.0'
+
+    implementation project(':libdmesh')
+    implementation project(':lib-util')
+
+    testImplementation 'junit:junit:4.13'
+}
+repositories {
+    mavenCentral()
+}
