@@ -1,17 +1,19 @@
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 27
-    buildToolsVersion ANDROID_BUILD_TOOLS_VERSION
+    compileSdkVersion 29
+    //compileSdkVersion 28
+    //compileSdkVersion 27
+    //buildToolsVersion ANDROID_BUILD_TOOLS_VERSION
 
 
     defaultConfig {
         minSdkVersion 10
-        targetSdkVersion TARGET_SDK_VERSION
+        targetSdkVersion 28
         versionCode 1
         versionName "1.0"
 
-        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
     }
 
@@ -34,6 +36,6 @@ android {
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
     implementation project(':lib-util')
-
-    implementation ANDROID_SUPPORT_ANNOTATIONS
+    //implementation files('libs/envoy.aar')
+    implementation 'androidx.annotation:annotation:1.1.0'
 }

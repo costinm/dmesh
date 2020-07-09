@@ -1,1 +1,1 @@
-include ':app-dm-wifi', ':lib-lm3', ':lib-util', ':lib-lm3', ':lib-util', ':libdmesh'
+include  ':app-dmesh', ':lib-lm3', ':lib-util', ':app-dmeshlite',  ':libdmesh'

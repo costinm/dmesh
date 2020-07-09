@@ -1,24 +1,22 @@
 package com.github.costinm.dmesh.lm3;
 
-import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
-import android.bluetooth.BluetoothServerSocket;
 import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Build;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
-import android.os.Messenger;
 import android.os.SystemClock;
 import android.util.Log;
 
-import com.github.costinm.dmesh.android.util.MsgMux;
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.msg.MsgMux;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -27,8 +25,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-
-import static android.content.ContentValues.TAG;
 
 /**
  * Legacy (GB to KK) device provisioning using BT.
@@ -65,14 +61,15 @@ import static android.content.ContentValues.TAG;
  *  * Limitations:
  * - discovery time is 5 min, requires user interaction on one device
  * - likely a second device will need user interaction to provision
+ * - max devices: 7 (4 on 4.3)
  *
  * TODO: include the device public key / cert and support private networks.
  * TODO: legacy device can also BT-scan and provision other legacy devices.
  */
-@SuppressLint("MissingPermission")
-public class Bt2 implements MsgMux.MessageHandler {
+public class Bt2 implements MessageHandler {
 
-    public static UUID dmeshUUID = new UUID(1973, 15);
+    private static final String TAG = "BT2";
+    public static UUID dmeshUUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     // Key is MAC address
     public Map<String, BluetoothDevice> devices = new HashMap<>();
@@ -88,6 +85,7 @@ public class Bt2 implements MsgMux.MessageHandler {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
+
             if (BluetoothDevice.ACTION_FOUND.equals(action)) {
                 // Discovery has found a device. Get the BluetoothDevice
                 // object and its info from the Intent.
@@ -100,8 +98,11 @@ public class Bt2 implements MsgMux.MessageHandler {
                     Log.d(TAG, "Non DM device " + deviceName + " " + deviceHardwareAddress);
                     return;
                 }
-                MsgMux.broadcast("BT", "Found", deviceName + " "
-                        + deviceHardwareAddress);
+                Log.d(TAG, "!!!Found " + deviceName + " " + deviceHardwareAddress);
+
+                MsgMux.get(ctx).publish("/bt/discovery",
+                        "name", deviceName,
+                        "addr", "" + deviceHardwareAddress);
 
                 devices.put(deviceHardwareAddress, device);
             }
@@ -114,9 +115,15 @@ public class Bt2 implements MsgMux.MessageHandler {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
             BluetoothManager bluetoothManager =
                     (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
+            if (bluetoothManager == null) {
+                return;
+            }
             mBluetoothAdapter = bluetoothManager.getAdapter();
         } else {
             mBluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+        }
+        if (mBluetoothAdapter == null) {
+            return;
         }
 
         IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
@@ -124,30 +131,24 @@ public class Bt2 implements MsgMux.MessageHandler {
 
         String name = mBluetoothAdapter.getName();
 
-        // This is the only way I know to bypass the lack of SDP.
-        if (name != null && !name.startsWith("DM-")) {
-            name = "DM-" + name;
-            mBluetoothAdapter.setName(name);
-        }
-
-        MsgMux.broadcast("BT", "Address", name + " " + mBluetoothAdapter.getAddress()
-                + " " + mBluetoothAdapter.getScanMode() + " " + mBluetoothAdapter.getState());
+        MsgMux.get(ctx).publish("/BT/start",
+                "name", name,
+                "addr", "" + mBluetoothAdapter.getAddress(),
+                "status", mBluetoothAdapter.getScanMode() + " " + mBluetoothAdapter.getState());
 
 
-        try {
-            // Will create a SDP entry - name, UID and channel.
-            // Unfortunately not accessible from android clients. Name prefix
-            // is the only way to discover at the moment.
-            final BluetoothServerSocket ss = mBluetoothAdapter.listenUsingInsecureRfcommWithServiceRecord("dmesh",
-                    dmeshUUID);
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    handleServer(ss);
+        Set<BluetoothDevice> pairedDevices = mBluetoothAdapter.getBondedDevices();
+        if (pairedDevices.size() > 0) {
+            // There are paired devices. Get the name and address of each paired device.
+            for (BluetoothDevice device : pairedDevices) {
+                String deviceName = device.getName();
+                if (!deviceName.startsWith("DM")) {
+                    continue;
                 }
-            }).start();
-        } catch (IOException e) {
-            e.printStackTrace();
+                String deviceHardwareAddress = device.getAddress(); // MAC address
+
+                Log.d("BT", "Pair: " + deviceName + " " + deviceHardwareAddress);
+            }
         }
     }
 
@@ -155,54 +156,6 @@ public class Bt2 implements MsgMux.MessageHandler {
         ctx.unregisterReceiver(mReceiver);
     }
 
-    private void handleServer(BluetoothServerSocket ss) {
-        while (true) {
-            try {
-                final BluetoothSocket s = ss.accept();
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        handleServerConnection(s);
-                    }
-                }).start();
-            } catch (IOException e) {
-                e.printStackTrace();
-                return;
-            }
-        }
-    }
-
-    protected void handleServerConnection(BluetoothSocket s) {
-        MsgMux.broadcast("BT", "SCon",
-                s.getRemoteDevice().getAddress());
-        devices.put(s.getRemoteDevice().getAddress(), s.getRemoteDevice());
-        try {
-            s.getOutputStream().write("Hello\n".getBytes());
-            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
-
-            while(true) {
-                String line = br.readLine();
-                if (line == null) {
-                    return;
-                }
-                if (line.equals("WIFI")) {
-                    String ssid = br.readLine();
-                    String pass = br.readLine();
-                    MsgMux.broadcast("WIFI", "ADD", "", "ssid", ssid, "psk", pass);
-                } else {
-                    MsgMux.broadcast("BT", "SRD", s.getRemoteDevice().getAddress() + " " + line);
-                }
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        } finally {
-            try {
-                s.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-    }
 
     /**
      * Connects to all known DM- bluetooth devices and sends a message.
@@ -234,7 +187,6 @@ public class Bt2 implements MsgMux.MessageHandler {
         discoverableIntent.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION,
                 300);
         ctx.startActivity(discoverableIntent);
-
     }
 
     public void connect(String address, String message) {
@@ -246,9 +198,12 @@ public class Bt2 implements MsgMux.MessageHandler {
             if (s == null || s.getOutputStream() == null) {
                 Log.d(TAG, "Failed to open " + address);
             }
-            s.getOutputStream().write("Hello\n".getBytes());
+            s.getOutputStream().write(message.getBytes());
             BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
-            MsgMux.broadcast("BT", "RD", address + " " + br.readLine());
+
+            MsgMux.get(ctx).publish("/BT/Message",
+                    "caddr", address,
+                    "msg", br.readLine());
         } catch (IOException e) {
             Log.d(TAG, "Error connecting " + address + " " + e.toString());
         } finally {
@@ -268,19 +223,6 @@ public class Bt2 implements MsgMux.MessageHandler {
         }
 
         lastScan = 0;
-        MsgMux.broadcast("BT", "Scan", "Start");
-
-        Set<BluetoothDevice> pairedDevices = mBluetoothAdapter.getBondedDevices();
-
-        if (pairedDevices.size() > 0) {
-            // There are paired devices. Get the name and address of each paired device.
-            for (BluetoothDevice device : pairedDevices) {
-                String deviceName = device.getName();
-                String deviceHardwareAddress = device.getAddress(); // MAC address
-
-                MsgMux.broadcast("BT", "Pair", deviceName + " " + deviceHardwareAddress);
-            }
-        }
 
         mHandler.postDelayed(new Runnable() {
             @Override
@@ -289,15 +231,17 @@ public class Bt2 implements MsgMux.MessageHandler {
                 mBluetoothAdapter.cancelDiscovery();
             }
         }, 15000);
+
         boolean s = mBluetoothAdapter.startDiscovery();
         if (!s) {
             Log.w(TAG, "Failed to start regular scan");
             return;
         }
+
         // Should take ~12 sec plus some extra
 
 
-        Log.d(TAG, "Starting scan");
+        Log.d(TAG, "Starting BT scan");
 
         scanStart = SystemClock.elapsedRealtime();
 
@@ -305,7 +249,7 @@ public class Bt2 implements MsgMux.MessageHandler {
     }
 
     @Override
-    public void handleMessage(Message msg, Messenger replyTo, String[] argv) {
+    public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] argv) {
         if (argv.length >= 2 && argv[2] == "disc" ) {
             makeDiscoverable();
         } else {

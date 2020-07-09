@@ -5,11 +5,14 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.ProxyInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Message;
-import android.os.Messenger;
-import android.support.annotation.RequiresApi;
+
+import androidx.annotation.RequiresApi;
+
+import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
 import com.github.costinm.dmesh.libdm.DMesh;
@@ -26,62 +29,77 @@ import static android.system.OsConstants.AF_INET6;
 /**
  * Simple VPN service.
  *
- * Glue code: see LMesh.maybeStartVpn and LMSettingsActivity for UI.
- * Will generate an event on the control handler when the file descriptor is available.
- *
  * Technically ICS/14 is the first version to support VPN, and could be made to work.
  * However LMP/21 is the first to allow 'disallowedApp' (i.e. iptables by uid), and
  * that greatly simplifies the VPN - so it is the first supported version.
  *
  * The settings activity must call 'prepare' to dial permission.
+ *
+ * TODO: make sure 'enable at startup' works and starts dmesh
+ * TODO: support http proxy mode in Q, file bug for socks mode
  */
 @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
 public class VpnService extends android.net.VpnService implements Handler.Callback {
-    private static final String TAG = "DM-VPN";
-
+    static final String TAG = "DM-VPN";
+    /**
+     * Singleton - null if vpn is stopped, interface if vpn is running.
+     */
+    public static ParcelFileDescriptor iface = null;
     public static FileDescriptor fd;
-    byte[] address6;
-    PendingIntent appIntent;
 
-    // Not used, for ICS
+    static PendingIntent appIntent;
+
+    // Not used, for ICS - KK
     public static final int CMD_PROTECT = 1024;
-
-    // Message sent back when a FD is available.
-    public static final int EV_VPN_ON = 1024;
+    static byte[] address6;
 
     public static void maybeStartVpn(SharedPreferences prefs,
-                                     Context ctx, DMesh dmUDS, Messenger serviceHandlerMsg,
-                                     Class activityClass) {
+                                     Context ctx, DMesh dmUDS) {
         boolean vpnEnabled = prefs.getBoolean("vpn_enabled", false);
-        if (vpnEnabled && DMesh.iface == null) {
-            if (dmUDS == null) {
-                return;
-            }
-            if (dmUDS.addr[0] == 0) {
-                return;
-            }
-            Intent i = new Intent(ctx, VpnService.class)
-                    .putExtra("app", PendingIntent.getActivity(ctx, 15,
-                            new Intent(ctx, activityClass), 0))
-                    .putExtra("addr", dmUDS.addr);
-            ComponentName cn = ctx.startService(i);
-            Log.d(TAG, "Start VPN " + cn);
-        }
 
-        if (!vpnEnabled && DMesh.iface != null) {
-            VpnService.close();
-            if (dmUDS != null) {
-                dmUDS.send("/KILL", null, null);
+        if (vpnEnabled && iface == null) {
+            if (dmUDS.addr[0] == 0) {
+                // A new update will happen after native process starts
+                return;
             }
+            Intent ai = new Intent();
+            ai.setComponent(new ComponentName(ctx.getPackageName(),
+                    ctx.getPackageName() + ".SetupActivity"));
+            appIntent = PendingIntent.getActivity(ctx, 15, ai, 0);
+            address6 = dmUDS.addr;
+
+            Intent i = new Intent(ctx, VpnService.class);
+            try {
+                ComponentName cn = ctx.startService(i);
+                Log.d(TAG, "Start VPN " + cn);
+            } catch(Throwable t) {
+                // "not allowed to start, app in background" ?
+                t.printStackTrace();
+            }
+        }
+        if (!vpnEnabled && iface != null) {
+            stopVpn();
+            if (dmUDS != null) {
+                dmUDS.stopVpn();
+            }
+        }
+    }
+
+    public static void stopVpn() {
+        if (iface != null) {
+            close();
         }
     }
 
     @Override
     public void onCreate() {
+        Log.d(TAG, "VPN CREATED");
     }
 
     @Override
-    public void onDestroy() {
+    public void onDestroy()
+    {
+        Log.d(TAG, "VPN DESTROY");
         close();
     }
 
@@ -90,18 +108,19 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
         if (intent == null) {
             return START_NOT_STICKY;
         }
-        // TODO: use dmuds directly, don't take start command args
-        Messenger ctl = intent.getParcelableExtra("ctl");
-        appIntent = intent.getParcelableExtra("app");
-        address6 = intent.getByteArrayExtra("addr");
-
+        Log.d(TAG, "VPN START " + intent);
         if (address6 == null || address6[0] == 0) {
             Log.d(TAG, "Invalid parameters");
             return START_NOT_STICKY;
         }
 
-        startVPN(ctl);
-        //Message.obtain(vpnHandler, what).sendToTarget();
+        Intent prepareIntent = VpnService.prepare(this);
+        if (prepareIntent!= null) {
+            Log.d(TAG, "VPN SETUP REQUIRED " + prepareIntent);
+            return START_NOT_STICKY;
+        }
+
+        startVPN();
         return START_NOT_STICKY;
     }
 
@@ -116,17 +135,17 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
     }
 
     /**
-     * If the singleton interface is on, close it.
-     * This is not sufficient if the fd is sent to the app - will need to also close the dup.
+     * If the singleton interface is on, closeNative it.
+     * This is not sufficient if the fd is sent to the app - will need to also closeNative the dup.
      */
     public static void close() {
-        if (DMesh.iface != null) {
+        if (iface != null) {
             try {
-                DMesh.iface.close();
+                iface.close();
             } catch (IOException e) {
                 e.printStackTrace();
             }
-            DMesh.iface = null;
+            iface = null;
             // TODO: send payload to DMesh
         }
     }
@@ -145,9 +164,9 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
      * Must be called only after the mesh is registered, either with
      * the local DMesh or with the VPN server.
      */
-    public void startVPN(Messenger ctl) {
+    public void startVPN() {
         try {
-            if (DMesh.iface != null) {
+            if (iface != null) {
                 return;
             }
             Intent i = VpnService.prepare(this); //dm.ctx);
@@ -189,12 +208,17 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             // is encrypted, untrusted border (internet connected) gateways can't see it.
             builder.addRoute("0.0.0.0", 0);
             builder.addRoute("2000::", 3);
+            builder.addRoute("fd00::", 8);
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 builder.addDisallowedApplication(getPackageName());
                 builder.allowFamily(AF_INET);
                 builder.allowFamily(AF_INET6);
                 builder.setBlocking(true);
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                // On Q, some apps will use http direct, bypassing TUN
+                builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", 15003));
             }
 
             // TODO: for 22, setUnderlyingNeworks (used for the upstream)
@@ -204,19 +228,20 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             }
 
             // Create a new interface using the builder and save the parameters.
-            DMesh.iface = builder
+            iface = builder
                     .setSession("dmesh") // not required
                     .establish();
-            if (DMesh.iface == null) {
+            if (iface == null) {
                 Log.d(TAG, "Failed to start, permissions not granted or VPN disabled");
                 return;
             }
 
-            Log.d(TAG, "New interface: " + DMesh.iface);
+            Log.d(TAG, "New interface: " + iface);
 
-            fd = DMesh.iface.getFileDescriptor();
+            fd = iface.getFileDescriptor();
 
-            DMesh uds = DMesh.get();
+
+            DMesh uds = DMesh.get(this);
             if (uds != null) {
                 uds.sendVpn(fd);
             }
@@ -225,5 +250,6 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             t.printStackTrace();
         }
     }
+
 
 }

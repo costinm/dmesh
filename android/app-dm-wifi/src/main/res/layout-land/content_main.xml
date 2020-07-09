@@ -5,7 +5,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     app:layout_behavior="@string/appbar_scrolling_view_behavior"
-    tools:context=".MainActivity"
+    tools:context=".WifiActivity"
     tools:layout_editor_absoluteY="56dp"
     tools:showIn="@layout/activity_main"
     android:orientation="horizontal">
@@ -23,7 +23,18 @@
         android:layout_width="0dp"
         android:layout_height="match_parent"
         android:layout_weight="40">
-    <include layout="@layout/content_disc" />
+
+
+
+        <ListView
+            android:id="@+id/disclist"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginTop="6dp"
+            android:layout_marginBottom="6dp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintTop_toBottomOf="@+id/disc_switch" />
+
     </ScrollView>
 </LinearLayout>
 

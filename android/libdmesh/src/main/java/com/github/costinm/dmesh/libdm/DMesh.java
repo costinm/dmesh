@@ -1,34 +1,31 @@
 package com.github.costinm.dmesh.libdm;
 
-import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.net.Credentials;
-import android.net.LocalServerSocket;
-import android.net.LocalSocket;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
 import android.os.Message;
-import android.os.Messenger;
-import android.os.ParcelFileDescriptor;
 import android.preference.PreferenceManager;
 import android.util.Base64;
 import android.util.Log;
 
-import com.github.costinm.dmesh.android.util.MsgClient;
-import com.github.costinm.dmesh.android.util.MsgMux;
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.util.BatteryMonitor;
+import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.msg.ConnUDS;
+import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.NativeProcess;
-import com.github.costinm.dmesh.android.util.UDS;
+import com.github.costinm.dmesh.android.msg.MsgServerUDS;
 import com.github.costinm.dmesh.libdm.vpn.VpnService;
 
-import java.io.File;
+import java.io.BufferedReader;
+import java.io.FileDescriptor;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 
@@ -43,152 +40,122 @@ import java.util.Map;
  * Similar protocol is used by dmroot native app for non-android.
  * </p>
  */
-public class DMesh extends UDS {
+public class DMesh {
 
     // 2001:20::/28 + 96 bit hash
     public static final byte[] RFC7343_host_id = new byte[]{
-            (byte)0xFD, 0x00, 0x00, 0, 0, 0, 0, 0
+            (byte) 0xFD, 0x00, 0x00, 0, 0, 0, 0, 0
     };
 
     private static final String TAG = "LMUDS";
-    public static final String DMWIFI = "com.github.costinm.dmwifi";
+
+    // Package to use for Android Wifi and networking interaction.
+    //public static String DMWIFI = "com.github.costinm.dmesh.lm";
 
     /**
-     * Singleton - null if vpn is stopped, interface if vpn is running.
-     */
-    public static ParcelFileDescriptor iface = null;
-    /**
-     *  IPv6 address bytes
+     * IPv6 address bytes
      */
     public final byte[] addr = new byte[16];
 
-    final Context ctx;
+    private final MsgMux mux;
+
+    Context ctx;
 
     private final String name;
-    private final SharedPreferences prefs;
+    final SharedPreferences prefs;
 
     public String userAgent = "";
 
-    // TODO: update from the status of the IP address or listener
-    public boolean apRunning;
-
-    NativeProcess dmGo;
+    public NativeProcess dmGo;
 
     ArrayList<String> dmGoCmd = new ArrayList<>();
 
     static DMesh singleton;
 
-    MsgClient wifi;
+    BatteryMonitor bm;
 
-    static final boolean wifiOne = false;
+    MsgServerUDS udss;
 
-    public static DMesh get() {
+    /**
+     * Provide access to DMesh object. Valid only when the service is running.
+     */
+    public synchronized static DMesh get(Context ctx) {
+        if (singleton == null) {
+            singleton = new DMesh(ctx.getApplicationContext());
+        }
+        if (singleton.ctx != ctx.getApplicationContext()) {
+            singleton.ctx = ctx.getApplicationContext();
+        }
         return singleton;
     }
 
-    // Will not work in all cases - Q with P2P (no internet) doesn't return anything.
-    // The P2P connection is tracked at P2P level.
-    public String getCurrentSSID() {
-//        WifiInfo cinfo = mWifiManager.getConnectionInfo();
-//        if (cinfo != null) {
-//            return NetUtil.cleanSSID(cinfo.getSSID());
-//        }
-        return null;
-    }
-
-    // Singleton
-    public DMesh(final Context ctx, String name) {
-        super(ctx, "DMesh");
-
+    private DMesh(final Context ictx) {
+        String name = "dmesh";
         singleton = this;
+
         this.name = name;
 
-        this.ctx = ctx;
+        this.ctx = ictx.getApplicationContext();
+
+        mux = MsgMux.get(ctx);
+
+        udss = new MsgServerUDS(ctx, mux, name) {
+            protected void onServerStart() {
+                openNative();
+            }
+
+            protected void onConnect(ConnUDS con) {
+                Credentials c = con.getPeerCredentials();
+                if (c == null) {
+                    return;
+                }
+                // SECURITY: only native process running as same UID can interact with the controller.
+                if (c.getUid() != ctx.getApplicationInfo().uid) {
+                    Log.e(TAG, "UDS Unexpected UID !!!" + ctx.getApplicationInfo().uid +
+                            " got " + c.getUid());
+                    con.close();
+                    return;
+                }
+                System.err.println("DMesh UDS connection uid=" +
+                        c.getUid() + " " + c.getPid() + " " + c.getGid()
+                        + " appuid=" + ctx.getApplicationInfo().uid);
+
+
+                // Model is too vague (Nexus 7), product is razor, etc.
+                // PRODUCT: google-manta
+
+                sendPrefs();
+            }
+
+        };
+
         prefs = PreferenceManager.getDefaultSharedPreferences(ctx);
 
-        wifi = MsgMux.get(ctx).dial(DMWIFI, new Handler.Callback() {
-            @Override
-            public boolean handleMessage(Message message) {
-                DMesh.this.handleMessage(message);
-                return false;
-            }
-        });
+//        new Thread(new Runnable() {
+//            @Override
+//            public void run() {
+//                try {
+//                    EnvoyEngine.load(ctx);
+//                    EnvoyEngine.run(loadEnvoyConfig(ctx, R.raw.config));
+//                } catch (Throwable t) {
+//                    t.printStackTrace();
+//                }
+//            }
+//        }).start();
 
-        wifi.handers.put("wifi", new MsgMux.MessageHandler() {
-            @Override
-            public void handleMessage(Message m, Messenger replyTo, String[] args) {
-                // Send it to UDS
-                send(m.getData().getString(":uri"), m.getData());
-            }
-        });
-
-        wifi.bind(ctx);
-
-        // Forward to the wifi app if present
-        Handler.Callback wifiFw = new Handler.Callback() {
-            @Override
-            public boolean handleMessage(Message message) {
-                Log.d(TAG, "Send to wifi app " + message.getData());
-                wifi.send(message);
-                return false;
-            }
-        };
-        udsHandlers.put("wifi", wifiFw);
-        udsHandlers.put("nan", wifiFw);
-        udsHandlers.put("bt", wifiFw);
-        udsHandlers.put("ble", wifiFw);
 
         // just notifies when battery changes, tracks battery status, sends broadcasts.
-        BatteryMonitor bm = new BatteryMonitor(ctx);
+        bm = new BatteryMonitor(ctx, mux);
 
-
-        udsHandlers.put("upgrade", new Handler.Callback() {
+        // Identity - called when the private key is rotated, or on startup.
+        // This should be the first message from the native app, may be repeated during connection.
+        mux.subscribe("I", new MessageHandler() {
             @Override
-            public boolean handleMessage(Message msg) {
+            public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] cmdArg) {
                 Bundle arg = msg.getData();
-                final String cmd = arg.getString(":uri");
 
-                String[] argv = cmd.split("/");
-                upgrade(argv.length > 3 ? argv[2] : null);
-                return false;
-            }
-        });
-
-        // Get preferences (TODO: remove, just initial values and onchange)
-        udsHandlers.put("P", new Handler.Callback() {
-            @Override
-            public boolean handleMessage(Message msg) {
-                // Request native preferences.
-                sendPrefs();
-                return false;
-            }
-        });
-
-        // Set preference
-        udsHandlers.put("p", new Handler.Callback() {
-            @Override
-            public boolean handleMessage(Message msg) {
-                Bundle arg = msg.getData();
-                final String cmd = arg.getString(":uri");
-                String[] cmdArg = cmd.split("/");
-                if (cmdArg[2].equals("s")) {
-                    prefs.edit().putString(cmdArg[3], cmdArg[4]).apply();
-                } else if (cmdArg[2].equals("i")) {
-                    prefs.edit().putInt(cmdArg[3], Integer.parseInt(cmdArg[4])).apply();
-                }
-                return false;
-            }
-        });
-
-        // Identity - called when the private key is rotated.
-        //
-        udsHandlers.put("I", new Handler.Callback() {
-            @Override
-            public boolean handleMessage(Message msg) {
-                Bundle arg = msg.getData();
-                final String cmd = arg.getString(":uri");
-                String[] cmdArg = cmd.split("/");
-                byte[] msgB = Base64.decode(cmdArg[2], Base64.URL_SAFE);
+                String pub = cmdArg[2];
+                byte[] msgB = Base64.decode(pub, Base64.URL_SAFE);
                 if (msgB.length == 16) {
                     System.arraycopy(msgB, 0, addr, 0, 16);
                 } else {
@@ -196,150 +163,90 @@ public class DMesh extends UDS {
                     System.arraycopy(msgB, 0, addr, 8, 8);
                 }
 
-                String MESH_NAME = Base64.encodeToString(addr, 11, 5, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
-                MsgMux.broadcast("DM", "Name", MESH_NAME);
+                bm.sendStatus("connect");
 
-                Log.d("DMesh", "Received ID " + MESH_NAME);
-
-                sendUserAgent();
+                sendPrefs();
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    if (iface != null) {
-                        sendVpn(iface.getFileDescriptor());
+                    if (VpnService.iface != null) {
+                        sendVpn(VpnService.iface.getFileDescriptor());
                     } else {
-                        VpnService.maybeStartVpn(prefs, ctx, DMesh.this, null, DMSettingsActivity.class);
+                        VpnService.maybeStartVpn(prefs, ctx, DMesh.this);
                     }
                 }
-
-                return false;
             }
         });
 
 
-        start();
+        udss.start();
     }
 
-    public void run() {
-        Log.d(TAG, "Starting native process");
+    private String loadEnvoyConfig(Context context, int configResourceId) throws RuntimeException {
+        InputStream inputStream = context.getResources().openRawResource(configResourceId);
+        InputStreamReader inputReader = new InputStreamReader(inputStream);
+        BufferedReader bufReader = new BufferedReader(inputReader);
+        StringBuilder text = new StringBuilder();
 
-        dmGo = new NativeProcess(ctx, "libDM.so", dmGoCmd);
-        dmGo.keepAlive = true;
-
-        while (ls == null) {
-            try {
-                ls = new LocalServerSocket(name);
-            } catch (IOException e) {
-                e.printStackTrace();
-                try {
-                    Thread.sleep(10000);
-                } catch (InterruptedException e1) {
-                    e1.printStackTrace();
-                }
+        try {
+            String line;
+            while ((line = bufReader.readLine()) != null) {
+                text.append(line);
+                text.append('\n');
             }
+        } catch (IOException e) {
+            return null;
         }
-        dmGo.start();
+        return text.toString();
+    }
 
-        while (running) {
-            try {
-                final LocalSocket s1 = ls.accept();
-
-                Credentials c = s1.getPeerCredentials();
-
-                System.err.println("DMesh connection uid=" +
-                        c.getUid() + " " + c.getPid() + " " + c.getGid()
-                        + " appuid=" + ctx.getApplicationInfo().uid);
-
-
-                socket = s1;
-
-
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        handleLocalSocket(s1);
-                    }
-                }).start();
-
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
+    public void sendVpn(FileDescriptor fd) {
+        for (ConnUDS uds: udss.active) {
+            uds.sendFileDescriptor("/v/fd", fd);
         }
     }
 
-    protected void onConnect() {
-        sendUserAgent();
-        sendPrefs();
-
-        // TODO: Fake startup events - wifi, ap status if started
-
-        String ssid1 = getCurrentSSID();
-        if (ssid1 != null) {
-            MsgMux.broadcast("CON", "STARTO", "", "ssid", ssid1);
+    public void stopVpn() {
+        for (ConnUDS uds: udss.active) {
+            uds.send("/KILL");
         }
+        dmGo.kill();
     }
 
-
-    public synchronized void sendUserAgent() {
-        // Model is too vague (Nexus 7), product is razor, etc.
-        // PRODUCT: google-manta
-        String adv =
-                Build.VERSION.SDK_INT + "-" + Build.PRODUCT + "-" +
-                        Build.MODEL + "-" + userAgent;
-        send("/u/" + adv.replace(' ', '_'), null, null);
-    }
-
-
+    // At startup as well as when the preferences change.
+    // Not clear it's still needed - prefs have been simplified and native has its own config.
     public synchronized void sendPrefs() {
         new Thread(new Runnable() {
             @Override
             public void run() {
                 Map<String, ?> allp = prefs.getAll();
-                send("/P", allp, null);
+
+                List<String> propList = MsgMux.mapToStringList(allp);
+                String adv = Build.VERSION.SDK_INT + "-" + Build.PRODUCT + "-" + Build.MODEL + "-" + userAgent;
+                propList.add("ua");
+                propList.add(adv.replace(' ', '_'));
+
+
+                mux.publish("/P/settings", propList.toArray(new String[]{}));
             }
-        });
+        }).start();
     }
 
-    public void upgrade(String vpn) {
-        final File f = ctx.getExternalFilesDir(null);
-        final File f2 = new File(f, "libDM.so");
+    public void openNative() {
+        if (dmGo == null) {
+            dmGo = new NativeProcess(ctx, "libDM.so", dmGoCmd);
+            dmGo.keepAlive = true;
+            dmGo.start();
+        }
+    }
 
-        if (vpn == null) {
-            final File fd = ctx.getFilesDir();
-            new File(fd, "libDM.so").delete();
+    public void closeNative() {
+        if (dmGo == null) {
             return;
         }
+        dmGo.keepAlive = false;
 
-        ctx.registerReceiver(new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                Log.d(TAG, "Downloaded " + intent  + " " + f2.exists() + " " + f2.getAbsolutePath());
-                ctx.unregisterReceiver(this);
-                DMesh.get().send("/KILL", null, null);
-            }
-        }, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
-
-        String base = prefs.getString("vpnaddr", "h.webinf.info");
-
-        String url = "https://" + base + "/www/jniLibs/armeabi/libDM.so";
-
-        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
-        request.setDescription("DMesh download");
-        request.setTitle("DMesh VPN");
-
-        // in order for this if to run, you must use the android 3.2 to compile your app
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
-            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
-        }
-        Uri dest = Uri.withAppendedPath(Uri.fromFile(f), "libDM.so");
-        request.setDestinationUri(dest);
-
-        request.setVisibleInDownloadsUi(false);
-
-        Log.d(TAG, "Start: " + f2.getAbsolutePath() + " " + dest);
-
-        // dial download service and enqueue file
-        DownloadManager manager = (DownloadManager) ctx.getSystemService(Context.DOWNLOAD_SERVICE);
-        manager.enqueue(request);
+        stopVpn();
+        bm.close();
+        dmGo = null;
     }
-
 }

@@ -1,29 +1,15 @@
 package com.github.costinm.dmesh.android.util;
 
-import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.net.Uri;
-import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.URL;
-import java.net.URLConnection;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Run a native process. Optional restart and suspend/resume.
@@ -33,15 +19,13 @@ public class NativeProcess extends Thread {
     public static final int RESTART_DELAY = 5000;
 
     public static final String TAG = "DM-nat";
-    // Cmd to start the process
     final List<String> cmd;
-    final BlockingQueue<String> suspendQueue = new LinkedBlockingQueue<>();
-    private final Context ctx;
+    // Cmd to start the process
     private final String exec;
+    private final Context ctx;
+    public boolean keepAlive = false;
     // Null when not running
     Process p;
-    public boolean keepAlive = false;
-    boolean suspended = false;
 
     /**
      * Start the native command.
@@ -54,7 +38,7 @@ public class NativeProcess extends Thread {
         setName(file);
     }
 
-    static void logStream(InputStream input)
+    static void logStream(InputStream input, boolean isErr)
             throws IOException {
         BufferedReader br = new BufferedReader(new InputStreamReader(input));
         while (true) {
@@ -63,25 +47,17 @@ public class NativeProcess extends Thread {
                 Log.d("DM-N", "Closed");
                 return;
             }
-//            if (l.length() > 20) {
-//                l = l.substring(20);
-//            }
-            // first word == tag-subtag
-            String[] parts = l.split(" ", 2);
-            if (parts.length == 1) {
-                Log.d("DM-N", l);
+            if (isErr) {
+                String[] parts = l.split(" ", 3);
+                if (parts.length < 3) {
+                    Log.d("DM-N", l);
+                } else {
+                    // skip timestamp
+                    Log.d("DM-N", parts[2]);
+                }
             } else {
-                Log.d(parts[0], parts[1]);
+                Log.d("DM-NO", l);
             }
-        }
-    }
-
-    public static void copyStream(InputStream input, OutputStream output)
-            throws IOException {
-        byte[] buffer = new byte[1024]; // Adjust if you want
-        int bytesRead;
-        while ((bytesRead = input.read(buffer)) != -1) {
-            output.write(buffer, 0, bytesRead);
         }
     }
 
@@ -89,38 +65,41 @@ public class NativeProcess extends Thread {
     // Then if the exec is find in files, use it from there.
     // Last use the bundled exec from lib.Ma
     String getExecutable() {
-        final File srcDir = ctx.getExternalFilesDir(null);
-        File src = new File(srcDir, exec);
+        String nativeLib = ctx.getApplicationInfo().nativeLibraryDir;
+        System.out.println("NATIVE LIBDIR: " + nativeLib);
 
-        final File f = ctx.getFilesDir();
-        if (!src.exists()) {
-            src = new File(f, exec + ".new");
-        }
-        final File f2 = new File(f, exec);
+//        final File srcDir = ctx.getExternalFilesDir(null);
+//        File src = new File(srcDir, exec);
+//
+//        final File f = ctx.getFilesDir();
+//        if (!src.exists()) {
+//            src = new File(f, exec + ".new");
+//        }
+//        final File f2 = new File(f, exec);
+//
+//        if (src.exists()) {
+//            try {
+//                OutputStream fos = new FileOutputStream(f2);
+//                InputStream fis = new FileInputStream(src);
+//                copyStream(fis, fos);
+//                fis.close();
+//                fos.close();
+//
+//                src.delete();
+//                f2.setExecutable(true);
+//            } catch (IOException e) {
+//                e.printStackTrace();
+//            }
+//        }
+//
+//        File d = ctx.getFilesDir();
+//        File bin = new File(d, exec);
+//
+//        if (bin.exists() && bin.canExecute()) {
+//            return bin.getAbsolutePath();
+//        }
 
-        if (src.exists()) {
-            try {
-                OutputStream fos = new FileOutputStream(f2);
-                InputStream fis = new FileInputStream(src);
-                copyStream(fis, fos);
-                fis.close();
-                fos.close();
-
-                src.delete();
-                f2.setExecutable(true);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-
-        File d = ctx.getFilesDir();
-        File bin = new File(d, exec);
-
-        if (bin.exists() && bin.canExecute()) {
-            return bin.getAbsolutePath();
-        }
-
-        return d.getParent() + "/lib/" + exec;
+        return nativeLib + "/" + exec; //d.getParent() + "/lib/" + exec;
     }
 
     public void kill() {
@@ -133,30 +112,10 @@ public class NativeProcess extends Thread {
         }
     }
 
-    public void suspendNative() {
-        suspendQueue.clear();
-        suspended = true;
-    }
-
-    public void resumeNative() {
-        suspended = false;
-        suspendQueue.add("Resume");
-    }
-
     public void run() {
         if (keepAlive) {
             while (keepAlive) {
-                if (suspended) {
-                    try {
-                        suspendQueue.take();
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-
-                if (!suspended) {
-                    runOnce();
-                }
+                runOnce();
 
                 try {
                     // Wait before restart
@@ -175,17 +134,20 @@ public class NativeProcess extends Thread {
         String exe = getExecutable();
         final File filesDir = ctx.getFilesDir();
         try {
-            InputStream is;
+            InputStream err;
+            //InputStream out;
             synchronized (NativeProcess.class) {
                 cmd.set(0, exe);
-                ProcessBuilder pb = new ProcessBuilder().command(cmd)
-                        .redirectErrorStream(true);
+                ProcessBuilder pb = new ProcessBuilder().command(cmd).redirectErrorStream(true);
                 pb.environment().put("STORAGE", ctx.getExternalFilesDir(null).getAbsolutePath());
                 pb.environment().put("BASE", ctx.getFilesDir().getAbsolutePath());
                 p = pb.start();
-                is = p.getInputStream();
+                err = p.getInputStream();
+                //err = p.getErrorStream();
             }
-            logStream(is); // will block until process is closed.
+            logStream(err, true); // will block until process is closed.
+            // TODO: feed this into the mux ?
+            //logStream(out, false); // will block until process is closed.
         } catch (Throwable t) {
             Log.d("DM-N", "Stopping !!" + t.getMessage());
         } finally {
@@ -202,20 +164,68 @@ public class NativeProcess extends Thread {
         }
     }
 
-    public void upgrade(String url) {
-        try {
-            URLConnection urlc = new URL(url).openConnection();
-            InputStream is = urlc.getInputStream();
-            File d = ctx.getFilesDir();
-            File bin = new File(d, exec);
-            OutputStream os = new FileOutputStream(bin);
-            copyStream(is, os);
-            os.close();
-            is.close();
-            bin.setExecutable(true);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
+    // No longer working in Q+ - exec permissions
+//
+//    public void upgrade(String url) {
+//        try {
+//            URLConnection urlc = new URL(url).openConnection();
+//            InputStream is = urlc.getInputStream();
+//            File d = ctx.getFilesDir();
+//            File bin = new File(d, exec);
+//            OutputStream os = new FileOutputStream(bin);
+//            copyStream(is, os);
+//            os.close();
+//            is.close();
+//            bin.setExecutable(true);
+//        } catch (IOException e) {
+//            e.printStackTrace();
+//        }
+//    }
+//
+//    public void upgrade(final Context ctx, String vpn, String fbase) {
+//        final File f = ctx.getExternalFilesDir(null);
+//        final File f2 = new File(f, fbase);
+//
+//        if (vpn == null) {
+//            final File fd = ctx.getFilesDir();
+//            new File(fd, fbase).delete();
+//            return;
+//        }
+//
+//        ctx.registerReceiver(new BroadcastReceiver() {
+//            @Override
+//            public void onReceive(Context context, Intent intent) {
+//                Log.d(TAG, "Downloaded " + intent  + " " + f2.exists() + " " + f2.getAbsolutePath());
+//                ctx.unregisterReceiver(this);
+//
+//                kill();
+//
+//                // TODO: override the old file
+//            }
+//        }, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+//
+//
+//        // TODO: arch from platform
+//        String url = "https://" + vpn + "/www/jniLibs/armeabi/" + fbase;
+//
+//        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+//        request.setDescription("DMesh download");
+//        request.setTitle("DMesh VPN");
+//
+//        // in order for this if to run, you must use the android 3.2 to compile your app
+//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
+//            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
+//        }
+//        Uri dest = Uri.withAppendedPath(Uri.fromFile(f), "libDM.so");
+//        request.setDestinationUri(dest);
+//
+//        request.setVisibleInDownloadsUi(false);
+//
+//        Log.d(TAG, "Start: " + f2.getAbsolutePath() + " " + dest);
+//
+//        // dial download service and enqueue file
+//        DownloadManager manager = (DownloadManager) ctx.getSystemService(Context.DOWNLOAD_SERVICE);
+//        manager.enqueue(request);
+//    }
 
 }

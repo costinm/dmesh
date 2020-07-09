@@ -10,8 +10,9 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
+
         <service
-            android:name="com.github.costinm.dmwifi.DMService"
+            android:name=".DMService"
             android:enabled="true"
             android:exported="true"></service>
 
@@ -20,16 +21,16 @@
             android:resource="@xml/actions" />
 
         <activity
-            android:name="com.github.costinm.dmwifi.MainActivity"
+            android:name=".WifiActivity"
             android:label="@string/title_activity_main"
             android:exported="true"
             android:theme="@style/AppTheme.NoActionBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
     </application>
 
 </manifest>

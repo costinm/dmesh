@@ -71,7 +71,7 @@ public class ConnectLegacy {
         setNoInternet(cfg);
         if (passphrase == null) {
             cfg.SSID = ssid2;
-            cfg.preSharedKey = '"' + "1234567890" + '"';
+            cfg.preSharedKey = '"' + Device.DEFAULT_PSK + '"';
             cfg.priority = 1;
         } else {
             // http://stackoverflow.com/questions/2140133/how-and-what-to-set-to-android-wificonfiguration-presharedkey-to-connect-to-the
@@ -90,7 +90,7 @@ public class ConnectLegacy {
             int i = mWifiManager.addNetwork(cfg);
             if (i < 0) {
                 // Do clients care ? Nothing to do about it.
-                Log.d(TAG, "Failed to add SSID ");
+                Log.d(TAG, "Failed to addNetwork " + i);
                 return -1;
             }
             id = i;

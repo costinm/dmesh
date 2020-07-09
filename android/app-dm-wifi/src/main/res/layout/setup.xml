@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+        xmlns:app="http://schemas.android.com/apk/res-auto"
+        xmlns:tools="http://schemas.android.com/tools"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        tools:context=".WifiActivity"
+    android:orientation="vertical">
+
+
+    <TextView
+        android:id="@+id/info_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Application uses Location to scan and configure the mesh. It can access and control the Wifi state."
+        />
+
+    <Button
+        android:id="@+id/location"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Enable Location permissions"
+        android:visibility="invisible"/>
+
+    <TextView
+        android:id="@+id/app_vpn"
+        android:text="Application will act as a VPN, intercepting and encrypting the traffic and redirecting it to other nodes in the mesh."
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+
+    <Button
+        android:id="@+id/vpn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Enable VPN"
+        android:visibility="invisible"/>
+
+
+    <TextView
+        android:id="@+id/app_enable"
+        android:text="Application will act as a VPN, intercepting and encrypting the traffic and redirecting it to other nodes in the mesh."
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+
+    <Button
+        android:id="@+id/enable"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Enable service"
+        />
+
+
+
+</LinearLayout>

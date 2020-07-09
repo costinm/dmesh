@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.net.Network;
@@ -27,19 +28,21 @@ import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
-import android.os.Messenger;
+import android.preference.PreferenceManager;
 import android.util.Log;
 
-import com.github.costinm.dmesh.android.util.MsgMux;
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.Reflect;
 import com.github.costinm.dmesh.android.util.UiUtil;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,10 +68,10 @@ Debug:
 2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Operating frequency for the associated BSS from scan results: 5785 MHz
 2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Associated on 5785 MHz
 2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Associated with 26:1f:a0:30:26:e0
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Set drv->ssid based on scan res info to 'DIRECT-BD-angler_n6p'
+2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Set drv->mySSID based on scan res info to 'DIRECT-BD-angler_n6p'
 
 
-2019-05-18 19:41:26.542 2401-2401/? I/wpa_supplicant: P2P-GROUP-STARTED p2p0 client ssid="DIRECT-BD-angler_n6p" freq=5785 go_dev_addr=26:1f:a0:30:a6:e0 [PERSISTENT]
+2019-05-18 19:41:26.542 2401-2401/? I/wpa_supplicant: P2P-GROUP-STARTED p2p0 client mySSID="DIRECT-BD-angler_n6p" freq=5785 go_dev_addr=26:1f:a0:30:a6:e0 [PERSISTENT]
 
 2019-05-18 19:41:26.544 1260-1470/? D/WifiP2pService: GroupNegotiationState{ when=0 what=147485 obj=network: DIRECT-BD-angler_n6p
 
@@ -100,6 +103,13 @@ Debug:
 2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: p2p0:  * reason 3 (locally generated)
  */
 
+/*
+
+TODO:
+- BLE, BT and NAN allow sending some messages without connecting. This can be integrated.
+
+
+ */
 
 /**
  * Wifi related code - targetting L-Q
@@ -132,26 +142,32 @@ Debug:
  * -- n: NET  // same
  * -- name: P2P name // if found as peer
  */
-public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
-    public static final int UPDATE = 3;
+public class Wifi extends BroadcastReceiver implements MessageHandler {
+	    public static final int UPDATE = 3;
     public static final int MSG = 2;
     static final Map<String, String> empty = new HashMap<>();
     // Used for P2P announce
     static final String SD_SUFFIX_PART = "_dm._udp";
     private static final String TAG = "DM/wifi";
-    // Database with recent discovered addresses.
+    private static final String PREF_ENABLED = "wifi_enabled" ;
 
-    // Key is 'discovery address' - p2p device address or nan or ble mac
-    public static Map<String, Device> sdDevByAddr = new HashMap<>();
-
+    // Database with recent discovered P2P devices, with DNS-SD completed and with a valid
+    // SSID
+    // Key is the SSID, so we can match against scan data.
     public static Map<String, Device> p2pDevBySdSSID = new HashMap<>();
+
+    private final SharedPreferences prefs;
 
     // Raw data from callbacks:
     // Last 'group' info, or null if the group is not started.
-    WifiP2pGroup group;
-    // Last p2p discovery. Empty if discovery not in progress.
+    public WifiP2pGroup group;
+
+    // Last p2p discovery. Empty if discovery not in progress. This has only WifiP2pDevice info,
+    // no discovery info. SD may be cached in txtDiscoveryByP2P or BySSID.
     static WifiP2pDeviceList wifiP2pDeviceList;
-    // Last scan results. Updated when result happens.
+
+    // Last scan results. Updated when result happens. Data is merged with txt info to
+    // select DMesh APs.
     private List<ScanResult> lscanResults;
 
     /**
@@ -162,7 +178,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     // end raw data
 
 
-    // SD discovery info, keyed by the P2P discAddr.
+    // SD discovery info, keyed by the P2P id.
     // The debug app depends on SD discovery working, doesn't persist any data.
     // The mesh app may persist and get the data from other nodes. When visibility reports are sent,
     // it'll merge with its own SD discovery data.
@@ -170,14 +186,20 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     public static Map<String, Map<String, String>> txtDiscoveryByP2P = new HashMap<>();
     public static Map<String, Map<String, String>> txtDiscoveryBySSID = new HashMap<>();
 
-
     static boolean discovering = false;
 
     static String lastCap = "";
 
     final Looper looper;
-    // Handler used to send broadcasts to all connected clients.
-    final Handler broadcastHandler;
+//                String MESH_NAME = Base64.encodeToString(addr, 11, 5, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
+//
+//                mux.publish("/DM", "Name", MESH_NAME);
+//
+//                Log.d("DMesh", "Received ID " + MESH_NAME);
+
+
+    // Handler used for postDelayed()
+    final Handler delayHandler;
 
     Context ctx;
     static WifiP2pManager.Channel mChannel;
@@ -185,13 +207,19 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     WifiP2pManager mP2PManager;
     WifiP2pDnsSdServiceInfo si;
     ConnectivityManager cm;
-    Nan nan;
 
-    boolean p2pGroupStarted;
+    // Used for discovery
+    public Nan nan;
+    public Ble ble;
+    public Bt2 bt;
+
+    // True if AP started in P2P mode
+    public boolean p2pGroupStarted;
 
 
     // Advertised URL - for NAN, BLE, TXT
-    String adv = "/dmesh";
+    // Current format: 16 bytes, PSK8 + SSIDHASH4 + ID4
+    String adv = "12345678SSIDID04";
 
     private WifiP2pManager.DnsSdTxtRecordListener discoveryListener;
 
@@ -199,15 +227,34 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     // Will be stopped during connect
     // Should not be relevant to the higher layers - this class should just track it.
     // May be reported in 'scan' events.
-    private int discoveryState;
+    public int discoveryState;
 
     private boolean p2pEnabled;
     private WifiP2pInfo pinfo;
 
-    public Wifi(Context appContext, Handler broadcaster, Looper mainLooper) {
+    private static Wifi singleton;
+
+    public static synchronized  Wifi get(Context ctx) {
+        if (singleton == null) {
+            HandlerThread ht = new HandlerThread("wifi");
+            ht.start();
+            // all messages from wifi posted here
+            Handler h = new Handler(ht.getLooper()) {
+                @Override
+                public void handleMessage(Message msg) {
+                    super.handleMessage(msg);
+                }
+            };
+
+            singleton = new Wifi(ctx.getApplicationContext(), h, ht.getLooper());
+        }
+        return singleton;
+    }
+
+    public Wifi(Context appContext, Handler delayHandler, Looper mainLooper) {
         ctx = appContext.getApplicationContext();
         looper = mainLooper;
-        broadcastHandler = broadcaster;
+        this.delayHandler = delayHandler;
         mP2PManager = (WifiP2pManager) appContext.getSystemService(Context.WIFI_P2P_SERVICE);
         mWifiManager = (WifiManager) appContext.getSystemService(Context.WIFI_SERVICE);
         cm = (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -216,16 +263,29 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
             nan = new Nan(this);
         }
         registerReceiver(appContext);
+
+        ble = new Ble(appContext, this, this.delayHandler);
+        bt = new Bt2(appContext, this.delayHandler);
+
+        prefs = PreferenceManager.getDefaultSharedPreferences(appContext);
+        mySSID = prefs.getString("mySSID", "");
+        psk = prefs.getString("psk", "");
+
+//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+//            nan.sub(delayHandler, true);
+//        }
+
     }
 
     /**
      * Called when all Bind (subscribers) disconnect.
-     *
+     * <p>
      * Will leave AP and connections in last known state. May exit.
      */
     public void onDestroy() {
         ctx.unregisterReceiver(this);
         stopPeerAndSDDiscovery();
+        bt.close();
     }
 
     // Last requested state for the AP.
@@ -262,40 +322,96 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
         }
     }
 
+    public void scan() {
+        boolean s = mWifiManager.startScan();
+        Log.d(TAG, "Request wifi scan " + s);
+
+        delayHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                ble.scan();
+            }
+        }, 3000);
+
+        // Will activate nan - but not detach, so beacons will continue to be sent.
+        // Also requires the other end to be attached - sending beacons. If we take the hit of
+        // sending beacons - P2P mode is more efficient anyways.
+        // Using NAN for discovery doesn't seem to present any benefits.
+
+//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nan != null) {
+//            delayHandler.postDelayed(new Runnable() {
+//                @Override
+//                public void run() {
+//                    nan.sub(delayHandler, true);
+//                    delayHandler.postDelayed(new Runnable() {
+//                        @Override
+//                        public void run() {
+//                            nan.stopNanSub();
+//                        }
+//                    }, 10000);
+//                }
+//            }, 6000);
+//        }
+    }
+
+
+    public void send(String uri, String... parms) {
+        Message m = Message.obtain();
+        m.what = 1;
+        m.getData().putString(":uri", uri);
+        Bundle b = m.getData();
+        for (int i = 0; i < parms.length; i += 2) {
+            b.putString(parms[i], parms[i + 1]);
+        }
+        String[] args = uri.split("/");
+        handleMessage(args[1], args[2], m, null, args);
+    }
+
     /**
      * Handle all incoming requests for the service.
      * <p>
      * Expects a :uri, with a path starting with /wifi/${ACTION}/${PARAMS...}
-     *
+     * <p>
      * Additional params sent in the message bundle.
      * <p>
      * May send a direct response using msg.replyTo - should include the :id parameter.
-     * May send at any time broadcasts using the broadcastHandler to all subscribers.
+     * May send at any time broadcasts using the delayHandler to all subscribers.
      * Broadcasts start with "/wifi/" or /net/
      */
     @Override
-    public void handleMessage(Message msg, Messenger replyTo, String[] args) {
-        if (args.length < 2 || ! (args[1].equals("wifi")||args[1].equals("net") ) ) {
+    public void handleMessage(String topic, String type, Message msg, MsgConn replyTo, String[] args) {
+        if (!prefs.getBoolean(PREF_ENABLED, true)) {
             return;
         }
 
-        Log.d(TAG, "Command: " + Arrays.toString(args));
+        switch (topic) {
+            case "I":
+                id4 = type.substring(0, 4);
+                announce(true);
+                return;
+        }
 
-        switch (args[2]) {
+        Bundle b = msg.getData();
+        Log.d(TAG, "WIFI Command: " + Arrays.toString(args) + " " + b);
+
+        switch (type) {
             case "p2p":
                 updateP2P(msg);
-
                 break;
 
             // Actions and testing
 
             case "scan":
-                boolean s = mWifiManager.startScan();
-                Log.d(TAG, "Request scan " + s);
+                // Wifi, BLE and NAN scan. No BT yet.
+                scan();
                 break;
 
             case "disc":
-                discoveryWifiP2POnce(msg);
+                // Should be used after wifi scan, if new DIRECT devices are
+                // found - to show the neigbor info.
+                //
+                // about 6 seconds
+                discoveryWifiP2POnce();
                 break;
 
             // p2p discovery must be started for con
@@ -313,27 +429,63 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
 
 
             case "nan":
-                if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    if ("start".equals(args[3])) {
-                        nan.startNan();
-                    } else if ("con".equals(args[3])) {
+                Log.d(TAG, "NAN command " + args);
+                if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && args.length >= 4) {
+                    if ("con".equals(args[3]) && args.length >= 5) {
                         nan.conNan(args[4]);
                     } else if ("ping".equals(args[3])) {
-                        nan.pingNan(args[4]);
+                         if(args.length >= 5) {
+                             nan.sendAll(args[4]);
+                           } else {
+                             nan.sendAll("PING");
+                         }
+                    } else if ("msg".equals(args[3]) && args.length >= 6) {
+                        nan.send(args[4], args[5]);
+                    } else if ("adv".equals(args[3])) {
+                        if (args.length > 4 && args[4].equals("stop")) {
+                            nan.stopPub();
+                        } else if (args.length > 4 && args[4].equals("act")) {
+                            nan.pub(true);
+                        } else {
+                            nan.pub(false);
+                        }
+                    } else if ("sub".equals(args[3])) {
+                        if (args.length > 4 && args[4].equals("stop")) {
+                            nan.stopSub();
+                        } else if (args.length > 4 && args[4].equals("pass")) {
+                            nan.sub(delayHandler, false);
+                        } else {
+                            nan.sub(delayHandler, true);
+                        }
+                    } else if ("start".equals(args[3])) {
+                        nan.nanRadio(true);
                     } else if ("stop".equals(args[3])) {
-                        nan.stopNan();
+                        nan.nanRadio(false);// detach, stop discovery and adv
                     }
                 }
                 break;
+            case "ble":
 
+                break;
 
+            // Controls BLE, NAN advertising. Param: id4 - the 4-byte short for of identifier.
             case "adv":
-                // For internal debug - it is started automatically on ap start.
-                //
-                if ("start".equals(args[3])) {
+                if (null != b.getString("id4", null)) {
+                    id4 = b.getString("id4");
+                }
+
+                String advOn = b.getString("on", "-1");
+                if ("1".equals(advOn)) {
+                    announce(true);
+                } else if ("0".equals(advOn)) {
+                    announce(false);
+                }
+
+                String p2p = b.getString("p2p", "-1");
+                if ("1".equals(p2p)) {
                     // TODO: optional parameters, use BLE/BT as well
                     announceWifiP2P(true);
-                } else {
+                } else if ("0".equals(p2p)) {
                     announceWifiP2P(false);
                 }
                 break;
@@ -355,160 +507,142 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     // 2.
     //
     //
-    public void sendWifiDiscoveryStatus(String event) {
+    // Merging:
+    // -
+    public void sendWifiDiscoveryStatus(String event, String id) {
 
-        // Key is SSID or device address.
-        Map<String, Device> newscanResults = new HashMap<>();
+        // Key is SSID - combines last scan results and DNS-SD ( based on P2P peers and
+        // previous or current DNS-SD TXT records that addMap2Bundle the SSID and ID )
+        Map<String, Device> devicesBySSID = new HashMap<>();
 
-        // Key is P2P discovery address - only if SSID is not found (peer without SD)
-        Map<String, Device> newscanResultsByP2P = new HashMap<>();
+        // Key is P2P discovery address - only if SSID is not found (peer without SD).
+        // The devices can still be paired with - or may be DMesh devices that failed DNS-SD.
+        // TODO: do we need this ? Can be safely ignored for must purposes, good mostly for debugging.
+        // It also includes connected clients.
+        Map<String, Device> p2pPeersWithoutDNSSDByMAC = new HashMap<>();
 
+        // Used to avoid dups for connected clients. All p2p peers.
         Map<String, Device> allP2PDiscovered = new HashMap<>();
 
-        Bundle b = new Bundle();
-        // Normal key/value pairs, next to :uri
-        ArrayList<String> extra = new ArrayList<>();
+        Bundle scanStatusMsg = new Bundle();
 
-        boolean newFound = false;
 
         // Add other P2P devices - some may be visible as SSID, but we don't know the association
         // because we didn't discover TXT yet.
         if (wifiP2pDeviceList != null) {
-            for (WifiP2pDevice pd: wifiP2pDeviceList.getDeviceList()) {
-                if (newscanResultsByP2P.get(pd.deviceAddress) != null) {
-                    continue;
-                }
+            for (WifiP2pDevice pd : wifiP2pDeviceList.getDeviceList()) {
                 Device d = new Device(pd);
                 // will populate TXT records, if previous SD found them. We cache since SD is not
                 // very reliable.
                 String ssid = d.data.getString(Device.SSID);
                 if (ssid != null) {
-                    newscanResults.put(ssid, d);
+                    devicesBySSID.put(ssid, d);
                 } else {
-                    newscanResultsByP2P.put(pd.deviceAddress, d);
+                    p2pPeersWithoutDNSSDByMAC.put(pd.deviceAddress, d);
                 }
                 allP2PDiscovered.put(pd.deviceAddress, d);
             }
         }
+        if (lscanResults != null) {
+            for (ScanResult sr : lscanResults) {
+                if (!isLM(sr.SSID)) {
+                    continue;
+                }
+                Device d = devicesBySSID.get(sr.SSID);
+                if (d == null) {
+                    d = new Device(sr);
+                    devicesBySSID.put(sr.SSID, d);
+                } else {
+                    d.setScanResult(sr);
+                }
+            }
+        }
+        for (WifiP2pDevice c : currentClientList) {
+            Device d = allP2PDiscovered.get(c.deviceAddress);
+            if (d == null) {
+                d = new Device(c);
+                p2pPeersWithoutDNSSDByMAC.put(c.deviceAddress, d);
+                allP2PDiscovered.put(c.deviceAddress, d);
+            }
+            d.data.putString("gc", "1");
+        }
+
+        ArrayList<Bundle> scanList = new ArrayList<>();
+        for (Device d : devicesBySSID.values()) {
+            scanList.add(d.data);
+        }
+        for (Device d : p2pPeersWithoutDNSSDByMAC.values()) {
+            scanList.add(d.data);
+        }
+        for (Device d : Ble.devices.values()) {
+            scanList.add(d.data);
+        }
+        if (nan != null) {
+            for (Device d : Nan.devices.values()) {
+                scanList.add(d.data);
+            }
+        }
+        scanStatusMsg.putParcelableArrayList("scan", scanList);
+
+        // Normal key/value pairs, next to :uri
+        ArrayList<String> extra = new ArrayList<>();
+        extra.add("visible");
+        extra.add(lscanResults == null ? "0" : "" + lscanResults.size());
+
+        extra.add("s");
+        extra.add(mySSID);
+        extra.add("p");
+        extra.add(psk);
+
+        if (pinfo != null && pinfo.groupFormed && !pinfo.isGroupOwner) {
+            // if groupOnwer - group will be set and used in next block
+            extra.add("go");
+            extra.add("0");
+            if (pinfo.groupOwnerAddress != null) {
+                extra.add("goAddress");
+                extra.add(pinfo.groupOwnerAddress.toString());
+            }
+        }
+
+        if (group != null) {
+            if (!group.isGroupOwner()) {
+                WifiP2pDevice owner = group.getOwner();
+                if (owner != null) {
+                    extra.add("owner");
+                    extra.add(owner.toString());
+                }
+            } else {
+                extra.add("go");
+                extra.add("1");
+                if (pinfo.groupOwnerAddress != null) {
+                    extra.add("goAddress");
+                    extra.add(pinfo.groupOwnerAddress.toString());
+                }
+                WifiP2pDevice owner = group.getOwner();
+                if (owner != null) {
+                    extra.add("owner");
+                    extra.add(owner.toString());
+                }
+
+                extra.add("ap");
+                extra.add("1");
+            }
+        }
+
+        extra.add("event");
+        extra.add(event);
+
+        if (id.length() > 0) {
+            extra.add("eventTarget");
+            extra.add(id);
+        }
+
         if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (nan.isAvailable()) {
                 extra.add("nan");
                 extra.add(nan.nanId);
             }
         }
-
-        if (lscanResults != null) {
-            for (ScanResult sr : lscanResults) {
-                if (!isLM(sr.SSID)) {
-                    continue;
-                }
-                Device d = newscanResults.get(sr.SSID);
-                if (d == null) {
-                    d = new Device(sr);
-                    newscanResults.put(sr.SSID, d);
-                } else {
-                    d.setScanResult(sr);
-                }
-            }
-        }
-
-        sdDevByAddr = allP2PDiscovered;
-
-
-        ArrayList<Bundle> blist = new ArrayList<>();
-        for (Device d: newscanResults.values()) {
-            blist.add(d.data);
-        }
-        for (Device d: newscanResultsByP2P.values()) {
-            blist.add(d.data);
-        }
-        b.putParcelableArrayList("scan", blist);
-
-        extra.add("visible");
-        extra.add(lscanResults == null ? "0" : "" + lscanResults.size());
-
-        if (pinfo != null && pinfo.groupFormed) {
-            if (pinfo.isGroupOwner) {
-                extra.add("go");
-                extra.add("1");
-                if (pinfo.groupOwnerAddress != null) {
-                    extra.add("goAddress");
-                    extra.add(pinfo.groupOwnerAddress.toString());
-                }
-                MsgMux.get(ctx).broadcastTxt("/wifi/P2P", "GO", "1",
-                        "groupOnwerAddress", pinfo.groupOwnerAddress != null ? pinfo.groupOwnerAddress.toString() : "");
-            } else {
-                extra.add("go");
-                extra.add("0");
-                if (pinfo.groupOwnerAddress != null) {
-                    extra.add("goAddress");
-                    extra.add(pinfo.groupOwnerAddress.toString());
-                }
-                // client
-                MsgMux.get(ctx).broadcastTxt("/wifi/P2P", "GO", "0",
-                        "groupOnwerAddress", pinfo.groupOwnerAddress != null ? pinfo.groupOwnerAddress.toString() : "");
-            }
-        } else {
-            extra.add("go");
-            extra.add("-1");
-            if (pinfo != null) {
-                MsgMux.get(ctx).broadcastTxt("/wifi/P2P", "GO", "-1",
-                        "groupOnwerAddress", pinfo.groupOwnerAddress != null ? pinfo.groupOwnerAddress.toString() : "");
-            }
-            currentClientList.clear();
-        }
-
-        if (group == null) {
-            if (p2pGroupStarted) {
-                announceWifiP2P(false);
-                p2pGroupStarted = false;
-            }
-            MsgMux.get(ctx).broadcastTxt("/wifi/AP",
-                    "on", "0");
-            currentClientList.clear();
-
-        } else {
-            currentClientList = new ArrayList<>(group.getClientList());
-            if (group.isGroupOwner()) {
-                if (!p2pGroupStarted) {
-                    p2pGroupStarted = true;
-                    announceWifiP2P(true);
-                }
-                extra.add("ap");
-                extra.add("1");
-                extra.add("s");
-                extra.add(group.getNetworkName());
-                extra.add("p");
-                extra.add(group.getPassphrase());
-
-            } else {
-                MsgMux.get(ctx).broadcastTxt("/wifi/AP",
-                        "on", "0");
-                currentClientList.clear();
-                if (p2pGroupStarted) {
-                    announceWifiP2P(false);
-                    p2pGroupStarted = false;
-                }
-            }
-            WifiP2pDevice owner = group.getOwner();
-            if (owner != null) {
-                extra.add("owner");
-                extra.add(owner.toString());
-            }
-        }
-
-        for (WifiP2pDevice c: currentClientList) {
-            Device d = allP2PDiscovered.get(c.deviceAddress);
-            if (d == null) {
-                d = new Device(c);
-                newscanResultsByP2P.put(c.deviceAddress, d);
-                allP2PDiscovered.put(c.deviceAddress, d);
-            }
-            d.data.putString("gc", "1");
-        }
-
-        extra.add("event");
-        extra.add(event);
 
         String wifiSsid = mWifiManager.getConnectionInfo().getSSID();
         if (wifiSsid != null) {
@@ -520,47 +654,82 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
             extra.add("" + mWifiManager.getConnectionInfo().getRssi());
         }
 
-        MsgMux.get(ctx).broadcastParcelable("/wifi/status", b, extra.toArray(new String[]{}));
+        MsgMux.get(ctx).publish("/net/status", scanStatusMsg, extra.toArray(new String[]{}));
     }
 
+    String mySSID = "";
+    String psk = "";
+
+    String id4 = "0000";
+
+    /**
+     * Advertise the presence of the device using BLE.
+     *
+     * NAN is not activated - attaching will send beacons.
+     * @param on
+     */
+    public void announce(boolean on) {
+        if (!on) {
+//            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+//                if (nan != null) {
+//                    nan.stopPub();
+//                }
+//            }
+            ble.advertise(null);
+            return;
+        }
+
+        if (mySSID.isEmpty() || psk.isEmpty()) {
+            adv = Device.DEFAULT_PSK + "0000" + id4;
+        } else {
+            // psk=8, delim=1 - remaining 9
+            // ssidHash returns 4 bytes, leaving 5 for ID
+            adv = psk + Device.ssidHash(mySSID) + id4;
+        }
+
+//        // Usually NAN doesn't work when AP is on
+//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+//            if (nan != null) {
+//                nan.pub(false);
+//            }
+//        }
+
+        // We have 20 bytes for advertisment
+        // - PSK key - 8 bytes ( if needed )
+        // - SSID hash - 2 bytes ?
+        // - public key hash - 4 or 8 bytes
+        // 2 or 6 remaining
+
+        adv = "X1234567890123456789";
+
+        ble.advertise(adv.getBytes());
+    }
 
     /**
      * Control the WifiP2P announce. Usually after AP starts/stops.
+     *
      * @param on
      */
     public void announceWifiP2P(boolean on) {
+        if (on && group != null) {
+            Map<String, String> map = new HashMap<>();
+            // TODO: use the short form as well ?
+            map.put(Device.SSID, group.getNetworkName());
+            map.put(Device.PSK, group.getPassphrase());
+            map.put(Device.ID4, id4);
 
-        if (on) {
-            adv = "/" + group.getNetworkName() + "/" + group.getPassphrase();
-            mP2PManager.requestGroupInfo(getmChannel(), new WifiP2pManager.GroupInfoListener() {
-                @Override
-                public void onGroupInfoAvailable(WifiP2pGroup group) {
-                    if (group == null) {
-                        return;
-                    }
-                    Map<String, String> map = new HashMap<>();
-                    map.put(Device.SSID, group.getNetworkName());
-                    map.put(Device.PSK, group.getPassphrase());
-                    String ssid = mWifiManager.getConnectionInfo().getSSID();
-                    if (ssid != null && !ssid.startsWith("<")) {
-                        map.put(Device.NET, ssid);
-                    }
+            String ssid = mWifiManager.getConnectionInfo().getSSID();
+            if (ssid != null && !ssid.startsWith("<")) {
+                map.put(Device.NET, ssid);
+            }
 
-                    si = WifiP2pDnsSdServiceInfo.newInstance("dm", SD_SUFFIX_PART, map);
+            si = WifiP2pDnsSdServiceInfo.newInstance("dm", SD_SUFFIX_PART, map);
 
-                    mP2PManager.addLocalService(getmChannel(), si, new MyActionListener("addLocalService"));
+            mP2PManager.addLocalService(getmChannel(), si, new MyActionListener("addLocalService"));
 
-                }
-            });
         } else {
-            //adv = "/dmesh";
             if (si != null) {
                 mP2PManager.removeLocalService(getmChannel(), si, new MyActionListener("SD-Announce-OFF"));
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (nan != null) {
-                nan.updateAnnounce();
             }
         }
     }
@@ -572,11 +741,17 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     @SuppressLint("NewApi")
     public void apOn(boolean started) {
         if (started) {
-            if (Build.VERSION.SDK_INT >= 28 && Build.VERSION.PREVIEW_SDK_INT > 0) {
+            if (Build.VERSION.SDK_INT >= 28) {
+                // TODO: can it skip DIRECT-DM- ? How long can id be ?
                 WifiP2pConfig cfg = new WifiP2pConfig.Builder().enablePersistentMode(false)
-                        .setNetworkName("DIRECT-DM-ESH").setPassphrase(Device.DEFAULT_PSK).build();
+                        .setNetworkName("DIRECT-DM-ESH-" + id4).setPassphrase(Device.DEFAULT_PSK).build();
                 mP2PManager.createGroup(getmChannel(), cfg, new MyActionListener("createGroupQ"));
             } else {
+                // Override the P2P device name with the ID.
+                // TODO: use a setting, and maybe only do it if user allows.
+                // The name is not frequently used.
+                setDeviceName(id4);
+
                 mP2PManager.createGroup(getmChannel(), new MyActionListener("createGroup"));
             }
         } else {
@@ -588,9 +763,9 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
      * @param devId - P2P device MAC ( found in discovery ) or SSID.
      * @param modeS - connect mode to attempt
      */
-    public void con( Message msg, final String devId, String modeS) {
+    public void con(Message msg, final String devId, String modeS) {
         Bundle param = msg.getData();
-        Log.d(TAG, "CONNECT " +  param);
+        Log.d(TAG, "CONNECT " + param);
         int mode = -1;
         switch (modeS) {
             case "":
@@ -644,7 +819,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
 
     @SuppressLint("NewApi")
     public void con2(Bundle msg, int mode) {
-        if (mode == -1 && Build.VERSION.SDK_INT >= 28 && Build.VERSION.PREVIEW_SDK_INT > 0) {
+        if (mode == -1 && Build.VERSION.SDK_INT >= 29) {
             if (null == msg.getString(Device.PSK) ||
                     null == msg.getString(Device.SSID)) {
 
@@ -672,7 +847,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
 
     /**
      * Start Peer discovery.
-     *
+     * <p>
      * If "sd" optional parameter is "0" - will not include SD request, just do discoverPeers.
      *
      * @param msg
@@ -690,11 +865,9 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
     }
 
     /**
-     * Scan - discover and stop.
-     *
-     * @param msg
+     * Scan - discover and stop. About 6 seconds.
      */
-    public void discoveryWifiP2POnce(Message msg) {
+    public void discoveryWifiP2POnce() {
         if (discovering) {
             stopPeerAndSDDiscovery();
             _sleep(500);
@@ -705,6 +878,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
 
     /**
      * Start wifi P2P discovery, including DNS-SD query.
+     *
      * @param delayMs if 0 will stay on.
      */
     public void sddisc1(final int delayMs) {
@@ -717,7 +891,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
                     return;
                 }
 
-                MsgMux.get(ctx).broadcastTxt("/wifi/peer/DISC/" + txt);
+                MsgMux.get(ctx).publish("/wifi/peer/DISC/" + txt);
 
                 txtDiscoveryByP2P.put(wifiP2pDevice.deviceAddress, txt);
 
@@ -731,7 +905,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
                 }
 
                 // Update wifi status - may include additional info
-                sendWifiDiscoveryStatus("/p2psd/" + txt);
+                sendWifiDiscoveryStatus("/p2psd/" + txt, "");
             }
         };
 
@@ -779,10 +953,10 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
 
                     }
                 });
-        MsgMux.get(ctx).broadcastTxt("/wifi/SD/START");
+        MsgMux.get(ctx).publish("/wifi/SD/START");
 
         if (delayMs > 0) {
-            broadcastHandler.postDelayed(new Runnable() {
+            delayHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     stopPeerAndSDDiscovery();
@@ -855,20 +1029,20 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (action.equals(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED)) {
                 nan.onWifiAwareStateChanged(intent);
-                sendWifiDiscoveryStatus("nan");
+                sendWifiDiscoveryStatus("nan", "");
             }
         }
 
         if (action.equals(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)) {
             lscanResults = mWifiManager.getScanResults();
 
-            sendWifiDiscoveryStatus("scan");
+            sendWifiDiscoveryStatus("scan", "");
 
             return; // don't update
         } else if (WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION.equals(action)) {
             wifiP2pDeviceList = intent.getParcelableExtra(WifiP2pManager.EXTRA_P2P_DEVICE_LIST);
 
-            sendWifiDiscoveryStatus("p2p");
+            sendWifiDiscoveryStatus("p2p", "");
 
             // Peers added/updated/removed.
 
@@ -880,6 +1054,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
             // Only visible peers can be connected to using P2P methods.
         } else if (WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION.equals(action)) {
             NetworkInfo ninfo = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
+
             pinfo = intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_INFO);
             // also available via: mP2PManager.requestGroupInfo(getmChannel(), new WifiP2pManager.GroupInfoListener() {
             // This is a sticky broadcast, so no need to do that.
@@ -887,7 +1062,37 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
 
             Log.d(TAG, "/wifi/P2P " + pinfo.toString() + " " + ninfo.toString() + " " + group);
 
-            sendWifiDiscoveryStatus(action);
+            if (group == null || !group.isGroupOwner()) {
+                if (p2pGroupStarted) {
+                    announceWifiP2P(false);
+                    p2pGroupStarted = false;
+                    MsgMux.get(ctx).publish("/wifi/AP", "on", "0");
+                }
+                currentClientList.clear();
+            } else {
+                if (!group.getNetworkName().equals(mySSID) ||
+                        !group.getPassphrase().equals(psk)) {
+                    MsgMux.get(ctx).publish("/wifi/ApIdChange",
+                            "mySSID", group.getNetworkName(),
+                            "psk", group.getPassphrase(),
+                            "oldssid", "" + mySSID);
+                    prefs.edit().
+                            putString("mySSID", group.getNetworkName()).
+                            putString("psk", group.getPassphrase()).
+                            commit();
+                    announce(true);
+                }
+                mySSID = group.getNetworkName();
+                psk = group.getPassphrase();
+                currentClientList = new ArrayList<>(group.getClientList());
+                if (!p2pGroupStarted) {
+                    p2pGroupStarted = true;
+                    announceWifiP2P(true);
+                    MsgMux.get(ctx).publish("/wifi/AP", "on", "1");
+                }
+            }
+
+            sendWifiDiscoveryStatus(action, "");
 
             // }
 //            });
@@ -904,7 +1109,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
         } else if (WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION.equals(action)) {
             // Also at startup.
             discoveryState = intent.getIntExtra(WifiP2pManager.EXTRA_DISCOVERY_STATE, 0);
-            MsgMux.get(ctx).broadcastTxt("/wifi/p2p/discState",
+            MsgMux.get(ctx).publish("/wifi/p2p/discState",
                     "on", discoveryState == 2 ? "1" : "0");
         } else {
             intent.getStringExtra("");
@@ -912,8 +1117,9 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
         }
 
         // TODO: remove, private
-        MsgMux.get(ctx).broadcastParcelable("/wifi/INTENT/" + intent.getAction(), intent.getExtras());
+        MsgMux.get(ctx).publish("/wifi/broadcast", intent.getExtras(), "a", action);
     }
+
 
 
     static class ConnectivityCallback extends ConnectivityManager.NetworkCallback {
@@ -926,7 +1132,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
         @Override
         public void onAvailable(Network network) {
             super.onAvailable(network);
-            // On add. Only network handle (number) is provided. Network allows binding and
+            // On addMap2Bundle. Only network handle (number) is provided. Network allows binding and
             // interface specific operations, but not much else.
             // LPCHANGE provides more info
             NetworkCapabilities cap = wifi.cm.getNetworkCapabilities(network);
@@ -934,10 +1140,10 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
             NetworkInfo ninfo = wifi.cm.getNetworkInfo(network);
 
             WifiInfo connectionInfo = wifi.mWifiManager.getConnectionInfo();
-            String ssid= connectionInfo == null ? "": connectionInfo.getSSID();
+            String ssid = connectionInfo == null ? "" : connectionInfo.getSSID();
 
 
-            MsgMux.get(wifi.ctx).broadcastTxt("/wifi/net/" + lp.getInterfaceName(),
+            MsgMux.get(wifi.ctx).publish("/wifi/net/" + lp.getInterfaceName(),
                     "addr", lp.getLinkAddresses().toString(),
                     "cap", cap.toString(),
                     "s", ssid == null ? "" : ssid,
@@ -953,31 +1159,31 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
             NetworkCapabilities cap = wifi.cm.getNetworkCapabilities(network);
             NetworkInfo ninfo = wifi.cm.getNetworkInfo(network);
             WifiInfo connectionInfo = wifi.mWifiManager.getConnectionInfo();
-            String ssid= connectionInfo == null ? "": connectionInfo.getSSID();
+            String ssid = connectionInfo == null ? "" : connectionInfo.getSSID();
 
-            MsgMux.get(wifi.ctx).broadcastTxt("/wifi/net/" + lp.getInterfaceName(),
+            MsgMux.get(wifi.ctx).publish("/wifi/net/" + lp.getInterfaceName(),
                     "addr", lp.getLinkAddresses().toString(),
-                    "cap", cap.toString(),
+                    "cap", cap == null ? "" : cap.toString(),
                     "s", ssid == null ? "" : ssid,
-                    "ninfo", ninfo.toString());
+                    "ninfo", ninfo == null ? "" : ninfo.toString());
         }
 
         @Override
         public void onLosing(Network network, int maxMsToLive) {
             super.onLosing(network, maxMsToLive);
-            MsgMux.get(wifi.ctx).broadcastTxt("/wifi/CON/LOSING/" + network.toString());
+            MsgMux.get(wifi.ctx).publish("/wifi/CON/LOSING/" + network.toString());
         }
 
         @Override
         public void onLost(Network network) {
             super.onLost(network);
-            MsgMux.get(wifi.ctx).broadcastTxt("/wifi/CON/LOST/" + network.toString());
+            MsgMux.get(wifi.ctx).publish("/wifi/CON/LOST/" + network.toString());
         }
 
         @Override
         public void onUnavailable() {
             super.onUnavailable();
-            MsgMux.get(wifi.ctx).broadcastTxt("/wifi/CON/UNAVAIL");
+            MsgMux.get(wifi.ctx).publish("/wifi/CON/UNAVAIL");
         }
 
         @Override
@@ -1025,7 +1231,7 @@ public class Wifi extends BroadcastReceiver implements MsgMux.MessageHandler {
         }
 
         public void onFailure(int reason) {
-            MsgMux.get(ctx).broadcastTxt("/ERR/" + name + "/" + reason);
+            MsgMux.get(ctx).publish("/wifi/ERR/" + name + "/" + reason);
         }
     }
 

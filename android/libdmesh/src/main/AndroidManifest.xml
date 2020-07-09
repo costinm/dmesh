@@ -15,10 +15,6 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
-        <service
-            android:name="com.github.costinm.dmesh.libdm.DMService"
-            android:exported="true"
-             />
 
 
 

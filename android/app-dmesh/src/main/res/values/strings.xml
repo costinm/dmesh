@@ -1,0 +1,42 @@
+<resources>
+    <string name="app_name">DMesh</string>
+    <string name="title_activity_main">DMesh</string>
+    <string name="setup_enable"><b>Enable Mesh service.</b><br/>
+        <p>A background service will discover nearby nodes, and register with
+            the mesh control plane. This allows local applications on the
+            device using DMesh API, SOCKS5 or HTTP PROXY to exchange messages
+            and streams to communicate with other mesh nodes.</p>
+        <p>If disabled, the DMesh service will exit and nothing will run until
+        the service is enabled again. The random identity of the node will
+        be reset.</p>
+    </string>
+    <string name="setup_vpn"><b>Capture all traffic using VPN.</b>
+        Traffic from all applications on the device will be intercepted.
+        Mesh addresses will be routed trough mesh. Normal egress traffic will use the
+        internet connection of the device. If the device is lacks an internet
+        connection the DMesh service will attempt to create tunnels using
+        reachable nodes.
+        <p>Enabling this option will require user to allow VPN permissions.
+        It is not possible to use 2 VPNs at the same time - if you are using
+        a different VPN, disable this option. Applications can still use DMesh
+        by setting SOCKS or HTTP_PROXY.</p>
+    </string>
+    <string name="setup_wifi">
+        <b>Use Wifi and Bluetooth to extend the mesh</b> <br/>
+        Enabling the option will request Location permission - scanning and
+        extending the mesh may reveal the Wifi/BLE MAC address. Some devices
+        do not rotate the MAC address and that may allow tracking the device
+        every time it is using Wifi. Scanning only happens if the device doesn\'t
+        have an internet connection and attempts to create a mesh with other
+        nearby devices. If this option is enabled, a device with internet
+        connection may become a gateway for nearby devices, and may propagate
+        messages to other nodes in the mesh.
+
+    </string>
+    <string name="setup_vpn_ext" >
+        Use the external VPN server. WIP - testing only.
+        Will require a user-configured egress server (exit node), for
+        all non-mesh, non-local traffic. Currently the registration server
+        is used.
+    </string>
+</resources>

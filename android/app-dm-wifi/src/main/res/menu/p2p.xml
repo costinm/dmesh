@@ -3,25 +3,44 @@
     xmlns:android="http://schemas.android.com/apk/res/android">
 
 
+    <item
+        android:id="@+id/view"
+        android:icon="@android:drawable/ic_menu_view"
+        app:showAsAction="always"
+        android:title="View Web UI"
+         />
+
+    <item
+        android:id="@+id/clean_upgrade"
+        app:showAsAction="never"
+        android:title="Reset Upgrade"
+         />
+
+    <item
+        android:id="@+id/upgrade"
+        app:showAsAction="never"
+        android:title="Upgrade"
+         />
 
     <item
         android:id="@+id/sddisc"
         android:title="SD"
         app:showAsAction="always" />
 
+    <item
+        android:id="@+id/nanstart"
+        android:icon="@android:drawable/ic_media_play"
+        android:title="Advertise BLE/NAN"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/nanstop"
+        android:title="Advertise BLE/NAN Stop"
+        app:showAsAction="never" />
+
+
     <item android:title="NAN">
         <menu >
-            <item
-                android:id="@+id/nanstart"
-                android:icon="@android:drawable/ic_media_play"
-                android:title="NAN Search"
-                app:showAsAction="never" />
-
-            <item
-                android:id="@+id/nanstop"
-                android:title="NAN Stop"
-                app:showAsAction="ifRoom" />
-
             <item
                 android:id="@+id/nanping"
                 android:title="NAN Ping"
@@ -39,6 +58,11 @@
         android:id="@+id/discoff"
         android:title="DiscOFF"
          />
+
+    <item
+        android:id="@+id/btlegacy"
+        android:title="Provision old device using BT"
+        />
 
 
     <item android:title="Debug" >
@@ -62,6 +86,13 @@
                 android:id="@+id/mdnssdoff"
                 android:title="DNS-SD ADV Off"
                 app:showAsAction="never" />
+
+            <item
+                android:id="@+id/listAct"
+                android:title="List activity"/>
+            <item
+                android:id="@+id/lastStatus"
+                android:title="Last Wifi status"/>
         </menu>
 
     </item>

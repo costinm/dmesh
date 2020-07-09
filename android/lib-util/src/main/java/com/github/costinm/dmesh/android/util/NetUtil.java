@@ -7,7 +7,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 
-
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -95,23 +94,6 @@ public class NetUtil {
         return ll;
     }
 
-
-    /**
-     * Remove quotes
-     */
-    public static String cleanSSID(String ssid) {
-        if (ssid == null) {
-            return null;
-        }
-        if (ssid.startsWith("\"")) {
-            ssid = ssid.substring(1, ssid.length() - 1);
-        }
-        if (ssid.startsWith("<")) {
-            return null;
-        }
-        return ssid;
-    }
-
     public static JSONObject toJSON(Bundle b) {
         JSONObject jso = new JSONObject();
         for (String k : b.keySet()) {
@@ -135,7 +117,7 @@ public class NetUtil {
     public static JSONArray toJSON(ArrayList a) {
         JSONArray ar = new JSONArray();
 
-        for(Object o: a) {
+        for (Object o : a) {
             if (o instanceof Bundle) {
                 ar.put(toJSON((Bundle) o));
             } else if (o instanceof ArrayList) {

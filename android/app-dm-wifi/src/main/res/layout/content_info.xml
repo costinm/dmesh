@@ -22,10 +22,6 @@
                     android:layout_height="?attr/actionBarSize"
                     android:background="?attr/colorPrimary"
                     app:popupTheme="@style/AppTheme.PopupOverlay" />
-
-                <ScrollView
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent">
                     -->
     <LinearLayout
         android:layout_width="match_parent"
@@ -39,10 +35,23 @@
     </LinearLayout>
 
         <Switch
+            android:id="@+id/dm_switch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Mesh " />
+
+        <Switch
+            android:id="@+id/vpn_switch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="External VPN " />
+
+        <Switch
             android:id="@+id/ap_switch"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="AP " />
+            android:text="Wifi mesh expansion (AP)" />
+
 
         <TextView
             android:id="@+id/con_text"
@@ -58,6 +67,13 @@
             android:id="@+id/msg_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
+
+        <Switch
+            android:id="@+id/disc_switch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Discovery"
+            app:layout_constraintTop_toBottomOf="@+id/linearLayout" />
 
     </LinearLayout>
     <!-- </ScrollView>

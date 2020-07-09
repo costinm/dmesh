@@ -2,17 +2,18 @@ package com.github.costinm.dmesh.android.util;
 
 import android.os.Bundle;
 import android.os.SystemClock;
-import android.support.annotation.NonNull;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ListAdapter;
 import android.widget.ListView;
 
+import androidx.annotation.NonNull;
+
 import java.util.Calendar;
 
 /**
  * Small utils used in various places in UI.
- *
+ * <p>
  * Created by costin on 12/26/16.
  */
 public class UiUtil {
@@ -28,6 +29,7 @@ public class UiUtil {
             }
         });
     }
+
     public static String logTimeOfDayE(long millis) {
         return logTimeOfDay(millis + System.currentTimeMillis() - SystemClock.elapsedRealtime());
     }
@@ -77,7 +79,7 @@ public class UiUtil {
         if (b == null) {
             return sb;
         }
-        for (String k: b.keySet()) {
+        for (String k : b.keySet()) {
             Object o = b.get(k);
             if (o == null) {
                 continue;
@@ -87,7 +89,7 @@ public class UiUtil {
         return sb;
     }
 
-        // Elapsed to system time
+    // Elapsed to system time
     public static long e2s(long millis) {
         return millis + System.currentTimeMillis() - SystemClock.elapsedRealtime();
     }
