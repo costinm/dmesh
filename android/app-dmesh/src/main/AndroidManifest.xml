@@ -20,7 +20,7 @@
             android:exported="true"></service>
 
         <receiver
-            android:name="com.github.costinm.dmesh.DMService$Receiver"
+            android:name="com.github.costinm.dmesh.lm.DMService$Receiver"
             android:enabled="true"
             android:exported="true"></receiver>
 
