@@ -13,10 +13,11 @@ import android.os.Message;
 import androidx.annotation.RequiresApi;
 import androidx.core.app.NotificationCompat;
 
-import com.github.costinm.dmesh.android.msg.MsgCon;
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
 
-public class NotificationHandler implements MsgMux.MessageHandler {
+public class NotificationHandler implements MessageHandler {
     Context ctx;
     protected NotificationManager nm;
     // Pending indent for main action ( show UI )
@@ -60,8 +61,8 @@ public class NotificationHandler implements MsgMux.MessageHandler {
     }
 
     @Override
-    public void handleMessage(Message msg, MsgCon replyTo, String[] args) {
-        Bundle arg = msg.getData();
+    public void handleMessage(String topic, String msgType, Message m, MsgConn replyTo, String[] args) {
+        Bundle arg = m.getData();
 
         Notification n = getNotification(arg);
         if (nm != null) {
@@ -81,25 +82,25 @@ public class NotificationHandler implements MsgMux.MessageHandler {
         b.setShowWhen(true);
         b.setContentTitle(data.getString("title", "Device Mesh"));
 
-        String iconId = data.getString("icon", "0");
-        switch (iconId) {
-            case "0":
-                b.setColor(0xFFDE03); // yellow
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_yellow_900_24dp);
-                break;
-            case "red":
-                b.setColor(0xd602ee); // redish
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_red_900_24dp);
-                break;
-            case "green":
-                b.setColor(0xAAF255); // light green
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_green_900_24dp);
-                break;
-            case "blue":
-                b.setColor(0x6002ee); // blue
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_blue_900_24dp);
-                break;
-        }
+//        String iconId = data.getString("icon", "0");
+//        switch (iconId) {
+//            case "0":
+//                b.setColor(0xFFDE03); // yellow
+//                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_yellow_900_24dp);
+//                break;
+//            case "red":
+//                b.setColor(0xd602ee); // redish
+//                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_red_900_24dp);
+//                break;
+//            case "green":
+//                b.setColor(0xAAF255); // light green
+//                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_green_900_24dp);
+//                break;
+//            case "blue":
+//                b.setColor(0x6002ee); // blue
+//                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_blue_900_24dp);
+//                break;
+//        }
 
         // TODO: header text customization (after app name)
 

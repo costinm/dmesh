@@ -17,21 +17,15 @@ import androidx.core.app.NotificationCompat;
 import android.util.Log;
 
 import com.github.costinm.dmesh.android.msg.BaseMsgService;
-import com.github.costinm.dmesh.android.msg.MsgCon;
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
-import com.github.costinm.dmesh.libdm.DMesh;
-import com.github.costinm.dmesh.libdm.vpn.VpnService;
-import com.github.costinm.dmesh.lm3.Ble;
-import com.github.costinm.dmesh.lm3.Bt2;
-import com.github.costinm.dmesh.lm3.Wifi;
 
 public class DMService extends BaseMsgService {
     public static final String TAG = "DM-SVC";
 
-    static Wifi wifi;
     private NotificationHandler nh;
     // The actual communication handlers
-    public static DMesh dmUDS;
     private SharedPreferences prefs;
 
     boolean fg = false;
@@ -41,28 +35,12 @@ public class DMService extends BaseMsgService {
         super.onCreate();
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        wifi = new Wifi(this.getApplicationContext(), mux.broadcastHandler, getMainLooper());
-        dmUDS = new DMesh(this.getApplicationContext(), "dmesh");
-
-        mux.addHandler("ble", wifi.ble);
-        mux.addHandler("bt", wifi.bt);
-        mux.addHandler("wifi", wifi);
 
         nh = new NotificationHandler(this);
-        mux.addHandler("N", nh);
-
-        // send status on connect.
-        mux.addHandler(":open", new MsgMux.MessageHandler() {
-            @Override
-            public void handleMessage(Message m, MsgCon replyTo, String[] args) {
-                wifi.sendWifiDiscoveryStatus("connect");
-            }
-        });
+        mux.subscribe("N", nh);
     }
 
     public void onDestroy() {
-        wifi.onDestroy();
-        dmUDS.closeNative();
         super.onDestroy();
     }
 
@@ -73,9 +51,6 @@ public class DMService extends BaseMsgService {
         }
 
         if (!prefs.getBoolean("lm_enabled", true)) {
-            dmUDS.closeNative();
-
-            VpnService.stopVpn();
 
             stopForeground(true);
             stopSelf();
@@ -83,16 +58,11 @@ public class DMService extends BaseMsgService {
             return START_NOT_STICKY;
         }
 
-        // If not started, make sure it runs
-        DMesh.get().openNative();
-
         if (!fg) {
             startForeground(1, nh.getNotification(new Bundle()));
             Log.d(TAG, "Starting fg");
             fg = true;
         }
-
-        VpnService.maybeStartVpn(prefs, this, DMesh.get());
 
         return super.onStartCommand(intent, flags, startId);
     }

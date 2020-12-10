@@ -3,6 +3,7 @@ package com.github.costinm.dmesh.lm3;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothServerSocket;
 import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -11,6 +12,7 @@ import android.content.IntentFilter;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Message;
+import android.os.ParcelUuid;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -69,6 +71,8 @@ import java.util.UUID;
 public class Bt2 implements MessageHandler {
 
     private static final String TAG = "BT2";
+
+    // Standard serial profile - using this will select any serial port device
     public static UUID dmeshUUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     // Key is MAC address
@@ -94,6 +98,13 @@ public class Bt2 implements MessageHandler {
                 String deviceHardwareAddress = device.getAddress(); // MAC address
 
                 lastScan++;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH_MR1) {
+                    ParcelUuid[] uuids = device.getUuids();
+                    for (ParcelUuid u:  uuids){
+                        Log.d(TAG, "UUID: " + u + " " + deviceName);
+                    }
+                    // If empty - fetchUuidsWithSdp
+                }
                 if (deviceName == null || !deviceName.startsWith("DM-")) {
                     Log.d(TAG, "Non DM device " + deviceName + " " + deviceHardwareAddress);
                     return;
@@ -131,11 +142,18 @@ public class Bt2 implements MessageHandler {
 
         String name = mBluetoothAdapter.getName();
 
-        MsgMux.get(ctx).publish("/BT/start",
+        MsgMux.get(ctx).publish("/bt/start",
                 "name", name,
                 "addr", "" + mBluetoothAdapter.getAddress(),
                 "status", mBluetoothAdapter.getScanMode() + " " + mBluetoothAdapter.getState());
 
+        // This is the only way I know to bypass the lack of SDP.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR2) {
+            if (name != null && !name.startsWith("DM-")) {
+                name = "DM-" + name;
+                mBluetoothAdapter.setName(name);
+            }
+        }
 
         Set<BluetoothDevice> pairedDevices = mBluetoothAdapter.getBondedDevices();
         if (pairedDevices.size() > 0) {
@@ -150,6 +168,23 @@ public class Bt2 implements MessageHandler {
                 Log.d("BT", "Pair: " + deviceName + " " + deviceHardwareAddress);
             }
         }
+
+        try {
+            // Will create a SDP entry - name, UID and channel.
+            // Unfortunately not accessible from android clients. Name prefix
+            // is the only way to discover at the moment.
+            final BluetoothServerSocket ss = mBluetoothAdapter.listenUsingInsecureRfcommWithServiceRecord("dmesh",
+                    dmeshUUID);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    handleServer(ss);
+                }
+            }).start();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
     }
 
     public void close() {
@@ -248,10 +283,67 @@ public class Bt2 implements MessageHandler {
         // can pass UUID[] of GATT services.
     }
 
+    private void handleServer(BluetoothServerSocket ss) {
+        while (true) {
+            try {
+                final BluetoothSocket s = ss.accept();
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleServerConnection(s);
+                    }
+                }).start();
+            } catch (IOException e) {
+                e.printStackTrace();
+                return;
+            }
+        }
+    }
+
+
+    protected void handleServerConnection(BluetoothSocket s) {
+        MsgMux.get(ctx).publish("/bt/srvcon",
+                "c", s.getRemoteDevice().getAddress());
+        devices.put(s.getRemoteDevice().getAddress(), s.getRemoteDevice());
+        try {
+            s.getOutputStream().write("Hello\n".getBytes());
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream()));
+
+            while(true) {
+                String line = br.readLine();
+                if (line == null) {
+                    return;
+                }
+                if (line.equals("WIFI")) {
+                    String ssid = br.readLine();
+                    String pass = br.readLine();
+                    MsgMux.get(ctx).publish("WIFI", "ADD", "", "ssid", ssid, "psk", pass);
+                } else {
+                    MsgMux.get(ctx).publish("/bt/msg",
+                            "c", s.getRemoteDevice().getAddress(),
+                            "data", line);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                s.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+
     @Override
     public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] argv) {
         if (argv.length >= 2 && argv[2] == "disc" ) {
             makeDiscoverable();
+        } else if (argv.length >= 2 && argv[2] == "con" ) {
+            connect(argv[3], "");
+        } else if (argv.length >= 2 && argv[2] == "sync" ) {
+            syncAll("SYNC");
         } else {
             scan();
         }

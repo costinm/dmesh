@@ -17,6 +17,10 @@ import android.os.Handler;
 import android.os.Message;
 import android.preference.PreferenceManager;
 import androidx.annotation.NonNull;
+
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.util.UiUtil;
 import com.google.android.material.snackbar.Snackbar;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
@@ -34,11 +38,7 @@ import android.widget.ListView;
 import android.widget.Switch;
 import android.widget.TextView;
 
-import com.github.costinm.dmesh.android.msg.MsgCon;
 import com.github.costinm.dmesh.android.msg.MsgMux;
-import com.github.costinm.dmesh.android.msg.UiUtil;
-import com.github.costinm.dmesh.libdm.DMesh;
-import com.github.costinm.dmesh.libdm.vpn.VpnService;
 import com.github.costinm.dmesh.lm3.Bt2;
 import com.github.costinm.dmesh.lm3.Device;
 import com.github.costinm.dmesh.lm3.Wifi;
@@ -61,7 +61,7 @@ public class ListActivity extends AppCompatActivity implements Handler.Callback 
     // Interacts with the wifi service, using messages.
     //MsgCon wifi;
 
-    MsgCon wifi;
+    MsgConn wifi;
 
     boolean started = false;
     Handler h;
@@ -141,43 +141,6 @@ public class ListActivity extends AppCompatActivity implements Handler.Callback 
             discSwitch.setChecked(true);
         }
 
-        dmSwitch = findViewById(R.id.dm_switch);
-        if (prefs.getBoolean("lm_enabled", false)) {
-            Intent i = new Intent(ListActivity.this, DMService.class);
-            startService(i);
-            dmSwitch.setChecked(true);
-        }
-        dmSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton compoundButton, boolean b) {
-                prefs.edit().putBoolean("lm_enabled", b).apply();
-                prefs.edit().putBoolean("vpn_enabled", b).apply();
-                Intent i = VpnService.prepare(ListActivity.this);
-                if (i != null) {
-                    startActivityForResult(i, A_REQUEST_VPN);
-                    // on return - will continue setup_menu of the VPN
-                    return;
-                }
-
-                Intent i2 = new Intent(ListActivity.this, DMService.class);
-                startService(i2);
-            }
-        });
-
-
-        vpnSwitch = findViewById(R.id.vpn_switch);
-        vpnSwitch.setChecked(prefs.getBoolean("vpn_ext", false));
-        vpnSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton compoundButton, boolean b) {
-                prefs.edit().putBoolean("vpn_ext", b).apply();
-                final DMesh uds = DMesh.get();
-                if (uds != null) {
-                    uds.sendPrefs();
-                }
-            }
-        });
-
         setSupportActionBar(toolbar);
 
         discList = findViewById(R.id.disclist);
@@ -238,9 +201,9 @@ public class ListActivity extends AppCompatActivity implements Handler.Callback 
                 ad.show();
             }
         });
-        MsgMux.get(getApplicationContext()).addHandler("wifi", new MsgMux.MessageHandler() {
+        MsgMux.get(getApplicationContext()).subscribe("wifi", new MessageHandler() {
             @Override
-            public void handleMessage(Message m, MsgCon replyTo, String[] args) {
+            public void handleMessage(String topic, String msgType, Message m, MsgConn replyTo, String[] args) {
                 messageFromWifi(m);
             }
         });

@@ -14,13 +14,17 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.preference.PreferenceManager;
+
 import androidx.annotation.NonNull;
+
 import com.google.android.material.navigation.NavigationView;
 import com.google.android.material.snackbar.Snackbar;
+
 import androidx.core.view.GravityCompat;
 import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
+
 import android.util.Log;
 import android.view.ContextMenu;
 import android.view.Menu;
@@ -159,7 +163,6 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
 //        }
 
 
-
         discList = findViewById(R.id.disclist);
         if (discList != null) {
             discListAdapter = new ArrayAdapter<Device>(this, android.R.layout.two_line_list_item,
@@ -236,13 +239,11 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
     /**
      * View for Device in the list.
      * - ID - if it is known ( DNS-SD, BLE, NAN as well as Wifi scan for Q)
-     *   If device has AP active, freq/level and SSID are also shown
+     * If device has AP active, freq/level and SSID are also shown
      * - SSID - if device was found via Wifi scan and failed in DNS-SD.
      * - P2P Name or MAC - if found via peer discovery, but failed in DNS-SD ( may not be active ).
-     *
+     * <p>
      * Connected devices are also shown - the wifi layer doesn't know the ID.
-     *
-     *
      */
     private View getDeviceView(ArrayAdapter<Device> deviceArrayAdapter, int position, View convertView, ViewGroup parent) {
         View view;
@@ -427,11 +428,11 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
         if (data1 != null) {
             ArrayList<Bundle> b = data1.getParcelableArrayList("scan");
             if (b != null) {
-                for (Bundle bb: b) {
+                for (Bundle bb : b) {
                     Device d = new Device(bb);
                     disc.add(d);
 
-                    if (d.data.getString("gc","0").equals("1")) {
+                    if (d.data.getString("gc", "0").equals("1")) {
                         gc++;
                     }
                 }
@@ -463,7 +464,7 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
             apSsid = data.getString("s");
             apPsk = data.getString("p");
             title.append("* ");
-        } else if (apStatus.equals("0")){
+        } else if (apStatus.equals("0")) {
             apStarted = false;
         }
         title.append(apSSID());
@@ -553,8 +554,9 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
                         if (msgText != null) {
                             Snackbar.make(msgText, "" + Arrays.toString(args) + " " + data, 3000).show();
                         }
+                }
             }
-        }});
+        });
 
     }
 
@@ -562,7 +564,7 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
         StringBuilder sb = new StringBuilder();
         try {
             Enumeration<NetworkInterface> nE = NetworkInterface.getNetworkInterfaces();
-            while(nE != null && nE.hasMoreElements()) {
+            while (nE != null && nE.hasMoreElements()) {
                 NetworkInterface ni = nE.nextElement();
                 String name = ni.getName();
                 if (ni.getInterfaceAddresses().size() == 0 ||
@@ -571,7 +573,7 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
                         name.equals("lo")) {
                     continue;
                 }
-                sb.append( ni.getDisplayName()).append(" ");
+                sb.append(ni.getDisplayName()).append(" ");
                 for (InterfaceAddress nii : ni.getInterfaceAddresses()) {
                     sb.append(nii.getAddress()).append(" ");
                 }
@@ -672,14 +674,24 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
                 wifi.send("/wifi/adv", "p2p", "1");
                 break;
             case R.id.mdnssdoff:
-                wifi.send("/wifi/adv","p2p", "0");
+                wifi.send("/wifi/adv", "p2p", "0");
                 break;
             case R.id.sddisc2:
                 wifi.send("/wifi/disc");
                 break;
+
+            // BT
+            case R.id.btscan:
+                bt().scan();
+                break;
+            case R.id.btdsc:
+                bt().makeDiscoverable();
+                break;
+
             case R.id.btlegacy:
                 btlegacy();
                 break;
+
             case R.id.scan:
                 wifi.send("/wifi/scan");
                 break;
@@ -733,19 +745,19 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
                 break;
 
             case R.id.lastStatus:
-                    AlertDialog ad = new AlertDialog.Builder(WifiActivity.this)
-                            .setTitle("Last status")
-                            .setMessage(UiUtil.toString(lastStatus, "\n"))
-                            .create();
-                    ad.show();
-                    break;
+                AlertDialog ad = new AlertDialog.Builder(WifiActivity.this)
+                        .setTitle("Last status")
+                        .setMessage(UiUtil.toString(lastStatus, "\n"))
+                        .create();
+                ad.show();
+                break;
             case R.id.lastIntent:
-                    ad = new AlertDialog.Builder(WifiActivity.this)
-                            .setTitle("Last intent data")
-                            .setMessage(UiUtil.toString(msgTxtDetails))
-                            .create();
-                    ad.show();
-                    break;
+                ad = new AlertDialog.Builder(WifiActivity.this)
+                        .setTitle("Last intent data")
+                        .setMessage(UiUtil.toString(msgTxtDetails))
+                        .create();
+                ad.show();
+                break;
 
             case R.id.view:
                 String url = "http://localhost:5227/status";
@@ -760,30 +772,33 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
 
     // Debugging and experimental stuff
 
-    /**
-     * Connect using BT SPP.
-     * ESP32, pre-JB Android devices, etc.
-     *
-     * Protocol is a multiplexed channel.
-     *
-     * Android JB+ only acts as client, i.e. discovers other devices but doesn't adertise the server.
-     * Advertising requires user interaction.
-     *
-     * ESP32 and old devices implement SPP server.
-     */
-    private void btlegacy() {
+    private Bt2 bt() {
         if (bt2 == null) {
             bt2 = new Bt2(this, h);
         }
+        return bt2;
+    }
 
-        bt2.scan();
+    /**
+     * Connect using BT SPP.
+     * ESP32, pre-JB Android devices, etc.
+     * <p>
+     * Protocol is a multiplexed channel.
+     * <p>
+     * Android JB+ only acts as client, i.e. discovers other devices but doesn't adertise the server.
+     * Advertising requires user interaction.
+     * <p>
+     * ESP32 and old devices implement SPP server.
+     */
+    private void btlegacy() {
+        bt().scan();
         h.postDelayed(new Runnable() {
             @Override
             public void run() {
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
-                        for (BluetoothDevice d: bt2.devices.values()) {
+                        for (BluetoothDevice d : bt().devices.values()) {
                             bt2.connect(d.getAddress(), "WIFI\n" + apSsid + "\n" + apPsk + "\n");
                         }
                     }
@@ -794,12 +809,11 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
 
     /**
      * Details about the node (dialog or hide/show?)
-     *  - RTT - distance to AP
-     *  - TDLS - direct sta to sta
-     *
+     * - RTT - distance to AP
+     * - TDLS - direct sta to sta
+     * <p>
      * Pixel1: RTT, PowerReport, TDLS
      * Nexus6: RTT, PowerReport, TDLS, OffloadScan
-     *
      */
     private void showWifiCaps() {
         // Nexus 6: all capabilities bellow.

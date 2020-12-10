@@ -16,6 +16,10 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.preference.PreferenceManager;
+
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.util.UiUtil;
 import com.google.android.material.snackbar.Snackbar;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
@@ -27,10 +31,7 @@ import android.widget.CompoundButton;
 import android.widget.Switch;
 import android.widget.TextView;
 
-import com.github.costinm.dmesh.android.msg.MsgCon;
 import com.github.costinm.dmesh.android.msg.MsgMux;
-import com.github.costinm.dmesh.android.msg.UiUtil;
-import com.github.costinm.dmesh.libdm.vpn.VpnService;
 import com.github.costinm.dmesh.lm3.Bt2;
 import com.github.costinm.dmesh.lm3.Device;
 import com.github.costinm.dmesh.lm3.Wifi;
@@ -46,9 +47,7 @@ public class WifiActivity extends AppCompatActivity {
     private static final String STATUS_URL = "http://127.0.0.1:5227/status";
 
     // Interacts with the wifi service, using messages.
-    //MsgCon wifi;
-
-    MsgCon wifi;
+    MsgConn wifi;
 
     boolean started = false;
     Handler h = new Handler();
@@ -63,7 +62,6 @@ public class WifiActivity extends AppCompatActivity {
     Switch discSwitch;
     // If enabled, VPN will also be enabled. Little value of running the mesh without
     // at least local capture.
-    Switch dmSwitch;
 
     boolean initialState = false;
     String visible = "0";
@@ -122,34 +120,6 @@ public class WifiActivity extends AppCompatActivity {
             discSwitch.setChecked(true);
         }
 
-        dmSwitch = findViewById(R.id.dm_switch);
-
-        if (prefs.getBoolean("lm_enabled", false)) {
-            Intent i = new Intent(WifiActivity.this, DMService.class);
-            startService(i);
-            dmSwitch.setChecked(true);
-        }
-
-        // Enabling DMesh also enables VPN - simpler UI and documentation...
-        // It is very easy to decouple and use it only as SOCKS/HTTP proxy via a setting.
-        dmSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton compoundButton, boolean b) {
-                prefs.edit().putBoolean("lm_enabled", b).apply();
-                prefs.edit().putBoolean("vpn_enabled", b).apply();
-                Intent i = VpnService.prepare(WifiActivity.this);
-                if (i != null) {
-                    startActivityForResult(i, A_REQUEST_VPN);
-                    // on return - will continue setup_menu of the VPN
-                    return;
-                }
-
-                Intent i2 = new Intent(WifiActivity.this, DMService.class);
-                startService(i2);
-            }
-        });
-
-
         setSupportActionBar(toolbar);
 
         conText = findViewById(R.id.con_text);
@@ -167,17 +137,18 @@ public class WifiActivity extends AppCompatActivity {
             }
         });
 
-        MsgMux.get(getApplicationContext()).addHandler("wifi", new MsgMux.MessageHandler() {
+        MsgMux.get(getApplicationContext()).subscribe("wifi", new MessageHandler() {
             @Override
-            public void handleMessage(Message m, MsgCon replyTo, String[] args) {
+            public void handleMessage(String topic, String msgType, Message m, MsgConn replyTo, String[] args) {
                 messageFromWifi(m);
             }
         });
 
-        wifi = MsgMux.get(getApplicationContext()).dial(getPackageName());
+        wifi = MsgMux.get(getApplicationContext()).dial("com.github.costinm.dmesh.lm");
         wifi.start();
 
         wv = findViewById(R.id.wv);
+
 
         refreshVisible();
     }
@@ -353,6 +324,7 @@ public class WifiActivity extends AppCompatActivity {
 
 
     private void refreshVisible() {
+
         wv.loadUrl(STATUS_URL);
     }
 

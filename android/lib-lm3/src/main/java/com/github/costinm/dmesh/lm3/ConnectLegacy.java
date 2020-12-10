@@ -1,5 +1,8 @@
 package com.github.costinm.dmesh.lm3;
 
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.content.pm.PackageManager;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -21,7 +24,7 @@ public class ConnectLegacy {
     public int connect(WifiManager mWifiManager, String ssid, String passphrase) {
 
         int id = findNetwork(mWifiManager, ssid);
-        if ( id != -1 ) {
+        if (id != -1) {
             boolean removed = mWifiManager.removeNetwork(id);
             if (!removed) {
                 Log.d(TAG, "Failed to remove existing network");
@@ -133,7 +136,8 @@ public class ConnectLegacy {
     private int findNetwork(WifiManager mWifiManager, String ssid) {
         String ssid2 = '"' + ssid + '"';
 
-        List<WifiConfiguration> existing = mWifiManager.getConfiguredNetworks();
+
+        @SuppressLint("MissingPermission") List<WifiConfiguration> existing = mWifiManager.getConfiguredNetworks();
         if (existing == null) {
             Log.d(TAG, "No existing networks or Q.");
             return -1;

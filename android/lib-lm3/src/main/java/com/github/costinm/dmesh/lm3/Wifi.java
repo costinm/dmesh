@@ -710,6 +710,7 @@ public class Wifi extends BroadcastReceiver implements MessageHandler {
      *
      * @param on
      */
+    @SuppressLint("MissingPermission")
     public void announceWifiP2P(boolean on) {
         if (on && group != null) {
             Map<String, String> map = new HashMap<>();
@@ -738,7 +739,7 @@ public class Wifi extends BroadcastReceiver implements MessageHandler {
      * Start AP.
      * A broadcast will be sent if the status changes, from the BroadcastReceiver.
      */
-    @SuppressLint("NewApi")
+    @SuppressLint({"NewApi", "MissingPermission"})
     public void apOn(boolean started) {
         if (started) {
             if (Build.VERSION.SDK_INT >= 28) {

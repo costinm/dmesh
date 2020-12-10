@@ -108,11 +108,22 @@
         android:title="DiscOFF"
          />
 
-    <item
-        android:id="@+id/btlegacy"
-        android:title="Provision old device using BT"
-        />
-
+    <item android:title="BT" >
+        <menu>
+            <item
+                android:id="@+id/btscan"
+                android:title="Scan"
+                />
+            <item
+                android:id="@+id/btdsc"
+                android:title="Discoverable"
+                />
+            <item
+            android:id="@+id/btlegacy"
+            android:title="Provision old device using BT"
+            />
+            </menu>
+        </item>
 
     <item android:title="Debug" >
         <menu>
