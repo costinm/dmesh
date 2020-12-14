@@ -3,6 +3,7 @@ package com.github.costinm.dmesh.android.msg;
 import android.content.Context;
 import android.net.Credentials;
 import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
 import android.os.Bundle;
 import android.os.Message;
 import android.os.ParcelFileDescriptor;
@@ -61,6 +62,54 @@ public class ConnUDS extends MsgConn {
             e.printStackTrace();
         }
     }
+
+    public static String proxyConnection(final InputStream in, final OutputStream out) throws IOException {
+        try {
+            LocalSocket ls = new LocalSocket();
+            ls.connect(new LocalSocketAddress("lproxy"));
+
+            final InputStream sin = ls.getInputStream();
+            final OutputStream sos = ls.getOutputStream();
+
+            final byte[] bufout = new byte[2048];
+
+            // Remote side
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    while (true) {
+                        try {
+                            int n = sin.read(bufout, 5, 2048 - 5);
+                            out.write(bufout, 0, n + 5);
+                        } catch (IOException e) {
+                            return;
+                        }
+                    }
+
+                }
+            }).start();
+
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    while (true) {
+                        try {
+                            final byte[] bufin = new byte[2048];
+                            int n = in.read(bufin);
+                            sos.write(bufin, 5, n - 5);
+                        } catch (IOException ex) {
+                            break;
+                        }
+                    }
+                }
+            }).start();
+
+            return ls.getLocalSocketAddress().getName();
+        } catch(IOException ex ) {
+            return "";
+        }
+    }
+
 
     // Decode a command from the stream, convert to Message
     // Text format: URL\nKey:value\n...

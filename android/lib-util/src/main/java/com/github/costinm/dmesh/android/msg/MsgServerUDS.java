@@ -11,7 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- *
+ * Interprocess message exchange using UDS.
  */
 public class MsgServerUDS {
     private static final String TAG = "LMUDSS";

@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothServerSocket;
+import android.bluetooth.BluetoothSocket;
 import android.bluetooth.le.AdvertiseCallback;
 import android.bluetooth.le.AdvertiseData;
 import android.bluetooth.le.AdvertiseSettings;
@@ -32,6 +33,7 @@ import android.util.Log;
 
 import androidx.annotation.RequiresApi;
 
+import com.github.costinm.dmesh.android.msg.ConnUDS;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
@@ -94,16 +96,12 @@ public class Ble implements MessageHandler {
 
     // Eddystone UUID: FEAA
     static UUID eddyUUID = UUID.fromString("0000FEAA-0000-1000-8000-00805f9b34fb");
-
+    public static ParcelUuid EDDY = new ParcelUuid(eddyUUID);
     // HTTP Body - 2AB9
     static UUID characteristicHttpBody = UUID.fromString("00002AB9-0000-1000-8000-00805f9b34fb");
-
     // write char - receive on server
     static UUID characteristicProxy = UUID.fromString("00002ADD-0000-1000-8000-00805f9b34fb");
     static UUID characteristicNotifyProxy = UUID.fromString("00002ADE-0000-1000-8000-00805f9b34fb");
-
-    public static ParcelUuid EDDY = new ParcelUuid(eddyUUID);
-
     static Map<String, Device> devices = new HashMap<>();
     static boolean scanFailed = false;
     private final BluetoothManager bluetoothManager;
@@ -119,8 +117,20 @@ public class Ble implements MessageHandler {
     int psm;
 
     int mConnectionState;
-    private BluetoothLeAdvertiser mBluetoothLeAdvertiser;
+    BluetoothGattServerCallback mGattServer = new ServerCallback();
+    // HTTP Body (closest) 2AB9
+    BluetoothGatt btGattClient;
+    // Notification char. Can also be receive char if we share.
+    BluetoothGattCharacteristic sendPort;
+    BluetoothGattCharacteristic receivePort;
+    // 21 bytes advertisment, first byte is 0x5x (type + flags).
+    // null if not advertising
+    byte[] currentAdvBytes;
 
+
+    // === GATT Server implementation
+    // String 2A3D
+    private BluetoothLeAdvertiser mBluetoothLeAdvertiser;
     private ScanCallback mScanCallback = new ScanCallback() {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
@@ -140,7 +150,7 @@ public class Ble implements MessageHandler {
             if (sd == null) {
                 return;
             }
-            
+
             byte[] record = sd.get(EDDY);
 
             // ADV Payload size: 37 bytes
@@ -192,12 +202,10 @@ public class Ble implements MessageHandler {
             scanFailed = true;
         }
     };
-
-
     private AdvertiseCallback mAdvertiseCallback = new AdvertiseCallback() {
         @Override
         public void onStartSuccess(AdvertiseSettings settingsInEffect) {
-            Log.i(TAG, "LE Advertise Started "  + settingsInEffect);
+            Log.i(TAG, "LE Advertise Started " + settingsInEffect);
             adv = true;
         }
 
@@ -210,22 +218,9 @@ public class Ble implements MessageHandler {
         }
     };
 
+    //static UUID eddyCharN = UUID.fromString("00002A3D-0000-1000-8000-00805f9b34fb");
     // TODO: if we have visible devices or mesh active, stop scanning
     private BluetoothGattServer gatS;
-    BluetoothGattServerCallback mGattServer = new ServerCallback();
-
-
-    // === GATT Server implementation
-    // String 2A3D
-
-    // HTTP Body (closest) 2AB9
-    BluetoothGatt btGattClient;
-
-    // Notification char. Can also be receive char if we share.
-    BluetoothGattCharacteristic sendPort;
-    BluetoothGattCharacteristic receivePort;
-
-    //static UUID eddyCharN = UUID.fromString("00002A3D-0000-1000-8000-00805f9b34fb");
 
     public Ble(Context ctx, Wifi wifi, Handler handler) {
         this.ctx = ctx;
@@ -250,16 +245,18 @@ public class Ble implements MessageHandler {
             return; // don't bother with just advertising
         }
 
+        initServer();
+
         if (mBluetoothLeAdvertiser == null) {
             MsgMux.get(ctx).publish("/BLE/start",
                     "name", mBluetoothAdapter.getName(),
                     "adv", "-1");
         } else {
             MsgMux.get(ctx).publish("/BLE/start",
-                    "name", mBluetoothAdapter.getName());
+                    "name", mBluetoothAdapter.getName(),
+                    "psm", "" + psm);
         }
 
-        initServer();
     }
 
     // Will be called when a DMesh device is found, or found again after 60 sec.
@@ -301,10 +298,6 @@ public class Ble implements MessageHandler {
 
         return false;
     }
-
-    // 21 bytes advertisment, first byte is 0x5x (type + flags).
-    // null if not advertising
-    byte[] currentAdvBytes;
 
     // See Device.updateNode(). Path must be <=21 bytes, first byte will be set to type (0x50)
     public void advertise(byte[] urlb) {
@@ -397,7 +390,7 @@ public class Ble implements MessageHandler {
     @Override
     public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] argv) {
         if (argv.length >= 2 && "adv".equals(argv[2])) {
-            if (argv.length > 2) {
+            if (argv.length > 3) {
                 advertise(argv[3].getBytes());
             } else {
                 advertise(null);
@@ -411,13 +404,46 @@ public class Ble implements MessageHandler {
         }
     }
 
+    private void handleServer(BluetoothServerSocket ss) {
+        while (true) {
+            try {
+                final BluetoothSocket s = ss.accept();
+                try {
+                    handleServerConnection(s);
+                } catch(Throwable t) {
+                    t.printStackTrace();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+                return;
+            }
+        }
+    }
+
+    protected void handleServerConnection(BluetoothSocket s) throws IOException {
+        String cid = ConnUDS.proxyConnection(s.getInputStream(), s.getOutputStream());
+        if (cid == "") {
+            s.close();
+            return;
+        }
+        MsgMux.get(ctx).publish("/BT/scon",
+                "raddr", s.getRemoteDevice().getAddress(),
+                "cid", cid);
+    }
+    BluetoothServerSocket ss;
     //BluetoothGattCharacteristic notChar;
     void initServer() {
         // TODO: use normal advertisment to indicate support for L2 channel and the PSM
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
-                BluetoothServerSocket ss = bluetoothManager.getAdapter().listenUsingInsecureL2capChannel();
+                ss = bluetoothManager.getAdapter().listenUsingInsecureL2capChannel();
                 psm = ss.getPsm();
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleServer(ss);
+                    }
+                }).start();
                 Log.d(TAG, "DIRECT L2 PSM=" + psm);
             } catch (IOException e) {
                 e.printStackTrace();

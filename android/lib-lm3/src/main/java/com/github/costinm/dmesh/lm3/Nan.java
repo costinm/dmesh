@@ -36,33 +36,31 @@ import java.util.Map;
 public class Nan {
     private static final String TAG = "DM/wifi/nan";
     static Map<String, Device> devices = new HashMap<>();
-
+    public WifiAwareManager nanMgr;
+    public String nanId;
     Context ctx;
-
     Wifi wifi;
     WifiAwareSession nanSession;
-    public WifiAwareManager nanMgr;
-
     // Not null if publish session active and nan active
     PublishDiscoverySession pubSession;
-
     // Not null if sub session active
     SubscribeDiscoverySession subSession;
-
     // Intended status of NAN subscription. subType indicates the type.
     boolean nanSub;
     int subType = SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
     // Intended status of NAN publishing.
     boolean nanPub;
     int pubType = PublishConfig.PUBLISH_TYPE_SOLICITED;
-
     // Intended status of NAN radio, based on command/setting.
     // If true, when possible radio will be started.
     boolean nanActive;
-
     byte[] nanMac;
+    String pubServiceName = "dmesh";
+    byte[] pubServiceInfo;
 
-    public String nanId;
+    // called when mgr reports 'isAvailable'. NAN may be turned off when P2P is enabled or in
+    // many other cases. When it returns, if we sub or adv attach will be called again.
+    int msgId;
 
     public Nan(Wifi wifi) {
         this.wifi = wifi;
@@ -86,13 +84,9 @@ public class Nan {
         return nanMac != null && nanMgr != null && nanMgr.isAvailable();
     }
 
-    // called when mgr reports 'isAvailable'. NAN may be turned off when P2P is enabled or in
-    // many other cases. When it returns, if we sub or adv attach will be called again.
-
     /**
      * Start the NAN radio, and after that possibly publish or subscribe, if the mode is enabled.
      * Once attach succeeds the radio will send discovery beacons and participate in NAN master.
-     *
      */
     @RequiresApi(api = Build.VERSION_CODES.O)
     private void startNanRadio() {
@@ -138,7 +132,7 @@ public class Nan {
                     wifi.sendWifiDiscoveryStatus("/nan/id", "");
                 }
             }, null);
-        } catch(Throwable t) {
+        } catch (Throwable t) {
             Log.d(TAG, "/NAN/ " + t);
             MsgMux.get(ctx).publish("/net/NAN/AttachError", "err", t.getMessage());
         }
@@ -146,9 +140,9 @@ public class Nan {
 
     /**
      * Set nan radio desired state.
-     *
+     * <p>
      * If on - will attempt to attach, and if not possible will attach when it it becomes so.
-     *
+     * <p>
      * If off, close the NAN session, will stop sending discovery beacons - and not start again.
      */
     public void nanRadio(boolean on) {
@@ -168,7 +162,6 @@ public class Nan {
         }
     }
 
-
     void onDiscovered(PeerHandle peerHandle, byte[] serviceSpecificInfo, boolean byPublisher) {
 
         Device bd = new Device(peerHandle, serviceSpecificInfo);
@@ -177,7 +170,7 @@ public class Nan {
             onDiscovery(bd, bd.id, true);
         } else {
             // See BLE - it keeps discovering device in range.
-            if( SystemClock.elapsedRealtime() - old.lastScan > 120000) {
+            if (SystemClock.elapsedRealtime() - old.lastScan > 120000) {
                 onDiscovery(bd, bd.id, false);
             }
         }
@@ -204,9 +197,6 @@ public class Nan {
     private void onDiscovery(Device bd, String id, boolean b) {
         wifi.sendWifiDiscoveryStatus("nan", "");
     }
-
-    String pubServiceName = "dmesh";
-    byte[] pubServiceInfo;
 
     @RequiresApi(api = Build.VERSION_CODES.O)
     private void publish() {
@@ -241,7 +231,7 @@ public class Nan {
                     Toast.makeText(wifi.ctx, "PINGP " + msg, Toast.LENGTH_SHORT);
                 } else if (msg.equals("CON")) {
                     NetworkSpecifier ns;
-                    if (Build.VERSION.SDK_INT >= 29 ) {
+                    if (Build.VERSION.SDK_INT >= 29) {
                         ns = new WifiAwareNetworkSpecifier.Builder(pubSession, peerHandle).build();
                     } else {
                         ns = pubSession.createNetworkSpecifierOpen(peerHandle);
@@ -320,7 +310,7 @@ public class Nan {
 
     /**
      * Start a subscribe discovery session.
-     *
+     * <p>
      * Will stay active until 'stop' is called.
      */
     private void startNanSub() {
@@ -342,6 +332,7 @@ public class Nan {
                 MsgMux.get(ctx).publish("/net/NAN/SubStart");
                 subSession = session;
             }
+
             @Override
             public void onSessionTerminated() {
                 super.onSessionTerminated();
@@ -383,12 +374,13 @@ public class Nan {
 
     /**
      * Connect to a NAN device.
+     *
      * @param id - the primary ID, from the pub announce.
      */
     @RequiresApi(api = Build.VERSION_CODES.O)
     public void conNan(String id) {
         if ("0".equals(id) || "*".equals(id)) {
-            for (Device d: devices.values()) {
+            for (Device d : devices.values()) {
                 subSession.sendMessage(d.nan, msgId++, "CON".getBytes());
                 if ("0".equals(id)) {
                     return;
@@ -407,24 +399,22 @@ public class Nan {
 
     }
 
-    int msgId;
-
     @RequiresApi(api = Build.VERSION_CODES.O)
     public void sendAll(String id) {
         if (subSession != null) {
-            for (Device d: devices.values()) {
+            for (Device d : devices.values()) {
                 if (d.nan != null && d.nanSession == subSession) {
                     // May log: DiscoverySession: called on terminated session
-                    Log.d(TAG, "NAN send " +  d.id + " "  + d.nan + " " + msgId);
+                    Log.d(TAG, "NAN send " + d.id + " " + d.nan + " " + msgId);
                     subSession.sendMessage(d.nan, msgId++, id.getBytes());
                 }
             }
         }
         if (pubSession != null) {
-            for (Device d: devices.values()) {
+            for (Device d : devices.values()) {
                 if (d.nan != null && d.nanSession == pubSession) {
                     // May log: DiscoverySession: called on terminated session
-                    Log.d(TAG, "NAN send pub " +  d.id + " "  + d.nan + " " + msgId);
+                    Log.d(TAG, "NAN send pub " + d.id + " " + d.nan + " " + msgId);
                     pubSession.sendMessage(d.nan, msgId++, id.getBytes());
                 }
             }
@@ -434,7 +424,7 @@ public class Nan {
     @RequiresApi(api = Build.VERSION_CODES.O)
     public void send(String id, String msg) {
         Device d = devices.get(id);
-        if (d!=null && d.nan != null && d.nanSession != null) {
+        if (d != null && d.nan != null && d.nanSession != null) {
             d.nanSession.sendMessage(d.nan, msgId++, msg.getBytes());
         }
     }
@@ -454,9 +444,9 @@ public class Nan {
         }
 
         /**
-         *  It appears only subscriber discovers the publisher, not the other way around.
-         *
-         *  For both ends to know, we need to send a message (further discovery).
+         * It appears only subscriber discovers the publisher, not the other way around.
+         * <p>
+         * For both ends to know, we need to send a message (further discovery).
          *
          * @param peerHandle
          * @param serviceSpecificInfo
@@ -501,7 +491,6 @@ public class Nan {
             MsgMux.get(ctx).publish("/net/NAN/MSGERR", "id", Integer.toString(messageId));
         }
     }
-
 
 
 }

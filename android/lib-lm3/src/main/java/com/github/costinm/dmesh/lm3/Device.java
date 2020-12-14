@@ -4,7 +4,6 @@ import android.bluetooth.BluetoothDevice;
 import android.net.wifi.ScanResult;
 import android.net.wifi.aware.DiscoverySession;
 import android.net.wifi.aware.PeerHandle;
-import android.net.wifi.aware.PublishDiscoverySession;
 import android.net.wifi.p2p.WifiP2pDevice;
 import android.os.Bundle;
 import android.os.SystemClock;
@@ -17,23 +16,23 @@ import java.util.Map;
 
 /**
  * Info about a discovered device.
- *
+ * <p>
  * Discovery may use Wifi scan, Wifi-Direct, BLE, legacy BT, NAN.
- *
+ * <p>
  * A device may be:
  * - 'visible' - i.e. known to be nearby, but whithout knowing its capabilities
  * - 'discovered' - a connectivity method is avaialble, device is mesh capable.
  * Currently Wifi SSID+PSK or WifiDirect Q method are used. In future BT, BLE, NAN might also
  * be used.
- *
+ * <p>
  * The device info is fed to the native app, and used in the debug UI.
  */
 public class Device {
 
     public static final String DEFAULT_PSK = "12345678";
     public static final String SSID = "s";
-    public static final String PSK= "p";
-    public static final String ID4= "i";
+    public static final String PSK = "p";
+    public static final String ID4 = "i";
     // Main wifi network of the device ( if connected to a mesh - root network )
     public static final String NET = "n";
     // Direct wifi network of the device ( if connected to a mesh - root network )
@@ -48,7 +47,7 @@ public class Device {
      */
     public static final String BSSID = "b";
     /**
-     *  capabilities - from scan result
+     * capabilities - from scan result
      */
     public static final String CAP = "c";
     /**
@@ -62,11 +61,8 @@ public class Device {
     // Set if device is currently visible as a peer (wifi will also be set)
     public String id;
     public DiscoverySession nanSession;
-
-    long lastScan;
-
     public Bundle data = new Bundle();
-
+    long lastScan;
     // Set if found via P2P Peers or SD
     WifiP2pDevice wifi;
     BluetoothDevice dev;
@@ -83,29 +79,29 @@ public class Device {
         data.putString(P2PAddr, wifiP2pDevice.deviceAddress);
         data.putString(P2PName, wifiP2pDevice.deviceName);
 
-        Map<String, String> txt= Wifi.txtDiscoveryByP2P.get(wifiP2pDevice.deviceAddress);
+        Map<String, String> txt = Wifi.txtDiscoveryByP2P.get(wifiP2pDevice.deviceAddress);
         if (txt != null) {
-            for (String k: txt.keySet()) {
+            for (String k : txt.keySet()) {
                 data.putString(k, txt.get(k));
             }
         }
 
         StringBuilder sb = new StringBuilder();
-                if (!wifi.isGroupOwner()) {
-                    sb.append(" !GO");
-                }
-                if (!wifi.isServiceDiscoveryCapable()) {
-                    sb.append(" !SD");
-                }
-                if (!wifi.wpsPbcSupported()) {
-                    sb.append(" !PBC");
-                }
-                if (!wifi.wpsDisplaySupported()) {
-                    sb.append(" !DIS");
-                }
-                if (!wifi.wpsKeypadSupported()) {
-                    sb.append(" !KPA");
-                }
+        if (!wifi.isGroupOwner()) {
+            sb.append(" !GO");
+        }
+        if (!wifi.isServiceDiscoveryCapable()) {
+            sb.append(" !SD");
+        }
+        if (!wifi.wpsPbcSupported()) {
+            sb.append(" !PBC");
+        }
+        if (!wifi.wpsDisplaySupported()) {
+            sb.append(" !DIS");
+        }
+        if (!wifi.wpsKeypadSupported()) {
+            sb.append(" !KPA");
+        }
 
         if (sb.length() > 0) {
             data.putString("p2pcap", sb.toString());
@@ -120,9 +116,9 @@ public class Device {
     public Device(ScanResult sr) {
         setScanResult(sr);
 
-        Map<String, String> txt= Wifi.txtDiscoveryBySSID.get(sr.SSID);
+        Map<String, String> txt = Wifi.txtDiscoveryBySSID.get(sr.SSID);
         if (txt != null) {
-            for (String k: txt.keySet()) {
+            for (String k : txt.keySet()) {
                 data.putString(k, txt.get(k));
             }
         } else {
@@ -135,7 +131,7 @@ public class Device {
     }
 
     public Device(BluetoothDevice device, String name) {
-        this.dev =  device;
+        this.dev = device;
         updateNode(name, "/ble/");
     }
 
@@ -183,7 +179,7 @@ public class Device {
     }
 
     /**
-     *  Called by BLE and NAN when a node is re-discovered.
+     * Called by BLE and NAN when a node is re-discovered.
      */
     public void updateNode(String ssidFlags, String idPrefix) {
         long now = SystemClock.elapsedRealtime();
