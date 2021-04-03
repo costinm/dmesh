@@ -1,1 +1,2 @@
-include  ':app-dmesh', ':lib-lm3', ':lib-util', ':app-dmeshlite',  ':libdmesh', ':app-dm-wifi'
+include ':wpgate-aar'
+include  ':app-dmesh', ':lib-lm3', ':lib-util', ':app-dmeshlite'

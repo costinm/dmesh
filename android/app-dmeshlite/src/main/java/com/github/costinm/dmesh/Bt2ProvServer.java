@@ -10,12 +10,12 @@ import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 
-import com.github.costinm.dmesh.android.msg.MsgMux;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.UUID;
+
+import wpgate.Wpgate;
 
 /**
  * Legacy device provisioning using BT.
@@ -117,8 +117,8 @@ public class Bt2ProvServer {
     }
 
     protected void handleServerConnection(BluetoothSocket s) {
-        MsgMux.get(ctx).publish("/BT/SCon",
-                "addr", s.getRemoteDevice().getAddress());
+//        MsgMux.get(ctx).publish("/BT/SCon",
+//                "addr", s.getRemoteDevice().getAddress());
         ConnectLegacy con = new ConnectLegacy();
         WifiManager  mWifiManager = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
 
@@ -137,9 +137,10 @@ public class Bt2ProvServer {
 
                     con.connect(mWifiManager, ssid, pass);
                 }
-                MsgMux.get(ctx).publish("/BT/Message",
-                        "addr", s.getRemoteDevice().getAddress(),
-                        "msg", line);
+                Wpgate.send("/BT/Message", (s.getRemoteDevice().getAddress() + " " + line).getBytes());
+//                MsgMux.get(ctx).publish("/BT/Message",
+//                        "addr", s.getRemoteDevice().getAddress(),
+//                        "msg", line);
             }
         } catch (IOException e) {
             e.printStackTrace();

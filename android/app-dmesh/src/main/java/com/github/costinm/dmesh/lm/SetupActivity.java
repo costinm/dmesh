@@ -24,7 +24,6 @@ import android.widget.TextView;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
-import com.github.costinm.dmesh.libdm.vpn.VpnService;
 import com.google.android.material.navigation.NavigationView;
 
 /**

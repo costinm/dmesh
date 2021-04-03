@@ -227,19 +227,19 @@ public class NotificationHandler implements MessageHandler {
         switch (iconId) {
             case "0":
                 b.setColor(0xFFDE03); // yellow
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_yellow_900_24dp);
+                b.setSmallIcon(R.drawable.ic_router_yellow_900_24dp);
                 break;
             case "red":
                 b.setColor(0xd602ee); // redish
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_red_900_24dp);
+                b.setSmallIcon(R.drawable.ic_router_red_900_24dp);
                 break;
             case "green":
                 b.setColor(0xAAF255); // light green
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_green_900_24dp);
+                b.setSmallIcon(R.drawable.ic_router_green_900_24dp);
                 break;
             case "blue":
                 b.setColor(0x6002ee); // blue
-                b.setSmallIcon(com.github.costinm.dmesh.libdm.R.drawable.ic_router_blue_900_24dp);
+                b.setSmallIcon(R.drawable.ic_router_blue_900_24dp);
                 break;
         }
 

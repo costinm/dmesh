@@ -1,12 +1,12 @@
 plugins {
     id("com.android.application")
-    id("com.github.triplet.play") version "2.5.0"
+    //id("com.github.triplet.play") version "2.5.0"
 }
 
 apply plugin: 'com.android.application'
 
 android {
-    compileSdkVersion 29
+    compileSdkVersion 30
 
     signingConfigs {
         release {
@@ -20,10 +20,10 @@ android {
     defaultConfig {
         applicationId 'com.github.costinm.dmesh'
         // GB10 - it should run on very old devices.
-        // ICS14 - min required by 28 SDK
+        // ICS14 - min required by 28 SDK.
         minSdkVersion 10
         //noinspection OldTargetApi
-        targetSdkVersion TARGET_SDK_VERSION
+        targetSdkVersion 30
         versionCode 5
         versionName "1.4"
     }
@@ -62,25 +62,27 @@ android {
             abortOnError false
         }
     }
+//    tools {
+//        overrideLibrary "go.wpgate.gojni"
+//    }
 }
 
-play {
-    serviceAccountCredentials = file("/home/costin/Private/playstore.json")
-    // internal alpha beta production
-    track = "production"
-    userFraction = 1
-}
+//play {
+//    serviceAccountCredentials = file("/home/costin/Private/playstore.json")
+//    // internal alpha beta production
+//    track = "production"
+//    userFraction = 1
+//}
 
 dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     // 27.0.0 -> requires ICS14
     //implementation 'com.android.support:appcompat-v7:27.0.0'
-    implementation 'androidx.annotation:annotation:1.1.0'
+    implementation 'androidx.annotation:annotation:1.2.0'
 
-    implementation project(':libdmesh')
-    implementation project(':lib-util')
+    implementation project(path: ':wpgate-aar')
 
-    testImplementation 'junit:junit:4.13'
+    testImplementation 'junit:junit:4.13.2'
 }
 repositories {
     mavenCentral()

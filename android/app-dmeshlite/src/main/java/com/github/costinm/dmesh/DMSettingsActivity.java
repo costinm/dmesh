@@ -13,9 +13,6 @@ import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
 
-import com.github.costinm.dmesh.libdm.DMesh;
-import com.github.costinm.dmesh.libdm.vpn.VpnService;
-
 /**
  * Base settings, for GB-KitKat without WifiDirect.
  * Doesn't include power or special permissions - only needed on L/5.0/21+.
@@ -83,10 +80,6 @@ public class DMSettingsActivity extends PreferenceActivity
         if ("lm_enabled".equals(key)) {
             Intent i = new Intent(this, DMService.class);
             startService(i);
-        }
-        final DMesh uds = DMesh.get(this);
-        if (uds != null) {
-                 uds.sendPrefs();
         }
     }
 

@@ -8,19 +8,14 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
-import android.os.Bundle;
-import android.os.Message;
 import androidx.annotation.RequiresApi;
-
-import com.github.costinm.dmesh.android.msg.MessageHandler;
-import com.github.costinm.dmesh.android.msg.MsgConn;
 
 /**
  * Handles a message by updating the notification.
  * Uses the platform notification package package. An alternative using app compat in the
  * 'modern' application - this is a minimal version.
  */
-public class NotificationHandler implements MessageHandler {
+public class NotificationHandler {
     Context ctx;
     protected NotificationManager nm;
     // Pending indent for main action ( show UI )
@@ -51,12 +46,9 @@ public class NotificationHandler implements MessageHandler {
     }
 
 
-    @Override
-    public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] args) {
-        Bundle arg = msg.getData();
-
+    public void handleMessage(String msg) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-            Notification n = getNotification(arg);
+            Notification n = getNotification(msg);
             if (nm != null) {
                 nm.notify(1, n);
             }
@@ -72,7 +64,7 @@ public class NotificationHandler implements MessageHandler {
      * @return
      */
     @RequiresApi(api = Build.VERSION_CODES.JELLY_BEAN)
-    protected Notification getNotification(Bundle data) {
+    protected Notification getNotification(String data) {
         Notification.Builder b;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -85,13 +77,16 @@ public class NotificationHandler implements MessageHandler {
             b.setDefaults(Notification.DEFAULT_LIGHTS);
         }
 
-        b.setContentTitle(data.getString("title", "Device Mesh"));
+        b.setContentTitle("DMesh");
 
         Intent i = new Intent();
         i.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".MainActivity"));
         pi = PendingIntent.getActivity(ctx, 1, i, 0);
 
-        String txt = data.getString("text", "Starting");
+        if (data.equals("")) {
+            data = "Active";
+        }
+        String txt = data;
         b.setContentText(txt);
         b.setContentIntent(pi);
 

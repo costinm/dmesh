@@ -11,7 +11,7 @@ import android.os.SystemClock;
 import androidx.annotation.RequiresApi;
 import android.util.Log;
 
-import com.github.costinm.dmesh.libdm.DMesh;
+import wpgate.Wpgate;
 
 import static android.app.job.JobScheduler.RESULT_SUCCESS;
 
@@ -27,7 +27,6 @@ public class LMJob extends JobService {
 
     static long lastStart;
     static boolean scheduled = false;
-    private DMesh lm;
 
     public static void schedule(Context ctx, long interval) {
         if (scheduled) {
@@ -75,31 +74,22 @@ public class LMJob extends JobService {
     @Override
     public boolean onStartJob(final JobParameters params) {
         lastStart = SystemClock.elapsedRealtime();
+        Log.d(TAG, "LMJob " + params.getJobId());
 
-        lm = DMesh.get(getApplicationContext());
-
-        Log.d(TAG, "LMJob " + params.getJobId() +  " " + lm.dmGo);
-//
-//        lm.jobStopper = new Runnable() {
-//
-//            @Override
-//            public void run() {
-//                lm.jobStopper = null;
-//                jobFinished(params, false);
-//            }
-//        };
-//
-//        lm.updateCycle();
-//        return true;
-        return false;
+        Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                Wpgate.update();
+                jobFinished(params, false);
+            }
+        };
+        new Thread(r).start();
+        return true;
     }
 
     @Override
     public boolean onStopJob(JobParameters params) {
-//        StringBuilder sb = lm.status();
-//        sb.append("c=").append(lm.connectable.size()).append(" ");
-//        Log.d(TAG, "LMJob stopped " + sb);
-
+        Log.d(TAG, "LMJob stopped ");
         return false;
     }
 }

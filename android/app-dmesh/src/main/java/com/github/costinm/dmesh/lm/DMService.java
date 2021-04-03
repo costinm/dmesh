@@ -17,9 +17,10 @@ import android.util.Log;
 import com.github.costinm.dmesh.android.msg.BaseMsgService;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
-import com.github.costinm.dmesh.libdm.DMesh;
-import com.github.costinm.dmesh.libdm.vpn.VpnService;
 import com.github.costinm.dmesh.lm3.Wifi;
+
+
+import wpgate.Wpgate;
 
 /**
  * Foreground service maintaining the notification, wifi, native process.
@@ -35,10 +36,6 @@ public class DMService extends BaseMsgService implements MessageHandler {
 
     // Notification bar UI - handles messages from the mux to update the bar.
     private NotificationHandler nh;
-
-    // The actual communication handlers/native process.
-    // Will receive messages from remotes and dispatch directly into the hub.
-    public static DMesh dmUDS;
 
     private SharedPreferences prefs;
 
@@ -87,13 +84,22 @@ public class DMService extends BaseMsgService implements MessageHandler {
         }
     }
 
+    static byte[] addr;
+
     @Override
     public void onCreate() {
         super.onCreate();
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
         wifi = Wifi.get(this.getApplicationContext());
-        dmUDS = DMesh.get(this.getApplicationContext());
+
+        addr = Wpgate.initDmesh(new wpgate.MessageHandler() {
+            @Override
+            public void handle(String topic, byte[] data) {
+                Log.d(TAG, "GO MSG " + topic + " " + new String(data));
+            }
+        });
+
         nh = new NotificationHandler(this);
 
         // Dispatching messages on this service.
@@ -121,7 +127,6 @@ public class DMService extends BaseMsgService implements MessageHandler {
 
     public void onDestroy() {
         wifi.onDestroy();
-        dmUDS.closeNative();
         super.onDestroy();
     }
 
@@ -132,7 +137,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
         }
 
         if (!prefs.getBoolean(PREF_ENABLED, true)) {
-            dmUDS.closeNative();
+            // TODO: implement a stop ? dmUDS.closeNative();
 
             VpnService.stopVpn();
 
@@ -144,21 +149,13 @@ public class DMService extends BaseMsgService implements MessageHandler {
             return START_NOT_STICKY;
         }
 
-        final DMesh uds = DMesh.get(this);
-
         if (!fg) {
             startForeground(1, nh.getNotification(new Bundle()));
             Log.d(TAG, "Starting fg");
             fg = true;
         }
 
-        VpnService.maybeStartVpn(prefs, this, dmUDS);
-
-        if (uds != null) {
-            // If not apStarted, make sure it runs
-            uds.openNative();
-            uds.sendPrefs();
-        }
+        VpnService.maybeStartVpn(prefs, this);
 
         return super.onStartCommand(intent, flags, startId);
     }
