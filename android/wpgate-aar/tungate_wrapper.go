@@ -1,7 +1,9 @@
 package wpgate
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -21,6 +23,7 @@ import (
 	// Control
 	msgs "github.com/costinm/ugate/webpush"
 
+	"github.com/costinm/ugate/pkg/http_proxy"
 	// UDP and TCP proxy
 	"github.com/costinm/ugate/pkg/udp"
 	"github.com/costinm/ugate/pkg/ugatesvc"
@@ -54,7 +57,7 @@ import (
 
 // Adapter from func to interface
 type MessageHandler interface {
-	Handle(topic string, data []byte)
+	Handle(topic string, meta []byte, data []byte)
 }
 
 var (
@@ -72,7 +75,7 @@ func Update() {
 }
 
 // Called to inject a message into Go impl
-func Send(cmdS string, data []byte) {
+func Send(cmdS string, meta []byte, data []byte) {
 	switch cmdS {
 	case "r":
 		// refresh networks
@@ -81,11 +84,18 @@ func Send(cmdS string, data []byte) {
 			time.Sleep(2 * time.Second)
 			ld.RefreshNetworks()
 		}()
-
+		return
 		// TODO: P - properties, json
 		// CON - STOP/START - set connected WIFI
 		// Stop VPN - message
 	}
+	metao := map[string]string{}
+	if meta != nil {
+		json.Unmarshal(meta, &metao)
+		log.Println("Decoded meta: ", metao)
+	}
+	log.Println("Java2Native", cmdS)
+	msgs.DefaultMux.SendMeta(cmdS, metao, data)
 }
 
 func StopVPN() {
@@ -105,8 +115,7 @@ func StartVPN(fd int) {
 }
 
 // Android and device version of DMesh.
-func InitDmesh(callbackFunc MessageHandler) []byte {
-	log.Print("Starting native process pwd=", os.Getenv("PWD"), os.Environ())
+func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 
 	// SYSTEMSERVERCLASSPATH=/system/framework/services.jar:/system/framework/ethernet-service.jar:/system/framework/wifi-service.jar:/system/framework/com.android.location.provider.jar
 	// PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin
@@ -123,25 +132,9 @@ func InitDmesh(callbackFunc MessageHandler) []byte {
 	// DOWNLOAD_CACHE=/data/cache
 	// BOOTCLASSPATH=/system/framework/core-oj.jar:/system/framework/core-libart.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/bouncycastle.jar:/system/framework/apache-xml.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/android.hidl.base-V1.0-java.jar:/system/framework/android.hidl.manager-V1.0-java.jar:/system/framework/framework-oahl-backward-compatibility.jar:/system/framework/android.test.base.jar:/system/framework/com.google.vr.platform.jar]
 
-	cfgf := os.Getenv("BASE")
-	if cfgf == "" {
-		cfgf = os.Getenv("HOME")
-		if cfgf == "" {
-			cfgf = os.Getenv("TEMPDIR")
-		}
-		if cfgf == "" {
-			cfgf = os.Getenv("TMP")
-		}
-		if cfgf == "" {
-			cfgf = "/tmp"
-		}
-	}
-
-	cfgf += "/"
-
 	// File-based config
-	config := ugatesvc.NewConf(cfgf)
-
+	config := ugatesvc.NewConf(baseDir)
+	log.Println("Starting native on ", baseDir)
 	// Init or load certificates/keys
 
 	gcfg := &ugate.GateCfg{
@@ -154,7 +147,16 @@ func InitDmesh(callbackFunc MessageHandler) []byte {
 
 	msgs.DefaultMux.Auth = gw.Auth
 
-	hproxy := ugatesvc.NewHTTPProxy(gw)
+	msgs.DefaultMux.AddHandler("*", msgs.HandlerCallbackFunc(func(ctx context.Context, cmdS string, meta map[string]string, data []byte) {
+		var metaB []byte
+		metaB, _ = json.Marshal(meta)
+		log.Println("XXX Go2java ", cmdS)
+		callbackFunc.Handle(cmdS, metaB, data)
+	}))
+
+	msgs.DefaultMux.Send("./test/local", nil)
+
+	hproxy := http_proxy.NewHTTPProxy(gw)
 	hproxy.HttpProxyCapture(fmt.Sprintf("127.0.0.1:%d", gcfg.BasePort+ugate.PORT_HTTP_PROXY))
 
 	// ugatesvc.Conf(config, "MESH", "v.webinf.info:5222")
@@ -205,6 +207,8 @@ func InitDmesh(callbackFunc MessageHandler) []byte {
 		gw.Auth.VIP6,
 		base64.RawURLEncoding.EncodeToString(gw.Auth.VIP6[8:]))
 
+	callbackFunc.Handle("/STARTED", nil, nil)
+	msgs.DefaultMux.Send("/START1", nil)
 	return gw.Auth.VIP6
 }
 

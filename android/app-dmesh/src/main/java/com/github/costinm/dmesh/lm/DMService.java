@@ -91,14 +91,23 @@ public class DMService extends BaseMsgService implements MessageHandler {
         super.onCreate();
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        wifi = Wifi.get(this.getApplicationContext());
+        String dataDir = getBaseContext().getFilesDir().getAbsolutePath();
 
-        addr = Wpgate.initDmesh(new wpgate.MessageHandler() {
+        mux.nativeHandler = new MessageHandler() {
             @Override
-            public void handle(String topic, byte[] data) {
-                Log.d(TAG, "GO MSG " + topic + " " + new String(data));
+            public void handleMessage(String topic, String msgType, Message m, MsgConn replyTo, String[] args) {
+                Wpgate.send(topic, null, null);
+            }
+        };
+
+        addr = Wpgate.initDmesh(dataDir, new wpgate.MessageHandler() {
+            @Override
+            public void handle(String topic, byte[] meta, byte[] data) {
+                Log.d(TAG, "GO MSG " + topic + " " + data);
             }
         });
+
+        wifi = Wifi.get(this.getApplicationContext());
 
         nh = new NotificationHandler(this);
 
@@ -120,6 +129,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
             }
         });
 
+        mux.publish("/hello/world");
 
         LMJob.schedule(this.getApplicationContext(), 15 * 60 * 1000);
 

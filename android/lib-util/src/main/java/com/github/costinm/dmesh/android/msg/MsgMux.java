@@ -29,9 +29,13 @@ public class MsgMux {
     private static int _id = 1;
     final Context ctx;
     final HandlerThread handlerThread;
+
     // Active activeIn (outbound connections to other apps)
     // Key is the package name / service name for the Messenger connection. Value is a ConnMessenger.
     Map<String, MsgConn> activeOut = new HashMap<>();
+
+    public MessageHandler nativeHandler;
+
     // Active server connections (inbound connections from other apps)
     // Active activeIn - will receive broadcasts. Once a Messanger fails, the activeIn are removed.
     Map<String, MsgConn> activeIn = new HashMap<>();
@@ -41,6 +45,7 @@ public class MsgMux {
     // Equivalent with an eventually consistent database.
     // Handler for incoming messages.
     Map<String, MessageHandler> inMessageHandlers = new HashMap<>();
+
     /**
      * Messages posted to broadcastHandler will be sent to all connected activeIn.
      * Equivalent with broadcast(), but runs in the handler thread.
@@ -51,6 +56,8 @@ public class MsgMux {
     // Testing only.
     public MsgMux(Context applicationContext) {
         this.ctx = applicationContext;
+
+        // All sending happens on this thread, in broadcast() method
         handlerThread = new HandlerThread("msgMux");
         handlerThread.start();
         broadcastHandler = new Handler(handlerThread.getLooper()) {
@@ -237,6 +244,11 @@ public class MsgMux {
         }
 
         String msgType = args.length >= 3 ? args[2] : "";
+
+        if(nativeHandler != null) {
+            nativeHandler.handleMessage(topic, msgType, m, receivedOn, args);
+        }
+
         MessageHandler handler = inMessageHandlers.get(topic);
         if (handler == null) {
             handler = inMessageHandlers.get("");
