@@ -1,5 +1,6 @@
 package com.github.costinm.dmesh.lm3;
 
+import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
@@ -9,7 +10,9 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
 import android.os.ParcelUuid;
@@ -17,12 +20,16 @@ import android.os.Parcelable;
 import android.os.SystemClock;
 import android.util.Log;
 
+import androidx.core.app.ActivityCompat;
+
 import com.github.costinm.dmesh.android.msg.ConnUDS;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -45,7 +52,6 @@ import java.util.UUID;
  * <p>
  * The legacy device should initiate discoverability - 5 min is the default.
  * In this interval the other devices can connect and provision the Wifi networks.
- * <p>
  * The modern device will scan BT, possibly based on user request/UI, and
  * send Wifi provisioning data to the device.
  * <p>
@@ -98,68 +104,73 @@ public class Bt2 implements MessageHandler {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
-            if (BluetoothDevice.ACTION_UUID.equals(action)) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                Parcelable[] uuid = intent.getParcelableArrayExtra(BluetoothDevice.EXTRA_UUID);
-                Log.d(TAG, "ACTION_UUID: " + device.getName() + " " + device.getAddress() + " " + uuid +
-                        " " + device.getUuids() + " " + intent.getExtras());
-                if (device.getUuids() != null) {
-                    scanUUIDFound++;
-                }
-                if (uuid != null && uuid.equals(dmeshUUID)) {
-                    onFound(device, device.getName(), device.getAddress());
-                }
-            }
-            if (BluetoothAdapter.ACTION_SCAN_MODE_CHANGED.equals(action)) {
-                int oldScanMode = scanMode;
-                // 23
-                scanMode = intent.getIntExtra(BluetoothAdapter.EXTRA_SCAN_MODE, 0);
-                Log.d(TAG, "ACTION_SCAN_MODE_CHANGED: " + oldScanMode + " " + scanMode + " " + intent.getExtras());
-
-            }
-            if (BluetoothAdapter.ACTION_DISCOVERY_STARTED.equals(action)) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                Log.d(TAG, "ACTION_DISCOVERY_STARTED: " + device + " " + intent.getExtras());
-                discStarted = SystemClock.elapsedRealtime();
-            }
-            if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
-                for (BluetoothDevice d : sdb.values()) {
-                    boolean ok = d.fetchUuidsWithSdp();
-                    if (!ok) {
-                        Log.d(TAG, "Failed to fetch SDP");
+            try {
+                if (BluetoothDevice.ACTION_UUID.equals(action)) {
+                    BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                    Parcelable[] uuid = intent.getParcelableArrayExtra(BluetoothDevice.EXTRA_UUID);
+                    Log.d(TAG, "ACTION_UUID: " + device.getName() + " " + device.getAddress() + " " + uuid +
+                            " " + device.getUuids() + " " + intent.getExtras());
+                    if (device.getUuids() != null) {
+                        scanUUIDFound++;
+                    }
+                    if (uuid != null && uuid.equals(dmeshUUID)) {
+                        onFound(device, device.getName(), device.getAddress());
                     }
                 }
-                Log.d(TAG, "Discovery done " + (SystemClock.elapsedRealtime() - discStarted));
-                discStarted = 0;
-            }
-            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
-                // Discovery has found a device. Get the BluetoothDevice
-                // object and its info from the Intent.
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                String deviceName = device.getName();
-                String deviceHardwareAddress = device.getAddress(); // MAC address
-                scanFound++;
-                lastScan++;
+                if (BluetoothAdapter.ACTION_SCAN_MODE_CHANGED.equals(action)) {
+                    int oldScanMode = scanMode;
+                    // 23
+                    scanMode = intent.getIntExtra(BluetoothAdapter.EXTRA_SCAN_MODE, 0);
+                    Log.d(TAG, "ACTION_SCAN_MODE_CHANGED: " + oldScanMode + " " + scanMode + " " + intent.getExtras());
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH_MR1) {
-                    ParcelUuid[] uuids = device.getUuids();
-                    if (uuids != null) {
-                        for (ParcelUuid u : uuids) {
-                            Log.d(TAG, "UUID: " + u + " " + deviceName);
-                            if (u.getUuid().equals(dmeshUUID)) {
-                                onFound(device, deviceName, deviceHardwareAddress);
-                            }
+                }
+                if (BluetoothAdapter.ACTION_DISCOVERY_STARTED.equals(action)) {
+                    BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                    Log.d(TAG, "ACTION_DISCOVERY_STARTED: " + device + " " + intent.getExtras());
+                    discStarted = SystemClock.elapsedRealtime();
+                }
+                if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                    for (BluetoothDevice d : sdb.values()) {
+                        boolean ok = d.fetchUuidsWithSdp();
+                        if (!ok) {
+                            Log.d(TAG, "Failed to fetch SDP");
                         }
-                    } else {
-                        sdb.put(deviceHardwareAddress, device);
                     }
-                    // If empty - fetchUuidsWithSdp
+                    Log.d(TAG, "Discovery done " + (SystemClock.elapsedRealtime() - discStarted));
+                    discStarted = 0;
                 }
-                if (deviceName == null || !deviceName.startsWith("DM-")) {
-                    //Log.d(TAG, "Non DM device " + deviceName + " " + deviceHardwareAddress);
-                    return;
+                if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                    // Discovery has found a device. Get the BluetoothDevice
+                    // object and its info from the Intent.
+                    BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                    String deviceName = device.getName();
+                    String deviceHardwareAddress = device.getAddress(); // MAC address
+                    scanFound++;
+                    lastScan++;
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH_MR1) {
+                        ParcelUuid[] uuids = device.getUuids();
+                        if (uuids != null) {
+                            for (ParcelUuid u : uuids) {
+                                Log.d(TAG, "UUID: " + u + " " + deviceName);
+                                if (u.getUuid().equals(dmeshUUID)) {
+                                    onFound(device, deviceName, deviceHardwareAddress);
+                                }
+                            }
+                        } else {
+                            sdb.put(deviceHardwareAddress, device);
+                        }
+                        // If empty - fetchUuidsWithSdp
+                    }
+                    if (deviceName == null || !deviceName.startsWith("DM-")) {
+                        //Log.d(TAG, "Non DM device " + deviceName + " " + deviceHardwareAddress);
+                        return;
+                    }
+                    onFound(device, deviceName, deviceHardwareAddress);
                 }
-                onFound(device, deviceName, deviceHardwareAddress);
+
+            } catch (SecurityException ex) {
+                return;
             }
         }
     };
@@ -189,6 +200,16 @@ public class Bt2 implements MessageHandler {
         filter.addAction(BluetoothAdapter.ACTION_SCAN_MODE_CHANGED);
         ctx.registerReceiver(mReceiver, filter);
 
+        if (ActivityCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            // TODO: Consider calling
+            //    ActivityCompat#requestPermissions
+            // here to request the missing permissions, and then overriding
+            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
+            //                                          int[] grantResults)
+            // to handle the case where the user grants the permission. See the documentation
+            // for ActivityCompat#requestPermissions for more details.
+            return;
+        }
         String name = mBluetoothAdapter.getName();
 
         MsgMux.get(ctx).publish("/bt/start",

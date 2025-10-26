@@ -1,4 +1,26 @@
-The dmesh project relies heavily on IPv6, and link-local multicast in particular.
+There are few uses for multicast in this project.
+
+1. Discovery of the master address in local net.  In normal dmesh using P2P APs, the 
+P2P DNS-SD also announces the IPv6 of the master, so multicast is mostly a backup. When connected
+to a regular AP, multicast is the main mechanism to find an active DMesh 'master'. Just like AP role,
+the master role rotates to minimize (spread) battery use.
+ 
+2. Address allocation (old devices). Since DHCP doesn't work reliably in power-saving mode 
+(TODO: link to details), devices use a random address, and generate a multicast when connecting.
+Everything is done in user space - so we have no good way to probe before allocating the address,
+it has to be set before 'wifi connect'. In case of conflict, the 'master' will send back a new 
+address, and the client will reconnect with the allocated address. The response will be sent
+as multicast - to make sure the device gets it. Unicast wouldn't work since ARP may point to the other
+device. This is not yet implemented (most of my tests are in IPv6-capable devices). Note that an IPv4
+device can't run in both AP/GO and CLI mode: the 192.168.49.1 address will be active on both the 
+dual-role client and the AP. Older devices don't allow binding to an interface (and even in newer
+devices it doesn't appear to work). So an old device can connect to DMesh, expose services (share
+storage, etc) - but it can't extend the network in pure 'mesh' mode. If the device is connected
+ to a normal AP - it can also start GO mode and extend the coverage. 
+
+3. Communication from AP to client: unfortunately I found no way to send an UDP6 from a device
+running as 'group owner' - setting the network interface, binding, etc don't appear to work. It 
+works ok from client to AP, just not the other way around.
 
 ```
 
@@ -54,6 +76,7 @@ problem.
 InetAddress ia = InetAddress.getByName(""FF02::5221");
 MulticastSocket ms = new MulticastSocket(new InetSocketAddress(sport));
 ms.setNetworkInterface(p2pInterface); 
+
 ms.joinGroup(new InetSocketAddress(ia, sport), wifiIf);
 
 InetAddress ia = InetAddress.getByName(""FF02::5223");
@@ -65,6 +88,23 @@ ms.joinGroup(new InetSocketAddress(ia, sport), wifiIf);
 
 To check that everything is on  the right interface for a node acting as 
 both client and server, i.e. connected to a wifi net and expanding it:
+
+The interface is critical:
+
+```
+// When running as P2P Group Owner / AP
+WifiP2pGroup info; // from WIFI_P2P_CONNECTION_CHANGED_ACTION
+NetworkInterface.getByName(info.getInterface());
+
+// As Wifi STA/client (LMP+):
+Network[] nets = cm.getAllNetworks();
+for (Network n: nets) {
+   // if connected, type WIFI
+   LinkProperties lp = ctl.cm.getLinkProperties(n);
+   ni = NetworkInterface.getByName(lp.getInterfaceName());
+}
+```
+
 
 ```
 cat /proc/net/igmp6

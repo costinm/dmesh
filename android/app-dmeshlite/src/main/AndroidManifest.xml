@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="com.github.costinm.dmesh">
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-sdk tools:overrideLibrary="go.wpgate.gojni"/>
     <uses-permission android:name="android.permission.BLUETOOTH" />
@@ -41,7 +40,7 @@
         android:extractNativeLibs="true"
         android:supportsRtl="true">
 
-        <activity android:name=".DMSettingsActivity">
+        <activity android:name=".DMSettingsActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.SETTINGS" />
                 <action android:name="android.intent.action.MANAGE_NETWORK_USAGE" />
@@ -60,7 +59,7 @@
 
 
         <receiver
-            android:name="com.github.costinm.dmesh.Starter"
+            android:name=".Starter"
             android:enabled="true"
             android:exported="true"
             tools:ignore="ExportedReceiver">

@@ -11,7 +11,7 @@ import android.os.SystemClock;
 import androidx.annotation.RequiresApi;
 import android.util.Log;
 
-import wpgate.Wpgate;
+//import wpgate.Wpgate;
 
 import static android.app.job.JobScheduler.RESULT_SUCCESS;
 
@@ -79,7 +79,7 @@ public class LMJob extends JobService {
         Runnable r = new Runnable() {
             @Override
             public void run() {
-                Wpgate.update();
+                //Wpgate.update();
                 jobFinished(params, false);
             }
         };

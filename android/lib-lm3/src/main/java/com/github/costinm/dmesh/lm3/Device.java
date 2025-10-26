@@ -30,32 +30,41 @@ import java.util.Map;
 public class Device {
 
     public static final String DEFAULT_PSK = "12345678";
+
+    // Set if device is currently visible as a peer (wifi will also be set)
+    public String discAddr;
     public static final String SSID = "s";
     public static final String PSK = "p";
     public static final String ID4 = "i";
     // Main wifi network of the device ( if connected to a mesh - root network )
     public static final String NET = "n";
+
     // Direct wifi network of the device ( if connected to a mesh - root network )
     public static final String WIFISSID = "w";
+
     /**
      * Set if the object was visible in last scan results.
      */
     public static final String FREQ = "f";
     public static final String LEVEL = "l";
+
     /**
      * Set if the object was visible in last scan results.
      */
     public static final String BSSID = "b";
+
     /**
      * capabilities - from scan result
      */
     public static final String CAP = "c";
+
     /**
      * Set if device was found in a P2P peer. Other fields will not be set unless a TXT discovery
      * also happened.
      */
     public static final String P2PAddr = "d";
     public static final String P2PName = "N";
+
     public static final String P2PConnected = "gc";
 
     // Set if device is currently visible as a peer (wifi will also be set)

@@ -174,17 +174,14 @@ public class SetupActivity extends AppCompatActivity implements MessageHandler, 
     public boolean onOptionsItemSelected(MenuItem item) {
         String url;
         Intent i;
-        switch (item.getItemId()) {
-            case R.id.wifiAct:
-                startActivityForResult(new Intent(this, WifiActivity.class), 6);
-                break;
-            case R.id.view:
-                urlOpen("http://localhost:5227/status");
-                break;
-            case R.id.nav_active:
-                urlOpen("http://localhost:5227/active");
-                break;
-
+        // ...
+        int itemId = item.getItemId();
+        if (itemId == R.id.wifiAct) {
+            startActivityForResult(new Intent(this, WifiActivity.class), 6);
+        } else if (itemId == R.id.view) {
+            urlOpen("http://localhost:5227/status");
+        } else if (itemId == R.id.nav_active) {
+            urlOpen("http://localhost:5227/active");
         }
         return super.onOptionsItemSelected(item);
     }

@@ -164,8 +164,8 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// If key=="" - uses port 443
 	// Else - default is 15007
 	// Set host config for other settings
-	gw.Config.H2R["h.webinf.info"] = "B5B6KYYUBVKCX4PWPWSWAIHW2X2D3Q4HZPJYWZ6UECL2PAODHTFA"
-	//gcfg.H2R["c1.webinf.info"] = ""
+	//gw.Config.H2R["h.webinf.info"] = "B5B6KYYUBVKCX4PWPWSWAIHW2X2D3Q4HZPJYWZ6UECL2PAODHTFA"
+	gcfg.H2R["c1.webinf.info"] = ""
 
 	gw.H2Handler.UpdateReverseAccept()
 
@@ -196,7 +196,7 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	net.DefaultResolver.PreferGo = true
 	net.DefaultResolver.Dial = dns.DNSDialer(5223)
 
-	udpGate = udp.NewUDPGate(dnss, dnss)
+	udpGate = udp.New(gw)
 
 	//hgw := httpproxy.NewHTTPGate(GW, h2s)
 	//hgw.HttpProxyCapture("localhost:5204")

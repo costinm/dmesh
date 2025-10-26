@@ -38,6 +38,8 @@ public class NetUtil {
         return new byte[]{(byte) addr, (byte) (addr >>> 8), (byte) (addr >>> 16), (byte) (addr >>> 24)};
     }
 
+
+
     static Inet6Address getLinkLocalIP6(NetworkInterface ni) {
         if (ni == null) {
             return null;
@@ -94,6 +96,23 @@ public class NetUtil {
         return ll;
     }
 
+
+    /**
+     * Remove quotes
+     */
+    public static String cleanSSID(String ssid) {
+        if (ssid == null) {
+            return null;
+        }
+        if (ssid.startsWith("\"")) {
+            ssid = ssid.substring(1, ssid.length() - 1);
+        }
+        if (ssid.startsWith("<")) {
+            return null;
+        }
+        return ssid;
+    }
+
     public static JSONObject toJSON(Bundle b) {
         JSONObject jso = new JSONObject();
         for (String k : b.keySet()) {
@@ -117,7 +136,7 @@ public class NetUtil {
     public static JSONArray toJSON(ArrayList a) {
         JSONArray ar = new JSONArray();
 
-        for (Object o : a) {
+        for(Object o: a) {
             if (o instanceof Bundle) {
                 ar.put(toJSON((Bundle) o));
             } else if (o instanceof ArrayList) {

@@ -2,12 +2,13 @@ module github.com/costinm/dmesh/android/wpgate
 
 go 1.16
 
-replace github.com/costinm/ugate => ../../../ugate
-replace github.com/costinm/ugate/dns => ../../../ugate/dns
+//replace github.com/costinm/ugate => ../../../ugate
+//replace github.com/costinm/ugate/auth => ../../../ugate/auth
+//replace github.com/costinm/ugate/dns => ../../../ugate/dns
 
-replace github.com/costinm/tungate/lwip => ../../../tungate/lwip
+//replace github.com/costinm/tungate/lwip => ../../../tungate/lwip
 
-replace github.com/eycorsican/go-tun2socks => github.com/costinm/go-tun2socks v1.16.12-0.20210328172757-88f6d54235cb
+//replace github.com/eycorsican/go-tun2socks => github.com/costinm/go-tun2socks v1.16.12-0.20210328172757-88f6d54235cb
 
 require (
 	github.com/costinm/tungate/lwip v0.0.0-20210328181250-b832f0735d5b

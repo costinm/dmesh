@@ -645,126 +645,121 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        switch (item.getItemId()) {
+        int id = item.getItemId();
 
-            case R.id.settings: {
-                startActivity(new Intent(this, SetupActivity.class));
-                break;
+        if (id == R.id.settings) {
+            startActivity(new Intent(this, SetupActivity.class));
+        } else if (id == R.id.dm_switch2) {
+            item.setChecked(!item.isChecked());
+            if (item.isChecked()) {
+                wifi.send("/wifi/p2p", "ap", "1");
+            } else {
+                wifi.send("/wifi/p2p", "ap", "0");
             }
-            case R.id.dm_switch2:
-                item.setChecked(!item.isChecked());
-                if (item.isChecked()) {
-                    wifi.send("/wifi/p2p", "ap", "1");
-                } else {
-                    wifi.send("/wifi/p2p", "ap", "0");
-                }
-                break;
 
 
-            case R.id.sddisc:
-                item.setChecked(!item.isChecked());
-                if (item.isChecked()) {
-                    wifi.send("/wifi/con/start");
-                } else {
-                    wifi.send("/wifi/con/stop");
-                }
-                break;
+        } else if (id == R.id.sddisc) {
+            item.setChecked(!item.isChecked());
+            if (item.isChecked()) {
+                wifi.send("/wifi/con/start");
+            } else {
+                wifi.send("/wifi/con/stop");
+            }
 
-            case R.id.mdnssdon:
-                wifi.send("/wifi/adv", "p2p", "1");
-                break;
-            case R.id.mdnssdoff:
-                wifi.send("/wifi/adv", "p2p", "0");
-                break;
-            case R.id.sddisc2:
-                wifi.send("/wifi/disc");
-                break;
+
+        } else if (id == R.id.mdnssdon) {
+            wifi.send("/wifi/adv", "p2p", "1");
+
+        } else if (id == R.id.mdnssdoff) {
+            wifi.send("/wifi/adv", "p2p", "0");
+
+        } else if (id == R.id.sddisc2) {
+            wifi.send("/wifi/disc");
+
 
             // BT
-            case R.id.btscan:
-                bt().scan();
-                break;
-            case R.id.btdsc:
-                bt().makeDiscoverable();
-                break;
+        } else if (id == R.id.btscan) {
+            bt().scan();
+        } else if (id == R.id.btdsc) {
+            bt().makeDiscoverable();
 
-            case R.id.btlegacy:
-                btlegacy();
-                break;
 
-            case R.id.scan:
-                wifi.send("/wifi/scan");
-                break;
-            case R.id.nanstart:
-                wifi.send("/wifi/adv", "on", "1");
-                break;
-            case R.id.nanstop:
-                wifi.send("/wifi/adv", "on", "0");
-                break;
-            case R.id.nanping:
-                wifi.send("/wifi/nan/ping");
-                break;
-            case R.id.nanAttach:
-                wifi.send("/wifi/nan/start");
-                break;
-            case R.id.nanDetach:
-                wifi.send("/wifi/nan/stop");
-                break;
-            case R.id.nanSub:
-                wifi.send("/wifi/nan/sub/pass");
-                break;
-            case R.id.nanSubStop:
-                wifi.send("/wifi/nan/sub/stop");
-                break;
-            case R.id.nanSubAct:
-                wifi.send("/wifi/nan/sub");
-                break;
-            case R.id.nanPub:
-                wifi.send("/wifi/nan/adv");
-                break;
-            case R.id.nanPubStop:
-                wifi.send("/wifi/nan/adv/stop");
-                break;
-            case R.id.nanPubAct:
-                wifi.send("/wifi/nan/adv/act");
-                break;
-            case R.id.nanCon:
-                wifi.send("/wifi/nan/con/0");
-                break;
+        } else if (id == R.id.btlegacy) {
+            btlegacy();
 
-            case R.id.disc:
-                //disc.clear();
-                discListAdapter.notifyDataSetChanged();
-                wifi.send("/wifi/con/start", "sd", "0", "wait", "0");
-                break;
-            case R.id.discoff:
-                wifi.send("/wifi/con/stop");
-                break;
-            case R.id.wificaps:
-                showWifiCaps();
-                break;
 
-            case R.id.lastStatus:
-                AlertDialog ad = new AlertDialog.Builder(WifiActivity.this)
-                        .setTitle("Last status")
-                        .setMessage(UiUtil.toString(lastStatus, "\n"))
-                        .create();
-                ad.show();
-                break;
-            case R.id.lastIntent:
-                ad = new AlertDialog.Builder(WifiActivity.this)
-                        .setTitle("Last intent data")
-                        .setMessage(UiUtil.toString(msgTxtDetails))
-                        .create();
-                ad.show();
-                break;
+        } else if (id == R.id.scan) {
+            wifi.send("/wifi/scan");
 
-            case R.id.view:
-                String url = "http://localhost:5227/status";
-                Intent i = new Intent(Intent.ACTION_VIEW);
-                i.setData(Uri.parse(url));
-                startActivityForResult(i, 5);
-                break;
+        } else if (id == R.id.nanstart) {
+            wifi.send("/wifi/adv", "on", "1");
+
+        } else if (id == R.id.nanstop) {
+            wifi.send("/wifi/adv", "on", "0");
+
+        } else if (id == R.id.nanping) {
+            wifi.send("/wifi/nan/ping");
+
+        } else if (id == R.id.nanAttach) {
+            wifi.send("/wifi/nan/start");
+
+        } else if (id == R.id.nanDetach) {
+            wifi.send("/wifi/nan/stop");
+
+        } else if (id == R.id.nanSub) {
+            wifi.send("/wifi/nan/sub/pass");
+
+        } else if (id == R.id.nanSubStop) {
+            wifi.send("/wifi/nan/sub/stop");
+
+        } else if (id == R.id.nanSubAct) {
+            wifi.send("/wifi/nan/sub");
+
+        } else if (id == R.id.nanPub) {
+            wifi.send("/wifi/nan/adv");
+
+        } else if (id == R.id.nanPubStop) {
+            wifi.send("/wifi/nan/adv/stop");
+
+        } else if (id == R.id.nanPubAct) {
+            wifi.send("/wifi/nan/adv/act");
+
+        } else if (id == R.id.nanCon) {
+            wifi.send("/wifi/nan/con/0");
+
+
+        } else if (id == R.id.disc) {
+            //disc.clear();
+            discListAdapter.notifyDataSetChanged();
+            wifi.send("/wifi/con/start", "sd", "0", "wait", "0");
+
+        } else if (id == R.id.discoff) {
+            wifi.send("/wifi/con/stop");
+
+        } else if (id == R.id.wificaps) {
+            showWifiCaps();
+
+
+        } else if (id == R.id.lastStatus) {
+            AlertDialog ad = new AlertDialog.Builder(WifiActivity.this)
+                    .setTitle("Last status")
+                    .setMessage(UiUtil.toString(lastStatus, "\n"))
+                    .create();
+            ad.show();
+
+        } else if (id == R.id.lastIntent) {
+            new AlertDialog.Builder(WifiActivity.this)
+                    .setTitle("Last intent data")
+                    .setMessage(UiUtil.toString(msgTxtDetails))
+                    .create().show();
+
+
+        } else if (id == R.id.view) {
+            String url = "http://localhost:5227/status";
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setData(Uri.parse(url));
+            startActivityForResult(i, 5);
+
 
         }
         return super.onOptionsItemSelected(item);
@@ -817,7 +812,6 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
      */
     private void showWifiCaps() {
         // Nexus 6: all capabilities bellow.
-        if (Build.VERSION.SDK_INT >= 21) {
             WifiManager mWifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             StringBuilder title = new StringBuilder();
             // May be used to reduce scans
@@ -843,17 +837,14 @@ public class WifiActivity extends AppCompatActivity implements MessageHandler {
             if (!mWifiManager.isP2pSupported()) {
                 title.append("!P2P, ");
             }
-            if (Build.VERSION.SDK_INT >= 29) {
                 if (mWifiManager.isEasyConnectSupported()) {
                     title.append("EC, ");
                 }
-            }
             AlertDialog ad = new AlertDialog.Builder(WifiActivity.this)
                     .setTitle("Wifi capabilities")
                     .setMessage(title.toString())
                     .create();
             ad.show();
         }
-    }
 
 }

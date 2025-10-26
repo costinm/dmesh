@@ -1,2 +1,27 @@
-include ':wpgate-aar'
-include  ':app-dmesh', ':lib-lm3', ':lib-util', ':app-dmeshlite'
+pluginManagement {
+    repositories {
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "DMesh"
+include   'wpgate-aar', ':lib-util', ':lib-lm3',  ":app-dmesh",   ":app-dmeshlite"
+//':lib-envoy',   ':app-envoy',  ':app-fortio',

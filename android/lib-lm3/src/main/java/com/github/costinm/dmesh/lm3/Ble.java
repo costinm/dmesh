@@ -247,14 +247,18 @@ public class Ble implements MessageHandler {
 
         initServer();
 
-        if (mBluetoothLeAdvertiser == null) {
-            MsgMux.get(ctx).publish("/BLE/start",
-                    "name", mBluetoothAdapter.getName(),
-                    "adv", "-1");
-        } else {
-            MsgMux.get(ctx).publish("/BLE/start",
-                    "name", mBluetoothAdapter.getName(),
-                    "psm", "" + psm);
+        try {
+            if (mBluetoothLeAdvertiser == null) {
+                MsgMux.get(ctx).publish("/BLE/start",
+                        "name", mBluetoothAdapter.getName(),
+                        "adv", "-1");
+            } else {
+                MsgMux.get(ctx).publish("/BLE/start",
+                        "name", mBluetoothAdapter.getName(),
+                        "psm", "" + psm);
+            }
+        } catch (Throwable t) {
+            t.printStackTrace();
         }
 
     }
@@ -433,9 +437,9 @@ public class Ble implements MessageHandler {
     BluetoothServerSocket ss;
     //BluetoothGattCharacteristic notChar;
     void initServer() {
-        // TODO: use normal advertisment to indicate support for L2 channel and the PSM
+        try {
+            // TODO: use normal advertisment to indicate support for L2 channel and the PSM
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
                 ss = bluetoothManager.getAdapter().listenUsingInsecureL2capChannel();
                 psm = ss.getPsm();
                 new Thread(new Runnable() {
@@ -445,9 +449,7 @@ public class Ble implements MessageHandler {
                     }
                 }).start();
                 Log.d(TAG, "DIRECT L2 PSM=" + psm);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
+
         }
 
         gatS = bluetoothManager.openGattServer(ctx, mGattServer);
@@ -455,7 +457,6 @@ public class Ble implements MessageHandler {
             Log.d(TAG, "Failed to open GATT server");
             return;
         }
-
         BluetoothGattService service = new BluetoothGattService(eddyUUID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
 
         if (false) {
@@ -497,6 +498,10 @@ public class Ble implements MessageHandler {
 
         }
         gatS.addService(service);
+        } catch (Throwable e) {
+            e.printStackTrace();
+        }
+
     }
 
     public void connect(String addr) {

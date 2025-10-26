@@ -382,6 +382,30 @@ public final class CodedInputStreamMicro {
     }
 
     /**
+     * WIP: return bytes without allocating a new copy.
+     * Result will be invalid after the protobuf buffer is reused. Not immutable.
+     * @param bb
+     * @return
+     * @throws IOException
+     */
+    public ByteStringMicro getBytes(java.nio.ByteBuffer bb) throws IOException {
+        final int size = readRawVarint32();
+        if (size <= (bufferSize - bufferPos) && size > 0) {
+            // Fast path:  We already have the bytes in a contiguous buffer, so
+            //   just copy directly from it.
+            final ByteStringMicro result = ByteStringMicro.copyFrom(buffer, bufferPos, size);
+            bb.reset();
+            bufferPos += size;
+            return result;
+        } else if (size == 0) {
+            return ByteStringMicro.EMPTY;
+        } else {
+            // Slow path:  Build a byte array first then copy it.
+            return ByteStringMicro.copyFrom(readRawBytes(size));
+        }
+    }
+
+    /**
      * Read a {@code uint32} field value from the stream.
      */
     public int readUInt32() throws IOException {

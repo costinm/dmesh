@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    android:extractNativeLibs="true"
-    package="com.github.costinm.dmesh.lm">
+    android:extractNativeLibs="true">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
 
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher_red"
@@ -19,12 +22,13 @@
         <service
             android:name=".DMService"
             android:enabled="true"
-            android:exported="true"></service>
+            android:foregroundServiceType="remoteMessaging"
+            android:exported="true"/>
 
         <receiver
             android:name="com.github.costinm.dmesh.lm.DMService$Receiver"
             android:enabled="true"
-            android:exported="true"></receiver>
+            android:exported="true"/>
 
         <service
             android:name=".LMJob"

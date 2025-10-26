@@ -47,7 +47,7 @@ public class NotificationHandler implements MessageHandler {
         }
         Intent i = new Intent();
         i.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".SetupActivity"));
-        pi = PendingIntent.getActivity(ctx, 1, i, 0);
+        pi = PendingIntent.getActivity(ctx, 1, i, PendingIntent.FLAG_MUTABLE);
 
         brIntent = new Intent();
         brIntent.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".DMService$Receiver"));
@@ -55,7 +55,7 @@ public class NotificationHandler implements MessageHandler {
         i = new Intent();
         i.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".DMService"))
                 .putExtra(":uri", "/sync");
-        syncPI = PendingIntent.getService(ctx, 1, i, 0);
+        syncPI = PendingIntent.getService(ctx, 1, i, PendingIntent.FLAG_MUTABLE);
 
     }
 
@@ -283,7 +283,8 @@ public class NotificationHandler implements MessageHandler {
                     PendingIntent.getBroadcast(ctx,
                             1, // request code
                             brIntent,
-                            PendingIntent.FLAG_UPDATE_CURRENT);
+                            PendingIntent.FLAG_MUTABLE
+                    );
             NotificationCompat.Action action =
                     new NotificationCompat.Action.Builder(R.drawable.ic_action_dbg,
                             "Cmd", replyPendingIntent)

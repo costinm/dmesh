@@ -1,17 +1,18 @@
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 29
-
+    compileSdkVersion COMPILE_SDK_VERSION
+    namespace 'com.github.costinm.dmesh.android.util'
 
 
     defaultConfig {
-        minSdkVersion 10
-        targetSdkVersion 29
+        // Utils are compatible with oldest android I can test with.
+        minSdkVersion 14
+        targetSdkVersion TARGET_SDK_VERSION
         versionCode 1
         versionName "1.0"
 
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
 
     }
 
@@ -21,15 +22,10 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
-    //buildToolsVersion = ANDROID_BUILD_TOOLS_VERSION
-
 }
 
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
-    implementation 'androidx.annotation:annotation:1.2.0'
-
-    testImplementation 'junit:junit:4.13.2'
-    androidTestImplementation 'androidx.test.ext:junit:1.1.2'
-    androidTestImplementation 'androidx.test.espresso:espresso-core:3.3.0'
+    //implementation 'com.android.support:support-annotations:28.0.0'
+    implementation libs.androidx.appcompat
 }

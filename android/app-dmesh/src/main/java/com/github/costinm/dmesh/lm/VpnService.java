@@ -20,7 +20,7 @@ import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 
-import wpgate.Wpgate;
+//import wpgate.Wpgate;
 
 import static android.system.OsConstants.AF_INET;
 import static android.system.OsConstants.AF_INET6;
@@ -37,7 +37,6 @@ import static android.system.OsConstants.AF_INET6;
  * TODO: make sure 'enable at startup' works and starts dmesh
  * TODO: support http proxy mode in Q, file bug for socks mode
  */
-@RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
 public class VpnService extends android.net.VpnService implements Handler.Callback {
     static final String TAG = "DM-VPN";
     /**
@@ -64,7 +63,7 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             Intent ai = new Intent();
             ai.setComponent(new ComponentName(ctx.getPackageName(),
                     ctx.getPackageName() + ".SetupActivity"));
-            appIntent = PendingIntent.getActivity(ctx, 15, ai, 0);
+            appIntent = PendingIntent.getActivity(ctx, 15, ai, PendingIntent.FLAG_MUTABLE);
             address6 = DMService.addr;
 
             Intent i = new Intent(ctx, VpnService.class);
@@ -236,7 +235,7 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             Log.d(TAG, "New interface: " + iface);
             fd = iface.getFileDescriptor();
 
-            Wpgate.startVPN(iface.getFd());
+            //Wpgate.startVPN(iface.getFd());
 
         } catch (Throwable t) {
             Log.i(TAG, "VPN connection failed " + t);

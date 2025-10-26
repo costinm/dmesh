@@ -1,15 +1,17 @@
 package com.github.costinm.dmesh.android.msg;
 
+import android.app.PendingIntent;
 import android.content.Context;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Message;
+import android.os.Messenger;
 import android.os.Parcelable;
 import android.util.Log;
 
 import com.github.costinm.dmesh.android.util.NetUtil;
-
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -24,10 +26,11 @@ public class MsgMux {
 
     public static final String URI = ":uri";
     public static final int TXT = 1;
-    private static final String TAG = "MsgMux";
     static MsgMux mux;
-    private static int _id = 1;
     final Context ctx;
+    private static final String TAG = "MsgMux";
+
+    private static int _id = 1;
     final HandlerThread handlerThread;
 
     // Active activeIn (outbound connections to other apps)
@@ -207,7 +210,52 @@ public class MsgMux {
         broadcast(msg, con);
         return false;
     }
+    /**
+     * Send a broadcast message to all connected services.
+     * @param cat
+     * @param type
+     * @param msg
+     * @param extra
+     * @deprecated
+     */
+    public static void broadcast(String cat, String type, String msg, String... extra) {
+        Message m = Message.obtain();
+        Bundle b = m.getData();
+        b.putString(":uri", cat + "/" + type);
+        if (msg != null && msg.length() > 0) {
+            b.putString("txt", msg);
+        }
+        for (int i = 0; i < extra.length; i+=2) {
+            b.putString(extra[i], extra[i+1]);
+        }
+        get(null).broadcast(m, null);
+    }
+    /**
+     * Status updates, broadcasted to all listeners.
+     */
+    public void broadcastParcelable(String msg, Parcelable p, String... extra) {
+        Log.d(TAG, msg);
+        Message m = broadcastHandler.obtainMessage(MsgMux.TXT);
+        m.getData().putString(":uri", msg);
+        m.getData().putParcelable("data", p);
+        for (int i = 0; i < extra.length; i += 2) {
+            m.getData().putString(extra[i], extra[i + 1]);
+        }
+        m.sendToTarget();
+    }
 
+    public void broadcastTxt(String msg, String... extra) {
+        Log.d(TAG, msg + " " +  Arrays.asList(extra));
+        Message m = broadcastHandler.obtainMessage(TXT);
+        m.getData().putString(":uri", msg);
+        for (int i = 0; i < extra.length; i+=2) {
+            if (i+1 < extra.length && extra[i+1] != null) {
+                m.getData().putString(extra[i], extra[i + 1]);
+            }
+        }
+        m.sendToTarget();
+
+    }
     /**
      * Main method for sending a message to all subscribers (UDS, Messenger connections).
      */
@@ -318,13 +366,12 @@ public class MsgMux {
         if (open != null) {
             open.handleMessage(":open", "", openM, null, null);
         }
-
     }
 
     class ListHandler implements MessageHandler {
         ArrayList<MessageHandler> handlers = new ArrayList<>();
 
-
+    
         @Override
         public void handleMessage(String topic, String msgType, Message m, MsgConn replyTo, String[] args) {
             for (MessageHandler h : handlers) {
@@ -347,5 +394,124 @@ public class MsgMux {
         }
     }
 
+/**
+     * Handle a message received from either a client or server.
+     * @param msg
+     * @return
+     */
+//    boolean handleInMessage(BaseMsgService svc, Message msg) {
+//        // TODO: verify MsgConnection first call, replyTo
+//        // TODO: inject debug handler
+//        getClient(svc, msg);
+//
+//        Bundle arg = msg.getData();
+//
+//        final String cmd = arg.getString(":uri");
+//        if (cmd == null) {
+//            return false;
+//        }
+//        String[] args = cmd.split("/");
+//        if (args.length < 2) {
+//            return false;
+//        }
+//
+//        MessageHandler open = svc.inHandlers.get(args[1]);
+//        if (open != null) {
+//            open.handleMessage(msg, msg.replyTo, args);
+//        }
+//
+//        return false;
+//    }
+
+//    /**
+//     * Return the client associated with the message, based on sendingUid (and PendingIntent for
+//     * older than Lollipop devices). If this is the first time, the client is added.
+//     *
+//     * Clients are removed when send fails or close() is called.
+//     *
+//     *
+//     * @param svc
+//     * @param msg
+//     * @return
+//     */
+//    public MsgConnection getClient(BaseMsgService svc, Message msg) {
+//        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+//
+//            MsgConnection c = clients.get("" + msg.sendingUid);
+//            if (c == null || msg.getData().getBoolean(":open", false)) {
+//                c = new MsgConnection(this, msg.replyTo, (PendingIntent) msg.getData().getParcelable("p"));
+//                clients.put("" + msg.sendingUid, c);
+//                Log.d(TAG, "New Client " + msg.sendingUid);
+//
+//                MessageHandler open = svc.inHandlers.get(":open");
+//                if (open != null) {
+//                    open.handleMessage(msg, msg.replyTo, null);
+//                }
+//            }
+//            return c;
+//
+//        } else {
+//            PendingIntent p = (PendingIntent) msg.getData().getParcelable("p");
+//            if (p == null) {
+//                return null;
+//            }
+//            MsgConnection c = clients.get(p.getTargetPackage());
+//            if (c == null) {
+//                c = new MsgConnection(this, msg.replyTo, p);
+//                clients.put(p.getTargetPackage(), c);
+//            }
+//            return c;
+//        }
+//    }
+    public static String getGroup(Message msg) {
+        String uri = msg.getData().getString(MsgMux.URI);
+        if (uri == null) {
+            return "";
+        }
+        String[] parts = uri.split("/");
+        if (parts.length < 2) {
+            return "";
+        }
+        String cat = parts[1];
+        return cat;
+    }
+
+    /**
+     * Interface for processing incoming messages.
+     *
+     * Used to be Handler.Callback - but it's harder to search for usages and gets confusing.
+     */
+//    public interface MessageHandler {
+//        void handleMessage(Message m, Messenger replyTo, String[] args);
+//    }
+
+    /**
+     * Handle a message received from either a client or server.
+     * @param msg
+     * @return
+     */
+//    boolean handleInMessage(BaseMsgService svc, Message msg) {
+//        // TODO: verify MsgConnection first call, replyTo
+//        // TODO: inject debug handler
+//        getClient(svc, msg);
+//
+//        Bundle arg = msg.getData();
+//
+//        final String cmd = arg.getString(":uri");
+//        if (cmd == null) {
+//            return false;
+//        }
+//        String[] args = cmd.split("/");
+//        if (args.length < 2) {
+//            return false;
+//        }
+//
+//        MessageHandler open = svc.inHandlers.get(args[1]);
+//        if (open != null) {
+//            open.handleMessage(msg, msg.replyTo, args);
+//        }
+//
+//        return false;
+//    }
 
 }
