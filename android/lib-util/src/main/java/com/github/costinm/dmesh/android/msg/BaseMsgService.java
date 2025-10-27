@@ -1,6 +1,5 @@
 package com.github.costinm.dmesh.android.msg;
 
-import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.os.Handler;
@@ -10,13 +9,20 @@ import android.os.Messenger;
 import android.os.RemoteException;
 import android.util.Log;
 
+import androidx.annotation.NonNull;
+
 /**
- * Server-side messaging mux, using Messenger. Client side is ConnMessenger.
+ * Server-side messaging mux, using Messenger. This is similar to typical HTTP - using Binder
+ * but without requiring an AIDL. Parameters can be marshalled as a Bundle (like json) or
+ * in byte[] - including proto, CBOR, json - as received from remote device and without
+ * expensive conversions.
  * <p>
- * The base service is exposing a Messenger interface for bind, and accepting a Messanger callback.
+ * The base service is exposing a Messenger interface for bind, and accepting a Messenger callback.
  * <p>
  * Works on GB+, but only LMP+ has support for credential passing and can verify the identity of the
  * caller.
+ * <p>
+ * Client side is Mux, who handles all in/out connections and dispatching.
  */
 public class BaseMsgService extends Service {
 
@@ -37,7 +43,7 @@ public class BaseMsgService extends Service {
         }
         Handler inHandler = new Handler(new Handler.Callback() {
             @Override
-            public boolean handleMessage(Message msg) {
+            public boolean handleMessage(@NonNull Message msg) {
                 return handleInMessage(msg);
             }
         });
@@ -71,43 +77,17 @@ public class BaseMsgService extends Service {
     private boolean handleInMessage(Message msg) {
         // TODO: verify MsgConn first call, replyTo
         // TODO: inject debug handler
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-            String key = "" + msg.sendingUid;
-            MsgConn c = mux.activeIn.get(key);
+        String key = "" + msg.sendingUid;
+        MsgConn c = mux.activeIn.get(key);
 
-            if (c == null || msg.getData().getBoolean(":open", false)) {
-                c = new MsgConMessengerS(mux, msg.replyTo, key);
-                mux.addInConnection(key, c, msg);
-                Log.d(TAG, "New Client " + msg.sendingUid);
-            }
-
-            mux.handleMessage(key, c, msg);
-        } else {
-            // TODO: handshake based on the pending intent - start service or send broadcast, to
-            // verify it is a legitimate PendingIntent ( and not one passed on behalf of another
-            // app )
-            PendingIntent p = (PendingIntent) msg.getData().getParcelable("p");
-            if (p == null) {
-                return false;
-            }
-            String key = p.getTargetPackage();
-            MsgConn c = mux.activeIn.get(key);
-            if (c == null) {
-                // TODO: handshake to verify this is not a stolen PI. Pass something, addMap2Bundle to handlers only
-                // when receiving confirmation.
-//                try {
-//                    p.send(this, 0, new Intent());
-//                } catch (PendingIntent.CanceledException e) {
-//                    e.printStackTrace();
-//                }
-
-                c = new MsgConMessengerS(mux, msg.replyTo, key);
-                mux.activeIn.put(key, c);
-            }
-            mux.handleMessage(key, c, msg);
+        if (c == null || msg.getData().getBoolean(":open", false)) {
+            c = new MsgConMessengerS(mux, msg.replyTo, key);
+            mux.addInConnection(key, c, msg);
+            Log.d(TAG, "New Client " + msg.sendingUid);
         }
 
-        return false;
+        return mux.handleMessage(key, c, msg);
+
     }
 
     /**
@@ -120,8 +100,6 @@ public class BaseMsgService extends Service {
      * <p>
      * This works in BroadcastReceivers and cases where a full bind is not needed. Note that the
      * service or the app may go away at any time.
-     *
-     * @return
      */
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {

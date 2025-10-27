@@ -87,7 +87,6 @@ import static android.bluetooth.BluetoothProfile.STATE_CONNECTED;
  * - system logs with D/BtGatt
  * - Nordic's debug apps
  */
-@RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
 public class Ble implements MessageHandler {
     static final String TAG = "LM-BLE";
 

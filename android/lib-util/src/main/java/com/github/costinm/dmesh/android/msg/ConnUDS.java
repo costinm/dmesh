@@ -41,28 +41,6 @@ public class ConnUDS extends MsgConn {
         conId = dmuds;
     }
 
-    public Credentials getPeerCredentials() {
-        try {
-            return socket.getPeerCredentials();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        return null;
-    }
-
-    protected void handleLocalSocket(LocalSocket s) {
-        // TODO: if self, pass the VPN fd. Otherwise - treat it as a proxy
-        try {
-            if (s == null) {
-                return;
-            }
-            this.socket = s;
-            handleConnection(s.getInputStream(), s.getOutputStream());
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
     public static String proxyConnection(final InputStream in, final OutputStream out) throws IOException {
         try {
             LocalSocket ls = new LocalSocket();
@@ -105,11 +83,32 @@ public class ConnUDS extends MsgConn {
             }).start();
 
             return ls.getLocalSocketAddress().getName();
-        } catch(IOException ex ) {
+        } catch (IOException ex) {
             return "";
         }
     }
 
+    public Credentials getPeerCredentials() {
+        try {
+            return socket.getPeerCredentials();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    protected void handleLocalSocket(LocalSocket s) {
+        // TODO: if self, pass the VPN fd. Otherwise - treat it as a proxy
+        try {
+            if (s == null) {
+                return;
+            }
+            this.socket = s;
+            handleConnection(s.getInputStream(), s.getOutputStream());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
 
     // Decode a command from the stream, convert to Message
     // Text format: URL\nKey:value\n...
@@ -246,7 +245,7 @@ public class ConnUDS extends MsgConn {
                 socket.setFileDescriptorsForSend(new FileDescriptor[]{});
             }
         } catch (Throwable t) {
-            Log.d(TAG, "Failed to send send " + t.toString());
+            Log.d(TAG, "Failed to send send " + t);
             out = null;
             try {
                 socket.close();
@@ -272,7 +271,7 @@ public class ConnUDS extends MsgConn {
             }
             String s = null;
             if (o instanceof CharSequence) {
-                s = ((CharSequence) o).toString();
+                s = o.toString();
             } else if (o instanceof Bundle) {
                 s = NetUtil.toJSON((Bundle) o).toString();
             } else if (o instanceof ArrayList) {
@@ -322,7 +321,7 @@ public class ConnUDS extends MsgConn {
             Log.d(TAG, "Sent file descriptor to native process");
 
         } catch (Throwable t) {
-            Log.d(TAG, "Failed to send vpn" + t.toString());
+            Log.d(TAG, "Failed to send vpn" + t);
         }
     }
 }

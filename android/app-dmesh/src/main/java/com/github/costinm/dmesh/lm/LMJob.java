@@ -21,7 +21,6 @@ import static android.app.job.JobScheduler.RESULT_SUCCESS;
  *
  *  If the battery permissions/fg are not enabled this is the main discovery.
  */
-@RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
 public class LMJob extends JobService {
     private static final String TAG = "DMJob";
 
@@ -42,9 +41,7 @@ public class LMJob extends JobService {
                     .setPersisted(true)
                     .setPeriodic(interval);
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                b.setRequiresBatteryNotLow(true);
-            }
+            b.setRequiresBatteryNotLow(true);
             JobInfo  job = b.build();
             if (RESULT_SUCCESS == js.schedule(job)) {
                 scheduled = true;

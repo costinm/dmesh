@@ -1,6 +1,5 @@
 package com.github.costinm.dmesh.android.msg;
 
-import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -20,16 +19,13 @@ import android.util.Log;
  */
 class ConnMessenger extends MsgConn {
 
-    private static String TAG = "MsgC";
+    private static final String TAG = "MsgC";
     // Package name of the remote side.
     // Used as key in either activeIn or activeOut.
     public String remotePackage;
     // MsgConn messenger receiving from service. Will be passed to all the bound services, in
     // 'replyTo' field.
     protected Messenger inMessenger;
-    // Used as a token to identify the client and possibly restart it on demand.
-    // Only for GB to KK
-    protected PendingIntent myPendingIntent;
     // exposed by the service. May be null if a binding is not active.
     // Set to null if sending a message fails.
     protected Messenger svc;
@@ -60,12 +56,6 @@ class ConnMessenger extends MsgConn {
                 return false;
             }
         });
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.LOLLIPOP) {
-            Intent i = new Intent();
-            i.setComponent(new ComponentName(mux.ctx.getPackageName(), mux.ctx.getPackageName() + ".DMService"));
-
-            myPendingIntent = PendingIntent.getService(mux.ctx, 1973, i, 0);
-        }
         inMessenger = new Messenger(fromLMHandler);
     }
 
@@ -126,9 +116,6 @@ class ConnMessenger extends MsgConn {
             return false;
         }
         m.replyTo = inMessenger;
-        if (myPendingIntent != null) {
-            m.getData().putParcelable(":p", myPendingIntent);
-        }
 
         try {
             mg.send(m);
@@ -140,7 +127,6 @@ class ConnMessenger extends MsgConn {
     }
 
     //@Override
-
     public void start() {
         bind(mux.ctx);
     }

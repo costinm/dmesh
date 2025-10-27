@@ -2,17 +2,18 @@ package com.github.costinm.dmesh.android.util;
 
 import android.os.Bundle;
 import android.os.SystemClock;
-import androidx.annotation.NonNull;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ListAdapter;
 import android.widget.ListView;
 
+import androidx.annotation.NonNull;
+
 import java.util.Calendar;
 
 /**
- * Small utils used in various places in UI.
- *
+ * Small utils used in various places in UI - for using the raw android APIs.
+ * <p>
  * Created by costin on 12/26/16.
  */
 public class UiUtil {
@@ -78,12 +79,12 @@ public class UiUtil {
         if (b == null) {
             return sb;
         }
-        for (String k: b.keySet()) {
+        for (String k : b.keySet()) {
             Object o = b.get(k);
             if (o == null) {
                 continue;
             }
-            sb.append(k).append(":").append(o.toString()).append(delim);
+            sb.append(k).append(":").append(o).append(delim);
         }
         return sb;
     }

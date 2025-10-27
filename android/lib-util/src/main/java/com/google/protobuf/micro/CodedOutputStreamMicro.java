@@ -33,6 +33,7 @@ package com.google.protobuf.micro;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Encodes and writes protocol message fields.
@@ -382,13 +383,9 @@ public final class CodedOutputStreamMicro {
      * {@code string} field.
      */
     public static int computeStringSizeNoTag(final String value) {
-        try {
-            final byte[] bytes = value.getBytes("UTF-8");
-            return computeRawVarint32Size(bytes.length) +
-                    bytes.length;
-        } catch (UnsupportedEncodingException e) {
-            throw new RuntimeException("UTF-8 not supported.");
-        }
+        final byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        return computeRawVarint32Size(bytes.length) +
+                bytes.length;
     }
 
     /**
@@ -807,7 +804,7 @@ public final class CodedOutputStreamMicro {
         // Unfortunately there does not appear to be any way to tell Java to encode
         // UTF-8 directly into our buffer, so we have to let it create its own byte
         // array and then copy.
-        final byte[] bytes = value.getBytes("UTF-8");
+        final byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         writeRawVarint32(bytes.length);
         writeRawBytes(bytes);
     }

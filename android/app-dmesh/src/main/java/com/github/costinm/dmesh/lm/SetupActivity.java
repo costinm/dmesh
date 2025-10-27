@@ -76,19 +76,18 @@ public class SetupActivity extends AppCompatActivity implements MessageHandler, 
         final Intent svcI = new Intent(this, DMService.class);
 
         boolean hasLocation = true;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                hasLocation = false;
-            }
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            hasLocation = false;
         }
 
         wifiSwitch.setChecked(prefs.getBoolean(DMService.PREF_WIFI_ENABLED, false) && hasLocation);
         final boolean hasLocationF = hasLocation;
+
         wifiSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             @Override
             public void onCheckedChanged(CompoundButton compoundButton, boolean b) {
                 prefs.edit().putBoolean(DMService.PREF_WIFI_ENABLED, b).commit();
-                if (!hasLocationF && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (!hasLocationF) {
                     try {
                         requestPermissions(new String[]{
                                 Manifest.permission.ACCESS_FINE_LOCATION,
@@ -124,15 +123,11 @@ public class SetupActivity extends AppCompatActivity implements MessageHandler, 
         setSwitch(R.id.vpn_ext_switch, "vpn_ext", false, svcI);
 
         if (prefs.getBoolean(DMService.PREF_ENABLED, true)) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 try {
                     startForegroundService(svcI);
                 } catch (Exception ex) {
                     Log.d(TAG, ex.getMessage());
                 }
-            } else {
-                startService(svcI);
-            }
         }
     }
 

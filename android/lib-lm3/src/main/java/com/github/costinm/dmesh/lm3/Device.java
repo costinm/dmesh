@@ -15,7 +15,7 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 
 /**
- * Info about a discovered device.
+ * Info about a discovered device, common across communication protocols.
  * <p>
  * Discovery may use Wifi scan, Wifi-Direct, BLE, legacy BT, NAN.
  * <p>

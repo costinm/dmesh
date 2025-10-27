@@ -22,6 +22,7 @@
         <service
             android:name=".DMService"
             android:enabled="true"
+            android:process=":dmesh"
             android:foregroundServiceType="remoteMessaging"
             android:exported="true"/>
 

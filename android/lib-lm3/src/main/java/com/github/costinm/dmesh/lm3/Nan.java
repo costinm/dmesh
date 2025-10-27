@@ -1,5 +1,6 @@
 package com.github.costinm.dmesh.lm3;
 
+import android.Manifest;
 import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.Intent;
@@ -24,6 +25,7 @@ import android.util.Log;
 import android.widget.Toast;
 
 import androidx.annotation.RequiresApi;
+import androidx.annotation.RequiresPermission;
 
 import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.Hex;
@@ -32,7 +34,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@TargetApi(Build.VERSION_CODES.O)
 public class Nan {
     private static final String TAG = "DM/wifi/nan";
     static Map<String, Device> devices = new HashMap<>();
@@ -88,7 +89,6 @@ public class Nan {
      * Start the NAN radio, and after that possibly publish or subscribe, if the mode is enabled.
      * Once attach succeeds the radio will send discovery beacons and participate in NAN master.
      */
-    @RequiresApi(api = Build.VERSION_CODES.O)
     private void startNanRadio() {
         if (nanMgr == null) {
             return;

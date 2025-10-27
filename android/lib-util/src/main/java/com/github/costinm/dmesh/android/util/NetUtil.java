@@ -39,7 +39,6 @@ public class NetUtil {
     }
 
 
-
     static Inet6Address getLinkLocalIP6(NetworkInterface ni) {
         if (ni == null) {
             return null;
@@ -120,7 +119,7 @@ public class NetUtil {
                 Object o1 = b.get(k);
 
                 if (o1 instanceof CharSequence) {
-                    jso.put(k, ((CharSequence) o1).toString());
+                    jso.put(k, o1.toString());
                 } else if (o1 instanceof Bundle) {
                     jso.put(k, toJSON((Bundle) o1));
                 } else if (o1 instanceof ArrayList) {
@@ -136,7 +135,7 @@ public class NetUtil {
     public static JSONArray toJSON(ArrayList a) {
         JSONArray ar = new JSONArray();
 
-        for(Object o: a) {
+        for (Object o : a) {
             if (o instanceof Bundle) {
                 ar.put(toJSON((Bundle) o));
             } else if (o instanceof ArrayList) {

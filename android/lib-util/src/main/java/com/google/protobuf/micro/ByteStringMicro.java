@@ -31,6 +31,7 @@
 package com.google.protobuf.micro;
 
 import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Immutable array of bytes.
@@ -84,11 +85,7 @@ public final class ByteStringMicro {
      * result as a {@code ByteStringMicro}.
      */
     public static ByteStringMicro copyFromUtf8(final String text) {
-        try {
-            return new ByteStringMicro(text.getBytes("UTF-8"));
-        } catch (UnsupportedEncodingException e) {
-            throw new RuntimeException("UTF-8 not supported?");
-        }
+        return new ByteStringMicro(text.getBytes(StandardCharsets.UTF_8));
     }
 
     /**
@@ -167,11 +164,7 @@ public final class ByteStringMicro {
      * Constructs a new {@code String} by decoding the bytes as UTF-8.
      */
     public String toStringUtf8() {
-        try {
-            return new String(bytes, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            throw new RuntimeException("UTF-8 not supported?");
-        }
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     //@Override for compatibility with Java 1.3 code we can't use annotations

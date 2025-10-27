@@ -7,7 +7,10 @@ android {
 
     defaultConfig {
         // Utils are compatible with oldest android I can test with.
-        minSdkVersion 14
+        // 21 (LMP) adds Messenger peer ID - older versions not secure and too complex
+        // to add verification. No longer have working phones with GB/ICS/JB/KK.
+        // 23 (M) adds few battery methods that are useful.
+        minSdkVersion 23
         targetSdkVersion TARGET_SDK_VERSION
         versionCode 1
         versionName "1.0"

@@ -32,6 +32,7 @@ package com.google.protobuf.micro;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Reads and decodes protocol message fields.
@@ -324,12 +325,12 @@ public final class CodedInputStreamMicro {
         if (size <= (bufferSize - bufferPos) && size > 0) {
             // Fast path:  We already have the bytes in a contiguous buffer, so
             //   just copy directly from it.
-            final String result = new String(buffer, bufferPos, size, "UTF-8");
+            final String result = new String(buffer, bufferPos, size, StandardCharsets.UTF_8);
             bufferPos += size;
             return result;
         } else {
             // Slow path:  Build a byte array first then copy it.
-            return new String(readRawBytes(size), "UTF-8");
+            return new String(readRawBytes(size), StandardCharsets.UTF_8);
         }
     }
 
@@ -384,6 +385,7 @@ public final class CodedInputStreamMicro {
     /**
      * WIP: return bytes without allocating a new copy.
      * Result will be invalid after the protobuf buffer is reused. Not immutable.
+     *
      * @param bb
      * @return
      * @throws IOException

@@ -1,33 +1,17 @@
 package wpgate
 
 import (
-	"context"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"os"
 	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/costinm/dmesh/pkg/lwip"
 	// Use LWIP for VPN
-	"github.com/costinm/tungate/lwip/pkg/lwip"
-	"github.com/costinm/ugate"
-	"github.com/costinm/ugate/dns"
-
-	// Local discovery
-	"github.com/costinm/ugate/pkg/local"
-
-	// Control
-	msgs "github.com/costinm/ugate/webpush"
-
-	"github.com/costinm/ugate/pkg/http_proxy"
-	// UDP and TCP proxy
-	"github.com/costinm/ugate/pkg/udp"
-	"github.com/costinm/ugate/pkg/ugatesvc"
 )
+
 /*
 	gomobile bindings
 
@@ -52,8 +36,7 @@ import (
   supported function types and all of whose exported fields
   have supported types.
 
- */
-
+*/
 
 // Adapter from func to interface
 type MessageHandler interface {
@@ -61,17 +44,17 @@ type MessageHandler interface {
 }
 
 var (
-	ld *local.LLDiscovery
-	gw *ugatesvc.UGate
-	udpGate *udp.UDPGate
+	//ld *local.LLDiscovery
+	//gw      *ugatesvc.UGate
+	//udpGate *udp.UDPGate
 	vpnFile *os.File
 )
 
 // Update is called in a Job, with wake locks.
 func Update() {
-	if ld != nil {
-		ld.RefreshNetworks()
-	}
+	// if ld != nil {
+	// 	ld.RefreshNetworks()
+	// }
 }
 
 // Called to inject a message into Go impl
@@ -82,7 +65,7 @@ func Send(cmdS string, meta []byte, data []byte) {
 		log.Println("UDS: refresh network (r)")
 		go func() {
 			time.Sleep(2 * time.Second)
-			ld.RefreshNetworks()
+			//ld.RefreshNetworks()
 		}()
 		return
 		// TODO: P - properties, json
@@ -95,7 +78,7 @@ func Send(cmdS string, meta []byte, data []byte) {
 		log.Println("Decoded meta: ", metao)
 	}
 	log.Println("Java2Native", cmdS)
-	msgs.DefaultMux.SendMeta(cmdS, metao, data)
+	//msgs.DefaultMux.SendMeta(cmdS, metao, data)
 }
 
 func StopVPN() {
@@ -104,14 +87,16 @@ func StopVPN() {
 		vpnFile = nil
 	}
 }
+
 // Directly pass the VPN, start processing it in go.
 func StartVPN(fd int) {
 	syscall.SetNonblock(fd, false)
 	vpnFile = os.NewFile(uintptr(fd), "dmesh-socket-"+strconv.Itoa(fd))
 	log.Println("Received VPN UDS client (v), starting TUN", fd)
-	tun := lwip.NewTUNFD(vpnFile,gw, udpGate)
+	tun := lwip.NewTUNFD(vpnFile, nil, nil)
 	//tun := netstack.NewTUNFD(fa, gw, udpNat)
-	udpGate.TransparentUDPWriter = tun
+	//udpGate.TransparentUDPWriter = tun
+	log.Println("Tun started", tun)
 }
 
 // Android and device version of DMesh.
@@ -133,31 +118,31 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// BOOTCLASSPATH=/system/framework/core-oj.jar:/system/framework/core-libart.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/bouncycastle.jar:/system/framework/apache-xml.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/android.hidl.base-V1.0-java.jar:/system/framework/android.hidl.manager-V1.0-java.jar:/system/framework/framework-oahl-backward-compatibility.jar:/system/framework/android.test.base.jar:/system/framework/com.google.vr.platform.jar]
 
 	// File-based config
-	config := ugatesvc.NewConf(baseDir)
+	//config := ugatesvc.NewConf(baseDir)
 	log.Println("Starting native on ", baseDir)
 	// Init or load certificates/keys
 
-	gcfg := &ugate.GateCfg{
-		BasePort: 15000,
-		Name: os.Getenv("HOSTNAME"),
-		Domain: "v.webinf.info",
-	}
+	// gcfg := &ugate.GateCfg{
+	// 	BasePort: 15000,
+	// 	Name:     os.Getenv("HOSTNAME"),
+	// 	Domain:   "v.webinf.info",
+	// }
 
-	gw = ugatesvc.NewGate(nil, nil, gcfg, config)
+	// gw = ugatesvc.NewGate(nil, nil, gcfg, config)
 
-	msgs.DefaultMux.Auth = gw.Auth
+	// msgs.DefaultMux.Auth = gw.Auth
 
-	msgs.DefaultMux.AddHandler("*", msgs.HandlerCallbackFunc(func(ctx context.Context, cmdS string, meta map[string]string, data []byte) {
-		var metaB []byte
-		metaB, _ = json.Marshal(meta)
-		log.Println("XXX Go2java ", cmdS)
-		callbackFunc.Handle(cmdS, metaB, data)
-	}))
+	// msgs.DefaultMux.AddHandler("*", msgs.HandlerCallbackFunc(func(ctx context.Context, cmdS string, meta map[string]string, data []byte) {
+	// 	var metaB []byte
+	// 	metaB, _ = json.Marshal(meta)
+	// 	log.Println("XXX Go2java ", cmdS)
+	// 	callbackFunc.Handle(cmdS, metaB, data)
+	// }))
 
-	msgs.DefaultMux.Send("./test/local", nil)
+	// msgs.DefaultMux.Send("./test/local", nil)
 
-	hproxy := http_proxy.NewHTTPProxy(gw)
-	hproxy.HttpProxyCapture(fmt.Sprintf("127.0.0.1:%d", gcfg.BasePort+ugate.PORT_HTTP_PROXY))
+	// hproxy := http_proxy.NewHTTPProxy(gw)
+	// hproxy.HttpProxyCapture(fmt.Sprintf("127.0.0.1:%d", gcfg.BasePort+ugate.PORT_HTTP_PROXY))
 
 	// ugatesvc.Conf(config, "MESH", "v.webinf.info:5222")
 
@@ -165,9 +150,9 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// Else - default is 15007
 	// Set host config for other settings
 	//gw.Config.H2R["h.webinf.info"] = "B5B6KYYUBVKCX4PWPWSWAIHW2X2D3Q4HZPJYWZ6UECL2PAODHTFA"
-	gcfg.H2R["c1.webinf.info"] = ""
+	//gcfg.H2R["c1.webinf.info"] = ""
 
-	gw.H2Handler.UpdateReverseAccept()
+	//gw.H2Handler.UpdateReverseAccept()
 
 	//// Connect to a mesh node
 	//if meshH != "" {
@@ -176,13 +161,12 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	//}
 
 	// Local discovery interface - multicast, local network IPs
-	ld = local.NewLocal(gw, gw.Auth)
-	// go ld.PeriodicThread() - not using the thread, use the Android call
-	go ld.RefreshNetworks()
-	local.ListenUDP(ld)
+	// ld = local.NewLocal(gw, gw.Auth)
+	// // go ld.PeriodicThread() - not using the thread, use the Android call
+	// go ld.RefreshNetworks()
+	// local.ListenUDP(ld)
 
-	gw.Mux.HandleFunc("/dmesh/ll/if", ld.HttpGetLLIf)
-
+	// gw.Mux.HandleFunc("/dmesh/ll/if", ld.HttpGetLLIf)
 
 	//h2s, err := h2.NewTransport(authz)
 	//if err != nil {
@@ -191,24 +175,23 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 
 	// DNS capture, interpret the names, etc
 	// Off until DNS moved to smaller package.
-	dnss, _ := dns.NewDmDns(5223)
-	//gw.DNS = dnss
-	net.DefaultResolver.PreferGo = true
-	net.DefaultResolver.Dial = dns.DNSDialer(5223)
+	// dnss, _ := dns.NewDmDns(5223)
+	// //gw.DNS = dnss
+	// net.DefaultResolver.PreferGo = true
+	// net.DefaultResolver.Dial = dns.DNSDialer(5223)
 
-	udpGate = udp.New(gw)
+	// udpGate = udp.New(gw)
 
-	//hgw := httpproxy.NewHTTPGate(GW, h2s)
-	//hgw.HttpProxyCapture("localhost:5204")
+	// //hgw := httpproxy.NewHTTPGate(GW, h2s)
+	// //hgw.HttpProxyCapture("localhost:5204")
 
-	go dnss.Serve()
+	// go dnss.Serve()
 
-	log.Printf("Loading with VIP6: %v ID64: %s\n",
-		gw.Auth.VIP6,
-		base64.RawURLEncoding.EncodeToString(gw.Auth.VIP6[8:]))
+	// log.Printf("Loading with VIP6: %v ID64: %s\n",
+	// 	gw.Auth.VIP6,
+	// 	base64.RawURLEncoding.EncodeToString(gw.Auth.VIP6[8:]))
 
-	callbackFunc.Handle("/STARTED", nil, nil)
-	msgs.DefaultMux.Send("/START1", nil)
-	return gw.Auth.VIP6
+	// callbackFunc.Handle("/STARTED", nil, nil)
+	// msgs.DefaultMux.Send("/START1", nil)
+	return nil // gw.Auth.VIP6
 }
-

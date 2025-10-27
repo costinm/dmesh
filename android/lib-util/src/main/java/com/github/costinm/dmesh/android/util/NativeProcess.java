@@ -1,32 +1,25 @@
 package com.github.costinm.dmesh.android.util;
 
-import android.app.DownloadManager;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.net.Uri;
-import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.net.URL;
-import java.net.URLConnection;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Run a native process. Optional restart and suspend/resume.
+ * <p>
+ * Note that native processes are likely to be killed if the app is not foreground.
  */
 public class NativeProcess extends Thread {
     // Wait before restarting.
@@ -38,9 +31,9 @@ public class NativeProcess extends Thread {
     final BlockingQueue<String> suspendQueue = new LinkedBlockingQueue<>();
     private final Context ctx;
     private final String exec;
+    public boolean keepAlive = false;
     // Null when not running
     Process p;
-    public boolean keepAlive = false;
     boolean suspended = false;
 
     /**

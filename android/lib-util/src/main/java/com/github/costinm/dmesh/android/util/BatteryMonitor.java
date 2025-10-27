@@ -67,14 +67,10 @@ public class BatteryMonitor extends BroadcastReceiver {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             mIntentFilter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            mIntentFilter.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
-        }
+        mIntentFilter.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
         ctx.registerReceiver(this, mIntentFilter);
         reg = true;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            bm = (BatteryManager) ctx.getSystemService(Context.BATTERY_SERVICE);
-        }
+        bm = (BatteryManager) ctx.getSystemService(Context.BATTERY_SERVICE);
         idleStop = SystemClock.elapsedRealtime();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -83,9 +79,7 @@ public class BatteryMonitor extends BroadcastReceiver {
             }
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            isPowerSave = pm.isPowerSaveMode();
-        }
+        isPowerSave = pm.isPowerSaveMode();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (bm.isCharging()) {
@@ -113,13 +107,11 @@ public class BatteryMonitor extends BroadcastReceiver {
         intent.getStringExtra("");
 
         if (PowerManager.ACTION_POWER_SAVE_MODE_CHANGED.equals(action)) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                isPowerSave = pm.isPowerSaveMode();
-                if (isPowerSave) {
-                    sendStatus("PSON");
-                } else {
-                    sendStatus("PSOFF");
-                }
+            isPowerSave = pm.isPowerSaveMode();
+            if (isPowerSave) {
+                sendStatus("PSON");
+            } else {
+                sendStatus("PSOFF");
             }
         } else if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(action)) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
