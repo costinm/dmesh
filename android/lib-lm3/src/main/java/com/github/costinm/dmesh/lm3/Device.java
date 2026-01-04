@@ -25,14 +25,9 @@ import java.util.Map;
  * Currently Wifi SSID+PSK or WifiDirect Q method are used. In future BT, BLE, NAN might also
  * be used.
  * <p>
- * The device info is fed to the native app, and used in the debug UI.
  */
 public class Device {
 
-    public static final String DEFAULT_PSK = "12345678";
-
-    // Set if device is currently visible as a peer (wifi will also be set)
-    public String discAddr;
     public static final String SSID = "s";
     public static final String PSK = "p";
     public static final String ID4 = "i";
@@ -67,15 +62,30 @@ public class Device {
 
     public static final String P2PConnected = "gc";
 
+    // ------------- Data about the device -------------------
+
     // Set if device is currently visible as a peer (wifi will also be set)
     public String id;
-    public DiscoverySession nanSession;
+
     public Bundle data = new Bundle();
+
     long lastScan;
-    // Set if found via P2P Peers or SD
+
+    public String desc;
+
+    // Depending on how the device was found.
+    public DiscoverySession nanSession;
+
     WifiP2pDevice wifi;
+
     BluetoothDevice dev;
+
     PeerHandle nan;
+
+    public Device(String name, String data) {
+        id = name;
+        desc = data;
+    }
 
     /**
      * Create a device from P2P peer discovery.
@@ -88,12 +98,12 @@ public class Device {
         data.putString(P2PAddr, wifiP2pDevice.deviceAddress);
         data.putString(P2PName, wifiP2pDevice.deviceName);
 
-        Map<String, String> txt = Wifi.txtDiscoveryByP2P.get(wifiP2pDevice.deviceAddress);
-        if (txt != null) {
-            for (String k : txt.keySet()) {
-                data.putString(k, txt.get(k));
-            }
-        }
+//        Map<String, String> txt = LocalMesh.txtDiscoveryByP2P.get(wifiP2pDevice.deviceAddress);
+//        if (txt != null) {
+//            for (String k : txt.keySet()) {
+//                data.putString(k, txt.get(k));
+//            }
+//        }
 
         StringBuilder sb = new StringBuilder();
         if (!wifi.isGroupOwner()) {
@@ -125,14 +135,10 @@ public class Device {
     public Device(ScanResult sr) {
         setScanResult(sr);
 
-        Map<String, String> txt = Wifi.txtDiscoveryBySSID.get(sr.SSID);
+        Map<String, String> txt = P2P.txtDiscoveryBySSID.get(sr.SSID);
         if (txt != null) {
             for (String k : txt.keySet()) {
                 data.putString(k, txt.get(k));
-            }
-        } else {
-            if (sr.SSID.startsWith("DIRECT-DM-ESH") || sr.SSID.startsWith("DMESH-")) {
-                data.putString(PSK, DEFAULT_PSK);
             }
         }
 

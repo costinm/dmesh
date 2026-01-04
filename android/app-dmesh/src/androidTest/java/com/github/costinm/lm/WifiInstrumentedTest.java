@@ -1,17 +1,19 @@
 package com.github.costinm.lm;
 
 import android.content.Context;
-
-import androidx.test.platform.app.InstrumentationRegistry;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.platform.app.InstrumentationRegistry;
 
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
-import com.github.costinm.dmesh.lm3.Wifi;
+import com.github.costinm.dmesh.lm3.LocalMesh;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+/**
+ * Test for local mesh - expects a second device running the same service.
+ */
 @RunWith(AndroidJUnit4.class)
 public class WifiInstrumentedTest {
 
@@ -19,17 +21,17 @@ public class WifiInstrumentedTest {
     public void discoverSD() throws Exception {
         Context appContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
 
-        Wifi wifi = Wifi.get(appContext);
+        LocalMesh wifi = LocalMesh.get(appContext);
 
         int failures = 0;
         int ok = 0;
         for (int i = 0; i < 10; i++) {
-            Wifi.txtDiscoveryByP2P.clear();
-            wifi.discoveryWifiP2POnce();
+            wifi.p2p.txtDiscoveryByP2P.clear();
+            wifi.p2p.discoveryWifiP2POnce();
 
             Thread.sleep(6000);
 
-            if (wifi.txtDiscoveryByP2P.size() == 0) {
+            if (wifi.p2p.txtDiscoveryByP2P.size() == 0) {
                 failures++;
             } else {
                 ok++;

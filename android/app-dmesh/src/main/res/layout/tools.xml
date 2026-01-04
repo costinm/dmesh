@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:padding="0dp"
+    android:orientation="horizontal">
+
+    <ImageButton
+        android:id="@+id/m_ping"
+        style="@android:style/Widget.Material.Button.Small"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:src="@android:drawable/ic_menu_compass" />
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent">
+        <ImageView
+            android:id="@+id/tinfo"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:layout_gravity="right"
+            android:clickable="true"
+            android:src="@android:drawable/ic_menu_info_details" />
+
+        <ImageView
+            android:id="@+id/tlinemenu"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:layout_gravity="right"
+            android:clickable="true"
+            android:src="@android:drawable/ic_menu_more" />
+    </LinearLayout>
+
+    <AutoCompleteTextView
+        android:text=""
+        android:autoHandwritingEnabled="true"
+        android:layout_width="match_parent"
+        android:inputType="textMultiLine"
+        android:layout_height="wrap_content"
+        android:id="@+id/inputa"/>
+
+</LinearLayout>

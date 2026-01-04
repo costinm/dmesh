@@ -8,12 +8,13 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.os.Build;
 import android.os.SystemClock;
-import androidx.annotation.RequiresApi;
 import android.util.Log;
 
 //import wpgate.Wpgate;
 
 import static android.app.job.JobScheduler.RESULT_SUCCESS;
+
+import com.github.costinm.dmesh.lm3.LocalMesh;
 
 /**
  *  LMJob runs avery 15min (min interval allowed).
@@ -49,39 +50,35 @@ public class LMJob extends JobService {
         }
     }
 
-    public static void scheduleAfter(Context ctx, long interval) {
-        JobScheduler js = (JobScheduler) ctx.getSystemService(Context.JOB_SCHEDULER_SERVICE);
-        js.cancel(2);
-        Log.d(TAG, "Schedule update after " + interval/1000);
-
-        if (interval > 0) {
-            JobInfo.Builder b = new JobInfo.Builder(2, new ComponentName(
-                    ctx.getPackageName(), LMJob.class.getName()));
-
-            b.setMinimumLatency(interval);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                b.setRequiresBatteryNotLow(true);
-            }
-
-            JobInfo  job = b.build();
-            js.schedule(job);
-        }
-    }
-
     @Override
     public boolean onStartJob(final JobParameters params) {
         lastStart = SystemClock.elapsedRealtime();
-        Log.d(TAG, "LMJob " + params.getJobId());
 
         Runnable r = new Runnable() {
             @Override
             public void run() {
-                //Wpgate.update();
+                LocalMesh lm = LocalMesh.get(LMJob.this.getApplicationContext());
+                dmjni.Dmjni.update();
+                lm.update();
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+                Log.d(TAG, "LMJob " + params.getJobId());
                 jobFinished(params, false);
             }
         };
         new Thread(r).start();
         return true;
+    }
+
+    public void onLowMemory() {
+        Log.d(TAG, "On Low memory");
+    }
+
+    public void onTrimMemory(int level) {
+        Log.d(TAG, "On Trim memory");
     }
 
     @Override

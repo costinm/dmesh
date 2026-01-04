@@ -12,8 +12,6 @@ import android.os.Message;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
-import androidx.annotation.RequiresApi;
-
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.net.Inet6Address;
@@ -235,7 +233,7 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             Log.d(TAG, "New interface: " + iface);
             fd = iface.getFileDescriptor();
 
-            //Wpgate.startVPN(iface.getFd());
+            dmjni.Dmjni.startVPN(iface.getFd());
 
         } catch (Throwable t) {
             Log.i(TAG, "VPN connection failed " + t);

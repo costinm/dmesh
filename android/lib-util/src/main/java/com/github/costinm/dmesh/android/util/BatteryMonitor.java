@@ -70,7 +70,9 @@ public class BatteryMonitor extends BroadcastReceiver {
         mIntentFilter.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
         ctx.registerReceiver(this, mIntentFilter);
         reg = true;
+
         bm = (BatteryManager) ctx.getSystemService(Context.BATTERY_SERVICE);
+
         idleStop = SystemClock.elapsedRealtime();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {

@@ -1,5 +1,6 @@
 package com.github.costinm.dmesh.lm3;
 
+import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -24,14 +25,15 @@ import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Context;
-import android.os.Build;
+import android.content.pm.PackageManager;
 import android.os.Handler;
 import android.os.Message;
 import android.os.ParcelUuid;
 import android.os.SystemClock;
 import android.util.Log;
-
-import androidx.annotation.RequiresApi;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.widget.Toast;
 
 import com.github.costinm.dmesh.android.msg.ConnUDS;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
@@ -104,7 +106,7 @@ public class Ble implements MessageHandler {
     static Map<String, Device> devices = new HashMap<>();
     static boolean scanFailed = false;
     private final BluetoothManager bluetoothManager;
-    Wifi wifi;
+    LocalMesh wifi;
     boolean mScanning = false;
     Handler mHandler;
     Context ctx;
@@ -221,7 +223,7 @@ public class Ble implements MessageHandler {
     // TODO: if we have visible devices or mesh active, stop scanning
     private BluetoothGattServer gatS;
 
-    public Ble(Context ctx, Wifi wifi, Handler handler) {
+    public Ble(Context ctx, LocalMesh wifi, Handler handler) {
         this.ctx = ctx;
         this.mHandler = handler;
         this.wifi = wifi;
@@ -237,6 +239,7 @@ public class Ble implements MessageHandler {
         }
 
         leScanner = mBluetoothAdapter.getBluetoothLeScanner();
+
         mBluetoothLeAdvertiser = mBluetoothAdapter.getBluetoothLeAdvertiser();
 
         if (leScanner == null) {
@@ -246,19 +249,25 @@ public class Ble implements MessageHandler {
 
         initServer();
 
-        try {
-            if (mBluetoothLeAdvertiser == null) {
-                MsgMux.get(ctx).publish("/BLE/start",
-                        "name", mBluetoothAdapter.getName(),
-                        "adv", "-1");
-            } else {
-                MsgMux.get(ctx).publish("/BLE/start",
-                        "name", mBluetoothAdapter.getName(),
-                        "psm", "" + psm);
+        String name = "";
+
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+            name = mBluetoothAdapter.getName();
+            try {
+                if (mBluetoothLeAdvertiser == null) {
+                    MsgMux.get(ctx).publish("/BLE/start",
+                            "name", name,
+                            "adv", "-1");
+                } else {
+                    MsgMux.get(ctx).publish("/BLE/start",
+                            "name", name,
+                            "psm", "" + psm);
+                }
+            } catch (Throwable t) {
+                t.printStackTrace();
             }
-        } catch (Throwable t) {
-            t.printStackTrace();
         }
+
 
     }
 
@@ -381,11 +390,13 @@ public class Ble implements MessageHandler {
                 .setServiceUuid(EDDY)
                 .build());
 
-        leScanner.startScan(
-                filters,
-                new ScanSettings.Builder()
-                        //.setReportDelay(2000) - breaks KindeFire10
-                        .build(), mScanCallback);
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
+            leScanner.startScan(
+                    filters,
+                    new ScanSettings.Builder()
+                            //.setReportDelay(2000) - breaks KindeFire10
+                            .build(), mScanCallback);
+        }
     }
 
     // == GATT client implementation
@@ -438,18 +449,19 @@ public class Ble implements MessageHandler {
     void initServer() {
         try {
             // TODO: use normal advertisment to indicate support for L2 channel and the PSM
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ss = bluetoothManager.getAdapter().listenUsingInsecureL2capChannel();
-                psm = ss.getPsm();
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        handleServer(ss);
-                    }
-                }).start();
-                Log.d(TAG, "DIRECT L2 PSM=" + psm);
+            if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
+            ss = bluetoothManager.getAdapter().listenUsingInsecureL2capChannel();
+            psm = ss.getPsm();
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    handleServer(ss);
+                }
+            }).start();
+            Log.d(TAG, "DIRECT L2 PSM=" + psm);
 
-        }
 
         gatS = bluetoothManager.openGattServer(ctx, mGattServer);
         if (gatS == null) {
@@ -509,6 +521,9 @@ public class Ble implements MessageHandler {
             return;
         }
         ClientCallback mGattCallback = new ClientCallback();
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
         btGattClient = d.dev.connectGatt(ctx, false, mGattCallback);
     }
 
@@ -533,12 +548,13 @@ public class Ble implements MessageHandler {
                 mConnectionState = STATE_CONNECTED;
 
                 Log.i(TAG, "Connected to GATT server.");
-                Log.i(TAG, "Attempting to start service discovery:" +
-                        btGattClient.discoverServices());
+                if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
 
-
-                btGattClient.requestMtu(2048);
-                gatt.requestMtu(2048);
+                    boolean ok = btGattClient.discoverServices();
+                    Log.i(TAG, "Attempting to start service discovery:" +  ok);
+                    btGattClient.requestMtu(2048);
+                    gatt.requestMtu(2048);
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 mConnectionState = STATE_DISCONNECTED;
                 Log.i(TAG, "Disconnected from GATT server.");
@@ -560,6 +576,7 @@ public class Ble implements MessageHandler {
         // Result of a characteristic read operation
         public void onCharacteristicRead(BluetoothGatt gatt,
                                          BluetoothGattCharacteristic characteristic,
+                                         byte[] value,
                                          int status) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 final byte[] data = characteristic.getValue();
@@ -579,13 +596,11 @@ public class Ble implements MessageHandler {
         }
 
         @Override
-        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
-            super.onCharacteristicChanged(gatt, characteristic);
+        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte []data) {
         }
 
         @Override
-        public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
-            super.onDescriptorRead(gatt, descriptor, status);
+        public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status, byte[] data) {
         }
 
         @Override
@@ -610,6 +625,9 @@ public class Ble implements MessageHandler {
 
         @Override
         public void onConnectionStateChange(BluetoothDevice device, int status, int newState) {
+            if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
             List<BluetoothDevice> connectedDevices = bluetoothManager.getConnectedDevices(GATT_SERVER);
             if (newState == STATE_CONNECTED) {
                 Log.d(TAG, "Connection change connected " + status + " " + newState + " " +
@@ -650,8 +668,13 @@ public class Ble implements MessageHandler {
             BluetoothGattCharacteristic nc = gatS
                     .getService(eddyUUID)
                     .getCharacteristic(sendPort.getUuid());
-            nc.setValue("HELLO".getBytes());
-            gatS.notifyCharacteristicChanged(device, nc, false);
+            byte[] data = "HELLO".getBytes();
+            nc.setValue(data);
+            if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
+            //gatS.writeCharacteristic(device, nc);
+            gatS.notifyCharacteristicChanged(device, nc,  false, data);
         }
 
         @Override

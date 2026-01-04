@@ -3,13 +3,14 @@ package com.github.costinm.dmesh.android.msg;
 import android.app.Service;
 import android.content.Intent;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Message;
 import android.os.Messenger;
+import android.os.Parcel;
 import android.os.RemoteException;
 import android.util.Log;
-
-import androidx.annotation.NonNull;
 
 /**
  * Server-side messaging mux, using Messenger. This is similar to typical HTTP - using Binder
@@ -41,9 +42,12 @@ public class BaseMsgService extends Service {
         if (mux == null) {
             mux = MsgMux.get(getApplicationContext());
         }
-        Handler inHandler = new Handler(new Handler.Callback() {
+        HandlerThread bgT = new HandlerThread("msg-thread");
+        bgT.start();
+
+        Handler inHandler = new Handler(bgT.getLooper(), new Handler.Callback() {
             @Override
-            public boolean handleMessage(@NonNull Message msg) {
+            public boolean handleMessage(Message msg) {
                 return handleInMessage(msg);
             }
         });
@@ -61,8 +65,19 @@ public class BaseMsgService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         Log.d(TAG, "BIND Intent " + intent + " " + intent.getExtras());
+        if (intent != null && "mesh.direct".equals(intent.getAction())) {
+            return db;
+        }
         return inMessenger.getBinder();
     }
+
+    protected DirectBinder db = new DirectBinder() {
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply,
+                                     int flags) throws RemoteException {
+            return BaseMsgService.this.onTransact(code, data, reply, flags);
+        }
+    };
 
     // When all activeIn have been disconnected
     @Override
@@ -72,9 +87,22 @@ public class BaseMsgService extends Service {
     }
 
     /**
+     * onTransact implements the raw binder interface - no marshalling with Parcelable is done,
+     * receiver can use the Parcel directly.
+     *
+     * This is the most memory efficient way to use binder - call  data.readBlob();
+     * reply.writeByte((byte)n), etc;
+     *
+     */
+    protected boolean onTransact(int code, Parcel data, Parcel reply,
+                                 int flags) throws RemoteException {
+        return true;
+    }
+
+    /**
      * Message received using the Messenger interface exposed to clients (registered handlers)
      */
-    private boolean handleInMessage(Message msg) {
+    protected boolean handleInMessage(Message msg) {
         // TODO: verify MsgConn first call, replyTo
         // TODO: inject debug handler
         String key = "" + msg.sendingUid;
@@ -87,7 +115,6 @@ public class BaseMsgService extends Service {
         }
 
         return mux.handleMessage(key, c, msg);
-
     }
 
     /**
@@ -162,6 +189,4 @@ public class BaseMsgService extends Service {
             return false;
         }
     }
-
-
 }

@@ -1,6 +1,7 @@
 <resources>
     <string name="app_name">DMesh</string>
     <string name="title_activity_main">DMesh</string>
+    <string name="title_activity_main2">DMeshL</string>
     <string name="setup_enable"><b>Enable Mesh service.</b><br/>
         <p>A background service will discover nearby nodes, and register with
             the mesh control plane. This allows local applications on the

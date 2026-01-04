@@ -4,9 +4,10 @@ import android.os.Bundle;
 import android.os.Message;
 
 /**
- * MsgConn represents one messaging connection/channel.
- * <p>
- * Transport may be Messenger, UDS or other stream-based connections.
+ * MsgConn represents one messaging connection/channel - similar to a H2/SSH connection.
+ * The messages are framed.
+ *
+ * It may use binder, UDS, SSH, H2, virtio or any other transport.
  */
 public class MsgConn {
     private static final String TAG = "MsgConn";

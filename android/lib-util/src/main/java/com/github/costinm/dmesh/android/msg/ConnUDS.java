@@ -31,6 +31,7 @@ public class ConnUDS extends MsgConn {
 
     // TODO: support multiple sockets
     protected LocalSocket socket;
+
     Context ctx;
     String conId;
     private OutputStream out;

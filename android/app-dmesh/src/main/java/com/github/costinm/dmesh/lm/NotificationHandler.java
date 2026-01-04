@@ -4,15 +4,14 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.RemoteInput;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Message;
-import androidx.annotation.RequiresApi;
-import androidx.core.app.NotificationCompat;
-import androidx.core.app.RemoteInput;
+
 
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
@@ -29,8 +28,7 @@ public class NotificationHandler implements MessageHandler {
     protected PendingIntent syncPI;
 
     /**
-     *  Recent messages notification
-     *
+     * Recent messages notification
      */
     static final int NID_MSG = 1;
 
@@ -60,7 +58,6 @@ public class NotificationHandler implements MessageHandler {
     }
 
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
     public void createNotificationChannel() {
         // Channel visible name is "DMesh status"
         NotificationChannel nc = new NotificationChannel(CHANNEL_STATUS, "DMesh status",
@@ -113,12 +110,12 @@ public class NotificationHandler implements MessageHandler {
 
     /**
      * Notification shown when a BLE or Wifi DMESH or similar network is detected.
-     *
+     * <p>
      * Action is to create a mesh with the neighbor device.
      * TODO
      */
     protected Notification getNeighborNotification(Bundle data) {
-        NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, CHANNEL_WIFI);
+        Notification.Builder b = new Notification.Builder(ctx, CHANNEL_WIFI);
         b.setDefaults(Notification.DEFAULT_LIGHTS);
         b.setShowWhen(true);
         b.setContentIntent(pi);
@@ -132,11 +129,11 @@ public class NotificationHandler implements MessageHandler {
 
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            b.setStyle(new NotificationCompat.BigTextStyle()
+            b.setStyle(new Notification.BigTextStyle()
                     .setBigContentTitle(title).setSummaryText(txt).bigText(txt));
 
 
-            b.addAction(new NotificationCompat.Action(1, "Sync", syncPI));
+            b.addAction(new Notification.Action(1, "Sync", syncPI));
             RemoteInput remoteInput = new RemoteInput.Builder("cmd")
                     .setLabel("Cmd")
                     .build();
@@ -146,8 +143,8 @@ public class NotificationHandler implements MessageHandler {
                             1, // request code
                             brIntent,
                             PendingIntent.FLAG_UPDATE_CURRENT);
-            NotificationCompat.Action action =
-                    new NotificationCompat.Action.Builder(R.drawable.ic_action_dbg,
+            Notification.Action action =
+                    new Notification.Action.Builder(R.drawable.ic_action_dbg,
                             "Cmd", replyPendingIntent)
                             .addRemoteInput(remoteInput)
                             .build();
@@ -161,12 +158,12 @@ public class NotificationHandler implements MessageHandler {
 
     /**
      * Broadcast or direct message.
-     *
+     * <p>
      * Action is to reply.
      * TODO
      */
     protected Notification getMsgNotification(Bundle data) {
-        NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, CHANNEL_MSG);
+        Notification.Builder b = new Notification.Builder(ctx, CHANNEL_MSG);
         b.setDefaults(Notification.DEFAULT_LIGHTS);
 
         b.setShowWhen(true);
@@ -186,9 +183,9 @@ public class NotificationHandler implements MessageHandler {
         b.setPriority(Notification.PRIORITY_MIN);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
 
-            b.setStyle(new NotificationCompat.BigTextStyle()
+            b.setStyle(new Notification.BigTextStyle()
                     .setBigContentTitle(title).setSummaryText(txt).bigText(txt));
-            b.addAction(new NotificationCompat.Action(1, "Sync", syncPI));
+            b.addAction(new Notification.Action(1, "Sync", syncPI));
             RemoteInput remoteInput = new RemoteInput.Builder("cmd")
                     .setLabel("Cmd")
                     .build();
@@ -198,8 +195,8 @@ public class NotificationHandler implements MessageHandler {
                             1, // request code
                             brIntent,
                             PendingIntent.FLAG_UPDATE_CURRENT);
-            NotificationCompat.Action action =
-                    new NotificationCompat.Action.Builder(R.drawable.ic_action_dbg,
+            Notification.Action action =
+                    new Notification.Action.Builder(R.drawable.ic_action_dbg,
                             "Cmd", replyPendingIntent)
                             .addRemoteInput(remoteInput)
                             .build();
@@ -213,12 +210,13 @@ public class NotificationHandler implements MessageHandler {
     }
 
     /**
-     *  Main notification.
+     * Main notification.
+     *
      * @param data
      * @return
      */
     protected Notification getNotification(Bundle data) {
-        NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, CHANNEL_STATUS);
+        Notification.Builder b = new Notification.Builder(ctx, CHANNEL_STATUS);
         b.setDefaults(Notification.DEFAULT_LIGHTS);
 
         b.setShowWhen(true);
@@ -237,7 +235,7 @@ public class NotificationHandler implements MessageHandler {
                 b.setColor(0xAAF255); // light green
                 b.setSmallIcon(R.drawable.ic_router_green_900_24dp);
                 break;
-            case "blue":
+            default: // case "blue":
                 b.setColor(0x6002ee); // blue
                 b.setSmallIcon(R.drawable.ic_router_blue_900_24dp);
                 break;
@@ -259,40 +257,36 @@ public class NotificationHandler implements MessageHandler {
         // vibrate=null sound=null defaults=0x4 flags=0x63 color=0xffffde03 actions=1 vis=PRIVATE))
 
 
-
         b.setContentIntent(pi);
 
         String title = data.getString("title", "Device Mesh");
         b.setContentTitle(title);
-        String txt = data.getString("text", "Starting");
+        String txt = data.getString("text", "Active");
         b.setContentText(txt);
 
 
-        b.setStyle(new NotificationCompat.BigTextStyle()
-            .setBigContentTitle(title).setSummaryText(txt).bigText(txt));
+        b.setStyle(new Notification.BigTextStyle()
+                .setBigContentTitle(title).setSummaryText(txt).bigText(txt));
 
         b.setPriority(Notification.PRIORITY_MIN);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        b.addAction(new Notification.Action(1, "Sync", syncPI));
+        RemoteInput remoteInput = new RemoteInput.Builder("cmd")
+                .setLabel("Cmd")
+                .build();
+        PendingIntent replyPendingIntent =
+                PendingIntent.getBroadcast(ctx,
+                        1, // request code
+                        brIntent,
+                        PendingIntent.FLAG_MUTABLE
+                );
+        Notification.Action action =
+                new Notification.Action.Builder(R.drawable.ic_action_dbg,
+                        "Cmd", replyPendingIntent)
+                        .addRemoteInput(remoteInput)
+                        .build();
 
-            b.addAction(new NotificationCompat.Action(1, "Sync", syncPI));
-            RemoteInput remoteInput = new RemoteInput.Builder("cmd")
-                    .setLabel("Cmd")
-                    .build();
-            PendingIntent replyPendingIntent =
-                    PendingIntent.getBroadcast(ctx,
-                            1, // request code
-                            brIntent,
-                            PendingIntent.FLAG_MUTABLE
-                    );
-            NotificationCompat.Action action =
-                    new NotificationCompat.Action.Builder(R.drawable.ic_action_dbg,
-                            "Cmd", replyPendingIntent)
-                            .addRemoteInput(remoteInput)
-                            .build();
-
-            b.addAction(action);
-        }
+        b.addAction(action);
 
         b.setOnlyAlertOnce(true);
 

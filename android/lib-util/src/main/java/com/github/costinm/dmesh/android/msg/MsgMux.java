@@ -15,6 +15,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /**
  * MsgMux controls message dispatching and connection. Acts like an HTTP server, using path to
@@ -415,9 +416,13 @@ public class MsgMux {
     }
 
     /**
-     * Get or return a client for a particular package.
+     * Get or return a client.
      */
     public MsgConn dial(String uri) {
+        MsgConn c = activeOut.get(uri);
+        if (c != null) {
+            return c;
+        }
         String[] parts = uri.split("/");
 
         // For now the svc name is hardcoded as pkg + ".MsgService"
@@ -429,10 +434,6 @@ public class MsgMux {
             clsName = parts[1];
         }
 
-        MsgConn c = activeOut.get(uri);
-        if (c != null) {
-            return c;
-        }
 
         c = new ConnMessenger(this, pkg, clsName);
 
@@ -447,6 +448,22 @@ public class MsgMux {
         if (open != null) {
             open.handleMessage(":open", "", openM, null, null);
         }
+    }
+
+    public static interface Action {
+        public void handle(Context ctx);
+    }
+
+    public Map<Integer, Action> byCode = new HashMap<>();
+    public Map<String, Action> byName = new HashMap<>();
+
+    public void register(int id, String name, Action a) {
+        byCode.put(id, a);
+        byName.put(name, a);
+    }
+
+    public void subscribe(String type, Consumer<Message> subscriber) {
+
     }
 
     class ListHandler implements MessageHandler {

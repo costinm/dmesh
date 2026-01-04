@@ -20,8 +20,6 @@ import android.os.Parcelable;
 import android.os.SystemClock;
 import android.util.Log;
 
-import androidx.core.app.ActivityCompat;
-
 import com.github.costinm.dmesh.android.msg.ConnUDS;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
@@ -196,7 +194,7 @@ public class Bt2 implements MessageHandler {
         filter.addAction(BluetoothAdapter.ACTION_SCAN_MODE_CHANGED);
         ctx.registerReceiver(mReceiver, filter);
 
-        if (ActivityCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             // TODO: Consider calling
             //    ActivityCompat#requestPermissions
             // here to request the missing permissions, and then overriding

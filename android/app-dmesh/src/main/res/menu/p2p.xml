@@ -1,27 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<menu xmlns:app="http://schemas.android.com/apk/res-auto"
-    xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <item
-        android:id="@+id/view"
-        android:icon="@android:drawable/ic_menu_view"
-        app:showAsAction="always"
-        android:title="Web UI"
-        />
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
 
     <item
         android:id="@+id/nanping"
         android:title="NAN Ping"
-        app:showAsAction="ifRoom"
+        android:showAsAction="always"
+        android:icon="@android:drawable/ic_menu_view"
         />
 
+    <!--         android:onClick=""
+-->
     <item
-        android:id="@+id/settings"
-        android:title="Settings"
-        android:icon="@android:drawable/ic_menu_preferences"
-        app:showAsAction="never" />
+        android:id="@+id/view"
+        android:title="Web UI"
+        />
 
-    <item android:title="NAN" >
+
+    <item android:title="NAN">
         <menu>
             <item
                 android:id="@+id/nanAttach"
@@ -69,38 +64,46 @@
         android:id="@+id/dm_switch2"
         android:checkable="true"
         android:title="AP"
-        app:actionViewClass="android.widget.Switch"
-        app:showAsAction="never" />
+         />
 
     <item
         android:id="@+id/sddisc"
         android:checkable="true"
         android:title="SD"
-        app:actionViewClass="android.widget.Switch"
-        app:showAsAction="never" />
+         />
 
 
     <item
         android:id="@+id/sddisc2"
         android:title="SD"
-        app:showAsAction="always" />
+        />
 
     <item
         android:id="@+id/nanstart"
         android:icon="@android:drawable/ic_media_play"
         android:title="Advertise BLE/NAN"
-        app:showAsAction="never" />
+         />
 
     <item
         android:id="@+id/nanstop"
         android:title="Advertise BLE/NAN Stop"
-        app:showAsAction="never" />
+         />
 
+    <item
+        android:id="@+id/vpnstart"
+        android:icon="@android:drawable/ic_media_play"
+        android:title="VPN strart"
+         />
+    <item
+        android:id="@+id/vpnstop"
+        android:icon="@android:drawable/ic_media_play"
+        android:title="VPN STop"
+         />
 
     <item
         android:id="@+id/scan"
         android:title="Scan"
-        app:showAsAction="always" />
+        />
 
 
     <item
@@ -122,7 +125,24 @@
             android:id="@+id/btlegacy"
             android:title="Provision old device using BT"
             />
-            </menu>
+            <item
+                android:id="@+id/action_list_accounts"
+                android:title="List Accounts" />
+            <item
+                android:id="@+id/action_choose_account"
+                android:title="Choose Account" />
+
+            <item
+                android:id="@+id/action_profile"
+                android:title="Profile" />
+
+
+            <item
+                android:id="@+id/nav_active"
+                android:title="Active connections" />
+
+
+        </menu>
         </item>
 
     <item android:title="Debug" >
@@ -133,6 +153,10 @@
                 />
 
             <item
+                android:id="@+id/wifiAct"
+                android:title="Wifi debug activity"
+                />
+            <item
                 android:id="@+id/wificaps"
                 android:title="Wifi Info"
                  />
@@ -140,12 +164,12 @@
             <item
                 android:id="@+id/mdnssdon"
                 android:title="DNS-SD ADV On"
-                app:showAsAction="never" />
+                />
 
             <item
                 android:id="@+id/mdnssdoff"
                 android:title="DNS-SD ADV Off"
-                app:showAsAction="never" />
+                />
 
             <item
                 android:id="@+id/lastStatus"

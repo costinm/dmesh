@@ -1,13 +1,18 @@
 package com.github.costinm.dmesh.lm3;
 
 import android.Manifest;
-import android.annotation.TargetApi;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.FeatureInfo;
+import android.content.pm.PackageManager;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.NetworkSpecifier;
+import android.net.wifi.WifiManager;
 import android.net.wifi.aware.AttachCallback;
+import android.net.wifi.aware.Characteristics;
 import android.net.wifi.aware.DiscoverySessionCallback;
 import android.net.wifi.aware.IdentityChangedListener;
 import android.net.wifi.aware.PeerHandle;
@@ -22,10 +27,6 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.util.Log;
-import android.widget.Toast;
-
-import androidx.annotation.RequiresApi;
-import androidx.annotation.RequiresPermission;
 
 import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.Hex;
@@ -35,12 +36,12 @@ import java.util.List;
 import java.util.Map;
 
 public class Nan {
-    private static final String TAG = "DM/wifi/nan";
+    private static final String TAG = "nan";
     static Map<String, Device> devices = new HashMap<>();
     public WifiAwareManager nanMgr;
     public String nanId;
     Context ctx;
-    Wifi wifi;
+    LocalMesh lm;
     WifiAwareSession nanSession;
     // Not null if publish session active and nan active
     PublishDiscoverySession pubSession;
@@ -48,122 +49,188 @@ public class Nan {
     SubscribeDiscoverySession subSession;
     // Intended status of NAN subscription. subType indicates the type.
     boolean nanSub;
+
+    // Active subscription/passive pub seem better for this use case, but
+    // it's a subtle difference: sending when looking for something, not
+    // advertising it
     int subType = SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
-    // Intended status of NAN publishing.
-    boolean nanPub;
+
     int pubType = PublishConfig.PUBLISH_TYPE_SOLICITED;
-    // Intended status of NAN radio, based on command/setting.
-    // If true, when possible radio will be started.
-    boolean nanActive;
+
     byte[] nanMac;
+
     String pubServiceName = "dmesh";
-    byte[] pubServiceInfo;
 
     // called when mgr reports 'isAvailable'. NAN may be turned off when P2P is enabled or in
     // many other cases. When it returns, if we sub or adv attach will be called again.
     int msgId;
 
-    public Nan(Wifi wifi) {
-        this.wifi = wifi;
+    public Nan(LocalMesh wifi) {
+        this.lm = wifi;
         this.ctx = wifi.ctx;
-
-        nanMgr = ctx.getSystemService(WifiAwareManager.class);
-        if (nanMgr == null) {
-            return;
-        }
-
-        if (nanMgr.getCharacteristics() != null) {
-            Log.d(TAG, "/NAN/Char" + nanMgr.getCharacteristics().getMaxServiceNameLength() +
-                    "/" + nanMgr.getCharacteristics().getMaxServiceSpecificInfoLength() + " " +
-                    nanMgr.isAvailable());
-        } else {
-            Log.d(TAG, "/NAN/Avail" + nanMgr.isAvailable());
-        }
     }
 
-    boolean isAvailable() {
-        return nanMac != null && nanMgr != null && nanMgr.isAvailable();
+    public void onCreate() {
+        if (!ctx.getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE)) {
+            return;
+        }
+
+        IntentFilter filter =
+                new IntentFilter(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED);
+        BroadcastReceiver myReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                onWifiAwareStateChanged(intent);
+            }
+        };
+        ctx.registerReceiver(myReceiver, filter);
+
+        onWifiAwareStateChanged(new Intent());
     }
 
-    /**
-     * Start the NAN radio, and after that possibly publish or subscribe, if the mode is enabled.
-     * Once attach succeeds the radio will send discovery beacons and participate in NAN master.
-     */
-    private void startNanRadio() {
-        if (nanMgr == null) {
+    public void stop() {
+        if (pubSession != null) {
+            pubSession.close();
+            pubSession = null;
+        }
+        if (nanSession != null) {
+            nanSession.close();
+        }
+        nanSub = false;
+        if (subSession != null) {
+            subSession.close();
+            subSession = null;
+        }
+
+        nanSession = null;
+        MsgMux.get(ctx).publish("/net/NAN/STOP");
+        nanId = null;
+    }
+
+    public void update(Handler delayHandler) {
+        startNanSub();
+        delayHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                stopSub();
+            }
+        }, 10000);
+
+    }
+
+    public String info() {
+        WifiManager mWifiManager = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
+        StringBuilder title = new StringBuilder();
+        // May be used to reduce scans
+        if (ctx.getPackageManager().hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE)) {
+            if (nanMgr == null) {
+                title.append(" NAN=FEATURE");
+            } else if (!nanMgr.isAvailable()) {
+                title.append(" NAN=UNAVAILABLE");
+            } else {
+                Characteristics ch = nanMgr.getCharacteristics();
+
+                title.append("SUP_DP=" + ch.getNumberOfSupportedDataPaths());
+                title.append(" SINFO_LEN=" + ch.getMaxServiceSpecificInfoLength());
+                title.append(" SN_LEN=" + ch.getMaxServiceNameLength());
+                title.append(" DI_LEN=" + ch.getNumberOfSupportedDataInterfaces());
+                title.append(" PUB_LEN=" + ch.getNumberOfSupportedPublishSessions());
+                title.append(" SUB_LEN=" + ch.getNumberOfSupportedSubscribeSessions());
+                title.append("DP=" + nanMgr.getAvailableAwareResources().getAvailableDataPathsCount() +
+                        " PUB=" + nanMgr.getAvailableAwareResources().getAvailablePublishSessionsCount() +
+                        " SUB=" + nanMgr.getAvailableAwareResources().getAvailableSubscribeSessionsCount());
+            }
+            title.append("\n");
+        }
+
+        title.append("WifiFeatures: ");
+        // This includes many non-wifi features.
+        // The methods that translate to feature:
+        // - isEnhancedPowerReportingSupported() -> LINK_LAYER_STATS
+        // - isTdlsSupported -> TDLS
+        // - isP2pSupported
+        // - is EasyConnectSupported
+        FeatureInfo[] fi = ctx.getPackageManager().getSystemAvailableFeatures();
+        for (FeatureInfo f : fi) {
+            if (f.name != null && f.name.toLowerCase().contains("wifi")) {
+                title.append(f.name + "\n");
+            }
+        }
+        if (mWifiManager.is5GHzBandSupported()) {
+            title.append("5G, ");
+        }
+        if (mWifiManager.isPreferredNetworkOffloadSupported()) {
+            title.append("Offload_Scan, ");
+        }
+        return title.toString();
+    }
+
+    public void onWifiAwareStateChanged(Intent i) {
+        i.getBooleanExtra("foo", true);
+
+        if (ctx.checkSelfPermission(Manifest.permission.ACCESS_WIFI_STATE) != PackageManager.PERMISSION_GRANTED ||
+                ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
+                ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+            Log.d(TAG, "Missing permissions");
             return;
         }
-        nanActive = true;
-        if (!nanMgr.isAvailable()) {
-            return;
-        }
-        Log.d(TAG, "/NAN/ATTACH");
         try {
-            nanMgr.attach(new AttachCallback() {
-                @Override
-                public void onAttached(WifiAwareSession session) {
-                    super.onAttached(session);
-                    nanSession = session;
-
-                    if (nanPub) {
-                        publish();
-                    }
-
-                    if (nanSub) {
-                        startNanSub();
-                    }
-
-                    MsgMux.get(ctx).publish("/net/NAN/Attach");
-                }
-
-                @Override
-                public void onAttachFailed() {
-                    super.onAttachFailed();
-                    MsgMux.get(ctx).publish("/net/NAN/AttachError");
-                }
-            }, new IdentityChangedListener() {
-                @Override
-                public void onIdentityChanged(byte[] mac) {
-                    super.onIdentityChanged(mac);
-                    nanMac = mac;
-                    nanId = new String(Hex.encode(mac));
-                    MsgMux.get(ctx).publish("/net/NAN/MAC/" + nanId);
-
-                    wifi.sendWifiDiscoveryStatus("/nan/id", "");
-                }
-            }, null);
-        } catch (Throwable t) {
-            Log.d(TAG, "/NAN/ " + t);
-            MsgMux.get(ctx).publish("/net/NAN/AttachError", "err", t.getMessage());
-        }
-    }
-
-    /**
-     * Set nan radio desired state.
-     * <p>
-     * If on - will attempt to attach, and if not possible will attach when it it becomes so.
-     * <p>
-     * If off, close the NAN session, will stop sending discovery beacons - and not start again.
-     */
-    public void nanRadio(boolean on) {
-        nanActive = on;
-        if (on) {
-            startNanRadio();
-        } else {
-            nanActive = false;
-            // TODO: for now auto-starts if available.
-            if (nanSession == null) {
+            nanMgr = ctx.getSystemService(WifiAwareManager.class);
+            if (nanMgr == null) {
+                Log.d(TAG, "State changed - no system service" + i.getAction() + " " + i.getExtras());
                 return;
             }
+            if (nanMgr.isAvailable()) {
+                if (nanMgr.getCharacteristics() != null) {
+                    Log.d(TAG, "/NAN/Char" + nanMgr.getCharacteristics().getMaxServiceNameLength() +
+                            "/" + nanMgr.getCharacteristics().getMaxServiceSpecificInfoLength() + " " +
+                            nanMgr.isAvailable());
+                } else {
+                    Log.d(TAG, "WifiAware available");
+                }
+                if (Build.VERSION.SDK_INT >= 34) {
+                    nanMgr.setOpportunisticModeEnabled(true);
+                }
+                // TODO: add a setting to control 'on' or 'off' for local mesh.
+                // if local mesh is on - Nan is best option.
+                nanMgr.attach(new AttachCallback() {
+                    @Override
+                    public void onAttached(WifiAwareSession session) {
+                        super.onAttached(session);
+                        nanSession = session;
 
-            nanSession.close();
-            nanSession = null;
-            nanId = null; // will be reset on next start.
+                        // No point being attached and not using discovery.
+                        publish();
+                        startNanSub();
+
+                        MsgMux.get(ctx).publish("/net/NAN/Attach");
+                    }
+
+                    @Override
+                    public void onAttachFailed() {
+                        super.onAttachFailed();
+                        MsgMux.get(ctx).publish("/net/NAN/AttachError");
+                    }
+                }, new IdentityChangedListener() {
+                    @Override
+                    public void onIdentityChanged(byte[] mac) {
+                        super.onIdentityChanged(mac);
+                        nanMac = mac;
+                        nanId = new String(Hex.encode(mac));
+                        MsgMux.get(ctx).publish("/net/NAN/MAC/" + nanId);
+                        lm.sendWifiDiscoveryStatus("/nan/id", "");
+                    }
+                }, null);
+            } else {
+                Log.d(TAG, "WifiAware unavailabe");
+                stop();
+            }
+        } catch(Throwable t) {
+            t.printStackTrace();
         }
     }
 
     void onDiscovered(PeerHandle peerHandle, byte[] serviceSpecificInfo, boolean byPublisher) {
-
         Device bd = new Device(peerHandle, serviceSpecificInfo);
         Device old = devices.get(bd.id);
         if (old == null) {
@@ -189,114 +256,31 @@ public class Nan {
             MsgMux.get(ctx).publish("/net/NAN/SubServiceDiscovered/" + info + "/" + peerHandle);
             bd.nanSession = subSession;
         }
-        send(bd.id, "FOUND");
-
-        //conNan(bd.id);
+        // Send a message to the found device to verify messaging works and introduce ourselves.
+        //
+        send(bd.id, "FOUNDP " + lm.id4 + " " + new String(serviceSpecificInfo) + " " +
+                (byPublisher ? "P" : "S"));
     }
 
     private void onDiscovery(Device bd, String id, boolean b) {
-        wifi.sendWifiDiscoveryStatus("nan", "");
+        lm.sendWifiDiscoveryStatus("nan", "");
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
     private void publish() {
+        if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
+                ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+            Log.d(TAG, "Missing permissions");
+            return;
+        }
         PublishConfig pub = new PublishConfig.Builder().setServiceName(pubServiceName)
                 .setPublishType(pubType) // silent, but respond to active requests
                 .setTerminateNotificationEnabled(true)
-                .setServiceSpecificInfo(wifi.adv.getBytes())
+                .setServiceSpecificInfo(lm.adv.getBytes())
                 .build();
-        nanSession.publish(pub, new MyNanCallback(true) {
-            @Override
-            public void onPublishStarted(PublishDiscoverySession session) {
-                super.onPublishStarted(session);
-                Log.d(TAG, "/NAN/PubStart");
-                MsgMux.get(ctx).publish("/net/NAN/PubStart");
-                pubSession = session;
-            }
-
-            @Override
-            public void onSessionTerminated() {
-                super.onSessionTerminated();
-                pubSession = null;
-                MsgMux.get(ctx).publish("/net/NAN/PubStop", "dev", "" + devices);
-            }
-
-            @Override
-            public void onMessageReceived(PeerHandle peerHandle, byte[] message) {
-
-                super.onMessageReceived(peerHandle, message);
-                String msg = new String(message);
-                if (msg.startsWith("PING")) {
-                    pubSession.sendMessage(peerHandle, 1, "PONGP".getBytes());
-                    Toast.makeText(wifi.ctx, "PINGP " + msg, Toast.LENGTH_SHORT);
-                } else if (msg.equals("CON")) {
-                    NetworkSpecifier ns;
-                    if (Build.VERSION.SDK_INT >= 29) {
-                        ns = new WifiAwareNetworkSpecifier.Builder(pubSession, peerHandle).build();
-                    } else {
-                        ns = pubSession.createNetworkSpecifierOpen(peerHandle);
-                    }
-                    NetworkRequest nr = new NetworkRequest.Builder()
-                            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE)
-                            .setNetworkSpecifier(ns).build();
-                    wifi.cm.requestNetwork(nr, new Wifi.ConnectivityCallback(wifi), 10000);
-                    pubSession.sendMessage(peerHandle, 1, "CONS".getBytes());
-
-                } else {
-                    Toast.makeText(wifi.ctx, "NAN: " + msg, Toast.LENGTH_SHORT);
-                }
-                MsgMux.get(ctx).publish("/net/NAN/TXT/" + msg + "/" + peerHandle);
-            }
-        }, null);
-    }
-
-    public void onWifiAwareStateChanged(Intent i) {
-        i.getBooleanExtra("foo", true);
-        Log.d("NAN", "State changed " + i.getAction() + " " + i.getExtras());
-        if (isAvailable()) {
-            if (nanActive) {
-                startNanRadio();
-            }
-        } else {
-            nanSession = null;
-            MsgMux.get(ctx).publish("/net/NAN/STOP");
-        }
-    }
-
-    public void pub(boolean active) {
-        nanPub = true;
-        pubType = active ? PublishConfig.PUBLISH_TYPE_UNSOLICITED : PublishConfig.PUBLISH_TYPE_SOLICITED;
-
-        if (!isAvailable()) {
-            nanRadio(true);
-            return;
-        }
-        if (pubSession == null) {
-            if (nanSession == null) {
-                startNanRadio(); // will use nanAnnActive to activate publish when attached
-            } else {
-                publish();
-            }
-        }
-    }
-
-    public void stopPub() {
-        nanPub = false;
-        if (pubSession != null) {
-            pubSession.close();
-            pubSession = null;
-        }
-    }
-
-    public void sub(Handler h, boolean active) {
-        subType = active ? SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE : SubscribeConfig.SUBSCRIBE_TYPE_PASSIVE;
-        nanSub = active;
-
         if (nanSession == null) {
-            nanRadio(true); // will set sub session
-        } else {
-            startNanSub();
+                return;
         }
+        nanSession.publish(pub, new NanDiscoveryCallback(true), null);
     }
 
     public void stopSub() {
@@ -314,61 +298,23 @@ public class Nan {
      * Will stay active until 'stop' is called.
      */
     private void startNanSub() {
-
         SubscribeConfig cfg = new SubscribeConfig.Builder()
                 .setServiceName("dmesh")
-                .setServiceSpecificInfo(wifi.adv.getBytes())
+                .setServiceSpecificInfo(lm.adv.getBytes())
                 .setSubscribeType(subType)
                 .setTerminateNotificationEnabled(true)
                 .build();
         Log.d(TAG, "/NAN/Subscribe");
+        if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
+                ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+            Log.d(TAG, "Missing permissions");
+            return;
+        }
+        if (nanSession == null) {
+            return;
+        }
 
-        nanSession.subscribe(cfg, new MyNanCallback(false) {
-
-            @Override
-            public void onSubscribeStarted(SubscribeDiscoverySession session) {
-                super.onSubscribeStarted(session);
-                Log.d(TAG, "/NAN/SubStart" + session);
-                MsgMux.get(ctx).publish("/net/NAN/SubStart");
-                subSession = session;
-            }
-
-            @Override
-            public void onSessionTerminated() {
-                super.onSessionTerminated();
-                subSession = null;
-                MsgMux.get(ctx).publish("/net/NAN/SubStop", "dev", "" + devices);
-            }
-
-
-            @Override
-            public void onMessageReceived(final PeerHandle peerHandle, byte[] message) {
-                super.onMessageReceived(peerHandle, message);
-                String msg = new String(message);
-                if (msg.equals("CONS")) {
-                    wifi.delayHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            NetworkSpecifier ns;
-                            if (Build.VERSION.SDK_INT >= 29) {
-                                ns = new WifiAwareNetworkSpecifier.Builder(subSession, peerHandle).build();
-                            } else {
-                                ns = subSession.createNetworkSpecifierOpen(peerHandle);
-                            }
-                            NetworkRequest nr = new NetworkRequest.Builder()
-                                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE)
-                                    .setNetworkSpecifier(ns).build();
-                            wifi.cm.requestNetwork(nr, new Wifi.ConnectivityCallback(wifi), 10000);
-                        }
-                    }, 3000);
-                } else {
-                    Toast.makeText(wifi.ctx, "NAN: " + msg, Toast.LENGTH_SHORT);
-                }
-
-                MsgMux.get(ctx).publish("/net/NAN/TXT/" + msg + "/" + peerHandle);
-                Log.d(TAG, "NAN received: " + msg + " " + peerHandle);
-            }
-        }, null);
+        nanSession.subscribe(cfg, new NanDiscoveryCallback(false), null);
 
     }
 
@@ -377,9 +323,10 @@ public class Nan {
      *
      * @param id - the primary ID, from the pub announce.
      */
-    @RequiresApi(api = Build.VERSION_CODES.O)
     public void conNan(String id) {
         if ("0".equals(id) || "*".equals(id)) {
+            // This is unlikely to work well - there are limits on how many.
+            // Good to identify them...
             for (Device d : devices.values()) {
                 subSession.sendMessage(d.nan, msgId++, "CON".getBytes());
                 if ("0".equals(id)) {
@@ -396,10 +343,8 @@ public class Nan {
         if (d.nan != null) {
             subSession.sendMessage(d.nan, msgId++, "CON".getBytes());
         }
-
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
     public void sendAll(String id) {
         if (subSession != null) {
             for (Device d : devices.values()) {
@@ -421,7 +366,6 @@ public class Nan {
         }
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
     public void send(String id, String msg) {
         Device d = devices.get(id);
         if (d != null && d.nan != null && d.nanSession != null) {
@@ -429,19 +373,17 @@ public class Nan {
         }
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
-    class MyNanCallback extends DiscoverySessionCallback {
+    /**
+     * Used for both publish and subscribe, get notified of nearby
+     * devices.
+     */
+    class NanDiscoveryCallback extends DiscoverySessionCallback {
         private final boolean pub;
 
-        public MyNanCallback(boolean pub) {
+        public NanDiscoveryCallback(boolean pub) {
             this.pub = pub;
         }
 
-        @Override
-        public void onSessionTerminated() {
-            devices.clear(); // TODO: only devices of given type
-            super.onSessionTerminated();
-        }
 
         /**
          * It appears only subscriber discovers the publisher, not the other way around.
@@ -490,6 +432,72 @@ public class Nan {
             super.onMessageSendFailed(messageId);
             MsgMux.get(ctx).publish("/net/NAN/MSGERR", "id", Integer.toString(messageId));
         }
+
+        @Override
+        public void onSubscribeStarted(SubscribeDiscoverySession session) {
+            super.onSubscribeStarted(session);
+            Log.d(TAG, "/NAN/SubStart" + session);
+            MsgMux.get(ctx).publish("/net/NAN/SubStart");
+            subSession = session;
+        }
+
+        @Override
+        public void onPublishStarted(PublishDiscoverySession session) {
+            super.onPublishStarted(session);
+            Log.d(TAG, "/NAN/PubStart");
+            MsgMux.get(ctx).publish("/net/NAN/PubStart");
+            pubSession = session;
+        }
+
+        @Override
+        public void onSessionTerminated() {
+            super.onSessionTerminated();
+            devices.clear(); // TODO: only devices of given type
+            pubSession = null;
+            if (pub) {
+                MsgMux.get(ctx).publish("/net/NAN/PubStop", "dev", "" + devices);
+            } else {
+                MsgMux.get(ctx).publish("/net/NAN/SubStop", "dev", "" + devices);
+            }
+        }
+
+        @Override
+        public void onMessageReceived(PeerHandle peerHandle, byte[] message) {
+            super.onMessageReceived(peerHandle, message);
+            String msg = new String(message);
+
+            if (msg.equals("CONS")) {
+                lm.delayHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        NetworkSpecifier ns;
+                        ns = new WifiAwareNetworkSpecifier.Builder(subSession, peerHandle).build();
+                        NetworkRequest nr = new NetworkRequest.Builder()
+                                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE)
+                                .setNetworkSpecifier(ns).build();
+                        lm.cm.requestNetwork(nr, new LocalMesh.ConnectivityCallback(lm), 10000);
+                    }
+                }, 3000);
+            } else if (msg.startsWith("PING")) {
+                pubSession.sendMessage(peerHandle, 1, "PONGP".getBytes());
+            } else if (msg.equals("CON")) {
+                NetworkSpecifier ns;
+                if (Build.VERSION.SDK_INT >= 29) {
+                    ns = new WifiAwareNetworkSpecifier.Builder(pubSession, peerHandle).build();
+                } else {
+                    ns = pubSession.createNetworkSpecifierOpen(peerHandle);
+                }
+                NetworkRequest nr = new NetworkRequest.Builder()
+                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE)
+                        .setNetworkSpecifier(ns).build();
+                lm.cm.requestNetwork(nr, new LocalMesh.ConnectivityCallback(lm), 10000);
+                pubSession.sendMessage(peerHandle, 1, "CONS".getBytes());
+            }
+
+            MsgMux.get(ctx).publish("/net/NAN/TXT/" + msg + "/" + peerHandle);
+            Log.d(TAG, "NAN received: " + msg + " " + peerHandle);
+        }
+
     }
 
 
