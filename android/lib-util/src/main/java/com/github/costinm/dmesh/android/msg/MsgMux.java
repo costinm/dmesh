@@ -8,7 +8,9 @@ import android.os.Message;
 import android.os.Parcelable;
 import android.util.Log;
 
-import com.github.costinm.dmesh.android.util.NetUtil;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -111,7 +113,7 @@ public class MsgMux {
                 out.add(o.toString());
             } else if (o instanceof Bundle) {
                 out.add(k);
-                s = NetUtil.toJSON((Bundle) o).toString();
+                s = toJSON((Bundle) o).toString();
                 out.add(s);
             } else if (o != null) {
                 out.add(k);
@@ -121,6 +123,40 @@ public class MsgMux {
         }
         return out;
     }
+
+    public static JSONObject toJSON(Bundle b) {
+        JSONObject jso = new JSONObject();
+        for (String k : b.keySet()) {
+            try {
+                Object o1 = b.get(k);
+
+                if (o1 instanceof CharSequence) {
+                    jso.put(k, o1.toString());
+                } else if (o1 instanceof Bundle) {
+                    jso.put(k, toJSON((Bundle) o1));
+                } else if (o1 instanceof ArrayList) {
+                    jso.put(k, toJSON((ArrayList) o1));
+                }
+            } catch (JSONException ex) {
+                ex.printStackTrace();
+            }
+        }
+        return jso;
+    }
+
+    public static JSONArray toJSON(ArrayList a) {
+        JSONArray ar = new JSONArray();
+
+        for (Object o : a) {
+            if (o instanceof Bundle) {
+                ar.put(toJSON((Bundle) o));
+            } else if (o instanceof ArrayList) {
+                ar.put(toJSON((ArrayList) o));
+            }
+        }
+        return ar;
+    }
+
 
     /**
      * Send a broadcast message to all connected services.

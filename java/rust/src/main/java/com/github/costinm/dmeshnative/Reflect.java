@@ -1,4 +1,4 @@
-package com.github.costinm.dmesh.android.util;
+package com.github.costinm.dmeshnative;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;

@@ -21,13 +21,14 @@ dependencyResolutionManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
-    
+    }
 }
 
 rootProject.name = "DMesh"
 include(
-    "java:rust", 
+    "java:rust",
     "android:wpgate-aar",
-     "android:lib-util", 
+     "android:lib-util",
      "android:lib-lm3",
-     "android:app-dmesh")
+     "android:app-dmesh"
+)

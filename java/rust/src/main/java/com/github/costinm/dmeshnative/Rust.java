@@ -2,7 +2,9 @@ package com.github.costinm.dmeshnative;
 
 public class Rust {
     static {
-        System.loadLibrary("libdmeshrs");
+        // TODO: pass lib dir explicitly, find
+        System.load(System.getProperty("user.dir") + 
+        "/../../../target/debug/libdmesh.so");
     }
 
     public static native void invokeCallbackViaJNI(Callback c);

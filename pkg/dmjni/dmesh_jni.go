@@ -1,14 +1,23 @@
-package wpgate
+package dmjni
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/costinm/dmesh/pkg/anet"
 	"github.com/costinm/dmesh/pkg/lwip"
+	"github.com/costinm/meshauth/pkg/local"
+	ssh_mesh "github.com/costinm/ssh-mesh"
+	"github.com/costinm/ssh-mesh/nio"
+	"github.com/costinm/ssh-mesh/pkg/udp"
 	// Use LWIP for VPN
 )
 
@@ -44,17 +53,15 @@ type MessageHandler interface {
 }
 
 var (
-	//ld *local.LLDiscovery
-	//gw      *ugatesvc.UGate
-	//udpGate *udp.UDPGate
+	ld      *local.LLDiscovery
 	vpnFile *os.File
 )
 
 // Update is called in a Job, with wake locks.
 func Update() {
-	// if ld != nil {
-	// 	ld.RefreshNetworks()
-	// }
+	if ld != nil {
+		ld.RefreshNetworks()
+	}
 }
 
 // Called to inject a message into Go impl
@@ -93,9 +100,25 @@ func StartVPN(fd int) {
 	syscall.SetNonblock(fd, false)
 	vpnFile = os.NewFile(uintptr(fd), "dmesh-socket-"+strconv.Itoa(fd))
 	log.Println("Received VPN UDS client (v), starting TUN", fd)
-	tun := lwip.NewTUNFD(vpnFile, nil, nil)
-	//tun := netstack.NewTUNFD(fa, gw, udpNat)
-	//udpGate.TransparentUDPWriter = tun
+
+	tun := lwip.NewTUNFD(vpnFile,
+		func(nc net.Conn, target, la *net.TCPAddr) {
+			dst, err := net.DialTCP("tcp", nil, target)
+			if err != nil {
+				slog.Warn("Egress.Error: ", "to", target, "from", la, "err", err)
+				return
+			}
+			err = nio.Proxy(dst, nc, nc, target.String())
+			if err != nil {
+				slog.Warn("Egress.ProxyError: ", "to", target, "from", la, "err", err)
+				return
+			}
+			slog.Info("Egress: ", "to", target, "from", la)
+			// TODO: apply policies.
+		},
+		func(dstAddr net.IP, dstPort uint16, localAddr net.IP, localPort uint16, data []byte) {})
+
+	udp.TransparentUDPWriter = tun
 	log.Println("Tun started", tun)
 }
 
@@ -120,17 +143,25 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// File-based config
 	//config := ugatesvc.NewConf(baseDir)
 	log.Println("Starting native on ", baseDir)
-	// Init or load certificates/keys
 
-	// gcfg := &ugate.GateCfg{
-	// 	BasePort: 15000,
-	// 	Name:     os.Getenv("HOSTNAME"),
-	// 	Domain:   "v.webinf.info",
-	// }
+	// Patch interfaces
+	local.Interfaces = anet.Interfaces
 
-	// gw = ugatesvc.NewGate(nil, nil, gcfg, config)
+	ctx := context.Background()
 
-	// msgs.DefaultMux.Auth = gw.Auth
+	s := ssh_mesh.NewSSHM()
+	s.SSH.FromEnv()
+	err := s.Provision(ctx)
+	if err != nil {
+		fmt.Printf("SSHMesh error %v", err)
+		return nil
+	}
+
+	s.Start(ctx)
+
+	disc := &local.LLDiscovery{}
+	disc.Provision(ctx)
+	disc.Start()
 
 	// msgs.DefaultMux.AddHandler("*", msgs.HandlerCallbackFunc(func(ctx context.Context, cmdS string, meta map[string]string, data []byte) {
 	// 	var metaB []byte
@@ -139,26 +170,13 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// 	callbackFunc.Handle(cmdS, metaB, data)
 	// }))
 
-	// msgs.DefaultMux.Send("./test/local", nil)
-
 	// hproxy := http_proxy.NewHTTPProxy(gw)
 	// hproxy.HttpProxyCapture(fmt.Sprintf("127.0.0.1:%d", gcfg.BasePort+ugate.PORT_HTTP_PROXY))
 
-	// ugatesvc.Conf(config, "MESH", "v.webinf.info:5222")
-
-	// If key=="" - uses port 443
-	// Else - default is 15007
-	// Set host config for other settings
 	//gw.Config.H2R["h.webinf.info"] = "B5B6KYYUBVKCX4PWPWSWAIHW2X2D3Q4HZPJYWZ6UECL2PAODHTFA"
 	//gcfg.H2R["c1.webinf.info"] = ""
 
 	//gw.H2Handler.UpdateReverseAccept()
-
-	//// Connect to a mesh node
-	//if meshH != "" {
-	//	GW.Vpn = meshH
-	//	go sshgate.MaintainVPNConnection(GW)
-	//}
 
 	// Local discovery interface - multicast, local network IPs
 	// ld = local.NewLocal(gw, gw.Auth)
@@ -167,11 +185,6 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// local.ListenUDP(ld)
 
 	// gw.Mux.HandleFunc("/dmesh/ll/if", ld.HttpGetLLIf)
-
-	//h2s, err := h2.NewTransport(authz)
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
 
 	// DNS capture, interpret the names, etc
 	// Off until DNS moved to smaller package.
@@ -185,13 +198,5 @@ func InitDmesh(baseDir string, callbackFunc MessageHandler) []byte {
 	// //hgw := httpproxy.NewHTTPGate(GW, h2s)
 	// //hgw.HttpProxyCapture("localhost:5204")
 
-	// go dnss.Serve()
-
-	// log.Printf("Loading with VIP6: %v ID64: %s\n",
-	// 	gw.Auth.VIP6,
-	// 	base64.RawURLEncoding.EncodeToString(gw.Auth.VIP6[8:]))
-
-	// callbackFunc.Handle("/STARTED", nil, nil)
-	// msgs.DefaultMux.Send("/START1", nil)
 	return nil // gw.Auth.VIP6
 }

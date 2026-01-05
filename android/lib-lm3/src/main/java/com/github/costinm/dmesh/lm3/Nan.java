@@ -10,6 +10,7 @@ import android.content.pm.PackageManager;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.NetworkSpecifier;
+import android.net.wifi.ScanResult;
 import android.net.wifi.WifiManager;
 import android.net.wifi.aware.AttachCallback;
 import android.net.wifi.aware.Characteristics;
@@ -272,10 +273,15 @@ public class Nan {
             Log.d(TAG, "Missing permissions");
             return;
         }
+        // According to docs, 6-byte hashed service name is sent on the wire - along with the 6 byte local MAC.
+        // This is sufficient for discovery and communication - security is at higher level.
+        //
+        // adv is about 255 bytes.
         PublishConfig pub = new PublishConfig.Builder().setServiceName(pubServiceName)
                 .setPublishType(pubType) // silent, but respond to active requests
                 .setTerminateNotificationEnabled(true)
                 .setServiceSpecificInfo(lm.adv.getBytes())
+                .setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ)
                 .build();
         if (nanSession == null) {
                 return;
@@ -303,6 +309,7 @@ public class Nan {
                 .setServiceSpecificInfo(lm.adv.getBytes())
                 .setSubscribeType(subType)
                 .setTerminateNotificationEnabled(true)
+                .setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ)
                 .build();
         Log.d(TAG, "/NAN/Subscribe");
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||

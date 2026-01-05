@@ -1,0 +1,48 @@
+[package]
+name = "dmesh"
+version = "0.0.1"
+# same as android - deps also use similar versions.
+# Version used by android - one of the targets.
+# See external/rust/android-crates-io/crates for list of crates
+# ported to android and usable in system.
+edition = "2021" 
+
+[build-dependencies]
+rsbinder-aidl = { version="0.4.3", features = ["async"] }
+
+[dependencies]
+ssh-mesh = { path = "../ssh-mesh" }
+#ssh-mesh = { git = "https://github.com/costinm/ssh-mesh" }
+
+jni = "0.21.1"
+libc = "0.2.161"
+
+log = "0.4.26"
+ctrlc = "3.2.1"
+
+tokio = { version = "1", features = ["full"] }
+
+clap = { version = "4.0", features = ["derive"] }
+
+env_logger = "0.10"
+
+[dev-dependencies]
+tempfile = "3.3"
+serial_test = "3.0"
+
+[lib]
+name = "dmesh"
+crate-type = ["cdylib", "rlib"]
+
+
+[[bin]]
+name = "dmesh"
+path = "src/main.rs"
+
+
+[profile.release]
+strip = true  # Automatically strip symbols from the binary.
+opt-level = "z"  # Optimize for size.
+lto = true # link time optimization  - may remove dead code
+codegen-units = 1 # See https://github.com/johnthagen/min-sized-rust
+panic = "abort"

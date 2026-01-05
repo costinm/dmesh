@@ -4,18 +4,6 @@
 
 Most difficult part is keeping the network alive in doze/idle mode - most popular commands:
 
-```
-adb shell dumpsys deviceidle force-idle
-adb shell dumpsys battery unplug
-adb shell dumpsys battery reset
-
-adb shell am get-idle PACKAGE
-adb shell am set-idle PACKAGE true|false
-
-```
-
-In idle mode, ping does not work - tcpdump shows the packet is sent, but response doesn't make it trough (at least to the shell)
-
 ## Tcpdump
 
 ```
@@ -30,3 +18,7 @@ Filters:
 wlan_mgt.ssid contains "DIRECT"
 
 ```
+# Remote adb
+
+- Ssh with `LocalForward 6018 127.0.0.1:5027`
+- ADB_SERVER_SOCKET=tcp:localhost:6018 adb devices

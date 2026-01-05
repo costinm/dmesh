@@ -16,3 +16,5 @@ bazel-testlogs
 bazel-genfiles
 libEnvoy.so
 android/local.properties
+.cargo/config.toml
+build

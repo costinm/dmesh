@@ -9,8 +9,10 @@ import (
 	"net"
 
 	"github.com/costinm/go-tun2socks/core"
-	//"github.com/costinm/ugate/pkg/udp"
 
+	"github.com/costinm/ssh-mesh/pkg/udp"
+
+	
 	"github.com/songgao/water"
 )
 
@@ -53,7 +55,7 @@ func (l *LWIP) Provision(ctx context.Context) error {
 		log.Println("TProxy UDP ", dstAddr, dstPort, localAddr, localPort, len(data))
 	})
 	// Use the TUN for transparent UDP write ?
-	//udp.TransparentUDPWriter = t
+	udp.TransparentUDPWriter = t
 	return nil
 }
 
