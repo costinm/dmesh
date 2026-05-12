@@ -20,7 +20,7 @@ android {
         applicationId = "com.github.costinm.dmesh.lm"
         minSdk = providers.gradleProperty("MIN_SDK_VERSION").get().toInt()
         // 30 - Android 11, 2020
-        versionCode = 7
+        versionCode = 30
         versionName = "1.4"
         multiDexEnabled = false
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -54,6 +54,7 @@ android {
 
 dependencies {
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
+    androidTestImplementation("androidx.test:runner:1.2.0")
 
     //implementation(libs.androidx.appcompat)
     //implementation(libs.androidx.cardview)
@@ -66,6 +67,7 @@ dependencies {
     implementation(project(mapOf("path" to ":android:lib-util")))
     implementation(project(mapOf("path" to ":android:lib-lm3")))
     implementation(project(mapOf("path" to ":android:wpgate-aar")))
+    implementation(project(mapOf("path" to ":java:rust")))
 
     //implementation(libs.androidx.monitor)
 

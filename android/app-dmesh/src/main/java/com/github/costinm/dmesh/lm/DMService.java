@@ -101,7 +101,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
     }
 
     public void onTrimMemory(int level) {
-        Log.d(TAG, "On Trim memory");
+        Log.d(TAG, "On Trim memory " + level);
     }
 
     public static class Receiver extends BroadcastReceiver {

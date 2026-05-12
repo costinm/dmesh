@@ -48,7 +48,9 @@ rustinit:
 rust:
 	cargo ndk build -t x86_64-linux-android -o android/app-dmesh/src/main/jniLibs/
 	cargo ndk build -t aarch64-linux-android -o android/app-dmesh/src/main/jniLibs/
+	cargo ndk build -t armv7-linux-androideabi -o android/app-dmesh/src/main/jniLibs/
 
+# Old gomobile target
 native:
 	cd pkg/dmjni && \
 	  gomobile bind \
@@ -66,6 +68,7 @@ NDK_GO_ARCH_mips64 := mips64x
 
 ANDROID_NDK_ROOT=${HOME}/Android/Sdk/ndk/29.0.14206865
 SYSROOT=${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+NDK_TOOLCHAIN=${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64
 export NDK_LOG=1
 
 JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
@@ -79,14 +82,35 @@ CGO_CFLAGS:="${CLANG_FLAGS} ${CFLAGS} -I${JAVA_HOME}/include/linux -I${JAVA_HOME
 jni:
 	mkdir -p android/app-dmesh/src/test/jniLibs
 	# CGO appears to be required
-	CGO_CFLAGS=${CGO_CFLAGS} CGO_ENABLED=1 GOARCH=amd64 \
-	go build -o android/app-dmesh/src/test/jniLibs/libdmjni.so -buildmode c-shared ./pkg/dmeshd
+	CGO_CFLAGS=${CGO_CFLAGS} \
+	CGO_ENABLED=1 \
+	GOARCH=amd64 \
+	  go build -o android/app-dmesh/src/test/jniLibs/libdmjni.so -buildmode c-shared ./pkg/dmeshd
 
 ajni:
-	CC=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android35-clang GOOS=android CGO_CFLAGS=${CGO_CFLAGS} CGO_ENABLED=1 GOARCH=amd64 \
+	CC=${NDK_TOOLCHAIN}/bin/x86_64-linux-android35-clang \
+    GOOS=android \
+	CGO_CFLAGS=${CGO_CFLAGS} \
+	CGO_ENABLED=1 \
+	GOARCH=amd64 \
 	 go build \
 	   -o android/app-dmesh/src/main/jniLibs/x86_64/libdmjni.so -buildmode c-shared ./pkg/dmeshd
 
+	CC=${NDK_TOOLCHAIN}/bin/aarch64-linux-android35-clang \
+    GOOS=android \
+	CGO_CFLAGS=${CGO_CFLAGS} \
+	CGO_ENABLED=1 \
+	GOARCH=arm64 \
+	 go build \
+	   -o android/app-dmesh/src/main/jniLibs/arm64-v8a/libdmjni.so -buildmode c-shared ./pkg/dmeshd
+
+	CC=${NDK_TOOLCHAIN}/bin/armv7a-linux-androideabi35-clang \
+    GOOS=android \
+	CGO_CFLAGS=${CGO_CFLAGS} \
+	CGO_ENABLED=1 \
+	GOARCH=arm GOARM=7 \
+	 go build \
+	   -o android/app-dmesh/src/main/jniLibs/armeabi-v7a/libdmjni.so -buildmode c-shared ./pkg/dmeshd
 
 
 connect:
