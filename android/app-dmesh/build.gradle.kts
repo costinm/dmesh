@@ -67,7 +67,7 @@ dependencies {
     implementation(project(mapOf("path" to ":android:lib-util")))
     implementation(project(mapOf("path" to ":android:lib-lm3")))
     implementation(project(mapOf("path" to ":android:wpgate-aar")))
-    implementation(project(mapOf("path" to ":java:rust")))
+    implementation(files("libs/dmesh.aar"))
 
     //implementation(libs.androidx.monitor)
 
