@@ -1,3 +1,9 @@
+# Radio research notes
+
+Status: historical/research notes. These observations are still useful for
+debugging Android WiFi, multicast, and 802.11s behavior, but they are not the
+current API contract.
+
 # DNS-SD discovery
 Did some experiments - before finding that IPv4 won't work well or getting P2P discovery to work reliably.
 Battery usage isn't good - DNS-SD requires a wake lock and it gets a lot of traffic. It doesn't seem to
@@ -84,4 +90,3 @@ Most useful commands, work on android (rooted):
 ip -6 route show
 ip -6 neigh show
 ```
-

@@ -347,6 +347,18 @@ public class MsgMux {
         return false;
     }
 
+    boolean handleFrame(String src, MsgConn con, MsgFrame frame) {
+        return handleMessage(src, con, frame.toMessage());
+    }
+
+    public boolean receive(String src, MsgConn con, Message msg) {
+        return handleMessage(src, con, msg);
+    }
+
+    public boolean receiveFrame(String src, MsgConn con, MsgFrame frame) {
+        return handleFrame(src, con, frame);
+    }
+
     /**
      * Status updates, broadcasted to all listeners.
      */
@@ -423,6 +435,7 @@ public class MsgMux {
             handler.handleMessage(topic, msgType, m, receivedOn, args);
         }
 
+        MsgFrame frame = MsgFrame.fromMessage(m);
         for (MsgConn c : activeIn.values()) {
             if (receivedOn != null && (receivedOn == c ||
                     receivedOn.name != null && receivedOn.name.equals(c.name))) {
@@ -430,11 +443,7 @@ public class MsgMux {
             }
 
             // TODO: filter by subscribed topics in c
-            Message m1 = new Message();
-            m1.setData(b);
-            m1.what = m.what;
-            m = m1;
-            c.send(m);
+            c.sendFrame(frame);
         }
 
         for (MsgConn c : activeOut.values()) {
@@ -443,11 +452,7 @@ public class MsgMux {
             }
 
             // TODO: filter by subscribed topics in c
-            Message m1 = new Message();
-            m1.setData(b);
-            m1.what = m.what;
-            m = m1;
-            c.send(m);
+            c.sendFrame(frame);
         }
     }
 
@@ -484,6 +489,10 @@ public class MsgMux {
         if (open != null) {
             open.handleMessage(":open", "", openM, null, null);
         }
+    }
+
+    public void removeInConnection(String key) {
+        activeIn.remove(key);
     }
 
     public static interface Action {

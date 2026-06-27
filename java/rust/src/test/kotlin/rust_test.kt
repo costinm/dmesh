@@ -1,28 +1,15 @@
+import com.github.costinm.dmeshnative.MeshNode
 import com.github.costinm.dmeshnative.Rust
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.DisplayName
 
-internal class TodoRepositoryTest {
+internal class RustBridgeApiTest {
 
-@Test
-fun test1() {
-    val callback = object : Rust.Callback() {
-        override fun callback(s: String) {
-            println("Callback received: $s")
-        }
+    @Test
+    fun exposesCurrentMeshApi() {
+        Assertions.assertNotNull(Rust::class.java.getDeclaredMethod("load"))
+        Assertions.assertNotNull(MeshNode::class.java.getDeclaredMethod("start", Int::class.java, Int::class.java))
+        Assertions.assertNotNull(MeshNode::class.java.getDeclaredMethod("getPublicKey"))
+        Assertions.assertNotNull(MeshNode::class.java.getDeclaredMethod("stop"))
     }
-    Rust.invokeCallbackViaJNI(callback)
-}
-
-}
-
-fun main() {
-    val callback = object : Rust.Callback() {
-        override fun callback(s: String) {
-            println("Callback received: $s")
-        }
-    }
-    Rust.invokeCallbackViaJNI(callback)
 }

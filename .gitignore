@@ -18,3 +18,7 @@ libEnvoy.so
 android/local.properties
 .cargo/config.toml
 build
+notes
+/target/
+/android/app-dmesh/src/main/jniLibs/
+*.so

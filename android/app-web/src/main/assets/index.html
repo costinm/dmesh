@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DMesh Web</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: sans-serif;
+      color: #1f2528;
+      background: #f7f9f9;
+    }
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 28px;
+      margin: 0 0 12px;
+    }
+    p {
+      line-height: 1.45;
+    }
+    a, button {
+      color: #0f5b62;
+      font-weight: 600;
+    }
+    label {
+      display: block;
+      margin: 14px 0 6px;
+      font-size: 14px;
+    }
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #b8c3c5;
+      border-radius: 4px;
+      font-size: 16px;
+      background: white;
+    }
+    button {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 0;
+      border-radius: 4px;
+      background: #d8eeee;
+      font-size: 16px;
+    }
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin: 20px 0 28px;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>DMesh Web</h1>
+  <p>
+    This example app hosts a small WebView and exposes a service that other mesh apps can use
+    to open URLs. It is intended as a remote app that app-dmesh can activate through SSH or Binder.
+  </p>
+
+  <nav>
+    <a href="appweb://open-admin">Open local ssh-mesh admin</a>
+    <a href="appweb://open-dmesh">Open app-dmesh UI</a>
+  </nav>
+
+  <form method="get" action="appweb://forward">
+    <label for="host">Remote host</label>
+    <input id="host" name="host" value="127.0.0.1">
+
+    <label for="port">Remote port</label>
+    <input id="port" name="port" value="22" inputmode="numeric">
+
+    <label for="localPort">Local forward port</label>
+    <input id="localPort" name="localPort" value="10022" inputmode="numeric">
+
+    <button type="submit">Request forward through app-dmesh</button>
+  </form>
+</main>
+</body>
+</html>

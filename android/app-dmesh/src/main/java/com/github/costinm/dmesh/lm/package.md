@@ -14,6 +14,5 @@ plane or from the minimal UI.
 It is expected that the tools will be exposed to an LLM or other apps which may execute the 
 same commands.
 
-Commands are implemented in DMService and in the golang native code (in future it may be rust).
-Usually android features are in java, while low-level networking is native.
-
+Commands are implemented in DMService and the Rust dmesh native library.
+Android features stay in Java, while low-level mesh networking belongs in Rust.

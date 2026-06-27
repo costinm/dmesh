@@ -127,7 +127,7 @@ public class ConnUDS extends MsgConn {
 //        }
 //    }
 
-    boolean send(Message m) {
+    public boolean send(Message m) {
         Bundle b = m.getData();
         String uri = b.getString(":uri");
         ArrayList<FileDescriptor> fds = null;

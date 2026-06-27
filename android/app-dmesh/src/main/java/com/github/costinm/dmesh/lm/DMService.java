@@ -26,7 +26,10 @@ import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 
 import com.github.costinm.dmesh.lm3.LocalMesh;
+import com.github.costinm.dmeshnative.MeshNode;
+import com.github.costinm.dmeshnative.Rust;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -59,12 +62,17 @@ public class DMService extends BaseMsgService implements MessageHandler {
     public static final String PREF_ENABLED = "lm_enabled";
     public static final String PREF_WIFI_ENABLED = "wifi_enabled";
     public static final String PREF_VPN_ENABLED = "vpn_enabled";
+    public static final int RUST_SSH_PORT = 15022;
+    public static final int RUST_HTTP_PORT = 18480;
 
     // Implements the Wifi, discovery messaging interface, using Android APIs.
     static LocalMesh wifi;
 
     // Notification bar UI - handles messages from the mux to update the bar.
     private NotificationHandler nh;
+
+    private MeshNode meshNode;
+    private static volatile DMService activeService;
 
     private SharedPreferences prefs;
 
@@ -147,18 +155,17 @@ public class DMService extends BaseMsgService implements MessageHandler {
     @Override
     public void onCreate() {
         super.onCreate();
+        activeService = this;
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
 
-        String dataDir = getBaseContext().getFilesDir().getAbsolutePath();
-
-        dmjni.Dmjni.initDmesh(dataDir, new dmjni.MessageHandler() {
-            @Override
-            public void handle(String s, byte[] bytes, byte[] bytes1) {
-
-                Log.d(TAG, "MESSAGE FROM NATIVE" + s);
-            }
-        });
+        try {
+            Rust.load();
+            Log.d(TAG, "Rust dmesh library loaded");
+        } catch (UnsatisfiedLinkError e) {
+            Log.w(TAG, "Rust dmesh library unavailable", e);
+        }
+        startRustMesh();
 
         wifi = LocalMesh.get(this.getApplicationContext());
 
@@ -210,8 +217,47 @@ public class DMService extends BaseMsgService implements MessageHandler {
     }
 
     public void onDestroy() {
+        activeService = null;
+        if (meshNode != null) {
+            meshNode.stop();
+            meshNode = null;
+        }
         wifi.onDestroy();
         super.onDestroy();
+    }
+
+    static DMService getActiveService() {
+        return activeService;
+    }
+
+    MeshNode shellMeshNode() {
+        return meshNode;
+    }
+
+    com.github.costinm.dmesh.android.msg.MsgMux shellMux() {
+        return mux;
+    }
+
+    private void startRustMesh() {
+        if (meshNode != null) {
+            return;
+        }
+        try {
+            File baseDir = new File(getFilesDir(), "ssh-mesh");
+            if (!baseDir.exists() && !baseDir.mkdirs()) {
+                Log.w(TAG, "Failed to create Rust mesh dir: " + baseDir);
+                return;
+            }
+            MeshNode node = new MeshNode(baseDir.getAbsolutePath());
+            node.start(RUST_SSH_PORT, RUST_HTTP_PORT);
+            node.setCallback(new SshJsonlMsgBridge(this, mux));
+            meshNode = node;
+            Log.d(TAG, "Rust mesh node started: ssh=" + RUST_SSH_PORT
+                    + " http=" + RUST_HTTP_PORT
+                    + " pubkey=" + meshNode.getPublicKey());
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed to start Rust mesh node", t);
+        }
     }
 
     public void stop() {

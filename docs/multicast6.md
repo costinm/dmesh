@@ -1,3 +1,9 @@
+# IPv6 multicast and WiFi Direct research notes
+
+Status: historical/research notes. This page captures Android WiFi Direct,
+IPv6 link-local, multicast, and interface-binding experiments. Keep it as
+debugging context; do not treat it as the current mesh protocol spec.
+
 There are few uses for multicast in this project.
 
 1. Discovery of the master address in local net.  In normal dmesh using P2P APs, the 
@@ -150,4 +156,3 @@ for (InterfaceAddress ia :networkIf.getInterfaceAddresses()) {
 if (wifi4Address == inteface IPv4) -> this is the wifi NetworkInterface
 if (192.168.49.1 == interface IPv4) -> this is the AP NetworkInterface
 ```
-

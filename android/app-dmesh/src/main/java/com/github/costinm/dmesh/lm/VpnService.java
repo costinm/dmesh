@@ -12,13 +12,13 @@ import android.os.Message;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import com.github.costinm.dmeshnative.MeshNode;
+
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
-
-//import wpgate.Wpgate;
 
 import static android.system.OsConstants.AF_INET;
 import static android.system.OsConstants.AF_INET6;
@@ -42,12 +42,22 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
      */
     public static ParcelFileDescriptor iface = null;
     public static FileDescriptor fd;
+    public static volatile long lastTunTestResult = 0;
+    public static volatile String lastTunTestError = null;
 
     static PendingIntent appIntent;
 
     // Not used, for ICS - KK
     public static final int CMD_PROTECT = 1024;
     static byte[] address6;
+
+    public static void startForTest(Context ctx, byte[] addr) {
+        address6 = addr;
+        lastTunTestResult = 0;
+        lastTunTestError = null;
+        Intent i = new Intent(ctx, VpnService.class);
+        ctx.startService(i);
+    }
 
     public static void maybeStartVpn(SharedPreferences prefs,
                                      Context ctx) {
@@ -233,9 +243,23 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             Log.d(TAG, "New interface: " + iface);
             fd = iface.getFileDescriptor();
 
-            dmjni.Dmjni.startVPN(iface.getFd());
+            int rawFd = iface.detachFd();
+            iface = null;
+            fd = null;
+            lastTunTestResult = MeshNode.testTunFd(rawFd);
+            if (lastTunTestResult < 0) {
+                lastTunTestError = "Rust rejected Android VPN fd";
+                Log.w(TAG, lastTunTestError);
+            } else {
+                lastTunTestError = null;
+                Log.d(TAG, "Rust accepted Android VPN fd " + lastTunTestResult);
+            }
+            Log.w(TAG, "VPN packet processing is disabled until the Rust dmesh VPN bridge run loop is wired");
+            close();
 
         } catch (Throwable t) {
+            lastTunTestResult = -1;
+            lastTunTestError = t.toString();
             Log.i(TAG, "VPN connection failed " + t);
             t.printStackTrace();
         }

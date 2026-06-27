@@ -29,6 +29,13 @@
     <uses-permission android:name="android.permission.GET_ACCOUNTS" />
     <uses-permission android:name="android.permission.USE_CREDENTIALS" />
 
+    <queries>
+        <package android:name="com.github.costinm.dmesh.chat" />
+        <intent>
+            <action android:name="mesh.direct" />
+        </intent>
+    </queries>
+
     <!-- System - only if installed in system, as root.
     <uses-permission android:name="android.permission.NETWORK_SETTINGS" />
     <uses-permission android:name="android.permission.BLUETOOTH_PRIVILEGED" />
@@ -56,6 +63,12 @@
             android:name="com.github.costinm.dmesh.lm.DMService$Receiver"
             android:enabled="true"
             android:exported="true"/>
+
+        <provider
+            android:name=".DMeshShellProvider"
+            android:authorities="com.github.costinm.dmesh.lm.shell"
+            android:enabled="true"
+            android:exported="true" />
 
         <service
             android:name=".LMJob"

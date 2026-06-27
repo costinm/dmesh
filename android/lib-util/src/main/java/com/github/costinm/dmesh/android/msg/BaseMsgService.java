@@ -2,6 +2,7 @@ package com.github.costinm.dmesh.android.msg;
 
 import android.app.Service;
 import android.content.Intent;
+import android.os.Binder;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
@@ -71,13 +72,7 @@ public class BaseMsgService extends Service {
         return inMessenger.getBinder();
     }
 
-    protected DirectBinder db = new DirectBinder() {
-        @Override
-        protected boolean onTransact(int code, Parcel data, Parcel reply,
-                                     int flags) throws RemoteException {
-            return BaseMsgService.this.onTransact(code, data, reply, flags);
-        }
-    };
+    protected DirectBinder db = new DirectBinder(this::handleDirectMessage);
 
     // When all activeIn have been disconnected
     @Override
@@ -97,6 +92,21 @@ public class BaseMsgService extends Service {
     protected boolean onTransact(int code, Parcel data, Parcel reply,
                                  int flags) throws RemoteException {
         return true;
+    }
+
+    protected boolean handleDirectMessage(int code, DirectBinder.DirectMessage direct,
+                                          Parcel reply) throws RemoteException {
+        String key = "direct:" + Binder.getCallingUid();
+        MsgConn c = mux.activeIn.get(key);
+        boolean open = direct.frame != null && "1".equals(direct.frame.fields.get(":open"));
+        if (c == null || open) {
+            c = new DirectMsgConn(mux, direct.callback, key);
+            mux.addInConnection(key, c, direct.frame == null ? Message.obtain() : direct.frame.toMessage());
+            Log.d(TAG, "New direct binder client " + key);
+        } else if (c instanceof DirectMsgConn && direct.callback != null) {
+            ((DirectMsgConn) c).out = direct.callback;
+        }
+        return mux.handleFrame(key, c, direct.frame == null ? new MsgFrame(null) : direct.frame);
     }
 
     /**
@@ -187,6 +197,38 @@ public class BaseMsgService extends Service {
                 out = null;
             }
             return false;
+        }
+    }
+
+    static class DirectMsgConn extends MsgConn {
+        IBinder out;
+
+        DirectMsgConn(MsgMux mux, IBinder out, String name) {
+            super(mux);
+            this.out = out;
+            this.name = name;
+        }
+
+        public boolean sendFrame(MsgFrame frame) {
+            IBinder binder = out;
+            if (binder == null) {
+                return false;
+            }
+            boolean ok = DirectBinder.transact(
+                    binder,
+                    DirectBinder.TRANSACT_MESSAGE,
+                    frame,
+                    null,
+                    null);
+            if (!ok && name != null) {
+                mux.removeInConnection(name);
+                out = null;
+            }
+            return ok;
+        }
+
+        public boolean send(Message m) {
+            return sendFrame(MsgFrame.fromMessage(m));
         }
     }
 }

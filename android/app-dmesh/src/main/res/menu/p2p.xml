@@ -162,6 +162,11 @@
                  />
 
             <item
+                android:id="@+id/addRootKeyUrl"
+                android:title="Add root key URL"
+                />
+
+            <item
                 android:id="@+id/mdnssdon"
                 android:title="DNS-SD ADV On"
                 />

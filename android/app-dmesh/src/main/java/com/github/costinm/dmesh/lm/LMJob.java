@@ -6,15 +6,12 @@ import android.app.job.JobScheduler;
 import android.app.job.JobService;
 import android.content.ComponentName;
 import android.content.Context;
-import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
 
-//import wpgate.Wpgate;
+import com.github.costinm.dmesh.lm3.LocalMesh;
 
 import static android.app.job.JobScheduler.RESULT_SUCCESS;
-
-import com.github.costinm.dmesh.lm3.LocalMesh;
 
 /**
  *  LMJob runs avery 15min (min interval allowed).
@@ -58,7 +55,6 @@ public class LMJob extends JobService {
             @Override
             public void run() {
                 LocalMesh lm = LocalMesh.get(LMJob.this.getApplicationContext());
-                dmjni.Dmjni.update();
                 lm.update();
                 try {
                     Thread.sleep(5000);

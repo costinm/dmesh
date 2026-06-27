@@ -35,9 +35,11 @@ import android.view.Window;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
+import android.widget.EditText;
 import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.text.InputType;
 
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
@@ -810,6 +812,8 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         } else if (id == R.id.wificaps) {
             showWifiCaps();
 
+        } else if (id == R.id.addRootKeyUrl) {
+            showAddRootKeyUrl();
 
         } else if (id == R.id.lastStatus) {
             AlertDialog ad = new AlertDialog.Builder(MeshActivityLight.this)
@@ -834,6 +838,37 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 
         }
         return super.onOptionsItemSelected(item);
+    }
+
+    private void showAddRootKeyUrl() {
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setSingleLine(true);
+        input.setHint("https://example/ca.pub");
+        new AlertDialog.Builder(this)
+                .setTitle("Add root key")
+                .setView(input)
+                .setPositiveButton("Add", (dialog, which) -> {
+                    String url = input.getText().toString().trim();
+                    new Thread(() -> {
+                        try {
+                            String path = DMeshKeys.downloadAndInstallRootPublicKey(
+                                    MeshActivityLight.this, url, true);
+                            runOnUiThread(() -> Toast.makeText(
+                                    MeshActivityLight.this,
+                                    "Installed root key: " + path,
+                                    Toast.LENGTH_LONG).show());
+                        } catch (Exception e) {
+                            Log.w(TAG, "Failed to add root key from " + url, e);
+                            runOnUiThread(() -> Toast.makeText(
+                                    MeshActivityLight.this,
+                                    "Failed to install key: " + e.getMessage(),
+                                    Toast.LENGTH_LONG).show());
+                        }
+                    }, "dmesh-key-download").start();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     // Debugging and experimental stuff

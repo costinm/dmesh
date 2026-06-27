@@ -1,3 +1,9 @@
+# Routing design notes
+
+Status: design direction. This page captures the intended user-space routing
+model and addressing tradeoffs. It is not a description of a completed routing
+implementation.
+
 One of the requirements for DMesh is to implement all routing in user space, since 
 it needs to work on un-rooted, regular devices. Most devices will simply act as clients,
 with few acting as 'routing nodes', in a round-robin to spread battery use. 

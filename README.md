@@ -120,10 +120,9 @@ The second part of the project - code is still too embarasingly ugly to put on
 github - handles forwarding of messages across clients and APs. It is
 based on the Webpush protocol, with a bit of UDP for small messages. Each device
 running in AP mode will also run a server - with webpush, gRPC and UDP (and HTTP).
-I'm using a native component in golang for HTTP/2 and encryption - it only runs
-in the intervals when each device has its rotation as 'master'. The UDP
-is in a java service, using foreground (and optionally battery-optimization
-whitelisting).
+The native mesh component is moving to the Rust dmesh library, loaded through the
+Android AAR. Android-specific networking and foreground-service integration stay
+in a small Java wrapper.
 
 Goals:
 
@@ -189,4 +188,3 @@ people go hiking and each has the app installed - it should work. Larger
 networks, by linking multiple meshes are possible - but that would be a
 different project, requiring some sharding and at least a couple of 'bridges'
 (bluetooth or multi-client IoT devices).
-

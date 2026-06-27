@@ -6,12 +6,16 @@ plugins {
 }
 
 android {
+    val releaseKeystore = file("/home/costin/Private/playstore_lmesh_key_new.jks")
+
     signingConfigs {
-        create("release") {
-            storeFile = file("/home/costin/Private/playstore_lmesh_key_new.jks")
-            storePassword = "android"
-            keyAlias = "key0"
-            keyPassword = "android"
+        if (releaseKeystore.exists()) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = "android"
+                keyAlias = "key0"
+                keyPassword = "android"
+            }
         }
     }
     compileSdkVersion(providers.gradleProperty("COMPILE_SDK_VERSION").get())
@@ -35,12 +39,21 @@ android {
             isMinifyEnabled = false
             //proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             isDebuggable = false
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (releaseKeystore.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
     lint {
         abortOnError = false
+    }
+    sourceSets {
+        getByName("main") {
+            java.srcDir("../../java/rust/src/main/java")
+        }
     }
     namespace = "com.github.costinm.dmesh.lm"
 }
@@ -66,8 +79,6 @@ dependencies {
 
     implementation(project(mapOf("path" to ":android:lib-util")))
     implementation(project(mapOf("path" to ":android:lib-lm3")))
-    implementation(project(mapOf("path" to ":android:wpgate-aar")))
-    implementation(files("libs/dmesh.aar"))
 
     //implementation(libs.androidx.monitor)
 

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:extractNativeLibs="true">
+
+    <queries>
+        <package android:name="com.github.costinm.dmesh.lm" />
+        <intent>
+            <action android:name="mesh.direct" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:label="DMesh Chat"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="DMesh Chat"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|screenSize">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="dmeshui" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".ChatService"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="mesh.direct" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>

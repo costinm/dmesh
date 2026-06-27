@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".WebActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.github.costinm.dmesh.web.OPEN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".WebBridgeService"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.github.costinm.dmesh.web.OPEN_URL" />
+                <action android:name="com.github.costinm.dmesh.web.FORWARD_PORT" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

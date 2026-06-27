@@ -1,0 +1,30 @@
+[package]
+name = "dmeshui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "dmeshui"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dmeshui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "android-native-activity",
+] }
+jni = "0.21.1"
+winit = { version = "0.30", features = ["android-native-activity"] }

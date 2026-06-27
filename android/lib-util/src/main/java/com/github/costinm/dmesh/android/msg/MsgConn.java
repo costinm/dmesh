@@ -14,7 +14,7 @@ public class MsgConn {
 
     MsgMux mux;
 
-    String name;
+    public String name;
 
     public MsgConn(MsgMux mux) {
         this.mux = mux;
@@ -34,18 +34,19 @@ public class MsgConn {
      * <p>
      * For client connections (bind to a server), it is sent to the server.
      */
-    boolean send(Message m) {
+    public boolean send(Message m) {
         return false;
     }
 
+    public boolean sendFrame(MsgFrame frame) {
+        return send(frame.toMessage());
+    }
+
     public boolean send(String uri, String... parms) {
-        Message m = Message.obtain();
-        m.what = 1;
-        m.getData().putString(":uri", uri);
-        Bundle b = m.getData();
+        MsgFrame frame = new MsgFrame(uri);
         for (int i = 0; i < parms.length; i += 2) {
-            b.putString(parms[i], parms[i + 1]);
+            frame.fields.put(parms[i], parms[i + 1]);
         }
-        return send(m);
+        return sendFrame(frame);
     }
 }

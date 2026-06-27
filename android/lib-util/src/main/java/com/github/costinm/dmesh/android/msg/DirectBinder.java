@@ -7,8 +7,13 @@ import android.content.ServiceConnection;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
+import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
+import android.util.Log;
 
+import java.io.FileDescriptor;
+import java.util.ArrayList;
+import java.util.List;
 
 
 /** DirectBinder is a raw, direct binder interface - not using AIDL or generated interface,
@@ -36,17 +41,101 @@ import android.os.RemoteException;
  *
  */
 public class DirectBinder extends Binder {
+    private static final String TAG = "DirectBinder";
+    public static final String ACTION_DIRECT = "mesh.direct";
+    public static final int TRANSACT_MESSAGE = IBinder.FIRST_CALL_TRANSACTION;
+    public static final int TRANSACT_OPEN = IBinder.FIRST_CALL_TRANSACTION + 1;
 
+    private final Receiver receiver;
+
+    public DirectBinder() {
+        this(null);
+    }
+
+    public DirectBinder(Receiver receiver) {
+        this.receiver = receiver;
+    }
+
+    @Override
     protected boolean onTransact(int code, Parcel data, Parcel reply,
                                  int flags) throws RemoteException {
+        if (code == TRANSACT_MESSAGE || code == TRANSACT_OPEN) {
+            DirectMessage msg = readMessage(data);
+            if (receiver != null) {
+                return receiver.onDirectMessage(code, msg, reply);
+            }
+            return onDirectMessage(code, msg, reply);
+        }
         return super.onTransact(code, data, reply, flags);
     }
 
+    protected boolean onDirectMessage(int code, DirectMessage msg, Parcel reply) throws RemoteException {
+        return false;
+    }
+
+    public static boolean transact(IBinder binder, int code, MsgFrame frame, IBinder callback,
+                                   List<ParcelFileDescriptor> fds) {
+        Parcel in = Parcel.obtain();
+        Parcel out = Parcel.obtain();
+        try {
+            writeMessage(in, frame, callback, fds);
+            return binder.transact(code, in, out, 0);
+        } catch (RemoteException e) {
+            Log.d(TAG, "Direct binder transaction failed", e);
+            return false;
+        } finally {
+            in.recycle();
+            out.recycle();
+        }
+    }
+
+    public static void writeMessage(Parcel out, MsgFrame frame, IBinder callback,
+                                    List<ParcelFileDescriptor> fds) {
+        out.writeString(frame == null ? null : frame.id);
+        out.writeString(frame == null ? null : frame.uri);
+        int fieldCount = frame == null ? 0 : frame.fields.size();
+        out.writeInt(fieldCount);
+        if (frame != null) {
+            for (String key : frame.fields.keySet()) {
+                out.writeString(key);
+                out.writeString(frame.fields.get(key));
+            }
+        }
+        out.writeStrongBinder(callback);
+        int fdCount = fds == null ? 0 : fds.size();
+        out.writeInt(fdCount);
+        if (fds == null) {
+            return;
+        }
+        for (ParcelFileDescriptor fd : fds) {
+            FileDescriptor rawFd = fd == null ? null : fd.getFileDescriptor();
+            out.writeFileDescriptor(rawFd);
+        }
+    }
+
+    public static DirectMessage readMessage(Parcel in) {
+        String id = in.readString();
+        String uri = in.readString();
+        MsgFrame frame = new MsgFrame(uri);
+        frame.id = id;
+        int fieldCount = in.readInt();
+        for (int i = 0; i < fieldCount; i++) {
+            frame.fields.put(in.readString(), in.readString());
+        }
+        IBinder callback = in.readStrongBinder();
+        int fdCount = in.readInt();
+        ArrayList<ParcelFileDescriptor> fds = new ArrayList<>(fdCount);
+        for (int i = 0; i < fdCount; i++) {
+            fds.add(in.readFileDescriptor());
+        }
+        return new DirectMessage(frame, callback, fds);
+    }
 
     public void dial(Context ctx, String addr) {
         String[] parts = addr.split("/");
         Intent i = new Intent();
         i.setComponent(new ComponentName(parts[0], parts[1]));
+        i.setAction(ACTION_DIRECT);
 
         // TODO: exp backoff, stop after X retries, etc.
         ServiceConnection sc = new ServiceConnection() {
@@ -59,13 +148,9 @@ public class DirectBinder extends Binder {
 //                Message m = Message.obtain();
 //                m.getData().putBoolean(":open", true);
 //                send(m);
-                Parcel in = Parcel.obtain(service);
-                Parcel out = Parcel.obtain();
-                try {
-                    service.transact(1, in, out, 0);
-                } catch (RemoteException e) {
-                    throw new RuntimeException(e);
-                }
+                MsgFrame open = new MsgFrame(null);
+                open.fields.put(":open", "1");
+                transact(service, TRANSACT_OPEN, open, DirectBinder.this, null);
             }
 
             @Override
@@ -85,5 +170,21 @@ public class DirectBinder extends Binder {
         if (!b) {
         }
 
+    }
+
+    public interface Receiver {
+        boolean onDirectMessage(int code, DirectMessage msg, Parcel reply) throws RemoteException;
+    }
+
+    public static class DirectMessage {
+        public final MsgFrame frame;
+        public final IBinder callback;
+        public final ArrayList<ParcelFileDescriptor> fds;
+
+        DirectMessage(MsgFrame frame, IBinder callback, ArrayList<ParcelFileDescriptor> fds) {
+            this.frame = frame;
+            this.callback = callback;
+            this.fds = fds;
+        }
     }
 }

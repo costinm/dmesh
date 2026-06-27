@@ -110,7 +110,7 @@ class ConnMessenger extends MsgConn {
         }
     }
 
-    boolean send(Message m) {
+    public boolean send(Message m) {
         Messenger mg = svc;
         if (mg == null) {
             return false;

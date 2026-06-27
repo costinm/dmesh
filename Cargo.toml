@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/dmesh",
+    "crates/dmeshui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false

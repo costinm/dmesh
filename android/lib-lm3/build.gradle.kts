@@ -17,6 +17,10 @@ android {
         targetSdk = providers.gradleProperty("TARGET_SDK_VERSION").get().toInt()
     }
 
+    lint {
+        abortOnError = false
+    }
+
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
