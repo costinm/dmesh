@@ -436,7 +436,7 @@ public class MsgMux {
         }
 
         MsgFrame frame = MsgFrame.fromMessage(m);
-        for (MsgConn c : activeIn.values()) {
+        for (MsgConn c : new ArrayList<>(activeIn.values())) {
             if (receivedOn != null && (receivedOn == c ||
                     receivedOn.name != null && receivedOn.name.equals(c.name))) {
                 continue;

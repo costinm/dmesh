@@ -10,6 +10,68 @@ export CARGO_HOME="${CARGO_HOME:-$SCRIPT_DIR/target/.cargo}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$SCRIPT_DIR/target/.gradle}"
 mkdir -p "$CARGO_HOME" "$GRADLE_USER_HOME"
 
+SSH_MESH_GIT_URL="${SSH_MESH_GIT_URL:-https://github.com/costinm/ssh-mesh}"
+SSH_MESH_OVERRIDE_ACTIVE=0
+CARGO_LOCK_BACKUP=""
+
+restore_cargo_lock() {
+    if [ -n "${CARGO_LOCK_BACKUP:-}" ] && [ -f "$CARGO_LOCK_BACKUP" ]; then
+        cp "$CARGO_LOCK_BACKUP" "$SCRIPT_DIR/Cargo.lock"
+        rm -f "$CARGO_LOCK_BACKUP"
+        CARGO_LOCK_BACKUP=""
+    fi
+}
+
+configure_ssh_mesh_override() {
+    SSH_MESH_OVERRIDE_ACTIVE=0
+    local override_dir="${DMESH_SSH_MESH_DIR:-}"
+    if [ -z "$override_dir" ] && [ -d /ws/rust/ssh-mesh ]; then
+        override_dir="/ws/rust/ssh-mesh"
+    fi
+
+    local config="$CARGO_HOME/config.toml"
+    if [ -z "$override_dir" ] || [ ! -d "$override_dir" ]; then
+        if [ -f "$config" ] && grep -q "BEGIN DMESH SSH_MESH OVERRIDE" "$config"; then
+            sed -i '/# BEGIN DMESH SSH_MESH OVERRIDE/,/# END DMESH SSH_MESH OVERRIDE/d' "$config"
+        fi
+        return
+    fi
+
+    for crate_dir in crates/ssh-mesh crates/tun crates/lmesh crates/mesh; do
+        if [ ! -f "$override_dir/$crate_dir/Cargo.toml" ]; then
+            echo "ERROR: DMESH_SSH_MESH_DIR does not look like ssh-mesh: $override_dir"
+            echo "Missing: $crate_dir/Cargo.toml"
+            exit 1
+        fi
+    done
+
+    mkdir -p "$CARGO_HOME"
+    touch "$config"
+    if grep -q "BEGIN DMESH SSH_MESH OVERRIDE" "$config"; then
+        sed -i '/# BEGIN DMESH SSH_MESH OVERRIDE/,/# END DMESH SSH_MESH OVERRIDE/d' "$config"
+    fi
+    cat >>"$config" <<EOF
+# BEGIN DMESH SSH_MESH OVERRIDE
+[patch."$SSH_MESH_GIT_URL"]
+ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
+mesh-tun = { path = "$override_dir/crates/tun" }
+lmesh = { path = "$override_dir/crates/lmesh" }
+mesh = { path = "$override_dir/crates/mesh" }
+# END DMESH SSH_MESH OVERRIDE
+EOF
+    SSH_MESH_OVERRIDE_ACTIVE=1
+    echo "Using local ssh-mesh override: $override_dir"
+}
+
+preserve_cargo_lock_for_override() {
+    if [ "${SSH_MESH_OVERRIDE_ACTIVE:-0}" != "1" ] || [ ! -f "$SCRIPT_DIR/Cargo.lock" ]; then
+        return
+    fi
+    CARGO_LOCK_BACKUP="$CARGO_HOME/Cargo.lock.before-ssh-mesh-override"
+    cp "$SCRIPT_DIR/Cargo.lock" "$CARGO_LOCK_BACKUP"
+    trap restore_cargo_lock EXIT
+}
+
 load_nix_profile_env() {
     if [ -f "$DMESH_NIX_PROFILE/bin/dmesh-setenv" ]; then
         # shellcheck disable=SC1090
@@ -46,9 +108,7 @@ install_nix_deps() {
     echo "Installed DMesh build dependencies in $NIX_PROFILE"
     echo "Load with: . target/nix/profile/bin/dmesh-setenv"
 
-    rustup target add \
-            aarch64-linux-android \
-            x86_64-linux-android 
+    rustup target add aarch64-linux-android
           
 }
 
@@ -122,21 +182,41 @@ copy_android_lib() {
         exit 1
     fi
 
-    if [ "${DMESH_STRIP_ANDROID_LIBS:-1}" = "1" ]; then
-        local strip_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+    local strip_libs="${DMESH_STRIP_ANDROID_LIBS:-}"
+    if [ -z "$strip_libs" ]; then
+        if [ "$build_type" = "release" ]; then
+            strip_libs=1
+        else
+            strip_libs=0
+        fi
+    fi
+
+    local strip_bin=""
+    if [ "$strip_libs" = "1" ]; then
+        strip_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
         if [ ! -x "$strip_bin" ]; then
             echo "ERROR: Android llvm-strip not found at $strip_bin"
             exit 1
         fi
-        "$strip_bin" --strip-unneeded "$so_path"
     fi
 
     local app
     for app in ${DMESH_JNILIB_APPS:-app-dmesh}; do
         local jnilib_dir="$SCRIPT_DIR/android/$app/src/main/jniLibs/$abi"
+        local jnilib_so="$jnilib_dir/lib$lib_name.so"
         mkdir -p "$jnilib_dir"
-        cp "$so_path" "$jnilib_dir/lib$lib_name.so"
-        echo "Copied $crate_name to: $jnilib_dir/lib$lib_name.so"
+        cp "$so_path" "$jnilib_so"
+        local copied_size
+        copied_size="$(stat -c%s "$jnilib_so")"
+        if [ "$strip_libs" = "1" ]; then
+            "$strip_bin" --strip-unneeded "$jnilib_so"
+            local stripped_size
+            stripped_size="$(stat -c%s "$jnilib_so")"
+            echo "Copied $crate_name ($build_type) to: $jnilib_so"
+            echo "Stripped $jnilib_so: $copied_size -> $stripped_size bytes"
+        else
+            echo "Copied $crate_name ($build_type, unstripped) to: $jnilib_so ($copied_size bytes)"
+        fi
     done
 }
 
@@ -208,10 +288,14 @@ build_rust_native() {
     echo "Using NDK: $ANDROID_NDK_HOME"
     echo "Using SDK: $ANDROID_HOME"
     echo ""
+    configure_ssh_mesh_override
+    preserve_cargo_lock_for_override
     clean_app_dmesh_dmeshui
-    build_rust_package dmesh dmesh "$build_type" "${DMESH_ANDROID_ABIS:-x86_64}"
-    copy_dmeshui_android_lib "$build_type" "${DMESH_UI_ANDROID_ABIS:-x86_64}"
+    build_rust_package dmesh dmesh "$build_type" "${DMESH_ANDROID_ABIS:-arm64-v8a}"
+    copy_dmeshui_android_lib "$build_type" "${DMESH_UI_ANDROID_ABIS:-arm64-v8a}"
     clean_app_dmesh_dmeshui
+    restore_cargo_lock
+    trap - EXIT
 }
 
 build_apps() {
@@ -444,10 +528,12 @@ Commands:
 
 Environment:
   DMESH_NIX_PROFILE       Nix profile path. Default: target/nix/profile.
-  DMESH_ANDROID_ABIS      ABIs for libdmesh.so. Default: x86_64.
-  DMESH_UI_ANDROID_ABIS   ABIs for libdmeshui.so. Default: x86_64.
+  DMESH_SSH_MESH_DIR      Local ssh-mesh checkout override. Default: /ws/rust/ssh-mesh if present.
+  SSH_MESH_GIT_URL        Default ssh-mesh Git URL. Default: https://github.com/costinm/ssh-mesh.
+  DMESH_ANDROID_ABIS      ABIs for libdmesh.so. Default: arm64-v8a.
+  DMESH_UI_ANDROID_ABIS   ABIs for libdmeshui.so. Default: arm64-v8a.
   DMESH_UI_APPS           Apps receiving libdmeshui.so. Default: app-chat.
-  DMESH_STRIP_ANDROID_LIBS=0 disables native library stripping. Default: 1.
+  DMESH_STRIP_ANDROID_LIBS=0 disables native library stripping. Default: 1 for release, 0 for debug.
   DMESH_AVD_NAME          AVD name for emulator startup. Default: Medium_Desktop_2.
   DMESH_EMULATOR_TIMEOUT Boot timeout in seconds. Default: 240.
   DMESH_HOST_SSH_PORT     Host port for ssh-forward-smoke. Default: 11522.

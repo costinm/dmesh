@@ -1,17 +1,19 @@
 [package]
 name = "dmesh"
-version = "0.0.1"
-edition = "2021" 
+version.workspace = true
+edition.workspace = true
 
 [features]
 default = ["jni-wrapper"]
 jni-wrapper = ["dep:jni"]
 
 [dependencies]
-ssh-mesh = { path = "/ws/rust/ssh-mesh/crates/ssh-mesh" }
-mesh-tun = { path = "/ws/rust/ssh-mesh/crates/tun", default-features = false }
-lmesh = { path = "/ws/rust/ssh-mesh/crates/lmesh" }
-mesh = { path = "/ws/rust/ssh-mesh/crates/mesh" }
+# Keep shared defaults on Git. scripts/build-android.sh can generate an
+# untracked Cargo patch for local ssh-mesh checkouts via DMESH_SSH_MESH_DIR.
+ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
+mesh-tun = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-tun", default-features = false }
+lmesh = { git = "https://github.com/costinm/ssh-mesh", package = "lmesh" }
+mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 tracing = "0.1"

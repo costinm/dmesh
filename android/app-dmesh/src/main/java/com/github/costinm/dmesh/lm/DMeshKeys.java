@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 
 final class DMeshKeys {
     static final String KEY_DIR = "ssh-mesh";
+    static final String AUTHORIZED_KEYS = "authorized_keys";
     static final String AUTHORIZED_CAS = "authorized_cas";
 
     private DMeshKeys() {
@@ -31,15 +32,24 @@ final class DMeshKeys {
         return new File(meshDir(context), AUTHORIZED_CAS);
     }
 
-    static String installRootPublicKey(Context context, String publicKey, boolean append)
-            throws IOException {
+    static File authorizedKeys(Context context) throws IOException {
+        return new File(meshDir(context), AUTHORIZED_KEYS);
+    }
+
+    static String installTrustedPublicKey(Context context, String publicKey, String target,
+                                          boolean append) throws IOException {
         String clean = normalizePublicKey(publicKey);
-        File out = authorizedCas(context);
+        File out = trustedKeyFile(context, target);
         try (FileOutputStream fos = new FileOutputStream(out, append)) {
             fos.write(clean.getBytes(StandardCharsets.UTF_8));
             fos.write('\n');
         }
         return out.getAbsolutePath();
+    }
+
+    static String installRootPublicKey(Context context, String publicKey, boolean append)
+            throws IOException {
+        return installTrustedPublicKey(context, publicKey, AUTHORIZED_CAS, append);
     }
 
     static String downloadAndInstallRootPublicKey(Context context, String url, boolean append)
@@ -60,13 +70,35 @@ final class DMeshKeys {
     }
 
     static String readAuthorizedCas(Context context) throws IOException {
-        File in = authorizedCas(context);
+        return readTrustedPublicKeys(context, AUTHORIZED_CAS);
+    }
+
+    static String readTrustedPublicKeys(Context context, String target) throws IOException {
+        File in = trustedKeyFile(context, target);
         if (!in.exists()) {
             return "";
         }
         try (InputStream is = new FileInputStream(in)) {
             return readUtf8(is, 512 * 1024);
         }
+    }
+
+    static File trustedKeyFile(Context context, String target) throws IOException {
+        String clean = target == null ? AUTHORIZED_CAS : target.trim();
+        if (clean.isEmpty()
+                || "ca".equals(clean)
+                || "cas".equals(clean)
+                || "root".equals(clean)
+                || AUTHORIZED_CAS.equals(clean)) {
+            return authorizedCas(context);
+        }
+        if ("key".equals(clean)
+                || "keys".equals(clean)
+                || "user".equals(clean)
+                || AUTHORIZED_KEYS.equals(clean)) {
+            return authorizedKeys(context);
+        }
+        throw new IOException("Unknown SSH trust target: " + target);
     }
 
     private static String normalizePublicKey(String publicKey) throws IOException {

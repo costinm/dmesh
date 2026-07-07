@@ -51,8 +51,10 @@ final class DMeshCommand {
             if (key == null && parsed.args.size() > 1) {
                 key = join(parsed.args, 1);
             }
-            String path = DMeshKeys.installRootPublicKey(context, key, parsed.bool("append", true));
-            return Result.ok("installed").field("path", path);
+            String target = parsed.value("type", parsed.value("target", DMeshKeys.AUTHORIZED_CAS));
+            String path = DMeshKeys.installTrustedPublicKey(
+                    context, key, target, parsed.bool("append", true));
+            return Result.ok("installed").field("path", path).field("type", target);
         }
         if ("add-url".equals(action) || "url".equals(action)) {
             String url = parsed.value("url");
@@ -64,9 +66,10 @@ final class DMeshCommand {
             return Result.ok("installed").field("path", path).field("url", url);
         }
         if ("show".equals(action) || "list".equals(action)) {
-            return Result.ok("authorized_cas")
-                    .field("path", DMeshKeys.authorizedCas(context).getAbsolutePath())
-                    .field("keys", DMeshKeys.readAuthorizedCas(context));
+            String target = parsed.value("type", parsed.value("target", DMeshKeys.AUTHORIZED_CAS));
+            return Result.ok(target)
+                    .field("path", DMeshKeys.trustedKeyFile(context, target).getAbsolutePath())
+                    .field("keys", DMeshKeys.readTrustedPublicKeys(context, target));
         }
         return Result.error("Unknown key action: " + action);
     }

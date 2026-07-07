@@ -74,7 +74,10 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 
     private static final String TAG = "Mesh";
     public static final String ACTION_START_VPN = "com.github.costinm.dmesh.START_VPN";
+    public static final String ACTION_REQUEST_PERMISSIONS =
+            "com.github.costinm.dmesh.REQUEST_PERMISSIONS";
     public static final String EXTRA_VPN_ADDRESS = "address6";
+    public static final String EXTRA_PERMISSIONS = "permissions";
     private static final byte[] DEFAULT_VPN_ADDRESS = new byte[] {
             (byte) 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1
     };
@@ -222,7 +225,39 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         }
         if (ACTION_START_VPN.equals(intent.getAction())) {
             startVpnFromIntent(intent);
+        } else if (ACTION_REQUEST_PERMISSIONS.equals(intent.getAction())) {
+            requestPermissionsFromIntent(intent);
         }
+    }
+
+    private void requestPermissionsFromIntent(Intent intent) {
+        List<String> wanted = new ArrayList<>();
+        String requested = intent.getStringExtra(EXTRA_PERMISSIONS);
+        if (requested != null && !requested.trim().isEmpty()) {
+            for (String raw : requested.split(",")) {
+                String normalized = normalizePermission(raw.trim());
+                if (normalized != null
+                        && checkSelfPermission(normalized) != PackageManager.PERMISSION_GRANTED) {
+                    wanted.add(normalized);
+                }
+            }
+        }
+        if (wanted.isEmpty()) {
+            wanted.addAll(checkPermissions(getApplicationContext()));
+        }
+        if (!wanted.isEmpty()) {
+            requestPermissions(wanted.toArray(new String[]{}), A_REQUEST_LOCATION);
+        }
+    }
+
+    private static String normalizePermission(String permission) {
+        if (permission == null || permission.isEmpty()) {
+            return null;
+        }
+        if (permission.startsWith("android.permission.")) {
+            return permission;
+        }
+        return "android.permission." + permission;
     }
 
     private void startVpnFromIntent(Intent intent) {

@@ -24,6 +24,7 @@ import android.app.RemoteInput;
 import com.github.costinm.dmesh.android.msg.BaseMsgService;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.msg.MsgFrame;
 
 import com.github.costinm.dmesh.lm3.LocalMesh;
 import com.github.costinm.dmeshnative.MeshNode;
@@ -47,6 +48,7 @@ import java.security.PrivateKey;
 import java.security.UnrecoverableEntryException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
+import java.util.List;
 
 /**
  * Foreground service maintaining the notification, wifi/BT/net and native code..
@@ -174,6 +176,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
         // Dispatching messages on this service.
         mux.subscribe("ble", wifi.ble);
         mux.subscribe("wifi", wifi);
+        mux.subscribe("permission", this::handlePermissionMessage);
         mux.subscribe("N", nh);
 
         // Info from the client - currently the 64-bit node ID, other info will be added.
@@ -236,6 +239,40 @@ public class DMService extends BaseMsgService implements MessageHandler {
 
     com.github.costinm.dmesh.android.msg.MsgMux shellMux() {
         return mux;
+    }
+
+    private void handlePermissionMessage(String topic, String msgType, Message m, MsgConn replyTo,
+                                         String[] args) {
+        MsgFrame req = MsgFrame.fromMessage(m);
+        MsgFrame reply = new MsgFrame("/permission/" + (msgType == null ? "status" : msgType));
+        reply.id = req.id;
+
+        if ("request".equals(msgType)) {
+            String requested = req.fields.get("permissions");
+            Intent intent = new Intent(this, MeshActivityLight.class);
+            intent.setAction(MeshActivityLight.ACTION_REQUEST_PERMISSIONS);
+            if (requested != null && !requested.isEmpty()) {
+                intent.putExtra(MeshActivityLight.EXTRA_PERMISSIONS, requested);
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                startActivity(intent);
+                reply.fields.put("requested", requested == null ? "" : requested);
+            } catch (Throwable t) {
+                reply.uri = "/permission/error";
+                reply.fields.put("error", t.toString());
+            }
+        } else if (!"status".equals(msgType) && msgType != null && !msgType.isEmpty()) {
+            reply.uri = "/permission/error";
+            reply.fields.put("error", "unknown permission command: " + msgType);
+        }
+
+        List<String> missing = MeshActivityLight.checkPermissions(getApplicationContext());
+        reply.fields.put("missing", String.join(",", missing));
+        reply.fields.put("ok", Boolean.toString(missing.isEmpty()));
+        if (replyTo != null) {
+            replyTo.sendFrame(reply);
+        }
     }
 
     private void startRustMesh() {

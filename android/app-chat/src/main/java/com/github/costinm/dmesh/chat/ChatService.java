@@ -10,6 +10,9 @@ import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgFrame;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 
+/**
+ * ChatService receives raw messages from the mesh.
+ */
 public class ChatService extends BaseMsgService implements MessageHandler {
     private static final String TAG = "DMeshChat";
 

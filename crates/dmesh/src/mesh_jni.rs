@@ -471,6 +471,95 @@ impl MeshListener for JniMeshListener {
             );
         });
     }
+
+    fn on_session(
+        &self,
+        client_id: u64,
+        _user: &str,
+        command: Option<&str>,
+        _env: &HashMap<String, String>,
+        stream: DuplexStream,
+    ) -> bool {
+        let jvm = self.jvm.clone();
+        let callback = self.callback.clone();
+        let command = command.map(|value| value.to_string());
+        self.runtime.spawn(async move {
+            match command {
+                Some(command) => handle_exec_session(jvm, callback, client_id, command, stream).await,
+                None => handle_bridge_stream(jvm, callback, client_id, stream).await,
+            }
+        });
+        true
+    }
+}
+
+async fn handle_exec_session(
+    jvm: Arc<JavaVM>,
+    callback: GlobalRef,
+    client_id: u64,
+    command: String,
+    mut stream: DuplexStream,
+) {
+    let (tx, mut rx) = unbounded_channel::<String>();
+    match bridge_senders().lock() {
+        Ok(mut senders) => {
+            senders.insert(client_id, tx);
+        }
+        Err(e) => {
+            log::error!("SSH exec sender map is poisoned: {}", e);
+            return;
+        }
+    }
+
+    let response = match parse_bridge_line(&command) {
+        Ok(cmd) => match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
+            Ok(()) => json!({
+                "id": cmd.id,
+                "ok": true,
+                "uri": cmd.uri,
+            }),
+            Err(e) => json!({
+                "id": cmd.id,
+                "ok": false,
+                "error": e.to_string(),
+            }),
+        },
+        Err(e) => json!({
+            "id": Value::Null,
+            "ok": false,
+            "error": e.to_string(),
+        }),
+    };
+
+    let mut out = response.to_string();
+    out.push('\n');
+    if let Err(e) = stream.write_all(out.as_bytes()).await {
+        log::warn!("SSH exec response write failed: {}", e);
+    }
+
+    let drain_until = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+    loop {
+        tokio::select! {
+            outbound = rx.recv() => {
+                let Some(mut out) = outbound else {
+                    break;
+                };
+                out.push('\n');
+                if let Err(e) = stream.write_all(out.as_bytes()).await {
+                    log::warn!("SSH exec event write failed: {}", e);
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(drain_until) => {
+                break;
+            }
+        }
+    }
+
+    let _ = stream.shutdown().await;
+    if let Ok(mut senders) = bridge_senders().lock() {
+        senders.remove(&client_id);
+    }
 }
 
 async fn handle_bridge_stream(
@@ -509,6 +598,16 @@ async fn handle_bridge_stream(
                         pending.clear();
                         if line.is_empty() {
                             continue;
+                        }
+                        if line == "exit" || line == "quit" {
+                            let response = json!({
+                                "ok": true,
+                                "uri": "/shell/exit",
+                            });
+                            let mut out = response.to_string();
+                            out.push('\n');
+                            let _ = stream.write_all(out.as_bytes()).await;
+                            break 'stream_loop;
                         }
                         let response = match parse_bridge_line(&line) {
                             Ok(cmd) => match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {

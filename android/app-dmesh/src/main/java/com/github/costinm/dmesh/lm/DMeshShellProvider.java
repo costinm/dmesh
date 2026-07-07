@@ -39,6 +39,10 @@ public class DMeshShellProvider extends ContentProvider {
             } else {
                 line = "key add " + (key == null ? "" : key);
             }
+        } else if ("provision-ssh-key".equals(method)) {
+            String key = extras == null ? null : extras.getString("key");
+            String type = extras == null ? "user" : extras.getString("type", "user");
+            line = "key add type=" + type + " " + (key == null ? "" : key);
         } else if ("ssh".equals(method)) {
             line = "ssh " + (line == null ? "" : line);
         } else if (!"command".equals(method)) {

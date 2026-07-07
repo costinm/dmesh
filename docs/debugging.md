@@ -39,6 +39,29 @@ command:
 ./scripts/build-android.sh ssh-jsonl-smoke
 ```
 
+For a USB device or emulator that already has `app-dmesh` installed, provision a
+host SSH public key into the app sandbox and verify authenticated SSH access:
+
+```sh
+DMESH_ADB_SERIAL=94AAY0LALC ./scripts/android_ssh_trust_and_verify.sh
+```
+
+The script writes the generated public key to:
+
+```sh
+/data/user/0/com.github.costinm.dmesh.lm/files/ssh-mesh/authorized_keys
+```
+
+It restarts `DMService`, forwards host `localhost:11522` to device port `15022`,
+forwards host `localhost:18080` to device admin HTTP port `18480`, checks the SSH
+banner, checks `/_m/adm`, and sends one authenticated SSH direct-stream command.
+
+To test CA trust instead of a single public key:
+
+```sh
+./scripts/android_ssh_trust_and_verify.sh ca
+```
+
 Generated test keys are under:
 
 ```sh
@@ -86,6 +109,30 @@ timeout 12 ssh \
   dmesh@127.0.0.1 \
   -W dmesh-msg:1
 ```
+
+Plain SSH exec and shell are also mapped to the same Android MsgMux command
+surface. These do not execute Android/Linux processes; they send commands into
+`app-dmesh` and return JSON frames:
+
+```sh
+ssh -F /dev/null \
+  -i target/android-ssh/id_ed25519 \
+  -p 11522 \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  dmesh@127.0.0.1 \
+  '/permission/status'
+
+printf '%s\n' '/permission/status' '/wifi/scan reason=manual-shell' exit |
+ssh -F /dev/null -T \
+  -i target/android-ssh/id_ed25519 \
+  -p 11522 \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  dmesh@127.0.0.1
+```
+
+Use `exit` or `quit` to close the line shell from scripts.
 
 Expected output includes an acknowledgement line:
 

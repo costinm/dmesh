@@ -6,15 +6,28 @@ plugins {
 }
 
 android {
-    val releaseKeystore = file("/home/costin/Private/playstore_lmesh_key_new.jks")
+    fun stringPropertyOrEnv(name: String, defaultValue: String): String {
+        return providers.gradleProperty(name)
+            .orElse(providers.environmentVariable(name))
+            .orElse(defaultValue)
+            .get()
+    }
+
+    val releaseKeystore = file(stringPropertyOrEnv(
+        "DMESH_RELEASE_STORE_FILE",
+        "${System.getProperty("user.home")}/.ssh/secrets/android/release.jks"
+    ))
+    val releaseStorePassword = stringPropertyOrEnv("DMESH_RELEASE_STORE_PASSWORD", "android")
+    val releaseKeyAlias = stringPropertyOrEnv("DMESH_RELEASE_KEY_ALIAS", "key0")
+    val releaseKeyPassword = stringPropertyOrEnv("DMESH_RELEASE_KEY_PASSWORD", "android")
 
     signingConfigs {
         if (releaseKeystore.exists()) {
             create("release") {
                 storeFile = releaseKeystore
-                storePassword = "android"
-                keyAlias = "key0"
-                keyPassword = "android"
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
