@@ -50,6 +50,7 @@ public class Nan {
     SubscribeDiscoverySession subSession;
     // Intended status of NAN subscription. subType indicates the type.
     boolean nanSub;
+    boolean enabled;
 
     // Active subscription/passive pub seem better for this use case, but
     // it's a subtle difference: sending when looking for something, not
@@ -85,11 +86,19 @@ public class Nan {
             }
         };
         ctx.registerReceiver(myReceiver, filter);
+    }
 
+    public void start() {
+        enabled = true;
         onWifiAwareStateChanged(new Intent());
     }
 
+    public boolean isEnabled() {
+        return enabled;
+    }
+
     public void stop() {
+        enabled = false;
         if (pubSession != null) {
             pubSession.close();
             pubSession = null;
@@ -109,6 +118,9 @@ public class Nan {
     }
 
     public void update(Handler delayHandler) {
+        if (!enabled) {
+            return;
+        }
         startNanSub();
         delayHandler.postDelayed(new Runnable() {
             @Override
@@ -167,6 +179,9 @@ public class Nan {
     }
 
     public void onWifiAwareStateChanged(Intent i) {
+        if (!enabled) {
+            return;
+        }
         i.getBooleanExtra("foo", true);
 
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_WIFI_STATE) != PackageManager.PERMISSION_GRANTED ||
@@ -201,8 +216,10 @@ public class Nan {
                         nanSession = session;
 
                         // No point being attached and not using discovery.
-                        publish();
-                        startNanSub();
+                        if (enabled) {
+                            publish();
+                            startNanSub();
+                        }
 
                         MsgMux.get(ctx).publish("/net/NAN/Attach");
                     }

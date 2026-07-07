@@ -12,11 +12,4 @@ final class WebUrls {
     static final String HOME_URL = "file:///android_asset/index.html";
     static final String APP_D_MESH_PACKAGE = "com.github.costinm.dmesh.lm";
     static final String APP_D_MESH_SERVICE = "com.github.costinm.dmesh.lm.DMService";
-
-    private WebUrls() {
-    }
-
-    static String adminUrl() {
-        return DEFAULT_ADMIN_URL;
-    }
 }

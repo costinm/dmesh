@@ -66,7 +66,7 @@ public class WebActivity extends Activity {
         }
         if ("appweb".equals(uri.getScheme())) {
             if ("open-admin".equals(uri.getHost())) {
-                webView.loadUrl(WebUrls.adminUrl());
+                webView.loadUrl(WebUrls.DEFAULT_ADMIN_URL);
                 return true;
             }
             if ("open-dmesh".equals(uri.getHost())) {

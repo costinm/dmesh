@@ -36,7 +36,7 @@ adb forwarding, temporary test CA generation, one JSONL command, and one human
 command:
 
 ```sh
-./build-android.sh ssh-jsonl-smoke
+./scripts/build-android.sh ssh-jsonl-smoke
 ```
 
 Generated test keys are under:

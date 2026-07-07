@@ -42,6 +42,7 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
      */
     public static ParcelFileDescriptor iface = null;
     public static FileDescriptor fd;
+    public static long nativeTunHandle = 0;
     public static volatile long lastTunTestResult = 0;
     public static volatile String lastTunTestError = null;
 
@@ -143,6 +144,10 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
      * This is not sufficient if the fd is sent to the app - will need to also closeNative the dup.
      */
     public static void close() {
+        if (nativeTunHandle != 0) {
+            MeshNode.stopTunFd(nativeTunHandle);
+            nativeTunHandle = 0;
+        }
         if (iface != null) {
             try {
                 iface.close();
@@ -246,16 +251,21 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             int rawFd = iface.detachFd();
             iface = null;
             fd = null;
-            lastTunTestResult = MeshNode.testTunFd(rawFd);
+            nativeTunHandle = MeshNode.startTunFd(rawFd);
+            lastTunTestResult = nativeTunHandle;
             if (lastTunTestResult < 0) {
                 lastTunTestError = "Rust rejected Android VPN fd";
                 Log.w(TAG, lastTunTestError);
+                try {
+                    ParcelFileDescriptor.adoptFd(rawFd).close();
+                } catch (IOException e) {
+                    Log.w(TAG, "Failed to close rejected VPN fd", e);
+                }
             } else {
                 lastTunTestError = null;
-                Log.d(TAG, "Rust accepted Android VPN fd " + lastTunTestResult);
+                Log.d(TAG, "Rust started Android VPN fd " + rawFd + " handle " + nativeTunHandle);
             }
-            Log.w(TAG, "VPN packet processing is disabled until the Rust dmesh VPN bridge run loop is wired");
-            close();
+            Log.i(TAG, "VPN packet processing is running in Rust mesh-tun");
 
         } catch (Throwable t) {
             lastTunTestResult = -1;

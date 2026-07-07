@@ -51,6 +51,7 @@ import com.github.costinm.dmesh.lm3.LocalMesh;
 import com.github.costinm.dmesh.lm3.P2P;
 
 import java.net.InterfaceAddress;
+import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.util.ArrayList;
@@ -72,6 +73,13 @@ import java.util.List;
 public class MeshActivityLight extends Activity implements MessageHandler {
 
     private static final String TAG = "Mesh";
+    public static final String ACTION_START_VPN = "com.github.costinm.dmesh.START_VPN";
+    public static final String EXTRA_VPN_ADDRESS = "address6";
+    private static final byte[] DEFAULT_VPN_ADDRESS = new byte[] {
+            (byte) 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1
+    };
+    private boolean pendingVpnStart;
+    private Intent pendingStartupIntent;
 
     // WIP: remove, all comms must be via mux so the service can be separate
     // process and to allow mesh control plane to control all devices in same
@@ -173,28 +181,99 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 
         localMesh = LocalMesh.get(this);
 
-        final Intent svcI = new Intent(this, DMService.class);
-
         List<String> missing = checkPermissions(getApplicationContext());
         if (missing.size() > 0) {
             Log.d(TAG, "Missing permissions " + missing);
+            pendingStartupIntent = getIntent();
             requestPermissions(missing.toArray(new String[]{}), A_REQUEST_LOCATION);
             return;
         }
 
+        startDMeshService();
+        setupUI();
+        handleIntent(getIntent());
+    }
+
+    private void startDMeshService() {
+        final Intent svcI = new Intent(this, DMService.class);
         try {
             startForegroundService(svcI);
         } catch (Throwable ex) {
             Log.d(TAG, ex.getMessage());
         }
-
-        setupUI();
     }
 
     @Override
     protected void onDestroy() {
         mux.unsubscribe("net", this);
         super.onDestroy();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent);
+    }
+
+    private void handleIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        if (ACTION_START_VPN.equals(intent.getAction())) {
+            startVpnFromIntent(intent);
+        }
+    }
+
+    private void startVpnFromIntent(Intent intent) {
+        VpnService.address6 = vpnAddressFromIntent(intent);
+        final Intent prepareIntent = VpnService.prepare(this);
+        if (prepareIntent != null) {
+            pendingVpnStart = true;
+            startActivityForResult(prepareIntent, A_REQUEST_VPN);
+            return;
+        }
+        startService(new Intent(this, VpnService.class));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != A_REQUEST_LOCATION) {
+            return;
+        }
+
+        List<String> missing = checkPermissions(getApplicationContext());
+        if (missing.size() > 0) {
+            Log.w(TAG, "Still missing permissions " + missing);
+            return;
+        }
+
+        Intent startupIntent = pendingStartupIntent;
+        pendingStartupIntent = null;
+        startDMeshService();
+        setupUI();
+        handleIntent(startupIntent != null ? startupIntent : getIntent());
+    }
+
+    private byte[] vpnAddressFromIntent(Intent intent) {
+        byte[] address = intent.getByteArrayExtra(EXTRA_VPN_ADDRESS);
+        if (address != null && address.length == 16) {
+            return address;
+        }
+        String addressText = intent.getStringExtra(EXTRA_VPN_ADDRESS);
+        if (addressText != null && !addressText.isEmpty()) {
+            try {
+                byte[] parsed = InetAddress.getByName(addressText).getAddress();
+                if (parsed.length == 16) {
+                    return parsed;
+                }
+                Log.w(TAG, "VPN address extra is not IPv6: " + addressText);
+            } catch (Throwable t) {
+                Log.w(TAG, "Invalid VPN address extra: " + addressText, t);
+            }
+        }
+        return DEFAULT_VPN_ADDRESS.clone();
     }
 
     public void setWebUi() {
@@ -930,6 +1009,10 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 
         if (A_REQUEST_VPN == requestCode || A_REQUEST_LOCATION == requestCode) {
             setupUI();
+            if (A_REQUEST_VPN == requestCode && pendingVpnStart) {
+                pendingVpnStart = false;
+                startService(new Intent(this, VpnService.class));
+            }
             super.onActivityResult(requestCode, resultCode, data);
             return;
         }

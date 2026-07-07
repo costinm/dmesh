@@ -393,7 +393,15 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             case "nan":
                 Log.d(TAG, "NAN command " + args);
                 if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && args.length >= 4) {
-                    if ("con".equals(args[3]) && args.length >= 5) {
+                    if ("start".equals(args[3])) {
+                        nan.start();
+                    } else if ("stop".equals(args[3])) {
+                        nan.stop();
+                    } else if ("sub".equals(args[3])) {
+                        nan.start();
+                    } else if ("adv".equals(args[3])) {
+                        nan.start();
+                    } else if ("con".equals(args[3]) && args.length >= 5) {
                         nan.conNan(args[4]);
                     } else if ("ping".equals(args[3])) {
                         if (args.length >= 5) {

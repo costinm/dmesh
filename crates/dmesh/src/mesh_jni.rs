@@ -10,16 +10,28 @@
 //! - Java wrapper: `java/rust/src/main/java/...`
 
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString};
+#[cfg(target_os = "android")]
+use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use ssh_mesh::sshc::SshClientListener;
 use ssh_mesh::MeshListener;
 use std::collections::{BTreeMap, HashMap};
+#[cfg(target_os = "android")]
+use std::ffi::{c_char, c_int, c_void, CString};
+#[cfg(target_os = "android")]
+use std::io::{self, Write};
+#[cfg(target_os = "android")]
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+#[cfg(target_os = "android")]
+use std::sync::Once;
 use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+#[cfg(target_os = "android")]
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::mesh_common::{MeshHandle, MeshStreamHandle};
 
@@ -27,9 +39,172 @@ const BRIDGE_HOST: &str = "dmesh-msg";
 const LEGACY_BRIDGE_HOST: &str = "local";
 const BRIDGE_PORT: u16 = 1;
 static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<String>>>> = OnceLock::new();
+#[cfg(target_os = "android")]
+static ANDROID_LOGGER: AndroidLog = AndroidLog;
+#[cfg(target_os = "android")]
+static ANDROID_LOG_INIT: Once = Once::new();
+
+#[cfg(target_os = "android")]
+struct AndroidVpnHandle {
+    _runtime: tokio::runtime::Runtime,
+    _injector: Arc<dyn mesh::tun::TunInjector>,
+}
 
 fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<String>>> {
     BRIDGE_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(target_os = "android")]
+const ANDROID_LOG_DEBUG: c_int = 3;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_INFO: c_int = 4;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_WARN: c_int = 5;
+#[cfg(target_os = "android")]
+const ANDROID_LOG_ERROR: c_int = 6;
+
+#[cfg(target_os = "android")]
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+}
+
+#[cfg(target_os = "android")]
+struct AndroidLog;
+
+#[cfg(target_os = "android")]
+impl log::Log for AndroidLog {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Trace
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            android_log_write(
+                android_log_priority(record.level()),
+                "dmesh-rust",
+                &format!("{}: {}", record.target(), record.args()),
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+#[cfg(target_os = "android")]
+struct AndroidTraceWriter {
+    buf: Vec<u8>,
+}
+
+#[cfg(target_os = "android")]
+impl Write for AndroidTraceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for AndroidTraceWriter {
+    fn drop(&mut self) {
+        let line = String::from_utf8_lossy(&self.buf);
+        let line = line.trim();
+        if !line.is_empty() {
+            android_log_write(ANDROID_LOG_INFO, "dmesh-trace", line);
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+struct AndroidTraceMakeWriter;
+
+#[cfg(target_os = "android")]
+impl<'a> MakeWriter<'a> for AndroidTraceMakeWriter {
+    type Writer = AndroidTraceWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        AndroidTraceWriter { buf: Vec::new() }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_log_priority(level: log::Level) -> c_int {
+    match level {
+        log::Level::Error => ANDROID_LOG_ERROR,
+        log::Level::Warn => ANDROID_LOG_WARN,
+        log::Level::Info => ANDROID_LOG_INFO,
+        log::Level::Debug | log::Level::Trace => ANDROID_LOG_DEBUG,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_log_write(priority: c_int, tag: &str, message: &str) {
+    let tag = cstring_lossy(tag);
+    let message = cstring_lossy(message);
+    unsafe {
+        __android_log_write(priority, tag.as_ptr(), message.as_ptr());
+    }
+}
+
+#[cfg(target_os = "android")]
+fn cstring_lossy(value: &str) -> CString {
+    CString::new(value).unwrap_or_else(|_| {
+        CString::new(value.replace('\0', "\\0")).unwrap_or_else(|_| CString::default())
+    })
+}
+
+#[cfg(target_os = "android")]
+fn init_android_logging() {
+    ANDROID_LOG_INIT.call_once(|| {
+        if log::set_logger(&ANDROID_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(AndroidTraceMakeWriter)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .try_init();
+
+        log::info!("Android Rust logging initialized");
+    });
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(_vm: *mut jni::sys::JavaVM, _reserved: *mut c_void) -> jint {
+    init_android_logging();
+    JNI_VERSION_1_6
+}
+
+#[cfg(target_os = "android")]
+fn catch_jni_jlong<F>(name: &str, f: F) -> jlong
+where
+    F: FnOnce() -> anyhow::Result<jlong>,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            log::error!("{} failed: {}", name, error);
+            -1
+        }
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            log::error!("{} panicked: {}", name, message);
+            -1
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +258,9 @@ fn insert_json_map(data: &mut BTreeMap<String, String>, obj: &Map<String, Value>
 }
 
 fn json_value_to_string(v: &Value) -> String {
-    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
 }
 
 fn parse_bridge_human(line: &str) -> anyhow::Result<BridgeCommand> {
@@ -227,7 +404,13 @@ impl MeshListener for JniMeshListener {
                     return;
                 }
             };
-            let j_user = env.new_string(user_str).unwrap();
+            let j_user = match env.new_string(user_str) {
+                Ok(value) => value,
+                Err(e) => {
+                    log::error!("Failed to create Java user string: {}", e);
+                    return;
+                }
+            };
             let _ = env.call_method(
                 &callback,
                 "onSshConnection",
@@ -260,7 +443,13 @@ impl MeshListener for JniMeshListener {
                     return;
                 }
             };
-            let j_host = env.new_string(host_str).unwrap();
+            let j_host = match env.new_string(host_str) {
+                Ok(value) => value,
+                Err(e) => {
+                    log::error!("Failed to create Java host string: {}", e);
+                    return;
+                }
+            };
 
             let stream_handle = MeshStreamHandle {
                 stream,
@@ -291,7 +480,15 @@ async fn handle_bridge_stream(
     mut stream: DuplexStream,
 ) {
     let (tx, mut rx) = unbounded_channel::<String>();
-    bridge_senders().lock().unwrap().insert(client_id, tx);
+    match bridge_senders().lock() {
+        Ok(mut senders) => {
+            senders.insert(client_id, tx);
+        }
+        Err(e) => {
+            log::error!("SSH message bridge sender map is poisoned: {}", e);
+            return;
+        }
+    }
     let mut pending = Vec::new();
     let mut buf = [0u8; 4096];
 
@@ -358,7 +555,9 @@ async fn handle_bridge_stream(
         }
     }
 
-    bridge_senders().lock().unwrap().remove(&client_id);
+    if let Ok(mut senders) = bridge_senders().lock() {
+        senders.remove(&client_id);
+    }
 }
 
 fn dispatch_bridge_command(
@@ -423,7 +622,13 @@ impl SshClientListener for JniSshClientListener {
                     return;
                 }
             };
-            let j_host = env.new_string(host_str).unwrap();
+            let j_host = match env.new_string(host_str) {
+                Ok(value) => value,
+                Err(e) => {
+                    log::error!("Failed to create Java host string: {}", e);
+                    return;
+                }
+            };
 
             let stream_handle = MeshStreamHandle {
                 stream,
@@ -454,9 +659,25 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
     handle: jlong,
     callback: jni::objects::JObject,
 ) {
+    if handle == 0 {
+        log::error!("nativeSetCallback called with null mesh handle");
+        return;
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let jvm = Arc::new(env.get_java_vm().unwrap());
-    let callback_ref = env.new_global_ref(callback).unwrap();
+    let jvm = match env.get_java_vm() {
+        Ok(jvm) => Arc::new(jvm),
+        Err(e) => {
+            log::error!("Failed to get Java VM: {}", e);
+            return;
+        }
+    };
+    let callback_ref = match env.new_global_ref(callback) {
+        Ok(callback_ref) => callback_ref,
+        Err(e) => {
+            log::error!("Failed to create callback global ref: {}", e);
+            return;
+        }
+    };
 
     let mesh_listener = Arc::new(JniMeshListener {
         jvm: jvm.clone(),
@@ -488,11 +709,13 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSendBr
         }
     };
     let sender = {
-        bridge_senders()
-            .lock()
-            .unwrap()
-            .get(&(client_id as u64))
-            .cloned()
+        match bridge_senders().lock() {
+            Ok(senders) => senders.get(&(client_id as u64)).cloned(),
+            Err(e) => {
+                log::error!("SSH message bridge sender map is poisoned: {}", e);
+                None
+            }
+        }
     };
     match sender {
         Some(tx) if tx.send(line).is_ok() => JNI_TRUE,
@@ -508,6 +731,9 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
     ssh_port: jint,
     http_port: jint,
 ) -> jlong {
+    #[cfg(target_os = "android")]
+    init_android_logging();
+
     let base_dir_str: String = match env.get_string(&base_dir) {
         Ok(s) => s.into(),
         Err(_) => return 0,
@@ -544,10 +770,32 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeConnec
     user: JString,
     server_key: JString,
 ) -> jlong {
+    if handle == 0 {
+        log::error!("nativeConnect called with null mesh handle");
+        return -1;
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let host_str: String = env.get_string(&host).unwrap().into();
-    let user_str: String = env.get_string(&user).unwrap().into();
-    let key_str: String = env.get_string(&server_key).unwrap().into();
+    let host_str: String = match env.get_string(&host) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read connect host: {}", e);
+            return -1;
+        }
+    };
+    let user_str: String = match env.get_string(&user) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read connect user: {}", e);
+            return -1;
+        }
+    };
+    let key_str: String = match env.get_string(&server_key) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read connect server key: {}", e);
+            return -1;
+        }
+    };
 
     match crate::mesh_common::mesh_connect(handle, &host_str, port as u16, &user_str, &key_str) {
         Ok(id) => id as jlong,
@@ -566,14 +814,32 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeExec<'
     conn_id: jlong,
     command: JString<'a>,
 ) -> JString<'a> {
+    if handle == 0 {
+        log::error!("nativeExec called with null mesh handle");
+        return env
+            .new_string("")
+            .unwrap_or_else(|_| JString::from(JObject::null()));
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let cmd_str: String = env.get_string(&command).unwrap().into();
+    let cmd_str: String = match env.get_string(&command) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read exec command: {}", e);
+            return env
+                .new_string("")
+                .unwrap_or_else(|_| JString::from(JObject::null()));
+        }
+    };
 
     match crate::mesh_common::mesh_exec(handle, conn_id as u64, &cmd_str) {
-        Ok(stdout) => env.new_string(stdout).unwrap(),
+        Ok(stdout) => env.new_string(stdout).unwrap_or_else(|e| {
+            log::error!("Failed to create exec result string: {}", e);
+            JString::from(JObject::null())
+        }),
         Err(e) => {
             log::error!("Exec failed: {}", e);
-            env.new_string("").unwrap()
+            env.new_string("")
+                .unwrap_or_else(|_| JString::from(JObject::null()))
         }
     }
 }
@@ -584,9 +850,18 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeGetPub
     _class: JClass<'a>,
     handle: jlong,
 ) -> JString<'a> {
+    if handle == 0 {
+        log::error!("nativeGetPublicKey called with null mesh handle");
+        return env
+            .new_string("")
+            .unwrap_or_else(|_| JString::from(JObject::null()));
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
     let pk_str = crate::mesh_common::mesh_get_public_key(handle);
-    env.new_string(pk_str).unwrap()
+    env.new_string(pk_str).unwrap_or_else(|e| {
+        log::error!("Failed to create public key string: {}", e);
+        JString::from(JObject::null())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -598,8 +873,18 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeOpenSt
     host: JString,
     port: jint,
 ) -> jlong {
+    if handle == 0 {
+        log::error!("nativeOpenStream called with null mesh handle");
+        return 0;
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let host_str: String = env.get_string(&host).unwrap().into();
+    let host_str: String = match env.get_string(&host) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read stream host: {}", e);
+            return 0;
+        }
+    };
 
     match crate::mesh_common::mesh_open_stream(handle, conn_id as u64, &host_str, port as u16) {
         Ok(stream_handle) => Box::into_raw(Box::new(stream_handle)) as jlong,
@@ -620,8 +905,18 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddLoc
     remote_host: JString,
     remote_port: jint,
 ) {
+    if handle == 0 {
+        log::error!("nativeAddLocalForward called with null mesh handle");
+        return;
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let host_str: String = env.get_string(&remote_host).unwrap().into();
+    let host_str: String = match env.get_string(&remote_host) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read local forward host: {}", e);
+            return;
+        }
+    };
 
     let _ = crate::mesh_common::mesh_add_local_forward(
         handle,
@@ -642,8 +937,18 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddRem
     local_host: JString,
     local_port: jint,
 ) -> jint {
+    if handle == 0 {
+        log::error!("nativeAddRemoteForward called with null mesh handle");
+        return -1;
+    }
     let handle = unsafe { &*(handle as *const MeshHandle) };
-    let host_str: String = env.get_string(&local_host).unwrap().into();
+    let host_str: String = match env.get_string(&local_host) {
+        Ok(value) => value.into(),
+        Err(e) => {
+            log::error!("Failed to read remote forward host: {}", e);
+            return -1;
+        }
+    };
 
     match crate::mesh_common::mesh_add_remote_forward(
         handle,
@@ -667,16 +972,39 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
     handle: jlong,
     buf: JByteArray,
 ) -> jint {
+    if handle == 0 {
+        log::error!("nativeStreamRead called with null stream handle");
+        return -1;
+    }
     let handle = unsafe { &mut *(handle as *mut MeshStreamHandle) };
-    let mut data = vec![0u8; env.get_array_length(&buf).unwrap() as usize];
+    let len = match env.get_array_length(&buf) {
+        Ok(len) if len >= 0 => len as usize,
+        Ok(len) => {
+            log::error!("nativeStreamRead got negative buffer length: {}", len);
+            return -1;
+        }
+        Err(e) => {
+            log::error!("Failed to read stream buffer length: {}", e);
+            return -1;
+        }
+    };
+    let mut data = vec![0u8; len];
 
     match crate::mesh_common::stream_read(handle, &mut data) {
         Ok(n) => {
             let byte_data: Vec<i8> = data[..n].iter().map(|&b| b as i8).collect();
-            env.set_byte_array_region(&buf, 0, &byte_data).unwrap();
-            n as jint
+            match env.set_byte_array_region(&buf, 0, &byte_data) {
+                Ok(()) => n as jint,
+                Err(e) => {
+                    log::error!("Failed to write stream bytes to Java buffer: {}", e);
+                    -1
+                }
+            }
         }
-        Err(_) => -1,
+        Err(e) => {
+            log::error!("Stream read failed: {}", e);
+            -1
+        }
     }
 }
 
@@ -687,10 +1015,22 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
     handle: jlong,
     data: JByteArray,
 ) {
+    if handle == 0 {
+        log::error!("nativeStreamWrite called with null stream handle");
+        return;
+    }
     let handle = unsafe { &mut *(handle as *mut MeshStreamHandle) };
-    let bytes = env.convert_byte_array(&data).unwrap();
+    let bytes = match env.convert_byte_array(&data) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Failed to read Java stream bytes: {}", e);
+            return;
+        }
+    };
 
-    let _ = crate::mesh_common::stream_write(handle, &bytes);
+    if let Err(e) = crate::mesh_common::stream_write(handle, &bytes) {
+        log::error!("Stream write failed: {}", e);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -708,19 +1048,85 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStre
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeTestTunFd(
+    env: JNIEnv,
+    class: JClass,
+    fd: jint,
+) -> jlong {
+    Java_com_github_costinm_dmeshnative_MeshNode_nativeStartTunFd(env, class, fd)
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartTunFd(
     mut _env: JNIEnv,
     _class: JClass,
     fd: jint,
 ) -> jlong {
-    log::info!("nativeTestTunFd called with fd: {}", fd);
-
-    match unsafe { tun_rs::AsyncDevice::from_fd(fd) } {
-        Ok(_device) => fd as jlong,
-        Err(e) => {
-            log::error!("Failed to create AsyncDevice from Android TUN fd: {}", e);
-            -1
+    init_android_logging();
+    catch_jni_jlong("nativeStartTunFd", || {
+        log::info!("nativeStartTunFd called with fd: {}", fd);
+        if fd < 0 {
+            anyhow::bail!("invalid Android TUN fd: {fd}");
         }
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .map_err(|error| anyhow::anyhow!("invalid Android TUN fd {fd}: {error}"));
+        }
+
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error())
+                .map_err(|error| anyhow::anyhow!("failed to inspect Android TUN fd: {error}"));
+        }
+        log::info!(
+            "Android TUN fd {} accepted, fd flags=0x{:x}; starting mesh-tun",
+            fd,
+            flags
+        );
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("dmesh-vpn")
+            .enable_all()
+            .build()?;
+        let tun = unsafe { mesh_tun::MeshTun::from_fd(fd) }?;
+        let passthrough = Arc::new(mesh_tun::flow::MeshPassthrough::new("android-vpn"));
+        let passthrough_udp = passthrough.clone();
+        let passthrough_dns = passthrough.clone();
+        let injector = runtime.block_on(async move {
+            let injector = tun
+                .run_with_policy(
+                    Arc::new(mesh_tun::policy::AllowAllPolicy),
+                    passthrough_udp,
+                    passthrough_dns,
+                )
+                .await?;
+            passthrough.set_injector(injector.clone());
+            anyhow::Ok(injector)
+        })?;
+        let handle = AndroidVpnHandle {
+            _runtime: runtime,
+            _injector: injector,
+        };
+        let ptr = Box::into_raw(Box::new(handle)) as jlong;
+        log::info!("Android VPN mesh-tun started handle={}", ptr);
+        Ok(ptr)
+    })
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStopTunFd(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    init_android_logging();
+    if handle == 0 {
+        return;
     }
+    log::info!("Stopping Android VPN mesh-tun handle={}", handle);
+    let _ = unsafe { Box::from_raw(handle as *mut AndroidVpnHandle) };
 }
 
 #[cfg(target_os = "android")]
@@ -730,7 +1136,7 @@ pub extern "C" fn Java_costinm_dmesh_MeshNode_nativeCreateTun(
     class: JClass,
     fd: jint,
 ) -> jlong {
-    Java_com_github_costinm_dmeshnative_MeshNode_nativeTestTunFd(env, class, fd)
+    Java_com_github_costinm_dmeshnative_MeshNode_nativeStartTunFd(env, class, fd)
 }
 
 #[cfg(test)]
@@ -739,10 +1145,9 @@ mod tests {
 
     #[test]
     fn parses_json_command() {
-        let cmd = parse_bridge_line(
-            r#"{"id":"j1","uri":"/wifi/scan","data":{"reason":"json","n":2}}"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_bridge_line(r#"{"id":"j1","uri":"/wifi/scan","data":{"reason":"json","n":2}}"#)
+                .unwrap();
         assert_eq!(cmd.id.as_deref(), Some("j1"));
         assert_eq!(cmd.uri, "/wifi/scan");
         assert_eq!(cmd.data.get("reason").unwrap(), "json");

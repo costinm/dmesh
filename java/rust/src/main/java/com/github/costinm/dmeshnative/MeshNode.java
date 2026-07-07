@@ -66,7 +66,15 @@ public class MeshNode implements AutoCloseable {
     }
 
     public static long testTunFd(int fd) {
-        return nativeTestTunFd(fd);
+        return nativeStartTunFd(fd);
+    }
+
+    public static long startTunFd(int fd) {
+        return nativeStartTunFd(fd);
+    }
+
+    public static void stopTunFd(long handle) {
+        nativeStopTunFd(handle);
     }
 
     public static boolean sendBridgeJson(long clientId, String line) {
@@ -90,5 +98,7 @@ public class MeshNode implements AutoCloseable {
     private native int nativeAddRemoteForward(long handle, long connId, int remotePort, String localHost, int localPort);
     private native void nativeSetCallback(long handle, MeshCallback callback);
     private static native long nativeTestTunFd(int fd);
+    private static native long nativeStartTunFd(int fd);
+    private static native void nativeStopTunFd(long handle);
     private static native boolean nativeSendBridgeMessage(long clientId, String line);
 }
