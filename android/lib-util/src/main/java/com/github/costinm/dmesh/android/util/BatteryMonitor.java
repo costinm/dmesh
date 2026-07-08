@@ -125,7 +125,7 @@ public class BatteryMonitor extends BroadcastReceiver {
                         if (idleStop == 0) {
                             sendStatus("ION");
                         } else {
-                            mux.publish("/BM/ION", "timeOn", Long.toString(idleStop - idleStart));
+                            mux.publish("BM.ION", "timeOn", Long.toString(idleStop - idleStart));
                         }
                     }
                     Log.d(TAG, "Idle: " + (idleStop - idleStart));
@@ -137,7 +137,7 @@ public class BatteryMonitor extends BroadcastReceiver {
                         idleStart = 0;
                         Log.d(TAG, "IdleOff:" + thisIdle + " " + totalIdleTime);
                         sendStatus("IOFF");
-                        mux.publish("/BM/IOFF",
+                        mux.publish("BM.IOFF",
                                 "timeOff", thisIdle + "",
                                 "totalOff", "" + totalIdleTime);
                     }
@@ -189,7 +189,7 @@ public class BatteryMonitor extends BroadcastReceiver {
             chState = "" + chargePlugExtraPlugged;
         }
 
-        mux.publish("/BM/status",
+        mux.publish("BM.status",
                 "batteryPct", (int) (batteryPct * 100) + "",
                 "charging", chState,
                 "ps", isPowerSave ? "1" : "0",

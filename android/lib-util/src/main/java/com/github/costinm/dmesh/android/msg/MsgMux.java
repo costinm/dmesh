@@ -20,8 +20,9 @@ import java.util.Map;
 import java.util.function.Consumer;
 
 /**
- * MsgMux controls message dispatching and connection. Acts like an HTTP server, using path to
- * route requests. For client side it may route to internal handlers or remote services.
+ * MsgMux controls message dispatching and connection using dot-separated
+ * message method names. For client side it may route to internal handlers or
+ * remote services.
  * <p>
  * Marshalling will be done late, if crossing process boundaries.
  */
@@ -170,7 +171,7 @@ public class MsgMux {
     public static void broadcast(String cat, String type, String msg, String... extra) {
         Message m = Message.obtain();
         Bundle b = m.getData();
-        b.putString(":uri", cat + "/" + type);
+        b.putString(":uri", cat + "." + type);
         if (msg != null && msg.length() > 0) {
             b.putString("txt", msg);
         }
@@ -251,16 +252,15 @@ public class MsgMux {
 //        }
 //    }
     public static String getGroup(Message msg) {
-        String uri = msg.getData().getString(MsgMux.URI);
-        if (uri == null) {
+        String method = msg.getData().getString(MsgMux.URI);
+        if (method == null) {
             return "";
         }
-        String[] parts = uri.split("/");
-        if (parts.length < 2) {
+        String[] parts = method.split("\\.");
+        if (parts.length < 1) {
             return "";
         }
-        String cat = parts[1];
-        return cat;
+        return parts[0];
     }
 
     public synchronized void unsubscribe(String prefix, MessageHandler handler) {
@@ -332,7 +332,7 @@ public class MsgMux {
      * Handle incoming message, received from one of the connections (either as a server or as a
      * client).
      * <p>
-     * The "uri" ( topic ) of the message will be used to find a local handler.
+     * The method/topic of the message will be used to find a local handler.
      * <p>
      * Message may also be forwarded to all other connections.
      *
@@ -400,8 +400,8 @@ public class MsgMux {
         if (cmd == null) {
             return;
         }
-        String[] args = cmd.split("/");
-        if (args.length < 2) {
+        String[] args = cmd.split("\\.");
+        if (args.length < 1) {
             return;
         }
         int hops = b.getInt(":hops");
@@ -415,13 +415,13 @@ public class MsgMux {
         if (from == null) {
             b.putString(":from", ctx.getPackageName() + "/" + ((receivedOn == null) ? "" : receivedOn.name));
         }
-        String topic = args[1];
+        String topic = args[0];
 
         if (!topic.equals("N")) {
             Log.d(TAG, "Broadcast " + b + " " + receivedOn);
         }
 
-        String msgType = args.length >= 3 ? args[2] : "";
+        String msgType = args.length >= 2 ? args[1] : "";
 
         if (nativeHandler != null) {
             nativeHandler.handleMessage(topic, msgType, m, receivedOn, args);

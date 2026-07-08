@@ -13,6 +13,7 @@ name = "dmeshui"
 path = "src/main.rs"
 
 [dependencies]
+dmeshtui = { path = "../dmeshtui", default-features = false }
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "glow",

@@ -13,10 +13,6 @@ android {
         testInstrumentationRunner = "android.support.test.runner.AndroidJUnitRunner"
     }
 
-    testOptions {
-        targetSdk = providers.gradleProperty("TARGET_SDK_VERSION").get().toInt()
-    }
-
     lint {
         abortOnError = false
     }

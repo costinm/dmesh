@@ -218,6 +218,13 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
         nan.onCreate();
         p2p.onCreate();
+        p2p.stopAll();
+        delayHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                announce(true);
+            }
+        }, 1000);
 
 //        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
 //            nan.sub(delayHandler, true);
@@ -319,17 +326,17 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             }, 6000);
     }
 
-    public void send(String uri, String... parms) {
+    public void send(String method, String... parms) {
         Message m = Message.obtain();
         m.what = 1;
-        m.getData().putString(":uri", uri);
+        m.getData().putString(":uri", method);
 
         Bundle b = m.getData();
         for (int i = 0; i < parms.length; i += 2) {
             b.putString(parms[i], parms[i + 1]);
         }
-        String[] args = uri.split("/");
-        handleMessage(args[1], args[2], m, null, args);
+        String[] args = method.split("\\.");
+        handleMessage(args.length > 0 ? args[0] : "", args.length > 1 ? args[1] : "", m, null, args);
     }
 
     /**
@@ -341,7 +348,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      * <p>
      * May send a direct response using msg.replyTo - should include the :id parameter.
      * May send at any time broadcasts using the delayHandler to all subscribers.
-     * Broadcasts start with "/wifi/" or /net/
+     * Broadcasts start with "wifi." or /net/
      */
     @Override
     public void handleMessage(String topic, String type, Message msg, MsgConn replyTo, String[] args) {
@@ -378,44 +385,47 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
             // p2p discovery must be started for con
             case "con":
-                if ("start".equals(args[3])) {
+                if (args.length >= 3 && "start".equals(args[2])) {
                     p2p.discoverPeersStart(msg);
-                } else if ("stop".equals(args[3])) {
-                    p2p.stopPeerAndSDDiscovery();
-                } else if ("cancel".equals(args[3])) {
+                } else if (args.length >= 3 && "stop".equals(args[2])) {
+                    p2p.stopAll();
+                } else if (args.length >= 3 && "cancel".equals(args[2])) {
+                    p2p.stopAll();
                     p2p.disconnect();
-                } else if ("peer".equals(args[3])) {
-                    con(msg, args[4], args[5]);
+                } else if (args.length >= 5 && "peer".equals(args[2])) {
+                    con(msg, args[3], args[4]);
                 }
                 break;
 
 
             case "nan":
                 Log.d(TAG, "NAN command " + args);
-                if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && args.length >= 4) {
-                    if ("start".equals(args[3])) {
+                if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && args.length >= 3) {
+                    if ("start".equals(args[2])) {
                         nan.start();
-                    } else if ("stop".equals(args[3])) {
+                    } else if ("stop".equals(args[2])) {
                         nan.stop();
-                    } else if ("sub".equals(args[3])) {
+                    } else if ("sub".equals(args[2])) {
                         nan.start();
-                    } else if ("adv".equals(args[3])) {
+                    } else if ("adv".equals(args[2])) {
                         nan.start();
-                    } else if ("con".equals(args[3]) && args.length >= 5) {
-                        nan.conNan(args[4]);
-                    } else if ("ping".equals(args[3])) {
-                        if (args.length >= 5) {
-                            nan.sendAll(args[4]);
+                    } else if ("con".equals(args[2]) && args.length >= 4) {
+                        nan.conNan(args[3]);
+                    } else if ("ping".equals(args[2])) {
+                        if (args.length >= 4) {
+                            nan.sendAll(args[3]);
                         } else {
                             nan.sendAll("PING");
                         }
-                    } else if ("msg".equals(args[3]) && args.length >= 6) {
-                        nan.send(args[4], args[5]);
+                    } else if ("msg".equals(args[2]) && args.length >= 5) {
+                        nan.send(args[3], args[4]);
                     }
                 }
                 break;
             case "ble":
-
+                if (ble != null) {
+                    ble.handleMessage(topic, type, msg, replyTo, args);
+                }
                 break;
 
             // Controls BLE, NAN advertising. Param: id4 - the 4-byte short for of identifier.
@@ -602,7 +612,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             extra.add("" + p2p.mWifiManager.getConnectionInfo().getRssi());
         }
 
-        MsgMux.get(ctx).publish("/net/status", scanStatusMsg, extra.toArray(new String[]{}));
+        MsgMux.get(ctx).publish("net.status", scanStatusMsg, extra.toArray(new String[]{}));
     }
 
     /**
@@ -623,12 +633,18 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             return;
         }
 
+        String nodeInfo;
         if (p2p.mySSID.isEmpty() || p2p.psk.isEmpty()) {
-            adv = "0000" + id4;
+            nodeInfo = ("000000000000" + id4);
         } else {
             // psk=8, delim=1 - remaining 9
             // ssidHash returns 4 bytes, leaving 5 for ID
-            adv = p2p.psk + Device.ssidHash(p2p.mySSID) + id4;
+            nodeInfo = p2p.psk + Device.ssidHash(p2p.mySSID) + id4;
+        }
+        if (nodeInfo.length() < 16) {
+            nodeInfo = (nodeInfo + "0000000000000000").substring(0, 16);
+        } else if (nodeInfo.length() > 16) {
+            nodeInfo = nodeInfo.substring(0, 16);
         }
 
 //        // Usually NAN doesn't work when AP is on
@@ -644,7 +660,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         // - public key hash - 4 or 8 bytes
         // 2 or 6 remaining
 
-        adv = "X1234567890123456789";
+        adv = "XDM" + nodeInfo;
 
         ble.advertise(adv.getBytes());
     }
@@ -746,7 +762,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                 ssid = connectionInfo == null ? "" : connectionInfo.getSSID();
             }
 
-            MsgMux.get(wifi.ctx).publish("/wifi/net/" + lp.getInterfaceName(),
+            MsgMux.get(wifi.ctx).publish("wifi.net." + lp.getInterfaceName(),
                     "addr", lp.getLinkAddresses().toString(),
                     "cap", cap.toString(),
                     "s", ssid == null ? "" : ssid,
@@ -764,7 +780,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             WifiInfo connectionInfo = wifi.p2p.mWifiManager.getConnectionInfo();
             String ssid = connectionInfo == null ? "" : connectionInfo.getSSID();
 
-            MsgMux.get(wifi.ctx).publish("/wifi/net/" + lp.getInterfaceName(),
+            MsgMux.get(wifi.ctx).publish("wifi.net." + lp.getInterfaceName(),
                     "addr", lp.getLinkAddresses().toString(),
                     "cap", cap == null ? "" : cap.toString(),
                     "s", ssid == null ? "" : ssid,
@@ -774,19 +790,19 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         @Override
         public void onLosing(Network network, int maxMsToLive) {
             super.onLosing(network, maxMsToLive);
-            MsgMux.get(wifi.ctx).publish("/wifi/CON/LOSING/" + network.toString());
+            MsgMux.get(wifi.ctx).publish("wifi.CON.LOSING." + network.toString());
         }
 
         @Override
         public void onLost(Network network) {
             super.onLost(network);
-            MsgMux.get(wifi.ctx).publish("/wifi/CON/LOST/" + network.toString());
+            MsgMux.get(wifi.ctx).publish("wifi.CON.LOST." + network.toString());
         }
 
         @Override
         public void onUnavailable() {
             super.onUnavailable();
-            MsgMux.get(wifi.ctx).publish("/wifi/CON/UNAVAIL");
+            MsgMux.get(wifi.ctx).publish("wifi.CON.UNAVAIL");
         }
 
         @Override

@@ -98,12 +98,17 @@ public class Ble implements MessageHandler {
     // Eddystone UUID: FEAA
     static UUID eddyUUID = UUID.fromString("0000FEAA-0000-1000-8000-00805f9b34fb");
     public static ParcelUuid EDDY = new ParcelUuid(eddyUUID);
+    static UUID meshtasticUUID = UUID.fromString("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
+    public static ParcelUuid MESHTASTIC = new ParcelUuid(meshtasticUUID);
+    static UUID nordicUartUUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+    public static ParcelUuid NORDIC_UART = new ParcelUuid(nordicUartUUID);
     // HTTP Body - 2AB9
     static UUID characteristicHttpBody = UUID.fromString("00002AB9-0000-1000-8000-00805f9b34fb");
     // write char - receive on server
     static UUID characteristicProxy = UUID.fromString("00002ADD-0000-1000-8000-00805f9b34fb");
     static UUID characteristicNotifyProxy = UUID.fromString("00002ADE-0000-1000-8000-00805f9b34fb");
     static Map<String, Device> devices = new HashMap<>();
+    static Map<String, Long> externalDevices = new HashMap<>();
     static boolean scanFailed = false;
     private final BluetoothManager bluetoothManager;
     LocalMesh wifi;
@@ -139,10 +144,23 @@ public class Ble implements MessageHandler {
             BluetoothDevice device = result.getDevice();
 
             ScanRecord sr = result.getScanRecord();
+            if (sr == null) {
+                return;
+            }
 
             List<ParcelUuid> suid = sr.getServiceUuids();
-            // Single UUID expected
-            if (suid == null || suid.size() == 0 || !suid.get(0).equals(EDDY)) {
+            if (suid == null || suid.size() == 0) {
+                return;
+            }
+            if (suid.contains(MESHTASTIC)) {
+                processExternalDiscovery(device, sr, result.getRssi(),
+                        "meshtastic", MESHTASTIC.toString(), "");
+            }
+            if (suid.contains(NORDIC_UART)) {
+                processExternalDiscovery(device, sr, result.getRssi(),
+                        "nordic_uart", NORDIC_UART.toString(), "meshcore");
+            }
+            if (!suid.contains(EDDY)) {
                 return;
             }
 
@@ -198,7 +216,7 @@ public class Ble implements MessageHandler {
             if (scanFailed) {
                 return;
             }
-            MsgMux.get(ctx).publish("/BLE/ERR/onScanFailed", "error", "" + errorCode);
+            MsgMux.get(ctx).publish("BLE.ERR.onScanFailed", "error", "" + errorCode);
             super.onScanFailed(errorCode);
             scanFailed = true;
         }
@@ -208,13 +226,14 @@ public class Ble implements MessageHandler {
         public void onStartSuccess(AdvertiseSettings settingsInEffect) {
             Log.i(TAG, "LE Advertise Started " + settingsInEffect);
             adv = true;
+            MsgMux.get(ctx).publish("BLE.advertise", "state", "started");
         }
 
         @Override
         public void onStartFailure(int errorCode) {
             // 1 = data too large (31 is the limit)
             Log.w(TAG, "LE Advertise Failed: " + errorCode);
-            MsgMux.get(ctx).publish("/BLE/ERR/advertise", "error", "" + errorCode);
+            MsgMux.get(ctx).publish("BLE.ERR.advertise", "error", "" + errorCode);
             currentAdvBytes = null;
         }
     };
@@ -255,11 +274,11 @@ public class Ble implements MessageHandler {
             name = mBluetoothAdapter.getName();
             try {
                 if (mBluetoothLeAdvertiser == null) {
-                    MsgMux.get(ctx).publish("/BLE/start",
+                    MsgMux.get(ctx).publish("BLE.start",
                             "name", name,
                             "adv", "-1");
                 } else {
-                    MsgMux.get(ctx).publish("/BLE/start",
+                    MsgMux.get(ctx).publish("BLE.start",
                             "name", name,
                             "psm", "" + psm);
                 }
@@ -273,7 +292,7 @@ public class Ble implements MessageHandler {
 
     // Will be called when a DMesh device is found, or found again after 60 sec.
     protected void onDiscovery(Device bd, String name, boolean firstTime) {
-        MsgMux.get(ctx).publish("/wifi/BLE/DISC",
+        MsgMux.get(ctx).publish("wifi.BLE.DISC",
                 "name", name,
                 "cnt", "" + discoveryCnt);
         // Update the status.
@@ -311,28 +330,77 @@ public class Ble implements MessageHandler {
         return false;
     }
 
+    private void processExternalDiscovery(BluetoothDevice device, ScanRecord record, int rssi, String proto,
+                                          String service, String compatible) {
+        String address = deviceAddress(device);
+        String name = deviceName(device, record);
+        String key = proto + ":" + address + ":" + name;
+        Long old = externalDevices.get(key);
+        long now = SystemClock.elapsedRealtime();
+        if (old != null && now - old < 120000) {
+            return;
+        }
+        externalDevices.put(key, now);
+        MsgMux.get(ctx).publish("BLE.DISC",
+                "proto", proto,
+                "compatible", compatible,
+                "service", service,
+                "name", name,
+                "addr", address,
+                "rssi", Integer.toString(rssi));
+    }
+
+    private String deviceAddress(BluetoothDevice device) {
+        if (device == null) {
+            return "";
+        }
+        try {
+            return device.getAddress();
+        } catch (SecurityException e) {
+            return "";
+        }
+    }
+
+    private String deviceName(BluetoothDevice device, ScanRecord record) {
+        String name = record == null ? null : record.getDeviceName();
+        if (name == null && device != null) {
+            try {
+                name = device.getName();
+            } catch (SecurityException e) {
+                name = "";
+            }
+        }
+        return name == null ? "" : name;
+    }
+
     // See Device.updateNode(). Path must be <=21 bytes, first byte will be set to type (0x50)
     public void advertise(byte[] urlb) {
         if (mBluetoothAdapter == null || mBluetoothLeAdvertiser == null) {
+            MsgMux.get(ctx).publish("BLE.ERR.unsupported", "advertiser", "missing");
+            return;
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+            MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", Manifest.permission.BLUETOOTH_ADVERTISE);
             return;
         }
         if (urlb == null) {
             mBluetoothLeAdvertiser.stopAdvertising(mAdvertiseCallback);
             adv = false;
             currentAdvBytes = null;
+            MsgMux.get(ctx).publish("BLE.advertise", "state", "stopped");
             return;
 
         }
 
-        if (adv) {
+        byte[] advBytes = Arrays.copyOf(urlb, urlb.length);
+        advBytes[0] = 0x50;
+
+        if (currentAdvBytes != null && Arrays.equals(currentAdvBytes, advBytes)) {
+            MsgMux.get(ctx).publish("BLE.advertise", "state", adv ? "started" : "pending");
             return;
         }
 
-        if (currentAdvBytes != null && Arrays.equals(currentAdvBytes, urlb)) {
-            return;
-        }
-
-        currentAdvBytes = urlb;
+        currentAdvBytes = advBytes;
 
         // LOW_POWER, LOW_LATENCY, BALANCED
         AdvertiseSettings settings = new AdvertiseSettings.Builder()
@@ -343,14 +411,11 @@ public class Ble implements MessageHandler {
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
                 .build();
 
-
-        urlb[0] = 0x50;
-
         AdvertiseData data = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .setIncludeTxPowerLevel(false)
                 .addServiceUuid(EDDY)
-                .addServiceData(EDDY, urlb)
+                .addServiceData(EDDY, advBytes)
                 .build();
 
         mBluetoothLeAdvertiser.stopAdvertising(mAdvertiseCallback);
@@ -359,14 +424,28 @@ public class Ble implements MessageHandler {
         } catch (InterruptedException e) {
         }
         mBluetoothLeAdvertiser.startAdvertising(settings, data, mAdvertiseCallback);
+        MsgMux.get(ctx).publish("BLE.advertise", "state", "starting", "uuid", EDDY.toString());
     }
 
     public void scanStop() {
+        if (leScanner == null) {
+            return;
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", Manifest.permission.BLUETOOTH_SCAN);
+            return;
+        }
         leScanner.stopScan(mScanCallback);
+        MsgMux.get(ctx).publish("BLE.stop");
     }
 
     public void scan() {
         if (leScanner == null) {
+            MsgMux.get(ctx).publish("BLE.ERR.unsupported", "scanner", "missing");
+            return;
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", Manifest.permission.BLUETOOTH_SCAN);
             return;
         }
         // Stops scanning after a pre-defined scan period.
@@ -389,6 +468,12 @@ public class Ble implements MessageHandler {
         filters.add(new ScanFilter.Builder()
                 .setServiceUuid(EDDY)
                 .build());
+        filters.add(new ScanFilter.Builder()
+                .setServiceUuid(MESHTASTIC)
+                .build());
+        filters.add(new ScanFilter.Builder()
+                .setServiceUuid(NORDIC_UART)
+                .build());
 
         if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
             leScanner.startScan(
@@ -396,6 +481,9 @@ public class Ble implements MessageHandler {
                     new ScanSettings.Builder()
                             //.setReportDelay(2000) - breaks KindeFire10
                             .build(), mScanCallback);
+            MsgMux.get(ctx).publish("BLE.scan", "filters", "eddy,meshtastic,nordic_uart");
+        } else {
+            MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", Manifest.permission.BLUETOOTH_SCAN);
         }
     }
 
@@ -403,17 +491,21 @@ public class Ble implements MessageHandler {
 
     @Override
     public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] argv) {
-        if (argv.length >= 2 && "adv".equals(argv[2])) {
-            if (argv.length > 3) {
+        String action = msgType;
+        if (argv != null && argv.length >= 3) {
+            action = argv[2];
+        }
+        if ("adv".equals(action)) {
+            if (argv != null && argv.length > 3) {
                 advertise(argv[3].getBytes());
             } else {
                 advertise(null);
             }
         }
-        if (argv.length >= 2 && "scan".equals(argv[2])) {
+        if ("scan".equals(action)) {
             scan();
         }
-        if (argv.length >= 2 && "stop".equals(argv[2])) {
+        if ("stop".equals(action)) {
             scanStop();
         }
     }
@@ -440,7 +532,7 @@ public class Ble implements MessageHandler {
             s.close();
             return;
         }
-        MsgMux.get(ctx).publish("/BT/scon",
+        MsgMux.get(ctx).publish("BT.scon",
                 "raddr", s.getRemoteDevice().getAddress(),
                 "cid", cid);
     }

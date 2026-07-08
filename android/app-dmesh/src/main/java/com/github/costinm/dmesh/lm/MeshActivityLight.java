@@ -136,6 +136,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
             Manifest.permission.POST_NOTIFICATIONS,
             Manifest.permission.BLUETOOTH_CONNECT,
             Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
             Manifest.permission.ACCESS_WIFI_STATE,
             Manifest.permission.CHANGE_WIFI_STATE,
             Manifest.permission.ACCESS_FINE_LOCATION,
@@ -515,7 +516,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
                         @Override
                         public boolean onMenuItemClick(MenuItem menuItem) {
                             final Device d = discListAdapter.getItem(acmi.position);
-                            localMesh.send("/wifi/con/peer/" + d.id + "/Q",
+                            localMesh.send("wifi.con.peer." + d.id + ".Q",
                                     Device.PSK, d.data.getString(Device.PSK, ""),
                                     Device.SSID, d.data.getString(Device.SSID, "")
                             );
@@ -530,7 +531,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
                         @Override
                         public boolean onMenuItemClick(MenuItem menuItem) {
                             final Device d = discListAdapter.getItem(acmi.position);
-                            localMesh.send("/wifi/con/peer/" + d.id + "/PBC",
+                            localMesh.send("wifi.con.peer." + d.id + ".PBC",
                                     Device.P2PAddr, d.id);
                             return false;
                         }
@@ -542,7 +543,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 //                        @Override
 //                        public boolean onMenuItemClick(MenuItem menuItem) {
 //                            final Device d = discListAdapter.getItem(acmi.position);
-//                            wifi.send("/wifi/con/peer/" + d.id + "/DISPLAY",
+//                            wifi.send("wifi.con.peer." + d.id + "/DISPLAY",
 //                                    Device.P2PAddr, d.id);
 //
 //                            return false;
@@ -555,7 +556,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 //                        @Override
 //                        public boolean onMenuItemClick(MenuItem menuItem) {
 //                            final Device d = discListAdapter.getItem(acmi.position);
-//                            wifi.send("/wifi/con/peer/" + d.id + "/KEYPAD",
+//                            wifi.send("wifi.con.peer." + d.id + "/KEYPAD",
 //                                    Device.P2PAddr, d.id);
 //                            return false;
 //                        }
@@ -567,7 +568,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
                         @Override
                         public boolean onMenuItemClick(MenuItem menuItem) {
                             final Device d = discListAdapter.getItem(acmi.position);
-                            localMesh.send("/wifi/con/peer/" + d.id + "/LABEL",
+                            localMesh.send("wifi.con.peer." + d.id + ".LABEL",
                                     Device.P2PAddr, d.id);
                             return false;
                         }
@@ -580,7 +581,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
                         @Override
                         public boolean onMenuItemClick(MenuItem menuItem) {
                             final Device d = discListAdapter.getItem(acmi.position);
-                            localMesh.send("/wifi/con/peer/" + d.data.getString(Device.SSID, "") + "/REFLECT",
+                            localMesh.send("wifi.con.peer." + d.data.getString(Device.SSID, "") + ".REFLECT",
                                     Device.PSK, d.data.getString(Device.PSK, ""),
                                     Device.SSID, d.data.getString(Device.SSID, ""));
                             return false;
@@ -592,7 +593,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
                 .setOnMenuItemClickListener(new MenuItem.OnMenuItemClickListener() {
                     @Override
                     public boolean onMenuItemClick(MenuItem menuItem) {
-                        localMesh.send("/wifi/con/cancel");
+                        localMesh.send("wifi.con.cancel");
                         return false;
                     }
                 });
@@ -836,9 +837,9 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         if (id == R.id.dm_switch2) {
             item.setChecked(!item.isChecked());
             if (item.isChecked()) {
-                localMesh.send("/wifi/p2p", "ap", "1");
+                localMesh.send("wifi.p2p", "ap", "1");
             } else {
-                localMesh.send("/wifi/p2p", "ap", "0");
+                localMesh.send("wifi.p2p", "ap", "0");
             }
 
         } else if (id == R.id.vpnstart) {
@@ -848,20 +849,20 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         } else if (id == R.id.sddisc) {
             item.setChecked(!item.isChecked());
             if (item.isChecked()) {
-                localMesh.send("/wifi/con/start");
+                localMesh.send("wifi.con.start");
             } else {
-                localMesh.send("/wifi/con/stop");
+                localMesh.send("wifi.con.stop");
             }
 
 
         } else if (id == R.id.mdnssdon) {
-            localMesh.send("/wifi/adv", "p2p", "1");
+            localMesh.send("wifi.adv", "p2p", "1");
 
         } else if (id == R.id.mdnssdoff) {
-            localMesh.send("/wifi/adv", "p2p", "0");
+            localMesh.send("wifi.adv", "p2p", "0");
 
         } else if (id == R.id.sddisc2) {
-            localMesh.send("/wifi/disc");
+            localMesh.send("wifi.disc");
 
 
             // BT
@@ -876,52 +877,52 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 
 
         } else if (id == R.id.scan) {
-            localMesh.send("/wifi/scan");
+            localMesh.send("wifi.scan");
 
         } else if (id == R.id.nanstart) {
-            localMesh.send("/wifi/adv", "on", "1");
+            localMesh.send("wifi.adv", "on", "1");
 
         } else if (id == R.id.nanstop) {
-            localMesh.send("/wifi/adv", "on", "0");
+            localMesh.send("wifi.adv", "on", "0");
 
         } else if (id == R.id.nanping) {
-            localMesh.send("/wifi/nan/ping");
+            localMesh.send("wifi.nan.ping");
 
         } else if (id == R.id.nanAttach) {
-            localMesh.send("/wifi/nan/start");
+            localMesh.send("wifi.nan.start");
 
         } else if (id == R.id.nanDetach) {
-            localMesh.send("/wifi/nan/stop");
+            localMesh.send("wifi.nan.stop");
 
         } else if (id == R.id.nanSub) {
-            localMesh.send("/wifi/nan/sub/pass");
+            localMesh.send("wifi.nan.sub.pass");
 
         } else if (id == R.id.nanSubStop) {
-            localMesh.send("/wifi/nan/sub/stop");
+            localMesh.send("wifi.nan.sub.stop");
 
         } else if (id == R.id.nanSubAct) {
-            localMesh.send("/wifi/nan/sub");
+            localMesh.send("wifi.nan.sub");
 
         } else if (id == R.id.nanPub) {
-            localMesh.send("/wifi/nan/adv");
+            localMesh.send("wifi.nan.adv");
 
         } else if (id == R.id.nanPubStop) {
-            localMesh.send("/wifi/nan/adv/stop");
+            localMesh.send("wifi.nan.adv.stop");
 
         } else if (id == R.id.nanPubAct) {
-            localMesh.send("/wifi/nan/adv/act");
+            localMesh.send("wifi.nan.adv.act");
 
         } else if (id == R.id.nanCon) {
-            localMesh.send("/wifi/nan/con/0");
+            localMesh.send("wifi.nan.con.0");
 
 
         } else if (id == R.id.disc) {
             //disc.clear();
             discListAdapter.notifyDataSetChanged();
-            localMesh.send("/wifi/con/start", "sd", "0", "wait", "0");
+            localMesh.send("wifi.con.start", "sd", "0", "wait", "0");
 
         } else if (id == R.id.discoff) {
-            localMesh.send("/wifi/con/stop");
+            localMesh.send("wifi.con.stop");
 
         } else if (id == R.id.wificaps) {
             showWifiCaps();

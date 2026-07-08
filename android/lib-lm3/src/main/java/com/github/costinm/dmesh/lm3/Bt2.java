@@ -206,7 +206,7 @@ public class Bt2 implements MessageHandler {
         }
         String name = mBluetoothAdapter.getName();
 
-        MsgMux.get(ctx).publish("/bt/start",
+        MsgMux.get(ctx).publish("bt.start",
                 "name", name,
                 "addr", "" + mBluetoothAdapter.getAddress(),
                 "status", mBluetoothAdapter.getScanMode() + " " + mBluetoothAdapter.getState());
@@ -246,7 +246,7 @@ public class Bt2 implements MessageHandler {
     private void onFound(BluetoothDevice device, String deviceName, String deviceHardwareAddress) {
         Log.d(TAG, "!!!Found " + deviceName + " " + deviceHardwareAddress);
 
-        MsgMux.get(ctx).publish("/bt/discovery",
+        MsgMux.get(ctx).publish("bt.discovery",
                 "name", deviceName,
                 "addr", "" + deviceHardwareAddress);
 
@@ -428,7 +428,7 @@ public class Bt2 implements MessageHandler {
             s.close();
             return;
         }
-        MsgMux.get(ctx).publish("/BT/scon",
+        MsgMux.get(ctx).publish("BT.scon",
                 "raddr", s.getRemoteDevice().getAddress(),
                 "cid", cid);
         devices.put(s.getRemoteDevice().getAddress(), s.getRemoteDevice());
@@ -440,7 +440,7 @@ public class Bt2 implements MessageHandler {
             s.close();
             return;
         }
-        MsgMux.get(ctx).publish("/BT/ccon",
+        MsgMux.get(ctx).publish("BT.ccon",
                 "raddr", address,
                 "cid", cid);
     }

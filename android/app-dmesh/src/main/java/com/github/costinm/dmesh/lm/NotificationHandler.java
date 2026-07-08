@@ -52,7 +52,7 @@ public class NotificationHandler implements MessageHandler {
 
         i = new Intent();
         i.setComponent(new ComponentName(ctx.getPackageName(), ctx.getPackageName() + ".DMService"))
-                .putExtra(":uri", "/sync");
+                .putExtra(":uri", "sync");
         syncPI = PendingIntent.getService(ctx, 1, i, PendingIntent.FLAG_MUTABLE);
 
     }

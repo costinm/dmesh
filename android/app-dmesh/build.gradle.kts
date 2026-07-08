@@ -1,6 +1,4 @@
 
-import com.android.build.api.dsl.ApplicationExtension
-
 plugins {
     alias(libs.plugins.android.application)
 }
@@ -36,15 +34,12 @@ android {
     defaultConfig {
         applicationId = "com.github.costinm.dmesh.lm"
         minSdk = providers.gradleProperty("MIN_SDK_VERSION").get().toInt()
+        targetSdk = providers.gradleProperty("TARGET_SDK_VERSION").get().toInt()
         // 30 - Android 11, 2020
         versionCode = 30
         versionName = "1.4"
         multiDexEnabled = false
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    }
-
-    lint {
-        targetSdk = providers.gradleProperty("TARGET_SDK_VERSION").get().toInt()
     }
 
     buildTypes {

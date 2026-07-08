@@ -2,9 +2,6 @@
 //!
 //! The JNI wrapper (`mesh_jni.rs`) delegates to these functions for the actual
 //! mesh logic. JNI-specific marshalling stays in the wrapper module.
-//!
-//! The Rust binary (`main.rs`) and Java/Android wrapper start a single node
-//! using the same feature set. Keep them in sync when adding new capabilities.
 
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::{run_ssh_server, MeshNode, MeshNodeConfig};

@@ -30,9 +30,9 @@ public class ChatService extends BaseMsgService implements MessageHandler {
         if (text == null) {
             text = frame.fields.get("txt");
         }
-        Log.d(TAG, "chat command " + frame.uri + " text=" + text);
+        Log.d(TAG, "chat command " + frame.method + " text=" + text);
         if (replyTo != null) {
-            MsgFrame out = new MsgFrame("/chat/message");
+            MsgFrame out = new MsgFrame("chat.message");
             out.fields.put("from", "app-chat");
             out.fields.put("text", text == null ? "" : text);
             replyTo.sendFrame(out);

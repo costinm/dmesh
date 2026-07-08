@@ -162,13 +162,13 @@ public class P2P extends BroadcastReceiver {
             // This is a sticky broadcast, so no need to do that.
             group = intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_GROUP);
 
-            Log.d(lm.TAG, "/wifi/P2P " + pinfo.toString() + " " + ninfo.toString() + " " + group);
+            Log.d(lm.TAG, "wifi.P2P " + pinfo.toString() + " " + ninfo.toString() + " " + group);
 
             if (group == null || !group.isGroupOwner()) {
                 if (p2pGroupStarted) {
                     announceWifiP2P(false);
                     p2pGroupStarted = false;
-                    MsgMux.get(ctx).publish("/wifi/AP", "on", "0");
+                    MsgMux.get(ctx).publish("wifi.AP", "on", "0");
                 }
                 currentClientList.clear();
             } else {
@@ -178,7 +178,7 @@ public class P2P extends BroadcastReceiver {
                     mySSID = group.getNetworkName();
                     psk = group.getPassphrase();
 
-                    MsgMux.get(ctx).publish("/wifi/ApIdChange",
+                    MsgMux.get(ctx).publish("wifi.ApIdChange",
                             "mySSID", group.getNetworkName(),
                             "psk", group.getPassphrase(),
                             "oldssid", "" + mySSID);
@@ -191,7 +191,7 @@ public class P2P extends BroadcastReceiver {
                 if (!p2pGroupStarted) {
                     p2pGroupStarted = true;
                     announceWifiP2P(true);
-                    MsgMux.get(ctx).publish("/wifi/AP", "on", "1");
+                    MsgMux.get(ctx).publish("wifi.AP", "on", "1");
                 }
             }
 
@@ -207,7 +207,7 @@ public class P2P extends BroadcastReceiver {
         } else if (WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION.equals(action)) {
             // Also at startup.
             discoveryState = intent.getIntExtra(WifiP2pManager.EXTRA_DISCOVERY_STATE, 0);
-            MsgMux.get(ctx).publish("/wifi/p2p/discState",
+            MsgMux.get(ctx).publish("wifi.p2p.discState",
                     "on", discoveryState == 2 ? "1" : "0");
         }
     }
@@ -234,7 +234,7 @@ public class P2P extends BroadcastReceiver {
         }
 
         public void onFailure(int reason) {
-            MsgMux.get(ctx).publish("/wifi/ERR/" + name + "/" + reason);
+            MsgMux.get(ctx).publish("wifi.ERR." + name + "." + reason);
         }
     }
 
@@ -264,6 +264,20 @@ public class P2P extends BroadcastReceiver {
         } else {
             mP2PManager.removeGroup(getmChannel(), new MyActionListener("removeGroup"));
         }
+    }
+
+    public void stopAll() {
+        stopPeerAndSDDiscovery();
+        if (si != null) {
+            mP2PManager.removeLocalService(getmChannel(), si, new MyActionListener("removeLocalService"));
+            si = null;
+        }
+        mP2PManager.cancelConnect(getmChannel(), new MyActionListener("cancelConnect"));
+        mP2PManager.removeGroup(getmChannel(), new MyActionListener("removeGroup"));
+        p2pGroupStarted = false;
+        group = null;
+        currentClientList.clear();
+        MsgMux.get(ctx).publish("wifi.p2p.STOP");
     }
 
     public void con(final Bundle data, final int mode) {
@@ -371,7 +385,7 @@ public class P2P extends BroadcastReceiver {
                     return;
                 }
 
-                MsgMux.get(ctx).publish("/wifi/peer/DISC/" + txt);
+                MsgMux.get(ctx).publish("wifi.peer.DISC." + txt);
 
                 txtDiscoveryByP2P.put(wifiP2pDevice.deviceAddress, txt);
 
@@ -435,7 +449,7 @@ public class P2P extends BroadcastReceiver {
 
                     }
                 });
-        MsgMux.get(ctx).publish("/wifi/SD/START");
+        MsgMux.get(ctx).publish("wifi.SD.START");
 
         if (delayMs > 0) {
             lm.delayHandler.postDelayed(new Runnable() {

@@ -30,6 +30,21 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".RatatuiActivity"
+            android:label="DMesh Ratatui"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|screenSize">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="dmeshui" />
+            <intent-filter>
+                <action android:name="com.github.costinm.dmesh.chat.RATATUI" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".ChatService"
             android:enabled="true"

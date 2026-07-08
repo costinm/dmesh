@@ -6,10 +6,9 @@
 //! and callback plumbing.
 //!
 //! See also:
-//! - Rust binary: `src/main.rs`
 //! - Java wrapper: `java/rust/src/main/java/...`
 
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JObjectArray, JString};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 #[cfg(target_os = "android")]
 use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
@@ -43,6 +42,9 @@ static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<String>>>> = 
 static ANDROID_LOGGER: AndroidLog = AndroidLog;
 #[cfg(target_os = "android")]
 static ANDROID_LOG_INIT: Once = Once::new();
+#[cfg(target_os = "android")]
+static ANDROID_MESSAGE_CALLBACK: OnceLock<Mutex<Option<(Arc<JavaVM>, GlobalRef)>>> =
+    OnceLock::new();
 
 #[cfg(target_os = "android")]
 struct AndroidVpnHandle {
@@ -80,11 +82,14 @@ impl log::Log for AndroidLog {
 
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            android_log_write(
-                android_log_priority(record.level()),
-                "dmesh-rust",
-                &format!("{}: {}", record.target(), record.args()),
-            );
+            let line = json!({
+                "level": record.level().to_string(),
+                "target": record.target(),
+                "message": record.args().to_string(),
+            })
+            .to_string();
+            android_log_write(android_log_priority(record.level()), "dmesh-rust", &line);
+            emit_android_message_line(0, rust_trace_frame(&line));
         }
     }
 
@@ -115,6 +120,7 @@ impl Drop for AndroidTraceWriter {
         let line = line.trim();
         if !line.is_empty() {
             android_log_write(ANDROID_LOG_INFO, "dmesh-trace", line);
+            emit_android_message_line(0, rust_trace_frame(line));
         }
     }
 }
@@ -151,6 +157,49 @@ fn android_log_write(priority: c_int, tag: &str, message: &str) {
 }
 
 #[cfg(target_os = "android")]
+fn android_message_callback() -> &'static Mutex<Option<(Arc<JavaVM>, GlobalRef)>> {
+    ANDROID_MESSAGE_CALLBACK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "android")]
+fn emit_android_message_line(client_id: u64, line: String) {
+    let callback = match android_message_callback().lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some((jvm, callback)) = callback else {
+        return;
+    };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(env) => env,
+        Err(_) => return,
+    };
+    let j_line = match env.new_string(line) {
+        Ok(line) => line,
+        Err(_) => return,
+    };
+    let _ = env.call_method(
+        &callback,
+        "onMessage",
+        "(JLjava/lang/String;)V",
+        &[(client_id as i64).into(), (&j_line).into()],
+    );
+}
+
+#[cfg(target_os = "android")]
+fn rust_trace_frame(line: &str) -> String {
+    let payload = serde_json::from_str::<Value>(line).unwrap_or_else(|_| Value::String(line.into()));
+    json!({
+        "method": "messages.event",
+        "data": {
+            "source": "rust.trace",
+            "json": payload,
+        }
+    })
+    .to_string()
+}
+
+#[cfg(target_os = "android")]
 fn cstring_lossy(value: &str) -> CString {
     CString::new(value).unwrap_or_else(|_| {
         CString::new(value.replace('\0', "\\0")).unwrap_or_else(|_| CString::default())
@@ -166,6 +215,7 @@ fn init_android_logging() {
 
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
+            .json()
             .with_writer(AndroidTraceMakeWriter)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -210,8 +260,30 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BridgeCommand {
     id: Option<String>,
-    uri: String,
+    method: String,
     data: BTreeMap<String, String>,
+}
+
+impl BridgeCommand {
+    fn to_json_value(&self) -> Value {
+        let mut root = Map::new();
+        if let Some(id) = &self.id {
+            root.insert("id".to_string(), Value::String(id.clone()));
+        }
+        root.insert("method".to_string(), Value::String(self.method.clone()));
+        let mut data = Map::new();
+        for (key, value) in &self.data {
+            data.insert(key.clone(), Value::String(value.clone()));
+        }
+        if !data.is_empty() {
+            root.insert("data".to_string(), Value::Object(data));
+        }
+        Value::Object(root)
+    }
+
+    fn to_json_line(&self) -> String {
+        self.to_json_value().to_string()
+    }
 }
 
 fn parse_bridge_line(line: &str) -> anyhow::Result<BridgeCommand> {
@@ -231,10 +303,10 @@ fn parse_bridge_json(line: &str) -> anyhow::Result<BridgeCommand> {
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("command must be a JSON object"))?;
-    let uri = obj
-        .get("uri")
+    let method = obj
+        .get("method")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing uri"))?
+        .ok_or_else(|| anyhow::anyhow!("missing method"))?
         .to_string();
     let id = obj.get("id").map(json_value_to_string);
     let mut data = BTreeMap::new();
@@ -244,11 +316,11 @@ fn parse_bridge_json(line: &str) -> anyhow::Result<BridgeCommand> {
     } else {
         insert_json_map(&mut data, obj);
         data.remove("id");
-        data.remove("uri");
+        data.remove("method");
         data.remove("data");
     }
 
-    Ok(BridgeCommand { id, uri, data })
+    Ok(BridgeCommand { id, method, data })
 }
 
 fn insert_json_map(data: &mut BTreeMap<String, String>, obj: &Map<String, Value>) {
@@ -271,8 +343,8 @@ fn parse_bridge_human(line: &str) -> anyhow::Result<BridgeCommand> {
 
     let mut id = None;
     let mut data = BTreeMap::new();
-    let mut uri = String::new();
-    let mut saw_path = false;
+    let mut method = String::new();
+    let mut saw_method = false;
 
     let mut i = 0;
     while i < parts.len() {
@@ -295,26 +367,30 @@ fn parse_bridge_human(line: &str) -> anyhow::Result<BridgeCommand> {
             continue;
         }
 
-        if !saw_path && part.starts_with('/') {
-            uri.clear();
-            uri.push_str(part);
-            saw_path = true;
+        if !saw_method && is_method_name(part) {
+            method.clear();
+            method.push_str(part);
+            saw_method = true;
         } else {
-            if uri.is_empty() {
-                uri.push('/');
-            } else if !uri.ends_with('/') {
-                uri.push('/');
+            if method.is_empty() {
+                method.push_str(part);
+            } else {
+                method.push('.');
+                method.push_str(part);
             }
-            uri.push_str(part);
-            saw_path = true;
+            saw_method = true;
         }
         i += 1;
     }
 
-    if uri.is_empty() {
-        anyhow::bail!("missing command path");
+    if method.is_empty() {
+        anyhow::bail!("missing command method");
     }
-    Ok(BridgeCommand { id, uri, data })
+    Ok(BridgeCommand { id, method, data })
+}
+
+fn is_method_name(value: &str) -> bool {
+    value.contains('.') && !value.contains('/') && !value.contains('=')
 }
 
 fn put_human_value(
@@ -516,7 +592,7 @@ async fn handle_exec_session(
             Ok(()) => json!({
                 "id": cmd.id,
                 "ok": true,
-                "uri": cmd.uri,
+                "method": cmd.method,
             }),
             Err(e) => json!({
                 "id": cmd.id,
@@ -602,7 +678,7 @@ async fn handle_bridge_stream(
                         if line == "exit" || line == "quit" {
                             let response = json!({
                                 "ok": true,
-                                "uri": "/shell/exit",
+                                "method": "shell.exit",
                             });
                             let mut out = response.to_string();
                             out.push('\n');
@@ -610,17 +686,36 @@ async fn handle_bridge_stream(
                             break 'stream_loop;
                         }
                         let response = match parse_bridge_line(&line) {
-                            Ok(cmd) => match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
-                                Ok(()) => json!({
-                                    "id": cmd.id,
-                                    "ok": true,
-                                    "uri": cmd.uri,
-                                }),
-                                Err(e) => json!({
-                                    "id": cmd.id,
-                                    "ok": false,
-                                    "error": e.to_string(),
-                                }),
+                            Ok(cmd) => {
+                                if let Some(open) = mesh::message::StreamOpenRequest::parse(
+                                    &cmd.to_json_value(),
+                                    format!("ssh:{client_id}"),
+                                ) {
+                                    let ack = open.opened_response();
+                                    let mut out = ack.to_string();
+                                    out.push('\n');
+                                    if let Err(e) = stream.write_all(out.as_bytes()).await {
+                                        log::warn!("SSH stream upgrade ACK write failed: {}", e);
+                                        break 'stream_loop;
+                                    }
+                                    if let Err(e) = notify_stream_opened(&jvm, &callback, client_id, &ack.to_string()) {
+                                        log::warn!("stream-opened callback failed: {}", e);
+                                    }
+                                    hand_stream_to_java(&jvm, &callback, client_id, stream, "mesh-stream", 0);
+                                    break 'stream_loop;
+                                }
+                                match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
+                                    Ok(()) => json!({
+                                        "id": cmd.id,
+                                        "ok": true,
+                                        "method": cmd.method,
+                                    }),
+                                    Err(e) => json!({
+                                        "id": cmd.id,
+                                        "ok": false,
+                                        "error": e.to_string(),
+                                    }),
+                                }
                             },
                             Err(e) => json!({
                                 "id": Value::Null,
@@ -659,6 +754,63 @@ async fn handle_bridge_stream(
     }
 }
 
+fn notify_stream_opened(
+    jvm: &JavaVM,
+    callback: &GlobalRef,
+    client_id: u64,
+    line: &str,
+) -> anyhow::Result<()> {
+    let mut env = jvm.attach_current_thread()?;
+    let j_line = env.new_string(line)?;
+    env.call_method(
+        callback,
+        "onStreamOpened",
+        "(JLjava/lang/String;)V",
+        &[(client_id as i64).into(), (&j_line).into()],
+    )?;
+    Ok(())
+}
+
+fn hand_stream_to_java(
+    jvm: &JavaVM,
+    callback: &GlobalRef,
+    client_id: u64,
+    stream: DuplexStream,
+    host: &str,
+    port: u16,
+) {
+    let mut env = match jvm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            log::error!("Failed to attach thread for upgraded stream: {}", e);
+            return;
+        }
+    };
+    let j_host = match env.new_string(host) {
+        Ok(value) => value,
+        Err(e) => {
+            log::error!("Failed to create upgraded stream host string: {}", e);
+            return;
+        }
+    };
+    let stream_handle = MeshStreamHandle {
+        stream,
+        runtime_handle: tokio::runtime::Handle::current(),
+    };
+    let h = Box::into_raw(Box::new(stream_handle)) as jlong;
+    let _ = env.call_method(
+        callback,
+        "onStream",
+        "(JLjava/lang/String;IJ)V",
+        &[
+            (client_id as i64).into(),
+            (&j_host).into(),
+            (port as i32).into(),
+            h.into(),
+        ],
+    );
+}
+
 fn dispatch_bridge_command(
     jvm: &JavaVM,
     callback: &GlobalRef,
@@ -666,38 +818,14 @@ fn dispatch_bridge_command(
     cmd: &BridgeCommand,
 ) -> anyhow::Result<()> {
     let mut env = jvm.attach_current_thread()?;
-    let j_id = env.new_string(cmd.id.as_deref().unwrap_or(""))?;
-    let j_uri = env.new_string(&cmd.uri)?;
-    let keys = cmd.data.keys().cloned().collect::<Vec<_>>();
-    let values = cmd.data.values().cloned().collect::<Vec<_>>();
-    let j_keys = new_string_array(&mut env, &keys)?;
-    let j_values = new_string_array(&mut env, &values)?;
+    let j_line = env.new_string(cmd.to_json_line())?;
     env.call_method(
         callback,
         "onMessage",
-        "(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V",
-        &[
-            (client_id as i64).into(),
-            (&j_id).into(),
-            (&j_uri).into(),
-            (&j_keys).into(),
-            (&j_values).into(),
-        ],
+        "(JLjava/lang/String;)V",
+        &[(client_id as i64).into(), (&j_line).into()],
     )?;
     Ok(())
-}
-
-fn new_string_array<'a>(
-    env: &mut JNIEnv<'a>,
-    values: &[String],
-) -> anyhow::Result<JObjectArray<'a>> {
-    let string_cls = env.find_class("java/lang/String")?;
-    let out = env.new_object_array(values.len() as i32, string_cls, JObject::null())?;
-    for (idx, value) in values.iter().enumerate() {
-        let j_value = env.new_string(value)?;
-        env.set_object_array_element(&out, idx as i32, j_value)?;
-    }
-    Ok(out)
 }
 
 struct JniSshClientListener {
@@ -777,6 +905,11 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
             return;
         }
     };
+
+    #[cfg(target_os = "android")]
+    if let Ok(mut message_callback) = android_message_callback().lock() {
+        *message_callback = Some((jvm.clone(), callback_ref.clone()));
+    }
 
     let mesh_listener = Arc::new(JniMeshListener {
         jvm: jvm.clone(),
@@ -1244,28 +1377,56 @@ mod tests {
 
     #[test]
     fn parses_json_command() {
-        let cmd =
-            parse_bridge_line(r#"{"id":"j1","uri":"/wifi/scan","data":{"reason":"json","n":2}}"#)
-                .unwrap();
+        let cmd = parse_bridge_line(
+            r#"{"id":"j1","method":"wifi.scan","data":{"reason":"json","n":2}}"#,
+        )
+        .unwrap();
         assert_eq!(cmd.id.as_deref(), Some("j1"));
-        assert_eq!(cmd.uri, "/wifi/scan");
+        assert_eq!(cmd.method, "wifi.scan");
         assert_eq!(cmd.data.get("reason").unwrap(), "json");
         assert_eq!(cmd.data.get("n").unwrap(), "2");
+    }
+
+    #[test]
+    fn parses_json_method_command() {
+        let cmd = parse_bridge_line(
+            r#"{"id":"m1","method":"wifi.scan","data":{"reason":"json","n":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(cmd.id.as_deref(), Some("m1"));
+        assert_eq!(cmd.method, "wifi.scan");
+        assert_eq!(cmd.to_json_value()["method"], "wifi.scan");
     }
 
     #[test]
     fn parses_human_key_value_command() {
         let cmd = parse_bridge_line(r#"wifi scan id=h1 reason="human value""#).unwrap();
         assert_eq!(cmd.id.as_deref(), Some("h1"));
-        assert_eq!(cmd.uri, "/wifi/scan");
+        assert_eq!(cmd.method, "wifi.scan");
         assert_eq!(cmd.data.get("reason").unwrap(), "human value");
     }
 
     #[test]
+    fn parses_human_method_name_command() {
+        let cmd = parse_bridge_line(r#"wifi.scan id=h3 reason="human value""#).unwrap();
+        assert_eq!(cmd.id.as_deref(), Some("h3"));
+        assert_eq!(cmd.method, "wifi.scan");
+        assert_eq!(cmd.data.get("reason").unwrap(), "human value");
+    }
+
+    #[test]
+    fn parses_app_alias_method_name_command() {
+        let cmd = parse_bridge_line(r#"app.chat.send id=a1 text=hello"#).unwrap();
+        assert_eq!(cmd.id.as_deref(), Some("a1"));
+        assert_eq!(cmd.method, "app.chat.send");
+        assert_eq!(cmd.to_json_value()["method"], "app.chat.send");
+    }
+
+    #[test]
     fn parses_human_long_options_command() {
-        let cmd = parse_bridge_line("/wifi/scan --id h2 --reason human --enabled").unwrap();
+        let cmd = parse_bridge_line("wifi.scan --id h2 --reason human --enabled").unwrap();
         assert_eq!(cmd.id.as_deref(), Some("h2"));
-        assert_eq!(cmd.uri, "/wifi/scan");
+        assert_eq!(cmd.method, "wifi.scan");
         assert_eq!(cmd.data.get("reason").unwrap(), "human");
         assert_eq!(cmd.data.get("enabled").unwrap(), "1");
     }

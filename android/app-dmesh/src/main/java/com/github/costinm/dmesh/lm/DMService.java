@@ -49,6 +49,9 @@ import java.security.UnrecoverableEntryException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Foreground service maintaining the notification, wifi/BT/net and native code..
@@ -75,6 +78,10 @@ public class DMService extends BaseMsgService implements MessageHandler {
 
     private MeshNode meshNode;
     private static volatile DMService activeService;
+    private static final int MAX_LOG_EVENTS = 512;
+    private final ArrayList<MsgFrame> logEvents = new ArrayList<>();
+    private final Map<String, MessageSubscriber> logSubscribers = new HashMap<>();
+    private MsgConn historyConn;
 
     private SharedPreferences prefs;
 
@@ -177,6 +184,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
         mux.subscribe("ble", wifi.ble);
         mux.subscribe("wifi", wifi);
         mux.subscribe("permission", this::handlePermissionMessage);
+        mux.subscribe("messages", this::handleMessagesMessage);
         mux.subscribe("N", nh);
 
         // Info from the client - currently the 64-bit node ID, other info will be added.
@@ -190,6 +198,14 @@ public class DMService extends BaseMsgService implements MessageHandler {
                 wifi.sendWifiDiscoveryStatus("connect", "");
             }
         });
+        historyConn = new MsgConn(mux) {
+            @Override
+            public boolean sendFrame(MsgFrame frame) {
+                recordJsonFrame(frame);
+                return true;
+            }
+        };
+        mux.addInConnection("dmservice-history", historyConn, new MsgFrame("session.open").toMessage());
 
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         Network[] nets = cm.getAllNetworks();
@@ -199,15 +215,15 @@ public class DMService extends BaseMsgService implements MessageHandler {
             try {
                 NetworkInterface ni = NetworkInterface.getByName(lp.getInterfaceName());
                 Log.d(TAG, "NetworkInterface: " + ni);
-                mux.publish("/netif/" + ni.getName());
+                mux.publish("netif." + ni.getName());
                 for (InterfaceAddress nia:  ni.getInterfaceAddresses()) {
                     InetAddress ia = nia.getAddress();
                     if (ia instanceof Inet6Address) {
                         Log.d(TAG, "I6 " + ((Inet6Address)ia).getScopeId() + " " +
                                 ((Inet6Address)ia).getHostAddress());
-                        mux.publish("/netip/" + ni.getName() + "/" + nia.getAddress());
+                        mux.publish("netip." + ni.getName() + "/" + nia.getAddress());
                     } else {
-                        mux.publish("/netip/" + ni.getName() + "/" + nia.getAddress());
+                        mux.publish("netip." + ni.getName() + "/" + nia.getAddress());
                     }
                 }
             } catch (SocketException e) {
@@ -225,6 +241,10 @@ public class DMService extends BaseMsgService implements MessageHandler {
             meshNode.stop();
             meshNode = null;
         }
+        if (historyConn != null) {
+            mux.removeInConnection("dmservice-history");
+            historyConn = null;
+        }
         wifi.onDestroy();
         super.onDestroy();
     }
@@ -241,10 +261,128 @@ public class DMService extends BaseMsgService implements MessageHandler {
         return mux;
     }
 
+    synchronized void recordJsonEvent(String source, String line) {
+        if (line == null || line.isEmpty()) {
+            return;
+        }
+        MsgFrame event = new MsgFrame("messages.event");
+        event.fields.put("source", source);
+        event.fields.put("json", line);
+        recordJsonFrame(event);
+    }
+
+    synchronized void recordJsonFrame(MsgFrame event) {
+        if (event == null || event.method == null) {
+            return;
+        }
+        logEvents.add(event);
+        while (logEvents.size() > MAX_LOG_EVENTS) {
+            logEvents.remove(0);
+        }
+        for (MessageSubscriber sub : new ArrayList<>(logSubscribers.values())) {
+            if (!event.matchesKeys(sub.keys)) {
+                continue;
+            }
+            if (!sub.conn.sendFrame(event)) {
+                logSubscribers.remove(sub.conn.name);
+            }
+        }
+    }
+
+    private void handleMessagesMessage(String topic, String msgType, Message m, MsgConn replyTo,
+                                   String[] args) {
+        MsgFrame req = MsgFrame.fromMessage(m);
+        MsgFrame reply = new MsgFrame("messages." + (msgType == null ? "status" : msgType));
+        reply.id = req.id;
+        if ("subscribe".equals(msgType)) {
+            if (replyTo == null) {
+                reply.method = "messages.error";
+                reply.fields.put("error", "messages subscribe requires a reply connection");
+            } else {
+                synchronized (this) {
+                    String keys = req.fields.getOrDefault("keys", req.fields.getOrDefault("filter", "all"));
+                    logSubscribers.put(replyTo.name, new MessageSubscriber(replyTo, keys));
+                    reply.fields.put("ok", "true");
+                    reply.fields.put("events", Integer.toString(logEvents.size()));
+                    reply.fields.put("keys", keys);
+                    replyTo.sendFrame(reply);
+                    for (MsgFrame event : logEvents) {
+                        if (event.matchesKeys(keys)) {
+                            replyTo.sendFrame(event);
+                        }
+                    }
+                    return;
+                }
+            }
+        } else if ("snapshot".equals(msgType) || "history".equals(msgType)) {
+            synchronized (this) {
+                String keys = req.fields.getOrDefault("keys", req.fields.getOrDefault("filter", "all"));
+                int limit = parsePositiveInt(req.fields.get("limit"), MAX_LOG_EVENTS);
+                int sent = 0;
+                reply.fields.put("ok", "true");
+                reply.fields.put("events", Integer.toString(logEvents.size()));
+                reply.fields.put("keys", keys);
+                reply.fields.put("limit", Integer.toString(limit));
+                if (replyTo != null) {
+                    replyTo.sendFrame(reply);
+                    int start = Math.max(0, logEvents.size() - limit);
+                    for (int i = start; i < logEvents.size(); i++) {
+                        MsgFrame event = logEvents.get(i);
+                        if (event.matchesKeys(keys)) {
+                            replyTo.sendFrame(event);
+                            sent++;
+                        }
+                    }
+                    MsgFrame done = new MsgFrame("messages.snapshot.done");
+                    done.id = req.id;
+                    done.fields.put("ok", "true");
+                    done.fields.put("count", Integer.toString(sent));
+                    done.fields.put("keys", keys);
+                    replyTo.sendFrame(done);
+                    return;
+                }
+            }
+        } else if ("status".equals(msgType) || msgType == null || msgType.isEmpty()) {
+            synchronized (this) {
+                reply.fields.put("ok", "true");
+                reply.fields.put("events", Integer.toString(logEvents.size()));
+                reply.fields.put("subscribers", Integer.toString(logSubscribers.size()));
+            }
+        } else {
+            reply.method = "messages.error";
+            reply.fields.put("error", "unknown messages command: " + msgType);
+        }
+        if (replyTo != null) {
+            replyTo.sendFrame(reply);
+        }
+    }
+
+    private static int parsePositiveInt(String raw, int def) {
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        try {
+            int parsed = Integer.parseInt(raw);
+            return parsed <= 0 ? def : parsed;
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static final class MessageSubscriber {
+        final MsgConn conn;
+        final String keys;
+
+        MessageSubscriber(MsgConn conn, String keys) {
+            this.conn = conn;
+            this.keys = keys;
+        }
+    }
+
     private void handlePermissionMessage(String topic, String msgType, Message m, MsgConn replyTo,
                                          String[] args) {
         MsgFrame req = MsgFrame.fromMessage(m);
-        MsgFrame reply = new MsgFrame("/permission/" + (msgType == null ? "status" : msgType));
+        MsgFrame reply = new MsgFrame("permission." + (msgType == null ? "status" : msgType));
         reply.id = req.id;
 
         if ("request".equals(msgType)) {
@@ -259,11 +397,11 @@ public class DMService extends BaseMsgService implements MessageHandler {
                 startActivity(intent);
                 reply.fields.put("requested", requested == null ? "" : requested);
             } catch (Throwable t) {
-                reply.uri = "/permission/error";
+                reply.method = "permission.error";
                 reply.fields.put("error", t.toString());
             }
         } else if (!"status".equals(msgType) && msgType != null && !msgType.isEmpty()) {
-            reply.uri = "/permission/error";
+            reply.method = "permission.error";
             reply.fields.put("error", "unknown permission command: " + msgType);
         }
 
@@ -313,7 +451,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "onStartCommand" + startId + " " + flags + " " + intent);
         if (intent == null) {
-            return START_NOT_STICKY;
+            return START_STICKY;
         }
 
         try {
@@ -326,7 +464,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
 
         //VpnService.maybeStartVpn(prefs, this);
 
-        return super.onStartCommand(intent, flags, startId);
+        return START_STICKY;
     }
 
 

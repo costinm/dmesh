@@ -11,6 +11,8 @@ import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmeshnative.MeshNode;
 import com.github.costinm.dmeshnative.MeshStream;
 
+import org.json.JSONException;
+
 import java.util.HashMap;
 import java.util.Map;
 
@@ -18,7 +20,7 @@ import java.util.Map;
  * Minimal Java adapter for the Rust-owned SSH message bridge.
  *
  * Rust owns the SSH stream, line framing, JSON/human command parsing, and
- * response framing. Java adapts parsed string pairs into MsgFrame and only
+ * response framing. Java adapts JSON frames into MsgFrame and only
  * converts to Android Message where existing MsgMux handlers still require it.
  */
 class SshJsonlMsgBridge implements MeshNode.MeshCallback {
@@ -26,11 +28,18 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
 
     private final Context context;
     private final MsgMux mux;
+    private final DMService service;
     private final Map<Long, BridgeMsgConn> conns = new HashMap<>();
+    private final Map<String, AppTarget> appTargets = new HashMap<>();
 
     SshJsonlMsgBridge(Context context, MsgMux mux) {
         this.context = context.getApplicationContext();
         this.mux = mux;
+        this.service = context instanceof DMService ? (DMService) context : null;
+        appTargets.put("chat", new AppTarget(
+                "com.github.costinm.dmesh.chat",
+                "com.github.costinm.dmesh.chat.ChatService",
+                "chat"));
     }
 
     @Override
@@ -39,50 +48,115 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
     }
 
     @Override
-    public void onMessage(long clientId, String id, String uri, String[] keys, String[] values) {
+    public void onMessage(long clientId, String jsonLine) {
+        MsgFrame frame;
+        try {
+            frame = MsgFrame.fromJsonLine(jsonLine);
+        } catch (JSONException e) {
+            Log.w(TAG, "invalid Rust JSON message: " + jsonLine, e);
+            return;
+        }
+        if (service != null) {
+            service.recordJsonFrame(frame);
+        }
+        if (clientId == 0) {
+            return;
+        }
         BridgeMsgConn conn = connFor(clientId);
-        MsgFrame frame = MsgFrame.fromPairs(id, uri, keys, values);
         if (forwardAppCommand(conn, frame)) {
             return;
         }
         mux.receiveFrame(conn.name, conn, frame);
     }
 
+    @Override
+    public void onStreamOpened(long clientId, String jsonLine) {
+        try {
+            MsgFrame frame = MsgFrame.fromJsonLine(jsonLine);
+            if (service != null) {
+                service.recordJsonFrame(frame);
+            }
+        } catch (JSONException e) {
+            Log.w(TAG, "invalid stream-opened JSON message: " + jsonLine, e);
+        }
+    }
+
     private boolean forwardAppCommand(BridgeMsgConn replyTo, MsgFrame frame) {
-        if (frame.uri == null || !frame.uri.startsWith("/app/")) {
+        if (frame.method == null || !frame.method.startsWith("app.")) {
             return false;
         }
-        String[] parts = frame.uri.split("/", 5);
-        if (parts.length < 5) {
-            MsgFrame err = new MsgFrame("/app/error");
+        String[] parts = frame.method.split("\\.", 3);
+        if (parts.length < 3) {
+            MsgFrame err = new MsgFrame("app.error");
             err.id = frame.id;
-            err.fields.put("error", "expected /app/<package>/<service>/<command>");
+            err.fields.put("error", "expected app.<target>.<command>");
             replyTo.sendFrame(err);
             return true;
         }
-        String pkg = parts[2];
-        String service = parts[3];
-        if (service.startsWith(".")) {
-            service = pkg + service;
+        String targetName = parts[1];
+        AppTarget target = appTargets.get(targetName);
+        if (target == null) {
+            MsgFrame err = new MsgFrame("app.error");
+            err.id = frame.id;
+            err.fields.put("error", "unknown app target: " + targetName);
+            replyTo.sendFrame(err);
+            return true;
         }
-        MsgFrame appFrame = new MsgFrame("/" + parts[4]);
+        MsgFrame appFrame = new MsgFrame(target.topic + "." + parts[2]);
         appFrame.id = frame.id;
         appFrame.fields.putAll(frame.fields);
-        DirectBinderConn appConn = new DirectBinderConn(mux, context, pkg, service);
+        DirectBinderConn appConn = new DirectBinderConn(mux, context, target.packageName, target.serviceName);
+        appConn.name = "direct:" + targetName;
         appConn.sendFrame(appFrame);
-        MsgFrame ack = new MsgFrame("/app/forwarded");
+        MsgFrame ack = new MsgFrame("app.forwarded");
         ack.id = frame.id;
-        ack.fields.put("package", pkg);
-        ack.fields.put("service", service);
-        ack.fields.put("uri", appFrame.uri);
+        ack.fields.put("target", targetName);
+        ack.fields.put("method", appFrame.method);
         replyTo.sendFrame(ack);
         return true;
     }
 
     @Override
     public void onStream(long clientId, String host, int port, long streamHandle) {
+        if ("mesh-stream".equals(host)) {
+            Log.d(TAG, "Accepted upgraded mesh stream: client=" + clientId + " port=" + port);
+            handleUpgradedStream(clientId, streamHandle);
+            return;
+        }
         Log.d(TAG, "Unhandled SSH stream: client=" + clientId + " target=" + host + ":" + port);
         new MeshStream(streamHandle).close();
+    }
+
+    private void handleUpgradedStream(long clientId, long streamHandle) {
+        MeshStream stream = new MeshStream(streamHandle);
+        new Thread(() -> {
+            byte[] buf = new byte[4096];
+            try {
+                while (true) {
+                    int n = stream.read(buf);
+                    if (n <= 0) {
+                        break;
+                    }
+                    if (service != null) {
+                        MsgFrame frame = new MsgFrame("mesh.stream.data");
+                        frame.session = "ssh:" + clientId;
+                        frame.stream = "ssh:" + clientId + ":binary";
+                        frame.type = "event";
+                        frame.fields.put("bytes", Integer.toString(n));
+                        service.recordJsonFrame(frame);
+                    }
+                }
+            } finally {
+                stream.close();
+                if (service != null) {
+                    MsgFrame frame = new MsgFrame("mesh.stream.close");
+                    frame.session = "ssh:" + clientId;
+                    frame.stream = "ssh:" + clientId + ":binary";
+                    frame.type = "close";
+                    service.recordJsonFrame(frame);
+                }
+            }
+        }, "dmesh-upgraded-stream-" + clientId).start();
     }
 
     @Override
@@ -91,19 +165,36 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
         new MeshStream(streamHandle).close();
     }
 
+    private static class AppTarget {
+        final String packageName;
+        final String serviceName;
+        final String topic;
+
+        AppTarget(String packageName, String serviceName, String topic) {
+            this.packageName = packageName;
+            this.serviceName = serviceName;
+            this.topic = topic;
+        }
+    }
+
     private static class BridgeMsgConn extends MsgConn {
         private final long clientId;
         private final MsgMux bridgeMux;
+        private final DMService service;
 
-        BridgeMsgConn(MsgMux mux, String name) {
+        BridgeMsgConn(MsgMux mux, String name, DMService service) {
             super(mux);
             this.bridgeMux = mux;
+            this.service = service;
             this.name = name;
             this.clientId = Long.parseLong(name.substring("ssh:".length()));
         }
 
         @Override
         public boolean sendFrame(MsgFrame frame) {
+            if (service != null) {
+                service.recordJsonEvent("rust.message.out", frame.toJsonLine());
+            }
             boolean ok = MeshNode.sendBridgeJson(clientId, frame.toJsonLine());
             if (!ok) {
                 bridgeMux.removeInConnection(name);
@@ -123,7 +214,7 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
             return conn;
         }
         String name = "ssh:" + clientId;
-        conn = new BridgeMsgConn(mux, name);
+        conn = new BridgeMsgConn(mux, name, service);
         conns.put(clientId, conn);
         Message open = Message.obtain();
         open.getData().putBoolean(":open", true);

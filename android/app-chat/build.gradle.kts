@@ -9,6 +9,7 @@ android {
     defaultConfig {
         applicationId = "com.github.costinm.dmesh.chat"
         minSdk = providers.gradleProperty("MIN_SDK_VERSION").get().toInt()
+        targetSdk = providers.gradleProperty("TARGET_SDK_VERSION").get().toInt()
         versionCode = 1
         versionName = "0.1"
     }

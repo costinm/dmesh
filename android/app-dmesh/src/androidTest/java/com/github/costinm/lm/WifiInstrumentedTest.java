@@ -52,7 +52,7 @@ public class WifiInstrumentedTest {
 
         for (int i = 0; i < 10; i++) {
 
-            cli.send("/wifi/con/start");
+            cli.send("wifi.con/start");
 
             Thread.sleep(10000);
 
@@ -66,7 +66,7 @@ public class WifiInstrumentedTest {
         MsgConn cli = MsgMux.get(appContext).dial(appContext.getPackageName());
         cli.start();
 
-        cli.send("/wifi/discoverPeersStart");
+        cli.send("wifi.discoverPeersStart");
     }
 
 }

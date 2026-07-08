@@ -92,7 +92,7 @@ public class DirectBinder extends Binder {
     public static void writeMessage(Parcel out, MsgFrame frame, IBinder callback,
                                     List<ParcelFileDescriptor> fds) {
         out.writeString(frame == null ? null : frame.id);
-        out.writeString(frame == null ? null : frame.uri);
+        out.writeString(frame == null ? null : frame.method);
         int fieldCount = frame == null ? 0 : frame.fields.size();
         out.writeInt(fieldCount);
         if (frame != null) {
@@ -115,8 +115,8 @@ public class DirectBinder extends Binder {
 
     public static DirectMessage readMessage(Parcel in) {
         String id = in.readString();
-        String uri = in.readString();
-        MsgFrame frame = new MsgFrame(uri);
+        String method = in.readString();
+        MsgFrame frame = new MsgFrame(method);
         frame.id = id;
         int fieldCount = in.readInt();
         for (int i = 0; i < fieldCount; i++) {

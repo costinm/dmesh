@@ -7,6 +7,8 @@ import android.net.Uri;
 import android.os.Binder;
 import android.os.Bundle;
 
+import com.github.costinm.dmesh.android.msg.MsgMux;
+
 import java.util.Map;
 
 /**
@@ -50,9 +52,10 @@ public class DMeshShellProvider extends ContentProvider {
         }
 
         DMService service = DMService.getActiveService();
+        MsgMux mux = service == null ? MsgMux.get(getContext()) : service.shellMux();
         DMeshCommand.Result result = DMeshCommand.run(
                 getContext(),
-                service == null ? null : service.shellMux(),
+                mux,
                 service == null ? null : service.shellMeshNode(),
                 line);
         Bundle out = new Bundle();

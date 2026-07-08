@@ -147,12 +147,7 @@ APP_WEB_PKG="com.github.costinm.dmesh.web"
 APP_CHAT_PKG="com.github.costinm.dmesh.chat"
 
 profile_dir() {
-    local build_type="${1:-debug}"
-    if [ "$build_type" = "release" ]; then
-        echo "release"
-    else
-        echo "debug"
-    fi
+    echo "release"
 }
 
 target_triple() {
@@ -171,12 +166,14 @@ target_triple() {
 copy_android_lib() {
     local crate_name="$1"
     local lib_name="$2"
-    local build_type="$3"
+    local android_build_type="$3"
     local abi="$4"
     local triple
     triple="$(target_triple "$abi")"
 
-    local so_path="$SCRIPT_DIR/target/$triple/$(profile_dir "$build_type")/lib$lib_name.so"
+    local rust_profile
+    rust_profile="$(profile_dir "$android_build_type")"
+    local so_path="$SCRIPT_DIR/target/$triple/$rust_profile/lib$lib_name.so"
     if [ ! -f "$so_path" ]; then
         echo "ERROR: Built library not found at $so_path"
         exit 1
@@ -184,7 +181,7 @@ copy_android_lib() {
 
     local strip_libs="${DMESH_STRIP_ANDROID_LIBS:-}"
     if [ -z "$strip_libs" ]; then
-        if [ "$build_type" = "release" ]; then
+        if [ "$android_build_type" = "release" ]; then
             strip_libs=1
         else
             strip_libs=0
@@ -212,10 +209,10 @@ copy_android_lib() {
             "$strip_bin" --strip-unneeded "$jnilib_so"
             local stripped_size
             stripped_size="$(stat -c%s "$jnilib_so")"
-            echo "Copied $crate_name ($build_type) to: $jnilib_so"
+            echo "Copied $crate_name (rust $rust_profile, android $android_build_type) to: $jnilib_so"
             echo "Stripped $jnilib_so: $copied_size -> $stripped_size bytes"
         else
-            echo "Copied $crate_name ($build_type, unstripped) to: $jnilib_so ($copied_size bytes)"
+            echo "Copied $crate_name (rust $rust_profile, android $android_build_type, unstripped) to: $jnilib_so ($copied_size bytes)"
         fi
     done
 }
@@ -263,22 +260,20 @@ copy_dmeshui_android_lib() {
 build_rust_package() {
     local package="$1"
     local lib_name="$2"
-    local build_type="$3"
+    local android_build_type="$3"
     local abi_list="$4"
-    local cargo_args=(build -p "$package" --lib)
+    local cargo_args=(build -p "$package" --lib --release)
 
-    if [ "$build_type" = "release" ]; then
-        cargo_args+=(--release)
-    elif [ "$build_type" != "debug" ]; then
+    if [ "$android_build_type" != "debug" ] && [ "$android_build_type" != "release" ]; then
         echo "Usage: $0 build [debug|release]"
         exit 1
     fi
 
     clean_android_lib_outputs "$lib_name"
     for abi in $abi_list; do
-        echo "=== Building $package for $abi ($build_type) ==="
+        echo "=== Building $package for $abi (rust release, android $android_build_type) ==="
         cargo ndk -t "$abi" -P 28 "${cargo_args[@]}"
-        copy_android_lib "$package" "$lib_name" "$build_type" "$abi"
+        copy_android_lib "$package" "$lib_name" "$android_build_type" "$abi"
     done
 }
 
@@ -446,6 +441,8 @@ grant_app_permissions() {
     adb shell pm grant "$pkg" android.permission.ACCESS_COARSE_LOCATION >/dev/null 2>&1 || true
     adb shell pm grant "$pkg" android.permission.NEARBY_WIFI_DEVICES >/dev/null 2>&1 || true
     adb shell pm grant "$pkg" android.permission.BLUETOOTH_CONNECT >/dev/null 2>&1 || true
+    adb shell pm grant "$pkg" android.permission.BLUETOOTH_SCAN >/dev/null 2>&1 || true
+    adb shell pm grant "$pkg" android.permission.BLUETOOTH_ADVERTISE >/dev/null 2>&1 || true
 
     # ACTIVATE_VPN is an app-op on many emulator images rather than a runtime
     # permission. Ignore failures so the instrumentation can report unsupported
@@ -533,7 +530,7 @@ Environment:
   DMESH_ANDROID_ABIS      ABIs for libdmesh.so. Default: arm64-v8a.
   DMESH_UI_ANDROID_ABIS   ABIs for libdmeshui.so. Default: arm64-v8a.
   DMESH_UI_APPS           Apps receiving libdmeshui.so. Default: app-chat.
-  DMESH_STRIP_ANDROID_LIBS=0 disables native library stripping. Default: 1 for release, 0 for debug.
+  DMESH_STRIP_ANDROID_LIBS=0 disables native library stripping. Default: 1 for release APKs, 0 for debug APKs.
   DMESH_AVD_NAME          AVD name for emulator startup. Default: Medium_Desktop_2.
   DMESH_EMULATOR_TIMEOUT Boot timeout in seconds. Default: 240.
   DMESH_HOST_SSH_PORT     Host port for ssh-forward-smoke. Default: 11522.

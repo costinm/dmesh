@@ -83,7 +83,8 @@ public class MeshNode implements AutoCloseable {
 
     public interface MeshCallback {
         void onSshConnection(long clientId, String user);
-        void onMessage(long clientId, String id, String uri, String[] keys, String[] values);
+        void onMessage(long clientId, String jsonLine);
+        void onStreamOpened(long clientId, String jsonLine);
         void onStream(long clientId, String host, int port, long streamHandle);
         void onForwardedTcpip(long connId, String host, int port, long streamHandle);
     }

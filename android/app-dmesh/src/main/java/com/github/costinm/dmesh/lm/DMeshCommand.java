@@ -12,6 +12,8 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 final class DMeshCommand {
     private DMeshCommand() {
@@ -29,11 +31,20 @@ final class DMeshCommand {
             if ("msg".equals(parsed.command)) {
                 return runMessage(mux, parsed.toFrameFromArgs(0));
             }
-            if (parsed.command != null && parsed.command.startsWith("/")) {
+            if ("subscribe".equals(parsed.command) || "sub".equals(parsed.command)) {
+                return runSubscribe(mux, parsed);
+            }
+            if ("history".equals(parsed.command) || "snapshot".equals(parsed.command)) {
+                return runSnapshot(mux, parsed);
+            }
+            if ("messages.snapshot".equals(parsed.command) || "messages.history".equals(parsed.command)) {
+                return runRequest(mux, parsed.toFrame(parsed.command, 0), parsed);
+            }
+            if (parsed.command != null && parsed.command.contains(".")) {
                 return runMessage(mux, parsed.toFrame(parsed.command, 0));
             }
             if (parsed.frame != null) {
-                if (parsed.frame.uri != null && parsed.frame.uri.startsWith("/ssh/")) {
+                if (parsed.frame.method != null && parsed.frame.method.startsWith("ssh.")) {
                     return runSshFrame(node, parsed.frame);
                 }
                 return runMessage(mux, parsed.frame);
@@ -117,8 +128,8 @@ final class DMeshCommand {
     private static Result runSshFrame(MeshNode node, MsgFrame frame) {
         Parsed parsed = new Parsed();
         parsed.command = "ssh";
-        if (frame.uri != null) {
-            parsed.args.add(frame.uri.substring("/ssh/".length()));
+        if (frame.method != null) {
+            parsed.args.add(frame.method.substring("ssh.".length()));
         }
         parsed.values.putAll(frame.fields);
         return runSsh(node, parsed);
@@ -131,7 +142,87 @@ final class DMeshCommand {
         MsgConn conn = new MsgConn(mux);
         conn.name = "shell";
         mux.receiveFrame("shell", conn, frame);
-        return Result.ok("sent").field("uri", frame.uri);
+        return Result.ok("sent").field("method", frame.method);
+    }
+
+    private static Result runSnapshot(MsgMux mux, Parsed parsed) throws InterruptedException {
+        MsgFrame frame = new MsgFrame("messages.snapshot");
+        frame.fields.putAll(parsed.values);
+        if (!frame.fields.containsKey("keys")) {
+            frame.fields.put("keys", parsed.value("filter", parsed.value("topic", "all")));
+        }
+        if (!frame.fields.containsKey("limit")) {
+            frame.fields.put("limit", Integer.toString(parsed.intValue("limit", 512)));
+        }
+        return runRequest(mux, frame, parsed);
+    }
+
+    private static Result runRequest(MsgMux mux, MsgFrame frame, Parsed parsed) throws InterruptedException {
+        if (mux == null) {
+            return Result.error("MsgMux is not available");
+        }
+        int durationMs = parsed.intValue("durationMs", "duration", 1000);
+        int limit = parsed.intValue("limit", 512);
+        if (durationMs < 0) {
+            durationMs = 0;
+        }
+        if (durationMs > 10_000) {
+            durationMs = 10_000;
+        }
+        if (limit <= 0) {
+            limit = 512;
+        }
+        if (limit > 512) {
+            limit = 512;
+        }
+        String keys = frame.fields.getOrDefault("keys", frame.fields.getOrDefault("filter", "all"));
+        CapturingConn conn = new CapturingConn(mux, "shell-request:" + System.nanoTime(), limit + 2, "all");
+        mux.receiveFrame("shell", conn, frame);
+        conn.await(durationMs);
+        return Result.ok("requested")
+                .field("method", frame.method)
+                .field("durationMs", Integer.toString(durationMs))
+                .field("keys", keys)
+                .field("count", Integer.toString(conn.count()))
+                .field("messages", conn.lines());
+    }
+
+    private static Result runSubscribe(MsgMux mux, Parsed parsed) throws InterruptedException {
+        if (mux == null) {
+            return Result.error("MsgMux is not available");
+        }
+        int durationMs = parsed.intValue("durationMs", "duration", 1000);
+        int limit = parsed.intValue("limit", 64);
+        if (durationMs < 0) {
+            durationMs = 0;
+        }
+        if (durationMs > 10_000) {
+            durationMs = 10_000;
+        }
+        if (limit <= 0) {
+            limit = 64;
+        }
+        if (limit > 512) {
+            limit = 512;
+        }
+
+        String name = "shell-sub:" + System.nanoTime();
+        String keys = parsed.value("keys", parsed.value("filter", parsed.value("topic", "all")));
+        CapturingConn conn = new CapturingConn(mux, name, limit, keys);
+        MsgFrame open = new MsgFrame("session.open");
+        open.fields.put("from", "adb-shell");
+        open.fields.put("subscribe", keys);
+        mux.addInConnection(name, conn, open.toMessage());
+        try {
+            conn.await(durationMs);
+        } finally {
+            mux.removeInConnection(name);
+        }
+        return Result.ok("subscribed")
+                .field("durationMs", Integer.toString(durationMs))
+                .field("keys", keys)
+                .field("count", Integer.toString(conn.count()))
+                .field("messages", conn.lines());
     }
 
     private static Parsed parse(String line) throws Exception {
@@ -142,7 +233,11 @@ final class DMeshCommand {
         if (clean.charAt(0) == '{') {
             JSONObject root = new JSONObject(clean);
             Parsed parsed = new Parsed();
-            parsed.frame = new MsgFrame(root.optString("uri", null));
+            String method = root.optString("method", null);
+            if (method == null || method.isEmpty()) {
+                throw new IllegalArgumentException("Missing method");
+            }
+            parsed.frame = new MsgFrame(method);
             parsed.frame.id = root.optString("id", null);
             JSONObject data = root.optJSONObject("data");
             if (data != null) {
@@ -153,7 +248,7 @@ final class DMeshCommand {
             }
             for (Iterator<String> it = root.keys(); it.hasNext(); ) {
                 String key = it.next();
-                if ("id".equals(key) || "uri".equals(key) || "data".equals(key)) {
+                if ("id".equals(key) || "method".equals(key) || "data".equals(key)) {
                     continue;
                 }
                 parsed.frame.fields.put(":" + key, String.valueOf(root.get(key)));
@@ -262,6 +357,52 @@ final class DMeshCommand {
         }
     }
 
+    private static final class CapturingConn extends MsgConn {
+        private final ArrayList<String> lines = new ArrayList<>();
+        private final CountDownLatch done = new CountDownLatch(1);
+        private final int limit;
+        private final String keys;
+
+        CapturingConn(MsgMux mux, String name, int limit, String keys) {
+            super(mux);
+            this.name = name;
+            this.limit = limit;
+            this.keys = keys;
+        }
+
+        @Override
+        public synchronized boolean sendFrame(MsgFrame frame) {
+            if (!frame.matchesKeys(keys)) {
+                return true;
+            }
+            if (lines.size() >= limit) {
+                done.countDown();
+                return true;
+            }
+            lines.add(frame.toJsonLine());
+            if (lines.size() >= limit) {
+                done.countDown();
+            }
+            return true;
+        }
+
+        void await(int durationMs) throws InterruptedException {
+            done.await(durationMs, TimeUnit.MILLISECONDS);
+        }
+
+        synchronized int count() {
+            return lines.size();
+        }
+
+        synchronized String lines() {
+            StringBuilder out = new StringBuilder();
+            for (String line : lines) {
+                out.append(line).append('\n');
+            }
+            return out.toString();
+        }
+    }
+
     private static final class Parsed {
         String command;
         MsgFrame frame;
@@ -311,13 +452,13 @@ final class DMeshCommand {
 
         MsgFrame toFrameFromArgs(int argOffset) {
             if (args.size() <= argOffset) {
-                throw new IllegalArgumentException("Missing URI");
+                throw new IllegalArgumentException("Missing method");
             }
             return toFrame(args.get(argOffset), argOffset + 1);
         }
 
-        MsgFrame toFrame(String uri, int extraArgStart) {
-            MsgFrame out = new MsgFrame(uri);
+        MsgFrame toFrame(String name, int extraArgStart) {
+            MsgFrame out = new MsgFrame(name);
             out.fields.putAll(values);
             for (int i = extraArgStart; i < args.size(); i++) {
                 String arg = args.get(i);

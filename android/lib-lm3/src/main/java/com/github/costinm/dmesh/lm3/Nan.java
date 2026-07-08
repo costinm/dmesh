@@ -44,6 +44,7 @@ public class Nan {
     Context ctx;
     LocalMesh lm;
     WifiAwareSession nanSession;
+    boolean attachInProgress;
     // Not null if publish session active and nan active
     PublishDiscoverySession pubSession;
     // Not null if sub session active
@@ -90,6 +91,7 @@ public class Nan {
 
     public void start() {
         enabled = true;
+        MsgMux.get(ctx).publish("net.NAN.START");
         onWifiAwareStateChanged(new Intent());
     }
 
@@ -106,6 +108,7 @@ public class Nan {
         if (nanSession != null) {
             nanSession.close();
         }
+        attachInProgress = false;
         nanSub = false;
         if (subSession != null) {
             subSession.close();
@@ -113,7 +116,7 @@ public class Nan {
         }
 
         nanSession = null;
-        MsgMux.get(ctx).publish("/net/NAN/STOP");
+        MsgMux.get(ctx).publish("net.NAN.STOP");
         nanId = null;
     }
 
@@ -188,15 +191,25 @@ public class Nan {
                 ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "Missing permissions");
+            MsgMux.get(ctx).publish("net.NAN.ERR.permission");
             return;
         }
         try {
             nanMgr = ctx.getSystemService(WifiAwareManager.class);
             if (nanMgr == null) {
                 Log.d(TAG, "State changed - no system service" + i.getAction() + " " + i.getExtras());
+                MsgMux.get(ctx).publish("net.NAN.ERR.service");
                 return;
             }
             if (nanMgr.isAvailable()) {
+                if (nanSession != null) {
+                    MsgMux.get(ctx).publish("net.NAN.Status", "state", "attached");
+                    return;
+                }
+                if (attachInProgress) {
+                    MsgMux.get(ctx).publish("net.NAN.Status", "state", "attaching");
+                    return;
+                }
                 if (nanMgr.getCharacteristics() != null) {
                     Log.d(TAG, "/NAN/Char" + nanMgr.getCharacteristics().getMaxServiceNameLength() +
                             "/" + nanMgr.getCharacteristics().getMaxServiceSpecificInfoLength() + " " +
@@ -205,14 +218,27 @@ public class Nan {
                     Log.d(TAG, "WifiAware available");
                 }
                 if (Build.VERSION.SDK_INT >= 34) {
-                    nanMgr.setOpportunisticModeEnabled(true);
+                    try {
+                        nanMgr.setOpportunisticModeEnabled(true);
+                    } catch (SecurityException se) {
+                        Log.w(TAG, "Unable to enable NAN opportunistic mode", se);
+                        MsgMux.get(ctx).publish("net.NAN.OpportunisticError",
+                                "error", se.toString());
+                    } catch (RuntimeException re) {
+                        Log.w(TAG, "Unable to enable NAN opportunistic mode", re);
+                        MsgMux.get(ctx).publish("net.NAN.OpportunisticError",
+                                "error", re.toString());
+                    }
                 }
                 // TODO: add a setting to control 'on' or 'off' for local mesh.
                 // if local mesh is on - Nan is best option.
+                attachInProgress = true;
+                MsgMux.get(ctx).publish("net.NAN.AttachStart");
                 nanMgr.attach(new AttachCallback() {
                     @Override
                     public void onAttached(WifiAwareSession session) {
                         super.onAttached(session);
+                        attachInProgress = false;
                         nanSession = session;
 
                         // No point being attached and not using discovery.
@@ -221,13 +247,15 @@ public class Nan {
                             startNanSub();
                         }
 
-                        MsgMux.get(ctx).publish("/net/NAN/Attach");
+                        MsgMux.get(ctx).publish("net.NAN.Attach");
                     }
 
                     @Override
                     public void onAttachFailed() {
                         super.onAttachFailed();
-                        MsgMux.get(ctx).publish("/net/NAN/AttachError");
+                        attachInProgress = false;
+                        enabled = false;
+                        MsgMux.get(ctx).publish("net.NAN.AttachError", "retry", "explicit-start-required");
                     }
                 }, new IdentityChangedListener() {
                     @Override
@@ -235,16 +263,21 @@ public class Nan {
                         super.onIdentityChanged(mac);
                         nanMac = mac;
                         nanId = new String(Hex.encode(mac));
-                        MsgMux.get(ctx).publish("/net/NAN/MAC/" + nanId);
+                        MsgMux.get(ctx).publish("net.NAN.MAC." + nanId);
                         lm.sendWifiDiscoveryStatus("/nan/id", "");
                     }
                 }, null);
             } else {
                 Log.d(TAG, "WifiAware unavailabe");
+                MsgMux.get(ctx).publish("net.NAN.unavailable");
                 stop();
             }
         } catch(Throwable t) {
-            t.printStackTrace();
+            Log.w(TAG, "NAN attach failed", t);
+            attachInProgress = false;
+            MsgMux.get(ctx).publish("net.NAN.AttachError",
+                    "error", t.getClass().getName(),
+                    "message", t.toString());
         }
     }
 
@@ -267,11 +300,11 @@ public class Nan {
         // for debugging
         if (byPublisher) {
             // Used with active sub and passive pub
-            MsgMux.get(ctx).publish("/net/NAN/PubServiceDiscovered/" + info + "/" + peerHandle);
+            MsgMux.get(ctx).publish("net.NAN.PubServiceDiscovered." + info + "." + peerHandle);
             bd.nanSession = pubSession;
         } else {
             // Used with active pub and passive sub
-            MsgMux.get(ctx).publish("/net/NAN/SubServiceDiscovered/" + info + "/" + peerHandle);
+            MsgMux.get(ctx).publish("net.NAN.SubServiceDiscovered." + info + "." + peerHandle);
             bd.nanSession = subSession;
         }
         // Send a message to the found device to verify messaging works and introduce ourselves.
@@ -294,16 +327,35 @@ public class Nan {
         // This is sufficient for discovery and communication - security is at higher level.
         //
         // adv is about 255 bytes.
-        PublishConfig pub = new PublishConfig.Builder().setServiceName(pubServiceName)
-                .setPublishType(pubType) // silent, but respond to active requests
-                .setTerminateNotificationEnabled(true)
-                .setServiceSpecificInfo(lm.adv.getBytes())
-                .setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ)
-                .build();
         if (nanSession == null) {
                 return;
         }
-        nanSession.publish(pub, new NanDiscoveryCallback(true), null);
+        if (pubSession != null) {
+            return;
+        }
+        try {
+            nanSession.publish(buildPublishConfig(true), new NanDiscoveryCallback(true), null);
+        } catch (IllegalArgumentException | SecurityException e) {
+            Log.w(TAG, "NAN publish with instant mode failed; retrying without instant mode", e);
+            MsgMux.get(ctx).publish("net.NAN.PubInstantError", "error", e.toString());
+            try {
+                nanSession.publish(buildPublishConfig(false), new NanDiscoveryCallback(true), null);
+            } catch (RuntimeException retryError) {
+                Log.w(TAG, "NAN publish failed", retryError);
+                MsgMux.get(ctx).publish("net.NAN.PubError", "error", retryError.toString());
+            }
+        }
+    }
+
+    private PublishConfig buildPublishConfig(boolean instant) {
+        PublishConfig.Builder builder = new PublishConfig.Builder().setServiceName(pubServiceName)
+                .setPublishType(pubType) // silent, but respond to active requests
+                .setTerminateNotificationEnabled(true)
+                .setServiceSpecificInfo(lm.adv.getBytes());
+        if (instant) {
+            builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ);
+        }
+        return builder.build();
     }
 
     public void stopSub() {
@@ -321,13 +373,6 @@ public class Nan {
      * Will stay active until 'stop' is called.
      */
     private void startNanSub() {
-        SubscribeConfig cfg = new SubscribeConfig.Builder()
-                .setServiceName("dmesh")
-                .setServiceSpecificInfo(lm.adv.getBytes())
-                .setSubscribeType(subType)
-                .setTerminateNotificationEnabled(true)
-                .setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ)
-                .build();
         Log.d(TAG, "/NAN/Subscribe");
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
@@ -337,9 +382,36 @@ public class Nan {
         if (nanSession == null) {
             return;
         }
+        if (subSession != null || nanSub) {
+            return;
+        }
+        nanSub = true;
 
-        nanSession.subscribe(cfg, new NanDiscoveryCallback(false), null);
+        try {
+            nanSession.subscribe(buildSubscribeConfig(true), new NanDiscoveryCallback(false), null);
+        } catch (IllegalArgumentException | SecurityException e) {
+            Log.w(TAG, "NAN subscribe with instant mode failed; retrying without instant mode", e);
+            MsgMux.get(ctx).publish("net.NAN.SubInstantError", "error", e.toString());
+            try {
+                nanSession.subscribe(buildSubscribeConfig(false), new NanDiscoveryCallback(false), null);
+            } catch (RuntimeException retryError) {
+                Log.w(TAG, "NAN subscribe failed", retryError);
+                MsgMux.get(ctx).publish("net.NAN.SubError", "error", retryError.toString());
+            }
+        }
 
+    }
+
+    private SubscribeConfig buildSubscribeConfig(boolean instant) {
+        SubscribeConfig.Builder builder = new SubscribeConfig.Builder()
+                .setServiceName("dmesh")
+                .setServiceSpecificInfo(lm.adv.getBytes())
+                .setSubscribeType(subType)
+                .setTerminateNotificationEnabled(true);
+        if (instant) {
+            builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ);
+        }
+        return builder.build();
     }
 
     /**
@@ -437,7 +509,7 @@ public class Nan {
         @Override
         public void onSessionConfigFailed() {
             super.onSessionConfigFailed();
-            MsgMux.get(ctx).publish("/net/NAN/PubSessionConfigFailed");
+            MsgMux.get(ctx).publish("net.NAN.PubSessionConfigFailed");
         }
 
         @Override
@@ -454,14 +526,14 @@ public class Nan {
         @Override
         public void onMessageSendFailed(int messageId) {
             super.onMessageSendFailed(messageId);
-            MsgMux.get(ctx).publish("/net/NAN/MSGERR", "id", Integer.toString(messageId));
+            MsgMux.get(ctx).publish("net.NAN.MSGERR", "id", Integer.toString(messageId));
         }
 
         @Override
         public void onSubscribeStarted(SubscribeDiscoverySession session) {
             super.onSubscribeStarted(session);
             Log.d(TAG, "/NAN/SubStart" + session);
-            MsgMux.get(ctx).publish("/net/NAN/SubStart");
+            MsgMux.get(ctx).publish("net.NAN.SubStart");
             subSession = session;
         }
 
@@ -469,7 +541,7 @@ public class Nan {
         public void onPublishStarted(PublishDiscoverySession session) {
             super.onPublishStarted(session);
             Log.d(TAG, "/NAN/PubStart");
-            MsgMux.get(ctx).publish("/net/NAN/PubStart");
+            MsgMux.get(ctx).publish("net.NAN.PubStart");
             pubSession = session;
         }
 
@@ -479,9 +551,9 @@ public class Nan {
             devices.clear(); // TODO: only devices of given type
             pubSession = null;
             if (pub) {
-                MsgMux.get(ctx).publish("/net/NAN/PubStop", "dev", "" + devices);
+                MsgMux.get(ctx).publish("net.NAN.PubStop", "dev", "" + devices);
             } else {
-                MsgMux.get(ctx).publish("/net/NAN/SubStop", "dev", "" + devices);
+                MsgMux.get(ctx).publish("net.NAN.SubStop", "dev", "" + devices);
             }
         }
 
@@ -518,7 +590,7 @@ public class Nan {
                 pubSession.sendMessage(peerHandle, 1, "CONS".getBytes());
             }
 
-            MsgMux.get(ctx).publish("/net/NAN/TXT/" + msg + "/" + peerHandle);
+            MsgMux.get(ctx).publish("net.NAN.TXT." + msg + "." + peerHandle);
             Log.d(TAG, "NAN received: " + msg + " " + peerHandle);
         }
 
