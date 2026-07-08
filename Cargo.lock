@@ -3092,7 +3092,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "lmesh"
 version = "0.0.1"
-source = "git+https://github.com/costinm/ssh-mesh#f39a9d41caa2771f715954c943ab716b02d96874"
+source = "git+https://github.com/costinm/ssh-mesh#fd7526ccb61e8fa59a21c68bff90c8408236515f"
 dependencies = [
  "anyhow",
  "mesh",
@@ -3186,7 +3186,7 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#f39a9d41caa2771f715954c943ab716b02d96874"
+source = "git+https://github.com/costinm/ssh-mesh#fd7526ccb61e8fa59a21c68bff90c8408236515f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3208,7 +3208,7 @@ dependencies = [
 [[package]]
 name = "mesh-tun"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#f39a9d41caa2771f715954c943ab716b02d96874"
+source = "git+https://github.com/costinm/ssh-mesh#fd7526ccb61e8fa59a21c68bff90c8408236515f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5182,7 +5182,7 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#f39a9d41caa2771f715954c943ab716b02d96874"
+source = "git+https://github.com/costinm/ssh-mesh#fd7526ccb61e8fa59a21c68bff90c8408236515f"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5494,7 +5494,7 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
-source = "git+https://github.com/costinm/ssh-mesh#f39a9d41caa2771f715954c943ab716b02d96874"
+source = "git+https://github.com/costinm/ssh-mesh#fd7526ccb61e8fa59a21c68bff90c8408236515f"
 dependencies = [
  "futures",
  "glob",
@@ -5557,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#f39a9d41caa2771f715954c943ab716b02d96874"
+source = "git+https://github.com/costinm/ssh-mesh#fd7526ccb61e8fa59a21c68bff90c8408236515f"
 dependencies = [
  "anyhow",
  "async-trait",
