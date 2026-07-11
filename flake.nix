@@ -110,6 +110,7 @@
               pkgs.jdk17
               pkgs.openssh
               pkgs.python3
+              pkgs.ripgrep
               pkgs.rustup
               pkgs.unzip
               pkgs.which

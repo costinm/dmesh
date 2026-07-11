@@ -28,12 +28,14 @@ import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.UiUtil;
+import com.github.costinm.dmeshnative.MeshNode;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 /*
 Debug:
@@ -172,6 +174,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     // Advertised URL - for NAN, BLE, TXT
     // Current format: 16 bytes, PSK8 + SSIDHASH4 + ID4
     String adv = "12345678SSIDID04";
+    byte[] deviceId = new byte[] {'A', 'N', 'D', 'R', '0', '0'};
     // Last requested state for the AP.
     // TODO: leave it as is at startup.
     boolean requestedAp;
@@ -222,7 +225,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         delayHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                announce(true);
+                listen();
             }
         }, 1000);
 
@@ -295,7 +298,16 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      * the server will run while the periodic job is active only.
      */
     public void update() {
-        scan();
+        listen();
+    }
+
+    public void listen() {
+        if (ble != null) {
+            ble.scan();
+        }
+        if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nan.start();
+        }
     }
 
     public void scan() {
@@ -356,6 +368,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         switch (topic) {
             case "I":
                 id4 = type.substring(0, 4);
+                updateDeviceId();
                 announce(true);
                 return;
         }
@@ -430,8 +443,9 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
             // Controls BLE, NAN advertising. Param: id4 - the 4-byte short for of identifier.
             case "adv":
-                if (null != b.getString("id4", null)) {
+        if (null != b.getString("id4", null)) {
                     id4 = b.getString("id4");
+                    updateDeviceId();
                 }
 
                 String advOn = b.getString("on", "-1");
@@ -633,36 +647,23 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             return;
         }
 
-        String nodeInfo;
-        if (p2p.mySSID.isEmpty() || p2p.psk.isEmpty()) {
-            nodeInfo = ("000000000000" + id4);
-        } else {
-            // psk=8, delim=1 - remaining 9
-            // ssidHash returns 4 bytes, leaving 5 for ID
-            nodeInfo = p2p.psk + Device.ssidHash(p2p.mySSID) + id4;
+        byte[] payload = p2p.mySSID.isEmpty() ? new byte[0] : p2p.mySSID.getBytes(StandardCharsets.UTF_8);
+        adv = new String(MeshNode.buildBleServiceData("wake_request", deviceIdBytes(), payload, 0, 0),
+                StandardCharsets.ISO_8859_1);
+        ble.advertise(MeshNode.buildBleServiceData("wake_request", deviceIdBytes(), payload, 0, 0));
+    }
+
+    public byte[] deviceIdBytes() {
+        updateDeviceId();
+        return Arrays.copyOf(deviceId, deviceId.length);
+    }
+
+    private void updateDeviceId() {
+        String src = (id4 == null ? "" : id4) + "000000";
+        byte[] raw = src.getBytes(StandardCharsets.US_ASCII);
+        for (int i = 0; i < deviceId.length; i++) {
+            deviceId[i] = i < raw.length ? raw[i] : (byte) '0';
         }
-        if (nodeInfo.length() < 16) {
-            nodeInfo = (nodeInfo + "0000000000000000").substring(0, 16);
-        } else if (nodeInfo.length() > 16) {
-            nodeInfo = nodeInfo.substring(0, 16);
-        }
-
-//        // Usually NAN doesn't work when AP is on
-//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-//            if (nan != null) {
-//                nan.pub(false);
-//            }
-//        }
-
-        // We have 20 bytes for advertisment
-        // - PSK key - 8 bytes ( if needed )
-        // - SSID hash - 2 bytes ?
-        // - public key hash - 4 or 8 bytes
-        // 2 or 6 remaining
-
-        adv = "XDM" + nodeInfo;
-
-        ble.advertise(adv.getBytes());
     }
 
 

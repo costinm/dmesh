@@ -1,6 +1,7 @@
 package com.github.costinm.dmesh.lm3;
 
 import android.Manifest;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -25,6 +26,7 @@ import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Handler;
 import android.os.Message;
@@ -39,6 +41,8 @@ import com.github.costinm.dmesh.android.msg.ConnUDS;
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
+import com.github.costinm.dmesh.android.util.Hex;
+import com.github.costinm.dmeshnative.MeshNode;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -91,22 +95,19 @@ import static android.bluetooth.BluetoothProfile.STATE_CONNECTED;
  */
 public class Ble implements MessageHandler {
     static final String TAG = "LM-BLE";
+    public static final String ACTION_SCAN_RESULT = "com.github.costinm.dmesh.lm3.BLE_SCAN";
 
     // Required for the notification - will be set to enable, 2902.
     public static UUID BLE_DESC_CLIENT_CONFIG = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
-    // Eddystone UUID: FEAA
-    static UUID eddyUUID = UUID.fromString("0000FEAA-0000-1000-8000-00805f9b34fb");
-    public static ParcelUuid EDDY = new ParcelUuid(eddyUUID);
+    static UUID dmeshAdvUUID = UUID.fromString("0000FD5D-0000-1000-8000-00805f9b34fb");
+    public static ParcelUuid DMESH_ADV = new ParcelUuid(dmeshAdvUUID);
     static UUID meshtasticUUID = UUID.fromString("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
     public static ParcelUuid MESHTASTIC = new ParcelUuid(meshtasticUUID);
     static UUID nordicUartUUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
     public static ParcelUuid NORDIC_UART = new ParcelUuid(nordicUartUUID);
-    // HTTP Body - 2AB9
-    static UUID characteristicHttpBody = UUID.fromString("00002AB9-0000-1000-8000-00805f9b34fb");
-    // write char - receive on server
-    static UUID characteristicProxy = UUID.fromString("00002ADD-0000-1000-8000-00805f9b34fb");
-    static UUID characteristicNotifyProxy = UUID.fromString("00002ADE-0000-1000-8000-00805f9b34fb");
+    static UUID nordicRxUUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
+    static UUID nordicTxUUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
     static Map<String, Device> devices = new HashMap<>();
     static Map<String, Long> externalDevices = new HashMap<>();
     static boolean scanFailed = false;
@@ -148,6 +149,15 @@ public class Ble implements MessageHandler {
                 return;
             }
 
+            Map<ParcelUuid, byte[]> sd = sr.getServiceData();
+            if (sd != null) {
+                byte[] record = sd.get(DMESH_ADV);
+                if (record != null && processDiscovery(device, record, result.getRssi())) {
+                    super.onScanResult(callbackType, result);
+                    return;
+                }
+            }
+
             List<ParcelUuid> suid = sr.getServiceUuids();
             if (suid == null || suid.size() == 0) {
                 return;
@@ -160,44 +170,21 @@ public class Ble implements MessageHandler {
                 processExternalDiscovery(device, sr, result.getRssi(),
                         "nordic_uart", NORDIC_UART.toString(), "meshcore");
             }
-            if (!suid.contains(EDDY)) {
+            if (!suid.contains(DMESH_ADV)) {
                 return;
             }
 
-            // One service data inside, using
-            Map<ParcelUuid, byte[]> sd = sr.getServiceData();
             if (sd == null) {
                 return;
             }
 
-            byte[] record = sd.get(EDDY);
-
-            // ADV Payload size: 37 bytes
-            // Connectable: 6 byte address overhead, 31 left
-
-            // Overhead: first 10 bytes ( 3 B flags, 4 B service ID, 3 B len/type for service data) - 21 left
-            // Prefix inserted by system (8):LE Ad
-            // 03 03 AAFE - 4 bytes service type
-            // LEN 16 AAFE - 4 bytes len + attribute type
-
-            // 1 B type - 20 left
-
-            // Actual data. We're using an extension to the protocol, using a new type to represent
-            // a binary tunnel.
-
-            //
-            // User content starts with 3-byte binary:
-            // 10 BA 03 - prefix (incl https://)
-            //
-            // 20 bytes remaining
-
-            // Type is 0x5x
-            if (record == null || record.length < 10 || ((record[0] & 0xF0) != 0x50)) {
+            byte[] record = sd.get(DMESH_ADV);
+            if (record == null) {
                 return;
             }
 
             discoveryCnt++;
-            processDiscovery(device, record);
+            processDiscovery(device, record, result.getRssi());
 
             super.onScanResult(callbackType, result);
         }
@@ -290,6 +277,31 @@ public class Ble implements MessageHandler {
 
     }
 
+    public static void handlePendingIntentScan(Context ctx, Intent intent) {
+        LocalMesh lm = LocalMesh.get(ctx.getApplicationContext());
+        if (lm.ble != null) {
+            lm.ble.onPendingIntentScan(intent);
+        }
+    }
+
+    private void onPendingIntentScan(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        int error = intent.getIntExtra(BluetoothLeScanner.EXTRA_ERROR_CODE, 0);
+        if (error != 0) {
+            MsgMux.get(ctx).publish("BLE.ERR.pendingIntentScan", "error", Integer.toString(error));
+            return;
+        }
+        ArrayList<ScanResult> results = intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT);
+        if (results == null) {
+            return;
+        }
+        for (ScanResult result : results) {
+            mScanCallback.onScanResult(0, result);
+        }
+    }
+
     // Will be called when a DMesh device is found, or found again after 60 sec.
     protected void onDiscovery(Device bd, String name, boolean firstTime) {
         MsgMux.get(ctx).publish("wifi.BLE.DISC",
@@ -299,35 +311,37 @@ public class Ble implements MessageHandler {
         wifi.sendWifiDiscoveryStatus("ble", name);
     }
 
-    private boolean processDiscovery(BluetoothDevice device, byte[] record) {
-        // We have max 20 bytes, starting at record[1]
-
-        String name = new String(record, 1, record.length - 1);
-        String info = name.substring(2);
-
-        // It seems to receive this every second.
-        // ~10 sec on pxl
-        if (info.length() == 16) {
-            Device bd = new Device(device, info);
-            if (bd.id == null) {
-                return true;
-            }
-            Device old = devices.get(bd.id);
-            if (old == null) {
-                devices.put(bd.id, bd);
-                connect(device.getAddress());
-
-                onDiscovery(bd, bd.id, true);
-            } else {
-                // See BLE - it keeps discovering device in range.
-                if (SystemClock.elapsedRealtime() - old.lastScan > 120000) {
-                    onDiscovery(bd, bd.id, false);
-                }
-                devices.put(bd.id, bd);
-            }
+    private boolean processDiscovery(BluetoothDevice device, byte[] record, int rssi) {
+        String addr = deviceAddress(device);
+        String parsed = MeshNode.parseBleServiceData(record, rssi, addr);
+        if (parsed == null || parsed.equals("{}")) {
+            return false;
         }
-
-        return false;
+        String id = jsonField(parsed, "device_id");
+        if (id.length() == 0) {
+            return false;
+        }
+        Device bd = new Device(id, parsed);
+        bd.dev = device;
+        bd.data.putString(Device.P2PAddr, "/ble/" + id);
+        bd.data.putString("proto", "dmesh_ble");
+        bd.data.putString("ble", parsed);
+        bd.data.putInt(Device.LEVEL, rssi);
+        Device old = devices.get(id);
+        devices.put(id, bd);
+        if (old == null || SystemClock.elapsedRealtime() - old.lastScan > 120000) {
+            onDiscovery(bd, id, old == null);
+        }
+        if (parsed.contains("\"connectable_response\":true")) {
+            connect(addr);
+        }
+        MsgMux.get(ctx).publish("BLE.DISC",
+                "proto", "dmesh",
+                "id", id,
+                "addr", addr,
+                "rssi", Integer.toString(rssi),
+                "json", parsed);
+        return true;
     }
 
     private void processExternalDiscovery(BluetoothDevice device, ScanRecord record, int rssi, String proto,
@@ -373,7 +387,6 @@ public class Ble implements MessageHandler {
         return name == null ? "" : name;
     }
 
-    // See Device.updateNode(). Path must be <=21 bytes, first byte will be set to type (0x50)
     public void advertise(byte[] urlb) {
         if (mBluetoothAdapter == null || mBluetoothLeAdvertiser == null) {
             MsgMux.get(ctx).publish("BLE.ERR.unsupported", "advertiser", "missing");
@@ -393,7 +406,6 @@ public class Ble implements MessageHandler {
         }
 
         byte[] advBytes = Arrays.copyOf(urlb, urlb.length);
-        advBytes[0] = 0x50;
 
         if (currentAdvBytes != null && Arrays.equals(currentAdvBytes, advBytes)) {
             MsgMux.get(ctx).publish("BLE.advertise", "state", adv ? "started" : "pending");
@@ -414,8 +426,8 @@ public class Ble implements MessageHandler {
         AdvertiseData data = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .setIncludeTxPowerLevel(false)
-                .addServiceUuid(EDDY)
-                .addServiceData(EDDY, advBytes)
+                .addServiceUuid(DMESH_ADV)
+                .addServiceData(DMESH_ADV, advBytes)
                 .build();
 
         mBluetoothLeAdvertiser.stopAdvertising(mAdvertiseCallback);
@@ -424,7 +436,7 @@ public class Ble implements MessageHandler {
         } catch (InterruptedException e) {
         }
         mBluetoothLeAdvertiser.startAdvertising(settings, data, mAdvertiseCallback);
-        MsgMux.get(ctx).publish("BLE.advertise", "state", "starting", "uuid", EDDY.toString());
+        MsgMux.get(ctx).publish("BLE.advertise", "state", "starting", "uuid", DMESH_ADV.toString());
     }
 
     public void scanStop() {
@@ -466,7 +478,10 @@ public class Ble implements MessageHandler {
 
         List<ScanFilter> filters = new ArrayList<>();
         filters.add(new ScanFilter.Builder()
-                .setServiceUuid(EDDY)
+                .setServiceUuid(DMESH_ADV)
+                .build());
+        filters.add(new ScanFilter.Builder()
+                .setServiceData(DMESH_ADV, new byte[0], new byte[0])
                 .build());
         filters.add(new ScanFilter.Builder()
                 .setServiceUuid(MESHTASTIC)
@@ -481,10 +496,25 @@ public class Ble implements MessageHandler {
                     new ScanSettings.Builder()
                             //.setReportDelay(2000) - breaks KindeFire10
                             .build(), mScanCallback);
-            MsgMux.get(ctx).publish("BLE.scan", "filters", "eddy,meshtastic,nordic_uart");
+            try {
+                leScanner.startScan(filters, new ScanSettings.Builder().build(), scanPendingIntent());
+            } catch (RuntimeException e) {
+                MsgMux.get(ctx).publish("BLE.ERR.pendingIntentScan", "error", e.toString());
+            }
+            MsgMux.get(ctx).publish("BLE.scan", "filters", "dmesh,meshtastic,nordic_uart", "wake", "pending_intent");
         } else {
             MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", Manifest.permission.BLUETOOTH_SCAN);
         }
+    }
+
+    private PendingIntent scanPendingIntent() {
+        Intent intent = new Intent(ACTION_SCAN_RESULT);
+        intent.setPackage(ctx.getPackageName());
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (android.os.Build.VERSION.SDK_INT >= 23) {
+            flags |= PendingIntent.FLAG_MUTABLE;
+        }
+        return PendingIntent.getBroadcast(ctx, 27, intent, flags);
     }
 
     // == GATT client implementation
@@ -496,10 +526,11 @@ public class Ble implements MessageHandler {
             action = argv[2];
         }
         if ("adv".equals(action)) {
+            byte[] deviceId = wifi.deviceIdBytes();
             if (argv != null && argv.length > 3) {
-                advertise(argv[3].getBytes());
+                advertise(MeshNode.buildBleServiceData("payload_pending", deviceId, argv[3].getBytes(), 0, 0));
             } else {
-                advertise(null);
+                advertise(MeshNode.buildBleServiceData("wake_request", deviceId, new byte[0], 0, 0));
             }
         }
         if ("scan".equals(action)) {
@@ -560,46 +591,24 @@ public class Ble implements MessageHandler {
             Log.d(TAG, "Failed to open GATT server");
             return;
         }
-        BluetoothGattService service = new BluetoothGattService(eddyUUID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+        BluetoothGattService service = new BluetoothGattService(nordicUartUUID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
 
-        if (false) {
-            // Old style - a single characteristic with WRITE_NO_RESPONSE and NOTIFICATION
-            sendPort = new BluetoothGattCharacteristic(
-                    characteristicHttpBody,
-                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE | BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-                    BluetoothGattCharacteristic.PERMISSION_WRITE | BluetoothGattCharacteristic.PERMISSION_READ);
+        receivePort = new BluetoothGattCharacteristic(
+                nordicRxUUID,
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                BluetoothGattCharacteristic.PERMISSION_WRITE | BluetoothGattCharacteristic.PERMISSION_READ);
+        service.addCharacteristic(receivePort);
 
-            // To enable notification
-            BluetoothGattDescriptor notDescriptor =
-                    new BluetoothGattDescriptor(BLE_DESC_CLIENT_CONFIG,
-                            BluetoothGattDescriptor.PERMISSION_WRITE);
+        sendPort = new BluetoothGattCharacteristic(
+                nordicTxUUID,
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                BluetoothGattCharacteristic.PERMISSION_WRITE | BluetoothGattCharacteristic.PERMISSION_READ);
 
-            sendPort.addDescriptor(notDescriptor);
-
-
-            service.addCharacteristic(sendPort);
-        } else {
-            receivePort = new BluetoothGattCharacteristic(
-                    characteristicProxy,
-                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-                    BluetoothGattCharacteristic.PERMISSION_WRITE | BluetoothGattCharacteristic.PERMISSION_READ);
-            service.addCharacteristic(receivePort);
-
-            sendPort = new BluetoothGattCharacteristic(
-                    characteristicNotifyProxy,
-                    BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-                    BluetoothGattCharacteristic.PERMISSION_WRITE | BluetoothGattCharacteristic.PERMISSION_READ);
-
-            // To enable notification
-            BluetoothGattDescriptor notDescriptor =
-                    new BluetoothGattDescriptor(BLE_DESC_CLIENT_CONFIG,
-                            BluetoothGattDescriptor.PERMISSION_WRITE);
-            sendPort.addDescriptor(notDescriptor);
-
-
-            service.addCharacteristic(sendPort);
-
-        }
+        BluetoothGattDescriptor notDescriptor =
+                new BluetoothGattDescriptor(BLE_DESC_CLIENT_CONFIG,
+                        BluetoothGattDescriptor.PERMISSION_WRITE);
+        sendPort.addDescriptor(notDescriptor);
+        service.addCharacteristic(sendPort);
         gatS.addService(service);
         } catch (Throwable e) {
             e.printStackTrace();
@@ -758,7 +767,7 @@ public class Ble implements MessageHandler {
 //            bodyChar.setValue("HELLO".getBytes());
 //            gatS.notifyCharacteristicChanged(device, bodyChar, false);
             BluetoothGattCharacteristic nc = gatS
-                    .getService(eddyUUID)
+                    .getService(nordicUartUUID)
                     .getCharacteristic(sendPort.getUuid());
             byte[] data = "HELLO".getBytes();
             nc.setValue(data);
@@ -858,5 +867,19 @@ public class Ble implements MessageHandler {
             Log.d(TAG, "PHY_READ" + txPhy + " " + rxPhy + " " + status);
             super.onPhyRead(device, txPhy, rxPhy, status);
         }
+    }
+
+    private String jsonField(String json, String field) {
+        String needle = "\"" + field + "\":\"";
+        int start = json.indexOf(needle);
+        if (start < 0) {
+            return "";
+        }
+        start += needle.length();
+        int end = json.indexOf('"', start);
+        if (end < 0) {
+            return "";
+        }
+        return json.substring(start, end);
     }
 }

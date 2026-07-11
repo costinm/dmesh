@@ -3,12 +3,84 @@
 
 Most difficult part is keeping the network alive in doze/idle mode - most popular commands:
 
+## Repo-local tooling
+
+Keep DMesh builds self-contained under `/ws/dmesh/target`. The build helper
+uses the repo-local Cargo and Gradle homes and the Nix profile in
+`target/nix/profile`; manual commands should use the same environment:
+
+```sh
+cd /ws/dmesh
+./scripts/build-android.sh deps
+. target/nix/profile/bin/dmesh-setenv
+export RUSTUP_HOME="$PWD/target/rustup"
+export CARGO_HOME="$PWD/target/.cargo"
+export GRADLE_USER_HOME="$PWD/target/.gradle"
+```
+
+Build only `app-dmesh` by default:
+
+```sh
+DMESH_SSH_MESH_DIR=/ws/rust/ssh-mesh \
+  ./scripts/build-android.sh build release
+```
+
+`DMESH_SSH_MESH_DIR=/ws/rust/ssh-mesh` uses the current ssh-mesh checkout as a
+dependency source, but the build still runs from `/ws/dmesh` and keeps DMesh
+tooling/caches under `/ws/dmesh/target`. To test the standalone Git dependency
+path instead, point the override at a missing directory:
+
+```sh
+DMESH_SSH_MESH_DIR=/ws/dmesh/no-ssh-mesh-override \
+  ./scripts/build-android.sh build release
+```
+
+Do not use the ESP-IDF/ESP toolchain for Android APK work. Firmware work has
+its own local build context under `/ws/rust/ssh-mesh/fw`; only rebuild or flash
+firmware when that is the task.
+
+Install the current release APK on a USB device and start the foreground
+service:
+
+```sh
+adb -s SERIAL install -r target/apk/release/app-dmesh-release.apk
+adb -s SERIAL shell am start-foreground-service \
+  -n com.github.costinm.dmesh.lm/.DMService
+```
+
+Grant runtime permissions explicitly on physical devices:
+
+```sh
+adb -s SERIAL shell pm grant --user 0 \
+  com.github.costinm.dmesh.lm android.permission.ACCESS_FINE_LOCATION
+adb -s SERIAL shell pm grant --user 0 \
+  com.github.costinm.dmesh.lm android.permission.ACCESS_BACKGROUND_LOCATION
+adb -s SERIAL shell pm grant --user 0 \
+  com.github.costinm.dmesh.lm android.permission.NEARBY_WIFI_DEVICES
+adb -s SERIAL shell pm grant --user 0 \
+  com.github.costinm.dmesh.lm android.permission.BLUETOOTH_SCAN
+adb -s SERIAL shell pm grant --user 0 \
+  com.github.costinm.dmesh.lm android.permission.BLUETOOTH_CONNECT
+adb -s SERIAL shell pm grant --user 0 \
+  com.github.costinm.dmesh.lm android.permission.BLUETOOTH_ADVERTISE
+```
+
+Prefer the app's command provider and in-memory history over `logcat` for normal
+radio debugging. `logcat` is useful as a last resort for framework WiFi Aware,
+Bluetooth, permission, or crash failures, but it is too noisy for routine
+message-level checks.
+
+JNI should follow the same message style. Rust modules should be reached through
+small generic command surfaces with text command/args, raw `byte[]` payloads,
+and an FD slot when needed. Keep local binary payloads as bytes; reserve CBOR
+for future structured binary frames rather than adding protobuf or base64.
+
 ## Tcpdump
 
 ```
 # Wifi Direct uses 1,6,11 for announcements / discovery - useful to stay in those
 # channels even in AP/client mode
-iw phy phy0 set channel 6 
+iw phy phy0 set channel 6
 
 # Radio tap shows signal level, freq, low level Wifi frames
 wireshark -i wlan0 -I -y IEEE802_11_RADIO
@@ -264,11 +336,106 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
 Expected message patterns:
 
 - WiFi scan: `net.status` with `event=scan` and `visible=N`.
-- BLE scan: `BLE.scan`, DMesh `wifi.BLE.DISC`, external `BLE.DISC`, or `BLE.ERR.*`.
+- BLE scan: `BLE.scan` should include `wake=pending_intent`. DMesh firmware or
+  phone advertisements appear as `BLE.DISC proto=dmesh` with a JSON payload
+  containing `event`, `device_id`, `payload_len`, `payload_hash`, `prefix`,
+  and `duplicate`. External devices still appear as `BLE.DISC proto=meshtastic`
+  or `BLE.DISC proto=nordic_uart`.
   `BLE.DISC proto=meshtastic` means the Meshtastic GATT service UUID was
   advertised; `BLE.DISC proto=nordic_uart compatible=meshcore` means Nordic
   UART Service was advertised, which is the MeshCore-compatible path.
-- NAN: `net.NAN.Attach`, then `net.NAN.PubStart` and `net.NAN.SubStart` before any `net.NAN.*ServiceDiscovered` messages. If the history shows `net.NAN.AttachError`, NAN did not reach publish/subscribe.
+- NAN: `net.NAN.Attach`, then `net.NAN.PubStart` and `net.NAN.SubStart` before
+  `net.NAN.*ServiceDiscovered` messages. DMesh follow-ups appear as
+  `net.NAN.FollowupRx` / `net.NAN.FollowupTx` with parsed JSON from the Rust
+  protocol code. If the history shows `net.NAN.AttachError`, NAN did not reach
+  publish/subscribe.
+
+The Android side does not hold wake locks. The expected wake paths are the
+foreground service while active, periodic `LMJob` update windows, BLE
+`PendingIntent` scan delivery, and normal WiFi Aware framework callbacks.
+
+## Two Android BLE/NAN live test
+
+Use this when two Android devices are connected over ADB and `app-dmesh` is
+installed. The script starts `DMService`, sends a BLE advertisement from each
+device, sends a NAN follow-up, then reads the in-memory history buffer through
+the app content provider:
+
+```sh
+scripts/live_android_radio_test.py \
+  --device 94AAY0LALC \
+  --device RFCNB05AJ7E \
+  --auto-serial \
+  --duration 12
+```
+
+Expected result:
+
+- `ble_status=True` on both devices.
+- `nan_status=True` on both devices.
+- At least one device reports `nan_peer=True`.
+- At least one device reports `nan_followup=True`.
+
+The script saves ADB history and captured output under
+`target/live-tests/android-radio-*`.
+
+## LoRa to Android live test
+
+Use this when two LoRa ESP32 boards are attached as serial devices and two
+Android devices are connected over ADB. The intended path is:
+
+```text
+/dev/ttyUSB0 LoRa sender -> /dev/ttyUSB1 ESP32 repeater -> Android BLE/NAN receive
+```
+
+Default BLE plus raw NAN forwarding:
+
+```sh
+scripts/live_lora_android_test.py \
+  --android 94AAY0LALC \
+  --android RFCNB05AJ7E \
+  --tx /dev/ttyUSB0 \
+  --rx /dev/ttyUSB1 \
+  --wait 12
+```
+
+Official WiFi Aware/NAN backend:
+
+```sh
+scripts/live_lora_android_test.py \
+  --android 94AAY0LALC \
+  --android RFCNB05AJ7E \
+  --tx /dev/ttyUSB0 \
+  --rx /dev/ttyUSB1 \
+  --nan-backend official \
+  --wait 14
+```
+
+Expected BLE evidence in Android history:
+
+- `BLE.DISC proto=dmesh`
+- `event=lora_rx`
+- `device_id`, `payload_len`, `payload_hash`, and `prefix`
+
+Expected firmware console evidence:
+
+- `lora_rx`
+- `ev=lora.fwd t=ble ok=true`
+- `ev=lora.fwd t=nan ...`
+
+For the official NAN backend, discovery/match evidence is currently the main
+signal to check. Firmware logs should show `nan.match`, and Android history may
+show firmware service state such as `/nan/<device_id>` with
+`role=firmware_publisher`. Payload follow-up over official NAN can still fail
+and fall back to raw forwarding, for example `ev=lora.fwd t=nan ... ok=false`
+followed by raw NAN forwarding. Android apps do not receive raw WiFi action
+frames as WiFi Aware follow-up messages; BLE is the proven LoRa-to-Android
+payload wake/notice path.
+
+The serial harness uses Python `termios` directly and does not require
+`pyserial`. Use `socat` for manual serial teeing if needed, or use the firmware
+project's own scripts and dependency environment when driving lower-level
+firmware tests.
 
 Check Android runtime permissions granted to `app-dmesh`:
 
@@ -280,7 +447,8 @@ The relevant runtime permissions are `ACCESS_FINE_LOCATION`,
 `ACCESS_BACKGROUND_LOCATION`, `NEARBY_WIFI_DEVICES`, `BLUETOOTH_SCAN`, and
 `BLUETOOTH_CONNECT`, and `BLUETOOTH_ADVERTISE`.
 
-For NAN attach failures, collect the framework WiFi Aware logs:
+For NAN attach failures that are not explained by app history or firmware
+serial logs, collect the framework WiFi Aware logs:
 
 ```sh
 adb shell logcat -d -v time -t 400 \
@@ -353,9 +521,13 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
 
 # Permissions
 
-In adb mode, grant the required permissions:
+In adb mode, grant the required permissions listed in
+[Repo-local tooling](#repo-local-tooling). For a quick status check:
 
+```sh
+adb shell dumpsys package com.github.costinm.dmesh.lm | \
+  sed -n '/runtime permissions:/,/install permissions:/p'
 ```
-adb shell pm grant com.github.costinm.dmesh.lm android.permission.NEARBY_WIFI_DEVICES
 
-```
+On some devices, especially Samsung builds, use `pm grant --user 0` so the
+runtime grant is applied to the active user.

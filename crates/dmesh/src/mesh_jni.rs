@@ -11,28 +11,29 @@
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 #[cfg(target_os = "android")]
 use jni::sys::JNI_VERSION_1_6;
-use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
-use serde_json::{json, Map, Value};
-use ssh_mesh::sshc::SshClientListener;
+use serde_json::{Map, Value, json};
 use ssh_mesh::MeshListener;
+use ssh_mesh::sshc::SshClientListener;
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "android")]
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 #[cfg(target_os = "android")]
 use std::io::{self, Write};
 #[cfg(target_os = "android")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Once;
 use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 #[cfg(target_os = "android")]
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::mesh_common::{MeshHandle, MeshStreamHandle};
+use lmesh::radio_protocol::{self, BleEvent};
 
 const BRIDGE_HOST: &str = "dmesh-msg";
 const LEGACY_BRIDGE_HOST: &str = "local";
@@ -188,7 +189,8 @@ fn emit_android_message_line(client_id: u64, line: String) {
 
 #[cfg(target_os = "android")]
 fn rust_trace_frame(line: &str) -> String {
-    let payload = serde_json::from_str::<Value>(line).unwrap_or_else(|_| Value::String(line.into()));
+    let payload =
+        serde_json::from_str::<Value>(line).unwrap_or_else(|_| Value::String(line.into()));
     json!({
         "method": "messages.event",
         "data": {
@@ -333,6 +335,114 @@ fn json_value_to_string(v: &Value) -> String {
     v.as_str()
         .map(str::to_string)
         .unwrap_or_else(|| v.to_string())
+}
+
+fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::Result<Vec<u8>> {
+    let cmd = parse_bridge_human(&format!("{} {}", method, args.trim()))?;
+    let response = match cmd.method.as_str() {
+        "radio.ble.build_service_data" => {
+            let event = cmd
+                .data
+                .get("event")
+                .map(String::as_str)
+                .unwrap_or("generic");
+            let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
+            let rssi = parse_i32(&cmd, "rssi", 0)?;
+            let snr_q4 = parse_i32(&cmd, "snr_q4", 0)?;
+            radio_protocol::build_ble_service_data(
+                BleEvent::parse(event),
+                &device_id,
+                payload,
+                rssi,
+                snr_q4,
+            )?
+        }
+        "radio.ble.parse_service_data" => {
+            let scan_rssi = parse_i32(&cmd, "scan_rssi", 0)?;
+            let address = cmd.data.get("address").map(String::as_str).unwrap_or("");
+            radio_protocol::parse_ble_service_data(payload, scan_rssi, address)?
+                .to_string()
+                .into_bytes()
+        }
+        "radio.nan.build_service_info" => {
+            let role = cmd
+                .data
+                .get("role")
+                .map(String::as_str)
+                .unwrap_or("android");
+            let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
+            let wake_count = parse_u32(&cmd, "wake_count", 0)?;
+            radio_protocol::build_nan_service_info(role, &device_id, wake_count)?
+        }
+        "radio.nan.parse_service_info" => radio_protocol::parse_nan_service_info(payload)?
+            .to_string()
+            .into_bytes(),
+        "radio.nan.build_followup" => {
+            let msg_type = cmd
+                .data
+                .get("msg_type")
+                .map(String::as_str)
+                .unwrap_or("hello");
+            let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
+            let target_id = hex_to_bytes(required_data(&cmd, "target_id")?)?;
+            radio_protocol::build_nan_followup(msg_type, &device_id, &target_id, payload)?
+        }
+        "radio.nan.parse_followup" => radio_protocol::parse_nan_followup(payload)?
+            .to_string()
+            .into_bytes(),
+        _ => anyhow::bail!("unknown radio method: {}", cmd.method),
+    };
+    Ok(response)
+}
+
+fn required_data<'a>(cmd: &'a BridgeCommand, key: &str) -> anyhow::Result<&'a str> {
+    cmd.data
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!("missing radio field: {}", key))
+}
+
+fn parse_i32(cmd: &BridgeCommand, key: &str, default: i32) -> anyhow::Result<i32> {
+    cmd.data
+        .get(key)
+        .map(|value| value.parse::<i32>())
+        .transpose()?
+        .map_or(Ok(default), Ok)
+}
+
+fn parse_u32(cmd: &BridgeCommand, key: &str, default: u32) -> anyhow::Result<u32> {
+    cmd.data
+        .get(key)
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .map_or(Ok(default), Ok)
+}
+
+fn hex_to_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.len() % 2 != 0 {
+        anyhow::bail!("hex value has odd length");
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> anyhow::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => anyhow::bail!("invalid hex byte: {}", byte as char),
+    }
 }
 
 fn parse_bridge_human(line: &str) -> anyhow::Result<BridgeCommand> {
@@ -561,7 +671,9 @@ impl MeshListener for JniMeshListener {
         let command = command.map(|value| value.to_string());
         self.runtime.spawn(async move {
             match command {
-                Some(command) => handle_exec_session(jvm, callback, client_id, command, stream).await,
+                Some(command) => {
+                    handle_exec_session(jvm, callback, client_id, command, stream).await
+                }
                 None => handle_bridge_stream(jvm, callback, client_id, stream).await,
             }
         });
@@ -1198,6 +1310,29 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeAddRem
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeRadioMessage<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    method: JString<'a>,
+    args: JString<'a>,
+    data: JByteArray<'a>,
+    fd: jint,
+) -> JByteArray<'a> {
+    let method: String = env
+        .get_string(&method)
+        .map(|v| v.into())
+        .unwrap_or_default();
+    let args: String = env.get_string(&args).map(|v| v.into()).unwrap_or_default();
+    let data = env.convert_byte_array(&data).unwrap_or_default();
+    let bytes = radio_message(&method, &args, &data, fd).unwrap_or_else(|error| {
+        log::error!("nativeRadioMessage failed: {}", error);
+        Vec::new()
+    });
+    env.byte_array_from_slice(&bytes)
+        .unwrap_or_else(|_| JByteArray::from(JObject::null()))
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStreamRead(
     env: JNIEnv,
     _class: JClass,
@@ -1367,10 +1502,9 @@ mod tests {
 
     #[test]
     fn parses_json_command() {
-        let cmd = parse_bridge_line(
-            r#"{"id":"j1","method":"wifi.scan","data":{"reason":"json","n":2}}"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_bridge_line(r#"{"id":"j1","method":"wifi.scan","data":{"reason":"json","n":2}}"#)
+                .unwrap();
         assert_eq!(cmd.id.as_deref(), Some("j1"));
         assert_eq!(cmd.method, "wifi.scan");
         assert_eq!(cmd.data.get("reason").unwrap(), "json");
@@ -1379,10 +1513,9 @@ mod tests {
 
     #[test]
     fn parses_json_method_command() {
-        let cmd = parse_bridge_line(
-            r#"{"id":"m1","method":"wifi.scan","data":{"reason":"json","n":2}}"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_bridge_line(r#"{"id":"m1","method":"wifi.scan","data":{"reason":"json","n":2}}"#)
+                .unwrap();
         assert_eq!(cmd.id.as_deref(), Some("m1"));
         assert_eq!(cmd.method, "wifi.scan");
         assert_eq!(cmd.to_json_value()["method"], "wifi.scan");
@@ -1419,5 +1552,47 @@ mod tests {
         assert_eq!(cmd.method, "wifi.scan");
         assert_eq!(cmd.data.get("reason").unwrap(), "human");
         assert_eq!(cmd.data.get("enabled").unwrap(), "1");
+    }
+
+    #[test]
+    fn radio_message_builds_and_parses_ble_service_data() {
+        let device_id = "010203040506";
+        let payload = b"abcdef";
+        let built = radio_message(
+            "radio.ble.build_service_data",
+            &format!("event=lora_rx device_id={device_id} rssi=-70 snr_q4=6"),
+            payload,
+            -1,
+        )
+        .unwrap();
+        assert_eq!(&built[0..3], b"DM\x01");
+
+        let parsed = radio_message(
+            "radio.ble.parse_service_data",
+            "scan_rssi=-62 address=aa:bb",
+            &built,
+            -1,
+        )
+        .unwrap();
+        let parsed = String::from_utf8(parsed).unwrap();
+        assert!(parsed.contains(r#""event":"lora_rx""#));
+        assert!(parsed.contains(r#""device_id":"010203040506""#));
+    }
+
+    #[test]
+    fn radio_message_builds_and_parses_nan_followup() {
+        let built = radio_message(
+            "radio.nan.build_followup",
+            "msg_type=command_text device_id=010101010101 target_id=020202020202",
+            b"ble stats=true",
+            -1,
+        )
+        .unwrap();
+        assert_eq!(&built[0..3], b"DM\x01");
+
+        let parsed = radio_message("radio.nan.parse_followup", "", &built, -1).unwrap();
+        let parsed = String::from_utf8(parsed).unwrap();
+        assert!(parsed.contains(r#""msg_type":"command_text""#));
+        assert!(parsed.contains(r#""payload_text":"ble stats=true""#));
     }
 }

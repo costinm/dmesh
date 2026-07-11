@@ -29,4 +29,5 @@ dependencies {
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
     
     implementation(project(mapOf("path" to ":android:lib-util")))
+    api(project(mapOf("path" to ":java:rust")))
 }

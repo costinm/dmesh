@@ -27,6 +27,7 @@ import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgFrame;
 
 import com.github.costinm.dmesh.lm3.LocalMesh;
+import com.github.costinm.dmesh.lm3.Ble;
 import com.github.costinm.dmeshnative.MeshNode;
 import com.github.costinm.dmeshnative.Rust;
 
@@ -133,6 +134,10 @@ public class DMService extends BaseMsgService implements MessageHandler {
 
         @Override
         public void onReceive(Context context, Intent intent) {
+            if (Ble.ACTION_SCAN_RESULT.equals(intent.getAction())) {
+                Ble.handlePendingIntentScan(context, intent);
+                return;
+            }
             CharSequence txt = getMessageText(intent);
             Log.d(TAG, "BROADCAST MSG: " + txt + " " + intent + " " + intent.getData());
 

@@ -58,11 +58,6 @@ android {
     lint {
         abortOnError = false
     }
-    sourceSets {
-        getByName("main") {
-            java.srcDir("../../java/rust/src/main/java")
-        }
-    }
     namespace = "com.github.costinm.dmesh.lm"
 }
 

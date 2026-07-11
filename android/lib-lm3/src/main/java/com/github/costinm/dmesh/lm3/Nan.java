@@ -31,7 +31,9 @@ import android.util.Log;
 
 import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.Hex;
+import com.github.costinm.dmeshnative.MeshNode;
 
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +69,7 @@ public class Nan {
     // called when mgr reports 'isAvailable'. NAN may be turned off when P2P is enabled or in
     // many other cases. When it returns, if we sub or adv attach will be called again.
     int msgId;
+    int wakeCount;
 
     public Nan(LocalMesh wifi) {
         this.lm = wifi;
@@ -283,6 +286,14 @@ public class Nan {
 
     void onDiscovered(PeerHandle peerHandle, byte[] serviceSpecificInfo, boolean byPublisher) {
         Device bd = new Device(peerHandle, serviceSpecificInfo);
+        String parsed = MeshNode.parseNanServiceInfo(serviceSpecificInfo);
+        String deviceId = jsonField(parsed, "device_id");
+        if (deviceId.length() > 0) {
+            bd.id = deviceId;
+            bd.data.putString(Device.P2PAddr, "/nan/" + deviceId);
+            bd.data.putString("proto", "dmesh_nan");
+            bd.data.putString("nan", parsed);
+        }
         Device old = devices.get(bd.id);
         if (old == null) {
             onDiscovery(bd, bd.id, true);
@@ -295,22 +306,23 @@ public class Nan {
         devices.put(bd.id, bd);
 
 
-        String info = new String(serviceSpecificInfo);
-
         // for debugging
         if (byPublisher) {
             // Used with active sub and passive pub
-            MsgMux.get(ctx).publish("net.NAN.PubServiceDiscovered." + info + "." + peerHandle);
+            MsgMux.get(ctx).publish("net.NAN.PubServiceDiscovered",
+                    "peer", peerHandle.toString(),
+                    "id", bd.id,
+                    "json", parsed);
             bd.nanSession = pubSession;
         } else {
             // Used with active pub and passive sub
-            MsgMux.get(ctx).publish("net.NAN.SubServiceDiscovered." + info + "." + peerHandle);
+            MsgMux.get(ctx).publish("net.NAN.SubServiceDiscovered",
+                    "peer", peerHandle.toString(),
+                    "id", bd.id,
+                    "json", parsed);
             bd.nanSession = subSession;
         }
-        // Send a message to the found device to verify messaging works and introduce ourselves.
-        //
-        send(bd.id, "FOUNDP " + lm.id4 + " " + new String(serviceSpecificInfo) + " " +
-                (byPublisher ? "P" : "S"));
+        sendFollowup(bd, "hello", new byte[0]);
     }
 
     private void onDiscovery(Device bd, String id, boolean b) {
@@ -351,7 +363,9 @@ public class Nan {
         PublishConfig.Builder builder = new PublishConfig.Builder().setServiceName(pubServiceName)
                 .setPublishType(pubType) // silent, but respond to active requests
                 .setTerminateNotificationEnabled(true)
-                .setServiceSpecificInfo(lm.adv.getBytes());
+                .setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
+                        lm.deviceIdBytes(),
+                        wakeCount++));
         if (instant) {
             builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ);
         }
@@ -405,7 +419,9 @@ public class Nan {
     private SubscribeConfig buildSubscribeConfig(boolean instant) {
         SubscribeConfig.Builder builder = new SubscribeConfig.Builder()
                 .setServiceName("dmesh")
-                .setServiceSpecificInfo(lm.adv.getBytes())
+                .setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
+                        lm.deviceIdBytes(),
+                        wakeCount++))
                 .setSubscribeType(subType)
                 .setTerminateNotificationEnabled(true);
         if (instant) {
@@ -424,7 +440,7 @@ public class Nan {
             // This is unlikely to work well - there are limits on how many.
             // Good to identify them...
             for (Device d : devices.values()) {
-                subSession.sendMessage(d.nan, msgId++, "CON".getBytes());
+                sendFollowup(d, "wake_request", new byte[0]);
                 if ("0".equals(id)) {
                     return;
                 }
@@ -437,7 +453,7 @@ public class Nan {
         }
 
         if (d.nan != null) {
-            subSession.sendMessage(d.nan, msgId++, "CON".getBytes());
+            sendFollowup(d, "wake_request", new byte[0]);
         }
     }
 
@@ -447,7 +463,7 @@ public class Nan {
                 if (d.nan != null && d.nanSession == subSession) {
                     // May log: DiscoverySession: called on terminated session
                     Log.d(TAG, "NAN send " + d.id + " " + d.nan + " " + msgId);
-                    subSession.sendMessage(d.nan, msgId++, id.getBytes());
+                    sendFollowup(d, "command_text", id.getBytes(StandardCharsets.UTF_8));
                 }
             }
         }
@@ -456,7 +472,7 @@ public class Nan {
                 if (d.nan != null && d.nanSession == pubSession) {
                     // May log: DiscoverySession: called on terminated session
                     Log.d(TAG, "NAN send pub " + d.id + " " + d.nan + " " + msgId);
-                    pubSession.sendMessage(d.nan, msgId++, id.getBytes());
+                    sendFollowup(d, "command_text", id.getBytes(StandardCharsets.UTF_8));
                 }
             }
         }
@@ -464,9 +480,52 @@ public class Nan {
 
     public void send(String id, String msg) {
         Device d = devices.get(id);
-        if (d != null && d.nan != null && d.nanSession != null) {
-            d.nanSession.sendMessage(d.nan, msgId++, msg.getBytes());
+        sendFollowup(d, "command_text", msg.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void sendFollowup(Device d, String msgType, byte[] payload) {
+        if (d == null || d.nan == null || d.nanSession == null) {
+            return;
         }
+        byte[] target = parseDeviceId(d.id);
+        byte[] body = MeshNode.buildNanFollowup(msgType, lm.deviceIdBytes(), target, payload);
+        d.nanSession.sendMessage(d.nan, msgId++, body);
+        MsgMux.get(ctx).publish("net.NAN.FollowupTx",
+                "id", d.id == null ? "" : d.id,
+                "type", msgType,
+                "bytes", Integer.toString(body.length));
+    }
+
+    private byte[] parseDeviceId(String id) {
+        byte[] out = new byte[6];
+        if (id == null || id.length() < 12) {
+            return out;
+        }
+        for (int i = 0; i < out.length; i++) {
+            try {
+                out[i] = (byte) Integer.parseInt(id.substring(i * 2, i * 2 + 2), 16);
+            } catch (RuntimeException e) {
+                return new byte[6];
+            }
+        }
+        return out;
+    }
+
+    private String jsonField(String json, String field) {
+        if (json == null) {
+            return "";
+        }
+        String needle = "\"" + field + "\":\"";
+        int start = json.indexOf(needle);
+        if (start < 0) {
+            return "";
+        }
+        start += needle.length();
+        int end = json.indexOf('"', start);
+        if (end < 0) {
+            return "";
+        }
+        return json.substring(start, end);
     }
 
     /**
@@ -561,6 +620,10 @@ public class Nan {
         public void onMessageReceived(PeerHandle peerHandle, byte[] message) {
             super.onMessageReceived(peerHandle, message);
             String msg = new String(message);
+            String parsed = MeshNode.parseNanFollowup(message);
+            MsgMux.get(ctx).publish("net.NAN.FollowupRx",
+                    "peer", peerHandle.toString(),
+                    "json", parsed);
 
             if (msg.equals("CONS")) {
                 lm.delayHandler.postDelayed(new Runnable() {
