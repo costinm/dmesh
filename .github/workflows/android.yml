@@ -66,8 +66,20 @@ jobs:
             x86_64-linux-android
           cargo install cargo-ndk --locked
 
+      - name: Check Rust code style
+        run: cargo fmt --check -p dmesh
+
+      - name: Check Rust lints
+        run: cargo clippy -- -D warnings -A clippy::result_large_err -A clippy::new_without_default -A clippy::needless_pass_by_value --package dmesh
+
+      - name: Check Rust code
+        run: cargo check -p dmesh
+
       - name: Build debug APKs
         run: ./scripts/build-android.sh build debug
+
+      - name: Test JVM modules
+        run: ./gradlew :java:rust:test :android:app-web:testDebugUnitTest
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4

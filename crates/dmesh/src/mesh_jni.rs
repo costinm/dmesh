@@ -1361,16 +1361,6 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStopTu
     let _ = unsafe { Box::from_raw(handle as *mut AndroidVpnHandle) };
 }
 
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_costinm_dmesh_MeshNode_nativeCreateTun(
-    env: JNIEnv,
-    class: JClass,
-    fd: jint,
-) -> jlong {
-    Java_com_github_costinm_dmeshnative_MeshNode_nativeStartTunFd(env, class, fd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
