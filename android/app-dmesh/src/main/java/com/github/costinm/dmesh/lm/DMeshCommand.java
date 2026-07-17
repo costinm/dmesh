@@ -40,6 +40,14 @@ final class DMeshCommand {
             if ("messages.snapshot".equals(parsed.command) || "messages.history".equals(parsed.command)) {
                 return runRequest(mux, parsed.toFrame(parsed.command, 0), parsed);
             }
+            if ("messages".equals(parsed.command)) {
+                String action = parsed.arg(0, "status");
+                return runRequest(mux, parsed.toFrame("messages." + action, 1), parsed);
+            }
+            if ("companion".equals(parsed.command)) {
+                String action = parsed.arg(0, "status");
+                return runRequest(mux, parsed.toFrame("companion." + action, 1), parsed);
+            }
             if (parsed.command != null && parsed.command.contains(".")) {
                 return runMessage(mux, parsed.toFrame(parsed.command, 0));
             }

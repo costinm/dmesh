@@ -39,6 +39,9 @@ const BRIDGE_HOST: &str = "dmesh-msg";
 const LEGACY_BRIDGE_HOST: &str = "local";
 const BRIDGE_PORT: u16 = 1;
 static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<String>>>> = OnceLock::new();
+const WEB_BRIDGE_CLIENT_ID: u64 = 9_000_000;
+#[cfg(target_os = "android")]
+static WEB_BRIDGE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 #[cfg(target_os = "android")]
 static ANDROID_LOGGER: AndroidLog = AndroidLog;
 #[cfg(target_os = "android")]
@@ -55,6 +58,152 @@ struct AndroidVpnHandle {
 
 fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<String>>> {
     BRIDGE_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(target_os = "android")]
+fn register_android_proxy_bridge() {
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        let _ =
+            ssh_mesh::generic_proxy::set_generic_proxy_bridge(|app, method, params| async move {
+                if app != "lmesh" && app != "dmesh" {
+                    return Err(format!("android bridge does not handle app {app}"));
+                }
+                dispatch_android_proxy_command(method, params).await
+            });
+    });
+}
+
+#[cfg(target_os = "android")]
+async fn dispatch_android_proxy_command(method: String, params: Value) -> Result<Value, String> {
+    let _guard = WEB_BRIDGE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let callback = android_message_callback()
+        .lock()
+        .map_err(|_| "android callback lock poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "android message callback not registered".to_string())?;
+
+    let client_id = WEB_BRIDGE_CLIENT_ID;
+    let (tx, mut rx) = unbounded_channel::<String>();
+    bridge_senders()
+        .lock()
+        .map_err(|_| "bridge sender map lock poisoned".to_string())?
+        .insert(client_id, tx);
+
+    let command = bridge_command_from_proxy(method, params);
+    let dispatch_result = dispatch_bridge_command(&callback.0, &callback.1, client_id, &command)
+        .map_err(|e| e.to_string());
+    if dispatch_result.is_err() {
+        let _ = bridge_senders().lock().map(|mut senders| {
+            senders.remove(&client_id);
+        });
+        return dispatch_result.map(|_| Value::Null);
+    }
+
+    let timeout = tokio::time::sleep(std::time::Duration::from_millis(650));
+    tokio::pin!(timeout);
+    let mut last = None;
+    loop {
+        tokio::select! {
+            line = rx.recv() => {
+                let Some(line) = line else {
+                    break;
+                };
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    last = Some(android_proxy_response_value(value));
+                    break;
+                }
+            }
+            _ = &mut timeout => {
+                break;
+            }
+        }
+    }
+
+    let _ = bridge_senders().lock().map(|mut senders| {
+        senders.remove(&client_id);
+    });
+
+    Ok(last.unwrap_or_else(|| {
+        json!({
+            "ok": true,
+            "status": "sent",
+            "method": command.method,
+        })
+    }))
+}
+
+#[cfg(target_os = "android")]
+fn bridge_command_from_proxy(method: String, params: Value) -> BridgeCommand {
+    let mut data = BTreeMap::new();
+    if let Some(obj) = params.as_object() {
+        insert_json_map(&mut data, obj);
+    }
+    let method = match method.as_str() {
+        "status" => "messages.status".to_string(),
+        "messages.history" => "messages.history".to_string(),
+        value => value.to_string(),
+    };
+    BridgeCommand {
+        id: None,
+        method,
+        data,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn configure_android_mesh_paths(base_dir: &str) {
+    let base = std::path::Path::new(base_dir);
+    let run_base = base.join("run").join("mesh");
+    let home_base = base.join("home");
+    let opt_base = base.join("opt");
+
+    for dir in [&run_base, &home_base, &opt_base] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log::warn!(
+                "Failed to create Android mesh path {}: {}",
+                dir.display(),
+                e
+            );
+        }
+    }
+
+    // Android has no system mesh runtime directory. Keep any defensive UDS
+    // fallback under the app's files/ tree and route web commands by bridge.
+    unsafe {
+        std::env::set_var("MESH_HOME", base);
+        std::env::set_var("MESH_RUN_BASE", &run_base);
+        std::env::set_var("MESH_HOME_BASE", &home_base);
+        std::env::set_var("MESH_OPT_BASE", &opt_base);
+        std::env::set_var("SSH_MESH_HOME_ROOT", &home_base);
+        std::env::set_var("LMESH_UDS", run_base.join("lmesh").join("mesh.sock"));
+        std::env::set_var(
+            "MESH_INIT_UDS",
+            run_base.join("mesh-init").join("mesh.sock"),
+        );
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_proxy_response_value(mut value: Value) -> Value {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if let Some(data) = value.get_mut("data") {
+        if let Some(obj) = data.as_object_mut()
+            && !method.is_empty()
+        {
+            obj.entry("method".to_string())
+                .or_insert(Value::String(method));
+        }
+        return data.take();
+    }
+    value
 }
 
 #[cfg(target_os = "android")]
@@ -1022,6 +1171,8 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
     if let Ok(mut message_callback) = android_message_callback().lock() {
         *message_callback = Some((jvm.clone(), callback_ref.clone()));
     }
+    #[cfg(target_os = "android")]
+    register_android_proxy_bridge();
 
     let mesh_listener = Arc::new(JniMeshListener {
         jvm: jvm.clone(),
@@ -1082,6 +1233,8 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
         Ok(s) => s.into(),
         Err(_) => return 0,
     };
+    #[cfg(target_os = "android")]
+    configure_android_mesh_paths(&base_dir_str);
 
     match crate::mesh_common::start_mesh(&base_dir_str, ssh_port, http_port) {
         Ok(handle) => Box::into_raw(Box::new(handle)) as jlong,

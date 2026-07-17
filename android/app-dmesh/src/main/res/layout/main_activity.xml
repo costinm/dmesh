@@ -22,42 +22,26 @@
         android:orientation="vertical">
 
         <TextView
-            android:id="@+id/info_text"
-            android:text="Info"
+            android:id="@+id/con_text"
+            android:text="Service starting"
+            android:textStyle="bold"
+            android:padding="10dp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:id="@+id/if_text"
+            android:text="Interfaces"
+            android:padding="10dp"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
         <TextView
             android:id="@+id/msg_text"
-            android:text="Msg"
+            android:text="Notifications"
+            android:padding="10dp"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
-
-        <AutoCompleteTextView
-            android:text="cmd"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:id="@+id/text_inputc"/>
-
-
-        <TextView
-            android:id="@+id/con_text"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content" />
-
-
-        <TextView
-            android:id="@+id/if_text"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content" />
-
-        <ListView
-            android:id="@+id/disclist"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:layout_marginBottom="6dp"
-         />
 
     </LinearLayout>
 </ScrollView>

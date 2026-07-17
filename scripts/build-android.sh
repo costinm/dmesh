@@ -7,8 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DMESH_NIX_PROFILE="${DMESH_NIX_PROFILE:-$SCRIPT_DIR/target/nix/profile}"
 
 export CARGO_HOME="${CARGO_HOME:-$SCRIPT_DIR/target/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$SCRIPT_DIR/target/rustup}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$SCRIPT_DIR/target/.gradle}"
-mkdir -p "$CARGO_HOME" "$GRADLE_USER_HOME"
+export TMPDIR="${TMPDIR:-$SCRIPT_DIR/target/tmp}"
+mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$GRADLE_USER_HOME" "$TMPDIR"
 
 SSH_MESH_GIT_URL="${SSH_MESH_GIT_URL:-https://github.com/costinm/ssh-mesh}"
 SSH_MESH_OVERRIDE_ACTIVE=0
@@ -98,17 +101,17 @@ nix_cmd() {
 install_nix_deps() {
     local flake_src
     flake_src="$(mktemp -d "${TMPDIR:-/tmp}/dmesh-flake.XXXXXX")"
-    trap 'rm -rf "$flake_src"' RETURN
+    trap "rm -rf '$flake_src'" RETURN
     cp "$SCRIPT_DIR/flake.nix" "$flake_src/flake.nix"
 
-    mkdir -p "$(dirname "$NIX_PROFILE")"
+    mkdir -p "$(dirname "$DMESH_NIX_PROFILE")"
     "$(nix_cmd)" profile install \
-        --profile "$NIX_PROFILE" \
+        --profile "$DMESH_NIX_PROFILE" \
         "path:$flake_src#deps"
-    echo "Installed DMesh build dependencies in $NIX_PROFILE"
+    echo "Installed DMesh build dependencies in $DMESH_NIX_PROFILE"
     echo "Load with: . target/nix/profile/bin/dmesh-setenv"
 
-    rustup target add aarch64-linux-android
+    "$DMESH_NIX_PROFILE/bin/rustup" target add aarch64-linux-android
           
 }
 

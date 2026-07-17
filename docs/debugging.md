@@ -217,6 +217,55 @@ closes it, so `timeout` may end the command after the acknowledgement has
 already been printed. Asynchronous event streaming back to the SSH client is not
 currently wired.
 
+## app-dmesh web command bridge
+
+The Android web UI uses the embedded ssh-mesh admin HTTP server, but command
+execution must not connect to Linux-style JSONL UDS paths such as
+`/mesh/run/mesh/...`. `app-dmesh` registers an in-process generic proxy bridge
+from Rust to Java after `MeshNode.setCallback(...)`; web tool calls under
+`/_m/proxy/mcp/lmesh` are translated to the same `MsgMux` command names used by
+SSH and the debug shell.
+
+If a defensive UDS fallback is ever needed on Android, JNI configures mesh paths
+under the app files tree:
+
+```text
+/data/user/0/com.github.costinm.dmesh.lm/files/ssh-mesh/run/mesh
+```
+
+Do not add Android command paths that depend on host `/mesh` directories.
+
+Manual web command smoke test:
+
+```sh
+adb -s SERIAL forward tcp:18480 tcp:18480
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/proxy/mcp/lmesh?tools=mesh/radio-tools.json' \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/proxy/mcp/lmesh?tools=mesh/radio-tools.json' \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"messages.file","arguments":{}}}'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/proxy/mcp/lmesh?tools=mesh/radio-tools.json' \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ble.scan","arguments":{"reason":"web-smoke"}}}'
+```
+
+Expected results are MCP JSON-RPC responses with `structuredContent`. Android
+message file responses should point under:
+
+```text
+/data/user/0/com.github.costinm.dmesh.lm/files/radio/ble/messages.bin
+```
+
+Async commands such as `ble.scan` may return `{"ok":true,"status":"sent"}` when
+the Java handler emits events later instead of a synchronous reply.
+
 Human command form is also accepted when the line does not start with `{`:
 
 ```sh
@@ -325,6 +374,9 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
   --method command --arg 'ble.scan reason=manual-debug'"
 
 adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+   --method command --arg 'ble.unbond addr=84:0D:8E:07:41:72'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
   --method command --arg 'wifi.nan.start reason=manual-debug'"
 
 sleep 6
@@ -336,14 +388,17 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
 Expected message patterns:
 
 - WiFi scan: `net.status` with `event=scan` and `visible=N`.
-- BLE scan: `BLE.scan` should include `wake=pending_intent`. DMesh firmware or
-  phone advertisements appear as `BLE.DISC proto=dmesh` with a JSON payload
-  containing `event`, `device_id`, `payload_len`, `payload_hash`, `prefix`,
-  and `duplicate`. External devices still appear as `BLE.DISC proto=meshtastic`
-  or `BLE.DISC proto=nordic_uart`.
+- BLE scan: `BLE.scan` should include `wake=pending_intent` and
+  `filters=dmesh_operational,...`. DMesh firmware or phone advertisements
+  appear as compact `BLE.DISC proto=dmesh` events with
+  `event`, `pending`, `payload_len`, `payload_hash`, `prefix`, and `pull`.
+  If a companion is stored, only that peer is pulled. External devices still
+  appear as `BLE.DISC proto=meshtastic`.
   `BLE.DISC proto=meshtastic` means the Meshtastic GATT service UUID was
-  advertised; `BLE.DISC proto=nordic_uart compatible=meshcore` means Nordic
-  UART Service was advertised, which is the MeshCore-compatible path.
+  advertised.
+- BLE payload transfer: expected events are `BLE.PENDING`, `BLE.PULL
+  state=subscribed`, `BLE.PULL state=ready_write`, `BLE.MSG`, and `BLE.PULL
+  state=done`. Android stores raw payloads in one append-only app-private file.
 - NAN: `net.NAN.Attach`, then `net.NAN.PubStart` and `net.NAN.SubStart` before
   `net.NAN.*ServiceDiscovered` messages. DMesh follow-ups appear as
   `net.NAN.FollowupRx` / `net.NAN.FollowupTx` with parsed JSON from the Rust
@@ -353,6 +408,45 @@ Expected message patterns:
 The Android side does not hold wake locks. The expected wake paths are the
 foreground service while active, periodic `LMJob` update windows, BLE
 `PendingIntent` scan delivery, and normal WiFi Aware framework callbacks.
+
+Single-companion and stored-message commands:
+
+```sh
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'companion status durationMs=1200'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'companion pair durationMs=2500'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'companion pair addr=84:0D:8E:07:42:C6 name=DMesh durationMs=2500'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'msg ble.pair addr=84:0D:8E:07:42:C6'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'messages file durationMs=1200'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'messages list limit=40 durationMs=1200'"
+
+adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method command --arg 'messages read seq=18 preview=96 durationMs=1200'"
+```
+
+`companion pair` first claims a recently seen `BLE.DISC proto=dmesh_pairing`
+advertisement and reports `pairing=recent_scan`. If no recent pairing
+advertisement is cached, it opens a 60 second direct-scan pairing window and
+starts BLE scanning if needed. If CDM times out but the app scan saw the ESP, use
+`companion pair addr=...` to store the single companion address directly. Use
+`msg ble.pair addr=...` to attempt the DMesh GATT pairing request; a `BLE.PAIR
+state=connecting` followed by `BLE.PULL phase=connect state=timeout` means
+Android could create a remote GATT client but the ESP did not accept or complete
+the connection in the timeout window.
+
+`messages list` returns metadata lines from
+`files/radio/ble/messages.bin`. `messages read` adds a bounded hex preview of
+the raw payload; it does not base64-encode the body.
 
 ## Two Android BLE/NAN live test
 
@@ -415,12 +509,19 @@ Expected BLE evidence in Android history:
 
 - `BLE.DISC proto=dmesh`
 - `event=lora_rx`
-- `device_id`, `payload_len`, `payload_hash`, and `prefix`
+- `pending`, `payload_len`, `payload_hash`, and `prefix`
+- `BLE.PENDING`
+- `BLE.PULL state=subscribed`
+- `BLE.MSG seq=... len=...`
+- `BLE.PULL state=done`
 
 Expected firmware console evidence:
 
 - `lora_rx`
-- `ev=lora.fwd t=ble ok=true`
+- companion BLE advertising while data is pending
+- DMesh GATT TX notification frames: `msg seq=... hash=... len=...`
+- Android ACKs: `ack seq=... hash=...`
+- pending queue empty and advertising stopped after ACK
 - `ev=lora.fwd t=nan ...`
 
 For the official NAN backend, discovery/match evidence is currently the main

@@ -32,7 +32,9 @@ import com.github.costinm.dmeshnative.MeshNode;
 import com.github.costinm.dmeshnative.Rust;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InterfaceAddress;
@@ -80,8 +82,11 @@ public class DMService extends BaseMsgService implements MessageHandler {
     private MeshNode meshNode;
     private static volatile DMService activeService;
     private static final int MAX_LOG_EVENTS = 512;
+    private static final long DUPLICATE_EVENT_WINDOW_MS = 30000;
     private final ArrayList<MsgFrame> logEvents = new ArrayList<>();
     private final Map<String, MessageSubscriber> logSubscribers = new HashMap<>();
+    private final Map<String, String> lastLogSignature = new HashMap<>();
+    private final Map<String, Long> lastLogAt = new HashMap<>();
     private MsgConn historyConn;
 
     private SharedPreferences prefs;
@@ -190,6 +195,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
         mux.subscribe("wifi", wifi);
         mux.subscribe("permission", this::handlePermissionMessage);
         mux.subscribe("messages", this::handleMessagesMessage);
+        mux.subscribe("companion", this::handleCompanionMessage);
         mux.subscribe("N", nh);
 
         // Info from the client - currently the 64-bit node ID, other info will be added.
@@ -280,6 +286,9 @@ public class DMService extends BaseMsgService implements MessageHandler {
         if (event == null || event.method == null) {
             return;
         }
+        if (isDuplicateHistoryFrame(event)) {
+            return;
+        }
         logEvents.add(event);
         while (logEvents.size() > MAX_LOG_EVENTS) {
             logEvents.remove(0);
@@ -291,6 +300,67 @@ public class DMService extends BaseMsgService implements MessageHandler {
             if (!sub.conn.sendFrame(event)) {
                 logSubscribers.remove(sub.conn.name);
             }
+        }
+    }
+
+    private boolean isDuplicateHistoryFrame(MsgFrame event) {
+        String key = historyDedupeKey(event);
+        if (key == null) {
+            return false;
+        }
+        String signature = historySignature(event);
+        long now = android.os.SystemClock.elapsedRealtime();
+        String previous = lastLogSignature.get(key);
+        Long previousAt = lastLogAt.get(key);
+        lastLogSignature.put(key, signature);
+        lastLogAt.put(key, now);
+        return signature.equals(previous) && previousAt != null
+                && now - previousAt < DUPLICATE_EVENT_WINDOW_MS;
+    }
+
+    private String historyDedupeKey(MsgFrame event) {
+        if ("BLE.DISC".equals(event.method)) {
+            return "BLE.DISC:" + event.fields.getOrDefault("id",
+                    event.fields.getOrDefault("addr", ""));
+        }
+        if ("BLE.PULL".equals(event.method) || "BLE.PENDING".equals(event.method)) {
+            return event.method + ":" + event.fields.getOrDefault("id",
+                    event.fields.getOrDefault("addr", ""));
+        }
+        if (event.method != null && event.method.startsWith("COMPANION.")) {
+            return event.method + ":" + event.fields.getOrDefault("association",
+                    event.fields.getOrDefault("addr", ""));
+        }
+        if ("wifi.BLE.DISC".equals(event.method)) {
+            return "wifi.BLE.DISC:" + event.fields.getOrDefault("name", "");
+        }
+        if ("net.status".equals(event.method)) {
+            return "net.status";
+        }
+        return null;
+    }
+
+    private String historySignature(MsgFrame event) {
+        StringBuilder sb = new StringBuilder(event.method);
+        appendHistoryField(sb, event, "id");
+        appendHistoryField(sb, event, "addr");
+        appendHistoryField(sb, event, "event");
+        appendHistoryField(sb, event, "pending");
+        appendHistoryField(sb, event, "payload_len");
+        appendHistoryField(sb, event, "payload_hash");
+        appendHistoryField(sb, event, "pull");
+        appendHistoryField(sb, event, "state");
+        appendHistoryField(sb, event, "association");
+        appendHistoryField(sb, event, "visible");
+        appendHistoryField(sb, event, "ap");
+        appendHistoryField(sb, event, "s");
+        return sb.toString();
+    }
+
+    private void appendHistoryField(StringBuilder sb, MsgFrame event, String key) {
+        String value = event.fields.get(key);
+        if (value != null && !value.isEmpty()) {
+            sb.append('|').append(key).append('=').append(value);
         }
     }
 
@@ -347,6 +417,8 @@ public class DMService extends BaseMsgService implements MessageHandler {
                     return;
                 }
             }
+        } else if ("file".equals(msgType) || "list".equals(msgType) || "read".equals(msgType)) {
+            fillRadioMessagesReply(reply, req, "read".equals(msgType));
         } else if ("status".equals(msgType) || msgType == null || msgType.isEmpty()) {
             synchronized (this) {
                 reply.fields.put("ok", "true");
@@ -360,6 +432,147 @@ public class DMService extends BaseMsgService implements MessageHandler {
         if (replyTo != null) {
             replyTo.sendFrame(reply);
         }
+    }
+
+    private void fillRadioMessagesReply(MsgFrame reply, MsgFrame req, boolean includePreview) {
+        File file = new File(getFilesDir(), "radio/ble/messages.bin");
+        reply.fields.put("ok", "true");
+        reply.fields.put("file", file.getAbsolutePath());
+        reply.fields.put("bytes", Long.toString(file.exists() ? file.length() : 0));
+        if (!file.exists()) {
+            reply.fields.put("count", "0");
+            reply.fields.put("messages", "");
+            return;
+        }
+        long wantSeq = parseLong(req.fields.get("seq"), -1);
+        int limit = parsePositiveInt(req.fields.get("limit"), 40);
+        int maxPreview = parsePositiveInt(req.fields.get("preview"), 96);
+        if (limit > 200) {
+            limit = 200;
+        }
+        if (maxPreview > 512) {
+            maxPreview = 512;
+        }
+        try {
+            RadioMessageList list = readRadioMessageList(file, wantSeq, limit, includePreview, maxPreview);
+            reply.fields.put("count", Integer.toString(list.count));
+            reply.fields.put("messages", list.text);
+        } catch (IOException e) {
+            reply.method = "messages.error";
+            reply.fields.put("ok", "false");
+            reply.fields.put("error", e.toString());
+        }
+    }
+
+    private RadioMessageList readRadioMessageList(File file, long wantSeq, int limit,
+                                                  boolean includePreview, int maxPreview)
+            throws IOException {
+        RadioMessageList out = new RadioMessageList();
+        try (FileInputStream in = new FileInputStream(file)) {
+            while (out.count < limit) {
+                String header = readLine(in);
+                if (header == null) {
+                    break;
+                }
+                if (!header.startsWith("msg ")) {
+                    continue;
+                }
+                int len = (int) parseLongField(header, "len", 0);
+                long seq = parseLongField(header, "seq", 0);
+                byte[] payload = readExact(in, len);
+                if (payload.length < len) {
+                    break;
+                }
+                in.read();
+                if (wantSeq >= 0 && wantSeq != seq) {
+                    continue;
+                }
+                if (out.text.length() > 0) {
+                    out.text += "\n";
+                }
+                out.text += header;
+                if (includePreview) {
+                    out.text += " preview_hex=" + hexPreview(payload, maxPreview);
+                }
+                out.count++;
+            }
+        }
+        return out;
+    }
+
+    private String readLine(FileInputStream in) throws IOException {
+        byte[] buf = new byte[512];
+        int pos = 0;
+        while (pos < buf.length) {
+            int b = in.read();
+            if (b < 0) {
+                return pos == 0 ? null : new String(buf, 0, pos, StandardCharsets.UTF_8);
+            }
+            if (b == '\n') {
+                return new String(buf, 0, pos, StandardCharsets.UTF_8);
+            }
+            buf[pos++] = (byte) b;
+        }
+        return new String(buf, 0, pos, StandardCharsets.UTF_8);
+    }
+
+    private byte[] readExact(FileInputStream in, int len) throws IOException {
+        if (len <= 0) {
+            return new byte[0];
+        }
+        byte[] data = new byte[len];
+        int pos = 0;
+        while (pos < len) {
+            int n = in.read(data, pos, len - pos);
+            if (n < 0) {
+                break;
+            }
+            pos += n;
+        }
+        if (pos == len) {
+            return data;
+        }
+        byte[] shortData = new byte[pos];
+        System.arraycopy(data, 0, shortData, 0, pos);
+        return shortData;
+    }
+
+    private String hexPreview(byte[] payload, int maxBytes) {
+        int n = Math.min(payload.length, maxBytes);
+        char[] out = new char[n * 2];
+        char[] hex = "0123456789abcdef".toCharArray();
+        for (int i = 0; i < n; i++) {
+            int v = payload[i] & 0xff;
+            out[i * 2] = hex[v >>> 4];
+            out[i * 2 + 1] = hex[v & 0x0f];
+        }
+        return new String(out);
+    }
+
+    private long parseLongField(String line, String key, long def) {
+        String prefix = key + "=";
+        for (String part : line.split("\\s+")) {
+            if (part.startsWith(prefix)) {
+                return parseLong(part.substring(prefix.length()), def);
+            }
+        }
+        return def;
+    }
+
+    private long parseLong(String raw, long def) {
+        if (raw == null || raw.isEmpty()) {
+            return def;
+        }
+        try {
+            return Long.parseLong(raw);
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static final class RadioMessageList {
+        int count;
+        String text = "";
     }
 
     private static int parsePositiveInt(String raw, int def) {
@@ -413,6 +626,40 @@ public class DMService extends BaseMsgService implements MessageHandler {
         List<String> missing = MeshActivityLight.checkPermissions(getApplicationContext());
         reply.fields.put("missing", String.join(",", missing));
         reply.fields.put("ok", Boolean.toString(missing.isEmpty()));
+        if (replyTo != null) {
+            replyTo.sendFrame(reply);
+        }
+    }
+
+    private void handleCompanionMessage(String topic, String msgType, Message m, MsgConn replyTo,
+                                        String[] args) {
+        MsgFrame req = MsgFrame.fromMessage(m);
+        MsgFrame reply = new MsgFrame("companion." + (msgType == null ? "status" : msgType));
+        reply.id = req.id;
+        if ("clear".equals(msgType)) {
+            DMeshCompanionManager.clear(this);
+            reply.fields.put("ok", "true");
+        } else if ("pair".equals(msgType) || "associate".equals(msgType)) {
+            String addr = req.fields.getOrDefault("addr", "");
+            String name = req.fields.getOrDefault("name", "");
+            if (!addr.isEmpty()) {
+                DMeshCompanionManager.saveDirect(this, addr, name);
+                reply.fields.put("pairing", "direct_addr");
+            } else {
+                boolean claimed = DMeshCompanionManager.startPairingWindow(this);
+                if (wifi != null && wifi.ble != null) {
+                    wifi.ble.scan();
+                }
+                reply.fields.put("pairing", claimed ? "recent_scan" : "direct_scan");
+            }
+            reply.fields.put("ok", "true");
+        } else if ("status".equals(msgType) || msgType == null || msgType.isEmpty()) {
+            reply.fields.put("ok", "true");
+        } else {
+            reply.method = "companion.error";
+            reply.fields.put("error", "unknown companion command: " + msgType);
+        }
+        reply.fields.put("status", DMeshCompanionManager.status(this));
         if (replyTo != null) {
             replyTo.sendFrame(reply);
         }
