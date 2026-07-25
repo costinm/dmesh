@@ -40,7 +40,7 @@ configure_ssh_mesh_override() {
         return
     fi
 
-    for crate_dir in crates/ssh-mesh crates/tun crates/lmesh crates/mesh; do
+    for crate_dir in crates/ssh-mesh crates/tun crates/lmesh crates/mesh crates/dmesh-store; do
         if [ ! -f "$override_dir/$crate_dir/Cargo.toml" ]; then
             echo "ERROR: DMESH_SSH_MESH_DIR does not look like ssh-mesh: $override_dir"
             echo "Missing: $crate_dir/Cargo.toml"
@@ -60,6 +60,7 @@ ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
 mesh-tun = { path = "$override_dir/crates/tun" }
 lmesh = { path = "$override_dir/crates/lmesh" }
 mesh = { path = "$override_dir/crates/mesh" }
+dmesh-store = { path = "$override_dir/crates/dmesh-store" }
 # END DMESH SSH_MESH OVERRIDE
 EOF
     SSH_MESH_OVERRIDE_ACTIVE=1

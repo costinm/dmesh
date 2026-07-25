@@ -6,7 +6,7 @@
 //! and callback plumbing.
 //!
 //! See also:
-//! - Java wrapper: `java/rust/src/main/java/...`
+//! - Java wrapper: `android/app-dmesh/src/main/java/...`
 
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 #[cfg(target_os = "android")]
@@ -16,6 +16,7 @@ use jni::{JNIEnv, JavaVM};
 use serde_json::{Map, Value, json};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
+use dmesh_store::{FrameRecord, StoreCommand};
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "android")]
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -39,6 +40,7 @@ const BRIDGE_HOST: &str = "dmesh-msg";
 const LEGACY_BRIDGE_HOST: &str = "local";
 const BRIDGE_PORT: u16 = 1;
 static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<String>>>> = OnceLock::new();
+static STORE_SENDER: OnceLock<UnboundedSender<StoreCommand>> = OnceLock::new();
 const WEB_BRIDGE_CLIENT_ID: u64 = 9_000_000;
 #[cfg(target_os = "android")]
 static WEB_BRIDGE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -58,6 +60,14 @@ struct AndroidVpnHandle {
 
 fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<String>>> {
     BRIDGE_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn init_store_sender(sender: UnboundedSender<StoreCommand>) {
+    STORE_SENDER.set(sender).ok();
+}
+
+fn store_sender() -> Option<&'static UnboundedSender<StoreCommand>> {
+    STORE_SENDER.get()
 }
 
 #[cfg(target_os = "android")]
@@ -539,6 +549,75 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "radio.nan.parse_followup" => radio_protocol::parse_nan_followup(payload)?
             .to_string()
             .into_bytes(),
+        "radio.nan.inject_frame" => {
+            let parsed = radio_protocol::parse_nan_followup(payload)?;
+            let src_device = parsed.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let target_device = parsed.get("target_id").and_then(|v| v.as_str()).unwrap_or("");
+            let seq = parsed.get("seq").and_then(|v| v.as_u64()).map(|s| s as u16);
+            let msg_type = parsed.get("msg_type").and_then(|v| v.as_str()).unwrap_or("");
+            let payload_hash = parsed
+                .get("payload_hash_u32")
+                .and_then(|v| v.as_u64())
+                .map(|h| h as u32)
+                .unwrap_or(0);
+            let frame = FrameRecord {
+                protocol: "dmesh_nan_followup".to_string(),
+                payload_hash,
+                src_device: src_device.to_string(),
+                target_device: if target_device.is_empty() {
+                    None
+                } else {
+                    Some(target_device.to_string())
+                },
+                seq,
+                msg_type: if msg_type.is_empty() {
+                    None
+                } else {
+                    Some(msg_type.to_string())
+                },
+                payload: payload.to_vec(),
+                rssi: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            if let Some(sender) = store_sender() {
+                let _ = sender.send(StoreCommand::InsertFrame(frame));
+            }
+            json!({"status": "ok"}).to_string().into_bytes()
+        }
+        "radio.ble.inject_frame" => {
+            let parsed = radio_protocol::parse_ble_service_data(
+                payload,
+                parse_i32(&cmd, "scan_rssi", 0)?,
+                cmd.data.get("address").map(String::as_str).unwrap_or(""),
+            )?;
+            let src_hex = parsed.get("src_hex").and_then(|v| v.as_str()).unwrap_or("");
+            let packet_id = parsed.get("packet_id").and_then(|v| v.as_u64()).map(|s| s as u16);
+            let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            let payload_hash = parsed
+                .get("packet_id")
+                .and_then(|v| v.as_u64())
+                .map(|h| h as u32)
+                .unwrap_or(0);
+            let frame = FrameRecord {
+                protocol: "dmesh_ble".to_string(),
+                payload_hash,
+                src_device: src_hex.to_string(),
+                target_device: None,
+                seq: packet_id,
+                msg_type: if event.is_empty() {
+                    None
+                } else {
+                    Some(event.to_string())
+                },
+                payload: payload.to_vec(),
+                rssi: parsed.get("scan_rssi").and_then(|v| v.as_i64()).map(|r| r as i32),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            if let Some(sender) = store_sender() {
+                let _ = sender.send(StoreCommand::InsertFrame(frame));
+            }
+            json!({"status": "ok"}).to_string().into_bytes()
+        }
         _ => anyhow::bail!("unknown radio method: {}", cmd.method),
     };
     Ok(response)

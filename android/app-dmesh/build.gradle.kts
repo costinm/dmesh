@@ -81,7 +81,6 @@ dependencies {
     //implementation("androidx.core:core:1.17.0")
 
     implementation(project(mapOf("path" to ":android:lib-util")))
-    implementation(project(mapOf("path" to ":android:lib-lm3")))
 
     //implementation(libs.androidx.monitor)
 

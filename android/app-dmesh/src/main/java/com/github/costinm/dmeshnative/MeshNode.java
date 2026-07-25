@@ -127,6 +127,22 @@ public class MeshNode implements AutoCloseable {
         return radioMessageText("radio.nan.parse_followup", "", followup, -1);
     }
 
+    public static boolean injectNanFollowup(byte[] followup, int rssi) {
+        byte[] result = radioMessage(
+                "radio.nan.inject_frame",
+                "rssi=" + rssi,
+                followup, -1);
+        return result != null && result.length > 0;
+    }
+
+    public static boolean injectBleFrame(byte[] serviceData, int rssi, String address) {
+        byte[] result = radioMessage(
+                "radio.ble.inject_frame",
+                "scan_rssi=" + rssi + " address=" + textArg(address),
+                serviceData, -1);
+        return result != null && result.length > 0;
+    }
+
     private static String radioMessageText(String method, String args, byte[] data, int fd) {
         return new String(radioMessage(method, args, data, fd), StandardCharsets.UTF_8);
     }

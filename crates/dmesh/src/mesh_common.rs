@@ -3,6 +3,7 @@
 //! The JNI wrapper (`mesh_jni.rs`) delegates to these functions for the actual
 //! mesh logic. JNI-specific marshalling stays in the wrapper module.
 
+use dmesh_store::StoreService;
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server};
 use std::path::PathBuf;
@@ -64,6 +65,23 @@ pub fn start_mesh(
         Some(base_path.join("config")),
         None,
     ));
+
+    // Initialize dmesh-store service
+    let db_path = base_path.join("dmesh-store.db");
+    runtime.block_on(async {
+        match StoreService::new(db_path.to_str().unwrap()).await {
+            Ok(svc) => {
+                let sender = svc.sender();
+                crate::mesh_jni::init_store_sender(sender);
+                tokio::spawn(async move {
+                    svc.run().await;
+                });
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize dmesh-store: {}", e);
+            }
+        }
+    });
 
     // Spawn SSH server
     let node_clone = node.clone();

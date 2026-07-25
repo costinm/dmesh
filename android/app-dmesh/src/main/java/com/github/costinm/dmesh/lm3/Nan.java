@@ -621,6 +621,7 @@ public class Nan {
             super.onMessageReceived(peerHandle, message);
             String msg = new String(message);
             String parsed = MeshNode.parseNanFollowup(message);
+            MeshNode.injectNanFollowup(message, 0);
             MsgMux.get(ctx).publish("net.NAN.FollowupRx",
                     "peer", peerHandle.toString(),
                     "json", parsed);

@@ -26,9 +26,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "DMesh"
 include(
-    "java:rust",
      "android:lib-util",
-     "android:lib-lm3",
      "android:app-dmesh",
      "android:app-web",
      "android:app-chat"
