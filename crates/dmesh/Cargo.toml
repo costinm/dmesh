@@ -8,12 +8,12 @@ default = ["jni-wrapper"]
 jni-wrapper = ["dep:jni"]
 
 [dependencies]
-# Keep shared defaults on Git. scripts/build-android.sh can generate an
-# untracked Cargo patch for local ssh-mesh checkouts via DMESH_SSH_MESH_DIR.
+# ssh-mesh and mesh remain reusable upstream dependencies. Device-mesh crates
+# live in this workspace so Android and Linux builds use the same source.
 ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
-mesh-tun = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-tun", default-features = false }
-lmesh = { git = "https://github.com/costinm/ssh-mesh", package = "lmesh" }
-dmesh-store = { git = "https://github.com/costinm/ssh-mesh", package = "dmesh-store" }
+mesh-tun = { path = "../tun", default-features = false }
+lmesh = { path = "../lmesh" }
+dmesh-store = { path = "../dmesh-store" }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
