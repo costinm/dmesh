@@ -5,12 +5,12 @@ Most difficult part is keeping the network alive in doze/idle mode - most popula
 
 ## Repo-local tooling
 
-Keep DMesh builds self-contained under `/ws/dmesh/target`. The build helper
+Keep DMesh builds self-contained under `target/`. The build helper
 uses the repo-local Cargo and Gradle homes and the Nix profile in
 `target/nix/profile`; manual commands should use the same environment:
 
 ```sh
-cd /ws/dmesh
+cd "$(git rev-parse --show-toplevel)"
 ./scripts/build-android.sh deps
 . target/nix/profile/bin/dmesh-setenv
 export RUSTUP_HOME="$PWD/target/rustup"
@@ -21,22 +21,21 @@ export GRADLE_USER_HOME="$PWD/target/.gradle"
 Build only `app-dmesh` by default:
 
 ```sh
-DMESH_SSH_MESH_DIR=/ws/rust/ssh-mesh \
-  ./scripts/build-android.sh build release
+./scripts/build-android.sh build release
 ```
 
-`DMESH_SSH_MESH_DIR=/ws/rust/ssh-mesh` uses the current ssh-mesh checkout as a
-dependency source, but the build still runs from `/ws/dmesh` and keeps DMesh
-tooling/caches under `/ws/dmesh/target`. To test the standalone Git dependency
-path instead, point the override at a missing directory:
+`DMESH_SSH_MESH_DIR` optionally selects a local ssh-mesh checkout. A sibling
+checkout is detected automatically; the build keeps DMesh tooling and caches
+under `target/`. To test the standalone Git dependency path instead, point the
+override at a missing directory:
 
 ```sh
-DMESH_SSH_MESH_DIR=/ws/dmesh/no-ssh-mesh-override \
+DMESH_SSH_MESH_DIR="$PWD/no-ssh-mesh-override" \
   ./scripts/build-android.sh build release
 ```
 
 Do not use the ESP-IDF/ESP toolchain for Android APK work. Firmware work has
-its own local build context under `/ws/rust/ssh-mesh/fw`; only rebuild or flash
+its own local build context under `fw/esp32`; only rebuild or flash
 firmware when that is the task.
 
 Install the current release APK on a USB device and start the foreground

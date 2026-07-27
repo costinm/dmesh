@@ -1,5 +1,5 @@
 {
-  description = "DMesh Android build dependencies";
+  description = "DMesh device-mesh, Android, MUSL, and ESP32 build dependencies";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -111,16 +111,32 @@
               pkgs.openssh
               pkgs.python3
               pkgs.ripgrep
+              pkgs.rustc
+              pkgs.socat
               pkgs.rustup
               pkgs.unzip
               pkgs.which
               pkgs.zip
+              musl-toolchain
             ];
             meta.priority = 10;
           };
+
+          musl-toolchain = pkgs.runCommand "dmesh-musl-toolchain" { } ''
+            mkdir -p "$out/bin"
+            for tool in ${pkgs.pkgsCross.musl64.stdenv.cc}/bin/*; do
+              ln -s "$tool" "$out/bin/$(basename "$tool")"
+            done
+            for tool in gcc g++ cc c++ cpp ar as ld ld.bfd ld.gold nm objcopy objdump ranlib readelf size strings strip; do
+              if [ -e "$out/bin/x86_64-unknown-linux-musl-$tool" ] &&
+                 [ ! -e "$out/bin/x86_64-linux-musl-$tool" ]; then
+                ln -s "x86_64-unknown-linux-musl-$tool" "$out/bin/x86_64-linux-musl-$tool"
+              fi
+            done
+          '';
         in
         {
-          inherit deps;
+          inherit deps musl-toolchain;
           default = deps;
         }
       );

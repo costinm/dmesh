@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DMESH_NIX_PROFILE="${DMESH_NIX_PROFILE:-$SCRIPT_DIR/target/nix/profile}"
 
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/env.sh"
+
 export CARGO_HOME="${CARGO_HOME:-$SCRIPT_DIR/target/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$SCRIPT_DIR/target/rustup}"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
@@ -28,8 +31,13 @@ restore_cargo_lock() {
 configure_ssh_mesh_override() {
     SSH_MESH_OVERRIDE_ACTIVE=0
     local override_dir="${DMESH_SSH_MESH_DIR:-}"
-    if [ -z "$override_dir" ] && [ -d /ws/rust/ssh-mesh ]; then
-        override_dir="/ws/rust/ssh-mesh"
+    if [ -z "$override_dir" ]; then
+        for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
+            if [ -f "$candidate/crates/ssh-mesh/Cargo.toml" ]; then
+                override_dir="$candidate"
+                break
+            fi
+        done
     fi
 
     local config="$CARGO_HOME/config.toml"
@@ -40,7 +48,7 @@ configure_ssh_mesh_override() {
         return
     fi
 
-    for crate_dir in crates/ssh-mesh crates/tun crates/lmesh crates/mesh crates/dmesh-store; do
+    for crate_dir in crates/ssh-mesh crates/mesh; do
         if [ ! -f "$override_dir/$crate_dir/Cargo.toml" ]; then
             echo "ERROR: DMESH_SSH_MESH_DIR does not look like ssh-mesh: $override_dir"
             echo "Missing: $crate_dir/Cargo.toml"
@@ -57,10 +65,7 @@ configure_ssh_mesh_override() {
 # BEGIN DMESH SSH_MESH OVERRIDE
 [patch."$SSH_MESH_GIT_URL"]
 ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
-mesh-tun = { path = "$override_dir/crates/tun" }
-lmesh = { path = "$override_dir/crates/lmesh" }
 mesh = { path = "$override_dir/crates/mesh" }
-dmesh-store = { path = "$override_dir/crates/dmesh-store" }
 # END DMESH SSH_MESH OVERRIDE
 EOF
     SSH_MESH_OVERRIDE_ACTIVE=1
@@ -100,32 +105,22 @@ nix_cmd() {
 }
 
 install_nix_deps() {
-    local flake_src
-    flake_src="$(mktemp -d "${TMPDIR:-/tmp}/dmesh-flake.XXXXXX")"
-    trap "rm -rf '$flake_src'" RETURN
-    cp "$SCRIPT_DIR/flake.nix" "$flake_src/flake.nix"
-
     mkdir -p "$(dirname "$DMESH_NIX_PROFILE")"
     "$(nix_cmd)" profile install \
         --profile "$DMESH_NIX_PROFILE" \
-        "path:$flake_src#deps"
+        "path:$SCRIPT_DIR#deps"
     echo "Installed DMesh build dependencies in $DMESH_NIX_PROFILE"
     echo "Load with: . target/nix/profile/bin/dmesh-setenv"
 
     "$DMESH_NIX_PROFILE/bin/rustup" target add aarch64-linux-android
-          
 }
 
 detect_android_env() {
     load_nix_profile_env
 
     if [ -z "${ANDROID_HOME:-}" ]; then
-        if [ -d "$HOME/Android/Sdk" ]; then
-            export ANDROID_HOME="$HOME/Android/Sdk"
-        else
-            echo "ERROR: ANDROID_HOME not set and ~/Android/Sdk not found."
-            exit 1
-        fi
+        echo "ERROR: ANDROID_HOME is unset. Run scripts/build-android.sh deps, then source env.sh."
+        exit 1
     fi
 
     if [ -z "${ANDROID_NDK_HOME:-}" ]; then
@@ -529,7 +524,7 @@ Commands:
 
 Environment:
   DMESH_NIX_PROFILE       Nix profile path. Default: target/nix/profile.
-  DMESH_SSH_MESH_DIR      Local ssh-mesh checkout override. Default: /ws/rust/ssh-mesh if present.
+  DMESH_SSH_MESH_DIR      Local ssh-mesh checkout override. A sibling checkout is detected automatically.
   SSH_MESH_GIT_URL        Default ssh-mesh Git URL. Default: https://github.com/costinm/ssh-mesh.
   DMESH_ANDROID_ABIS      ABIs for libdmesh.so. Default: arm64-v8a.
   DMESH_UI_ANDROID_ABIS   ABIs for libdmeshui.so. Default: arm64-v8a.

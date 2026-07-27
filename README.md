@@ -1,5 +1,9 @@
 # Device Mesh
 
+For development setup, build commands, and target-contained toolchains, see
+[BUILD.md](BUILD.md). The active Android/Rust component split is described in
+[docs/architecture.md](docs/architecture.md).
+
 I started this free-time project ~1 year ago with a simple goal: to communicate
 with my family/friends while hiking/skiing in places with no internet or
 mobile coverage.

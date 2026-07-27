@@ -1,8 +1,11 @@
 [workspace]
 members = [
     "crates/dmesh",
+    "crates/dmesh-store",
     "crates/dmeshtui",
     "crates/dmeshui",
+    "crates/lmesh",
+    "crates/tun",
 ]
 resolver = "2"
 
