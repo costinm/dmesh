@@ -1,0 +1,34 @@
+[package]
+name = "dmesh-rs"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+embedded-svc = "0.29"
+esp-idf-svc = { version = "0.52", default-features = false, features = ["std", "experimental"] }
+esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
+libc = "0.2"
+log = "0.4"
+minicbor = { version = "2.2", features = ["std"] }
+
+[build-dependencies]
+embuild = "0.33"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["native"]
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = true
+opt-level = "z"
