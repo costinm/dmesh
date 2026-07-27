@@ -2,10 +2,10 @@ use crate::MeshClient;
 use anyhow::Context;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct LocalMeshSocket {
-    app: String,
+    active_service: String,
     socket_path: PathBuf,
     remote: Option<RemoteTarget>,
 }
@@ -16,8 +16,8 @@ impl LocalMeshSocket {
             eprintln!("failed to configure dmeshtui mesh socket: {err}");
             let app = "mesh-init".to_owned();
             Self {
-                socket_path: socket_path_from_env(&app),
-                app,
+                socket_path: socket_path_for(&app),
+                active_service: app,
                 remote: None,
             }
         })
@@ -42,7 +42,7 @@ impl LocalMeshSocket {
         let socket_path = options
             .socket
             .or_else(|| std::env::var_os("DMESHTUI_MESH_SOCK").map(PathBuf::from))
-            .unwrap_or_else(|| socket_path_from_env(&app));
+            .unwrap_or_else(|| socket_path_for(&app));
         let remote = remote.map(|node| RemoteTarget {
             node,
             app: options
@@ -55,10 +55,35 @@ impl LocalMeshSocket {
                 .unwrap_or_else(|| "mesh.remote.jsonl".to_owned()),
         });
         Ok(Self {
-            app,
+            active_service: app,
             socket_path,
             remote,
         })
+    }
+
+    pub fn new_for_service(service: &str, socket_path: PathBuf) -> Self {
+        Self {
+            active_service: service.to_string(),
+            socket_path,
+            remote: None,
+        }
+    }
+
+    pub fn active_service(&self) -> &str {
+        &self.active_service
+    }
+
+    pub fn set_active_service(&mut self, service: &str) {
+        self.active_service = service.to_string();
+        self.socket_path = socket_path_for(service);
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub fn is_socket_available(&self) -> bool {
+        self.socket_path.exists()
     }
 }
 
@@ -72,7 +97,7 @@ impl MeshClient for LocalMeshSocket {
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
                 "failed to connect to {} socket at {}",
-                self.app,
+                self.active_service,
                 self.socket_path.display()
             )
         })?;
@@ -87,7 +112,7 @@ impl MeshClient for LocalMeshSocket {
         reader.read_line(&mut response).with_context(|| {
             format!(
                 "failed to read response from {} socket at {}",
-                self.app,
+                self.active_service,
                 self.socket_path.display()
             )
         })?;
@@ -96,11 +121,10 @@ impl MeshClient for LocalMeshSocket {
         if response.is_empty() {
             anyhow::bail!("empty response from {}", self.socket_path.display());
         }
-        pretty_json_or_raw(response)
+        Ok(response.to_string())
     }
 }
 
-/// Backward-compatible alias for older callers. This no longer executes a command.
 pub type LocalMeshCommand = LocalMeshSocket;
 
 #[derive(Default)]
@@ -189,7 +213,7 @@ impl MeshRequest {
     }
 }
 
-fn socket_path_from_env(app: &str) -> PathBuf {
+pub fn socket_path_for(app: &str) -> PathBuf {
     if let Some(path) = std::env::var_os("DMESHTUI_MESH_SOCK") {
         return PathBuf::from(path);
     }
@@ -213,18 +237,5 @@ fn socket_path_from_env(app: &str) -> PathBuf {
             .join("mesh.sock");
     }
 
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("mesh")
-        .join("run")
-        .join("mesh")
-        .join(app)
-        .join("mesh.sock")
-}
-
-fn pretty_json_or_raw(response: &str) -> anyhow::Result<String> {
-    match serde_json::from_str::<serde_json::Value>(response) {
-        Ok(value) => Ok(serde_json::to_string_pretty(&value)?),
-        Err(_) => Ok(response.to_owned()),
-    }
+    PathBuf::from("/run/mesh").join(app).join("mesh.sock")
 }
