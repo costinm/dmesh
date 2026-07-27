@@ -1,0 +1,38 @@
+[package]
+name = "mesh-tun"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bin-full"]
+bin-full = ["vhost-user-net"]
+vhost-user-net = [
+    "dep:vhost",
+    "dep:vhost-user-backend",
+    "dep:virtio-queue",
+    "dep:vm-memory",
+    "dep:vmm-sys-util",
+]
+
+[dependencies]
+mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
+tun-rs = { version = "2.8", features = ["async"] }
+tokio = { version = "1", features = ["net", "sync", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+async-trait = "0.1"
+libc = "0.2"
+bytes = "1"
+vhost = { version = "0.16", optional = true, features = ["vhost-user-backend", "vhost-user-frontend"] }
+vhost-user-backend = { version = "0.22", optional = true }
+virtio-queue = { version = "0.17", optional = true }
+vm-memory = { version = "=0.17.1", optional = true, features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
+vmm-sys-util = { version = "0.15", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "mesh-tun"
+path = "src/main.rs"
