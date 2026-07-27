@@ -1,0 +1,51 @@
+# Lab USB serial forwards for ESP firmware development.
+#
+# lmesh normally reads /home/system/etc/lmesh/lmesh.toml. Use stable
+# /dev/serial/by-id paths and role names; ttyUSB/ttyACM numbering is transient.
+# ACM0 is Android and USB4 is the USB1 power-meter stream, so neither is an ESP
+# flash target.
+
+# One chronological log for UART TX/RX from every forward. Each record includes
+# the role name, host timestamp, escaped text, and exact bytes as hex.
+serial_log_path = "target/lmesh-radio-build/log/serial.log"
+
+[[serial_forwards]]
+port = "lora1"
+path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
+baud = 460800
+tcp_port = 3330
+tcp_mode = "rfc2217"
+# lora1 is the powered raw-NAN gateway. It is activated after reset with the
+# binary `active` command, not an automatic CP210x edge on every UDS client.
+# Use the local `dtr [ms]` diagnostic only when debugging the board wiring.
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "lora2"
+path = "/dev/serial/by-id/usb-Silicon_Labs_CP2104_USB_to_UART_Bridge_Controller_01DC99BB-if00-port0"
+baud = 460800
+tcp_port = 3331
+tcp_mode = "rfc2217"
+dtr = true
+multi = true
+
+[[serial_forwards]]
+port = "s3-1"
+path = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C82104982-if00"
+baud = 460800
+tcp_port = 3334
+tcp_mode = "rfc2217"
+dtr = true
+multi = true
+
+[[serial_forwards]]
+port = "power1"
+path = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AH02TSMU-if00-port0"
+baud = 115200
+dtr = false
+multi = false
+log = false
+# The meter is not firmware UART: pass its newline-delimited samples through
+# unchanged to the E2E power collector.
+raw = true
