@@ -93,6 +93,16 @@ load_nix_profile_env() {
     fi
 }
 
+use_rustup_toolchain() {
+    local rustup_bin="$DMESH_NIX_PROFILE/bin/rustup"
+    local rust_bin="$RUSTUP_HOME/toolchains/stable-x86_64-unknown-linux-gnu/bin"
+
+    if ! "$rustup_bin" toolchain list | grep -q '^stable-'; then
+        "$rustup_bin" toolchain install stable --profile minimal
+    fi
+    export PATH="$rust_bin:$PATH"
+}
+
 nix_cmd() {
     if command -v nix >/dev/null 2>&1; then
         command -v nix
@@ -109,14 +119,27 @@ install_nix_deps() {
     "$(nix_cmd)" profile install \
         --profile "$DMESH_NIX_PROFILE" \
         "path:$SCRIPT_DIR#deps"
+    # The profile may already contain this local flake.  Upgrade it explicitly
+    # so `deps` reflects the current flake.nix instead of silently retaining
+    # an earlier closure.
+    "$(nix_cmd)" profile upgrade --profile "$DMESH_NIX_PROFILE" --all
     echo "Installed DMesh build dependencies in $DMESH_NIX_PROFILE"
     echo "Load with: . target/nix/profile/bin/dmesh-setenv"
 
-    "$DMESH_NIX_PROFILE/bin/rustup" target add aarch64-linux-android
+    if [ ! -d "$SCRIPT_DIR/target/android-sdk/ndk" ]; then
+        "$DMESH_NIX_PROFILE/bin/dmesh-android-sdk"
+    fi
+    use_rustup_toolchain
+    "$DMESH_NIX_PROFILE/bin/rustup" target add \
+        aarch64-linux-android \
+        armv7-linux-androideabi \
+        i686-linux-android \
+        x86_64-linux-android
 }
 
 detect_android_env() {
     load_nix_profile_env
+    use_rustup_toolchain
 
     if [ -z "${ANDROID_HOME:-}" ]; then
         echo "ERROR: ANDROID_HOME is unset. Run scripts/build-android.sh deps, then source env.sh."
@@ -335,14 +358,51 @@ stage_apks() {
     find "$out_dir" -maxdepth 1 -type f -name '*.apk' -printf '  %f\n' | sort
 }
 
-android_device_serial() {
-    adb devices | awk 'NR > 1 && $2 == "device" { print $1; exit }'
+selected_android_devices() {
+    # Physical includes USB and Wi-Fi ADB devices. The latter exercise Android
+    # scheduling and background behavior differently, so they are first-class
+    # validation targets. Use `usb` only for a cable-focused run.
+    local selector="${DMESH_ANDROID_DEVICES:-physical}"
+    local serial usb
+
+    while read -r serial usb; do
+        [ -n "$serial" ] || continue
+        case "$selector" in
+            all)
+                printf '%s\n' "$serial"
+                ;;
+            physical)
+                [[ "$serial" != emulator-* ]] && printf '%s\n' "$serial"
+                ;;
+            usb)
+                [ "$usb" = "usb" ] && printf '%s\n' "$serial"
+                ;;
+            emulator)
+                [[ "$serial" == emulator-* ]] && printf '%s\n' "$serial"
+                ;;
+            *)
+                [[ ",$selector," == *",$serial,"* ]] && printf '%s\n' "$serial"
+                ;;
+        esac
+    done < <(adb devices -l | awk 'NR > 1 && $2 == "device" { usb=""; for (i = 3; i <= NF; i++) if ($i ~ /^usb:/) usb="usb"; print $1, usb }')
+    return 0
+}
+
+require_android_devices() {
+    local devices
+    devices="$(selected_android_devices)"
+    if [ -z "$devices" ]; then
+        echo "ERROR: no selected Android devices."
+        echo "Connect a device, set DMESH_ANDROID_DEVICES=usb/all, or run '$0 emulator'."
+        exit 1
+    fi
+    printf '%s\n' "$devices"
 }
 
 start_emulator() {
     local avd_name="${DMESH_AVD_NAME:-${ANDROID_AVD_NAME:-Medium_Desktop_2}}"
     local serial
-    serial="$(android_device_serial || true)"
+    serial="$(selected_android_devices | head -1 || true)"
     if [ -n "$serial" ]; then
         echo "Reusing connected Android device/emulator: $serial"
         return
@@ -420,47 +480,164 @@ install_apps() {
         exit 1
     fi
 
+    local serial index=0
+    local -a devices
     build_apps "$build_type"
-    start_emulator
+    mapfile -t devices < <(require_android_devices)
+    for serial in "${devices[@]}"; do
+        install_apps_on_device "$serial" "$dmesh_apk" "$web_apk" "$chat_apk"
+        setup_device "$serial"
+        create_host_forwards_for_device "$serial" "$index"
+        index=$((index + 1))
+    done
+}
 
-    echo "=== Installing app-dmesh ==="
-    adb install -r "$dmesh_apk"
-    echo "=== Installing app-web ==="
-    adb install -r "$web_apk"
-    echo "=== Installing app-chat ==="
-    adb install -r "$chat_apk"
+install_all_apps() {
+    local build_type="${1:-debug}"
+    local dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type/app-dmesh-$build_type.apk"
+    local web_apk="$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type/app-web-$build_type.apk"
+    local chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type/app-chat-$build_type.apk"
+    local serial index=0
+    local -a devices
+
+    build_apps "$build_type"
+    mapfile -t devices < <(require_android_devices)
+    for serial in "${devices[@]}"; do
+        if [ "${DMESH_CONFIRM_UNINSTALL:-0}" == "1" ]; then
+            uninstall_apps_on_device "$serial"
+        fi
+        install_apps_on_device "$serial" "$dmesh_apk" "$web_apk" "$chat_apk"
+        setup_device "$serial"
+        create_host_forwards_for_device "$serial" "$index"
+        index=$((index + 1))
+    done
 }
 
 grant_app_permissions() {
-    local pkg="$1"
+    local serial="$1"
+    local pkg="$2"
 
     echo "=== Granting runtime permissions for $pkg where possible ==="
-    adb shell pm grant "$pkg" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
-    adb shell pm grant "$pkg" android.permission.ACCESS_FINE_LOCATION >/dev/null 2>&1 || true
-    adb shell pm grant "$pkg" android.permission.ACCESS_COARSE_LOCATION >/dev/null 2>&1 || true
-    adb shell pm grant "$pkg" android.permission.NEARBY_WIFI_DEVICES >/dev/null 2>&1 || true
-    adb shell pm grant "$pkg" android.permission.BLUETOOTH_CONNECT >/dev/null 2>&1 || true
-    adb shell pm grant "$pkg" android.permission.BLUETOOTH_SCAN >/dev/null 2>&1 || true
-    adb shell pm grant "$pkg" android.permission.BLUETOOTH_ADVERTISE >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.ACCESS_FINE_LOCATION >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.ACCESS_COARSE_LOCATION >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.NEARBY_WIFI_DEVICES >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.BLUETOOTH_CONNECT >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.BLUETOOTH_SCAN >/dev/null 2>&1 || true
+    adb -s "$serial" shell pm grant "$pkg" android.permission.BLUETOOTH_ADVERTISE >/dev/null 2>&1 || true
 
     # ACTIVATE_VPN is an app-op on many emulator images rather than a runtime
     # permission. Ignore failures so the instrumentation can report unsupported
     # images with the actual VpnService.prepare state.
-    adb shell appops set "$pkg" ACTIVATE_VPN allow >/dev/null 2>&1 || true
-    adb shell cmd appops set "$pkg" ACTIVATE_VPN allow >/dev/null 2>&1 || true
+    adb -s "$serial" shell appops set "$pkg" ACTIVATE_VPN allow >/dev/null 2>&1 || true
+    adb -s "$serial" shell cmd appops set "$pkg" ACTIVATE_VPN allow >/dev/null 2>&1 || true
 }
 
-prepare_connected_device() {
-    local dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/debug/app-dmesh-debug.apk"
-    local chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/debug/app-chat-debug.apk"
-    start_emulator
-    echo "=== Installing app-dmesh for permission setup ==="
-    adb install -r "$dmesh_apk" >/dev/null
-    if [ -f "$chat_apk" ]; then
-        echo "=== Installing app-chat for direct binder smoke ==="
-        adb install -r "$chat_apk" >/dev/null
+install_apps_on_device() {
+    local serial="$1"
+    local dmesh_apk="$2"
+    local web_apk="$3"
+    local chat_apk="$4"
+    echo "=== [$serial] Installing app-dmesh/app-web/app-chat ==="
+    adb -s "$serial" install -r "$dmesh_apk"
+    adb -s "$serial" install -r "$web_apk"
+    adb -s "$serial" install -r "$chat_apk"
+}
+
+uninstall_apps_on_device() {
+    local serial="$1"
+    local pkg
+    echo "=== [$serial] Removing existing DMesh packages and their app data ==="
+    for pkg in "$APP_DMESH_PKG" "$APP_WEB_PKG" "$APP_CHAT_PKG"; do
+        adb -s "$serial" uninstall "$pkg" >/dev/null 2>&1 || true
+    done
+}
+
+setup_device() {
+    local serial="$1"
+    local deadline=$((SECONDS + ${DMESH_SERVICE_START_TIMEOUT:-15}))
+    grant_app_permissions "$serial" "$APP_DMESH_PKG"
+    adb -s "$serial" shell am start-foreground-service -n "$APP_DMESH_PKG/.DMService" >/dev/null || \
+        adb -s "$serial" shell am startservice -n "$APP_DMESH_PKG/.DMService" >/dev/null
+    while ! adb -s "$serial" shell dumpsys activity services "$APP_DMESH_PKG/.DMService" \
+        | grep -q 'isForeground=true'; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: [$serial] app-dmesh did not enter the foreground service state."
+            adb -s "$serial" shell dumpsys activity services "$APP_DMESH_PKG/.DMService" | head -60 || true
+            return 1
+        fi
+        sleep 1
+    done
+    echo "=== [$serial] app-dmesh service status ==="
+    adb -s "$serial" shell dumpsys activity services "$APP_DMESH_PKG/.DMService" \
+        | grep -E 'app=|startForegroundCount=|isForeground=|foregroundId=' || true
+}
+
+create_host_forwards_for_device() {
+    local serial="$1"
+    local index="$2"
+    local ssh_port=$(( ${DMESH_FORWARD_SSH_BASE:-11522} + index ))
+    local http_port=$(( ${DMESH_FORWARD_HTTP_BASE:-18480} + index ))
+    local lmesh_port=$(( ${DMESH_FORWARD_LMESH_BASE:-11622} + index ))
+    local app_files="/data/user/0/$APP_DMESH_PKG/files"
+    local lmesh_socket="$app_files/run/mesh/lmesh/mesh.sock"
+    local env_dir="$SCRIPT_DIR/target/android-forwards"
+    local socket_state="not-listening"
+
+    mkdir -p "$env_dir"
+    adb -s "$serial" forward --remove "tcp:$ssh_port" >/dev/null 2>&1 || true
+    adb -s "$serial" forward --remove "tcp:$http_port" >/dev/null 2>&1 || true
+    adb -s "$serial" forward --remove "tcp:$lmesh_port" >/dev/null 2>&1 || true
+    adb -s "$serial" forward "tcp:$ssh_port" "tcp:${DMESH_DEVICE_SSH_PORT:-15022}"
+    adb -s "$serial" forward "tcp:$http_port" "tcp:${DMESH_DEVICE_HTTP_PORT:-18480}"
+
+    # Android's app-private UDS cannot be assumed to exist: app-dmesh currently
+    # reaches lmesh through the generic proxy bridge. Keep this canonical path
+    # stable for the future Binder-FD/UDS owner and expose it when a listener is
+    # actually present.
+    if adb -s "$serial" shell run-as "$APP_DMESH_PKG" test -S "files/run/mesh/lmesh/mesh.sock"; then
+        if adb -s "$serial" forward "tcp:$lmesh_port" "localfilesystem:$lmesh_socket"; then
+            socket_state="forwarded"
+        else
+            socket_state="present-but-adb-forward-failed"
+        fi
     fi
-    grant_app_permissions "$APP_DMESH_PKG"
+
+    cat >"$env_dir/$serial.env" <<EOF
+# Generated by scripts/build-android.sh forwards/install/install-all.
+DMESH_ADB_SERIAL=$serial
+DMESH_HOST_SSH_PORT=$ssh_port
+DMESH_HOST_HTTP_PORT=$http_port
+DMESH_HOST_LMESH_PORT=$lmesh_port
+DMESH_DEVICE_LMESH_SOCKET=$lmesh_socket
+DMESH_LMESH_SOCKET_STATE=$socket_state
+EOF
+    echo "=== [$serial] host forwards ==="
+    adb -s "$serial" forward --list | grep "$serial" || true
+    echo "Saved $env_dir/$serial.env"
+}
+
+create_host_forwards() {
+    local serial index=0
+    local -a devices
+    mapfile -t devices < <(require_android_devices)
+    for serial in "${devices[@]}"; do
+        create_host_forwards_for_device "$serial" "$index"
+        index=$((index + 1))
+    done
+}
+
+prepare_connected_devices() {
+    local dmesh_apk="$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/debug/app-dmesh-debug.apk"
+    local web_apk="$SCRIPT_DIR/android/app-web/build/outputs/apk/debug/app-web-debug.apk"
+    local chat_apk="$SCRIPT_DIR/android/app-chat/build/outputs/apk/debug/app-chat-debug.apk"
+    local serial
+    local -a devices
+    mapfile -t devices < <(require_android_devices)
+    for serial in "${devices[@]}"; do
+        install_apps_on_device "$serial" "$dmesh_apk" "$web_apk" "$chat_apk"
+        setup_device "$serial"
+    done
 }
 
 run_tests() {
@@ -472,31 +649,47 @@ run_tests() {
         return
     fi
 
-    prepare_connected_device
-    echo "=== Running connected Android tests ==="
-    gradle connectedDebugAndroidTest
+    prepare_connected_devices
+    local serial
+    while read -r serial; do
+        echo "=== [$serial] Running connected Android tests ==="
+        ANDROID_SERIAL="$serial" gradle connectedDebugAndroidTest
+    done < <(require_android_devices)
 }
 
 run_native_health() {
     build_apps debug
-    prepare_connected_device
-    echo "=== Running app-dmesh native JNI health test ==="
-    gradle :android:app-dmesh:connectedDebugAndroidTest \
-        -Pandroid.testInstrumentationRunnerArguments.class=com.github.costinm.lm.NativeInstrumentedTest
+    prepare_connected_devices
+    local serial
+    while read -r serial; do
+        echo "=== [$serial] Running app-dmesh native JNI health test ==="
+        ANDROID_SERIAL="$serial" gradle :android:app-dmesh:connectedDebugAndroidTest \
+            -Pandroid.testInstrumentationRunnerArguments.class=com.github.costinm.lm.NativeInstrumentedTest
+    done < <(require_android_devices)
 }
 
 run_ssh_forward_smoke() {
     build_apps debug
-    prepare_connected_device
-    echo "=== Checking adb forward to app-dmesh Rust SSH port ==="
-    "$SCRIPT_DIR/scripts/test_emulator_ssh_forward.sh"
+    prepare_connected_devices
+    local serial index=0
+    while read -r serial; do
+        echo "=== [$serial] Checking adb forward to app-dmesh Rust SSH port ==="
+        DMESH_ADB_SERIAL="$serial" DMESH_HOST_SSH_PORT="$((11522 + index))" \
+            "$SCRIPT_DIR/scripts/test_emulator_ssh_forward.sh"
+        index=$((index + 1))
+    done < <(require_android_devices)
 }
 
 run_ssh_jsonl_smoke() {
     build_apps debug
-    prepare_connected_device
-    echo "=== Checking SSH JSONL MsgMux bridge ==="
-    "$SCRIPT_DIR/scripts/test_emulator_ssh_jsonl.sh"
+    prepare_connected_devices
+    local serial index=0
+    while read -r serial; do
+        echo "=== [$serial] Checking SSH JSONL MsgMux bridge ==="
+        DMESH_ADB_SERIAL="$serial" DMESH_HOST_SSH_PORT="$((11522 + index))" \
+            "$SCRIPT_DIR/scripts/test_emulator_ssh_jsonl.sh"
+        index=$((index + 1))
+    done < <(require_android_devices)
 }
 
 open_web_admin() {
@@ -515,10 +708,12 @@ Commands:
   deps                    Install Nix build dependencies into target/nix/profile.
   build [debug|release]   Build Rust UI and Android apps. Default.
   emulator                Start a headless emulator and wait for boot.
-  install [debug|release] Build, start emulator, and install app-dmesh/app-web.
+  install [debug|release] Build and install all apps on selected physical devices.
+  install-all [debug|release] Remove old DMesh apps, install all apps, and set permissions.
+  forwards                Create and record SSH/HTTP/lmesh host forwards for selected devices.
   test                    Build and run JVM tests plus connected Android tests.
-  native-health           Run the app-dmesh JNI health test on a headless emulator.
-  ssh-forward-smoke       Build/install app-dmesh and verify adb SSH port forwarding.
+  native-health           Run the app-dmesh JNI health test on selected devices.
+  ssh-forward-smoke       Build/install app-dmesh and verify every selected adb SSH forward.
   ssh-jsonl-smoke         Verify JSONL MsgMux command stream over SSH.
   open-web-admin          Open app-web on the localhost ssh-mesh admin URL.
 
@@ -531,9 +726,15 @@ Environment:
   DMESH_UI_APPS           Apps receiving libdmeshui.so. Default: app-chat.
   DMESH_STRIP_ANDROID_LIBS=0 disables native library stripping. Default: 1 for release APKs, 0 for debug APKs.
   DMESH_AVD_NAME          AVD name for emulator startup. Default: Medium_Desktop_2.
+  DMESH_ANDROID_DEVICES   physical (default: USB + Wi-Fi), usb, all, emulator, or comma-separated adb serials.
+  DMESH_CONFIRM_UNINSTALL Set to 1 to allow install-all to remove existing app data.
+  DMESH_SERVICE_START_TIMEOUT Foreground-service startup timeout in seconds. Default: 15.
   DMESH_EMULATOR_TIMEOUT Boot timeout in seconds. Default: 240.
   DMESH_HOST_SSH_PORT     Host port for ssh-forward-smoke. Default: 11522.
   DMESH_DEVICE_SSH_PORT   Device port for app-dmesh Rust SSH. Default: 15022.
+  DMESH_FORWARD_SSH_BASE  Base SSH host port for forwards. Default: 11522.
+  DMESH_FORWARD_HTTP_BASE Base HTTP host port for forwards. Default: 18480.
+  DMESH_FORWARD_LMESH_BASE Base lmesh UDS host port. Default: 11622.
   DMESH_SKIP_ANDROID_TESTS=1 skips connected Android tests.
 EOF
 }
@@ -559,6 +760,14 @@ main() {
         install)
             detect_android_env
             install_apps "${2:-debug}"
+            ;;
+        install-all)
+            detect_android_env
+            install_all_apps "${2:-debug}"
+            ;;
+        forwards)
+            detect_android_env
+            create_host_forwards
             ;;
         test)
             detect_android_env

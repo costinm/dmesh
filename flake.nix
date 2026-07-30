@@ -99,6 +99,7 @@
               dmeshAndroidSdk
               dmeshSetenv
               pkgs.bashInteractive
+              pkgs.bluez
               pkgs.cargo-ndk
               pkgs.coreutils
               pkgs.findutils
