@@ -36,25 +36,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
+ROOT = Path(__file__).resolve().parents[4]
+SSH_MESH_ROOT = Path(
+    os.environ.get("DMESH_SSH_MESH_DIR") or ROOT.parent / "rust" / "ssh-mesh"
+).resolve()
+sys.path.insert(0, str(SSH_MESH_ROOT / "python"))
 
 from dmesh.radio import RadioClient
 
-
-ROOT = Path(__file__).resolve().parents[4]
 FW_RUST = ROOT / "fw" / "esp32" / "rust"
+FW_TARGET_ROOT = Path(os.environ.get("DMESH_FW_TARGET_DIR", ROOT / "target" / "fw"))
 SERIAL_CMD = FW_RUST / "tools" / "serial_cmd.py"
 NAN_PAIR_TEST = FW_RUST / "tools" / "nan_pair_test.py"
 LORA_CAD_TEST = FW_RUST / "tools" / "lora_cad_test.py"
 LORA_PAIR_TEST = FW_RUST / "tools" / "lora_pair_test.py"
 PRESUBMIT = FW_RUST / "tools" / "presubmit.py"
-ESP32_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32" / "dmesh-rs-merged.bin"
-ESP32S3_MERGED_IMAGE = FW_RUST / "target" / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
-ESP32S3_8MB_TARGET = FW_RUST / "target" / "esp32s3-8mb"
+ESP32_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32" / "dmesh-rs-merged.bin"
+ESP32S3_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
+ESP32S3_8MB_TARGET = FW_TARGET_ROOT / "esp32s3-8mb"
 ESP32S3_8MB_MERGED_IMAGE = (
-    FW_RUST / "target" / "flash" / "esp32s3-8mb" / "dmesh-rs-merged.bin"
+    FW_TARGET_ROOT / "flash" / "esp32s3-8mb" / "dmesh-rs-merged.bin"
 )
-SPARSE_FLASH_DIR = FW_RUST / "target" / "flash" / "sparse"
+SPARSE_FLASH_DIR = FW_TARGET_ROOT / "flash" / "sparse"
 FLASH_BAUD = 460_800
 DEFAULT_LMESH_CONFIG = Path("/home/system/etc/lmesh/lmesh.toml")
 PREFLASH_FAILURE_MARKERS = (
@@ -256,6 +259,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--flash-size-esp32", default="4mb")
     parser.add_argument("--flash-size-s3", default="16mb")
+    parser.add_argument(
+        "--flash-baud",
+        type=int,
+        default=int(os.environ.get("DMESH_FLASH_BAUD", str(FLASH_BAUD))),
+        help="esptool baud rate; use 115200 for a recovery flash on an unstable USB-UART link",
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-flash", action="store_true")
     parser.add_argument("--skip-config", action="store_true")
@@ -278,9 +287,27 @@ def parse_args() -> argparse.Namespace:
         help="Delay between pre-flash status samples.",
     )
     parser.add_argument(
+        "--preflash-stability-dtr-ms",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in managed lmesh DTR pulse before each pre-flash status "
+            "sample (1..10000 ms). Use for a raw-NAN board whose UART is "
+            "quiet between duty windows; uptime must still increase."
+        ),
+    )
+    parser.add_argument(
         "--preflash-stability-dir",
         default=None,
         help="Directory for pre-flash per-board status transcripts.",
+    )
+    parser.add_argument(
+        "--preflash-only",
+        action="store_true",
+        help=(
+            "Run only the managed pre-flash status/DTR stability gate and exit. "
+            "Does not stop lmesh forwards, probe, flash, or run feature tests."
+        ),
     )
     parser.add_argument(
         "--skip-feature-tests",
@@ -435,7 +462,13 @@ def physical_port_for(args: argparse.Namespace, logical_port_name: str) -> str:
     forward = lmesh_forward_map(args).get(logical_port_name)
     if forward and isinstance(forward.get("port"), str):
         return str(forward["port"])
-    spec = configured_forward_spec(logical_port_name)
+    try:
+        spec = configured_forward_spec(logical_port_name)
+    except RuntimeError:
+        # A running lmesh may be configured by mesh-init rather than a host
+        # /home/system file.  Explicit USBn/ACMn recovery targets remain safe
+        # and must not make the direct-flash path depend on that absent file.
+        spec = None
     if spec and spec.path:
         return spec.path
     return physical_usb_port(logical_port_name)
@@ -628,10 +661,31 @@ def probe(
     )
 
 
+def image_build_env(
+    env: dict[str, str], sdkconfig: str, partition_file: str
+) -> dict[str, str]:
+    """Return an ESP-IDF build environment with a portable partition path."""
+    config_dir = FW_RUST / "target" / "flash-config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    overlay = config_dir / f"{partition_file}.defaults"
+    partition_path = (FW_RUST / partition_file).resolve()
+    overlay.write_text(
+        f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{partition_path}"\n', encoding="utf-8"
+    )
+    result = env.copy()
+    result["ESP_IDF_SDKCONFIG_DEFAULTS"] = f"{sdkconfig};{overlay}"
+    return result
+
+
 def build_targets(env: dict[str, str]) -> None:
     for image in (ESP32_MERGED_IMAGE, ESP32S3_MERGED_IMAGE, ESP32S3_8MB_MERGED_IMAGE):
         image.parent.mkdir(parents=True, exist_ok=True)
-    run(["cargo", "build", "--release", "--target", "xtensa-esp32-espidf"], cwd=FW_RUST, env=env)
+    esp32_env = image_build_env(env, "sdkconfig.defaults", "partitions_4mb_large_app.csv")
+    run(
+        ["cargo", "build", "--release", "--target", "xtensa-esp32-espidf"],
+        cwd=FW_RUST,
+        env=esp32_env,
+    )
     run(
         [
             "cargo",
@@ -649,17 +703,38 @@ def build_targets(env: dict[str, str]) -> None:
             str(ESP32_MERGED_IMAGE),
         ],
         cwd=FW_RUST,
-        env=env,
+        env=esp32_env,
     )
-    s3_env = env.copy()
-    s3_env.setdefault("ESP_IDF_SDKCONFIG_DEFAULTS", "sdkconfig.heltec_v3.defaults")
+    s3_env = image_build_env(
+        env, "sdkconfig.heltec_v3.defaults", "partitions_16mb_large_app_store.csv"
+    )
     run(
         ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
         cwd=FW_RUST,
         env=s3_env,
     )
-    s3_8mb_env = env.copy()
-    s3_8mb_env["ESP_IDF_SDKCONFIG_DEFAULTS"] = "sdkconfig.esp32s3_8mb.defaults"
+    run(
+        [
+            "cargo",
+            "espflash",
+            "save-image",
+            "--release",
+            "--target",
+            "xtensa-esp32s3-espidf",
+            "--chip",
+            "esp32s3",
+            "--flash-size",
+            "16mb",
+            "--merge",
+            "--skip-padding",
+            str(ESP32S3_MERGED_IMAGE),
+        ],
+        cwd=FW_RUST,
+        env=s3_env,
+    )
+    s3_8mb_env = image_build_env(
+        env, "sdkconfig.esp32s3_8mb.defaults", "partitions_8mb_large_app_store.csv"
+    )
     s3_8mb_env["CARGO_TARGET_DIR"] = str(ESP32S3_8MB_TARGET)
     run(
         ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
@@ -700,29 +775,10 @@ def merged_image_for(device: Device) -> Path:
 
 def executable_for(device: Device) -> Path:
     if not device.is_s3:
-        return FW_RUST / "target" / "xtensa-esp32-espidf" / "release" / "dmesh-rs"
+        return FW_TARGET_ROOT / "xtensa-esp32-espidf" / "release" / "dmesh-rs"
     if s3_uses_8mb_image(device):
         return ESP32S3_8MB_TARGET / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
-    return FW_RUST / "target" / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
-    run(
-        [
-            "cargo",
-            "espflash",
-            "save-image",
-            "--release",
-            "--target",
-            "xtensa-esp32s3-espidf",
-            "--chip",
-            "esp32s3",
-            "--flash-size",
-            "16mb",
-            "--merge",
-            "--skip-padding",
-            str(ESP32S3_MERGED_IMAGE),
-        ],
-        cwd=FW_RUST,
-        env=s3_env,
-    )
+    return FW_TARGET_ROOT / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
 
 
 def validate_prebuilt_images(devices: list[Device]) -> None:
@@ -758,7 +814,7 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
         "--port",
         port,
         "--baud",
-        str(FLASH_BAUD),
+        str(args.flash_baud),
         "--before",
         "no_reset" if rfc2217 else "default_reset",
         "--after",
@@ -769,6 +825,31 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
     for offset, image in flash_files:
         cmd.extend([offset, str(image)])
     run_logged(f"flash {device.port}", cmd, cwd=FW_RUST, env=env, tail_lines=24)
+
+    # A successful transport exit is not sufficient evidence that every app
+    # segment reached flash.  In particular, a partially written factory image
+    # can look like a normal reset until the second-stage bootloader reaches a
+    # later (blank) segment.  Verify the exact sparse ranges before restoring
+    # lmesh's framed forward or declaring this board flashed.
+    verify_cmd = [
+        esptool_python(),
+        "-m",
+        "esptool",
+        "--chip",
+        chip,
+        "--port",
+        port,
+        "--baud",
+        str(args.flash_baud),
+        "--before",
+        "no_reset" if rfc2217 else "default_reset",
+        "--after",
+        "no_reset" if rfc2217 else "hard_reset",
+        "verify_flash",
+    ]
+    for offset, image in flash_files:
+        verify_cmd.extend([offset, str(image)])
+    run_logged(f"verify flash {device.port}", verify_cmd, cwd=FW_RUST, env=env, tail_lines=24)
 
 
 def sparse_flash_args(device: Device) -> tuple[list[str], list[tuple[str, Path]]]:
@@ -939,6 +1020,7 @@ def preflash_stability_check(
     *,
     samples: int,
     interval_sec: float,
+    dtr_ms: int,
     output_dir: Path,
 ) -> None:
     samples = max(2, samples)
@@ -949,6 +1031,12 @@ def preflash_stability_check(
     try:
         client.connect()
         for index in range(samples):
+            if dtr_ms:
+                transcript.append(
+                    "# sample {} wake\n{}".format(
+                        index + 1, client.wake(dtr_ms, timeout=5.0)
+                    )
+                )
             result = client.command("status", timeout=20.0)
             transcript.append("# sample {}\n{}".format(index + 1, result.raw))
             match = re.search(r"\buptime_ms=(\d+)\b", result.raw)
@@ -1174,6 +1262,8 @@ def run_parallel(
 
 def main() -> int:
     args = parse_args()
+    if not 0 <= args.preflash_stability_dtr_ms <= 10_000:
+        raise SystemExit("--preflash-stability-dtr-ms must be between 0 and 10000")
     if not args.lmesh_control_socket:
         print("--lmesh-control-socket or LMESH_CONTROL_SOCKET is required", file=sys.stderr)
         return 1
@@ -1207,7 +1297,7 @@ def main() -> int:
         if args.lmesh_mode == "tcp":
             tcp_ports[port] = ensure_lmesh_forward(args, port, tcp_ports[port])
 
-    if not args.skip_flash and not args.skip_preflash_stability:
+    if (not args.skip_flash or args.preflash_only) and not args.skip_preflash_stability:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         stability_dir = Path(
             args.preflash_stability_dir
@@ -1227,6 +1317,7 @@ def main() -> int:
                     port,
                     samples=args.preflash_stability_samples,
                     interval_sec=args.preflash_stability_interval_sec,
+                    dtr_ms=args.preflash_stability_dtr_ms,
                     output_dir=stability_dir,
                 ): port
                 for port in ports
@@ -1246,6 +1337,10 @@ def main() -> int:
                     stability_dir, "\n".join(failures)
                 )
             )
+
+    if args.preflash_only:
+        print("preflash stability: passed; no probe/flash requested", flush=True)
+        return 0
 
     if args.lmesh_mode == "local-release":
         # Stability checks use the logical lmesh UDS forwards. Release them
@@ -1271,7 +1366,7 @@ def main() -> int:
             )
             return probe(
                 probe_port,
-                FLASH_BAUD,
+                args.flash_baud,
                 physical_port=port,
                 before="no_reset" if args.lmesh_mode == "tcp" else "default_reset",
             )

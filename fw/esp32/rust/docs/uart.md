@@ -40,11 +40,12 @@ CBOR payload across all transports, and may add MAC auth for host-firmware auth.
 
 ## Periodic UART Heartbeat
 
-`uart.hb_every` controls an opt-in wake heartbeat and defaults to `0`:
+`uart.hb_every` controls the raw-NAN host rendezvous heartbeat and defaults to
+`1` (one empty frame per raw-NAN wake):
 
-- `0`: firmware keeps UART quiet during raw-NAN duty wakes and after LoRa/FSK
-  receive. lmesh retains queued UART commands until another wake source opens
-  the console.
+- `0`: explicitly disables the rendezvous. lmesh then retains queued UART
+  commands until another wake source opens the console. Use only for a
+  deliberate power experiment; it is not a usable battery-modem default.
 - `N > 0`: on every Nth raw-NAN Wi-Fi wake, firmware opens UART only for that
   raw-NAN active window (`nan.active_ms`, normally 250 ms) and writes exactly
   `0x7e 0x7e`. This is an empty UART frame, not a CBOR message. lmesh treats it
@@ -83,8 +84,10 @@ APB and no-light-sleep locks:
 - `active` opens the same bounded UART window while its radio override remains
   active until `idle` or reset.
 
-Classic ESP32 UART0 must use the APB clock source at 460800 while its APB lock
-is held. Do not select REF_TICK: it causes RX corruption at this baud.
+Classic ESP32 UART0 uses the APB clock source at 115200 while its APB lock is
+held. This deliberately matches the ROM and second-stage bootloader console,
+so a single managed raw capture can decode both boot and application output.
+Do not select REF_TICK.
 
 ## Reset And Resynchronization
 
@@ -124,16 +127,23 @@ mesh lmesh esp.serial.command port=lora2 command=status
 
 Forward connections are passive: lmesh never pulses DTR or sends a disposable
 probe on connect. `dtr [milliseconds]` and `rst` are explicit lmesh-local
-CP210x diagnostics, not firmware commands. An explicit `dtr` opens a bounded
-two-second lmesh flush window, so the next framed CBOR command is written
-directly to the firmware even when `uart.hb_every=0`. They can be
-board-specific and may reset a board. Keep RTS released for DTR diagnostics.
+**recovery diagnostics**, not firmware commands. Never put DTR before a normal
+command, test, raw-NAN wake, BLE workflow, or power measurement. It bypasses
+the heartbeat queue, can lose the first command during light-sleep resume, and
+can reset CP210x-wired boards. Keep RTS released for deliberate DTR recovery
+diagnostics.
 
-For firmware commands, use `esp.serial.command` or high-level lmesh methods.
-Bare UDS console traffic is binary and intended for a binary client, not a text
-terminal.
+For firmware commands, use generic `mesh` against the lmesh control UDS with
+the generated `resources/tools.json` catalog, or use high-level lmesh methods.
+`esp.serial.command` queues its CBOR request until the firmware's empty UART
+heartbeat opens RX. Bare serial-forward UDS traffic is binary and intended for
+a binary client, not a text terminal.
 
 ## Flash Policy
+
+Follow [flashing.md](flashing.md) for the complete build, preflight, direct
+flash, recovery, and verification procedure. This section records the UART
+constraints behind that procedure.
 
 Do not flash via RFC2217. A bootloader probe can work while a long write is
 corrupted. Flash through the local physical USB-UART after releasing the lmesh
@@ -182,15 +192,15 @@ Never use `write_flash 0x0 dmesh-rs-merged.bin`: that merged image contains
    mesh lmesh esp.serial.command port=lora2 command=status timeout_sec=8
    ```
 
-3. If the ready marker never arrives, stop only that forward and use the
-   reusable capture mode at both boot and application bauds:
+3. If the ready marker never arrives, switch only that managed forward to
+   RFC2217 at 115200 and capture it. ROM, second-stage bootloader, and the
+   application now share that one rate; do not open the physical TTY.
 
    ```bash
    mesh lmesh usb.serial.forward.stop port=lora2
-   python fw/esp32/rust/tools/serial_cmd.py --port /dev/serial/by-id/<device> \
-     --baud 115200 --capture-ms 1800 --no-sync
-   python fw/esp32/rust/tools/serial_cmd.py --port /dev/serial/by-id/<device> \
-     --baud 460800 --capture-ms 1800 --no-sync
+   mesh lmesh usb.serial.forward.start port=lora2 baud=115200 tcp_port=3331 \
+     tcp_mode=rfc2217 multi=true
+   fw/esp32/rust/tools/capture_lmesh_serial_raw.sh 3331 12
    ```
 
 4. A repeated bootloader checksum failure is an image problem. Reflash directly
@@ -200,6 +210,26 @@ Never use `write_flash 0x0 dmesh-rs-merged.bin`: that merged image contains
    RX errors, `uart_frame_drop`, and `uart_escape_err` should remain zero over
    repeated idle/recovery cycles. The physical decoder has no boot marker or
    synthetic resynchronization stream.
+
+## Managed-Forward Reliability Check
+
+Use the focused lora1/lora4 profile after changing UART framing, wake handling,
+or lmesh forwarding. It keeps firmware in its normal light-sleep/raw-NAN mode;
+it does not pulse DTR. The case queues commands until the firmware's empty UART
+heartbeat opens its receive window, requires monotonic uptime and zero UART
+RX/frame/escape errors, and verifies that delayed UART output is still gated.
+
+```bash
+source env.sh
+target/nix/profile/bin/python fw/esp32/rust/tools/presubmit.py \
+  --topology fw/esp32/rust/tools/lab.uart-reliability.json \
+  --case uart_wake_reliability --profile quick --timeout 15
+```
+
+The artifact directory printed by the runner is the evidence: inspect
+`results.jsonl` and `commands/lora1.jsonl` / `commands/lora4.jsonl`. A slower
+response is normal at a duty-window boundary; a timeout, uptime regression, or
+nonzero UART error counter is not.
 
 ## lora2 Recovery: 2026-07-26
 
@@ -248,6 +278,7 @@ The target reported `infra_active=true` and
   blocking tasks with queues.
 - UART RX wake can consume initial bytes on some silicon. It is not part of the
   product wake contract; use raw-NAN/BLE or GPIO0/PRG recovery.
-- A bootloader line at 115200 may look like garbage to a forward configured at
-  460800. Only continuous application-era corruption or checksum errors prove
-  a firmware/flash failure.
+- Before the 115200 unification, a bootloader line could look like garbage to
+  a 460800 application forward. That is no longer an expected mixed-rate
+  condition: garbage on the unified managed capture is actionable evidence of
+  a firmware, forward, or physical-link fault.

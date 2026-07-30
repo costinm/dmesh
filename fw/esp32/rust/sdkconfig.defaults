@@ -21,15 +21,15 @@ CONFIG_ESP_CONSOLE_UART_CUSTOM=y
 CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_ROM_SERIAL_PORT_NUM=0
-CONFIG_ESP_CONSOLE_UART_BAUDRATE=460800
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 # CONFIG_CONSOLE_UART_DEFAULT is not set
 CONFIG_CONSOLE_UART_CUSTOM=y
 CONFIG_CONSOLE_UART_CUSTOM_NUM_0=y
 CONFIG_CONSOLE_UART_NUM=0
-CONFIG_CONSOLE_UART_BAUDRATE=460800
+CONFIG_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESPTOOLPY_BAUD_460800B=y
 CONFIG_ESPTOOLPY_BAUD=460800
-CONFIG_MONITOR_BAUD=460800
+CONFIG_MONITOR_BAUD=115200
 
 CONFIG_PM_ENABLE=y
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
@@ -60,17 +60,44 @@ CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_GATT_SERVER=y
 CONFIG_BT_NIMBLE_GAP_SERVICE=y
 CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
-CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# ESP-IDF 5.5's bundled TinyCrypt CMAC configuration does not provide the
+# complete CMAC type when SMP is enabled.  Use the supported mbedTLS backend
+# for bonded GATT/CoC links instead.
+CONFIG_BT_NIMBLE_CRYPTO_STACK_MBEDTLS=y
+CONFIG_BT_SMP_CRYPTO_STACK_MBEDTLS=y
 CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_MAX_BONDS=3
 CONFIG_BT_NIMBLE_MAX_CCCDS=8
-CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=y
-CONFIG_BT_NIMBLE_EXT_ADV=y
-CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=1
+# Prefer a BLE link that permits the peripheral to miss three 1-second
+# connection events while raw-NAN keeps its 4-second cadence.  The ESP applies
+# the same values after either a GATT or CoC connection; Android remains free
+# to negotiate a stricter value if its controller cannot accept this profile.
+CONFIG_BT_NIMBLE_SVC_GAP_PPCP_MIN_CONN_INTERVAL=800
+CONFIG_BT_NIMBLE_SVC_GAP_PPCP_MAX_CONN_INTERVAL=800
+CONFIG_BT_NIMBLE_SVC_GAP_PPCP_SLAVE_LATENCY=3
+CONFIG_BT_NIMBLE_SVC_GAP_PPCP_SUPERVISION_TMO=3000
+# Keep one LE Credit-Based Connection-Oriented Channel available for the
+# explicitly requested Android CoC lab probe.  It is idle unless
+# `ble coc=true` is sent; the probe uses a dynamic PSM, not IPSP's reserved
+# PSM, and does not turn the firmware into an IPv6-over-BLE implementation.
+CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=1
+# The classic ESP32 companion path is a single legacy peripheral.  Do not
+# enable BLE 5 / extended-advertising controller features until basic Android
+# ATT discovery and notification exchange are proven on hardware.
+# CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT is not set
+# CONFIG_BT_NIMBLE_EXT_ADV is not set
+# Keep the NimBLE host on the classic ESP32 controller/HCI core for the
+# initial Android ATT validation.  Moving the host to APP CPU left a connected
+# link unable to service discovery on lora2.
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
+# CONFIG_BT_NIMBLE_PINNED_TO_CORE_1 is not set
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 
-# Reduce IRAM footprint by moving GATT/GAP/NPL to FLASH.
-# BLE peripheral-only role does not need low-latency IRAM paths.
-CONFIG_BT_NIMBLE_LOW_SPEED_MODE=y
+# Keep the NimBLE GAP/GATT event path in IRAM while validating Android GATT.
+# This must remain off until a connected peripheral is proven on the lab boards.
+# CONFIG_BT_NIMBLE_LOW_SPEED_MODE is not set
 
 # Disable unused default NimBLE services to save code space.
 # The firmware uses its own custom GATT service via native/dmesh_nimble/.
@@ -85,9 +112,9 @@ CONFIG_BT_NIMBLE_LLS_SERVICE=n
 CONFIG_BT_NIMBLE_SPS_SERVICE=n
 CONFIG_BT_NIMBLE_HR_SERVICE=n
 
-# Classic ESP32 BT controller modem sleep. Main-XTAL clock supports BLE modem
-# sleep with DFS; true BT + automatic light sleep requires boards configured
-# with an external 32 kHz RTC clock, which our mixed dev boards do not all have.
-CONFIG_BTDM_CTRL_MODEM_SLEEP=y
-CONFIG_BTDM_CTRL_MODEM_SLEEP_MODE_ORIG=y
-CONFIG_BTDM_CTRL_LPCLK_SEL_MAIN_XTAL=y
+# The current classic ESP32 lab boards have no external 32.768 kHz RTC clock.
+# ESP-IDF permits Bluetooth modem sleep with the main XTAL, but not system
+# light sleep; keep controller modem sleep disabled so the firmware's raw-NAN
+# light-sleep mode remains available. A board with an external RTC clock may
+# enable and qualify Bluetooth modem sleep separately.
+# CONFIG_BTDM_CTRL_MODEM_SLEEP is not set

@@ -8,7 +8,8 @@ host or Android `lmesh`; it does not make autonomous routing decisions.
 
 The normal low-power profile remains unchanged: raw-NAN Wi-Fi duty windows and
 Meshtastic MEDIUM_FAST receive. FSK is used only when a powered host or Android
-control plane asks for a bounded discovery or transfer session.
+control plane asks for a bounded discovery or transfer session over FSK.
+
 
 ## Initial US915 Test Profile
 
@@ -132,13 +133,34 @@ valid as both the metered FSK sender and receiver. This proves the bounded
 fixed-channel modem operation only. The 50-slot sweep, 100-attempt loss/RSSI
 run, post-operation LoRa restoration, and FSK power matrix above remain open.
 
-## Flashing Rule For This Test
+# Others 
+## BLE L2CAP and CoC 
 
-Use direct USB flashing only. Before each flash, stop that board's managed
-lmesh forward; do not flash through RFC2217/TCP. Flash the appropriate classic
-ESP32 or ESP32-S3 image without erase/NVS-reset options, then restore the UDS
-forward before issuing verification commands. Preserve the existing NVS radio
-pins, node identity, and low-power configuration unless the test explicitly
-changes one setting. For this lab, flash `lora1` (driver), `lora2` (metered
-primary witness), and `lora4` (SX126x witness); leave `lora3` for Android-led
-tests.
+For inspiration, CoC:
+- each PDU is sent on a different channel - size based on allowed time, with SAR
+- L2CAP handles fragmentation - PDU len is 27 for 4.0, 251 for 4.2+ (262 incl crc/header)
+- CoC uses connection credit flow, like H2/SSH/Quic
+- 37 data channels, 3 'announcement channels'
+- very strict timing requirements.
+- no Wifi-like beacons - not using the announcements as beacons/time sync
+
+We can reuse a simplified SAR, without the layers (since streams/messages are the
+only abstraction we want), but we can add beacons like NAN.
+
+## Z-Wave
+
+- 3 frequncies: 
+Channel IndexFrequencyModulationData RatePrimary FunctionChannel
+1908.42 MHz2-FSK9.6 kbps / 40 kbps Legacy mesh traffic & discoveryChannel
+2908.40 MHz2-FSK40 kbps Mid-rate mesh trafficChannel 
+3916.00 MHz2-GFSK100 kbps - high speed
+
+- 1 sec wake up, listen on one channel
+- low power - so no need for hoping.
+
+## Wi-SUN
+
+- 802.15.4g
+- 128 + 64 + 42 channels, 
+- could be directly supported instead of the custom protocol
+- but would likely require the extra overhead of MAC/IP headers

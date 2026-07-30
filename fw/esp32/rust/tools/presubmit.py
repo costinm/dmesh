@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[4]
-PYTHON = REPO / "python"
+SSH_MESH_ROOT = Path(
+    os.environ.get("DMESH_SSH_MESH_DIR") or REPO.parent / "rust" / "ssh-mesh"
+).resolve()
+PYTHON = SSH_MESH_ROOT / "python"
 sys.path.insert(0, str(PYTHON))
 
 from dmesh.lab import LabConfig  # noqa: E402

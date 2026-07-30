@@ -19,4 +19,12 @@ else
     unset IDF_PYTHON_ENV_PATH
 fi
 
+# esp-idf-sys discovers Python through PATH when configuring CMake.  The
+# generated environment deliberately restores the Nix profile at the front,
+# but that Python does not contain ESP-IDF's component-manager module.  Keep
+# the IDF virtualenv first while retaining every tool path supplied by Nix.
+if [ -n "${IDF_PYTHON_ENV_PATH:-}" ] && [ -x "${IDF_PYTHON_ENV_PATH}/bin/python" ]; then
+    export PATH="${IDF_PYTHON_ENV_PATH}/bin:${PATH}"
+fi
+
 unset _fw_esp32_env_dir

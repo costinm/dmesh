@@ -130,6 +130,7 @@ impl Settings {
                 "nan.boot",
                 "nan.channel",
                 "nan.dw_off_tu",
+                "nan.dw_stride",
                 "nan.dw_tu",
                 "nan.enabled",
                 "nan.light_sleep",

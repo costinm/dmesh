@@ -10,6 +10,12 @@ use super::settings::SharedSettings;
 /// UART is re-opened by its next raw-NAN wake window, so an interactive
 /// console window need only cover one command/response exchange.
 pub const DEFAULT_ACTIVE_MS: u32 = 2_000;
+/// Send an empty UART delimiter on every raw-NAN wake unless NVS overrides it.
+///
+/// This is the battery-node host rendezvous: it lets lmesh flush one queued
+/// CBOR command during the already scheduled radio window.  It does not add a
+/// wake or keep UART powered between raw-NAN windows.
+pub const DEFAULT_RAW_NAN_HEARTBEAT_EVERY: i32 = 1;
 const MIN_ACTIVE_MS: u32 = 2_000;
 #[cfg(target_feature = "esp32s3ops")]
 const UART_REQUIRES_APB_LOCK: bool = false;
@@ -53,7 +59,7 @@ static UART0_OUTPUT_PROBE_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART0_FRAME_DROPS: AtomicU32 = AtomicU32::new(0);
 static UART0_ESCAPE_ERRORS: AtomicU32 = AtomicU32::new(0);
-static UART0_HEARTBEAT_EVERY: AtomicU32 = AtomicU32::new(0);
+static UART0_HEARTBEAT_EVERY: AtomicU32 = AtomicU32::new(DEFAULT_RAW_NAN_HEARTBEAT_EVERY as u32);
 static UART0_HEARTBEAT_WAKES: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_DROPPED: AtomicU32 = AtomicU32::new(0);
@@ -69,7 +75,7 @@ const UART_TX_QUEUE_LEN: u32 = 16;
 // Keep every driver write below the hardware FIFO capacity. The task waits
 // for idle before each chunk, so ESP-IDF never enables its TX-empty ISR.
 const UART_TX_FRAME_MAX: usize = 512;
-// At 460800 baud a 32-byte chunk drains in less than a millisecond.  Leave a
+// At 115200 baud a 32-byte chunk drains in less than three milliseconds. Leave a
 // full FreeRTOS tick before the next one instead of using the driver's
 // TX-done/TX-empty ISR path.
 const UART_TX_FIFO_CHUNK: usize = 32;
@@ -159,8 +165,8 @@ pub fn configure_active_window(settings: &SharedSettings) {
     set_heartbeat_every(
         settings
             .borrow()
-            .get_i32("uart.hb_every", 0)
-            .unwrap_or(0)
+            .get_i32("uart.hb_every", DEFAULT_RAW_NAN_HEARTBEAT_EVERY)
+            .unwrap_or(DEFAULT_RAW_NAN_HEARTBEAT_EVERY)
             .max(0) as u32,
     );
     activate_window();

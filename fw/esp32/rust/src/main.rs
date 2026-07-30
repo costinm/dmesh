@@ -394,7 +394,7 @@ fn init_console_uart() {
         // buffer or TX-empty interrupt; serial.rs owns it with direct FIFO
         // writes, avoiding the classic ESP32 UART TX ISR watchdog failure.
         let mut config = esp_idf_sys::uart_config_t::default();
-        config.baud_rate = 460_800;
+        config.baud_rate = 115_200;
         config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
         config.parity = esp_idf_sys::uart_parity_t_UART_PARITY_DISABLE;
         config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;
@@ -437,7 +437,7 @@ fn init_console_uart() {
             Ok(()) => {
                 components::serial::activate_window();
                 components::telemetry::record_log(
-                    "event type=uart.rx_queue state=ready baud=460800 tx_isr=false",
+                    "event type=uart.rx_queue state=ready baud=115200 tx_isr=false",
                 );
             }
             Err(err) => {

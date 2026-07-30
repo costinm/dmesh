@@ -226,7 +226,17 @@ pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::Jo
     let state = LoraState::load(&settings)?;
     let mut config = state.config;
     if BACKGROUND_RX_RUNNING.swap(true, Ordering::Relaxed) {
-        return Ok(None);
+        // A synchronous `loralisten` or radio-stop transition can finish its
+        // task after the flag has been restored by a following command. Do not
+        // report RX as running when no task owns the IRQ line: reconcile this
+        // stale state and spawn the normal background receiver again.
+        if !LORA_RX_TASK.load(Ordering::Acquire).is_null() {
+            return Ok(None);
+        }
+        BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
+        if BACKGROUND_RX_RUNNING.swap(true, Ordering::Relaxed) {
+            return Ok(None);
+        }
     }
     if let Err(err) = probe_lora_ready(&config) {
         BACKGROUND_RX_RUNNING.store(false, Ordering::Relaxed);
@@ -761,6 +771,19 @@ impl LoraCommand {
             cad_dirty = true;
         }
         if cad_dirty {
+            // The receiver selects its CAD/continuous implementation when its
+            // task starts. Persisting the atomics alone leaves a currently
+            // running task on its old mode, while the infra supervisor reports
+            // it as healthy. Restart it synchronously so `lora cad_rx=...`
+            // takes effect immediately and status matches the actual radio.
+            let restart_rx = BACKGROUND_RX_RUNNING.swap(false, Ordering::Relaxed);
+            if restart_rx {
+                notify_lora_rx_task();
+                if !wait_for_background_rx_stopped(Duration::from_secs(2)) {
+                    bail!("LoRa background receiver did not stop after CAD update");
+                }
+                let _ = start_background_rx(self.settings.clone())?;
+            }
             return Ok(CommandResponse::ok(cad_status_text()));
         }
         if let Some(mode) = request.arg("mode") {
@@ -1539,7 +1562,10 @@ fn rearm_background_rx(config: &LoraConfig) -> Result<()> {
 fn background_poll_interval(config: &LoraConfig) -> Duration {
     match config.chip {
         LoraChip::Sx1262 => Duration::from_millis(250),
-        LoraChip::Sx127x => Duration::from_secs(30),
+        // DIO0 is the normal wake path, but an absent/miswired IRQ must not
+        // make an otherwise valid SX127x packet invisible for thirty seconds.
+        // RX_CONTINUOUS retains RX_DONE/FIFO until this bounded recovery poll.
+        LoraChip::Sx127x => Duration::from_millis(250),
     }
 }
 

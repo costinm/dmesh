@@ -189,6 +189,7 @@ fn nvs_key(tag: u16) -> Option<&'static str> {
         385 => "nan.ap_slot_tu",
         386 => "nan.ap_beacon_tu",
         387 => "uart.hb_every",
+        392 => "nan.dw_stride",
         _ => return None,
     })
 }

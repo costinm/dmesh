@@ -70,6 +70,19 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         return Ok(());
     }
 
+    // Connectivity-test override: retain an LE CoC advertisement and its
+    // controller while validating Android connection behavior.  The normal
+    // raw-NAN path keeps its periodic light sleep whenever this is disabled.
+    if super::ble_bt::raw_nan_keep_active() {
+        // Yield the raw-NAN duty task for the scheduled interval. Returning
+        // immediately turns the normal four-second schedule into a busy loop
+        // and starves the NimBLE host while the controller remains awake.
+        unsafe {
+            sys::vTaskDelay(duration_to_ticks(Duration::from_millis(sleep_ms as u64)).max(1));
+        }
+        return Ok(());
+    }
+
     // A DTR/PRG wake owns the next active window. Do not let the NAN duty
     // scheduler suspend UART again while the operator is still using the
     // console or while a command response is being emitted.
@@ -86,7 +99,7 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         // physical PRG and the CP210x DTR line and is the explicit console
         // wake source; leave UART RX out of the sleep mask because its level
         // detector can remain asserted by the bridge and reject the request.
-        configure_light_wake_sources(settings, sleep_ms, false, false, true)?;
+        configure_light_wake_sources(settings, sleep_ms, false, false, true, false)?;
         super::serial::suspend_for_light_sleep();
         RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
         let before_us = now_us();
@@ -130,6 +143,7 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
             super::serial::RAW_NAN_UART_WAKE,
             false,
             super::serial::RAW_NAN_BUTTON_WAKE,
+            super::ble_bt::raw_nan_keep_active(),
         )?;
         super::serial::suspend_for_light_sleep();
         RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
@@ -567,7 +581,7 @@ pub fn enter_companion_deep_sleep(
 
 pub fn enable_companion_idle_pm(settings: &SharedSettings) -> Result<()> {
     configure_pm(true)?;
-    configure_light_wake_sources(settings, DEFAULT_WAKE_MS, true, true, true)?;
+    configure_light_wake_sources(settings, DEFAULT_WAKE_MS, true, true, true, true)?;
     telemetry::record_log("ev=sleep.pm companion_idle=true light=true serial=true");
     Ok(())
 }
@@ -624,6 +638,7 @@ fn start_light_sleep_profile(settings: &SharedSettings, profile: LightSleepProfi
         profile.serial,
         profile.wifi || profile.raw || profile.nan || profile.ble,
         true,
+        profile.ble,
     )?;
 
     LIGHT_SLEEP_ENABLED.store(true, Ordering::Relaxed);
@@ -1136,6 +1151,7 @@ fn configure_light_wake_sources(
     serial: bool,
     radio_wake: bool,
     button_wake: bool,
+    ble_wake: bool,
 ) -> Result<()> {
     unsafe {
         let _ = sys::esp_sleep_disable_wakeup_source(sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_ALL);
@@ -1154,6 +1170,8 @@ fn configure_light_wake_sources(
         if radio_wake {
             let _ = sys::esp_sleep_enable_wifi_wakeup();
             let _ = sys::esp_sleep_enable_wifi_beacon_wakeup();
+        }
+        if ble_wake {
             let _ = sys::esp_sleep_enable_bt_wakeup();
         }
     }

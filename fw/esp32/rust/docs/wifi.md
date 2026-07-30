@@ -1,13 +1,10 @@
 # ESP Wi-Fi Operation
 
 The main design is centered around battery saving using synchronized wake windows.
-Wifi is used as a radio - like LoRA and low-level FSK - without the higher level
-protocol. NAN and AP beacons are used to sync around the same window - NAN clusters
-have a larger span, while AP can only sync in its vicinity. 
 
-The design is primarily using NAN and AP for the time sync. We can send NAN follow-up
-frames in the DW - for Android or Hosts supporting NAN discovery, or ESP-NOW frames
-to other ESP devices or host with custom listener.
+Wifi is used as any other  radio - like LoRA and low-level FSK - without the higher level protocol. NAN and AP beacons are used to sync around the same window - NAN clusters have a larger span, while AP can only sync in its vicinity. 
+
+The design is primarily using NAN and AP beacons for the time sync. We can send NAN follow-up frames in the DW - for Android or Hosts supporting NAN discovery, or ESP-NOW frames to other ESP devices or host with custom listener.
 
 This is optimized for power saving and range - not latency or througput. The messages
 can be used by a control plane to establish and modify AP (DIRECT in android) and STA
@@ -76,7 +73,6 @@ it has no usable source, it runs a bounded management-beacon recovery listen:
 | --- | --- | --- |
 | `nan.ap_recovery_ms` | 32000 ms | Avoid keeping Wi-Fi on after each missed timing source. |
 | `nan.ap_recovery_listen_ms` | 1200 ms | Acquires AP/NAN timing without sustained Wi-Fi load. |
-| `nan.ap_slot_tu` | 4000 TU | Shared AP-derived wake cadence, 4.096 s. |
 
 Counters in `mode status=true`, `nan stats=true`, and `xstatus` show NAN DW
 activity, source choice, AP recovery runs, beacon freshness, misses, and
@@ -94,11 +90,13 @@ channel: 6
 beacon interval: nan.ap_beacon_tu (500 TU / 512 ms by default)
 ```
 
-The AP is a timing source, not an IP service. It retains raw management/action
-receive. While AP is active the board must not turn Wi-Fi off or enter the raw
-NAN duty sleep path. In `auto`, a fresh NAN beacon stops the fallback AP and
-returns the owner to NAN watch mode. `ap_only` starts the AP immediately and
-is intended for repeatable laboratory tests.
+The AP is a timing source, not an IP service. The powered owner starts AP+STA
+on the same channel: AP emits the timing beacon while the unassociated STA
+interface is reserved for raw NAN management/action injection and the raw
+receiver remains armed. While AP is active the board must not turn Wi-Fi off
+or enter the raw NAN duty sleep path. In `auto`, a fresh NAN beacon stops the
+fallback AP and returns the owner to NAN watch mode. `ap_only` starts the AP
+immediately and is intended for repeatable laboratory tests.
 
 An AP owner has no raw-NAN sleep callback, so it emits the same bounded UART
 heartbeat on the saved `nan.wake_ms` cadence. This keeps the lmesh CBOR modem
@@ -108,7 +106,62 @@ forward usable while the owner is powered and hosting the AP.
 | --- | --- | --- |
 | `nan.ap_owner` | `false` | Enables powered gateway timing-source behavior. |
 | `nan.ap_loss_ms` | 5000 ms | NAN absence before starting the fallback AP. |
-| `nan.ap_beacon_tu` | 500 TU | AP beacon interval, close to the 512-TU NAN timing base. |
+| `nan.ap_beacon_tu` | 500 TU | AP beacon interval. ESP-IDF requires a multiple of 100 TU. In AP fallback, `TSF / beacon_interval mod nan.dw_stride` defines AP-DW0, AP-DW0+4, etc.; a fresh NAN beacon replaces this with the 512-TU NAN grid. |
+| `nan.dw_stride` | 4 | Use every fourth source slot: NAN-DW0/NAN-DW0+4 or AP-DW0/AP-DW0+4. |
+
+### 512-TU cadence probe
+
+`nan.dw_stride` is the firmware wake-scheduler contract.  With a 512-TU base,
+`nan.dw_stride=8` selects one 4.194304-second slot per cycle.  `xstatus`
+reports both `nan_selected_stride` and the absolute
+`nan_expected_slot_index`; the latter must be divisible by the selected stride.
+
+To verify reception without using a physical UART, start the Android NAN
+service, publish the ESP descriptor, then have Android send one follow-up per
+512-ms interval:
+
+```bash
+# Android app-dmesh shell command (after a PeerReady event)
+adb -s <serial> shell "content call \
+  --uri content://com.github.costinm.dmesh.lm.shell --method command \
+  --arg 'wifi.nan.probe text=BITMAP count=16 interval_ms=512'"
+
+# Managed lmesh forward only
+mesh lmesh esp.serial.command port=<radio> command='nan action_dump=true'
+mesh lmesh esp.serial.command port=<radio> command='xstatus'
+```
+
+For an ESP-to-Android discovery failure, inspect the exact bounded descriptor
+that the firmware handed to raw Wi-Fi TX before changing timing or UART:
+
+```bash
+mesh lmesh esp.serial.command port=<radio> command='nan publish_dump=true'
+```
+
+`publish_dump` is diagnostic only; it does not transmit or retain an
+unbounded packet history.
+
+On 2026-07-30, lora3 with `nan.dw_stride=8` received `BITMAP#5` at
+`dw512_index=37408`, which is `0 mod 8`; its current status independently
+reported `nan_selected_stride=8` and `nan_expected_slot_index=37568`
+(`0 mod 8`). Android recorded one `FollowupProbe sent=1` and a successful
+`FollowupTxOk` for every bitmap position.
+
+This validates the ESP receive scheduler, not the SDF Availability attribute.
+The firmware now generates its NAN Availability attribute from `nan.dw_tu`,
+`nan.dw_off_tu`, `nan.dw_stride`, and `nan.active_ms`: one committed 2.4-GHz
+entry, 16-TU bitmap bits, and a standard 128..8192-TU repeat period. A 512-TU
+base with stride 8 uses a 4096-TU repeat and a 16-bit (250-ms rounded) awake
+bitmap at DW0.
+
+Changing that ESP schedule also requires checking Android's
+`awake_dw_interval`/discovery-window setting. Android's 2.4-GHz framework/HAL
+supports values 1..5, representing every 1, 2, 4, 8, or 16 DWs; stride 8 maps
+to Android value 4. `ConfigRequest` is hidden from ordinary apps, and the
+current app attaches with the interval unset. On the Pixel, `dumpsys wifiaware`
+reports `mDiscoveryWindowInterval=[-1,-1,-1]`; it therefore does not request a
+matching Android cadence today. Recheck that output and repeat the bitmap probe
+whenever `nan.dw_tu` or `nan.dw_stride` changes.
 
 Ordinary channel-6 AP beacons can supply timing in `auto`, but
 `DIRECT-DMESH-*` signals that the AP also accepts DMesh action frames. Identity
@@ -123,9 +176,17 @@ source fw/esp32/env.sh
 export LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock
 export PYTHONPATH="${SSH_MESH_PYTHON:?set SSH_MESH_PYTHON to the ssh-mesh Python directory}"
 
-# Persist the powered fallback role on lora1, then apply it after reset.
+# Persist the powered fallback role on lora1, then reinitialize infra radios.
+# `reset` is not a firmware CBOR command; do not use DTR as a substitute.
 mesh lmesh esp.serial.command port=lora1 command='nvs op=set nan.ap_owner=true nan.sync_source=auto'
-mesh lmesh esp.serial.command port=lora1 command='reset'
+mesh lmesh esp.serial.command port=lora1 command='mode infra=true'
+
+# Lab observer: retain the AP (512 TU) and raw NAN management/action receiver
+# even when NAN beacons are present. This is a powered-gateway test role, not
+# the normal `auto` fallback policy.
+mesh lmesh esp.serial.command port=lora1 \
+  command='nvs op=set nan.ap_owner=true nan.sync_source=ap_only nan.ap_beacon_tu=512'
+mesh lmesh esp.serial.command port=lora1 command='mode infra=true'
 
 # Deterministic AP fallback validation. The runner restores normal auto policy.
 python fw/esp32/rust/tools/presubmit.py \

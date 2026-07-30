@@ -83,6 +83,36 @@ pub fn dispatch_binary_packet(registry: &mut CommandRegistry, packet: &[u8]) -> 
     }
 }
 
+/// Dispatch a compact-CBOR command for the BLE CoC rendezvous transport.
+///
+/// The current CoC service deliberately uses a single 256-byte SDU per
+/// request and response.  Keep the response as a complete CBOR map: cutting
+/// the ordinary response byte stream would turn an otherwise useful status
+/// reply into malformed CBOR.  Larger component responses therefore become a
+/// small, explicit partial response; callers can request a narrower command
+/// or use a packet transport with a larger framing budget.
+pub fn dispatch_coc_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec<u8> {
+    const COC_MAX_RESPONSE: usize = 256;
+
+    let response = dispatch_binary_packet(registry, packet);
+    if response.len() <= COC_MAX_RESPONSE {
+        return response;
+    }
+
+    let method = decode_binary(packet)
+        .map(|request| request.method)
+        .unwrap_or(0);
+    let mut partial = CommandRequest::new_binary(method);
+    partial.args.insert(4, "partial".to_string()); // CBOR_STATUS is 4
+    partial.args.insert(
+        32,
+        format!("CoC response exceeds {COC_MAX_RESPONSE} bytes; request a compact status"),
+    );
+    let response = encode_binary(&partial);
+    debug_assert!(response.len() <= COC_MAX_RESPONSE);
+    response
+}
+
 /// Dispatch one compact-CBOR UART packet. UART's HDLC/PPP codec is below this
 /// layer; lmesh adds the generic mesh stream envelope on the UDS side.
 /// UART always returns a complete stream record, including malformed input

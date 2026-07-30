@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
-"""Run compact-CBOR ESP32 firmware commands over UART or lmesh forwards."""
+"""Transitional helper for direct UART capture and flash-fleet provisioning.
+
+Normal firmware commands must use the generic ``mesh`` CLI with lmesh's
+generated ``resources/tools.json`` catalog.  This helper is retained only
+until the direct post-flash provisioning handoff is migrated; it must not be
+used as a DTR wake wrapper for normal commands or tests.
+"""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import re
 import select
 import socket
+import json
+import struct
 import sys
 import termios
 import time
@@ -15,12 +24,6 @@ from urllib.parse import urlparse
 
 PROMPT = b"dm-rs> "
 FIRMWARE_FATAL_MARKERS = ("Guru Meditation", "Interrupt wdt timeout", "Rebooting...")
-# Matches `mesh::cbor::ESP_RECORD_MAX` and the firmware UART contract. Status
-# and sleep records commonly exceed the historical 512-byte debug limit.
-FIRMWARE_RECORD_MAX = 4_000
-UART_FLAG = 0x7E
-UART_ESCAPE = 0x7D
-UART_ESCAPE_XOR = 0x20
 
 
 class Console:
@@ -31,12 +34,19 @@ class Console:
         timeout: float,
     ) -> None:
         self.port = port
+        self.baud = baud
         self.timeout = timeout
-        self.endpoint = open_endpoint(port, baud)
+        self.endpoint: Endpoint | None = open_endpoint(port, baud)
         self.uart_wire = is_physical_uart(port)
+        # Passive boot/application-baud capture is intentionally supported on
+        # a direct physical UART after its managed forward is stopped.  Only
+        # firmware commands need a logical lmesh adapter name.
+        self.adapter = None if self.uart_wire else adapter_name(port)
 
     def close(self) -> None:
-        self.endpoint.close()
+        if self.endpoint is not None:
+            self.endpoint.close()
+            self.endpoint = None
 
     def sync(self) -> str:
         # Classic ESP32 UART0 wakes from light sleep after a few RX edges and
@@ -44,104 +54,89 @@ class Console:
         # a wake transition cannot merge the tail of the preamble into the
         # first real command. A single bulk write previously produced records
         # such as "!tus" when the receiver resumed mid-frame.
+        if self.endpoint is None:
+            self.endpoint = open_endpoint(self.port, self.baud)
+        endpoint = self.endpoint
         time.sleep(0.55)
         for _ in range(4):
-            self.endpoint.write(b"\n")
+            endpoint.write(b"\n")
             time.sleep(0.06)
-        self.endpoint.flush_input()
+        endpoint.flush_input()
         time.sleep(0.20)
-        self.endpoint.write(b"status\n")
+        endpoint.write(b"status\n")
         return self.read_until_prompt(self.timeout, require_prompt=True)
-
-    def cbor_cmd(self, command: str, timeout: float | None = None) -> str:
-        """Send one firmware stream frame and return decoded response records.
-
-        Firmware UART is binary-only.  This intentionally bypasses lmesh's
-        text convenience adapter so it can validate exactly the physical
-        modem protocol used by UART, BLE, and radio command transports.
-        """
-        self.endpoint.flush_input()
-        self.endpoint.write(self.encode_command(command))
-        return self.read_cbor_records(timeout or self.timeout)
-
-    def cbor_cmd_payload(
-        self, command: str, payload: bytes, timeout: float | None = None
-    ) -> str:
-        """Send a compact-CBOR command with an opaque binary payload."""
-        self.endpoint.flush_input()
-        self.endpoint.write(self.encode_command(command, payload=payload))
-        return self.read_cbor_records(timeout or self.timeout)
 
     def wake_probe(self, settle_sec: float = 4.5) -> None:
         """Consume a UART RX wake transition before a test command.
 
-        A sleeping ESP may consume the first compact-CBOR record while its
-        UART clock resumes. The default also covers the four-second raw-NAN
-        duty cycle used by the battery test profile. The probe is a harmless ``status``
-        request whose response is discarded; callers must still send their
-        actual command normally.  This avoids retrying a potentially
-        side-effecting command after an ambiguous timeout.
+        The forward uses a bounded DTR wake rather than a speculative firmware
+        command, so a sleeping UART cannot consume a side-effecting request.
         """
-        self.endpoint.flush_input()
-        self.endpoint.write(self.encode_command("status"))
-        time.sleep(settle_sec)
-        self.endpoint.flush_input()
+        del settle_sec
+        self.pulse_lmesh_dtr(120)
 
-    def read_cbor_records(self, timeout: float) -> str:
-        deadline = time.monotonic() + timeout
-        pending = bytearray()
-        uart_decoder = UartDecoder()
-        events: list[str] = []
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([self.endpoint.fd], [], [], 0.05)
-            if not readable:
-                continue
-            try:
-                chunk = self.endpoint.read(4096)
-            except BlockingIOError:
-                continue
-            if not chunk:
-                continue
-            if self.uart_wire:
-                for cbor in uart_decoder.push(chunk):
-                    rendered = render_cbor(cbor)
-                    if is_event_cbor(cbor):
-                        events.append(rendered)
-                    else:
-                        return rendered
-                continue
-            pending.extend(chunk)
-            while len(pending) >= 4:
-                body_len = int.from_bytes(pending[:4], "big")
-                if not 4 <= body_len <= FIRMWARE_RECORD_MAX + 4:
-                    # Boot ROM diagnostics are not valid command frames.
-                    del pending[:1]
-                    continue
-                frame_len = 4 + body_len
-                if len(pending) < frame_len:
-                    break
-                body = bytes(pending[4:frame_len])
-                del pending[:frame_len]
-                if not body.startswith(b"\x00\xcb\x00\x00"):
-                    continue
-                rendered = render_cbor(body[4:])
-                if is_event_cbor(body[4:]):
-                    events.append(rendered)
-                else:
-                    return rendered
-        tail = pending[-96:].hex()
-        event_tail = " | ".join(events[-2:])
-        raise TimeoutError(
-            f"no framed CBOR response after {timeout:.1f}s; tail={tail} events={event_tail}"
-        )
+    def pulse_lmesh_dtr(self, hold_ms: int) -> None:
+        """Request lmesh's explicit bounded DTR wake on a managed UDS/TCP forward.
 
-    def encode_command(self, command: str, *, payload: bytes | None = None) -> bytes:
-        frame = encode_firmware_command(command, payload=payload)
-        return encode_uart_frame(frame[8:]) if self.uart_wire else frame
+        This is a local lmesh control record, never firmware text.  It is used
+        only when the raw-NAN profile has UART heartbeats disabled and a host
+        command needs the documented console wake/flush window.
+        """
+        if self.uart_wire:
+            raise ValueError("--dtr requires a managed lmesh UDS/TCP endpoint")
+        if self.endpoint is None:
+            self.endpoint = open_endpoint(self.port, self.baud)
+        endpoint = self.require_endpoint()
+        endpoint.flush_input()
+        endpoint.write(f"dtr {hold_ms}\n".encode("ascii"))
+        # lmesh arms a bounded flush window after releasing DTR. Let the local
+        # acknowledgement arrive before the subsequent JSONL command.
+        time.sleep(0.20)
+        endpoint.flush_input()
+        # The managed forward accepts input from its first client by default.
+        # Close this one-shot DTR client before `esp.serial.command` opens its
+        # own lmesh-managed exchange.
+        endpoint.close()
+        self.endpoint = None
+
+    def reset_run(self) -> None:
+        """Reset a directly opened ESP USB-UART into normal application mode.
+
+        This mirrors lmesh's `usb.serial.reset mode=run` sequence and is for
+        the documented boot-baud capture after that one managed forward has
+        been stopped.  It deliberately preserves DTR while toggling RTS, so a
+        CP210x wiring cannot accidentally select the bootloader.
+        """
+        if not self.uart_wire:
+            raise ValueError("--reset-run requires a direct physical UART endpoint")
+        endpoint = self.require_endpoint()
+        set_modem_line(endpoint.fd, termios.TIOCM_DTR, False)
+        set_modem_line(endpoint.fd, termios.TIOCM_RTS, True)
+        time.sleep(0.120)
+        set_modem_line(endpoint.fd, termios.TIOCM_RTS, False)
+        time.sleep(0.500)
+        set_modem_line(endpoint.fd, termios.TIOCM_DTR, False)
+
+    def command(self, command: str, timeout: float | None = None) -> str:
+        """Run a text command through lmesh; this tool never encodes CBOR."""
+        if self.uart_wire:
+            raise ValueError(
+                "physical UART commands are unsupported: use a managed lmesh socket "
+                "(for example uds:///run/mesh/lmesh/lora2.sock)"
+            )
+        assert self.adapter is not None
+        return lmesh_serial_command(self.adapter, command, timeout or self.timeout)
 
     def cmd(self, command: str, timeout: float | None = None) -> str:
-        self.endpoint.write((command + "\n").encode("utf-8"))
+        if not self.uart_wire:
+            return self.command(command, timeout)
+        self.require_endpoint().write((command + "\n").encode("utf-8"))
         return self.read_until_prompt(timeout or self.timeout, require_prompt=True)
+
+    def require_endpoint(self) -> "Endpoint":
+        if self.endpoint is None:
+            raise RuntimeError("the temporary managed-forward connection is closed")
+        return self.endpoint
 
     def read_until_prompt(self, timeout: float, *, require_prompt: bool = False) -> str:
         deadline = time.monotonic() + timeout
@@ -149,11 +144,12 @@ class Console:
         saw_prompt = False
         while time.monotonic() < deadline:
             remaining = max(0.0, min(0.05, deadline - time.monotonic()))
-            readable, _, _ = select.select([self.endpoint.fd], [], [], remaining)
+            endpoint = self.require_endpoint()
+            readable, _, _ = select.select([endpoint.fd], [], [], remaining)
             if not readable:
                 continue
             try:
-                chunk = self.endpoint.read(4096)
+                chunk = endpoint.read(4096)
             except BlockingIOError:
                 continue
             if not chunk:
@@ -285,177 +281,55 @@ def configure_serial(fd: int, baud: int) -> None:
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
-def cbor_head(major: int, value: int) -> bytes:
-    if value < 24:
-        return bytes([(major << 5) | value])
-    if value <= 0xFF:
-        return bytes([(major << 5) | 24, value])
-    if value <= 0xFFFF:
-        return bytes([(major << 5) | 25]) + value.to_bytes(2, "big")
-    raise ValueError(f"CBOR value too large: {value}")
+def set_modem_line(fd: int, line: int, enabled: bool) -> None:
+    """Set one UART modem-control bit without clobbering the other line."""
+    bits = struct.pack("I", int(line))
+    request = termios.TIOCMBIS if enabled else termios.TIOCMBIC
+    fcntl.ioctl(fd, request, bits)
 
 
-def cbor_uint(value: int) -> bytes:
-    return cbor_head(0, value)
+def adapter_name(port: str) -> str:
+    """Resolve a managed lmesh socket spelling to its configured adapter name."""
+    if port.endswith(".lmesh") and "/" not in port:
+        return port.removesuffix(".lmesh")
+    if port.startswith(("uds://", "unix://")) or port.endswith(".sock"):
+        return os.path.basename(parse_uds_path(port)).removesuffix(".sock")
+    raise ValueError(f"cannot resolve managed lmesh adapter from {port!r}")
 
 
-def cbor_text(value: str) -> bytes:
-    data = value.encode("utf-8")
-    return cbor_head(3, len(data)) + data
-
-
-def cbor_bytes(value: bytes) -> bytes:
-    return cbor_head(2, len(value)) + value
-
-
-def encode_firmware_command(command: str, *, payload: bytes | None = None) -> bytes:
-    words = command.split()
-    if not words:
-        raise ValueError("empty firmware command")
-    fields: list[tuple[str, bytes]] = []
-    for word in words[1:]:
-        key, value = word.split("=", 1) if "=" in word else (word, "true")
-        if key == "payload":
-            raw = bytes.fromhex(value.removeprefix("hex:"))
-            fields.append(("data", cbor_bytes(raw)))
-        else:
-            fields.append((key, cbor_text(value)))
-    if payload is not None:
-        fields.append(("data", cbor_bytes(payload)))
-    cbor = bytearray(cbor_head(5, 1 + bool(fields)))
-    cbor.extend(cbor_uint(0))
-    cbor.extend(cbor_text(words[0]))
-    if fields:
-        cbor.extend(cbor_uint(6))
-        cbor.extend(cbor_head(5, len(fields)))
-        for key, encoded_value in fields:
-            cbor.extend(cbor_text(key))
-            cbor.extend(encoded_value)
-    body = b"\x00\xcb\x00\x00" + bytes(cbor)
-    return len(body).to_bytes(4, "big") + body
-
-
-def encode_uart_frame(cbor: bytes) -> bytes:
-    if not 1 <= len(cbor) <= FIRMWARE_RECORD_MAX:
-        raise ValueError(f"UART CBOR frame must be 1..{FIRMWARE_RECORD_MAX} bytes")
-    output = bytearray([UART_FLAG])
-    for byte in cbor:
-        if byte in (UART_FLAG, UART_ESCAPE):
-            output.extend((UART_ESCAPE, byte ^ UART_ESCAPE_XOR))
-        else:
-            output.append(byte)
-    output.append(UART_FLAG)
-    return bytes(output)
-
-
-class UartDecoder:
-    """Bounded HDLC/PPP-style decoder for the physical UART payload."""
-
-    def __init__(self) -> None:
-        self.in_frame = False
-        self.escaped = False
-        self.discard_until_flag = False
-        self.payload = bytearray()
-
-    def push(self, bytes_: bytes) -> list[bytes]:
-        records: list[bytes] = []
-        for byte in bytes_:
-            if byte == UART_FLAG:
-                if not self.in_frame:
-                    self.in_frame = True
-                    self.escaped = False
-                    self.discard_until_flag = False
-                    self.payload.clear()
-                    continue
-                if self.escaped:
-                    self.payload.clear()
-                    self.escaped = False
-                    self.discard_until_flag = False
-                    continue
-                if not self.discard_until_flag and self.payload:
-                    records.append(bytes(self.payload))
-                self.payload.clear()
-                self.discard_until_flag = False
-                continue
-            if not self.in_frame or self.discard_until_flag:
-                continue
-            if self.escaped:
-                self.payload.append(byte ^ UART_ESCAPE_XOR)
-                self.escaped = False
-            elif byte == UART_ESCAPE:
-                self.escaped = True
-                continue
-            else:
-                self.payload.append(byte)
-            if len(self.payload) > FIRMWARE_RECORD_MAX:
-                self.payload.clear()
-                self.escaped = False
-                self.discard_until_flag = True
-        return records
-
-
-def decode_cbor(data: bytes, offset: int = 0) -> tuple[object, int]:
-    if offset >= len(data):
-        raise ValueError("truncated CBOR")
-    head = data[offset]
-    offset += 1
-    major, extra = head >> 5, head & 0x1F
-    if extra < 24:
-        length = extra
-    elif extra == 24:
-        length = data[offset]
-        offset += 1
-    elif extra == 25:
-        length = int.from_bytes(data[offset:offset + 2], "big")
-        offset += 2
-    else:
-        raise ValueError(f"unsupported CBOR additional info {extra}")
-    if major == 0:
-        return length, offset
-    if major in (2, 3):
-        end = offset + length
-        raw = data[offset:end]
-        if len(raw) != length:
-            raise ValueError("truncated CBOR string")
-        return (raw if major == 2 else raw.decode("utf-8", "replace")), end
-    if major == 5:
-        out: dict[object, object] = {}
-        for _ in range(length):
-            key, offset = decode_cbor(data, offset)
-            value, offset = decode_cbor(data, offset)
-            out[key] = value
-        return out, offset
-    raise ValueError(f"unsupported CBOR major type {major}")
-
-
-def render_cbor(data: bytes) -> str:
-    try:
-        value, used = decode_cbor(data)
-        if used != len(data):
-            raise ValueError("trailing bytes")
-        if not isinstance(value, dict):
-            return repr(value)
-        payload = value.get(6)
-        if isinstance(payload, dict) and isinstance(payload.get(32), str):
-            return payload[32]
-        if isinstance(value.get(5), str):
-            return f"error message={value[5]}"
-        if isinstance(value.get(4), str):
-            return f"status={value[4]}"
-        return repr(value)
-    except (UnicodeDecodeError, ValueError, IndexError):
-        return f"cbor_hex={data.hex()}"
-
-
-def is_event_cbor(data: bytes) -> bool:
-    try:
-        value, used = decode_cbor(data)
-        if used != len(data) or not isinstance(value, dict):
-            return False
-        payload = value.get(6)
-        return isinstance(payload, dict) and payload.get(4) == "event"
-    except (UnicodeDecodeError, ValueError, IndexError):
-        return False
+def lmesh_serial_command(adapter: str, command: str, timeout: float) -> str:
+    """Call the lmesh text API; lmesh owns all firmware CBOR translation."""
+    control_socket = os.environ.get("LMESH_CONTROL_SOCKET", "/run/mesh/lmesh/mesh.sock")
+    request = {
+        "id": "serial-cmd",
+        "method": "esp.serial.command",
+        "port": adapter,
+        "command": command,
+        "timeout_sec": timeout,
+    }
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        control.settimeout(timeout + 1.0)
+        control.connect(control_socket)
+        control.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
+        response = bytearray()
+        while b"\n" not in response:
+            chunk = control.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+    if not response:
+        raise TimeoutError(f"no JSONL response from lmesh control socket {control_socket}")
+    reply = json.loads(bytes(response).split(b"\n", 1)[0])
+    if reply.get("error"):
+        raise RuntimeError(str(reply["error"]))
+    data = reply.get("data", reply.get("result", {}))
+    if not isinstance(data, dict):
+        return json.dumps(data, sort_keys=True)
+    if not data.get("ok", True):
+        raise RuntimeError(str(data.get("error", data)))
+    messages = data.get("messages", [])
+    lines = [entry["console"] for entry in messages if isinstance(entry, dict) and "console" in entry]
+    return "\n".join(lines) if lines else json.dumps(data, sort_keys=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -467,17 +341,30 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Endpoint to query: /dev/ttyUSB0, uds:///run/.../USB0.sock, "
             "lora1.lmesh, tcp://127.0.0.1:3330, socket://127.0.0.1:3330, "
-            "or a bare .sock path. UDS/TCP endpoints use the mesh stream; "
-            "physical UART endpoints use escaped delimiter-framed CBOR."
+            "or a bare .sock path. Commands require a managed lmesh UDS socket; "
+            "direct physical UART is only available for reset/capture diagnostics."
         ),
     )
     parser.add_argument("--baud", type=int, default=460800)
-    parser.add_argument(
-        "--text-debug",
-        action="store_true",
-        help="Use obsolete newline/prompt console mode instead of framed CBOR.",
-    )
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--dtr",
+        type=int,
+        default=0,
+        metavar="MS",
+        help=(
+            "Pulse managed lmesh DTR when used alone (1..10000 ms). Firmware "
+            "commands request their own one-connection wake through lmesh."
+        ),
+    )
+    parser.add_argument(
+        "--reset-run",
+        action="store_true",
+        help=(
+            "Reset a direct physical ESP UART into normal application mode "
+            "before capture/commands; use only after its managed forward is stopped."
+        ),
+    )
     parser.add_argument(
         "--cmd", action="append", help="Command to run. Repeat for multiple commands in order."
     )
@@ -522,13 +409,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not args.cmd and args.capture_ms <= 0:
-        raise SystemExit("at least one --cmd or a positive --capture-ms is required")
+    if not args.cmd and args.capture_ms <= 0 and args.dtr <= 0 and not args.reset_run:
+        raise SystemExit("at least one --cmd, --dtr, --reset-run, or a positive --capture-ms is required")
     if (
         args.capture_ms < 0
         or args.repeat_delay_ms < 0
     ):
         raise SystemExit("timing arguments must be non-negative")
+    if args.dtr and not 1 <= args.dtr <= 10_000:
+        raise SystemExit("--dtr must be between 1 and 10000 milliseconds")
     if args.repeat < 1 or args.repeat_cmds < 1:
         raise SystemExit("--repeat and --repeat-cmds must be at least one")
     rc = 0
@@ -544,25 +433,25 @@ def main() -> int:
                 args.timeout,
             )
             try:
+                if args.dtr and not args.cmd:
+                    print(f"[{port}] $ lmesh dtr {args.dtr}", flush=True)
+                    console.pulse_lmesh_dtr(args.dtr)
+                if args.reset_run:
+                    print(f"[{port}] $ reset run", flush=True)
+                    console.reset_run()
                 if args.capture_ms:
                     print(console.read_until_prompt(args.capture_ms / 1000.0).rstrip(), flush=True)
                     if not args.cmd:
                         continue
-                if not args.no_sync and args.text_debug:
-                    print(console.sync().rstrip(), flush=True)
                 for command_set in range(args.repeat_cmds):
                     if args.repeat_cmds > 1:
                         print(
                             f"--- command set {command_set + 1}/{args.repeat_cmds} ---",
                             flush=True,
                         )
-                    for command in args.cmd:
+                    for command in args.cmd or []:
                         print(f"[{port}] $ {command}", flush=True)
-                        out = (
-                            console.cmd(command, args.timeout)
-                            if args.text_debug
-                            else console.cbor_cmd(command, args.timeout)
-                        )
+                        out = console.command(command, args.timeout)
                         print(out.rstrip(), flush=True)
                         assert_no_firmware_fault(out, args.assert_uptime_monotonic)
                         text = out.strip()

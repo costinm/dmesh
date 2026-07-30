@@ -10,7 +10,7 @@ use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::frames::{decode_frame, hex_bytes};
+use super::frames::decode_frame;
 use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
@@ -22,13 +22,22 @@ extern "C" {
         min_units: c_ushort,
         max_units: c_ushort,
     ) -> c_int;
+    fn dmesh_nimble_start_pairing_advertising(min_units: c_ushort, max_units: c_ushort) -> c_int;
     fn dmesh_nimble_stop_advertising() -> c_int;
+    fn dmesh_nimble_start_scan(duration_ms: u32, active: c_uchar) -> c_int;
+    fn dmesh_nimble_stop_scan() -> c_int;
     fn dmesh_nimble_notify(data: *const c_uchar, len: c_ushort) -> c_int;
     fn dmesh_nimble_clear_bonds() -> c_int;
+    fn dmesh_nimble_set_bonding(enabled: c_uchar) -> c_int;
+    fn dmesh_nimble_set_raw_nan_link_profile(enabled: c_uchar) -> c_int;
     fn dmesh_nimble_tx_handle() -> c_ushort;
     fn dmesh_nimble_rx_handle() -> c_ushort;
     fn dmesh_nimble_enable_sleep() -> c_int;
     fn dmesh_nimble_disable_sleep() -> c_int;
+    fn dmesh_nimble_start_coc_server(psm: c_ushort) -> c_int;
+    fn dmesh_nimble_coc_server_psm() -> c_ushort;
+    fn dmesh_nimble_coc_connected() -> bool;
+    fn dmesh_nimble_coc_send(data: *const c_uchar, len: c_ushort) -> c_int;
 }
 
 static BLE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -55,7 +64,7 @@ static BLE_GATT_TX: AtomicU32 = AtomicU32::new(0);
 static BLE_GATT_CONN_ID: AtomicU32 = AtomicU32::new(0xffff);
 static BLE_GATT_TX_HANDLE: AtomicU32 = AtomicU32::new(0);
 static BLE_GATT_RX_HANDLE: AtomicU32 = AtomicU32::new(0);
-static BLE_TEXT_QUEUE: OnceLock<Mutex<VecDeque<Vec<u8>>>> = OnceLock::new();
+static BLE_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<BleCommand>>> = OnceLock::new();
 static BLE_COMPANION_ENABLED: AtomicBool = AtomicBool::new(false);
 static BLE_COMPANION_SAVE_PENDING: AtomicBool = AtomicBool::new(false);
 static BLE_PAIRING_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
@@ -75,6 +84,20 @@ static BLE_ADV_INT_MIN: AtomicU32 = AtomicU32::new(0x20);
 static BLE_ADV_INT_MAX: AtomicU32 = AtomicU32::new(0x40);
 static BLE_READY: AtomicBool = AtomicBool::new(false);
 static BLE_BONDS_CLEARED: AtomicU32 = AtomicU32::new(0);
+static BLE_RENDEZVOUS_SCAN_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+static BLE_RENDEZVOUS_WAKE_SEEN: AtomicBool = AtomicBool::new(false);
+static BLE_RENDEZVOUS_ADV_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+static BLE_RENDEZVOUS_SCAN_MS: AtomicU32 = AtomicU32::new(250);
+static BLE_RENDEZVOUS_ADV_MS: AtomicU32 = AtomicU32::new(1_000);
+static BLE_COC_PSM: AtomicU32 = AtomicU32::new(0);
+static BLE_COC_CONNECTED: AtomicBool = AtomicBool::new(false);
+static BLE_COC_RX: AtomicU32 = AtomicU32::new(0);
+static BLE_COC_TX: AtomicU32 = AtomicU32::new(0);
+static BLE_BONDING_ENABLED: AtomicBool = AtomicBool::new(false);
+static BLE_RAW_NAN_LINK_PROFILE: AtomicBool = AtomicBool::new(false);
+// Lab-only policy switch: retain connectable BLE across raw-NAN's Wi-Fi-off
+// interval so GATT and CoC can be compared with the same 4-second scheduler.
+static BLE_RAW_NAN_KEEP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 static BLE_CONNECTED_ADDR: [AtomicU8; 6] = [
     AtomicU8::new(0),
@@ -111,7 +134,9 @@ static BLE_LOCAL_ADDR: [AtomicU8; 6] = [
 static BLE_LOCAL_ADDR_TYPE: AtomicU8 = AtomicU8::new(0xff);
 
 #[allow(dead_code)]
-pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
+/// Temporary adopted IPSP identity used for compact legacy discovery records.
+/// The actual DMesh GATT characteristics remain under the 128-bit DMesh UUID.
+pub const DMESH_BLE_SERVICE_UUID16: u16 = 0x1820;
 pub const DMESH_BLE_PAIRING_UUID: [u8; 16] = [
     0x01, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
 ];
@@ -134,6 +159,17 @@ const BLE_MODE_LISTEN: u8 = 1;
 const BLE_MODE_ANNOUNCE: u8 = 2;
 const BLE_MODE_CONNECTABLE: u8 = 3;
 
+#[derive(Clone, Copy)]
+enum BleTransport {
+    Gatt,
+    Coc,
+}
+
+struct BleCommand {
+    transport: BleTransport,
+    data: Vec<u8>,
+}
+
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
     {
         let settings_ref = settings.borrow();
@@ -148,20 +184,31 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
                 .clamp(0, 999_999) as u32,
             Ordering::Relaxed,
         );
+        BLE_RENDEZVOUS_SCAN_MS.store(
+            settings_ref
+                .get_i32("bc.scan_ms", 250)
+                .unwrap_or(250)
+                .clamp(50, 2_000) as u32,
+            Ordering::Relaxed,
+        );
+        BLE_RENDEZVOUS_ADV_MS.store(
+            settings_ref
+                .get_i32("bc.adv_ms", 1_000)
+                .unwrap_or(1_000)
+                .clamp(100, 10_000) as u32,
+            Ordering::Relaxed,
+        );
     }
     registry.register(RadioCommand::with_settings("ble", settings));
 }
 
 pub fn advertised_identity() -> String {
     format!(
-        "mac={} addr_type={} adv_uuid={} pair_uuid={} gatt_service={} gatt_rx={} gatt_tx={}",
+        "mac={} addr_type={} adv_uuid={} pair_uuid={} transport=coc gatt_service=false",
         public_bt_address_string(),
         BLE_LOCAL_ADDR_TYPE.load(Ordering::Relaxed),
         uuid128_string(&DMESH_BLE_OPERATIONAL_UUID),
-        uuid128_string(&DMESH_BLE_PAIRING_UUID),
-        uuid128_string(&DMESH_GATT_SERVICE_UUID),
-        uuid128_string(&DMESH_GATT_RX_UUID),
-        uuid128_string(&DMESH_GATT_TX_UUID)
+        uuid128_string(&DMESH_BLE_PAIRING_UUID)
     )
 }
 
@@ -175,9 +222,8 @@ pub fn uuid128_string(uuid: &[u8; 16]) -> String {
 
 pub fn forward_packet_for_window(packet: &[u8], window_ms: u32) -> Result<bool> {
     ensure_ble()?;
-    start_gatt()?;
     announce_packet(DmeshBleEvent::PayloadPending, packet, None)?;
-    send_gatt(packet);
+    send_coc(packet);
     let deadline = Instant::now() + Duration::from_millis(window_ms as u64);
     while Instant::now() < deadline {
         task_delay(Duration::from_millis(100));
@@ -187,7 +233,6 @@ pub fn forward_packet_for_window(packet: &[u8], window_ms: u32) -> Result<bool> 
 
 pub fn start_listen_mode() -> Result<()> {
     ensure_ble()?;
-    start_gatt()?;
     start_scan_params(0, true)?;
     BLE_MODE.store(BLE_MODE_LISTEN, Ordering::Relaxed);
     Ok(())
@@ -218,14 +263,140 @@ pub fn disable_controller_sleep() -> Result<()> {
 }
 
 pub fn stop_radio_activity() {
+    if BLE_RAW_NAN_KEEP_ACTIVE.load(Ordering::Relaxed) {
+        telemetry::record_log("event type=ble.radio_stop deferred=keep_active");
+        return;
+    }
+    force_stop_radio_activity();
+}
+
+/// Stop BLE activity even while the explicit connectivity-test override is set.
+pub fn force_stop_radio_activity() {
     if BLE_STARTED.load(Ordering::Relaxed) {
         unsafe {
             let _ = dmesh_nimble_stop_advertising();
+            let _ = dmesh_nimble_stop_scan();
         }
     }
     BLE_ADV_STARTED.store(false, Ordering::Relaxed);
     BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
     BLE_MODE.store(BLE_MODE_OFF, Ordering::Relaxed);
+}
+
+/// Whether an Android client currently owns the ESP GATT server connection.
+/// Raw-NAN uses this to avoid entering a CPU light-sleep interval that would
+/// exceed the negotiated BLE supervision timeout.
+pub fn gatt_connected() -> bool {
+    BLE_GATT_CONNECTED.load(Ordering::Relaxed)
+}
+
+/// A live companion transport keeps the ESP awake for the short transfer.
+/// CoC and GATT have the same raw-NAN sleep policy: disconnect before the
+/// next idle interval, then resume rendezvous advertising/scanning.
+pub fn companion_connected() -> bool {
+    BLE_GATT_CONNECTED.load(Ordering::Relaxed)
+        || BLE_COC_CONNECTED.load(Ordering::Relaxed)
+        || unsafe { dmesh_nimble_coc_connected() }
+}
+
+/// True while a bounded scan or response advertisement owns the current
+/// raw-NAN awake window. This deliberately does not include idle BLE state.
+pub fn rendezvous_active() -> bool {
+    let now = now_ms();
+    let scan = BLE_RENDEZVOUS_SCAN_DEADLINE_MS.load(Ordering::Relaxed);
+    let adv = BLE_RENDEZVOUS_ADV_DEADLINE_MS.load(Ordering::Relaxed);
+    BLE_GATT_CONNECTED.load(Ordering::Relaxed)
+        || (scan != 0 && now.wrapping_sub(scan) >= i32::MAX as u32)
+        || (adv != 0 && now.wrapping_sub(adv) >= i32::MAX as u32)
+}
+
+/// Start the bounded BLE rendezvous for a raw-NAN active window.
+///
+/// This only makes the ESP discoverable. Android treats the advertisement as a
+/// pending-data signal and opens a short-lived CoC channel; DMesh does not use
+/// GATT for payloads. This is active after either the saved companion policy
+/// (`ble.comp=true`) or an explicit current-boot `ble start=true` request.
+/// The latter keeps the transport probe independent of pairing/encryption
+/// policy.
+pub fn raw_nan_wake_window() {
+    if !BLE_COMPANION_ENABLED.load(Ordering::Relaxed) && !BLE_STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if companion_connected() {
+        telemetry::record_log("event type=ble.raw_nan state=connection_retained");
+        return;
+    }
+    if BLE_RAW_NAN_KEEP_ACTIVE.load(Ordering::Relaxed) {
+        if !BLE_ADV_STARTED.load(Ordering::Relaxed) {
+            if let Err(err) = start_connectable_idle() {
+                telemetry::record_log(format!(
+                    "event type=ble.raw_nan state=retain_failed msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+                return;
+            }
+        }
+        telemetry::record_log("event type=ble.raw_nan state=advertising_retained");
+        return;
+    }
+    let pending = telemetry::pending_message_count() > 0;
+    let scan_ms = companion_scan_ms();
+    if pending {
+        match start_connectable_event(DmeshBleEvent::PayloadPending, &[]) {
+            Ok(()) => {
+                open_companion_active_window(companion_adv_ms());
+                telemetry::record_log("event type=ble.raw_nan state=payload_advertising")
+            }
+            Err(err) => telemetry::record_log(format!(
+                "event type=ble.raw_nan state=advertise_failed msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            )),
+        }
+    } else if scan_ms == 0 {
+        return;
+    } else {
+        match start_scan_params(scan_ms, true) {
+            Ok(()) => {
+                BLE_RENDEZVOUS_WAKE_SEEN.store(false, Ordering::Relaxed);
+                BLE_RENDEZVOUS_SCAN_DEADLINE_MS
+                    .store(now_ms().wrapping_add(scan_ms), Ordering::Relaxed);
+                telemetry::record_log(format!(
+                    "event type=ble.raw_nan state=wake_scan scan_ms={scan_ms}"
+                ));
+            }
+            Err(err) => telemetry::record_log(format!(
+                "event type=ble.raw_nan state=scan_failed msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            )),
+        }
+    }
+}
+
+/// Align disconnected BLE radio-off time with raw-NAN's Wi-Fi-off interval.
+/// A connected link remains up so explicit light sleep can prove whether it
+/// survives the interval or must use the next advertisement to reconnect.
+pub fn raw_nan_idle_window() {
+    if !BLE_COMPANION_ENABLED.load(Ordering::Relaxed) && !BLE_STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if companion_connected() {
+        telemetry::record_log("event type=ble.raw_nan state=connection_retained");
+    } else if BLE_RAW_NAN_KEEP_ACTIVE.load(Ordering::Relaxed) {
+        if let Err(err) = enable_controller_sleep() {
+            telemetry::record_log(format!(
+                "event type=ble.raw_nan state=retain_sleep_failed msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
+        }
+        telemetry::record_log("event type=ble.raw_nan state=advertising_retained");
+    } else {
+        stop_radio_activity();
+        telemetry::record_log("event type=ble.raw_nan state=off");
+    }
+}
+
+pub fn raw_nan_keep_active() -> bool {
+    BLE_RAW_NAN_KEEP_ACTIVE.load(Ordering::Relaxed)
 }
 
 pub fn configure_companion_advertising(period_ms: u32, window_ms: u32) {
@@ -249,7 +420,12 @@ pub fn open_companion_active_window(timeout_ms: u32) {
     }
     BLE_COMPANION_ACTIVE_DEADLINE_MS.store(now_ms().wrapping_add(timeout_ms), Ordering::Relaxed);
     BLE_COMPANION_ACTIVE_CHANGED.store(true, Ordering::Relaxed);
-    if BLE_COMPANION_ENABLED.load(Ordering::Relaxed) {
+    // The mode transition has already started the connectable advertisement.
+    // Replacing it again here races the controller's asynchronous stop/start
+    // sequence and can wedge the classic ESP32 host before it processes the
+    // next console request.  Only start it when this window is opened by a
+    // caller that did not already create an advertisement.
+    if BLE_COMPANION_ENABLED.load(Ordering::Relaxed) && !BLE_ADV_STARTED.load(Ordering::Relaxed) {
         let _ = start_connectable_idle();
     }
     telemetry::record_log(format!(
@@ -269,6 +445,7 @@ pub fn take_companion_active_changed() -> bool {
 }
 
 pub fn poll_text_commands(registry: &mut CommandRegistry) {
+    poll_raw_nan_rendezvous();
     poll_companion_advertising();
     if BLE_COMPANION_SAVE_PENDING.swap(false, Ordering::Relaxed) {
         let peer = paired_addr_string();
@@ -299,17 +476,25 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
     }
     for _ in 0..4 {
         let command = {
-            let mut queue = ble_text_queue().lock().unwrap();
+            let mut queue = ble_command_queue().lock().unwrap();
             queue.pop_front()
         };
         let Some(command) = command else {
             return;
         };
-        if command.is_empty() {
+        if command.data.is_empty() {
             continue;
         }
-        let response = crate::transports::dispatch_binary_packet(registry, &command);
-        send_gatt(&response);
+        let response = match command.transport {
+            BleTransport::Gatt => {
+                crate::transports::dispatch_binary_packet(registry, &command.data)
+            }
+            BleTransport::Coc => crate::transports::dispatch_coc_packet(registry, &command.data),
+        };
+        match command.transport {
+            BleTransport::Gatt => send_gatt(&response),
+            BleTransport::Coc => send_coc(&response),
+        }
     }
 }
 
@@ -323,11 +508,9 @@ pub fn announce_packet(
     metrics: Option<(i32, f32)>,
 ) -> Result<()> {
     ensure_ble()?;
-    start_gatt()?;
-    wait_gatt_service_ready(Duration::from_millis(1_000))?;
     let adv = dmesh_adv_data(event, packet, metrics)?;
     start_raw_adv(&adv)?;
-    send_gatt(packet);
+    send_coc(packet);
     BLE_ANNOUNCE_TX.fetch_add(1, Ordering::Relaxed);
     BLE_MODE.store(BLE_MODE_CONNECTABLE, Ordering::Relaxed);
     telemetry::record_packet("ble", Direction::Tx, &adv, "announce=true");
@@ -472,6 +655,16 @@ pub enum DmeshBleEvent {
 }
 
 impl DmeshBleEvent {
+    fn code(self) -> u8 {
+        match self {
+            Self::Generic => 0,
+            Self::LoraRx => 1,
+            Self::IdleHello => 2,
+            Self::WakeRequest => 3,
+            Self::PayloadPending => 4,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Generic => "generic",
@@ -569,6 +762,31 @@ impl CommandHandler for RadioCommand {
                 .unwrap_or(min_ms as i32)
                 .max(min_ms as i32) as u32;
             set_advertising_interval_ms(min_ms, max_ms);
+        }
+        if request.arg("rendezvous_scan_ms").is_some() || request.arg("rendezvous_adv_ms").is_some()
+        {
+            let scan_ms = request
+                .arg_i32("rendezvous_scan_ms")?
+                .unwrap_or(BLE_RENDEZVOUS_SCAN_MS.load(Ordering::Relaxed) as i32)
+                .clamp(50, 2_000) as u32;
+            let adv_ms = request
+                .arg_i32("rendezvous_adv_ms")?
+                .unwrap_or(BLE_RENDEZVOUS_ADV_MS.load(Ordering::Relaxed) as i32)
+                .clamp(100, 10_000) as u32;
+            BLE_RENDEZVOUS_SCAN_MS.store(scan_ms, Ordering::Relaxed);
+            BLE_RENDEZVOUS_ADV_MS.store(adv_ms, Ordering::Relaxed);
+            if request
+                .arg("save")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                if let Some(settings) = &self.settings {
+                    let mut settings = settings.borrow_mut();
+                    settings.set_i32("bc.scan_ms", scan_ms as i32)?;
+                    settings.set_i32("bc.adv_ms", adv_ms as i32)?;
+                }
+            }
         }
         if let Some(uuid16) = request.arg("filter_uuid16") {
             let uuid16 = parse_i32(uuid16)? as u32;
@@ -723,9 +941,62 @@ impl CommandHandler for RadioCommand {
         }
         if request.arg("start").is_some() {
             self.ensure_ble()?;
-            start_gatt()?;
+            // An earlier bounded raw-NAN rendezvous may have left an expired
+            // deadline behind.  A manual CoC listener start is an explicit
+            // advertising request and must not be immediately cancelled by
+            // that old window.
+            BLE_RENDEZVOUS_SCAN_DEADLINE_MS.store(0, Ordering::Relaxed);
+            BLE_RENDEZVOUS_ADV_DEADLINE_MS.store(0, Ordering::Relaxed);
             start_connectable_idle()?;
             return Ok(CommandResponse::ok("ble started"));
+        }
+        if let Some(keep_active) = request.arg("keep_active").map(parse_bool).transpose()? {
+            BLE_RAW_NAN_KEEP_ACTIVE.store(keep_active, Ordering::Relaxed);
+            if keep_active {
+                self.ensure_ble()?;
+                start_connectable_idle()?;
+                if let Err(err) = enable_controller_sleep() {
+                    telemetry::record_log(format!(
+                        "event type=ble.controller_sleep enabled=false reason={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                }
+            }
+            return Ok(CommandResponse::ok(format!(
+                "ble keep_active={} {}",
+                keep_active,
+                ble_stats()
+            )));
+        }
+        if let Some(bonding) = request.arg("bonding").map(parse_bool).transpose()? {
+            self.ensure_ble()?;
+            let rc = unsafe { dmesh_nimble_set_bonding(bonding as c_uchar) };
+            if rc != 0 {
+                bail!("nimble bonding policy rc={rc}");
+            }
+            BLE_BONDING_ENABLED.store(bonding, Ordering::Relaxed);
+            return Ok(CommandResponse::ok(format!(
+                "ble bonding={} existing_links_unchanged=true",
+                bonding
+            )));
+        }
+        if let Some(profile) = request.arg("link_profile") {
+            let raw_nan = match profile {
+                "raw_nan" => true,
+                "default" => false,
+                other => bail!("ble link_profile must be raw_nan or default, got {other:?}"),
+            };
+            self.ensure_ble()?;
+            let rc = unsafe { dmesh_nimble_set_raw_nan_link_profile(raw_nan as c_uchar) };
+            if rc != 0 {
+                bail!("nimble link profile rc={rc}");
+            }
+            BLE_RAW_NAN_LINK_PROFILE.store(raw_nan, Ordering::Relaxed);
+            return Ok(CommandResponse::ok(if raw_nan {
+                "ble link_profile=raw_nan interval_ms=1000 latency=3 supervision_ms=30000"
+            } else {
+                "ble link_profile=default"
+            }));
         }
         if request
             .arg("stop")
@@ -738,11 +1009,34 @@ impl CommandHandler for RadioCommand {
                 .transpose()?
                 .is_some_and(|advertise| !advertise)
         {
-            stop_radio_activity();
+            force_stop_radio_activity();
             return Ok(CommandResponse::ok("ble stopped"));
         }
         if request.arg("stats").is_some() {
             return Ok(CommandResponse::ok(ble_stats()));
+        }
+        if request.arg("identity").is_some() {
+            self.ensure_ble()?;
+            return Ok(CommandResponse::ok(advertised_identity()));
+        }
+        if request.arg("coc").is_some() {
+            self.ensure_ble()?;
+            let psm = request
+                .arg("psm")
+                .map(parse_coc_psm)
+                .transpose()?
+                .unwrap_or(0x80);
+            if !(0x80..=0xff).contains(&psm) {
+                bail!("CoC PSM must be in 0x80..0xff, got 0x{psm:04x}");
+            }
+            let rc = unsafe { dmesh_nimble_start_coc_server(psm as c_ushort) };
+            if rc != 0 {
+                bail!("nimble CoC server rc={rc} psm=0x{psm:04x}");
+            }
+            BLE_COC_PSM.store(psm as u32, Ordering::Relaxed);
+            return Ok(CommandResponse::ok(format!(
+                "ble coc started=true psm=0x{psm:04x} echo=true"
+            )));
         }
         if request.arg("bonds").is_some() || request.arg("paired").is_some() {
             return Ok(CommandResponse::ok(ble_bond_status(self.settings.as_ref())));
@@ -758,7 +1052,6 @@ impl CommandHandler for RadioCommand {
             .unwrap_or(false)
         {
             self.ensure_ble()?;
-            start_gatt()?;
             start_scan(request)?;
             return Ok(CommandResponse::ok(format!(
                 "ble scan started {}",
@@ -772,7 +1065,6 @@ impl CommandHandler for RadioCommand {
             .unwrap_or(false)
         {
             self.ensure_ble()?;
-            start_gatt()?;
             start_pairable_advertising()?;
             return Ok(CommandResponse::ok(format!(
                 "ble pairable started {}",
@@ -818,22 +1110,12 @@ impl CommandHandler for RadioCommand {
                 ble_stats()
             )));
         }
-        if let Some(data) = request.arg("send").or_else(|| request.arg("gatt")) {
-            self.ensure_ble()?;
-            start_gatt()?;
-            let payload = parse_bytes(data)?;
-            send_gatt(&payload);
-            telemetry::record_packet("ble", Direction::Tx, &payload, "source=gatt_command");
-            return Ok(CommandResponse::ok(format!(
-                "ble gatt sent bytes={} {}",
-                payload.len(),
-                ble_stats()
-            )));
+        if request.arg("gatt").is_some() {
+            bail!("GATT payload transport is disabled; use CoC after rendezvous advertising");
         }
         if let Some(mode) = request.arg("mode") {
             if mode == "listen" || mode == "scan" {
                 self.ensure_ble()?;
-                start_gatt()?;
                 start_scan_params(0, true)?;
                 BLE_MODE.store(BLE_MODE_LISTEN, Ordering::Relaxed);
                 return Ok(CommandResponse::ok(format!(
@@ -843,7 +1125,6 @@ impl CommandHandler for RadioCommand {
             }
             if mode == "announce" || mode == "connectable" {
                 self.ensure_ble()?;
-                start_gatt()?;
                 let payload = request
                     .arg("payload")
                     .or_else(|| request.arg("data"))
@@ -862,21 +1143,26 @@ impl CommandHandler for RadioCommand {
                 )));
             }
             if mode == "gatt" || mode == "nus" || mode == "meshcore" {
-                self.ensure_ble()?;
-                start_gatt()?;
-                return Ok(CommandResponse::ok(format!(
-                    "ble gatt started {}",
-                    ble_stats()
-                )));
+                bail!("GATT application mode is disabled; use CoC after rendezvous advertising");
             }
         }
         Ok(CommandResponse::ok(ble_stats()))
     }
 }
 
+fn parse_coc_psm(value: &str) -> Result<u16> {
+    let value = value.trim();
+    let parsed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u16::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse::<u16>())
+        .map_err(|err| anyhow::anyhow!("invalid CoC PSM {value:?}: {err}"))?;
+    Ok(parsed)
+}
+
 pub fn start_companion_runtime() -> Result<()> {
     ensure_ble()?;
-    start_gatt()?;
     start_connectable_idle()?;
     Ok(())
 }
@@ -938,7 +1224,8 @@ fn start_raw_adv(data: &[u8]) -> Result<()> {
     if data.len() > 31 {
         bail!("BLE legacy advertising data is limited to 31 bytes");
     }
-    wait_gatt_service_ready(Duration::from_millis(1_000))?;
+    ensure_ble()?;
+    stop_scan_for_advertising()?;
     let rc = unsafe {
         dmesh_nimble_start_advertising(
             data.as_ptr(),
@@ -959,24 +1246,46 @@ fn start_connectable_idle() -> Result<()> {
 }
 
 fn start_pairable_advertising() -> Result<()> {
-    start_gatt()?;
-    wait_gatt_service_ready(Duration::from_millis(1_000))?;
-    let mut adv = Vec::with_capacity(28);
-    adv.extend_from_slice(&[0x02, 0x01, 0x06]);
-    adv.push((DMESH_BLE_PAIRING_UUID.len() + 1) as u8);
-    adv.push(0x07);
-    adv.extend_from_slice(&DMESH_BLE_PAIRING_UUID);
-    adv.extend_from_slice(&[0x06, 0x08, b'D', b'M', b'e', b's', b'h']);
-    start_raw_adv(&adv)?;
+    ensure_ble()?;
+    stop_scan_for_advertising()?;
+    let rc = unsafe {
+        dmesh_nimble_start_pairing_advertising(
+            BLE_ADV_INT_MIN.load(Ordering::Relaxed) as c_ushort,
+            BLE_ADV_INT_MAX.load(Ordering::Relaxed) as c_ushort,
+        )
+    };
+    if rc != 0 {
+        bail!("nimble pairing advertise rc={rc}");
+    }
+    BLE_ADV_STARTED.store(true, Ordering::Relaxed);
     BLE_MODE.store(BLE_MODE_CONNECTABLE, Ordering::Relaxed);
     let line = format!(
         "event type=ble.pairing state=advertising uuid={} name=DMesh adv_raw={} {}",
         uuid128_string(&DMESH_BLE_PAIRING_UUID),
-        hex_bytes(&adv),
+        "nimble_fields",
         advertised_identity()
     );
-    telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
+    // NimBLE invokes this on its host task.  Do not forward a console event
+    // from here: emit_console may start raw Wi-Fi to reach a previous command
+    // peer, which blocks the host before it can process ATT/GATT traffic.
+    telemetry::record_log(line);
+    Ok(())
+}
+
+/// A classic ESP32 controller cannot perform the continuous discovery scan and
+/// the connectable advertising procedure needed by Android at the same time.
+/// Always end a pending scan before handing the controller to an advertising
+/// transition; otherwise NimBLE can report advertising enabled while Android
+/// never receives a connectable advertisement or callback.
+fn stop_scan_for_advertising() -> Result<()> {
+    if !BLE_STARTED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let rc = unsafe { dmesh_nimble_stop_scan() };
+    if rc != 0 {
+        bail!("nimble stop scan before advertising rc={rc}");
+    }
+    BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -985,28 +1294,100 @@ fn start_scan(_request: &CommandRequest) -> Result<()> {
 }
 
 fn start_scan_params(_duration: u32, _active: bool) -> Result<()> {
-    bail!("BLE scanning is not implemented on the NimBLE backend yet")
+    ensure_ble()?;
+    let rc = unsafe { dmesh_nimble_start_scan(_duration, _active as c_uchar) };
+    if rc != 0 {
+        bail!("nimble scan rc={rc}");
+    }
+    BLE_SCAN_STARTED.store(true, Ordering::Relaxed);
+    BLE_MODE.store(BLE_MODE_LISTEN, Ordering::Relaxed);
+    Ok(())
+}
+
+fn companion_scan_ms() -> u32 {
+    BLE_RENDEZVOUS_SCAN_MS.load(Ordering::Relaxed)
+}
+
+fn companion_adv_ms() -> u32 {
+    BLE_RENDEZVOUS_ADV_MS.load(Ordering::Relaxed)
+}
+
+fn start_connectable_event(event: DmeshBleEvent, packet: &[u8]) -> Result<()> {
+    ensure_ble()?;
+    announce_packet(event, packet, None)?;
+    BLE_MODE.store(BLE_MODE_CONNECTABLE, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Advance the bounded scan/advertise state before raw-NAN decides whether it
+/// may enter its next light-sleep interval.
+pub fn poll_raw_nan_rendezvous() {
+    let now = now_ms();
+    let scan_deadline = BLE_RENDEZVOUS_SCAN_DEADLINE_MS.load(Ordering::Relaxed);
+    if scan_deadline != 0 && now.wrapping_sub(scan_deadline) < i32::MAX as u32 {
+        BLE_RENDEZVOUS_SCAN_DEADLINE_MS.store(0, Ordering::Relaxed);
+        unsafe {
+            let _ = dmesh_nimble_stop_scan();
+        }
+        BLE_SCAN_STARTED.store(false, Ordering::Relaxed);
+        if BLE_RENDEZVOUS_WAKE_SEEN.swap(false, Ordering::Relaxed) {
+            match start_connectable_event(DmeshBleEvent::IdleHello, &[]) {
+                Ok(()) => {
+                    let adv_ms = companion_adv_ms();
+                    BLE_RENDEZVOUS_ADV_DEADLINE_MS
+                        .store(now.wrapping_add(adv_ms), Ordering::Relaxed);
+                    telemetry::record_log(format!(
+                        "event type=ble.rendezvous state=connectable wake=true adv_ms={adv_ms}"
+                    ));
+                }
+                Err(err) => telemetry::record_log(format!(
+                    "event type=ble.rendezvous state=advertise_failed msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                )),
+            }
+        } else {
+            telemetry::record_log("event type=ble.rendezvous state=no_wake");
+        }
+    }
+    let adv_deadline = BLE_RENDEZVOUS_ADV_DEADLINE_MS.load(Ordering::Relaxed);
+    if adv_deadline != 0
+        && now.wrapping_sub(adv_deadline) < i32::MAX as u32
+        && !BLE_GATT_CONNECTED.load(Ordering::Relaxed)
+    {
+        BLE_RENDEZVOUS_ADV_DEADLINE_MS.store(0, Ordering::Relaxed);
+        stop_radio_activity();
+        telemetry::record_log("event type=ble.rendezvous state=expired");
+    }
 }
 
 fn dmesh_adv_data(
-    _event: DmeshBleEvent,
+    event: DmeshBleEvent,
     packet: &[u8],
     _metrics: Option<(i32, f32)>,
 ) -> Result<Vec<u8>> {
     let (source, packet_id) = dmesh_adv_ids(packet);
     let pending = telemetry::pending_message_count();
     let battery = battery_level();
-    let mut service = Vec::with_capacity(26);
-    service.extend_from_slice(&DMESH_BLE_OPERATIONAL_UUID);
+    // Legacy advertisements permit 31 bytes total.  A 128-bit service-data
+    // UUID plus flags and the DMesh rendezvous fields needs 32 bytes, so the
+    // broadcast discovery marker uses the compact registered 16-bit UUID.
+    // The operational 128-bit UUID remains the GATT service after Android
+    // connects; it is not repeated in the advertisement.
+    let mut service = Vec::with_capacity(13);
+    service.extend_from_slice(&DMESH_BLE_SERVICE_UUID16.to_le_bytes());
     service.extend_from_slice(&source.to_le_bytes());
     service.extend_from_slice(&packet_id.to_le_bytes());
-    service.push(pending);
+    // v2 marker: Android can distinguish wake/idle/pending without treating
+    // an event code as a queue depth. The one-byte extension still fits in a
+    // legacy 31-byte advertisement with no payload prefix.
+    service.push(0x80 | pending.min(0x7f));
     service.push(battery);
+    service.push(event.code());
 
     let mut adv = Vec::with_capacity(31);
     adv.extend_from_slice(&[0x02, 0x01, 0x06]);
     adv.push((service.len() + 1).min(0xff) as u8);
-    adv.push(0x21);
+    adv.push(0x16); // Service Data - 16-bit UUID.
     adv.extend_from_slice(&service);
     if adv.len() > 31 {
         bail!("DMesh BLE announcement exceeded legacy advertising limit");
@@ -1120,12 +1501,15 @@ fn reset_pairing_state() -> usize {
 
 fn ble_stats() -> String {
     format!(
-        "ble backend=nimble started={} ready={} mode={} adv={} scan={} reports={} matched={} last_rssi={} filter=dmesh:{} filter_uuid16=0x{:04x} filter_addr={} announce_tx={} announce_rx={} wake_rx={} pending_switches={} gatt_started={} gatt_connected={} notify={} auth={} pairing_requested={} pairing_open={} fixed_pin={} gatt_rx_text={} gatt_rx_binary={} gatt_tx={} rx_handle={} tx_handle={}",
+        "ble backend=nimble started={} ready={} mode={} adv={} scan={} keep_active={} bonding={} link_profile={} reports={} matched={} last_rssi={} filter=dmesh:{} filter_uuid16=0x{:04x} filter_addr={} announce_tx={} announce_rx={} wake_rx={} pending_switches={} gatt_started={} gatt_connected={} notify={} auth={} coc_psm=0x{:04x} coc_ready={} coc_connected={} coc_rx={} coc_tx={} pairing_requested={} pairing_open={} fixed_pin={} gatt_rx_text={} gatt_rx_binary={} gatt_tx={} rx_handle={} tx_handle={}",
         BLE_STARTED.load(Ordering::Relaxed),
         BLE_READY.load(Ordering::Relaxed),
         ble_mode_name(),
         BLE_ADV_STARTED.load(Ordering::Relaxed),
         BLE_SCAN_STARTED.load(Ordering::Relaxed),
+        BLE_RAW_NAN_KEEP_ACTIVE.load(Ordering::Relaxed),
+        BLE_BONDING_ENABLED.load(Ordering::Relaxed),
+        if BLE_RAW_NAN_LINK_PROFILE.load(Ordering::Relaxed) { "raw_nan" } else { "default" },
         BLE_SCAN_REPORTS.load(Ordering::Relaxed),
         BLE_SCAN_MATCHED.load(Ordering::Relaxed),
         BLE_SCAN_LAST_RSSI.load(Ordering::Relaxed),
@@ -1140,6 +1524,11 @@ fn ble_stats() -> String {
         BLE_GATT_CONNECTED.load(Ordering::Relaxed),
         BLE_GATT_NOTIFY_ENABLED.load(Ordering::Relaxed),
         BLE_GATT_AUTHENTICATED.load(Ordering::Relaxed),
+        BLE_COC_PSM.load(Ordering::Relaxed),
+        unsafe { dmesh_nimble_coc_server_psm() },
+        BLE_COC_CONNECTED.load(Ordering::Relaxed),
+        BLE_COC_RX.load(Ordering::Relaxed),
+        BLE_COC_TX.load(Ordering::Relaxed),
         pairing_requested(),
         pairing_open(),
         BLE_FIXED_PIN.load(Ordering::Relaxed),
@@ -1194,23 +1583,34 @@ fn ble_mode_name() -> &'static str {
     }
 }
 
-fn handle_gatt_rx(data: &[u8]) -> Vec<u8> {
-    telemetry::record_packet("ble", Direction::Rx, data, "source=gatt_rx");
-    if BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
+fn handle_ble_rx(data: &[u8], transport: BleTransport) -> Vec<u8> {
+    let source = match transport {
+        BleTransport::Gatt => "source=gatt_rx",
+        BleTransport::Coc => "source=coc_rx",
+    };
+    telemetry::record_packet("ble", Direction::Rx, data, source);
+    // The companion encryption flag is the legacy GATT pairing policy.  LE
+    // CoC uses its own short-lived channel and must not be rejected merely
+    // because no GATT authentication callback has run; otherwise a queued
+    // radio message can advertise successfully but can never be pulled over
+    // the CoC-only transport.
+    if matches!(transport, BleTransport::Gatt)
+        && BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
         && !BLE_GATT_AUTHENTICATED.load(Ordering::Relaxed)
     {
         return b"error message=companion_requires_encryption\n".to_vec();
     }
-    if data
-        .first()
-        .map(|byte| is_meshcore_binary_tag(*byte))
-        .unwrap_or(false)
+    if matches!(transport, BleTransport::Gatt)
+        && data
+            .first()
+            .map(|byte| is_meshcore_binary_tag(*byte))
+            .unwrap_or(false)
     {
         BLE_GATT_RX_BINARY.fetch_add(1, Ordering::Relaxed);
         return meshcore_response(data);
     }
     BLE_GATT_RX_BINARY.fetch_add(1, Ordering::Relaxed);
-    queue_ble_text(data);
+    queue_ble_command(transport, data);
     Vec::new()
 }
 
@@ -1266,17 +1666,20 @@ fn push_fixed_ascii(out: &mut Vec<u8>, value: &[u8], width: usize) {
     out.resize(out.len() + width - used, 0);
 }
 
-fn queue_ble_text(data: &[u8]) {
-    let mut queue = ble_text_queue().lock().unwrap();
+fn queue_ble_command(transport: BleTransport, data: &[u8]) {
+    let mut queue = ble_command_queue().lock().unwrap();
     if queue.len() >= 8 {
         let _ = queue.pop_front();
     }
-    queue.push_back(data.to_vec());
+    queue.push_back(BleCommand {
+        transport,
+        data: data.to_vec(),
+    });
     super::wake::notify();
 }
 
-fn ble_text_queue() -> &'static Mutex<VecDeque<Vec<u8>>> {
-    BLE_TEXT_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
+fn ble_command_queue() -> &'static Mutex<VecDeque<BleCommand>> {
+    BLE_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
 fn send_gatt(data: &[u8]) {
@@ -1294,6 +1697,26 @@ fn send_gatt(data: &[u8]) {
             telemetry::record_log(format!("event type=ble.gatt_notify ok=false rc={rc}"));
             break;
         }
+    }
+}
+
+fn send_coc(data: &[u8]) {
+    if !BLE_COC_CONNECTED.load(Ordering::Relaxed) || data.is_empty() {
+        return;
+    }
+    if data.len() > 256 {
+        telemetry::record_log(format!(
+            "event type=ble.coc_send ok=false reason=oversize len={}",
+            data.len()
+        ));
+        return;
+    }
+    let rc = unsafe { dmesh_nimble_coc_send(data.as_ptr(), data.len() as c_ushort) };
+    if rc == 0 {
+        BLE_COC_TX.fetch_add(1, Ordering::Relaxed);
+        telemetry::record_packet("ble", Direction::Tx, data, "source=coc_tx");
+    } else {
+        telemetry::record_log(format!("event type=ble.coc_send ok=false rc={rc}"));
     }
 }
 
@@ -1398,7 +1821,14 @@ fn paired_addr_string() -> String {
 fn format_mac(mac: &[u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        // NimBLE stores BLE address bytes least-significant first.  Keep all
+        // human-facing identities in the canonical Android / Bluetooth order.
+        mac[5],
+        mac[4],
+        mac[3],
+        mac[2],
+        mac[1],
+        mac[0]
     )
 }
 
@@ -1422,8 +1852,9 @@ pub unsafe extern "C" fn dmesh_nimble_on_ready(addr: *const c_uchar, addr_type: 
         addr_type,
         advertised_identity()
     );
-    telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
+    // Keep NimBLE callbacks nonblocking; normal command polling publishes
+    // telemetry outside the Bluetooth host task.
+    telemetry::record_log(line);
 }
 
 #[no_mangle]
@@ -1452,19 +1883,8 @@ pub unsafe extern "C" fn dmesh_nimble_on_connect(
         BLE_COMPANION_ENABLED.store(true, Ordering::Relaxed);
         BLE_COMPANION_SAVE_PENDING.store(true, Ordering::Relaxed);
     }
-    let line = format!(
-        "event type=ble.gatt state=connected peer={} conn={} encrypted={} authenticated={} bonded={} pairing_open={} companion={}",
-        format_mac(&peer),
-        conn_handle,
-        encrypted,
-        authenticated,
-        bonded,
-        pairing_open(),
-        BLE_COMPANION_ENABLED.load(Ordering::Relaxed)
-    );
-    telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
-    super::wake::notify();
+    // NimBLE invokes this from its host task.  Keep connection establishment
+    // allocation- and I/O-free so ATT service discovery can run immediately.
 }
 
 #[no_mangle]
@@ -1472,25 +1892,52 @@ pub unsafe extern "C" fn dmesh_nimble_on_disconnect(reason: c_ushort) {
     BLE_GATT_CONNECTED.store(false, Ordering::Relaxed);
     BLE_GATT_NOTIFY_ENABLED.store(false, Ordering::Relaxed);
     BLE_GATT_AUTHENTICATED.store(false, Ordering::Relaxed);
-    let line = format!("event type=ble.gatt state=disconnected reason={}", reason);
-    telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
-    super::wake::notify();
+    let _ = reason;
+}
+
+/// Record Android's short-lived `wake_request` advertisement.  This callback
+/// runs on the NimBLE host task; the normal firmware polling loop performs the
+/// scan-to-advertise transition after the bounded scan window completes.
+#[no_mangle]
+pub unsafe extern "C" fn dmesh_nimble_on_scan(
+    service_data: *const c_uchar,
+    len: c_ushort,
+    rssi: i8,
+) {
+    if service_data.is_null() || len < 11 {
+        return;
+    }
+    let data = core::slice::from_raw_parts(service_data, len as usize);
+    let data = if data.len() >= 18 && data[..16] == DMESH_BLE_OPERATIONAL_UUID {
+        &data[16..]
+    } else {
+        data
+    };
+    if data.len() < 11 || data[0..2] != DMESH_BLE_SERVICE_UUID16.to_le_bytes() {
+        return;
+    }
+    BLE_SCAN_REPORTS.fetch_add(1, Ordering::Relaxed);
+    BLE_SCAN_LAST_RSSI.store(rssi as i32, Ordering::Relaxed);
+    let event = if data[10] & 0x80 != 0 && data.len() >= 13 {
+        data[12]
+    } else {
+        // Pre-v2 Android builds overloaded this field with the event.
+        data[10]
+    };
+    if event == 3 {
+        BLE_SCAN_MATCHED.fetch_add(1, Ordering::Relaxed);
+        BLE_WAKE_REQUEST_RX.fetch_add(1, Ordering::Relaxed);
+        BLE_RENDEZVOUS_WAKE_SEEN.store(true, Ordering::Relaxed);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn dmesh_nimble_on_subscribe(attr_handle: c_ushort, notify: c_uchar) {
     BLE_GATT_NOTIFY_ENABLED.store(notify != 0, Ordering::Relaxed);
-    let line = format!(
-        "event type=ble.gatt_subscribe handle={} notify={}",
-        attr_handle, notify
-    );
-    telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
+    let _ = attr_handle;
     if notify != 0 {
         notify_companion_pending();
     }
-    super::wake::notify();
 }
 
 #[no_mangle]
@@ -1500,12 +1947,38 @@ pub unsafe extern "C" fn dmesh_nimble_on_write(data: *const c_uchar, len: c_usho
     }
     let data = core::slice::from_raw_parts(data, len as usize);
     let line = format!("event type=ble.gatt_write target=rx len={}", data.len());
-    telemetry::record_log(line.clone());
-    telemetry::emit_console(&line);
-    let response = handle_gatt_rx(data);
+    telemetry::record_log(line);
+    let response = handle_ble_rx(data, BleTransport::Gatt);
     if !response.is_empty() {
         send_gatt(&response);
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dmesh_nimble_on_coc_write(data: *const c_uchar, len: c_ushort) {
+    if data.is_null() || len == 0 {
+        return;
+    }
+    let data = core::slice::from_raw_parts(data, len as usize);
+    BLE_COC_RX.fetch_add(1, Ordering::Relaxed);
+    telemetry::record_log(format!("event type=ble.coc_write len={}", data.len()));
+    let response = handle_ble_rx(data, BleTransport::Coc);
+    if !response.is_empty() {
+        send_coc(&response);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dmesh_nimble_on_coc_state(connected: c_uchar) {
+    BLE_COC_CONNECTED.store(connected != 0, Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "event type=ble.coc state={}",
+        if connected != 0 {
+            "connected"
+        } else {
+            "disconnected"
+        }
+    ));
 }
 
 #[no_mangle]
@@ -1514,7 +1987,8 @@ pub unsafe extern "C" fn dmesh_nimble_on_log(line: *const c_char) {
         return;
     }
     if let Ok(line) = CStr::from_ptr(line).to_str() {
+        // Called by the NimBLE host task.  Recording is try-lock based and
+        // bounded; console forwarding can synchronously touch Wi-Fi.
         telemetry::record_log(line.to_string());
-        telemetry::emit_console(line);
     }
 }

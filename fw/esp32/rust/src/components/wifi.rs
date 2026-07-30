@@ -165,6 +165,61 @@ pub fn beacon_wake_plan_from(
     })
 }
 
+/// Compute a wake plan for a numbered NAN discovery-window cadence.
+///
+/// `slot_stride` selects global DW indices rather than free-running elapsed
+/// time: with a 512-TU DW period and stride four, valid targets are DW0,
+/// DW0+4, DW0+8, and so on. This is used by sleepy radios after they have a
+/// fresh NAN TSF source. `min_delay_ms` protects against scheduling a target
+/// that is already too close to wake reliably.
+pub fn beacon_wake_plan_for_dw_stride(
+    snapshot: BeaconSnapshot,
+    min_delay_ms: u32,
+    interval_tu: u32,
+    offset_tu: u32,
+    slot_stride: u32,
+    wake_early_ms: u32,
+) -> Option<BeaconWakePlan> {
+    let period_us = u64::from(interval_tu.max(1)).saturating_mul(1024);
+    if snapshot.local_us == 0 || snapshot.tsf_us == 0 {
+        return None;
+    }
+    let now_us = unsafe { sys::esp_timer_get_time().max(0) as u64 };
+    let age_us = now_us.saturating_sub(snapshot.local_us);
+    if age_us > period_us.saturating_mul(2) {
+        return None;
+    }
+    let now_tsf_us = snapshot.tsf_us.saturating_add(age_us);
+    let target_phase_us = u64::from(offset_tu).saturating_mul(1024) % period_us;
+    let stride = u64::from(slot_stride.max(1));
+    let current_index = now_tsf_us / period_us;
+    let mut target_index = current_index
+        .saturating_div(stride)
+        .saturating_add(1)
+        .saturating_mul(stride);
+    let min_target_us = now_tsf_us.saturating_add(u64::from(min_delay_ms) * 1000);
+    let mut expected_tsf_us = target_index
+        .saturating_mul(period_us)
+        .saturating_add(target_phase_us);
+    while expected_tsf_us < min_target_us {
+        target_index = target_index.saturating_add(stride);
+        expected_tsf_us = target_index
+            .saturating_mul(period_us)
+            .saturating_add(target_phase_us);
+    }
+    let delay_us = expected_tsf_us.saturating_sub(now_tsf_us);
+    Some(BeaconWakePlan {
+        window_delay_ms: delay_us.div_ceil(1000).min(u64::from(u32::MAX)) as u32,
+        light_sleep_ms: delay_us
+            .saturating_sub(u64::from(wake_early_ms) * 1000)
+            .saturating_div(1000)
+            .min(u64::from(u32::MAX)) as u32,
+        beacon_age_ms: (age_us / 1000).min(u64::from(u32::MAX)) as u32,
+        expected_tsf_us,
+        period_us: period_us.min(u64::from(u32::MAX)) as u32,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct RawWifiCommand {
     pub source: [u8; 6],
@@ -1128,7 +1183,13 @@ fn low_level_start_ap_with_beacon_tu(
     unsafe {
         let _ = sys::esp_wifi_stop();
         let _ = sys::esp_wifi_set_promiscuous(false);
-        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_AP))?;
+        // Keep the STA interface started alongside the SoftAP. The AP supplies
+        // the 512-TU timing beacon, while raw NAN SDF/action injection uses
+        // STA. In AP-only mode `esp_wifi_80211_tx(WIFI_IF_AP, ...)` accepts
+        // the call but the injected NAN management frame is not observable by
+        // another ESP receiver. AP+STA keeps both on the same configured
+        // channel without creating an IP/association data path.
+        esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_APSTA))?;
         let mut ap = sys::wifi_ap_config_t::default();
         copy_cstr_bytes(&mut ap.ssid, ssid.as_bytes());
         copy_cstr_bytes(&mut ap.password, psk.as_bytes());
@@ -1497,7 +1558,12 @@ fn raw_tx_frame(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
     }
 }
 
-fn raw_tx_interface() -> sys::wifi_interface_t {
+/// Select the active Wi-Fi interface for injected management/action frames.
+///
+/// AP-owner mode runs the driver as `WIFI_MODE_AP`, whereas the normal raw-NAN
+/// window runs as STA. Callers must not hard-code STA or AP-owner NAN TX fails
+/// with `ESP_ERR_WIFI_IF`.
+pub(crate) fn raw_tx_interface() -> sys::wifi_interface_t {
     let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
     let ret = unsafe { sys::esp_wifi_get_mode(&mut mode) };
     if ret == sys::ESP_OK && mode == sys::wifi_mode_t_WIFI_MODE_AP {
@@ -1505,6 +1571,22 @@ fn raw_tx_interface() -> sys::wifi_interface_t {
     } else {
         sys::wifi_interface_t_WIFI_IF_STA
     }
+}
+
+/// Return the MAC address belonging to the interface selected for injected
+/// management/action frames. The 802.11 source address must match the active
+/// interface: a SoftAP raw transmitter cannot advertise a STA source address.
+pub(crate) fn raw_tx_source_mac() -> Result<[u8; 6]> {
+    let mac_type = if raw_tx_interface() == sys::wifi_interface_t_WIFI_IF_AP {
+        sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP
+    } else {
+        sys::esp_mac_type_t_ESP_MAC_WIFI_STA
+    };
+    let mut mac = [0_u8; 6];
+    unsafe {
+        esp_ok(sys::esp_read_mac(mac.as_mut_ptr(), mac_type))?;
+    }
+    Ok(mac)
 }
 
 fn start_netif_probe(iface: &str) -> Result<()> {
