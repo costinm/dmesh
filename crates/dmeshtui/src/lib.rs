@@ -84,16 +84,19 @@ impl UiModel {
 
     pub fn push_system(&mut self, content: impl Into<String>) {
         self.conversation.push(Role::System, content);
+        self.scroll_offset = 0;
         self.trim_conversation();
     }
 
     pub fn push_user(&mut self, content: impl Into<String>) {
         self.conversation.push(Role::User, content);
+        self.scroll_offset = 0;
         self.trim_conversation();
     }
 
     pub fn push_response(&mut self, content: impl Into<String>, raw: impl Into<String>) {
         self.conversation.push_response(content, raw);
+        self.scroll_offset = 0;
         self.trim_conversation();
     }
 
@@ -101,6 +104,7 @@ impl UiModel {
         let text = content.into();
         self.conversation
             .push(Role::Assistant, format!("error: {}", text));
+        self.scroll_offset = 0;
         self.trim_conversation();
     }
 
@@ -261,8 +265,8 @@ pub const HELP_TEXT: &str = "DMesh TUI Help
 Enter        - Send command
 Up/Down      - Scroll message history
 Ctrl-P       - Command palette (fuzzy search)
-Ctrl-Tab     - Cycle active service
-Tab          - Cycle mode
+Ctrl-N       - Cycle active service
+Tab          - Cycle active service
 Esc          - Close palette
 /help        - Show this help
 /save        - Save current conversation

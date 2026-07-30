@@ -32,6 +32,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 #[cfg(target_os = "android")]
 use tracing_subscriber::fmt::MakeWriter;
+#[cfg(target_os = "android")]
+use tracing_subscriber::layer::SubscriberExt;
+#[cfg(target_os = "android")]
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::mesh_common::{MeshHandle, MeshStreamHandle};
 use lmesh::radio_protocol::{self, BleEvent};
@@ -51,6 +55,10 @@ static ANDROID_LOG_INIT: Once = Once::new();
 #[cfg(target_os = "android")]
 static ANDROID_MESSAGE_CALLBACK: OnceLock<Mutex<Option<(Arc<JavaVM>, GlobalRef)>>> =
     OnceLock::new();
+/// The same bounded telemetry source used by ssh-mesh binaries. Android keeps
+/// it in-process and exposes it through the SSH JSON/text bridge.
+#[cfg(target_os = "android")]
+static ANDROID_TELEMETRY: OnceLock<mesh::local_trace::LogBuffer> = OnceLock::new();
 
 #[cfg(target_os = "android")]
 struct AndroidVpnHandle {
@@ -323,6 +331,16 @@ fn android_message_callback() -> &'static Mutex<Option<(Arc<JavaVM>, GlobalRef)>
 
 #[cfg(target_os = "android")]
 fn emit_android_message_line(client_id: u64, line: String) {
+    // Rust tracing is useful to both Android's local message history and open
+    // SSH clients. Do not route it through MsgMux first: the bridge sender is
+    // the transport-neutral remote socket surface.
+    if client_id == 0 {
+        if let Ok(senders) = bridge_senders().lock() {
+            for sender in senders.values() {
+                let _ = sender.send(line.clone());
+            }
+        }
+    }
     let callback = match android_message_callback().lock() {
         Ok(guard) => guard.clone(),
         Err(_) => None,
@@ -374,18 +392,67 @@ fn init_android_logging() {
             log::set_max_level(log::LevelFilter::Info);
         }
 
-        let _ = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .json()
-            .with_writer(AndroidTraceMakeWriter)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let buffer_layer = mesh::local_trace::LogBufferLayer::new();
+        let _ = ANDROID_TELEMETRY.set(buffer_layer.buffer());
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(buffer_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .json()
+                    .with_writer(AndroidTraceMakeWriter),
             )
             .try_init();
 
         log::info!("Android Rust logging initialized");
     });
+}
+
+#[cfg(target_os = "android")]
+fn local_bridge_response(cmd: &BridgeCommand) -> Option<Value> {
+    if cmd.method != "telemetry.history" && cmd.method != "telemetry.status" {
+        return None;
+    }
+    let buffer = ANDROID_TELEMETRY.get();
+    let limit = cmd
+        .data
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(1000);
+    let entries = buffer
+        .map(|buffer| {
+            let mut entries = buffer.get_all();
+            if entries.len() > limit {
+                entries.drain(..entries.len() - limit);
+            }
+            entries
+        })
+        .unwrap_or_default();
+    let count = entries.len();
+    let entries = if cmd.method == "telemetry.history" {
+        serde_json::to_value(entries).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    Some(json!({
+        "id": cmd.id,
+        "ok": true,
+        "method": cmd.method,
+        "data": {
+            "entries": entries,
+            "count": count,
+            "capacity": 1000,
+        },
+    }))
+}
+
+#[cfg(not(target_os = "android"))]
+fn local_bridge_response(_cmd: &BridgeCommand) -> Option<Value> {
+    None
 }
 
 #[cfg(target_os = "android")]
@@ -617,6 +684,40 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 let _ = sender.send(StoreCommand::InsertFrame(frame));
             }
             json!({"status": "ok"}).to_string().into_bytes()
+        }
+        "radio.coc.store_frame" => {
+            let src_device = required_data(&cmd, "src_device")?;
+            let seq = parse_i32(&cmd, "seq", -1)?;
+            let hash = parse_u32(&cmd, "hash", 0)?;
+            if seq < 0 || seq > u16::MAX as i32 {
+                anyhow::bail!("radio.coc.store_frame requires seq=0..{}", u16::MAX);
+            }
+            if payload.is_empty() {
+                anyhow::bail!("radio.coc.store_frame requires a non-empty payload");
+            }
+            let frame = FrameRecord {
+                protocol: "dmesh_coc_lora".to_string(),
+                payload_hash: hash,
+                src_device: src_device.to_string(),
+                target_device: None,
+                seq: Some(seq as u16),
+                msg_type: Some("lora".to_string()),
+                payload: payload.to_vec(),
+                rssi: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            let sender = store_sender().ok_or_else(|| anyhow::anyhow!(
+                "dmesh-store is not initialized"
+            ))?;
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            sender
+                .send(StoreCommand::InsertFrameWithReply(frame, reply_tx))
+                .map_err(|_| anyhow::anyhow!("dmesh-store service is unavailable"))?;
+            let id = reply_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| anyhow::anyhow!("timed out waiting for dmesh-store"))?
+                .map_err(anyhow::Error::msg)?;
+            json!({"status": "stored", "id": id}).to_string().into_bytes()
         }
         _ => anyhow::bail!("unknown radio method: {}", cmd.method),
     };
@@ -928,18 +1029,20 @@ async fn handle_exec_session(
     }
 
     let response = match parse_bridge_line(&command) {
-        Ok(cmd) => match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
-            Ok(()) => json!({
-                "id": cmd.id,
-                "ok": true,
-                "method": cmd.method,
-            }),
-            Err(e) => json!({
-                "id": cmd.id,
-                "ok": false,
-                "error": e.to_string(),
-            }),
-        },
+        Ok(cmd) => local_bridge_response(&cmd).unwrap_or_else(|| {
+            match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
+                Ok(()) => json!({
+                    "id": cmd.id,
+                    "ok": true,
+                    "method": cmd.method,
+                }),
+                Err(e) => json!({
+                    "id": cmd.id,
+                    "ok": false,
+                    "error": e.to_string(),
+                }),
+            }
+        }),
         Err(e) => json!({
             "id": Value::Null,
             "ok": false,
@@ -1044,18 +1147,20 @@ async fn handle_bridge_stream(
                                     hand_stream_to_java(&jvm, &callback, client_id, stream, "mesh-stream", 0);
                                     break 'stream_loop;
                                 }
-                                match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
-                                    Ok(()) => json!({
-                                        "id": cmd.id,
-                                        "ok": true,
-                                        "method": cmd.method,
-                                    }),
-                                    Err(e) => json!({
-                                        "id": cmd.id,
-                                        "ok": false,
-                                        "error": e.to_string(),
-                                    }),
-                                }
+                                local_bridge_response(&cmd).unwrap_or_else(|| {
+                                    match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
+                                        Ok(()) => json!({
+                                            "id": cmd.id,
+                                            "ok": true,
+                                            "method": cmd.method,
+                                        }),
+                                        Err(e) => json!({
+                                            "id": cmd.id,
+                                            "ok": false,
+                                            "error": e.to_string(),
+                                        }),
+                                    }
+                                })
                             },
                             Err(e) => json!({
                                 "id": Value::Null,
@@ -1778,6 +1883,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_telemetry_text_command() {
+        let cmd = parse_bridge_line("telemetry.history --id traces --limit 8").unwrap();
+        assert_eq!(cmd.id.as_deref(), Some("traces"));
+        assert_eq!(cmd.method, "telemetry.history");
+        assert_eq!(cmd.data.get("limit").unwrap(), "8");
+    }
+
+    #[test]
     fn parses_human_long_options_command() {
         let cmd = parse_bridge_line("wifi.scan --id h2 --reason human --enabled").unwrap();
         assert_eq!(cmd.id.as_deref(), Some("h2"));
@@ -1797,7 +1910,12 @@ mod tests {
             -1,
         )
         .unwrap();
-        assert_eq!(&built[0..3], b"DM\x01");
+        // Current ESP32 advertisements begin with the DMesh BLE UUID16; the
+        // legacy `DM\x01` header remains accepted only by the parser.
+        assert_eq!(
+            u16::from_le_bytes([built[0], built[1]]),
+            lmesh::radio_protocol::DMESH_BLE_SERVICE_UUID16
+        );
 
         let parsed = radio_message(
             "radio.ble.parse_service_data",
@@ -1807,8 +1925,9 @@ mod tests {
         )
         .unwrap();
         let parsed = String::from_utf8(parsed).unwrap();
+        assert!(parsed.contains(r#""layout":"esp32_service_data""#));
         assert!(parsed.contains(r#""event":"lora_rx""#));
-        assert!(parsed.contains(r#""device_id":"010203040506""#));
+        assert!(parsed.contains(r#""src_hex":"0x04030201""#));
     }
 
     #[test]

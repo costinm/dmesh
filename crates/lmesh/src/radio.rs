@@ -64,12 +64,17 @@ const SERIAL_FORWARD_IO_BUFFER_BYTES: usize = 16 * 1024;
 const SERIAL_DTR_DEFAULT_MS: u64 = 120;
 const SERIAL_DTR_MAX_MS: u64 = 10_000;
 const SERIAL_DTR_FLUSH_WINDOW_MS: u64 = 2_000;
+// Firmware keeps its normal console receptive during the first ten seconds
+// after a recovery reset.  The forward must use that documented window to
+// deliver queued framed commands even if the retained duty profile has its
+// periodic UART heartbeat disabled.
+const SERIAL_RESET_FLUSH_WINDOW_MS: u64 = 10_000;
+// The ROM and second-stage bootloader use a different baud rate.  Do not send
+// a 460800 framed command until the application has taken over UART0.
+const SERIAL_RESET_APP_READY_DELAY_MS: u64 = 2_000;
 // GPIO0/DTR wakes firmware through a short button task before UART RX is
 // re-armed. Keep incoming client bytes in the kernel socket buffer until that
 // transition is complete.
-// GPIO0 wake reaches the firmware button task before UART RX is re-armed.
-// Some boards need a full scheduler/light-sleep transition after DTR rises;
-// 600 ms still lost the first compact-CBOR record after a cold idle period.
 const SERIAL_FLASH_LOG_QUIET_MS: u64 = 60_000;
 // UART is an HDLC/PPP-style byte stream. Its payload is compact CBOR; the
 // generic mesh stream envelope remains at the lmesh UDS boundary.
@@ -2672,8 +2677,16 @@ impl RadioService {
             // Product APIs use stable lmesh role names (`lora1`, `lora2`),
             // while direct diagnostics may still pass a literal tty path.
             // Resolve the role before falling back to the caller's path.
-            let path = configured_serial_path(&port).unwrap_or(port);
-            return Some(("direct-port".to_string(), path, 460_800));
+            let path = configured_serial_path(&port).unwrap_or_else(|| port.clone());
+            let baud = self
+                .serial_forwards
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .find(|forward| forward.id == port || forward.port == path)
+                .map(|forward| forward.baud)
+                .unwrap_or(460_800);
+            return Some(("direct-port".to_string(), path, baud));
         }
         let requested = adapter.as_deref();
         self.radios
@@ -3827,6 +3840,7 @@ fn serial_forward_loop(
     // A DTR pulse is an explicit UART wake request. Firmware keeps UART awake
     // for a bounded window, but may not emit a heartbeat first.
     let mut serial_flush_until_ms = 0_u64;
+    let mut serial_flush_not_before_ms = 0_u64;
     let mut serial_buf = [0_u8; SERIAL_FORWARD_IO_BUFFER_BYTES];
     while !stop.load(Ordering::Acquire) {
         let mut progressed = false;
@@ -3837,6 +3851,10 @@ fn serial_forward_loop(
                     .with_context(|| format!("failed to reset {port} to bootloader"))?;
                 configure_serial(serial.as_raw_fd(), baud)
                     .with_context(|| format!("failed to restore serial baud for {port}"))?;
+                let now = now_millis_u64();
+                serial_flush_not_before_ms = now.saturating_add(SERIAL_RESET_APP_READY_DELAY_MS);
+                serial_flush_until_ms = now
+                    .saturating_add(SERIAL_RESET_FLUSH_WINDOW_MS);
                 progressed = true;
             }
             SERIAL_RESET_RUN => {
@@ -3844,6 +3862,10 @@ fn serial_forward_loop(
                     .with_context(|| format!("failed to reset {port} to running firmware"))?;
                 configure_serial(serial.as_raw_fd(), baud)
                     .with_context(|| format!("failed to restore serial baud for {port}"))?;
+                let now = now_millis_u64();
+                serial_flush_not_before_ms = now.saturating_add(SERIAL_RESET_APP_READY_DELAY_MS);
+                serial_flush_until_ms = now
+                    .saturating_add(SERIAL_RESET_FLUSH_WINDOW_MS);
                 progressed = true;
             }
             _ => {}
@@ -3960,6 +3982,7 @@ fn serial_forward_loop(
                 Ok((true, client_progressed, dtr_wake)) => {
                     progressed |= client_progressed;
                     if dtr_wake {
+                        serial_flush_not_before_ms = now_millis_u64();
                         serial_flush_until_ms =
                             now_millis_u64().saturating_add(SERIAL_DTR_FLUSH_WINDOW_MS);
                         uart_wake_seen = true;
@@ -3989,7 +4012,9 @@ fn serial_forward_loop(
                 }
             }
         }
-        if (uart_wake_seen || now_millis_u64() < serial_flush_until_ms)
+        let now = now_millis_u64();
+        if (uart_wake_seen
+            || (now >= serial_flush_not_before_ms && now < serial_flush_until_ms))
             && !serial_pending.is_empty()
         {
             if serial_tx.len().saturating_add(serial_pending.len()) > SERIAL_FORWARD_MAX_PENDING {
@@ -5168,9 +5193,28 @@ fn serial_exchange_cbor(
             Ok(0) => std::thread::sleep(Duration::from_millis(10)),
             Ok(count) => {
                 for frame in decoder.push(&buf[..count])? {
-                    let payload = mesh::cbor::decode_stream_frame(&frame)?;
-                    let decoded =
-                        mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())?;
+                    // PPP/HDLC delimiters let the UART decoder recover at the
+                    // next flag after noise or a truncated record.  A frame
+                    // can still be syntactically complete but contain a bad
+                    // length or CBOR payload, so treat that record as noise
+                    // too: do not let it abort the request that follows it.
+                    let payload = match mesh::cbor::decode_stream_frame(&frame) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            tracing::debug!(%path, %error, "ignored malformed direct UART stream frame");
+                            continue;
+                        }
+                    };
+                    let decoded = match mesh::cbor::decode_json(
+                        payload,
+                        &mesh::cbor::Catalog::default(),
+                    ) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            tracing::debug!(%path, %error, "ignored malformed direct UART CBOR payload");
+                            continue;
+                        }
+                    };
                     let mut message = MeshMessage::new(0, MeshMessageCodec::Cbor);
                     if let Some(status) = decoded.get("status") {
                         message.fields.insert(FIELD_STATUS, status.to_string());
@@ -5210,6 +5254,12 @@ fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64)
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
         .with_context(|| format!("failed to set read timeout on {socket_path}"))?;
+    // Battery nodes advertise an empty framed UART heartbeat during their
+    // configured raw-NAN wake window.  The managed forward keeps this command
+    // pending until that authoritative frame arrives, then flushes it while
+    // firmware UART RX is open.  GPIO0/DTR is a recovery control and is not a
+    // reliable product wake mechanism: using it here can consume the first
+    // command on a board waking from light sleep.
     stream
         .write_all(&command_frame)
         .with_context(|| format!("failed to write managed serial command to {socket_path}"))?;
@@ -5244,9 +5294,26 @@ fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64)
                         break;
                     }
                     let frame = output.drain(..frame_len).collect::<Vec<_>>();
-                    let payload = mesh::cbor::decode_stream_frame(&frame)?;
-                    let decoded =
-                        mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())?;
+                    // The managed forward can contain a stale partial record
+                    // after a board reset or wake.  It is not a command error:
+                    // discard this candidate and continue looking for the next
+                    // length-prefixed CBOR response on the same connection.
+                    // In particular, do not let one bad record prevent a
+                    // sleepy board's valid response from being observed.
+                    let payload = match mesh::cbor::decode_stream_frame(&frame) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            tracing::debug!(%socket_path, %error, "ignored malformed UART stream frame");
+                            continue;
+                        }
+                    };
+                    let decoded = match mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default()) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            tracing::debug!(%socket_path, %error, "ignored malformed UART CBOR payload");
+                            continue;
+                        }
+                    };
                     // Firmware response text is compact-CBOR payload tag 32.
                     // The generic catalog intentionally does not assign this
                     // firmware-private tag a global field name.
@@ -8765,7 +8832,7 @@ fn iface_mac(iface: &str) -> Result<[u8; 6]> {
     for (idx, byte) in name_bytes.iter().enumerate() {
         request.ifr_name[idx] = *byte as libc::c_char;
     }
-    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::c_int, &mut request) };
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::Ioctl, &mut request) };
     let error = std::io::Error::last_os_error();
     unsafe {
         libc::close(fd);
@@ -9344,7 +9411,7 @@ fn hci_dev_up(dev_id: u16) -> Result<String> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("failed to open HCI control socket");
     }
-    let rc = unsafe { libc::ioctl(fd, HCIDEVUP, dev_id as libc::c_int) };
+    let rc = unsafe { libc::ioctl(fd, HCIDEVUP as libc::Ioctl, dev_id as libc::c_int) };
     let result = if rc < 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EALREADY) {
@@ -9490,6 +9557,19 @@ mod tests {
         let escaped_wire = encode_firmware_uart_frame(&escaped).unwrap();
         let mut decoder = FirmwareUartDecoder::default();
         assert_eq!(decoder.push(&escaped_wire).unwrap(), vec![escaped]);
+    }
+
+    #[test]
+    fn firmware_uart_decoder_resynchronizes_after_oversize_record() {
+        let frame = firmware_command_cbor("status").unwrap();
+        let valid = encode_firmware_uart_frame(&frame).unwrap();
+        let mut noisy = vec![FIRMWARE_UART_FLAG];
+        noisy.extend(std::iter::repeat_n(0_u8, mesh::cbor::ESP_RECORD_MAX + 1));
+        noisy.push(FIRMWARE_UART_FLAG);
+        noisy.extend(valid);
+
+        let mut decoder = FirmwareUartDecoder::default();
+        assert_eq!(decoder.push(&noisy).unwrap(), vec![frame]);
     }
 
     #[test]

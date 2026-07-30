@@ -4,7 +4,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const DMESH_BLE_SERVICE_UUID16: u16 = 0xfd5d;
+/// Temporary discovery identity: Bluetooth Internet Protocol Support Service.
+/// This is intentionally an adopted-service interoperability experiment, not
+/// a DMesh-assigned UUID; replace it once DMesh has a SIG allocation.
+pub const DMESH_BLE_SERVICE_UUID16: u16 = 0x1820;
 pub const DMESH_BLE_OPERATIONAL_UUID: [u8; 16] = [
     0x02, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c, 0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f,
 ];
@@ -19,6 +22,10 @@ const BLE_EVENT_LORA_RX: u8 = 1;
 const BLE_EVENT_IDLE_HELLO: u8 = 2;
 const BLE_EVENT_WAKE_REQUEST: u8 = 3;
 const BLE_EVENT_PAYLOAD_PENDING: u8 = 4;
+/// High bit in the ESP32 service-data pending byte.  Older firmware used the
+/// whole byte as a queue count; v2 reserves the low seven bits for that count
+/// and appends the explicit event byte after battery.
+const BLE_ESP32_V2: u8 = 0x80;
 
 const NAN_ROLE_FIRMWARE_PUBLISHER: u8 = 1;
 const NAN_ROLE_ANDROID_PUBLISHER: u8 = 2;
@@ -129,13 +136,19 @@ pub fn build_ble_service_data(
 ) -> Result<Vec<u8>> {
     let device_id = checked_device_id(device_id)?;
     let source = u32::from_le_bytes([device_id[0], device_id[1], device_id[2], device_id[3]]);
-    let pending = event.code();
+    // The ESP32 layout historically overloaded `pending` with the event code.
+    // Keep the queue count separate and put the event in its v2 extension.
+    let pending = if matches!(event, BleEvent::PayloadPending | BleEvent::LoraRx) {
+        1
+    } else {
+        0
+    };
     let battery = if snr_q4 > 0 {
         snr_q4.clamp(0, u8::MAX as i32) as u8
     } else {
         rssi.clamp(0, u8::MAX as i32) as u8
     };
-    build_ble_esp32_service_data(source, fnv1a32(payload), pending, battery, payload)
+    build_ble_esp32_service_data_event(source, fnv1a32(payload), pending, battery, event, payload)
 }
 
 /// Build the current ESP32 DMesh BLE service-data layout.
@@ -157,10 +170,32 @@ pub fn build_ble_esp32_service_data(
     Ok(out)
 }
 
+/// Build the v2 ESP32 service-data layout with an explicit rendezvous event.
+/// The marker preserves parsing compatibility with pre-v2 advertisements.
+pub fn build_ble_esp32_service_data_event(
+    source: u32,
+    packet_id: u32,
+    pending: u8,
+    battery: u8,
+    event: BleEvent,
+    packet: &[u8],
+) -> Result<Vec<u8>> {
+    let prefix_len = packet.len().min(BLE_MAX_PREFIX.saturating_sub(1));
+    let mut out = Vec::with_capacity(13 + prefix_len);
+    out.extend_from_slice(&DMESH_BLE_SERVICE_UUID16.to_le_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&packet_id.to_le_bytes());
+    out.push(BLE_ESP32_V2 | pending.min(0x7f));
+    out.push(battery);
+    out.push(event.code());
+    out.extend_from_slice(&packet[..prefix_len]);
+    Ok(out)
+}
+
 pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Result<Value> {
     let (data, service_uuid) =
         if data.len() >= 12 && u16::from_le_bytes([data[0], data[1]]) == DMESH_BLE_SERVICE_UUID16 {
-            (&data[2..], "fd5d")
+            (&data[2..], "1820")
         } else if data.len() >= 26 && data[..16] == DMESH_BLE_OPERATIONAL_UUID {
             (&data[16..], "5f6b6f80-4f2a-4a6f-8c42-4d6573680002")
         } else {
@@ -174,10 +209,14 @@ pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Res
     }
     let source = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     let packet_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let pending = data[8];
+    let encoded_pending = data[8];
+    let v2 = encoded_pending & BLE_ESP32_V2 != 0 && data.len() >= 11;
+    let pending = encoded_pending & !BLE_ESP32_V2;
     let battery = data[9];
-    let prefix = &data[10..];
-    let event = if pending > 0 {
+    let prefix = if v2 { &data[11..] } else { &data[10..] };
+    let event = if v2 {
+        BleEvent::from_code(data[10])
+    } else if pending > 0 {
         BleEvent::PayloadPending
     } else {
         BleEvent::IdleHello
@@ -206,7 +245,7 @@ pub fn parse_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> Res
         "scan_rssi": scan_rssi,
         "address": address,
         "duplicate": duplicate,
-        "connectable_response": pending > 0,
+        "connectable_response": matches!(event, BleEvent::WakeRequest | BleEvent::PayloadPending | BleEvent::LoraRx),
     }))
 }
 

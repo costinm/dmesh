@@ -1,5 +1,5 @@
 use eframe::egui;
-use dmeshtui::{MemoryMeshClient, MeshEventKind, UiModel};
+use dmeshtui::{MemoryMeshClient, Role, UiModel};
 
 #[cfg(target_os = "android")]
 mod android_bridge {
@@ -314,10 +314,7 @@ impl RatatuiPreviewApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         let mut model = UiModel::new("DMesh Ratatui");
-        model.push(
-            MeshEventKind::Info,
-            "Android eframe preview using the dmeshtui shared model.",
-        );
+        model.push_system("Android eframe preview using the dmeshtui shared model.");
         Self {
             model,
             client: MemoryMeshClient::default(),
@@ -339,16 +336,15 @@ impl eframe::App for RatatuiPreviewApp {
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for event in &self.model.events {
-                    let color = match event.kind {
-                        MeshEventKind::Info => egui::Color32::LIGHT_BLUE,
-                        MeshEventKind::Inbound => egui::Color32::LIGHT_GREEN,
-                        MeshEventKind::Outbound => egui::Color32::YELLOW,
-                        MeshEventKind::Error => egui::Color32::LIGHT_RED,
+                for message in &self.model.conversation.messages {
+                    let color = match message.role {
+                        Role::System => egui::Color32::LIGHT_BLUE,
+                        Role::Assistant => egui::Color32::LIGHT_GREEN,
+                        Role::User => egui::Color32::YELLOW,
                     };
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(color, format!("{:?}", event.kind));
-                        ui.monospace(&event.text);
+                        ui.colored_label(color, format!("{:?}", message.role));
+                        ui.monospace(&message.content);
                     });
                 }
             });

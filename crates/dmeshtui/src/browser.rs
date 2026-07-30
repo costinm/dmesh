@@ -53,7 +53,6 @@ impl CommandBrowser {
 
     fn rebuild_entries(&mut self) {
         self.entries.clear();
-        let mut idx = 0;
 
         let mut grouped: Vec<(String, Vec<&MeshCommand>)> = Vec::new();
         let mut map: std::collections::HashMap<String, Vec<&MeshCommand>> =
@@ -71,6 +70,13 @@ impl CommandBrowser {
                 grouped.push((service.clone(), cmds.clone()));
             }
         }
+
+        let cmd_index: std::collections::HashMap<(&str, &str), usize> = self
+            .all_commands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ((c.service.as_str(), c.name.as_str()), i))
+            .collect();
 
         for (service, cmds) in &grouped {
             let connected = self
@@ -102,6 +108,10 @@ impl CommandBrowser {
 
             for (group, gcmds) in &grouped_cmds {
                 for cmd in gcmds {
+                    let real_idx = cmd_index
+                        .get(&(service.as_str(), cmd.name.as_str()))
+                        .copied()
+                        .unwrap_or(0);
                     self.entries.push(PaletteEntry {
                         kind: EntryKind::Command,
                         service: service.clone(),
@@ -109,9 +119,8 @@ impl CommandBrowser {
                         name: cmd.name.clone(),
                         description: cmd.description.clone(),
                         connected,
-                        index: idx,
+                        index: real_idx,
                     });
-                    idx += 1;
                 }
             }
         }

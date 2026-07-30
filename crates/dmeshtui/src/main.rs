@@ -84,10 +84,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: Args) -> any
             continue;
         }
 
-        let exiting = handle_key(&mut model, &mut browser, &mut client, &key)?;
-        if exiting
-            || key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL))
+        handle_key(&mut model, &mut browser, &mut client, &key)?;
+
+        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return Ok(());
         }
@@ -111,8 +110,8 @@ fn handle_key(
         return Ok(false);
     }
 
-    // Ctrl-Tab: cycle active service
-    if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Ctrl-N: cycle active service
+    if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
         model.cycle_service(browser.services());
         client.set_active_service(&model.active_service);
         model.push_system(format!("active service: {}", model.active_service));
@@ -131,7 +130,7 @@ fn handle_key(
     }
 
     // Normal mode keys
-    handle_normal_key(model, client, key)
+    handle_normal_key(model, browser, client, key)
 }
 
 fn handle_palette_key(
@@ -191,12 +190,14 @@ fn handle_palette_key(
 
 fn handle_normal_key(
     model: &mut UiModel,
+    browser: &CommandBrowser,
     client: &mut LocalMeshSocket,
     key: &crossterm::event::KeyEvent,
 ) -> anyhow::Result<bool> {
     match key.code {
         KeyCode::Tab => {
-            model.cycle_service(browser_services_from_client(client));
+            model.cycle_service(browser.services());
+            client.set_active_service(&model.active_service);
         }
         KeyCode::Char(c) => model.input.push(c),
         KeyCode::Backspace => {
@@ -211,20 +212,11 @@ fn handle_normal_key(
         KeyCode::Down => {
             model.scroll_offset = model.scroll_offset.saturating_sub(1);
         }
-        KeyCode::PageUp => {
-            model.scroll_offset = model.scroll_offset.saturating_add(20);
-        }
-        KeyCode::PageDown => {
-            model.scroll_offset = model.scroll_offset.saturating_sub(20);
-        }
         _ => {}
     }
     Ok(false)
 }
 
-fn browser_services_from_client(_client: &LocalMeshSocket) -> &[dmeshtui::commands::ServiceInfo] {
-    &[]
-}
 
 // ============ DRAW ============
 
@@ -234,15 +226,15 @@ fn draw(frame: &mut Frame<'_>, model: &UiModel, browser: &CommandBrowser) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(3),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
 
-    draw_input_bar(frame, model, chunks[0]);
-    draw_content(frame, model, chunks[1]);
-    draw_status_bar(frame, model, chunks[2]);
+    draw_content(frame, model, chunks[0]);
+    draw_status_bar(frame, model, chunks[1]);
+    draw_input_bar(frame, model, chunks[2]);
 
     if model.show_palette {
         draw_palette(frame, browser, area);
@@ -266,27 +258,17 @@ fn draw_content(frame: &mut Frame<'_>, model: &UiModel, area: Rect) {
     let messages = &model.conversation.messages;
     if messages.is_empty() {
         frame.render_widget(
-            Paragraph::new("No messages. Type a command above or Ctrl-P for commands.")
+            Paragraph::new("No messages. Ctrl-P for commands, /help for keys.")
                 .style(Style::default().fg(Color::DarkGray)),
             area,
         );
         return;
     }
 
-    let total = messages.len();
-    let visible_height = area.height.saturating_sub(2) as usize;
-
-    let mut scroll_offset = model.scroll_offset;
-    if scroll_offset > total.saturating_sub(visible_height) {
-        scroll_offset = total.saturating_sub(visible_height);
-    }
-
-    let start = total.saturating_sub(visible_height + scroll_offset);
-    let end = total.saturating_sub(scroll_offset);
-
     let mut lines: Vec<Line<'_>> = Vec::new();
+    let max_width = area.width.saturating_sub(4) as usize;
 
-    for msg in messages.iter().skip(start).take(end - start) {
+    for msg in messages {
         let (prefix, color) = match msg.role {
             Role::User => ("> ", Color::Yellow),
             Role::Assistant => ("< ", Color::Green),
@@ -300,13 +282,13 @@ fn draw_content(frame: &mut Frame<'_>, model: &UiModel, area: Rect) {
                 Style::default().fg(color),
             )));
         } else {
-            let first_line: String = content_lines[0].chars().take(area.width.saturating_sub(4) as usize).collect();
+            let first_line: String = content_lines[0].chars().take(max_width).collect();
             lines.push(Line::from(Span::styled(
                 format!("{}{}", prefix, first_line),
                 Style::default().fg(color),
             )));
             for line in content_lines.iter().skip(1) {
-                let truncated: String = line.chars().take(area.width.saturating_sub(4) as usize).collect();
+                let truncated: String = line.chars().take(max_width).collect();
                 lines.push(Line::from(Span::styled(
                     format!("  {}", truncated),
                     Style::default().fg(color),
@@ -315,8 +297,14 @@ fn draw_content(frame: &mut Frame<'_>, model: &UiModel, area: Rect) {
         }
     }
 
+    let total_lines = lines.len();
+    let visible_height = area.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll_offset = model.scroll_offset.min(max_scroll);
+    let row = (total_lines.saturating_sub(visible_height)).saturating_sub(scroll_offset) as u16;
+
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll(((total.saturating_sub(visible_height + scroll_offset)) as u16, 0)),
+        Paragraph::new(Text::from(lines)).scroll((row, 0)),
         area,
     );
 }
@@ -330,7 +318,7 @@ fn draw_status_bar(frame: &mut Frame<'_>, model: &UiModel, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(format!(
-            "{} | {} msgs | Ctrl-P:commands Tab:switch /help{}",
+            "{} | {} msgs | Ctrl-P:commands Ctrl-N:switch /help{}",
             service, msg_count, palette_indicator
         ))
         .style(Style::default().fg(Color::Black).bg(Color::Gray)),

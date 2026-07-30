@@ -5,9 +5,12 @@ domain socket. Under mesh-init it uses systemd-style socket activation and takes
 the activated listener fd. When started standalone without activation, it binds
 `./lmesh/mesh.sock` by default.
 
-Use the generic `mesh` client for normal device commands, for example
-`mesh lmesh esp.serial.command port=lora1 command=status`. The local endpoint
-resolves to the UDS forward `/run/mesh/lmesh/lora1.sock`; the optional RFC2217
+Use the generic `mesh` client for normal device commands. After sourcing DMesh
+`env.sh`, its generated catalog is selected and `mesh lmesh esp serial.command
+port=lora1 command=status` resolves the managed service. Use an explicit
+UDS/TCP endpoint with another catalog or isolated deployment. The command
+targets the lmesh **control** UDS; lmesh then resolves the managed
+forward `/run/mesh/lmesh/lora1.sock`. The optional RFC2217
 TCP listener is diagnostic/remote-serial transport only and is never a
 flashing path. FQDN-shaped endpoints may instead resolve to a remote host,
 container, VM, SSH forward, or sandbox, so callers must not assume local
@@ -216,7 +219,7 @@ not become the product contract when an equivalent high-level method exists.
 | `wifi.sta.join_open` | `iface: string = LMESH_WIFI_IFACE`, `ssid: string` | Joins a password-less open AP on channel 6 through direct nl80211. |
 | `wifi.sta.status` | `iface: string = LMESH_WIFI_IFACE` | Dumps station-mode AP peer metrics through nl80211 and reports `associated=true` when the interface has a current AP peer. Peer observations feed `links.list` as `radio=sta`. |
 | `ble.scan` | `dev_id: integer = 0`, `reason: string = "jsonl"`, `scan_ms: integer = 1500` | Runs a bounded passive LE scan through raw Linux HCI sockets, parses DMesh 16-bit and operational 128-bit service-data announcements, records `BLE.rx` events, and returns `reports` plus parsed `dmesh` entries with `mode`, `event`, RSSI, address, and duplicate status. Requires `CAP_NET_RAW`. |
-| `ble.adv` | `dev_id: integer = 0`, `on: bool = true`, `payload: string = "lmesh"` | Enables or disables BLE advertising with DMesh service UUID `0xFD5D` and current DMesh service-data layout. Requires `CAP_NET_RAW`. |
+| `ble.adv` | `dev_id: integer = 0`, `on: bool = true`, `payload: string = "lmesh"` | Enables or disables BLE advertising with temporary IPSP UUID `0x1820` and current DMesh service-data layout. Requires `CAP_NET_RAW`. |
 | `esp.serial.command` | `adapter: string \| null`, `port: string \| null`, `command: string`, `timeout_sec: number = 1.5` | Debug/test method: accepts a local text command, translates it to framed CBOR, and returns normalized binary firmware records. Prefer high-level methods for product flows. |
 | `esp.active` | `adapter: string \| null`, `port: string \| null`, `gateway: string \| null`, `target: mac-or-last4 \| null`, `active: bool = true`, `active_ms: integer \| null` | Put an ESP into runtime-only powered/transfer radio mode. Direct `active=true` (`active`) stays on until `active=false` (`idle`) or reset; `active_ms` requests a bounded 1,000..300,000 ms session. Each `active` also enables the target's normal bounded UART debug/modem window, while the radio override remains active until `idle` or reset. With `gateway=lora1` and `target=<last4-or-MAC>`, lmesh sends addressed compact-CBOR `active`/`idle` via lora1's raw-NAN queue; this is the normal sleepy-node control path. Gateway delivery does not support `active_ms` yet. |
 | `esp.status` | `adapter: string \| null`, `port: string \| null`, `extended: bool = false` | Diagnostic wrapper for firmware `status` or `xstatus`. `status` is the compact golden-signal line; `xstatus` is verbose debug telemetry. |
@@ -317,7 +320,7 @@ Public helpers:
 
 | Helper | Purpose |
 | --- | --- |
-| `DMESH_BLE_SERVICE_UUID16` | DMesh BLE service UUID16, `0xFD5D`. |
+| `DMESH_BLE_SERVICE_UUID16` | Temporary IPSP discovery UUID16, `0x1820`; replace when DMesh has a SIG allocation. |
 | `build_ble_service_data` / `parse_ble_service_data` | BLE service-data wake and payload-hint frames. |
 | `build_nan_service_info` / `parse_nan_service_info` | WiFi Aware/NAN service-specific info frames. |
 | `build_nan_followup` / `parse_nan_followup` | WiFi Aware/NAN follow-up message frames. |

@@ -306,6 +306,9 @@ pub struct StoreService {
 #[derive(Debug)]
 pub enum StoreCommand {
     InsertFrame(FrameRecord),
+    /// Insert a received frame and report the durable SQLite result to the
+    /// caller.  Receivers use this before acknowledging an upstream peer.
+    InsertFrameWithReply(FrameRecord, std::sync::mpsc::Sender<Result<i64, String>>),
     UpdateNode(NodeRecord),
     SetNanActive(bool),
     QueryPending(usize),
@@ -350,6 +353,11 @@ impl StoreService {
                             if let Err(e) = self.store.insert_frame(&frame).await {
                                 error!("failed to insert frame: {}", e);
                             }
+                        }
+                        StoreCommand::InsertFrameWithReply(frame, reply) => {
+                            let result = self.store.insert_frame(&frame).await
+                                .map_err(|error| error.to_string());
+                            let _ = reply.send(result);
                         }
                         StoreCommand::UpdateNode(node) => {
                             if let Err(e) = self.store.update_node(&node).await {

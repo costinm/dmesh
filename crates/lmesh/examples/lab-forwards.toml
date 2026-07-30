@@ -11,10 +11,10 @@ serial_log_path = "target/lmesh-radio-build/log/serial.log"
 
 [[serial_forwards]]
 port = "lora1"
-path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
-baud = 460800
+path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA1-840D8E074170-if00-port0"
+baud = 115200
 tcp_port = 3330
-tcp_mode = "rfc2217"
+tcp_mode = "framed"
 # lora1 is the powered raw-NAN gateway. It is activated after reset with the
 # binary `active` command, not an automatic CP210x edge on every UDS client.
 # Use the local `dtr [ms]` diagnostic only when debugging the board wiring.
@@ -24,19 +24,46 @@ multi = true
 [[serial_forwards]]
 port = "lora2"
 path = "/dev/serial/by-id/usb-Silicon_Labs_CP2104_USB_to_UART_Bridge_Controller_01DC99BB-if00-port0"
-baud = 460800
+baud = 115200
 tcp_port = 3331
-tcp_mode = "rfc2217"
-dtr = true
+tcp_mode = "framed"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "lora3"
+path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA3-D8A01D4C5E1C-if00-port0"
+baud = 115200
+tcp_port = 3332
+tcp_mode = "framed"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "lora4"
+path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA4-441BF6FC543C-if00-port0"
+baud = 115200
+tcp_port = 3333
+tcp_mode = "framed"
+dtr = false
+multi = true
+
+[[serial_forwards]]
+port = "e5"
+path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-E5-FCF5C40EF1E8-if00-port0"
+baud = 115200
+tcp_port = 3335
+tcp_mode = "framed"
+dtr = false
 multi = true
 
 [[serial_forwards]]
 port = "s3-1"
 path = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C82104982-if00"
-baud = 460800
+baud = 115200
 tcp_port = 3334
-tcp_mode = "rfc2217"
-dtr = true
+tcp_mode = "framed"
+dtr = false
 multi = true
 
 [[serial_forwards]]

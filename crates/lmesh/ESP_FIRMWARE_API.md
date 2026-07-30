@@ -347,6 +347,12 @@ remains the canonical ABI for the setting names and CBOR tags.
 | `ble.comp.adv_window_ms` | Companion advertising window. |
 | `ble.comp.active_ms` | Companion active window. |
 | `ble.comp.ble_scan` | Companion BLE scan/listen flag. |
+| `bc.scan_ms` | Bounded ESP scan duration for Android `wake_request` advertisements (50-2000 ms). |
+| `bc.adv_ms` | Bounded connectable GATT response advertisement after a matched wake (100-10000 ms). |
+
+The live (non-persisted) equivalents are `ble rendezvous_scan_ms=<50..2000>`
+and `rendezvous_adv_ms=<100..10000>`; include `save=true` to persist them as
+`bc.scan_ms` and `bc.adv_ms`.
 | `ble.comp.channel` | Companion Wi-Fi channel. |
 | `ble.comp.nan` | Companion NAN flag. |
 | `ble.comp.ps` | Companion Wi-Fi power-save setting. |
@@ -679,6 +685,11 @@ Infra boot radio settings:
   is detected; `lora.enabled=false` disables infra LoRa RX startup.
 
 ## BLE
+
+`ble coc=true psm=0x80` enables the lab-only LE CoC echo server after NimBLE is
+ready. It accepts only dynamic application PSMs `0x80..0xff`; it is not an
+IPSP/6LoWPAN implementation. Android's `ble.coc addr=<BLE-address> psm=0x80`
+probe writes a ping and records `BLE.COC state=echo_ok` on success.
 
 | Command | Params | Result |
 | --- | --- | --- |
