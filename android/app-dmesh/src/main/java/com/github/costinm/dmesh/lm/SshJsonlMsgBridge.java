@@ -39,7 +39,11 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
         appTargets.put("chat", new AppTarget(
                 "com.github.costinm.dmesh.chat",
                 "com.github.costinm.dmesh.chat.ChatService",
-                "chat"));
+                "chat", "."));
+        appTargets.put("web", new AppTarget(
+                "com.github.costinm.dmesh.web",
+                "com.github.costinm.dmesh.web.WebBridgeService",
+                "/web", "/"));
     }
 
     @Override
@@ -102,7 +106,7 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
             replyTo.sendFrame(err);
             return true;
         }
-        MsgFrame appFrame = new MsgFrame(target.topic + "." + parts[2]);
+        MsgFrame appFrame = new MsgFrame(target.methodPrefix + target.separator + parts[2]);
         appFrame.id = frame.id;
         appFrame.fields.putAll(frame.fields);
         DirectBinderConn appConn = new DirectBinderConn(mux, context, target.packageName, target.serviceName);
@@ -168,12 +172,14 @@ class SshJsonlMsgBridge implements MeshNode.MeshCallback {
     private static class AppTarget {
         final String packageName;
         final String serviceName;
-        final String topic;
+        final String methodPrefix;
+        final String separator;
 
-        AppTarget(String packageName, String serviceName, String topic) {
+        AppTarget(String packageName, String serviceName, String methodPrefix, String separator) {
             this.packageName = packageName;
             this.serviceName = serviceName;
-            this.topic = topic;
+            this.methodPrefix = methodPrefix;
+            this.separator = separator;
         }
     }
 

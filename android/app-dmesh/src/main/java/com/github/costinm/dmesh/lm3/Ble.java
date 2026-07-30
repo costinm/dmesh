@@ -58,8 +58,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static android.bluetooth.BluetoothAdapter.STATE_DISCONNECTED;
 import static android.bluetooth.BluetoothProfile.GATT_SERVER;
@@ -113,6 +115,9 @@ public class Ble implements MessageHandler {
     public static ParcelUuid DMESH_PAIRING = new ParcelUuid(dmeshPairingUUID);
     static UUID dmeshOperationalUUID = UUID.fromString("5f6b6f80-4f2a-4a6f-8c42-4d6573680002");
     public static ParcelUuid DMESH_OPERATIONAL = new ParcelUuid(dmeshOperationalUUID);
+    // Temporary compact discovery identity.  The connected GATT service stays
+    // on DMESH_GATT until DMesh receives its own assigned 16-bit UUID.
+    public static ParcelUuid DMESH_IPSP = ParcelUuid.fromString("00001820-0000-1000-8000-00805f9b34fb");
     static UUID meshtasticUUID = UUID.fromString("6ba1b218-15a8-461f-9fa8-5dcae273eafd");
     public static ParcelUuid MESHTASTIC = new ParcelUuid(meshtasticUUID);
     static UUID dmeshGattUUID = UUID.fromString("5f6b6f80-4f2a-4a6f-8c42-4d6573680003");
@@ -129,17 +134,21 @@ public class Ble implements MessageHandler {
     static boolean scanFailed = false;
     private static final long DMESH_DISCOVERY_REPEAT_MS = 30000;
     private static final long DMESH_PULL_REPEAT_MS = 45000;
+    private static final long BLE_DIAGNOSTIC_SCAN_MS = 5000;
     private static final int BLE_READY_MAX_BYTES = 1200;
     private static final long BLE_PULL_TIMEOUT_MS = 15000;
     private final BluetoothManager bluetoothManager;
     LocalMesh wifi;
     boolean mScanning = false;
+    /** Changes whenever the current scan is stopped or replaced. */
+    private int scanGeneration;
     Handler mHandler;
     Context ctx;
     BluetoothLeScanner leScanner;
     BluetoothAdapter mBluetoothAdapter;
     int discoveryCnt;
     int scanCnt;
+    boolean debugUnfilteredScan;
     boolean adv = false;
     int psm;
 
@@ -154,6 +163,8 @@ public class Ble implements MessageHandler {
     // 21 bytes advertisment, first byte is 0x5x (type + flags).
     // null if not advertising
     byte[] currentAdvBytes;
+    long wakeRequestUntilMs;
+    String wakeCommand;
 
 
     // === GATT Server implementation
@@ -169,10 +180,27 @@ public class Ble implements MessageHandler {
             if (sr == null) {
                 return;
             }
+            if (debugUnfilteredScan) {
+                String address = deviceAddress(device);
+                if (!lastDmeshPairingAt.containsKey("raw:" + address)) {
+                    lastDmeshPairingAt.put("raw:" + address, SystemClock.elapsedRealtime());
+                    // Diagnostic scans are test evidence too. Keep one bounded
+                    // structured record per address in service history instead
+                    // of requiring logcat to discover the ESP's live address.
+                    MsgMux.get(ctx).publish("BLE.RAW_SCAN",
+                            "addr", address,
+                            "name", deviceName(device, sr),
+                            "rssi", Integer.toString(result.getRssi()),
+                            "services", String.valueOf(sr.getServiceUuids()));
+                }
+            }
 
             Map<ParcelUuid, byte[]> sd = sr.getServiceData();
             if (sd != null) {
-                byte[] record = sd.get(DMESH_OPERATIONAL);
+                byte[] record = sd.get(DMESH_IPSP);
+                if (record == null) {
+                    record = sd.get(DMESH_OPERATIONAL);
+                }
                 if (record != null && processDiscovery(device, record, result.getRssi())) {
                     super.onScanResult(callbackType, result);
                     return;
@@ -183,6 +211,13 @@ public class Ble implements MessageHandler {
             if (suid == null || suid.size() == 0) {
                 return;
             }
+            if (suid.contains(DMESH_PAIRING) || suid.contains(DMESH_IPSP)
+                    || suid.contains(DMESH_OPERATIONAL)) {
+                Log.i(TAG, "scan addr=" + deviceAddress(device)
+                        + " name=" + deviceName(device, sr)
+                        + " rssi=" + result.getRssi()
+                        + " services=" + suid);
+            }
             if (suid.contains(MESHTASTIC)) {
                 processExternalDiscovery(device, sr, result.getRssi(),
                         "meshtastic", MESHTASTIC.toString(), "");
@@ -190,7 +225,7 @@ public class Ble implements MessageHandler {
             if (suid.contains(DMESH_PAIRING)) {
                 processPairingDiscovery(device, sr, result.getRssi());
             }
-            if (!suid.contains(DMESH_OPERATIONAL)) {
+            if (!suid.contains(DMESH_IPSP) && !suid.contains(DMESH_OPERATIONAL)) {
                 return;
             }
 
@@ -198,7 +233,10 @@ public class Ble implements MessageHandler {
                 return;
             }
 
-            byte[] record = sd.get(DMESH_OPERATIONAL);
+            byte[] record = sd.get(DMESH_IPSP);
+            if (record == null) {
+                record = sd.get(DMESH_OPERATIONAL);
+            }
             if (record == null) {
                 return;
             }
@@ -373,10 +411,17 @@ public class Ble implements MessageHandler {
             onDiscovery(bd, id, old == null);
         }
         boolean pending = hasPendingPayload(data);
-        boolean connectable = data.optBoolean("connectable_response", false);
         boolean companionAllowed = DMeshCompanionPrefs.isAllowed(ctx, id, addr);
-        if (pending && companionAllowed) {
-            maybePullPending(device, id, addr, connectable);
+        boolean wakeResponse = SystemClock.elapsedRealtime() < wakeRequestUntilMs
+                && "idle_hello".equals(dmeshEvent(data));
+        if ((pending || wakeResponse) && companionAllowed) {
+            if (wakeResponse && wakeCommand != null && !wakeCommand.isEmpty()) {
+                String command = wakeCommand;
+                wakeCommand = null;
+                command(addr, command);
+            } else {
+                maybePullPending(id, addr);
+            }
         }
         String signature = dmeshSignature(data, id);
         Long lastAt = lastDmeshDiscoveryAt.get(id);
@@ -402,7 +447,7 @@ public class Ble implements MessageHandler {
                 "prefix", shortPrefix(optText(data, "prefix")),
                 "scan_rssi", optText(data, "scan_rssi"),
                 "companion", companionAllowed ? "allowed" : "ignored",
-                "pull", pending && companionAllowed ? (connectable ? "gatt" : "probe") : "none");
+                "pull", (pending || wakeResponse) && companionAllowed ? "coc" : "none");
         return true;
     }
 
@@ -466,7 +511,13 @@ public class Ble implements MessageHandler {
                 + dmeshPacketId(data) + "|" + shortPrefix(optText(data, "prefix"));
     }
 
-    private void maybePullPending(BluetoothDevice device, String id, String addr, boolean connectable) {
+    /**
+     * A DMesh pending-data advertisement is only a CoC rendezvous signal.
+     * There is no DMesh GATT payload service: after discovery Android opens
+     * the advertised ESP by its stable address and requests bounded compact
+     * CBOR status on the fixed lab CoC PSM.
+     */
+    private void maybePullPending(String id, String addr) {
         long now = SystemClock.elapsedRealtime();
         Long last = lastDmeshPullAt.get(id);
         if (last != null && now - last < DMESH_PULL_REPEAT_MS) {
@@ -476,13 +527,9 @@ public class Ble implements MessageHandler {
         MsgMux.get(ctx).publish("BLE.PENDING",
                 "id", id,
                 "addr", addr,
-                "connectable", Boolean.toString(connectable),
-                "action", connectable ? "connect" : "probe");
-        if (connectable) {
-            connect(addr);
-        } else if (device != null) {
-            connectDevice(device, addr, false);
-        }
+                "transport", "coc",
+                "action", "status");
+        cocPendingStatus(addr);
     }
 
     private void processExternalDiscovery(BluetoothDevice device, ScanRecord record, int rssi, String proto,
@@ -576,6 +623,10 @@ public class Ble implements MessageHandler {
     }
 
     public void advertise(byte[] urlb) {
+        advertise(urlb, AdvertiseSettings.ADVERTISE_MODE_LOW_POWER);
+    }
+
+    private void advertise(byte[] urlb, int advertiseMode) {
         if (mBluetoothAdapter == null || mBluetoothLeAdvertiser == null) {
             MsgMux.get(ctx).publish("BLE.ERR.unsupported", "advertiser", "missing");
             return;
@@ -605,17 +656,25 @@ public class Ble implements MessageHandler {
         // LOW_POWER, LOW_LATENCY, BALANCED
         AdvertiseSettings settings = new AdvertiseSettings.Builder()
                 // 1 sec (BALANCED=250ms)
-                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+                .setAdvertiseMode(advertiseMode)
                 .setConnectable(false)
                 .setTimeout(0)
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
                 .build();
 
+        // Android serializes the Service Data AD type as UUID16 followed by
+        // this payload. The shared DMesh encoder includes UUID16 for raw
+        // ESP32 packets, so remove that header here rather than advertising
+        // it twice (which shifts the ESP event byte by two positions).
+        byte[] serviceData = advBytes;
+        if (advBytes.length >= 2 && advBytes[0] == 0x20 && advBytes[1] == 0x18) {
+            serviceData = Arrays.copyOfRange(advBytes, 2, advBytes.length);
+        }
         AdvertiseData data = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .setIncludeTxPowerLevel(false)
-                .addServiceUuid(DMESH_OPERATIONAL)
-                .addServiceData(DMESH_OPERATIONAL, advBytes)
+                .addServiceUuid(DMESH_IPSP)
+                .addServiceData(DMESH_IPSP, serviceData)
                 .build();
 
         mBluetoothLeAdvertiser.stopAdvertising(mAdvertiseCallback);
@@ -624,10 +683,41 @@ public class Ble implements MessageHandler {
         } catch (InterruptedException e) {
         }
         mBluetoothLeAdvertiser.startAdvertising(settings, data, mAdvertiseCallback);
-        MsgMux.get(ctx).publish("BLE.advertise", "state", "starting", "uuid", DMESH_OPERATIONAL.toString());
+        MsgMux.get(ctx).publish("BLE.advertise", "state", "starting", "uuid", DMESH_IPSP.toString());
+    }
+
+    /**
+     * Advertise a bounded non-connectable wake request while Android has
+     * outbound work. The sleeping ESP scans during its raw-NAN awake window,
+     * then becomes connectable only after observing this record.
+     */
+    public void advertiseWake(byte[] payload, long windowMs) {
+        advertiseWake(payload, windowMs, "");
+    }
+
+    public void advertiseWake(byte[] payload, long windowMs, String command) {
+        byte[] deviceId = wifi.deviceIdBytes();
+        byte[] record = MeshNode.buildBleServiceData("wake_request", deviceId,
+                payload == null ? new byte[0] : payload, 0, 0);
+        wakeRequestUntilMs = SystemClock.elapsedRealtime() + Math.max(100, Math.min(windowMs, 20_000)) + 5000;
+        wakeCommand = command == null ? "" : command.trim();
+        // The ESP only scans briefly once per raw-NAN duty interval. Use a
+        // balanced advertising cadence for this bounded wake request so a
+        // 250 ms ESP scan has several chances to overlap without retaining
+        // Android advertising after the rendezvous completes.
+        advertise(record, AdvertiseSettings.ADVERTISE_MODE_BALANCED);
+        long bounded = Math.max(100, Math.min(windowMs, 20_000));
+        mHandler.postDelayed(() -> {
+            if (currentAdvBytes != null && Arrays.equals(currentAdvBytes, record)) {
+                advertise(null);
+            }
+        }, bounded);
+        MsgMux.get(ctx).publish("BLE.rendezvous", "state", "wake_advertising",
+                "window_ms", Long.toString(bounded));
     }
 
     public void scanStop() {
+        scanGeneration++;
         if (leScanner == null) {
             return;
         }
@@ -663,10 +753,13 @@ public class Ble implements MessageHandler {
             leScanner.stopScan(scanPendingIntent());
         }
         mScanning = false;
+        final int generation = ++scanGeneration;
         mHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                startScan();
+                if (generation == scanGeneration) {
+                    startScan();
+                }
             }
         }, 500);
     }
@@ -678,13 +771,13 @@ public class Ble implements MessageHandler {
 
         List<ScanFilter> filters = new ArrayList<>();
         filters.add(new ScanFilter.Builder()
-                .setServiceUuid(DMESH_OPERATIONAL)
+                .setServiceUuid(DMESH_IPSP)
                 .build());
         filters.add(new ScanFilter.Builder()
                 .setServiceUuid(DMESH_PAIRING)
                 .build());
         filters.add(new ScanFilter.Builder()
-                .setServiceData(DMESH_OPERATIONAL, new byte[0], new byte[0])
+                .setServiceData(DMESH_IPSP, new byte[0], new byte[0])
                 .build());
         filters.add(new ScanFilter.Builder()
                 .setServiceUuid(MESHTASTIC)
@@ -704,6 +797,45 @@ public class Ble implements MessageHandler {
             MsgMux.get(ctx).publish("BLE.scan", "filters", "dmesh_operational,dmesh_pairing,meshtastic", "wake", "pending_intent");
         } else {
             MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", Manifest.permission.BLUETOOTH_SCAN);
+        }
+    }
+
+    public void scanAll() {
+        if (leScanner == null || ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)
+                != PackageManager.PERMISSION_GRANTED) {
+            MsgMux.get(ctx).publish("BLE.ERR.permission", "permission", "BLUETOOTH_SCAN");
+            return;
+        }
+        scanStop();
+        final int generation = ++scanGeneration;
+        debugUnfilteredScan = true;
+        lastDmeshPairingAt.clear();
+        final int scanStartCount = scanCnt;
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .setReportDelay(0)
+                .build();
+        try {
+            leScanner.startScan(null, settings, mScanCallback);
+            mScanning = true;
+            MsgMux.get(ctx).publish("BLE.scan", "filters", "none", "mode", "diagnostic",
+                    "settings", "low_latency");
+            mHandler.postDelayed(() -> {
+                if (generation != scanGeneration || !mScanning) {
+                    return;
+                }
+                leScanner.stopScan(mScanCallback);
+                mScanning = false;
+                MsgMux.get(ctx).publish("BLE.scan",
+                        "mode", "diagnostic", "state", "complete",
+                        "callbacks", Integer.toString(scanCnt - scanStartCount),
+                        "window_ms", Long.toString(BLE_DIAGNOSTIC_SCAN_MS));
+            }, BLE_DIAGNOSTIC_SCAN_MS);
+        } catch (RuntimeException e) {
+            mScanning = false;
+            MsgMux.get(ctx).publish("BLE.ERR.scanStart", "mode", "diagnostic",
+                    "error", e.toString());
         }
     }
 
@@ -741,11 +873,50 @@ public class Ble implements MessageHandler {
                 advertise(MeshNode.buildBleServiceData("wake_request", deviceId, new byte[0], 0, 0));
             }
         }
+        if ("wake".equals(action) || "rendezvous".equals(action)) {
+            long windowMs = 2000;
+            if (frame != null && frame.fields.containsKey("window_ms")) {
+                try {
+                    windowMs = Long.parseLong(frame.fields.get("window_ms"));
+                } catch (NumberFormatException ignored) {
+                    // Bounded default.
+                }
+            }
+            String command = frame == null ? "" : frame.fields.get("command");
+            if ((command == null || command.isEmpty()) && argv != null && argv.length > 3) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 3; i < argv.length; i++) {
+                    if (i > 3) {
+                        sb.append(' ');
+                    }
+                    sb.append(argv[i]);
+                }
+                command = sb.toString();
+            }
+            byte[] payload = command == null || command.isEmpty()
+                    ? new byte[0] : command.getBytes(StandardCharsets.UTF_8);
+            advertiseWake(payload, windowMs, command);
+        }
         if ("scan".equals(action)) {
+            debugUnfilteredScan = false;
             scan();
+        }
+        if ("scanall".equals(action)) {
+            scanAll();
         }
         if ("pair".equals(action) || "pairing".equals(action)) {
             pair(argAddr);
+        }
+        if ("probe".equals(action) || "sleep_probe".equals(action)) {
+            long delayMs = 4500;
+            if (frame != null && frame.fields.containsKey("delay_ms")) {
+                try {
+                    delayMs = Long.parseLong(frame.fields.get("delay_ms"));
+                } catch (NumberFormatException ignored) {
+                    // Keep the bounded default for shell/debug callers.
+                }
+            }
+            sleepProbe(argAddr, Math.max(1000, Math.min(delayMs, 12000)));
         }
         if ("bond".equals(action)) {
             bond(argAddr);
@@ -767,9 +938,352 @@ public class Ble implements MessageHandler {
             }
             command(argAddr, command);
         }
+        if ("coc".equals(action) || "coc_probe".equals(action)
+                || "coc_status".equals(action) || "coc_wake".equals(action)
+                || "coc_wake_status".equals(action)) {
+            int requestedPsm = 0x80;
+            if (frame != null && frame.fields.containsKey("psm")) {
+                try {
+                    requestedPsm = Integer.decode(frame.fields.get("psm"));
+                } catch (NumberFormatException ignored) {
+                    // Use the lab default below.
+                }
+            }
+            if ("coc_wake_status".equals(action)) {
+                cocWakeStatus(argAddr, requestedPsm);
+            } else if ("coc_wake".equals(action)) {
+                cocWakeProbe(argAddr, requestedPsm);
+            } else if ("coc_status".equals(action)) {
+                cocStatus(argAddr, requestedPsm);
+            } else {
+                cocProbe(argAddr, requestedPsm);
+            }
+        }
         if ("stop".equals(action)) {
             scanStop();
         }
+    }
+
+    /**
+     * Opens Android's public LE CoC client and verifies the firmware's
+     * opt-in echo server. This is deliberately a dynamic-PSM transport probe,
+     * not an IPSP/IPv6 implementation: IPSP uses assigned PSM 0x0023 whereas
+     * Android's app-facing API accepts dynamic LE PSMs (0x0080..0x00ff).
+     */
+    public void cocProbe(String addr, int requestedPsm) {
+        cocExchange(addr, requestedPsm, "probe",
+                "dmesh-coc-ping".getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Send the compact-CBOR firmware status request ({0: 33}) over CoC. */
+    public void cocStatus(String addr, int requestedPsm) {
+        cocExchange(addr, requestedPsm, "status",
+                new byte[] {(byte) 0xa1, 0x00, 0x18, 0x21});
+    }
+
+    /**
+     * Retry a CoC status request after seeing an ESP payload advertisement.
+     * The ESP repeats that advertisement on subsequent raw-NAN wake windows,
+     * so Android retries the link but never advertises its own wake request in
+     * this direction.
+     */
+    private void cocPendingStatus(String addr) {
+        // {0: 37, 6: {197: "true"}}: firmware `messages pull=true`.
+        // The response is bounded to one CoC SDU and contains the queued
+        // LoRa/raw-radio record that caused the advertisement.
+        cocDiscoveryExchange(addr, 0x80, "pending_pull",
+                new byte[] {(byte) 0xa2, 0x00, 0x18, 0x25, 0x06, (byte) 0xa1,
+                        0x18, (byte) 0xc5, 0x64, 0x74, 0x72, 0x75, 0x65});
+    }
+
+    /**
+     * Advertise an Android pending request, then retry CoC until the sleeping
+     * ESP observes it and opens its next short response window. This never
+     * uses GATT and does not require Android to receive a scan callback.
+     */
+    public void cocWakeProbe(String addr, int requestedPsm) {
+        cocWakeExchange(addr, requestedPsm, "probe",
+                "dmesh-coc-ping".getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Send compact-CBOR status through the bounded advertising/CoC rendezvous. */
+    public void cocWakeStatus(String addr, int requestedPsm) {
+        cocWakeExchange(addr, requestedPsm, "status",
+                new byte[] {(byte) 0xa1, 0x00, 0x18, 0x21});
+    }
+
+    private void cocWakeExchange(String addr, int requestedPsm, String operation, byte[] request) {
+        if (addr == null || addr.isEmpty()) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "missing_device", "op", operation);
+            return;
+        }
+        final long windowMs = 16_000;
+        final long deadline = SystemClock.elapsedRealtime() + windowMs;
+        final AtomicBoolean completed = new AtomicBoolean(false);
+        final AtomicBoolean inFlight = new AtomicBoolean(false);
+        advertiseWake(request, windowMs, "");
+        MsgMux.get(ctx).publish("BLE.COC", "state", "wake_advertising", "op", operation,
+                "addr", addr, "window_ms", Long.toString(windowMs));
+        Runnable[] attempt = new Runnable[1];
+        attempt[0] = () -> {
+            if (completed.get()) {
+                return;
+            }
+            if (SystemClock.elapsedRealtime() >= deadline) {
+                advertise(null);
+                MsgMux.get(ctx).publish("BLE.COC", "state", "wake_timeout", "op", operation,
+                        "addr", addr);
+                return;
+            }
+            if (inFlight.compareAndSet(false, true)) {
+                cocExchange(addr, requestedPsm, operation, request, completed, inFlight);
+            }
+            mHandler.postDelayed(attempt[0], 1_000);
+        };
+        // The ESP scans during its next raw-NAN wake, then advertises the
+        // response window. Start near that cadence and keep at most one LE
+        // socket request outstanding so Android's CoC resource pool is not
+        // exhausted by overlapping retries.
+        mHandler.postDelayed(attempt[0], 4_500);
+    }
+
+    private void cocDiscoveryExchange(String addr, int requestedPsm, String operation,
+                                      byte[] request) {
+        if (addr == null || addr.isEmpty()) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "missing_device", "op", operation);
+            return;
+        }
+        final long windowMs = 8_000;
+        final long deadline = SystemClock.elapsedRealtime() + windowMs;
+        final AtomicBoolean completed = new AtomicBoolean(false);
+        final AtomicBoolean inFlight = new AtomicBoolean(false);
+        MsgMux.get(ctx).publish("BLE.COC", "state", "pending_discovered", "op", operation,
+                "addr", addr, "window_ms", Long.toString(windowMs));
+        Runnable[] attempt = new Runnable[1];
+        attempt[0] = () -> {
+            if (completed.get()) {
+                return;
+            }
+            if (SystemClock.elapsedRealtime() >= deadline) {
+                MsgMux.get(ctx).publish("BLE.COC", "state", "pending_timeout", "op", operation,
+                        "addr", addr);
+                return;
+            }
+            if (inFlight.compareAndSet(false, true)) {
+                cocExchange(addr, requestedPsm, operation, request, completed, inFlight, false);
+            }
+            mHandler.postDelayed(attempt[0], 1_000);
+        };
+        attempt[0].run();
+    }
+
+    private void cocExchange(String addr, int requestedPsm, String operation, byte[] request) {
+        cocExchange(addr, requestedPsm, operation, request, null, null);
+    }
+
+    private void cocExchange(String addr, int requestedPsm, String operation, byte[] request,
+                             AtomicBoolean completed, AtomicBoolean inFlight) {
+        cocExchange(addr, requestedPsm, operation, request, completed, inFlight, true);
+    }
+
+    private void cocExchange(String addr, int requestedPsm, String operation, byte[] request,
+                             AtomicBoolean completed, AtomicBoolean inFlight,
+                             boolean stopWakeAdvertisement) {
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "unsupported_api", "api",
+                    Integer.toString(android.os.Build.VERSION.SDK_INT));
+            return;
+        }
+        if (requestedPsm < 0x80 || requestedPsm > 0xff) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "invalid_psm", "psm",
+                    String.format("0x%04x", requestedPsm));
+            return;
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED) {
+            MsgMux.get(ctx).publish("BLE.ERR.permission", "permission",
+                    Manifest.permission.BLUETOOTH_CONNECT);
+            return;
+        }
+        BluetoothDevice device = remoteDeviceFor(addr);
+        if (device == null) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "missing_device", "addr",
+                    addr == null ? "" : addr);
+            return;
+        }
+        final int psm = requestedPsm;
+        final String target = deviceAddress(device);
+        new Thread(() -> {
+            try (BluetoothSocket socket = device.createInsecureL2capChannel(psm)) {
+                MsgMux.get(ctx).publish("BLE.COC", "state", "connecting", "op", operation,
+                        "addr", target, "psm", String.format("0x%04x", psm));
+                socket.connect();
+                socket.getOutputStream().write(request);
+                socket.getOutputStream().flush();
+                byte[] reply = new byte[256];
+                int offset = 0;
+                while (offset < reply.length) {
+                    int read = socket.getInputStream().read(reply, offset, reply.length - offset);
+                    if (read < 0) {
+                        break;
+                    }
+                    offset += read;
+                    if ("probe".equals(operation) || socket.getInputStream().available() == 0) {
+                        break;
+                    }
+                }
+                boolean echoed = "probe".equals(operation) && offset == request.length
+                        && Arrays.equals(request, Arrays.copyOf(reply, offset));
+                String state = "probe".equals(operation)
+                        ? (echoed ? "echo_ok" : "short_reply")
+                        : (offset > 0 ? "response" : "short_reply");
+                if (("echo_ok".equals(state) || "response".equals(state))
+                        && completed != null && completed.compareAndSet(false, true)) {
+                    if (stopWakeAdvertisement) {
+                        advertise(null);
+                    }
+                }
+                MsgMux.get(ctx).publish("BLE.COC", "state", state, "op", operation,
+                        "addr", target, "psm", String.format("0x%04x", psm),
+                        "rx", Integer.toString(offset), "hex", hex(reply, offset));
+                if ("response".equals(state) && "pending_pull".equals(operation)) {
+                    byte[] received = Arrays.copyOf(reply, offset);
+                    // The CoC socket is short lived. Persist/ack on a separate
+                    // task after this pull has been published and its socket is
+                    // allowed to close; an unpersisted frame is deliberately
+                    // not acknowledged and will be offered again.
+                    mHandler.post(() -> persistAndAckPending(target, psm, received));
+                }
+            } catch (IOException | SecurityException e) {
+                MsgMux.get(ctx).publish("BLE.COC", "state", "failed", "op", operation, "addr", target,
+                        "psm", String.format("0x%04x", psm), "error", e.toString());
+            } finally {
+                if (inFlight != null) {
+                    inFlight.set(false);
+                }
+            }
+        }, "dmesh-coc-" + operation).start();
+    }
+
+    /** Persist a pulled companion record before acknowledging its ESP queue entry. */
+    private void persistAndAckPending(String addr, int psm, byte[] reply) {
+        PendingReceipt receipt = pendingReceipt(reply);
+        if (receipt == null) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "no_pending_record", "op", "pending_pull",
+                    "addr", addr);
+            return;
+        }
+        byte[] stored = MeshNode.radioMessage("radio.coc.store_frame",
+                "src_device=" + addr + " seq=" + receipt.seq + " hash="
+                        + Integer.toUnsignedString(receipt.hash), receipt.payload, -1);
+        String result = new String(stored, StandardCharsets.UTF_8);
+        if (!result.contains("\"status\":\"stored\"")) {
+            MsgMux.get(ctx).publish("BLE.COC", "state", "persist_failed", "op", "pending_pull",
+                    "addr", addr, "seq", Integer.toString(receipt.seq), "error", result);
+            return;
+        }
+        MsgMux.get(ctx).publish("BLE.COC", "state", "persisted", "op", "pending_pull",
+                "addr", addr, "seq", Integer.toString(receipt.seq),
+                "hash", String.format("0x%08x", receipt.hash));
+        // The ESP may already be back in its BLE-off raw-NAN interval after
+        // the pull. Retry against its next pending advertisement rather than
+        // retaining a connection or treating a first reconnect miss as loss.
+        cocDiscoveryExchange(addr, psm, "pending_ack", pendingAckRequest(receipt));
+    }
+
+    /** Build `{0:37,6:{121:"true",220:"seq",164:"hash"}}` for firmware `messages ack`. */
+    private static byte[] pendingAckRequest(PendingReceipt receipt) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(20);
+        out.write(0xa2); out.write(0x00); out.write(0x18); out.write(0x25);
+        out.write(0x06); out.write(0xa3);
+        out.write(0x18); out.write(0x79); out.write(0x64);
+        out.write('t'); out.write('r'); out.write('u'); out.write('e');
+        out.write(0x18); out.write(0xdc); writeCborText(out, Integer.toString(receipt.seq));
+        out.write(0x18); out.write(0xa4);
+        writeCborText(out, String.format(Locale.ROOT, "0x%08x", receipt.hash));
+        return out.toByteArray();
+    }
+
+    private static void writeCborText(ByteArrayOutputStream out, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length < 24) {
+            out.write(0x60 | bytes.length);
+        } else {
+            out.write(0x78); out.write(bytes.length);
+        }
+        out.write(bytes, 0, bytes.length);
+    }
+
+    /** Extract the one bounded telemetry record returned by `messages pull=true`. */
+    private static PendingReceipt pendingReceipt(byte[] reply) {
+        String text = cborTextValue(reply, 32);
+        if (text == null || !text.startsWith("msg ")) {
+            return null;
+        }
+        int seq = -1;
+        long hash = -1;
+        String data = null;
+        for (String token : text.substring(0, text.indexOf('\n') >= 0 ? text.indexOf('\n') : text.length())
+                .split("\\s+")) {
+            if (token.startsWith("seq=")) {
+                try { seq = Integer.parseInt(token.substring(4)); } catch (NumberFormatException ignored) { }
+            } else if (token.startsWith("hash=0x")) {
+                try { hash = Long.parseLong(token.substring(7), 16); } catch (NumberFormatException ignored) { }
+            } else if (token.startsWith("data=hex:")) {
+                data = token.substring(9);
+            }
+        }
+        if (seq < 0 || hash < 0 || hash > 0xffff_ffffL || data == null || data.length() % 2 != 0) {
+            return null;
+        }
+        try {
+            byte[] payload = new byte[data.length() / 2];
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] = (byte) Integer.parseInt(data.substring(i * 2, i * 2 + 2), 16);
+            }
+            return new PendingReceipt(seq, (int) hash, payload);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    /** Return the text value for a known compact-CBOR integer key (tag 32 here). */
+    private static String cborTextValue(byte[] data, int key) {
+        for (int i = 0; i + 2 < data.length; i++) {
+            if ((data[i] & 0xff) != 0x18 || (data[i + 1] & 0xff) != key) continue;
+            int header = data[i + 2] & 0xff;
+            if ((header & 0xe0) != 0x60) continue;
+            int len = header & 0x1f;
+            int start = i + 3;
+            if (len == 24 && start < data.length) { len = data[start] & 0xff; start++; }
+            else if (len == 25 && start + 1 < data.length) {
+                len = ((data[start] & 0xff) << 8) | (data[start + 1] & 0xff); start += 2;
+            }
+            if (len >= 0 && start + len <= data.length) {
+                return new String(data, start, len, StandardCharsets.UTF_8);
+            }
+        }
+        return null;
+    }
+
+    private static final class PendingReceipt {
+        final int seq;
+        final int hash;
+        final byte[] payload;
+
+        PendingReceipt(int seq, int hash, byte[] payload) {
+            this.seq = seq;
+            this.hash = hash;
+            this.payload = payload;
+        }
+    }
+
+    private static String hex(byte[] bytes, int length) {
+        StringBuilder out = new StringBuilder(length * 2);
+        for (int i = 0; i < length; i++) {
+            out.append(String.format("%02x", bytes[i] & 0xff));
+        }
+        return out.toString();
     }
 
     private void handleServer(BluetoothServerSocket ss) {
@@ -870,11 +1384,12 @@ public class Ble implements MessageHandler {
     }
 
     private BluetoothDevice remoteDeviceFor(String addr) {
-        if (addr == null || !BluetoothAdapter.checkBluetoothAddress(addr)
+        String normalized = addr == null ? "" : addr.trim().toUpperCase(Locale.ROOT);
+        if (!BluetoothAdapter.checkBluetoothAddress(normalized)
                 || mBluetoothAdapter == null) {
             return null;
         }
-        return mBluetoothAdapter.getRemoteDevice(addr);
+        return mBluetoothAdapter.getRemoteDevice(normalized);
     }
 
     private String requestedAddress(String requested, BluetoothDevice device) {
@@ -937,6 +1452,35 @@ public class Ble implements MessageHandler {
             return;
         }
         connectDevice(device, deviceAddress(device), false, text);
+    }
+
+    /**
+     * Keep one GATT connection open across a bounded device sleep interval.
+     * This is a transport probe, not a product command: it writes a compact
+     * text record immediately after CCCD setup and once more after delayMs.
+     */
+    public void sleepProbe(String addr, long delayMs) {
+        sleepProbe(addr, delayMs, SystemClock.elapsedRealtime() + 12_000);
+    }
+
+    private void sleepProbe(String addr, long delayMs, long retryUntilMs) {
+        Device d = findPairingDevice(addr);
+        BluetoothDevice device = d == null ? null : d.dev;
+        if (device == null) {
+            device = remoteDeviceFor(addr);
+        }
+        if (device == null) {
+            MsgMux.get(ctx).publish("BLE.PROBE", "addr", addr == null ? "" : addr,
+                    "state", "missing_device");
+            return;
+        }
+        if (activePull != null && activePull.isActive()) {
+            MsgMux.get(ctx).publish("BLE.PROBE", "addr", addr,
+                    "state", "preempt", "active", activePull.addr);
+            disconnectPull(activePull.gatt);
+            activePull = null;
+        }
+        connectDevice(device, deviceAddress(device), false, null, delayMs, retryUntilMs);
     }
 
     public void bond(String addr) {
@@ -1043,11 +1587,21 @@ public class Ble implements MessageHandler {
     }
 
     private void connectDevice(BluetoothDevice device, String addr, boolean pairingRequest) {
-        connectDevice(device, addr, pairingRequest, null);
+        connectDevice(device, addr, pairingRequest, null, 0);
     }
 
     private void connectDevice(BluetoothDevice device, String addr, boolean pairingRequest,
                                String commandText) {
+        connectDevice(device, addr, pairingRequest, commandText, 0);
+    }
+
+    private void connectDevice(BluetoothDevice device, String addr, boolean pairingRequest,
+                               String commandText, long probeDelayMs) {
+        connectDevice(device, addr, pairingRequest, commandText, probeDelayMs, 0);
+    }
+
+    private void connectDevice(BluetoothDevice device, String addr, boolean pairingRequest,
+                               String commandText, long probeDelayMs, long probeRetryUntilMs) {
         if (device == null) {
             return;
         }
@@ -1064,7 +1618,8 @@ public class Ble implements MessageHandler {
             MsgMux.get(ctx).publish("BLE.PULL", "addr", addr, "state", "busy");
             return;
         }
-        ClientCallback mGattCallback = new ClientCallback(id, addr, pairingRequest, commandText);
+        ClientCallback mGattCallback = new ClientCallback(
+                id, addr, pairingRequest, commandText, probeDelayMs, probeRetryUntilMs);
         activePull = mGattCallback.session;
         MsgMux.get(ctx).publish(commandText != null ? "BLE.CMD" : (pairingRequest ? "BLE.PAIR" : "BLE.PULL"),
                 "addr", addr,
@@ -1087,10 +1642,13 @@ public class Ble implements MessageHandler {
     class ClientCallback extends BluetoothGattCallback {
         final PullSession session;
 
-        ClientCallback(String id, String addr, boolean pairingRequest, String commandText) {
+        ClientCallback(String id, String addr, boolean pairingRequest, String commandText,
+                       long probeDelayMs, long probeRetryUntilMs) {
             session = new PullSession(id, addr);
             session.pairingRequest = pairingRequest;
             session.commandText = commandText;
+            session.probeDelayMs = probeDelayMs;
+            session.probeRetryUntilMs = probeRetryUntilMs;
         }
 
         @Override
@@ -1110,7 +1668,8 @@ public class Ble implements MessageHandler {
             if (newState == STATE_CONNECTED) {
                 mConnectionState = STATE_CONNECTED;
                 session.gatt = gatt;
-                MsgMux.get(ctx).publish("BLE.PULL", "addr", deviceAddress(gatt.getDevice()), "state", "connected");
+                MsgMux.get(ctx).publish("BLE.PULL", "addr", deviceAddress(gatt.getDevice()),
+                        "state", "connected", "status", Integer.toString(status));
 
                 Log.i(TAG, "Connected to GATT server.");
                 if (ctx.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
@@ -1119,13 +1678,26 @@ public class Ble implements MessageHandler {
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 mConnectionState = STATE_DISCONNECTED;
-                MsgMux.get(ctx).publish("BLE.PULL", "addr", deviceAddress(gatt.getDevice()), "state", "disconnected");
+                MsgMux.get(ctx).publish("BLE.PULL", "addr", deviceAddress(gatt.getDevice()),
+                        "state", "disconnected", "status", Integer.toString(status));
                 session.done = true;
                 if (activePull == session) {
                     activePull = null;
                 }
                 gatt.close();
-                Log.i(TAG, "Disconnected from GATT server.");
+                Log.i(TAG, "Disconnected from GATT server: status=" + status
+                        + " state=" + newState);
+                if (!session.probeSubscribed && session.probeRetryUntilMs
+                        > SystemClock.elapsedRealtime()) {
+                    long remainingMs = session.probeRetryUntilMs
+                            - SystemClock.elapsedRealtime();
+                    MsgMux.get(ctx).publish("BLE.PROBE", "addr", session.addr,
+                            "state", "retry", "remaining_ms", Long.toString(remainingMs));
+                    mHandler.postDelayed(
+                            () -> sleepProbe(session.addr, session.probeDelayMs,
+                                    session.probeRetryUntilMs),
+                            700);
+                }
             }
         }
 
@@ -1138,6 +1710,8 @@ public class Ble implements MessageHandler {
                         "addr", deviceAddress(gatt.getDevice()),
                         "state", "services",
                         "count", Integer.toString(services == null ? 0 : services.size()));
+                Log.i(TAG, "DMesh GATT services discovered: count="
+                        + (services == null ? 0 : services.size()));
                 BluetoothGattService service = gatt.getService(dmeshGattUUID);
                 if (service == null) {
                     MsgMux.get(ctx).publish("BLE.PULL",
@@ -1211,10 +1785,11 @@ public class Ble implements MessageHandler {
 
         @Override
         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
-            MsgMux.get(ctx).publish("BLE.PULL",
-                    "addr", deviceAddress(gatt.getDevice()),
-                    "state", "write",
-                    "status", Integer.toString(status));
+                MsgMux.get(ctx).publish("BLE.PULL",
+                        "addr", deviceAddress(gatt.getDevice()),
+                        "state", "write",
+                        "status", Integer.toString(status));
+            Log.i(TAG, "DMesh GATT characteristic write: status=" + status);
         }
 
         @Override
@@ -1240,6 +1815,7 @@ public class Ble implements MessageHandler {
                     "state", "notify",
                     "bytes", Integer.toString(data.length),
                     "text", preview);
+            Log.i(TAG, "DMesh GATT notification: bytes=" + data.length);
             session.lastProgress = SystemClock.elapsedRealtime();
             session.append(data);
             parsePullSession(session);
@@ -1262,7 +1838,18 @@ public class Ble implements MessageHandler {
             MsgMux.get(ctx).publish("BLE.PULL",
                     "addr", deviceAddress(gatt.getDevice()),
                     "state", "subscribed");
-            if (session.commandText != null) {
+            Log.i(TAG, "DMesh GATT notification subscription enabled");
+            if (session.probeDelayMs > 0) {
+                session.probeSubscribed = true;
+                writeGattText(gatt, session, "gatt-probe seq=0\n");
+                Log.i(TAG, "DMesh GATT sleep probe scheduled: delay_ms="
+                        + session.probeDelayMs);
+                mHandler.postDelayed(() -> {
+                    if (!session.done && session.gatt != null) {
+                        writeGattText(session.gatt, session, "gatt-probe seq=1\n");
+                    }
+                }, session.probeDelayMs);
+            } else if (session.commandText != null) {
                 writeGattText(gatt, session, session.commandText + "\n");
             } else if (session.pairingRequest) {
                 writeGattText(gatt, session, "pairing request\n");
@@ -1297,10 +1884,15 @@ public class Ble implements MessageHandler {
                 BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
         MsgMux.get(ctx).publish("BLE.PULL",
                 "addr", session.addr,
-                "state", text.startsWith("ack ")
+                "state", text.startsWith("gatt-probe")
+                        ? "probe_write"
+                        : (text.startsWith("ack ")
                         ? "ack_write"
-                        : (text.startsWith("pairing ") ? "pairing_request_write" : "ready_write"),
+                        : (text.startsWith("pairing ") ? "pairing_request_write" : "ready_write")),
                 "status", Integer.toString(status));
+        if (text.startsWith("gatt-probe")) {
+            Log.i(TAG, "DMesh GATT sleep probe write: " + text.trim() + " status=" + status);
+        }
     }
 
     private void parsePullSession(PullSession session) {
@@ -1485,6 +2077,9 @@ public class Ble implements MessageHandler {
         boolean done;
         boolean pairingRequest;
         String commandText;
+        long probeDelayMs;
+        long probeRetryUntilMs;
+        boolean probeSubscribed;
         long lastProgress = SystemClock.elapsedRealtime();
 
         PullSession(String id, String addr) {

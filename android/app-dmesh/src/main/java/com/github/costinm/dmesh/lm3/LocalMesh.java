@@ -422,16 +422,39 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                         nan.start();
                     } else if ("adv".equals(args[2])) {
                         nan.start();
-                    } else if ("con".equals(args[2]) && args.length >= 4) {
-                        nan.conNan(args[3]);
+                    } else if ("con".equals(args[2])) {
+                        String peerId = args.length >= 4 ? args[3]
+                                : b.getString("peer", b.getString("id"));
+                        if (peerId != null) {
+                            nan.conNan(peerId);
+                        }
                     } else if ("ping".equals(args[2])) {
-                        if (args.length >= 4) {
-                            nan.sendAll(args[3]);
+                        String message = args.length >= 4 ? args[3] : b.getString("text");
+                        if (message != null && !message.isEmpty()) {
+                            nan.sendAll(message);
                         } else {
                             nan.sendAll("PING");
                         }
-                    } else if ("msg".equals(args[2]) && args.length >= 5) {
-                        nan.send(args[3], args[4]);
+                    } else if ("probe".equals(args[2])) {
+                        String message = args.length >= 4 ? args[3] : b.getString("text", "NANPROBE");
+                        int count = 16;
+                        long intervalMs = 512L;
+                        try {
+                            count = Integer.parseInt(b.getString("count", "16"));
+                            intervalMs = Long.parseLong(b.getString("interval_ms", "512"));
+                        } catch (NumberFormatException ignored) {
+                            // Use the bounded probe defaults for malformed shell input.
+                        }
+                        nan.probeFollowupCadence(message, count, intervalMs);
+                    } else if ("msg".equals(args[2])) {
+                        // Shell/JSON callers retain named fields, while the in-app command
+                        // path uses positional argv. Support both forms at this boundary.
+                        String peerId = args.length >= 4 ? args[3]
+                                : b.getString("peer", b.getString("id"));
+                        String message = args.length >= 5 ? args[4] : b.getString("text");
+                        if (peerId != null && message != null) {
+                            nan.send(peerId, message);
+                        }
                     }
                 }
                 break;
@@ -659,6 +682,15 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     }
 
     private void updateDeviceId() {
+        // Wi-Fi Aware peers are scoped by the framework's NAN interface MAC.
+        // Do not overwrite it with the legacy P2P `id4` placeholder: the
+        // default produced the shared ASCII identity "000000", causing every
+        // discovered DMesh NAN peer to collide and follow-ups to be routed to
+        // stale zero-ID entries.
+        if (nan != null && nan.nanMac != null && nan.nanMac.length == deviceId.length) {
+            System.arraycopy(nan.nanMac, 0, deviceId, 0, deviceId.length);
+            return;
+        }
         String src = (id4 == null ? "" : id4) + "000000";
         byte[] raw = src.getBytes(StandardCharsets.US_ASCII);
         for (int i = 0; i < deviceId.length; i++) {

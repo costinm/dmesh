@@ -177,6 +177,12 @@ public class DMService extends BaseMsgService implements MessageHandler {
         activeService = this;
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        // A foreground-service launch has a short system deadline.  Native
+        // mesh and radio setup can take longer, so publish the notification
+        // before loading Rust or constructing LocalMesh; otherwise Android
+        // keeps the service pending and BLE scans never register.
+        nh = new NotificationHandler(this);
+        ensureForeground();
 
         try {
             Rust.load();
@@ -184,11 +190,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
         } catch (UnsatisfiedLinkError e) {
             Log.w(TAG, "Rust dmesh library unavailable", e);
         }
-        startRustMesh();
-
         wifi = LocalMesh.get(this.getApplicationContext());
-
-        nh = new NotificationHandler(this);
 
         // Dispatching messages on this service.
         mux.subscribe("ble", wifi.ble);
@@ -243,6 +245,11 @@ public class DMService extends BaseMsgService implements MessageHandler {
         }
 
         LMJob.schedule(this.getApplicationContext(), 15 * 60 * 1000);
+
+        // MeshNode.start() enters native code and may create keys, sockets, and
+        // worker threads.  Do not hold the service main thread while that
+        // happens: Android delivers BLE scan and GATT callbacks there.
+        new Thread(this::startRustMesh, "dmesh-rust-mesh").start();
 
     }
 
@@ -665,7 +672,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
         }
     }
 
-    private void startRustMesh() {
+    private synchronized void startRustMesh() {
         if (meshNode != null) {
             return;
         }
@@ -706,17 +713,26 @@ public class DMService extends BaseMsgService implements MessageHandler {
             return START_STICKY;
         }
 
-        try {
-            startForeground( 5228, nh.getNotification(new Bundle()), ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
-            Log.d(TAG, "Starting fg");
-            fg = true;
-        } catch (Throwable t) {
-            t.printStackTrace();
-        }
+        ensureForeground();
 
         //VpnService.maybeStartVpn(prefs, this);
 
         return START_STICKY;
+    }
+
+    private void ensureForeground() {
+        if (fg || nh == null) {
+            return;
+        }
+        try {
+            startForeground(5228, nh.getNotification(new Bundle()),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+                            | ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+            Log.d(TAG, "Starting fg");
+            fg = true;
+        } catch (Throwable t) {
+            Log.e(TAG, "Unable to start foreground service", t);
+        }
     }
 
 

@@ -10,10 +10,10 @@ import android.content.pm.PackageManager;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.NetworkSpecifier;
-import android.net.wifi.ScanResult;
 import android.net.wifi.WifiManager;
 import android.net.wifi.aware.AttachCallback;
 import android.net.wifi.aware.Characteristics;
+import android.net.wifi.aware.DiscoverySession;
 import android.net.wifi.aware.DiscoverySessionCallback;
 import android.net.wifi.aware.IdentityChangedListener;
 import android.net.wifi.aware.PeerHandle;
@@ -45,14 +45,18 @@ public class Nan {
     public String nanId;
     Context ctx;
     LocalMesh lm;
-    WifiAwareSession nanSession;
+    volatile WifiAwareSession nanSession;
     boolean attachInProgress;
     // Not null if publish session active and nan active
-    PublishDiscoverySession pubSession;
+    volatile PublishDiscoverySession pubSession;
+    // publish()/subscribe() complete asynchronously. State-change broadcasts
+    // may arrive before their Started callbacks; these guards prevent duplicate
+    // discovery sessions and peer handles scoped to a superseded session.
+    volatile boolean pubStarting;
     // Not null if sub session active
-    SubscribeDiscoverySession subSession;
+    volatile SubscribeDiscoverySession subSession;
     // Intended status of NAN subscription. subType indicates the type.
-    boolean nanSub;
+    volatile boolean nanSub;
     boolean enabled;
 
     // Active subscription/passive pub seem better for this use case, but
@@ -70,6 +74,7 @@ public class Nan {
     // many other cases. When it returns, if we sub or adv attach will be called again.
     int msgId;
     int wakeCount;
+    final Map<Integer, String> pendingFollowups = new HashMap<>();
 
     public Nan(LocalMesh wifi) {
         this.lm = wifi;
@@ -104,21 +109,42 @@ public class Nan {
 
     public void stop() {
         enabled = false;
-        if (pubSession != null) {
-            pubSession.close();
-            pubSession = null;
-        }
-        if (nanSession != null) {
-            nanSession.close();
-        }
+        pubStarting = false;
         attachInProgress = false;
         nanSub = false;
-        if (subSession != null) {
-            subSession.close();
-            subSession = null;
+        // Discovery sessions are children of the aware attachment. Close and
+        // clear them first: closing the parent before either child makes the
+        // Android Wi-Fi Aware service reject the later close with an invalid
+        // uid/client mapping, and the following start remains attached but
+        // cannot recreate discovery sessions.
+        PublishDiscoverySession publishing = pubSession;
+        SubscribeDiscoverySession subscribing = subSession;
+        pubSession = null;
+        subSession = null;
+        if (publishing != null) {
+            try {
+                publishing.close();
+            } catch (IllegalStateException ignored) {
+                // The session may already have terminated asynchronously.
+            }
         }
-
+        if (subscribing != null) {
+            try {
+                subscribing.close();
+            } catch (IllegalStateException ignored) {
+                // The session may already have terminated asynchronously.
+            }
+        }
+        WifiAwareSession attachment = nanSession;
         nanSession = null;
+        if (attachment != null) {
+            try {
+                attachment.close();
+            } catch (IllegalStateException ignored) {
+                // The attachment may already have terminated asynchronously.
+            }
+        }
+        devices.clear();
         MsgMux.get(ctx).publish("net.NAN.STOP");
         nanId = null;
     }
@@ -207,6 +233,16 @@ public class Nan {
             if (nanMgr.isAvailable()) {
                 if (nanSession != null) {
                     MsgMux.get(ctx).publish("net.NAN.Status", "state", "attached");
+                    // Discovery sessions can terminate independently while the
+                    // attachment stays valid. Recreate only the missing side so
+                    // a clean test/app restart does not remain attached but
+                    // permanently undiscoverable.
+                    if (pubSession == null && !pubStarting) {
+                        publish();
+                    }
+                    if (subSession == null && !nanSub) {
+                        startNanSub();
+                    }
                     return;
                 }
                 if (attachInProgress) {
@@ -267,9 +303,14 @@ public class Nan {
                         nanMac = mac;
                         nanId = new String(Hex.encode(mac));
                         MsgMux.get(ctx).publish("net.NAN.MAC." + nanId);
+                        // onAttached() normally starts discovery before the framework has
+                        // delivered this identity callback. Refresh the session descriptors
+                        // rather than retaining the legacy placeholder identity in service
+                        // specific information (or tearing down peer handles mid-test).
+                        refreshDiscoveryIdentity();
                         lm.sendWifiDiscoveryStatus("/nan/id", "");
                     }
-                }, null);
+                }, lm.delayHandler);
             } else {
                 Log.d(TAG, "WifiAware unavailabe");
                 MsgMux.get(ctx).publish("net.NAN.unavailable");
@@ -284,16 +325,28 @@ public class Nan {
         }
     }
 
-    void onDiscovered(PeerHandle peerHandle, byte[] serviceSpecificInfo, boolean byPublisher) {
+    void onDiscovered(PeerHandle peerHandle, byte[] serviceSpecificInfo, boolean byPublisher,
+                      DiscoverySession discoverySession) {
+        if (discoverySession == null) {
+            return;
+        }
         Device bd = new Device(peerHandle, serviceSpecificInfo);
         String parsed = MeshNode.parseNanServiceInfo(serviceSpecificInfo);
         String deviceId = jsonField(parsed, "device_id");
-        if (deviceId.length() > 0) {
+        if (isUsableDmeshIdentity(deviceId)) {
             bd.id = deviceId;
             bd.data.putString(Device.P2PAddr, "/nan/" + deviceId);
             bd.data.putString("proto", "dmesh_nan");
             bd.data.putString("nan", parsed);
+        } else {
+            // A stale app version advertised the ASCII value "000000" here.
+            // Never retain it as a peer: its shared map key caused follow-ups
+            // to be routed through arbitrary stale discovery handles.
+            MsgMux.get(ctx).publish("net.NAN.InvalidServiceIdentity",
+                    "peer", peerHandle.toString(), "id", deviceId);
+            return;
         }
+        bd.nanSession = discoverySession;
         Device old = devices.get(bd.id);
         if (old == null) {
             onDiscovery(bd, bd.id, true);
@@ -303,9 +356,6 @@ public class Nan {
                 onDiscovery(bd, bd.id, false);
             }
         }
-        devices.put(bd.id, bd);
-
-
         // for debugging
         if (byPublisher) {
             // Used with active sub and passive pub
@@ -313,23 +363,37 @@ public class Nan {
                     "peer", peerHandle.toString(),
                     "id", bd.id,
                     "json", parsed);
-            bd.nanSession = pubSession;
         } else {
             // Used with active pub and passive sub
             MsgMux.get(ctx).publish("net.NAN.SubServiceDiscovered",
                     "peer", peerHandle.toString(),
                     "id", bd.id,
                     "json", parsed);
-            bd.nanSession = subSession;
         }
-        sendFollowup(bd, "hello", new byte[0]);
+        // Peer handles are scoped to a discovery session. Replace the old handle only after
+        // this callback's session has been recorded, so callers cannot send on a stale one.
+        devices.put(bd.id, bd);
+        // Do not send a debug hello here. Some Android Wi-Fi Aware HALs leave a
+        // queued message unresolved when a raw peer disappears between discovery
+        // windows, which blocks every later application command in their single
+        // transmit queue. A caller sends only when it has real data.
+        MsgMux.get(ctx).publish("net.NAN.PeerReady",
+                "id", bd.id == null ? "" : bd.id,
+                "peer", peerHandle.toString());
+    }
+
+    private static boolean isUsableDmeshIdentity(String deviceId) {
+        if (deviceId == null || !deviceId.matches("[0-9A-Fa-f]{12}")) {
+            return false;
+        }
+        return !"000000000000".equals(deviceId) && !"303030303030".equals(deviceId);
     }
 
     private void onDiscovery(Device bd, String id, boolean b) {
         lm.sendWifiDiscoveryStatus("nan", "");
     }
 
-    private void publish() {
+    private synchronized void publish() {
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "Missing permissions");
@@ -342,33 +406,30 @@ public class Nan {
         if (nanSession == null) {
                 return;
         }
-        if (pubSession != null) {
+        if (pubSession != null || pubStarting) {
             return;
         }
         try {
-            nanSession.publish(buildPublishConfig(true), new NanDiscoveryCallback(true), null);
-        } catch (IllegalArgumentException | SecurityException e) {
-            Log.w(TAG, "NAN publish with instant mode failed; retrying without instant mode", e);
-            MsgMux.get(ctx).publish("net.NAN.PubInstantError", "error", e.toString());
-            try {
-                nanSession.publish(buildPublishConfig(false), new NanDiscoveryCallback(true), null);
-            } catch (RuntimeException retryError) {
-                Log.w(TAG, "NAN publish failed", retryError);
-                MsgMux.get(ctx).publish("net.NAN.PubError", "error", retryError.toString());
-            }
+            // Classic ESP32 raw NAN runs on 2.4 GHz channel 6. Do not ask the
+            // Android HAL for 5 GHz instant communication here: a discovery
+            // callback can still be observed while follow-ups are scheduled on
+            // a radio the ESP cannot receive.
+            pubStarting = true;
+            nanSession.publish(buildPublishConfig(), new NanDiscoveryCallback(true), lm.delayHandler);
+        } catch (RuntimeException e) {
+            pubStarting = false;
+            Log.w(TAG, "NAN publish failed", e);
+            MsgMux.get(ctx).publish("net.NAN.PubError", "error", e.toString());
         }
     }
 
-    private PublishConfig buildPublishConfig(boolean instant) {
+    private PublishConfig buildPublishConfig() {
         PublishConfig.Builder builder = new PublishConfig.Builder().setServiceName(pubServiceName)
                 .setPublishType(pubType) // silent, but respond to active requests
                 .setTerminateNotificationEnabled(true)
                 .setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
                         lm.deviceIdBytes(),
                         wakeCount++));
-        if (instant) {
-            builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ);
-        }
         return builder.build();
     }
 
@@ -386,7 +447,7 @@ public class Nan {
      * <p>
      * Will stay active until 'stop' is called.
      */
-    private void startNanSub() {
+    private synchronized void startNanSub() {
         Log.d(TAG, "/NAN/Subscribe");
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
@@ -402,21 +463,18 @@ public class Nan {
         nanSub = true;
 
         try {
-            nanSession.subscribe(buildSubscribeConfig(true), new NanDiscoveryCallback(false), null);
-        } catch (IllegalArgumentException | SecurityException e) {
-            Log.w(TAG, "NAN subscribe with instant mode failed; retrying without instant mode", e);
-            MsgMux.get(ctx).publish("net.NAN.SubInstantError", "error", e.toString());
-            try {
-                nanSession.subscribe(buildSubscribeConfig(false), new NanDiscoveryCallback(false), null);
-            } catch (RuntimeException retryError) {
-                Log.w(TAG, "NAN subscribe failed", retryError);
-                MsgMux.get(ctx).publish("net.NAN.SubError", "error", retryError.toString());
-            }
+            // Keep discovery and follow-ups on the normal 2.4 GHz aware
+            // cluster while validating a raw classic-ESP peer.
+            nanSession.subscribe(buildSubscribeConfig(), new NanDiscoveryCallback(false), lm.delayHandler);
+        } catch (RuntimeException e) {
+            nanSub = false;
+            Log.w(TAG, "NAN subscribe failed", e);
+            MsgMux.get(ctx).publish("net.NAN.SubError", "error", e.toString());
         }
 
     }
 
-    private SubscribeConfig buildSubscribeConfig(boolean instant) {
+    private SubscribeConfig buildSubscribeConfig() {
         SubscribeConfig.Builder builder = new SubscribeConfig.Builder()
                 .setServiceName("dmesh")
                 .setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
@@ -424,10 +482,27 @@ public class Nan {
                         wakeCount++))
                 .setSubscribeType(subType)
                 .setTerminateNotificationEnabled(true);
-        if (instant) {
-            builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ);
-        }
         return builder.build();
+    }
+
+    /** Update active discovery descriptors after Wi-Fi Aware supplies our NAN MAC. */
+    private synchronized void refreshDiscoveryIdentity() {
+        if (pubSession != null) {
+            try {
+                pubSession.updatePublish(buildPublishConfig());
+                MsgMux.get(ctx).publish("net.NAN.PubIdentityUpdated", "id", nanId);
+            } catch (IllegalStateException e) {
+                MsgMux.get(ctx).publish("net.NAN.PubIdentityUpdateError", "error", e.toString());
+            }
+        }
+        if (subSession != null) {
+            try {
+                subSession.updateSubscribe(buildSubscribeConfig());
+                MsgMux.get(ctx).publish("net.NAN.SubIdentityUpdated", "id", nanId);
+            } catch (IllegalStateException e) {
+                MsgMux.get(ctx).publish("net.NAN.SubIdentityUpdateError", "error", e.toString());
+            }
+        }
     }
 
     /**
@@ -457,13 +532,15 @@ public class Nan {
         }
     }
 
-    public void sendAll(String id) {
+    public int sendAll(String id) {
+        int sent = 0;
         if (subSession != null) {
             for (Device d : devices.values()) {
                 if (d.nan != null && d.nanSession == subSession) {
                     // May log: DiscoverySession: called on terminated session
                     Log.d(TAG, "NAN send " + d.id + " " + d.nan + " " + msgId);
                     sendFollowup(d, "command_text", id.getBytes(StandardCharsets.UTF_8));
+                    sent++;
                 }
             }
         }
@@ -473,8 +550,34 @@ public class Nan {
                     // May log: DiscoverySession: called on terminated session
                     Log.d(TAG, "NAN send pub " + d.id + " " + d.nan + " " + msgId);
                     sendFollowup(d, "command_text", id.getBytes(StandardCharsets.UTF_8));
+                    sent++;
                 }
             }
+        }
+        return sent;
+    }
+
+    /**
+     * Send the same follow-up on a bounded cadence for discovery-window tests.
+     *
+     * This is deliberately a test surface rather than a reliability policy:
+     * production callers keep their own pending payload and send only when the
+     * selected transport is available.  The fixed cadence lets the ESP record
+     * exactly which 512-TU interval accepted a frame advertised by its NAN
+     * Availability attribute.
+     */
+    public void probeFollowupCadence(String text, int count, long intervalMs) {
+        int boundedCount = Math.max(1, Math.min(count, 32));
+        long boundedIntervalMs = Math.max(128L, Math.min(intervalMs, 4_000L));
+        for (int index = 0; index < boundedCount; index++) {
+            final int probeIndex = index;
+            lm.delayHandler.postDelayed(() -> {
+                int sent = sendAll(text + "#" + probeIndex);
+                MsgMux.get(ctx).publish("net.NAN.FollowupProbe",
+                        "index", Integer.toString(probeIndex),
+                        "intervalMs", Long.toString(boundedIntervalMs),
+                        "sent", Integer.toString(sent));
+            }, probeIndex * boundedIntervalMs);
         }
     }
 
@@ -489,7 +592,22 @@ public class Nan {
         }
         byte[] target = parseDeviceId(d.id);
         byte[] body = MeshNode.buildNanFollowup(msgType, lm.deviceIdBytes(), target, payload);
-        d.nanSession.sendMessage(d.nan, msgId++, body);
+        int messageId = msgId++;
+        pendingFollowups.put(messageId,
+                (d.id == null ? "" : d.id) + ":" + msgType);
+        try {
+            d.nanSession.sendMessage(d.nan, messageId, body);
+        } catch (IllegalStateException | SecurityException e) {
+            pendingFollowups.remove(messageId);
+            devices.remove(d.id, d);
+            MsgMux.get(ctx).publish("net.NAN.MSGERR",
+                    "id", Integer.toString(messageId),
+                    "device", d.id == null ? "" : d.id,
+                    "phase", "send",
+                    "error", e.toString());
+            Log.w(TAG, "NAN follow-up send failed for " + d.id, e);
+            return;
+        }
         MsgMux.get(ctx).publish("net.NAN.FollowupTx",
                 "id", d.id == null ? "" : d.id,
                 "type", msgType,
@@ -534,6 +652,7 @@ public class Nan {
      */
     class NanDiscoveryCallback extends DiscoverySessionCallback {
         private final boolean pub;
+        private DiscoverySession discoverySession;
 
         public NanDiscoveryCallback(boolean pub) {
             this.pub = pub;
@@ -555,7 +674,10 @@ public class Nan {
 
             super.onServiceDiscovered(peerHandle, serviceSpecificInfo, matchFilter);
 
-            onDiscovered(peerHandle, serviceSpecificInfo, pub);
+            if (discoverySession == null) {
+                return;
+            }
+            onDiscovered(peerHandle, serviceSpecificInfo, pub, discoverySession);
         }
 
 
@@ -568,7 +690,15 @@ public class Nan {
         @Override
         public void onSessionConfigFailed() {
             super.onSessionConfigFailed();
-            MsgMux.get(ctx).publish("net.NAN.PubSessionConfigFailed");
+            synchronized (Nan.this) {
+                if (pub) {
+                    pubStarting = false;
+                    MsgMux.get(ctx).publish("net.NAN.PubSessionConfigFailed");
+                } else {
+                    nanSub = false;
+                    MsgMux.get(ctx).publish("net.NAN.SubSessionConfigFailed");
+                }
+            }
         }
 
         @Override
@@ -579,13 +709,20 @@ public class Nan {
         @Override
         public void onMessageSendSucceeded(int messageId) {
             super.onMessageSendSucceeded(messageId);
+            String pending = pendingFollowups.remove(messageId);
+            MsgMux.get(ctx).publish("net.NAN.FollowupTxOk",
+                    "id", Integer.toString(messageId),
+                    "message", pending == null ? "" : pending);
             Log.d(TAG, "/NAN/SENT/" + messageId);
         }
 
         @Override
         public void onMessageSendFailed(int messageId) {
             super.onMessageSendFailed(messageId);
-            MsgMux.get(ctx).publish("net.NAN.MSGERR", "id", Integer.toString(messageId));
+            String pending = pendingFollowups.remove(messageId);
+            MsgMux.get(ctx).publish("net.NAN.MSGERR",
+                    "id", Integer.toString(messageId),
+                    "message", pending == null ? "" : pending);
         }
 
         @Override
@@ -593,7 +730,13 @@ public class Nan {
             super.onSubscribeStarted(session);
             Log.d(TAG, "/NAN/SubStart" + session);
             MsgMux.get(ctx).publish("net.NAN.SubStart");
-            subSession = session;
+            synchronized (Nan.this) {
+                discoverySession = session;
+                subSession = session;
+                // IdentityChanged may have arrived before this asynchronous
+                // callback. Apply the real NAN identity in either ordering.
+                refreshDiscoveryIdentity();
+            }
         }
 
         @Override
@@ -601,17 +744,34 @@ public class Nan {
             super.onPublishStarted(session);
             Log.d(TAG, "/NAN/PubStart");
             MsgMux.get(ctx).publish("net.NAN.PubStart");
-            pubSession = session;
+            synchronized (Nan.this) {
+                discoverySession = session;
+                pubSession = session;
+                pubStarting = false;
+                // IdentityChanged may have arrived before this asynchronous
+                // callback. Apply the real NAN identity in either ordering.
+                refreshDiscoveryIdentity();
+            }
         }
 
         @Override
         public void onSessionTerminated() {
             super.onSessionTerminated();
-            devices.clear(); // TODO: only devices of given type
-            pubSession = null;
+            DiscoverySession endedSession = discoverySession;
+            devices.entrySet().removeIf(entry -> entry.getValue().nanSession == endedSession);
+            pendingFollowups.clear();
+            discoverySession = null;
             if (pub) {
+                pubStarting = false;
+                if (pubSession == endedSession) {
+                    pubSession = null;
+                }
                 MsgMux.get(ctx).publish("net.NAN.PubStop", "dev", "" + devices);
             } else {
+                if (subSession == endedSession) {
+                    subSession = null;
+                    nanSub = false;
+                }
                 MsgMux.get(ctx).publish("net.NAN.SubStop", "dev", "" + devices);
             }
         }

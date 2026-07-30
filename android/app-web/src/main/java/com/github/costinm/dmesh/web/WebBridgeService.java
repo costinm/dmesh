@@ -12,8 +12,11 @@ import android.os.RemoteException;
 import android.util.Log;
 
 import com.github.costinm.dmesh.android.msg.BaseMsgService;
+import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.msg.MsgFrame;
 
-public class WebBridgeService extends BaseMsgService {
+public class WebBridgeService extends BaseMsgService implements MessageHandler {
     private static final String TAG = "DMeshWebSvc";
 
     @Override
@@ -34,6 +37,12 @@ public class WebBridgeService extends BaseMsgService {
     }
 
     @Override
+    public void onCreate() {
+        super.onCreate();
+        mux.subscribe("/web", this);
+    }
+
+    @Override
     protected boolean handleInMessage(Message msg) {
         Bundle data = msg.getData();
         String uri = data.getString(":uri", "");
@@ -46,6 +55,27 @@ public class WebBridgeService extends BaseMsgService {
             return true;
         }
         return super.handleInMessage(msg);
+    }
+
+    @Override
+    public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo,
+                              String[] args) {
+        MsgFrame frame = MsgFrame.fromMessage(msg);
+        if ("/web/open".equals(frame.method)) {
+            openUrl(frame.fields.get(WebUrls.EXTRA_URL));
+        } else if ("/web/forward".equals(frame.method)) {
+            Bundle data = msg.getData();
+            requestForward(data);
+        } else {
+            return;
+        }
+        if (replyTo != null) {
+            MsgFrame receipt = new MsgFrame("web.received");
+            receipt.id = frame.id;
+            receipt.fields.put("from", "app-web");
+            receipt.fields.put("method", frame.method);
+            replyTo.sendFrame(receipt);
+        }
     }
 
     private void openUrl(String url) {
