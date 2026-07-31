@@ -23,8 +23,14 @@ connectionless modem. It does **not** depend on IP, DHCP, lwIP data delivery,
 or normal STA association for mesh control traffic.
 
 - Raw/custom NAN uses management beacons and DMesh action frames.
-- Action-frame payloads are compact CBOR. They are the ESP-NOW-like
-  connectionless path, but no ESP-NOW API or 250-byte ESP-NOW limit is used.
+- Today, action-frame payloads are compact CBOR. The reviewed transport
+  direction is a minimal, plaintext QUIC-shaped short-packet envelope carrying
+  compact-CBOR JSON-RPC; it is documented in
+  [`docs/plans/nan-quic-short-transport.md`](../../../docs/plans/nan-quic-short-transport.md)
+  and is **not implemented yet**. It will replace the former custom DMesh
+  follow-up ACK, not add another acknowledgement layer.
+- The raw path is ESP-NOW-like and connectionless at L2, but does not use the
+  ESP-NOW API or its 250-byte limit.
 - Promiscuous data-frame receive is deliberately off in normal operation. It
   wakes the device for unrelated channel traffic; data/AP/STA experiments are
   debug-only and must not become the battery transport.
@@ -32,6 +38,44 @@ or normal STA association for mesh control traffic.
   It does not make promiscuous reception a hardware destination filter.
 - Official Espressif NAN is not the low-power default. The raw implementation
   owns the Wi-Fi-on window and explicitly powers Wi-Fi down between windows.
+
+## Radio roles and transport direction
+
+The device mesh is deliberately multi-radio. Discovery, synchronization,
+payload transport, and companion attachment are separate jobs; a successful
+discovery callback is not proof that every subsequent radio path is reliable.
+
+| Radio/path | Current role | Operating constraint |
+| --- | --- | --- |
+| Raw NAN SDF and beacons | Discovery and common DW/time synchronization. NAN TSF is preferred; channel-6 AP beacons are a powered fallback. | Battery ESPs wake only in their selected DW slots. SDF and raw NAN TX must be scheduled inside those windows. |
+| Raw NAN follow-up/action | ESP-to-ESP control/data bearer and observer evidence. It is the first target for the shared short-packet/CBOR connection model. | Use the NAN discovery/multicast destination, not an application-selected peer MAC. The 802.11 source remains useful only for bootstrap context. |
+| Android Wi-Fi Aware follow-up | Android-to-Android messages, and bounded Android-to-ESP diagnostics immediately after a fresh matching discovery callback. | Public Android APIs send to a short-lived `PeerHandle`; they cannot request arbitrary raw NAN BSSID/multicast destination frames. Do not retain a stale peer handle or claim delivery from framework queue acceptance alone. |
+| BLE CoC | Preferred Android companion payload path after ESP discovery/publish. An unsolicited ESP publish can cause Android to open a short-lived CoC connection. | CoC must be assessed with the ESP wake policy; a retained connection may prevent the intended sleep behavior. |
+| BLE GATT | Diagnostic and compatibility companion path, not the selected low-power bearer. | Validate pairing/read/write independently; keeping BLE active or a GATT link alive has not met the battery goal. |
+| AP/STA or higher-rate links | Optional control-plane-selected bulk path between capable hosts/Android devices. | They are not the normal battery ESP payload transport. |
+
+The shared model is therefore: NAN synchronizes and discovers; a suitable
+transport carries the same compact-CBOR JSON-RPC payload. Raw NAN will use the
+reviewed short-packet connection bearer first. CoC can carry the same payload
+after Android rendezvous. GATT is retained only where its power and lifecycle
+trade-offs are acceptable. A later encrypted form can derive connection IDs
+from Ed25519/DH state; plaintext MAC-derived bootstrap IDs are only the current
+reviewed direction.
+
+### Reliability boundary
+
+The lower radio bearer may use packet numbers, selective ACK ranges, and
+retransmission timers. That is distinct from a command result: CBOR's reserved
+`id=1` identifies a JSON-RPC request and its response, and each caller times
+out or retries a command according to the active radio cadence. Do not restore
+the retired custom `DMESH_NAN_ACK` payload message as a substitute for either
+layer.
+
+For current Android evidence, prefer the app's bounded NAN history/status and
+`dumpsys wifiaware` only for framework diagnostics. A Pixel has accepted the
+spec-derived ESP SDF and immediate callback-armed follow-up delivery; Samsung
+raw-ESP acceptance and delayed follow-up behavior remain platform-specific
+open evidence, not a general interoperability claim.
 
 ## Normal Battery Profile
 
@@ -138,8 +182,19 @@ that the firmware handed to raw Wi-Fi TX before changing timing or UART:
 mesh lmesh esp.serial.command port=<radio> command='nan publish_dump=true'
 ```
 
+The required Service Descriptor, Device Capability, Availability, and optional
+SDEA fields are specified in [nan-sdf-fields.md](nan-sdf-fields.md). Generate
+the ESP descriptor from those fields; never copy an Android capture into the
+production encoder.
+
 `publish_dump` is diagnostic only; it does not transmit or retain an
 unbounded packet history.
+
+`nan publish=true` requires `sync=true` and only queues SDFs. The mode task
+releases at most one descriptor immediately after each observed NAN beacon.
+For hardware evidence, require `publish_dw_tx` to advance and
+`publish_dw_last_offset_us` to remain inside the post-beacon dwell reported by
+`nan stats=true`; a queued publish acknowledgement alone is not TX evidence.
 
 On 2026-07-30, lora3 with `nan.dw_stride=8` received `BITMAP#5` at
 `dw512_index=37408`, which is `0 mod 8`; its current status independently
@@ -172,7 +227,7 @@ is not a security boundary; authentication/encryption is a higher-layer task.
 Use lmesh logical forwards, never a raw physical TTY, for normal testing:
 
 ```bash
-source fw/esp32/env.sh
+source env.sh
 export LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock
 export PYTHONPATH="${SSH_MESH_PYTHON:?set SSH_MESH_PYTHON to the ssh-mesh Python directory}"
 

@@ -236,6 +236,14 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "action_dump" => 391,
         "action_history" => 394,
         "publish_dump" => 395,
+        "subscribe_dump" => 396,
+        // Non-persistent raw-NAN interoperability probe.  This controls
+        // whether an otherwise bare unsolicited Publish carries the optional
+        // Service Descriptor Extension Attribute.
+        "sdea" => 397,
+        "availability_map" => 398,
+        "sdea_update" => 399,
+        "service_history" => 400,
         "uart.hb_every" => 387,
         "battery.divider" => 163,
         "battery.mult" => 164,
@@ -342,6 +350,7 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "request_ms" => 216,
         "restore" => 217,
         "rssi" => 218,
+        "role" => 219,
         "seq" => 220,
         "serial" => 221,
         "service" => 222,
@@ -532,7 +541,7 @@ fn is_bare_text_value(value: &str) -> bool {
 mod tests {
     use minicbor::Encoder;
 
-    use super::{command_id, decode_binary};
+    use super::{arg_tag, command_id, decode_binary};
 
     #[test]
     fn active_and_idle_aliases_keep_their_cbor_method_name() {
@@ -549,5 +558,20 @@ mod tests {
             assert_eq!(request.method, command_id("mode").unwrap());
             assert_eq!(request.name, name);
         }
+    }
+
+    #[test]
+    fn sdea_probe_has_a_stable_cbor_tag() {
+        assert_eq!(arg_tag("sdea"), Some(397));
+    }
+
+    #[test]
+    fn service_history_has_a_stable_cbor_tag() {
+        assert_eq!(arg_tag("service_history"), Some(400));
+    }
+
+    #[test]
+    fn role_has_a_stable_cbor_tag() {
+        assert_eq!(arg_tag("role"), Some(219));
     }
 }

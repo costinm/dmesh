@@ -119,7 +119,6 @@ work.
 optional TCP/RFC endpoint, bounded queues, and per-forward counters.
 
 ```bash
-source env.sh
 mesh lmesh usb.serial.forward.list
 mesh lmesh usb.serial.reset port=lora2 mode=run
 mesh lmesh esp.serial.command port=lora2 command=status
@@ -150,12 +149,7 @@ corrupted. Flash through the local physical USB-UART after releasing the lmesh
 forward. Use the fleet tool's sparse write path so NVS and PHY remain intact.
 
 ```bash
-source fw/esp32/env.sh
-export LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock
-export PYTHONPATH="${SSH_MESH_PYTHON:?set SSH_MESH_PYTHON to the ssh-mesh Python directory}"
-python fw/esp32/rust/tools/flash_test_fleet.py \
-  --lmesh-mode local-release --port lora2 --flash-size-esp32 4mb \
-  --skip-config --skip-preflash-stability --jobs 1
+scripts/flash-fw.sh --recovery lora2
 ```
 
 Without `--skip-config`, the fleet tool provisions over the physical UART about
@@ -212,6 +206,15 @@ Never use `write_flash 0x0 dmesh-rs-merged.bin`: that merged image contains
    synthetic resynchronization stream.
 
 ## Managed-Forward Reliability Check
+
+## UART evidence rule
+
+The managed lab profile records every forwarded board TX/RX record, including
+role, host timestamp, escaped text, and exact bytes in hex, in
+`target/lmesh-radio-build/log/serial.log`. Before changing a forward, resetting
+a board, or reflashing after any UART timeout/framing error, inspect the
+relevant role's records in that file and retain the excerpt with the test
+artifact. A timeout without this log evidence is not a firmware-crash claim.
 
 Use the focused lora1/lora4 profile after changing UART framing, wake handling,
 or lmesh forwarding. It keeps firmware in its normal light-sleep/raw-NAN mode;

@@ -838,6 +838,57 @@ pub fn raw_nan_duty_enabled() -> bool {
     RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether a just-observed NAN beacon is in this node's advertised publish
+/// cadence.
+///
+/// The raw-NAN duty scheduler chooses DW0, DW0 + stride, ... from the same
+/// TSF/512-TU timeline.  SDF transmission must use that selection too: sending
+/// after every nearby cluster beacon while advertising `dw_stride=4` makes the
+/// Availability Attribute untrue on air.  The AP owner is intentionally the
+/// exception because its descriptor advertises every DW and it is powered
+/// continuously.
+pub fn raw_nan_publish_dw_slot(tsf_us: u64) -> Option<u32> {
+    if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
+        // The AP owner publishes every DW. Its slot is still returned so the
+        // caller can keep one SDF per observed discovery window.
+        let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+        return (period_us != 0).then(|| (tsf_us / period_us).min(u64::from(u32::MAX)) as u32);
+    }
+    if !RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed)
+        || RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) != SYNC_SOURCE_NAN
+    {
+        return None;
+    }
+    let base_period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+    if base_period_us == 0 {
+        return None;
+    }
+    let stride = u64::from(RAW_NAN_DATA_DW_STRIDE.load(Ordering::Relaxed).max(1));
+    let slot = tsf_us / base_period_us;
+    (slot % stride == 0).then(|| slot.min(u64::from(u32::MAX)) as u32)
+}
+
+/// Smallest local interval between two queued service descriptors.  Beacon
+/// TSF is the primary DW authority, but a raw receiver can observe two
+/// transmitters that claim the same cluster BSSID with incompatible TSFs.  A
+/// local guard prevents the second claim from releasing another descriptor in
+/// the same physical radio window while retaining enough jitter for observed
+/// ESP/Android DW scheduling.
+pub fn raw_nan_publish_min_spacing_us() -> u64 {
+    let base_period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+    if base_period_us == 0 {
+        return 0;
+    }
+    let stride = if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
+        1
+    } else {
+        u64::from(RAW_NAN_DATA_DW_STRIDE.load(Ordering::Relaxed).max(1))
+    };
+    // Permit up to one quarter of a selected interval for real beacon jitter;
+    // this still makes a second SDF milliseconds later impossible.
+    base_period_us.saturating_mul(stride).saturating_mul(3) / 4
+}
+
 /// Open the data plane only for the selected DW0/DW0+4 rendezvous slot.
 ///
 /// `tsf_us` is sampled from the NAN beacon that arrived on channel 6. The

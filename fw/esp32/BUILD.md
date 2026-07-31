@@ -9,7 +9,7 @@ scripts/esp32-deps.sh
 Build the firmware:
 
 ```bash
-. fw/esp32/env.sh
+. env.sh
 (cd fw/esp32 && idf.py build)
 ```
 
@@ -29,7 +29,7 @@ cd fw/esp32
 idf.py -p PORT flash
 ```
 
-For Rust ESP development, source the same environment. `fw/esp32/env.sh` owns
+For Rust ESP development, source the same environment. `env.sh` owns
 the repo-local Nix profile, ESP-IDF tools, ESP Python environment, Cargo home,
 rustup home, and Xtensa Rust toolchain paths under `target/esp32-5.5`; do not
 set those paths manually in scripts.
@@ -37,7 +37,7 @@ set those paths manually in scripts.
 Build the Rust translation scaffold:
 
 ```bash
-. fw/esp32/env.sh
+. env.sh
 (cd fw/esp32/rust && cargo build)
 ```
 

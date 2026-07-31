@@ -3,7 +3,7 @@
 
 Run from the repository root after sourcing the firmware environment:
 
-    . fw/esp32/env.sh
+    . env.sh
     python fw/esp32/rust/tools/flash_test_fleet.py
 
 Defaults:
@@ -493,7 +493,9 @@ def lmesh_rfc2217_url(tcp_port: int) -> str:
 def lmesh_request(control_socket: str, method: str, **params: object) -> dict[str, object]:
     request = {"method": method, **{k: v for k, v in params.items() if v is not None}}
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    timeout_sec = float(os.environ.get("LMESH_CONTROL_TIMEOUT_SEC", "8"))
     try:
+        sock.settimeout(timeout_sec)
         sock.connect(control_socket)
         sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
         response = bytearray()
@@ -673,93 +675,84 @@ def image_build_env(
         f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{partition_path}"\n', encoding="utf-8"
     )
     result = env.copy()
+    # The root environment includes host development tools first. Fleet builds
+    # must match scripts/build-fw.sh and select the repo-local ESP Rust
+    # toolchain explicitly; otherwise cargo reaches the host sysroot and fails
+    # with a misleading missing-core error for xtensa-esp32-espidf.
+    toolchain_bin = result.get("RUST_ESP_TOOLCHAIN_BIN")
+    cargo_home = result.get("CARGO_HOME")
+    if not toolchain_bin or not cargo_home:
+        raise RuntimeError("missing ESP Rust environment; run scripts/esp32-deps.sh")
+    result["PATH"] = os.pathsep.join(
+        [toolchain_bin, str(Path(cargo_home) / "bin"), result.get("PATH", "")]
+    )
     result["ESP_IDF_SDKCONFIG_DEFAULTS"] = f"{sdkconfig};{overlay}"
     return result
 
 
-def build_targets(env: dict[str, str]) -> None:
-    for image in (ESP32_MERGED_IMAGE, ESP32S3_MERGED_IMAGE, ESP32S3_8MB_MERGED_IMAGE):
-        image.parent.mkdir(parents=True, exist_ok=True)
-    esp32_env = image_build_env(env, "sdkconfig.defaults", "partitions_4mb_large_app.csv")
-    run(
-        ["cargo", "build", "--release", "--target", "xtensa-esp32-espidf"],
-        cwd=FW_RUST,
-        env=esp32_env,
-    )
-    run(
-        [
-            "cargo",
-            "espflash",
-            "save-image",
-            "--release",
-            "--target",
-            "xtensa-esp32-espidf",
-            "--chip",
-            "esp32",
-            "--flash-size",
-            "4mb",
-            "--merge",
-            "--skip-padding",
-            str(ESP32_MERGED_IMAGE),
-        ],
-        cwd=FW_RUST,
-        env=esp32_env,
-    )
-    s3_env = image_build_env(
-        env, "sdkconfig.heltec_v3.defaults", "partitions_16mb_large_app_store.csv"
-    )
-    run(
-        ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
-        cwd=FW_RUST,
-        env=s3_env,
-    )
-    run(
-        [
-            "cargo",
-            "espflash",
-            "save-image",
-            "--release",
-            "--target",
-            "xtensa-esp32s3-espidf",
-            "--chip",
-            "esp32s3",
-            "--flash-size",
-            "16mb",
-            "--merge",
-            "--skip-padding",
-            str(ESP32S3_MERGED_IMAGE),
-        ],
-        cwd=FW_RUST,
-        env=s3_env,
-    )
-    s3_8mb_env = image_build_env(
-        env, "sdkconfig.esp32s3_8mb.defaults", "partitions_8mb_large_app_store.csv"
-    )
-    s3_8mb_env["CARGO_TARGET_DIR"] = str(ESP32S3_8MB_TARGET)
-    run(
-        ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
-        cwd=FW_RUST,
-        env=s3_8mb_env,
-    )
-    run(
-        [
-            "cargo",
-            "espflash",
-            "save-image",
-            "--release",
-            "--target",
-            "xtensa-esp32s3-espidf",
-            "--chip",
-            "esp32s3",
-            "--flash-size",
-            "8mb",
-            "--merge",
-            "--skip-padding",
-            str(ESP32S3_8MB_MERGED_IMAGE),
-        ],
-        cwd=FW_RUST,
-        env=s3_8mb_env,
-    )
+def build_targets(env: dict[str, str], devices: list[Device]) -> None:
+    """Build only the image families selected by the physical probe."""
+    needs_esp32 = any(not device.is_s3 for device in devices)
+    needs_s3_16mb = any(device.is_s3 and not s3_uses_8mb_image(device) for device in devices)
+    needs_s3_8mb = any(device.is_s3 and s3_uses_8mb_image(device) for device in devices)
+
+    for image, required in (
+        (ESP32_MERGED_IMAGE, needs_esp32),
+        (ESP32S3_MERGED_IMAGE, needs_s3_16mb),
+        (ESP32S3_8MB_MERGED_IMAGE, needs_s3_8mb),
+    ):
+        if required:
+            image.parent.mkdir(parents=True, exist_ok=True)
+
+    if needs_esp32:
+        esp32_env = image_build_env(env, "sdkconfig.defaults", "partitions_4mb_large_app.csv")
+        run(
+            ["cargo", "build", "--release", "--target", "xtensa-esp32-espidf"],
+            cwd=FW_RUST,
+            env=esp32_env,
+        )
+        run(
+            ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32-espidf",
+             "--chip", "esp32", "--flash-size", "4mb", "--merge", "--skip-padding",
+             str(ESP32_MERGED_IMAGE)],
+            cwd=FW_RUST,
+            env=esp32_env,
+        )
+
+    if needs_s3_16mb:
+        s3_env = image_build_env(
+            env, "sdkconfig.heltec_v3.defaults", "partitions_16mb_large_app_store.csv"
+        )
+        run(
+            ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
+            cwd=FW_RUST,
+            env=s3_env,
+        )
+        run(
+            ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32s3-espidf",
+             "--chip", "esp32s3", "--flash-size", "16mb", "--merge", "--skip-padding",
+             str(ESP32S3_MERGED_IMAGE)],
+            cwd=FW_RUST,
+            env=s3_env,
+        )
+
+    if needs_s3_8mb:
+        s3_8mb_env = image_build_env(
+            env, "sdkconfig.esp32s3_8mb.defaults", "partitions_8mb_large_app_store.csv"
+        )
+        s3_8mb_env["CARGO_TARGET_DIR"] = str(ESP32S3_8MB_TARGET)
+        run(
+            ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
+            cwd=FW_RUST,
+            env=s3_8mb_env,
+        )
+        run(
+            ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32s3-espidf",
+             "--chip", "esp32s3", "--flash-size", "8mb", "--merge", "--skip-padding",
+             str(ESP32S3_8MB_MERGED_IMAGE)],
+            cwd=FW_RUST,
+            env=s3_8mb_env,
+        )
 
 
 def s3_uses_8mb_image(device: Device) -> bool:
@@ -1397,7 +1390,7 @@ def main() -> int:
         print(f"  {device.port}: {device.chip} mac={device.mac or 'unknown'}", flush=True)
 
     if not args.skip_build:
-        build_targets(env)
+        build_targets(env, devices)
     elif not args.skip_flash:
         validate_prebuilt_images(devices)
 

@@ -29,8 +29,17 @@ const DEFAULT_CHANNEL: u8 = 6;
 const NAN_COMMAND_QUEUE_MAX: usize = 8;
 const NAN_OUTGOING_QUEUE_MAX: usize = 8;
 const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
+// Keep a short source-indexed history because an observer can hear several
+// phones at once.  A single "last service descriptor" cannot prove which
+// publisher produced a later test burst.
+const NAN_SERVICE_HISTORY_LEN: usize = 32;
 const NAN_COMMAND_MAX_LEN: usize = 231;
 const NAN_RX_QUEUE_LEN: u32 = 8;
+// A synchronized 512-TU NAN cluster beacon is normally visible at least once
+// per raw-NAN wake.  Do not replace the chosen cluster merely because another
+// nearby NAN cluster happens to transmit in the same receive window.  After
+// this bounded absence the next valid cluster can become the new authority.
+const NAN_CLUSTER_RESELECT_AFTER_US: u64 = 3 * 512 * 1024;
 // NAN beacons, SDFs, and the DMesh action payload all fit below this bound.
 // Drop unusual large management frames in the Wi-Fi callback rather than
 // parsing or allocating in the driver task.
@@ -53,6 +62,17 @@ static NAN_DMESH_FOLLOWUP_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_DMESH_FOLLOWUP_TX: AtomicU32 = AtomicU32::new(0);
 static NAN_SYNC_BEACON_TX: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_PUBLISH_BEACON: AtomicU32 = AtomicU32::new(0);
+static NAN_DISCOVERY_ROLE: AtomicU8 = AtomicU8::new(0);
+// Service descriptors are released only from the post-beacon DW drain. Keep
+// bounded counters so a hardware test can prove that invariant from runtime
+// evidence, not merely from the command's `sync=true` acknowledgement.
+static NAN_PUBLISH_DW_TX: AtomicU32 = AtomicU32::new(0);
+static NAN_PUBLISH_DW_LAST_OFFSET_US: AtomicU32 = AtomicU32::new(0);
+static NAN_PUBLISH_DW_SKIPPED_SLOT: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_PUBLISH_SLOT: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_PUBLISH_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_PUBLISH_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
+static NAN_PUBLISH_DW_LOCAL_GUARD_DROPS: AtomicU32 = AtomicU32::new(0);
 // Bounded timing evidence for the last Android DMesh service descriptor and
 // follow-up. A powered observer uses these fields to place Android traffic on
 // the NAN 512-TU timeline without retaining packet history.
@@ -68,8 +88,9 @@ static NAN_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
-// The NAN cluster ID is learned from the synchronized beacon.  It is not a
-// fixed value: Android rotates the final bytes as it forms or joins a cluster.
+// The NAN cluster ID is learned from the first synchronized beacon. It stays
+// sticky while that cluster remains fresh: nearby clusters have independent
+// TSF timelines and must not replace the timing authority mid-window.
 static NAN_CLUSTER_BSSID: [AtomicU8; 6] = [
     AtomicU8::new(NAN_BSSID[0]),
     AtomicU8::new(NAN_BSSID[1]),
@@ -78,6 +99,9 @@ static NAN_CLUSTER_BSSID: [AtomicU8; 6] = [
     AtomicU8::new(NAN_BSSID[4]),
     AtomicU8::new(NAN_BSSID[5]),
 ];
+static NAN_CLUSTER_LOCKED: AtomicBool = AtomicBool::new(false);
+static NAN_CLUSTER_FOREIGN_DROPS: AtomicU32 = AtomicU32::new(0);
+static NAN_CLUSTER_RESELECTS: AtomicU32 = AtomicU32::new(0);
 static AP_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static AP_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static AP_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
@@ -126,15 +150,11 @@ static NAN_HEADER: [u8; 30] = [
     0x50, 0x6f, 0x9a, 0x01, 0x05, 0x01, 0x00, 0x00, 0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13,
 ];
 
-static NAN_DEVICE_CAPABILITIES: [u8; 12] = [
-    0x0f, 0x09, 0x00, 0x00, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x14, 0x00,
-];
-
 const NAN_AVAILABILITY_ATTR_ID: u8 = 0x12;
 const NAN_TU_US: u32 = 1024;
 const NAN_AVAILABILITY_BITMAP_TU: u32 = 16;
 
-static NAN_SERVICE_EXTENSION: [u8; 7] = [0x0e, 0x04, 0x00, NAN_ID, 0x00, 0x02, 0x02];
+const NAN_SDEA_SERVICE_UPDATE_CONTROL: [u8; 2] = [0x00, 0x02];
 
 const NAN_SERVICE_INFO_LEN: usize = 21;
 // Service Control bits 0..=1 identify the descriptor type: 00 = publish,
@@ -184,9 +204,15 @@ static NAN_LAST_ACTION_FRAME: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 // for Android discovery failures; it is populated in task context, not in the
 // Wi-Fi callback.
 static NAN_LAST_PUBLISH_FRAME: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+// The raw worker receives Subscribe SDFs in task context.  Cache only the
+// standards-generated optional attributes needed to form its bounded
+// solicited Publish response; never retain or rewrite a peer's frame.
+static NAN_SOLICITED_PUBLISH_ATTRIBUTES: OnceLock<Mutex<Option<NanPublishAttributes>>> =
+    OnceLock::new();
 // Bounded evidence for scheduled Android follow-up probes.  This is filled by
 // the worker after DMesh parsing, never by the Wi-Fi callback.
 static NAN_FOLLOWUP_HISTORY: OnceLock<Mutex<VecDeque<NanFollowupReceipt>>> = OnceLock::new();
+static NAN_SERVICE_HISTORY: OnceLock<Mutex<VecDeque<NanServiceReceipt>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 enum NanCommandPeer {
@@ -214,11 +240,85 @@ struct NanFollowupReceipt {
     payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct NanServiceReceipt {
+    local_us: u64,
+    source: [u8; 6],
+    device_id: [u8; 6],
+    instance: u8,
+    kind: u8,
+}
+
+#[derive(Clone, Debug)]
+struct NanPublishAttributes {
+    availability: Vec<u8>,
+    device_capabilities: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NanDiscoveryRole {
+    Publisher,
+    PublisherSolicited,
+    Subscriber,
+    Both,
+}
+
+impl NanDiscoveryRole {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "publish" | "publisher" => Ok(Self::Publisher),
+            "publisher_solicited" => Ok(Self::PublisherSolicited),
+            "subscribe" | "subscriber" => Ok(Self::Subscriber),
+            "both" => Ok(Self::Both),
+            _ => bail!("nan role must be publisher, publisher_solicited, subscriber, or both"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Publisher => "publisher",
+            Self::PublisherSolicited => "publisher_solicited",
+            Self::Subscriber => "subscriber",
+            Self::Both => "both",
+        }
+    }
+
+    fn responds_to_subscribe(self) -> bool {
+        matches!(self, Self::PublisherSolicited | Self::Both)
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Publisher => 0,
+            Self::PublisherSolicited => 1,
+            Self::Subscriber => 2,
+            Self::Both => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::PublisherSolicited,
+            2 => Self::Subscriber,
+            3 => Self::Both,
+            _ => Self::Publisher,
+        }
+    }
+}
+
+fn configured_discovery_role() -> Result<NanDiscoveryRole> {
+    Ok(NanDiscoveryRole::from_code(
+        NAN_DISCOVERY_ROLE.load(Ordering::Relaxed),
+    ))
+}
+
 #[repr(C)]
 struct RawNanRxFrame {
     len: u16,
     rssi: i8,
     _reserved: u8,
+    // Captured in the Wi-Fi callback before bounded worker-queue delay.
+    local_us: u64,
     data: [u8; NAN_RX_FRAME_MAX],
 }
 
@@ -233,6 +333,27 @@ fn nan_outgoing_queue() -> &'static Mutex<VecDeque<RawNanOutgoing>> {
 fn nan_publish_queue() -> &'static Mutex<VecDeque<Vec<u8>>> {
     NAN_PUBLISH_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_OUTGOING_QUEUE_MAX)));
     NAN_PUBLISH_QUEUE.get().expect("publish queue initialized")
+}
+
+/// Drop queued wire transmissions when their discovery-session context ends.
+///
+/// A solicited Publish binds a particular received Subscribe instance.  It
+/// must never be sent after changing role or stopping NAN, even if the next
+/// command happens to be an otherwise valid unsolicited Publish.
+fn clear_pending_nan_transmissions() {
+    if let Ok(mut queue) = nan_publish_queue().lock() {
+        queue.clear();
+    }
+    if let Ok(mut queue) = nan_outgoing_queue().lock() {
+        queue.clear();
+    }
+}
+
+fn set_discovery_role(role: NanDiscoveryRole) {
+    let previous = NAN_DISCOVERY_ROLE.swap(role.code(), Ordering::Relaxed);
+    if previous != role.code() {
+        clear_pending_nan_transmissions();
+    }
 }
 
 fn last_sync_beacon_frame() -> &'static Mutex<Vec<u8>> {
@@ -255,9 +376,112 @@ fn last_publish_frame() -> &'static Mutex<Vec<u8>> {
     NAN_LAST_PUBLISH_FRAME.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn solicited_publish_attributes() -> &'static Mutex<Option<NanPublishAttributes>> {
+    NAN_SOLICITED_PUBLISH_ATTRIBUTES.get_or_init(|| Mutex::new(None))
+}
+
+fn set_solicited_publish_attributes(settings: &SharedSettings) -> Result<()> {
+    let (availability, device_capabilities) = nan_publish_attributes(settings, 1)?;
+    let mut attributes = solicited_publish_attributes()
+        .lock()
+        .map_err(|_| anyhow!("NAN solicited publish attributes lock poisoned"))?;
+    *attributes = Some(NanPublishAttributes {
+        availability,
+        device_capabilities,
+    });
+    Ok(())
+}
+
+fn queue_solicited_publish(requestor_instance: u8) -> Result<usize> {
+    if requestor_instance == 0 {
+        bail!("solicited publish requires a nonzero subscriber instance ID");
+    }
+    let attributes = solicited_publish_attributes()
+        .lock()
+        .map_err(|_| anyhow!("NAN solicited publish attributes lock poisoned"))?
+        .clone()
+        .ok_or_else(|| anyhow!("NAN solicited publish attributes are not configured"))?;
+    let frame = nan_publish_frame_with_requestor(
+        &attributes.availability,
+        &attributes.device_capabilities,
+        true,
+        2,
+        requestor_instance,
+    )?;
+    let mut queue = nan_publish_queue()
+        .lock()
+        .map_err(|_| anyhow!("nan publish queue lock failed"))?;
+    if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
+        queue.pop_front();
+    }
+    queue.push_back(frame);
+    Ok(queue.len())
+}
+
 fn followup_history() -> &'static Mutex<VecDeque<NanFollowupReceipt>> {
     NAN_FOLLOWUP_HISTORY
         .get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_FOLLOWUP_HISTORY_LEN)))
+}
+
+fn service_history() -> &'static Mutex<VecDeque<NanServiceReceipt>> {
+    NAN_SERVICE_HISTORY.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_SERVICE_HISTORY_LEN)))
+}
+
+fn record_service_receipt(info: &RawNanCommandInfo<'_>, kind: u8, local_us: u64) {
+    let Some(device_id) = info
+        .payload
+        .get(5..11)
+        .and_then(|bytes| bytes.try_into().ok())
+    else {
+        return;
+    };
+    let receipt = NanServiceReceipt {
+        local_us,
+        source: info.source,
+        device_id,
+        instance: info.instance,
+        kind,
+    };
+    if let Ok(mut history) = service_history().lock() {
+        if history.len() == NAN_SERVICE_HISTORY_LEN {
+            history.pop_front();
+        }
+        history.push_back(receipt);
+    }
+}
+
+fn render_service_history() -> Result<String> {
+    let history = service_history()
+        .lock()
+        .map_err(|_| anyhow!("NAN service history lock poisoned"))?;
+    if history.is_empty() {
+        return Ok("nan service_history=empty".to_string());
+    }
+    let entries = history
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                0 => "publish",
+                1 => "subscribe",
+                2 => "followup",
+                _ => "reserved",
+            };
+            format!(
+                "local_us:{}:source:{}:device:{}:instance:{}:kind:{}",
+                entry.local_us,
+                format_mac(&entry.source),
+                format_mac(&entry.device_id),
+                entry.instance,
+                kind,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "nan service_history count={} entries={}",
+        history.len(),
+        entries
+    ))
 }
 
 fn record_followup_receipt(msg_type: u8, seq: u16, payload: &[u8]) {
@@ -337,7 +561,11 @@ pub fn poll_rx() {
         }
         let received = unsafe { received.assume_init() };
         let len = usize::from(received.len).min(NAN_RX_FRAME_MAX);
-        observe_promiscuous_frame(&received.data[..len], received.rssi as i32);
+        observe_promiscuous_frame_at(
+            &received.data[..len],
+            received.rssi as i32,
+            received.local_us,
+        );
     }
 }
 
@@ -699,6 +927,34 @@ pub fn drain_publish_on_discovery_window() -> usize {
     if now_us().saturating_sub(last_beacon_local_us()) > DWELL_US {
         return 0;
     }
+    // Do not turn idle beacon traffic into a skipped-slot counter. The counter
+    // is evidence about queued SDFs that were deliberately held for their
+    // advertised rendezvous slot.
+    let has_publish = nan_publish_queue()
+        .lock()
+        .map(|queue| !queue.is_empty())
+        .unwrap_or(false);
+    if !has_publish {
+        return 0;
+    }
+    let beacon_tsf_us = last_beacon_tsf_us();
+    let Some(slot) = super::mode::raw_nan_publish_dw_slot(beacon_tsf_us) else {
+        NAN_PUBLISH_DW_SKIPPED_SLOT.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    };
+    if slot == NAN_LAST_PUBLISH_SLOT.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let local_us = now_us();
+    let min_spacing_us = super::mode::raw_nan_publish_min_spacing_us();
+    let last_publish_local_us = load_u64(&NAN_LAST_PUBLISH_LOCAL_LO, &NAN_LAST_PUBLISH_LOCAL_HI);
+    if min_spacing_us != 0
+        && last_publish_local_us != 0
+        && local_us.saturating_sub(last_publish_local_us) < min_spacing_us
+    {
+        NAN_PUBLISH_DW_LOCAL_GUARD_DROPS.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
     let frame = nan_publish_queue()
         .lock()
         .ok()
@@ -712,10 +968,20 @@ pub fn drain_publish_on_discovery_window() -> usize {
     }
     match raw_tx(&frame, true) {
         Ok(()) => {
+            let offset_us = now_us().saturating_sub(last_beacon_local_us());
             NAN_LAST_PUBLISH_BEACON.store(beacon, Ordering::Relaxed);
+            NAN_LAST_PUBLISH_SLOT.store(slot, Ordering::Relaxed);
+            store_u64(
+                &NAN_LAST_PUBLISH_LOCAL_LO,
+                &NAN_LAST_PUBLISH_LOCAL_HI,
+                local_us,
+            );
+            NAN_PUBLISH_DW_TX.fetch_add(1, Ordering::Relaxed);
+            NAN_PUBLISH_DW_LAST_OFFSET_US
+                .store(offset_us.min(u32::MAX as u64) as u32, Ordering::Relaxed);
             telemetry::record_log(format!(
-                "event type=nan.publish_dw ok=true beacon={}",
-                beacon
+                "event type=nan.publish_dw ok=true beacon={} slot={} tsf_us={} offset_us={}",
+                beacon, slot, beacon_tsf_us, offset_us
             ));
             1
         }
@@ -770,6 +1036,8 @@ struct NanCommand {
     channel: u8,
     backend: NanBackend,
     service: String,
+    role: NanDiscoveryRole,
+    role_loaded: bool,
 }
 
 impl NanCommand {
@@ -780,6 +1048,8 @@ impl NanCommand {
             channel: DEFAULT_CHANNEL,
             backend: NanBackend::Raw,
             service: DEFAULT_SERVICE.to_string(),
+            role: NanDiscoveryRole::Publisher,
+            role_loaded: false,
         }
     }
 
@@ -803,6 +1073,24 @@ impl NanCommand {
                 .get_i32("nan.channel", DEFAULT_CHANNEL as i32)?
                 .clamp(1, 13) as u8;
         }
+        // NVS supplies the initial role after boot.  Subsequent commands in
+        // this firmware session retain an explicit runtime role until the
+        // caller changes it again; otherwise `nan publish` could silently
+        // revert a non-persistent `nan start role=publisher` to an old
+        // persisted solicited role and emit the wrong SDF form.
+        if let Some(role) = request.arg("role") {
+            self.role = NanDiscoveryRole::parse(role)?;
+            self.role_loaded = true;
+        } else if !self.role_loaded {
+            self.role = if let Some(role) = self.settings.borrow().get_str("nan.role")? {
+                NanDiscoveryRole::parse(&role)?
+            } else {
+                NanDiscoveryRole::Publisher
+            };
+            self.role_loaded = true;
+        }
+        set_discovery_role(self.role);
+        set_solicited_publish_attributes(&self.settings)?;
         Ok(())
     }
 
@@ -818,6 +1106,7 @@ impl NanCommand {
             settings.set_str("nan.backend", self.backend.name())?;
             settings.set_str("nan.service", &self.service)?;
             settings.set_i32("nan.channel", self.channel as i32)?;
+            settings.set_str("nan.role", self.role.name())?;
         }
         Ok(())
     }
@@ -851,6 +1140,7 @@ impl CommandHandler for NanCommand {
             return self.raw_cycle_test(request);
         }
         if request.arg("stop").is_some() {
+            clear_pending_nan_transmissions();
             super::mode::stop_raw_nan_duty();
             stop_nan()?;
             super::wifi::stop_raw_monitor()?;
@@ -873,10 +1163,14 @@ impl CommandHandler for NanCommand {
                 encode_hex(&beacon)
             )));
         }
-        if request.arg("service_dump").is_some() {
-            let frame = last_dmesh_service_frame()
+        if let Some(service_dump) = request.arg("service_dump") {
+            let mut frame = last_dmesh_service_frame()
                 .lock()
                 .map_err(|_| anyhow!("NAN service descriptor capture lock poisoned"))?;
+            if service_dump == "clear" {
+                frame.clear();
+                return Ok(CommandResponse::ok("nan service_dump=cleared"));
+            }
             if frame.is_empty() {
                 return Ok(CommandResponse::ok("nan service_dump=empty"));
             }
@@ -886,6 +1180,29 @@ impl CommandHandler for NanCommand {
                     &NAN_LAST_SERVICE_LOCAL_LO,
                     &NAN_LAST_SERVICE_LOCAL_HI,
                 )),
+                frame.len(),
+                encode_hex(&frame)
+            )));
+        }
+        if let Some(service_history_request) = request.arg("service_history") {
+            if service_history_request == "clear" {
+                service_history()
+                    .lock()
+                    .map_err(|_| anyhow!("NAN service history lock poisoned"))?
+                    .clear();
+                return Ok(CommandResponse::ok("nan service_history=cleared"));
+            }
+            return Ok(CommandResponse::ok(render_service_history()?));
+        }
+        if request.arg("subscribe_dump").is_some() {
+            let frame = last_dmesh_subscribe_frame()
+                .lock()
+                .map_err(|_| anyhow!("NAN subscribe descriptor capture lock poisoned"))?;
+            if frame.is_empty() {
+                return Ok(CommandResponse::ok("nan subscribe_dump=empty"));
+            }
+            return Ok(CommandResponse::ok(format!(
+                "nan subscribe_dump bytes={} hex={}",
                 frame.len(),
                 encode_hex(&frame)
             )));
@@ -986,8 +1303,9 @@ impl CommandHandler for NanCommand {
             self.start_selected()?;
             self.maybe_save_settings(request, true)?;
             return Ok(CommandResponse::ok(format!(
-                "nan started backend={} service={} channel={} dump={} filter={}",
+                "nan started backend={} role={} service={} channel={} dump={} filter={}",
                 self.backend.name(),
+                self.role.name(),
                 self.service,
                 self.channel.max(1),
                 self.dump,
@@ -1015,14 +1333,39 @@ impl CommandHandler for NanCommand {
                 bail!("nan publish requires sync=true; raw NAN data is DW-gated");
             }
             let _ = request.arg_i32("sync_timeout_ms")?;
-            let availability = nan_availability_from_settings(&self.settings)?;
+            let availability_map = request.arg_i32("availability_map")?.unwrap_or(1);
+            if !(0..=15).contains(&availability_map) {
+                bail!("availability_map must be in 0..=15; got {availability_map}");
+            }
+            let availability_map = availability_map as u8;
+            let (availability, device_capabilities) =
+                nan_publish_attributes(&self.settings, availability_map)?;
+            // Table 25 permits a bare unsolicited Publish SDF without SDEA.
+            // Keep SDEA enabled by default, but expose this narrow wire-level
+            // experiment for implementations that reject the optional Service
+            // Update Indicator before creating a peer.
+            let include_sdea = request
+                .arg("sdea")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(true);
+            let sdea_update = request.arg_i32("sdea_update")?.unwrap_or(2);
+            if !(0..=u8::MAX as i32).contains(&sdea_update) {
+                bail!("sdea_update must be in 0..=255; got {sdea_update}");
+            }
+            let sdea_update = sdea_update as u8;
             let mut frame_len = 0_usize;
             let mut destination = NAN_DISCOVERY_MAC;
             let mut queue = nan_publish_queue()
                 .lock()
                 .map_err(|_| anyhow!("nan publish queue lock failed"))?;
             for _ in 0..count {
-                let frame = nan_publish_frame(&availability)?;
+                let frame = nan_publish_frame(
+                    &availability,
+                    &device_capabilities,
+                    include_sdea,
+                    sdea_update,
+                )?;
                 frame_len = frame.len();
                 destination.copy_from_slice(&frame[FRAME_DST..FRAME_DST + 6]);
                 if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
@@ -1031,10 +1374,13 @@ impl CommandHandler for NanCommand {
                 queue.push_back(frame);
             }
             return Ok(CommandResponse::ok(format!(
-                "nan publish queued=true backend={} service={} count={} dst={} bssid={} bytes={}",
+                "nan publish queued=true backend={} service={} count={} sdea={} sdea_update={} availability_map={} dst={} bssid={} bytes={}",
                 self.backend.name(),
                 self.service,
                 count,
+                include_sdea,
+                sdea_update,
+                availability_map,
                 format_mac(&destination),
                 format_mac(&nan_cluster_bssid()),
                 frame_len
@@ -1686,7 +2032,11 @@ fn nan_availability_attribute(
     offset_tu: u32,
     stride: u32,
     active_ms: u32,
+    map_id: u8,
 ) -> Result<Vec<u8>> {
+    if map_id > 15 {
+        bail!("NAN Availability Map ID must be in 0..=15; got {map_id}");
+    }
     let period_tu = dw_tu
         .checked_mul(stride)
         .ok_or_else(|| anyhow!("NAN availability period overflow"))?;
@@ -1731,7 +2081,7 @@ fn nan_availability_attribute(
         bitmap[(bit / 8) as usize] |= 1 << (bit % 8);
     }
 
-    // Attribute control: map 1, no change flags. Entry control: committed,
+    // Attribute control: caller-selected map, no change flags. Entry control: committed,
     // one receive spatial stream, and Time Bitmap Present. The one-entry
     // band list explicitly constrains this schedule to 2.4 GHz.
     let entry_len = 2 + 2 + 1 + bitmap.len() + 2;
@@ -1740,10 +2090,15 @@ fn nan_availability_attribute(
     attr.push(NAN_AVAILABILITY_ATTR_ID);
     attr.extend_from_slice(&(attr_len as u16).to_le_bytes());
     attr.push(1); // sequence ID for the initial stable schedule
-    attr.extend_from_slice(&0x0001_u16.to_le_bytes()); // Map ID 1
+    attr.extend_from_slice(&u16::from(map_id).to_le_bytes());
     attr.extend_from_slice(&(entry_len as u16).to_le_bytes());
     attr.extend_from_slice(&0x1101_u16.to_le_bytes()); // committed + bitmap + RX NSS=1
-    let bitmap_control = (period_code << 3) | ((offset_tu / NAN_AVAILABILITY_BITMAP_TU) << 6);
+                                                       // Table 89 is a two-octet field. Keep the type explicit: `period_code`
+                                                       // originates from u32 scheduling arithmetic, and calling `to_le_bytes()`
+                                                       // on that inferred type would append reserved zero octets beyond the
+                                                       // declared Availability-entry length.
+    let bitmap_control: u16 =
+        ((period_code << 3) | ((offset_tu / NAN_AVAILABILITY_BITMAP_TU) << 6)) as u16;
     attr.extend_from_slice(&bitmap_control.to_le_bytes()); // 16-TU bit duration
     attr.push(bitmap.len() as u8);
     attr.extend_from_slice(&bitmap);
@@ -1751,57 +2106,112 @@ fn nan_availability_attribute(
     Ok(attr)
 }
 
-fn nan_availability_from_settings(settings: &SharedSettings) -> Result<Vec<u8>> {
+fn nan_publish_attributes(
+    settings: &SharedSettings,
+    availability_map: u8,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let settings = settings.borrow();
     let dw_tu = settings.get_i32("nan.dw_tu", 512)?.clamp(128, 8_192) as u32;
     let offset_tu = settings.get_i32("nan.dw_off_tu", 0)?.max(0) as u32;
-    let stride = settings.get_i32("nan.dw_stride", 4)?.clamp(1, 64) as u32;
+    let configured_stride = settings.get_i32("nan.dw_stride", 4)?.clamp(1, 64) as u32;
+    // An AP owner is powered continuously and must advertise that truth.  A
+    // sleeping-device cadence here would make peers legitimately defer its
+    // unsolicited-publish discovery to slots in which this node is actually
+    // listening and transmitting.  Non-AP nodes retain their configured
+    // sparse DW cadence.
+    let stride = if settings.get_bool("nan.ap_owner", false)? {
+        1
+    } else {
+        configured_stride
+    };
     let active_ms = settings.get_i32("nan.active_ms", 250)?.clamp(16, 8_000) as u32;
-    nan_availability_attribute(dw_tu, offset_tu, stride, active_ms)
+    Ok((
+        nan_availability_attribute(dw_tu, offset_tu, stride, active_ms, availability_map)?,
+        nan_device_capability_attribute(stride)?,
+    ))
 }
 
-fn nan_publish_frame(availability: &[u8]) -> Result<Vec<u8>> {
+/// Encode the Device Capability attribute tied to the 2.4-GHz duty schedule.
+///
+/// Classic ESP32 is HT-only with one TX/RX chain. Do not advertise VHT, a
+/// 5-GHz DW, or an invented channel-switch bound. The Committed DW value is
+/// relative to DW0: 1, 2, 4, 8, or 16 means wake every 1, 2, 4, 8, or 16 DWs.
+fn nan_device_capability_attribute(stride: u32) -> Result<Vec<u8>> {
+    let dw_code = match stride {
+        1 => 1,
+        2 => 2,
+        4 => 3,
+        8 => 4,
+        16 => 5,
+        _ => bail!(
+            "nan.dw_stride must be 1, 2, 4, 8, or 16 for a standards-valid Device Capability; got {stride}"
+        ),
+    };
+    Ok(vec![
+        0x0f, 0x09, 0x00, // Device Capability, 9-byte body
+        0x00, // Map ID 0: applies to all Availability maps in this SDF
+        dw_code, 0x00, // 2.4-GHz committed DW cadence; no 5-GHz DW/overwrite
+        0x04, // supported bands: 2.4 GHz only
+        0x00, // operation mode: HT only
+        0x11, // one TX and one RX antenna
+        0x00, 0x00, // max channel-switch time unavailable
+        0x00, // no DFS master, extended key ID, or NDPE support
+    ])
+}
+
+fn nan_publish_frame(
+    availability: &[u8],
+    device_capabilities: &[u8],
+    include_sdea: bool,
+    sdea_update: u8,
+) -> Result<Vec<u8>> {
+    nan_publish_frame_with_requestor(
+        availability,
+        device_capabilities,
+        include_sdea,
+        sdea_update,
+        0,
+    )
+}
+
+fn nan_publish_frame_with_requestor(
+    availability: &[u8],
+    device_capabilities: &[u8],
+    include_sdea: bool,
+    sdea_update: u8,
+    requestor_instance: u8,
+) -> Result<Vec<u8>> {
     let device_mac = station_mac()?;
     let tx_mac = super::wifi::raw_tx_source_mac()?;
     let cluster_bssid = nan_cluster_bssid();
-    let subscribe_template = last_dmesh_subscribe_frame()
-        .lock()
-        .map_err(|_| anyhow!("NAN service descriptor capture lock poisoned"))?
-        .clone();
-    let template = if subscribe_template.is_empty() {
-        last_dmesh_service_frame()
-            .lock()
-            .map_err(|_| anyhow!("NAN service descriptor capture lock poisoned"))?
-            .clone()
-    } else {
-        subscribe_template
-    };
-    if !template.is_empty() {
-        return nan_publish_frame_from_template(
-            &template,
-            &tx_mac,
-            &device_mac,
-            &cluster_bssid,
-            availability,
-        );
-    }
-    Ok(nan_publish_frame_for(
+    // First-contact unsolicited publish is standards-generated, not
+    // capture-derived. Its Requestor Instance ID is zero because no received
+    // discovery frame triggered it. Captured SDFs remain diagnostic evidence
+    // only, so peer identifiers and optional attributes cannot leak into this
+    // broadcast.
+    Ok(nan_publish_frame_for_requestor(
         &tx_mac,
         &device_mac,
         &cluster_bssid,
         availability,
+        device_capabilities,
+        include_sdea,
+        sdea_update,
+        requestor_instance,
     ))
 }
 
-/// Reuse a captured Android SDF for its interoperable NAN envelope while
-/// replacing its service identity and Availability attribute with this ESP's
-/// configured duty schedule.
+/// Historical capture-rewrite regression helper. Production publish frames
+/// are standards-generated by `nan_publish_frame_for`, never this routine.
+#[cfg(test)]
+/// Normalize a captured SDF only for the historical regression test below.
+/// It documents why the requestor must not escape into a first-contact publish.
 fn nan_publish_frame_from_template(
     template: &[u8],
     tx_mac: &[u8; 6],
     device_mac: &[u8; 6],
     cluster_bssid: &[u8; 6],
-    availability: &[u8],
+    _availability: &[u8],
 ) -> Result<Vec<u8>> {
     if template.len() < NAN_ACTION_START + 3 || template.len() > NAN_RX_FRAME_MAX {
         bail!(
@@ -1818,7 +2228,6 @@ fn nan_publish_frame_from_template(
     frame[FRAME_BSSID..FRAME_BSSID + 6].copy_from_slice(cluster_bssid);
 
     let mut found_descriptor = false;
-    let mut availability_range = None;
     let mut offset = NAN_ACTION_START;
     while offset + 3 <= frame.len() {
         let attr_id = frame[offset];
@@ -1843,14 +2252,13 @@ fn nan_publish_frame_from_template(
             if info_len != NAN_SERVICE_INFO_LEN || body.len() != 10 + info_len {
                 bail!("unexpected DMesh service descriptor length={}", body.len());
             }
-            // NAN service discovery frames stay on the NAN discovery multicast
-            // address, including a solicited response to an active subscribe.
-            // The Requestor Instance ID, not a unicast 802.11 destination,
-            // binds this publish descriptor to the Android subscriber.
-            let peer_instance = body[6];
-            let peer_is_subscribe = body[8] & 0x03 == 0x01;
+            // This is a first-contact broadcast publish. A captured subscribe
+            // template may belong to another Android phone, so retaining its
+            // instance as requestor ID binds the descriptor to that phone and
+            // makes every other subscriber discard it. Follow-up/solicited
+            // response frames bind a requestor only after discovery.
             body[6] = NAN_ID;
-            body[7] = if peer_is_subscribe { peer_instance } else { 0 };
+            body[7] = 0;
             body[8] = NAN_SERVICE_CONTROL_PUBLISH_WITH_INFO;
             body[10..10 + NAN_SERVICE_INFO_LEN].copy_from_slice(&nan_service_info(device_mac));
             found_descriptor = true;
@@ -1860,20 +2268,10 @@ fn nan_publish_frame_from_template(
             // commonly has `2` here; leaving it after the SDA becomes our
             // publisher instance `1` makes the pair internally inconsistent.
             body[0] = NAN_ID;
-        } else if attr_id == NAN_AVAILABILITY_ATTR_ID {
-            availability_range = Some(offset..body_end);
         }
         offset = body_end;
     }
     if found_descriptor {
-        if let Some(range) = availability_range {
-            frame.splice(range, availability.iter().copied());
-        } else {
-            // A publish SDF requires Availability after the SDEA and Device
-            // Capability attributes. Captured Android descriptors normally
-            // have it; append only for a malformed/minimal capture.
-            frame.extend_from_slice(availability);
-        }
         Ok(frame)
     } else {
         bail!("captured NAN SDF has no DMesh service descriptor")
@@ -1887,6 +2285,31 @@ fn nan_publish_frame_for(
     device_mac: &[u8; 6],
     cluster_bssid: &[u8; 6],
     availability: &[u8],
+    device_capabilities: &[u8],
+    include_sdea: bool,
+    sdea_update: u8,
+) -> Vec<u8> {
+    nan_publish_frame_for_requestor(
+        tx_mac,
+        device_mac,
+        cluster_bssid,
+        availability,
+        device_capabilities,
+        include_sdea,
+        sdea_update,
+        0,
+    )
+}
+
+fn nan_publish_frame_for_requestor(
+    tx_mac: &[u8; 6],
+    device_mac: &[u8; 6],
+    cluster_bssid: &[u8; 6],
+    availability: &[u8],
+    device_capabilities: &[u8],
+    include_sdea: bool,
+    sdea_update: u8,
+    requestor_instance: u8,
 ) -> Vec<u8> {
     let mut frame = NAN_HEADER.to_vec();
     frame[FRAME_DST..FRAME_DST + 6].copy_from_slice(&NAN_DISCOVERY_MAC);
@@ -1894,24 +2317,42 @@ fn nan_publish_frame_for(
     frame[FRAME_BSSID..FRAME_BSSID + 6].copy_from_slice(cluster_bssid);
     let service_info = nan_service_info(device_mac);
     let descriptor_len = SVC_ID.len() + 4 + service_info.len();
-    // NAN v3.2 table 25 requires the publish SDA first, followed by the SDA
-    // extension, device capability, and NAN availability. Android's NAN
-    // implementation drops a descriptor that is syntactically valid but
-    // violates this required ordering.
+    // NAN v3.2 table 25 orders the included attributes after the SDA: optional
+    // SDEA, then Device Capability and NAN Availability. The SDEA can be
+    // omitted only for the bounded bare-publish interoperability experiment.
     frame.push(0x03);
     frame.extend_from_slice(&(descriptor_len as u16).to_le_bytes());
     frame.extend_from_slice(&SVC_ID);
     frame.push(NAN_ID);
     // No matching peer triggered this first-contact publish, so NAN requires
     // a zero requestor instance ID.
-    frame.push(0);
+    frame.push(requestor_instance);
     frame.push(NAN_SERVICE_CONTROL_PUBLISH_WITH_INFO);
     frame.push(service_info.len() as u8);
     frame.extend_from_slice(&service_info);
-    frame.extend_from_slice(&NAN_SERVICE_EXTENSION);
-    frame.extend_from_slice(&NAN_DEVICE_CAPABILITIES);
+    if include_sdea {
+        frame.extend_from_slice(&nan_service_extension(sdea_update));
+    }
+    frame.extend_from_slice(device_capabilities);
     frame.extend_from_slice(availability);
     frame
+}
+
+/// Encode a valid SDEA that carries only the service-update indicator.
+///
+/// The control field has just bit 9 set, so no FSD, data-path, ranging, or
+/// reserved feature is claimed. The caller owns the monotonically increasing
+/// indicator; the lab command merely selects a single SDF value.
+fn nan_service_extension(service_update: u8) -> [u8; 7] {
+    [
+        0x0e,
+        0x04,
+        0x00,
+        NAN_ID,
+        NAN_SDEA_SERVICE_UPDATE_CONTROL[0],
+        NAN_SDEA_SERVICE_UPDATE_CONTROL[1],
+        service_update,
+    ]
 }
 
 /// DMesh NAN service-specific information shared with the Android JNI and
@@ -2001,7 +2442,14 @@ unsafe extern "C" fn sniffer_cb(
     // Otherwise unrelated SDF/action traffic fills the queue before the main
     // task can reach a directed raw-NAN command.
     let frame = unsafe { core::slice::from_raw_parts(payload, len) };
-    if !matches_filter(frame) && super::wifi::custom_raw_action_payload(frame).is_none() {
+    // Keep NAN beacons long enough for the worker to make the bounded
+    // cluster-reselection decision.  Filtering a foreign beacon here would
+    // prevent recovery after the selected cluster disappears.
+    let is_nan_beacon = frame.first() == Some(&0x80) && is_nan_bssid(frame);
+    if !is_nan_beacon
+        && !matches_filter(frame)
+        && super::wifi::custom_raw_action_payload(frame).is_none()
+    {
         NAN_RX_PREFILTER_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -2014,6 +2462,7 @@ unsafe extern "C" fn sniffer_cb(
         len: len as u16,
         rssi: pkt.rx_ctrl.rssi() as i8,
         _reserved: 0,
+        local_us: now_us(),
         data: [0; NAN_RX_FRAME_MAX],
     };
     unsafe {
@@ -2034,15 +2483,19 @@ unsafe extern "C" fn sniffer_cb(
     }
 }
 
-pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
+pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
+    observe_promiscuous_frame_at(frame, rssi, now_us());
+}
+
+fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64) {
     if !NAN_RUNNING.load(Ordering::Relaxed) {
         return;
     }
     NAN_RX_MGMT.fetch_add(1, Ordering::Relaxed);
     NAN_RX_BYTES.fetch_add(frame.len() as u32, Ordering::Relaxed);
-    super::wifi::observe_promiscuous_frame(frame, _rssi);
+    super::wifi::observe_promiscuous_frame(frame, rssi);
     if frame.first() == Some(&0x80) {
-        observe_sync_beacon(frame, _rssi);
+        observe_sync_beacon(frame, rssi);
     }
     let custom_raw_action = super::wifi::custom_raw_action_payload(frame);
     if custom_raw_action.is_none() && !matches_filter(frame) {
@@ -2097,15 +2550,38 @@ pub fn observe_promiscuous_frame(frame: &[u8], _rssi: i32) {
                 if let Some(info) = raw_command_info(frame) {
                     super::mode::observe_ping("nan_raw", info.payload);
                     if is_dmesh_nan_service_info(info.payload) {
+                        let kind = dmesh_service_descriptor_kind(frame).unwrap_or(3);
+                        record_service_receipt(&info, kind, received_local_us);
                         if let Ok(mut captured) = last_dmesh_service_frame().lock() {
                             captured.clear();
                             captured.extend_from_slice(&frame[..frame.len().min(NAN_RX_FRAME_MAX)]);
                         }
-                        if dmesh_service_descriptor_kind(frame) == Some(0x01) {
+                        if kind == 0x01 {
                             if let Ok(mut captured) = last_dmesh_subscribe_frame().lock() {
                                 captured.clear();
                                 captured
                                     .extend_from_slice(&frame[..frame.len().min(NAN_RX_FRAME_MAX)]);
+                            }
+                            // A solicited Publisher responds on the next
+                            // observed DW.  The response is still an SDF
+                            // Publish, but its Requestor Instance ID is the
+                            // instance carried by the matching Subscribe.
+                            // Do not borrow source, optional attributes, or
+                            // requestor state from a peer capture.
+                            if let Ok(role) = configured_discovery_role() {
+                                if role.responds_to_subscribe() {
+                                    match queue_solicited_publish(info.instance) {
+                                        Ok(queued) => telemetry::record_log(format!(
+                                            "event type=nan.solicited_publish_queued peer={} requestor_instance={} queue_len={}",
+                                            format_mac(&info.source), info.instance, queued
+                                        )),
+                                        Err(error) => telemetry::record_log(format!(
+                                            "event type=nan.solicited_publish_queued ok=false peer={} requestor_instance={} message={}",
+                                            format_mac(&info.source), info.instance,
+                                            crate::commands::protocol::escape_value(&error.to_string())
+                                        )),
+                                    }
+                                }
                             }
                         }
                         store_u64(
@@ -2222,6 +2698,9 @@ fn observe_sync_beacon(frame: &[u8], rssi: i32) {
     };
     let local_us = now_us();
     if is_nan_bssid(frame) {
+        if !accept_nan_cluster(frame, local_us) {
+            return;
+        }
         if let Ok(mut captured) = last_sync_beacon_frame().lock() {
             captured.clear();
             captured.extend_from_slice(&frame[..frame.len().min(NAN_RX_FRAME_MAX)]);
@@ -2257,9 +2736,102 @@ fn store_nan_cluster_bssid(frame: &[u8]) {
     let Some(bssid) = frame.get(FRAME_BSSID..FRAME_BSSID + 6) else {
         return;
     };
+    let Ok(bssid) = <&[u8] as TryInto<&[u8; 6]>>::try_into(bssid) else {
+        return;
+    };
+    store_nan_cluster_bssid_bytes(*bssid);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterBeaconDecision {
+    Initial,
+    Current,
+    Reselect,
+    Foreign,
+}
+
+fn cluster_beacon_decision(
+    locked: bool,
+    current: [u8; 6],
+    candidate: [u8; 6],
+    last_local_us: u64,
+    local_us: u64,
+) -> ClusterBeaconDecision {
+    if !locked {
+        return ClusterBeaconDecision::Initial;
+    }
+    if current == candidate {
+        return ClusterBeaconDecision::Current;
+    }
+    if local_us.saturating_sub(last_local_us) >= NAN_CLUSTER_RESELECT_AFTER_US {
+        ClusterBeaconDecision::Reselect
+    } else {
+        ClusterBeaconDecision::Foreign
+    }
+}
+
+/// Adopt one NAN cluster as the raw-duty timing authority.  Manual BSSID
+/// filtering is a diagnostic override; otherwise a fresh selected cluster is
+/// sticky and a foreign cluster can replace it only after bounded absence.
+fn accept_nan_cluster(frame: &[u8], local_us: u64) -> bool {
+    let Some(candidate) = frame
+        .get(FRAME_BSSID..FRAME_BSSID + 6)
+        .and_then(|bytes| <&[u8] as TryInto<&[u8; 6]>>::try_into(bytes).ok())
+        .copied()
+    else {
+        return false;
+    };
+    if NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed) {
+        let expected = configured_filter_bssid();
+        if candidate != expected {
+            NAN_CLUSTER_FOREIGN_DROPS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let changed =
+            !NAN_CLUSTER_LOCKED.load(Ordering::Relaxed) || nan_cluster_bssid() != candidate;
+        store_nan_cluster_bssid_bytes(candidate);
+        NAN_CLUSTER_LOCKED.store(true, Ordering::Relaxed);
+        if changed {
+            NAN_CLUSTER_RESELECTS.fetch_add(1, Ordering::Relaxed);
+        }
+        return true;
+    }
+    match cluster_beacon_decision(
+        NAN_CLUSTER_LOCKED.load(Ordering::Relaxed),
+        nan_cluster_bssid(),
+        candidate,
+        last_beacon_local_us(),
+        local_us,
+    ) {
+        ClusterBeaconDecision::Initial | ClusterBeaconDecision::Current => {
+            store_nan_cluster_bssid_bytes(candidate);
+            NAN_CLUSTER_LOCKED.store(true, Ordering::Relaxed);
+            true
+        }
+        ClusterBeaconDecision::Reselect => {
+            store_nan_cluster_bssid_bytes(candidate);
+            NAN_CLUSTER_RESELECTS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        ClusterBeaconDecision::Foreign => {
+            NAN_CLUSTER_FOREIGN_DROPS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn store_nan_cluster_bssid_bytes(bssid: [u8; 6]) {
     for (index, byte) in bssid.iter().enumerate() {
         NAN_CLUSTER_BSSID[index].store(*byte, Ordering::Relaxed);
     }
+}
+
+fn configured_filter_bssid() -> [u8; 6] {
+    let mut bssid = [0_u8; 6];
+    for (index, byte) in bssid.iter_mut().enumerate() {
+        *byte = NAN_FILTER_BSSID[index].load(Ordering::Relaxed);
+    }
+    bssid
 }
 
 fn nan_cluster_bssid() -> [u8; 6] {
@@ -2324,11 +2896,18 @@ fn matches_filter(frame: &[u8]) -> bool {
         if frame.len() < FRAME_BSSID + 6 {
             return false;
         }
-        for idx in 0..6 {
-            if frame[FRAME_BSSID + idx] != NAN_FILTER_BSSID[idx].load(Ordering::Relaxed) {
-                return false;
-            }
+        if frame[FRAME_BSSID..FRAME_BSSID + 6] != configured_filter_bssid() {
+            return false;
         }
+    } else if is_nan_bssid(frame)
+        && NAN_CLUSTER_LOCKED.load(Ordering::Relaxed)
+        && frame.len() >= FRAME_BSSID + 6
+        && frame[FRAME_BSSID..FRAME_BSSID + 6] != nan_cluster_bssid()
+    {
+        // `observe_sync_beacon()` has already decided whether a stale cluster
+        // may be replaced.  Do not deliver service descriptors or actions
+        // from a foreign cluster while the selected one remains fresh.
+        return false;
     }
     match NAN_FILTER_MODE.load(Ordering::Relaxed) {
         FILTER_ALL_MGMT => true,
@@ -2366,11 +2945,14 @@ fn stats() -> String {
         .unwrap_or_else(|| "none".to_string());
     let cluster_bssid = format_mac(&nan_cluster_bssid());
     format!(
-        "nan support=raw running={} filter={} bssid_filter={} cluster_bssid={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={}",
+        "nan support=raw running={} filter={} bssid_filter={} cluster_bssid={} cluster_locked={} cluster_foreign_drop={} cluster_reselects={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={} publish_dw_tx={} publish_dw_skipped_slot={} publish_dw_local_guard_drop={} publish_dw_last_slot={} publish_dw_last_offset_us={}",
         NAN_RUNNING.load(Ordering::Relaxed),
         filter_name(),
         NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
         cluster_bssid,
+        NAN_CLUSTER_LOCKED.load(Ordering::Relaxed),
+        NAN_CLUSTER_FOREIGN_DROPS.load(Ordering::Relaxed),
+        NAN_CLUSTER_RESELECTS.load(Ordering::Relaxed),
         NAN_RX_MGMT.load(Ordering::Relaxed),
         NAN_RX_MATCHED.load(Ordering::Relaxed),
         NAN_RX_ACTION.load(Ordering::Relaxed),
@@ -2399,7 +2981,12 @@ fn stats() -> String {
         beacon_age_ms,
         queue_len,
         publish_queue_len,
-        NAN_LAST_PUBLISH_BEACON.load(Ordering::Relaxed)
+        NAN_LAST_PUBLISH_BEACON.load(Ordering::Relaxed),
+        NAN_PUBLISH_DW_TX.load(Ordering::Relaxed),
+        NAN_PUBLISH_DW_SKIPPED_SLOT.load(Ordering::Relaxed),
+        NAN_PUBLISH_DW_LOCAL_GUARD_DROPS.load(Ordering::Relaxed),
+        NAN_LAST_PUBLISH_SLOT.load(Ordering::Relaxed),
+        NAN_PUBLISH_DW_LAST_OFFSET_US.load(Ordering::Relaxed)
     )
 }
 
@@ -2486,12 +3073,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cluster_selection_is_sticky_until_the_current_cluster_is_stale() {
+        let first = [0x50, 0x6f, 0x9a, 0x01, 0x11, 0x11];
+        let foreign = [0x50, 0x6f, 0x9a, 0x01, 0x22, 0x22];
+        assert_eq!(
+            cluster_beacon_decision(false, NAN_BSSID, first, 0, 10),
+            ClusterBeaconDecision::Initial
+        );
+        assert_eq!(
+            cluster_beacon_decision(true, first, first, 1_000, 1_500),
+            ClusterBeaconDecision::Current
+        );
+        assert_eq!(
+            cluster_beacon_decision(
+                true,
+                first,
+                foreign,
+                1_000,
+                1_000 + NAN_CLUSTER_RESELECT_AFTER_US - 1
+            ),
+            ClusterBeaconDecision::Foreign
+        );
+        assert_eq!(
+            cluster_beacon_decision(
+                true,
+                first,
+                foreign,
+                1_000,
+                1_000 + NAN_CLUSTER_RESELECT_AFTER_US
+            ),
+            ClusterBeaconDecision::Reselect
+        );
+    }
+
+    #[test]
     fn raw_nan_publish_is_a_publish_with_required_attribute_order() {
         let tx_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1d];
         let device_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c];
         let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x55, 0x46];
-        let availability = nan_availability_attribute(512, 0, 8, 250).unwrap();
-        let frame = nan_publish_frame_for(&tx_mac, &device_mac, &bssid, &availability);
+        let availability = nan_availability_attribute(512, 0, 8, 250, 1).unwrap();
+        let capabilities = nan_device_capability_attribute(8).unwrap();
+        let frame = nan_publish_frame_for(
+            &tx_mac,
+            &device_mac,
+            &bssid,
+            &availability,
+            &capabilities,
+            true,
+            2,
+        );
 
         assert_eq!(&frame[FRAME_DST..FRAME_DST + 6], NAN_DISCOVERY_MAC);
         assert_eq!(&frame[FRAME_SRC..FRAME_SRC + 6], tx_mac);
@@ -2516,7 +3146,92 @@ mod tests {
         assert_eq!(attributes[0].1[8], NAN_SERVICE_CONTROL_PUBLISH_WITH_INFO);
         assert_eq!(&attributes[0].1[10..12], b"DM");
         assert_eq!(&attributes[0].1[15..21], device_mac);
+        assert_eq!(attributes[2].1, &capabilities[3..]);
         assert_eq!(attributes[3].1, &availability[3..]);
+        assert_eq!(offset, frame.len(), "no bytes may trail the NAN attributes");
+    }
+
+    #[test]
+    fn raw_nan_bare_publish_can_omit_optional_sdea() {
+        let tx_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1d];
+        let device_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c];
+        let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x55, 0x46];
+        let availability = nan_availability_attribute(512, 0, 8, 250, 1).unwrap();
+        let capabilities = nan_device_capability_attribute(8).unwrap();
+        let frame = nan_publish_frame_for(
+            &tx_mac,
+            &device_mac,
+            &bssid,
+            &availability,
+            &capabilities,
+            false,
+            2,
+        );
+        let mut ids = Vec::new();
+        let mut offset = NAN_ACTION_START;
+        while offset + 3 <= frame.len() {
+            let size = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
+            ids.push(frame[offset]);
+            offset += 3 + size;
+        }
+        assert_eq!(ids, [0x03, 0x0f, 0x12]);
+    }
+
+    #[test]
+    fn solicited_publish_binds_the_subscriber_instance_only() {
+        let tx_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1d];
+        let device_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c];
+        let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x55, 0x46];
+        let availability = nan_availability_attribute(512, 0, 8, 250, 1).unwrap();
+        let capabilities = nan_device_capability_attribute(8).unwrap();
+        let frame = nan_publish_frame_for_requestor(
+            &tx_mac,
+            &device_mac,
+            &bssid,
+            &availability,
+            &capabilities,
+            true,
+            2,
+            7,
+        );
+        let descriptor = &frame[NAN_ACTION_START + 3..];
+        assert_eq!(descriptor[6], NAN_ID);
+        assert_eq!(descriptor[7], 7);
+        assert_eq!(descriptor[8], NAN_SERVICE_CONTROL_PUBLISH_WITH_INFO);
+        assert_eq!(&frame[FRAME_DST..FRAME_DST + 6], NAN_DISCOVERY_MAC);
+    }
+
+    #[test]
+    fn publisher_solicited_role_allows_only_subscribe_triggered_publish() {
+        assert!(NanDiscoveryRole::PublisherSolicited.responds_to_subscribe());
+        assert!(NanDiscoveryRole::Both.responds_to_subscribe());
+        assert!(!NanDiscoveryRole::Publisher.responds_to_subscribe());
+        assert!(!NanDiscoveryRole::Subscriber.responds_to_subscribe());
+    }
+
+    #[test]
+    fn role_change_discards_pending_solicited_publish() {
+        let mut queue = nan_publish_queue().lock().unwrap();
+        queue.clear();
+        queue.push_back(vec![0x03, 0x01, 0x10]);
+        drop(queue);
+
+        NAN_DISCOVERY_ROLE.store(
+            NanDiscoveryRole::PublisherSolicited.code(),
+            Ordering::Relaxed,
+        );
+        set_discovery_role(NanDiscoveryRole::Publisher);
+
+        assert!(nan_publish_queue().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sdea_update_value_only_changes_the_indicator() {
+        let update_two = nan_service_extension(2);
+        let update_four = nan_service_extension(4);
+        assert_eq!(&update_two[..6], &[0x0e, 0x04, 0x00, NAN_ID, 0x00, 0x02]);
+        assert_eq!(update_two[6], 2);
+        assert_eq!(update_four[6], 4);
     }
 
     #[test]
@@ -2550,14 +3265,23 @@ mod tests {
     }
 
     #[test]
-    fn captured_service_descriptor_keeps_live_attributes_and_replaces_identity() {
+    fn captured_service_descriptor_rewrite_keeps_requestor_out_of_broadcast() {
         let old_mac = [0xc2, 0x17, 0x1e, 0x09, 0x88, 0x38];
         let tx_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1d];
         let device_mac = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c];
         let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x55, 0x46];
-        let old_availability = nan_availability_attribute(512, 0, 4, 250).unwrap();
-        let availability = nan_availability_attribute(512, 0, 8, 250).unwrap();
-        let mut template = nan_publish_frame_for(&old_mac, &old_mac, &bssid, &old_availability);
+        let old_availability = nan_availability_attribute(512, 0, 4, 250, 1).unwrap();
+        let availability = nan_availability_attribute(512, 0, 8, 250, 1).unwrap();
+        let old_capabilities = nan_device_capability_attribute(4).unwrap();
+        let mut template = nan_publish_frame_for(
+            &old_mac,
+            &old_mac,
+            &bssid,
+            &old_availability,
+            &old_capabilities,
+            true,
+            2,
+        );
         // Model the Android subscribe SDF that is commonly the most recent
         // captured descriptor when both app sessions are active.
         let descriptor_start = NAN_ACTION_START + 3;
@@ -2575,19 +3299,21 @@ mod tests {
         assert_eq!(&frame[frame.len() - 5..], &[0x0b, 0x02, 0x00, 0xaa, 0xbb]);
         let descriptor = &frame[descriptor_start..descriptor_start + 31];
         assert_eq!(descriptor[6], NAN_ID);
-        assert_eq!(descriptor[7], 2);
+        assert_eq!(descriptor[7], 0);
         assert_eq!(descriptor[8], NAN_SERVICE_CONTROL_PUBLISH_WITH_INFO);
         assert!(frame
             .windows(NAN_SERVICE_INFO_LEN)
             .any(|part| part == nan_service_info(&device_mac)));
+        // This historical normalizer retains unrelated capture attributes, but
+        // production never calls it: the real encoder constructs Availability.
         assert!(frame
-            .windows(availability.len())
-            .any(|part| part == availability));
+            .windows(old_availability.len())
+            .any(|part| part == old_availability));
     }
 
     #[test]
     fn availability_bitmap_matches_eight_512_tu_slot_schedule() {
-        let availability = nan_availability_attribute(512, 0, 8, 250).unwrap();
+        let availability = nan_availability_attribute(512, 0, 8, 250, 1).unwrap();
         assert_eq!(availability[0], NAN_AVAILABILITY_ATTR_ID);
         // 250 ms rounds up to sixteen 16-TU bits, repeated every 4096 TU.
         assert_eq!(availability[3..6], [1, 1, 0]);
@@ -2609,5 +3335,38 @@ mod tests {
             &availability[entry_start + 9..entry_start + 11],
             &[0x10, 0x02]
         );
+    }
+
+    #[test]
+    fn availability_map_is_explicit_and_bounded() {
+        let map_zero = nan_availability_attribute(512, 0, 4, 250, 0).unwrap();
+        let map_fifteen = nan_availability_attribute(512, 0, 4, 250, 15).unwrap();
+        assert_eq!(&map_zero[4..6], &0_u16.to_le_bytes());
+        assert_eq!(&map_fifteen[4..6], &15_u16.to_le_bytes());
+        assert!(nan_availability_attribute(512, 0, 4, 250, 16).is_err());
+    }
+
+    #[test]
+    fn device_capability_matches_classic_esp32_four_dw_schedule() {
+        let capability = nan_device_capability_attribute(4).unwrap();
+        assert_eq!(
+            capability,
+            [0x0f, 0x09, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00]
+        );
+        assert!(nan_device_capability_attribute(3).is_err());
+    }
+
+    #[test]
+    fn ap_owner_advertises_every_dw_even_with_sleepy_default() {
+        let settings = SharedSettings::new();
+        {
+            let mut settings = settings.borrow_mut();
+            settings.set_i32("nan.dw_tu", 512).unwrap();
+            settings.set_i32("nan.dw_stride", 4).unwrap();
+            settings.set_i32("nan.active_ms", 250).unwrap();
+            settings.set_bool("nan.ap_owner", true).unwrap();
+        }
+        let (_availability, capability) = nan_publish_attributes(&settings, 1).unwrap();
+        assert_eq!(capability[4], 1);
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ffi::c_char;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -2385,7 +2386,7 @@ fn auth_name(auth: sys::wifi_auth_mode_t) -> &'static str {
 fn wifi_net_status() -> String {
     let (channel, second) = wifi_channel_status();
     format!(
-        "sta_mac={} ap_mac={} ch={} second={} ip=disabled ap_stations={}",
+        "sta_mac={} ap_mac={} ch={} second={} country={} ip=disabled ap_stations={}",
         station_mac()
             .map(format_mac)
             .unwrap_or_else(|_| "unknown".to_string()),
@@ -2394,8 +2395,31 @@ fn wifi_net_status() -> String {
             .unwrap_or_else(|_| "unknown".to_string()),
         channel,
         second,
+        wifi_country_code(),
         ap_station_count()
     )
+}
+
+/// Read the ESP-IDF effective two-character regulatory country code.
+///
+/// `01` is ESP-IDF's world-safe default and must not be emitted as a NAN
+/// Country Code attribute. The raw-NAN publisher uses this status value only
+/// as the authoritative source for a later optional-attribute experiment.
+fn wifi_country_code() -> String {
+    let mut country = [0 as c_char; 3];
+    let ret = unsafe { sys::esp_wifi_get_country_code(country.as_mut_ptr()) };
+    if ret != sys::ESP_OK {
+        return "unknown".to_string();
+    }
+    let bytes = [country[0] as u8, country[1] as u8];
+    if bytes
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 fn wifi_channel_status() -> (i32, &'static str) {
