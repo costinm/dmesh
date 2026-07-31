@@ -1,0 +1,5 @@
+# Name,     Type, SubType, Offset,   Size,      Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+recovery_app, app, factory, 0x10000, 0xc0000,
+main,       app,  ota_0,   0xd0000, 0x300000,
