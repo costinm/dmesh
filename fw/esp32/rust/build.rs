@@ -18,5 +18,11 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_pm/dmesh_pm.c");
     println!("cargo:rerun-if-changed=native/dmesh_pm/include/dmesh_pm.h");
     println!("cargo:rerun-if-changed=native/dmesh_pm/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=native/dmesh_boot_health/dmesh_boot_health.c");
+    println!("cargo:rerun-if-changed=native/dmesh_boot_health/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=native/dmesh_flash_tcp/dmesh_flash_tcp.c");
+    println!("cargo:rerun-if-changed=native/dmesh_flash_tcp/dmesh_flash_tcp.h");
+    println!("cargo:rerun-if-changed=native/dmesh_flash_tcp/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../../boot/boot_health_rtc.h");
     embuild::espidf::sysenv::output();
 }

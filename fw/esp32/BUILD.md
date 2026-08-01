@@ -1,12 +1,17 @@
 # ESP32 Build
 
+The active fleet firmware is the Rust ESP-IDF application under
+`fw/esp32/rust`. The older C application and Rust translation scaffold below
+remain development material; the canonical current provisioning and remote
+flashing procedure is [rust/docs/flashing.md](rust/docs/flashing.md).
+
 Install dependencies:
 
 ```bash
 scripts/esp32-deps.sh
 ```
 
-Build the firmware:
+Build the legacy C application:
 
 ```bash
 . env.sh
@@ -22,12 +27,26 @@ Successful build outputs:
 - `fw/esp32/build/bootloader/bootloader.bin`
 - `fw/esp32/build/partition_table/partition-table.bin`
 
-Flash command from ESP-IDF after a successful build:
+Legacy direct flash command from ESP-IDF after a successful build:
 
 ```bash
 cd fw/esp32
 idf.py -p PORT flash
 ```
+
+Build the current Rust fleet images from the repository root:
+
+```bash
+. env.sh
+scripts/build-fw.sh e5          # classic ESP32 Main
+scripts/build-fw.sh recovery-s3 # 8 MB ESP32-S3 Main
+scripts/build-recovery-fleet.sh all
+```
+
+Artifacts are kept under `target/flash/` and `target/recovery-fleet/`.
+Direct USB flashing is only for initial provisioning or emergency repair. Once
+Main is installed, use `scripts/flash-main-command.py` through managed lmesh;
+CBOR starts the session and the image travels as a raw `DRS1` TCP stream.
 
 For Rust ESP development, source the same environment. `env.sh` owns
 the repo-local Nix profile, ESP-IDF tools, ESP Python environment, Cargo home,

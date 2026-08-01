@@ -25,9 +25,16 @@ pub extern "C" fn app_main() {
 fn run() -> Result<()> {
     boot_print("dm-rs boot step=link_patches");
     esp_idf_sys::link_patches();
+    components::recovery::mark_main_boot_start();
     components::wake::register_main_task();
     init_console_uart();
     quiet_runtime_logs();
+    if let Err(err) = components::wifi::init_ip_stack() {
+        components::telemetry::record_log(format!(
+            "event type=wifi.ip_stack_init ok=false message={}",
+            commands::protocol::escape_value(&err.to_string())
+        ));
+    }
 
     let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
     boot_print("dm-rs boot step=settings\n");
@@ -40,6 +47,10 @@ fn run() -> Result<()> {
             commands::protocol::escape_value(&err.to_string())
         ));
     }
+    // Keep the boot/control path awake until the first stable main loop. This
+    // also prevents an invalid retained power profile from entering light
+    // sleep while peripherals are still being initialized.
+    let _ = components::power::configure_for_light_sleep(false);
     boot_print("dm-rs boot step=wake\n");
     if let Err(err) = components::sleep::handle_deep_sleep_wake() {
         components::telemetry::record_log(format!(
@@ -122,6 +133,7 @@ fn run() -> Result<()> {
 
     let ready = "event type=system.ready app=dmesh-rs";
     components::telemetry::record_log(ready);
+    components::recovery::mark_main_boot_healthy();
     boot_print("dm-rs boot step=console\n");
     // GPIO0 is shared by physical PRG and CP210x DTR. Its ISR only coalesces
     // an edge and wakes the button task; all GPIO re-arm/classification work
@@ -162,6 +174,12 @@ fn run() -> Result<()> {
         poll_nan_commands(&mut registry, &settings);
         components::test::poll_main();
         drain_uart_console(&mut registry, &settings, companion_active_ms);
+        // The CBOR recovery command only arms the raw TCP session. The worker
+        // owns the outbound socket and flash operations; keep this call as a
+        // compatibility no-op for the stable Main command loop.
+        if components::mode::ip_transport_active() {
+            components::recovery::poll_flash_tcp();
+        }
         match wait_for_firmware_activity(Duration::from_millis(MAIN_HOUSEKEEPING_POLL_MS)) {
             UartWait::Data => {}
             UartWait::Timeout => {
@@ -425,12 +443,12 @@ fn init_console_uart() {
         // S3 external bridge used by the Heltec V3 test board.
         let _ = esp_idf_sys::uart_set_pin(UART0, tx_pin, rx_pin, -1, -1);
         let _ = esp_idf_sys::uart_disable_tx_intr(UART0);
-        // A console line is much smaller than the default FIFO threshold;
-        // use the hardware timeout to wake the RX manager after short input.
-        let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 1);
+        // Let the IDF driver own RX interrupt arming. A one-byte threshold
+        // can create an interrupt storm on a floating/noisy USB-UART input
+        // during startup; the timeout still wakes the manager for commands.
+        let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 64);
         let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
         esp_idf_sys::uart_set_always_rx_timeout(UART0, true);
-        let _ = esp_idf_sys::uart_enable_rx_intr(UART0);
         let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
         let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
         match components::serial::start_ingress_task(queue) {

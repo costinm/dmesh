@@ -21,10 +21,10 @@ After normal second-stage initialization, the bootloader checks these sources
 in order:
 
 1. a valid long button hold during the first three seconds;
-2. the exact ASCII string `BOOT` on the boot console UART during the first
+2. the exact ASCII string `RECOVER` on the boot console UART during the first
    three seconds;
 3. a valid bootloader-readable Recovery request in NVS;
-4. three rapid Main boot failures without a healthy-start acknowledgement;
+4. six consecutive Main boot failures without a healthy-start acknowledgement;
 5. otherwise, Main.
 
 If any of the first three conditions is true, the bootloader loads Recovery.
@@ -43,8 +43,9 @@ Recovery performs the authenticated update and clears the request only after
 the stream has completed successfully. It then reboots. With no `otadata`
 partition, the bootloader sees no pending request and starts Main.
 
-Main writes a request before rebooting when it wants Recovery, and clears the
-crash-loop acknowledgement after reaching its healthy startup milestone.
+Main writes a request before rebooting when it wants Recovery, and publishes a
+healthy-start marker through the shared RTC-retained ABI. The bootloader only
+reads NVS during selection; it never commits NVS for routine boot attempts.
 
 ## Crash-loop state
 
@@ -52,15 +53,14 @@ Use ESP-IDF RTC-retained bootloader memory, including its CRC, plus a small
 custom field for:
 
 - consecutive Main handoff attempts;
-- a rapid-reset time/window marker;
-- the selected Main partition identity;
-- a healthy-start acknowledgement state.
+- a healthy-start acknowledgement state and separate Main/Recovery counters.
 
 The counter is incremented before loading Main. Main clears it once startup is
-healthy. If Main resets before that acknowledgement three times inside the
-configured rapid-reset window, the next boot selects Recovery. A power-cycle
-reset of the retained state is acceptable and prevents a stale crash count
-from permanently forcing Recovery.
+healthy. Six consecutive attempts without that acknowledgement select
+Recovery. Recovery has its own six-attempt counter; if both applications have
+reached the limit, the bootloader halts and logs that UART flashing is
+required. A successful Recovery transaction clears both counters before the
+next Main attempt. The counters live in RTC RAM and are not NVS wear events.
 
 The existing ESP-IDF primitives are the intended starting points:
 
@@ -98,9 +98,10 @@ mode.
 
 ## Partition layout
 
-The first E5 layout is based on the existing classic ESP32 4 MiB profile and
-keeps the current NVS and PHY offsets to avoid destroying deployed settings.
-The final offsets are intentionally not committed yet.
+The E5 layout is based on the existing classic ESP32 4 MiB profile and keeps
+the current NVS and PHY offsets to avoid destroying deployed settings. The
+same Recovery/Main shape is used on the 8 MiB S3 layout, which additionally
+contains `dmesh_store`.
 
 The target shape is:
 
@@ -118,8 +119,9 @@ partition starts conservatively; its exact size will be the optimized release
 image size plus measured headroom. Main retains enough capacity for the
 current firmware image and future growth.
 
-No `otadata`, OTA slots, filesystem, or store partition is needed for the E5
-bring-up.
+No `otadata` partition or OTA slot is used. The S3 layout has a `dmesh_store`
+partition for the larger-flash boards; it is a normal named data target for
+Main-controlled raw TCP flashing.
 
 ## Scope boundary
 
@@ -158,3 +160,20 @@ Before any E5 flash:
 5. run host tests for request parsing, crash-loop state, and boot selection;
 6. build a signed test stream and exercise Recovery without hardware writes;
 7. review the final layout and only then prepare a sparse E5 flash image.
+
+## Deferred integrity index
+
+For future differential updates, reserve the final sector of each updatable
+partition for a compact per-block digest index. It is deliberately outside
+the usable image area. A device-first transfer can return that index, receive
+a signed replacement index, and accept only blocks whose digests changed.
+The replacement index is committed last, after all block writes verify. This
+also gives the second-stage bootloader a bounded way to verify Main and
+Recovery before starting them. Truncated SHA-256 is the first candidate; the
+index must fit without requiring a Merkle tree, or the partition format must
+explicitly reject images that exceed its capacity.
+
+The current implementation does not reserve or consume this sector and still
+uses complete-image `DRS1` transfers. PPP framing for the second-stage,
+Recovery, and Main paths is a separate future evaluation, with size and RAM
+cost as the deciding constraints.

@@ -157,6 +157,12 @@ const NAN_AVAILABILITY_BITMAP_TU: u32 = 16;
 const NAN_SDEA_SERVICE_UPDATE_CONTROL: [u8; 2] = [0x00, 0x02];
 
 const NAN_SERVICE_INFO_LEN: usize = 21;
+const NAN_SERVICE_FLAG_UART_WAKE: u8 = 0x80;
+const NAN_SERVICE_FLAG_BLE_WAKE: u8 = 0x40;
+// TODO: reserve another service-info flag for a stronger "I really want to
+// talk" advertisement that also asks the target to enable STA and associate
+// with the infrastructure AP. Keep the current control radio-only until that
+// association path has explicit power and security tests.
 // Service Control bits 0..=1 identify the descriptor type: 00 = publish,
 // 01 = subscribe, 10 = follow-up.  Bit 4 says that service-specific
 // information follows.  This is an ESP publisher, not a subscriber.
@@ -830,6 +836,22 @@ fn is_dmesh_nan_service_info(data: &[u8]) -> bool {
     data.len() == NAN_SERVICE_INFO_LEN && data[..2] == DMESH_MAGIC && data[2] == DMESH_VERSION
 }
 
+fn wake_request_for_service(data: &[u8]) -> Option<(u32, u8)> {
+    if !is_dmesh_nan_service_info(data)
+        || data[4] & (NAN_SERVICE_FLAG_UART_WAKE | NAN_SERVICE_FLAG_BLE_WAKE) == 0
+    {
+        return None;
+    }
+    let target = u32::from_le_bytes(data[11..15].try_into().ok()?);
+    let local = station_mac().ok()?;
+    let local_suffix = u32::from_be_bytes(local[2..6].try_into().ok()?);
+    if target != u32::MAX && target != local_suffix {
+        return None;
+    }
+    let duration = u16::from_le_bytes(data[15..17].try_into().ok()?) as u32;
+    Some((duration.clamp(1_000, 300_000), data[4]))
+}
+
 fn dmesh_nan_followup_frame(
     msg_type: u8,
     seq: u16,
@@ -1319,6 +1341,111 @@ impl CommandHandler for NanCommand {
             return Ok(CommandResponse::ok(format!(
                 "nan raw sent bytes={}",
                 bytes.len()
+            )));
+        }
+        if let Some(target) = request
+            .arg("uart_wake")
+            .or_else(|| request.arg("wake_uart"))
+        {
+            self.ensure_raw_started()?;
+            let sync = request
+                .arg("sync")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(false);
+            if !sync {
+                bail!("nan uart_wake requires sync=true; raw NAN data is DW-gated");
+            }
+            let target = parse_uart_wake_target(target)?;
+            let duration_ms = request
+                .arg_i32("duration_ms")?
+                .or(request.arg_i32("ms")?)
+                .unwrap_or(2_000)
+                .clamp(1_000, 300_000) as u16;
+            let availability_map = request.arg_i32("availability_map")?.unwrap_or(1);
+            if !(0..=15).contains(&availability_map) {
+                bail!("availability_map must be in 0..=15; got {availability_map}");
+            }
+            let (availability, device_capabilities) =
+                nan_publish_attributes(&self.settings, availability_map as u8)?;
+            let frame = nan_publish_frame_with_uart_wake(
+                &availability,
+                &device_capabilities,
+                true,
+                2,
+                0,
+                Some(target),
+                duration_ms,
+                NAN_SERVICE_FLAG_UART_WAKE,
+            )?;
+            let frame_len = frame.len();
+            let mut queue = nan_publish_queue()
+                .lock()
+                .map_err(|_| anyhow!("nan publish queue lock failed"))?;
+            if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
+                queue.pop_front();
+            }
+            queue.push_back(frame);
+            return Ok(CommandResponse::ok(format!(
+                "nan uart_wake queued=true target={} duration_ms={} bytes={}",
+                if target == u32::MAX {
+                    "*".to_string()
+                } else {
+                    format!("{target:08x}")
+                },
+                duration_ms,
+                frame_len
+            )));
+        }
+        if let Some(target) = request.arg("ble_wake").or_else(|| request.arg("wake_ble")) {
+            self.ensure_raw_started()?;
+            let sync = request
+                .arg("sync")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(false);
+            if !sync {
+                bail!("nan ble_wake requires sync=true; raw NAN data is DW-gated");
+            }
+            let target = parse_uart_wake_target(target)?;
+            let duration_ms = request
+                .arg_i32("duration_ms")?
+                .or(request.arg_i32("ms")?)
+                .unwrap_or(2_000)
+                .clamp(1_000, 300_000) as u16;
+            let availability_map = request.arg_i32("availability_map")?.unwrap_or(1);
+            if !(0..=15).contains(&availability_map) {
+                bail!("availability_map must be in 0..=15; got {availability_map}");
+            }
+            let (availability, device_capabilities) =
+                nan_publish_attributes(&self.settings, availability_map as u8)?;
+            let frame = nan_publish_frame_with_uart_wake(
+                &availability,
+                &device_capabilities,
+                true,
+                2,
+                0,
+                Some(target),
+                duration_ms,
+                NAN_SERVICE_FLAG_BLE_WAKE,
+            )?;
+            let frame_len = frame.len();
+            let mut queue = nan_publish_queue()
+                .lock()
+                .map_err(|_| anyhow!("nan publish queue lock failed"))?;
+            if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
+                queue.pop_front();
+            }
+            queue.push_back(frame);
+            return Ok(CommandResponse::ok(format!(
+                "nan ble_wake queued=true target={} duration_ms={} bytes={}",
+                if target == u32::MAX {
+                    "*".to_string()
+                } else {
+                    format!("{target:08x}")
+                },
+                duration_ms,
+                frame_len
             )));
         }
         if request.arg("publish").is_some() {
@@ -2113,7 +2240,7 @@ fn nan_publish_attributes(
     let settings = settings.borrow();
     let dw_tu = settings.get_i32("nan.dw_tu", 512)?.clamp(128, 8_192) as u32;
     let offset_tu = settings.get_i32("nan.dw_off_tu", 0)?.max(0) as u32;
-    let configured_stride = settings.get_i32("nan.dw_stride", 4)?.clamp(1, 64) as u32;
+    let configured_stride = settings.get_i32("nan.dw_stride", 8)?.clamp(1, 64) as u32;
     // An AP owner is powered continuously and must advertise that truth.  A
     // sleeping-device cadence here would make peers legitimately defer its
     // unsolicited-publish discovery to slots in which this node is actually
@@ -2181,6 +2308,28 @@ fn nan_publish_frame_with_requestor(
     sdea_update: u8,
     requestor_instance: u8,
 ) -> Result<Vec<u8>> {
+    nan_publish_frame_with_uart_wake(
+        availability,
+        device_capabilities,
+        include_sdea,
+        sdea_update,
+        requestor_instance,
+        None,
+        0,
+        0,
+    )
+}
+
+fn nan_publish_frame_with_uart_wake(
+    availability: &[u8],
+    device_capabilities: &[u8],
+    include_sdea: bool,
+    sdea_update: u8,
+    requestor_instance: u8,
+    uart_wake_target: Option<u32>,
+    uart_wake_duration_ms: u16,
+    wake_flags: u8,
+) -> Result<Vec<u8>> {
     let device_mac = station_mac()?;
     let tx_mac = super::wifi::raw_tx_source_mac()?;
     let cluster_bssid = nan_cluster_bssid();
@@ -2189,7 +2338,7 @@ fn nan_publish_frame_with_requestor(
     // discovery frame triggered it. Captured SDFs remain diagnostic evidence
     // only, so peer identifiers and optional attributes cannot leak into this
     // broadcast.
-    Ok(nan_publish_frame_for_requestor(
+    Ok(nan_publish_frame_for_requestor_with_wake(
         &tx_mac,
         &device_mac,
         &cluster_bssid,
@@ -2198,6 +2347,9 @@ fn nan_publish_frame_with_requestor(
         include_sdea,
         sdea_update,
         requestor_instance,
+        uart_wake_target,
+        uart_wake_duration_ms,
+        wake_flags,
     ))
 }
 
@@ -2311,11 +2463,44 @@ fn nan_publish_frame_for_requestor(
     sdea_update: u8,
     requestor_instance: u8,
 ) -> Vec<u8> {
+    nan_publish_frame_for_requestor_with_wake(
+        tx_mac,
+        device_mac,
+        cluster_bssid,
+        availability,
+        device_capabilities,
+        include_sdea,
+        sdea_update,
+        requestor_instance,
+        None,
+        0,
+        0,
+    )
+}
+
+fn nan_publish_frame_for_requestor_with_wake(
+    tx_mac: &[u8; 6],
+    device_mac: &[u8; 6],
+    cluster_bssid: &[u8; 6],
+    availability: &[u8],
+    device_capabilities: &[u8],
+    include_sdea: bool,
+    sdea_update: u8,
+    requestor_instance: u8,
+    uart_wake_target: Option<u32>,
+    uart_wake_duration_ms: u16,
+    wake_flags: u8,
+) -> Vec<u8> {
     let mut frame = NAN_HEADER.to_vec();
     frame[FRAME_DST..FRAME_DST + 6].copy_from_slice(&NAN_DISCOVERY_MAC);
     frame[FRAME_SRC..FRAME_SRC + 6].copy_from_slice(tx_mac);
     frame[FRAME_BSSID..FRAME_BSSID + 6].copy_from_slice(cluster_bssid);
-    let service_info = nan_service_info(device_mac);
+    let service_info = nan_service_info_with_wake(
+        device_mac,
+        uart_wake_target,
+        uart_wake_duration_ms,
+        wake_flags,
+    );
     let descriptor_len = SVC_ID.len() + 4 + service_info.len();
     // NAN v3.2 table 25 orders the included attributes after the SDA: optional
     // SDEA, then Device Capability and NAN Availability. The SDEA can be
@@ -2359,6 +2544,15 @@ fn nan_service_extension(service_update: u8) -> [u8; 7] {
 /// lmesh radio protocol.  Keeping this wire shape identical lets Android
 /// accept a raw ESP NAN publish as a normal `dmesh` service discovery event.
 fn nan_service_info(mac: &[u8; 6]) -> [u8; NAN_SERVICE_INFO_LEN] {
+    nan_service_info_with_wake(mac, None, 0, 0)
+}
+
+fn nan_service_info_with_wake(
+    mac: &[u8; 6],
+    uart_wake_target: Option<u32>,
+    uart_wake_duration_ms: u16,
+    wake_flags: u8,
+) -> [u8; NAN_SERVICE_INFO_LEN] {
     let mut info = [0_u8; NAN_SERVICE_INFO_LEN];
     info[0..2].copy_from_slice(b"DM");
     info[2] = 1;
@@ -2367,6 +2561,11 @@ fn nan_service_info(mac: &[u8; 6]) -> [u8; NAN_SERVICE_INFO_LEN] {
     info[5..11].copy_from_slice(mac);
     // wake_count, last_len, and last_hash deliberately remain zero until the
     // raw-NAN scheduler owns per-advertisement payload metadata.
+    if let Some(target) = uart_wake_target {
+        info[4] |= wake_flags & (NAN_SERVICE_FLAG_UART_WAKE | NAN_SERVICE_FLAG_BLE_WAKE);
+        info[11..15].copy_from_slice(&target.to_le_bytes());
+        info[15..17].copy_from_slice(&uart_wake_duration_ms.to_le_bytes());
+    }
     info
 }
 
@@ -2412,6 +2611,20 @@ fn is_broadcast_target(value: &str) -> bool {
         || value.eq_ignore_ascii_case("ff:ff:ff:ff")
         || value.eq_ignore_ascii_case("broadcast")
         || value.eq_ignore_ascii_case("all")
+}
+
+fn parse_uart_wake_target(value: &str) -> Result<u32> {
+    if is_broadcast_target(value) || value == "*" {
+        return Ok(u32::MAX);
+    }
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("uart wake target must be * or an 8-digit device suffix");
+    }
+    u32::from_str_radix(value, 16).map_err(|_| anyhow!("invalid uart wake target"))
 }
 
 fn mac_suffix4_hex(mac: &[u8; 6]) -> String {
@@ -2555,6 +2768,27 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                         if let Ok(mut captured) = last_dmesh_service_frame().lock() {
                             captured.clear();
                             captured.extend_from_slice(&frame[..frame.len().min(NAN_RX_FRAME_MAX)]);
+                        }
+                        if let Some((duration_ms, wake_flags)) =
+                            wake_request_for_service(info.payload)
+                        {
+                            if wake_flags & NAN_SERVICE_FLAG_UART_WAKE != 0 {
+                                super::mode::request_targeted_wake(duration_ms);
+                                super::serial::activate_window_for(duration_ms);
+                                telemetry::record_log(format!(
+                                    "event type=nan.uart_wake target=matched duration_ms={} peer={}",
+                                    duration_ms,
+                                    format_mac(&info.source)
+                                ));
+                            }
+                            if wake_flags & NAN_SERVICE_FLAG_BLE_WAKE != 0 {
+                                if let Err(error) = super::ble_bt::request_coc_wake(duration_ms) {
+                                    telemetry::record_log(format!(
+                                        "event type=nan.ble_wake target=matched ok=false message={}",
+                                        crate::commands::protocol::escape_value(&error.to_string())
+                                    ));
+                                }
+                            }
                         }
                         if kind == 0x01 {
                             if let Ok(mut captured) = last_dmesh_subscribe_frame().lock() {

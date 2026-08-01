@@ -43,8 +43,13 @@ static COMPANION_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static COMPANION_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static COMPANION_PENDING_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Set while Main has handed the radio to the IP/TCP flash transport.  The
+/// normal mode poller must not restart raw-NAN windows or light-sleep while a
+/// socket listener owns the Wi-Fi driver.
+static IP_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_TARGET_WAKE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_SYNC_SOURCE: AtomicU8 = AtomicU8::new(SYNC_SOURCE_NONE);
 static RAW_NAN_RECOVERY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_RECOVERY_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -84,6 +89,9 @@ static RAW_NAN_DW_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DW0_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DW_SYNC_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DW_EARLY_WAKE_TOTAL: AtomicU32 = AtomicU32::new(0);
+// Runtime-only wake margin. It starts at nan.early_ms and is reduced after
+// successful beacon reception, then increased after a missed window.
+static RAW_NAN_WAKE_EARLY_MS: AtomicU32 = AtomicU32::new(DEFAULT_NAN_WAKE_EARLY_MS);
 static RAW_NAN_DW_ACTIVE_SEQ: AtomicU32 = AtomicU32::new(0);
 // The data plane is permitted only for the short interval immediately after a
 // selected NAN discovery window beacon.  Keeping this separate from the
@@ -92,7 +100,7 @@ static RAW_NAN_DW_ACTIVE_SEQ: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DATA_DW_DEADLINE_LO: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DATA_DW_DEADLINE_HI: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DATA_DW_PERIOD_US: AtomicU32 = AtomicU32::new(0);
-static RAW_NAN_DATA_DW_STRIDE: AtomicU32 = AtomicU32::new(4);
+static RAW_NAN_DATA_DW_STRIDE: AtomicU32 = AtomicU32::new(8);
 const RAW_NAN_DATA_DW_DWELL_US: u64 = 32_000;
 static RAW_NAN_DW_HISTORY_SEQ: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
     [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
@@ -196,6 +204,9 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
 }
 
 pub fn poll(settings: &SharedSettings) {
+    if IP_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     poll_infra_active_session();
     if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
         poll_ap_owner(settings);
@@ -269,7 +280,25 @@ fn poll_infra_active_session() {
 }
 
 fn infra_radio_hold_active() -> bool {
-    infra_active_session_enabled() || super::serial::is_active()
+    infra_active_session_enabled() || targeted_wake_active() || super::serial::is_active()
+}
+
+fn targeted_wake_active() -> bool {
+    let deadline = RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Acquire);
+    deadline != 0 && !deadline_is_due(deadline, now_ms())
+}
+
+/// Keep raw Wi-Fi active after a matching NAN service advertisement.
+pub fn request_targeted_wake(duration_ms: u32) {
+    let deadline = now_ms().wrapping_add(duration_ms.clamp(1_000, 300_000));
+    let current = RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Acquire);
+    if current == 0 || deadline_is_due(current, deadline) {
+        RAW_NAN_TARGET_WAKE_UNTIL_MS.store(deadline, Ordering::Release);
+    }
+    telemetry::record_log(format!(
+        "event type=nan.target_wake requested_ms={} deadline_ms={}",
+        duration_ms, deadline
+    ));
 }
 
 fn extend_infra_active_session(settings: &SharedSettings, window_ms: u32, reason: &'static str) {
@@ -618,6 +647,7 @@ fn start_ap_owner(settings: &SharedSettings, reason: &'static str, channel: u8) 
     }
     stop_raw_nan_duty();
     AP_OWNER_RUNNING.store(true, Ordering::Relaxed);
+    super::serial::set_always_on(true);
     AP_OWNER_STARTED_MS.store(now_ms(), Ordering::Relaxed);
     AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
     AP_OWNER_AP_ACTIVE.store(false, Ordering::Relaxed);
@@ -646,6 +676,7 @@ fn stop_ap_owner() -> Result<()> {
         AP_OWNER_STOPS.fetch_add(1, Ordering::Relaxed);
     }
     RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
+    super::serial::set_always_on(false);
     Ok(())
 }
 
@@ -670,19 +701,11 @@ fn start_ap_owner_fallback(settings: &SharedSettings, channel: u8) -> Result<()>
 }
 
 fn poll_ap_owner(settings: &SharedSettings) {
-    // An AP owner keeps Wi-Fi powered rather than entering raw-NAN duty sleep,
-    // so it has no regular duty callback to emit the UART heartbeat. Keep the
-    // host modem contract identical to battery nodes: one bounded UART window
-    // per configured wake cadence, without extending it from UART output.
-    let now = now_ms();
-    let next_uart = AP_OWNER_UART_NEXT_MS.load(Ordering::Relaxed);
-    if next_uart == 0 || now.wrapping_sub(next_uart) < i32::MAX as u32 {
-        let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(100, 5_000);
-        let wake_ms =
-            get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS).clamp(active_ms, 60_000);
-        let _ = super::serial::on_raw_nan_wake(active_ms);
-        AP_OWNER_UART_NEXT_MS.store(now.wrapping_add(wake_ms), Ordering::Relaxed);
-    }
+    // Infrastructure/AP owners are deliberately always reachable. Keep the
+    // UART powered for the lifetime of AP ownership; sleepy-node duty windows
+    // do not apply while infrastructure mode is selected.
+    super::serial::set_always_on(true);
+    AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
     let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
     let policy = sync_policy(settings);
     let nan_fresh = super::nan::nan_beacon_age_ms()
@@ -750,8 +773,9 @@ fn start_raw_nan_duty(
         .max(active_ms)
         .clamp(100, 60_000);
     let light_sleep = get_bool(settings, "nan.light_sleep", true);
-    let wake_early_ms = get_u32(settings, "nan.early_ms", DEFAULT_NAN_WAKE_EARLY_MS)
+    let configured_wake_early_ms = get_u32(settings, "nan.early_ms", DEFAULT_NAN_WAKE_EARLY_MS)
         .min(duty_ms.saturating_sub(active_ms));
+    RAW_NAN_WAKE_EARLY_MS.store(configured_wake_early_ms, Ordering::Relaxed);
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
     arm_raw_nan_beacon_window(None);
@@ -787,7 +811,7 @@ fn start_raw_nan_duty(
         duty_ms,
         active_ms,
         light_sleep,
-        wake_early_ms,
+        configured_wake_early_ms,
         dw_tu,
         dw_offset_tu,
         sync_policy_name(sync_policy(settings)),
@@ -832,6 +856,29 @@ pub fn stop_raw_nan_duty() {
     RAW_NAN_DUTY_NEXT_MS.store(0, Ordering::Relaxed);
     RAW_NAN_MISS_BACKOFF_MS.store(0, Ordering::Relaxed);
     RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
+    RAW_NAN_TARGET_WAKE_UNTIL_MS.store(0, Ordering::Release);
+}
+
+/// Hand the Wi-Fi driver to an IP data-plane user such as the recovery/TCP
+/// flasher.  The normal firmware scheduler is allowed to stop raw Wi-Fi and
+/// enter light sleep; that is correct for NAN but would make an established
+/// TCP listener intermittently unreachable.  This is runtime-only state and
+/// is intentionally not persisted in NVS.
+pub fn stop_for_ip_transport() {
+    IP_TRANSPORT_ACTIVE.store(true, Ordering::Release);
+    // Keep the tcpip task scheduled while the update data plane is active;
+    // raw-NAN normally enables automatic light sleep between discovery
+    // windows, which is not compatible with starting a BSD listener.
+    super::power::configure_for_light_sleep(false).ok();
+    stop_ap_owner().ok();
+    stop_raw_nan_duty();
+    super::nan::stop_nan().ok();
+    super::wifi::stop_raw_monitor().ok();
+    telemetry::record_log("event type=mode.ip_transport scheduler=stopped");
+}
+
+pub fn ip_transport_active() -> bool {
+    IP_TRANSPORT_ACTIVE.load(Ordering::Acquire)
 }
 
 pub fn raw_nan_duty_enabled() -> bool {
@@ -843,7 +890,8 @@ pub fn raw_nan_duty_enabled() -> bool {
 ///
 /// The raw-NAN duty scheduler chooses DW0, DW0 + stride, ... from the same
 /// TSF/512-TU timeline.  SDF transmission must use that selection too: sending
-/// after every nearby cluster beacon while advertising `dw_stride=4` makes the
+/// after every nearby cluster beacon while advertising a sparse `dw_stride`
+/// makes the
 /// Availability Attribute untrue on air.  The AP owner is intentionally the
 /// exception because its descriptor advertises every DW and it is powered
 /// continuously.
@@ -889,7 +937,8 @@ pub fn raw_nan_publish_min_spacing_us() -> u64 {
     base_period_us.saturating_mul(stride).saturating_mul(3) / 4
 }
 
-/// Open the data plane only for the selected DW0/DW0+4 rendezvous slot.
+/// Open the data plane only for the selected DW0/DW-stride rendezvous slot
+/// (DW0/DW8 in the default 512-TU, four-second profile).
 ///
 /// `tsf_us` is sampled from the NAN beacon that arrived on channel 6. The
 /// scheduler selected this radio-on interval; the observed cluster beacon,
@@ -1015,7 +1064,7 @@ fn sync_wake_plan(
         local_us: beacon.local_us,
         tsf_us: beacon.tsf_us,
     };
-    let configured_stride = get_u32(settings, "nan.dw_stride", 4).clamp(1, 64);
+    let configured_stride = get_u32(settings, "nan.dw_stride", 8).clamp(1, 64);
     // The configured stride is the device's selected power contract. A
     // pending frame must wait for that rendezvous; silently changing to every
     // 512-TU DW defeats sleep. The raw SDF Availability attribute is encoded
@@ -1036,6 +1085,10 @@ fn deadline_due(now: u32, deadline: u32) -> bool {
     deadline == 0 || now.wrapping_sub(deadline) < u32::MAX / 2
 }
 
+fn deadline_not_due(now: u32, deadline: u32) -> bool {
+    deadline != 0 && now.wrapping_sub(deadline) >= u32::MAX / 2
+}
+
 fn poll_raw_nan_duty(settings: &SharedSettings) {
     if !RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed) {
         return;
@@ -1045,7 +1098,22 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     let _ = super::nan::drain_publish_on_discovery_window();
     let now = now_ms();
     let deadline = RAW_NAN_DUTY_NEXT_MS.load(Ordering::Relaxed);
-    if deadline != 0 && now.wrapping_sub(deadline) >= u32::MAX / 2 {
+    let post_beacon_due = if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed)
+        && !infra_radio_hold_active()
+        && RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN
+    {
+        let snapshot = super::wifi::beacon_snapshot();
+        let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
+        snapshot.count > baseline
+            && now_us().saturating_sub(snapshot.local_us) >= RAW_NAN_DATA_DW_DWELL_US
+    } else {
+        false
+    };
+    // `wrapping_sub(deadline) >= HALF` means the deadline is still in the
+    // future. Keep servicing the active window in that case, unless the
+    // expected beacon has already arrived and the short post-beacon dwell has
+    // elapsed; that path must fall through to the shutdown code below.
+    if deadline_not_due(now, deadline) && !post_beacon_due {
         // Raw-NAN publish frames are queued by the command task and released
         // here, in task context, only within the beacon-defined DW.
         let _ = super::nan::drain_publish_on_discovery_window();
@@ -1069,8 +1137,10 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         .max(active_ms)
         .clamp(100, 60_000);
     let light_sleep = get_bool(settings, "nan.light_sleep", true);
-    let wake_early_ms = get_u32(settings, "nan.early_ms", DEFAULT_NAN_WAKE_EARLY_MS)
-        .min(duty_ms.saturating_sub(active_ms));
+    let wake_early_ms = RAW_NAN_WAKE_EARLY_MS
+        .load(Ordering::Relaxed)
+        .min(duty_ms.saturating_sub(active_ms))
+        .max(1);
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
     let hold_active = infra_radio_hold_active();
@@ -1119,6 +1189,23 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
             return;
         }
+        // Once the selected NAN beacon has arrived, retain the radio only for
+        // the bounded data-plane dwell. The full active_ms remains the miss
+        // timeout, so a late/missing beacon still gets a recovery window.
+        if RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN {
+            let snapshot = super::wifi::beacon_snapshot();
+            let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
+            if snapshot.count > baseline {
+                let since_beacon_us = now_us().saturating_sub(snapshot.local_us);
+                if since_beacon_us >= RAW_NAN_DATA_DW_DWELL_US {
+                    telemetry::record_log(format!(
+                        "event type=nan.duty phase=post_beacon_stop since_beacon_us={} dwell_us={}",
+                        since_beacon_us, RAW_NAN_DATA_DW_DWELL_US
+                    ));
+                    RAW_NAN_DUTY_NEXT_MS.store(now, Ordering::Relaxed);
+                }
+            }
+        }
         let recovery_window = RAW_NAN_RECOVERY_ACTIVE.swap(false, Ordering::AcqRel);
         if RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN {
             finish_raw_nan_beacon_window();
@@ -1134,7 +1221,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
         let backoff_ms = RAW_NAN_MISS_BACKOFF_MS.swap(0, Ordering::Relaxed);
         let idle_ms = duty_ms.saturating_sub(active_ms).saturating_add(backoff_ms);
-        // A fresh NAN TSF selects the next DW0/DW0+4 cadence slot. The
+        // A fresh NAN TSF selects the next DW0/DW-stride cadence slot. The
         // four-second duty interval is only the fallback when no beacon is
         // available; it must not create a free-running synchronized schedule.
         let selected_plan =
@@ -1283,6 +1370,8 @@ fn arm_raw_nan_beacon_window(plan: Option<super::wifi::BeaconWakePlan>) {
 fn finish_raw_nan_beacon_window() {
     const LATE_TOLERANCE_US: u64 = 80_000;
     const MISS_BACKOFF_MS: u32 = 1_000;
+    const WAKE_MARGIN_MIN_MS: u32 = 1;
+    const WAKE_MARGIN_MAX_MS: u32 = 100;
 
     let snapshot = super::wifi::beacon_snapshot();
     let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
@@ -1291,9 +1380,14 @@ fn finish_raw_nan_beacon_window() {
         RAW_NAN_BEACON_MISSED.fetch_add(1, Ordering::Relaxed);
         record_raw_nan_dw_finish(0, 0);
         RAW_NAN_MISS_BACKOFF_MS.store(MISS_BACKOFF_MS, Ordering::Relaxed);
+        let previous = RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed);
+        let next = previous
+            .saturating_add(5)
+            .clamp(WAKE_MARGIN_MIN_MS, WAKE_MARGIN_MAX_MS);
+        RAW_NAN_WAKE_EARLY_MS.store(next, Ordering::Relaxed);
         telemetry::record_log(format!(
-            "event type=nan.duty beacon=missed active_ms_backoff={} baseline={} current={}",
-            MISS_BACKOFF_MS, baseline, snapshot.count
+            "event type=nan.duty beacon=missed active_ms_backoff={} wake_margin_ms={} previous_margin_ms={} baseline={} current={}",
+            MISS_BACKOFF_MS, next, previous, baseline, snapshot.count
         ));
         return;
     }
@@ -1317,6 +1411,15 @@ fn finish_raw_nan_beacon_window() {
         beacon_to_sleep_us.min(u64::from(u32::MAX)) as u32,
         Ordering::Relaxed,
     );
+    let previous_margin = RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed);
+    let next_margin = previous_margin
+        .saturating_sub(1)
+        .clamp(WAKE_MARGIN_MIN_MS, WAKE_MARGIN_MAX_MS);
+    RAW_NAN_WAKE_EARLY_MS.store(next_margin, Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "event type=nan.duty beacon=seen wake_to_beacon_us={} beacon_to_sleep_us={} wake_margin_ms={} previous_margin_ms={}",
+        wake_to_beacon_us, beacon_to_sleep_us, next_margin, previous_margin
+    ));
     RAW_NAN_LAST_BEACON_TSF_LO.store(snapshot.tsf_us as u32, Ordering::Relaxed);
     RAW_NAN_LAST_BEACON_TSF_HI.store((snapshot.tsf_us >> 32) as u32, Ordering::Relaxed);
     record_raw_nan_dw_finish(received, RAW_NAN_DW_FLAG_BEACON);
@@ -1449,11 +1552,12 @@ pub fn raw_nan_status_fields() -> String {
         )
     };
     format!(
-        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_expected_tsf_us={} nan_expected_slot_period_us={} nan_selected_stride={} nan_expected_slot_index={} nan_expected_slot_phase_us={} nan_last_beacon_tsf_us={} nan_last_beacon_slot_index={} nan_last_beacon_slot_phase_us={} nan_last_wake_to_beacon_us={} nan_last_beacon_to_sleep_us={} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
+        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_wake_early_ms={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_expected_tsf_us={} nan_expected_slot_period_us={} nan_selected_stride={} nan_expected_slot_index={} nan_expected_slot_phase_us={} nan_last_beacon_tsf_us={} nan_last_beacon_slot_index={} nan_last_beacon_slot_phase_us={} nan_last_wake_to_beacon_us={} nan_last_beacon_to_sleep_us={} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
         RAW_NAN_DW_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW0_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW_SYNC_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW_EARLY_WAKE_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed),
         raw_nan_dw_recent_fields(),
         expected_tsf_us,
         expected_period_us,
@@ -1792,7 +1896,7 @@ fn save_requested(request: &CommandRequest) -> bool {
 
 fn status_text() -> String {
     format!(
-        "mode active={} infra_active={} infra_active_persistent={} infra_active_deadline_ms={} infra_active_start={} infra_active_stop={} infra_active_expire={} infra_active_uart_extend={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
+        "mode active={} infra_active={} infra_active_persistent={} infra_active_deadline_ms={} infra_active_start={} infra_active_stop={} infra_active_expire={} infra_active_uart_extend={} targeted_wake={} targeted_wake_deadline_ms={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
         mode_name(),
         infra_active_session_enabled(),
         INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed),
@@ -1801,6 +1905,8 @@ fn status_text() -> String {
         INFRA_ACTIVE_STOPS.load(Ordering::Relaxed),
         INFRA_ACTIVE_EXPIRES.load(Ordering::Relaxed),
         INFRA_ACTIVE_UART_EXTENDS.load(Ordering::Relaxed),
+        targeted_wake_active(),
+        RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Relaxed),
         COMPANION_ADVERTISING.load(Ordering::Relaxed),
         COMPANION_PENDING_ADVERTISING.load(Ordering::Relaxed),
         telemetry::pending_message_count(),
@@ -1813,7 +1919,7 @@ fn status_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ping_packet;
+    use super::{deadline_due, deadline_not_due, ping_packet};
     use crate::commands::protocol::{decode_binary, CBOR_STATUS};
 
     #[test]
@@ -1828,5 +1934,16 @@ mod tests {
             pong.args.get(&CBOR_STATUS).map(String::as_str),
             Some("pong")
         );
+    }
+
+    #[test]
+    fn duty_deadline_wrap_logic_keeps_future_window_open() {
+        assert!(deadline_not_due(100, 1_000));
+        assert!(!deadline_due(100, 1_000));
+        assert!(deadline_due(1_001, 1_000));
+        assert!(!deadline_not_due(1_001, 1_000));
+        // Timer wrap must preserve the same ordering semantics.
+        assert!(deadline_not_due(u32::MAX - 10, 5));
+        assert!(deadline_due(5, u32::MAX - 10));
     }
 }

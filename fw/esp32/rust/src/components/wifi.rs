@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::c_char;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -59,6 +60,7 @@ const IEEE80211_LLC_SNAP_IPV4: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+static IP_STA_NETIF: OnceLock<usize> = OnceLock::new();
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
 static RAW_FILTER_BSSID_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_BSSID: [AtomicU8; 6] = [
@@ -145,7 +147,13 @@ pub fn beacon_wake_plan_from(
         return None;
     }
     let now_tsf_us = snapshot.tsf_us.saturating_add(age_us);
-    let target_us = u64::from(offset_tu).saturating_mul(1024) % period_us;
+    // The captured beacon timestamp is the local authority for the cluster's
+    // DW phase. Do not project every cluster onto absolute TSF zero: Android
+    // and AP timing sources commonly run at a stable non-zero phase. The
+    // configured offset is relative to that observed phase.
+    let target_us = (snapshot.tsf_us % period_us)
+        .saturating_add(u64::from(offset_tu).saturating_mul(1024))
+        % period_us;
     let earliest_us = now_tsf_us.saturating_add(u64::from(min_delay_ms) * 1000);
     let phase_us = earliest_us % period_us;
     let until_us = if phase_us <= target_us {
@@ -169,8 +177,8 @@ pub fn beacon_wake_plan_from(
 /// Compute a wake plan for a numbered NAN discovery-window cadence.
 ///
 /// `slot_stride` selects global DW indices rather than free-running elapsed
-/// time: with a 512-TU DW period and stride four, valid targets are DW0,
-/// DW0+4, DW0+8, and so on. This is used by sleepy radios after they have a
+/// time: with a 512-TU DW period and stride eight, the default valid targets
+/// are DW0, DW0+8, DW0+16, and so on. This is used by sleepy radios after they have a
 /// fresh NAN TSF source. `min_delay_ms` protects against scheduling a target
 /// that is already too close to wake reliably.
 pub fn beacon_wake_plan_for_dw_stride(
@@ -191,7 +199,13 @@ pub fn beacon_wake_plan_for_dw_stride(
         return None;
     }
     let now_tsf_us = snapshot.tsf_us.saturating_add(age_us);
-    let target_phase_us = u64::from(offset_tu).saturating_mul(1024) % period_us;
+    // Preserve the observed source phase and apply the configured offset
+    // relative to it. This is what makes the selected DW0/DW8 rendezvous
+    // follow the actual NAN/AP beacon rather than an invented absolute-zero
+    // epoch.
+    let target_phase_us = (snapshot.tsf_us % period_us)
+        .saturating_add(u64::from(offset_tu).saturating_mul(1024))
+        % period_us;
     let stride = u64::from(slot_stride.max(1));
     let current_index = now_tsf_us / period_us;
     let mut target_index = current_index
@@ -980,8 +994,22 @@ impl WifiCommand {
         self.psk = Some(psk.to_string());
 
         let timeout_ms = self.command_timeout(request)?;
-        low_level_start_sta(ssid, psk, channel)?;
-        start_raw_after_wifi(channel, raw_filter_name())?;
+        let ip_mode = request
+            .arg("ip")
+            .or_else(|| request.arg("local_ip"))
+            .is_some();
+        if ip_mode {
+            start_ip_sta(request, ssid, psk, channel)?;
+        } else {
+            low_level_start_sta(ssid, psk, channel)?;
+        }
+        // IP STA is the recovery/update data plane. Starting the raw monitor
+        // after it would replace the normal Wi-Fi receive path and make TCP
+        // listeners unreachable. Raw STA remains the default when no IP was
+        // requested.
+        if !ip_mode {
+            start_raw_after_wifi(channel, raw_filter_name())?;
+        }
         if timeout_ms > 0 {
             task_delay(Duration::from_millis(timeout_ms as u64));
             disable_mesh_ip_services();
@@ -1150,6 +1178,14 @@ pub fn stop_direct_ap_beacon_source() -> Result<()> {
 
 fn ensure_low_level_wifi() -> Result<()> {
     unsafe {
+        // Keep lwIP/socket initialization independent from whether the
+        // current radio profile is raw NAN or IP STA.  Flash TCP may be
+        // requested after either profile has been running.
+        esp_ok_allow_invalid_state(sys::esp_netif_init())?;
+        // esp_netif_init() must precede the default event loop.  Reversing
+        // these calls can leave lwIP's tcpip mailbox uninitialized; the first
+        // socket operation then aborts with "tcpip_send_msg_wait_sem: Invalid
+        // mbox".
         esp_ok_allow_invalid_state(sys::esp_event_loop_create_default())?;
         if !RAW_WIFI_INIT.swap(true, Ordering::SeqCst) {
             let mut cfg = wifi_init_config_default();
@@ -1161,6 +1197,102 @@ fn ensure_low_level_wifi() -> Result<()> {
             let _ = sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM);
         }
     }
+    Ok(())
+}
+
+/// Initialize the IDF IP stack even when Main normally runs raw NAN only.
+///
+/// This is deliberately separate from creating a Wi-Fi netif: it makes the
+/// lwIP tcpip mailbox available before a later STA/recovery command starts a
+/// BSD socket.  Delaying this until after a raw-radio transition can leave
+/// the mailbox invalid on some IDF builds.
+pub fn init_ip_stack() -> Result<()> {
+    unsafe {
+        esp_ok_allow_invalid_state(sys::esp_netif_init())?;
+        esp_ok_allow_invalid_state(sys::esp_event_loop_create_default())?;
+    }
+    Ok(())
+}
+
+fn ensure_ip_sta_netif() -> Result<*mut sys::esp_netif_t> {
+    if let Some(value) = IP_STA_NETIF.get() {
+        return Ok(*value as *mut sys::esp_netif_t);
+    }
+    let value = unsafe {
+        esp_ok_allow_invalid_state(sys::esp_netif_init())?;
+        let netif = sys::esp_netif_create_default_wifi_sta();
+        if netif.is_null() {
+            return Err(anyhow!("failed to create STA IP netif"));
+        }
+        esp_ok(sys::esp_netif_set_default_netif(netif))?;
+        netif as usize
+    };
+    let _ = IP_STA_NETIF.set(value);
+    Ok(*IP_STA_NETIF.get().unwrap_or(&value) as *mut sys::esp_netif_t)
+}
+
+fn parse_ipv4(value: &str, name: &str) -> Result<u32> {
+    let address = value
+        .parse::<Ipv4Addr>()
+        .map_err(|error| anyhow!("invalid {name} address {value}: {error}"))?;
+    Ok(u32::from_ne_bytes(address.octets()))
+}
+
+fn start_ip_sta(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -> Result<()> {
+    // Establish the lwIP/tcpip stack and its default netif before handing the
+    // radio away from raw NAN. This matches Recovery's initialization order;
+    // stopping the raw driver first can leave a later BSD socket with an
+    // invalid tcpip mailbox on ESP32.
+    init_ip_stack()?;
+    ensure_low_level_wifi()?;
+    let netif = ensure_ip_sta_netif()?;
+    // Main normally owns a sleepy raw-NAN scheduler. IP STA is a dedicated
+    // bulk-transfer mode, so stop that scheduler after the IP stack exists.
+    super::mode::stop_for_ip_transport();
+    // Let the STA scan for the AP.  Recovery uses channel 0 here as well;
+    // forcing the raw-radio channel can prevent association when the host AP
+    // was started on a different channel.
+    configure_sta(ssid, psk, 0)?;
+
+    let local_ip = request
+        .arg("ip")
+        .or_else(|| request.arg("local_ip"))
+        .context("wifi STA IP mode requires ip=...")?;
+    let gateway = request.arg("gw").unwrap_or("10.78.0.1");
+    let netmask = request.arg("mask").unwrap_or("255.255.255.0");
+    let mut info = sys::esp_netif_ip_info_t::default();
+    info.ip.addr = parse_ipv4(local_ip, "local")?;
+    info.gw.addr = parse_ipv4(gateway, "gateway")?;
+    info.netmask.addr = parse_ipv4(netmask, "netmask")?;
+    unsafe {
+        esp_ok_allow_invalid_state(sys::esp_netif_dhcpc_stop(netif))?;
+        esp_ok(sys::esp_netif_set_ip_info(netif, &info))?;
+    }
+    // Configure the static address before starting the station. This is the
+    // same ordering used by Recovery and prevents the DHCP/netif event path
+    // from replacing the address while the association is coming up.
+    unsafe {
+        esp_ok(sys::esp_wifi_start())?;
+        esp_ok(sys::esp_wifi_connect())?;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut ap = sys::wifi_ap_record_t::default();
+        let mut current = sys::esp_netif_ip_info_t::default();
+        let associated = unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK };
+        let has_ip = unsafe {
+            sys::esp_netif_get_ip_info(netif, &mut current) == sys::ESP_OK && current.ip.addr != 0
+        };
+        if associated && has_ip {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("STA association/IP timeout for ssid={ssid}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1233,7 +1365,7 @@ fn command_beacon_tu(request: &CommandRequest) -> Result<u16> {
     Ok(beacon_ms_to_tu(beacon_ms.max(1) as u32))
 }
 
-fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
+fn configure_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
     ensure_low_level_wifi()?;
     unsafe {
         let _ = sys::esp_wifi_disconnect();
@@ -1254,6 +1386,13 @@ fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
             sys::wifi_interface_t_WIFI_IF_STA,
             &mut conf,
         ))?;
+    }
+    Ok(())
+}
+
+fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
+    configure_sta(ssid, psk, channel)?;
+    unsafe {
         esp_ok(sys::esp_wifi_start())?;
         esp_ok(sys::esp_wifi_connect())?;
         disable_mesh_ip_services();
@@ -2385,8 +2524,27 @@ fn auth_name(auth: sys::wifi_auth_mode_t) -> &'static str {
 
 fn wifi_net_status() -> String {
     let (channel, second) = wifi_channel_status();
+    let ip = IP_STA_NETIF
+        .get()
+        .and_then(|value| unsafe {
+            let mut info = sys::esp_netif_ip_info_t::default();
+            if sys::esp_netif_get_ip_info(*value as *mut sys::esp_netif_t, &mut info) == sys::ESP_OK
+                && info.ip.addr != 0
+            {
+                Some(format!(
+                    "{}.{}.{}.{}",
+                    info.ip.addr.to_ne_bytes()[0],
+                    info.ip.addr.to_ne_bytes()[1],
+                    info.ip.addr.to_ne_bytes()[2],
+                    info.ip.addr.to_ne_bytes()[3]
+                ))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "disabled".to_string());
     format!(
-        "sta_mac={} ap_mac={} ch={} second={} country={} ip=disabled ap_stations={}",
+        "sta_mac={} ap_mac={} ch={} second={} country={} ip={} ap_stations={}",
         station_mac()
             .map(format_mac)
             .unwrap_or_else(|_| "unknown".to_string()),
@@ -2396,6 +2554,7 @@ fn wifi_net_status() -> String {
         channel,
         second,
         wifi_country_code(),
+        ip,
         ap_station_count()
     )
 }

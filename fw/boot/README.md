@@ -21,12 +21,12 @@ fw/boot second-stage bootloader
 There is deliberately no `otadata` partition. The bootloader owns the choice
 between the fixed Recovery and Main application partitions.
 
-The first hardware target is the `e5` lab board: classic ESP32,
-MAC `fc:f5:c4:0e:f1:e8`, with no LoRa hardware. The existing LoRa profiles are
-not part of the initial bring-up.
+The first hardware target was the `e5` lab board: classic ESP32,
+MAC `fc:f5:c4:0e:f1:e8`, with no LoRa hardware. The same layout has now been
+validated on the attached classic fleet and the 8 MB ESP32-S3 `lora4` board.
 
-The bootloader and Recovery have been built for the E5 layout. Hardware flash
-testing remains an explicit bring-up step; the layout is now measured rather
-than provisional.
+The bootloader and Recovery have been built for the E5 layout and exercised
+through the managed lmesh path. Direct USB flashing remains reserved for
+initial provisioning and emergency recovery.
 
 See [DESIGN.md](DESIGN.md) for the architecture, failure policy, and rationale.

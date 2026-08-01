@@ -669,7 +669,11 @@ def image_build_env(
     """Return an ESP-IDF build environment with a portable partition path."""
     config_dir = FW_RUST / "target" / "flash-config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    overlay = config_dir / f"{partition_file}.defaults"
+    # Partition paths may be relative to the firmware crate (the 8 MB S3
+    # profile uses ../../boot/...). Keep the generated overlay inside the
+    # repo-local config directory instead of accidentally escaping it through
+    # the path separators in the filename.
+    overlay = config_dir / f"{Path(partition_file).name}.defaults"
     partition_path = (FW_RUST / partition_file).resolve()
     overlay.write_text(
         f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{partition_path}"\n', encoding="utf-8"
@@ -738,7 +742,7 @@ def build_targets(env: dict[str, str], devices: list[Device]) -> None:
 
     if needs_s3_8mb:
         s3_8mb_env = image_build_env(
-            env, "sdkconfig.esp32s3_8mb.defaults", "partitions_8mb_large_app_store.csv"
+            env, "sdkconfig.esp32s3_8mb.defaults", "../../boot/partitions_recovery_8mb_store.csv"
         )
         s3_8mb_env["CARGO_TARGET_DIR"] = str(ESP32S3_8MB_TARGET)
         run(
@@ -748,7 +752,8 @@ def build_targets(env: dict[str, str], devices: list[Device]) -> None:
         )
         run(
             ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32s3-espidf",
-             "--chip", "esp32s3", "--flash-size", "8mb", "--merge", "--skip-padding",
+             "--chip", "esp32s3", "--flash-size", "8mb", "--target-app-partition", "main",
+             "--merge", "--skip-padding",
              str(ESP32S3_8MB_MERGED_IMAGE)],
             cwd=FW_RUST,
             env=s3_8mb_env,
@@ -840,6 +845,11 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
         "no_reset" if rfc2217 else "hard_reset",
         "verify_flash",
     ]
+    # verify_flash applies the same bootloader-header normalization as
+    # write_flash.  Keep these parameters here; removing them makes esptool
+    # compare the original image header/hash with the patched bytes actually
+    # written at the bootloader offset.
+    verify_cmd.extend(flash_args)
     for offset, image in flash_files:
         verify_cmd.extend([offset, str(image)])
     run_logged(f"verify flash {device.port}", verify_cmd, cwd=FW_RUST, env=env, tail_lines=24)
@@ -887,7 +897,7 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
             f"nvs op=set mode=infra wifi.mode={args.wifi_mode} power.profile=auto "
             f"nan.backend=raw nan.boot=true nan.role={args.nan_role} "
             f"nan.service={args.nan_service} nan.channel={channel} "
-            "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0 "
+                "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0 nan.dw_stride=8 "
             "uart.hb_every=1"
         ),
         "power profile=auto save=true",
@@ -913,16 +923,13 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
         else:
             commands.append("lora mode=meshtastic")
     if port.startswith("uds://"):
-        # Firmware UART is intentionally asleep between duty windows. Use the
-        # managed lmesh DTR wake before each command so initial provisioning
-        # does not depend on a previously configured heartbeat.
-        client = RadioClient(f"{device.port}.lmesh", timeout=20)
-        try:
-            for command in commands:
-                result = client.command(command, timeout=20)
-                print(f"configure {device.port}: {result.raw.strip()}", flush=True)
-        finally:
-            client.close()
+        # Use the same managed UDS command path as normal diagnostics. The
+        # forward must remain supervised; only direct USB/esptool flashing
+        # releases it temporarily.
+        argv = [sys.executable, str(SERIAL_CMD), "--port", port, "--timeout", "20"]
+        for item in commands:
+            argv.extend(["--cmd", item])
+        run_logged(f"configure {device.port}", argv, cwd=FW_RUST)
         return
 
     # Direct physical UART is reserved for low-level diagnostics. It has no
@@ -1421,7 +1428,13 @@ def main() -> int:
                 lmesh_stop_forward(args, device.port)
                 flash(device, args, env, physical_port_for(args, device.port))
                 if direct_config_after_flash:
-                    configure(device, args, physical_port_for(args, device.port))
+                    # The physical bridge is intentionally released after the
+                    # flash. Configuration must go through the supervised
+                    # lmesh forward; serial_cmd rejects direct physical UART
+                    # paths for normal firmware commands.
+                    lmesh_start_forward(args, device.port, None)
+                    time.sleep(1.0)
+                    configure(device, args, lmesh_uds_url(device.port))
 
         flashed, flash_failed = run_parallel("flash", devices, args.jobs, flash_one)
         flashed_devices = list(flashed)
@@ -1454,11 +1467,19 @@ def main() -> int:
             )
 
     if args.lmesh_mode == "local-release" and not args.skip_flash:
+        def restore_forward(device: Device) -> None:
+            try:
+                lmesh_start_forward(args, device.port, None)
+            except RuntimeError as exc:
+                if "already exists" not in str(exc):
+                    raise
+                print(f"lmesh restore {device.port}: already active", flush=True)
+
         _, restore_failed = run_parallel(
             "restore forwards",
             flashed_devices,
             args.jobs,
-            lambda device: lmesh_start_forward(args, device.port, None),
+            restore_forward,
         )
         if restore_failed:
             print(

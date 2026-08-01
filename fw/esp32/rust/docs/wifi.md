@@ -89,7 +89,7 @@ The saved infra defaults are:
 | `nan.wake_ms` | `4000` ms | Battery wake cadence; compatible with a bounded discovery delay. |
 | `nan.active_ms` | `250` ms | Wi-Fi/action receive and queue-drain window. |
 | `nan.light_sleep` | `true` | Explicit light sleep while Wi-Fi is off. |
-| `nan.early_ms` | `5` ms | Returns from sleep before the target window. |
+| `nan.early_ms` | `5` ms | Initial return margin before the selected DW0/DW-stride window. Runtime adapts this between 1 and 100 ms from beacon misses/successes without changing the selected slot. |
 | `nan.dw_tu` / `nan.dw_off_tu` | `512` / `0` TU | Raw NAN cadence and phase. |
 | `power.profile` | `auto` | DFS plus automatic idle light sleep outside explicit radio work. |
 | `uart.hb_every` | `1` | Emits one empty framed UART heartbeat on every Wi-Fi wake so lmesh can flush queued CBOR. |
@@ -99,6 +99,18 @@ absence of a source the device uses its local duty timer. The current lab
 measurements are board-specific: `lora2` settles around 18 mA and `lora4`
 around 12 mA between raw-NAN wake spikes. Do not treat those as a release
 power specification.
+
+The scheduler sleeps until the current runtime wake margin before the selected
+DW0/DW-stride slot, then stays awake only for `nan.active_ms`. After a beacon is
+received the margin is reduced by 1 ms; after a missed beacon it is increased by
+5 ms (bounded to 1..100 ms). The slot phase is unchanged. `mode status=true`
+reports `nan_wake_early_ms`, `nan_last_wake_to_beacon_us`, and
+`nan_last_beacon_to_sleep_us` for tuning and loss detection.
+
+For a timing-only power experiment, set `uart.hb_every=4` on a stride-8 node;
+that permits one UART activation about every 16 seconds while leaving the NAN
+DW0/DW8 schedule unchanged. Restore `1` before interactive command or
+reliability tests.
 
 ## Sync Source Selection
 
@@ -150,8 +162,8 @@ forward usable while the owner is powered and hosting the AP.
 | --- | --- | --- |
 | `nan.ap_owner` | `false` | Enables powered gateway timing-source behavior. |
 | `nan.ap_loss_ms` | 5000 ms | NAN absence before starting the fallback AP. |
-| `nan.ap_beacon_tu` | 500 TU | AP beacon interval. ESP-IDF requires a multiple of 100 TU. In AP fallback, `TSF / beacon_interval mod nan.dw_stride` defines AP-DW0, AP-DW0+4, etc.; a fresh NAN beacon replaces this with the 512-TU NAN grid. |
-| `nan.dw_stride` | 4 | Use every fourth source slot: NAN-DW0/NAN-DW0+4 or AP-DW0/AP-DW0+4. |
+| `nan.ap_beacon_tu` | 500 TU | AP beacon interval. ESP-IDF requires a multiple of 100 TU. In AP fallback, `TSF / beacon_interval mod nan.dw_stride` defines AP-DW0 and subsequent selected slots; a fresh NAN beacon replaces this with the 512-TU NAN grid. |
+| `nan.dw_stride` | 8 | Use DW0 and every eighth source slot: NAN-DW0/NAN-DW0+8 or AP-DW0/AP-DW0+8 (about 4.19 seconds at 512 TU). |
 
 ### 512-TU cadence probe
 

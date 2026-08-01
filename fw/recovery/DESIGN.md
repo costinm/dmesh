@@ -1,12 +1,28 @@
 # Recovery design
 
+## Implementation status
+
+The active E5 implementation is the C bootstrap path. It has been built and
+used to transfer a complete unsigned Main image over TCP, erase/write Main,
+reboot, and return control through the second-stage bootloader. Signed-record
+parsing and signature verification are not implemented yet. The `trust_key`
+presence check currently rejects unsigned bootstrap input when a key exists,
+but does not authenticate any stream.
+
+The Rust implementation in [`../recovery-rust`](../recovery-rust) is retained
+for size and dependency comparison only; it is not used for E5.
+
+AP-only and STA-only size variants have not yet been measured. The current C
+build supports both roles and is the baseline for that comparison.
+
 ## Responsibilities
 
 Recovery has exactly four jobs:
 
 1. read the bootloader request and trust root;
 2. select AP or STA and a TCP client/server role;
-3. verify and apply independently signed firmware records;
+3. verify and apply independently signed firmware records (planned, not yet
+   implemented in the current C bootstrap);
 4. clear the request and reboot into Main after successful EOF.
 
 It does not perform update policy, version selection, discovery, scheduling,
@@ -91,7 +107,7 @@ TCP stream is rejected once the key exists.
 
 ## Shared core
 
-The reusable `core` library is the important interface. It owns:
+The reusable `core` library is the intended interface. It owns:
 
 - bounded request parsing and validation;
 - the signed-record parser;
@@ -103,11 +119,10 @@ The reusable `core` library is the important interface. It owns:
 - verified flash writes;
 - request completion/failure state transitions.
 
-The core is compiled as a small C static library with no ESP-IDF application
-runtime dependency. It can be linked by both Recovery and Main. Platform
-adapters are supplied by the caller, so Main can use the same implementation
-to flash a newer Recovery image without importing Wi-Fi or Recovery's entry
-point.
+The current tree does not yet contain that shared authenticated core. The
+existing C bootstrap path is in `app/main.c`; the core boundary remains the
+planned structure so Main can later link the update logic without importing
+Wi-Fi or Recovery's entry point.
 
 ## Record format
 
@@ -120,9 +135,8 @@ with a partition-relative offset and one bounded flash block. Records are
 verified before any erase or write. Gaps are allowed; a sector is erased at
 most once per update session.
 
-The initial target algorithm is ECDSA P-256 using the smallest ESP-IDF-native
-verification path found during the size probe. The envelope version reserves
-future algorithm changes without changing the update state machine.
+The initial target algorithm is still undecided. ECDSA P-256, Ed25519, and RSA
+remain candidates; the choice will follow an implementation and size probe.
 
 ## Update paths
 
@@ -146,13 +160,15 @@ as a clearly named test feature so production builds can omit it.
 
 ### Recovery to Main
 
-Recovery uses the same core with its TCP or optional HTTP stream adapter and writes Main. On
-success it clears the Recovery request and reboots. The bootloader then sees
-no recovery condition and loads Main.
+The current Recovery uses its TCP bootstrap adapter and writes Main. On
+success it reboots. Request clearing and authenticated record handling remain
+future work.
 
 ## Failure behavior
 
-Any HTTP, parsing, signature, bounds, erase, or write error stops the update.
+Any transport, bounds, erase, or write error stops the current bootstrap
+update. Parsing and signature errors will be added with the signed record
+implementation.
 The request remains set, Recovery remains observable over serial, and the
 next reset retries Recovery. A partially written Main is not selected by
 policy; the bootloader's selection policy remains the authority.
@@ -168,5 +184,6 @@ enable the existing LoRa, BLE, NAN, or mesh application components. The size
 acceptance gate is the measured release binary plus explicit headroom, not a
 preselected partition size.
 
-No flash operation is authorized until the E5 bootloader, Recovery app, Main
-image, and partition table all fit in a measured release layout.
+No further authenticated-update feature should be considered complete until
+the E5 bootloader, Recovery app, Main image, partition table, and AP-only vs
+STA-only size comparison are measured together.

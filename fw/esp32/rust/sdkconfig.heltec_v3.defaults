@@ -26,6 +26,10 @@ CONFIG_CONSOLE_UART_NUM=0
 CONFIG_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESPTOOLPY_BAUD_460800B=y
 CONFIG_ESPTOOLPY_BAUD=460800
+# Main deliberately installs Recovery and the second-stage/partition-table
+# images.  Permit those dangerous-region writes; the Recovery command still
+# rejects the running Main target and validates the explicit target/range.
+CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y
 CONFIG_MONITOR_BAUD=115200
 
 # Keep official Wi-Fi NAN available when the target/linker supports it. In

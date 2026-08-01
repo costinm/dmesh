@@ -56,6 +56,7 @@ pub fn command_id(name: &str) -> Option<u16> {
         "button" => 65,
         "nvs" => 66,
         "radio" => 67,
+        "recovery" => 68,
         _ => return None,
     })
 }
@@ -97,6 +98,7 @@ pub fn command_name(id: u16) -> Option<&'static str> {
         65 => "button",
         66 => "nvs",
         67 => "radio",
+        68 => "recovery",
         _ => return None,
     })
 }
@@ -377,6 +379,19 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "wifi" => 241,
         "wifi_wake" => 242,
         "window_ms" => 243,
+        "request" => 244,
+        "reboot" => 245,
+        "server" => 246,
+        "ip" => 247,
+        "url" => 248,
+        "flags" => 249,
+        "password" => 250,
+        "offset" => 251,
+        "length" => 252,
+        "verify" => 253,
+        "size" => 254,
+        "gw" => 255,
+        "mask" => 256,
         _ => return None,
     })
 }

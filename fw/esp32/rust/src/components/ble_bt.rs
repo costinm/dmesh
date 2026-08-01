@@ -634,6 +634,26 @@ pub fn start_connectable_advertising() -> Result<()> {
     start_connectable_idle()
 }
 
+/// Start a bounded BLE CoC rendezvous requested by a targeted NAN control
+/// advertisement. This is deliberately separate from the Wi-Fi wake hold:
+/// the caller may bring up BLE without keeping raw NAN Wi-Fi active.
+pub fn request_coc_wake(duration_ms: u32) -> Result<()> {
+    ensure_ble()?;
+    start_connectable_event(DmeshBleEvent::WakeRequest, &[])?;
+    let psm = 0x80_u16;
+    let rc = unsafe { dmesh_nimble_start_coc_server(psm as c_ushort) };
+    if rc != 0 {
+        bail!("nimble CoC server rc={rc} psm=0x{psm:04x}");
+    }
+    BLE_COC_PSM.store(psm as u32, Ordering::Relaxed);
+    open_companion_active_window(duration_ms.clamp(1_000, 300_000));
+    telemetry::record_log(format!(
+        "event type=ble.nan_wake state=connectable_coc duration_ms={} psm=0x{psm:04x}",
+        duration_ms
+    ));
+    Ok(())
+}
+
 pub fn set_advertising_interval_ms(min_ms: u32, max_ms: u32) {
     let min = adv_ms_to_units(min_ms);
     let max = adv_ms_to_units(max_ms).max(min);

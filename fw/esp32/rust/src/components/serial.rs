@@ -36,6 +36,7 @@ static UART0_NO_LIGHT_SLEEP_LOCK: AtomicPtr<sys::esp_pm_lock> =
     AtomicPtr::new(core::ptr::null_mut());
 static UART0_NO_LIGHT_SLEEP_LOCK_HELD: AtomicBool = AtomicBool::new(false);
 static UART0_ACTIVE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+static UART0_ALWAYS_ON: AtomicBool = AtomicBool::new(false);
 static UART0_ACTIVE_WINDOW_MS: AtomicU32 = AtomicU32::new(DEFAULT_ACTIVE_MS);
 static UART0_DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
 static UART0_SUSPENDED_UNTIL_DTR: AtomicBool = AtomicBool::new(false);
@@ -187,7 +188,9 @@ pub fn set_heartbeat_every(every: u32) {
 ///
 /// The empty `0x7e 0x7e` frame is transport activity only: lmesh consumes it
 /// locally and uses it to flush queued host-to-firmware records.
-fn activate_window_for(window_ms: u32) {
+/// Open the bounded UART console window from an authenticated/in-band wake
+/// trigger such as a targeted NAN service advertisement.
+pub fn activate_window_for(window_ms: u32) {
     if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
         return;
     }
@@ -380,6 +383,9 @@ pub fn activate_window() {
 }
 
 pub fn poll_active_window() {
+    if UART0_ALWAYS_ON.load(Ordering::Acquire) {
+        return;
+    }
     if !UART0_APB_LOCK_HELD.load(Ordering::Relaxed) {
         return;
     }
@@ -422,7 +428,20 @@ pub fn poll_output_probe() {
 }
 
 pub fn is_active() -> bool {
-    UART0_DEBUG_ENABLED.load(Ordering::Relaxed) && UART0_APB_LOCK_HELD.load(Ordering::Relaxed)
+    UART0_DEBUG_ENABLED.load(Ordering::Relaxed)
+        && (UART0_ALWAYS_ON.load(Ordering::Relaxed) || UART0_APB_LOCK_HELD.load(Ordering::Relaxed))
+}
+
+/// Keep the infrastructure UART and its power lock active continuously.
+pub fn set_always_on(enabled: bool) {
+    UART0_ALWAYS_ON.store(enabled, Ordering::Release);
+    if enabled {
+        UART0_DEBUG_ENABLED.store(true, Ordering::Release);
+        let _ = ensure_power_locks();
+    } else {
+        release_apb_lock();
+        UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Release);
+    }
 }
 
 pub fn set_debug_enabled(enabled: bool) {
@@ -488,6 +507,9 @@ pub fn finish_pending_suspend() -> bool {
 
 /// Power down UART RX while retaining the independent GPIO/DTR wake.
 pub fn suspend_for_light_sleep() {
+    if UART0_ALWAYS_ON.load(Ordering::Acquire) {
+        return;
+    }
     // Keep RX interrupt and UART wake armed. The ingress task turns received
     // bytes into a console-active window; disabling RX here made sleeping
     // boards require a physical DTR edge and stranded remote consoles.
