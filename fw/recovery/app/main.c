@@ -1,7 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <netdb.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,7 +10,6 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_partition.h"
 #include "esp_system.h"
@@ -28,7 +26,6 @@
 #define DEFAULT_PORT 3333
 #define MAX_IMAGE_SIZE (3 * 1024 * 1024)
 #define STREAM_MAGIC 0x44525331u /* DRS1 */
-#define RECOVERY_AP_IP "192.168.4.1"
 /* Keep the UART command task alive long enough for the second-stage
  * RECOVER/STA handoff. Without this grace period, a stale or unreachable
  * NVS request can make Recovery attempt TCP and restart before the explicit
@@ -64,6 +61,10 @@ static bool save_sta_request(char *line)
         local_ip == NULL || network == NULL) {
         return false;
     }
+    if (network_password != NULL && network_password[0] != '\0') {
+        ESP_LOGW(TAG, "rejecting non-open STA request");
+        return false;
+    }
     char *colon = strrchr(endpoint, ':');
     if (colon == NULL || colon[1] == '\0') {
         return false;
@@ -81,7 +82,6 @@ static bool save_sta_request(char *line)
     esp_err_t err = nvs_set_str(nvs, "request_magic", "0x52455131");
     if (err == ESP_OK) err = nvs_set_str(nvs, "request_version", "1");
     if (err == ESP_OK) err = nvs_set_str(nvs, "ssid", network);
-    if (err == ESP_OK) err = nvs_set_str(nvs, "password", network_password ? network_password : "");
     if (err == ESP_OK) err = nvs_set_str(nvs, "server", endpoint);
     if (err == ESP_OK) err = nvs_set_str(nvs, "ip", local_ip);
     if (err == ESP_OK) err = nvs_set_u16(nvs, "port", (uint16_t)parsed);
