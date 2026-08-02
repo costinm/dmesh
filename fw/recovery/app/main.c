@@ -4,12 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_partition.h"
 #include "esp_system.h"
@@ -20,20 +22,25 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "boot_health_rtc.h"
+#include "boot_protocol.h"
+#include "dmesh_flash_tcp.h"
 
 #define TAG "dmesh-recovery"
 #define RECOVERY_NAMESPACE "recovery"
-#define DEFAULT_PORT 3333
-#define MAX_IMAGE_SIZE (3 * 1024 * 1024)
-#define STREAM_MAGIC 0x44525331u /* DRS1 */
+#define BOOTSTRAP_HOST "10.78.0.1"
+#if CONFIG_IDF_TARGET_ESP32S3
+#define DEFAULT_PORT 3337
+#else
+#define DEFAULT_PORT 3336
+#endif
+#define DIRECT_DMESH_PREFIX "Direct-"
 /* Keep the UART command task alive long enough for the second-stage
  * RECOVER/STA handoff. Without this grace period, a stale or unreachable
  * NVS request can make Recovery attempt TCP and restart before the explicit
  * UART transport arrives. */
-#define UART_COMMAND_GRACE_MS 7000
+#define UART_COMMAND_GRACE_MS 1500
 
 static char ssid[33];
-static char password[65];
 static char remote_host[128];
 static char local_address[32];
 static uint16_t remote_port = DEFAULT_PORT;
@@ -41,11 +48,65 @@ static char uart_ssid[33];
 static char uart_remote[128];
 static uint16_t uart_port;
 
+static bool set_unconfigured_defaults(void)
+{
+    uint8_t mac[6] = {0};
+    if (remote_host[0] == '\0') {
+        strlcpy(remote_host, BOOTSTRAP_HOST, sizeof(remote_host));
+        ESP_LOGI(TAG, "using bootstrap host=%s port=%u",
+                 remote_host, (unsigned)remote_port);
+    }
+    if (local_address[0] != '\0') {
+        return true;
+    }
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot derive bootstrap address from STA MAC");
+        return false;
+    }
+    /* Keep all unconfigured boards on the lab 10.78/16 link while making
+     * each address deterministic from the final two MAC octets. */
+    snprintf(local_address, sizeof(local_address), "10.78.%u.%u",
+             (unsigned)mac[4], (unsigned)mac[5]);
+    ESP_LOGI(TAG, "using bootstrap local_ip=%s from STA MAC %02x:%02x",
+             local_address, mac[4], mac[5]);
+    return true;
+}
+
+static void send_boot_identity(void)
+{
+    uint8_t payload[DMESH_BOOT_HELLO_LEN] = {
+        DMESH_BOOT_MAGIC_0, DMESH_BOOT_MAGIC_1, DMESH_BOOT_MAGIC_2,
+        DMESH_BOOT_MAGIC_3, DMESH_BOOT_VERSION, DMESH_BOOT_KIND_HELLO,
+        DMESH_BOOT_ROLE_RECOVERY, DMESH_BOOT_PARTITION_RECOVERY,
+        (uint8_t)esp_reset_reason(), 0, 0, 0,
+    };
+    (void)esp_read_mac(payload + 12, ESP_MAC_WIFI_STA);
+    uint8_t wire[DMESH_BOOT_HELLO_LEN * 2 + 2];
+    size_t length = dmesh_boot_frame_encode(payload, sizeof(payload), wire,
+                                             sizeof(wire));
+    if (length != 0) {
+        (void)uart_write_bytes(UART_NUM_0, wire, length);
+    }
+}
+
 static void restart_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(150));
     esp_restart();
+    vTaskDelete(NULL);
+}
+
+static bool save_sta_request(char *line);
+
+static void save_sta_and_restart(char *line)
+{
+    if (!save_sta_request(line)) {
+        return;
+    }
+    /* Keep the reset outside the UART parser call stack. */
+    xTaskCreate(restart_task, "recovery_restart", 2048, NULL,
+                configMAX_PRIORITIES - 1, NULL);
     vTaskDelete(NULL);
 }
 
@@ -97,23 +158,46 @@ static void uart_command_task(void *arg)
     (void)arg;
     char line[256];
     size_t length = 0;
+    uint8_t frame[sizeof(line)];
+    size_t frame_length = 0;
+    bool in_frame = false;
+    bool escaped = false;
     while (true) {
         uint8_t byte;
         int got = uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(100));
         if (got != 1) {
             continue;
         }
+        if (byte == DMESH_BOOT_WIRE_FLAG) {
+            if (in_frame && frame_length != 0) {
+                if (frame_length < sizeof(line)) {
+                    memcpy(line, frame, frame_length);
+                    line[frame_length] = '\0';
+                    save_sta_and_restart(line);
+                }
+            }
+            in_frame = true;
+            escaped = false;
+            frame_length = 0;
+            continue;
+        }
+        if (in_frame) {
+            if (escaped) {
+                if (frame_length < sizeof(frame)) {
+                    frame[frame_length++] = byte ^ DMESH_BOOT_WIRE_ESCAPE_XOR;
+                }
+                escaped = false;
+            } else if (byte == DMESH_BOOT_WIRE_ESCAPE) {
+                escaped = true;
+            } else if (frame_length < sizeof(frame)) {
+                frame[frame_length++] = byte;
+            }
+            continue;
+        }
         if (byte == '\n' || byte == '\r') {
             if (length != 0) {
                 line[length] = '\0';
-                if (save_sta_request(line)) {
-                    /* Do not restart while this task is still unwinding the
-                     * token/NVS/logging call chain.  In particular, the S3
-                     * UART/NVS path needs more stack and a clean reset task. */
-                    xTaskCreate(restart_task, "recovery_restart", 2048, NULL,
-                                configMAX_PRIORITIES - 1, NULL);
-                    vTaskDelete(NULL);
-                }
+                save_sta_and_restart(line);
                 length = 0;
             }
         } else if (length + 1 < sizeof(line)) {
@@ -159,7 +243,7 @@ static void read_uart_override(void)
         cursor += 7;
     } else {
         /* Accept the continuation left by the bootloader: endpoint IP, local
-         * IP, SSID, and optional password. */
+         * IP, and open-network SSID. */
         char probe[128] = {0};
         strlcpy(probe, cursor, sizeof(probe));
         char *probe_save = NULL;
@@ -187,9 +271,11 @@ static void read_uart_override(void)
     strlcpy(uart_remote, endpoint, sizeof(uart_remote));
     strlcpy(uart_ssid, network, sizeof(uart_ssid));
     strlcpy(local_address, local_ip, sizeof(local_address));
-    password[0] = '\0';
-    if (network_password != NULL) {
-        strlcpy(password, network_password, sizeof(password));
+    if (network_password != NULL && network_password[0] != '\0') {
+        ESP_LOGW(TAG, "rejecting non-open UART STA request");
+        uart_remote[0] = '\0';
+        uart_ssid[0] = '\0';
+        return;
     }
     ESP_LOGI(TAG, "uart override remote=%s port=%u ssid=%s", uart_remote,
              (unsigned)uart_port, uart_ssid);
@@ -219,15 +305,14 @@ static void load_request(void)
         return;
     }
     bool have_ssid = read_string(nvs, "ssid", ssid, sizeof(ssid));
-    bool have_password = read_string(nvs, "password", password, sizeof(password));
     bool have_server = read_string(nvs, "server", remote_host, sizeof(remote_host));
     bool have_local = read_string(nvs, "ip", local_address, sizeof(local_address));
     esp_err_t port_error = nvs_get_u16(nvs, "port", &remote_port);
     if (remote_port == 0) {
         remote_port = DEFAULT_PORT;
     }
-    ESP_LOGI(TAG, "nvs ssid=%d password=%d server=%d ip=%d port=%u port_error=%s",
-             have_ssid, have_password, have_server, have_local, (unsigned)remote_port,
+    ESP_LOGI(TAG, "nvs ssid=%d server=%d ip=%d port=%u port_error=%s",
+             have_ssid, have_server, have_local, (unsigned)remote_port,
              esp_err_to_name(port_error));
     nvs_close(nvs);
 }
@@ -245,187 +330,144 @@ static bool trust_key_present(void)
     return present;
 }
 
-static void start_network(void)
+static bool direct_dmesh_ssid(const uint8_t *name, size_t length)
+{
+    static const char prefix[] = DIRECT_DMESH_PREFIX;
+    if (length < sizeof(prefix) - 1 ||
+        strncmp((const char *)name, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+    for (size_t i = sizeof(prefix) - 1; i + 5 <= length; ++i) {
+        if ((name[i] == 'D' || name[i] == 'd') &&
+            (name[i + 1] == 'M' || name[i + 1] == 'm') &&
+            (name[i + 2] == 'E' || name[i + 2] == 'e') &&
+            (name[i + 3] == 'S' || name[i + 3] == 's') &&
+            (name[i + 4] == 'H' || name[i + 4] == 'h')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool select_direct_dmesh_ssid(void)
+{
+    uint16_t count = 0;
+    esp_err_t err = esp_wifi_scan_start(NULL, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sta scan start failed error=%s", esp_err_to_name(err));
+        return false;
+    }
+    err = esp_wifi_scan_get_ap_num(&count);
+    if (err != ESP_OK || count == 0) {
+        ESP_LOGW(TAG, "sta scan found no APs error=%s", esp_err_to_name(err));
+        return false;
+    }
+    if (count > 16) {
+        count = 16;
+    }
+    wifi_ap_record_t *records = calloc(count, sizeof(*records));
+    if (records == NULL) {
+        ESP_LOGE(TAG, "sta scan record allocation failed count=%u", (unsigned)count);
+        return false;
+    }
+    err = esp_wifi_scan_get_ap_records(&count, records);
+    bool found = false;
+    if (err == ESP_OK) {
+        for (uint16_t i = 0; i < count; ++i) {
+            size_t length = strnlen((const char *)records[i].ssid,
+                                    sizeof(records[i].ssid));
+            if (records[i].authmode == WIFI_AUTH_OPEN &&
+                direct_dmesh_ssid(records[i].ssid, length)) {
+                strlcpy(ssid, (const char *)records[i].ssid, sizeof(ssid));
+                ESP_LOGI(TAG, "sta scan selected open ssid=%s rssi=%d channel=%u",
+                         ssid, records[i].rssi, (unsigned)records[i].primary);
+                found = true;
+                break;
+            }
+        }
+    }
+    free(records);
+    if (!found) {
+        ESP_LOGW(TAG, "sta scan found no open Direct-*-Dmesh AP error=%s",
+                 esp_err_to_name(err));
+    }
+    return found;
+}
+
+static bool start_network(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    esp_netif_t *netif;
+    if (remote_host[0] == '\0') {
+        ESP_LOGE(TAG, "minimal STA profile requires numeric server");
+        return false;
+    }
+
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&config));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
+    wifi_config_t wifi = {0};
+    bool scan_for_direct = ssid[0] == '\0';
+    wifi.sta.password[0] = '\0';
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     if (ssid[0] != '\0') {
-        netif = esp_netif_create_default_wifi_sta();
-        wifi_config_t wifi = {0};
         strlcpy((char *)wifi.sta.ssid, ssid, sizeof(wifi.sta.ssid));
-        strlcpy((char *)wifi.sta.password, password, sizeof(wifi.sta.password));
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
-        if (local_address[0] != '\0') {
-            esp_netif_ip_info_t static_ip = {0};
-            uint32_t parsed_ip = esp_ip4addr_aton(local_address);
-            if (parsed_ip == 0) {
-                ESP_LOGE(TAG, "invalid sta ip=%s", local_address);
-            } else {
-                static_ip.ip.addr = parsed_ip;
-                IP4_ADDR(&static_ip.gw, 10, 78, 0, 1);
-                IP4_ADDR(&static_ip.netmask, 255, 255, 255, 0);
-                ESP_ERROR_CHECK(esp_netif_dhcpc_stop(netif));
-                ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &static_ip));
-                ESP_LOGI(TAG, "sta_static_ip=%s", local_address);
-            }
+    }
+    if (local_address[0] != '\0') {
+        esp_netif_ip_info_t static_ip = {0};
+        uint32_t parsed_ip = esp_ip4addr_aton(local_address);
+        if (parsed_ip == 0) {
+            ESP_LOGE(TAG, "invalid sta ip=%s", local_address);
+            return false;
         }
-        ESP_ERROR_CHECK(esp_wifi_start());
-        ESP_ERROR_CHECK(esp_wifi_connect());
-        ESP_LOGI(TAG, "network=sta ssid=%s", ssid);
-        wifi_ap_record_t ap = {0};
+        static_ip.ip.addr = parsed_ip;
+        IP4_ADDR(&static_ip.gw, 10, 78, 0, 1);
+        IP4_ADDR(&static_ip.netmask, 255, 255, 0, 0);
+        ESP_ERROR_CHECK(esp_netif_dhcpc_stop(netif));
+        ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &static_ip));
+        ESP_LOGI(TAG, "sta_static_ip=%s", local_address);
+    }
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Keep Recovery resident while the infrastructure AP is temporarily
+     * absent. A reset is deliberately not used as a network retry: stage2
+     * should only count actual boot failures, not a failed association. */
+    for (;;) {
+        TickType_t window_start = xTaskGetTickCount();
+        TickType_t window_ticks = pdMS_TO_TICKS(30 * 1000);
+        bool configured = false;
         esp_netif_ip_info_t ip = {0};
-        for (unsigned attempt = 0; attempt < 150; ++attempt) {
+        while ((xTaskGetTickCount() - window_start) < window_ticks) {
+            if (scan_for_direct && !configured) {
+                ssid[0] = '\0';
+                if (!select_direct_dmesh_ssid()) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+            }
+            strlcpy((char *)wifi.sta.ssid, ssid, sizeof(wifi.sta.ssid));
+            if (!configured) {
+                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
+                esp_err_t connect_error = esp_wifi_connect();
+                ESP_LOGI(TAG, "network=sta-open ssid=%s connect=%s", ssid,
+                         esp_err_to_name(connect_error));
+                configured = true;
+            }
+            wifi_ap_record_t ap = {0};
             if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK &&
                 esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
                 ESP_LOGI(TAG, "sta_ip=" IPSTR, IP2STR(&ip.ip));
-                break;
+                return true;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (ip.ip.addr == 0) {
-            ESP_LOGE(TAG, "sta address timeout");
-        }
-    } else {
-        netif = esp_netif_create_default_wifi_ap();
-        wifi_config_t wifi = {0};
-        uint8_t mac[6] = {0};
-        ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
-        snprintf((char *)wifi.ap.ssid, sizeof(wifi.ap.ssid),
-                 "ESP32S3_8_BOOT_%02X%02X", mac[4], mac[5]);
-        wifi.ap.ssid_len = strlen((char *)wifi.ap.ssid);
-        wifi.ap.channel = 6;
-        wifi.ap.max_connection = 1;
-        wifi.ap.authmode = WIFI_AUTH_OPEN;
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi));
-        ESP_ERROR_CHECK(esp_netif_dhcps_stop(netif));
-        esp_netif_ip_info_t ip = {0};
-        IP4_ADDR(&ip.ip, 192, 168, 4, 1);
-        IP4_ADDR(&ip.gw, 192, 168, 4, 1);
-        IP4_ADDR(&ip.netmask, 255, 255, 255, 0);
-        ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip));
-        ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));
-        ESP_ERROR_CHECK(esp_wifi_start());
-        ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
-        ESP_LOGI(TAG, "network=ap ssid=%s ip=%s open=true", wifi.ap.ssid, RECOVERY_AP_IP);
+        ESP_LOGW(TAG, "sta attempt window expired; sleeping before retry");
+        (void)esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
-    (void)netif;
-}
-
-static int connect_remote(void)
-{
-    char port[8];
-    snprintf(port, sizeof(port), "%u", (unsigned)remote_port);
-    struct addrinfo hints = {.ai_socktype = SOCK_STREAM};
-    struct addrinfo *result = NULL;
-    if (getaddrinfo(remote_host, port, &hints, &result) != 0 || result == NULL) {
-        return -1;
-    }
-    int fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-    if (fd >= 0 && connect(fd, result->ai_addr, result->ai_addrlen) != 0) {
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(result);
-    return fd;
-}
-
-static int accept_client(void)
-{
-    int server = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (server < 0) {
-        return -1;
-    }
-    struct sockaddr_in address = {
-        .sin_family = AF_INET,
-        .sin_port = htons(remote_port),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-    int one = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(server, 1) != 0) {
-        close(server);
-        return -1;
-    }
-    ESP_LOGI(TAG, "tcp_server port=%u", (unsigned)remote_port);
-    int client = accept(server, NULL, NULL);
-    close(server);
-    return client;
-}
-
-static int recv_all(int fd, void *buffer, size_t length)
-{
-    size_t received = 0;
-    while (received < length) {
-        int count = recv(fd, (uint8_t *)buffer + received, length - received, 0);
-        if (count <= 0) {
-            return (int)received;
-        }
-        received += (size_t)count;
-    }
-    return (int)received;
-}
-
-static bool receive_bootstrap_image(int fd)
-{
-    uint32_t header[3];
-    int header_bytes = recv_all(fd, header, sizeof(header));
-    if (header_bytes != sizeof(header)) {
-        ESP_LOGE(TAG, "bootstrap header recv failed bytes=%d errno=%d", header_bytes, errno);
-        return false;
-    }
-    uint32_t image_size = ntohl(header[2]);
-    if (ntohl(header[0]) != STREAM_MAGIC || ntohl(header[1]) != 0 ||
-        image_size == 0 || image_size > MAX_IMAGE_SIZE) {
-        ESP_LOGE(TAG, "bootstrap header rejected magic=%08" PRIx32 " target=%" PRIu32
-                 " size=%" PRIu32, ntohl(header[0]), ntohl(header[1]), image_size);
-        return false;
-    }
-
-    uint32_t remaining = image_size;
-    const esp_partition_t *main_part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, "main");
-    if (main_part == NULL || remaining > main_part->size) {
-        ESP_LOGE(TAG, "bootstrap partition rejected partition=%p size=%" PRIu32,
-                 (void *)main_part, main_part == NULL ? 0 : main_part->size);
-        return false;
-    }
-    uint32_t erase_size = (remaining + 0xfff) & ~0xfff;
-    ESP_LOGI(TAG, "bootstrap image size=%" PRIu32 " erase=%" PRIu32, remaining, erase_size);
-    esp_err_t erase_error = esp_partition_erase_range(main_part, 0, erase_size);
-    if (erase_error != ESP_OK) {
-        ESP_LOGE(TAG, "bootstrap erase failed offset=0 size=%" PRIu32 " error=%s",
-                 erase_size, esp_err_to_name(erase_error));
-        return false;
-    }
-
-    uint8_t buffer[4096];
-    uint32_t offset = 0;
-    while (remaining != 0) {
-        size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-        int got = recv_all(fd, buffer, want);
-        if (got != (int)want) {
-            ESP_LOGE(TAG, "bootstrap recv failed offset=%" PRIu32 " want=%u got=%d errno=%d",
-                     offset, (unsigned)want, got, errno);
-            return false;
-        }
-        esp_err_t write_error = esp_partition_write(main_part, offset, buffer, want);
-        if (write_error != ESP_OK) {
-            ESP_LOGE(TAG, "bootstrap write failed offset=%" PRIu32 " size=%u error=%s",
-                     offset, (unsigned)want, esp_err_to_name(write_error));
-            return false;
-        }
-        offset += want;
-        remaining -= want;
-    }
-    return true;
 }
 
 static void clear_recovery_request(void)
@@ -459,12 +501,16 @@ void recovery_app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     dmesh_boot_health_write(DMESH_BOOT_HEALTH_RECOVERY_START);
     read_uart_override();
+    send_boot_identity();
     xTaskCreate(uart_command_task, "recovery_uart", 6144, NULL, 5, NULL);
     load_request();
     if (uart_ssid[0] != '\0') {
         strlcpy(ssid, uart_ssid, sizeof(ssid));
         strlcpy(remote_host, uart_remote, sizeof(remote_host));
         remote_port = uart_port == 0 ? DEFAULT_PORT : uart_port;
+    }
+    if (!set_unconfigured_defaults()) {
+        esp_restart();
     }
     bool key_present = trust_key_present();
     ESP_LOGI(TAG, "boot ssid=%s remote=%s key=%d", ssid, remote_host, key_present);
@@ -473,21 +519,19 @@ void recovery_app_main(void)
              (unsigned)UART_COMMAND_GRACE_MS);
     vTaskDelay(pdMS_TO_TICKS(UART_COMMAND_GRACE_MS));
 
-    start_network();
-    int fd = remote_host[0] != '\0' ? connect_remote() : accept_client();
-    if (fd < 0) {
-        ESP_LOGE(TAG, "tcp connection failed");
+    if (!start_network()) {
         esp_restart();
     }
-
-    if (key_present) {
-        ESP_LOGI(TAG, "signed TCP stream required; bootstrap rejected");
-        close(fd);
+    if (!dmesh_flash_tcp_start(remote_port, remote_host)) {
+        ESP_LOGE(TAG, "unable to start negotiated TCP session");
         esp_restart();
     }
-    bool ok = receive_bootstrap_image(fd);
-    close(fd);
-    ESP_LOGI(TAG, "bootstrap result=%s", ok ? "ok" : "failed");
+    bool ok = false;
+    for (unsigned attempt = 0; attempt < 1800; ++attempt) {
+        if (dmesh_flash_tcp_accept()) { ok = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "negotiated flash result=%s", ok ? "ok" : "failed");
     if (ok) {
         clear_recovery_request();
         dmesh_boot_health_write(DMESH_BOOT_HEALTH_RECOVERY_OK);

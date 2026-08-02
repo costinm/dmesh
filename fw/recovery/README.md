@@ -1,160 +1,135 @@
-# DMesh Recovery application and shared library
+# DMesh Recovery
 
-This directory contains the active C ESP-IDF Recovery application. Unlike the
-second-stage bootloader in [`../boot`](../boot), Recovery has the runtime
-needed for Wi-Fi, TCP, NVS, and flash writes.
+Recovery is the minimal C ESP-IDF application that updates Main when selected
+by the custom second-stage bootloader. It owns open-STA Wi-Fi, one TCP
+connection, DRS2 parsing, optional P-256 verification, flash writes, request
+clearing, and reboot. It contains no product update policy.
 
-Current status: the E5 C Recovery implements and has been exercised for the
-unsigned bootstrap image transport. It does not yet implement signed-record
-parsing or signature verification. The trust-key check is therefore only a
-bootstrap gate at present; it is not an authentication boundary until record
-verification is added.
-
-The Recovery implementation is split so Main can link the same update code
-when Main later needs to install a newer Recovery image:
+The shared flash transport is owned by
+`fw/recovery/transport/dmesh_flash_tcp/`. Main imports that platform-only C
+source through its native CMake component; Recovery has no dependency on the
+mesh application. This is intentional so the Recovery/stage2 tree can move to
+a separate repository later.
 
 ```text
-fw/recovery/
-  core/       platform-neutral request, record, signature, and flash logic
-  app/        Wi-Fi/TCP source and ESP-IDF Recovery entrypoint
+Main command -> stage2 -> Recovery -> flash-server.py -> Main partition
+                                      |
+                                      +-> reboot -> stage2 -> Main
 ```
 
-The shared core must not depend on FreeRTOS, Wi-Fi, or application globals. It
-uses small callback interfaces for:
+The design is sound and the Wi-Fi path has repeatedly updated ESP32 and
+ESP32-S3 boards. Current deployment is still bootstrap-grade: fleet devices do
+not yet have trust keys and the default server uses unsigned-fast for unkeyed
+devices. See [DESIGN.md](DESIGN.md) for the exact security properties and the
+priority hardening list.
 
-- reading a byte stream;
-- reading/writing/erasing a partition;
-- obtaining the trust key;
-- logging;
-- reboot and request-state operations.
+## Normal operation
 
-Recovery supplies the TCP and ESP-IDF adapters. Main can link the same core
-with a local/file/mesh transport when updating the Recovery partition. Main
-must never overwrite the running Recovery image; it writes a verified image to
-the inactive Recovery partition location and reboots only after the write is
-complete.
+`scripts/flash-server.py` is the long-running host service. With no arguments
+it serves chip/flash-specific Main images from `target/flash` on
+`10.78.0.1:3336` and keeps accepting connections. The mesh-init definition is
+`docs/lab/recovery-tcp-server.toml`.
 
-The supported fleet images are classic ESP32 (4 MB) and ESP32-S3 (8 MB).
-The current fleet bootstrap remains unsigned; no LoRa, BLE, discovery, MQTT,
-HTTPS, or product application logic belongs in Recovery. Main uses the same
-raw TCP image framing for non-running partitions: CBOR starts the session,
-then the host sends a `DRS1` header and the complete image over TCP. CBOR is
-not used for each flash block.
+The checked-in lab service has no private signing key configured. It serves the
+current unkeyed fleet; keyed devices will fail closed until that service is
+given the corresponding `--signing-key` configuration.
 
-For initial factory/testing bring-up, Recovery also has an explicit
-`bootstrap` mode. It is available only when no trust key exists in NVS. If an
-SSID exists, Recovery joins it as a station using the configured static `ip`;
-otherwise it starts the open AP
-`ESP32S3_8_BOOT_XXXX`, where `XXXX` is the last four hexadecimal MAC bytes,
-with fixed address `192.168.4.1`. If a remote server address exists, Recovery
-is a TCP client; otherwise it starts a bounded TCP image server. The UART
-selectors are `RECOVER` and the runtime `STA` command. Recovery can consume
-the form `RECOVER IMG_IP:port IP SSID [PASSWORD]`, or save transport settings
-with `STA IMG_IP:port IP SSID [PASSWORD]`. UART transport values
-override NVS transport values, but the trust key is always read from NVS.
-At present, a signing key causes the unsigned bootstrap stream to be rejected,
-but no signed TCP input is implemented yet.
-
-See [DESIGN.md](DESIGN.md) for the shared-library boundary and update flow.
-
-## E5 bootstrap test
-
-With the E5 in Recovery AP mode and the USB Wi-Fi adapter available through
-the existing lmesh-managed `wpa_supplicant` control socket, send a Main image
-with:
+Start an update through Main with only the logical board role:
 
 ```sh
-python3 scripts/recovery_wifi_push.py \
-  target/flash/e5/main-app.bin \
-  --interface wlan1 \
-  --ctrl-dir /run/mesh/wpa-supplicant-nan
+scripts/flash-main-command.py e5
 ```
 
-The script scans for `ESP32S3_8_BOOT_XXXX` with raw commands on the managed
-wpa_supplicant socket, asks the managed lmesh controller to perform the fixed
-channel-6 open-STA join, assigns the host `192.168.4.2`, and sends the bounded
-bootstrap stream to `192.168.4.1:3333`. The caller needs the same
-`CAP_NET_ADMIN` privilege used by the lmesh service for the host address step.
+The script reads `target/flash-devices/network.json`. The saved SSID is written
+to the Recovery request so normal updates do not scan. If no SSID is saved,
+Recovery falls back to scanning for an open `Direct-*-Dmesh` AP. Server and
+port default to `10.78.0.1:3336`; local IP defaults to
+`10.78.<MAC[4]>.<MAC[5]>`.
 
-The STA test path uses a static lab link because the host AP does not provide
-DHCP. The tested values are host `10.78.0.1`, E5 `10.78.0.200`, and TCP port
-3336. The one-shot sender is:
+The control command currently travels through managed lmesh. The image data is
+Wi-Fi/TCP only. Do not stop lmesh forwarding during the Wi-Fi transfer; it is
+useful for serial evidence. USB/esptool is for first provisioning or emergency
+repair, not routine Main updates.
 
-```sh
-python3 scripts/recovery_tcp_server.py \
-  target/flash/e5/main-app.bin --bind 10.78.0.1 --port 3336
-```
-
-The sender does not require pacing. TCP flow control handles receiver
-backpressure; the Recovery receiver loops until it has collected each
-expected byte range. `--pace-ms` is available only as a diagnostic option for
-comparing burst behavior, not as part of the protocol.
-
-The current build intentionally contains no HTTP client/server components.
-
-## Fleet provisioning and normal updates
-
-Build all chip-specific stage-2/Recovery artifacts and the matching custom
-Main images with:
+## Build and measured size
 
 ```sh
 scripts/build-recovery-fleet.sh all
-scripts/build-fw.sh e5
-CARGO_TARGET_DIR="$PWD/target/fw/recovery-s3" scripts/build-fw.sh recovery-s3
 ```
 
-For a new board, `scripts/flash-recovery-fleet.py` processes roles strictly in
-the order given. It stops the selected lmesh forward only for the initial USB
-stage-2/Recovery write and the one-time `RECOVER` UART handoff, then restores
-the forward before the TCP transfer and Main health check:
+| chip | Recovery binary | `0xd0000` partition free |
+|---|---:|---:|
+| ESP32 | 634,176 bytes | 217,792 bytes |
+| ESP32-S3 | 634,032 bytes | 217,936 bytes |
 
-```sh
-scripts/flash-recovery-fleet.py e5 \\
-  --ssid TEST_AP --board-ip e5=10.78.0.200
-```
+Artifacts are written under `target/recovery-fleet/<chip>/` and published under
+`target/flash/<chip>-<flash-size>/` for the shared server. The Rust Recovery
+prototype remains for comparison; the active image is C because ESP-IDF's
+Wi-Fi/vendor libraries dominate both builds and C is smaller.
 
-This is initial provisioning only. After Main contains the `recovery`
-command, use `scripts/update-main-wifi-fleet.py`; it sends the request through
-the managed lmesh UDS and never opens a physical UART or uses USB directly.
-USB is reserved for initial provisioning and emergency repair:
+## Protocol summary
 
-```sh
-scripts/update-main-wifi-fleet.py e5 target/flash/e5/main-app.bin \
-  --ssid TEST_AP --board-ip e5=10.78.0.200
-```
+DRS2 is a device-first, length-prefixed protocol over TCP. The device sends its
+chip, flash size, MAC, partition role, and trust-key fingerprint. The host reads
+the partition table, selects a matching image, and negotiates one of:
 
-The current C Recovery build is 786,864 bytes on classic ESP32 and 783,504
-bytes on ESP32-S3. Both fit the `0xd0000` Recovery partition. AP-only and
-STA-only variants have not been measured; the production bootstrap remains
-STA-capable with an open AP fallback.
+- compatibility manifest plus missing-block bitmap;
+- signed sparse changed-block manifest;
+- explicit unsigned-fast full transfer for an unkeyed device.
 
-Fleet evidence (2026-08-01): E5, lora1, lora2, lora3, and lora4 returned live
-Main status after current Main-controlled updates through lmesh. Classic
-lora1, lora2, and lora3 accepted stage2 and Recovery over raw TCP; lora4
-accepted the S3 stage2, Recovery, and `dmesh_store` data target. The current
-Recovery images include a bounded UART grace window for explicit handoff
-commands. No signed records are implemented yet.
+Blocks are 4 KiB. New builds stream blocks without per-block ACK round trips
+and finish with one `DONE`. Verified modes authenticate a P-256-signed manifest,
+check received blocks, read back writes, and verify the full image SHA-256.
+Unsigned-fast deliberately skips those checks and must remain a bootstrap path.
 
-## E5 validation
+The trust key is the 65-byte uncompressed P-256 point in NVS key
+`recovery/trust_key`. No provisioned fleet key means no authenticated-update
+claim should be made yet.
 
-The custom bootloader and optimized Recovery were flashed on E5 with the
-measured layout: Recovery at `0x10000` with size `0xd0000`, Main at `0xe0000`
-with size `0x2e0000`. A current 1,615,760-byte Main image transferred over
-STA/TCP, Recovery rebooted, and the
-second-stage bootloader handed control to Main. Main returned live status with
-`uptime_ms=22445`, heap telemetry, and zero LoRa counters. The original NVS
-was restored and its readback SHA-256 matched
-`d04172aaef332b66fbb798234e66b9c90acc87d7b55ba6e8be9225009802c9ab`.
+## Supported targets
 
-The current Main-side raw TCP worker has additionally completed these E5
-targets over STA: Recovery (786,864 bytes), stage2 (27,808 bytes), the
-partition table (3,072 bytes), and a sanitized full NVS image (24,576 bytes).
-Each write was followed by a reboot and live Main status check. These are
-unsigned bootstrap transfers; authenticated records remain unimplemented.
+The shared worker knows Main, Recovery, stage2/bootloader, partition table, NVS,
+and data targets. Intended use is Recovery -> Main and Main -> Recovery.
+Remote stage2 replacement is high risk because there is only one ROM-loaded
+copy and no power-loss rollback.
 
-The lora4 S3 data-target qualification then passed with the current Main
-image: a 24,576-byte stream was written to `dmesh_store` over STA/TCP, the
-board was reset through managed lmesh, and Main returned live status. The
-initial apparent bootloader mismatch was a verifier bug: esptool normalizes
-the bootloader flash-parameter header and appended SHA during writes, so the
-verifier now applies the same parameters.
+Important current gap: the C worker does not yet bind a session to the target
+authorized by its caller; the manifest can select any supported target. Fix
+target pinning before treating authenticated DRS2 as a production boundary.
+
+## Completion and retries
+
+Recovery clears only the one-shot request marker after the device reports a
+successful DRS2 session. Transport settings remain in NVS for later updates.
+Failures leave the marker set. Wi-Fi association retries in 30-second windows,
+and TCP connection retries for 30 seconds per attempt.
+
+Unsigned-fast currently needs an additional received-block bitmap: an early
+`DONE` can otherwise mark a partial unkeyed transfer successful. This is a
+known high-priority reliability fix.
+
+## Logs and evidence
+
+- per-device state: `target/flash-devices/<mac>/`
+- saved network defaults: `target/flash-devices/network.json`
+- flash service logs: `target/recovery-server/`
+- managed serial capture: `target/lmesh-radio-build/log/serial.log`
+- USB provisioning/emergency incidents: `target/evidence/flash/`
+
+Each per-device directory includes HELLO/device metadata, the observed
+partition table, flash session JSON, image hashes, last observed Recovery IP,
+and captured NVS when provisioning tools fetched it.
+
+## Current recommendation
+
+Keep this architecture and keep Recovery small. Before production use:
+
+1. pin the allowed flash target in the device API;
+2. make unsigned-fast completion strict;
+3. add a protected provisioned latch and provision P-256 keys;
+4. increase per-block authenticated digests and add protocol capability/version
+   negotiation;
+5. test power loss and malformed sessions on real boards.
+
+The detailed rationale, wire behavior, security caveats, measurements, and
+long-term alternatives are in [DESIGN.md](DESIGN.md).

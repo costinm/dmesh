@@ -1,0 +1,53 @@
+# Minimal Recovery profile: open STA client with one raw TCP connection.
+# The infrastructure node provides the AP; Recovery does not provide one.
+
+CONFIG_LWIP_MAX_SOCKETS=1
+# CONFIG_LWIP_IPV6 is not set
+# CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES is not set
+# CONFIG_LWIP_DHCPS is not set
+
+# CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set
+# CONFIG_ESP_WIFI_ENABLE_WPA3_SAE is not set
+# CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA is not set
+# CONFIG_ESP_WIFI_DPP_SUPPORT is not set
+# CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT is not set
+# CONFIG_ESP_WIFI_WPS_SOFTAP_REGISTRAR is not set
+# CONFIG_ESP_WIFI_WPS_STRICT is not set
+# CONFIG_ESP_WIFI_WPS_PASSPHRASE is not set
+# CONFIG_ESP_WIFI_NAN_ENABLE is not set
+# CONFIG_ESP_WIFI_MBEDTLS_CRYPTO is not set
+# CONFIG_ESP_WIFI_NVS_ENABLED is not set
+
+# No TLS, certificates, or general-purpose MbedTLS in the bootstrap image.
+CONFIG_MBEDTLS_TLS_DISABLED=y
+# CONFIG_MBEDTLS_CERTIFICATE_BUNDLE is not set
+CONFIG_MBEDTLS_ECDSA_C=y
+CONFIG_MBEDTLS_ECDH_C=y
+# CONFIG_MBEDTLS_RSA_C is not set
+CONFIG_MBEDTLS_ECP_C=y
+# CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED is not set
+CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=y
+# CONFIG_MBEDTLS_ECP_DP_SECP384R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP521R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP192K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP224K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP256K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP256R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED is not set
+# CONFIG_MBEDTLS_CURVE25519_C is not set
+# CONFIG_MBEDTLS_SHA512_C is not set
+# Keep the WPA SHA-1 implementation self-contained when the Wi-Fi MbedTLS
+# integration is disabled. Enabling either MbedTLS or hardware SHA here would
+# select an adapter that is not linked in the no-MbedTLS crypto path.
+# CONFIG_MBEDTLS_HARDWARE_SHA is not set
+# CONFIG_MBEDTLS_SHA1_C is not set
+CONFIG_MBEDTLS_SHA256_C=y
+# ESP-IDF's baseline MbedTLS port hard-defines AES/CTR-DRBG support even when
+# Wi-Fi MbedTLS integration is disabled. Keep the AES module for that ABI;
+# TLS, certificates, asymmetric curves, and general-purpose public-key APIs
+# remain disabled.
+CONFIG_MBEDTLS_AES_C=y
+# CONFIG_MBEDTLS_CCM_C is not set
+# CONFIG_MBEDTLS_GCM_C is not set

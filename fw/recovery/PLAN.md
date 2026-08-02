@@ -2,16 +2,21 @@
 
 ## Current status
 
-The active E5 implementation is the C Recovery bootstrap path. It has been
-built and exercised for an unsigned TCP image transfer and boot handoff. It
-does not yet verify signatures or authenticated records. The Rust prototype is
-retained under [`../recovery-rust`](../recovery-rust) for comparison, but is
-not used.
+The active implementation is the shared C DRS2 TCP path. It builds for E5
+classic ESP32 and ESP32-S3, verifies P-256 manifests when a trust key exists,
+supports explicitly unsigned provisioning when it does not, and performs
+device-first sparse 4096-byte updates. The Rust prototype is retained under
+[`../recovery-rust`](../recovery-rust) for comparison, but is not used.
 
-The current C image is 786,864 bytes on classic ESP32 and 783,504 bytes on
-ESP32-S3. Both fit the 0xd0000 Recovery partition. AP-only and STA-only
-variants have not been built; the current tested configuration is STA-capable
-with the open AP fallback.
+The previous C image was 786,864 bytes on classic ESP32 and 783,504 bytes on
+ESP32-S3. The new minimal profile is open-STA only; AP fallback, TCP-server
+mode, password handling, HTTP, and DNS are excluded. If the SSID is omitted,
+the profile performs one bounded scan for an open `Direct-...-Dmesh` AP. An
+unconfigured request uses host `10.78.0.1`, port `3336` for classic ESP32 or
+`3337` for ESP32-S3, and local `10.78.<MAC[4]>.<MAC[5]>`. Measured Recovery
+the current classic ESP32 image is 632,336 bytes (`0x9a610`) within the
+`0xd0000` app slot; the previously measured S3 image is 631,024 bytes. The E5
+layout and USB stage2/Recovery provisioning have been exercised on hardware.
 
 ## Phase 1: shared ABI and host tests
 
@@ -34,9 +39,10 @@ with the open AP fallback.
 ## Phase 3: Recovery application
 
 - Create the minimal ESP-IDF application under `fw/recovery/app`.
-- Add network-role selection: STA when SSID is present, otherwise AP.
-- Add transport-role selection: TCP client when a remote server address is
-  present, otherwise TCP server.
+- Add network-role selection: open STA with configured SSID, or a bounded
+  `Direct-...-Dmesh` scan when SSID is absent.
+- Add fixed unconfigured bootstrap defaults: host `10.78.0.1`, per-CPU TCP
+  ports, and a MAC-derived `10.78.<MAC[4]>.<MAC[5]>` local address.
 - Implement the minimal framed TCP stream first; measure an optional HTTP
   adapter separately and retain it only if its code/RAM cost is justified.
 - Link the shared core and provide ESP-IDF flash/NVS/reboot adapters.
@@ -54,11 +60,11 @@ with the open AP fallback.
   rejected.
 
 Bootstrap bring-up is implemented and tested on E5 and the attached classic
-fleet. The open AP remains fixed
-to channel 6 so it matches lmesh's existing `wifi.sta.join_open` helper; the
-signed record path is still pending. Recovery waits for STA association and
-handles short TCP reads with an explicit receive-all loop. No signature
-verification has been tested or claimed yet.
+fleet. The open AP remains fixed to channel 6 so it matches lmesh's existing
+`wifi.sta.join_open` helper. Recovery waits for STA association, retries the
+outbound TCP connection for 30 seconds, and handles short TCP reads with an
+explicit receive-all loop. The P-256 manifest path is implemented and covered
+by host protocol tests; signed hardware verification remains a separate test.
 
 ## Phase 4: Main integration
 
@@ -73,25 +79,26 @@ verification has been tested or claimed yet.
 - Record map/component sizes and finalize the partition CSV.
 - Verify no LoRa profile or unrelated mesh component is linked.
 - Perform build-only and host tests first.
-- Flash E5 only after the layout and recovery failure tests are reviewed.
+- Flash E5 only after the layout and recovery failure tests are reviewed. Done.
 
-E5 validation evidence (2026-08-01): custom bootloader 27,808 bytes,
-Recovery 786,864 bytes, Main 1,615,760 bytes in the current build, and the
-partition table all build successfully. Recovery is `0xd0000` bytes at
-`0x10000`; Main is `0x2e0000` bytes at `0xe0000`.
+E5 validation evidence (2026-08-01): custom bootloader 28,192 bytes,
+Recovery 632,336 bytes, Main 1,633,760 bytes, and the partition table all
+build successfully. Recovery is `0xd0000` bytes at `0x10000`; Main is
+`0x2e0000` bytes at `0xe0000`.
 
-Using the Recovery UART `STA` command, an open STA association on the lmesh host AP, static
-addresses host `10.78.0.1` / E5 `10.78.0.200`, and TCP port 3336, Recovery
-received and flashed the full Main image. The host measured 10.381 seconds
-(1.150 Mbit/s including flash writes). Recovery rebooted and the corrected
-second-stage bootloader selected Main; Main returned `uptime_ms=22445`, heap
-telemetry, and `lora_rx=0 lora_tx=0`. The original NVS was restored and read
-back with matching SHA-256
-`d04172aaef332b66fbb798234e66b9c90acc87d7b55ba6e8be9225009802c9ab`.
+Using the Recovery UART `STA` command, an open STA association on the lmesh
+host AP, static addresses host `10.78.0.1` / E5 `10.78.0.200`, and TCP port
+3336, Recovery received and flashed the full Main image. The host observed a
+Recovery hello with role/partition `2/2`, validated the partition table, sent
+all 399 blocks, and independently verified all 399 post-write truncated
+SHA-256 values before the final device image SHA check. Recovery rebooted and
+the second-stage bootloader selected Main; the Main boot log was captured over
+the managed UART forward. This is the first complete E5 Main-over-Recovery
+proof using the current 4096-byte DRS2 protocol.
 
 This evidence is bootstrap-only. It does not establish signed-record
-verification, and it does not include an AP-only versus STA-only size
-comparison.
+verification. The minimal profile now uses the infrastructure AP and a
+numeric host address.
 
 S3 fleet evidence (2026-08-01): lora4 accepted the 22,400-byte second-stage
 bootloader and the 783,504-byte Recovery image over Main/TCP, along with the S3 Main
@@ -143,7 +150,7 @@ protocol without pulling normal networking or policy into the bootloader.
 
 Also evaluate PPP framing for the second-stage, Recovery, and Main control/data
 channels. Compare its size, RAM, escaping, packet-boundary, and diagnostic
-benefits with the working `DRS1` raw TCP stream. This is a consistency study,
+benefits with the working `DRS2` raw TCP stream. This is a consistency study,
 not a prerequisite for the current bootstrap or remote Main-flash path.
 
 ## Non-urgent TODO: host-AP IPv6 zero-config transport
