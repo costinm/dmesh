@@ -1,0 +1,22 @@
+[package]
+name = "dmesh-recovery-rs"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[workspace]
+
+[dependencies]
+libc = "0.2"
+esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = true
