@@ -56,6 +56,7 @@
 #define BLOCK_SIZE 4096u
 #define MAX_BLOCKS 1024u
 #define PARTITION_TABLE_SIZE 0x1000u
+#define DATA_PARTITION_START 0x3c0000u
 #define TRUST_KEY_SIZE 65u
 #define TRUST_NAMESPACE "recovery"
 #define CONNECT_RETRY_COUNT 150u /* 30 seconds at 200 ms per attempt */
@@ -211,12 +212,6 @@ static const esp_partition_t *partition_for(uint8_t target)
         return esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
                                         ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");
     }
-    if (target == TARGET_DATA) {
-        const esp_partition_t *p = esp_partition_find_first(
-            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "dmesh_store");
-        return p != NULL ? p : esp_partition_find_first(
-            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "data");
-    }
     return NULL;
 }
 
@@ -231,6 +226,20 @@ static bool target_partition(uint8_t target, const esp_partition_t **out,
         raw->subtype = ESP_PARTITION_SUBTYPE_ANY;
         raw->address = target == TARGET_BOOT ? BOOT_FLASH_ADDRESS : 0x8000;
         raw->size = target == TARGET_BOOT ? BOOT_LIMIT : PARTITION_LIMIT;
+        raw->erase_size = 0x1000;
+        raw->encrypted = false; raw->readonly = false;
+        *out = raw; *limit = raw->size; return true;
+    }
+    if (target == TARGET_DATA) {
+        uint32_t flash_size = 0;
+        if (esp_flash_get_size(NULL, &flash_size) != ESP_OK ||
+            flash_size <= DATA_PARTITION_START) return false;
+        memset(raw, 0, sizeof(*raw));
+        raw->flash_chip = esp_flash_default_chip;
+        raw->type = ESP_PARTITION_TYPE_DATA;
+        raw->subtype = ESP_PARTITION_SUBTYPE_ANY;
+        raw->address = DATA_PARTITION_START;
+        raw->size = flash_size - DATA_PARTITION_START;
         raw->erase_size = 0x1000;
         raw->encrypted = false; raw->readonly = false;
         *out = raw; *limit = raw->size; return true;

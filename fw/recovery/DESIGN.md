@@ -57,8 +57,9 @@ or package manager in Recovery.
 
 ## Normal update flow
 
-The long-running host process is `scripts/flash-server.py`. With no arguments
-it serves Main images from `target/flash`, listens on `10.78.0.1:3336`, keeps
+The long-running host process is `fw/recovery/tools/flash-server.py`. With no arguments
+it serves chip-selected Main images from `target/flash`, listens on
+`10.78.0.1:3336`, keeps
 accepting devices, and enables unsigned-fast only for devices reporting no
 trust key. `docs/lab/recovery-tcp-server.toml` runs it under mesh-init.
 That lab service does not currently provide a signing key. Once a device trust
@@ -68,7 +69,7 @@ private signing key or the device will correctly reject its manifests.
 The normal control action is:
 
 ```sh
-scripts/flash-main-command.py <lmesh-role>
+fw/recovery/tools/flash-main-command.py <lmesh-role>
 ```
 
 Network defaults live in `target/flash-devices/network.json`. A saved SSID is

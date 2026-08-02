@@ -26,10 +26,16 @@ priority hardening list.
 
 ## Normal operation
 
-`scripts/flash-server.py` is the long-running host service. With no arguments
-it serves chip/flash-specific Main images from `target/flash` on
+`fw/recovery/tools/flash-server.py` is the long-running host service. With no arguments
+it serves chip-specific Main images from `target/flash` on
 `10.78.0.1:3336` and keeps accepting connections. The mesh-init definition is
 `docs/lab/recovery-tcp-server.toml`.
+
+For a systemd host, the on-demand units are next to the tools:
+`fw/recovery/tools/flash-server.socket` and `flash-server.service`. Start the
+socket explicitly with `systemctl start flash-server.socket`; neither
+unit is boot-enabled. The socket listens on TCP port 3336 and activates the
+server only when a Recovery connection arrives.
 
 The checked-in lab service has no private signing key configured. It serves the
 current unkeyed fleet; keyed devices will fail closed until that service is
@@ -38,7 +44,7 @@ given the corresponding `--signing-key` configuration.
 Start an update through Main with only the logical board role:
 
 ```sh
-scripts/flash-main-command.py e5
+fw/recovery/tools/flash-main-command.py e5
 ```
 
 The script reads `target/flash-devices/network.json`. The saved SSID is written
@@ -57,6 +63,11 @@ repair, not routine Main updates.
 ```sh
 scripts/build-recovery-fleet.sh all
 ```
+
+Both chip builds use the same 4 MiB partition table from
+[`../boot/partitions.csv`](../boot/partitions.csv). The final 256 KiB, labelled
+`data`, is reserved for shared future use and is ignored by the current Main
+image. Larger physical flash is intentionally outside the Recovery layout.
 
 | chip | Recovery binary | `0xd0000` partition free |
 |---|---:|---:|

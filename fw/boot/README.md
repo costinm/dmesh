@@ -1,32 +1,49 @@
-# DMesh ESP boot supervisor
+# DMesh ESP second-stage bootloader
 
-This directory will contain the custom ESP-IDF second-stage bootloader for
-DMesh. It is the small, deterministic supervisor that runs after the ROM
-bootloader and before either application image.
-
-The bootloader does not contain Wi-Fi, HTTP, update parsing, or product logic.
-It only decides which application to load:
+`fw/boot` is the small supervisor between the ESP ROM and the two application
+partitions. It normally starts Main and selects Recovery when Main requested an
+update, a host responds during the 50 ms UART window, rapid resets are observed,
+or Main repeatedly fails to reach its healthy marker.
 
 ```text
-ROM bootloader
-      |
-      v
-fw/boot second-stage bootloader
-      |
-      +-- recovery request, button hold, or Main crash loop -> Recovery
-      |
-      +-- otherwise -----------------------------------------> Main
+ROM -> stage2 -> Main
+               Recovery -> Wi-Fi DRS2 update -> reboot -> Main
 ```
 
-There is deliberately no `otadata` partition. The bootloader owns the choice
-between the fixed Recovery and Main application partitions.
+There is no OTA-data partition and no ESP-IDF boot-partition switch. Recovery
+is the fixed `factory` application and Main is the fixed `ota_0` application.
+Wi-Fi, signatures, flash writes, and update policy are outside this component.
 
-The first hardware target was the `e5` lab board: classic ESP32,
-MAC `fc:f5:c4:0e:f1:e8`, with no LoRa hardware. The same layout has now been
-validated on the attached classic fleet and the 8 MB ESP32-S3 `lora4` board.
+Current release artifacts:
 
-The bootloader and Recovery have been built for the E5 layout and exercised
-through the managed lmesh path. Direct USB flashing remains reserved for
-initial provisioning and emergency recovery.
+| chip | bootloader size | configured raw boot region |
+|---|---:|---:|
+| ESP32 | 28,192 bytes | `0x7000` bytes |
+| ESP32-S3 | 22,816 bytes | `0x7000` bytes |
 
-See [DESIGN.md](DESIGN.md) for the architecture, failure policy, and rationale.
+Build both fleet variants from the repository root:
+
+```sh
+scripts/build-recovery-fleet.sh all
+```
+
+Outputs are under `target/recovery-fleet/<chip>/`. The same build also produces
+the matching partition table and Recovery image.
+
+Both ESP32 and ESP32-S3 use the single 4 MiB layout in
+[`partitions.csv`](partitions.csv). It reserves a 256 KiB `data` partition at
+`0x3c0000`; boards with more physical flash may use addresses above 4 MiB
+through explicit Main code without changing the Recovery/stage2 layout.
+
+Routine Main updates do not flash stage2 and do not use USB. USB/esptool is
+reserved for first provisioning or emergency repair. Although Main's shared
+flash worker can technically target stage2, rewriting the only bootloader copy
+has no power-loss rollback and should remain rare and explicitly controlled.
+
+Implemented triggers are UART, the NVS request marker, rapid resets, and RTC
+failure counters. A button trigger is not currently implemented. The intended
+both-images-failed halt and RTC-corruption handling still need the hardening
+listed in [DESIGN.md](DESIGN.md).
+
+See [DESIGN.md](DESIGN.md) for the exact selector, RTC ABI, request ABI,
+partition layout, limitations, and long-term options.

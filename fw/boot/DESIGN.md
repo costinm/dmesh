@@ -1,179 +1,213 @@
-# Recovery boot design and rationale
+# DMesh second-stage bootloader design
 
-## Objective
+## Status and judgment
 
-Provide a stable, reusable boot supervisor for ESP32 projects. The supervisor
-must make Main recoverable even when Main cannot initialize, request recovery,
-or remain alive long enough to handle a reset.
+The architecture is on the right track: keep the always-executed supervisor
+small, keep Wi-Fi and flash-update logic in a normal ESP-IDF application, and
+keep Main policy out of both. This gives a broken Main a recovery path without
+putting a network stack in the bootloader.
 
-The system has three executable images:
+The implementation is usable and has booted the classic ESP32 fleet and the
+8 MB ESP32-S3 board. It is not yet a hardened immutable root of recovery. The
+highest-value remaining work is listed below; in particular, the RTC state and
+terminal halt behavior need stronger validation before calling the supervisor
+fail-safe.
 
-1. the ROM bootloader;
-2. this custom second-stage bootloader;
-3. two application images: Recovery and Main.
-
-The second-stage bootloader is not an application and must remain small. The
-Recovery application owns networking and update transport.
-
-## Boot policy
-
-After normal second-stage initialization, the bootloader checks these sources
-in order:
-
-1. a valid long button hold during the first three seconds;
-2. the exact ASCII string `RECOVER` on the boot console UART during the first
-   three seconds;
-3. a valid bootloader-readable Recovery request in NVS;
-4. six consecutive Main boot failures without a healthy-start acknowledgement;
-5. otherwise, Main.
-
-If any of the first three conditions is true, the bootloader loads Recovery.
-Otherwise it loads Main. Application image loading uses the ESP-IDF bootloader
-loader with policy/hash validation disabled; the loader still has to parse
-segments and configure RAM and flash mappings in order to start an image.
-
-If Recovery has no provisioned trust key, Recovery may enter the explicitly
-named `bootstrap` test mode. SSID presence selects STA versus AP, and remote
-server-address presence selects TCP client versus TCP server. This is a
-factory/development escape hatch for the first image installation, not a
-response to a bad signature or a network failure. A present trust key always
-disables unsigned input.
-
-Recovery performs the authenticated update and clears the request only after
-the stream has completed successfully. It then reboots. With no `otadata`
-partition, the bootloader sees no pending request and starts Main.
-
-Main writes a request before rebooting when it wants Recovery, and publishes a
-healthy-start marker through the shared RTC-retained ABI. The bootloader only
-reads NVS during selection; it never commits NVS for routine boot attempts.
-
-## Crash-loop state
-
-Use ESP-IDF RTC-retained bootloader memory, including its CRC, plus a small
-custom field for:
-
-- consecutive Main handoff attempts;
-- a healthy-start acknowledgement state and separate Main/Recovery counters.
-
-The counter is incremented before loading Main. Main clears it once startup is
-healthy. Six consecutive attempts without that acknowledgement select
-Recovery. Recovery has its own six-attempt counter; if both applications have
-reached the limit, the bootloader halts and logs that UART flashing is
-required. A successful Recovery transaction clears both counters before the
-next Main attempt. The counters live in RTC RAM and are not NVS wear events.
-
-The existing ESP-IDF primitives are the intended starting points:
-
-- `bootloader_common_check_long_hold_gpio_level()` for the button;
-- `bootloader_common_update_rtc_retain_mem()` and
-  `bootloader_common_get_rtc_retain_mem()` for retained state;
-- `bootloader_load_image_no_verify()` for image loading;
-- the bootloader's `set_cache_and_start_app()` path for the final handoff.
-
-## NVS request ABI
-
-The bootloader uses the ESP-IDF `nvs_bootloader_read()` API. That API supports
-integers and strings, not arbitrary blobs, so the first ABI stores request
-fields separately:
-
-| Namespace | Key | Type |
-| --- | --- | --- |
-| `recovery` | `request_magic` | `u32` |
-| `recovery` | `request_version` | `u32` |
-| `recovery` | `flags` | `u32` |
-| `recovery` | `ssid` | string |
-| `recovery` | `password` | string |
-| `recovery` | `update_url` | string |
-
-The request is valid only when magic, version, lengths, and required fields
-match the checked-in ABI. Main writes these fields atomically from the user's
-perspective, then reboots. Recovery clears them only after success.
-
-The trust key is consumed by Recovery, not by the bootloader. Bootloader NVS
-reads must remain small and safe even if the normal NVS contents are corrupt.
-
-The bootloader does not select bootstrap mode itself. It only sends the device
-to Recovery; Recovery decides whether the trust-key state permits bootstrap
-mode.
-
-## Partition layout
-
-The E5 layout is based on the existing classic ESP32 4 MiB profile and keeps
-the current NVS and PHY offsets to avoid destroying deployed settings. The
-same Recovery/Main shape is used on the 8 MiB S3 layout, which additionally
-contains `dmesh_store`.
-
-The target shape is:
+## Executable and partition model
 
 ```text
-0x00001000  second-stage bootloader
-0x00008000  partition table
-0x00009000  NVS                 (preserve current location)
-0x0000F000  PHY init             (preserve current location)
-0x........  Recovery app
-0x........  Main app
+ESP ROM
+  -> DMesh second-stage bootloader (fw/boot)
+       -> Recovery application (factory subtype, label recovery_app)
+       -> Main application     (ota_0 subtype, label main)
 ```
 
-Recovery and Main must be aligned to ESP app boundaries. The Recovery
-partition starts conservatively; its exact size will be the optimized release
-image size plus measured headroom. Main retains enough capacity for the
-current firmware image and future growth.
+There is no `otadata` partition and no call to
+`esp_ota_set_boot_partition()`. `factory` and `ota_0` are fixed identifiers
+used by the custom selector; they are not ESP-IDF OTA slots.
 
-No `otadata` partition or OTA slot is used. The S3 layout has a `dmesh_store`
-partition for the larger-flash boards; it is a normal named data target for
-Main-controlled raw TCP flashing.
+The single canonical layout preserves deployed NVS and PHY offsets and fits a
+4 MiB flash on every supported board:
 
-## Scope boundary
+| Region | Offset | Size |
+|---|---:|---:|---:|
+| second stage | chip boot offset | up to `0x7000` bytes |
+| partition table | `0x8000` | `0x1000` |
+| NVS | `0x9000` | `0x6000` |
+| PHY init | `0xf000` | `0x1000` |
+| Recovery | `0x10000` | `0xd0000` |
+| Main | `0xe0000` | `0x2e0000` |
+| data | `0x3c0000` | `0x40000` |
 
-The bootloader does not:
+The authoritative table is `partitions.csv`. Physical flash larger than 4 MiB
+is deliberately not represented in this table; Main may use the remaining
+flash with explicit raw-address code or a future coordinated layout change.
+Current measured second-stage binaries are 28,192 bytes on ESP32 and 22,816
+bytes on ESP32-S3.
 
-- connect to Wi-Fi;
-- perform HTTP;
-- parse update records;
-- verify update signatures;
-- compare versions;
-- erase or write Main;
-- make product policy decisions.
+## Implemented boot sequence
 
-Those responsibilities belong to Recovery or Main.
+After ESP-IDF bootloader initialization and partition-table loading, stage2:
 
-## Rationale
+1. emits a fixed DMB1 identity in PPP/HDLC framing;
+2. waits 50 ms for either the fixed framed Recovery command or legacy ASCII
+   `RECOVER`;
+3. reads the Recovery request marker from NVS;
+4. consumes the application health event in RTC memory;
+5. evaluates rapid boots and Main/Recovery failure counters;
+6. loads the selected fixed application partition with ESP-IDF bootloader
+   loading primitives.
 
-Putting the decision in the second-stage bootloader avoids the failure mode
-where Main is too broken to request Recovery. Keeping networking out of the
-bootloader avoids porting a full TCP/IP stack into the tiny pre-RTOS
-environment. Keeping update logic in the Recovery application allows normal
-ESP-IDF Wi-Fi/HTTP APIs and makes Recovery independently reusable.
+There is currently no boot-button check. A healthy device needs no button:
+Main requests Recovery through its normal command path, while repeated rapid
+resets are the local fallback.
 
-The no-`otadata` design also makes the boot path explicit: the supervisor
-always owns the Recovery-versus-Main decision instead of depending on OTA
-selection state.
+Selection priority is:
 
-## Validation before flashing
+1. explicit UART Recovery selector;
+2. valid/persisting NVS Recovery request;
+3. four boots close enough that three prior timestamps fall within the raw RTC
+   tick window;
+4. failure-counter fallback;
+5. Main.
 
-Before any E5 flash:
+When Recovery was explicitly selected but has failed six times, stage2 tries
+Main if Main has not also reached six failures. When both counters have reached
+the limit, the intended terminal state is a low-activity UART-repair halt.
 
-1. build the bootloader and Recovery release images;
-2. record bootloader, Recovery, Main, and partition-table sizes;
-3. inspect map files and retained-memory usage;
-4. validate partition offsets with ESP-IDF tooling;
-5. run host tests for request parsing, crash-loop state, and boot selection;
-6. build a signed test stream and exercise Recovery without hardware writes;
-7. review the final layout and only then prepare a sparse E5 flash image.
+## RTC boot-health ABI
 
-## Deferred integrity index
+Stage2 reserves 32 bytes of RTC retain memory. Its custom state contains:
 
-For future differential updates, reserve the final sector of each updatable
-partition for a compact per-block digest index. It is deliberately outside
-the usable image area. A device-first transfer can return that index, receive
-a signed replacement index, and accept only blocks whose digests changed.
-The replacement index is committed last, after all block writes verify. This
-also gives the second-stage bootloader a bounded way to verify Main and
-Recovery before starting them. Truncated SHA-256 is the first candidate; the
-index must fit without requiring a Merkle tree, or the partition format must
-explicitly reject images that exceed its capacity.
+- magic and layout generation;
+- Main and Recovery failure counters;
+- four raw RTC boot timestamps;
+- four boot-kind bytes (reserved by the current logic).
 
-The current implementation does not reserve or consume this sector and still
-uses complete-image `DRS1` transfers. PPP framing for the second-stage,
-Recovery, and Main paths is a separate future evaluation, with size and RAM
-cost as the deciding constraints.
+Applications write one volatile event byte:
+
+- `MAIN_START` immediately after Main begins;
+- `MAIN_OK` after Main reaches its ready point;
+- `RECOVERY_START` when Recovery starts;
+- `RECOVERY_OK` only after a successful flash session.
+
+Stage2 increments a target's counter before handoff. `MAIN_OK` clears Main's
+counter and rapid-boot history. `RECOVERY_OK` clears both counters and the
+history so the next boot is a fresh Main attempt. Routine boots do not update
+NVS.
+
+Current limitations are important:
+
+- the custom RTC bytes are outside ESP-IDF's retained-memory CRC;
+- magic and generation detect an uninitialized layout but not arbitrary bit
+  corruption;
+- the rapid-boot window uses a fixed raw-tick threshold and does not calibrate
+  the selected RTC slow clock;
+- reset reasons are logged but not used to exclude deep-sleep wakeups, planned
+  resets, or other benign rapid boots;
+- `RECOVERY_START` and `MAIN_START` are informational in the current selector;
+  only the `*_OK` events alter counters.
+
+RTC state is the right storage medium for wear and latency, but it must be
+treated as volatile evidence rather than trusted persistent state.
+
+## Recovery request ABI
+
+Stage2 reads only these NVS fields in namespace `recovery`:
+
+| Key | Accepted type | Meaning |
+|---|---|---|
+| `request_magic` | `u32` or numeric string | `0x52455131` (`REQ1`) |
+| `request_version` | `u32` or numeric string | currently `1` |
+
+For compatibility with older provisioned devices, version `1` currently
+selects Recovery even when `request_magic` cannot be read. That compatibility
+exception is an availability risk: a stale version key can repeatedly select
+Recovery. It should be removed after fleet migration or replaced by a compact
+record with an integrity check.
+
+Main also stores transport fields (`ssid`, `password`, `server`, `ip`, `port`,
+`update_url`, and `flags`). Stage2 deliberately does not parse them. Recovery
+retains transport configuration but clears the one-shot marker fields only
+after a successful update.
+
+The P-256 trust key is consumed by Recovery, not stage2.
+
+## UART boot handoff
+
+DMB1 is a fixed byte layout, not general CBOR. PPP/HDLC delimiters and escaping
+allow a UART receiver to regain framing. The identity includes version, role,
+partition, reset reason, and a short RTC tick value; remaining bytes are
+reserved. The 50 ms window is deliberately bounded on every boot.
+
+DRS2 is not used in stage2. TCP does not need PPP framing, and pulling the full
+flash protocol into the bootloader would weaken the size and audit boundary.
+
+## Failure behavior and power loss
+
+- A crashing Main leaves `MAIN_OK` unset, so repeated stage2 handoffs eventually
+  select Recovery.
+- An interrupted Main write leaves the Recovery request set. The next boot
+  selects Recovery and retries.
+- An unavailable AP does not make Recovery reboot immediately; Recovery keeps
+  retrying association in bounded windows.
+- A corrupt or non-starting Recovery eventually causes a Main fallback.
+- A corrupt Main and corrupt Recovery are intended to stop in UART-repair mode.
+
+The last item is not fully proven: `halt_for_uart()` loops without feeding or
+disabling the enabled bootloader watchdog. The watchdog may reset the chip,
+turning the intended halt into another boot loop. Fix and test this before
+relying on the six-plus-six terminal policy for power savings.
+
+## Security boundary
+
+Stage2 does not authenticate update traffic. It relies on Recovery's verified
+flash path and on optional ESP secure-boot/flash-encryption facilities if those
+are enabled for a product. It does not implement version policy, rollback
+policy, key rotation, networking, or application semantics.
+
+Loading and mapping an ESP image still requires structurally valid segments.
+The custom policy does not currently add a separate signed digest index or
+explicit pre-handoff Main/Recovery hash check.
+
+## High-value improvements
+
+In priority order:
+
+1. Make terminal halt real: disable or feed the bootloader watchdog, enter the
+   lowest safe wait state available, and verify current draw and UART recovery.
+2. Add a CRC to the custom RTC structure and reset state on CRC, generation,
+   impossible counter, or impossible timestamp values.
+3. Calibrate the rapid-reset threshold from the RTC slow clock and filter reset
+   reasons so planned reboot/deep-sleep cycles do not imitate a crash loop.
+4. Remove the version-only NVS request compatibility exception after all fleet
+   writers use the typed magic, or replace the split keys with a small
+   checksummed request marker.
+5. Add host tests for the complete state machine: normal boot, healthy marker,
+   rapid-reset entry, six Main failures, six Recovery failures, both-failed
+   halt, RTC corruption, timer wrap, and power-on reset.
+6. Record a compact boot-decision reason that Main/Recovery can report later;
+   RTC or serial is preferable to routine NVS writes.
+
+## Long-term options
+
+- A signed per-partition digest index could let stage2 cheaply reject an image
+  that does not match the last committed update. The index must be committed
+  last and must not become another mutable selection database.
+- ESP secure boot is the stronger production root of code authenticity. DRS2
+  signatures protect update input but do not replace ROM-to-stage2 secure boot.
+- A/B Recovery is worth considering on larger flash devices if Recovery itself
+  will be updated frequently. It is probably not worth the space on 4 MB
+  devices while Recovery remains stable.
+- Remotely rewriting the single stage2 at the ROM boot offset is inherently
+  risky. Keep it rare. A truly rollback-safe stage2 update requires an
+  immutable first shim or vendor-supported bootloader recovery mechanism, not
+  merely another DRS2 target.
+- ESP8266 remains a separate future design because its RAM, flash layouts, ROM
+  loader, and SDK primitives differ materially.
+
+## Non-goals
+
+Stage2 does not connect to Wi-Fi, parse DRS2, erase applications, compare
+versions, schedule updates, provide product recovery UI, or make rollout
+policy decisions.

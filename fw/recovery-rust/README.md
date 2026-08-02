@@ -1,6 +1,6 @@
 # Rust Recovery
 
-This is a retained, standalone Rust implementation of the E5 bootstrap
+This is a retained, standalone Rust implementation of the canonical bootstrap
 Recovery application. It intentionally does not depend on the larger Rust
 Main firmware crate. It is not the Recovery implementation currently used
 for E5; the C Recovery remains active while the bootstrap transport and
@@ -41,13 +41,14 @@ The Rust project uses `esp-idf-sys` and the ESP-IDF Wi-Fi/netif/lwIP,
 partition, NVS, event, and UART components directly. It does not use
 `esp-idf-svc`, `embedded-svc`, HTTP, or the existing Main application graph.
 
-## E5 layout and size
+## Canonical layout and size
 
-The build uses the same E5 partition table as the C Recovery:
+The build uses the same canonical partition table as the C Recovery:
 
 ```text
 Recovery: 0x10000, 0xd0000
 Main:     0xe0000, 0x2e0000
+Data:     0x3c0000, 0x40000
 ```
 
 Measured optimized application images:

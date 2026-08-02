@@ -1,8 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-changed=sdkconfig.defaults");
-    println!("cargo:rerun-if-changed=partitions_e5.csv");
+    println!("cargo:rerun-if-changed=../boot/partitions.csv");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    std::fs::copy("partitions_e5.csv", format!("{out_dir}/partitions_e5.csv"))
-        .expect("copy E5 partition table");
+    std::fs::copy("../boot/partitions.csv", format!("{out_dir}/partitions.csv"))
+        .expect("copy canonical partition table");
     embuild::espidf::sysenv::output();
 }
