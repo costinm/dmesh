@@ -9,7 +9,8 @@ The shared flash transport is owned by
 `fw/recovery/transport/dmesh_flash_tcp/`. Main imports that platform-only C
 source through its native CMake component; Recovery has no dependency on the
 mesh application. This is intentional so the Recovery/stage2 tree can move to
-a separate repository later.
+a separate repository later. Main's default import path is in-tree, and can be
+overridden for a split checkout with `DMESH_RECOVERY_TRANSPORT_DIR`.
 
 ```text
 Main command -> stage2 -> Recovery -> flash-server.py -> Main partition

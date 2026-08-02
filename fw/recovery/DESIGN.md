@@ -46,6 +46,9 @@ The shared implementation is owned here at
 Recovery and imported by Main's native CMake component. The transport includes
 only ESP-IDF/lwIP/mbedTLS/NVS interfaces; it does not include or link against
 the mesh application. This keeps `fw/recovery` movable to another repository.
+Main's CMake integration defaults to the in-tree path and accepts
+`DMESH_RECOVERY_TRANSPORT_DIR` when the transport is supplied by a separate
+checkout or vendored dependency.
 The caller sets up Wi-Fi and starts either an outbound connection or a listener;
 the manifest currently supplies the actual target.
 
