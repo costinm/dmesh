@@ -79,7 +79,7 @@ open evidence, not a general interoperability claim.
 
 ## Normal Battery Profile
 
-The saved infra defaults are:
+The saved battery-node defaults are:
 
 | Setting | Default | Rationale |
 | --- | --- | --- |
@@ -87,12 +87,67 @@ The saved infra defaults are:
 | `nan.boot` | `true` | Re-enters the saved raw-NAN duty profile after reset. |
 | `nan.channel` | `6` | All active radios share one 2.4 GHz channel. |
 | `nan.wake_ms` | `4000` ms | Battery wake cadence; compatible with a bounded discovery delay. |
-| `nan.active_ms` | `250` ms | Wi-Fi/action receive and queue-drain window. |
+| `nan.active_ms` | `64` ms | Minimum NAN receive/data dwell; the fixed pre-wake margin and 32 ms post-beacon dwell are added separately. |
 | `nan.light_sleep` | `true` | Explicit light sleep while Wi-Fi is off. |
-| `nan.early_ms` | `5` ms | Initial return margin before the selected DW0/DW-stride window. Runtime adapts this between 1 and 100 ms from beacon misses/successes without changing the selected slot. |
-| `nan.dw_tu` / `nan.dw_off_tu` | `512` / `0` TU | Raw NAN cadence and phase. |
+| `nan.early_ms` | `40` ms | Conservative default guard before the selected DW0/DW-stride window. An explicit experiment may set `mode nan_early_ms=<n> save=true`; values are clamped to 1..2000 ms. |
+| `nan.dw_tu` / `nan.dw_off_tu` | `512` / `0` TU | Raw NAN base cadence and phase. `nan.dw_stride=8` selects about 4 s; use stride 4 (about 2 s) or 2 (about 1 s) for controlled cadence experiments. |
 | `power.profile` | `auto` | DFS plus automatic idle light sleep outside explicit radio work. |
-| `uart.hb_every` | `1` | Emits one empty framed UART heartbeat on every Wi-Fi wake so lmesh can flush queued CBOR. |
+| `uart.hb_every` | `16` for sleepy nodes (`1` in infra mode) | Emits one empty framed UART heartbeat every Nth Wi-Fi wake; infrastructure UART remains continuously active. |
+
+### Talk-request wake
+
+An infrastructure node or Android may publish a target-specific “I want to
+talk” SDF during the advertised DW. The target must treat that SDF as a
+control-plane request: it enters a bounded non-sleepy command window, enables
+its normal UART/radio service, and keeps the window open for the requested
+duration. CoC or ESP-NOW/follow-up traffic may then run at any time in that
+window; it is not limited to the next 512-TU slot. The window expires back to
+the normal `nan.dw_stride` scheduler unless another request extends it.
+
+Follow-ups are deliberately a short-message bearer (synchronisation notices,
+status, and SMS-like payloads). lmesh promotes larger commands to a bounded
+talk window automatically; that window is reserved for the future QUIC-like
+bulk path rather than attempting to fragment an oversized follow-up.
+
+Within the DW path, exactly one follow-up is exchanged per selected window.
+The gateway adds a one-byte continuation hint (CBOR argument `332`): `MORE`
+keeps the target awake for additional queued frames, `DONE` says the flush is
+complete, and the upper six bits approximate extra 512-TU dwell units. This
+lets a short follow-up extend only the required window; the subsequent burst
+uses CoC for Android or ESP-NOW-style frames for ESP peers.
+
+A command that requires an immediate response may include the normal command
+`timeout=<milliseconds>` argument (CBOR tag `41`). On a raw-NAN target this is
+also an awake deadline: the target remains awake for the bounded timeout while
+executing the command and flushing its response. The firmware clamps this to
+the same finite session limit as other wake requests; an absent or non-positive
+timeout does not keep the radio active.
+
+For a powered ESP gateway, lmesh's `esp.active gateway=<infra> target=<id>
+active_ms=<n>` queues `mode active_ms=<n>` as an addressed raw-NAN command. The
+gateway drains both follow-up and SDF queues only after a fresh beacon and
+inside the configured DW, so the request remains compliant with DW timing.
+This path is the intended replacement for routine USB activation of remote
+sleepy nodes.
+
+The reverse data path is symmetric:
+
+* A sleepy ESP that receives LoRa/NAN data queues its response for the next
+  DW; an infrastructure ESP (such as lora1) is already awake and sends the
+  response immediately when the current DW permit is open.
+* A target-specific Android SDF with the UART/control wake flag opens the ESP's
+  bounded command window. A SDF with the BLE wake flag starts the ESP NimBLE
+  CoC server and opens the bounded CoC window.
+* If the ESP has pending application data, it starts BLE and advertises the
+  payload-pending event. Android uses that event to initiate CoC. Android can
+  make the corresponding request by publishing its own target-specific
+  “I-want-to-talk” service advertisement; the ESP scans only during its
+  scheduled rendezvous window.
+
+These advertisements are control-plane rendezvous, not the data transport.
+After the bounded window is established, CoC or ESP-NOW/follow-up frames may
+be exchanged at any time until the deadline; otherwise all raw-NAN data stays
+DW0/DW-stride gated.
 
 When a recent NAN beacon exists, its TSF aligns the next active window. In the
 absence of a source the device uses its local duty timer. The current lab
@@ -100,17 +155,44 @@ measurements are board-specific: `lora2` settles around 18 mA and `lora4`
 around 12 mA between raw-NAN wake spikes. Do not treat those as a release
 power specification.
 
-The scheduler sleeps until the current runtime wake margin before the selected
-DW0/DW-stride slot, then stays awake only for `nan.active_ms`. After a beacon is
-received the margin is reduced by 1 ms; after a missed beacon it is increased by
-5 ms (bounded to 1..100 ms). The slot phase is unchanged. `mode status=true`
+The scheduler sleeps until the configured guard (40 ms by default) before the selected
+DW0/DW-stride slot, then stays awake only for the NAN post-beacon dwell (32 ms
+plus scheduler polling latency). A missing or unexpected-slot beacon is
+recorded as a miss/late event and does not retune the schedule automatically;
+this keeps source timing, channel loss, and local radio-start latency
+distinguishable. `mode status=true`
 reports `nan_wake_early_ms`, `nan_last_wake_to_beacon_us`, and
-`nan_last_beacon_to_sleep_us` for tuning and loss detection.
+`nan_last_beacon_to_sleep_us` for tuning and loss detection. The wake-to-beacon
+measurement starts immediately before Wi-Fi/monitor bring-up, so it includes
+radio startup rather than only the promiscuous callback interval.
+Those two `nan_last_*` values update only for a beacon in the expected DW;
+stale or adjacent-slot observations are reported as misses/late events and do
+not replace the successful timing sample.
 
-For a timing-only power experiment, set `uart.hb_every=4` on a stride-8 node;
-that permits one UART activation about every 16 seconds while leaving the NAN
-DW0/DW8 schedule unchanged. Restore `1` before interactive command or
-reliability tests.
+For a compact bounded sample, use `nan timing=true`; it returns the margin,
+selected-window counts, first-frame, beacon, post-beacon, and miss timings
+without the full NAN or mode dump.
+
+Margin experiments should use `mode nan_early_ms=<n> save=true` and retain a
+no-command soak for each candidate. If the running image does not include this
+command, change the default and deploy through the documented Wi-Fi recovery
+path; do not use USB flashing as a routine experiment. Do not infer a safe
+smaller margin from one successful window: compare
+`nan_last_wake_to_first_frame_us`, expected-beacon loss, and the
+adjacent-slot/phase counters over many selected DWs.
+
+For a timing-only power experiment, set `uart.hb_every=16` on a stride-8 node;
+that permits one UART activation about every 64 seconds while leaving the NAN
+DW0/DW8 schedule unchanged. Use `4` for a shorter approximately 16-second
+diagnostic cadence; restore `1` before interactive command or reliability tests.
+
+The checked-in soak harness exposes the same cadence controls:
+`scripts/raw-nan-soak.sh --dw-stride 8 --early-ms 40` is the 4 s baseline;
+repeat with `--dw-stride 4` and `--dw-stride 2` only after recording a fresh
+no-command baseline. The selected stride changes the rendezvous schedule and
+the advertised Device Capability/Availability bitmap; it
+does not change the NAN Availability bitmap, which must remain consistent with
+the advertised wake slots.
 
 ## Sync Source Selection
 
@@ -133,6 +215,24 @@ it has no usable source, it runs a bounded management-beacon recovery listen:
 Counters in `mode status=true`, `nan stats=true`, and `xstatus` show NAN DW
 activity, source choice, AP recovery runs, beacon freshness, misses, and
 timing drift. Verify counters rather than assuming a source is present.
+`nan beacon_history=true` returns the bounded
+`(sequence, TSF, local_us, source_mac)` history for comparing a powered
+observer with a sleepy node. `source_mac` is the transmitter address from the
+802.11 beacon header. It is diagnostic attribution only: all beacons from the
+currently selected NAN cluster are still accepted for cluster tracking. The
+current lora1 capture showed one dominant source with roughly 180 ms TSF
+spacing, not a single 512-TU cadence, so timing must not assume that the most
+recent beacon alone identifies DW0/DW8.
+
+Use `nan beacon_stats=reset` before a measurement and
+`nan beacon_stats=true` for the bounded, beacon-only reference. This excludes
+service descriptors, follow-ups, other management frames, and foreign NAN
+clusters. The response reports the selected BSSID, interval, stride, accepted
+beacons, selected slots seen/missed, duplicate beacons in one slot, TSF
+regressions, phase range/span, and TSF/local receive deltas. When NAN is stale and
+AP fallback is selected, the same counters switch to `source=ap` and use the
+advertised AP beacon interval. The counters are observational and resettable;
+they do not retune the scheduler.
 
 ## Powered AP Fallback
 
@@ -154,13 +254,20 @@ or enter the raw NAN duty sleep path. In `auto`, a fresh NAN beacon stops the
 fallback AP and returns the owner to NAN watch mode. `ap_only` starts the AP
 immediately and is intended for repeatable laboratory tests.
 
-An AP owner has no raw-NAN sleep callback, so it emits the same bounded UART
-heartbeat on the saved `nan.wake_ms` cadence. This keeps the lmesh CBOR modem
-forward usable while the owner is powered and hosting the AP.
+An infrastructure/AP owner is a powered, always-on role. It does not enter
+light sleep, does not use battery wake/heartbeat windows, and keeps UART
+powered continuously for the lmesh CBOR modem forward. The `uart.hb_every`
+setting applies only to non-infrastructure duty-cycled nodes; it must not be
+used to infer an AP owner's reachability cadence.
+
+The `mode`, NAN, and heartbeat settings are stored in the writable `dmesh`
+NVS namespace. After changing a profile, verify it after reset; a sleepy node
+must report `mode=sleepy`, `nan.ap_owner=false`, and its configured heartbeat
+cadence before starting a timing run.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `nan.ap_owner` | `false` | Enables powered gateway timing-source behavior. |
+| `nan.ap_owner` | `false` | Legacy profile hint; `mode=infra` is always the powered owner. Use `nan.sync_source=ap_only` to force the fallback AP immediately. |
 | `nan.ap_loss_ms` | 5000 ms | NAN absence before starting the fallback AP. |
 | `nan.ap_beacon_tu` | 500 TU | AP beacon interval. ESP-IDF requires a multiple of 100 TU. In AP fallback, `TSF / beacon_interval mod nan.dw_stride` defines AP-DW0 and subsequent selected slots; a fresh NAN beacon replaces this with the 512-TU NAN grid. |
 | `nan.dw_stride` | 8 | Use DW0 and every eighth source slot: NAN-DW0/NAN-DW0+8 or AP-DW0/AP-DW0+8 (about 4.19 seconds at 512 TU). |

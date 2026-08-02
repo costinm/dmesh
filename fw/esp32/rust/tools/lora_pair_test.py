@@ -7,7 +7,7 @@ import argparse
 import threading
 import time
 
-from serial_cmd import Console
+from lmesh_diag import Console
 
 
 def require_ok(output: str, context: str) -> None:
@@ -31,8 +31,6 @@ def main() -> int:
     rx = Console(args.rx, 460800, args.timeout)
     tx = Console(args.tx, 460800, args.timeout)
     try:
-        rx.wake_probe()
-        tx.wake_probe()
         require_ok(run(rx, "lora rx=false", args.timeout), "rx stop background")
         require_ok(run(tx, "lora rx=false", args.timeout), "tx stop background")
         time.sleep(0.5)

@@ -83,7 +83,7 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         return Ok(());
     }
 
-    // A DTR/PRG wake owns the next active window. Do not let the NAN duty
+    // A physical PRG wake owns the next active window. Do not let the NAN duty
     // scheduler suspend UART again while the operator is still using the
     // console or while a command response is being emitted.
     if super::serial::is_active() {
@@ -95,10 +95,9 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
     {
         // Do not rely on automatic PM here. The S3 has long-lived Wi-Fi and
         // system tasks, so a FreeRTOS notification wait can remain runnable
-        // while tickless idle never calls into light sleep. GPIO0 is shared by
-        // physical PRG and the CP210x DTR line and is the explicit console
-        // wake source; leave UART RX out of the sleep mask because its level
-        // detector can remain asserted by the bridge and reject the request.
+        // while tickless idle never calls into light sleep. GPIO0 is the
+        // physical PRG wake source; leave UART RX out of the sleep mask because
+        // its level detector can remain asserted by a diagnostic host.
         configure_light_wake_sources(settings, sleep_ms, false, false, true, false)?;
         super::serial::suspend_for_light_sleep();
         RAW_NAN_LIGHT_RUNS.fetch_add(1, Ordering::Relaxed);
@@ -112,9 +111,7 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
         let cause = unsafe { sys::esp_sleep_get_wakeup_cause() };
         RAW_NAN_LIGHT_LAST_CAUSE.store(cause as u32, Ordering::Relaxed);
         RAW_NAN_LIGHT_LAST_RET.store(ret as u32, Ordering::Relaxed);
-        // GPIO0 is both PRG and the CP210x DTR line. DTR is a pulse, so the
-        // level may already be released when esp_light_sleep_start returns.
-        // It is the only GPIO source armed for this S3 raw-NAN interval;
+        // GPIO0 is the only GPIO source armed for this S3 raw-NAN interval;
         // LoRa DIO is intentionally not registered here.
         if cause == sys::esp_sleep_source_t_ESP_SLEEP_WAKEUP_GPIO {
             super::serial::rearm_after_wake();
@@ -130,9 +127,9 @@ pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> 
 
     #[cfg(not(target_feature = "esp32s3ops"))]
     {
-        // Classic ESP32 keeps UART RX wake armed in idle. ESP32-S3 uses GPIO0/DTR
-        // instead: its UART wake detector can be left asserted by the USB-UART
-        // bridge and rejects the sleep request before the timer can run.
+        // Classic ESP32 keeps UART RX wake armed in idle. ESP32-S3 uses GPIO0
+        // instead: its UART wake detector can be left asserted by a diagnostic
+        // host and rejects the sleep request before the timer can run.
         // Raw-NAN has already stopped Wi-Fi before this interval. Its scheduler
         // resumes the modem from its timer deadline, so do not register Wi-Fi,
         // beacon, or BT wake sources here. On ESP32-S3 those inactive sources make
@@ -1203,7 +1200,7 @@ fn configure_light_wake_sources(
         }
     }
     if let Some(pin) = button_gpio {
-        telemetry::record_log(format!("ev=sleep.light_wake source=button gpio={}", pin));
+        telemetry::record_log(format!("ev=sleep.light_wake armed=prg gpio={}", pin));
     }
     Ok(())
 }

@@ -9,20 +9,92 @@ used when a device sleeps with Wi-Fi off between discovery windows.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import statistics
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dmesh.lab import ArtifactWriter, PowerCollector, PowerMeterConfig
-from dmesh.radio import RadioClient
+from dmesh.radio import parse_text_record
+
+
+ROOT = Path(os.environ.get("DMESH_ROOT", Path(__file__).resolve().parents[4]))
+
+
+class ManagedRadioResult:
+    """Small CommandResult-compatible wrapper for mesh/lmesh JSON replies."""
+
+    def __init__(self, command: str, raw: str, records: list[dict]):
+        self.command = command
+        self.raw = raw
+        self.records = records
+
+    def record(self, record_type=None):
+        candidates = self.records
+        if record_type is not None:
+            candidates = [item for item in candidates if item["type"] == record_type]
+        if not candidates:
+            raise KeyError(f"response to {self.command!r} has no {record_type!r}: {self.raw[-300:]!r}")
+        return candidates[-1]
+
+
+class ManagedRadioClient:
+    """Issue framed firmware commands through the supervised lmesh API."""
+
+    def __init__(self, role: str, timeout: float = 15.0):
+        self.role = role.removesuffix(".lmesh")
+        self.timeout = timeout
+
+    def connect(self):
+        return self
+
+    def close(self):
+        return None
+
+    def command(self, command: str, timeout: float | None = None, expected=None):
+        del expected
+        limit = int(timeout or self.timeout)
+        proc = subprocess.run(
+            [
+                str(ROOT / "scripts" / "with-env.sh"),
+                "mesh",
+                "lmesh",
+                "esp.serial.command",
+                f"port={self.role}",
+                f"command={command}",
+                f"timeout_sec={limit}",
+            ],
+            cwd=ROOT,
+            env=os.environ.copy(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=limit + 15,
+            check=True,
+        )
+        outer = json.loads(proc.stdout)
+        data = outer.get("data", {})
+        if data.get("ok") is False:
+            raise TimeoutError(data.get("error", f"managed command failed: {proc.stdout[-300:]!r}"))
+        records = []
+        for message in data.get("messages", []):
+            console = message.get("console", "")
+            for line in console.splitlines():
+                record = parse_text_record(line)
+                if record is not None:
+                    records.append(record)
+        return ManagedRadioResult(command, proc.stdout, records)
 
 
 RAW_NAN_SETTINGS = (
-    "nvs op=set mode=infra wifi.mode=nan power.profile=auto "
+    "nvs op=set mode={mode} wifi.mode=nan power.profile=auto "
     "nan.backend=raw nan.boot=true nan.role=both nan.service=dmesh nan.channel={channel} "
     "nan.wake_ms={wake_ms} nan.active_ms={active_ms} nan.light_sleep=true "
-    "nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0 lora.enabled=false"
+    "nan.early_ms={early_ms} nan.dw_tu=512 nan.dw_off_tu=0 nan.dw_stride={dw_stride} "
+    "nan.ap_owner={ap_owner} uart.hb_every={hb_every} lora.enabled=false"
 )
 
 
@@ -33,7 +105,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--meter", default="power1.lmesh")
     parser.add_argument("--channel", type=int, default=6)
     parser.add_argument("--wake-ms", type=int, default=4000)
-    parser.add_argument("--active-ms", type=int, default=250)
+    parser.add_argument("--active-ms", type=int, default=64)
+    parser.add_argument(
+        "--early-ms",
+        type=int,
+        default=40,
+        help="Pre-wake guard in milliseconds for a deliberate margin experiment.",
+    )
+    parser.add_argument(
+        "--dw-stride",
+        type=int,
+        default=8,
+        help="Selected NAN DW stride: 8≈4 s, 4≈2 s, 2≈1 s at 512 TU.",
+    )
     parser.add_argument("--duration-sec", type=float, default=80.0)
     parser.add_argument(
         "--quiet-settle-sec",
@@ -53,24 +137,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def fresh_command(client: RadioClient, command: str, timeout: float, *, expected: str | None = None):
-    """Issue one control request through a fresh lmesh-managed UART stream.
-
-    A new UDS connection invokes lmesh's DTR/preflight sequence. Do not send a
-    second in-band ``dtr`` request here: that turns one diagnostic snapshot
-    into two nested wake windows and makes the power soak spend most of its
-    time waiting for the console rather than observing the duty cycle.
-    """
-    client.close()
-    client.connect()
+def fresh_command(client: ManagedRadioClient, command: str, timeout: float, *, expected: str | None = None):
+    """Issue one framed control request through the managed lmesh API."""
     return client.command(command, timeout=timeout, expected=expected)
 
 
-def stats(client: RadioClient, timeout: float) -> dict:
+def stats(client: ManagedRadioClient, timeout: float) -> dict:
     return fresh_command(client, "nan stats=true", timeout).record("nan")["fields"]
 
 
-def sleep(client: RadioClient, timeout: float) -> dict:
+def sleep(client: ManagedRadioClient, timeout: float) -> dict:
     return fresh_command(client, "sleep status=true", timeout).record("sleep")["fields"]
 
 
@@ -93,43 +169,53 @@ def phase_summary(samples) -> dict:
     }
 
 
-def configure(client: RadioClient, args: argparse.Namespace) -> None:
+def configure(client: ManagedRadioClient, args: argparse.Namespace, *, infra: bool) -> None:
+    mode = "infra" if infra else "sleepy"
     fresh_command(
         client,
         RAW_NAN_SETTINGS.format(
+            mode=mode,
+            ap_owner="true" if infra else "false",
+            hb_every=1 if infra else 16,
             channel=args.channel,
             wake_ms=args.wake_ms,
             active_ms=args.active_ms,
+            early_ms=args.early_ms,
+            dw_stride=args.dw_stride,
         ),
         expected="set",
         timeout=args.timeout,
     )
     fresh_command(client, "power profile=auto", timeout=args.timeout)
-    mode_command = "mode raw_nan=true lora=false channel={}".format(args.channel)
+    mode_command = "mode infra=true save=true" if infra else "mode sleepy=true save=true"
     try:
         fresh_command(client, mode_command, timeout=args.timeout)
     except TimeoutError:
-        # Starting a duty window may suspend UART before its own response has
-        # left the device. Reopen a console window and verify the resulting
-        # radio state instead of retrying the state-changing command.
-        state = stats(client, args.timeout)
-        if not state.get("running"):
-            raise RuntimeError("raw-NAN start lost its response and did not take effect")
-    fresh_command(client, "power reset=true", timeout=args.timeout)
+        if infra:
+            raise
+        # Starting a sleepy duty window may suspend UART before its own
+        # response leaves the device. The role transition has already saved
+        # NVS; do not retry it or turn this into a second wake window.
+    if infra:
+        fresh_command(client, "power reset=true", timeout=args.timeout)
 
 
 def main() -> int:
     args = parse_args()
     if args.active_ms < 50 or args.active_ms > args.wake_ms:
         raise ValueError("active-ms must be at least 50 and no greater than wake-ms")
+    if args.early_ms < 1 or args.early_ms > 2_000:
+        raise ValueError("early-ms must be between 1 and 2000")
+    if args.dw_stride < 1 or args.dw_stride > 64:
+        raise ValueError("dw-stride must be between 1 and 64")
     if args.duration_sec < args.wake_ms / 1000.0 * 3:
         raise ValueError("duration-sec must cover at least three raw-NAN duty windows")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = Path(args.output or "target/esp32-raw-nan-soak/{}".format(stamp))
     artifacts = ArtifactWriter(output)
-    sender = RadioClient(args.sender, timeout=args.timeout)
-    receiver = RadioClient(args.receiver, timeout=args.timeout)
+    sender = ManagedRadioClient(args.sender, timeout=args.timeout)
+    receiver = ManagedRadioClient(args.receiver, timeout=args.timeout)
     meter = PowerCollector(
         PowerMeterConfig("power1", args.meter, "sender", required=True), artifacts
     )
@@ -143,6 +229,8 @@ def main() -> int:
             "channel": args.channel,
             "wake_ms": args.wake_ms,
             "active_ms": args.active_ms,
+            "early_ms": args.early_ms,
+            "dw_stride": args.dw_stride,
             "duration_sec": args.duration_sec,
             "quiet_settle_sec": args.quiet_settle_sec,
             "console_interval_sec": args.console_interval_sec,
@@ -155,8 +243,8 @@ def main() -> int:
     try:
         if not args.no_configure:
             meter.set_phase("configure")
-            configure(sender, args)
-            configure(receiver, args)
+            configure(sender, args, infra=True)
+            configure(receiver, args, infra=False)
 
         meter.set_phase("baseline")
         before_sender = stats(sender, args.timeout)

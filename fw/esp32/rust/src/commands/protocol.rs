@@ -57,6 +57,7 @@ pub fn command_id(name: &str) -> Option<u16> {
         "nvs" => 66,
         "radio" => 67,
         "recovery" => 68,
+        "reset" | "rst" => 69,
         _ => return None,
     })
 }
@@ -99,6 +100,7 @@ pub fn command_name(id: u16) -> Option<&'static str> {
         66 => "nvs",
         67 => "radio",
         68 => "recovery",
+        69 => "reset",
         _ => return None,
     })
 }
@@ -154,7 +156,7 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "save" => 78,
         "wake_ms" => 79,
         "active_ms" => 80,
-        "early_ms" => 81,
+        "early_ms" | "nan_early_ms" | "wake_early_ms" => 81,
         "dw_tu" => 82,
         "dw_off_tu" | "offset_tu" => 83,
         "channel" => 84,
@@ -187,6 +189,8 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "keep_active" => 353,
         "bonding" => 354,
         "link_profile" => 355,
+        "sleepy" => 356,
+        "battery" => 357,
         "pairable" => 108,
         "raw_adv" => 109,
         "announce" => 110,
@@ -246,6 +250,13 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "availability_map" => 398,
         "sdea_update" => 399,
         "service_history" => 400,
+        "beacon_history" => 401,
+        "beacon_stats" => 404,
+        "response_history" => 405,
+        // Targeted DW-gated rendezvous SDFs. These are firmware-private
+        // fields shared with lmesh's `nan uart_wake`/`ble_wake` helpers.
+        "uart_wake" => 402,
+        "ble_wake" => 403,
         "uart.hb_every" => 387,
         "battery.divider" => 163,
         "battery.mult" => 164,
@@ -583,6 +594,16 @@ mod tests {
     #[test]
     fn service_history_has_a_stable_cbor_tag() {
         assert_eq!(arg_tag("service_history"), Some(400));
+    }
+
+    #[test]
+    fn beacon_history_has_a_stable_cbor_tag() {
+        assert_eq!(arg_tag("beacon_history"), Some(401));
+    }
+
+    #[test]
+    fn beacon_stats_has_a_stable_cbor_tag() {
+        assert_eq!(arg_tag("beacon_stats"), Some(404));
     }
 
     #[test]

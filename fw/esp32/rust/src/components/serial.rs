@@ -15,7 +15,9 @@ pub const DEFAULT_ACTIVE_MS: u32 = 2_000;
 /// This is the battery-node host rendezvous: it lets lmesh flush one queued
 /// CBOR command during the already scheduled radio window.  It does not add a
 /// wake or keep UART powered between raw-NAN windows.
-pub const DEFAULT_RAW_NAN_HEARTBEAT_EVERY: i32 = 1;
+/// Keep the console rendezvous out of most battery wake windows. Infrastructure
+/// mode overrides this with its continuously active UART policy.
+pub const DEFAULT_RAW_NAN_HEARTBEAT_EVERY: i32 = 16;
 const MIN_ACTIVE_MS: u32 = 2_000;
 #[cfg(target_feature = "esp32s3ops")]
 const UART_REQUIRES_APB_LOCK: bool = false;
@@ -39,7 +41,7 @@ static UART0_ACTIVE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 static UART0_ALWAYS_ON: AtomicBool = AtomicBool::new(false);
 static UART0_ACTIVE_WINDOW_MS: AtomicU32 = AtomicU32::new(DEFAULT_ACTIVE_MS);
 static UART0_DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
-static UART0_SUSPENDED_UNTIL_DTR: AtomicBool = AtomicBool::new(false);
+static UART0_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static UART0_SUSPEND_AFTER_RESPONSE: AtomicBool = AtomicBool::new(false);
 static UART0_UNINSTALL_AFTER_RESPONSE: AtomicBool = AtomicBool::new(false);
 static UART0_DRIVER_INSTALLED: AtomicBool = AtomicBool::new(true);
@@ -49,6 +51,7 @@ static UART0_TX_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(core:
 static UART0_FRAME_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
 static UART0_TX_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
 static UART0_RX_EVENTS: AtomicU32 = AtomicU32::new(0);
+static UART0_RX_BREADCRUMB: AtomicBool = AtomicBool::new(false);
 static UART0_RX_DROPS: AtomicU32 = AtomicU32::new(0);
 static UART0_RX_ERRORS: AtomicU32 = AtomicU32::new(0);
 static UART0_TX_DROPS_IDLE: AtomicU32 = AtomicU32::new(0);
@@ -116,7 +119,7 @@ pub fn measurement_status_fields() -> String {
         "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_frame_drop={} uart_escape_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_hb_every={} uart_hb_wakes={} uart_hb_sent={} uart_hb_dropped={} uart_hb_window_ms={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
         UART0_DRIVER_INSTALLED.load(Ordering::Relaxed),
         is_active(),
-        !UART0_SUSPENDED_UNTIL_DTR.load(Ordering::Relaxed),
+        !UART0_SUSPENDED.load(Ordering::Relaxed),
         UART0_RX_EVENTS.load(Ordering::Relaxed),
         UART0_RX_DROPS.load(Ordering::Relaxed),
         UART0_RX_ERRORS.load(Ordering::Relaxed),
@@ -432,6 +435,18 @@ pub fn is_active() -> bool {
         && (UART0_ALWAYS_ON.load(Ordering::Relaxed) || UART0_APB_LOCK_HELD.load(Ordering::Relaxed))
 }
 
+/// Whether UART was explicitly opened as a bounded interactive window.
+///
+/// Infrastructure nodes hold the UART power lock permanently so that the
+/// managed lmesh forward never disappears.  That persistent lock must not
+/// turn a queued NAN packet into an arbitrary-time transmission to a sleepy
+/// peer; callers that need to bypass DW gating must use this predicate.
+pub fn interactive_active() -> bool {
+    UART0_DEBUG_ENABLED.load(Ordering::Relaxed)
+        && !UART0_ALWAYS_ON.load(Ordering::Relaxed)
+        && UART0_APB_LOCK_HELD.load(Ordering::Relaxed)
+}
+
 /// Keep the infrastructure UART and its power lock active continuously.
 pub fn set_always_on(enabled: bool) {
     UART0_ALWAYS_ON.store(enabled, Ordering::Release);
@@ -457,17 +472,17 @@ pub fn set_debug_enabled(enabled: bool) {
 /// Called from the UART event task as soon as RX data arrives.
 ///
 /// This runs before the main task parses the line. RX extends an open debug
-/// window, but a console suspended for measurement remains closed until PRG/DTR
-/// wakes it.
+/// window. A quiet console is reopened by the next framed UART/radio
+/// rendezvous, never by modem-control lines.
 pub fn note_rx_activity() {
     if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
         return;
     }
-    UART0_SUSPENDED_UNTIL_DTR.store(false, Ordering::Release);
+    UART0_SUSPENDED.store(false, Ordering::Release);
     set_debug_enabled(true);
 }
 
-/// Restore UART RX after a GPIO/DTR light-sleep wake.
+/// Restore UART RX after a light-sleep wake.
 ///
 /// ESP-IDF can leave the UART RX interrupt disabled after a GPIO wake even
 /// though the UART peripheral and its driver queue remain installed. Re-arm
@@ -476,7 +491,7 @@ pub fn rearm_after_wake() {
     if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
         return;
     }
-    UART0_SUSPENDED_UNTIL_DTR.store(false, Ordering::Relaxed);
+    UART0_SUSPENDED.store(false, Ordering::Relaxed);
     unsafe {
         let _ = sys::uart_set_wakeup_threshold(sys::uart_port_t_UART_NUM_0, 3);
         let _ = sys::uart_enable_rx_intr(sys::uart_port_t_UART_NUM_0);
@@ -485,8 +500,8 @@ pub fn rearm_after_wake() {
 }
 
 /// Close the console immediately after the current command response is sent.
-/// A PRG/DTR GPIO wake is then required before UART can be used again.
-pub fn request_suspend_until_dtr() {
+/// The next scheduled UART/radio rendezvous can reopen it.
+pub fn request_suspend_after_response() {
     UART0_SUSPEND_AFTER_RESPONSE.store(true, Ordering::Relaxed);
 }
 
@@ -498,21 +513,21 @@ pub fn finish_pending_suspend() -> bool {
     }
     // "quiet" suppresses TX and permits light sleep. RX remains armed so a
     // line (or its wake preamble) is sufficient to reopen the console.
-    UART0_SUSPENDED_UNTIL_DTR.store(false, Ordering::Relaxed);
+    UART0_SUSPENDED.store(false, Ordering::Relaxed);
     UART0_DEBUG_ENABLED.store(false, Ordering::Relaxed);
     UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Relaxed);
     release_apb_lock();
     true
 }
 
-/// Power down UART RX while retaining the independent GPIO/DTR wake.
+/// Release UART power locks while retaining the normal framed RX wake.
 pub fn suspend_for_light_sleep() {
     if UART0_ALWAYS_ON.load(Ordering::Acquire) {
         return;
     }
     // Keep RX interrupt and UART wake armed. The ingress task turns received
     // bytes into a console-active window; disabling RX here made sleeping
-    // boards require a physical DTR edge and stranded remote consoles.
+    // boards otherwise stranded remote diagnostic consoles.
     release_apb_lock();
 }
 
@@ -740,6 +755,12 @@ unsafe extern "C" fn uart_manager_task(arg: *mut c_void) {
         match event.type_ {
             x if x == sys::uart_event_type_t_UART_DATA => {
                 UART0_RX_EVENTS.fetch_add(1, Ordering::Relaxed);
+                if !UART0_RX_BREADCRUMB.swap(true, Ordering::AcqRel) {
+                    // One ROM breadcrumb distinguishes a working UART RX
+                    // event path from a board/bridge that only transmits
+                    // boot text. It is deliberately once-per-boot.
+                    rom_print(b"dm-rs uart rx_event=first\r\n\0");
+                }
                 note_rx_activity();
                 drain_driver_rx(&mut parser);
             }

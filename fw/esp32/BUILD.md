@@ -27,7 +27,8 @@ Successful build outputs:
 - `fw/esp32/build/bootloader/bootloader.bin`
 - `fw/esp32/build/partition_table/partition-table.bin`
 
-Legacy direct flash command from ESP-IDF after a successful build:
+Legacy direct flash command from ESP-IDF after a successful build (development
+only; never use it for Main on a provisioned board):
 
 ```bash
 cd fw/esp32
@@ -44,9 +45,41 @@ scripts/build-recovery-fleet.sh all
 ```
 
 Artifacts are kept under `target/flash/` and `target/recovery-fleet/`.
-Direct USB flashing is only for initial provisioning or emergency repair. Once
-Main is installed, use `scripts/flash-main-command.py` through managed lmesh;
-CBOR starts the session and the image travels as a raw `DRS1` TCP stream.
+USB flashing is limited to initial provisioning or emergency repair of the
+stage-2 and Recovery partitions. Never use USB to replace Main on a provisioned
+board. Once stage-2/Recovery are installed, the supported Main update is:
+
+```bash
+# mesh-init should run docs/lab/recovery-tcp-server.toml continuously.
+# For a manual development start:
+fw/recovery/tools/flash-server.py
+
+# Then send the Recovery-start command for each board.
+python3 fw/recovery/tools/flash-main-command.py e5
+# server, port, saved SSID, and MAC-derived IP use defaults
+```
+
+Optional network values are saved in
+`target/flash-devices/network.json`; pass `--ssid` or `--board-ip` once and
+subsequent commands reuse them. An example is in
+`docs/lab/flash-network.json.example`.
+
+The helper sends only the recovery-start command through managed lmesh; the
+Main image is transferred over Wi-Fi by Recovery. It reuses port 3336 for
+successive boards. Do not invoke `idf.py flash`, `flash-fw.sh`, or an esptool
+Main-image command for routine updates. The older
+`update-main-wifi-fleet.py` remains a per-board/temporary-listener test helper,
+not the canonical persistent-server procedure.
+
+Main-update logs are available in:
+
+- `target/recovery-server/all-3336.log` when using
+  `fw/recovery/tools/start-server.sh` (or the compatibility wrapper
+  `scripts/start-recovery-server.sh`);
+- `target/flash-devices/<mac-without-colons>/`, especially `device.json`,
+  `flashes/*.json`, `current.sha256`, and `flash-history.jsonl`;
+- `target/evidence/flash/` and the active managed serial capture at
+  `target/lmesh-radio-build/log/serial.log`.
 
 For Rust ESP development, source the same environment. `env.sh` owns
 the repo-local Nix profile, ESP-IDF tools, ESP Python environment, Cargo home,

@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -10,6 +10,7 @@ use super::telemetry;
 
 const MODE_COMPANION: u8 = 0;
 const MODE_INFRA: u8 = 1;
+const MODE_SLEEPY: u8 = 2;
 const DEFAULT_ADV_MS: u32 = 1_000;
 const DEFAULT_PENDING_ADV_MS: u32 = 1_500;
 const DEFAULT_WINDOW_MS: u32 = 10_000;
@@ -17,11 +18,26 @@ const DEFAULT_ACTIVE_MS: u32 = 5_000;
 const DEFAULT_PENDING_WINDOW_MS: u32 = 30_000;
 const DEFAULT_WAKE_MS: u32 = 30_000;
 const DEFAULT_NAN_DUTY_MS: u32 = 4_000;
-const DEFAULT_NAN_ACTIVE_MS: u32 = 250;
-const DEFAULT_NAN_WAKE_EARLY_MS: u32 = 5;
+// The active interval is the NAN receive/data dwell, not the radio resume
+// margin. The scheduler adds the measured pre-wake margin separately.
+const DEFAULT_NAN_ACTIVE_MS: u32 = 64;
+// Fixed pre-wake guard. Packet loss is intentionally diagnostic only; it must
+// not retune the schedule because a missed 802.11 frame is not evidence that
+// the local clock or radio-start latency changed.
+const NAN_WAKE_MARGIN_MIN_MS: u32 = 1;
+// Keep the bounds explicit for diagnostics and future controlled experiments.
+// The current production profile does not adapt this value at runtime: a
+// missed frame can be caused by the NAN publisher or channel occupancy, not by
+// local startup latency, so changing the schedule automatically would hide
+// the failure mode.
+const NAN_WAKE_MARGIN_MAX_MS: u32 = 2_000;
+const DEFAULT_NAN_WAKE_EARLY_MS: u32 = 40;
 const DEFAULT_NAN_DW_TU: u32 = 512;
 const DEFAULT_NAN_DW_OFFSET_TU: u32 = 0;
-const DEFAULT_AP_LOSS_MS: u32 = 5_000;
+// Keep the last NAN TSF usable across the normal 4 s duty interval and a
+// delayed UART/active window, while still forcing recovery when the cluster
+// has been absent for a bounded period.
+const DEFAULT_AP_LOSS_MS: u32 = 15_000;
 const DEFAULT_AP_RECOVERY_MS: u32 = 32_000;
 const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = 1_200;
 // ESP-IDF requires SoftAP beacon intervals to be multiples of 100 TU. The AP
@@ -29,6 +45,7 @@ const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = 1_200;
 // 512-TU NAN DW grid below.
 const DEFAULT_AP_BEACON_TU: u16 = 500;
 const RAW_NAN_DW_HISTORY_LEN: usize = 8;
+const RAW_NAN_TIMING_HISTORY_LEN: usize = 32;
 const RAW_NAN_DW_FLAG_DW0: u32 = 1 << 0;
 const RAW_NAN_DW_FLAG_SYNC: u32 = 1 << 1;
 const RAW_NAN_DW_FLAG_BEACON: u32 = 1 << 2;
@@ -57,7 +74,6 @@ static RAW_NAN_RECOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AP_OWNER_RUNNING: AtomicBool = AtomicBool::new(false);
 static AP_OWNER_AP_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AP_OWNER_STARTED_MS: AtomicU32 = AtomicU32::new(0);
-static AP_OWNER_UART_NEXT_MS: AtomicU32 = AtomicU32::new(0);
 static AP_OWNER_STARTS: AtomicU32 = AtomicU32::new(0);
 static AP_OWNER_STOPS: AtomicU32 = AtomicU32::new(0);
 // Infra active mode is a runtime-only override for a powered gateway or a
@@ -70,6 +86,9 @@ static INFRA_ACTIVE_STOPS: AtomicU32 = AtomicU32::new(0);
 static INFRA_ACTIVE_EXPIRES: AtomicU32 = AtomicU32::new(0);
 static INFRA_ACTIVE_UART_EXTENDS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_BASELINE: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_EXPECT_EXTENDS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_MISS_PROBES: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_MISS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_EXPECT_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_EXPECT_TSF_HI: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_EXPECT_PERIOD_US: AtomicU32 = AtomicU32::new(0);
@@ -77,8 +96,18 @@ static RAW_NAN_WINDOW_START_US_LO: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_WINDOW_START_US_HI: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LAST_WAKE_TO_BEACON_US: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LAST_BEACON_TO_SLEEP_US: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_WAKE_TO_FIRST_FRAME_US: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_WAKE_TO_FIRST_FRAME_US: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LAST_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_EXPECT_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_EXPECT_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_NOW_LO: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_LAST_MISS_NOW_HI: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_MISS_BACKOFF_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_SEEN: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_BEACON_MISSED: AtomicU32 = AtomicU32::new(0);
@@ -89,8 +118,9 @@ static RAW_NAN_DW_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DW0_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DW_SYNC_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DW_EARLY_WAKE_TOTAL: AtomicU32 = AtomicU32::new(0);
-// Runtime-only wake margin. It starts at nan.early_ms and is reduced after
-// successful beacon reception, then increased after a missed window.
+// Runtime copy of the configured nan.early_ms guard. It changes only on boot
+// or an explicit `mode nan_early_ms=...` experiment; no feedback loop adapts
+// it from individual beacon outcomes.
 static RAW_NAN_WAKE_EARLY_MS: AtomicU32 = AtomicU32::new(DEFAULT_NAN_WAKE_EARLY_MS);
 static RAW_NAN_DW_ACTIVE_SEQ: AtomicU32 = AtomicU32::new(0);
 // The data plane is permitted only for the short interval immediately after a
@@ -102,6 +132,23 @@ static RAW_NAN_DATA_DW_DEADLINE_HI: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DATA_DW_PERIOD_US: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_DATA_DW_STRIDE: AtomicU32 = AtomicU32::new(8);
 const RAW_NAN_DATA_DW_DWELL_US: u64 = 32_000;
+// The duty deadline must include the adaptive pre-wake margin.  Otherwise a
+// margin larger than `nan.active_ms` turns a deliberately early wake into a
+// missed beacon because Wi-Fi is stopped before the target DW arrives.
+const RAW_NAN_DATA_DW_DWELL_MS: u32 = 32;
+// The callback may arrive well after the nominal wake margin while the
+// ESP32 radio/driver resumes. Keep a bounded receive floor so the first
+// preceding beacon can extend the window to the selected sparse DW.
+// Keep a small lower bound for driver polling and the 32 ms NAN data dwell;
+// synchronized windows otherwise use wake_margin + dwell. Recovery windows
+// have their own longer configured listen interval.
+const RAW_NAN_BEACON_LISTEN_FLOOR_MS: u32 = 64;
+// A 512-TU discovery window is 524,288 us. The beacon's phase within that
+// window can move substantially when the source is an Android/host NAN
+// publisher. The rendezvous contract is the selected DW0/DW8 slot, not a
+// particular phase inside it, so accept any phase in the same slot. The slot
+// index check below still rejects a beacon from DW0/DW8's neighbour.
+const RAW_NAN_BEACON_LATE_TOLERANCE_US: u64 = 512 * 1024 - 1;
 static RAW_NAN_DW_HISTORY_SEQ: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
     [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
 static RAW_NAN_DW_HISTORY_START_MS: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
@@ -110,6 +157,16 @@ static RAW_NAN_DW_HISTORY_BEACONS: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
     [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
 static RAW_NAN_DW_HISTORY_FLAGS: [AtomicU32; RAW_NAN_DW_HISTORY_LEN] =
     [const { AtomicU32::new(0) }; RAW_NAN_DW_HISTORY_LEN];
+static RAW_NAN_TIMING_SEQ: [AtomicU32; RAW_NAN_TIMING_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_TIMING_HISTORY_LEN];
+static RAW_NAN_TIMING_FIRST_FRAME_US: [AtomicU32; RAW_NAN_TIMING_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_TIMING_HISTORY_LEN];
+static RAW_NAN_TIMING_BEACON_US: [AtomicU32; RAW_NAN_TIMING_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_TIMING_HISTORY_LEN];
+static RAW_NAN_TIMING_POST_BEACON_US: [AtomicU32; RAW_NAN_TIMING_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_TIMING_HISTORY_LEN];
+static RAW_NAN_TIMING_FLAGS: [AtomicU32; RAW_NAN_TIMING_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; RAW_NAN_TIMING_HISTORY_LEN];
 static PING_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
 static PING_RESPONSE_NOT_BEFORE_MS: AtomicU32 = AtomicU32::new(0);
 static PING_LAST_REQUEST_HASH: AtomicU32 = AtomicU32::new(0);
@@ -136,8 +193,14 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
 }
 
 pub fn init(settings: &SharedSettings) {
-    PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
-    if let Err(err) = start_infra_radios(settings, "boot") {
+    let mode = configured_mode(settings);
+    PRODUCT_MODE.store(mode, Ordering::Relaxed);
+    let result = if mode == MODE_SLEEPY {
+        start_raw_nan_duty(settings, "boot", get_u32(settings, "nan.channel", 6) as u8)
+    } else {
+        start_infra_radios(settings, "boot")
+    };
+    if let Err(err) = result {
         telemetry::record_log(format!(
             "event type=mode.infra_start ok=false reason=boot msg={}",
             crate::commands::protocol::escape_value(&err.to_string())
@@ -163,8 +226,14 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
     } else {
         "boot_window_done"
     };
-    PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
-    if let Err(err) = start_infra_radios(settings, reason) {
+    let mode = configured_mode(settings);
+    PRODUCT_MODE.store(mode, Ordering::Relaxed);
+    let result = if mode == MODE_SLEEPY {
+        start_raw_nan_duty(settings, reason, get_u32(settings, "nan.channel", 6) as u8)
+    } else {
+        start_infra_radios(settings, reason)
+    };
+    if let Err(err) = result {
         telemetry::record_log(format!(
             "event type=mode.infra_start ok=false reason={} msg={}",
             reason,
@@ -174,6 +243,23 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
 }
 
 pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) -> Result<()> {
+    // Infrastructure mode is a persistent powered role.  Reissuing the mode
+    // command from the managed UART must not tear down and recreate the AP/
+    // raw-NAN callbacks while the command task is servicing that same UART;
+    // doing so can deadlock the Wi-Fi driver and leave the gateway silent.
+    if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA {
+        super::serial::set_always_on(true);
+        if save {
+            settings.borrow_mut().set_str("mode", "infra")?;
+        }
+        telemetry::record_log(format!(
+            "event type=mode active=infra reason={} already_running={} ap_owner_running={}",
+            reason,
+            true,
+            AP_OWNER_RUNNING.load(Ordering::Relaxed)
+        ));
+        return Ok(());
+    }
     PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
     COMPANION_ADVERTISING.store(false, Ordering::Relaxed);
     COMPANION_PENDING_ADVERTISING.store(false, Ordering::Relaxed);
@@ -208,6 +294,12 @@ pub fn poll(settings: &SharedSettings) {
         return;
     }
     poll_infra_active_session();
+    // Infrastructure mode is continuously powered even while AP ownership is
+    // being (re)established. Never let the generic housekeeping path turn
+    // this node into a battery heartbeat/light-sleep participant.
+    if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA {
+        super::serial::set_always_on(true);
+    }
     if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
         poll_ap_owner(settings);
         // The powered AP owner does not run the sleepy raw-NAN duty loop, but
@@ -215,7 +307,12 @@ pub fn poll(settings: &SharedSettings) {
         // raw NAN publish in the common post-beacon dwell guard so its ESP
         // advertisements are not stranded behind the duty-only scheduler.
         let _ = super::nan::drain_publish_on_discovery_window();
-    } else {
+        // The raw command queue uses the same selected-DW gate as service
+        // publishes. Poll it continuously while infra is awake so a command
+        // queued between beacons is released at the next DW, never free-run
+        // transmitted merely because the gateway has power.
+        let _ = super::nan::drain_raw_queue();
+    } else if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_SLEEPY {
         poll_raw_nan_duty(settings);
     }
 
@@ -281,6 +378,30 @@ fn poll_infra_active_session() {
 
 fn infra_radio_hold_active() -> bool {
     infra_active_session_enabled() || targeted_wake_active() || super::serial::is_active()
+}
+
+/// An explicit "I want to talk" window permits immediate raw command/response
+/// traffic after the wake handshake. Sleepy nodes still use DW gating when no
+/// bounded active session is in force.
+pub fn raw_nan_interactive_active() -> bool {
+    // The infrastructure gateway receives its queue over a local UART, but
+    // that UART activity is not permission to transmit over NAN immediately.
+    // lora1 must remain DW-gated; otherwise the frame is emitted hundreds of
+    // milliseconds after the beacon and a sleepy peer has already powered its
+    // radio down.  Only non-infrastructure targets may use the bounded active
+    // session/console exemption.
+    if ap_owner_running() {
+        return false;
+    }
+    // Infrastructure nodes keep the radio and UART awake continuously, but
+    // that does not make every queued packet an arbitrary-time transmission.
+    // A target-specific wake request or an explicit bounded `mode active`
+    // session does, however: the receiver has acknowledged the DW control
+    // frame and is now in the post-DW burst interval for CoC/ESP-NOW-style
+    // traffic. A serial/interactive console remains the local fallback.
+    targeted_wake_active()
+        || infra_active_session_enabled()
+        || super::serial::interactive_active()
 }
 
 fn targeted_wake_active() -> bool {
@@ -537,12 +658,11 @@ fn start_infra_radios(settings: &SharedSettings, reason: &'static str) -> Result
     let channel =
         get_u32(settings, "nan.channel", get_u32(settings, "raw.ch", 6)).clamp(1, 13) as u8;
     if get_bool(settings, "wifi.enabled", true) {
-        if get_bool(settings, "nan.ap_owner", false) {
-            start_ap_owner(settings, reason, channel)?;
-        } else {
-            stop_ap_owner().ok();
-            start_raw_nan_duty(settings, reason, channel)?;
-        }
+        // `mode=infra` is the powered/infrastructure role. It must remain
+        // reachable continuously; battery-node raw-NAN duty cycling is an
+        // explicit non-infrastructure path. `nan.sync_source=ap_only` can
+        // still force the timing-source AP immediately.
+        start_ap_owner(settings, reason, channel)?;
         telemetry::record_log(format!(
             "event type=mode.infra_radio medium=wifi profile=discovery_window channel={} reason={}",
             channel, reason
@@ -649,10 +769,16 @@ fn start_ap_owner(settings: &SharedSettings, reason: &'static str, channel: u8) 
     AP_OWNER_RUNNING.store(true, Ordering::Relaxed);
     super::serial::set_always_on(true);
     AP_OWNER_STARTED_MS.store(now_ms(), Ordering::Relaxed);
-    AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
     AP_OWNER_AP_ACTIVE.store(false, Ordering::Relaxed);
-    RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
-    AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
+    // Infra/AP owners remain awake, but the preferred common clock is still
+    // the shared NAN cluster.  Only an explicit AP-only policy starts with
+    // no NAN source; Auto/NAN modes must be able to receive and DW-gate
+    // follow-ups immediately after observing the cluster.
+    let initial_source = match sync_policy(settings) {
+        SyncPolicy::ApOnly => SYNC_SOURCE_NONE,
+        _ => SYNC_SOURCE_NAN,
+    };
+    RAW_NAN_SYNC_SOURCE.store(initial_source, Ordering::Relaxed);
     super::nan::start_raw_window(channel, "nan")?;
     telemetry::record_log(format!(
         "event type=mode.ap_owner state=watching channel={} reason={} sync_policy={}",
@@ -702,10 +828,10 @@ fn start_ap_owner_fallback(settings: &SharedSettings, channel: u8) -> Result<()>
 
 fn poll_ap_owner(settings: &SharedSettings) {
     // Infrastructure/AP owners are deliberately always reachable. Keep the
-    // UART powered for the lifetime of AP ownership; sleepy-node duty windows
-    // do not apply while infrastructure mode is selected.
+    // UART powered for the lifetime of AP ownership. There is no heartbeat
+    // cadence or battery wake window in infrastructure mode; sleepy-node duty
+    // scheduling does not apply while infrastructure mode is selected.
     super::serial::set_always_on(true);
-    AP_OWNER_UART_NEXT_MS.store(0, Ordering::Relaxed);
     let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
     let policy = sync_policy(settings);
     let nan_fresh = super::nan::nan_beacon_age_ms()
@@ -726,6 +852,16 @@ fn poll_ap_owner(settings: &SharedSettings) {
     }
 
     RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NAN, Ordering::Relaxed);
+    // Infrastructure nodes stay awake, but they still need the shared NAN
+    // TSF/512-TU grid as their transmit reference.  The sleepy scheduler
+    // normally arms this state before each wake; AP owners bypass that loop,
+    // so refresh the base timing directly from the selected NAN beacon.
+    if RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed) == 0 {
+        let snapshot = super::nan::nan_beacon_snapshot();
+        if let Some(plan) = super::wifi::beacon_wake_plan_for_dw_stride(snapshot, 0, 512, 0, 1, 0) {
+            arm_raw_nan_beacon_window(Some(plan));
+        }
+    }
     if AP_OWNER_AP_ACTIVE.swap(false, Ordering::AcqRel) {
         super::nan::stop_nan().ok();
         if let Err(err) = super::wifi::stop_direct_ap_beacon_source() {
@@ -768,13 +904,22 @@ fn start_raw_nan_duty(
     }
     super::wifi::stop_raw_monitor().ok();
     let channel = get_u32(settings, "nan.channel", default_channel as u32).clamp(1, 13) as u8;
-    let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(50, 60_000);
+    let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(32, 60_000);
     let duty_ms = get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS)
         .max(active_ms)
         .clamp(100, 60_000);
     let light_sleep = get_bool(settings, "nan.light_sleep", true);
+    // The default is conservative, but an explicit margin experiment may be
+    // selected with `mode nan_early_ms=<n> save=true`. Clamp persisted values
+    // so a stale or malformed profile cannot disable the startup guard.
     let configured_wake_early_ms = get_u32(settings, "nan.early_ms", DEFAULT_NAN_WAKE_EARLY_MS)
-        .min(duty_ms.saturating_sub(active_ms));
+        .clamp(
+            NAN_WAKE_MARGIN_MIN_MS,
+            duty_ms
+                .saturating_sub(active_ms)
+                .max(NAN_WAKE_MARGIN_MIN_MS)
+                .min(NAN_WAKE_MARGIN_MAX_MS),
+        );
     RAW_NAN_WAKE_EARLY_MS.store(configured_wake_early_ms, Ordering::Relaxed);
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
@@ -833,7 +978,7 @@ fn ensure_infra_active_radios(settings: &SharedSettings, reason: &'static str) -
     } else if !RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
         arm_raw_nan_beacon_window(None);
         super::nan::start_raw_window(channel, sync_window_filter(settings, false))?;
-        let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(50, 60_000);
+        let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(32, 60_000);
         let queued_sent = super::nan::drain_raw_queue();
         record_raw_nan_dw_start(
             get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU),
@@ -883,6 +1028,32 @@ pub fn ip_transport_active() -> bool {
 
 pub fn raw_nan_duty_enabled() -> bool {
     RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed)
+}
+
+/// True while the raw-NAN receiver is in its bounded awake window. The main
+/// loop uses this to poll housekeeping more frequently only while the radio is
+/// already awake; the long timeout remains in force during light sleep.
+pub fn raw_nan_duty_active() -> bool {
+    RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Whether this node is the continuously powered infrastructure gateway.
+/// Infrastructure still schedules addressed traffic to sleepy peers in the
+/// observed discovery window; it does not use the battery-node duty state.
+pub fn ap_owner_running() -> bool {
+    AP_OWNER_RUNNING.load(Ordering::Relaxed)
+}
+
+/// Infrastructure-to-sleepy traffic uses the default advertised stride even
+/// though the infrastructure radio itself never sleeps. This keeps addressed
+/// follow-ups on DW0/DW8 instead of transmitting on every nearby beacon.
+pub fn infra_target_dw_open(tsf_us: u64) -> bool {
+    let base_period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+    if base_period_us == 0 {
+        return false;
+    }
+    let stride = u64::from(RAW_NAN_DATA_DW_STRIDE.load(Ordering::Relaxed).max(1));
+    (tsf_us / base_period_us) % stride == 0
 }
 
 /// Whether a just-observed NAN beacon is in this node's advertised publish
@@ -973,6 +1144,21 @@ pub fn open_raw_nan_data_dw(tsf_us: u64, local_us: u64) -> bool {
 
 /// Whether a queued NAN data-plane packet may be transmitted right now.
 pub fn raw_nan_data_dw_open() -> bool {
+    if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
+        let Some(beacon) = super::nan::last_nan_sync_beacon() else {
+            return false;
+        };
+        let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+        let stride = u64::from(RAW_NAN_DATA_DW_STRIDE.load(Ordering::Relaxed).max(1));
+        if period_us == 0 || (beacon.tsf_us / period_us) % stride != 0 {
+            return false;
+        }
+        // Infra nodes receive continuously, but the shared NAN action/SDF
+        // contract permits transmission only in the short post-beacon DW
+        // dwell. Sending later in the 512-TU interval is unreliable for
+        // sleepy peers, which have already powered the radio back down.
+        return now_us().saturating_sub(beacon.local_us) <= RAW_NAN_DATA_DW_DWELL_US;
+    }
     if !RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed) {
         return true;
     }
@@ -1053,7 +1239,9 @@ fn sync_wake_plan(
     // modulo of the AP's own beacon cadence, not an accidental test of the
     // trailing digits of TSF and not a projection onto NAN's 512-TU grid.
     // Once a fresh NAN beacon exists, `selected_sync_beacon` chooses NAN
-    // above and restores its configured 512-TU DW timeline.
+    // above and restores its configured 512-TU DW timeline. The received
+    // beacon's transmission phase is not reused: a beacon can arrive anywhere
+    // in a discovery window, while DW0/DW8 are defined by the TSF period.
     let (period_tu, offset_tu) = if source == SYNC_SOURCE_NAN {
         (nan_dw_tu, nan_dw_offset_tu)
     } else {
@@ -1089,6 +1277,79 @@ fn deadline_not_due(now: u32, deadline: u32) -> bool {
     deadline != 0 && now.wrapping_sub(deadline) >= u32::MAX / 2
 }
 
+/// Return the selected sparse-slot beacon received after `baseline`.
+///
+/// Prefer the bounded NAN beacon history over the latest snapshot. A raw-NAN
+/// window can contain several beacons; using only the last one can hide a
+/// valid DW0/DW8 beacon behind a later frame and incorrectly increase the
+/// wake margin.
+fn raw_nan_expected_beacon(
+    snapshot: super::wifi::BeaconSnapshot,
+    baseline: u32,
+) -> Option<super::wifi::BeaconSnapshot> {
+    let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
+    let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+    if expected_tsf_us == 0 || period_us == 0 {
+        return None;
+    }
+    if let Some(matched) = super::nan::nan_beacon_matching_since(
+        baseline,
+        expected_tsf_us,
+        period_us,
+        RAW_NAN_BEACON_LATE_TOLERANCE_US,
+    ) {
+        return Some(matched);
+    }
+    if snapshot.count <= baseline || snapshot.tsf_us == 0 {
+        return None;
+    }
+    let phase_delta_us = (snapshot.tsf_us % period_us).abs_diff(expected_tsf_us % period_us);
+    (snapshot.tsf_us / period_us == expected_tsf_us / period_us
+        && phase_delta_us <= RAW_NAN_BEACON_LATE_TOLERANCE_US)
+        .then_some(snapshot)
+}
+
+/// If the receiver first reports the immediately preceding sparse DW, keep
+/// Wi-Fi on until the selected target can actually arrive. This is a bounded
+/// recovery for TSF/local-clock skew: it lets the next pass measure the real
+/// radio-on interval instead of stopping after the stale beacon and learning
+/// nothing useful from every cycle.
+fn pending_expected_remaining_ms(
+    snapshot: super::wifi::BeaconSnapshot,
+    baseline: u32,
+) -> Option<u32> {
+    if snapshot.count <= baseline || snapshot.tsf_us == 0 {
+        return None;
+    }
+    let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
+    let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
+    if expected_tsf_us == 0 || period_us == 0 || snapshot.tsf_us >= expected_tsf_us {
+        return None;
+    }
+    if snapshot.tsf_us / period_us >= expected_tsf_us / period_us {
+        return None;
+    }
+    let elapsed_us = now_us().saturating_sub(snapshot.local_us);
+    // If the target passed while the radio was down, this is no longer a
+    // pending expected slot. Returning `None` lets the normal window finish
+    // and recompute the next stride instead of reopening the same stale slot
+    // once per second.
+    if expected_tsf_us <= snapshot.tsf_us.saturating_add(elapsed_us) {
+        return None;
+    }
+    let remaining_us = expected_tsf_us
+        .saturating_sub(snapshot.tsf_us)
+        .saturating_sub(elapsed_us);
+    let extension_ms = remaining_us
+        .div_ceil(1_000)
+        .saturating_add(u64::from(RAW_NAN_DATA_DW_DWELL_MS))
+        .saturating_add(2)
+        .min(u64::from(u32::MAX)) as u32;
+    Some(extension_ms)
+}
+
 fn poll_raw_nan_duty(settings: &SharedSettings) {
     if !RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed) {
         return;
@@ -1097,18 +1358,80 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     // active raw NAN radio and a fresh observed cluster beacon.
     let _ = super::nan::drain_publish_on_discovery_window();
     let now = now_ms();
-    let deadline = RAW_NAN_DUTY_NEXT_MS.load(Ordering::Relaxed);
+    let mut deadline = RAW_NAN_DUTY_NEXT_MS.load(Ordering::Relaxed);
     let post_beacon_due = if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed)
         && !infra_radio_hold_active()
         && RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN
     {
-        let snapshot = super::wifi::beacon_snapshot();
+        let snapshot = super::nan::nan_beacon_snapshot();
         let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
-        snapshot.count > baseline
-            && now_us().saturating_sub(snapshot.local_us) >= RAW_NAN_DATA_DW_DWELL_US
+        raw_nan_expected_beacon(snapshot, baseline)
+            .map(|beacon| now_us().saturating_sub(beacon.local_us) >= RAW_NAN_DATA_DW_DWELL_US)
+            .unwrap_or(false)
     } else {
         false
     };
+    if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed)
+        && !post_beacon_due
+        && RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN
+    {
+        let snapshot = super::nan::nan_beacon_snapshot();
+        let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
+        if let Some(remaining_ms) = pending_expected_remaining_ms(snapshot, baseline) {
+            // A beacon from the immediately preceding sparse slot proves the
+            // receiver is synchronized, but it is not the target slot. Keep
+            // this already-open radio window alive only until the target plus
+            // the minimum data dwell. Stopping here and restarting through
+            // the inactive path loses the pending plan and can classify the
+            // same stale slot as a multi-DW drift.
+            // The scheduler polls while the radio is open. Count and log the
+            // reschedule once, when the current deadline is first observed;
+            // otherwise a single preceding beacon inflates the counter by
+            // hundreds of poll iterations and floods the bounded log ring.
+            let first_reschedule = deadline_due(now, deadline);
+            if first_reschedule {
+                RAW_NAN_EXPECT_EXTENDS.fetch_add(1, Ordering::Relaxed);
+            }
+            let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+                | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
+            if first_reschedule {
+                telemetry::record_log(format!(
+                    "event type=nan.duty stale_beacon_reschedule=true remaining_ms={} expected_tsf_us={} actual_tsf_us={}",
+                    remaining_ms, expected_tsf_us, snapshot.tsf_us
+                ));
+            }
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(remaining_ms), Ordering::Relaxed);
+            return;
+        }
+        deadline = RAW_NAN_DUTY_NEXT_MS.load(Ordering::Relaxed);
+    }
+    // If the selected DW produced no accepted beacon at all, keep the already
+    // running receiver through the immediately following 512-TU slot. A
+    // beacon there proves the selected frame was lost at RX; no beacon in the
+    // probe indicates TSF/local-clock drift or a source that disappeared.
+    if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed)
+        && deadline_due(now, deadline)
+        && !post_beacon_due
+        && RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN
+        && !RAW_NAN_MISS_PROBE_ACTIVE.swap(true, Ordering::AcqRel)
+    {
+        let snapshot = super::nan::nan_beacon_snapshot();
+        let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
+        if snapshot.count <= baseline {
+            const NAN_MISS_PROBE_MS: u32 = 600;
+            RAW_NAN_MISS_PROBES.fetch_add(1, Ordering::Relaxed);
+            RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(NAN_MISS_PROBE_MS), Ordering::Relaxed);
+            telemetry::record_log(format!(
+                "event type=nan.duty miss_probe=true duration_ms={} expected_tsf_us={} baseline={} current={}",
+                NAN_MISS_PROBE_MS,
+                (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+                    | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed)),
+                baseline,
+                snapshot.count
+            ));
+            return;
+        }
+    }
     // `wrapping_sub(deadline) >= HALF` means the deadline is still in the
     // future. Keep servicing the active window in that case, unless the
     // expected beacon has already arrived and the short post-beacon dwell has
@@ -1132,15 +1455,18 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         return;
     }
     let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
-    let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(50, 60_000);
+    let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(32, 60_000);
     let duty_ms = get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS)
         .max(active_ms)
         .clamp(100, 60_000);
     let light_sleep = get_bool(settings, "nan.light_sleep", true);
-    let wake_early_ms = RAW_NAN_WAKE_EARLY_MS
-        .load(Ordering::Relaxed)
-        .min(duty_ms.saturating_sub(active_ms))
-        .max(1);
+    let wake_early_ms = RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed).clamp(
+        NAN_WAKE_MARGIN_MIN_MS,
+        duty_ms
+            .saturating_sub(active_ms)
+            .max(NAN_WAKE_MARGIN_MIN_MS)
+            .min(NAN_WAKE_MARGIN_MAX_MS),
+    );
     let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
     let dw_offset_tu = get_u32(settings, "nan.dw_off_tu", DEFAULT_NAN_DW_OFFSET_TU);
     let hold_active = infra_radio_hold_active();
@@ -1148,7 +1474,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     let recovery_due = source_before_window.is_none()
         && sync_policy(settings) != SyncPolicy::NanOnly
         && deadline_due(now, RAW_NAN_RECOVERY_NEXT_MS.load(Ordering::Relaxed));
-    let window_active_ms = if recovery_due {
+    let requested_active_ms = if recovery_due {
         get_u32(
             settings,
             "nan.ap_recovery_listen_ms",
@@ -1158,6 +1484,16 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     } else {
         active_ms
     };
+    // Keep Wi-Fi through the expected beacon and the minimum NAN data dwell.
+    // `wake_early_ms` is measured from the expected beacon, not from the
+    // beginning of this active window, so it must be part of the deadline.
+    let window_active_ms = requested_active_ms
+        .max(
+            wake_early_ms
+                .saturating_add(RAW_NAN_DATA_DW_DWELL_MS)
+                .saturating_add(2),
+        )
+        .max(RAW_NAN_BEACON_LISTEN_FLOOR_MS);
 
     // A powered gateway, bounded transfer, or locally woken console owns the
     // radio. If duty sleep had already stopped Wi-Fi, bring it up immediately;
@@ -1174,7 +1510,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     }
 
     if RAW_NAN_DUTY_ACTIVE.load(Ordering::Relaxed) {
-        // A GPIO0/DTR or UART wake deliberately owns a short debug window.
+        // A UART/radio wake deliberately owns a short debug window.
         // Keep the existing raw Wi-Fi instance up for that window instead of
         // tearing it down and rebuilding it every `nan.active_ms`. Apart from
         // wasting power, that restart loop races UART TX and leaves forwarded
@@ -1185,7 +1521,18 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             // deliver queued addressed commands without waiting for its next
             // duty transition. Leaving this queue undrained made remote
             // `active` requests remain pending forever.
-            super::nan::drain_raw_queue();
+            let queued_sent = super::nan::drain_raw_queue();
+            // SDFs (including UART/BLE wake advertisements) use the separate
+            // publish queue. Infrastructure nodes do not pass through the
+            // sleepy DW loop, so drain that queue here as well; the helper
+            // still requires a fresh beacon and the configured DW slot.
+            let publish_sent = super::nan::drain_publish_on_discovery_window();
+            if queued_sent > 0 || publish_sent > 0 {
+                telemetry::record_log(format!(
+                    "event type=nan.infra_queue_tx raw={} publish={}",
+                    queued_sent, publish_sent
+                ));
+            }
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
             return;
         }
@@ -1193,10 +1540,10 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         // the bounded data-plane dwell. The full active_ms remains the miss
         // timeout, so a late/missing beacon still gets a recovery window.
         if RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN {
-            let snapshot = super::wifi::beacon_snapshot();
+            let snapshot = super::nan::nan_beacon_snapshot();
             let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
-            if snapshot.count > baseline {
-                let since_beacon_us = now_us().saturating_sub(snapshot.local_us);
+            if let Some(beacon) = raw_nan_expected_beacon(snapshot, baseline) {
+                let since_beacon_us = now_us().saturating_sub(beacon.local_us);
                 if since_beacon_us >= RAW_NAN_DATA_DW_DWELL_US {
                     telemetry::record_log(format!(
                         "event type=nan.duty phase=post_beacon_stop since_beacon_us={} dwell_us={}",
@@ -1292,13 +1639,19 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                 }
             }
             arm_raw_nan_beacon_window(sync_plan);
+            // Start timing before Wi-Fi/monitor bring-up. This measures the
+            // real radio-on-to-beacon interval, not just the time after the
+            // promiscuous callback has already been installed.
+            let radio_on_start_us = now_us();
             match super::nan::start_raw_window(channel, sync_window_filter(settings, recovery_due))
             {
                 Ok(()) => {
                     let queued_sent = super::nan::drain_raw_queue();
                     record_raw_nan_dw_start(dw_offset_tu, sync_plan.is_some(), true);
+                    set_raw_nan_window_start_us(radio_on_start_us);
                     let uart_heartbeat = super::serial::on_raw_nan_wake(active_ms);
                     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
+                    RAW_NAN_MISS_PROBE_ACTIVE.store(false, Ordering::Release);
                     RAW_NAN_RECOVERY_ACTIVE.store(recovery_due, Ordering::Relaxed);
                     if recovery_due {
                         RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
@@ -1306,8 +1659,13 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                     RAW_NAN_DUTY_NEXT_MS
                         .store(now_ms().wrapping_add(window_active_ms), Ordering::Relaxed);
                     telemetry::record_log(format!(
-                        "event type=nan.duty phase=active channel={} active_ms={} wake=light recovery={} queued_sent={} uart_heartbeat={}",
-                        channel, window_active_ms, recovery_due, queued_sent, uart_heartbeat
+                        "event type=nan.duty phase=active channel={} active_ms={} listen_floor_ms={} wake=light recovery={} queued_sent={} uart_heartbeat={}",
+                        channel,
+                        window_active_ms,
+                        RAW_NAN_BEACON_LISTEN_FLOOR_MS,
+                        recovery_due,
+                        queued_sent,
+                        uart_heartbeat
                     ));
                 }
                 Err(err) => {
@@ -1327,6 +1685,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
 
     // The non-light-sleep diagnostic path arms its beacon baseline when it
     // schedules the window above. Keep it intact until this delayed start.
+    let radio_on_start_us = now_us();
     match super::nan::start_raw_window(channel, sync_window_filter(settings, recovery_due)) {
         Ok(()) => {
             let queued_sent = super::nan::drain_raw_queue();
@@ -1334,16 +1693,23 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             // wake plan across polls, so only mark it synchronized when the
             // active window itself was entered from the light-sleep path.
             record_raw_nan_dw_start(dw_offset_tu, false, false);
+            set_raw_nan_window_start_us(radio_on_start_us);
             let uart_heartbeat = super::serial::on_raw_nan_wake(active_ms);
             RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
+            RAW_NAN_MISS_PROBE_ACTIVE.store(false, Ordering::Release);
             RAW_NAN_RECOVERY_ACTIVE.store(recovery_due, Ordering::Relaxed);
             if recovery_due {
                 RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
             }
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_active_ms), Ordering::Relaxed);
             telemetry::record_log(format!(
-                "event type=nan.duty phase=active channel={} active_ms={} recovery={} queued_sent={} uart_heartbeat={}",
-                channel, window_active_ms, recovery_due, queued_sent, uart_heartbeat
+                "event type=nan.duty phase=active channel={} active_ms={} listen_floor_ms={} recovery={} queued_sent={} uart_heartbeat={}",
+                channel,
+                window_active_ms,
+                RAW_NAN_BEACON_LISTEN_FLOOR_MS,
+                recovery_due,
+                queued_sent,
+                uart_heartbeat
             ));
         }
         Err(err) => {
@@ -1357,7 +1723,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
 }
 
 fn arm_raw_nan_beacon_window(plan: Option<super::wifi::BeaconWakePlan>) {
-    let snapshot = super::wifi::beacon_snapshot();
+    let snapshot = super::nan::nan_beacon_snapshot();
     RAW_NAN_BEACON_BASELINE.store(snapshot.count, Ordering::Relaxed);
     let (expected_tsf_us, period_us) = plan
         .map(|plan| (plan.expected_tsf_us, plan.period_us))
@@ -1368,76 +1734,133 @@ fn arm_raw_nan_beacon_window(plan: Option<super::wifi::BeaconWakePlan>) {
 }
 
 fn finish_raw_nan_beacon_window() {
-    const LATE_TOLERANCE_US: u64 = 80_000;
-    const MISS_BACKOFF_MS: u32 = 1_000;
-    const WAKE_MARGIN_MIN_MS: u32 = 1;
-    const WAKE_MARGIN_MAX_MS: u32 = 100;
-
-    let snapshot = super::wifi::beacon_snapshot();
+    // Loss classification must not perturb the next synchronized wake. The
+    // one-slot probe above is the only extra listen interval.
+    const MISS_BACKOFF_MS: u32 = 0;
+    let snapshot = super::nan::nan_beacon_snapshot();
     let baseline = RAW_NAN_BEACON_BASELINE.load(Ordering::Relaxed);
     let received = snapshot.count.saturating_sub(baseline);
+    let window_start_us = (u64::from(RAW_NAN_WINDOW_START_US_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_WINDOW_START_US_LO.load(Ordering::Relaxed));
+    // Preserve this measurement even when no NAN beacon was accepted. It is
+    // the key discriminator between a late/absent beacon and a radio/RX
+    // startup failure.
+    let first_frame_local_us = super::wifi::raw_first_frame_local_us();
+    let wake_to_first_frame_us = first_frame_local_us
+        .saturating_sub(window_start_us)
+        .min(u64::from(u32::MAX));
+    RAW_NAN_LAST_WAKE_TO_FIRST_FRAME_US.store(wake_to_first_frame_us as u32, Ordering::Relaxed);
     if received == 0 {
+        let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+            | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
+        let now_us_value = now_us();
+        RAW_NAN_LAST_MISS_EXPECT_TSF_LO.store(expected_tsf_us as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_EXPECT_TSF_HI.store((expected_tsf_us >> 32) as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_TSF_LO.store(snapshot.tsf_us as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_TSF_HI.store((snapshot.tsf_us >> 32) as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_LOCAL_LO.store(snapshot.local_us as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_LOCAL_HI.store((snapshot.local_us >> 32) as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_NOW_LO.store(now_us_value as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_NOW_HI.store((now_us_value >> 32) as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_MISS_WAKE_TO_FIRST_FRAME_US
+            .store(wake_to_first_frame_us as u32, Ordering::Relaxed);
         RAW_NAN_BEACON_MISSED.fetch_add(1, Ordering::Relaxed);
         record_raw_nan_dw_finish(0, 0);
         RAW_NAN_MISS_BACKOFF_MS.store(MISS_BACKOFF_MS, Ordering::Relaxed);
-        let previous = RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed);
-        let next = previous
-            .saturating_add(5)
-            .clamp(WAKE_MARGIN_MIN_MS, WAKE_MARGIN_MAX_MS);
-        RAW_NAN_WAKE_EARLY_MS.store(next, Ordering::Relaxed);
         telemetry::record_log(format!(
-            "event type=nan.duty beacon=missed active_ms_backoff={} wake_margin_ms={} previous_margin_ms={} baseline={} current={}",
-            MISS_BACKOFF_MS, next, previous, baseline, snapshot.count
+            "event type=nan.duty beacon=missed active_ms_backoff={} wake_margin_ms={} wake_to_first_frame_us={} baseline={} current={} expected_tsf_us={} expected_period_us={} last_tsf_us={} last_local_us={} now_us={}",
+            MISS_BACKOFF_MS,
+            RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed),
+            wake_to_first_frame_us,
+            baseline,
+            snapshot.count,
+            expected_tsf_us,
+            RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed),
+            snapshot.tsf_us,
+            snapshot.local_us,
+            now_us_value,
         ));
+        record_raw_nan_timing(wake_to_first_frame_us, 0, 0, 0);
         return;
     }
 
     RAW_NAN_BEACON_SEEN.fetch_add(received, Ordering::Relaxed);
-    // `wifi::beacon_snapshot` reports the most recent beacon received in
-    // this bounded window. When `received == 1` it is exactly the first sync
-    // beacon; with multiple beacons it remains a conservative upper bound for
-    // wake-to-sync and a lower bound for sync-to-sleep. Both values are kept
-    // so the early-wake and post-beacon window margins can be tuned from real
-    // radio timing rather than an assumed 4 s cadence.
-    let window_start_us = (u64::from(RAW_NAN_WINDOW_START_US_HI.load(Ordering::Relaxed)) << 32)
-        | u64::from(RAW_NAN_WINDOW_START_US_LO.load(Ordering::Relaxed));
-    let wake_to_beacon_us = snapshot.local_us.saturating_sub(window_start_us);
-    let beacon_to_sleep_us = now_us().saturating_sub(snapshot.local_us);
-    RAW_NAN_LAST_WAKE_TO_BEACON_US.store(
-        wake_to_beacon_us.min(u64::from(u32::MAX)) as u32,
-        Ordering::Relaxed,
-    );
-    RAW_NAN_LAST_BEACON_TO_SLEEP_US.store(
-        beacon_to_sleep_us.min(u64::from(u32::MAX)) as u32,
-        Ordering::Relaxed,
-    );
-    let previous_margin = RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed);
-    let next_margin = previous_margin
-        .saturating_sub(1)
-        .clamp(WAKE_MARGIN_MIN_MS, WAKE_MARGIN_MAX_MS);
-    RAW_NAN_WAKE_EARLY_MS.store(next_margin, Ordering::Relaxed);
-    telemetry::record_log(format!(
-        "event type=nan.duty beacon=seen wake_to_beacon_us={} beacon_to_sleep_us={} wake_margin_ms={} previous_margin_ms={}",
-        wake_to_beacon_us, beacon_to_sleep_us, next_margin, previous_margin
-    ));
-    RAW_NAN_LAST_BEACON_TSF_LO.store(snapshot.tsf_us as u32, Ordering::Relaxed);
-    RAW_NAN_LAST_BEACON_TSF_HI.store((snapshot.tsf_us >> 32) as u32, Ordering::Relaxed);
-    record_raw_nan_dw_finish(received, RAW_NAN_DW_FLAG_BEACON);
+    // The latest snapshot is useful for diagnostics, but the bounded history
+    // selects the actual expected DW when several beacons arrived in one
+    // window. This keeps timing measurements tied to the rendezvous that
+    // justified the sleep decision rather than to a later beacon.
     let expected_tsf_us = (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
         | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed));
     let period_us = u64::from(RAW_NAN_EXPECT_PERIOD_US.load(Ordering::Relaxed));
     if expected_tsf_us == 0 || period_us == 0 || snapshot.tsf_us == 0 {
         return;
     }
+    let matched_beacon = raw_nan_expected_beacon(snapshot, baseline);
+    let timing_snapshot = matched_beacon.unwrap_or(snapshot);
+    let wake_to_beacon_us = timing_snapshot.local_us.saturating_sub(window_start_us);
+    let beacon_to_sleep_us = now_us().saturating_sub(timing_snapshot.local_us);
+    RAW_NAN_LAST_BEACON_TSF_LO.store(snapshot.tsf_us as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_BEACON_TSF_HI.store((snapshot.tsf_us >> 32) as u32, Ordering::Relaxed);
+    record_raw_nan_dw_finish(received, RAW_NAN_DW_FLAG_BEACON);
 
-    let delta_us = snapshot.tsf_us.abs_diff(expected_tsf_us);
-    if delta_us <= LATE_TOLERANCE_US {
+    // Beacon TSF values include the global base-DW index. The selected sparse
+    // stride is already reflected in `expected_tsf_us`; requiring the expected
+    // index prevents a stale beacon from a previous DW from looking successful
+    // merely because its phase happens to match.
+    let expected_phase_us = expected_tsf_us % period_us;
+    let actual_phase_us = timing_snapshot.tsf_us % period_us;
+    let phase_delta_us = expected_phase_us.abs_diff(actual_phase_us);
+    let expected_slot_index = expected_tsf_us / period_us;
+    let actual_slot_index = timing_snapshot.tsf_us / period_us;
+    let expected_beacon = matched_beacon.is_some()
+        || (actual_slot_index == expected_slot_index
+            && phase_delta_us <= RAW_NAN_BEACON_LATE_TOLERANCE_US);
+    if expected_beacon {
+        RAW_NAN_LAST_WAKE_TO_BEACON_US.store(
+            wake_to_beacon_us.min(u64::from(u32::MAX)) as u32,
+            Ordering::Relaxed,
+        );
+        RAW_NAN_LAST_WAKE_TO_FIRST_FRAME_US.store(wake_to_first_frame_us as u32, Ordering::Relaxed);
+        RAW_NAN_LAST_BEACON_TO_SLEEP_US.store(
+            beacon_to_sleep_us.min(u64::from(u32::MAX)) as u32,
+            Ordering::Relaxed,
+        );
+        RAW_NAN_MISS_BACKOFF_MS.store(0, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=nan.duty beacon=expected slot_index={} wake_to_first_frame_us={} wake_to_beacon_us={} beacon_to_sleep_us={} wake_margin_ms={}",
+            actual_slot_index,
+            wake_to_first_frame_us,
+            wake_to_beacon_us,
+            beacon_to_sleep_us,
+            RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed)
+        ));
+        record_raw_nan_timing(
+            wake_to_first_frame_us,
+            wake_to_beacon_us.min(u64::from(u32::MAX)) as u32,
+            beacon_to_sleep_us.min(u64::from(u32::MAX)) as u32,
+            RAW_NAN_DW_FLAG_BEACON,
+        );
         return;
     }
+    let now_us_value = now_us();
+    RAW_NAN_LAST_MISS_EXPECT_TSF_LO.store(expected_tsf_us as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_EXPECT_TSF_HI.store((expected_tsf_us >> 32) as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_TSF_LO.store(snapshot.tsf_us as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_TSF_HI.store((snapshot.tsf_us >> 32) as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_LOCAL_LO.store(snapshot.local_us as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_LOCAL_HI.store((snapshot.local_us >> 32) as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_NOW_LO.store(now_us_value as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_NOW_HI.store((now_us_value >> 32) as u32, Ordering::Relaxed);
+    RAW_NAN_LAST_MISS_WAKE_TO_FIRST_FRAME_US
+        .store(wake_to_first_frame_us as u32, Ordering::Relaxed);
+    // A beacon outside the expected slot is diagnostic only. Do not retune
+    // the fixed guard based on a single lost or filtered 802.11 frame.
+    RAW_NAN_MISS_BACKOFF_MS.store(MISS_BACKOFF_MS, Ordering::Relaxed);
     RAW_NAN_BEACON_LATE.fetch_add(1, Ordering::Relaxed);
     raw_nan_dw_add_flags(RAW_NAN_DW_FLAG_LATE);
-    let next_dw =
-        snapshot.tsf_us >= expected_tsf_us && delta_us.abs_diff(period_us) <= LATE_TOLERANCE_US;
+    let next_dw = actual_slot_index == expected_slot_index.saturating_add(1)
+        && phase_delta_us <= RAW_NAN_BEACON_LATE_TOLERANCE_US;
+    RAW_NAN_BEACON_MISSED.fetch_add(1, Ordering::Relaxed);
     if next_dw {
         RAW_NAN_BEACON_LATE_NEXT_DW.fetch_add(1, Ordering::Relaxed);
         raw_nan_dw_add_flags(RAW_NAN_DW_FLAG_NEXT);
@@ -1446,14 +1869,24 @@ fn finish_raw_nan_beacon_window() {
         raw_nan_dw_add_flags(RAW_NAN_DW_FLAG_DRIFT);
     }
     telemetry::record_log(format!(
-        "event type=nan.duty beacon=late class={} delta_us={} expected_tsf_us={} actual_tsf_us={} local_us={} period_us={}",
+        "event type=nan.duty beacon=late class={} expected_slot_index={} actual_slot_index={} phase_delta_us={} wake_to_first_frame_us={} expected_tsf_us={} actual_tsf_us={} local_us={} period_us={} wake_margin_ms={}",
         if next_dw { "next_dw" } else { "drift" },
-        delta_us,
+        expected_slot_index,
+        actual_slot_index,
+        phase_delta_us,
+        wake_to_first_frame_us,
         expected_tsf_us,
         snapshot.tsf_us,
         snapshot.local_us,
-        period_us
+        period_us,
+        RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed)
     ));
+    record_raw_nan_timing(
+        wake_to_first_frame_us,
+        wake_to_beacon_us.min(u64::from(u32::MAX)) as u32,
+        beacon_to_sleep_us.min(u64::from(u32::MAX)) as u32,
+        RAW_NAN_DW_FLAG_LATE,
+    );
 }
 
 fn record_raw_nan_dw_start(dw_offset_tu: u32, synced: bool, light_sleep: bool) {
@@ -1474,13 +1907,17 @@ fn record_raw_nan_dw_start(dw_offset_tu: u32, synced: bool, light_sleep: bool) {
         flags |= RAW_NAN_DW_FLAG_LIGHT;
     }
     let start_us = now_us();
-    RAW_NAN_WINDOW_START_US_LO.store(start_us as u32, Ordering::Relaxed);
-    RAW_NAN_WINDOW_START_US_HI.store((start_us >> 32) as u32, Ordering::Relaxed);
+    set_raw_nan_window_start_us(start_us);
     RAW_NAN_DW_HISTORY_START_MS[index].store((start_us / 1000) as u32, Ordering::Relaxed);
     RAW_NAN_DW_HISTORY_BEACONS[index].store(0, Ordering::Relaxed);
     RAW_NAN_DW_HISTORY_FLAGS[index].store(flags, Ordering::Relaxed);
     RAW_NAN_DW_HISTORY_SEQ[index].store(seq, Ordering::Release);
     RAW_NAN_DW_ACTIVE_SEQ.store(seq, Ordering::Release);
+}
+
+fn set_raw_nan_window_start_us(start_us: u64) {
+    RAW_NAN_WINDOW_START_US_LO.store(start_us as u32, Ordering::Relaxed);
+    RAW_NAN_WINDOW_START_US_HI.store((start_us >> 32) as u32, Ordering::Relaxed);
 }
 
 fn raw_nan_dw_add_flags(flags: u32) {
@@ -1504,6 +1941,46 @@ fn record_raw_nan_dw_finish(beacons: u32, flags: u32) {
         RAW_NAN_DW_HISTORY_BEACONS[index].store(beacons, Ordering::Relaxed);
         RAW_NAN_DW_HISTORY_FLAGS[index].fetch_or(flags, Ordering::Relaxed);
     }
+}
+
+fn record_raw_nan_timing(first_frame_us: u64, beacon_us: u32, post_beacon_us: u32, flags: u32) {
+    let seq = RAW_NAN_DW_TOTAL.load(Ordering::Acquire);
+    if seq == 0 {
+        return;
+    }
+    let index = (seq as usize) % RAW_NAN_TIMING_HISTORY_LEN;
+    RAW_NAN_TIMING_FIRST_FRAME_US[index].store(
+        first_frame_us.min(u64::from(u32::MAX)) as u32,
+        Ordering::Relaxed,
+    );
+    RAW_NAN_TIMING_BEACON_US[index].store(beacon_us, Ordering::Relaxed);
+    RAW_NAN_TIMING_POST_BEACON_US[index].store(post_beacon_us, Ordering::Relaxed);
+    RAW_NAN_TIMING_FLAGS[index].store(flags, Ordering::Relaxed);
+    RAW_NAN_TIMING_SEQ[index].store(seq, Ordering::Release);
+}
+
+fn raw_nan_timing_history_fields() -> String {
+    let newest = RAW_NAN_DW_TOTAL.load(Ordering::Acquire);
+    let mut records = Vec::with_capacity(RAW_NAN_TIMING_HISTORY_LEN);
+    for offset in 0..RAW_NAN_TIMING_HISTORY_LEN {
+        let seq = newest.saturating_sub(offset as u32);
+        if seq == 0 {
+            break;
+        }
+        let index = (seq as usize) % RAW_NAN_TIMING_HISTORY_LEN;
+        if RAW_NAN_TIMING_SEQ[index].load(Ordering::Acquire) != seq {
+            continue;
+        }
+        records.push(format!(
+            "{}:{}:{}:{}:{}",
+            seq,
+            RAW_NAN_TIMING_FIRST_FRAME_US[index].load(Ordering::Relaxed),
+            RAW_NAN_TIMING_BEACON_US[index].load(Ordering::Relaxed),
+            RAW_NAN_TIMING_POST_BEACON_US[index].load(Ordering::Relaxed),
+            RAW_NAN_TIMING_FLAGS[index].load(Ordering::Relaxed),
+        ));
+    }
+    records.join(",")
 }
 
 fn raw_nan_dw_recent_fields() -> String {
@@ -1551,13 +2028,26 @@ pub fn raw_nan_status_fields() -> String {
             (last_beacon_tsf_us % expected_period_us).to_string(),
         )
     };
+    let last_miss_expected_tsf_us =
+        (u64::from(RAW_NAN_LAST_MISS_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+            | u64::from(RAW_NAN_LAST_MISS_EXPECT_TSF_LO.load(Ordering::Relaxed));
+    let last_miss_tsf_us = (u64::from(RAW_NAN_LAST_MISS_TSF_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_LAST_MISS_TSF_LO.load(Ordering::Relaxed));
+    let last_miss_local_us = (u64::from(RAW_NAN_LAST_MISS_LOCAL_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_LAST_MISS_LOCAL_LO.load(Ordering::Relaxed));
+    let last_miss_now_us = (u64::from(RAW_NAN_LAST_MISS_NOW_HI.load(Ordering::Relaxed)) << 32)
+        | u64::from(RAW_NAN_LAST_MISS_NOW_LO.load(Ordering::Relaxed));
     format!(
-        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_wake_early_ms={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_expected_tsf_us={} nan_expected_slot_period_us={} nan_selected_stride={} nan_expected_slot_index={} nan_expected_slot_phase_us={} nan_last_beacon_tsf_us={} nan_last_beacon_slot_index={} nan_last_beacon_slot_phase_us={} nan_last_wake_to_beacon_us={} nan_last_beacon_to_sleep_us={} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
+        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_wake_early_ms={} nan_miss_probes={} nan_raw_cmd_rx={} nan_raw_resp_tx={} nan_raw_queue_len={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_expected_tsf_us={} nan_expected_slot_period_us={} nan_selected_stride={} nan_expected_slot_index={} nan_expected_slot_phase_us={} nan_last_beacon_tsf_us={} nan_last_beacon_slot_index={} nan_last_beacon_slot_phase_us={} nan_last_wake_to_first_frame_us={} nan_last_wake_to_beacon_us={} nan_last_beacon_to_sleep_us={} nan_last_miss_wake_to_first_frame_us={} nan_last_miss_expected_tsf_us={} nan_last_miss_tsf_us={} nan_last_miss_local_us={} nan_last_miss_now_us={} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
         RAW_NAN_DW_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW0_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW_SYNC_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW_EARLY_WAKE_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed),
+        RAW_NAN_MISS_PROBES.load(Ordering::Relaxed),
+        super::nan::raw_command_rx_count(),
+        super::nan::raw_response_tx_count(),
+        super::nan::raw_queue_len(),
         raw_nan_dw_recent_fields(),
         expected_tsf_us,
         expected_period_us,
@@ -1567,8 +2057,14 @@ pub fn raw_nan_status_fields() -> String {
         last_beacon_tsf_us,
         last_beacon_dw_index,
         last_beacon_dw_phase_us,
+        RAW_NAN_LAST_WAKE_TO_FIRST_FRAME_US.load(Ordering::Relaxed),
         RAW_NAN_LAST_WAKE_TO_BEACON_US.load(Ordering::Relaxed),
         RAW_NAN_LAST_BEACON_TO_SLEEP_US.load(Ordering::Relaxed),
+        RAW_NAN_LAST_MISS_WAKE_TO_FIRST_FRAME_US.load(Ordering::Relaxed),
+        last_miss_expected_tsf_us,
+        last_miss_tsf_us,
+        last_miss_local_us,
+        last_miss_now_us,
         RAW_NAN_BEACON_SEEN.load(Ordering::Relaxed),
         RAW_NAN_BEACON_MISSED.load(Ordering::Relaxed),
         RAW_NAN_BEACON_LATE.load(Ordering::Relaxed),
@@ -1584,6 +2080,39 @@ pub fn raw_nan_status_fields() -> String {
         RAW_NAN_RECOVERY_RUNS.load(Ordering::Relaxed),
         RAW_NAN_RECOVERY_NEXT_MS.load(Ordering::Relaxed),
     )
+}
+
+/// Return the bounded timing counters used by the no-command sleep soak.
+/// Unlike the full mode status this excludes queue, AP, and companion state,
+/// so a host can sample it without turning the diagnostic itself into a large
+/// UART wake.
+pub fn raw_nan_timing_fields() -> String {
+    format!(
+        "nan_timing wake_margin_ms={} dw_stride={} dw_total={} dw_sync={} dw_missed={} dw_late={} dw_next_dw={} dw_drift={} early_wakes={} wake_to_first_frame_us={} wake_to_beacon_us={} beacon_to_sleep_us={} miss_wake_to_first_frame_us={} expected_tsf_us={} last_tsf_us={} history=seq:first_frame_us:beacon_us:post_beacon_us:flags:{}",
+        RAW_NAN_WAKE_EARLY_MS.load(Ordering::Relaxed),
+        RAW_NAN_DATA_DW_STRIDE.load(Ordering::Relaxed),
+        RAW_NAN_DW_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_DW_SYNC_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_MISSED.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_LATE.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_LATE_NEXT_DW.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_DRIFT.load(Ordering::Relaxed),
+        RAW_NAN_DW_EARLY_WAKE_TOTAL.load(Ordering::Relaxed),
+        RAW_NAN_LAST_WAKE_TO_FIRST_FRAME_US.load(Ordering::Relaxed),
+        RAW_NAN_LAST_WAKE_TO_BEACON_US.load(Ordering::Relaxed),
+        RAW_NAN_LAST_BEACON_TO_SLEEP_US.load(Ordering::Relaxed),
+        RAW_NAN_LAST_MISS_WAKE_TO_FIRST_FRAME_US.load(Ordering::Relaxed),
+        (u64::from(RAW_NAN_EXPECT_TSF_HI.load(Ordering::Relaxed)) << 32)
+            | u64::from(RAW_NAN_EXPECT_TSF_LO.load(Ordering::Relaxed)),
+        (u64::from(RAW_NAN_LAST_BEACON_TSF_HI.load(Ordering::Relaxed)) << 32)
+            | u64::from(RAW_NAN_LAST_BEACON_TSF_LO.load(Ordering::Relaxed)),
+        raw_nan_timing_history_fields(),
+    )
+}
+
+/// Return the configured NAN slot stride for source-side beacon accounting.
+pub fn raw_nan_data_stride() -> u32 {
+    RAW_NAN_DATA_DW_STRIDE.load(Ordering::Relaxed).max(1)
 }
 
 fn queue_boot_discovery(_settings: &SharedSettings, _source: &'static str) -> Result<()> {
@@ -1645,10 +2174,16 @@ fn ping_packet(reply: bool) -> Vec<u8> {
 
 fn configured_mode(settings: &SharedSettings) -> u8 {
     let from_mode = settings.borrow().get_str("mode").ok().flatten();
-    if matches!(from_mode.as_deref(), Some("companion")) {
-        telemetry::record_log("event type=mode.startup saved=companion action=ignore start=infra");
+    match from_mode.as_deref() {
+        Some("sleepy") | Some("battery") | Some("nan_sleep") => MODE_SLEEPY,
+        Some("companion") => {
+            telemetry::record_log(
+                "event type=mode.startup saved=companion action=ignore start=infra",
+            );
+            MODE_INFRA
+        }
+        _ => MODE_INFRA,
     }
-    MODE_INFRA
 }
 
 fn get_u32(settings: &SharedSettings, key: &str, default: u32) -> u32 {
@@ -1681,6 +2216,7 @@ fn boot_print(line: &str) {
 fn mode_name() -> &'static str {
     match PRODUCT_MODE.load(Ordering::Relaxed) {
         MODE_INFRA => "infra",
+        MODE_SLEEPY => "sleepy",
         _ => "companion",
     }
 }
@@ -1713,6 +2249,27 @@ impl CommandHandler for ModeCommand {
             stop_infra_active_session();
             return Ok(CommandResponse::ok(status_text()));
         }
+        if let Some(value) = request
+            .arg("nan_early_ms")
+            .or_else(|| request.arg("wake_early_ms"))
+        {
+            let margin = value
+                .parse::<u32>()
+                .map_err(|err| anyhow!("invalid nan_early_ms={value}: {err}"))?
+                .clamp(NAN_WAKE_MARGIN_MIN_MS, NAN_WAKE_MARGIN_MAX_MS);
+            RAW_NAN_WAKE_EARLY_MS.store(margin, Ordering::Release);
+            if save_requested(request) {
+                self.settings
+                    .borrow_mut()
+                    .set_i32("nan.early_ms", margin as i32)?;
+            }
+            telemetry::record_log(format!(
+                "event type=nan.duty wake_margin_update_ms={} saved={}",
+                margin,
+                save_requested(request)
+            ));
+            return Ok(CommandResponse::ok(status_text()));
+        }
         if request
             .arg("infra")
             .map(parse_bool)
@@ -1728,6 +2285,23 @@ impl CommandHandler for ModeCommand {
             } else {
                 set_infra(&self.settings, false, "command")?;
             }
+            return Ok(CommandResponse::ok(status_text()));
+        }
+        if request
+            .arg("sleepy")
+            .or_else(|| request.arg("battery"))
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            PRODUCT_MODE.store(MODE_SLEEPY, Ordering::Relaxed);
+            if save_requested(request) {
+                self.settings.borrow_mut().set_str("mode", "sleepy")?;
+            }
+            stop_ap_owner().ok();
+            stop_raw_nan_duty();
+            let channel = get_u32(&self.settings, "nan.channel", 6).clamp(1, 13) as u8;
+            start_raw_nan_duty(&self.settings, "command", channel)?;
             return Ok(CommandResponse::ok(status_text()));
         }
         if request
@@ -1760,7 +2334,7 @@ impl CommandHandler for ModeCommand {
         }
         if let Some(raw_nan) = request.arg("raw_nan").map(parse_bool).transpose()? {
             if raw_nan {
-                PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
+                PRODUCT_MODE.store(MODE_SLEEPY, Ordering::Relaxed);
                 let channel = request.arg_i32("channel")?.unwrap_or(6).clamp(1, 13) as u8;
                 start_raw_nan_duty(&self.settings, "command", channel)?;
                 if request
@@ -1896,7 +2470,7 @@ fn save_requested(request: &CommandRequest) -> bool {
 
 fn status_text() -> String {
     format!(
-        "mode active={} infra_active={} infra_active_persistent={} infra_active_deadline_ms={} infra_active_start={} infra_active_stop={} infra_active_expire={} infra_active_uart_extend={} targeted_wake={} targeted_wake_deadline_ms={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
+        "mode active={} infra_active={} infra_active_persistent={} infra_active_deadline_ms={} infra_active_start={} infra_active_stop={} infra_active_expire={} infra_active_uart_extend={} nan_expected_extends={} targeted_wake={} targeted_wake_deadline_ms={} companion_advertising={} companion_pending_advertising={} pending={} deadline_ms={} ping_rx={} ping_tx={} {}",
         mode_name(),
         infra_active_session_enabled(),
         INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed),
@@ -1905,6 +2479,7 @@ fn status_text() -> String {
         INFRA_ACTIVE_STOPS.load(Ordering::Relaxed),
         INFRA_ACTIVE_EXPIRES.load(Ordering::Relaxed),
         INFRA_ACTIVE_UART_EXTENDS.load(Ordering::Relaxed),
+        RAW_NAN_EXPECT_EXTENDS.load(Ordering::Relaxed),
         targeted_wake_active(),
         RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Relaxed),
         COMPANION_ADVERTISING.load(Ordering::Relaxed),

@@ -7,7 +7,7 @@ import argparse
 import re
 import time
 
-from serial_cmd import Console, encode_firmware_command
+from lmesh_diag import Console, encode_firmware_command
 
 
 STAT_RE = re.compile(
@@ -54,7 +54,6 @@ def wait_for_raw_discovery(a: Console, b: Console, timeout: float) -> None:
 
 def start_pair(a: Console, b: Console, channel: int, backend: str, disable_lora: bool) -> None:
     for console in (a, b):
-        console.wake_probe()
         run(console, "wifi mode=off")
         if disable_lora:
             try:

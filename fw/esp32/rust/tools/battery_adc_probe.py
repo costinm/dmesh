@@ -6,33 +6,31 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
-import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
 
 
 DEFAULT_ADC1_PINS = "32,33,34,35,36,39"
 DEFAULT_ADC2_PINS = "1,2,4,12,13,14,15,25,26,27"
 
 
-def run_serial_cmd(port: str, commands: list[str], timeout: float) -> str:
-    cmd = [
-        sys.executable,
-        "tools/serial_cmd.py",
-        "--port",
-        port,
-        "--timeout",
-        str(timeout),
-    ]
+def run_lmesh_commands(port: str, commands: list[str], timeout: float) -> str:
+    """Run firmware diagnostics through the supervised lmesh UDS only."""
+    output: list[str] = []
+    mesh = ROOT / "scripts" / "with-env.sh"
     for command in commands:
-        cmd.extend(["--cmd", command])
-    proc = subprocess.run(
-        cmd,
-        cwd=".",
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    return proc.stdout
+        proc = subprocess.run(
+            [str(mesh), "mesh", "lmesh", "esp.serial.command", f"port={port}",
+             f"command={command}", f"timeout_sec={timeout}"],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        output.append(proc.stdout)
+    return "\n".join(output)
 
 
 def max_mv(output: str) -> int:
@@ -64,7 +62,7 @@ def main() -> int:
             ),
             "battery status=true",
         ]
-        output = run_serial_cmd(port, commands, args.timeout)
+        output = run_lmesh_commands(port, commands, args.timeout)
         print(output.rstrip())
         peak = max_mv(output)
         if peak < 100:

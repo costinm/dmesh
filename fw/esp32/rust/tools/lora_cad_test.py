@@ -7,7 +7,7 @@ import argparse
 import re
 import time
 
-from serial_cmd import Console
+from lmesh_diag import Console
 
 
 PROMPT = b"dm-rs> "

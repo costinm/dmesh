@@ -33,7 +33,27 @@ const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
 // phones at once.  A single "last service descriptor" cannot prove which
 // publisher produced a later test burst.
 const NAN_SERVICE_HISTORY_LEN: usize = 32;
+// A sleepy receiver can hear several cluster beacons during one active
+// window. Keep their bounded TSF history so the scheduler can prove that the
+// selected DW was received even when a later beacon becomes the "last" one.
+const NAN_BEACON_HISTORY_LEN: usize = 64;
 const NAN_COMMAND_MAX_LEN: usize = 231;
+// Optional command argument carried inside the compact-CBOR args map.  The
+// low two bits are DW continuation state (MORE/DONE); bits 2..7 request that
+// many additional 512-TU units of awake time.  The gateway adds this byte at
+// enqueue time, so older callers do not need to know about the hint.
+const NAN_DW_CONTROL_KEY: u16 = 332;
+// The regular command `timeout` argument (tag 41) is also a wire-level
+// response deadline.  Keep a separate named constant here so the raw-NAN
+// scheduler documents that it is intentionally used to hold a sleepy target
+// awake while the command is executed and its response is queued.
+const NAN_COMMAND_TIMEOUT_KEY: u16 = 41;
+// Per-command correlation token. The gateway copies this into the response
+// so delayed status/active records cannot satisfy a later request.
+const NAN_REQUEST_ID_KEY: u16 = 333;
+const NAN_DW_MORE: u8 = 1 << 0;
+const NAN_DW_DONE: u8 = 1 << 1;
+const NAN_DW_UNITS_SHIFT: u8 = 2;
 const NAN_RX_QUEUE_LEN: u32 = 8;
 // A synchronized 512-TU NAN cluster beacon is normally visible at least once
 // per raw-NAN wake.  Do not replace the chosen cluster merely because another
@@ -55,8 +75,17 @@ static NAN_RX_OTHER: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_BYTES: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_MATCHED: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_COMMAND_RX: AtomicU32 = AtomicU32::new(0);
+static NAN_RAW_COMMAND_TX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_TX: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_RAW_TX_OFFSET_US: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_RAW_TX_SLOT_LO: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_RAW_TX_SLOT_HI: AtomicU32 = AtomicU32::new(0);
+// Raw-NAN work queues are deliberately bounded.  Keep explicit drop counters
+// so a saturated node is observable and the higher-level sender can retry;
+// never grow these queues with unbounded radio input.
+static NAN_RAW_COMMAND_DROPS: AtomicU32 = AtomicU32::new(0);
+static NAN_RAW_OUTGOING_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_DMESH_SERVICE_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_DMESH_FOLLOWUP_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_DMESH_FOLLOWUP_TX: AtomicU32 = AtomicU32::new(0);
@@ -88,6 +117,18 @@ static NAN_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static NAN_BEACON_HISTORY_SEQ: [AtomicU32; NAN_BEACON_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; NAN_BEACON_HISTORY_LEN];
+static NAN_BEACON_HISTORY_TSF_LO: [AtomicU32; NAN_BEACON_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; NAN_BEACON_HISTORY_LEN];
+static NAN_BEACON_HISTORY_TSF_HI: [AtomicU32; NAN_BEACON_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; NAN_BEACON_HISTORY_LEN];
+static NAN_BEACON_HISTORY_LOCAL_LO: [AtomicU32; NAN_BEACON_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; NAN_BEACON_HISTORY_LEN];
+static NAN_BEACON_HISTORY_LOCAL_HI: [AtomicU32; NAN_BEACON_HISTORY_LEN] =
+    [const { AtomicU32::new(0) }; NAN_BEACON_HISTORY_LEN];
+static NAN_BEACON_HISTORY_SOURCE: [[AtomicU8; 6]; NAN_BEACON_HISTORY_LEN] =
+    [const { [const { AtomicU8::new(0) }; 6] }; NAN_BEACON_HISTORY_LEN];
 // The NAN cluster ID is learned from the first synchronized beacon. It stays
 // sticky while that cluster remains fresh: nearby clusters have independent
 // TSF timelines and must not replace the timing authority mid-window.
@@ -102,6 +143,46 @@ static NAN_CLUSTER_BSSID: [AtomicU8; 6] = [
 static NAN_CLUSTER_LOCKED: AtomicBool = AtomicBool::new(false);
 static NAN_CLUSTER_FOREIGN_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_CLUSTER_RESELECTS: AtomicU32 = AtomicU32::new(0);
+// Source-aware beacon timing evidence. These counters are deliberately
+// separate from raw management/action/SDF counters: only accepted beacon
+// subtype frames update them.
+const BEACON_STATS_NONE: u32 = 0;
+const BEACON_STATS_NAN: u32 = 1;
+const BEACON_STATS_AP: u32 = 2;
+const BEACON_STATS_RAW: u32 = 3;
+static BEACON_STATS_SOURCE: AtomicU32 = AtomicU32::new(BEACON_STATS_NONE);
+static BEACON_STATS_BSSID: [AtomicU8; 6] = [
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+];
+static BEACON_STATS_INTERVAL_TU: AtomicU32 = AtomicU32::new(512);
+static BEACON_STATS_STRIDE: AtomicU32 = AtomicU32::new(8);
+static BEACON_STATS_FIRST_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_FIRST_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_TSF_LO: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_SLOT_LO: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_SLOT_HI: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_SELECTED_SLOT_LO: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_SELECTED_SLOT_HI: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LAST_PHASE: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_SELECTED_SEEN: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_SELECTED_MISSED: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_DUPLICATES: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_TSF_REGRESSIONS: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_PHASE_MIN: AtomicU32 = AtomicU32::new(u32::MAX);
+static BEACON_STATS_PHASE_MAX: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_LOCAL_DELTA_MIN: AtomicU32 = AtomicU32::new(u32::MAX);
+static BEACON_STATS_LOCAL_DELTA_MAX: AtomicU32 = AtomicU32::new(0);
+static BEACON_STATS_TSF_DELTA_MIN: AtomicU32 = AtomicU32::new(u32::MAX);
+static BEACON_STATS_TSF_DELTA_MAX: AtomicU32 = AtomicU32::new(0);
 static AP_LAST_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static AP_LAST_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static AP_LAST_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
@@ -159,6 +240,7 @@ const NAN_SDEA_SERVICE_UPDATE_CONTROL: [u8; 2] = [0x00, 0x02];
 const NAN_SERVICE_INFO_LEN: usize = 21;
 const NAN_SERVICE_FLAG_UART_WAKE: u8 = 0x80;
 const NAN_SERVICE_FLAG_BLE_WAKE: u8 = 0x40;
+const NAN_SERVICE_FLAG_ACTIVE_ACK: u8 = 0x20;
 // TODO: reserve another service-info flag for a stronger "I really want to
 // talk" advertisement that also asks the target to enable STA and associate
 // with the infrastructure AP. Keep the current control radio-only until that
@@ -219,6 +301,7 @@ static NAN_SOLICITED_PUBLISH_ATTRIBUTES: OnceLock<Mutex<Option<NanPublishAttribu
 // the worker after DMesh parsing, never by the Wi-Fi callback.
 static NAN_FOLLOWUP_HISTORY: OnceLock<Mutex<VecDeque<NanFollowupReceipt>>> = OnceLock::new();
 static NAN_SERVICE_HISTORY: OnceLock<Mutex<VecDeque<NanServiceReceipt>>> = OnceLock::new();
+static NAN_RAW_RESPONSE_HISTORY: OnceLock<Mutex<VecDeque<RawResponseReceipt>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 enum NanCommandPeer {
@@ -253,6 +336,13 @@ struct NanServiceReceipt {
     device_id: [u8; 6],
     instance: u8,
     kind: u8,
+}
+
+#[derive(Clone, Debug)]
+struct RawResponseReceipt {
+    local_us: u64,
+    source: [u8; 6],
+    payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -545,6 +635,60 @@ fn render_followup_history() -> Result<String> {
     ))
 }
 
+fn raw_response_history() -> &'static Mutex<VecDeque<RawResponseReceipt>> {
+    NAN_RAW_RESPONSE_HISTORY.get_or_init(|| Mutex::new(VecDeque::with_capacity(16)))
+}
+
+fn record_raw_response(source: [u8; 6], payload: &[u8]) {
+    if let Ok(mut history) = raw_response_history().lock() {
+        if history.len() >= 16 {
+            history.pop_front();
+        }
+        history.push_back(RawResponseReceipt {
+            local_us: now_us(),
+            source,
+            payload: payload[..payload.len().min(NAN_COMMAND_MAX_LEN)].to_vec(),
+        });
+    }
+}
+
+fn render_raw_response_history() -> Result<String> {
+    const MAX_ENTRIES: usize = 6;
+    const MAX_TEXT: usize = 3_200;
+    let history = raw_response_history()
+        .lock()
+        .map_err(|_| anyhow!("NAN raw response history lock poisoned"))?;
+    if history.is_empty() {
+        return Ok("nan response_history=empty".to_string());
+    }
+    // This is queried over the same bounded UART record as normal commands.
+    // Keep the response below the firmware CBOR/PPP budget and retain the
+    // newest receipts, which are the only ones useful for command matching.
+    let mut selected = history.iter().rev().take(MAX_ENTRIES).collect::<Vec<_>>();
+    selected.reverse();
+    let mut entries = String::new();
+    for entry in selected {
+        let item = format!(
+            "local_us:{}:source:{}:payload_hex:{}",
+            entry.local_us,
+            format_mac(&entry.source),
+            encode_hex(&entry.payload)
+        );
+        if entries.len().saturating_add(item.len()).saturating_add(1) > MAX_TEXT {
+            break;
+        }
+        if !entries.is_empty() {
+            entries.push(',');
+        }
+        entries.push_str(&item);
+    }
+    Ok(format!(
+        "nan response_history count={} entries={}",
+        history.len(),
+        entries
+    ))
+}
+
 pub fn take_command() -> Option<NanIncomingCommand> {
     nan_command_queue().lock().ok()?.pop_front()
 }
@@ -628,6 +772,7 @@ pub fn raw_followup_frame(dst: &[u8; 6], data: &[u8]) -> Result<Vec<u8>> {
 
 pub fn start_raw_window(channel: u8, filter: &str) -> Result<()> {
     NAN_FILTER_MODE.store(parse_filter_mode(filter)?, Ordering::Relaxed);
+    super::wifi::reset_raw_first_frame();
     start_raw_sniffer(channel.max(1))
 }
 
@@ -642,6 +787,265 @@ pub fn last_nan_sync_beacon() -> Option<SyncBeacon> {
         bssid: nan_cluster_bssid(),
         direct: false,
     })
+}
+
+/// Return the selected NAN-cluster timing snapshot for the sleepy scheduler.
+/// This excludes unrelated AP beacons that may be visible in the same active
+/// window; AP fallback timing is exposed separately by `last_ap_sync_beacon`.
+pub fn nan_beacon_snapshot() -> super::wifi::BeaconSnapshot {
+    super::wifi::BeaconSnapshot {
+        count: NAN_RX_BEACON.load(Ordering::Relaxed),
+        local_us: last_beacon_local_us(),
+        tsf_us: last_beacon_tsf_us(),
+    }
+}
+
+/// Render the bounded TSF/local history used by the sleepy scheduler. This is
+/// intentionally compact so an always-on observer can be compared with a
+/// sleepy node without retaining full beacon frames.
+fn render_beacon_history() -> String {
+    let newest = NAN_RX_BEACON.load(Ordering::Relaxed);
+    let mut entries = Vec::new();
+    for offset in 0..NAN_BEACON_HISTORY_LEN {
+        let sequence = newest.saturating_sub(offset as u32);
+        if sequence == 0 {
+            break;
+        }
+        let index = (sequence as usize) % NAN_BEACON_HISTORY_LEN;
+        if NAN_BEACON_HISTORY_SEQ[index].load(Ordering::Acquire) != sequence {
+            continue;
+        }
+        let tsf_us = load_u64(
+            &NAN_BEACON_HISTORY_TSF_LO[index],
+            &NAN_BEACON_HISTORY_TSF_HI[index],
+        );
+        let local_us = load_u64(
+            &NAN_BEACON_HISTORY_LOCAL_LO[index],
+            &NAN_BEACON_HISTORY_LOCAL_HI[index],
+        );
+        let mut source = [0_u8; 6];
+        for (byte, value) in source.iter_mut().enumerate() {
+            *value = NAN_BEACON_HISTORY_SOURCE[index][byte].load(Ordering::Relaxed);
+        }
+        entries.push(format!(
+            "{}:{}:{}:{}",
+            sequence,
+            tsf_us,
+            local_us,
+            format_mac(&source)
+        ));
+    }
+    format!(
+        "nan beacon_history count={} entries={}",
+        entries.len(),
+        entries.join(",")
+    )
+}
+
+fn beacon_stats_source_name(source: u32) -> &'static str {
+    match source {
+        BEACON_STATS_NAN => "nan",
+        BEACON_STATS_AP => "ap",
+        BEACON_STATS_RAW => "raw",
+        _ => "none",
+    }
+}
+
+fn beacon_stats_bssid() -> [u8; 6] {
+    let mut bssid = [0_u8; 6];
+    for (index, byte) in bssid.iter_mut().enumerate() {
+        *byte = BEACON_STATS_BSSID[index].load(Ordering::Relaxed);
+    }
+    bssid
+}
+
+fn store_beacon_stats_bssid(bssid: [u8; 6]) {
+    for (index, byte) in bssid.iter().enumerate() {
+        BEACON_STATS_BSSID[index].store(*byte, Ordering::Relaxed);
+    }
+}
+
+/// Clear the bounded accepted-beacon timing reference.
+pub fn reset_beacon_stats() {
+    BEACON_STATS_SOURCE.store(BEACON_STATS_NONE, Ordering::Relaxed);
+    store_beacon_stats_bssid([0; 6]);
+    BEACON_STATS_INTERVAL_TU.store(512, Ordering::Relaxed);
+    BEACON_STATS_STRIDE.store(8, Ordering::Relaxed);
+    for cell in [
+        &BEACON_STATS_FIRST_TSF_LO,
+        &BEACON_STATS_FIRST_TSF_HI,
+        &BEACON_STATS_LAST_TSF_LO,
+        &BEACON_STATS_LAST_TSF_HI,
+        &BEACON_STATS_LAST_LOCAL_LO,
+        &BEACON_STATS_LAST_LOCAL_HI,
+        &BEACON_STATS_LAST_SLOT_LO,
+        &BEACON_STATS_LAST_SLOT_HI,
+        &BEACON_STATS_LAST_SELECTED_SLOT_LO,
+        &BEACON_STATS_LAST_SELECTED_SLOT_HI,
+    ] {
+        cell.store(0, Ordering::Relaxed);
+    }
+    BEACON_STATS_LAST_PHASE.store(0, Ordering::Relaxed);
+    BEACON_STATS_ACCEPTED.store(0, Ordering::Relaxed);
+    BEACON_STATS_SELECTED_SEEN.store(0, Ordering::Relaxed);
+    BEACON_STATS_SELECTED_MISSED.store(0, Ordering::Relaxed);
+    BEACON_STATS_DUPLICATES.store(0, Ordering::Relaxed);
+    BEACON_STATS_TSF_REGRESSIONS.store(0, Ordering::Relaxed);
+    BEACON_STATS_PHASE_MIN.store(u32::MAX, Ordering::Relaxed);
+    BEACON_STATS_PHASE_MAX.store(0, Ordering::Relaxed);
+    BEACON_STATS_LOCAL_DELTA_MIN.store(u32::MAX, Ordering::Relaxed);
+    BEACON_STATS_LOCAL_DELTA_MAX.store(0, Ordering::Relaxed);
+    BEACON_STATS_TSF_DELTA_MIN.store(u32::MAX, Ordering::Relaxed);
+    BEACON_STATS_TSF_DELTA_MAX.store(0, Ordering::Relaxed);
+}
+
+fn record_beacon_stats(
+    source: u32,
+    bssid: [u8; 6],
+    tsf_us: u64,
+    local_us: u64,
+    interval_tu: u32,
+    stride: u32,
+) {
+    let current_source = BEACON_STATS_SOURCE.load(Ordering::Acquire);
+    if current_source != source || beacon_stats_bssid() != bssid {
+        reset_beacon_stats();
+        BEACON_STATS_SOURCE.store(source, Ordering::Release);
+        store_beacon_stats_bssid(bssid);
+    }
+    let interval_tu = interval_tu.max(1);
+    let stride = stride.max(1);
+    BEACON_STATS_INTERVAL_TU.store(interval_tu, Ordering::Relaxed);
+    BEACON_STATS_STRIDE.store(stride, Ordering::Relaxed);
+    let period_us = u64::from(interval_tu).saturating_mul(1024);
+    let slot = tsf_us / period_us;
+    let phase = (tsf_us % period_us).min(u64::from(u32::MAX)) as u32;
+    let last_tsf = load_u64(&BEACON_STATS_LAST_TSF_LO, &BEACON_STATS_LAST_TSF_HI);
+    let last_local = load_u64(&BEACON_STATS_LAST_LOCAL_LO, &BEACON_STATS_LAST_LOCAL_HI);
+    if last_tsf != 0 {
+        if tsf_us < last_tsf {
+            BEACON_STATS_TSF_REGRESSIONS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let delta = tsf_us.saturating_sub(last_tsf).min(u64::from(u32::MAX)) as u32;
+            BEACON_STATS_TSF_DELTA_MIN.fetch_min(delta, Ordering::Relaxed);
+            BEACON_STATS_TSF_DELTA_MAX.fetch_max(delta, Ordering::Relaxed);
+        }
+    } else {
+        store_u64(
+            &BEACON_STATS_FIRST_TSF_LO,
+            &BEACON_STATS_FIRST_TSF_HI,
+            tsf_us,
+        );
+    }
+    if last_local != 0 {
+        let delta = local_us.saturating_sub(last_local).min(u64::from(u32::MAX)) as u32;
+        BEACON_STATS_LOCAL_DELTA_MIN.fetch_min(delta, Ordering::Relaxed);
+        BEACON_STATS_LOCAL_DELTA_MAX.fetch_max(delta, Ordering::Relaxed);
+    }
+    BEACON_STATS_PHASE_MIN.fetch_min(phase, Ordering::Relaxed);
+    BEACON_STATS_PHASE_MAX.fetch_max(phase, Ordering::Relaxed);
+    BEACON_STATS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    let selected = slot % u64::from(stride) == 0;
+    if selected {
+        let last_selected = load_u64(
+            &BEACON_STATS_LAST_SELECTED_SLOT_LO,
+            &BEACON_STATS_LAST_SELECTED_SLOT_HI,
+        );
+        if last_selected == slot {
+            BEACON_STATS_DUPLICATES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            if last_selected != 0 && slot > last_selected + 1 {
+                let selected_gap = (slot - last_selected) / u64::from(stride);
+                BEACON_STATS_SELECTED_MISSED.fetch_add(
+                    selected_gap.saturating_sub(1).min(u64::from(u32::MAX)) as u32,
+                    Ordering::Relaxed,
+                );
+            }
+            BEACON_STATS_SELECTED_SEEN.fetch_add(1, Ordering::Relaxed);
+            store_u64(
+                &BEACON_STATS_LAST_SELECTED_SLOT_LO,
+                &BEACON_STATS_LAST_SELECTED_SLOT_HI,
+                slot,
+            );
+        }
+    }
+    store_u64(&BEACON_STATS_LAST_TSF_LO, &BEACON_STATS_LAST_TSF_HI, tsf_us);
+    store_u64(
+        &BEACON_STATS_LAST_LOCAL_LO,
+        &BEACON_STATS_LAST_LOCAL_HI,
+        local_us,
+    );
+    store_u64(&BEACON_STATS_LAST_SLOT_LO, &BEACON_STATS_LAST_SLOT_HI, slot);
+    BEACON_STATS_LAST_PHASE.store(phase, Ordering::Relaxed);
+}
+
+fn beacon_stats() -> String {
+    let min_or_zero = |value: u32| if value == u32::MAX { 0 } else { value };
+    format!(
+        "beacon_stats source={} bssid={} interval_tu={} stride={} accepted={} selected_seen={} selected_missed={} duplicates={} tsf_regressions={} phase_min_us={} phase_max_us={} phase_span_us={} last_phase_us={} tsf_delta_min_us={} tsf_delta_max_us={} local_delta_min_us={} local_delta_max_us={} first_tsf_us={} last_tsf_us={}",
+        beacon_stats_source_name(BEACON_STATS_SOURCE.load(Ordering::Relaxed)),
+        format_mac(&beacon_stats_bssid()),
+        BEACON_STATS_INTERVAL_TU.load(Ordering::Relaxed),
+        BEACON_STATS_STRIDE.load(Ordering::Relaxed),
+        BEACON_STATS_ACCEPTED.load(Ordering::Relaxed),
+        BEACON_STATS_SELECTED_SEEN.load(Ordering::Relaxed),
+        BEACON_STATS_SELECTED_MISSED.load(Ordering::Relaxed),
+        BEACON_STATS_DUPLICATES.load(Ordering::Relaxed),
+        BEACON_STATS_TSF_REGRESSIONS.load(Ordering::Relaxed),
+        min_or_zero(BEACON_STATS_PHASE_MIN.load(Ordering::Relaxed)),
+        BEACON_STATS_PHASE_MAX.load(Ordering::Relaxed),
+        BEACON_STATS_PHASE_MAX
+            .load(Ordering::Relaxed)
+            .saturating_sub(min_or_zero(BEACON_STATS_PHASE_MIN.load(Ordering::Relaxed))),
+        BEACON_STATS_LAST_PHASE.load(Ordering::Relaxed),
+        min_or_zero(BEACON_STATS_TSF_DELTA_MIN.load(Ordering::Relaxed)),
+        BEACON_STATS_TSF_DELTA_MAX.load(Ordering::Relaxed),
+        min_or_zero(BEACON_STATS_LOCAL_DELTA_MIN.load(Ordering::Relaxed)),
+        BEACON_STATS_LOCAL_DELTA_MAX.load(Ordering::Relaxed),
+        load_u64(&BEACON_STATS_FIRST_TSF_LO, &BEACON_STATS_FIRST_TSF_HI),
+        load_u64(&BEACON_STATS_LAST_TSF_LO, &BEACON_STATS_LAST_TSF_HI),
+    )
+}
+
+/// Find a selected-slot beacon received after `baseline`.
+///
+/// The latest-beacon snapshot is insufficient when a receiver hears several
+/// cluster beacons in one active window: a later beacon can make an otherwise
+/// valid DW0/DW8 rendezvous look late. The bounded history is only timing
+/// metadata and is overwritten continuously.
+pub fn nan_beacon_matching_since(
+    baseline: u32,
+    expected_tsf_us: u64,
+    period_us: u64,
+    tolerance_us: u64,
+) -> Option<super::wifi::BeaconSnapshot> {
+    if expected_tsf_us == 0 || period_us == 0 {
+        return None;
+    }
+    let current = NAN_RX_BEACON.load(Ordering::Acquire);
+    let expected_slot = expected_tsf_us / period_us;
+    let expected_phase = expected_tsf_us % period_us;
+    for index in 0..NAN_BEACON_HISTORY_LEN {
+        let sequence = NAN_BEACON_HISTORY_SEQ[index].load(Ordering::Acquire);
+        if sequence <= baseline || sequence > current {
+            continue;
+        }
+        let tsf_us = (u64::from(NAN_BEACON_HISTORY_TSF_HI[index].load(Ordering::Relaxed)) << 32)
+            | u64::from(NAN_BEACON_HISTORY_TSF_LO[index].load(Ordering::Relaxed));
+        let phase_delta_us = (tsf_us % period_us).abs_diff(expected_phase);
+        if tsf_us / period_us != expected_slot || phase_delta_us > tolerance_us {
+            continue;
+        }
+        let local_us = (u64::from(NAN_BEACON_HISTORY_LOCAL_HI[index].load(Ordering::Relaxed))
+            << 32)
+            | u64::from(NAN_BEACON_HISTORY_LOCAL_LO[index].load(Ordering::Relaxed));
+        return Some(super::wifi::BeaconSnapshot {
+            count: sequence,
+            local_us,
+            tsf_us,
+        });
+    }
+    None
 }
 
 /// The latest non-NAN channel beacon. Direct DMesh APs are marked so callers
@@ -843,13 +1247,24 @@ fn wake_request_for_service(data: &[u8]) -> Option<(u32, u8)> {
         return None;
     }
     let target = u32::from_le_bytes(data[11..15].try_into().ok()?);
-    let local = station_mac().ok()?;
-    let local_suffix = u32::from_be_bytes(local[2..6].try_into().ok()?);
-    if target != u32::MAX && target != local_suffix {
+    if target != u32::MAX && !target_matches_local(target) {
         return None;
     }
     let duration = u16::from_le_bytes(data[15..17].try_into().ok()?) as u32;
     Some((duration.clamp(1_000, 300_000), data[4]))
+}
+
+fn active_ack_for_service(data: &[u8]) -> Option<(u32, u16)> {
+    if !is_dmesh_nan_service_info(data) || data[4] & NAN_SERVICE_FLAG_ACTIVE_ACK == 0 {
+        return None;
+    }
+    let target = u32::from_le_bytes(data[11..15].try_into().ok()?);
+    if target != u32::MAX && !target_matches_local(target) {
+        return None;
+    }
+    let peer_suffix = u32::from_be_bytes(data[5..9].try_into().ok()?);
+    let duration = u16::from_le_bytes(data[15..17].try_into().ok()?);
+    Some((peer_suffix, duration))
 }
 
 fn dmesh_nan_followup_frame(
@@ -887,27 +1302,71 @@ fn fnv1a32(data: &[u8]) -> u32 {
 /// window. In continuously active raw mode, drain it now so interactive
 /// diagnostics retain their request/response behavior.
 pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -> Result<usize> {
+    let request_id = crate::commands::protocol::decode_binary(&command.payload)
+        .ok()
+        .and_then(|request| request.args.get(&NAN_REQUEST_ID_KEY).cloned());
     // A raw-NAN SDF carries at most 255 bytes. Never truncate compact CBOR:
     // an incomplete response is decoded as a request by the peer and corrupts
     // response accounting. Preserve the method ID where possible and return a
-    // small, valid CBOR error instead.
+    // small, valid response. A status response is intentionally marked as
+    // truncated rather than converted to an error: `status` and `ping` carry
+    // verbose UART text, but the addressed command still completed and the
+    // gateway must be able to observe that completion over NAN.
     let bounded = if payload.len() <= NAN_COMMAND_MAX_LEN {
         payload.to_vec()
     } else {
-        let method = crate::commands::protocol::decode_binary(payload)
-            .map(|response| response.method)
-            .unwrap_or(0);
-        let mut response = CommandRequest::new_binary(method);
-        response.args.insert(
-            crate::commands::protocol::CBOR_ERROR,
-            format!("raw NAN response exceeds {NAN_COMMAND_MAX_LEN} bytes"),
-        );
-        crate::commands::protocol::encode_binary(&response)
+        let decoded = crate::commands::protocol::decode_binary(payload).ok();
+        let method = decoded.as_ref().map(|response| response.method).unwrap_or(0);
+        let mut compact = CommandRequest::new_binary(method);
+        if decoded
+            .as_ref()
+            .is_some_and(|response| response.args.contains_key(&crate::commands::protocol::CBOR_ERROR))
+        {
+            compact.args.insert(
+                crate::commands::protocol::CBOR_ERROR,
+                "raw NAN response exceeds 231 bytes".to_string(),
+            );
+        } else {
+            compact.args.insert(
+                crate::commands::protocol::CBOR_STATUS,
+                "partial".to_string(),
+            );
+            if let Some(message) = decoded
+                .as_ref()
+        .and_then(|response| response.args.get(&32))
+            {
+                let prefix = message.chars().take(150).collect::<String>();
+                compact.args.insert(32, format!("{prefix} [truncated]"));
+            }
+        }
+        crate::commands::protocol::encode_binary(&compact)
+    };
+    let bounded = if let Some(request_id) = request_id {
+        if let Ok(mut response) = crate::commands::protocol::decode_binary(&bounded) {
+            response.args.insert(NAN_REQUEST_ID_KEY, request_id);
+            let encoded = crate::commands::protocol::encode_binary(&response);
+            if encoded.len() <= NAN_COMMAND_MAX_LEN {
+                encoded
+            } else {
+                bounded
+            }
+        } else {
+            bounded
+        }
+    } else {
+        bounded
     };
     match &command.peer {
         NanCommandPeer::Raw { mac, instance } => {
-            let queued = enqueue_outgoing_raw(*mac, *instance, &bounded, true)?;
-            if !super::mode::raw_nan_duty_enabled() && NAN_RUNNING.load(Ordering::Relaxed) {
+            // Keep the response on the NAN discovery multicast destination.
+            // ESP STA/AP MAC filtering is inconsistent across IDF modes, while
+            // the request already carries the logical target in CBOR. The
+            // gateway filters by source/sequence in response history.
+            let _ = mac;
+            let queued = enqueue_outgoing_raw([0xff; 6], *instance, &bounded, true)?;
+            if (!super::mode::raw_nan_duty_enabled() || super::mode::raw_nan_interactive_active())
+                && NAN_RUNNING.load(Ordering::Relaxed)
+            {
                 drain_outgoing_raw();
             }
             Ok(queued)
@@ -1019,6 +1478,22 @@ pub fn drain_publish_on_discovery_window() -> usize {
 
 pub fn raw_response_rx_count() -> u32 {
     NAN_RAW_RESPONSE_RX.load(Ordering::Relaxed)
+}
+
+/// Bounded raw command/response counters exposed in the compact mode status.
+pub fn raw_command_rx_count() -> u32 {
+    NAN_RAW_COMMAND_RX.load(Ordering::Relaxed)
+}
+
+pub fn raw_response_tx_count() -> u32 {
+    NAN_RAW_RESPONSE_TX.load(Ordering::Relaxed)
+}
+
+pub fn raw_queue_len() -> usize {
+    nan_outgoing_queue()
+        .lock()
+        .map(|queue| queue.len())
+        .unwrap_or(0)
 }
 
 pub fn raw_tx_active() -> bool {
@@ -1172,6 +1647,19 @@ impl CommandHandler for NanCommand {
         if request.arg("stats").is_some() {
             return Ok(CommandResponse::ok(stats()));
         }
+        if let Some(value) = request.arg("beacon_stats") {
+            if matches!(value, "reset" | "clear" | "false") {
+                reset_beacon_stats();
+                return Ok(CommandResponse::ok("beacon_stats reset=true"));
+            }
+            return Ok(CommandResponse::ok(beacon_stats()));
+        }
+        if request.arg("timing").is_some() {
+            return Ok(CommandResponse::ok(super::mode::raw_nan_timing_fields()));
+        }
+        if request.arg("beacon_history").is_some() {
+            return Ok(CommandResponse::ok(render_beacon_history()));
+        }
         if request.arg("beacon_dump").is_some() {
             let beacon = last_sync_beacon_frame()
                 .lock()
@@ -1268,6 +1756,9 @@ impl CommandHandler for NanCommand {
                 return Ok(CommandResponse::ok("nan action_history=cleared"));
             }
             return Ok(CommandResponse::ok(render_followup_history()?));
+        }
+        if request.arg("response_history").is_some() {
+            return Ok(CommandResponse::ok(render_raw_response_history()?));
         }
         if request.arg("sync_beacon").is_some() {
             self.ensure_raw_started()?;
@@ -1801,8 +2292,11 @@ fn start_raw_sniffer(channel: u8) -> Result<()> {
     ensure_rx_queue()?;
     super::wifi::ensure_raw_wifi_started(channel)?;
     unsafe {
+        // Include data frames for the first-frame timing marker.  NAN still
+        // queues/parses management frames only; a data frame merely proves
+        // that the RX path was alive before the selected beacon.
         let mut filter = sys::wifi_promiscuous_filter_t {
-            filter_mask: sys::WIFI_PROMIS_FILTER_MASK_MGMT,
+            filter_mask: sys::WIFI_PROMIS_FILTER_MASK_MGMT | sys::WIFI_PROMIS_FILTER_MASK_DATA,
         };
         esp_ok(sys::esp_wifi_set_promiscuous(false))?;
         esp_ok(sys::esp_wifi_set_promiscuous_rx_cb(Some(sniffer_cb)))?;
@@ -1938,6 +2432,7 @@ fn enqueue_raw_command(source: [u8; 6], instance: u8, payload: &[u8]) -> bool {
         telemetry::record_log("event type=nan.reject reason=target".to_string());
         return false;
     }
+    apply_dw_control(&req);
     if station_mac().map(|mac| mac == source).unwrap_or(false) {
         telemetry::record_log("event type=nan.reject reason=self".to_string());
         return false;
@@ -1947,6 +2442,10 @@ fn enqueue_raw_command(source: [u8; 6], instance: u8, payload: &[u8]) -> bool {
     };
     if queue.len() >= NAN_COMMAND_QUEUE_MAX {
         queue.pop_front();
+        NAN_RAW_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=nan.queue_drop kind=command limit={NAN_COMMAND_QUEUE_MAX}"
+        ));
     }
     queue.push_back(NanIncomingCommand {
         peer: NanCommandPeer::Raw {
@@ -1969,15 +2468,14 @@ fn command_targets_this_device_cbor(request: &CommandRequest) -> bool {
         telemetry::record_log("event type=nan.target_check to=broadcast".to_string());
         return true;
     }
-    let Ok(mac) = station_mac() else {
-        telemetry::record_log("event type=nan.target_check err=no_mac".to_string());
-        return false;
-    };
-    let suffix = mac_suffix4_hex(&mac);
-    let matched = to.eq_ignore_ascii_case(&suffix);
+    let matched = local_target_suffixes()
+        .iter()
+        .any(|suffix| to.eq_ignore_ascii_case(suffix));
     telemetry::record_log(format!(
-        "event type=nan.target_check to={} suffix={} matched={}",
-        to, suffix, matched
+        "event type=nan.target_check to={} suffixes={} matched={}",
+        to,
+        local_target_suffixes().join(","),
+        matched
     ));
     matched
 }
@@ -1997,11 +2495,28 @@ fn enqueue_outgoing_raw(
         };
         if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
             queue.pop_front();
+            NAN_RAW_OUTGOING_DROPS.fetch_add(1, Ordering::Relaxed);
+            telemetry::record_log(format!(
+                "event type=nan.queue_drop kind=outgoing limit={NAN_OUTGOING_QUEUE_MAX}"
+            ));
         }
+        // Add continuation metadata to command records at the gateway.  It
+        // is deliberately derived from the bounded queue, not from a caller
+        // supplied duration: a peer stays awake only while this gateway has
+        // more work to flush.  Responses are left untouched.
+        let wire_payload = if response {
+            payload.to_vec()
+        } else {
+            let queued_after = queue.len().saturating_add(1);
+            let mut control = if queued_after > 1 { NAN_DW_MORE } else { NAN_DW_DONE };
+            let units = queued_after.min(8) as u8;
+            control |= units << NAN_DW_UNITS_SHIFT;
+            add_dw_control(payload, control)
+        };
         queue.push_back(RawNanOutgoing {
             dst,
             instance,
-            payload: payload.to_vec(),
+            payload: wire_payload,
             response,
         });
         queue.len()
@@ -2011,15 +2526,96 @@ fn enqueue_outgoing_raw(
     Ok(queued)
 }
 
+fn add_dw_control(payload: &[u8], control: u8) -> Vec<u8> {
+    let Ok(mut request) = crate::commands::protocol::decode_binary(payload) else {
+        return payload.to_vec();
+    };
+    request
+        .args
+        .insert(NAN_DW_CONTROL_KEY, control.to_string());
+    let encoded = crate::commands::protocol::encode_binary(&request);
+    if encoded.len() <= NAN_COMMAND_MAX_LEN {
+        encoded
+    } else {
+        payload.to_vec()
+    }
+}
+
+fn apply_dw_control(request: &CommandRequest) {
+    let (more, done, units) = match request.args.get(&NAN_DW_CONTROL_KEY) {
+        None => (false, false, 0),
+        Some(raw) => match raw.parse::<u8>() {
+            Ok(control) => {
+                let more = control & NAN_DW_MORE != 0;
+                let done = control & NAN_DW_DONE != 0;
+                let units = control >> NAN_DW_UNITS_SHIFT;
+                if more || units != 0 {
+                    // One unit is one 512-TU cadence. Clamp through the mode
+                    // helper so a malformed hint cannot pin a node awake.
+                    let duration_ms = u32::from(units.max(1)).saturating_mul(512);
+                    super::mode::request_targeted_wake(duration_ms);
+                }
+                (more, done, units)
+            }
+            Err(_) => {
+                telemetry::record_log("event type=nan.dw_control invalid=true".to_string());
+                (false, false, 0)
+            }
+        },
+    };
+    // Commands that explicitly carry `timeout=<ms>` expect an immediate
+    // response.  Treat that value as a bounded post-DW awake deadline too;
+    // this lets the target execute the command and flush its response over
+    // the interactive burst transport without requiring another wake hint.
+    if let Some(raw_timeout) = request.args.get(&NAN_COMMAND_TIMEOUT_KEY) {
+        match raw_timeout.parse::<i32>() {
+            Ok(timeout_ms) if timeout_ms > 0 => {
+                super::mode::request_targeted_wake(timeout_ms as u32);
+                telemetry::record_log(format!(
+                    "event type=nan.response_deadline timeout_ms={}",
+                    timeout_ms
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => telemetry::record_log(
+                "event type=nan.response_deadline invalid=true".to_string(),
+            ),
+        }
+    }
+    if request.args.contains_key(&NAN_DW_CONTROL_KEY) {
+        telemetry::record_log(format!(
+            "event type=nan.dw_control more={} done={} units={}",
+            more, done, units
+        ));
+    }
+}
+
 fn drain_outgoing_raw() -> usize {
     // A duty-cycled ESP may have Wi-Fi powered for beacon acquisition before
     // the peer's actual DW.  Do not turn that wider receive interval into a
     // transmit opportunity: Android departs channel 6 rapidly after DW.
-    if !super::mode::raw_nan_data_dw_open() {
+    let infra_dw_open = super::mode::ap_owner_running()
+        && last_beacon_local_us() != 0
+        && now_us().saturating_sub(last_beacon_local_us()) <= 64_000
+        && super::mode::infra_target_dw_open(last_beacon_tsf_us());
+    if !super::mode::raw_nan_data_dw_open()
+        && !super::mode::raw_nan_interactive_active()
+        && !infra_dw_open
+    {
         return 0;
     }
+    // A sleepy peer has only a short receive dwell after the selected beacon.
+    // The DW protocol intentionally exchanges exactly one frame per selected
+    // window. That frame may carry the continuation hint (MORE/DONE); a MORE
+    // request keeps the peer awake for the following burst, where the
+    // session-oriented bearer takes over. Never turn a retry backlog into a
+    // same-DW burst.
+    let max_per_window = 1;
     let mut sent = 0_usize;
     loop {
+        if sent >= max_per_window {
+            return sent;
+        }
         let item = {
             let Ok(mut queue) = nan_outgoing_queue().lock() else {
                 return sent;
@@ -2034,8 +2630,19 @@ fn drain_outgoing_raw() -> usize {
         {
             Ok(()) => {
                 sent += 1;
+                NAN_LAST_RAW_TX_OFFSET_US.store(
+                    now_us()
+                        .saturating_sub(last_beacon_local_us())
+                        .min(u64::from(u32::MAX)) as u32,
+                    Ordering::Relaxed,
+                );
+                let tx_slot = last_beacon_tsf_us() / 524_288;
+                NAN_LAST_RAW_TX_SLOT_LO.store(tx_slot as u32, Ordering::Relaxed);
+                NAN_LAST_RAW_TX_SLOT_HI.store((tx_slot >> 32) as u32, Ordering::Relaxed);
                 if item.response {
                     NAN_RAW_RESPONSE_TX.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    NAN_RAW_COMMAND_TX.fetch_add(1, Ordering::Relaxed);
                 }
                 telemetry::record_log(format!(
                     "event type=nan.queue_tx ok=true dst={} len={} sent={}",
@@ -2251,7 +2858,7 @@ fn nan_publish_attributes(
     } else {
         configured_stride
     };
-    let active_ms = settings.get_i32("nan.active_ms", 250)?.clamp(16, 8_000) as u32;
+    let active_ms = settings.get_i32("nan.active_ms", 64)?.clamp(16, 8_000) as u32;
     Ok((
         nan_availability_attribute(dw_tu, offset_tu, stride, active_ms, availability_map)?,
         nan_device_capability_attribute(stride)?,
@@ -2562,7 +3169,10 @@ fn nan_service_info_with_wake(
     // wake_count, last_len, and last_hash deliberately remain zero until the
     // raw-NAN scheduler owns per-advertisement payload metadata.
     if let Some(target) = uart_wake_target {
-        info[4] |= wake_flags & (NAN_SERVICE_FLAG_UART_WAKE | NAN_SERVICE_FLAG_BLE_WAKE);
+        info[4] |= wake_flags
+            & (NAN_SERVICE_FLAG_UART_WAKE
+                | NAN_SERVICE_FLAG_BLE_WAKE
+                | NAN_SERVICE_FLAG_ACTIVE_ACK);
         info[11..15].copy_from_slice(&target.to_le_bytes());
         info[15..17].copy_from_slice(&uart_wake_duration_ms.to_le_bytes());
     }
@@ -2605,6 +3215,39 @@ fn station_mac() -> Result<[u8; 6]> {
     Ok(mac)
 }
 
+/// Return the suffixes that may identify this node on raw NAN.  ESP-IDF uses
+/// the STA MAC for station identity, while raw management/action frames sent
+/// through the AP interface carry the adjacent SoftAP MAC.  The gateway maps
+/// targets from the on-air NAN source, so filtering only the STA suffix drops
+/// every addressed command by one in the final octet.
+fn local_target_suffixes() -> Vec<String> {
+    let mut suffixes = Vec::with_capacity(2);
+    if let Ok(mac) = station_mac() {
+        suffixes.push(mac_suffix4_hex(&mac));
+    }
+    if let Ok(mac) = super::wifi::raw_tx_source_mac() {
+        let suffix = mac_suffix4_hex(&mac);
+        if !suffixes.iter().any(|known| known == &suffix) {
+            suffixes.push(suffix);
+        }
+    }
+    suffixes
+}
+
+fn target_matches_local(target: u32) -> bool {
+    let wanted = format!("{target:08x}");
+    local_target_suffixes()
+        .iter()
+        .any(|suffix| suffix.eq_ignore_ascii_case(&wanted))
+}
+
+fn local_mac_matches(target: [u8; 6]) -> bool {
+    station_mac().map(|mac| mac == target).unwrap_or(false)
+        || super::wifi::raw_tx_source_mac()
+            .map(|mac| mac == target)
+            .unwrap_or(false)
+}
+
 fn is_broadcast_target(value: &str) -> bool {
     let value = value.strip_prefix("0x").unwrap_or(value);
     value.eq_ignore_ascii_case("ffffffff")
@@ -2635,6 +3278,9 @@ unsafe extern "C" fn sniffer_cb(
     buf: *mut core::ffi::c_void,
     type_: sys::wifi_promiscuous_pkt_type_t,
 ) {
+    if !buf.is_null() {
+        super::wifi::mark_raw_first_frame(unsafe { sys::esp_timer_get_time().max(0) as u64 });
+    }
     if type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_MGMT || buf.is_null() {
         NAN_RX_OTHER.fetch_add(1, Ordering::Relaxed);
         return;
@@ -2728,7 +3374,31 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
     match frame[0] {
         0x80 => {
             if is_nan_bssid(frame) {
-                NAN_RX_BEACON.fetch_add(1, Ordering::Relaxed);
+                let sequence = NAN_RX_BEACON.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+                let index = (sequence as usize) % NAN_BEACON_HISTORY_LEN;
+                if let Some(tsf_us) = beacon_tsf_us(frame) {
+                    store_u64(
+                        &NAN_BEACON_HISTORY_TSF_LO[index],
+                        &NAN_BEACON_HISTORY_TSF_HI[index],
+                        tsf_us,
+                    );
+                    store_u64(
+                        &NAN_BEACON_HISTORY_LOCAL_LO[index],
+                        &NAN_BEACON_HISTORY_LOCAL_HI[index],
+                        received_local_us,
+                    );
+                    if let Some(source) = frame
+                        .get(FRAME_SRC..FRAME_SRC + 6)
+                        .and_then(|bytes| <&[u8] as TryInto<&[u8; 6]>>::try_into(bytes).ok())
+                    {
+                        for (byte, value) in source.iter().enumerate() {
+                            NAN_BEACON_HISTORY_SOURCE[index][byte].store(*value, Ordering::Relaxed);
+                        }
+                    }
+                    // Publish the sequence last so readers never accept a
+                    // partially written history entry.
+                    NAN_BEACON_HISTORY_SEQ[index].store(sequence, Ordering::Release);
+                }
             }
         }
         0xd0 => {
@@ -2769,12 +3439,51 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                             captured.clear();
                             captured.extend_from_slice(&frame[..frame.len().min(NAN_RX_FRAME_MAX)]);
                         }
+                        if let Some((peer_suffix, duration_ms)) =
+                            active_ack_for_service(info.payload)
+                        {
+                            telemetry::record_log(format!(
+                                "event type=nan.active_ack peer={:08x} duration_ms={}",
+                                peer_suffix, duration_ms
+                            ));
+                        }
                         if let Some((duration_ms, wake_flags)) =
                             wake_request_for_service(info.payload)
                         {
                             if wake_flags & NAN_SERVICE_FLAG_UART_WAKE != 0 {
                                 super::mode::request_targeted_wake(duration_ms);
                                 super::serial::activate_window_for(duration_ms);
+                                // A sleepy node acknowledges the negotiated
+                                // active interval in the same DW protocol.
+                                // The ACK is queued here and released by the
+                                // normal selected-DW transmitter, preserving
+                                // the one-frame rendezvous rule.
+                                if let Ok(availability) =
+                                    nan_availability_attribute(512, 0, 8, 64, 1)
+                                {
+                                    if let Ok(capabilities) = nan_device_capability_attribute(8) {
+                                        let peer_suffix = u32::from_be_bytes(
+                                            info.source[2..6].try_into().unwrap_or([0; 4]),
+                                        );
+                                        if let Ok(ack) = nan_publish_frame_with_uart_wake(
+                                            &availability,
+                                            &capabilities,
+                                            true,
+                                            2,
+                                            0,
+                                            Some(peer_suffix),
+                                            duration_ms as u16,
+                                            NAN_SERVICE_FLAG_ACTIVE_ACK,
+                                        ) {
+                                            if let Ok(mut queue) = nan_publish_queue().lock() {
+                                                if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
+                                                    queue.pop_front();
+                                                }
+                                                queue.push_back(ack);
+                                            }
+                                        }
+                                    }
+                                }
                                 telemetry::record_log(format!(
                                     "event type=nan.uart_wake target=matched duration_ms={} peer={}",
                                     duration_ms,
@@ -2836,9 +3545,7 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                     if let Some(dmesh) = parse_dmesh_nan_followup(info.payload) {
                         NAN_DMESH_FOLLOWUP_RX.fetch_add(1, Ordering::Relaxed);
                         record_followup_receipt(dmesh.msg_type, dmesh.seq, dmesh.payload);
-                        let targets_this_device = station_mac()
-                            .map(|mac| mac == dmesh.target_id)
-                            .unwrap_or(false);
+                        let targets_this_device = local_mac_matches(dmesh.target_id);
                         telemetry::record_log(format!(
                             "event type=nan.dmesh_followup_rx peer={} instance={} requestor_instance={} type={} seq={} device={} target={} len={} targeted={}",
                             format_mac(&info.source),
@@ -2909,6 +3616,7 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                         is_resp
                     ));
                     if !station_mac().map(|mac| mac == info.source).unwrap_or(false) && is_resp {
+                        record_raw_response(info.source, info.payload);
                         telemetry::record_log(format!(
                             "event type=nan.raw_response_rx source={}",
                             format_mac(&info.source)
@@ -2935,6 +3643,19 @@ fn observe_sync_beacon(frame: &[u8], rssi: i32) {
         if !accept_nan_cluster(frame, local_us) {
             return;
         }
+        let bssid = frame
+            .get(FRAME_BSSID..FRAME_BSSID + 6)
+            .and_then(|bytes| <&[u8] as TryInto<&[u8; 6]>>::try_into(bytes).ok())
+            .copied()
+            .unwrap_or_else(nan_cluster_bssid);
+        record_beacon_stats(
+            BEACON_STATS_NAN,
+            bssid,
+            tsf_us,
+            local_us,
+            512,
+            super::mode::raw_nan_data_stride(),
+        );
         if let Ok(mut captured) = last_sync_beacon_frame().lock() {
             captured.clear();
             captured.extend_from_slice(&frame[..frame.len().min(NAN_RX_FRAME_MAX)]);
@@ -2964,6 +3685,22 @@ fn observe_sync_beacon(frame: &[u8], rssi: i32) {
         AP_LAST_BEACON_BSSID[index].store(*byte, Ordering::Relaxed);
     }
     AP_LAST_BEACON_DIRECT.store(is_direct_dmesh_ssid(frame), Ordering::Relaxed);
+    // Do not let nearby AP traffic overwrite an active NAN reference. AP
+    // timing becomes the source only after the NAN source has gone stale.
+    if last_beacon_local_us() == 0
+        || local_us.saturating_sub(last_beacon_local_us()) >= NAN_CLUSTER_RESELECT_AFTER_US
+    {
+        record_beacon_stats(
+            BEACON_STATS_AP,
+            <&[u8] as TryInto<&[u8; 6]>>::try_into(bssid)
+                .copied()
+                .unwrap_or([0; 6]),
+            tsf_us,
+            local_us,
+            interval_tu,
+            1,
+        );
+    }
 }
 
 fn store_nan_cluster_bssid(frame: &[u8]) {
@@ -3178,8 +3915,12 @@ fn stats() -> String {
         .map(|value| format_mac(&value.bssid))
         .unwrap_or_else(|| "none".to_string());
     let cluster_bssid = format_mac(&nan_cluster_bssid());
+    let last_raw_tx_slot = load_u64(
+        &NAN_LAST_RAW_TX_SLOT_LO,
+        &NAN_LAST_RAW_TX_SLOT_HI,
+    );
     format!(
-        "nan support=raw running={} filter={} bssid_filter={} cluster_bssid={} cluster_locked={} cluster_foreign_drop={} cluster_reselects={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_resp_rx={} raw_resp_tx={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={} publish_dw_tx={} publish_dw_skipped_slot={} publish_dw_local_guard_drop={} publish_dw_last_slot={} publish_dw_last_offset_us={}",
+        "nan support=raw running={} filter={} bssid_filter={} cluster_bssid={} cluster_locked={} cluster_foreign_drop={} cluster_reselects={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_cmd_tx={} raw_cmd_drop={} raw_resp_rx={} raw_resp_tx={} raw_outgoing_drop={} raw_last_tx_offset_us={} raw_last_tx_slot={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={} publish_dw_tx={} publish_dw_skipped_slot={} publish_dw_local_guard_drop={} publish_dw_last_slot={} publish_dw_last_offset_us={}",
         NAN_RUNNING.load(Ordering::Relaxed),
         filter_name(),
         NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -3202,8 +3943,13 @@ fn stats() -> String {
         NAN_RX_OTHER.load(Ordering::Relaxed),
         NAN_RX_BYTES.load(Ordering::Relaxed),
         NAN_RAW_COMMAND_RX.load(Ordering::Relaxed),
+        NAN_RAW_COMMAND_TX.load(Ordering::Relaxed),
+        NAN_RAW_COMMAND_DROPS.load(Ordering::Relaxed),
         NAN_RAW_RESPONSE_RX.load(Ordering::Relaxed),
         NAN_RAW_RESPONSE_TX.load(Ordering::Relaxed),
+        NAN_RAW_OUTGOING_DROPS.load(Ordering::Relaxed),
+        NAN_LAST_RAW_TX_OFFSET_US.load(Ordering::Relaxed),
+        last_raw_tx_slot,
         NAN_DMESH_SERVICE_RX.load(Ordering::Relaxed),
         NAN_DMESH_FOLLOWUP_RX.load(Ordering::Relaxed),
         NAN_DMESH_FOLLOWUP_TX.load(Ordering::Relaxed),
@@ -3338,6 +4084,22 @@ mod tests {
             ),
             ClusterBeaconDecision::Reselect
         );
+    }
+
+    #[test]
+    fn beacon_stats_count_only_selected_slots_and_duplicates() {
+        reset_beacon_stats();
+        let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x54, 0x6c];
+        let period = 512_u64 * 1024;
+        record_beacon_stats(BEACON_STATS_NAN, bssid, period * 8, 10_000, 512, 8);
+        record_beacon_stats(BEACON_STATS_NAN, bssid, period * 8 + 100, 10_100, 512, 8);
+        record_beacon_stats(BEACON_STATS_NAN, bssid, period * 24, 20_000, 512, 8);
+        let rendered = beacon_stats();
+        assert!(rendered.contains("accepted=3"));
+        assert!(rendered.contains("selected_seen=2"));
+        assert!(rendered.contains("selected_missed=1"));
+        assert!(rendered.contains("duplicates=1"));
+        assert!(rendered.contains("source=nan"));
     }
 
     #[test]
@@ -3578,6 +4340,20 @@ mod tests {
         assert_eq!(&map_zero[4..6], &0_u16.to_le_bytes());
         assert_eq!(&map_fifteen[4..6], &15_u16.to_le_bytes());
         assert!(nan_availability_attribute(512, 0, 4, 250, 16).is_err());
+    }
+
+    #[test]
+    fn availability_period_tracks_two_and_one_second_test_strides() {
+        // Keep the test cadence coupled to the scheduler's stride: changing
+        // stride changes both the repeat period and the advertised bitmap
+        // control, while the awake DW remains the first slot in that period.
+        let two_second = nan_availability_attribute(512, 0, 4, 64, 1).unwrap();
+        let one_second = nan_availability_attribute(512, 0, 2, 64, 1).unwrap();
+        let two_control = u16::from_le_bytes([two_second[10], two_second[11]]);
+        let one_control = u16::from_le_bytes([one_second[10], one_second[11]]);
+        assert_eq!((two_control >> 3) & 0x07, 2); // 2048 TU period
+        assert_eq!((one_control >> 3) & 0x07, 1); // 1024 TU period
+        assert_eq!(&two_second[12..14], &one_second[12..14]);
     }
 
     #[test]

@@ -9,9 +9,9 @@ Run from the repository root after sourcing the firmware environment:
 Defaults:
   * discover devices through lmesh usb.serial.list;
   * stop the selected lmesh forward and flash its physical USB-UART bridge;
-  * configure baseline infra Wi-Fi mode, currently wifi.mode=nan;
-  * configure all ESP targets for raw/custom NAN duty cycle with Wi-Fi off
-    between discovery windows;
+  * configure infrastructure ports (normally lora1) as powered/always-on;
+  * configure all other ESP targets as sleepy raw/custom NAN nodes with Wi-Fi
+    off between discovery windows;
   * configure DFS and LoRa receive when the board has saved/probed LoRa pins.
 
 Use explicit logical --port arguments such as lora1 or s3-1, or set
@@ -24,6 +24,7 @@ in separate test scripts or manual serial commands.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "scripts"))
 SSH_MESH_ROOT = Path(
     os.environ.get("DMESH_SSH_MESH_DIR") or ROOT.parent / "rust" / "ssh-mesh"
 ).resolve()
@@ -44,16 +46,25 @@ sys.path.insert(0, str(SSH_MESH_ROOT / "python"))
 
 from dmesh.radio import RadioClient
 
+from device_flash_archive import append_event, device_dir, record_flash, update_device, utc_now
+
 FW_RUST = ROOT / "fw" / "esp32" / "rust"
-FW_TARGET_ROOT = Path(os.environ.get("DMESH_FW_TARGET_DIR", ROOT / "target" / "fw"))
-SERIAL_CMD = FW_RUST / "tools" / "serial_cmd.py"
+# build-fw.sh honors the repo-local CARGO_TARGET_DIR. Keep flashing on that
+# same top-level target tree; falling back to target/fw would silently reuse
+# stale images from the pre-containment layout.
+FW_TARGET_ROOT = Path(
+    os.environ.get("DMESH_FW_TARGET_DIR")
+    or os.environ.get("CARGO_TARGET_DIR")
+    or ROOT / "target"
+).resolve()
+MESH_ENV = ROOT / "scripts" / "with-env.sh"
 NAN_PAIR_TEST = FW_RUST / "tools" / "nan_pair_test.py"
 LORA_CAD_TEST = FW_RUST / "tools" / "lora_cad_test.py"
 LORA_PAIR_TEST = FW_RUST / "tools" / "lora_pair_test.py"
 PRESUBMIT = FW_RUST / "tools" / "presubmit.py"
 ESP32_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32" / "dmesh-rs-merged.bin"
 ESP32S3_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
-ESP32S3_8MB_TARGET = FW_TARGET_ROOT / "esp32s3-8mb"
+ESP32S3_8MB_TARGET = FW_TARGET_ROOT
 ESP32S3_8MB_MERGED_IMAGE = (
     FW_TARGET_ROOT / "flash" / "esp32s3-8mb" / "dmesh-rs-merged.bin"
 )
@@ -108,7 +119,6 @@ class ForwardSpec:
     baud: int = FLASH_BAUD
     tcp_port: int | None = None
     tcp_mode: str = "framed"
-    dtr: bool = False
     multi: bool = True
 
 
@@ -169,6 +179,55 @@ def print_output_block(label: str, output: str) -> None:
     print(f"--- {label} output end ---", flush=True)
 
 
+def archive_usb_device(device: Device, port: str, baud: int) -> Path:
+    """Read immutable device diagnostics before any USB flash write."""
+    if not device.mac:
+        raise RuntimeError(f"{device.port}: probe did not return a MAC address")
+    path = device_dir(device.mac)
+    chip = "esp32s3" if device.is_s3 else "esp32"
+    table = path / "partition-table.bin"
+    nvs = path / "nvs.bin"
+    common = [
+        esptool_python(), "-m", "esptool", "--chip", chip, "--port", port,
+        "--baud", str(baud), "--before", "default_reset", "--after", "no_reset",
+        "read_flash",
+    ]
+    run_logged(
+        f"read partition table {device.port}",
+        common + ["0x8000", "0x1000", str(table)],
+        cwd=FW_RUST,
+        tail_lines=12,
+    )
+    run_logged(
+        f"read NVS {device.port}",
+        common + ["0x9000", "0x6000", str(nvs)],
+        cwd=FW_RUST,
+        tail_lines=12,
+    )
+    update_device(
+        device.mac,
+        mac=device.mac.lower(),
+        last_seen=utc_now(),
+        source="usb-esptool",
+        probe={
+            "chip": device.chip,
+            "flash_size_mb": device.flash_size_mb,
+            "port": device.port,
+        },
+        partition_table_sha256=hashlib.sha256(table.read_bytes()).hexdigest(),
+        nvs_sha256=hashlib.sha256(nvs.read_bytes()).hexdigest(),
+        nvs_size=nvs.stat().st_size,
+    )
+    append_event(device.mac, {
+        "event": "usb_snapshot",
+        "at": utc_now(),
+        "chip": device.chip,
+        "partition_table_sha256": hashlib.sha256(table.read_bytes()).hexdigest(),
+        "nvs_sha256": hashlib.sha256(nvs.read_bytes()).hexdigest(),
+    })
+    return path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -202,6 +261,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--infra-port",
+        action="append",
+        default=os.environ.get("DMESH_INFRA_PORTS", "lora1").split(","),
+        help="Logical port(s) that remain powered infrastructure owners (default: lora1).",
+    )
+    parser.add_argument(
         "--heltec-v3-port",
         action="append",
         default=split_env_list("DMESH_HELTEC_V3_PORTS") or ["lora4"],
@@ -222,11 +287,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lmesh-mode",
-        choices=("tcp", "local-release"),
+        choices=("local-release",),
         default=os.environ.get("DMESH_LMESH_MODE", "local-release"),
         help=(
-            "local-release stops lmesh, flashes the physical USB-UART bridge, then reopens UDS. "
-            "tcp is experimental: use it only after a hardware write/verify qualification run."
+            "Stops lmesh, flashes the physical USB-UART bridge with esptool, then reopens UDS. "
+            "TCP/RFC2217 flashing is intentionally unsupported."
         ),
     )
     parser.add_argument(
@@ -238,18 +303,6 @@ def parse_args() -> argparse.Namespace:
         "--lmesh-control-socket",
         default=os.environ.get("LMESH_CONTROL_SOCKET"),
         help="lmesh JSONL control UDS.",
-    )
-    parser.add_argument(
-        "--lmesh-tcp-base",
-        type=int,
-        default=int(os.environ.get("DMESH_LMESH_TCP_BASE", "3330")),
-        help="First localhost TCP port to request from lmesh in tcp mode.",
-    )
-    parser.add_argument(
-        "--lmesh-dtr",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override configured DTR pulse behavior on forwarded client connects.",
     )
     parser.add_argument(
         "--lmesh-multi",
@@ -267,6 +320,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-flash", action="store_true")
+    parser.add_argument(
+        "--erase-nvs",
+        action="store_true",
+        help="Emergency recovery only: erase the ESP NVS partition before flashing.",
+    )
     parser.add_argument("--skip-config", action="store_true")
     parser.add_argument("--skip-sanity", action="store_true")
     parser.add_argument(
@@ -287,13 +345,12 @@ def parse_args() -> argparse.Namespace:
         help="Delay between pre-flash status samples.",
     )
     parser.add_argument(
-        "--preflash-stability-dtr-ms",
-        type=int,
-        default=0,
+        "--preflash-status-timeout-sec",
+        type=float,
+        default=75.0,
         help=(
-            "Opt-in managed lmesh DTR pulse before each pre-flash status "
-            "sample (1..10000 ms). Use for a raw-NAN board whose UART is "
-            "quiet between duty windows; uptime must still increase."
+            "Managed status timeout; sleepy nodes may answer only on their "
+            "periodic UART heartbeat (default: 75 seconds)."
         ),
     )
     parser.add_argument(
@@ -305,7 +362,7 @@ def parse_args() -> argparse.Namespace:
         "--preflash-only",
         action="store_true",
         help=(
-            "Run only the managed pre-flash status/DTR stability gate and exit. "
+            "Run only the managed pre-flash lmesh status stability gate and exit. "
             "Does not stop lmesh forwards, probe, flash, or run feature tests."
         ),
     )
@@ -409,7 +466,6 @@ def configured_forward_specs() -> dict[str, ForwardSpec]:
             baud=int(item.get("baud", FLASH_BAUD)),
             tcp_port=int(item["tcp_port"]) if isinstance(item.get("tcp_port"), int) else None,
             tcp_mode=str(item.get("tcp_mode", "rfc2217" if item.get("tcp_port") else "framed")),
-            dtr=bool(item.get("dtr", False)),
             multi=bool(item.get("multi", True)),
         )
     return specs
@@ -482,14 +538,6 @@ def lmesh_uds_url(logical_port_name: str) -> str:
     return f"uds://{lmesh_socket_path(logical_port_name)}"
 
 
-def lmesh_tcp_url(tcp_port: int) -> str:
-    return f"socket://127.0.0.1:{tcp_port}"
-
-
-def lmesh_rfc2217_url(tcp_port: int) -> str:
-    return f"rfc2217://127.0.0.1:{tcp_port}"
-
-
 def lmesh_request(control_socket: str, method: str, **params: object) -> dict[str, object]:
     request = {"method": method, **{k: v for k, v in params.items() if v is not None}}
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -532,41 +580,25 @@ def lmesh_stop_forward(args: argparse.Namespace, logical_port_name: str) -> None
         print(f"lmesh stop {logical_port_name}: {exc}", flush=True)
 
 
-def lmesh_reset(args: argparse.Namespace, logical_port_name: str, mode: str) -> None:
-    assert args.lmesh_control_socket
-    data = lmesh_request(
-        args.lmesh_control_socket,
-        "usb.serial.reset",
-        port=logical_port_name,
-        mode=mode,
-    )
-    print(f"lmesh reset {logical_port_name} {mode}: {data}", flush=True)
-
-
 def lmesh_start_forward(
     args: argparse.Namespace,
     logical_port_name: str,
-    tcp_port: int | None,
+    *,
+    direct: bool | None = None,
 ) -> dict[str, object]:
     assert args.lmesh_control_socket
     spec = configured_forward_spec(logical_port_name)
-    requested_tcp_port = tcp_port if tcp_port is not None else (spec.tcp_port if spec else None)
-    dtr = args.lmesh_dtr if args.lmesh_dtr is not None else (spec.dtr if spec else False)
     multi = args.lmesh_multi if args.lmesh_multi is not None else (spec.multi if spec else True)
     baud = spec.baud if spec else FLASH_BAUD
-    tcp_mode = "rfc2217" if requested_tcp_port is not None else "framed"
-    if spec and requested_tcp_port == spec.tcp_port:
-        tcp_mode = spec.tcp_mode
     data = lmesh_request(
         args.lmesh_control_socket,
         "usb.serial.forward.start",
         port=logical_port_name,
         baud=baud,
-        tcp_port=requested_tcp_port,
-        tcp_mode=tcp_mode,
-        dtr=dtr,
+        tcp_mode="framed",
         multi=multi,
         handshake=False,
+        direct=direct,
     )
     print(f"lmesh start {logical_port_name}: {data}", flush=True)
     return data
@@ -583,36 +615,6 @@ def lmesh_forward_map(args: argparse.Namespace) -> dict[str, dict[str, object]]:
         if isinstance(item, dict) and isinstance(item.get("id"), str):
             mapped[item["id"]] = item
     return mapped
-
-
-def tcp_port_from_forward(forward: dict[str, object]) -> int | None:
-    listen = forward.get("tcp_listen")
-    if not isinstance(listen, str):
-        return None
-    match = re.search(r":(\d+)$", listen)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
-def ensure_lmesh_forward(
-    args: argparse.Namespace,
-    logical_port_name: str,
-    requested_tcp_port: int,
-) -> int:
-    existing = lmesh_forward_map(args).get(logical_port_name)
-    if existing:
-        tcp_port = tcp_port_from_forward(existing)
-        if tcp_port is not None:
-            print(
-                f"lmesh reuse {logical_port_name}: tcp=127.0.0.1:{tcp_port}",
-                flush=True,
-            )
-            return tcp_port
-        print(f"lmesh reuse {logical_port_name}: UDS-only forward", flush=True)
-        return requested_tcp_port
-    data = lmesh_start_forward(args, logical_port_name, requested_tcp_port)
-    return tcp_port_from_forward(data) or requested_tcp_port
 
 
 def probe(
@@ -800,9 +802,36 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
     # Always sparse-flash through the esptool RAM stub. This is both more
     # reliable on direct CP210x bridges than cargo-espflash's retained monitor
     # handle and protects NVS by omitting its partition entirely.
+    archive_usb_device(device, port, args.flash_baud)
     chip = "esp32s3" if device.is_s3 else "esp32"
     flash_args, flash_files = sparse_flash_args(device)
     rfc2217 = port.startswith("rfc2217://")
+    if args.erase_nvs:
+        erase_cmd = [
+            esptool_python(),
+            "-m",
+            "esptool",
+            "--chip",
+            chip,
+            "--port",
+            port,
+            "--baud",
+            str(args.flash_baud),
+            "--before",
+            "default_reset",
+            "--after",
+            "no_reset",
+            "erase_region",
+            "0x9000",
+            "0x6000",
+        ]
+        run_logged(
+            f"erase NVS {device.port}",
+            erase_cmd,
+            cwd=FW_RUST,
+            env=env,
+            tail_lines=24,
+        )
     cmd = [
         esptool_python(),
         "-m",
@@ -853,6 +882,8 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
     for offset, image in flash_files:
         verify_cmd.extend([offset, str(image)])
     run_logged(f"verify flash {device.port}", verify_cmd, cwd=FW_RUST, env=env, tail_lines=24)
+    if device.mac:
+        record_flash(device.mac, "main", flash_files)
 
 
 def sparse_flash_args(device: Device) -> tuple[list[str], list[tuple[str, Path]]]:
@@ -890,18 +921,39 @@ def trim_trailing_ff(data: bytes) -> bytes:
     return data[:end]
 
 
+def mesh_command_argv(port: str, command: str, timeout: int = 20) -> list[str]:
+    """Build the only supported firmware-command path: mesh -> lmesh."""
+    return [
+        str(MESH_ENV),
+        "mesh",
+        "lmesh",
+        "esp.serial.command",
+        f"port={logical_usb_port(port)}",
+        f"command={command}",
+        f"timeout_sec={timeout}",
+    ]
+
+
 def configure(device: Device, args: argparse.Namespace, port: str) -> None:
     channel = max(1, min(args.nan_channel, 13))
+    infra = device.port in {logical_usb_port(item) for item in args.infra_port}
+    # Keep the board in the continuously-serviced role while provisioning.
+    # Writing `mode=sleepy` in the same bulk NVS request can stop UART before
+    # its response is framed, leaving the remaining setup commands queued
+    # behind the new heartbeat policy. The final role command below persists
+    # the requested sleepy mode after all probes/configuration have completed.
+    saved_mode = "infra"
+    ap_owner = "true" if infra else "false"
+    uart_heartbeat_every = 1
     commands = [
         (
-            f"nvs op=set mode=infra wifi.mode={args.wifi_mode} power.profile=auto "
+            f"nvs op=set mode={saved_mode} wifi.mode={args.wifi_mode} power.profile=auto "
             f"nan.backend=raw nan.boot=true nan.role={args.nan_role} "
             f"nan.service={args.nan_service} nan.channel={channel} "
-                "nan.wake_ms=4000 nan.active_ms=250 nan.light_sleep=true nan.early_ms=5 nan.dw_tu=512 nan.dw_off_tu=0 nan.dw_stride=8 "
-            "uart.hb_every=1"
+                f"nan.ap_owner={ap_owner} nan.ap_loss_ms=15000 nan.wake_ms=4000 nan.active_ms=64 nan.light_sleep=true nan.early_ms=40 nan.dw_tu=512 nan.dw_off_tu=0 nan.dw_stride=8 "
+                f"uart.hb_every={uart_heartbeat_every}"
         ),
         "power profile=auto save=true",
-        "mode infra=true save=true",
         "nan stats=true",
         "lora status=true",
         "power status=true",
@@ -922,27 +974,79 @@ def configure(device: Device, args: argparse.Namespace, port: str) -> None:
             commands.append("lora mode=meshcore")
         else:
             commands.append("lora mode=meshtastic")
+    if not infra:
+        # Apply the sparse heartbeat only after all radio probes have run
+        # while UART is continuously serviced. The following role transition
+        # then enters the requested light-sleep schedule.
+        commands.append("nvs op=set uart.hb_every=16")
+    # Sleepy nodes switch into their selected runtime role last because that
+    # command may stop servicing UART immediately; infrastructure nodes are
+    # inserted first below so they remain reachable during provisioning.
+    role_command = "mode infra=true save=true" if infra else "mode sleepy=true save=true"
+    # Infrastructure nodes must be made persistent before the provisioning
+    # probe.  They remain awake and keep servicing the supervised UART, so
+    # moving this command into the boot window avoids a probe timeout leaving
+    # lora1 in a stale sleepy configuration.  Sleepy nodes still switch role
+    # last because that command can intentionally stop UART service.
+    if infra:
+        commands.insert(0, role_command)
+    else:
+        # A board may retain the previous sleepy profile across a USB flash.
+        # Wake it into the continuously-serviced role before provisioning so
+        # the remaining NVS and radio commands do not queue behind the
+        # intentionally sparse `uart.hb_every=16` diagnostic heartbeat.  The
+        # final role command below restores the requested sleepy profile.
+        commands.insert(0, "mode infra=true")
     if port.startswith("uds://"):
         # Use the same managed UDS command path as normal diagnostics. The
         # forward must remain supervised; only direct USB/esptool flashing
         # releases it temporarily.
-        argv = [sys.executable, str(SERIAL_CMD), "--port", port, "--timeout", "20"]
+        # A sleepy node may already have stopped its UART by the time a
+        # The application starts its UART/mesh tasks after the bootloader has
+        # printed its banner.  A command sent during that short interval can
+        # be consumed by the boot console and never produce a framed reply.
+        # Retry idempotent provisioning commands once; this is especially
+        # important when a sleepy board still has the previous heartbeat
+        # policy in NVS and the first role command arrives near boot.
         for item in commands:
-            argv.extend(["--cmd", item])
-        run_logged(f"configure {device.port}", argv, cwd=FW_RUST)
+            command_timeout = 90 if not infra else 20
+            for attempt in range(2):
+                output = run_logged(
+                    f"configure {device.port} {item}"
+                    + (" retry" if attempt else ""),
+                    mesh_command_argv(device.port, item, timeout=command_timeout),
+                    cwd=ROOT,
+                )
+                # mesh-cli deliberately exits zero for a valid JSON response
+                # whose firmware command failed, so inspect the response as
+                # well as the subprocess status before deciding to continue.
+                if '"ok": false' not in output and '"ok":false' not in output:
+                    break
+                if attempt == 1:
+                    raise RuntimeError(
+                        f"configure {device.port} {item}: firmware returned ok=false"
+                    )
+                print(
+                    f"configure {device.port} {item}: retry after UART boot window",
+                    flush=True,
+                )
+                time.sleep(2.0)
+        if not infra:
+            try:
+                run_logged(
+                    f"configure role {device.port}",
+                    mesh_command_argv(device.port, role_command, timeout=90),
+                    cwd=ROOT,
+                )
+            except subprocess.CalledProcessError:
+                # The sleepy transition intentionally stops servicing UART
+                # before a response can be framed. NVS is written before the
+                # transition; verify it after the next recovery/status pass
+                # instead of marking an otherwise successful run as failed.
+                print(f"configure role {device.port}: sleepy transition closed UART (expected)", flush=True)
         return
 
-    # Direct physical UART is reserved for low-level diagnostics. It has no
-    # lmesh-owned DTR wake, so it is not the normal provisioning path.
-    # ESP-IDF has initialized UART0 by about 0.7 s on the lab boards. The
-    # measured three-second delay leaves seven seconds of the deterministic
-    # boot window for the first CBOR command, without relying on DTR (which is
-    # a reset line on some CP210x boards).
-    time.sleep(3.0)
-    argv = [sys.executable, str(SERIAL_CMD), "--port", port, "--timeout", "20"]
-    for item in commands:
-        argv.extend(["--cmd", item])
-    run_logged(f"configure {device.port}", argv, cwd=FW_RUST)
+    raise RuntimeError("firmware provisioning requires a supervised lmesh UDS endpoint")
 
 
 def sanity(device: Device, port: str) -> None:
@@ -953,26 +1057,14 @@ def sanity(device: Device, port: str) -> None:
         "power status=true",
         "logs count=20",
     ]
-    argv = [sys.executable, str(SERIAL_CMD), "--port", port, "--timeout", "20"]
-    for item in commands:
-        argv.extend(["--cmd", item])
     print(f"sanity {device.port}: start", flush=True)
-    run_logged(f"sanity {device.port}", argv, cwd=FW_RUST)
+    for command in commands:
+        run_logged(f"sanity {device.port} {command}", mesh_command_argv(device.port, command), cwd=ROOT)
     print(f"sanity {device.port}: done", flush=True)
 
 
 def console_output(device: Device, command: str, timeout: int = 20) -> str:
-    argv = [
-        sys.executable,
-        str(SERIAL_CMD),
-        "--port",
-        lmesh_uds_url(device.port),
-        "--timeout",
-        str(timeout),
-        "--cmd",
-        command,
-    ]
-    return run_logged(f"query {device.port} {command}", argv, cwd=FW_RUST)
+    return run_logged(f"query {device.port} {command}", mesh_command_argv(device.port, command, timeout), cwd=ROOT)
 
 
 def discover_mac_from_console(device: Device) -> str | None:
@@ -985,17 +1077,10 @@ def discover_mac_from_console(device: Device) -> str | None:
 
 
 def console_commands(device: Device, commands: list[str], timeout: int = 20) -> str:
-    argv = [
-        sys.executable,
-        str(SERIAL_CMD),
-        "--port",
-        lmesh_uds_url(device.port),
-        "--timeout",
-        str(timeout),
-    ]
+    outputs = []
     for command in commands:
-        argv.extend(["--cmd", command])
-    return run_logged(f"cmds {device.port}", argv, cwd=FW_RUST)
+        outputs.append(run_logged(f"cmd {device.port} {command}", mesh_command_argv(device.port, command, timeout), cwd=ROOT))
+    return "\n".join(outputs)
 
 
 def send_console_line_no_wait(device: Device, command: str) -> None:
@@ -1020,31 +1105,33 @@ def preflash_stability_check(
     *,
     samples: int,
     interval_sec: float,
-    dtr_ms: int,
+    status_timeout_sec: float,
     output_dir: Path,
 ) -> None:
     samples = max(2, samples)
     output_dir.mkdir(parents=True, exist_ok=True)
     transcript: list[str] = []
     uptimes: list[int] = []
-    client = RadioClient(lmesh_uds_url(port), timeout=20.0)
+    status_timeout_sec = max(20.0, status_timeout_sec)
+    client = RadioClient(lmesh_uds_url(port), timeout=status_timeout_sec)
+    sample_interval_sec = max(0.0, interval_sec)
     try:
         client.connect()
         for index in range(samples):
-            if dtr_ms:
-                transcript.append(
-                    "# sample {} wake\n{}".format(
-                        index + 1, client.wake(dtr_ms, timeout=5.0)
-                    )
-                )
-            result = client.command("status", timeout=20.0)
+            result = client.command("status", timeout=status_timeout_sec)
             transcript.append("# sample {}\n{}".format(index + 1, result.raw))
             match = re.search(r"\buptime_ms=(\d+)\b", result.raw)
             if not match:
                 raise RuntimeError("status response has no uptime_ms")
             uptimes.append(int(match.group(1)))
+            # Sleepy nodes service the managed UART only on the periodic
+            # heartbeat. Once identified, leave a full heartbeat interval
+            # between samples so the stability gate does not queue commands
+            # and mistake a healthy node for a dead one.
+            if re.search(r"\bmode active=sleepy\b", result.raw):
+                sample_interval_sec = max(sample_interval_sec, 70.0)
             if index + 1 < samples:
-                time.sleep(interval_sec)
+                time.sleep(sample_interval_sec)
     finally:
         client.close()
         path = output_dir / "{}.log".format(port)
@@ -1224,10 +1311,9 @@ def sleepy_raw_nan_feature_test(devices: list[Device], args: argparse.Namespace)
             flush=True,
         )
     finally:
-        if args.lmesh_mode == "tcp":
-            lmesh_reset(args, sleepy.port, "run")
-            time.sleep(1.5)
-            configure(sleepy, args, lmesh_uds_url(sleepy.port))
+        # The lmesh forward remains the runtime diagnostics owner.  Physical
+        # reset/recovery is performed only by esptool in the flash path.
+        pass
 
 
 def run_parallel(
@@ -1262,8 +1348,6 @@ def run_parallel(
 
 def main() -> int:
     args = parse_args()
-    if not 0 <= args.preflash_stability_dtr_ms <= 10_000:
-        raise SystemExit("--preflash-stability-dtr-ms must be between 0 and 10000")
     if not args.lmesh_control_socket:
         print("--lmesh-control-socket or LMESH_CONTROL_SOCKET is required", file=sys.stderr)
         return 1
@@ -1271,7 +1355,7 @@ def main() -> int:
         restored = 0
         for port in configured_forward_specs():
             try:
-                lmesh_start_forward(args, port, None)
+                lmesh_start_forward(args, port)
                 restored += 1
             except RuntimeError as exc:
                 if "already exists" not in str(exc):
@@ -1286,16 +1370,11 @@ def main() -> int:
         print("no lmesh USB serial ports found", file=sys.stderr)
         return 1
 
-    tcp_ports = {port: args.lmesh_tcp_base + index for index, port in enumerate(ports)}
-    if args.lmesh_mode == "local-release":
-        args.local_physical_ports = {
-            port: str(forward["port"])
-            for port, forward in lmesh_forward_map(args).items()
-            if port in ports and isinstance(forward.get("port"), str)
-        }
-    for port in ports:
-        if args.lmesh_mode == "tcp":
-            tcp_ports[port] = ensure_lmesh_forward(args, port, tcp_ports[port])
+    args.local_physical_ports = {
+        port: str(forward["port"])
+        for port, forward in lmesh_forward_map(args).items()
+        if port in ports and isinstance(forward.get("port"), str)
+    }
 
     if (not args.skip_flash or args.preflash_only) and not args.skip_preflash_stability:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -1304,8 +1383,11 @@ def main() -> int:
             or FW_RUST / "target" / "esp32-preflash-stability" / stamp
         )
         print(
-            "preflash stability: checking {} board(s), samples={} interval_sec={}".format(
-                len(ports), max(2, args.preflash_stability_samples), args.preflash_stability_interval_sec
+            "preflash stability: checking {} board(s), samples={} interval_sec={} timeout_sec={}".format(
+                len(ports),
+                max(2, args.preflash_stability_samples),
+                args.preflash_stability_interval_sec,
+                args.preflash_status_timeout_sec,
             ),
             flush=True,
         )
@@ -1317,7 +1399,7 @@ def main() -> int:
                     port,
                     samples=args.preflash_stability_samples,
                     interval_sec=args.preflash_stability_interval_sec,
-                    dtr_ms=args.preflash_stability_dtr_ms,
+                    status_timeout_sec=args.preflash_status_timeout_sec,
                     output_dir=stability_dir,
                 ): port
                 for port in ports
@@ -1356,19 +1438,12 @@ def main() -> int:
     else:
 
         def probe_one(port: str) -> Device | None:
-            if args.lmesh_mode == "tcp":
-                lmesh_reset(args, port, "bootloader")
-                time.sleep(0.8)
-            probe_port = (
-                lmesh_rfc2217_url(tcp_ports[port])
-                if args.lmesh_mode == "tcp"
-                else physical_port_for(args, port)
-            )
+            probe_port = physical_port_for(args, port)
             return probe(
                 probe_port,
                 args.flash_baud,
                 physical_port=port,
-                before="no_reset" if args.lmesh_mode == "tcp" else "default_reset",
+                before="default_reset",
             )
 
         with ThreadPoolExecutor(max_workers=max(1, len(ports))) as executor:
@@ -1407,34 +1482,19 @@ def main() -> int:
     flashed_devices: list[Device] = []
     if not args.skip_flash:
         def flash_one(device: Device) -> None:
-            if args.lmesh_mode == "tcp":
-                try:
-                    lmesh_reset(args, device.port, "bootloader")
-                    time.sleep(0.8)
-                    flash(device, args, env, lmesh_rfc2217_url(tcp_ports[device.port]))
-                    lmesh_reset(args, device.port, "run")
-                except subprocess.CalledProcessError as exc:
-                    print(exc.stdout or "", flush=True)
-                    if not args.allow_local_physical_fallback:
-                        raise
-                    print(
-                        f"TCP flash failed for {device.port}; using explicit local physical fallback.",
-                        flush=True,
-                    )
-                    lmesh_stop_forward(args, device.port)
-                    flash(device, args, env, physical_port_for(args, device.port))
-                    lmesh_start_forward(args, device.port, tcp_ports[device.port])
-            else:
-                lmesh_stop_forward(args, device.port)
-                flash(device, args, env, physical_port_for(args, device.port))
-                if direct_config_after_flash:
-                    # The physical bridge is intentionally released after the
-                    # flash. Configuration must go through the supervised
-                    # lmesh forward; serial_cmd rejects direct physical UART
-                    # paths for normal firmware commands.
-                    lmesh_start_forward(args, device.port, None)
-                    time.sleep(1.0)
-                    configure(device, args, lmesh_uds_url(device.port))
+            lmesh_stop_forward(args, device.port)
+            flash(device, args, env, physical_port_for(args, device.port))
+            if direct_config_after_flash:
+                # The physical bridge is intentionally released after the
+                # flash. Configuration must go through the supervised lmesh
+                # forward; normal commands never use direct UART paths.
+                lmesh_start_forward(args, device.port, direct=True)
+                # Do not race the application boot sequence.  The bootloader
+                # itself can finish in under a second, but the firmware does
+                # not install the framed UART ingress task until its mode/
+                # mesh initialization has completed.
+                time.sleep(12.0)
+                configure(device, args, lmesh_uds_url(device.port))
 
         flashed, flash_failed = run_parallel("flash", devices, args.jobs, flash_one)
         flashed_devices = list(flashed)
@@ -1452,7 +1512,7 @@ def main() -> int:
         def configure_one(device: Device) -> None:
             if args.lmesh_mode == "local-release":
                 try:
-                    lmesh_start_forward(args, device.port, None)
+                    lmesh_start_forward(args, device.port)
                 except RuntimeError as exc:
                     if "already exists" not in str(exc):
                         raise
@@ -1469,7 +1529,7 @@ def main() -> int:
     if args.lmesh_mode == "local-release" and not args.skip_flash:
         def restore_forward(device: Device) -> None:
             try:
-                lmesh_start_forward(args, device.port, None)
+                lmesh_start_forward(args, device.port)
             except RuntimeError as exc:
                 if "already exists" not in str(exc):
                     raise

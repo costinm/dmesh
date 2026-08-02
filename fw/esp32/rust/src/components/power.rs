@@ -191,8 +191,8 @@ impl CommandHandler for PowerCommand {
             .transpose()?
             .unwrap_or(false)
         {
-            super::serial::request_suspend_until_dtr();
-            return Ok(CommandResponse::ok("power quiet=true pending=dtr"));
+            super::serial::request_suspend_after_response();
+            return Ok(CommandResponse::ok("power quiet=true pending=uart_wake"));
         }
         if request
             .arg("locks")

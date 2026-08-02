@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-reset",
         action="store_true",
-        help="Use an already-running firmware console instead of issuing lmesh rst.",
+        help="Use an already-running lmesh console; never reset through diagnostics.",
     )
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--output")

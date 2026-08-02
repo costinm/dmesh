@@ -100,6 +100,8 @@ static WIFI_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static RAW_FIRST_FRAME_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
+static RAW_FIRST_FRAME_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static mut RAW_RX_LAST: [u8; 256] = [0; 256];
 
 /// Generic beacon-derived wake plan shared by NAN and AP-beacon schedulers.
@@ -195,17 +197,24 @@ pub fn beacon_wake_plan_for_dw_stride(
     }
     let now_us = unsafe { sys::esp_timer_get_time().max(0) as u64 };
     let age_us = now_us.saturating_sub(snapshot.local_us);
-    if age_us > period_us.saturating_mul(2) {
+    // A sparse duty cadence can legitimately observe its timing beacon several
+    // base DWs before the next selected slot. Keep the freshness bound tied to
+    // the selected stride and the configured ~15 s NAN-loss recovery horizon;
+    // rejecting everything older than two 512-TU periods makes stride=8 fall
+    // back to an unsynchronized free-running wake loop after a few misses.
+    let freshness_periods = u64::from(slot_stride.max(1)).saturating_mul(8);
+    if age_us > period_us.saturating_mul(freshness_periods) {
         return None;
     }
     let now_tsf_us = snapshot.tsf_us.saturating_add(age_us);
-    // Preserve the observed source phase and apply the configured offset
-    // relative to it. This is what makes the selected DW0/DW8 rendezvous
-    // follow the actual NAN/AP beacon rather than an invented absolute-zero
-    // epoch.
-    let target_phase_us = (snapshot.tsf_us % period_us)
-        .saturating_add(u64::from(offset_tu).saturating_mul(1024))
-        % period_us;
+    // NAN's TSF is the cluster clock.  A received beacon may be transmitted
+    // at any point while the cluster is active, so its own phase is not the
+    // Discovery Window boundary.  Chasing `snapshot.tsf_us % period_us`
+    // made a sleepy node wake at the phase of whichever beacon happened to be
+    // last, which is why the powered observer showed ~180-ms beacon spacing.
+    // Anchor the rendezvous to the configured DW offset modulo the NAN period
+    // instead (DW0 is zero; DW8 is selected by the stride).
+    let target_phase_us = u64::from(offset_tu).saturating_mul(1024) % period_us;
     let stride = u64::from(slot_stride.max(1));
     let current_index = now_tsf_us / period_us;
     let mut target_index = current_index
@@ -1623,12 +1632,13 @@ pub fn stop_raw_monitor() -> Result<()> {
 
 /// Stop raw Wi-Fi for a bounded raw-NAN sleep interval.
 ///
-/// `esp_wifi_stop()` powers down the modem.  Classic ESP32 also deinitializes
-/// the driver to release its task and allocation.  On ESP32-S3, repeatedly
-/// deinitializing and recreating Wi-Fi from the raw-NAN scheduler can leave
-/// UART0 RX unusable after the boot-time duty cycle.  Keep the stopped driver
-/// initialized there; the next window still calls `esp_wifi_start()` and the
-/// radio remains off between windows.
+/// Stop raw Wi-Fi for an explicit light-sleep interval.
+///
+/// The classic ESP32 must fully tear down the driver before
+/// `esp_light_sleep_start()`: retaining it leaves a Wi-Fi/interrupt watchdog
+/// path active in the RTC sleep transition.  ESP32-S3 keeps the initialized
+/// driver because repeatedly recreating it there has previously left UART0
+/// unusable; the target-specific split is intentional.
 pub fn stop_raw_wifi_for_sleep() -> Result<()> {
     #[cfg(target_feature = "esp32s3ops")]
     {
@@ -1947,6 +1957,7 @@ unsafe extern "C" fn raw_wifi_cb(
         return;
     }
     let frame = unsafe { core::slice::from_raw_parts(payload, len) };
+    mark_raw_first_frame(unsafe { sys::esp_timer_get_time().max(0) as u64 });
     observe_beacon(frame);
     super::nan::observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
     observe_promiscuous_frame(frame, pkt.rx_ctrl.rssi() as i32);
@@ -1956,10 +1967,15 @@ unsafe extern "C" fn raw_wifi_cb(
 /// Raw-NAN owns its own promiscuous callback, so it calls this directly rather
 /// than relying on the generic raw-monitor callback.
 pub fn observe_beacon(frame: &[u8]) {
-    // Beacon management frames carry the AP/NAN TSF timestamp immediately after
-    // the 24-byte 802.11 header. This is deliberately BSSID-agnostic so an AP
-    // can become the timing source when no NAN publisher is available.
-    if frame.first() != Some(&0x80) || frame.len() < 32 {
+    // Beacon management frames carry the AP/NAN TSF timestamp immediately
+    // after the 24-byte 802.11 header. This shared snapshot is the raw-NAN
+    // clock, so accept only NAN cluster BSSIDs (50:6f:9a vendor OUI). Generic
+    // nearby AP beacons use `nan::last_ap_sync_beacon` instead; mixing them
+    // here can move a sleepy node several DWs away from its selected cluster.
+    if frame.first() != Some(&0x80)
+        || frame.len() < 32
+        || frame.get(FRAME_ADDR3..FRAME_ADDR3 + 3) != Some(&[0x50, 0x6f, 0x9a])
+    {
         return;
     }
     let tsf_us = u64::from_le_bytes(frame[24..32].try_into().unwrap_or([0; 8]));
@@ -1970,6 +1986,27 @@ pub fn observe_beacon(frame: &[u8]) {
     store_u64(&WIFI_BEACON_LOCAL_LO, &WIFI_BEACON_LOCAL_HI, local_us);
     store_u64(&WIFI_BEACON_TSF_LO, &WIFI_BEACON_TSF_HI, tsf_us);
     WIFI_BEACON_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reset the first-frame marker before arming a raw-NAN receive window.
+pub fn reset_raw_first_frame() {
+    RAW_FIRST_FRAME_LOCAL_LO.store(0, Ordering::Relaxed);
+    RAW_FIRST_FRAME_LOCAL_HI.store(0, Ordering::Relaxed);
+}
+
+/// Return the local timestamp of the first accepted Wi-Fi frame in the window.
+pub fn raw_first_frame_local_us() -> u64 {
+    load_u64(&RAW_FIRST_FRAME_LOCAL_LO, &RAW_FIRST_FRAME_LOCAL_HI)
+}
+
+pub fn mark_raw_first_frame(local_us: u64) {
+    if RAW_FIRST_FRAME_LOCAL_LO.load(Ordering::Acquire) == 0 {
+        store_u64(
+            &RAW_FIRST_FRAME_LOCAL_LO,
+            &RAW_FIRST_FRAME_LOCAL_HI,
+            local_us,
+        );
+    }
 }
 
 pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {

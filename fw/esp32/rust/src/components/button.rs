@@ -31,7 +31,7 @@ static BUTTON_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(std::pt
 static GPIO_ISR_SERVICE_READY: AtomicBool = AtomicBool::new(false);
 
 // This is deliberately independent from BUTTON_GPIO. GPIO0 is commonly wired
-// to the USB-UART DTR/PRG debug button; a protocol capture must never alter
+// to the physical PRG debug button; a protocol capture must never alter
 // that pin's interrupt, pull configuration, or wake behavior.
 static SNIFF_ENABLED: AtomicBool = AtomicBool::new(false);
 static SNIFF_PIN: AtomicI32 = AtomicI32::new(-1);
@@ -64,7 +64,7 @@ pub fn initialize(settings: &SharedSettings) -> Result<()> {
 /// Install the runtime edge interrupt only after the boot console and long
 /// press probe are available. GPIO input configuration is intentionally kept
 /// separate because ISR service installation has previously stalled startup on
-/// boards where GPIO0 is also driven by the USB-UART DTR line.
+/// boards where GPIO0 is the physical PRG input.
 pub fn start_runtime_interrupts() -> Result<()> {
     if !BUTTON_ENABLED.load(Ordering::Relaxed) {
         return Ok(());
@@ -77,7 +77,7 @@ pub fn configure_light_wake(settings: &SharedSettings) -> Result<Option<i32>> {
         .borrow()
         .get_i32("button.gpio", DEFAULT_BUTTON_GPIO)?
         .clamp(0, 39);
-    // GPIO wake is level-triggered.  Entering sleep while DTR/PRG is already
+    // GPIO wake is level-triggered. Entering sleep while PRG is already
     // asserted causes ESP_ERR_SLEEP_REJECT immediately, so leave it disabled
     // for this interval and let the timer retry after the line is released.
     let level = unsafe { sys::gpio_get_level(pin as sys::gpio_num_t) };
@@ -106,7 +106,7 @@ pub fn take_long_presses() -> u32 {
     BUTTON_LONG_PENDING.swap(0, Ordering::Relaxed)
 }
 
-/// Consume physical PRG/DTR wake events. The GPIO task deliberately does not
+/// Consume physical PRG wake events. The GPIO task deliberately does not
 /// manipulate UART state; the control task opens the console window.
 pub fn take_console_wakes() -> u32 {
     BUTTON_CONSOLE_PENDING.swap(0, Ordering::Relaxed)
@@ -228,9 +228,9 @@ fn configure_button_input(pin: i32) -> Result<()> {
             mode: sys::gpio_mode_t_GPIO_MODE_INPUT,
             pull_up_en: sys::gpio_pullup_t_GPIO_PULLUP_ENABLE,
             pull_down_en: sys::gpio_pulldown_t_GPIO_PULLDOWN_DISABLE,
-            // GPIO0 is connected to CP210x DTR on lab boards. A falling edge
+            // GPIO0 is the PRG input on lab boards. A falling edge
             // is the press/wake event; using both edges here caused an ISR
-            // storm on DTR release. The button task samples only while a
+            // storm on release. The button task samples only while a
             // press is active to classify release, double, and long presses.
             intr_type: sys::gpio_int_type_t_GPIO_INTR_NEGEDGE,
         };
@@ -443,7 +443,7 @@ unsafe extern "C" fn button_task(_arg: *mut core::ffi::c_void) {
         };
         let timeout = deadline.saturating_duration_since(now);
         // Re-arm before blocking. The IRAM ISR coalesces edges while a task
-        // notification is pending, which bounds GPIO0/DTR interrupt work.
+        // notification is pending, which bounds GPIO0 interrupt work.
         unsafe { dmesh_button_irq_rearm() };
         let count =
             unsafe { sys::ulTaskGenericNotifyTake(0, 1, duration_to_ticks(timeout).max(1)) };
@@ -510,7 +510,7 @@ fn record_button_press(source: &str, long_press: bool) {
         let line = "ev=button.long action=sync".to_string();
         telemetry::record_log(line.clone());
     } else {
-        // A short PRG press is the physical equivalent of a console/DTR wake.
+        // A short PRG press is the physical console wake.
         // Keep it side-effect free so it is safe as a recovery action.
         let line = "ev=button.short action=console".to_string();
         telemetry::record_log(line.clone());

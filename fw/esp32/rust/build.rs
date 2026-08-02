@@ -1,4 +1,10 @@
 fn main() {
+    let recovery_transport = std::env::var_os("DMESH_RECOVERY_TRANSPORT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../recovery/transport/dmesh_flash_tcp")
+        });
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     for partition_file in [
         "partitions_4mb_large_app.csv",
@@ -20,8 +26,15 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_pm/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/dmesh_boot_health.c");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=native/dmesh_flash_tcp/dmesh_flash_tcp.c");
-    println!("cargo:rerun-if-changed=native/dmesh_flash_tcp/dmesh_flash_tcp.h");
+    println!("cargo:rerun-if-env-changed=DMESH_RECOVERY_TRANSPORT_DIR");
+    println!(
+        "cargo:rerun-if-changed={}",
+        recovery_transport.join("dmesh_flash_tcp.c").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        recovery_transport.join("dmesh_flash_tcp.h").display()
+    );
     println!("cargo:rerun-if-changed=native/dmesh_flash_tcp/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../boot/boot_health_rtc.h");
     embuild::espidf::sysenv::output();

@@ -135,7 +135,7 @@ fn run() -> Result<()> {
     components::telemetry::record_log(ready);
     components::recovery::mark_main_boot_healthy();
     boot_print("dm-rs boot step=console\n");
-    // GPIO0 is shared by physical PRG and CP210x DTR. Its ISR only coalesces
+    // GPIO0 is the physical PRG input. Its ISR only coalesces
     // an edge and wakes the button task; all GPIO re-arm/classification work
     // runs outside interrupt context.
     match components::button::start_runtime_interrupts() {
@@ -145,14 +145,16 @@ fn run() -> Result<()> {
             commands::protocol::escape_value(&err.to_string())
         )),
     }
+    boot_print("dm-rs boot step=runtime_interrupts");
+    let mut first_loop_trace = true;
     loop {
         components::telemetry::record_main_loop();
-        // GPIO0/DTR must be handled before the raw-NAN scheduler.  Otherwise
-        // the scheduler can try to enter light sleep while the DTR/PRG level
+        // GPIO0/PRG must be handled before the raw-NAN scheduler. Otherwise
+        // the scheduler can try to enter light sleep while the PRG level
         // is still asserted, and ESP-IDF rejects that sleep request.
         if components::button::take_console_wakes() > 0 {
             components::serial::rearm_after_wake();
-            // GPIO0/DTR is the explicit console wake source. Rearming RX on
+            // GPIO0/PRG is the explicit console wake source. Rearming RX on
             // its own is insufficient: command responses remain TX-gated
             // unless this also restores the bounded UART active window.
             components::serial::activate_window();
@@ -168,7 +170,13 @@ fn run() -> Result<()> {
         for _ in 0..components::button::take_sync_requests() {
             components::mode::send_button_sync(&settings);
         }
+        if first_loop_trace {
+            boot_print("dm-rs loop before_mode");
+        }
         components::mode::poll(&settings);
+        if first_loop_trace {
+            boot_print("dm-rs loop after_mode");
+        }
         components::ble_bt::poll_text_commands(&mut registry);
         poll_raw_wifi_commands(&mut registry, &settings);
         poll_nan_commands(&mut registry, &settings);
@@ -180,7 +188,19 @@ fn run() -> Result<()> {
         if components::mode::ip_transport_active() {
             components::recovery::poll_flash_tcp();
         }
-        match wait_for_firmware_activity(Duration::from_millis(MAIN_HOUSEKEEPING_POLL_MS)) {
+        // A beacon can arrive near the end of a sparse DW. Poll quickly only
+        // while the raw-NAN window is already awake so post-beacon shutdown is
+        // bounded by the NAN dwell without adding periodic wakeups during
+        // light sleep.
+        let housekeeping_ms = if components::mode::raw_nan_duty_active() {
+            // The NAN-required post-beacon dwell is only 32 ms. Polling at
+            // 10 ms keeps shutdown close to that dwell without adding any
+            // periodic wakeups while the radio is light-sleeping.
+            10
+        } else {
+            MAIN_HOUSEKEEPING_POLL_MS
+        };
+        match wait_for_firmware_activity(Duration::from_millis(housekeeping_ms)) {
             UartWait::Data => {}
             UartWait::Timeout => {
                 components::telemetry::record_uart_timeout();
@@ -188,6 +208,10 @@ fn run() -> Result<()> {
         }
         components::serial::poll_active_window();
         components::serial::poll_output_probe();
+        if first_loop_trace {
+            boot_print("dm-rs loop complete");
+            first_loop_trace = false;
+        }
     }
 }
 
@@ -197,6 +221,13 @@ fn drain_uart_console(
     companion_active_ms: u32,
 ) {
     while let Some(frame) = components::serial::take_frame() {
+        // `0x7e 0x7e` is the scheduled empty UART heartbeat. It only grants
+        // lmesh permission to flush a queued command and must not extend the
+        // radio/infra session; otherwise a heartbeat every Nth NAN wake keeps
+        // a sleepy node powered indefinitely and contaminates timing tests.
+        if frame.data.is_empty() {
+            continue;
+        }
         components::mode::mark_companion_active(settings, companion_active_ms);
         let response = transports::dispatch_uart_packet(registry, &frame.data);
         components::serial::write_packet(&response);
@@ -403,6 +434,18 @@ fn poll_nan_commands(
 /// ISR active through the radio startup transition.
 fn boot_print(message: &str) {
     components::telemetry::record_log(message.trim());
+    // Keep a small unframed boot breadcrumb in the captured UART stream. This
+    // runs only during startup, before the bounded framed console policy, and
+    // lets recovery distinguish a board hang from a quiet runtime UART.
+    if let Ok(message) = std::ffi::CString::new(message.trim()) {
+        unsafe {
+            esp_rom_printf(b"%s\r\n\0".as_ptr() as *const c_char, message.as_ptr());
+        }
+    }
+}
+
+unsafe extern "C" {
+    fn esp_rom_printf(format: *const c_char, ...);
 }
 
 fn init_console_uart() {
@@ -457,6 +500,12 @@ fn init_console_uart() {
                 components::telemetry::record_log(
                     "event type=uart.rx_queue state=ready baud=115200 tx_isr=false",
                 );
+                esp_rom_printf(
+                    b"dm-rs uart rx_queue=ready rx_gpio=%d tx_gpio=%d\r\n\0".as_ptr()
+                        as *const c_char,
+                    rx_pin,
+                    tx_pin,
+                );
             }
             Err(err) => {
                 components::telemetry::record_log(&format!("event type=uart.rx_queue err={err}"));
@@ -480,7 +529,7 @@ fn preserve_uart0_pins_in_light_sleep() {
     unsafe {
         // ESP32-S3 UART0 is fixed to TX=GPIO43/RX=GPIO44. IDF otherwise
         // switches those pins to its automatic GPIO sleep configuration,
-        // preventing DTR/UART RX from waking the console while raw-NAN is
+        // preventing a stale PRG/UART wake from reopening the console while raw-NAN is
         // between Wi-Fi windows.
         let _ = esp_idf_sys::gpio_sleep_sel_dis(43);
         let _ = esp_idf_sys::gpio_sleep_sel_dis(44);

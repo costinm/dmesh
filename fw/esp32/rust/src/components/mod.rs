@@ -11,6 +11,7 @@ pub mod nan;
 pub mod nvs;
 pub mod power;
 pub mod recovery;
+pub mod reset;
 pub mod rgbled;
 pub mod serial;
 pub mod settings;
@@ -35,6 +36,7 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     nan::register_commands(registry, settings.clone());
     power::register_commands(registry, settings.clone());
     recovery::register_commands(registry);
+    reset::register_commands(registry);
     rgbled::register_commands(registry);
     sleep::register_commands(registry, settings.clone());
     test::register_commands(registry);
