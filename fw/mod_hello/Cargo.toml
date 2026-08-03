@@ -1,0 +1,25 @@
+[package]
+name = "dmesh-mod-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+flat-image = []
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "mod_hello"
+required-features = ["flat-image"]
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = "symbols"
