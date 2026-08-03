@@ -1,0 +1,21 @@
+[Unit]
+Description=DMesh Recovery TCP flash server
+Requires=flash-server.socket
+After=flash-server.socket
+
+[Service]
+Type=simple
+# Adjust these two values in a drop-in or environment file for the host.
+Environment=DMESH_REPO=/ws/dmesh
+Environment=DMESH_PYTHON=/usr/bin/python3
+WorkingDirectory=/ws/dmesh
+ExecStart=/bin/sh -c 'exec "$DMESH_PYTHON" "$DMESH_REPO/fw/recovery/tools/flash-server.py" "$DMESH_REPO/target/flash" --target main --socket-activation'
+User=build
+Group=build
+Restart=on-failure
+RestartSec=1s
+KillMode=control-group
+TimeoutStopSec=2s
+
+[Install]
+# Deliberately empty: start the .socket unit explicitly for the lab port.
