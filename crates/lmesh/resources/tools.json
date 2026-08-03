@@ -712,6 +712,37 @@
     }
   },
   {
+    "name": "wifi.sta.configure_ipv4",
+    "title": "Configure Station IPv4",
+    "group": "Wi-Fi",
+    "description": "Configure a static IPv4 address through the managed lmesh process.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "address": {
+          "type": "string",
+          "title": "IPv4 address"
+        },
+        "prefix": {
+          "type": "integer",
+          "title": "Prefix length",
+          "default": 24,
+          "minimum": 0,
+          "maximum": 32
+        }
+      },
+      "required": [
+        "address"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "wifi.scan",
     "title": "Wi-Fi Scan",
     "group": "Wi-Fi",
@@ -1137,24 +1168,35 @@
     }
   },
   {
-    "name": "usb.serial.reset",
-    "title": "Reset USB Serial ESP",
+    "name": "usb.serial.boot",
+    "title": "Stage2 Boot Command",
     "group": "USB",
-    "description": "Pulse ESP USB serial modem lines into ROM bootloader or running firmware mode. Stop any active serial forward for the port before calling this. Flash scripts should reset to bootloader, run esptool with no_reset, then reset to run.",
+    "description": "Send the fixed PPP-framed stage2 recovery command and return the boot identity; reset=true performs the command transaction directly at the fixed 115200 boot baud and restores any managed forward.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "port": {
           "type": "string",
           "title": "USB port",
-          "description": "Logical USB serial token such as USB0, USB1, or ACM1.",
+          "description": "Logical USB serial token or configured role, such as e5.",
           "default": "USB0"
         },
-        "mode": {
+        "command": {
           "type": "string",
-          "title": "Reset mode",
-          "enum": ["run", "app", "firmware", "bootloader", "boot", "download"],
-          "default": "run"
+          "title": "Boot command",
+          "enum": ["recovery"],
+          "default": "recovery"
+        },
+        "timeout_sec": {
+          "type": "number",
+          "title": "Timeout seconds",
+          "default": 1.0
+        },
+        "reset": {
+          "type": "boolean",
+          "title": "Reset before command",
+          "description": "Perform the managed reset and send the PPP command immediately; use for stage2 provisioning.",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -1199,12 +1241,6 @@
           "title": "Handshake",
           "default": false
         },
-        "dtr": {
-          "type": "boolean",
-          "title": "Legacy DTR Option",
-          "description": "Ignored. Managed forward connections are passive; use the explicit local dtr command when a GPIO0/PRG wake is required.",
-          "default": false
-        },
         "multi": {
           "type": "boolean",
           "title": "Multi-writer",
@@ -1245,10 +1281,42 @@
     }
   },
   {
+    "name": "usb.serial.rst",
+    "title": "Pulse USB Serial Reset",
+    "group": "USB",
+    "description": "Explicit recovery/test operation: pulse RTS on a logical USB serial bridge, then restore its managed forward. This is not part of routine Wi-Fi flashing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "port": {
+          "type": ["string", "null"],
+          "title": "USB port",
+          "description": "Logical USB serial token such as lora1 or USB0."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "usb.serial.dtr",
+    "title": "Set USB Serial DTR",
+    "group": "USB",
+    "description": "Explicit recovery/test operation: set or pulse DTR on a logical USB serial bridge. Use only when diagnosing reset/recovery hardware behavior.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "port": {"type": ["string", "null"], "title": "USB port"},
+        "asserted": {"type": ["boolean", "null"], "title": "Asserted"},
+        "pulse_ms": {"type": ["integer", "null"], "title": "Pulse milliseconds"}
+      },
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "esp.serial.command",
     "title": "ESP Serial Command",
     "group": "ESP32 Debug",
-    "description": "Low-level debug action: run one firmware command over a serial, BLE, or raw-Wi-Fi firmware adapter and return parsed text records. lmesh may use this internally, but product flows should prefer higher-level radio tools.",
+    "description": "Run one ESP command. Configured target roles route through the default lora1 infrastructure gateway when adapter is omitted; explicit adapter selects direct UART/BLE/raw-Wi-Fi diagnostics. DW-gated delivery is the default and active_ms requests a bounded I-want-to-talk window.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1266,7 +1334,7 @@
             "null"
           ],
           "title": "Serial port",
-          "description": "Optional direct serial device path such as /dev/ttyUSB4."
+          "description": "Optional direct serial device path such as /dev/ttyUSB4; specifying adapter/port opts into emergency or diagnostic access."
         },
         "command": {
           "type": "string",
@@ -1276,6 +1344,21 @@
           "type": "number",
           "title": "Timeout seconds",
           "default": 5
+        },
+        "gateway": {
+          "type": ["string", "null"],
+          "title": "Infrastructure gateway",
+          "description": "Optional infrastructure gateway override; configured target roles default to lora1."
+        },
+        "target": {
+          "type": ["string", "null"],
+          "title": "Target ESP",
+          "description": "Target MAC or eight-hex device suffix; configured roles supply this automatically."
+        },
+        "active_ms": {
+          "type": ["integer", "null"],
+          "title": "Active window milliseconds",
+          "description": "Optional bounded I-want-to-talk wake window before the command."
         }
       },
       "required": [
@@ -1302,6 +1385,16 @@
         "port": {
           "type": ["string", "null"],
           "title": "Logical serial port"
+        },
+        "gateway": {
+          "type": ["string", "null"],
+          "title": "Infrastructure gateway",
+          "description": "Optional gateway override; configured target roles default to lora1."
+        },
+        "target": {
+          "type": ["string", "null"],
+          "title": "Target ESP",
+          "description": "Target suffix or MAC; configured roles supply this automatically."
         },
         "active": {
           "type": "boolean",

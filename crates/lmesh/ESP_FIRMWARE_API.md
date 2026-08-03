@@ -14,6 +14,11 @@ is the product API; lmesh adapts these commands over serial, BLE, and raw Wi-Fi.
 > firmware modes and tests because it cannot meet the sleep budget. Any later
 > mentions of official NAN in historical measurement notes are not supported API.
 
+Runtime UART diagnostics use the managed lmesh service (`esp.serial.command`)
+and never open a raw tty or toggle modem-control lines. UART recovery is
+reserved for `esptool` while flashing the bootloader, second-stage, or recovery
+image; older DTR wake notes below are historical only.
+
 ## Compact CBOR command IDs
 
 The outer CBOR envelope uses the IDs documented in `API.md`; command arguments
@@ -118,18 +123,19 @@ Use repo-local dependencies only:
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 scripts/esp32-deps.sh
-. fw/esp32/env.sh
+. env.sh
 cd fw/esp32/rust
 ```
 
-`fw/esp32/env.sh` is responsible for all ESP firmware paths: repo-local Nix
+`env.sh` is responsible for all ESP firmware paths: repo-local Nix
 profile binaries, ESP-IDF tools, ESP Python environment, Cargo home, rustup
 home, and the Xtensa Rust toolchain. Do not hand-edit `PATH`, `IDF_PATH`,
 `CARGO_HOME`, or `RUSTUP_HOME` in test scripts; source `env.sh` instead.
 
 Normal host/CI testing should access firmware through `crates/lmesh` USB
-forwarding. Flashing always uses the physical USB-UART path after the managed
-forward has been released; it is not an RFC2217 or lmesh transport.
+forwarding. Deployed updates use Main/Recovery Wi-Fi DRS2 while the managed
+forward remains active for evidence. Physical USB-UART is only initial
+provisioning or P0 stage-2/Recovery repair; it is not an RFC2217 transport.
 
 Local recovery flash for classic ESP32:
 
@@ -159,10 +165,12 @@ LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock \
     --port lora1 --port lora2 --port lora3 --port lora4 --port e5
 ```
 
-The helper resolves logical lmesh roles, releases their UDS forwards, sparse
-flashes and verifies directly through the stable physical USB-UART paths, then
-restores the forwards. Use logical role names or `DMESH_FLASH_PORTS` when
-device selection matters.
+The helper resolves logical lmesh roles, keeps their UDS forwards active,
+sparse-flashes and verifies through the stable physical USB-UART paths, and
+retains forward evidence. Use logical role names or `DMESH_FLASH_PORTS` when
+device selection matters. This is initial provisioning/P0 repair only; normal
+Main and Recovery updates use Wi-Fi DRS2 because deployed boards may not have
+USB.
 
 Flashing must preserve NVS. Do not write the padded merged image at `0x0`: the
 merged image contains `0xff` bytes across NVS (`0x9000..0xefff`) and erases
@@ -182,12 +190,10 @@ fails if any expected LoRa port is missing. Test-specific modes, such as
 dedicated test scripts. See `docs/lmesh-firmware-handoff.md` for the current
 lmesh-first workflow.
 
-Run direct firmware commands through the lmesh UDS forward:
+Run direct firmware commands through the lmesh control service:
 
 ```bash
-python tools/serial_cmd.py \
-  --port uds:///run/mesh/lmesh/USB0.sock \
-  --cmd 'status'
+mesh lmesh esp.serial.command port=USB0 command=status
 ```
 
 NAN/LoRa command payloads should include explicit mesh addressing:
@@ -202,10 +208,9 @@ device accepts.
 Run multiple checks through lmesh:
 
 ```bash
-python tools/serial_cmd.py --port uds:///run/mesh/lmesh/USB0.sock \
-  --cmd 'lora status=true' \
-  --cmd 'nan stats=true' \
-  --cmd 'stats'
+mesh lmesh esp.serial.command port=USB0 command='lora status=true'
+mesh lmesh esp.serial.command port=USB0 command='nan stats=true'
+mesh lmesh esp.serial.command port=USB0 command=stats
 ```
 
 ## Core Commands
@@ -219,7 +224,7 @@ python tools/serial_cmd.py --port uds:///run/mesh/lmesh/USB0.sock \
 | `logs` | Recent structured event lines. Supports `count`, `depth`, `max_bytes`, `clear=true`. |
 | `messages` | Recent packet buffer. Supports `transport`, `direction`, bounded output, pull/ACK fields. |
 | `local_messages` | Local-address packet buffer. |
-| `button` | `gpio=N` and `enabled=true|false` configure the physical PRG/DTR debug button. `pin=N slots=N [min_us=N|min_ms=N]` starts a separate any-edge GPIO interval capture; it never reconfigures the debug button and rejects its GPIO. `button get` (or `get=true`) returns chronological `low:DELTA_US,high:DELTA_US` samples and resets the ring. `button stop` disables the capture. `slots` is 1-128; `min_us` drops shorter edge intervals and reports the drop count. |
+| `button` | `gpio=N` and `enabled=true|false` configure the physical PRG debug button. `pin=N slots=N [min_us=N|min_ms=N]` starts a separate any-edge GPIO interval capture; it never reconfigures the debug button and rejects its GPIO. `button get` (or `get=true`) returns chronological `low:DELTA_US,high:DELTA_US` samples and resets the ring. `button stop` disables the capture. `slots` is 1-128; `min_us` drops shorter edge intervals and reports the drop count. |
 | `nvs` | Settings namespace and key/value operations: `op=ns|get|set|list`, direct `KEY=VALUE` updates, and `stats=true`. Debug text also accepts `nvs ns`, `nvs get KEY`, `nvs set KEY=VALUE...`, and `nvs list`. |
 | `namespace`, `set`, `get`, `list` | Debug compatibility aliases for the grouped `nvs` command. |
 
@@ -250,19 +255,19 @@ reliably stored in NVS on all targets.
 
 | Setting | Help |
 | --- | --- |
-| `mode` | Persisted operating mode: infra or companion. |
+| `mode` | Persisted operating mode: `infra` is powered/always-on; `companion` is the battery/duty-cycled role. |
 | `power.profile` | Boot PM profile: `dfs`, `perf`, `low`, or `auto`. |
 | `uart.active_ms` | UART debug input/output window after boot, PRG/button, or UART input. Minimum/default: 2000 ms. |
-| `uart.hb_every` | UART heartbeat cadence for raw-NAN duty wakes. `0` (default) disables periodic and LoRa/FSK-triggered UART output. `N>0` opens UART only for `nan.active_ms` and emits one empty `0x7e 0x7e` frame on every Nth raw-NAN wake; LoRa/FSK receive uses a 250 ms event window. A host UART frame then extends the normal `uart.active_ms` interactive window. |
-| `wifi.mode` | Boot Wi-Fi policy; current default is raw/custom NAN duty cycle. |
+| `uart.hb_every` | UART heartbeat cadence for non-infrastructure raw-NAN duty wakes. `0` (default) disables periodic and LoRa/FSK-triggered UART output. `N>0` opens UART only for `nan.active_ms` and emits one empty `0x7e 0x7e` frame on every Nth raw-NAN wake; LoRa/FSK receive uses a 250 ms event window. Infrastructure mode keeps UART continuously active and does not use this cadence. |
+| `wifi.mode` | Boot Wi-Fi policy; battery nodes use raw/custom NAN duty cycle, while `mode=infra` remains continuously powered. |
 | `wifi.ssid` | Saved Wi-Fi SSID for explicit STA/AP experiments. |
-| `nan.enabled` | Enable infra raw/custom NAN duty cycle at boot. |
+| `nan.enabled` | Enable raw/custom NAN at boot; `mode=infra` keeps it continuously active, while battery nodes use the duty cycle. |
 | `nan.backend` | `raw` for custom low-power NAN-like action frames, `official` for Espressif NAN tests. |
 | `nan.role` | NAN role: publisher, publisher_solicited, subscriber, or both. |
 | `nan.service` | NAN service name, normally `dmesh`. |
 | `nan.channel` | NAN/raw-NAN channel, default 6. |
 | `nan.wake_ms` | Raw-NAN duty period. Default: `4000` ms. |
-| `nan.active_ms` | Raw-NAN active Wi-Fi/SDF window. Default: `250` ms. |
+| `nan.active_ms` | Raw-NAN active Wi-Fi/SDF dwell. Default: `64` ms; the adaptive pre-wake margin is scheduled separately. |
 | Runtime `mode active` | Non-persistent powered/transfer override. `mode active=true` keeps raw-NAN Wi-Fi, NAN beacon/action receive, and configured LoRa RX active until `mode active=false`. `mode active_ms=N` keeps the same radios active for `1000..300000` ms, then resumes the configured duty cycle. UART/PRG input opens its configured console window and temporarily holds the same radio path active; it does not persist across reset. |
 | `nan.light_sleep` | Use explicit light sleep while raw-NAN Wi-Fi is off between windows. Default: `true`; set `false` for timing/debug comparison. |
 | `nan.early_ms` | Return from light sleep this many milliseconds before the expected window. Default: `5` ms. |
@@ -540,6 +545,25 @@ Action-frame sizing:
   deterministic validation;
 - larger payloads need chunking above this command path.
 
+Follow-up versus session transport: raw-NAN follow-ups are intentionally for
+short control or SMS-like messages (sync notification, status, and similarly
+small records).  lmesh automatically requests a bounded “I want to talk”
+window when a command exceeds its short payload budget; that window is where
+the eventual QUIC-like/ESP-NOW-style bulk bearer belongs.  The current firmware
+only establishes the active window and still carries the command over the
+bounded raw-NAN command path.  It must not grow the command or radio queues:
+each raw command and outgoing queue is capped at eight entries, oldest entries
+are dropped on saturation, and `nan stats=true` reports `raw_cmd_drop` and
+`raw_outgoing_drop` for sender-side retry/NACK policy.
+
+DW continuation metadata uses reserved argument key `332`, encoded as one
+byte: bit 0 means `MORE`, bit 1 means `DONE`, and bits 2..7 request additional
+512-TU awake units. Exactly one NAN follow-up is sent in each selected DW. The
+infrastructure gateway adds this hint from its bounded queue. A sleepy target
+extends its awake window only for `MORE`/unit hints; `DONE` permits it to return
+to the normal scheduler after the current command. The subsequent burst uses
+the session bearer (CoC for Android, ESP-NOW-style frames for ESP peers).
+
 ## Sleep / Power
 
 | Command | Params | Result |
@@ -577,13 +601,23 @@ Raw-NAN's Wi-Fi-off interval uses explicit timer/GPIO light sleep, not automatic
 PM. `sleep status=true` reports this separately as `raw_nan_light_runs`,
 `raw_nan_light_ok`, and `raw_nan_light_last_ms`; `power status=true`'s `ls_*`
 fields only cover automatic light sleep. `power quiet=true` returns its response
-then disables UART RX and releases its PM locks until a PRG/DTR wake. This is
+then disables UART RX and releases its PM locks until a PRG wake. This is
 required for a valid battery measurement.
 
 Raw NAN timing instrumentation:
 
 - `nan stats=true` includes `last_beacon_local_us`, `last_beacon_tsf_us`, and
   `beacon_age_ms` when the raw NAN sniffer has seen NAN beacons;
+- `nan beacon_history=true` returns the bounded sequence/TSF/local timestamp
+  history plus the 802.11 source MAC used to compare a powered observer with a
+  sleepy node. The source is diagnostic attribution; all beacons from the
+  selected NAN cluster remain eligible for timing.
+- `nan beacon_stats=reset` starts a beacon-only measurement and
+  `nan beacon_stats=true` reports the selected BSSID, interval/stride,
+  accepted beacons, selected slots seen/missed, duplicates, TSF regressions,
+  phase range/span, and TSF/local receive deltas. Service descriptors, follow-ups,
+  generic management frames, and foreign clusters are excluded. AP fallback
+  uses the same counters with `source=ap` and the advertised AP interval.
 - `nan cycle=true ... sync=true` uses that beacon TSF estimate to align active
   windows to `TSF % (dw_tu * 1024) == offset_tu * 1024`;
 - USB1 measured raw-NAN radio startup at about 10.5 ms in the no-deep-sleep
@@ -655,7 +689,7 @@ Infra boot radio settings:
   off and explicitly enters light sleep until shortly before a Discovery Window
   calculated from the most recent NAN beacon TSF. If no recent beacon is
   available, it uses the configured duty interval as a conservative fallback.
-  Defaults: `nan.wake_ms=4000`, `nan.active_ms=250`,
+  Defaults: `nan.wake_ms=4000`, `nan.active_ms=64`,
   `nan.light_sleep=true`, `nan.early_ms=5`, `nan.channel=6`;
 - AP fallback is available for a powered infra owner. Set `nan.ap_owner=true`
   on `lora1`; after five seconds without NAN it starts open
@@ -669,12 +703,9 @@ Infra boot radio settings:
   one-second backoff before the next scheduled window. Late beacons are
   classified as approximately one Discovery Window late (`next_dw`) or timing
   phase drift (`drift`).
-- `power.profile=dfs` is the default on all ESP targets: dynamic frequency
-  scaling enabled, automatic light sleep disabled;
-- `wifi.mode=nan_sleep` makes infra boot enter the raw-NAN deep-sleep loop.
-  It wakes on timer/PRG, opens a raw-NAN active window, then deep-sleeps again.
-  Tune with `nan.wake_ms`, `nan.active_ms`, and `nan.channel`. If
-  `lora.enabled=true`, LoRa is also armed as a wake/listen source.
+- The older `wifi.mode=nan_sleep`/infra deep-sleep experiment is historical and
+  must not be used as the infrastructure default. Current `mode=infra` is
+  always-on; only non-infrastructure battery nodes use the raw-NAN sleep loop.
 - `wifi.mode=official_nan` starts Espressif official NAN explicitly on classic
   ESP32 boards for comparison tests;
 - `wifi.mode=sta_idle` starts unassociated STA-idle mode;
@@ -722,13 +753,13 @@ unless explicitly started for testing.
 | `mode` | `ping=true` | Send ping across enabled transports. |
 | `power` | `status=true` | Current CPU frequency, XTAL, PM min/max, automatic light-sleep permission, and tick counter. Heap/PSRAM/task stats are in `status`/`xstatus`, not `power`. |
 | `power` | `locks=true` | Print the active ESP-IDF power-management lock table to the debug UART. |
-| `power` | `quiet=true` | Send the response, then enter UART idle: output is suppressed and PM locks are released, but RX/light-sleep wake stays armed. A DTR/PRG edge or UART wake preamble followed by a command reopens the active window. Intended for power tests. |
+| `power` | `quiet=true` | Send the response, then enter UART idle: output is suppressed and PM locks are released, but RX/light-sleep wake stays armed. A PRG edge or UART wake preamble followed by a command reopens the active window. Intended for power tests. |
 | `power` | `uart_status=true` | Report driver, active-window, RX-wake, ingress error/drop, `uart_frame_drop`, `uart_escape_err`, idle-TX-drop, and `uart_hb_*` heartbeat counters including the last heartbeat window. The physical UART decoder drops malformed frames at the next delimiter; it emits no recovery stream. |
-| `power` | `uart_probe_ms=N` | Debug verification only: schedule one UART output attempt after `N` ms (1..60000). After a DTR/UART wake, `uart_status=true` must report `uart_probe_dropped` when the probe ran outside the active window; it must not emit the probe line. |
+| `power` | `uart_probe_ms=N` | Debug verification only: schedule one UART output attempt after `N` ms (1..60000). After a PRG/UART wake, `uart_status=true` must report `uart_probe_dropped` when the probe ran outside the active window; it must not emit the probe line. |
 | `power` | `uart_probe_reset=true` | Clear the debug output-gate probe counters before a bounded test. |
 | `power` | `uart_uninstall=true` | One-boot power-test operation: acknowledge first, then remove UART0's driver. Reset is required to restore the console. It is never part of normal boot or radio profiles. |
 | `power` | `profile=dfs\|perf\|low\|auto save=true min_mhz=... max_mhz=... light=true\|false` | Configure ESP-IDF PM. Default boot profile is `dfs`: dynamic frequency scaling enabled, automatic light sleep disabled. `light=true` permits automatic light sleep; it does not force immediate sleep if UART, Wi-Fi, BLE, LoRa, timers, or tasks hold the chip active. |
-| `nvs` | `op=set uart.active_ms=2000` | Configure the debug UART input/output window in milliseconds (minimum/default: 2000 ms). PRG/button, explicit lmesh DTR, or UART RX opens/extends the window. RX wake remains armed while idle; firmware output is dropped while idle. |
+| `nvs` | `op=set uart.active_ms=2000` | Configure the debug UART input/output window in milliseconds (minimum/default: 2000 ms). A scheduled UART/radio rendezvous or UART RX opens/extends the window. RX wake remains armed while idle; firmware output is dropped while idle. Modem-line control is reserved for direct esptool recovery flashing. |
 | `nvs` | `op=set uart.hb_every=N` | Configure the disabled-by-default periodic UART heartbeat. `0` suppresses raw-NAN wake and LoRa/FSK-triggered UART output; `N>0` writes an empty UART frame and opens the bounded console window on every Nth raw-NAN wake. lmesh flushes queued command frames after receiving any firmware UART frame. |
 | `sleep` | `status=true` | Sleep/PM/radio state and counters. |
 | `sleep` | `test=ble\|raw\|raw_data\|sta\|ap\|nan ms=... restore=true` | Bounded light-sleep experiment with timer recovery. |
@@ -745,13 +776,13 @@ not deep sleep.
 
 `event type=uart.pm_lock ok=true state=released` means the firmware released
 the APB frequency lock for the debug UART after the active window expired. It
-does not uninstall the UART driver. PRG/button or lmesh DTR opens a new window;
-RX input also opens a closed console window; when waking from light sleep, send
+does not uninstall the UART driver. A scheduled UART/radio rendezvous or RX
+input opens a closed console window; when waking from light sleep, send
 a complete delimiter-framed CBOR command; partial or corrupt UART bytes are
 discarded at the next delimiter. Output while closed is intentionally dropped.
 Each active console window holds both the UART APB lock and an
 `ESP_PM_NO_LIGHT_SLEEP` lock for at least two seconds. lmesh UDS forwards are
-passive; use explicit `dtr` only for a local GPIO0/PRG wake.
+passive; modem-control lines are reserved for direct esptool recovery flashing.
 
 ## Hardware and Probe
 
@@ -772,9 +803,14 @@ On classic ESP32, avoid ADC2 pins while Wi-Fi is active. Use ADC1 pins
 
 | Command | Params | Result |
 | --- | --- | --- |
-| `nan` | `start=true\|stop=true`, `backend=raw`, `role=publish\|publisher_solicited\|subscribe\|both`, `service=dmesh`, `channel=6` | Start/stop raw NAN-like mode. `publisher_solicited` is the low-duty responder mode for lmesh/Android active subscribers. |
+| `nan` | `start=true\|stop=true`, `backend=raw`, `role=publish\|publisher_solicited\|subscribe\|both`, `service=dmesh`, `channel=6` | Start/stop raw NAN-like mode. `publisher_solicited` queues a standards-generated Publish only after a matching Subscribe and binds the received subscriber instance as the Publish Requestor Instance ID. |
+| `nan` | `publish=true sync=true count=N sdea=true\|false sdea_update=0..255 availability_map=0..15` | Queue `N` raw-NAN unsolicited Publish SDFs in Discovery Windows. `sdea=false` omits only the optional Service Descriptor Extension Attribute; `sdea_update` changes only its Service Update Indicator (default `2`); `availability_map` changes only the Availability Attribute Map ID (default `1`). All are non-persistent interoperability probes, not saved radio settings. |
+| `nan` | `uart_wake=*\|<last8> sync=true duration_ms=...` | Queue a targeted infrastructure wake Publish SDF. `*` targets every sleepy node; an 8-hex suffix targets one device. A match keeps raw Wi-Fi active for the bounded interval, opens UART, and permits raw action/ESP-NOW-like exchange. The advertisement is released only in the selected DW. |
+| `nan` | `ble_wake=*\|<last8> sync=true duration_ms=...` | Queue a targeted BLE wake Publish SDF. A match starts the connectable NimBLE CoC server (PSM `0x80`) for the bounded interval without holding raw Wi-Fi or opening UART. This is intentionally separate from `uart_wake`; a frame carrying both flags requests both bearers. |
 | `nan` | `queue=<CBOR command> dst=MAC` | Queue a compact CBOR command for the next raw-NAN active window; use it for sleepy peers. Raw-NAN command responses use the same queue while duty cycling. |
 | `nan` | `stats=true` | NAN support, counters, role/backend state, beacon timing, queued raw-NAN work, and raw command/response counters. `rx_prefilter_drop` counts unrelated management frames rejected in the Wi-Fi callback before they can fill the raw-NAN queue. |
+| `nan` | `service_dump=true\|clear` | Show or clear the bounded last received DMesh service descriptor. Clear before a one-peer observer test; it neither transmits nor changes radio configuration. |
+| `nan` | `service_history=true\|clear` | Show or clear the bounded source/device/instance history of received DMesh service descriptors. Use it when nearby Android devices make a single last-frame capture ambiguous. |
 
 Use `role=both` when testing ESP-to-ESP discovery without a host/phone active
 subscriber. Use `role=publisher_solicited` when lmesh or Android owns active
@@ -783,6 +819,11 @@ broadcasting unsolicited publish frames every discovery window.
 
 Raw/custom NAN command/response is the current reliable ESP-to-ESP validation
 path. Example:
+
+The raw-NAN payload budget is 231 bytes for compact-CBOR command/response
+records. Verbose `status` and `ping` responses are returned as valid CBOR
+`status=partial` records containing a bounded message prefix; they are not
+truncated byte streams and must not be treated as transport errors.
 
 ```bash
 python tools/nan_pair_test.py --backend raw \

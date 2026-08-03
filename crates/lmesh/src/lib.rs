@@ -593,14 +593,20 @@ pub enum Request {
         profile: Option<String>,
         #[serde(default)]
         timeout_sec: Option<f64>,
+        #[serde(default)]
+        baud: Option<u32>,
     },
-    /// Reset an ESP USB serial adapter into bootloader or running firmware mode.
-    #[serde(rename = "usb.serial.reset")]
-    UsbSerialReset {
+    /// Send a fixed PPP-framed stage2 boot command through a managed forward.
+    #[serde(rename = "usb.serial.boot")]
+    UsbSerialBoot {
         #[serde(default)]
         port: Option<String>,
         #[serde(default)]
-        mode: Option<String>,
+        command: Option<String>,
+        #[serde(default)]
+        timeout_sec: Option<f64>,
+        #[serde(default)]
+        reset: Option<bool>,
     },
     /// Start a managed USB serial byte forward on a UDS.
     #[serde(rename = "usb.serial.forward.start", alias = "usb.serial.connect")]
@@ -616,9 +622,9 @@ pub enum Request {
         #[serde(default)]
         handshake: Option<bool>,
         #[serde(default)]
-        dtr: Option<bool>,
-        #[serde(default)]
         multi: Option<bool>,
+        #[serde(default)]
+        direct: Option<bool>,
     },
     /// Stop a managed USB serial byte forward.
     #[serde(rename = "usb.serial.forward.stop", alias = "usb.serial.disconnect")]
@@ -629,6 +635,22 @@ pub enum Request {
     /// List managed USB serial byte forwards.
     #[serde(rename = "usb.serial.forward.list")]
     UsbSerialForwardList,
+    /// Pulse RTS to reset a board through a USB-UART bridge (explicit recovery tool).
+    #[serde(rename = "usb.serial.rst", alias = "usb.serial.reset")]
+    UsbSerialReset {
+        #[serde(default)]
+        port: Option<String>,
+    },
+    /// Set or pulse DTR on a USB-UART bridge (explicit hardware test tool).
+    #[serde(rename = "usb.serial.dtr")]
+    UsbSerialDtr {
+        #[serde(default)]
+        port: Option<String>,
+        #[serde(default)]
+        asserted: Option<bool>,
+        #[serde(default)]
+        pulse_ms: Option<u64>,
+    },
     /// Run one low-level command against an ESP firmware adapter.
     #[serde(rename = "esp.serial.command")]
     EspSerialCommand {
@@ -639,6 +661,21 @@ pub enum Request {
         command: String,
         #[serde(default)]
         timeout_sec: Option<f64>,
+        /// Optional infrastructure gateway for a raw-NAN addressed command.
+        #[serde(default)]
+        gateway: Option<String>,
+        /// Target ESP MAC or eight-hex suffix when `gateway` is present.
+        #[serde(default)]
+        target: Option<String>,
+        /// Optional bounded "I want to talk" window before the command. If
+        /// omitted, the command is sent as one DW-gated message.
+        #[serde(default)]
+        active_ms: Option<u32>,
+        /// Optional TCP endpoint for an already active Main STA maintenance
+        /// session.  The NAN wake/control command remains the session setup;
+        /// normal commands then avoid the gateway UART path.
+        #[serde(default)]
+        tcp: Option<String>,
     },
     /// Enter or leave the runtime-only ESP powered/transfer radio mode.
     #[serde(rename = "esp.active")]
@@ -888,6 +925,15 @@ pub enum Request {
     WifiStaStatus {
         #[serde(default)]
         iface: Option<String>,
+    },
+    /// Configure a static IPv4 address for a station test or bootstrap link.
+    #[serde(rename = "wifi.sta.configure_ipv4")]
+    WifiStaConfigureIpv4 {
+        #[serde(default)]
+        iface: Option<String>,
+        address: String,
+        #[serde(default)]
+        prefix: Option<u8>,
     },
     /// Request a BLE scan through raw Linux HCI sockets.
     #[serde(rename = "ble.scan")]
@@ -1150,25 +1196,35 @@ impl LmeshService {
                 port,
                 profile,
                 timeout_sec,
+                baud,
             } => mesh::protocol::Response::ok_with_data(self.radio.usb_serial_handshake(
                 port,
                 profile,
                 timeout_sec,
+                baud,
             )),
-            Request::UsbSerialReset { port, mode } => {
-                mesh::protocol::Response::ok_with_data(self.radio.usb_serial_reset(port, mode))
-            }
+            Request::UsbSerialBoot {
+                port,
+                command,
+                timeout_sec,
+                reset,
+            } => mesh::protocol::Response::ok_with_data(self.radio.usb_serial_boot(
+                port,
+                command,
+                timeout_sec,
+                reset,
+            )),
             Request::UsbSerialForwardStart {
                 port,
                 baud,
                 tcp_port,
                 tcp_mode,
                 handshake,
-                dtr,
                 multi,
+                direct,
             } => mesh::protocol::Response::ok_with_data(
                 self.radio
-                    .serial_forward_start(port, baud, tcp_port, tcp_mode, handshake, dtr, multi),
+                    .serial_forward_start(port, baud, tcp_port, tcp_mode, handshake, multi, direct),
             ),
             Request::UsbSerialForwardStop { port } => {
                 mesh::protocol::Response::ok_with_data(self.radio.serial_forward_stop(port))
@@ -1176,17 +1232,46 @@ impl LmeshService {
             Request::UsbSerialForwardList => {
                 mesh::protocol::Response::ok_with_data(self.radio.serial_forward_list())
             }
+            Request::UsbSerialReset { port } => {
+                mesh::protocol::Response::ok_with_data(self.radio.serial_modem_reset(port))
+            }
+            Request::UsbSerialDtr {
+                port,
+                asserted,
+                pulse_ms,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.serial_modem_dtr(port, asserted, pulse_ms),
+            ),
             Request::EspSerialCommand {
                 adapter,
                 port,
                 command,
                 timeout_sec,
-            } => mesh::protocol::Response::ok_with_data(self.radio.esp_serial_command(
-                adapter,
-                port,
-                command,
-                timeout_sec,
-            )),
+                gateway,
+                target,
+                active_ms,
+                tcp,
+            } => {
+                let default_route = gateway
+                    .is_none()
+                    .then(|| {
+                        self.radio
+                            .default_esp_route(port.as_deref(), adapter.as_deref())
+                    })
+                    .flatten();
+                let route = gateway
+                    .map(|gateway| (gateway, target))
+                    .or(default_route.map(|(gateway, target)| (gateway, Some(target))));
+                mesh::protocol::Response::ok_with_data(if let Some(tcp) = tcp {
+                    self.radio.esp_tcp_command(tcp, command, timeout_sec)
+                } else if let Some((gateway, target)) = route {
+                    self.radio
+                        .esp_remote_command(gateway, target, command, timeout_sec, active_ms)
+                } else {
+                    self.radio
+                        .esp_serial_command(adapter, port, command, timeout_sec)
+                })
+            }
             Request::EspActive {
                 adapter,
                 port,
@@ -1194,10 +1279,25 @@ impl LmeshService {
                 active_ms,
                 gateway,
                 target,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio
-                    .esp_active(adapter, port, active, active_ms, gateway, target),
-            ),
+            } => {
+                let default_route = gateway
+                    .is_none()
+                    .then(|| {
+                        self.radio
+                            .default_esp_route(port.as_deref(), adapter.as_deref())
+                    })
+                    .flatten();
+                let (gateway, target) = gateway
+                    .map(|gateway| (Some(gateway), target.clone()))
+                    .or_else(|| {
+                        default_route.map(|(gateway, target)| (Some(gateway), Some(target)))
+                    })
+                    .unwrap_or((None, target));
+                mesh::protocol::Response::ok_with_data(
+                    self.radio
+                        .esp_active(adapter, port, active, active_ms, gateway, target),
+                )
+            }
             Request::EspLoraStatus { adapter, port } => {
                 mesh::protocol::Response::ok_with_data(self.radio.esp_lora_status(adapter, port))
             }
@@ -1352,6 +1452,13 @@ impl LmeshService {
             Request::WifiStaStatus { iface } => {
                 mesh::protocol::Response::ok_with_data(self.radio.wifi_sta_status(iface))
             }
+            Request::WifiStaConfigureIpv4 {
+                iface,
+                address,
+                prefix,
+            } => mesh::protocol::Response::ok_with_data(
+                self.radio.wifi_sta_configure_ipv4(iface, address, prefix),
+            ),
             Request::BleScan {
                 dev_id,
                 reason,

@@ -7,7 +7,28 @@
 
 # One chronological log for UART TX/RX from every forward. Each record includes
 # the role name, host timestamp, escaped text, and exact bytes as hex.
-serial_log_path = "target/lmesh-radio-build/log/serial.log"
+# Relative paths are resolved from this (symlink-safe) config file. Keep every
+# board capture in the checkout-level target directory, never lmesh's CWD.
+serial_log_path = "../../../target/lmesh-radio-build/log/serial.log"
+
+# Normal ESP commands route through the continuously powered infrastructure
+# node.  The target suffixes are stable station-MAC identities; callers that
+# explicitly provide `adapter=` retain the direct UART diagnostic path.
+esp_gateway = "lora1"
+[esp_targets]
+lora2 = "1d4c5e1d"
+lora3 = "8e0742c5"
+lora4 = "f6fc543c"
+e5 = "fcf5c40ef1e8"
+
+# Main joins the local AP only for a bounded maintenance session. It opens this
+# TCP connection back to lmesh; the AP may isolate stations, so lmesh must not
+# try to connect to the station. The managed UDS socket parallels e5.sock.
+[[esp_reverse_sessions]]
+id = "e5"
+ip = "10.78.0.201"
+port = 3343
+socket = "/run/mesh/lmesh/e5-ip.sock"
 
 [[serial_forwards]]
 port = "lora1"
@@ -16,10 +37,10 @@ baud = 115200
 tcp_port = 3330
 tcp_mode = "framed"
 # lora1 is the powered raw-NAN gateway. It is activated after reset with the
-# binary `active` command, not an automatic CP210x edge on every UDS client.
-# Use the local `dtr [ms]` diagnostic only when debugging the board wiring.
-dtr = false
+# binary `active` command; managed diagnostic clients never toggle modem lines.
 multi = true
+raw = false
+direct = true
 
 [[serial_forwards]]
 port = "lora2"
@@ -27,7 +48,6 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2104_USB_to_UART_Bridge_Controller_
 baud = 115200
 tcp_port = 3331
 tcp_mode = "framed"
-dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -36,7 +56,6 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_
 baud = 115200
 tcp_port = 3332
 tcp_mode = "framed"
-dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -45,7 +64,6 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_
 baud = 115200
 tcp_port = 3333
 tcp_mode = "framed"
-dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -54,7 +72,6 @@ path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_
 baud = 115200
 tcp_port = 3335
 tcp_mode = "framed"
-dtr = false
 multi = true
 
 [[serial_forwards]]
@@ -63,14 +80,12 @@ path = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C82104982-if00"
 baud = 115200
 tcp_port = 3334
 tcp_mode = "framed"
-dtr = false
 multi = true
 
 [[serial_forwards]]
 port = "power1"
 path = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AH02TSMU-if00-port0"
 baud = 115200
-dtr = false
 multi = false
 log = false
 # The meter is not firmware UART: pass its newline-delimited samples through
