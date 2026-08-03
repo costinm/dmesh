@@ -40,6 +40,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_module_loader/include/dmesh_module_loader.h");
     println!("cargo:rerun-if-changed=native/dmesh_module_loader/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../mod_hello/include/dmesh_module_abi.h");
+    println!("cargo:rerun-if-changed=../../mod_lora/include/dmesh_lora_abi.h");
     println!("cargo:rerun-if-changed=../../boot/boot_health_rtc.h");
     embuild::espidf::sysenv::output();
 }
