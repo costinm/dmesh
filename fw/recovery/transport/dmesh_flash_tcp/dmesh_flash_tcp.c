@@ -50,6 +50,7 @@
 #define TARGET_NVS 4u
 #define TARGET_DATA 5u
 #define TARGET_MAIN 6u
+#define TARGET_MODULE 7u
 #define BOOT_LIMIT 0x7000u
 #define PARTITION_LIMIT 0x1000u
 #define BOOT_HEAP_STACK 8192
@@ -201,7 +202,7 @@ static const esp_partition_t *partition_for(uint8_t target)
 {
     if (target == TARGET_MAIN) {
         return esp_partition_find_first(ESP_PARTITION_TYPE_APP,
-                                        ESP_PARTITION_SUBTYPE_APP_OTA_0, "main");
+                                        ESP_PARTITION_SUBTYPE_ANY, "main");
     }
     if (target == TARGET_RECOVERY) {
         return esp_partition_find_first(ESP_PARTITION_TYPE_APP,
@@ -219,6 +220,16 @@ static bool target_partition(uint8_t target, const esp_partition_t **out,
                              esp_partition_t *raw, uint32_t *limit)
 {
     *out = NULL;
+#if defined(DMESH_FLASH_ROLE_RECOVERY)
+    /* Recovery executes from recovery_app.  Erasing or writing that
+     * partition while it is running invalidates the code and can reset the
+     * chip in the middle of the TCP session.  Main is the only component
+     * allowed to update Recovery. */
+    if (target == TARGET_RECOVERY) {
+        ESP_LOGE(TAG, "refusing self-update of recovery_app");
+        return false;
+    }
+#endif
     if (target == TARGET_BOOT || target == TARGET_PARTITION) {
         memset(raw, 0, sizeof(*raw));
         raw->flash_chip = esp_flash_default_chip;
@@ -230,9 +241,9 @@ static bool target_partition(uint8_t target, const esp_partition_t **out,
         raw->encrypted = false; raw->readonly = false;
         *out = raw; *limit = raw->size; return true;
     }
-    if (target == TARGET_DATA) {
+    if (target == TARGET_DATA || target == TARGET_MODULE) {
         uint32_t flash_size = 0;
-        if (esp_flash_get_size(NULL, &flash_size) != ESP_OK ||
+        if (esp_flash_get_physical_size(NULL, &flash_size) != ESP_OK ||
             flash_size <= DATA_PARTITION_START) return false;
         memset(raw, 0, sizeof(*raw));
         raw->flash_chip = esp_flash_default_chip;
@@ -317,7 +328,7 @@ static bool send_hello(int fd)
 {
     uint8_t payload[71] = {0}; uint8_t mac[6] = {0}; uint8_t key[65]; uint8_t fp[32] = {0};
     esp_chip_info_t chip = {0}; esp_chip_info(&chip); (void)esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    uint32_t flash = 0; (void)esp_flash_get_size(NULL, &flash);
+    uint32_t flash = 0; (void)esp_flash_get_physical_size(NULL, &flash);
     put_u32(payload + 8, (uint32_t)esp_clk_cpu_freq());
     put_u32(payload + 12, 40); put_u32(payload + 16, flash);
     put_u32(payload + 20, heap_caps_get_total_size(MALLOC_CAP_8BIT));
@@ -529,7 +540,7 @@ static bool parse_fast_unsigned_manifest(const uint8_t *data, uint16_t length,
     if (manifest->block_size != BLOCK_SIZE || manifest->count == 0 || manifest->count > MAX_BLOCKS ||
         manifest->image_size == 0 || manifest->image_size > manifest->count * BLOCK_SIZE ||
         manifest->start % BLOCK_SIZE != 0 || manifest->image_size % 4 != 0 ||
-        load_trust_key(key) != 0 || memcmp(data + 84, zero, sizeof(zero)) != 0) return false;
+        load_trust_key(key) < 0 || memcmp(data + 84, zero, sizeof(zero)) != 0) return false;
     memcpy(manifest->partition_sha, data + 20, 32);
     memcpy(manifest->image_sha, data + 52, 32);
     memcpy(manifest->key_fp, data + 84, 32);
@@ -547,23 +558,49 @@ static bool receive_fast_unsigned_block(manifest_t *manifest, const uint8_t *dat
         block_length + index * BLOCK_SIZE > manifest->image_size || length != 12 + block_length)
         return false;
     uint32_t offset = manifest->start + index * BLOCK_SIZE;
-    return esp_partition_erase_range(manifest->partition, offset, BLOCK_SIZE) == ESP_OK &&
-           esp_partition_write(manifest->partition, offset, data + 12, block_length) == ESP_OK;
+    ESP_LOGI(TAG, "fast block start target=%u index=%u address=0x%x length=%u",
+             (unsigned)manifest->target, (unsigned)index,
+             (unsigned)(manifest->partition->address + offset), (unsigned)block_length);
+    esp_err_t err = esp_partition_erase_range(manifest->partition, offset, BLOCK_SIZE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "fast block erase failed target=%u index=%u address=0x%x err=0x%x",
+                 (unsigned)manifest->target, (unsigned)index,
+                 (unsigned)(manifest->partition->address + offset), (unsigned)err);
+        return false;
+    }
+    ESP_LOGI(TAG, "fast block erased target=%u index=%u", (unsigned)manifest->target,
+             (unsigned)index);
+    err = esp_partition_write(manifest->partition, offset, data + 12, block_length);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "fast block write failed target=%u index=%u address=0x%x err=0x%x",
+                 (unsigned)manifest->target, (unsigned)index,
+                 (unsigned)(manifest->partition->address + offset), (unsigned)err);
+        return false;
+    }
+    ESP_LOGI(TAG, "fast block complete target=%u index=%u", (unsigned)manifest->target,
+             (unsigned)index);
+    return true;
 }
 
-static bool send_missing(int fd, manifest_t *manifest)
+static bool send_missing(int fd, manifest_t *manifest, const char **error)
 {
     const esp_partition_t *partition = NULL; uint32_t limit = 0;
     if (!target_partition(manifest->target, &partition, &manifest->raw_partition, &limit) ||
-        manifest->start > limit || manifest->image_size > limit - manifest->start) return false;
+        manifest->start > limit || manifest->image_size > limit - manifest->start) {
+        *error = "target partition unavailable";
+        return false;
+    }
     manifest->partition = partition;
     uint8_t actual_table_sha[32];
     esp_partition_t table_raw = {0}; const esp_partition_t *table = NULL; uint32_t table_limit = 0;
     if (!target_partition(TARGET_PARTITION, &table, &table_raw, &table_limit) ||
         !sha256_partition(table, 0, PARTITION_TABLE_SIZE, actual_table_sha) ||
-        memcmp(actual_table_sha, manifest->partition_sha, 32) != 0) return false;
+        memcmp(actual_table_sha, manifest->partition_sha, 32) != 0) {
+        *error = "partition table mismatch";
+        return false;
+    }
     uint32_t bytes = (manifest->count + 7) / 8; uint8_t *response = malloc(20 + bytes);
-    if (response == NULL) return false;
+    if (response == NULL) { *error = "missing-map allocation failed"; return false; }
     memset(response, 0, 20 + bytes);
     response[0] = manifest->target; put_u32(response + 4, manifest->start);
     put_u32(response + 8, manifest->block_size); put_u32(response + 12, manifest->count);
@@ -572,7 +609,9 @@ static bool send_missing(int fd, manifest_t *manifest)
         uint32_t length = manifest->image_size - i * BLOCK_SIZE;
         if (length > BLOCK_SIZE) length = BLOCK_SIZE;
         uint8_t hash[4];
-        if (!block_hash(partition, manifest->start + i * BLOCK_SIZE, length, hash)) { free(response); return false; }
+        if (!block_hash(partition, manifest->start + i * BLOCK_SIZE, length, hash)) {
+            free(response); *error = "target hash read failed"; return false;
+        }
         if (memcmp(hash, manifest->hashes + i * 4, 4) != 0) response[20 + i / 8] |= (uint8_t)(1u << (i % 8));
     }
     bool ok = send_frame(fd, FRAME_MISSING, response, (uint16_t)(20 + bytes));
@@ -600,21 +639,31 @@ static bool receive_block(int fd, manifest_t *manifest, const uint8_t *data, uin
 static bool receive_session(int fd)
 {
     manifest_t manifest = {0}; bool sparse = false; bool fast_unsigned = false;
+    const char *failure = "flash protocol failed";
     bool ok = send_hello(fd); uint16_t type = 0, length = 0; uint8_t *payload = NULL;
-    if (!ok || !recv_frame(fd, &type, &payload, &length) || type != FRAME_READ_PARTITION_TABLE) goto fail;
+    if (!ok || !recv_frame(fd, &type, &payload, &length) || type != FRAME_READ_PARTITION_TABLE) {
+        failure = "partition-table request failed"; goto fail;
+    }
     free(payload); payload = NULL; if (!send_partition_table(fd)) goto fail;
-    if (!recv_frame(fd, &type, &payload, &length)) goto fail;
+    if (!recv_frame(fd, &type, &payload, &length)) { failure = "manifest receive failed"; goto fail; }
     if (type == FRAME_FAST_UNSIGNED) {
         fast_unsigned = true;
         if (!parse_fast_unsigned_manifest(payload, length, &manifest)) goto fail;
+        ESP_LOGI(TAG, "fast manifest target=%u start=0x%x size=%u blocks=%u",
+                 (unsigned)manifest.target, (unsigned)manifest.start,
+                 (unsigned)manifest.image_size, (unsigned)manifest.count);
         uint8_t ready[4]; put_u32(ready, manifest.count);
         free(payload); payload = NULL;
         if (!send_frame(fd, FRAME_FAST_READY, ready, sizeof(ready))) goto fail_manifest;
     } else {
-        if (type != FRAME_HASH_QUERY || !send_hash_list(fd, payload, length)) goto fail;
+        if (type != FRAME_HASH_QUERY || !send_hash_list(fd, payload, length)) {
+            failure = "hash query failed"; goto fail;
+        }
         free(payload); payload = NULL;
     }
-    if (!fast_unsigned && !recv_frame(fd, &type, &payload, &length)) goto fail;
+    if (!fast_unsigned && !recv_frame(fd, &type, &payload, &length)) {
+        failure = "manifest receive failed"; goto fail;
+    }
     if (!fast_unsigned && type == FRAME_SPARSE_MANIFEST) {
         sparse = true;
         if (!parse_sparse_manifest(payload, length, &manifest) || !erase_sparse_manifest(&manifest)) goto fail;
@@ -622,11 +671,15 @@ static bool receive_session(int fd)
         free(payload); payload = NULL;
         if (!send_frame(fd, FRAME_MANIFEST_READY, ready, sizeof(ready))) goto fail_manifest;
     } else if (!fast_unsigned) {
-        if (type != FRAME_MANIFEST || !parse_manifest(payload, length, &manifest)) goto fail;
-        free(payload); payload = NULL; if (!send_missing(fd, &manifest)) goto fail_manifest;
+        if (type != FRAME_MANIFEST || !parse_manifest(payload, length, &manifest)) {
+            failure = "invalid legacy manifest"; goto fail;
+        }
+        free(payload); payload = NULL;
+        if (!send_missing(fd, &manifest, &failure)) goto fail_manifest;
     }
     while (true) {
         if (!recv_frame(fd, &type, &payload, &length)) goto fail_manifest;
+        ESP_LOGI(TAG, "received frame type=%u length=%u", (unsigned)type, (unsigned)length);
         if (type == FRAME_DONE) { free(payload); payload = NULL; break; }
         if (type == FRAME_HASH_QUERY) {
             bool hashes_ok = send_hash_list(fd, payload, length);
@@ -659,7 +712,9 @@ fail:
     free(payload); payload = NULL;
 fail_manifest:
     free(payload); free(manifest.hashes); free(manifest.indices); free(manifest.lengths);
-    free(manifest.changed_hashes); (void)send_frame(fd, FRAME_ERROR, "flash failed", 12); return false;
+    free(manifest.changed_hashes);
+    ESP_LOGE(TAG, "negotiated session failed: %s", failure);
+    (void)send_frame(fd, FRAME_ERROR, failure, (uint16_t)strlen(failure)); return false;
 }
 
 static void flash_worker(void *arg)
@@ -710,4 +765,9 @@ void dmesh_flash_tcp_poll(void) {}
 bool dmesh_flash_tcp_accept(void)
 {
     return flash_done && flash_result;
+}
+
+bool dmesh_flash_tcp_finished(void)
+{
+    return flash_done;
 }

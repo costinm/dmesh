@@ -1,5 +1,13 @@
 # DMesh Recovery
 
+The main idea is to use the 'control plane' pattern for flash updates. Instead of
+using signed images we sign blocks that fit in a low-end device RAM and can be
+verified independently. The 'control plane' sends first a signed list of blocks SHAs,
+followed by each block - device verifies the EC-256 signature based on the provisioned root key and verifies and writes each block.
+
+The protocol can read and write any region of the flash - the device is not trusted
+but the control plane signature is. Initial implementation lacks some elements (version and anti-rollback, etc) and the main use is to flash remote devices over wifi, but it'll eventually converge with the generic mesh control plane protocol. 
+ 
 Recovery is the minimal C ESP-IDF application that updates Main when selected
 by the custom second-stage bootloader. It owns open-STA Wi-Fi, one TCP
 connection, DRS2 parsing, optional P-256 verification, flash writes, request
@@ -17,12 +25,6 @@ Main command -> stage2 -> Recovery -> flash-server.py -> Main partition
                                       |
                                       +-> reboot -> stage2 -> Main
 ```
-
-The design is sound and the Wi-Fi path has repeatedly updated ESP32 and
-ESP32-S3 boards. Current deployment is still bootstrap-grade: fleet devices do
-not yet have trust keys and the default server uses unsigned-fast for unkeyed
-devices. See [DESIGN.md](DESIGN.md) for the exact security properties and the
-priority hardening list.
 
 ## Normal operation
 
@@ -54,9 +56,16 @@ port default to `10.78.0.1:3336`; local IP defaults to
 `10.78.<MAC[4]>.<MAC[5]>`.
 
 The control command currently travels through managed lmesh. The image data is
-Wi-Fi/TCP only. Do not stop lmesh forwarding during the Wi-Fi transfer; it is
-useful for serial evidence. USB/esptool is for first provisioning or emergency
-repair, not routine Main updates.
+Wi-Fi/TCP only. This is a deployment requirement: remote devices may no longer
+have a USB connection, so Main -> Recovery and Recovery -> Main upgrades must
+remain Wi-Fi-only. Do not stop lmesh forwarding during the transfer; it is
+useful for serial evidence. USB/esptool is only first provisioning or P0 repair
+of stage-2/Recovery, never a fallback for a failed remote Main update.
+
+Recovery must never update `recovery_app` while executing from that partition.
+The transport rejects that target in the Recovery build before any manifest or
+erase operation. Main, executing from `main`, is the only updater for
+Recovery and stage-2; Recovery updates Main and other non-self targets.
 
 ## Build and measured size
 

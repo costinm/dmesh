@@ -9,3 +9,4 @@
 bool dmesh_flash_tcp_start(uint16_t port, const char *remote_ip);
 void dmesh_flash_tcp_poll(void);
 bool dmesh_flash_tcp_accept(void);
+bool dmesh_flash_tcp_finished(void);

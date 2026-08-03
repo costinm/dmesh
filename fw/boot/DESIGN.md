@@ -26,8 +26,8 @@ There is no `otadata` partition and no call to
 `esp_ota_set_boot_partition()`. `factory` and `ota_0` are fixed identifiers
 used by the custom selector; they are not ESP-IDF OTA slots.
 
-The single canonical layout preserves deployed NVS and PHY offsets and fits a
-4 MiB flash on every supported board:
+Main and Recovery use one canonical application layout. It preserves deployed
+NVS and PHY offsets and fits a 4 MiB flash:
 
 | Region | Offset | Size |
 |---|---:|---:|---:|
@@ -39,9 +39,29 @@ The single canonical layout preserves deployed NVS and PHY offsets and fits a
 | Main | `0xe0000` | `0x2e0000` |
 | data | `0x3c0000` | `0x40000` |
 
-The authoritative table is `partitions.csv`. Physical flash larger than 4 MiB
-is deliberately not represented in this table; Main may use the remaining
-flash with explicit raw-address code or a future coordinated layout change.
+The authoritative application table is `partitions.csv`. Physical flash
+larger than 4 MiB is deliberately not represented in that application layout;
+Main uses the additional region explicitly for modules/raw data. The
+`partitions_8mb.csv` table is the current boot-provisioning artifact for
+boards with more than 4 MiB and up to 8 MiB of flash; `lora4` is the current
+example. It preserves the same NVS, Recovery, and Main offsets while
+expanding the data entry. Its matching 8 MiB stage2 is flashed only during
+initial USB/esptool provisioning or emergency repair. Future flash sizes need
+the same treatment with a matching table/stage2 limit.
+
+The current fleet policy is:
+
+| boards | physical flash | stage2/table at initial provisioning | Main/Recovery images |
+|---|---:|---|---|
+| `e5`, `lora1`, `lora2`, `lora3` | 4 MiB | common 4 MiB | common 4 MiB-layout images |
+| `lora4` | 8 MiB | 8 MiB-specific stage2 and table | common 4 MiB-layout images |
+
+The expanded stage2/table distinction exists because stage2 validates
+partition entries against its configured flash limit. It is not an OTA
+variant and is not touched by routine Main or module updates. After
+provisioning, Main owns the data/module region and the normal update path uses
+the Main TCP control plane; Recovery remains the failure-recovery updater for
+Main.
 Current measured second-stage binaries are 28,192 bytes on ESP32 and 22,816
 bytes on ESP32-S3.
 

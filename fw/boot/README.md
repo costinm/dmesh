@@ -30,10 +30,30 @@ scripts/build-recovery-fleet.sh all
 Outputs are under `target/recovery-fleet/<chip>/`. The same build also produces
 the matching partition table and Recovery image.
 
-Both ESP32 and ESP32-S3 use the single 4 MiB layout in
-[`partitions.csv`](partitions.csv). It reserves a 256 KiB `data` partition at
-`0x3c0000`; boards with more physical flash may use addresses above 4 MiB
-through explicit Main code without changing the Recovery/stage2 layout.
+The application images are deliberately built against the common 4 MiB
+layout in [`partitions.csv`](partitions.csv). Recovery and Main keep those
+offsets and are not rebuilt or reprovisioned for the physical flash size.
+The 4 MiB layout reserves a 256 KiB `data` partition at `0x3c0000`; Main uses
+additional physical flash above that range for modules and other explicit raw
+data when the hardware provides it.
+
+The bootloader has a provisioning-only physical-size variant. Any board with
+more than 4 MiB of flash must receive a stage2 and partition table whose
+configured limit covers that physical flash. The current fleet is:
+
+| board | chip | physical flash | initial stage2/table |
+|---|---|---:|---|
+| `e5`, `lora1`, `lora2`, `lora3` | ESP32 | 4 MiB | common 4 MiB build |
+| `lora4` | ESP32-S3 | 8 MiB | 8 MiB stage2 and table |
+
+`lora4` needs the 8 MiB stage2/table because stage2 validates the installed
+partition table against the configured flash limit. The same rule applies to
+any future board above 4 MiB; use the smallest matching expanded table and
+stage2 variant. This distinction applies only to initial USB/esptool
+provisioning (or emergency repair). It is not a second Main/Recovery image
+family and it is never part of routine updates. Use the real chip size with
+esptool when provisioning; do not flash an expanded table onto a smaller
+board.
 
 Routine Main updates do not flash stage2 and do not use USB. USB/esptool is
 reserved for first provisioning or emergency repair. Although Main's shared
