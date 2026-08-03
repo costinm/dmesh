@@ -153,13 +153,14 @@ a binary client, not a text terminal.
 
 ## Flash Policy
 
-Follow [flashing.md](flashing.md) for the complete build, preflight, direct
-flash, recovery, and verification procedure. This section records the UART
+Follow [flashing.md](flashing.md) for the complete build, preflight, Wi-Fi
+update, recovery, and verification procedure. This section records the UART
 constraints behind that procedure.
 
 Do not flash via RFC2217. A bootloader probe can work while a long write is
-corrupted. Flash through the local physical USB-UART after releasing the lmesh
-forward. Use the fleet tool's sparse write path so NVS and PHY remain intact.
+corrupted. Deployed boards update through Wi-Fi DRS2 while lmesh remains
+active. The local physical USB-UART fleet tool is only initial provisioning or
+P0 stage-2/Recovery repair; it preserves NVS and PHY.
 
 ```bash
 scripts/flash-recovery-fleet.py --stage-only lora2
@@ -169,7 +170,7 @@ Without `--skip-config`, the fleet tool provisions through the supervised lmesh
 UDS after flashing. Commands and diagnostics never pulse DTR and never open a
 raw UART; DTR/RTS are reserved for esptool bootloader/recovery operations.
 
-Restore forwards after flashing:
+If an old local bootstrap run left a forward absent, restore it:
 
 ```bash
 python fw/esp32/rust/tools/flash_test_fleet.py \
@@ -194,14 +195,14 @@ Never use `write_flash 0x0 dmesh-rs-merged.bin`: that merged image contains
    mesh lmesh esp.serial.command port=lora2 command=status timeout_sec=8
    ```
 
-3. If the ready marker never arrives, stop the managed forward and use the
-   direct `esptool` recovery procedure. Do not switch lmesh to RFC2217 or use
-   modem-line toggles as a diagnostic workaround. Runtime diagnostics never
-   open a physical UART; the only UART recovery operation is esptool writing
-   the second-stage and Recovery images.
+3. If the ready marker never arrives, preserve the managed forward and its
+   capture, then hand the failed Wi-Fi update to the flash/recovery owner. Do
+   not switch lmesh to RFC2217, stop the forward, or use modem-line toggles as
+   a diagnostic workaround. Deployed devices may have no USB connection;
+   esptool is only initial provisioning or a P0 repair of stage-2/Recovery.
 
-   Capture the managed lmesh serial log and use the direct `esptool` recovery
-   procedure for bootloader evidence; do not open an RFC2217 diagnostic path.
+   Capture the managed lmesh serial log for boot evidence; do not open an
+   RFC2217 diagnostic path.
 
 4. A repeated bootloader checksum failure is an image problem. Reflash directly
    and do not diagnose it as a UART wake failure.
@@ -258,8 +259,9 @@ NVS. After recovery, `status` returned framed CBOR with monotonic uptime and
 Remote recovery was then verified from powered `lora3`:
 
 ```text
-Use the direct `esptool` recovery procedure for any reset/bootloader action;
-then restore the managed forwards and issue framed commands through lmesh.
+For a deployed-board reset/bootloader failure, preserve the managed evidence
+and hand it off; do not use USB as a fallback. Issue framed commands through
+lmesh when the board is reachable.
 mesh lmesh esp.serial.command port=lora2 command='mode raw_nan=true channel=6'
 mesh lmesh esp.active port=lora3 active=true
 mesh lmesh esp.active gateway=lora3 target=1d4c5e1c active=true

@@ -1316,12 +1316,16 @@ pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -
         payload.to_vec()
     } else {
         let decoded = crate::commands::protocol::decode_binary(payload).ok();
-        let method = decoded.as_ref().map(|response| response.method).unwrap_or(0);
-        let mut compact = CommandRequest::new_binary(method);
-        if decoded
+        let method = decoded
             .as_ref()
-            .is_some_and(|response| response.args.contains_key(&crate::commands::protocol::CBOR_ERROR))
-        {
+            .map(|response| response.method)
+            .unwrap_or(0);
+        let mut compact = CommandRequest::new_binary(method);
+        if decoded.as_ref().is_some_and(|response| {
+            response
+                .args
+                .contains_key(&crate::commands::protocol::CBOR_ERROR)
+        }) {
             compact.args.insert(
                 crate::commands::protocol::CBOR_ERROR,
                 "raw NAN response exceeds 231 bytes".to_string(),
@@ -1331,10 +1335,7 @@ pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -
                 crate::commands::protocol::CBOR_STATUS,
                 "partial".to_string(),
             );
-            if let Some(message) = decoded
-                .as_ref()
-        .and_then(|response| response.args.get(&32))
-            {
+            if let Some(message) = decoded.as_ref().and_then(|response| response.args.get(&32)) {
                 let prefix = message.chars().take(150).collect::<String>();
                 compact.args.insert(32, format!("{prefix} [truncated]"));
             }
@@ -2508,7 +2509,11 @@ fn enqueue_outgoing_raw(
             payload.to_vec()
         } else {
             let queued_after = queue.len().saturating_add(1);
-            let mut control = if queued_after > 1 { NAN_DW_MORE } else { NAN_DW_DONE };
+            let mut control = if queued_after > 1 {
+                NAN_DW_MORE
+            } else {
+                NAN_DW_DONE
+            };
             let units = queued_after.min(8) as u8;
             control |= units << NAN_DW_UNITS_SHIFT;
             add_dw_control(payload, control)
@@ -2530,9 +2535,7 @@ fn add_dw_control(payload: &[u8], control: u8) -> Vec<u8> {
     let Ok(mut request) = crate::commands::protocol::decode_binary(payload) else {
         return payload.to_vec();
     };
-    request
-        .args
-        .insert(NAN_DW_CONTROL_KEY, control.to_string());
+    request.args.insert(NAN_DW_CONTROL_KEY, control.to_string());
     let encoded = crate::commands::protocol::encode_binary(&request);
     if encoded.len() <= NAN_COMMAND_MAX_LEN {
         encoded
@@ -2577,9 +2580,9 @@ fn apply_dw_control(request: &CommandRequest) {
                 ));
             }
             Ok(_) => {}
-            Err(_) => telemetry::record_log(
-                "event type=nan.response_deadline invalid=true".to_string(),
-            ),
+            Err(_) => {
+                telemetry::record_log("event type=nan.response_deadline invalid=true".to_string())
+            }
         }
     }
     if request.args.contains_key(&NAN_DW_CONTROL_KEY) {
@@ -3422,12 +3425,7 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                 );
             }
             if let Some((source, payload)) = custom_raw_action {
-                telemetry::record_log(format!(
-                    "event type=wifi.raw_action_rx peer={} len={}",
-                    format_mac(&source),
-                    payload.len()
-                ));
-                telemetry::record_packet("wifi", Direction::Rx, payload, "source=raw_action");
+                super::wifi::observe_raw_action_payload(source, payload, rssi);
             } else if is_nan_sdf(frame) {
                 NAN_RX_SDF.fetch_add(1, Ordering::Relaxed);
                 if let Some(info) = raw_command_info(frame) {
@@ -3915,10 +3913,7 @@ fn stats() -> String {
         .map(|value| format_mac(&value.bssid))
         .unwrap_or_else(|| "none".to_string());
     let cluster_bssid = format_mac(&nan_cluster_bssid());
-    let last_raw_tx_slot = load_u64(
-        &NAN_LAST_RAW_TX_SLOT_LO,
-        &NAN_LAST_RAW_TX_SLOT_HI,
-    );
+    let last_raw_tx_slot = load_u64(&NAN_LAST_RAW_TX_SLOT_LO, &NAN_LAST_RAW_TX_SLOT_HI);
     format!(
         "nan support=raw running={} filter={} bssid_filter={} cluster_bssid={} cluster_locked={} cluster_foreign_drop={} cluster_reselects={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_cmd_tx={} raw_cmd_drop={} raw_resp_rx={} raw_resp_tx={} raw_outgoing_drop={} raw_last_tx_offset_us={} raw_last_tx_slot={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={} publish_dw_tx={} publish_dw_skipped_slot={} publish_dw_local_guard_drop={} publish_dw_last_slot={} publish_dw_last_offset_us={}",
         NAN_RUNNING.load(Ordering::Relaxed),

@@ -282,6 +282,16 @@ impl WifiResponsePath {
 }
 
 static RAW_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<RawWifiCommand>>> = OnceLock::new();
+const RAW_RESPONSE_HISTORY_MAX: usize = 4;
+
+#[derive(Clone, Debug)]
+struct RawWifiResponse {
+    local_us: u64,
+    source: [u8; 6],
+    payload: Vec<u8>,
+}
+
+static RAW_RESPONSE_HISTORY: OnceLock<Mutex<VecDeque<RawWifiResponse>>> = OnceLock::new();
 
 pub fn register_commands(registry: &mut CommandRegistry) {
     registry.register(WifiCommand::default());
@@ -365,6 +375,37 @@ pub fn send_to_last_command_peer(payload: &[u8]) -> Result<()> {
 
 pub fn take_raw_command() -> Option<RawWifiCommand> {
     raw_command_queue().lock().ok()?.pop_front()
+}
+
+/// Receive an ESP-NOW-style custom action payload. Terminal CBOR records are
+/// retained for the lora1 session gateway; all other records are dispatched by
+/// Main and answered unicast on the same action bearer.
+pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
+    telemetry::record_log(format!(
+        "event type=wifi.raw_action_rx peer={} len={}",
+        format_mac(source),
+        payload.len()
+    ));
+    telemetry::record_packet("wifi", Direction::Rx, payload, "source=raw_action");
+    if is_wifi_terminal_payload(payload) {
+        let response = RawWifiResponse {
+            local_us: unsafe { sys::esp_timer_get_time().max(0) as u64 },
+            source,
+            payload: payload.to_vec(),
+        };
+        if let Ok(mut history) = raw_response_history().lock() {
+            if history.len() >= RAW_RESPONSE_HISTORY_MAX {
+                history.pop_front();
+            }
+            history.push_back(response);
+        }
+        return;
+    }
+    // The NAN exchange only creates this serverless session. Each subsequent
+    // ESP-NOW-style command refreshes a short idle lease, so a burst of work
+    // stays awake but an idle target naturally returns to its duty schedule.
+    super::mode::request_targeted_wake(5_000);
+    enqueue_command(source, payload, rssi, WifiResponsePath::Action);
 }
 
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
@@ -515,6 +556,9 @@ impl CommandHandler for WifiCommand {
         if request.arg("raw_stop").is_some() {
             stop_raw_monitor()?;
             return Ok(CommandResponse::ok("wifi raw monitor stopped"));
+        }
+        if request.arg("raw_response_history").is_some() {
+            return Ok(CommandResponse::ok(raw_response_history_text()));
         }
         if request.arg("raw_stats").is_some() {
             return Ok(CommandResponse::ok(raw_stats()));
@@ -993,7 +1037,7 @@ impl WifiCommand {
         }
     }
 
-    fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
+fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let ssid = request.arg("ssid").context("wifi sta requires ssid=...")?;
         let psk = request.arg("psk").unwrap_or("");
         let channel = command_channel(request, 6)?;
@@ -1030,8 +1074,8 @@ impl WifiCommand {
             channel,
             timeout_ms,
             wifi_net_status()
-        )))
-    }
+    )))
+}
 
     fn start_ap(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let (ssid, psk) = self.ap_identity(request)?;
@@ -1126,6 +1170,27 @@ impl WifiCommand {
             bail!("AP psk must be empty or at least 8 bytes");
         }
         Ok((ssid, psk))
+    }
+}
+
+/// Temporarily move Main from raw NAN to the IP STA data plane. This is used
+/// only by the control-plane flasher; callers must later resume NAN through
+/// mode::resume_from_ip_transport().
+pub fn start_flash_sta(ssid: &str, psk: &str, ip: &str, gateway: &str) -> Result<()> {
+    let request = CommandRequest::new("wifi")
+        .arg_pair("ssid", ssid)
+        .arg_pair("psk", psk)
+        .arg_pair("ip", ip)
+        .arg_pair("gw", gateway)
+        .arg_pair("timeout", "0");
+    let mut command = WifiCommand::default();
+    command.start_sta(&request).map(|_| ())
+}
+
+pub fn stop_flash_sta() {
+    unsafe {
+        let _ = sys::esp_wifi_disconnect();
+        let _ = sys::esp_wifi_stop();
     }
 }
 
@@ -2386,6 +2451,34 @@ fn is_wifi_terminal_payload(payload: &[u8]) -> bool {
 
 fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {
     RAW_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(RAW_COMMAND_QUEUE_MAX)))
+}
+
+fn raw_response_history() -> &'static Mutex<VecDeque<RawWifiResponse>> {
+    RAW_RESPONSE_HISTORY
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(RAW_RESPONSE_HISTORY_MAX)))
+}
+
+fn raw_response_history_text() -> String {
+    let Ok(history) = raw_response_history().lock() else {
+        return "raw_response_history unavailable".to_string();
+    };
+    let entries = history
+        .iter()
+        .map(|item| {
+            format!(
+                "local_us:{}:source={}:payload_hex:{}",
+                item.local_us,
+                format_mac(item.source),
+                hex_bytes(&item.payload)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "raw_response_history count={} entries={}",
+        history.len(),
+        entries
+    )
 }
 
 fn frame_address(frame: &[u8], offset: usize) -> Option<[u8; 6]> {

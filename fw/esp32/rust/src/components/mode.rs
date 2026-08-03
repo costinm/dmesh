@@ -67,6 +67,7 @@ static IP_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_TARGET_WAKE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_TARGET_WAKE_SESSION_END_SENT: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_SYNC_SOURCE: AtomicU8 = AtomicU8::new(SYNC_SOURCE_NONE);
 static RAW_NAN_RECOVERY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_RECOVERY_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -294,6 +295,7 @@ pub fn poll(settings: &SharedSettings) {
         return;
     }
     poll_infra_active_session();
+    poll_targeted_wake_session_end();
     // Infrastructure mode is continuously powered even while AP ownership is
     // being (re)established. Never let the generic housekeeping path turn
     // this node into a battery heartbeat/light-sleep participant.
@@ -399,14 +401,40 @@ pub fn raw_nan_interactive_active() -> bool {
     // session does, however: the receiver has acknowledged the DW control
     // frame and is now in the post-DW burst interval for CoC/ESP-NOW-style
     // traffic. A serial/interactive console remains the local fallback.
-    targeted_wake_active()
-        || infra_active_session_enabled()
-        || super::serial::interactive_active()
+    targeted_wake_active() || infra_active_session_enabled() || super::serial::interactive_active()
 }
 
 fn targeted_wake_active() -> bool {
     let deadline = RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Acquire);
     deadline != 0 && !deadline_is_due(deadline, now_ms())
+}
+
+/// Notify the gateway immediately before a serverless wake lease expires.
+/// The notification is best effort; lmesh also expires the lease locally.
+fn poll_targeted_wake_session_end() {
+    let deadline = RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Acquire);
+    if deadline == 0
+        || deadline_is_due(deadline, now_ms())
+        || RAW_NAN_TARGET_WAKE_SESSION_END_SENT.load(Ordering::Acquire)
+        || deadline.wrapping_sub(now_ms()) > 250
+    {
+        return;
+    }
+    RAW_NAN_TARGET_WAKE_SESSION_END_SENT.store(true, Ordering::Release);
+    let mut notice = crate::commands::CommandRequest::new_binary(33);
+    notice.args.insert(
+        crate::commands::protocol::CBOR_STATUS,
+        "session_end".to_string(),
+    );
+    let payload = crate::commands::protocol::encode_binary(&notice);
+    if let Err(error) = super::wifi::send_to_last_command_peer(&payload) {
+        telemetry::record_log(format!(
+            "event type=session.end notify=false msg={}",
+            crate::commands::protocol::escape_value(&error.to_string())
+        ));
+    } else {
+        telemetry::record_log("event type=session.end notify=true");
+    }
 }
 
 /// Keep raw Wi-Fi active after a matching NAN service advertisement.
@@ -416,6 +444,7 @@ pub fn request_targeted_wake(duration_ms: u32) {
     if current == 0 || deadline_is_due(current, deadline) {
         RAW_NAN_TARGET_WAKE_UNTIL_MS.store(deadline, Ordering::Release);
     }
+    RAW_NAN_TARGET_WAKE_SESSION_END_SENT.store(false, Ordering::Release);
     telemetry::record_log(format!(
         "event type=nan.target_wake requested_ms={} deadline_ms={}",
         duration_ms, deadline
@@ -1024,6 +1053,20 @@ pub fn stop_for_ip_transport() {
 
 pub fn ip_transport_active() -> bool {
     IP_TRANSPORT_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Return Main to its normal raw-NAN duty cycle after a control-plane TCP
+/// session, including failed sessions. This state is runtime-only and is not
+/// persisted in NVS.
+pub fn resume_from_ip_transport(settings: &SharedSettings) -> Result<()> {
+    if !IP_TRANSPORT_ACTIVE.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    super::ip_command::stop();
+    super::wifi::stop_flash_sta();
+    super::power::configure_for_light_sleep(true).ok();
+    let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
+    start_raw_nan_duty(settings, "flash_complete", channel)
 }
 
 pub fn raw_nan_duty_enabled() -> bool {

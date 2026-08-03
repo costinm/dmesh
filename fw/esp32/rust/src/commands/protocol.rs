@@ -58,6 +58,8 @@ pub fn command_id(name: &str) -> Option<u16> {
         "radio" => 67,
         "recovery" => 68,
         "reset" | "rst" => 69,
+        "module" => 70,
+        "hello" => 71,
         _ => return None,
     })
 }
@@ -101,6 +103,8 @@ pub fn command_name(id: u16) -> Option<&'static str> {
         67 => "radio",
         68 => "recovery",
         69 => "reset",
+        70 => "module",
+        71 => "hello",
         _ => return None,
     })
 }
@@ -163,6 +167,9 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "light_sleep" | "light" => 85,
         "profile" => 86,
         "op" => 87,
+        "args" => 408,
+        "name" => 409,
+        "raw_response_history" => 410,
         "key" => 88,
         "value" => 89,
         "mult" | "multiplier" => 90,

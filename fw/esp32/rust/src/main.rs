@@ -25,6 +25,10 @@ pub extern "C" fn app_main() {
 fn run() -> Result<()> {
     boot_print("dm-rs boot step=link_patches");
     esp_idf_sys::link_patches();
+    if let Err(err) = components::recovery::configure_flash_size_from_hardware() {
+        boot_print("dm-rs flash size override failed");
+        eprintln!("flash size override failed: {err}");
+    }
     components::recovery::mark_main_boot_start();
     components::wake::register_main_task();
     init_console_uart();
@@ -70,6 +74,8 @@ fn run() -> Result<()> {
     boot_print("dm-rs boot step=registry\n");
     let mut registry = CommandRegistry::new();
     components::register_commands(&mut registry, settings.clone());
+    boot_print("dm-rs boot step=module_init\n");
+    components::module::init();
 
     boot_print("dm-rs boot step=ble_config\n");
     let companion_setting = settings.borrow().get_bool("ble.comp", true);
@@ -180,14 +186,14 @@ fn run() -> Result<()> {
         components::ble_bt::poll_text_commands(&mut registry);
         poll_raw_wifi_commands(&mut registry, &settings);
         poll_nan_commands(&mut registry, &settings);
+        components::ip_command::poll(&mut registry);
+        components::module::poll_main(&mut registry);
         components::test::poll_main();
         drain_uart_console(&mut registry, &settings, companion_active_ms);
         // The CBOR recovery command only arms the raw TCP session. The worker
         // owns the outbound socket and flash operations; keep this call as a
         // compatibility no-op for the stable Main command loop.
-        if components::mode::ip_transport_active() {
-            components::recovery::poll_flash_tcp();
-        }
+        components::recovery::poll_flash_tcp(&settings);
         // A beacon can arrive near the end of a sparse DW. Poll quickly only
         // while the raw-NAN window is already awake so post-beacon shutdown is
         // bounded by the NAN dwell without adding periodic wakeups during

@@ -8,7 +8,8 @@ Run from the repository root after sourcing the firmware environment:
 
 Defaults:
   * discover devices through lmesh usb.serial.list;
-  * stop the selected lmesh forward and flash its physical USB-UART bridge;
+  * keep the selected lmesh forward active while an exceptional physical
+    USB-UART bootstrap is performed;
   * configure infrastructure ports (normally lora1) as powered/always-on;
   * configure all other ESP targets as sleepy raw/custom NAN nodes with Wi-Fi
     off between discovery windows;
@@ -290,7 +291,8 @@ def parse_args() -> argparse.Namespace:
         choices=("local-release",),
         default=os.environ.get("DMESH_LMESH_MODE", "local-release"),
         help=(
-            "Stops lmesh, flashes the physical USB-UART bridge with esptool, then reopens UDS. "
+            "Historical bootstrap/P0-repair mode. Keeps lmesh forwarding active while "
+            "using the physical USB-UART bridge; deployed updates use Wi-Fi DRS2. "
             "TCP/RFC2217 flashing is intentionally unsupported."
         ),
     )
@@ -565,19 +567,6 @@ def lmesh_request(control_socket: str, method: str, **params: object) -> dict[st
     if not isinstance(data, dict):
         return {"data": data}
     return data
-
-
-def lmesh_stop_forward(args: argparse.Namespace, logical_port_name: str) -> None:
-    assert args.lmesh_control_socket
-    try:
-        data = lmesh_request(
-            args.lmesh_control_socket,
-            "usb.serial.forward.stop",
-            port=logical_port_name,
-        )
-        print(f"lmesh stop {logical_port_name}: {data}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - stale forwards should not block recovery.
-        print(f"lmesh stop {logical_port_name}: {exc}", flush=True)
 
 
 def lmesh_start_forward(
@@ -1424,14 +1413,6 @@ def main() -> int:
         print("preflash stability: passed; no probe/flash requested", flush=True)
         return 0
 
-    if args.lmesh_mode == "local-release":
-        # Stability checks use the logical lmesh UDS forwards. Release them
-        # only after that check passes, immediately before direct USB probing
-        # and flashing need exclusive ownership of the physical bridge.
-        for port in ports:
-            lmesh_stop_forward(args, port)
-        time.sleep(0.5)
-
     probed: list[Device] = []
     if args.skip_flash:
         probed = [Device(port=port, chip="unknown", mac=None) for port in ports]
@@ -1476,25 +1457,11 @@ def main() -> int:
     elif not args.skip_flash:
         validate_prebuilt_images(devices)
 
-    direct_config_after_flash = (
-        not args.skip_flash and not args.skip_config and args.lmesh_mode == "local-release"
-    )
+    direct_config_after_flash = False
     flashed_devices: list[Device] = []
     if not args.skip_flash:
         def flash_one(device: Device) -> None:
-            lmesh_stop_forward(args, device.port)
             flash(device, args, env, physical_port_for(args, device.port))
-            if direct_config_after_flash:
-                # The physical bridge is intentionally released after the
-                # flash. Configuration must go through the supervised lmesh
-                # forward; normal commands never use direct UART paths.
-                lmesh_start_forward(args, device.port, direct=True)
-                # Do not race the application boot sequence.  The bootloader
-                # itself can finish in under a second, but the firmware does
-                # not install the framed UART ingress task until its mode/
-                # mesh initialization has completed.
-                time.sleep(12.0)
-                configure(device, args, lmesh_uds_url(device.port))
 
         flashed, flash_failed = run_parallel("flash", devices, args.jobs, flash_one)
         flashed_devices = list(flashed)
@@ -1510,12 +1477,6 @@ def main() -> int:
 
     if not args.skip_config and not direct_config_after_flash:
         def configure_one(device: Device) -> None:
-            if args.lmesh_mode == "local-release":
-                try:
-                    lmesh_start_forward(args, device.port)
-                except RuntimeError as exc:
-                    if "already exists" not in str(exc):
-                        raise
             configure(device, args, lmesh_uds_url(device.port))
 
         configured, config_failed = run_parallel("configure", devices, args.jobs, configure_one)
@@ -1526,27 +1487,6 @@ def main() -> int:
                 flush=True,
             )
 
-    if args.lmesh_mode == "local-release" and not args.skip_flash:
-        def restore_forward(device: Device) -> None:
-            try:
-                lmesh_start_forward(args, device.port)
-            except RuntimeError as exc:
-                if "already exists" not in str(exc):
-                    raise
-                print(f"lmesh restore {device.port}: already active", flush=True)
-
-        _, restore_failed = run_parallel(
-            "restore forwards",
-            flashed_devices,
-            args.jobs,
-            restore_forward,
-        )
-        if restore_failed:
-            print(
-                "restore forwards: failed devices: "
-                + ", ".join(device.port for device in restore_failed),
-                flush=True,
-            )
             return 1
 
 
