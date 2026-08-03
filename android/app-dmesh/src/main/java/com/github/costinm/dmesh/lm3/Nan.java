@@ -40,6 +40,13 @@ import java.util.Map;
 
 public class Nan {
     private static final String TAG = "nan";
+    private static final String PREF_DISCOVERY_ROLE = "nan_discovery_role";
+    private static final String ROLE_BOTH = "both";
+    private static final String ROLE_SUB_ACTIVE = "sub-active";
+    private static final String ROLE_SUB_PASSIVE = "sub-passive";
+    private static final String ROLE_SUB_PASSIVE_EMPTY_SSI = "sub-passive-empty-ssi";
+    private static final String ROLE_PUB_SOLICITED = "pub-solicited";
+    private static final String ROLE_PUB_UNSOLICITED = "pub-unsolicited";
     static Map<String, Device> devices = new HashMap<>();
     public WifiAwareManager nanMgr;
     public String nanId;
@@ -59,9 +66,16 @@ public class Nan {
     volatile boolean nanSub;
     boolean enabled;
 
-    // Active subscription/passive pub seem better for this use case, but
-    // it's a subtle difference: sending when looking for something, not
-    // advertising it
+    // Discovery roles are deliberately independent.  A normal DMesh service
+    // uses both, while lab runs can isolate Android framework matching rules.
+    private boolean publishEnabled = true;
+    private boolean subscribeEnabled = true;
+    private boolean subscribeServiceInfoEnabled = true;
+    private String discoveryRole = ROLE_BOTH;
+
+    // Default DMesh discovery uses an active subscription and a solicited
+    // publisher. Android calls the publish alternatives solicited and
+    // unsolicited; "active" applies to the subscribe type.
     int subType = SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
 
     int pubType = PublishConfig.PUBLISH_TYPE_SOLICITED;
@@ -75,10 +89,33 @@ public class Nan {
     int msgId;
     int wakeCount;
     final Map<Integer, String> pendingFollowups = new HashMap<>();
+    // One explicitly armed lab follow-up. Unlike the retired automatic hello,
+    // this is consumed only by the requested peer's next discovery callback.
+    // It proves the Android framework's immediate post-match route without
+    // retaining a message across a match-expiry/session-replacement boundary.
+    private String armedPeerId;
+    private String armedFollowupText;
+
+    private long startCount;
+    private long attachAttempts;
+    private long attachSuccesses;
+    private long attachFailures;
+    private long publishStarts;
+    private long publishFailures;
+    private long subscribeStarts;
+    private long subscribeFailures;
+    private long discoveredByPublish;
+    private long discoveredBySubscribe;
+    private long followupTx;
+    private long followupTxOk;
+    private long followupTxFailed;
+    private long followupRx;
 
     public Nan(LocalMesh wifi) {
         this.lm = wifi;
         this.ctx = wifi.ctx;
+        applyDiscoveryRole(ctx.getSharedPreferences("dmesh", Context.MODE_PRIVATE)
+                .getString(PREF_DISCOVERY_ROLE, ROLE_BOTH));
     }
 
     public void onCreate() {
@@ -99,6 +136,7 @@ public class Nan {
 
     public void start() {
         enabled = true;
+        startCount++;
         MsgMux.get(ctx).publish("net.NAN.START");
         onWifiAwareStateChanged(new Intent());
     }
@@ -107,11 +145,107 @@ public class Nan {
         return enabled;
     }
 
+    /**
+     * Select the discovery sessions owned by this Android instance.
+     *
+     * <p>The default {@code both} is the production state.  The single-role
+     * modes are a lab surface used to establish whether a raw ESP SDF needs an
+     * active subscriber, a solicited publisher, or a passive subscriber.</p>
+     */
+    public synchronized void setDiscoveryRole(String requestedRole) {
+        String role = normalizeDiscoveryRole(requestedRole);
+        applyDiscoveryRole(role);
+        ctx.getSharedPreferences("dmesh", Context.MODE_PRIVATE).edit()
+                .putString(PREF_DISCOVERY_ROLE, role).apply();
+
+        if (!publishEnabled && pubSession != null) {
+            pubSession.close();
+            pubSession = null;
+            pubStarting = false;
+        }
+        if (!subscribeEnabled && subSession != null) {
+            subSession.close();
+            subSession = null;
+            nanSub = false;
+        }
+        emitStatus();
+        if (enabled) {
+            onWifiAwareStateChanged(new Intent());
+        }
+    }
+
+    /** Publish the bounded state/counters used by shell and SSH evidence collection. */
+    public synchronized void emitStatus() {
+        MsgMux.get(ctx).publish("net.NAN.Status",
+                "enabled", Boolean.toString(enabled),
+                "role", discoveryRole,
+                "publish", Boolean.toString(publishEnabled),
+                "publishType", publishTypeName(),
+                "publishSession", Boolean.toString(pubSession != null),
+                "subscribe", Boolean.toString(subscribeEnabled),
+                "subscribeType", subscribeTypeName(),
+                "subscribeSession", Boolean.toString(subSession != null),
+                "attached", Boolean.toString(nanSession != null),
+                "peers", Integer.toString(devices.size()),
+                "pending", Integer.toString(pendingFollowups.size()),
+                "starts", Long.toString(startCount),
+                "attachAttempts", Long.toString(attachAttempts),
+                "attachOk", Long.toString(attachSuccesses),
+                "attachFail", Long.toString(attachFailures),
+                "pubStarts", Long.toString(publishStarts),
+                "pubFail", Long.toString(publishFailures),
+                "subStarts", Long.toString(subscribeStarts),
+                "subFail", Long.toString(subscribeFailures),
+                "discoverPub", Long.toString(discoveredByPublish),
+                "discoverSub", Long.toString(discoveredBySubscribe),
+                "tx", Long.toString(followupTx),
+                "txOk", Long.toString(followupTxOk),
+                "txFail", Long.toString(followupTxFailed),
+                "rx", Long.toString(followupRx));
+    }
+
+    private void applyDiscoveryRole(String role) {
+        discoveryRole = role;
+        publishEnabled = ROLE_BOTH.equals(role) || ROLE_PUB_SOLICITED.equals(role)
+                || ROLE_PUB_UNSOLICITED.equals(role);
+        subscribeEnabled = ROLE_BOTH.equals(role) || ROLE_SUB_ACTIVE.equals(role)
+                || ROLE_SUB_PASSIVE.equals(role) || ROLE_SUB_PASSIVE_EMPTY_SSI.equals(role);
+        // A passive subscribe needs only the service name for discovery. This
+        // lab role isolates vendor handling of SubscribeConfig service-specific
+        // info without changing the production `sub-passive` descriptor.
+        subscribeServiceInfoEnabled = !ROLE_SUB_PASSIVE_EMPTY_SSI.equals(role);
+        pubType = ROLE_PUB_UNSOLICITED.equals(role)
+                ? PublishConfig.PUBLISH_TYPE_UNSOLICITED : PublishConfig.PUBLISH_TYPE_SOLICITED;
+        subType = (ROLE_SUB_PASSIVE.equals(role) || ROLE_SUB_PASSIVE_EMPTY_SSI.equals(role))
+                ? SubscribeConfig.SUBSCRIBE_TYPE_PASSIVE : SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
+    }
+
+    private static String normalizeDiscoveryRole(String role) {
+        if (ROLE_SUB_ACTIVE.equals(role) || ROLE_SUB_PASSIVE.equals(role)
+                || ROLE_SUB_PASSIVE_EMPTY_SSI.equals(role)
+                || ROLE_PUB_SOLICITED.equals(role) || ROLE_PUB_UNSOLICITED.equals(role)) {
+            return role;
+        }
+        return ROLE_BOTH;
+    }
+
+    private String publishTypeName() {
+        return pubType == PublishConfig.PUBLISH_TYPE_UNSOLICITED ? "unsolicited" : "solicited";
+    }
+
+    private String subscribeTypeName() {
+        return subType == SubscribeConfig.SUBSCRIBE_TYPE_PASSIVE ? "passive" : "active";
+    }
+
     public void stop() {
         enabled = false;
         pubStarting = false;
         attachInProgress = false;
         nanSub = false;
+        synchronized (this) {
+            armedPeerId = null;
+            armedFollowupText = null;
+        }
         // Discovery sessions are children of the aware attachment. Close and
         // clear them first: closing the parent before either child makes the
         // Android Wi-Fi Aware service reject the later close with an invalid
@@ -237,10 +371,10 @@ public class Nan {
                     // attachment stays valid. Recreate only the missing side so
                     // a clean test/app restart does not remain attached but
                     // permanently undiscoverable.
-                    if (pubSession == null && !pubStarting) {
+                    if (publishEnabled && pubSession == null && !pubStarting) {
                         publish();
                     }
-                    if (subSession == null && !nanSub) {
+                    if (subscribeEnabled && subSession == null && !nanSub) {
                         startNanSub();
                     }
                     return;
@@ -272,6 +406,7 @@ public class Nan {
                 // TODO: add a setting to control 'on' or 'off' for local mesh.
                 // if local mesh is on - Nan is best option.
                 attachInProgress = true;
+                attachAttempts++;
                 MsgMux.get(ctx).publish("net.NAN.AttachStart");
                 nanMgr.attach(new AttachCallback() {
                     @Override
@@ -279,11 +414,16 @@ public class Nan {
                         super.onAttached(session);
                         attachInProgress = false;
                         nanSession = session;
+                        attachSuccesses++;
 
                         // No point being attached and not using discovery.
                         if (enabled) {
-                            publish();
-                            startNanSub();
+                            if (publishEnabled) {
+                                publish();
+                            }
+                            if (subscribeEnabled) {
+                                startNanSub();
+                            }
                         }
 
                         MsgMux.get(ctx).publish("net.NAN.Attach");
@@ -293,6 +433,7 @@ public class Nan {
                     public void onAttachFailed() {
                         super.onAttachFailed();
                         attachInProgress = false;
+                        attachFailures++;
                         enabled = false;
                         MsgMux.get(ctx).publish("net.NAN.AttachError", "retry", "explicit-start-required");
                     }
@@ -358,12 +499,14 @@ public class Nan {
         }
         // for debugging
         if (byPublisher) {
+            discoveredByPublish++;
             // Used with active sub and passive pub
             MsgMux.get(ctx).publish("net.NAN.PubServiceDiscovered",
                     "peer", peerHandle.toString(),
                     "id", bd.id,
                     "json", parsed);
         } else {
+            discoveredBySubscribe++;
             // Used with active pub and passive sub
             MsgMux.get(ctx).publish("net.NAN.SubServiceDiscovered",
                     "peer", peerHandle.toString(),
@@ -380,6 +523,37 @@ public class Nan {
         MsgMux.get(ctx).publish("net.NAN.PeerReady",
                 "id", bd.id == null ? "" : bd.id,
                 "peer", peerHandle.toString());
+        sendArmedFollowupIfMatched(bd);
+    }
+
+    /**
+     * Arrange one follow-up to be submitted directly from the next matching
+     * discovery callback. This is a bounded test surface, not a persistent
+     * delivery queue: a caller must re-arm after each test/session restart.
+     */
+    public synchronized boolean armFollowupOnDiscovery(String peerId, String text) {
+        if (!isUsableDmeshIdentity(peerId) || text == null || text.isEmpty()) {
+            return false;
+        }
+        armedPeerId = peerId.toLowerCase();
+        armedFollowupText = text;
+        MsgMux.get(ctx).publish("net.NAN.FollowupArmed", "id", armedPeerId);
+        return true;
+    }
+
+    private void sendArmedFollowupIfMatched(Device device) {
+        String text;
+        synchronized (this) {
+            if (device.id == null || armedPeerId == null
+                    || !armedPeerId.equalsIgnoreCase(device.id)) {
+                return;
+            }
+            text = armedFollowupText;
+            armedPeerId = null;
+            armedFollowupText = null;
+        }
+        MsgMux.get(ctx).publish("net.NAN.FollowupArmedMatch", "id", device.id);
+        sendFollowup(device, "command_text", text.getBytes(StandardCharsets.UTF_8));
     }
 
     private static boolean isUsableDmeshIdentity(String deviceId) {
@@ -394,6 +568,9 @@ public class Nan {
     }
 
     private synchronized void publish() {
+        if (!publishEnabled) {
+            return;
+        }
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "Missing permissions");
@@ -418,6 +595,7 @@ public class Nan {
             nanSession.publish(buildPublishConfig(), new NanDiscoveryCallback(true), lm.delayHandler);
         } catch (RuntimeException e) {
             pubStarting = false;
+            publishFailures++;
             Log.w(TAG, "NAN publish failed", e);
             MsgMux.get(ctx).publish("net.NAN.PubError", "error", e.toString());
         }
@@ -448,6 +626,9 @@ public class Nan {
      * Will stay active until 'stop' is called.
      */
     private synchronized void startNanSub() {
+        if (!subscribeEnabled) {
+            return;
+        }
         Log.d(TAG, "/NAN/Subscribe");
         if (ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
@@ -468,6 +649,7 @@ public class Nan {
             nanSession.subscribe(buildSubscribeConfig(), new NanDiscoveryCallback(false), lm.delayHandler);
         } catch (RuntimeException e) {
             nanSub = false;
+            subscribeFailures++;
             Log.w(TAG, "NAN subscribe failed", e);
             MsgMux.get(ctx).publish("net.NAN.SubError", "error", e.toString());
         }
@@ -477,11 +659,13 @@ public class Nan {
     private SubscribeConfig buildSubscribeConfig() {
         SubscribeConfig.Builder builder = new SubscribeConfig.Builder()
                 .setServiceName("dmesh")
-                .setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
-                        lm.deviceIdBytes(),
-                        wakeCount++))
                 .setSubscribeType(subType)
                 .setTerminateNotificationEnabled(true);
+        if (subscribeServiceInfoEnabled) {
+            builder.setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
+                    lm.deviceIdBytes(),
+                    wakeCount++));
+        }
         return builder.build();
     }
 
@@ -595,10 +779,12 @@ public class Nan {
         int messageId = msgId++;
         pendingFollowups.put(messageId,
                 (d.id == null ? "" : d.id) + ":" + msgType);
+        followupTx++;
         try {
             d.nanSession.sendMessage(d.nan, messageId, body);
         } catch (IllegalStateException | SecurityException e) {
             pendingFollowups.remove(messageId);
+            followupTxFailed++;
             devices.remove(d.id, d);
             MsgMux.get(ctx).publish("net.NAN.MSGERR",
                     "id", Integer.toString(messageId),
@@ -693,9 +879,11 @@ public class Nan {
             synchronized (Nan.this) {
                 if (pub) {
                     pubStarting = false;
+                    publishFailures++;
                     MsgMux.get(ctx).publish("net.NAN.PubSessionConfigFailed");
                 } else {
                     nanSub = false;
+                    subscribeFailures++;
                     MsgMux.get(ctx).publish("net.NAN.SubSessionConfigFailed");
                 }
             }
@@ -710,6 +898,7 @@ public class Nan {
         public void onMessageSendSucceeded(int messageId) {
             super.onMessageSendSucceeded(messageId);
             String pending = pendingFollowups.remove(messageId);
+            followupTxOk++;
             MsgMux.get(ctx).publish("net.NAN.FollowupTxOk",
                     "id", Integer.toString(messageId),
                     "message", pending == null ? "" : pending);
@@ -720,6 +909,7 @@ public class Nan {
         public void onMessageSendFailed(int messageId) {
             super.onMessageSendFailed(messageId);
             String pending = pendingFollowups.remove(messageId);
+            followupTxFailed++;
             MsgMux.get(ctx).publish("net.NAN.MSGERR",
                     "id", Integer.toString(messageId),
                     "message", pending == null ? "" : pending);
@@ -733,6 +923,7 @@ public class Nan {
             synchronized (Nan.this) {
                 discoverySession = session;
                 subSession = session;
+                subscribeStarts++;
                 // IdentityChanged may have arrived before this asynchronous
                 // callback. Apply the real NAN identity in either ordering.
                 refreshDiscoveryIdentity();
@@ -748,6 +939,7 @@ public class Nan {
                 discoverySession = session;
                 pubSession = session;
                 pubStarting = false;
+                publishStarts++;
                 // IdentityChanged may have arrived before this asynchronous
                 // callback. Apply the real NAN identity in either ordering.
                 refreshDiscoveryIdentity();
@@ -780,6 +972,7 @@ public class Nan {
         public void onMessageReceived(PeerHandle peerHandle, byte[] message) {
             super.onMessageReceived(peerHandle, message);
             String msg = new String(message);
+            followupRx++;
             String parsed = MeshNode.parseNanFollowup(message);
             MeshNode.injectNanFollowup(message, 0);
             MsgMux.get(ctx).publish("net.NAN.FollowupRx",

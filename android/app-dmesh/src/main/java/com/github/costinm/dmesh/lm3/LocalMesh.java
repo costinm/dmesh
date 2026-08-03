@@ -419,9 +419,20 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                     } else if ("stop".equals(args[2])) {
                         nan.stop();
                     } else if ("sub".equals(args[2])) {
+                        nan.setDiscoveryRole("sub-active");
                         nan.start();
                     } else if ("adv".equals(args[2])) {
+                        nan.setDiscoveryRole("pub-solicited");
                         nan.start();
+                    } else if ("both".equals(args[2])) {
+                        nan.setDiscoveryRole("both");
+                        nan.start();
+                    } else if ("role".equals(args[2])) {
+                        String role = args.length >= 4 ? args[3] : b.getString("role", "both");
+                        nan.setDiscoveryRole(role);
+                        nan.start();
+                    } else if ("status".equals(args[2])) {
+                        nan.emitStatus();
                     } else if ("con".equals(args[2])) {
                         String peerId = args.length >= 4 ? args[3]
                                 : b.getString("peer", b.getString("id"));
@@ -446,6 +457,14 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                             // Use the bounded probe defaults for malformed shell input.
                         }
                         nan.probeFollowupCadence(message, count, intervalMs);
+                    } else if ("arm".equals(args[2])) {
+                        String peerId = args.length >= 4 ? args[3]
+                                : b.getString("peer", b.getString("id"));
+                        String message = args.length >= 5 ? args[4] : b.getString("text");
+                        if (!nan.armFollowupOnDiscovery(peerId, message)) {
+                            MsgMux.get(ctx).publish("net.NAN.FollowupArmError",
+                                    "peer", peerId == null ? "" : peerId);
+                        }
                     } else if ("msg".equals(args[2])) {
                         // Shell/JSON callers retain named fields, while the in-app command
                         // path uses positional argv. Support both forms at this boundary.
