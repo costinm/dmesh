@@ -196,10 +196,7 @@ impl UiModel {
             self.push_error(format!("Failed to create sessions dir: {}", e));
             return;
         }
-        let ts = self
-            .conversation
-            .created_ms
-            .to_string();
+        let ts = self.conversation.created_ms.to_string();
         let path = dir.join(format!("{}.jsonl", ts));
         let mut out = String::new();
         for msg in &self.conversation.messages {

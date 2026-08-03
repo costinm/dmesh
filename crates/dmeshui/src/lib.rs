@@ -1,5 +1,5 @@
-use eframe::egui;
 use dmeshtui::{MemoryMeshClient, Role, UiModel};
+use eframe::egui;
 
 #[cfg(target_os = "android")]
 mod android_bridge {
@@ -50,8 +50,7 @@ mod android_bridge {
         let Ok(class_obj) = class_value.l() else {
             return String::new();
         };
-        let Ok(name_value) =
-            env.call_method(class_obj, "getName", "()Ljava/lang/String;", &[])
+        let Ok(name_value) = env.call_method(class_obj, "getName", "()Ljava/lang/String;", &[])
         else {
             return String::new();
         };
@@ -231,10 +230,7 @@ impl ChatApp {
         #[cfg(target_os = "android")]
         android_bridge::submit_text(&text);
 
-        self.messages.push(ChatMessage {
-            author: "me",
-            text,
-        });
+        self.messages.push(ChatMessage { author: "me", text });
         self.input_value.clear();
     }
 
@@ -355,7 +351,9 @@ impl eframe::App for RatatuiPreviewApp {
                 egui::TextEdit::singleline(&mut self.model.input)
                     .hint_text("mesh method, e.g. messages.snapshot"),
             );
-            let send = ui.add_sized([68.0, 40.0], egui::Button::new("Send")).clicked();
+            let send = ui
+                .add_sized([68.0, 40.0], egui::Button::new("Send"))
+                .clicked();
             let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if send || enter {
                 self.submit();

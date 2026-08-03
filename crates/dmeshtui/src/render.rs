@@ -3,9 +3,7 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub enum RenderFormat {
     Flat,
-    Csv {
-        headers: Vec<String>,
-    },
+    Csv { headers: Vec<String> },
     Table,
     Summary,
 }
@@ -130,11 +128,7 @@ fn render_csv(value: &Value, headers: &[String]) -> String {
                 if let Value::Object(map) = row {
                     let cells: Vec<String> = headers
                         .iter()
-                        .map(|h| {
-                            map.get(h)
-                                .map(render_scalar)
-                                .unwrap_or_default()
-                        })
+                        .map(|h| map.get(h).map(render_scalar).unwrap_or_default())
                         .collect();
                     out.push_str(&cells.join(", "));
                     out.push('\n');
@@ -162,10 +156,8 @@ fn render_table(value: &Value) -> String {
                             .iter()
                             .enumerate()
                             .map(|(i, h)| {
-                                let val = map
-                                    .get(h.as_str())
-                                    .map(render_scalar)
-                                    .unwrap_or_default();
+                                let val =
+                                    map.get(h.as_str()).map(render_scalar).unwrap_or_default();
                                 if val.len() > widths[i] {
                                     widths[i] = val.len();
                                 }
@@ -177,7 +169,11 @@ fn render_table(value: &Value) -> String {
                     }
                 })
                 .collect();
-            let sep: String = widths.iter().map(|w| "-".repeat(*w + 2)).collect::<Vec<_>>().join("+");
+            let sep: String = widths
+                .iter()
+                .map(|w| "-".repeat(*w + 2))
+                .collect::<Vec<_>>()
+                .join("+");
             let mut out = String::new();
             let header_line: String = headers
                 .iter()

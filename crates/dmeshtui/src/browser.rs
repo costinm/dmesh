@@ -90,7 +90,11 @@ impl CommandBrowser {
                 kind: EntryKind::Header,
                 service: service.clone(),
                 group: String::new(),
-                name: format!("── {} {} ──", service, if connected { "" } else { " (offline)" }),
+                name: format!(
+                    "── {} {} ──",
+                    service,
+                    if connected { "" } else { " (offline)" }
+                ),
                 description: String::new(),
                 connected,
                 index: 0,

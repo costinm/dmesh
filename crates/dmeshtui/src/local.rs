@@ -184,7 +184,10 @@ impl MeshRequest {
             Some(rest.to_owned())
         } else {
             let mut params = serde_json::Map::new();
-            params.insert("text".to_owned(), serde_json::Value::String(rest.to_owned()));
+            params.insert(
+                "text".to_owned(),
+                serde_json::Value::String(rest.to_owned()),
+            );
             Some(serde_json::Value::Object(params).to_string())
         };
 

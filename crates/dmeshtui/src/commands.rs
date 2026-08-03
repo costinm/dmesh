@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolCommand {
@@ -91,7 +91,9 @@ fn load_tools_from_path(path: &Path) -> Vec<ToolCommand> {
     }
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
         if let Some(arr) = val.get("tools").and_then(|t| t.as_array()) {
-            if let Ok(tools) = serde_json::from_value::<Vec<ToolCommand>>(serde_json::Value::Array(arr.clone())) {
+            if let Ok(tools) =
+                serde_json::from_value::<Vec<ToolCommand>>(serde_json::Value::Array(arr.clone()))
+            {
                 return tools;
             }
         }

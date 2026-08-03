@@ -8,6 +8,7 @@
 //! See also:
 //! - Java wrapper: `android/app-dmesh/src/main/java/...`
 
+use dmesh_store::{FrameRecord, StoreCommand};
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 #[cfg(target_os = "android")]
 use jni::sys::JNI_VERSION_1_6;
@@ -16,7 +17,6 @@ use jni::{JNIEnv, JavaVM};
 use serde_json::{Map, Value, json};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
-use dmesh_store::{FrameRecord, StoreCommand};
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "android")]
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -618,10 +618,19 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             .into_bytes(),
         "radio.nan.inject_frame" => {
             let parsed = radio_protocol::parse_nan_followup(payload)?;
-            let src_device = parsed.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
-            let target_device = parsed.get("target_id").and_then(|v| v.as_str()).unwrap_or("");
+            let src_device = parsed
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target_device = parsed
+                .get("target_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let seq = parsed.get("seq").and_then(|v| v.as_u64()).map(|s| s as u16);
-            let msg_type = parsed.get("msg_type").and_then(|v| v.as_str()).unwrap_or("");
+            let msg_type = parsed
+                .get("msg_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let payload_hash = parsed
                 .get("payload_hash_u32")
                 .and_then(|v| v.as_u64())
@@ -658,7 +667,10 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 cmd.data.get("address").map(String::as_str).unwrap_or(""),
             )?;
             let src_hex = parsed.get("src_hex").and_then(|v| v.as_str()).unwrap_or("");
-            let packet_id = parsed.get("packet_id").and_then(|v| v.as_u64()).map(|s| s as u16);
+            let packet_id = parsed
+                .get("packet_id")
+                .and_then(|v| v.as_u64())
+                .map(|s| s as u16);
             let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("");
             let payload_hash = parsed
                 .get("packet_id")
@@ -677,7 +689,10 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     Some(event.to_string())
                 },
                 payload: payload.to_vec(),
-                rssi: parsed.get("scan_rssi").and_then(|v| v.as_i64()).map(|r| r as i32),
+                rssi: parsed
+                    .get("scan_rssi")
+                    .and_then(|v| v.as_i64())
+                    .map(|r| r as i32),
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
             if let Some(sender) = store_sender() {
@@ -706,9 +721,8 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 rssi: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
-            let sender = store_sender().ok_or_else(|| anyhow::anyhow!(
-                "dmesh-store is not initialized"
-            ))?;
+            let sender =
+                store_sender().ok_or_else(|| anyhow::anyhow!("dmesh-store is not initialized"))?;
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             sender
                 .send(StoreCommand::InsertFrameWithReply(frame, reply_tx))
@@ -717,7 +731,9 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .map_err(|_| anyhow::anyhow!("timed out waiting for dmesh-store"))?
                 .map_err(anyhow::Error::msg)?;
-            json!({"status": "stored", "id": id}).to_string().into_bytes()
+            json!({"status": "stored", "id": id})
+                .to_string()
+                .into_bytes()
         }
         _ => anyhow::bail!("unknown radio method: {}", cmd.method),
     };

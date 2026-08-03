@@ -86,8 +86,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, args: Args) -> any
 
         handle_key(&mut model, &mut browser, &mut client, &key)?;
 
-        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
     }
@@ -217,7 +216,6 @@ fn handle_normal_key(
     Ok(false)
 }
 
-
 // ============ DRAW ============
 
 fn draw(frame: &mut Frame<'_>, model: &UiModel, browser: &CommandBrowser) {
@@ -303,10 +301,7 @@ fn draw_content(frame: &mut Frame<'_>, model: &UiModel, area: Rect) {
     let scroll_offset = model.scroll_offset.min(max_scroll);
     let row = (total_lines.saturating_sub(visible_height)).saturating_sub(scroll_offset) as u16;
 
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((row, 0)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((row, 0)), area);
 }
 
 // ============ STATUS BAR ============
