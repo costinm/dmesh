@@ -46,7 +46,7 @@ Main uses the additional region explicitly for modules/raw data. The
 boards with more than 4 MiB and up to 8 MiB of flash; `lora4` is the current
 example. It preserves the same NVS, Recovery, and Main offsets while
 expanding the data entry. Its matching 8 MiB stage2 is flashed only during
-initial USB/esptool provisioning or emergency repair. Future flash sizes need
+initial USB provisioning or emergency repair. Future flash sizes need
 the same treatment with a matching table/stage2 limit.
 
 The current fleet policy is:
@@ -70,7 +70,7 @@ bytes on ESP32-S3.
 After ESP-IDF bootloader initialization and partition-table loading, stage2:
 
 1. emits a fixed DMB1 identity in PPP/HDLC framing;
-2. waits 50 ms for either the fixed framed Recovery command or legacy ASCII
+2. when `recovery:uart_boot` is enabled, waits 500 ms for either the fixed framed Recovery command or legacy ASCII
    `RECOVER`;
 3. reads the Recovery request marker from NVS;
 4. consumes the application health event in RTC memory;
@@ -111,10 +111,12 @@ Applications write one volatile event byte:
 - `RECOVERY_START` when Recovery starts;
 - `RECOVERY_OK` only after a successful flash session.
 
-Stage2 increments a target's counter before handoff. `MAIN_OK` clears Main's
-counter and rapid-boot history. `RECOVERY_OK` clears both counters and the
-history so the next boot is a fresh Main attempt. Routine boots do not update
-NVS.
+Stage2 increments a target's counter before handoff. `MAIN_OK` clears only
+Main's failure counter; rapid-reset timestamps are retained so three deliberate
+external resets can select Recovery even when Main normally reaches `MAIN_OK`.
+Entries older than the rapid-reset window are ignored. `RECOVERY_OK` clears
+both counters and the history so the next boot is a fresh Main attempt. Routine
+boots do not update NVS.
 
 Current limitations are important:
 
@@ -139,6 +141,7 @@ Stage2 reads only these NVS fields in namespace `recovery`:
 |---|---|---|
 | `request_magic` | `u32` or numeric string | `0x52455131` (`REQ1`) |
 | `request_version` | `u32` or numeric string | currently `1` |
+| `uart_boot` | `u32` or numeric string | missing/nonzero enables the stage2 UART selector; `0` disables it |
 
 For compatibility with older provisioned devices, version `1` currently
 selects Recovery even when `request_magic` cannot be read. That compatibility
@@ -158,7 +161,21 @@ The P-256 trust key is consumed by Recovery, not stage2.
 DMB1 is a fixed byte layout, not general CBOR. PPP/HDLC delimiters and escaping
 allow a UART receiver to regain framing. The identity includes version, role,
 partition, reset reason, and a short RTC tick value; remaining bytes are
-reserved. The 50 ms window is deliberately bounded on every boot.
+reserved. The 500 ms window is deliberately bounded on every boot. The managed
+lmesh host sends the fixed command immediately after the reset pulse; it does not
+wait for the identity to make the round trip first. This is necessary because the
+old 50 ms window was shorter than the managed forwarding path and caused stage2
+to report its identity while still falling through to Main. Stage2 also logs
+whether Recovery was selected by the NVS request, the flash reset journal, or
+the RTC rapid-reset history; these reasons are intentionally diagnostic only.
+
+The selector is controlled by `recovery:uart_boot` in NVS. Missing or malformed
+values default to enabled for development and backward compatibility. A value
+of zero disables the DMB1 identity, legacy `RECOVER` parsing, and all stage2
+UART polling. Production provisioning must set this key to zero explicitly;
+rapid reboot history and the RTC failure counters remain available.
+`scripts/prepare-nvs-image.py` accepts `--uart-boot 0` to add or replace this
+setting while generating a provisioning NVS image.
 
 DRS2 is not used in stage2. TCP does not need PPP framing, and pulling the full
 flash protocol into the bootloader would weaken the size and audit boundary.

@@ -1,18 +1,16 @@
-# Generic ESP32-S3 profile for boards with 8 MB embedded flash.  Keep the
-# application layout compatible with the 16 MB S3 image and reserve the upper
-# 4 MB for DMesh storage.  Do not require PSRAM: Heltec-class LoRa boards
-# commonly have no PSRAM even when other S3 development boards do.
+# Generic ESP32-S3 Main profile. Main uses the same 4 MiB image/layout as
+# classic ESP32 boards; the second-stage boot build is the only 8 MiB profile.
+# The module/data loader extends the data region to the detected physical end.
 
 CONFIG_IDF_TARGET="esp32s3"
-# CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 # CONFIG_XTAL_FREQ_26 is not set
 # CONFIG_XTAL_FREQ_40 is not set
 CONFIG_XTAL_FREQ_AUTO=y
 # CONFIG_PARTITION_TABLE_SINGLE_APP is not set
 # CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8mb_large_app_store.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
@@ -29,9 +27,6 @@ CONFIG_CONSOLE_UART_NUM=0
 CONFIG_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESPTOOLPY_BAUD_460800B=y
 CONFIG_ESPTOOLPY_BAUD=460800
-# Main deliberately installs Recovery and the second-stage/partition-table
-# images.  Permit those dangerous-region writes; the Recovery command still
-# rejects the running Main target and validates the explicit target/range.
 CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y
 CONFIG_MONITOR_BAUD=115200
 
@@ -41,7 +36,7 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
 
-# Keep bring-up observable on a board whose peripheral wiring is not yet
+# Keep bring-up observable on boards whose peripheral wiring is not yet
 # characterized. Production profiles must retain watchdog protection.
 CONFIG_ESP_INT_WDT=n
 CONFIG_ESP_TASK_WDT_EN=n
@@ -54,7 +49,6 @@ CONFIG_BT_BLE_ENABLED=y
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
 # CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY is not set
 # CONFIG_BTDM_CTRL_MODE_BTDM is not set
-# CONFIG_BT_BLUEDROID_ENABLED is not set
 # CONFIG_BLUEDROID_ENABLED is not set
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_GATT_SERVER=y
@@ -64,8 +58,6 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_NIMBLE_SM_SC=y
 CONFIG_BT_NIMBLE_MAX_BONDS=3
 CONFIG_BT_NIMBLE_MAX_CCCDS=8
-# Keep one short-lived CoC channel available for the Android companion.  The
-# IDF default is zero, which compiles CoC out entirely on the S3 profile.
 CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=1
 CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=y
 CONFIG_BT_NIMBLE_EXT_ADV=y

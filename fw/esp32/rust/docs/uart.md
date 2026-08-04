@@ -16,10 +16,11 @@ or even an Android using USB API. Several mechanism wake the UART:
 - when receiving a LoRA/FSK frame
 - `active` commands received via NAN/ESP-NOW.
 
-GPIO0/PRG and USB modem-control lines are not runtime transports. DTR is
-reserved for direct `esptool` flashing of the bootloader, second-stage, and
-recovery image; lmesh never toggles it and firmware diagnostics must not
-depend on it.
+GPIO0/PRG is a firmware wake/recovery input, but the USB modem-control lines
+are board-specific and are not runtime transports. On the lab bridges, DTR is
+coupled to the ESP reset/strap circuit and may reset the board; it remains
+reserved for explicit hardware tests or direct `esptool` flashing when the
+managed forward is unavailable.
 
 When the device is idle - after finishing the commands, including a small wait time - the UART, wifi are off and CPU in light sleep, unless the host activates an 'always on' mode, with firmware acting as infrastructure (active at all times). 
 
@@ -36,6 +37,15 @@ Firmware accepts only framed compact CBOR:
 - Maximum decoded CBOR payload: 4,096 bytes.
 - Application responses and logs are compact-CBOR frames. ESP ROM boot and
   panic text are outside the application protocol and ignored until a frame delimiter is detected.
+- Once the framed UART driver is installed, it is the sole UART0 writer for
+  application output. Raw ROM boot breadcrumbs are permitted only before that
+  handoff; interleaving `esp_rom_printf` with a CBOR frame corrupts both the
+  frame and lmesh's mode/boot classification.
+- The Main `recovery` command only writes the request and acknowledges it. STA
+  association and flash TCP startup run in a worker task, so the primary Main
+  loop remains available for UART responses, managed reset, and NAN bookkeeping
+  while Wi-Fi connects. Worker failure is reported back to the primary loop,
+  which resumes the normal transport mode.
 - lmesh converts between this UART-only codec and its normal UDS mesh stream
   envelope. Do not send newline commands directly to a firmware UDS socket.
 
@@ -51,19 +61,24 @@ This setting is for non-infrastructure, duty-cycled nodes only. An
 infrastructure/AP owner is powered and always-on: it keeps UART active
 continuously and has no battery heartbeat window or light-sleep schedule.
 
-- `0`: explicitly disables the rendezvous. lmesh then retains queued UART
-  commands until another wake source opens the console. Use only for a
-  deliberate power experiment; it is not a usable battery-modem default.
+- `0`: explicitly disables the rendezvous. lmesh retains queued UART commands
+  until another wake source opens the console. Use only for a deliberate
+  power experiment; it is not a usable battery-modem default.
 - `N > 0`: on every Nth raw-NAN Wi-Fi wake, firmware opens UART only for that
 raw-NAN active window (`nan.active_ms`, normally 64 ms) and writes exactly
-  `0x7e 0x7e`. This is an empty UART frame, not a CBOR message. lmesh treats it
-  as permission to flush its pending command queue. A received LoRa/FSK packet
-  uses the same enabled setting with a 250 ms event window, then emits its
-  normal binary notification.
+  `0x7e 0x7e`. This is an empty UART frame, not a CBOR message. lmesh treats
+  it as permission to flush its pending command queue. A received LoRa/FSK
+  packet uses the same enabled setting with a 250 ms event window, then emits
+  its normal binary notification.
 
 UART RX is different: a complete host frame extends the normal configured
 `uart.active_ms` interactive window (currently 2000 ms). A periodic heartbeat
 or radio event must never create that longer window by itself.
+
+After the startup hold, Main emits a framed `boot.state` notification with
+`rebooted=true|false`, `mode=infra|sleepy|companion`, and the current
+`infra_active` state. lmesh uses this packet, when available, to classify the
+managed forward; its startup probes remain the fallback for older images.
 
 For infrastructure mode, keep `uart.hb_every=1` because the UART is always
 awake. For a non-infrastructure four-second `nan.wake_ms`, use `1` for every
@@ -118,6 +133,11 @@ retired automatic-PM-only behavior. Runtime diagnostics do not pulse DTR or
 reset a sleeping board; they wait for the configured UART heartbeat/active
 window.
 
+The managed lmesh diagnostic escape `force_direct=true` applies only to the
+one client connection and writes immediately to an already-awake board. It is
+not the default and must not bypass the sleepy-node heartbeat queue; the
+Python surface exposes it only as `flash-control.py ... --direct`.
+
 On a clean post-boot validation, `power uart_status=true` and `xstatus` should
 show zero `uart_rx_drop`, `uart_rx_err`, `uart_frame_drop`, and
 `uart_escape_err`. The PPP/HDLC migration and the disabled-by-default periodic
@@ -136,14 +156,17 @@ mesh lmesh esp.serial.command port=lora2 command=status
 ```
 
 Forward connections are passive: lmesh never toggles DTR/RTS or sends a
-disposable probe on connect. Modem-line control is reserved for direct esptool
-while flashing the bootloader/second-stage and recovery image; it is not
-available as a lmesh diagnostic command or a firmware wake mechanism.
+disposable probe on connect. DTR/RTS are not part of the runtime UART
+protocol and are not used for module testing, Main updates, or normal lmesh
+operation. They are reserved for explicit physical bootloader/recovery
+experiments; the supported runtime and flashing paths use framed CBOR over
+the managed lmesh forward.
 
-There is no lmesh `usb.serial.reset` operation. If a running image needs a
-software restart, send the firmware's normal `rst` command through
-`esp.serial.command`; this remains framed CBOR over the managed lmesh forward
-and does not touch UART modem lines.
+If a running image needs a software restart, send the firmware's normal `rst`
+command through `esp.serial.command`; this remains framed CBOR over the
+managed lmesh forward and does not touch UART modem lines. The lmesh
+`usb.serial.rst` and `usb.serial.dtr` controls are test-only modem-line
+overrides and must not be used as a runtime wake or command path.
 
 For firmware commands, use generic `mesh` against the lmesh control UDS with
 the generated `resources/tools.json` catalog, or use high-level lmesh methods.
@@ -167,8 +190,9 @@ scripts/flash-recovery-fleet.py --stage-only lora2
 ```
 
 Without `--skip-config`, the fleet tool provisions through the supervised lmesh
-UDS after flashing. Commands and diagnostics never pulse DTR and never open a
-raw UART; DTR/RTS are reserved for esptool bootloader/recovery operations.
+UDS after flashing. Commands and diagnostics never pulse DTR/RTS and never
+open a raw UART; modem lines are reserved for explicit esptool
+bootloader/recovery operations.
 
 If an old local bootstrap run left a forward absent, restore it:
 
@@ -273,9 +297,9 @@ The target reported `infra_active=true` and
 
 ## lora4 Recovery: 2026-07-26
 
-`lora4` is the 8 MB ESP32-S3/SX126x at `44:1b:f6:fc:54:3c`
+`lora4` is the ESP32-S3/SX126x at `44:1b:f6:fc:54:3c`
 (`target=f6fc543c`). An incomplete app image produced `invalid segment length
-0xffffffff`; flashing the 8 MB S3 sparse image repaired it. Addressed raw-NAN
+0xffffffff`; stage2 repair restored it. Addressed raw-NAN
 `active` then set its `infra_active` state and opened its bounded UART window.
 
 ## History And Rejected Paths

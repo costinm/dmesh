@@ -22,6 +22,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "boot_health_rtc.h"
+#include "boot_health_flash.h"
 #include "boot_protocol.h"
 #include "dmesh_flash_tcp.h"
 
@@ -534,6 +535,7 @@ void recovery_app_main(void)
     ESP_LOGI(TAG, "negotiated flash result=%s", ok ? "ok" : "failed");
     if (ok) {
         clear_recovery_request();
+        dmesh_boot_journal_clear();
         dmesh_boot_health_write(DMESH_BOOT_HEALTH_RECOVERY_OK);
     }
     esp_restart();

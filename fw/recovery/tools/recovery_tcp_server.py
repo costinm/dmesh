@@ -28,7 +28,16 @@ TYPES = {
 }
 TARGETS = {"boot": 1, "stage2": 1, "partition": 2, "partition-table": 2,
            "recovery": 3, "nvs": 4, "data": 5, "main": 6, "module": 7}
-LABELS = {"main": "main", "recovery": "recovery_app", "nvs": "nvs", "data": "data", "module": "data"}
+TARGET_NAMES = {value: key for key, value in TARGETS.items()}
+LABELS = {
+    "main": ("main",),
+    "recovery": ("recovery_app",),
+    "nvs": ("nvs",),
+    # Early boot tables called this region `data`; current Rust fleet tables
+    # call it `dmesh_store`. Both names are the same raw blob/module target.
+    "data": ("data", "dmesh_store"),
+    "module": ("data", "dmesh_store"),
+}
 
 
 def recv_all(sock: socket.socket, length: int) -> bytes:
@@ -53,7 +62,7 @@ def read_frame(sock: socket.socket) -> tuple[int, bytes]:
 
 
 def parse_info(payload: bytes) -> dict[str, object]:
-    if len(payload) not in (69, 71):
+    if len(payload) not in (69, 71, 89):
         raise RuntimeError(f"invalid DEVICE_INFO length={len(payload)}")
     info = {
         "model": payload[0], "revision": payload[1], "mac": payload[2:8].hex(":"),
@@ -68,6 +77,19 @@ def parse_info(payload: bytes) -> dict[str, object]:
         "psram_free": struct.unpack_from("!I", payload, 32)[0],
         "key_present": bool(payload[36]), "key_sha256": payload[37:69].hex(),
     }
+    if len(payload) == 89 and payload[71] != 0:
+        requested = TARGET_NAMES.get(payload[71])
+        if requested is None:
+            raise RuntimeError(f"unsupported requested target id={payload[71]}")
+        info["requested_target"] = requested
+        name_length = payload[72]
+        if name_length > 16:
+            raise RuntimeError("requested resource name is too long")
+        if name_length:
+            try:
+                info["requested_name"] = payload[73:73 + name_length].decode("ascii")
+            except UnicodeDecodeError as error:
+                raise RuntimeError("requested resource name is not ASCII") from error
     return info
 
 
@@ -96,7 +118,7 @@ def parse_table(table: bytes, flash_size: int, target: str) -> tuple[int, int]:
     if wanted is None:
         return 0, 0
     for partition in parse_partitions(table, flash_size):
-        if partition["label"] == wanted:
+        if partition["label"] in wanted:
             address = int(partition["address"])
             size = int(partition["size"])
             # The table reserves the first 256 KiB of data at the 4 MiB
@@ -127,6 +149,20 @@ def archive_initial(info: dict[str, object], hello: bytes, table: bytes) -> Path
 
 
 ACTIVE_FLASH: tuple[str, Path] | None = None
+
+
+def snapshot_image(path: Path) -> bytes:
+    """Read one stable artifact, rejecting a concurrent build replacement."""
+    for _ in range(3):
+        before = path.stat()
+        data = path.read_bytes()
+        after = path.stat()
+        if (before.st_ino == after.st_ino and
+                before.st_size == len(data) == after.st_size and
+                before.st_mtime_ns == after.st_mtime_ns):
+            return data
+        time.sleep(0.05)
+    raise RuntimeError(f"image changed while being snapshotted: {path}")
 
 
 def finish_active(status: str, **fields: object) -> None:
@@ -201,15 +237,76 @@ def target_image(path: Path, info: dict[str, object], target: str) -> Path:
     candidates.extend(path / target / f"{key}.bin" for key in keys)
     for candidate in candidates:
         if candidate.is_file():
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
             print(f"image-select chip={chip} physical_flash={flash_size} target={target} "
-                  f"selected={candidate}", flush=True)
+                  f"selected={candidate} size={candidate.stat().st_size} sha256={digest}", flush=True)
             return candidate
     tried = ", ".join(str(candidate.relative_to(path)) for candidate in candidates)
     raise RuntimeError(f"no image for chip={chip} physical_flash={flash_size} target={target} "
                        f"under {path}; tried: {tried}")
 
 
-def update(sock: socket.socket, image_path: Path, target: str, signer_path: Path | None,
+def select_module(path: Path, name: str, info: dict[str, object] | None = None) -> Path:
+    """Resolve a module artifact without making callers know the store layout."""
+    if not name or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                       for char in name):
+        raise RuntimeError("module name must contain only ASCII letters, digits, '_' or '-'")
+    roots = [path]
+    if path.name == "flash":
+        roots.append(path.parent)
+    if info is not None and path.is_dir():
+        chip = "esp32s3" if int(info["model"]) == 9 else "esp32"
+        rust_target = f"xtensa-{chip}-espidf"
+        # Prefer the same CPU-specific artifact namespace used by Main and
+        # Recovery images. Shared target/modules remains a compatibility
+        # fallback for artifacts built before this layout was adopted.
+        roots.insert(0, path / chip)
+        # `target/modules/<rust-target>` is the canonical module output.  Put
+        # the device's exact ISA directory ahead of the compatibility glob so
+        # an S3 never receives the classic-ESP32 image (or vice versa).
+        module_base = path.parent / "modules" if path.name == "flash" else path / "modules"
+        preferred_module_root = module_base / rust_target
+        if preferred_module_root.is_dir():
+            roots.insert(0, preferred_module_root)
+    candidates: list[Path] = []
+    if path.is_dir():
+        for root in roots:
+            candidates.extend((root / "modules" / f"{name}.dmod",
+                               root / "modules" / f"mod_{name}.dmod",
+                               root / f"{name}.dmod",
+                               root / f"mod_{name}.dmod"))
+            # Module builds are kept in target/modules/<rust-target>/ so
+            # ESP32 and ESP32-S3 artifacts do not collide with Main images.
+            for module_root in sorted((root / "modules").glob("*/")):
+                candidates.extend((module_root / f"{name}.dmod",
+                                   module_root / f"mod_{name}.dmod"))
+    else:
+        candidates = [path]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"module {name!r} not found under {path}; tried: "
+                       + ", ".join(str(candidate) for candidate in candidates))
+
+
+def list_modules(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+    roots = [path / "modules", path]
+    if path.name == "flash":
+        roots.append(path.parent / "modules")
+    found: dict[str, Path] = {}
+    for root in roots:
+        if root.is_dir():
+            for candidate in root.glob("*.dmod"):
+                found.setdefault(candidate.stem.removeprefix("mod_"), candidate)
+            for candidate in sorted(root.glob("*/**/*.dmod")):
+                found.setdefault(candidate.stem.removeprefix("mod_"), candidate)
+    return [found[name] for name in sorted(found)]
+
+
+def update(sock: socket.socket, image_path: Path, target: str, module_name: str | None,
+           signer_path: Path | None,
            sparse: bool = False, force_all: bool = False,
            fast_unsigned: bool = False, per_block_acks: bool = False) -> None:
     global ACTIVE_FLASH
@@ -218,6 +315,12 @@ def update(sock: socket.socket, image_path: Path, target: str, signer_path: Path
     if kind != TYPES["hello"]:
         raise RuntimeError("device did not start with DEVICE_INFO")
     info = parse_info(hello)
+    # New clients select the requested blob in HELLO. The CLI target remains
+    # the compatibility default for older clients with a 69/71-byte HELLO.
+    target = str(info.get("requested_target", target))
+    module_name = str(info.get("requested_name", module_name or "")) or None
+    if target == "module" and not module_name:
+        raise RuntimeError("module target requires a requested module name")
     print("device", info, flush=True)
     # Recovery executes from recovery_app and must never be asked to overwrite
     # that same partition.  Main is the updater for Recovery; rejecting this
@@ -241,8 +344,15 @@ def update(sock: socket.socket, image_path: Path, target: str, signer_path: Path
     write_json(session_path, record)
     ACTIVE_FLASH = (str(info["mac"]), session_path)
     address, partition_size = parse_table(table, int(info["flash_size"]), target)
-    image = target_image(image_path, info, target)
-    image_size = image.stat().st_size
+    image = (select_module(image_path, module_name, info)
+             if target == "module" and module_name
+             else target_image(image_path, info, target))
+    # Snapshot the selected artifact before negotiating any blocks. Builds
+    # replace files while the daemon remains running; retaining the exact
+    # bytes here prevents a concurrent rebuild from changing the transfer or
+    # making the archived SHA ambiguous.
+    image_bytes = snapshot_image(image)
+    image_size = len(image_bytes)
     if target not in ("boot", "stage2", "partition", "partition-table") and image_size > partition_size:
         raise RuntimeError(f"image {image_size} exceeds {target} partition {partition_size}")
     if image_size == 0 or image_size > MAX_BLOCKS * BLOCK_SIZE or image_size % 4:
@@ -252,13 +362,14 @@ def update(sock: socket.socket, image_path: Path, target: str, signer_path: Path
     block_hashes: list[bytes] = []
     full = hashlib.sha256()
     blocks: list[bytes] = []
-    with image.open("rb") as stream:
-        for _ in range(count):
-            block = stream.read(BLOCK_SIZE)
-            if not block:
-                raise RuntimeError("image ended before expected block count")
-            blocks.append(block); full.update(block)
-            block_hashes.append(hashlib.sha256(block).digest()[:4])
+    for offset in range(0, image_size, BLOCK_SIZE):
+        block = image_bytes[offset:offset + BLOCK_SIZE]
+        blocks.append(block)
+        full.update(block)
+        block_hashes.append(hashlib.sha256(block).digest()[:4])
+    image_sha = full.digest().hex()
+    record.update(image=str(image), image_size=image_size, image_sha256=image_sha)
+    write_json(session_path, record)
     key_fp, key = load_signer(signer_path)
     query = struct.pack("!B3xIIII", TARGETS[target], 0, BLOCK_SIZE, count, image_size)
     fast_mode = fast_unsigned and not bool(info["key_present"])
@@ -364,7 +475,6 @@ def update(sock: socket.socket, image_path: Path, target: str, signer_path: Path
     kind, result = read_frame(sock)
     if kind != TYPES["done"]:
         raise RuntimeError(f"device final verification failed: frame={kind} payload={result!r}")
-    image_sha = full.digest().hex()
     (archive_path / "current.sha256").write_text(image_sha + "\n", encoding="ascii")
     update_device(str(info["mac"]), last_seen=utc_now(), last_flash=utc_now(),
                   last_flash_status="success", current_sha256=image_sha,
@@ -383,6 +493,10 @@ def main() -> int:
     parser.add_argument("image", nargs="?", type=Path, default=ROOT / "target" / "flash",
                         help="image file or top-level image directory (default: target/flash)")
     parser.add_argument("--target", default="main", choices=sorted(TARGETS))
+    parser.add_argument("--module", metavar="NAME",
+                        help="serve a .dmod from modules/ (sets --target module)")
+    parser.add_argument("--list-modules", action="store_true",
+                        help="list available .dmod artifacts and exit")
     parser.add_argument("--signing-key", type=Path)
     parser.add_argument("--sparse", action="store_true",
                         help="use the host-selected sparse-manifest extension; legacy is default")
@@ -399,6 +513,13 @@ def main() -> int:
     parser.add_argument("--socket-activation", action="store_true",
                         help="use systemd LISTEN_FDS descriptor 3 instead of binding")
     args = parser.parse_args()
+    if args.list_modules:
+        for module in list_modules(args.image):
+            print(f"{module.stem.removeprefix('mod_')}\t{module.stat().st_size}\t{module}")
+        return 0
+    if args.module:
+        args.target = "module"
+        args.image = select_module(args.image, args.module)
     activated = args.socket_activation or (
         os.environ.get("LISTEN_PID") == str(os.getpid()) and
         int(os.environ.get("LISTEN_FDS", "0")) >= 1
@@ -420,7 +541,7 @@ def main() -> int:
                 client.settimeout(180.0)
                 print(f"accepted {peer}", flush=True)
                 try:
-                    update(client, args.image, args.target, args.signing_key,
+                    update(client, args.image, args.target, args.module, args.signing_key,
                            args.sparse, args.force_all, args.fast_unsigned,
                            args.per_block_acks)
                 except Exception as error:  # noqa: BLE001 - daemon must survive one bad device

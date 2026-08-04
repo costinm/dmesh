@@ -19,7 +19,7 @@ Build the legacy C application:
 ```
 
 The build uses the flake package in `fw/esp32` for host tools and keeps SDKs
-under `target/esp32-5.5`, not `$HOME`.
+under `target/esp32-6.0`, not `$HOME`.
 
 Successful build outputs:
 
@@ -27,27 +27,23 @@ Successful build outputs:
 - `fw/esp32/build/bootloader/bootloader.bin`
 - `fw/esp32/build/partition_table/partition-table.bin`
 
-Legacy direct flash command from ESP-IDF after a successful build (development
-only; never use it for Main on a provisioned board):
-
-```bash
-cd fw/esp32
-idf.py -p PORT flash
-```
+The legacy C build is retained for reference and does not own a flashing
+workflow. Do not use `idf.py flash`, Cargo flash subcommands, or `espflash`.
+Use the repository scripts below. Main images are never written over USB.
 
 Build the current Rust fleet images from the repository root:
 
 ```bash
 . env.sh
 scripts/build-fw.sh e5          # classic ESP32 Main
-scripts/build-fw.sh recovery-s3 # 8 MB ESP32-S3 Main
+scripts/build-fw.sh recovery-s3 # ESP32-S3 Main, common 4 MiB image
 scripts/build-recovery-fleet.sh all
 ```
 
 Artifacts are kept under `target/flash/` and `target/recovery-fleet/`.
 USB flashing is limited to initial provisioning or emergency repair of the
-stage-2 and Recovery partitions. Never use USB to replace Main on a provisioned
-board. Once stage-2/Recovery are installed, the supported Main update is:
+stage-2 and Recovery partitions. Never use USB or esptool to replace Main on a
+provisioned board. Once stage-2/Recovery are installed, the supported Main update is:
 
 ```bash
 # mesh-init should run docs/lab/recovery-tcp-server.toml continuously.
@@ -81,10 +77,77 @@ Main-update logs are available in:
 - `target/evidence/flash/` and the active managed serial capture at
   `target/lmesh-radio-build/log/serial.log`.
 
+For exceptional Stage2/Recovery provisioning, the fleet script archives the
+existing partition table and NVS before writing. If a board's flash chip can
+be identified but cannot be read, use one bounded attempt with the checked-in
+SDK6 artifacts and the known partition table:
+
+```sh
+python3 scripts/flash-recovery-fleet.py --stage-only --skip-build \
+  --skip-archive --flash-baud 115200 --flash-freq 20m lora2
+```
+
+`--skip-archive` does not bypass esptool flash verification; it only omits the
+pre-write reads. Stop if the write still reports flash-chip communication
+failure. Do not use this path for Main images.
+
+The same persistent Recovery flash server can serve a module in the raw data
+region. New Main clients select the requested resource in HELLO, so this does
+not require a second port or a server restart. The module build outputs under
+`target/modules/` are discovered automatically (CPU-specific copies under
+`target/flash/esp32/modules/` or `target/flash/esp32s3/modules/` take
+precedence); inspect them with:
+
+```sh
+python3 fw/recovery/tools/flash-server.py --list-modules
+python3 fw/recovery/tools/flash-server.py --module lora
+```
+
+`--module NAME` sets the fallback target to `module` for older clients. New
+clients request `module` plus its name directly, while the server keeps the
+normal sparse/hash or unsigned-fast transfer protocol. The server remains
+persistent and can serve Main, Recovery, stage2, data, or a module on the same
+listener.
+Build output under `target/modules/<rust-target>/` is discovered automatically
+as well.
+
+The target resolves both legacy `data` and current Rust `dmesh_store` partition
+labels. On larger flash parts the module region begins at the selected
+partition address and extends to the physical flash end; module images are
+placed at 64 KiB-aligned offsets within that region.
+
+The Main module command may target any aligned slot with `offset=...`. When
+`size` is omitted, the loader reads and validates that slot's header and uses
+the remaining raw region as its bounds, allowing independently deployed
+modules larger than one 64 KiB slot.
+
 For Rust ESP development, source the same environment. `env.sh` owns
 the repo-local Nix profile, ESP-IDF tools, ESP Python environment, Cargo home,
-rustup home, and Xtensa Rust toolchain paths under `target/esp32-5.5`; do not
+rustup home, and Xtensa Rust toolchain paths under `target/esp32-6.0`; do not
 set those paths manually in scripts.
+
+Build and module deployment timing
+----------------------------------
+
+The canonical S3 Main output is `target/flash/esp32s3/main-app.bin`. Main uses
+the same `fw/boot/partitions.csv` image layout on every chip; only the
+second-stage boot build uses the larger physical-flash profile.
+
+The build scripts record JSONL timing under `target/evidence/` and print a
+single elapsed value. Main and module commands therefore stay short:
+
+```bash
+. env.sh
+scripts/build-fw.sh esp32s3       # prints MAIN_BUILD_MS=...
+fw/mod_lora/build.sh              # prints MODULE_BUILD_MS=...
+scripts/flash-module.sh lora4 lora # prints MODULE_PUSH_REQUEST_MS=...
+```
+
+The last command uses the direct managed lmesh USB path to Main; it does not
+use DTR/RTS or Recovery. The negotiated transfer duration is appended by the
+flash server to `target/recovery-server/all-${DMESH_FLASH_PORT}.log`. AP,
+server, device IP, and mesh binary defaults are supplied by `env.sh` and can
+be overridden with `DMESH_FLASH_*` variables.
 
 Build the Rust translation scaffold:
 

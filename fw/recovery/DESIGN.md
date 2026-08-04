@@ -58,10 +58,19 @@ or package manager in Recovery.
 ## Normal update flow
 
 The long-running host process is `fw/recovery/tools/flash-server.py`. With no arguments
-it serves chip-selected Main images from `target/flash`, listens on
-`10.78.0.1:3336`, keeps
-accepting devices, and enables unsigned-fast only for devices reporting no
-trust key. `docs/lab/recovery-tcp-server.toml` runs it under mesh-init.
+it serves CPU-selected resources from `target/flash`, listens on
+`10.78.0.1:3336`, keeps accepting devices, and enables unsigned-fast only for
+devices reporting no trust key. New clients put the requested target in the
+extended HELLO, allowing one listener to serve Main, Recovery, stage2, and
+named modules. A missing selector falls back to Main for compatibility.
+`docs/lab/recovery-tcp-server.toml` runs it under mesh-init.
+
+The preferred artifact layout is `target/flash/<cpu>/`, for example
+`target/flash/esp32/main-app.bin`, `recovery.bin`, and `bootloader.bin`.
+Named module lookup first checks the matching CPU directory and then the
+older shared `target/modules/<rust-target>/` layout. The selector extension is
+reserved for future signed configuration/resource blobs without requiring
+another TCP listener.
 That lab service does not currently provide a signing key. Once a device trust
 key is provisioned, the service must be configured with the corresponding
 private signing key or the device will correctly reject its manifests.
@@ -79,6 +88,14 @@ The server defaults to `10.78.0.1`, the port to `3336`, and an absent local
 address to `10.78.<MAC[4]>.<MAC[5]>` with a `/16` mask. Recovery is currently
 open-STA only; the NVS password field is retained for ABI compatibility but is
 not applied by the minimal Wi-Fi implementation.
+
+Human-facing flash tools use the managed direct lmesh forward by default and
+load the saved SSID, netmask, and board address from
+`target/flash-devices/network.json`. The Main control-plane request carries
+the netmask through to its static STA setup; this matters for the lab's
+`10.78.0.0/16` network when a device address is in another third-octet
+subnet, such as `10.78.84.60`.
+NAN-gateway routing is experimental/WIP and is not used for routine flashing.
 
 Recovery retries association in 30-second windows with a short delay between
 windows. It remains in Recovery while the AP is absent. After association, the
@@ -115,6 +132,14 @@ device -> DONE or ERROR
 HELLO reports chip model/revision, MAC, CPU/crystal frequency, flash size,
 DRAM/PSRAM totals, device role/partition, trust-key presence, and the SHA-256
 fingerprint of the exact 65-byte uncompressed SEC1 P-256 public key.
+
+New clients append an 18-byte HELLO extension: the target id and an optional
+ASCII resource name. The server uses it to select the requested blob for that
+connection. Recovery always sends `main`; Main may request `recovery`,
+`stage2`, `partition`, `data`, or `module` plus a name such as `hello` or
+`lora`. Old 69/71-byte HELLO messages remain valid and use the server's Main
+default. The extension is intentionally the resource-selection point for
+future signed configuration blobs; they do not require a second listener.
 
 Supported targets are raw stage2/boot, raw partition table, Recovery, NVS,
 data, and Main. `READ_BLOCK`/`BLOCK_DATA` are reserved diagnostic frames.
@@ -223,16 +248,11 @@ The intended matrix is:
 | Main | Recovery; optionally data/NVS |
 | factory/emergency flow | stage2 and partition table with explicit authority |
 
-Main correctly rejects `target=main` at its Rust command surface. However, the
-shared C start API receives only port and remote address; it does not receive
-an allowed target. The peer's manifest can currently select any supported
-target regardless of the initiating command or running role. This defeats the
-intended safety matrix and is the first protocol fix to make.
-
-Pass an allowed-target mask (or one exact target) into
-`dmesh_flash_tcp_start()`, advertise it in HELLO, and reject a manifest whose
-target does not match before erase. The host can then use one port with an
-explicit device-selected target negotiation in a protocol extension.
+Main correctly rejects `target=main` at its Rust command surface. The current
+client now sends the requested target in the extended HELLO, and the host
+selects the matching CPU-specific blob before sending a manifest. The device
+still validates the manifest target and partition range; a future hardening
+step should advertise and enforce an allowed-target mask before erase.
 
 Updating Recovery from Main is reasonable because Main remains bootable if the
 Recovery write fails. Updating stage2 is qualitatively different: ROM has one
@@ -288,6 +308,13 @@ archives state under `target/flash-devices/<mac>/`:
 - `flashes/*.json` and `flash-history.jsonl`;
 - current image and block hashes;
 - last observed Recovery IP.
+
+The selected artifact is snapshotted before negotiation; the server checks its
+inode, size, and modification time before and after reading, retrying briefly
+if a build is replacing it. Its full SHA-256 is written into the flash session
+record before the first block is sent. A concurrent build therefore cannot
+silently change the bytes of an in-progress transfer or make its evidence
+ambiguous.
 
 The saved network defaults are in `target/flash-devices/network.json`. Server
 logs are under `target/recovery-server/` when the wrapper is used; managed UART

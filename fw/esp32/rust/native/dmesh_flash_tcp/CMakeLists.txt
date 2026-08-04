@@ -18,3 +18,6 @@ idf_component_register(
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE DMESH_FLASH_ROLE_MAIN=1)
+if(IDF_VERSION_MAJOR LESS 6)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DMESH_FLASH_USE_LEGACY_MBEDTLS=1)
+endif()

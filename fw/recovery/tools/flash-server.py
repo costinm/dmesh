@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the persistent Main firmware flash server.
+"""Run the persistent DMesh resource/flash server.
 
-With no arguments this serves ``target/flash`` for ``main`` on port 3336 and
-keeps listening for successive Recovery connections. Additional arguments use
-the same options as recovery_tcp_server.py. ``--once`` is available for the
-legacy per-board test helpers.
+With no arguments this serves ``target/flash`` with ``main`` as the fallback
+target on port 3336 and keeps listening for successive connections. New
+clients select Main, Recovery, stage2, or a named module in their HELLO;
+older clients use the fallback. Additional arguments select the image root,
+target, bind address, and transport policy.
 """
 
 from __future__ import annotations

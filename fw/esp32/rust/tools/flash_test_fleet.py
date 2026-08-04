@@ -65,10 +65,6 @@ LORA_PAIR_TEST = FW_RUST / "tools" / "lora_pair_test.py"
 PRESUBMIT = FW_RUST / "tools" / "presubmit.py"
 ESP32_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32" / "dmesh-rs-merged.bin"
 ESP32S3_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
-ESP32S3_8MB_TARGET = FW_TARGET_ROOT
-ESP32S3_8MB_MERGED_IMAGE = (
-    FW_TARGET_ROOT / "flash" / "esp32s3-8mb" / "dmesh-rs-merged.bin"
-)
 SPARSE_FLASH_DIR = FW_TARGET_ROOT / "flash" / "sparse"
 FLASH_BAUD = 460_800
 DEFAULT_LMESH_CONFIG = Path("/home/system/etc/lmesh/lmesh.toml")
@@ -686,88 +682,65 @@ def image_build_env(
 
 
 def build_targets(env: dict[str, str], devices: list[Device]) -> None:
-    """Build only the image families selected by the physical probe."""
+    """Build the common 4 MiB Main image for each CPU family."""
     needs_esp32 = any(not device.is_s3 for device in devices)
-    needs_s3_16mb = any(device.is_s3 and not s3_uses_8mb_image(device) for device in devices)
-    needs_s3_8mb = any(device.is_s3 and s3_uses_8mb_image(device) for device in devices)
+    needs_s3 = any(device.is_s3 for device in devices)
 
     for image, required in (
         (ESP32_MERGED_IMAGE, needs_esp32),
-        (ESP32S3_MERGED_IMAGE, needs_s3_16mb),
-        (ESP32S3_8MB_MERGED_IMAGE, needs_s3_8mb),
+        (ESP32S3_MERGED_IMAGE, needs_s3),
     ):
         if required:
             image.parent.mkdir(parents=True, exist_ok=True)
 
     if needs_esp32:
-        esp32_env = image_build_env(env, "sdkconfig.defaults", "partitions_4mb_large_app.csv")
+        esp32_env = image_build_env(env, "sdkconfig.defaults", "../../boot/partitions.csv")
         run(
             ["cargo", "build", "--release", "--target", "xtensa-esp32-espidf"],
             cwd=FW_RUST,
             env=esp32_env,
         )
-        run(
-            ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32-espidf",
-             "--chip", "esp32", "--flash-size", "4mb", "--merge", "--skip-padding",
-             str(ESP32_MERGED_IMAGE)],
-            cwd=FW_RUST,
-            env=esp32_env,
-        )
+        package_main_image(esp32_env, "xtensa-esp32-espidf", "esp32", ESP32_MERGED_IMAGE)
 
-    if needs_s3_16mb:
-        s3_env = image_build_env(
-            env, "sdkconfig.heltec_v3.defaults", "partitions_16mb_large_app_store.csv"
-        )
+    if needs_s3:
+        s3_env = image_build_env(env, "sdkconfig.esp32s3.defaults", "../../boot/partitions.csv")
         run(
             ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
             cwd=FW_RUST,
             env=s3_env,
         )
-        run(
-            ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32s3-espidf",
-             "--chip", "esp32s3", "--flash-size", "16mb", "--merge", "--skip-padding",
-             str(ESP32S3_MERGED_IMAGE)],
-            cwd=FW_RUST,
-            env=s3_env,
-        )
-
-    if needs_s3_8mb:
-        s3_8mb_env = image_build_env(
-            env, "sdkconfig.esp32s3_8mb.defaults", "../../boot/partitions_recovery_8mb_store.csv"
-        )
-        s3_8mb_env["CARGO_TARGET_DIR"] = str(ESP32S3_8MB_TARGET)
-        run(
-            ["cargo", "build", "--release", "--target", "xtensa-esp32s3-espidf"],
-            cwd=FW_RUST,
-            env=s3_8mb_env,
-        )
-        run(
-            ["cargo", "espflash", "save-image", "--release", "--target", "xtensa-esp32s3-espidf",
-             "--chip", "esp32s3", "--flash-size", "8mb", "--target-app-partition", "main",
-             "--merge", "--skip-padding",
-             str(ESP32S3_8MB_MERGED_IMAGE)],
-            cwd=FW_RUST,
-            env=s3_8mb_env,
-        )
+        package_main_image(s3_env, "xtensa-esp32s3-espidf", "esp32s3", ESP32S3_MERGED_IMAGE)
 
 
-def s3_uses_8mb_image(device: Device) -> bool:
-    """Return whether a probed S3 needs the 8 MB partition table."""
-    return device.is_s3 and device.flash_size_mb is not None and device.flash_size_mb <= 8
+def package_main_image(env: dict[str, str], target: str, chip: str, output: Path) -> None:
+    """Create a merged image with esptool; never open a serial port here."""
+    target_root = Path(env["CARGO_TARGET_DIR"])
+    release = target_root / target / "release"
+    app = output.with_name(output.stem + ".app.bin")
+    run(
+        [esptool_python(), "-m", "esptool", "--chip", chip, "elf2image",
+         "--flash_mode", "dio", "--flash_freq", "40m", "--flash_size", "4MB",
+         "--output", str(app), str(release / "dmesh-rs")],
+        cwd=FW_RUST,
+        env=env,
+    )
+    boot_offset = "0x0" if chip == "esp32s3" else "0x1000"
+    run(
+        [esptool_python(), "-m", "esptool", "--chip", chip, "merge_bin",
+         "--output", str(output), boot_offset, str(release / "bootloader.bin"),
+         "0x8000", str(release / "partition-table.bin"), "0xe0000", str(app)],
+        cwd=FW_RUST,
+        env=env,
+    )
 
 
 def merged_image_for(device: Device) -> Path:
-    if not device.is_s3:
-        return ESP32_MERGED_IMAGE
-    return ESP32S3_8MB_MERGED_IMAGE if s3_uses_8mb_image(device) else ESP32S3_MERGED_IMAGE
+    return ESP32S3_MERGED_IMAGE if device.is_s3 else ESP32_MERGED_IMAGE
 
 
 def executable_for(device: Device) -> Path:
-    if not device.is_s3:
-        return FW_TARGET_ROOT / "xtensa-esp32-espidf" / "release" / "dmesh-rs"
-    if s3_uses_8mb_image(device):
-        return ESP32S3_8MB_TARGET / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
-    return FW_TARGET_ROOT / "xtensa-esp32s3-espidf" / "release" / "dmesh-rs"
+    target = "xtensa-esp32s3-espidf" if device.is_s3 else "xtensa-esp32-espidf"
+    return FW_TARGET_ROOT / target / "release" / "dmesh-rs"
 
 
 def validate_prebuilt_images(devices: list[Device]) -> None:
@@ -781,16 +754,15 @@ def validate_prebuilt_images(devices: list[Device]) -> None:
         if merged.stat().st_mtime_ns < executable.stat().st_mtime_ns:
             raise SystemExit(
                 "--skip-build refused stale merged image {} older than {}; "
-                "run without --skip-build or regenerate it with cargo espflash save-image".format(
+                "run without --skip-build or regenerate it with scripts/build-fw.sh".format(
                     merged, executable
                 )
             )
 
 
 def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: str) -> None:
-    # Always sparse-flash through the esptool RAM stub. This is both more
-    # reliable on direct CP210x bridges than cargo-espflash's retained monitor
-    # handle and protects NVS by omitting its partition entirely.
+    # This helper is initial/emergency provisioning only. It uses esptool for
+    # the boot/Recovery stage images and deliberately omits NVS.
     archive_usb_device(device, port, args.flash_baud)
     chip = "esp32s3" if device.is_s3 else "esp32"
     flash_args, flash_files = sparse_flash_args(device)
@@ -877,10 +849,10 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
 
 def sparse_flash_args(device: Device) -> tuple[list[str], list[tuple[str, Path]]]:
     image = merged_image_for(device)
-    flash_size = "8MB" if s3_uses_8mb_image(device) else "16MB" if device.is_s3 else "4MB"
+    flash_size = "4MB"
     flash_freq = "80m" if device.is_s3 else "40m"
     boot_offset = 0x0 if device.is_s3 else 0x1000
-    label = "esp32s3-8mb" if s3_uses_8mb_image(device) else "esp32s3" if device.is_s3 else "esp32"
+    label = "esp32s3" if device.is_s3 else "esp32"
     data = image.read_bytes()
     chunks = [
         (boot_offset, 0x8000, f"{label}-bootloader.bin"),
@@ -1337,6 +1309,14 @@ def run_parallel(
 
 def main() -> int:
     args = parse_args()
+    if not args.skip_flash:
+        print(
+            "refusing direct USB firmware flash: Main updates must use "
+            "fw/recovery/tools/flash-main-command.py through managed lmesh; "
+            "stage-2/Recovery provisioning uses scripts/flash-recovery-fleet.py",
+            file=sys.stderr,
+        )
+        return 2
     if not args.lmesh_control_socket:
         print("--lmesh-control-socket or LMESH_CONTROL_SOCKET is required", file=sys.stderr)
         return 1

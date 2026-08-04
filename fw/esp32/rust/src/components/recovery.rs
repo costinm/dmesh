@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -15,14 +15,16 @@ const REQUEST_MAGIC: &str = "0x52455131"; // REQ1
 const RECOVERY_NAMESPACE: &str = "recovery";
 const DEFAULT_RECOVERY_SERVER: &str = "10.78.0.1";
 const DEFAULT_RECOVERY_PORT: u16 = 3336;
-/// A completed data-plane exchange must leave enough time for the host to
-/// issue follow-up commands (for example module activation) over the same
-/// STA session.  This is runtime-only: a quiet session still returns to NAN.
-const POST_TRANSFER_CONTROL_MS: u64 = 30_000;
 extern "C" {
     static mut esp_flash_default_chip: *mut sys::esp_flash_t;
     fn dmesh_boot_health_set(event: u8);
-    fn dmesh_flash_tcp_start(port: u16, remote_ip: *const i8) -> bool;
+    fn dmesh_flash_tcp_start_target(
+        port: u16,
+        remote_ip: *const i8,
+        target: *const i8,
+        module: *const i8,
+    ) -> bool;
+    fn dmesh_flash_tcp_prepare() -> bool;
     fn dmesh_flash_tcp_poll();
     fn dmesh_flash_tcp_accept() -> bool;
     fn dmesh_flash_tcp_finished() -> bool;
@@ -35,10 +37,15 @@ struct PendingFlash {
     psk: String,
     ip: String,
     gateway: String,
+    netmask: String,
+    target: String,
+    module: String,
 }
 
 static PENDING_FLASH: OnceLock<Mutex<Option<PendingFlash>>> = OnceLock::new();
-static POST_TRANSFER_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+static FLASH_STARTING: AtomicBool = AtomicBool::new(false);
+static FLASH_START_FAILED: AtomicBool = AtomicBool::new(false);
+static FLASH_FINISHED_REPORTED: AtomicBool = AtomicBool::new(false);
 static CONTROL_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn pending_flash() -> &'static Mutex<Option<PendingFlash>> {
@@ -74,59 +81,112 @@ pub fn mark_main_boot_healthy() {
 }
 
 /// Advance the armed raw TCP flash session from Main's normal task context.
-/// This is intentionally runtime-only; it does not touch NVS.
+/// The potentially slow STA association is handed to a worker; the polling
+/// function itself remains bounded and runtime-only and does not touch NVS.
 pub fn poll_flash_tcp(settings: &SharedSettings) {
     unsafe { dmesh_flash_tcp_poll() };
+    if FLASH_START_FAILED.swap(false, Ordering::AcqRel) {
+        let _ = crate::components::mode::resume_from_ip_transport(settings);
+        // The previous session may still have left flash_done set. Do not
+        // interpret that stale completion as the result of this failed start.
+        return;
+    }
+    if FLASH_STARTING.load(Ordering::Acquire) {
+        // The STA association and TCP worker are started asynchronously. The
+        // C transport still contains the previous session's completion bit
+        // until the worker resets it, so skip completion polling while start
+        // is in progress.
+        return;
+    }
     if let Some(pending) = pending_flash().lock().unwrap().take() {
+        if FLASH_STARTING.swap(true, Ordering::AcqRel) {
+            set_control_status("flash start already in progress");
+            return;
+        }
         set_control_status(format!("starting STA server={} port={}", pending.server, pending.port));
-        let result = crate::components::wifi::start_flash_sta(
-            &pending.ssid, &pending.psk, &pending.ip, &pending.gateway,
-        ).and_then(|()| {
-            let remote_ip = CString::new(pending.server.as_str())
-                .map_err(|err| anyhow!("invalid flash server address: {err}"))?;
-            if unsafe { dmesh_flash_tcp_start(pending.port, remote_ip.as_ptr().cast()) } {
-                crate::components::ip_command::start(
-                    &pending.server,
-                    pending.port.saturating_add(1),
-                )?;
-                POST_TRANSFER_DEADLINE_MS.store(0, Ordering::Release);
-                set_control_status(format!(
-                    "active STA server={} data_port={} reverse_command_port={}",
-                    pending.server,
-                    pending.port,
-                    pending.port.saturating_add(1)
-                ));
-                Ok(())
-            } else {
-                Err(anyhow!("flash TCP task could not start"))
-            }
-        });
-        if let Err(err) = result {
+        FLASH_FINISHED_REPORTED.store(false, Ordering::Release);
+        // Association and static-IP setup can take up to 15 seconds. Keep it
+        // out of Main's primary loop so UART responses, NAN bookkeeping, and
+        // an emergency managed reset remain serviceable while the control
+        // plane is connecting.
+        let spawn_result = thread::Builder::new()
+            .name("flash-sta-start".to_owned())
+            .spawn(move || {
+                let result = crate::components::wifi::start_flash_sta(
+                    &pending.ssid,
+                    &pending.psk,
+                    &pending.ip,
+                    &pending.gateway,
+                    &pending.netmask,
+                ).and_then(|()| {
+                    let remote_ip = CString::new(pending.server.as_str())
+                        .map_err(|err| anyhow!("invalid flash server address: {err}"))?;
+                    let target = CString::new(pending.target.as_str())
+                        .map_err(|err| anyhow!("invalid flash target: {err}"))?;
+                    let module = CString::new(pending.module.as_str())
+                        .map_err(|err| anyhow!("invalid flash module: {err}"))?;
+                    if unsafe {
+                        dmesh_flash_tcp_start_target(
+                            pending.port,
+                            remote_ip.as_ptr().cast(),
+                            target.as_ptr().cast(),
+                            module.as_ptr().cast(),
+                        )
+                    } {
+                        crate::components::ip_command::start(
+                            &pending.server,
+                            pending.port.saturating_add(1),
+                        )?;
+                        set_control_status(format!(
+                            "active STA server={} data_port={} reverse_command_port={}",
+                            pending.server,
+                            pending.port,
+                            pending.port.saturating_add(1)
+                        ));
+                        Ok(())
+                    } else {
+                        Err(anyhow!("flash TCP task could not start"))
+                    }
+                });
+                FLASH_STARTING.store(false, Ordering::Release);
+                if let Err(err) = result {
+                    set_control_status(format!("start failed: {err}"));
+                    crate::components::telemetry::record_log(format!(
+                        "event type=flash.control_plane start=false message={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                    FLASH_START_FAILED.store(true, Ordering::Release);
+                }
+            });
+        if let Err(err) = spawn_result {
+            FLASH_STARTING.store(false, Ordering::Release);
             set_control_status(format!("start failed: {err}"));
-            crate::components::telemetry::record_log(format!(
-                "event type=flash.control_plane start=false message={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            ));
-            let _ = crate::components::mode::resume_from_ip_transport(settings);
+            FLASH_START_FAILED.store(true, Ordering::Release);
         }
         return;
     }
     if unsafe { dmesh_flash_tcp_finished() } {
-        let now_ms = (unsafe { sys::esp_timer_get_time().max(0) as u64 } / 1_000) as u32;
-        let deadline_ms = POST_TRANSFER_DEADLINE_MS.load(Ordering::Acquire);
-        if deadline_ms == 0 {
-            POST_TRANSFER_DEADLINE_MS.store(
-                now_ms.wrapping_add(POST_TRANSFER_CONTROL_MS as u32),
-                Ordering::Release,
+        let succeeded = unsafe { dmesh_flash_tcp_accept() };
+        if FLASH_FINISHED_REPORTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !succeeded {
+            set_control_status("transfer failed");
+            crate::components::telemetry::record_log(
+                "event type=flash.control_plane transfer=failed",
             );
-            crate::components::telemetry::record_log(format!(
-                "event type=flash.control_plane transfer=complete post_transfer_control_ms={POST_TRANSFER_CONTROL_MS}"
-            ));
-            set_control_status(format!("transfer complete; control window={}ms", POST_TRANSFER_CONTROL_MS));
-        } else if now_ms.wrapping_sub(deadline_ms) < (1 << 31) {
-            POST_TRANSFER_DEADLINE_MS.store(0, Ordering::Release);
-            set_control_status("idle; control window expired");
             let _ = crate::components::mode::resume_from_ip_transport(settings);
+        } else {
+            // DONE is the end of the data-plane session.  Do not retain the
+            // IP transport state after it: doing so left Main looking alive
+            // over UART while its normal NAN/command scheduler remained
+            // suspended, and a later command could time out indefinitely.
+            crate::components::telemetry::record_log(
+                "event type=flash.control_plane transfer=complete resume=immediate",
+            );
+            set_control_status("transfer complete; resuming normal transport");
+            let _ = crate::components::mode::resume_from_ip_transport(settings);
+            set_control_status("idle");
         }
     }
 }
@@ -149,28 +209,29 @@ pub fn command_transport_ready() -> bool {
 /// flash that the hardware actually provides.
 pub fn configure_flash_size_from_hardware() -> Result<(usize, usize)> {
     let mut physical_size = 0_u32;
-    let configured_size = unsafe {
-        if esp_flash_default_chip.is_null() {
-            return Err(anyhow!("default flash chip is not initialized"));
-        }
-        (*esp_flash_default_chip).size as usize
-    };
-    let ret =
-        unsafe { sys::esp_flash_get_physical_size(esp_flash_default_chip, &mut physical_size) };
+    let mut configured_size = 0_u32;
+    let chip = unsafe { esp_flash_default_chip };
+    if chip.is_null() {
+        return Err(anyhow!("default flash chip is not initialized"));
+    }
+    let ret = unsafe { sys::esp_flash_get_size(chip, &mut configured_size) };
+    if ret != sys::ESP_OK {
+        return Err(anyhow!("configured flash-size query failed err=0x{ret:x}"));
+    }
+    let ret = unsafe { sys::esp_flash_get_physical_size(chip, &mut physical_size) };
     if ret != sys::ESP_OK {
         return Err(anyhow!("physical flash-size query failed err=0x{ret:x}"));
     }
+    let configured_size = configured_size as usize;
     let physical_size = physical_size as usize;
     if physical_size < configured_size {
         return Err(anyhow!(
             "physical flash size 0x{physical_size:x} is below configured size 0x{configured_size:x}"
         ));
     }
-    if physical_size != configured_size {
-        unsafe {
-            (*esp_flash_default_chip).size = physical_size as u32;
-        }
-    }
+    // ESP-IDF 6 makes esp_flash_t opaque, so its image-header `size` member
+    // cannot be modified from Rust. Raw high-flash operations use the
+    // physical-size API and explicit bounds instead.
     Ok((configured_size, physical_size))
 }
 
@@ -267,16 +328,25 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             // target and resolves the partition after receiving the header.
             if !matches!(
                 target.as_str(),
-                "boot" | "stage2" | "partition" | "partition-table" | "recovery" | "nvs" | "data"
+                "boot" | "stage2" | "partition" | "partition-table" | "recovery" | "nvs" | "data" | "module"
             ) {
                 return Err(anyhow!("unsupported TCP flash target={target}"));
             }
             let remote_ip = CString::new("")?;
+            let target_c = CString::new(target.as_str())?;
+            let module_c = CString::new(request.arg("module").unwrap_or(""))?;
             // This C entry point creates the FreeRTOS worker and returns; the
             // worker owns the socket, erase, write, and TCP wait. Keep the
             // control-plane handler synchronous only for startup so its CBOR
             // response is sent before the data-plane handoff.
-            let started = unsafe { dmesh_flash_tcp_start(port, remote_ip.as_ptr().cast()) };
+            let started = unsafe {
+                dmesh_flash_tcp_start_target(
+                    port,
+                    remote_ip.as_ptr().cast(),
+                    target_c.as_ptr().cast(),
+                    module_c.as_ptr().cast(),
+                )
+            };
             if !started {
                 return Err(anyhow!("flash TCP task could not start"));
             }
@@ -285,6 +355,9 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             )))
         }
         "connect" => {
+            if FLASH_STARTING.load(Ordering::Acquire) {
+                return Err(anyhow!("flash control plane start already in progress"));
+            }
             let target = required(request, "target")?.to_owned();
             let port: u16 = required(request, "port")?
                 .parse()
@@ -292,10 +365,14 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             let server = required(request, "server")?;
             let ssid = required(request, "ssid")?;
             let local_ip = required(request, "ip")?;
-            let gateway = request.arg("gateway").unwrap_or("10.78.0.1");
+            let gateway = request
+                .arg("gateway")
+                .or_else(|| request.arg("server"))
+                .unwrap_or("10.78.0.1");
+            let netmask = request.arg("mask").unwrap_or("255.255.0.0");
             if !matches!(
                 target.as_str(),
-                "boot" | "stage2" | "partition" | "partition-table" | "recovery" | "nvs" | "data"
+                "boot" | "stage2" | "partition" | "partition-table" | "recovery" | "nvs" | "data" | "module"
             ) {
                 return Err(anyhow!("unsupported TCP flash target={target}"));
             }
@@ -310,7 +387,14 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
                 psk: request.arg("psk").unwrap_or("").to_owned(),
                 ip: local_ip.to_owned(),
                 gateway: gateway.to_owned(),
+                netmask: netmask.to_owned(),
+                target: target.clone(),
+                module: request.arg("module").unwrap_or("").to_owned(),
             });
+            if !unsafe { dmesh_flash_tcp_prepare() } {
+                slot.take();
+                return Err(anyhow!("flash control plane already active"));
+            }
             set_control_status(format!("pending server={server} port={port}"));
             Ok(CommandResponse::ok(format!(
                 "flash control plane pending server={server} port={port}; NAN remains active until acknowledged"
@@ -462,7 +546,7 @@ fn find_partition(target: &str) -> Result<EspPartition> {
     let labels: &[&str] = match target {
         "main" => &["main", "factory"],
         "recovery" => &["recovery_app", "recovery"],
-        "data" => &["dmesh_store", "data"],
+        "data" | "module" => &["dmesh_store", "data"],
         "nvs" => &["nvs"],
         other => &[other],
     };

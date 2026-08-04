@@ -31,6 +31,8 @@ typedef int (*dmesh_lora_wait_irq_fn)(void *user, uint32_t timeout_ms);
 typedef uint64_t (*dmesh_lora_now_ms_fn)(void *user);
 typedef int (*dmesh_lora_log_fn)(void *user, const uint8_t *data, size_t len);
 typedef int (*dmesh_lora_packet_fn)(void *user, const uint8_t *data, size_t len, int16_t rssi_dbm, int8_t snr_db);
+typedef int (*dmesh_lora_poll_command_fn)(void *user, uint8_t *args, size_t *args_len,
+                                          uint8_t *payload, size_t *payload_len);
 
 typedef struct {
     uint32_t abi_version;
@@ -46,6 +48,7 @@ typedef struct {
     dmesh_lora_now_ms_fn now_ms;
     dmesh_lora_log_fn log_line;
     dmesh_lora_packet_fn emit_packet;
+    dmesh_lora_poll_command_fn poll_command;
 } dmesh_lora_host_v1;
 
 typedef struct {
@@ -62,4 +65,28 @@ typedef struct {
     int8_t cs_pin;
     int8_t irq_pin;
     int8_t busy_pin;
+    int8_t sck_pin;
+    int8_t miso_pin;
+    int8_t mosi_pin;
+    /* Board-level radio power is host-owned electrical setup, but belongs in
+     * the module configuration so a module deployment does not depend on a
+     * separate Main LoRa driver. Values < 0 disable the optional pin. */
+    int32_t board_power_pin;
+    int32_t board_power_level;
+    int32_t sx1262_dio2_rf_switch;
+    int32_t sx1262_tcxo_mv;
+    int32_t sx1262_pa_duty;
+    int32_t sx1262_pa_hp;
+    int32_t sx1262_pa_device;
+    int32_t sx1262_pa_lut;
+    int32_t sx1262_sync_word;
+    int32_t sx1262_rx_timeout_ms;
+    int32_t coding_rate;
+    int32_t preamble;
+    int32_t crc;
 } dmesh_lora_config_v1;
+
+#if UINTPTR_MAX == 0xffffffffu
+_Static_assert(sizeof(dmesh_lora_host_v1) == 56, "dmesh_lora_host_v1 ABI size");
+_Static_assert(sizeof(dmesh_lora_config_v1) == 92, "dmesh_lora_config_v1 ABI size");
+#endif

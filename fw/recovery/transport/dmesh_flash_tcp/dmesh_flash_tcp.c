@@ -18,10 +18,14 @@
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "nvs.h"
+#if defined(DMESH_FLASH_USE_LEGACY_MBEDTLS)
 #include "mbedtls/ecp.h"
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/sha256.h"
-#include "nvs.h"
+#else
+#include "psa/crypto.h"
+#endif
 
 #define TAG "dmesh-flash"
 #define PROTOCOL_MAGIC 0x44525332u /* DRS2 */
@@ -62,6 +66,8 @@
 #define TRUST_NAMESPACE "recovery"
 #define CONNECT_RETRY_COUNT 150u /* 30 seconds at 200 ms per attempt */
 #define CONNECT_RETRY_DELAY_MS 200u
+#define HELLO_EXTENDED_LEN 89u
+#define HELLO_MODULE_MAX 16u
 
 #if defined(DMESH_FLASH_ROLE_RECOVERY)
 #define FLASH_ROLE 2u
@@ -81,6 +87,8 @@ typedef struct {
     uint16_t port;
     int listener;
     char remote_ip[16];
+    char target[16];
+    char module[HELLO_MODULE_MAX + 1];
 } flash_job_t;
 
 typedef struct {
@@ -265,19 +273,44 @@ static bool sha256_partition(const esp_partition_t *partition, uint32_t offset,
                              uint32_t length, uint8_t digest[32])
 {
     uint8_t buffer[BLOCK_SIZE];
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    if (mbedtls_sha256_starts(&ctx, 0) != 0) return false;
+#if defined(DMESH_FLASH_USE_LEGACY_MBEDTLS)
+    mbedtls_sha256_context context;
+    mbedtls_sha256_init(&context);
+    if (mbedtls_sha256_starts(&context, 0) != 0) return false;
     while (length != 0) {
         size_t part = length > sizeof(buffer) ? sizeof(buffer) : length;
         if (esp_partition_read(partition, offset, buffer, part) != ESP_OK ||
-            mbedtls_sha256_update(&ctx, buffer, part) != 0) {
-            mbedtls_sha256_free(&ctx); return false;
+            mbedtls_sha256_update(&context, buffer, part) != 0) {
+            mbedtls_sha256_free(&context); return false;
         }
         offset += (uint32_t)part; length -= (uint32_t)part;
     }
-    bool ok = mbedtls_sha256_finish(&ctx, digest) == 0;
-    mbedtls_sha256_free(&ctx); return ok;
+    bool ok = mbedtls_sha256_finish(&context, digest) == 0;
+    mbedtls_sha256_free(&context); return ok;
+#else
+    if (psa_crypto_init() != PSA_SUCCESS) return false;
+    psa_hash_operation_t operation = PSA_HASH_OPERATION_INIT;
+    if (psa_hash_setup(&operation, PSA_ALG_SHA_256) != PSA_SUCCESS) return false;
+    while (length != 0) {
+        size_t part = length > sizeof(buffer) ? sizeof(buffer) : length;
+        if (esp_partition_read(partition, offset, buffer, part) != ESP_OK ||
+            psa_hash_update(&operation, buffer, part) != PSA_SUCCESS) {
+            psa_hash_abort(&operation); return false;
+        }
+        offset += (uint32_t)part; length -= (uint32_t)part;
+    }
+    return psa_hash_finish(&operation, digest, 32, NULL) == PSA_SUCCESS;
+#endif
+}
+
+static bool sha256_bytes(const uint8_t *data, size_t length, uint8_t digest[32])
+{
+#if defined(DMESH_FLASH_USE_LEGACY_MBEDTLS)
+    return mbedtls_sha256(data, length, digest, 0) == 0;
+#else
+    if (psa_crypto_init() != PSA_SUCCESS) return false;
+    return psa_hash_compute(PSA_ALG_SHA_256, data, length, digest, 32, NULL) == PSA_SUCCESS;
+#endif
 }
 
 static bool block_hash(const esp_partition_t *partition, uint32_t offset,
@@ -302,7 +335,7 @@ static int load_trust_key(uint8_t key[TRUST_KEY_SIZE])
 
 static bool key_fingerprint(const uint8_t key[TRUST_KEY_SIZE], uint8_t out[32])
 {
-    return mbedtls_sha256(key, TRUST_KEY_SIZE, out, 0) == 0;
+    return sha256_bytes(key, TRUST_KEY_SIZE, out);
 }
 
 static bool verify_manifest_signature(const uint8_t *data, size_t length,
@@ -310,7 +343,8 @@ static bool verify_manifest_signature(const uint8_t *data, size_t length,
                                       const uint8_t key[TRUST_KEY_SIZE])
 {
     uint8_t digest[32];
-    if (mbedtls_sha256(data, length, digest, 0) != 0) return false;
+    if (!sha256_bytes(data, length, digest)) return false;
+#if defined(DMESH_FLASH_USE_LEGACY_MBEDTLS)
     mbedtls_ecp_group group; mbedtls_ecp_point point;
     mbedtls_mpi r; mbedtls_mpi s;
     mbedtls_ecp_group_init(&group); mbedtls_ecp_point_init(&point);
@@ -322,11 +356,38 @@ static bool verify_manifest_signature(const uint8_t *data, size_t length,
               mbedtls_ecdsa_verify(&group, digest, sizeof(digest), &point, &r, &s) == 0;
     mbedtls_mpi_free(&s); mbedtls_mpi_free(&r); mbedtls_ecp_point_free(&point);
     mbedtls_ecp_group_free(&group); return ok;
+#else
+    if (psa_crypto_init() != PSA_SUCCESS) return false;
+    psa_key_attributes_t attributes = psa_key_attributes_init();
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attributes, 256);
+    psa_key_id_t key_id = 0;
+    psa_status_t status = psa_import_key(&attributes, key, TRUST_KEY_SIZE, &key_id);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS) return false;
+    status = psa_verify_hash(key_id, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                             digest, sizeof(digest), signature, 64);
+    (void)psa_destroy_key(key_id);
+    return status == PSA_SUCCESS;
+#endif
+}
+
+static uint8_t target_id(const char *target)
+{
+    if (target == NULL) return 0;
+    if (strcmp(target, "boot") == 0 || strcmp(target, "stage2") == 0) return TARGET_BOOT;
+    if (strcmp(target, "partition") == 0 || strcmp(target, "partition-table") == 0) return TARGET_PARTITION;
+    if (strcmp(target, "recovery") == 0) return TARGET_RECOVERY;
+    if (strcmp(target, "nvs") == 0) return TARGET_NVS;
+    if (strcmp(target, "data") == 0) return TARGET_DATA;
+    if (strcmp(target, "main") == 0) return TARGET_MAIN;
+    if (strcmp(target, "module") == 0) return TARGET_MODULE;
+    return 0;
 }
 
 static bool send_hello(int fd)
 {
-    uint8_t payload[71] = {0}; uint8_t mac[6] = {0}; uint8_t key[65]; uint8_t fp[32] = {0};
+    uint8_t payload[HELLO_EXTENDED_LEN] = {0}; uint8_t mac[6] = {0}; uint8_t key[65]; uint8_t fp[32] = {0};
     esp_chip_info_t chip = {0}; esp_chip_info(&chip); (void)esp_read_mac(mac, ESP_MAC_WIFI_STA);
     uint32_t flash = 0; (void)esp_flash_get_physical_size(NULL, &flash);
     put_u32(payload + 8, (uint32_t)esp_clk_cpu_freq());
@@ -339,6 +400,14 @@ static bool send_hello(int fd)
      * remains compatible with older hosts. */
     payload[69] = FLASH_ROLE;
     payload[70] = FLASH_PARTITION;
+    // Bytes 71..88 are an optional extension.  A zero target preserves the
+    // old client behavior and makes the server use its configured default.
+    payload[71] = target_id(active.target);
+    if (payload[71] == TARGET_MODULE && active.module[0] != '\0') {
+        size_t length = strnlen(active.module, HELLO_MODULE_MAX);
+        payload[72] = (uint8_t)length;
+        memcpy(payload + 73, active.module, length);
+    }
 #if CONFIG_SPIRAM
     put_u32(payload + 28, (uint32_t)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
     put_u32(payload + 32, (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -516,7 +585,7 @@ static bool receive_sparse_block(int fd, manifest_t *manifest, const uint8_t *da
     if (data[0] != manifest->target || !sparse_entry(manifest, index, &expected_length, &expected_hash) ||
         block_length != expected_length || length != 12 + block_length) return false;
     uint8_t digest[32];
-    if (mbedtls_sha256(data + 12, block_length, digest, 0) != 0 ||
+        if (!sha256_bytes(data + 12, block_length, digest) ||
         memcmp(digest, expected_hash, 4) != 0) return false;
     if (esp_partition_write(manifest->partition, manifest->start + index * BLOCK_SIZE,
                             data + 12, block_length) != ESP_OK) return false;
@@ -625,7 +694,7 @@ static bool receive_block(int fd, manifest_t *manifest, const uint8_t *data, uin
     if (data[0] != manifest->target || index >= manifest->count || block_length > BLOCK_SIZE ||
         block_length + index * BLOCK_SIZE > manifest->image_size || length != 12 + block_length)
         return false;
-    uint8_t digest[32]; if (mbedtls_sha256(data + 12, block_length, digest, 0) != 0 ||
+    uint8_t digest[32]; if (!sha256_bytes(data + 12, block_length, digest) ||
         memcmp(digest, manifest->hashes + index * 4, 4) != 0) return false;
     if (esp_partition_erase_range(manifest->partition, manifest->start + index * BLOCK_SIZE, BLOCK_SIZE) != ESP_OK ||
         esp_partition_write(manifest->partition, manifest->start + index * BLOCK_SIZE, data + 12, block_length) != ESP_OK)
@@ -746,18 +815,38 @@ done:
     active.listener = -1; flash_done = true; flash_pending = false; flash_task = NULL; vTaskDelete(NULL);
 }
 
-bool dmesh_flash_tcp_start(uint16_t port, const char *remote_ip)
+bool dmesh_flash_tcp_start_target(uint16_t port, const char *remote_ip,
+                                  const char *target, const char *module)
 {
     if (port == 0 || (flash_pending && !flash_done)) return false;
     if (active.listener >= 0) close(active.listener);
     memset(&active, 0, sizeof(active)); active.listener = -1; active.port = port;
     if (remote_ip != NULL) strncpy(active.remote_ip, remote_ip, sizeof(active.remote_ip) - 1);
+    strlcpy(active.target, target != NULL && target[0] != '\0' ? target : "main",
+            sizeof(active.target));
+    if (module != NULL) strlcpy(active.module, module, sizeof(active.module));
     flash_done = false; flash_result = false; flash_pending = true;
     if (xTaskCreatePinnedToCore(flash_worker, "dmesh_flash", BOOT_HEAP_STACK, NULL, 4, &flash_task, 1) != pdPASS) {
         flash_pending = false; return false;
     }
     ESP_LOGI(TAG, "negotiated session armed port=%u remote=%s", (unsigned)port,
-             active.remote_ip[0] != '\0' ? active.remote_ip : "listen"); return true;
+    active.remote_ip[0] != '\0' ? active.remote_ip : "listen"); return true;
+}
+
+bool dmesh_flash_tcp_prepare(void)
+{
+    if (flash_pending && !flash_done) return false;
+    // A completed worker leaves these bits set until the next start. Clear
+    // them at control-plane acceptance so an asynchronous STA-start failure
+    // cannot be reported as the previous session's success.
+    flash_done = false;
+    flash_result = false;
+    return true;
+}
+
+bool dmesh_flash_tcp_start(uint16_t port, const char *remote_ip)
+{
+    return dmesh_flash_tcp_start_target(port, remote_ip, "main", NULL);
 }
 
 void dmesh_flash_tcp_poll(void) {}

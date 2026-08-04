@@ -59,6 +59,21 @@ static RAW_NAN_LIGHT_WAKE_FAIL: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LIGHT_LAST_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LIGHT_LAST_CAUSE: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_LIGHT_LAST_RET: AtomicU32 = AtomicU32::new(0);
+// Main uses this only to prevent automatic light sleep immediately after a
+// cold boot. It is a deadline, not a task wait and is unrelated to UART input.
+static STARTUP_HOLD_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Keep the device awake until `duration_ms` has elapsed without blocking the
+/// Main task. The normal sleep scheduler observes this deadline below.
+pub fn begin_startup_hold(duration_ms: u32) {
+    let until = now_ms().wrapping_add(duration_ms);
+    STARTUP_HOLD_UNTIL_MS.store(until, Ordering::Release);
+}
+
+fn startup_hold_active() -> bool {
+    let until = STARTUP_HOLD_UNTIL_MS.load(Ordering::Acquire);
+    until != 0 && now_ms().wrapping_sub(until) >= 0x8000_0000
+}
 
 /// Sleep for a bounded idle interval with the radio-independent wake sources armed.
 ///
@@ -67,6 +82,11 @@ static RAW_NAN_LIGHT_LAST_RET: AtomicU32 = AtomicU32::new(0);
 /// their own deadlines and resume their radios after this returns.
 pub fn idle_light_sleep(settings: &SharedSettings, sleep_ms: u32) -> Result<()> {
     if sleep_ms == 0 {
+        return Ok(());
+    }
+
+    if startup_hold_active() {
+        telemetry::record_log("event type=boot_window sleep=skipped reason=startup_hold");
         return Ok(());
     }
 
@@ -1448,6 +1468,10 @@ fn active_window(state: &RtcSleepState) -> Result<bool> {
 
 fn now_us() -> u64 {
     unsafe { sys::esp_timer_get_time().max(0) as u64 }
+}
+
+fn now_ms() -> u32 {
+    (now_us() / 1_000) as u32
 }
 
 fn task_delay(timeout: Duration) {

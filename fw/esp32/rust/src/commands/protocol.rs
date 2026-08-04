@@ -14,6 +14,20 @@ pub const CBOR_ERROR: u16 = 5;
 /// resynchronization marker without treating the marker as a valid packet.
 pub const CBOR_MAX_RECORD: usize = 4_000;
 
+fn decode_text_bytes(value: &str) -> Result<Vec<u8>> {
+    let value = value.strip_prefix("hex:").unwrap_or(value);
+    if value.len() % 2 != 0 {
+        bail!("hex payload must have even length");
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| anyhow!("invalid hex payload at byte {index}"))
+        })
+        .collect()
+}
+
 /// Firmware-local command identifiers. These are two-byte CBOR values and are
 /// documented in `crates/lmesh/ESP_FIRMWARE_API.md`.
 pub fn command_id(name: &str) -> Option<u16> {
@@ -260,6 +274,11 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "beacon_history" => 401,
         "beacon_stats" => 404,
         "response_history" => 405,
+        // Flash-control resource selectors.  `module` identifies the DMOD
+        // name requested from the negotiated resource server; `gateway` is
+        // the static IPv4 route used by Main's STA maintenance session.
+        "module" => 406,
+        "gateway" => 407,
         // Targeted DW-gated rendezvous SDFs. These are firmware-private
         // fields shared with lmesh's `nan uart_wake`/`ble_wake` helpers.
         "uart_wake" => 402,
@@ -518,7 +537,14 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
                         kind => bail!("unsupported CBOR payload key {kind:?}"),
                     };
                     if tag == 39 {
-                        payload.extend_from_slice(decoder.bytes()?);
+                        match decoder.datatype()? {
+                            Type::Bytes => payload.extend_from_slice(decoder.bytes()?),
+                            // Text transports encode `data=...` as a string
+                            // inside the payload map. Accept the documented
+                            // hex form as well as native CBOR byte strings.
+                            Type::String => payload.extend(decode_text_bytes(decoder.str()?)?),
+                            kind => bail!("unexpected payload data type {kind:?}; expected bytes or hex string"),
+                        }
                     } else {
                         args.insert(tag, decoder.str()?.to_owned());
                     }
@@ -616,5 +642,17 @@ mod tests {
     #[test]
     fn role_has_a_stable_cbor_tag() {
         assert_eq!(arg_tag("role"), Some(219));
+    }
+
+    #[test]
+    fn text_payload_data_is_decoded_as_hex_bytes() {
+        let mut bytes = Vec::new();
+        Encoder::new(&mut bytes)
+            .map(2).unwrap()
+            .u16(0).unwrap().str("lorasend").unwrap()
+            .u16(6).unwrap()
+            .map(1).unwrap().str("data").unwrap().str("hex:00ff10").unwrap();
+        let request = decode_binary(&bytes).unwrap();
+        assert_eq!(request.payload, vec![0x00, 0xff, 0x10]);
     }
 }

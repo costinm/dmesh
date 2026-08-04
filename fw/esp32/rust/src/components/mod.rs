@@ -34,7 +34,7 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     i2c::register_commands(registry, settings.clone());
     lora::register_commands(registry, settings.clone());
     mode::register_commands(registry, settings.clone());
-    module::register_commands(registry);
+    module::register_commands(registry, settings.clone());
     ble_bt::register_commands(registry, settings.clone());
     nan::register_commands(registry, settings.clone());
     power::register_commands(registry, settings.clone());

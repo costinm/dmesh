@@ -9,7 +9,7 @@ use super::settings::SharedSettings;
 ///
 /// UART is re-opened by its next raw-NAN wake window, so an interactive
 /// console window need only cover one command/response exchange.
-pub const DEFAULT_ACTIVE_MS: u32 = 2_000;
+pub const DEFAULT_ACTIVE_MS: u32 = 4_000;
 /// Send an empty UART delimiter on every raw-NAN wake unless NVS overrides it.
 ///
 /// This is the battery-node host rendezvous: it lets lmesh flush one queued
@@ -17,8 +17,8 @@ pub const DEFAULT_ACTIVE_MS: u32 = 2_000;
 /// wake or keep UART powered between raw-NAN windows.
 /// Keep the console rendezvous out of most battery wake windows. Infrastructure
 /// mode overrides this with its continuously active UART policy.
-pub const DEFAULT_RAW_NAN_HEARTBEAT_EVERY: i32 = 16;
-const MIN_ACTIVE_MS: u32 = 2_000;
+pub const DEFAULT_RAW_NAN_HEARTBEAT_EVERY: i32 = 8;
+const MIN_ACTIVE_MS: u32 = 4_000;
 #[cfg(target_feature = "esp32s3ops")]
 const UART_REQUIRES_APB_LOCK: bool = false;
 #[cfg(not(target_feature = "esp32s3ops"))]

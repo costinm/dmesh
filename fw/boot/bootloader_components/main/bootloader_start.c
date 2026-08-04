@@ -7,7 +7,7 @@
 #include "sdkconfig.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_rom_uart.h"
+#include "esp_rom_serial_output.h"
 #include "esp_rom_sys.h"
 #include "esp_rom_gpio.h"
 #include "soc/rtc_cntl_reg.h"
@@ -17,13 +17,18 @@
 #include "bootloader_common.h"
 #include "nvs_bootloader.h"
 #include "boot_health_rtc.h"
+#include "boot_health_flash.h"
 #include "boot_protocol.h"
+#include "bootloader_flash_priv.h"
 
 #define RECOVERY_INDEX FACTORY_INDEX
 #define MAIN_INDEX 0 /* ota_0; factory (-1) is Recovery */
 #define RECOVERY_NAMESPACE "recovery"
 #define REQUEST_MAGIC 0x52455131u /* REQ1 */
-#define UART_BOOT_WINDOW_MS 50
+/* The command arrives through managed lmesh, not a locally polled UART
+ * client.  It is sent immediately after reset, so the development window can
+ * remain short and bounded. */
+#define UART_BOOT_WINDOW_MS 500
 #define BOOT_LOOP_WINDOW_TICKS 1000000u /* about 5 s at the ESP32 slow clock */
 #define FAILURE_LIMIT 6
 static const char *TAG = "dmesh-boot";
@@ -43,6 +48,30 @@ static uint64_t rtc_boot_ticks(void)
 {
     return ((uint64_t)(REG_READ(RTC_CNTL_TIME1_REG) & 0xffffu) << 32) |
            REG_READ(RTC_CNTL_TIME0_REG);
+}
+
+static uint8_t boot_journal_count(void)
+{
+    uint32_t word = UINT32_MAX;
+    if (bootloader_flash_read(DMESH_BOOT_JOURNAL_BYTE_OFFSET, &word, sizeof(word), false) != ESP_OK) {
+        return 0;
+    }
+    uint8_t marker = (uint8_t)word;
+    if (marker == 0xff) return 0;
+    if (marker == 0xfe) return 1;
+    return 2;
+}
+
+static void boot_journal_record(uint8_t count)
+{
+    if (count > 2) return;
+    uint32_t word = UINT32_MAX;
+    if (bootloader_flash_read(DMESH_BOOT_JOURNAL_BYTE_OFFSET, &word, sizeof(word), false) != ESP_OK) {
+        return;
+    }
+    uint8_t marker = (uint8_t)(0xffu << (count + 1));
+    word = (word & ~0xffu) | marker;
+    (void)bootloader_flash_write(DMESH_BOOT_JOURNAL_BYTE_OFFSET, &word, sizeof(word), false);
 }
 
 #if CONFIG_BOOTLOADER_CUSTOM_RESERVE_RTC
@@ -144,6 +173,17 @@ static bool read_u32(const char *key, uint32_t *value)
     return false;
 }
 
+static bool uart_boot_enabled(void)
+{
+    uint32_t value = 1;
+    bool configured = read_u32("uart_boot", &value);
+    /* Missing or malformed configuration is development-safe for existing
+     * boards. Production provisioning must write recovery:uart_boot=0. */
+    ESP_LOGI(TAG, "uart_boot configured=%d value=%u enabled=%d",
+             configured, (unsigned)value, configured ? (value != 0) : 1);
+    return !configured || value != 0;
+}
+
 static bool recovery_requested(void)
 {
     uint32_t magic = 0;
@@ -239,15 +279,30 @@ static void halt_for_uart(const char *reason)
 
 static int select_partition(void)
 {
-    bool uart = uart_boot_requested();
+    bool uart_enabled = uart_boot_enabled();
+    bool uart = uart_enabled && uart_boot_requested();
     bool request = recovery_requested();
+    uint8_t journal_count = boot_journal_count();
+    /* Some boards, including E5, wire CP210x RTS to EN and report the reset
+     * as POWERON_RESET. Their RTC retention is cleared, so keep only the
+     * small reset streak in the reserved final data sector as a fallback. */
+    if (!request && !uart) {
+        if (journal_count >= 2) {
+            request = true;
+        } else {
+            boot_journal_record((uint8_t)(journal_count + 1));
+        }
+    }
 #if CONFIG_BOOTLOADER_RESERVE_RTC_MEM
     boot_health_state_t *health = boot_health_state();
     uint8_t event = DMESH_RTC_HEALTH_EVENT;
     if (event == DMESH_BOOT_HEALTH_MAIN_OK) {
         health->main_failures = 0;
-        memset(health->boot_times, 0, sizeof(health->boot_times));
-        memset(health->boot_kinds, 0, sizeof(health->boot_kinds));
+        /* Keep rapid-reset timestamps across a healthy Main boot.  A
+         * deliberate sequence of external RTS resets must be able to select
+         * Recovery even when Main normally reaches MAIN_OK.  Old entries are
+         * ignored by BOOT_LOOP_WINDOW_TICKS and Recovery_OK clears the whole
+         * history after a successful update. */
     }
     if (event == DMESH_BOOT_HEALTH_RECOVERY_OK) {
         /* Recovery completed its transaction and is about to reboot.  The
@@ -275,16 +330,26 @@ static int select_partition(void)
             sizeof(health->boot_kinds) - sizeof(health->boot_kinds[0]));
     health->boot_times[0] = (uint32_t)now_ticks;
     health->boot_kinds[0] = 1;
-    ESP_LOGI(TAG, "select uart=%d request=%d recent_boots=%u main_failures=%u recovery_failures=%u reset_reason=%d",
-             uart, request, recent, health->main_failures,
-             health->recovery_failures, esp_rom_get_reset_reason(0));
+    ESP_LOGW(TAG, "select uart_enabled=%d uart=%d request=%d recent_boots=%u main_failures=%u recovery_failures=%u reset_reason=%d",
+             uart_enabled, uart, request, recent, health->main_failures,
+             health->recovery_failures,
+             esp_rom_get_reset_reason(0));
 
     if (recent >= 3 && !request && !uart) {
         ESP_LOGW(TAG, "rapid reboot history selects Recovery");
         request = true;
     }
 
-    if (uart || request) {
+    /* An explicit physical RECOVER selector is the last-resort repair path.
+     * It must remain usable even when stale RTC health state has exhausted
+     * the automatic Recovery retry budget.  Automatic/NVS requests still
+     * obey the failure limit below. */
+    if (uart) {
+        ESP_LOGW(TAG, "explicit UART Recovery overrides failure limit");
+        return RECOVERY_INDEX;
+    }
+
+    if (request) {
         if (health->recovery_failures >= FAILURE_LIMIT) {
             ESP_LOGW(TAG, "recovery failed %u times; falling back to Main",
                      health->recovery_failures);

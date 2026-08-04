@@ -8,7 +8,8 @@
 
 use core::ffi::c_void;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+const ERR_CONTEXT_ABI: i32 = -100;
 
 pub type LogLine = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 pub type CallService = unsafe extern "C" fn(
@@ -20,6 +21,21 @@ pub type CallService = unsafe extern "C" fn(
     *const u8,
     usize,
 ) -> i32;
+pub type GetSetting = unsafe extern "C" fn(
+    *mut c_void, *const u8, usize, *mut u8, usize, *mut usize,
+) -> i32;
+pub type SetSetting = unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize) -> i32;
+#[repr(C)]
+pub struct ModuleEvent {
+    pub event_id: u16,
+    pub value_type: u8,
+    pub flags: u8,
+    pub value: *const u8,
+    pub value_len: usize,
+}
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<ModuleEvent>() == 12);
+pub type EmitEvent = unsafe extern "C" fn(*mut c_void, *const ModuleEvent) -> i32;
 
 #[repr(C)]
 pub struct ModuleContext {
@@ -28,8 +44,15 @@ pub struct ModuleContext {
     pub user: *mut c_void,
     pub log_line: Option<LogLine>,
     pub call_service: Option<CallService>,
+    pub get_setting: Option<GetSetting>,
+    pub set_setting: Option<SetSetting>,
+    pub emit_event: Option<EmitEvent>,
     pub lora_host: *const c_void,
+    pub lora_config: *const c_void,
 }
+
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<ModuleContext>() == 40);
 
 /// Module implementation used by the flat-image entry stub.
 ///
@@ -47,7 +70,7 @@ pub unsafe fn entry(
     }
     let context = &*context;
     if context.abi_version != ABI_VERSION || context.size < core::mem::size_of::<ModuleContext>() as u32 {
-        return -2;
+        return ERR_CONTEXT_ABI;
     }
 
     // Touch both borrowed buffers without retaining pointers. This proves the

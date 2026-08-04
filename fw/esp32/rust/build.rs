@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(esp_idf_version_at_least_6_0_0)");
     let recovery_transport = std::env::var_os("DMESH_RECOVERY_TRANSPORT_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -6,15 +7,10 @@ fn main() {
                 .join("../../recovery/transport/dmesh_flash_tcp")
         });
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    for partition_file in [
-        "partitions_4mb_large_app.csv",
-        "partitions_8mb_large_app_store.csv",
-        "partitions_16mb_large_app_store.csv",
-    ] {
-        std::fs::copy(partition_file, format!("{out_dir}/{partition_file}"))
-            .unwrap_or_else(|err| panic!("copy {partition_file}: {err}"));
-        println!("cargo:rerun-if-changed={partition_file}");
-    }
+    let partition_file = std::path::Path::new("../../boot/partitions.csv");
+    std::fs::copy(partition_file, format!("{out_dir}/partitions.csv"))
+        .unwrap_or_else(|err| panic!("copy {}: {err}", partition_file.display()));
+    println!("cargo:rerun-if-changed={}", partition_file.display());
     println!("cargo:rerun-if-changed=native/dmesh_nimble/dmesh_nimble.c");
     println!("cargo:rerun-if-changed=native/dmesh_nimble/include/dmesh_nimble.h");
     println!("cargo:rerun-if-changed=native/dmesh_nimble/CMakeLists.txt");

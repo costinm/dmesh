@@ -6,11 +6,13 @@ and argument bytes. Its initial host capability is a bounded `log_line`
 callback; the ABI also reserves `call_service`, which queues a service command
 to Main's serialized command registry.
 
-The module is intended to be linked as position-independent code and wrapped
-in the 64-byte `DMOD` header from `include/dmesh_module_abi.h`. The wrapper is
+The module is wrapped in the 64-byte `DMOD` header from
+`include/dmesh_module_abi.h`. The wrapper is
 written to a 64 KiB-aligned offset of the ESP `data` region using DRS2 target
 `module`; Main maps it into instruction space and invokes the entry after
-validating the header.
+validating the header. The header records the module's requested FreeRTOS
+stack depth in words; Main clamps it to its supported range before creating
+the task.
 
 This is deliberately an ABI experiment, not a sandbox. Module code executes
 with Main's privileges. It must not define retained state, call host symbols,
@@ -25,12 +27,28 @@ Build the ESP image with the repository-local toolchain:
 bash fw/mod_hello/build.sh xtensa-esp32-espidf
 ```
 
-This writes `target/modules/xtensa-esp32-espidf/mod_hello.dmod`. The script
-links at address zero and refuses artifacts with relocations, global symbols,
-data, or BSS. The Xtensa Rust backend currently rejects the formal PIC
-relocation model, but the accepted flat artifact has no relocations and its
-disassembly uses only local control flow plus the callback supplied in the
-context. It can therefore be mapped at any 64 KiB-aligned flash location.
+For RISC-V boards, use the Espressif target instead:
+
+```sh
+bash fw/mod_hello/build.sh riscv32imac-esp-espidf
+```
+
+The RISC-V build uses Rust's PIC relocation model and is checked for an empty
+relocation table before packaging.
+
+This writes `target/modules/xtensa-esp32-espidf/mod_hello.dmod`. The default
+script links at address zero and refuses artifacts with relocations, global
+symbols, data, or BSS. Xtensa Rust does not currently produce a safe generic
+PIC image: a flat image with VMA zero must not be mapped at an arbitrary
+virtual address. The loader's fixed-window experiment can be built explicitly
+with a code VMA 64 bytes after its target window, for example:
+
+```sh
+DMESH_MODULE_VMA=0x43000040 bash fw/mod_hello/build.sh xtensa-esp32s3-espidf
+```
+
+That sets the DMOD fixed-VMA flag; Main must be built with the corresponding
+reserved MMU window before such an image is deployed.
 
 The wrapped image is named `hello`. Upload it through DRS2 target `module` at
 a 64 KiB-aligned offset, then invoke it from Main with

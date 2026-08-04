@@ -40,6 +40,10 @@ const RAW_FILTER_DMESH_DATA: u32 = 8;
 const RAW_COMMAND_QUEUE_MAX: usize = 8;
 const RAW_COMMAND_MAX_LEN: usize = 512;
 const RAW_BROADCAST: [u8; 6] = [0xff; 6];
+// ESP-IDF does not expose esp-netif error constants through every generated
+// esp-idf-sys binding set.  This is ESP_ERR_ESP_NETIF_BASE + 0x05 from
+// esp_netif_types.h (0x5005): stopping DHCP when it is already stopped.
+const ESP_ERR_DHCP_ALREADY_STOPPED: sys::esp_err_t = 0x5005;
 // lmesh discovery uses ff02::5227, whose Ethernet/Wi-Fi multicast mapping is
 // 33:33:00:00:52:27. Directed device traffic uses the peer MAC with the
 // multicast bit set.
@@ -1176,12 +1180,19 @@ fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
 /// Temporarily move Main from raw NAN to the IP STA data plane. This is used
 /// only by the control-plane flasher; callers must later resume NAN through
 /// mode::resume_from_ip_transport().
-pub fn start_flash_sta(ssid: &str, psk: &str, ip: &str, gateway: &str) -> Result<()> {
+pub fn start_flash_sta(
+    ssid: &str,
+    psk: &str,
+    ip: &str,
+    gateway: &str,
+    netmask: &str,
+) -> Result<()> {
     let request = CommandRequest::new("wifi")
         .arg_pair("ssid", ssid)
         .arg_pair("psk", psk)
         .arg_pair("ip", ip)
         .arg_pair("gw", gateway)
+        .arg_pair("mask", netmask)
         .arg_pair("timeout", "0");
     let mut command = WifiCommand::default();
     command.start_sta(&request).map(|_| ())
@@ -1339,7 +1350,12 @@ fn start_ip_sta(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -
     info.gw.addr = parse_ipv4(gateway, "gateway")?;
     info.netmask.addr = parse_ipv4(netmask, "netmask")?;
     unsafe {
-        esp_ok_allow_invalid_state(sys::esp_netif_dhcpc_stop(netif))?;
+        // The STA netif is cached across control-plane sessions.  The first
+        // session stops DHCP for the static address, so subsequent sessions
+        // legitimately report DHCP_ALREADY_STOPPED.  Treat that state as
+        // idempotent; otherwise a valid recovery request fails before the
+        // radio can associate or open its TCP socket.
+        esp_ok_allow_dhcp_already_stopped(sys::esp_netif_dhcpc_stop(netif))?;
         esp_ok(sys::esp_netif_set_ip_info(netif, &info))?;
     }
     // Configure the static address before starting the station. This is the
@@ -2769,5 +2785,13 @@ fn esp_ok_allow_invalid_state(ret: sys::esp_err_t) -> Result<()> {
         Ok(())
     } else {
         bail!("esp_err=0x{ret:x}")
+    }
+}
+
+fn esp_ok_allow_dhcp_already_stopped(ret: sys::esp_err_t) -> Result<()> {
+    if ret == ESP_ERR_DHCP_ALREADY_STOPPED {
+        Ok(())
+    } else {
+        esp_ok_allow_invalid_state(ret)
     }
 }

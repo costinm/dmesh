@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::ffi::{c_char, c_int};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 mod commands;
 mod components;
@@ -10,8 +11,12 @@ use commands::CommandRegistry;
 use components::l3dmesh::L3Mesh;
 
 const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
-const BOOT_PAIRING_HOLD_MS: u32 = 3_000;
 const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
+
+// UART0 has exactly one framed owner after init_console_uart().  Raw ROM
+// breadcrumbs are useful before that point, but writing them afterwards can
+// split a CBOR/PPP record and make lmesh lose the boot/mode notification.
+static FRAMED_UART_READY: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let _ = run();
@@ -43,7 +48,6 @@ fn run() -> Result<()> {
     let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
     boot_print("dm-rs boot step=settings\n");
     let settings = components::settings::open_shared();
-    components::serial::configure_active_window(&settings);
     boot_print("dm-rs boot step=power\n");
     if let Err(err) = components::power::apply_default(&settings) {
         components::telemetry::record_log(format!(
@@ -74,8 +78,10 @@ fn run() -> Result<()> {
     boot_print("dm-rs boot step=registry\n");
     let mut registry = CommandRegistry::new();
     components::register_commands(&mut registry, settings.clone());
-    boot_print("dm-rs boot step=module_init\n");
-    components::module::init();
+    // Optional modules are deliberately not touched during boot. A stale or
+    // incompatible module must not prevent Main from reaching its console;
+    // explicit `module`/`lora` commands initialize the loader instead.
+    boot_print("dm-rs boot step=module_deferred\n");
 
     boot_print("dm-rs boot step=ble_config\n");
     let companion_setting = settings.borrow().get_bool("ble.comp", true);
@@ -94,8 +100,11 @@ fn run() -> Result<()> {
     components::ble_bt::configure_companion_advertising(30_000, 5_000);
     components::ble_bt::configure_companion_active_window(companion_active_ms);
     boot_print("dm-rs boot step=boot_window\n");
-    let boot_window = run_boot_active_window(wake_cause, &mut registry);
-    apply_post_boot_uart_policy(&boot_window);
+    let boot_window = run_boot_active_window(wake_cause);
+    // UART remains available through its dedicated manager task, but it is
+    // configured after the startup hold is armed and never decides its
+    // duration or whether Main may continue booting.
+    components::serial::configure_active_window(&settings);
     boot_print("dm-rs boot step=mode\n");
     if boot_window.pairing_recovery {
         match components::ble_bt::start_pairing_recovery(&settings) {
@@ -117,7 +126,11 @@ fn run() -> Result<()> {
             components::ble_bt::PAIRING_RECOVERY_WINDOW_MS,
         );
     } else if is_real_boot(wake_cause) || is_button_wake(wake_cause) {
-        components::mode::init_after_boot_window(&settings, is_button_wake(wake_cause));
+        components::mode::init_after_boot_window(
+            &settings,
+            is_button_wake(wake_cause),
+            is_real_boot(wake_cause),
+        );
     } else {
         components::mode::init(&settings);
     }
@@ -132,6 +145,12 @@ fn run() -> Result<()> {
         let mut mesh = L3Mesh::new();
         boot_print("dm-rs boot step=mesh_ble_local_only\n");
         boot_print("dm-rs boot step=mesh_lora\n");
+        if components::module::lora_enabled() {
+            boot_print("dm-rs lora backend=module");
+        }
+        // Keep the transport registration stable. The module owns the radio
+        // task; this transport remains the Main-side forwarding surface and
+        // legacy fallback path.
         mesh.add_transport(components::lora::transport(settings.clone()));
         boot_print("dm-rs boot step=mesh_nan\n");
         mesh.add_transport(components::nan::transport());
@@ -141,17 +160,15 @@ fn run() -> Result<()> {
     components::telemetry::record_log(ready);
     components::recovery::mark_main_boot_healthy();
     boot_print("dm-rs boot step=console\n");
-    // GPIO0 is the physical PRG input. Its ISR only coalesces
-    // an edge and wakes the button task; all GPIO re-arm/classification work
-    // runs outside interrupt context.
-    match components::button::start_runtime_interrupts() {
-        Ok(()) => components::telemetry::record_log("event type=button.runtime_interrupt ok=true"),
-        Err(err) => components::telemetry::record_log(format!(
-            "event type=button.runtime_interrupt ok=false msg={}",
-            commands::protocol::escape_value(&err.to_string())
-        )),
-    }
-    boot_print("dm-rs boot step=runtime_interrupts");
+    // Stage2 owns boot-time recovery selection. Do not install the GPIO0 ISR
+    // during Main startup: on some ESP32 boards the physical PRG line can
+    // generate an interrupt storm before the scheduler is fully settled,
+    // starving CPU0 and tripping the interrupt watchdog. Button GPIO setup
+    // remains available for sleep configuration and explicit future repair.
+    components::telemetry::record_log(
+        "event type=button.runtime_interrupt enabled=false reason=stage2_owns_recovery",
+    );
+    boot_print("dm-rs boot step=runtime_interrupts_skipped");
     let mut first_loop_trace = true;
     loop {
         components::telemetry::record_main_loop();
@@ -187,7 +204,7 @@ fn run() -> Result<()> {
         poll_raw_wifi_commands(&mut registry, &settings);
         poll_nan_commands(&mut registry, &settings);
         components::ip_command::poll(&mut registry);
-        components::module::poll_main(&mut registry);
+        components::module::poll_main(&mut registry, &settings);
         components::test::poll_main();
         drain_uart_console(&mut registry, &settings, companion_active_ms);
         // The CBOR recovery command only arms the raw TCP session. The worker
@@ -250,117 +267,40 @@ enum UartWait {
 }
 
 struct BootWindowResult {
-    probed: bool,
     pairing_recovery: bool,
-    uart_input: bool,
 }
 
-fn run_boot_active_window(
-    wake_cause: esp_idf_sys::esp_sleep_source_t,
-    registry: &mut CommandRegistry,
-) -> BootWindowResult {
+fn run_boot_active_window(wake_cause: esp_idf_sys::esp_sleep_source_t) -> BootWindowResult {
     if !is_real_boot(wake_cause) {
         return BootWindowResult {
-            probed: false,
             pairing_recovery: false,
-            uart_input: false,
         };
     }
 
-    let boot_pressed = components::button::is_pressed();
-    let probe_long_press = true;
     components::telemetry::record_log(
-        "event type=boot_window barrier=true action=watch_prg_and_console",
+        "event type=boot_window barrier=true action=startup_hold",
     );
     components::telemetry::record_log(format!(
-        "event type=boot_window start=true cause={} probe_long_press={} window_ms={}",
+        "event type=boot_window start=true cause={} window_ms={}",
         wake_cause_name(wake_cause),
-        probe_long_press,
         boot_active_window_ms()
     ));
 
-    let deadline = Instant::now() + Duration::from_millis(boot_active_window_ms() as u64);
-    let mut uart_input = false;
-    if boot_pressed {
-        let hold = Duration::from_millis(BOOT_PAIRING_HOLD_MS as u64);
-        let _ = wait_for_firmware_activity(hold);
-        uart_input |= poll_boot_console(registry);
-        if components::button::is_pressed() {
-            components::button::suppress_until_release();
-            components::telemetry::record_log(
-                "event type=boot_window long_press=true pending=pairing_recovery",
-            );
-            components::telemetry::record_log(
-                "event type=boot_window done=true pairing_recovery=true immediate=true",
-            );
-            return BootWindowResult {
-                probed: true,
-                pairing_recovery: true,
-                uart_input,
-            };
-        }
-    }
-    while Instant::now() < deadline {
-        uart_input |= poll_boot_console(registry);
-        if probe_long_press && components::button::take_long_presses() > 0 {
-            components::button::suppress_until_release();
-            components::telemetry::record_log(
-                "event type=boot_window long_press=true pending=pairing_recovery",
-            );
-            components::telemetry::record_log(
-                "event type=boot_window done=true pairing_recovery=true immediate=true",
-            );
-            return BootWindowResult {
-                probed: true,
-                pairing_recovery: true,
-                uart_input,
-            };
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let wait = remaining.min(Duration::from_millis(500));
-        let _ = wait_for_firmware_activity(wait);
-    }
+    // Do not delay the Main task here. The sleep scheduler will skip light
+    // sleep until this deadline, while all normal tasks (including UART) keep
+    // running.
+    components::sleep::begin_startup_hold(boot_active_window_ms());
     components::telemetry::record_log(format!(
         "event type=boot_window done=true pairing_recovery={}",
         false
     ));
     BootWindowResult {
-        probed: true,
         pairing_recovery: false,
-        uart_input,
     }
 }
 
 fn boot_active_window_ms() -> u32 {
     BOOT_ACTIVE_WINDOW_MS
-}
-
-fn apply_post_boot_uart_policy(boot_window: &BootWindowResult) {
-    if !boot_window.probed {
-        return;
-    }
-    if boot_window.uart_input {
-        components::telemetry::record_log("event type=uart.boot_policy input=true debug=true");
-        components::serial::set_debug_enabled(true);
-        return;
-    }
-
-    components::telemetry::record_log("event type=uart.boot_policy input=false debug=false");
-    components::serial::set_debug_enabled(false);
-}
-
-fn poll_boot_console(registry: &mut CommandRegistry) -> bool {
-    let mut received = false;
-    while let Some(frame) = components::serial::take_frame() {
-        received = true;
-        components::serial::write_packet(&transports::dispatch_uart_packet(registry, &frame.data));
-        let _ = components::serial::finish_pending_suspend();
-        let _ = components::serial::finish_pending_uninstall();
-    }
-    received
 }
 
 fn is_real_boot(cause: esp_idf_sys::esp_sleep_source_t) -> bool {
@@ -440,12 +380,14 @@ fn poll_nan_commands(
 /// ISR active through the radio startup transition.
 fn boot_print(message: &str) {
     components::telemetry::record_log(message.trim());
-    // Keep a small unframed boot breadcrumb in the captured UART stream. This
-    // runs only during startup, before the bounded framed console policy, and
-    // lets recovery distinguish a board hang from a quiet runtime UART.
-    if let Ok(message) = std::ffi::CString::new(message.trim()) {
-        unsafe {
-            esp_rom_printf(b"%s\r\n\0".as_ptr() as *const c_char, message.as_ptr());
+    // Keep raw output strictly before the framed UART owner starts. Once the
+    // driver is ready, telemetry is the only output path; otherwise a ROM
+    // breadcrumb can be inserted in the middle of a framed response/event.
+    if !FRAMED_UART_READY.load(Ordering::Acquire) {
+        if let Ok(message) = std::ffi::CString::new(message.trim()) {
+            unsafe {
+                esp_rom_printf(b"%s\r\n\0".as_ptr() as *const c_char, message.as_ptr());
+            }
         }
     }
 }
@@ -490,27 +432,29 @@ fn init_console_uart() {
         // A replaced early-console driver does not retain a portable pin
         // attachment. UART0 is GPIO1/3 on classic ESP32 and GPIO43/44 on the
         // S3 external bridge used by the Heltec V3 test board.
+        // ESP-IDF 6 exposes the variadic C macro as its concrete 7-argument
+        // implementation in bindgen. Older SDKs expose the 5-argument symbol.
+        #[cfg(esp_idf_version_at_least_6_0_0)]
+        let _ = esp_idf_sys::_uart_set_pin6(UART0, tx_pin, rx_pin, -1, -1, -1, -1);
+        #[cfg(not(esp_idf_version_at_least_6_0_0))]
         let _ = esp_idf_sys::uart_set_pin(UART0, tx_pin, rx_pin, -1, -1);
         let _ = esp_idf_sys::uart_disable_tx_intr(UART0);
-        // Let the IDF driver own RX interrupt arming. A one-byte threshold
-        // can create an interrupt storm on a floating/noisy USB-UART input
-        // during startup; the timeout still wakes the manager for commands.
+        // Let the hardware report a complete short command or the RX timeout.
+        // On ESP32-S3, a one-byte threshold can leave the IDF event path
+        // disabled after the driver is installed; the timeout still handles
+        // the short framed commands without requiring a second UART reader.
         let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 64);
         let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
         esp_idf_sys::uart_set_always_rx_timeout(UART0, true);
+        let _ = esp_idf_sys::uart_enable_rx_intr(UART0);
         let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
         let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
         match components::serial::start_ingress_task(queue) {
             Ok(()) => {
                 components::serial::activate_window();
+                FRAMED_UART_READY.store(true, Ordering::Release);
                 components::telemetry::record_log(
                     "event type=uart.rx_queue state=ready baud=115200 tx_isr=false",
-                );
-                esp_rom_printf(
-                    b"dm-rs uart rx_queue=ready rx_gpio=%d tx_gpio=%d\r\n\0".as_ptr()
-                        as *const c_char,
-                    rx_pin,
-                    tx_pin,
                 );
             }
             Err(err) => {

@@ -221,7 +221,11 @@ pub fn is_companion_mode() -> bool {
     PRODUCT_MODE.load(Ordering::Relaxed) == MODE_COMPANION
 }
 
-pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
+pub fn init_after_boot_window(
+    settings: &SharedSettings,
+    button_wake: bool,
+    rebooted: bool,
+) {
     let reason = if button_wake {
         "button_wake"
     } else {
@@ -241,6 +245,29 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool) {
             crate::commands::protocol::escape_value(&err.to_string())
         ));
     }
+    // This is the first compact framed state packet after the startup hold.
+    // lmesh uses it to classify the forward without waiting for a host probe;
+    // `active` is intentionally present so older lmesh versions can consume
+    // it using the existing mode parser.
+    telemetry::emit_console(&format!(
+        "event type=boot.state rebooted={} mode={} active={} infra_active={}",
+        rebooted,
+        mode_name(),
+        mode_name(),
+        infra_active_session_enabled()
+    ));
+    emit_mode_state();
+}
+
+/// Host-visible state transition used by managed UART forwards.  This is an
+/// event, not a command response, so lmesh can update its write policy when a
+/// board enters or leaves a bounded active window without polling repeatedly.
+fn emit_mode_state() {
+    telemetry::emit_console(&format!(
+        "event type=mode.state active={} infra_active={}",
+        mode_name(),
+        infra_active_session_enabled()
+    ));
 }
 
 pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) -> Result<()> {
@@ -259,6 +286,7 @@ pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) ->
             true,
             AP_OWNER_RUNNING.load(Ordering::Relaxed)
         ));
+        emit_mode_state();
         return Ok(());
     }
     PRODUCT_MODE.store(MODE_INFRA, Ordering::Relaxed);
@@ -270,6 +298,7 @@ pub fn set_infra(settings: &SharedSettings, save: bool, reason: &'static str) ->
     }
     start_infra_radios(settings, reason)?;
     telemetry::record_log(format!("event type=mode active=infra reason={}", reason));
+    emit_mode_state();
     Ok(())
 }
 
@@ -288,6 +317,7 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
         "event type=mode active=companion state=pairing_recovery window_ms={}",
         window_ms
     ));
+    emit_mode_state();
 }
 
 pub fn poll(settings: &SharedSettings) {
@@ -375,6 +405,7 @@ fn poll_infra_active_session() {
     {
         INFRA_ACTIVE_EXPIRES.fetch_add(1, Ordering::Relaxed);
         telemetry::record_log("event type=mode.infra_active state=expired");
+        emit_mode_state();
     }
 }
 
@@ -503,6 +534,7 @@ fn start_infra_active_session(
         persistent,
         active_ms.unwrap_or(0)
     ));
+    emit_mode_state();
     Ok(())
 }
 
@@ -515,6 +547,7 @@ fn stop_infra_active_session() {
         // beacon-aligned duty sleep interval.
         RAW_NAN_DUTY_NEXT_MS.store(now_ms(), Ordering::Relaxed);
         telemetry::record_log("event type=mode.infra_active state=stopped");
+        emit_mode_state();
     }
 }
 
@@ -1040,6 +1073,11 @@ pub fn stop_raw_nan_duty() {
 /// is intentionally not persisted in NVS.
 pub fn stop_for_ip_transport() {
     IP_TRANSPORT_ACTIVE.store(true, Ordering::Release);
+    // Main remains the control-plane owner while the STA/TCP worker is
+    // active. Keep its managed UART available for status, handoff errors,
+    // and an emergency firmware reset for the entire transfer; the normal
+    // bounded UART window must not expire halfway through a flash session.
+    super::serial::set_always_on(true);
     // Keep the tcpip task scheduled while the update data plane is active;
     // raw-NAN normally enables automatic light sleep between discovery
     // windows, which is not compatible with starting a BSD listener.
@@ -1064,6 +1102,7 @@ pub fn resume_from_ip_transport(settings: &SharedSettings) -> Result<()> {
     }
     super::ip_command::stop();
     super::wifi::stop_flash_sta();
+    super::serial::set_always_on(false);
     super::power::configure_for_light_sleep(true).ok();
     let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
     start_raw_nan_duty(settings, "flash_complete", channel)
@@ -2283,14 +2322,14 @@ impl CommandHandler for ModeCommand {
                 bail!("active requires infra mode; run mode infra=true first");
             }
             start_infra_active_session(&self.settings, None, "command_alias")?;
-            return Ok(CommandResponse::ok(status_text()));
+            return Ok(CommandResponse::ok(active_status_text()));
         }
         if request.name == "idle" {
             if is_companion_mode() {
                 bail!("idle requires infra mode; run mode infra=true first");
             }
             stop_infra_active_session();
-            return Ok(CommandResponse::ok(status_text()));
+            return Ok(CommandResponse::ok(active_status_text()));
         }
         if let Some(value) = request
             .arg("nan_early_ms")
@@ -2456,7 +2495,7 @@ impl CommandHandler for ModeCommand {
                 } else {
                     enter_companion_sleep(&self.settings)?;
                 }
-                return Ok(CommandResponse::ok(status_text()));
+                return Ok(CommandResponse::ok(active_status_text()));
             }
             if enabled {
                 let active_ms = request
@@ -2468,7 +2507,7 @@ impl CommandHandler for ModeCommand {
             } else {
                 stop_infra_active_session();
             }
-            return Ok(CommandResponse::ok(status_text()));
+            return Ok(CommandResponse::ok(active_status_text()));
         }
         if request
             .arg("advertise")
@@ -2532,6 +2571,22 @@ fn status_text() -> String {
         PING_RX.load(Ordering::Relaxed),
         PING_TX.load(Ordering::Relaxed),
         raw_nan_status_fields()
+    )
+}
+
+// Keep the response to the runtime active/idle control command below the
+// 4 KiB UART record limit. The full status includes the raw-NAN diagnostic
+// counters and can be several kilobytes long; returning it here makes lmesh
+// reject the otherwise successful command as an oversized framed record.
+fn active_status_text() -> String {
+    format!(
+        "mode active={} infra_active={} infra_active_persistent={} infra_active_deadline_ms={} pending={} deadline_ms={}",
+        mode_name(),
+        infra_active_session_enabled(),
+        INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed),
+        INFRA_ACTIVE_DEADLINE_MS.load(Ordering::Relaxed),
+        telemetry::pending_message_count(),
+        COMPANION_DEADLINE_MS.load(Ordering::Relaxed),
     )
 }
 

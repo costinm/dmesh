@@ -18,12 +18,16 @@ CONFIG_LWIP_MAX_SOCKETS=1
 # CONFIG_ESP_WIFI_MBEDTLS_CRYPTO is not set
 # CONFIG_ESP_WIFI_NVS_ENABLED is not set
 
-# No TLS, certificates, or general-purpose MbedTLS in the bootstrap image.
+# No application TLS or certificate bundle in the bootstrap image.  The Wi-Fi
+# dependency graph may still retain the SDK's certificate/RSA support.
 CONFIG_MBEDTLS_TLS_DISABLED=y
 # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE is not set
+# ESP-IDF 6's Wi-Fi dependency graph still compiles certificate-aware TLS
+# support even though Recovery does not initiate TLS.  Keep the SDK-required
+# RSA backend enabled; Recovery itself verifies direct P-256 signatures.
+CONFIG_MBEDTLS_RSA_C=y
 CONFIG_MBEDTLS_ECDSA_C=y
 CONFIG_MBEDTLS_ECDH_C=y
-# CONFIG_MBEDTLS_RSA_C is not set
 CONFIG_MBEDTLS_ECP_C=y
 # CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED is not set
 # CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED is not set
@@ -51,3 +55,12 @@ CONFIG_MBEDTLS_SHA256_C=y
 CONFIG_MBEDTLS_AES_C=y
 # CONFIG_MBEDTLS_CCM_C is not set
 # CONFIG_MBEDTLS_GCM_C is not set
+
+# Ship the minimal Recovery image without debug optimization, assertions, or
+# runtime logging.  Recovery reports protocol errors to its bounded control
+# path; normal operation has no serial log dependency.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

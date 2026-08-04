@@ -111,15 +111,21 @@
           name = "ssh-mesh-esp32-firmware-deps";
           paths = with pkgs; [
             cmake
+            curl
             dfu-util
-            espflash
             espup
+            file
             git
             ldproxy
             meshcore-cli
             meshtastic
             ninja
+            openssl
             pythonEnv
+            unzip
+            wget
+            which
+            xz
           ];
         };
       in

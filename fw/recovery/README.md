@@ -28,9 +28,12 @@ Main command -> stage2 -> Recovery -> flash-server.py -> Main partition
 
 ## Normal operation
 
-`fw/recovery/tools/flash-server.py` is the long-running host service. With no arguments
-it serves chip-specific Main images from `target/flash` on
-`10.78.0.1:3336` and keeps accepting connections. The mesh-init definition is
+`fw/recovery/tools/flash-server.py` is the long-running host resource service.
+With no arguments it serves CPU-specific blobs from `target/flash` on
+`10.78.0.1:3336` and keeps accepting connections. New Main clients identify
+the requested resource in HELLO, so one listener can serve Main, Recovery,
+stage2, and named modules; older clients use Main as the default. The
+mesh-init definition is
 `docs/lab/recovery-tcp-server.toml`.
 
 For a systemd host, the on-demand units are next to the tools:
@@ -38,6 +41,20 @@ For a systemd host, the on-demand units are next to the tools:
 socket explicitly with `systemctl start flash-server.socket`; neither
 unit is boot-enabled. The socket listens on TCP port 3336 and activates the
 server only when a Recovery connection arrives.
+
+The lab host AP and route can be bootstrapped with
+`fw/recovery/tools/bootstrap-ap-route.sh`. The preferred deployment configures
+lmesh itself with `LMESH_AP_AUTOSTART=1`, `LMESH_AP_IFACE=wlan0`,
+`LMESH_AP_ADDRESS=10.78.0.1/16`, and `LMESH_AP_NETWORK=10.78.0.0/16`.
+lmesh then owns the address, route, and open AP on every service start. With
+no environment overrides lmesh uses
+its MAC-derived `Direct-XXXXXXXX-Dmesh-local` SSID, which Recovery can find.
+The corresponding mesh-init definition is
+`fw/recovery/tools/recovery-bootstrap-ap.toml`; install it only on the host
+that owns the AP interface. The script does not run hostapd itself, so lmesh
+remains the AP owner. Optional overrides are `DMESH_RECOVERY_AP_IFACE`,
+`DMESH_RECOVERY_HOST_IP`, `DMESH_RECOVERY_NETWORK`, and
+`DMESH_RECOVERY_AP_SSID`.
 
 The checked-in lab service has no private signing key configured. It serves the
 current unkeyed fleet; keyed devices will fail closed until that service is
@@ -59,8 +76,97 @@ The control command currently travels through managed lmesh. The image data is
 Wi-Fi/TCP only. This is a deployment requirement: remote devices may no longer
 have a USB connection, so Main -> Recovery and Recovery -> Main upgrades must
 remain Wi-Fi-only. Do not stop lmesh forwarding during the transfer; it is
-useful for serial evidence. USB/esptool is only first provisioning or P0 repair
+useful for serial evidence. USB provisioning is only first provisioning or P0 repair
 of stage-2/Recovery, never a fallback for a failed remote Main update.
+
+## Managed UART and Recovery test commands
+
+All UART, reset, and stage2 tests use the same lmesh control socket. The
+Python tools never open `/dev/tty*` themselves and use saved defaults from
+`target/flash-devices/network.json`:
+
+Starting or restarting a lmesh forward never pulses RTS and never enters the
+bootloader. Linux may assert DTR/RTS while opening a CP210x tty; lmesh
+normalizes both together to the released/normal state so a transient line
+combination cannot select reset or ROM bootloader. Only an explicit managed
+reset pulses RTS, and DTR remains reserved for separately requested hardware
+tests.
+
+```sh
+fw/recovery/tools/flash-control.py status lora4
+fw/recovery/tools/flash-control.py status lora4 --count 3
+fw/recovery/tools/flash-control.py list
+fw/recovery/tools/flash-control.py devices
+fw/recovery/tools/flash-control.py reset lora4
+fw/recovery/tools/flash-control.py forward lora4
+fw/recovery/tools/flash-control.py flush lora4
+fw/recovery/tools/flash-control.py command lora4 'status'
+fw/recovery/tools/flash-control.py handshake lora4 'cmd:status'
+fw/recovery/tools/flash-control.py stage2 lora4
+fw/recovery/tools/flash-control.py boot lora4 --command recovery
+fw/recovery/tools/flash-control.py recovery-sta lora4
+```
+
+`reset` requires a lower post-reset Main uptime; an lmesh ACK alone is not
+reset evidence. `stage2` requires the fixed DMB1 identity and sends the
+selector immediately through the managed forward. `recovery-sta` is separate
+so a failed Recovery handoff can be diagnosed without another reset. Use
+`flash-main-command.py` for a complete update and its server-side SHA/timing.
+The normal command runs the same read-only preflight automatically before any
+reset or Recovery handoff; use `--check` when only that preflight is wanted.
+verification. Status uses the managed `port=` path by default, which queues
+sleepy-node commands until a UART heartbeat; pass `--direct` only when the
+board is known to be awake. `--direct` marks only that client connection for
+immediate delivery; it does not change the forward's default sleepy-node
+policy. For a sleepy board where only the reset request
+should be issued, use `reset --no-verify`; otherwise give `reset` a timeout
+long enough to span its UART heartbeat.
+
+If a bounded status/command timeout occurs, the tool prints the forward's
+drop, reset, queue, and wake counters. A running forward with zero client
+drops and increasing wake counters indicates a sleepy-window miss; it does
+not justify an immediate reset or USB flash.
+
+The reset implementation changes RTS only. It first checks that DTR is
+released, waits for the managed forward to report an executed pulse, and
+leaves the forward alive if the pulse is rejected. `reset --no-verify` skips
+the Main status preflight but still verifies that lmesh executed the pulse.
+Use the explicit `dtr --release` hardware test only when a bridge line was
+previously asserted; DTR is otherwise not touched by flashing or reset.
+
+The same helper exposes the remaining managed UART operations used in lab
+work: `command`, `handshake`, `list`, `devices`, `forward-start`, `forward-stop`, and
+`boot`. Normal forward lifecycle remains owned by mesh-init; use the manual
+start/stop commands only for a deliberate lab override. `dtr` is an explicit
+hardware experiment and may reset or strap a board; it is never part of status,
+flashing, forward startup, or Recovery. No operation in this script opens a
+UART device directly.
+
+Named modules use the same negotiated server through the Python verifier:
+
+```sh
+fw/recovery/tools/flash-module-command.py lora4 --module lora
+```
+
+It waits for a completed `target=module` record. The server selects the
+CPU-specific artifact: `target/modules/xtensa-esp32s3-espidf` for S3 and
+`target/modules/xtensa-esp32-espidf` for classic ESP32. Do not hand-copy a
+module between those ISA directories.
+
+Before an authorized canary or fleet update, run the read-only Main-flash
+preflight:
+
+```sh
+fw/recovery/tools/flash-main-command.py --check e5
+```
+
+It verifies the saved board entry, managed forward, server listener, and both
+CPU-specific Main artifacts, including their sizes and SHA-256 values. It does
+not reset or send a firmware command.
+
+The Python tools use the managed direct lmesh forward by default and load the
+saved SSID and board address from `target/flash-devices/network.json`. NAN
+gateway routing is experimental/WIP and is not used by normal flashing.
 
 Recovery must never update `recovery_app` while executing from that partition.
 The transport rejects that target in the Recovery build before any manifest or
@@ -68,6 +174,18 @@ erase operation. Main, executing from `main`, is the only updater for
 Recovery and stage-2; Recovery updates Main and other non-self targets.
 
 ## Build and measured size
+
+Run the offline flash-helper regression before changing the host protocol or
+handoff logic:
+
+```sh
+python3 -m unittest fw/recovery/tools/test_flash_tools.py
+```
+
+It covers the important late-success case where Recovery creates a failed
+intermediate TCP record before a later retry succeeds. Runtime verification
+still requires the managed lmesh forward and the server-side per-device
+transfer record.
 
 ```sh
 scripts/build-recovery-fleet.sh all

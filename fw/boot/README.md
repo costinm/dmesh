@@ -2,7 +2,7 @@
 
 `fw/boot` is the small supervisor between the ESP ROM and the two application
 partitions. It normally starts Main and selects Recovery when Main requested an
-update, a host responds during the 50 ms UART window, rapid resets are observed,
+update, a host responds during the bounded 500 ms UART window, rapid resets are observed,
 or Main repeatedly fails to reach its healthy marker.
 
 ```text
@@ -49,19 +49,27 @@ configured limit covers that physical flash. The current fleet is:
 `lora4` needs the 8 MiB stage2/table because stage2 validates the installed
 partition table against the configured flash limit. The same rule applies to
 any future board above 4 MiB; use the smallest matching expanded table and
-stage2 variant. This distinction applies only to initial USB/esptool
+stage2 variant. This distinction applies only to initial USB
 provisioning (or emergency repair). It is not a second Main/Recovery image
 family and it is never part of routine updates. Use the real chip size with
-esptool when provisioning; do not flash an expanded table onto a smaller
+the provisioning tool when provisioning; do not flash an expanded table onto a smaller
 board.
 
-Routine Main updates do not flash stage2 and do not use USB. USB/esptool is
+Routine Main updates do not flash stage2 and do not use USB. USB provisioning is
 reserved for first provisioning or emergency repair. Although Main's shared
 flash worker can technically target stage2, rewriting the only bootloader copy
 has no power-loss rollback and should remain rare and explicitly controlled.
 
-Implemented triggers are UART, the NVS request marker, rapid resets, and RTC
-failure counters. A button trigger is not currently implemented. The intended
+The stage2 UART selector is controlled by `recovery:uart_boot` in NVS. It is
+enabled when the key is missing or nonzero, preserving the lab/default behavior.
+Production provisioning should write `uart_boot=0`; stage2 then emits no DMB1
+UART identity and performs no UART polling, leaving rapid resets and the RTC
+failure counters as the recovery path. The enabled selector window is 500 ms.
+For an NVS image made from a dump, use
+`scripts/prepare-nvs-image.py ... --uart-boot 0`.
+
+Implemented triggers are UART (when enabled), the NVS request marker, rapid
+resets, and RTC failure counters. A button trigger is not currently implemented. The intended
 both-images-failed halt and RTC-corruption handling still need the hardening
 listed in [DESIGN.md](DESIGN.md).
 

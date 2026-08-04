@@ -16,7 +16,7 @@ log = "0.4"
 minicbor = { version = "2.2", features = ["std"] }
 
 [build-dependencies]
-embuild = "0.33"
+embuild = "0.33.3"
 
 [[package.metadata.esp-idf-sys.extra_components]]
 component_dirs = ["native"]
@@ -32,3 +32,13 @@ strip = true
 [profile.dev]
 debug = true
 opt-level = "z"
+
+# ESP-IDF 6 ships MbedTLS 4, which removed the legacy headers (aes.h,
+# cipher.h, etc.).  The released esp-idf-sys 0.37.2 binding template still
+# includes them unconditionally.  Until the fix is released, use the
+# upstream revision that gates those headers on ESP-IDF < 6.  This regenerates
+# bindings against the selected SDK; it is not a checked-in bindings fork.
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git", rev = "8369f610a31e9c90a5479ed7f366f983589dfa0a" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git", rev = "f1bac2d93fe9e92a1df2ad0acd34ef702a791ba4" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git", rev = "f59ffada5638cf582fe8cab1771fa38873ef6d73" }
