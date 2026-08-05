@@ -379,6 +379,21 @@ pub fn mark_companion_active(settings: &SharedSettings, window_ms: u32) {
     extend_infra_active_session(settings, window_ms, "uart");
 }
 
+/// Request a bounded active session after a LoRa packet wakes the receiver.
+/// This only updates atomics; the normal mode poll performs any Wi-Fi/NAN
+/// transition, so the module callback never blocks on radio setup.
+pub fn request_lora_packet_active(window_ms: u32) {
+    if is_companion_mode() || INFRA_ACTIVE_PERSISTENT.load(Ordering::Relaxed) {
+        return;
+    }
+    let deadline = now_ms().wrapping_add(window_ms.clamp(1_000, 300_000));
+    let previous = INFRA_ACTIVE_DEADLINE_MS.load(Ordering::Acquire);
+    if previous == 0 || deadline_is_due(previous, deadline) {
+        INFRA_ACTIVE_DEADLINE_MS.store(deadline, Ordering::Release);
+    }
+    INFRA_ACTIVE_UART_EXTENDS.fetch_add(1, Ordering::Relaxed);
+}
+
 fn deadline_is_due(deadline: u32, now: u32) -> bool {
     deadline != 0 && now.wrapping_sub(deadline) < u32::MAX / 2
 }
@@ -1636,6 +1651,14 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             }
         }
         let recovery_window = RAW_NAN_RECOVERY_ACTIVE.swap(false, Ordering::AcqRel);
+        // Notify the managed UART forward before handing the radio and CPU
+        // back to the duty-cycle sleep path.  This is deliberately a state
+        // notification, not a response to a command; lmesh uses it to mark
+        // the device unreachable while retaining queued commands.
+        telemetry::emit_console(&format!(
+            "event type=mode.state active={} infra_active=false phase=enter_sleep",
+            mode_name()
+        ));
         if RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN {
             finish_raw_nan_beacon_window();
         }
@@ -1740,6 +1763,12 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                     }
                     RAW_NAN_DUTY_NEXT_MS
                         .store(now_ms().wrapping_add(window_active_ms), Ordering::Relaxed);
+                    if uart_heartbeat {
+                        telemetry::emit_console(&format!(
+                            "event type=mode.state active={} infra_active=true phase=active_window",
+                            mode_name()
+                        ));
+                    }
                     telemetry::record_log(format!(
                         "event type=nan.duty phase=active channel={} active_ms={} listen_floor_ms={} wake=light recovery={} queued_sent={} uart_heartbeat={}",
                         channel,
@@ -1784,6 +1813,12 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                 RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
             }
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_active_ms), Ordering::Relaxed);
+            if uart_heartbeat {
+                telemetry::emit_console(&format!(
+                    "event type=mode.state active={} infra_active=true phase=active_window",
+                    mode_name()
+                ));
+            }
             telemetry::record_log(format!(
                 "event type=nan.duty phase=active channel={} active_ms={} listen_floor_ms={} recovery={} queued_sent={} uart_heartbeat={}",
                 channel,
@@ -2164,6 +2199,18 @@ pub fn raw_nan_status_fields() -> String {
     )
 }
 
+/// Small subset of NAN counters suitable for an event-triggered LoRa wake
+/// report. The full mode status remains available on demand.
+pub fn raw_nan_wake_summary() -> String {
+    format!(
+        "nan_miss_probes={} nan_beacon_seen={} nan_beacon_missed={} sync_source={}",
+        RAW_NAN_MISS_PROBES.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_SEEN.load(Ordering::Relaxed),
+        RAW_NAN_BEACON_MISSED.load(Ordering::Relaxed),
+        sync_source_name(RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed)),
+    )
+}
+
 /// Return the bounded timing counters used by the no-command sleep soak.
 /// Unlike the full mode status this excludes queue, AP, and companion state,
 /// so a host can sample it without turning the diagnostic itself into a large
@@ -2376,6 +2423,13 @@ impl CommandHandler for ModeCommand {
             .transpose()?
             .unwrap_or(false)
         {
+            // A sleepy transition must terminate an earlier explicit
+            // `mode active` session.  Without this, the persistent active
+            // flag keeps the raw-WiFi and UART no-light-sleep locks held even
+            // though PRODUCT_MODE is changed to sleepy, leaving a battery
+            // node at the infrastructure power level indefinitely.
+            stop_infra_active_session();
+            super::serial::set_always_on(false);
             PRODUCT_MODE.store(MODE_SLEEPY, Ordering::Relaxed);
             if save_requested(request) {
                 self.settings.borrow_mut().set_str("mode", "sleepy")?;

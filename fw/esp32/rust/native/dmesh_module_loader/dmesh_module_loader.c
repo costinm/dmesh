@@ -12,6 +12,13 @@
 #include "esp_cache.h"
 #include "hal/mmu_hal.h"
 #include "hal/mmu_types.h"
+#if CONFIG_IDF_TARGET_ESP32
+#include "esp_attr.h"
+#include "esp_private/cache_utils.h"
+#include "esp_private/esp_cache_esp32_private.h"
+#include "hal/cache_ll.h"
+#include "hal/cache_types.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -31,6 +38,7 @@
 #define MODULE_TASK_PRIORITY 1u
 #define MODULE_MAX_ARGUMENTS 4096u
 #define LORA_COMMAND_MAX 128u
+#define LORA_SPI_MAX_TRANSFER 272u
 #define MODULE_DATA_START 0x3c0000u
 
 /* The fixed-VMA experiment is deliberately opt-in through the DMOD header.
@@ -43,9 +51,21 @@
 #define MODULE_FIXED_DATA_VADDR 0x3d000000u
 #define MODULE_FIXED_WINDOW_SIZE 0x10000u
 #elif CONFIG_IDF_TARGET_ESP32
-#define MODULE_FIXED_VADDR 0x400d0000u
-#define MODULE_FIXED_DATA_VADDR 0x3f400000u
+#define MODULE_FIXED_VADDR 0x40300000u
+#define MODULE_FIXED_DATA_VADDR 0x3f700000u
 #define MODULE_FIXED_WINDOW_SIZE 0x10000u
+#endif
+
+#if defined(MODULE_FIXED_VADDR)
+_Static_assert((MODULE_FIXED_VADDR % 0x10000u) == 0, "module code alias must be MMU aligned");
+_Static_assert((MODULE_FIXED_DATA_VADDR % 0x10000u) == 0, "module data alias must be MMU aligned");
+_Static_assert(MODULE_FIXED_WINDOW_SIZE == 0x10000u, "module window must be one MMU page");
+#if CONFIG_IDF_TARGET_ESP32
+/* Main's classic ESP32 IROM begins at 0x400d0000. Keep the dynamic module
+ * window above the application image rather than replacing Main's code. */
+_Static_assert(MODULE_FIXED_VADDR >= 0x40300000u, "classic module alias overlaps Main IROM");
+_Static_assert(MODULE_FIXED_DATA_VADDR >= 0x3f700000u, "classic module alias overlaps Main DROM");
+#endif
 #endif
 
 static const char *TAG = "dmesh-module";
@@ -96,6 +116,43 @@ static uint32_t module_mmu_id(void)
 #endif
 }
 
+#if CONFIG_IDF_TARGET_ESP32
+/* IDF's public esp_mmu_map() has safe cache handling, but does not accept a
+ * caller-selected virtual address.  Keep the fixed-VMA experiment safe by
+ * reproducing its small IRAM mapping critical section here.  Every operation
+ * while caches are stopped is either IRAM or an inline HAL primitive. */
+static IRAM_ATTR NOINLINE_ATTR void map_fixed_aliases_esp32(
+    uint32_t paddr, uint32_t len, uint32_t *code_len, uint32_t *data_len)
+{
+    const uint32_t page_size = mmu_hal_pages_to_bytes(0, 1);
+    uint32_t mapped = 0;
+    spi_flash_disable_interrupts_caches_and_other_cpu();
+    mmu_hal_map_region(0, MMU_TARGET_FLASH0, MODULE_FIXED_VADDR, paddr,
+                       len, &mapped);
+#if !CONFIG_ESP_SYSTEM_SINGLE_CORE_MODE
+    mmu_hal_map_region(1, MMU_TARGET_FLASH0, MODULE_FIXED_VADDR, paddr,
+                       len, &mapped);
+#endif
+    *code_len = mapped;
+    mmu_hal_map_region(0, MMU_TARGET_FLASH0, MODULE_FIXED_DATA_VADDR, paddr,
+                       len, &mapped);
+#if !CONFIG_ESP_SYSTEM_SINGLE_CORE_MODE
+    mmu_hal_map_region(1, MMU_TARGET_FLASH0, MODULE_FIXED_DATA_VADDR, paddr,
+                       len, &mapped);
+#endif
+    *data_len = mapped;
+    cache_bus_mask_t buses = cache_ll_l1_get_bus(0, MODULE_FIXED_VADDR, len);
+    buses |= cache_ll_l1_get_bus(0, MODULE_FIXED_DATA_VADDR, len);
+    cache_ll_l1_enable_bus(0, buses);
+#if !CONFIG_ESP_SYSTEM_SINGLE_CORE_MODE
+    cache_ll_l1_enable_bus(1, buses);
+#endif
+    cache_sync();
+    spi_flash_enable_interrupts_caches_and_other_cpu();
+    (void)page_size;
+}
+#endif
+
 static esp_err_t map_fixed_module(const esp_partition_t *partition, uint32_t offset,
                                   uint32_t image_size, const uint8_t **out_base,
                                   uint32_t *out_mapped_size)
@@ -103,20 +160,52 @@ static esp_err_t map_fixed_module(const esp_partition_t *partition, uint32_t off
     if (partition == NULL || out_base == NULL || out_mapped_size == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (offset > partition->size || image_size == 0 ||
+        image_size > partition->size - offset ||
+        offset % MODULE_ALIGN != 0 || partition->address > UINT32_MAX - offset) {
+        ESP_LOGE(TAG, "fixed module source rejected address=0x%08lx offset=0x%08lx partition=0x%08lx image=0x%08lx",
+                 (unsigned long)partition->address, (unsigned long)offset,
+                 (unsigned long)partition->size, (unsigned long)image_size);
+        return ESP_ERR_INVALID_ARG;
+    }
     const uint32_t paddr = partition->address + offset;
     const uint32_t mmu_id = module_mmu_id();
     const uint32_t page_size = mmu_hal_pages_to_bytes(mmu_id, 1);
     if (page_size == 0 || (MODULE_FIXED_VADDR % page_size) != 0 ||
+        (MODULE_FIXED_DATA_VADDR % page_size) != 0 ||
+        MODULE_FIXED_VADDR > UINT32_MAX - MODULE_FIXED_WINDOW_SIZE ||
+        MODULE_FIXED_DATA_VADDR > UINT32_MAX - MODULE_FIXED_WINDOW_SIZE ||
+        (MODULE_FIXED_VADDR < MODULE_FIXED_DATA_VADDR + MODULE_FIXED_WINDOW_SIZE &&
+         MODULE_FIXED_DATA_VADDR < MODULE_FIXED_VADDR + MODULE_FIXED_WINDOW_SIZE) ||
         (paddr % page_size) != 0 || image_size > MODULE_FIXED_WINDOW_SIZE) {
+        ESP_LOGE(TAG, "fixed module window rejected code=0x%08lx data=0x%08lx page=0x%08lx image=0x%08lx",
+                 (unsigned long)MODULE_FIXED_VADDR, (unsigned long)MODULE_FIXED_DATA_VADDR,
+                 (unsigned long)page_size, (unsigned long)image_size);
         return ESP_ERR_INVALID_ARG;
     }
+    ESP_LOGI(TAG, "fixed module window code=0x%08lx data=0x%08lx page=0x%08lx image=0x%08lx",
+             (unsigned long)MODULE_FIXED_VADDR, (unsigned long)MODULE_FIXED_DATA_VADDR,
+             (unsigned long)page_size, (unsigned long)image_size);
     uint32_t mapped_size = 0;
     const uint32_t rounded_size =
         ((image_size + page_size - 1u) / page_size) * page_size;
-    if (rounded_size > MODULE_FIXED_WINDOW_SIZE) return ESP_ERR_INVALID_SIZE;
+    if (rounded_size == 0 || rounded_size > MODULE_FIXED_WINDOW_SIZE ||
+        MODULE_FIXED_VADDR > UINT32_MAX - rounded_size ||
+        MODULE_FIXED_DATA_VADDR > UINT32_MAX - rounded_size) {
+        ESP_LOGE(TAG, "fixed module mapping size rejected rounded=0x%08lx window=0x%08x",
+                 (unsigned long)rounded_size, MODULE_FIXED_WINDOW_SIZE);
+        return ESP_ERR_INVALID_SIZE;
+    }
+#if CONFIG_IDF_TARGET_ESP32
+    uint32_t data_mapped_size = 0;
+    map_fixed_aliases_esp32(paddr, image_size, &mapped_size, &data_mapped_size);
+#else
     mmu_hal_map_region(mmu_id, MMU_TARGET_FLASH0, MODULE_FIXED_VADDR, paddr,
                        image_size, &mapped_size);
-    if (mapped_size < rounded_size) {
+#endif
+    if (mapped_size < rounded_size || mapped_size > MODULE_FIXED_WINDOW_SIZE) {
+        ESP_LOGE(TAG, "fixed code mapping incomplete requested=0x%08lx mapped=0x%08lx",
+                 (unsigned long)rounded_size, (unsigned long)mapped_size);
         mmu_hal_unmap_region(mmu_id, MODULE_FIXED_VADDR, mapped_size);
         return ESP_FAIL;
     }
@@ -124,24 +213,31 @@ static esp_err_t map_fixed_module(const esp_partition_t *partition, uint32_t off
      * code and data buses have different virtual aliases, so map the same
      * contiguous flash image into both. MODULE_DATA_VMA in the fixed linker
      * script points .rodata at this corresponding data-bus window. */
+#if !CONFIG_IDF_TARGET_ESP32
     uint32_t data_mapped_size = 0;
     mmu_hal_map_region(mmu_id, MMU_TARGET_FLASH0, MODULE_FIXED_DATA_VADDR, paddr,
                        image_size, &data_mapped_size);
-    if (data_mapped_size < rounded_size) {
+#endif
+    if (data_mapped_size < rounded_size || data_mapped_size > MODULE_FIXED_WINDOW_SIZE) {
+        ESP_LOGE(TAG, "fixed data mapping incomplete requested=0x%08lx mapped=0x%08lx",
+                 (unsigned long)rounded_size, (unsigned long)data_mapped_size);
         mmu_hal_unmap_region(mmu_id, MODULE_FIXED_VADDR, mapped_size);
         mmu_hal_unmap_region(mmu_id, MODULE_FIXED_DATA_VADDR, data_mapped_size);
         return ESP_FAIL;
     }
     /* The HAL only changes MMU entries. Invalidate both caches so a previous
      * module occupying either alias cannot be executed/read accidentally. */
-    esp_err_t sync_err = esp_cache_msync((void *)MODULE_FIXED_VADDR, mapped_size,
-                                         ESP_CACHE_MSYNC_FLAG_DIR_M2C |
-                                         ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+    esp_err_t sync_err = ESP_OK;
+#if !CONFIG_IDF_TARGET_ESP32
+    sync_err = esp_cache_msync((void *)MODULE_FIXED_VADDR, mapped_size,
+                               ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                               ESP_CACHE_MSYNC_FLAG_TYPE_INST);
     if (sync_err == ESP_OK) {
         sync_err = esp_cache_msync((void *)MODULE_FIXED_DATA_VADDR, data_mapped_size,
                                    ESP_CACHE_MSYNC_FLAG_DIR_M2C |
                                    ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
     }
+#endif
     if (sync_err != ESP_OK) {
         mmu_hal_unmap_region(mmu_id, MODULE_FIXED_VADDR, mapped_size);
         mmu_hal_unmap_region(mmu_id, MODULE_FIXED_DATA_VADDR, data_mapped_size);
@@ -216,7 +312,9 @@ static int emit_event(void *user, const dmesh_module_event_v1 *event)
 static int lora_spi_transfer(void *user, const uint8_t *tx, uint8_t *rx, size_t len)
 {
     (void)user;
-    if (lora_spi == NULL || tx == NULL || rx == NULL || len == 0 || len > 256) return -1;
+    /* SX126x reads include opcode/address/status bytes around a 255-byte
+     * packet, so the SPI transaction is larger than the radio payload. */
+    if (lora_spi == NULL || tx == NULL || rx == NULL || len == 0 || len > LORA_SPI_MAX_TRANSFER) return -1;
     /* SX126x holds BUSY high while a command is being processed. Waiting in
      * the module's dedicated task keeps this host primitive synchronous and
      * prevents a command from being clocked into the radio too early. The
@@ -232,7 +330,15 @@ static int lora_spi_transfer(void *user, const uint8_t *tx, uint8_t *rx, size_t 
     t.length = len * 8;
     t.tx_buffer = tx;
     t.rx_buffer = rx;
-    if (spi_device_transmit(lora_spi, &t) != ESP_OK) return -1;
+    /* Do not use spi_device_transmit here: a module must never be able to
+     * wedge Main indefinitely on a claimed bus or missing radio. Queue the
+     * transaction and bound both queueing and completion waits. */
+    const TickType_t spi_timeout = pdMS_TO_TICKS(100);
+    esp_err_t spi_err = spi_device_queue_trans(lora_spi, &t, spi_timeout);
+    if (spi_err != ESP_OK) return -1;
+    spi_transaction_t *completed = NULL;
+    spi_err = spi_device_get_trans_result(lora_spi, &completed, spi_timeout);
+    if (spi_err != ESP_OK || completed != &t) return -1;
     /* SX126x commands are not complete when CS rises: the chip keeps BUSY
      * asserted while it applies the command. The former Main driver waited
      * after every transaction; without this wait a following GET_IRQ_STATUS
@@ -258,23 +364,40 @@ static int lora_irq_configure(void *user, int pin, int active_level)
     (void)active_level;
     esp_err_t err = gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
     if (err != ESP_OK) return -1;
-    err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return -1;
-    (void)gpio_isr_handler_remove((gpio_num_t)pin);
-    if (gpio_set_intr_type((gpio_num_t)pin, GPIO_INTR_POSEDGE) != ESP_OK) return -1;
-    return gpio_isr_handler_add((gpio_num_t)pin, dmesh_lora_gpio_isr,
-                                (void *)(uintptr_t)pin) == ESP_OK ? 0 : -1;
+    /* SX127 RX currently uses bounded polling.  The module task is loaded at
+     * runtime and may run on either core; installing a second GPIO ISR and
+     * notifying that task from the ISR caused aborts on classic ESP32.  Keep
+     * the pin configured as an input so the module can sample DIO0, but do
+     * not attach a process-wide ISR until the ABI owns an ISR-safe wake path. */
+    if (lora_config.chip != DMESH_LORA_CHIP_SX127X) {
+        err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return -1;
+        (void)gpio_isr_handler_remove((gpio_num_t)pin);
+        if (gpio_set_intr_type((gpio_num_t)pin, GPIO_INTR_POSEDGE) != ESP_OK) return -1;
+        return gpio_isr_handler_add((gpio_num_t)pin, dmesh_lora_gpio_isr,
+                                    (void *)(uintptr_t)pin) == ESP_OK ? 0 : -1;
+    }
+    return 0;
 }
 static int lora_irq_enable(void *user, int pin, int enabled)
-{ (void)user; return enabled ? gpio_intr_enable((gpio_num_t)pin) : gpio_intr_disable((gpio_num_t)pin); }
+{
+    (void)user;
+    if (lora_config.chip != DMESH_LORA_CHIP_SX127X) {
+        return enabled ? gpio_intr_enable((gpio_num_t)pin) : gpio_intr_disable((gpio_num_t)pin);
+    }
+    (void)pin; (void)enabled; return 0;
+}
 static int lora_wait_irq(void *user, uint32_t timeout_ms)
 {
     (void)user;
-    dmesh_lora_irq_rearm();
-    /* This is the only intentionally waiting module primitive. It runs in
-     * the module's dedicated FreeRTOS task and always has a finite timeout;
-     * Main's command path never invokes it. */
     if (timeout_ms > 1000u) timeout_ms = 1000u;
+    if (lora_config.chip == DMESH_LORA_CHIP_SX127X) {
+        /* Polling is deliberately finite and does not depend on a GPIO ISR or
+         * a task notification whose lifetime crosses the dynamic boundary. */
+        vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+        return 1;
+    }
+    dmesh_lora_irq_rearm();
     return ulTaskGenericNotifyTake(0, pdTRUE, pdMS_TO_TICKS(timeout_ms)) != 0 ? 0 : 1;
 }
 static uint64_t lora_now_ms(void *user)
@@ -372,11 +495,14 @@ static void lora_host_init(void)
                        (lora_config.spi_host == 1 ? 11 : 19),
         .sclk_io_num = lora_config.sck_pin >= 0 ? lora_config.sck_pin :
                        (lora_config.spi_host == 1 ? 9 : 5),
-        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 256,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = LORA_SPI_MAX_TRANSFER,
     };
-    if (spi_bus_initialize(host, &bus, SPI_DMA_CH_AUTO) != ESP_OK && lora_spi == NULL) {
-        /* The legacy path may already own the bus; the module will report an
-         * IO error and Main can use its fallback. */
+    esp_err_t bus_err = spi_bus_initialize(host, &bus, SPI_DMA_CH_AUTO);
+    bool bus_owned = bus_err == ESP_OK;
+    if (bus_err != ESP_OK && bus_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "LoRa SPI bus init failed host=%d err=%s pins=%d/%d/%d",
+                 (int)host, esp_err_to_name(bus_err), bus.mosi_io_num,
+                 bus.miso_io_num, bus.sclk_io_num);
         return;
     }
     spi_device_interface_config_t dev = {
@@ -384,7 +510,18 @@ static void lora_host_init(void)
         .spics_io_num = lora_config.cs_pin >= 0 ? lora_config.cs_pin :
                         (lora_config.spi_host == 2 ? 8 : 18), .queue_size = 1,
     };
-    (void)spi_bus_add_device(host, &dev, &lora_spi);
+    esp_err_t device_err = spi_bus_add_device(host, &dev, &lora_spi);
+    if (device_err != ESP_OK || lora_spi == NULL) {
+        ESP_LOGE(TAG, "LoRa SPI device add failed host=%d err=%s cs=%d bus_err=%s",
+                 (int)host, esp_err_to_name(device_err), dev.spics_io_num,
+                 esp_err_to_name(bus_err));
+        lora_spi = NULL;
+        if (bus_owned) (void)spi_bus_free(host);
+    } else {
+        ESP_LOGI(TAG, "LoRa SPI ready host=%d cs=%d pins=%d/%d/%d max_transfer=%u",
+                 (int)host, dev.spics_io_num, bus.mosi_io_num, bus.miso_io_num,
+                 bus.sclk_io_num, (unsigned)LORA_SPI_MAX_TRANSFER);
+    }
 }
 
 static const esp_partition_t *resolve_module_partition(void)
@@ -508,7 +645,11 @@ int dmesh_module_lora_configure(const dmesh_lora_config_v1 *config)
     if (lora_spi != NULL) {
         spi_bus_remove_device(lora_spi);
         lora_spi = NULL;
-        spi_bus_free(lora_config.spi_host == 2 ? SPI2_HOST : SPI3_HOST);
+        /* Keep teardown's host mapping identical to lora_host_init(): the
+         * persisted enum uses 1=SPI2/HSPI and 2=SPI3/VSPI. Freeing the
+         * opposite bus leaves the real bus allocated and can make the next
+         * module invocation fail or collide with another peripheral. */
+        spi_bus_free(lora_config.spi_host == 1 ? SPI2_HOST : SPI3_HOST);
     }
     lora_config = *config;
     lora_host_init();
@@ -553,6 +694,27 @@ int dmesh_module_lora_command(const uint8_t *args, size_t args_len,
     lora_command_pending = true;
     portEXIT_CRITICAL(&lora_command_mux);
     return 0;
+}
+
+bool dmesh_module_loader_prepare_flash(uint32_t timeout_ms)
+{
+    if (!cached_task_running) return true;
+    static const uint8_t stop[] = "stop";
+    /* Flash erases disable the instruction cache while the module is mapped
+     * from this same raw data region. Replace any queued radio command with a
+     * bounded stop request before the TCP worker can touch the partition. */
+    portENTER_CRITICAL(&lora_command_mux);
+    memcpy(lora_command_args, stop, sizeof(stop) - 1);
+    lora_command_args_len = sizeof(stop) - 1;
+    lora_command_payload_len = 0;
+    lora_command_pending = true;
+    portEXIT_CRITICAL(&lora_command_mux);
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (cached_task_running) {
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) return false;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return true;
 }
 bool dmesh_module_loader_task_done(void) { return cached_task_done; }
 int dmesh_module_loader_last_result(void) { return cached_last_result; }

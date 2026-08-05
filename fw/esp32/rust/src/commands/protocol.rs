@@ -14,6 +14,29 @@ pub const CBOR_ERROR: u16 = 5;
 /// resynchronization marker without treating the marker as a valid packet.
 pub const CBOR_MAX_RECORD: usize = 4_000;
 
+fn cbor_major_type(byte: u8) -> &'static str {
+    match byte >> 5 {
+        0 => "unsigned",
+        1 => "negative",
+        2 => "bytes",
+        3 => "text",
+        4 => "array",
+        5 => "map",
+        6 => "tag",
+        _ => "simple/float",
+    }
+}
+
+fn cbor_first_byte_error(input: &[u8], expected: &str) -> anyhow::Error {
+    match input.first().copied() {
+        Some(byte) => anyhow!(
+            "CBOR first_byte=0x{byte:02x} major_type={} expected {expected}",
+            cbor_major_type(byte),
+        ),
+        None => anyhow!("CBOR first_byte=none expected {expected}"),
+    }
+}
+
 fn decode_text_bytes(value: &str) -> Result<Vec<u8>> {
     let value = value.strip_prefix("hex:").unwrap_or(value);
     if value.len() % 2 != 0 {
@@ -485,15 +508,32 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
     if input.len() > CBOR_MAX_RECORD {
         bail!("CBOR command exceeds {CBOR_MAX_RECORD} bytes");
     }
+    if input.first().map(|byte| byte >> 5) != Some(5) {
+        return Err(cbor_first_byte_error(input, "map").context("invalid CBOR command"));
+    }
     let mut decoder = Decoder::new(input);
-    let Some(count) = decoder.map()? else {
-        bail!("indefinite CBOR maps are not supported");
-    };
+    let count = decoder.map().map_err(|error| {
+        anyhow!(
+            "CBOR first_byte=0x{:02x} major_type={} expected map: {error}",
+            input[0],
+            cbor_major_type(input[0]),
+        )
+    })?;
     let mut method_id = 0;
     let mut method_name = None;
     let mut args = std::collections::BTreeMap::new();
     let mut payload = Vec::new();
-    for _ in 0..count {
+    let mut entries = 0u64;
+    loop {
+        if let Some(count) = count {
+            if entries >= count {
+                break;
+            }
+        } else if decoder.datatype()? == Type::Break {
+            decoder.skip()?;
+            break;
+        }
+        entries += 1;
         let numeric_key = match decoder.datatype()? {
             Type::U8 | Type::U16 | Type::U32 => decoder.u16()?,
             kind => bail!("unsupported CBOR command key {kind:?}"),
@@ -519,10 +559,18 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
                 args.insert(CBOR_ERROR, decoder.str()?.to_owned());
             }
             CBOR_PAYLOAD => {
-                let Some(payload_count) = decoder.map()? else {
-                    bail!("indefinite firmware payload maps are not supported");
-                };
-                for _ in 0..payload_count {
+                let payload_count = decoder.map()?;
+                let mut payload_entries = 0u64;
+                loop {
+                    if let Some(payload_count) = payload_count {
+                        if payload_entries >= payload_count {
+                            break;
+                        }
+                    } else if decoder.datatype()? == Type::Break {
+                        decoder.skip()?;
+                        break;
+                    }
+                    payload_entries += 1;
                     let tag = match decoder.datatype()? {
                         Type::U8 | Type::U16 | Type::U32 => decoder.u16()?,
                         Type::String => {
@@ -654,5 +702,17 @@ mod tests {
             .map(1).unwrap().str("data").unwrap().str("hex:00ff10").unwrap();
         let request = decode_binary(&bytes).unwrap();
         assert_eq!(request.payload, vec![0x00, 0xff, 0x10]);
+    }
+
+    #[test]
+    fn indefinite_command_and_payload_maps_are_stream_decoded() {
+        // {0: "mode", 6: {80: "1000"}} using indefinite maps.
+        let bytes = vec![
+            0xbf, 0x00, 0x64, b'm', b'o', b'd', b'e', 0x06, 0xbf, 0x18, 0x50, 0x64, b'1',
+            b'0', b'0', b'0', 0xff, 0xff,
+        ];
+        let request = decode_binary(&bytes).unwrap();
+        assert_eq!(request.name, "mode");
+        assert_eq!(request.args.get(&80).map(String::as_str), Some("1000"));
     }
 }

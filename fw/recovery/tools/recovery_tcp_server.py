@@ -315,6 +315,10 @@ def update(sock: socket.socket, image_path: Path, target: str, module_name: str 
     if kind != TYPES["hello"]:
         raise RuntimeError("device did not start with DEVICE_INFO")
     info = parse_info(hello)
+    # A client must identify itself promptly. Keep the long timeout only for
+    # the negotiated image transfer; otherwise one half-open Recovery socket
+    # can occupy the single-threaded listener and make the AP appear down.
+    sock.settimeout(180.0)
     # New clients select the requested blob in HELLO. The CLI target remains
     # the compatibility default for older clients with a 69/71-byte HELLO.
     target = str(info.get("requested_target", target))
@@ -532,13 +536,18 @@ def main() -> int:
     else:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((args.bind, args.port)); server.listen(8)
+        # Updates are processed serially. Keep a bounded cushion for retries,
+        # while ensuring half-open clients cannot make the listener appear
+        # dead by occupying the accept loop for the transfer timeout.
+        server.bind((args.bind, args.port)); server.listen(32)
         print(f"listening on {args.bind}:{args.port} for negotiated {args.target}", flush=True)
     with server:
         while True:
             client, peer = server.accept()
             with client:
-                client.settimeout(180.0)
+                # update() raises this to the transfer timeout after HELLO.
+                # Stale retry connections must drain quickly before HELLO.
+                client.settimeout(10.0)
                 print(f"accepted {peer}", flush=True)
                 try:
                     update(client, args.image, args.target, args.module, args.signing_key,

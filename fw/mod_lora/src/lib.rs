@@ -80,16 +80,19 @@ pub struct LoraConfig {
     pub coding_rate: i32,
     pub preamble: i32,
     pub crc: i32,
+    pub cad_rx: i32,
+    pub cad_interval_ms: u32,
+    pub cad_rx_ms: u32,
 }
 
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(core::mem::size_of::<LoraHost>() == 56);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(core::mem::size_of::<ModuleContext>() == 40);
-const _: () = assert!(core::mem::size_of::<LoraConfig>() == 92);
+const _: () = assert!(core::mem::size_of::<LoraConfig>() == 104);
 
 const ABI_VERSION: u32 = 2;
-const LORA_ABI_VERSION: u32 = 1;
+const LORA_ABI_VERSION: u32 = 2;
 const ERR_CONTEXT_ABI: i32 = -100;
 const ERR_HOST_ABI: i32 = -101;
 const SX127X_VERSION: u8 = 0x12;
@@ -122,13 +125,19 @@ const SX127X_MODE_SLEEP: u8 = 0x00;
 const SX127X_MODE_STDBY: u8 = 0x01;
 const SX127X_MODE_TX: u8 = 0x03;
 const SX127X_MODE_RX_CONTINUOUS: u8 = 0x05;
+const SX127X_MODE_RX_SINGLE: u8 = 0x06;
+const SX127X_MODE_CAD: u8 = 0x07;
 const SX127X_IRQ_RX_DONE: u8 = 0x40;
 const SX127X_IRQ_CRC_ERROR: u8 = 0x20;
 const SX127X_IRQ_TX_DONE: u8 = 0x08;
+const SX127X_IRQ_CAD_DONE: u8 = 0x04;
+const SX127X_IRQ_CAD_DETECTED: u8 = 0x01;
 const SX127X_FIFO_RX_BASE: u8 = 0;
 const MAX_PACKET: usize = 255;
 const SX126X_CMD_SET_STANDBY: u8 = 0x80;
 const SX126X_CMD_SET_RX: u8 = 0x82;
+const SX126X_CMD_SET_CAD: u8 = 0xc5;
+const SX126X_CMD_SET_CAD_PARAMS: u8 = 0x88;
 const SX126X_CMD_SET_TX: u8 = 0x83;
 const SX126X_CMD_SET_PACKET_TYPE: u8 = 0x8a;
 const SX126X_CMD_SET_RF_FREQUENCY: u8 = 0x86;
@@ -156,7 +165,10 @@ const SX126X_PACKET_TYPE_GFSK: u8 = 0x00;
 const SX126X_PACKET_TYPE_LORA: u8 = 0x01;
 const SX126X_IRQ_TX_DONE: u16 = 0x0001;
 const SX126X_IRQ_RX_DONE: u16 = 0x0002;
+const SX126X_IRQ_CAD_DONE: u16 = 0x0004;
+const SX126X_IRQ_CAD_DETECTED: u16 = 0x0008;
 const SX126X_IRQ_CRC_ERR: u16 = 0x0040;
+const SX126X_IRQ_TIMEOUT: u16 = 0x0200;
 const SX126X_REG_SYNC_WORD: u16 = 0x0740;
 const SX126X_REG_OCP: u16 = 0x08e7;
 const SX126X_REG_RX_GAIN: u16 = 0x08ac;
@@ -182,6 +194,10 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
 
 #[inline(always)] unsafe fn event_bytes(ctx: &ModuleContext, event_id: u16, bytes: &[u8]) {
     event(ctx, event_id, bytes);
+}
+
+#[inline(always)] unsafe fn event_i32(ctx: &ModuleContext, event_id: u16, value: i32) {
+    event(ctx, event_id, &value.to_le_bytes());
 }
 
 #[inline(always)] unsafe fn power_down_radio(host: &LoraHost, config: &LoraConfig) {
@@ -303,7 +319,36 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
     ] {
         if sx127x_write(host, reg, value) != 0 { return -3; }
     }
-    sx127x_write(host, SX127X_REG_OP_MODE, SX127X_LONG_RANGE | SX127X_MODE_RX_CONTINUOUS)
+    sx127x_write(host, SX127X_REG_OP_MODE,
+                 SX127X_LONG_RANGE | if config.cad_rx != 0 {
+                     SX127X_MODE_STDBY
+                 } else {
+                     SX127X_MODE_RX_CONTINUOUS
+                 })
+}
+
+#[inline(always)] unsafe fn sx127x_start_cad(host: &LoraHost) -> i32 {
+    if sx127x_write(host, SX127X_REG_IRQ_FLAGS, 0xff) != 0 { return -3; }
+    sx127x_write(host, SX127X_REG_OP_MODE, SX127X_LONG_RANGE | SX127X_MODE_CAD)
+}
+
+#[inline(always)] unsafe fn sx127x_cad_window(host: &LoraHost, config: &LoraConfig) -> i32 {
+    if sx127x_start_cad(host) != 0 { return -3; }
+    let cadence = if config.cad_interval_ms == 0 { 5 } else { config.cad_interval_ms };
+    wait_for_irq(host, config.irq_pin, cadence);
+    let irq = match sx127x_read(host, SX127X_REG_IRQ_FLAGS) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if sx127x_write(host, SX127X_REG_IRQ_FLAGS, 0xff) != 0 { return -3; }
+    if irq & SX127X_IRQ_CAD_DONE == 0 { return 1; }
+    if irq & SX127X_IRQ_CAD_DETECTED == 0 { return 2; }
+    if sx127x_write(host, SX127X_REG_OP_MODE, SX127X_LONG_RANGE | SX127X_MODE_RX_SINGLE) != 0 { return -3; }
+    let receive_ms = if config.cad_rx_ms == 0 { 1000 } else { config.cad_rx_ms };
+    wait_for_irq(host, config.irq_pin, receive_ms);
+    if sx127x_emit_packet(host) == 0 { return 0; }
+    let _ = sx127x_write(host, SX127X_REG_OP_MODE, SX127X_LONG_RANGE | SX127X_MODE_STDBY);
+    1
 }
 
 #[inline(always)] unsafe fn sx127x_emit_packet(host: &LoraHost) -> i32 {
@@ -360,7 +405,13 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
     tx[1..args.len() + 1].copy_from_slice(args);
     let total = args.len() + out.len() + 2;
     let rc = spi(host.user, tx.as_ptr(), rx.as_mut_ptr(), total);
-    if rc == 0 { out.copy_from_slice(&rx[args.len() + 2..total]); }
+    if rc == 0 {
+        /* GetStatus returns its single status byte immediately after the
+         * opcode; the other commands have a leading SPI status byte followed
+         * by their response payload. */
+        let response_offset = if opcode == SX126X_GET_STATUS { 1 } else { args.len() + 2 };
+        out.copy_from_slice(&rx[response_offset..response_offset + out.len()]);
+    }
     rc
 }
 
@@ -427,10 +478,67 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
     if sx126x_command(host, SX126X_CMD_SET_PACKET_PARAMS,
                       &[(preamble >> 8) as u8, preamble as u8, 0,
                         255, if config.crc != 0 { 1 } else { 0 }, 0]) != 0 { return -3; }
-    let irq = SX126X_IRQ_TX_DONE | SX126X_IRQ_RX_DONE | SX126X_IRQ_CRC_ERR | 0x0200;
+    let mut irq = SX126X_IRQ_TX_DONE | SX126X_IRQ_RX_DONE | SX126X_IRQ_CRC_ERR | SX126X_IRQ_TIMEOUT;
+    if config.cad_rx != 0 { irq |= SX126X_IRQ_CAD_DONE | SX126X_IRQ_CAD_DETECTED; }
     if sx126x_command(host, SX126X_CMD_SET_DIO_IRQ_PARAMS, &[(irq >> 8) as u8, irq as u8, (irq >> 8) as u8, irq as u8, 0, 0, 0, 0]) != 0 { return -3; }
     if sx126x_command(host, SX126X_CMD_CLEAR_IRQ_STATUS, &[0xff, 0xff]) != 0 { return -3; }
-    sx126x_command(host, SX126X_CMD_SET_RX, &[0xff, 0xff, 0xff])
+    if config.cad_rx == 0 {
+        sx126x_command(host, SX126X_CMD_SET_RX, &[0xff, 0xff, 0xff])
+    } else {
+        /* Use the modem's CAD state machine instead of SetRxDutyCycle. The
+         * latter is not reliable on the deployed SX1262 board (it can leave
+         * DIO1 idle even with a full receive window). CAD keeps the radio in
+         * its low-power detector, and we explicitly enter a bounded RX window
+         * only after a preamble is detected. */
+        if sx126x_command(host, SX126X_CMD_SET_CAD_PARAMS,
+                          /* 4-symbol CAD, then enter RX immediately when a
+                           * preamble is detected. Returning to standby and
+                           * issuing SetRx afterwards loses that preamble. */
+                          &[0x02, 0x1a, 0x0a, 0x01, 0xff, 0xff, 0xff]) != 0 { return -3; }
+        sx126x_command(host, SX126X_CMD_SET_CAD, &[])
+    }
+}
+
+#[inline(always)] unsafe fn sx126x_cad_window(host: &LoraHost, config: &LoraConfig) -> i32 {
+    if sx126x_command(host, SX126X_CMD_CLEAR_IRQ_STATUS, &[0xff, 0xff]) != 0 { return -3; }
+    /* CAD exits to STDBY_RC on a quiet window. Re-enter standby explicitly
+     * and publish the CAD parameters before every new operation so a timeout
+     * or previous RX transition cannot leave the command rejected. */
+    if sx126x_command(host, SX126X_CMD_SET_STANDBY, &[0]) != 0 { return -3; }
+    if sx126x_command(host, SX126X_CMD_SET_CAD_PARAMS,
+                      &[0x02, 0x1a, 0x0a, 0x01, 0xff, 0xff, 0xff]) != 0 { return -3; }
+    if sx126x_command(host, SX126X_CMD_SET_CAD, &[]) != 0 { return -3; }
+    /* Four CAD symbols at SF10/BW250 are short; the configured interval is a
+     * bounded polling floor, not a packet preamble change. */
+    wait_for_irq(host, config.irq_pin, config.cad_interval_ms.max(5).min(1000));
+    let mut irq_bytes = [0u8; 2];
+    if sx126x_read(host, SX126X_CMD_GET_IRQ_STATUS, &[], &mut irq_bytes) != 0 { return -3; }
+    let irq = u16::from_be_bytes(irq_bytes);
+    if irq & SX126X_IRQ_CAD_DONE == 0 {
+        let _ = sx126x_command(host, SX126X_CMD_CLEAR_IRQ_STATUS, &[0xff, 0xff]);
+        let mut status = [0u8; 1];
+        if sx126x_read(host, SX126X_GET_STATUS, &[], &mut status) == 0 {
+            return 0x100 | status[0] as i32;
+        }
+        return 11;
+    }
+    if irq & SX126X_IRQ_CAD_DETECTED == 0 {
+        let _ = sx126x_command(host, SX126X_CMD_CLEAR_IRQ_STATUS, &[0xff, 0xff]);
+        return 1;
+    }
+    /* CAD_RX has already switched the modem into RX. Clear only the CAD
+     * completion bits so the subsequent RxDone remains observable. */
+    let _ = sx126x_command(host, SX126X_CMD_CLEAR_IRQ_STATUS, &[0x00, (SX126X_IRQ_CAD_DONE | SX126X_IRQ_CAD_DETECTED) as u8]);
+    let receive_ms = config.cad_rx_ms.max(1).min(4000);
+    wait_for_irq(host, config.irq_pin, receive_ms);
+    let result = sx126x_emit_packet(host);
+    if result == 0 { return 0; }
+    let _ = sx126x_command(host, SX126X_CMD_CLEAR_IRQ_STATUS, &[0xff, 0xff]);
+    /* 2 means CAD detected activity but no valid packet completed; 1 is the
+     * normal quiet-channel result. This distinction is surfaced as event 7
+     * so the host can diagnose detector versus RX failures without a UART
+     * parser. */
+    if irq & SX126X_IRQ_CAD_DETECTED != 0 { 2 } else { 1 }
 }
 
 #[inline(always)] unsafe fn sx126x_emit_packet(host: &LoraHost) -> i32 {
@@ -487,6 +595,16 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
      * treats every negative value as a failed TX, while status makes it
      * possible to distinguish a radio timeout from a never-started TX. */
     -1000 - last_irq as i32
+}
+
+#[inline(always)] unsafe fn sx126x_hard_reset(host: &LoraHost, config: &LoraConfig) {
+    if config.reset_pin < 0 { return; }
+    if let Some(write) = host.gpio_write {
+        let _ = write(host.user, config.reset_pin as i32, 0);
+        if let Some(wait) = host.wait_irq { let _ = wait(host.user, 10); }
+        let _ = write(host.user, config.reset_pin as i32, 1);
+        if let Some(wait) = host.wait_irq { let _ = wait(host.user, 20); }
+    }
 }
 
 #[inline(always)] unsafe fn sx126x_write_register(host: &LoraHost, address: u16, value: &[u8]) -> i32 {
@@ -558,13 +676,20 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
                 let command = core::str::from_utf8(&args_buf[..args_len]).unwrap_or("");
                 if command == "stop" {
                     if let Some(disable) = host.irq_enable { let _ = disable(host.user, config.irq_pin as i32, 0); }
+                    if let Some(configure) = host.irq_configure { let _ = configure(host.user, config.irq_pin as i32, 0); }
                     power_down_radio(host, config);
                     log(ctx, b"mod_lora sx127x rx stopped"); event(ctx, 2, &[]); return 0;
                 }
                 if command == "tx" {
                     let tx_rc = sx127x_send(host, &payload_buf[..payload_len]);
                     let _ = sx127x_configure_rx(host, config);
-                    if tx_rc != 0 { log(ctx, b"mod_lora sx127x tx failed"); } else { tx_packets = tx_packets.saturating_add(1); event_bytes(ctx, 3, &payload_buf[..payload_len]); }
+                    if tx_rc != 0 {
+                        log(ctx, b"mod_lora sx127x tx failed");
+                        event_i32(ctx, 6, tx_rc);
+                    } else {
+                        tx_packets = tx_packets.saturating_add(1);
+                        event_bytes(ctx, 3, &payload_buf[..payload_len]);
+                    }
                 } else if command == "reconfigure" {
                     let rc = sx127x_configure_rx(host, config);
                     if rc != 0 { log(ctx, b"mod_lora sx127x reconfigure failed"); } else { event(ctx, 4, &[]); }
@@ -586,6 +711,10 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
                 }
             }
         }
+        if config.cad_rx != 0 {
+            let _ = sx127x_cad_window(host, config);
+            continue;
+        }
         /* Do not issue a SPI status transaction on every poll when the DIO
          * line is idle.  Apart from wasting bus time, a radio held BUSY can
          * otherwise delay command polling (including stop/tx) indefinitely. */
@@ -605,7 +734,8 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
     let mut args_buf = [0u8; 64];
     let mut payload_buf = [0u8; MAX_PACKET];
     let mut rx_packets = 0u32;
-    let mut tx_packets = 0u32;
+    let tx_packets = 0u32;
+    let mut cad_windows = 0u32;
     loop {
         if let Some(poll) = host.poll_command {
             let mut args_len = args_buf.len();
@@ -615,13 +745,39 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
                 let command = core::str::from_utf8(&args_buf[..args_len]).unwrap_or("");
                 if command == "stop" {
                     if let Some(disable) = host.irq_enable { let _ = disable(host.user, config.irq_pin as i32, 0); }
+                    if let Some(configure) = host.irq_configure { let _ = configure(host.user, config.irq_pin as i32, 0); }
                     power_down_radio(host, config);
                     log(ctx, b"mod_lora sx126x rx stopped"); event(ctx, 2, &[]); return 0;
                 }
                 if command == "tx" {
+                    /* A persistent RX task may have observed an IRQ edge or
+                     * a modem timeout since its last configuration.  Put the
+                     * SX126x back through the complete session setup before
+                     * switching it to TX; this also reapplies the calibrated
+                     * PA/RF path rather than relying on RX state surviving a
+                     * queued command. */
+                    if let Some(disable) = host.irq_enable {
+                        let _ = disable(host.user, config.irq_pin as i32, 0);
+                    }
+                    sx126x_hard_reset(host, config);
+                    let setup_rc = sx126x_configure_rx(host, config);
+                    if setup_rc != 0 {
+                        log(ctx, b"mod_lora sx126x tx setup failed");
+                        event_i32(ctx, 6, setup_rc);
+                        if let Some(enable) = host.irq_enable {
+                            let _ = enable(host.user, config.irq_pin as i32, 1);
+                        }
+                        continue;
+                    }
                     let tx_rc = sx126x_send(host, config, &payload_buf[..payload_len]);
-                    let _ = sx126x_configure_rx(host, config);
-                    if tx_rc != 0 { log(ctx, b"mod_lora sx126x tx failed"); } else { tx_packets = tx_packets.saturating_add(1); event_bytes(ctx, 3, &payload_buf[..payload_len]); }
+                    if tx_rc != 0 {
+                        log(ctx, b"mod_lora sx126x tx failed");
+                        event_i32(ctx, 6, tx_rc);
+                        return tx_rc;
+                    } else {
+                        event_bytes(ctx, 3, &payload_buf[..payload_len]);
+                        return 0;
+                    }
                 } else if command == "reconfigure" {
                     let rc = sx126x_configure_rx(host, config);
                     if rc != 0 { log(ctx, b"mod_lora sx126x reconfigure failed"); } else { event(ctx, 4, &[]); }
@@ -639,6 +795,24 @@ const SX126X_REG_TX_CLAMP_CONFIG: u16 = 0x08d8;
                     event(ctx, 5, &stats);
                 }
             }
+        }
+        if config.cad_rx != 0 {
+            let cad_result = sx126x_cad_window(host, config);
+            cad_windows = cad_windows.saturating_add(1);
+            if cad_result != 1 || cad_windows % 20 == 0 {
+                /* 7=CAD completed quietly, 8=CAD detected but RX failed,
+                 * 9=host/radio error, 10=packet delivered, 11=no CAD_DONE.
+                 * Keep the result
+                 * in the payload too; the event id is visible in Main logs. */
+                let event_id = if cad_result == 1 { 7u16 }
+                    else if cad_result == 2 { 8u16 }
+                    else if cad_result == 0 { 10u16 }
+                    else if cad_result == 11 { 11u16 }
+                    else if cad_result >= 0x100 { 32 + (cad_result & 0xff) as u16 }
+                    else { 9u16 };
+                event_i32(ctx, event_id, cad_result);
+            }
+            continue;
         }
         let irq_active = host.gpio_read.map(|read| read(host.user, config.irq_pin as i32) != 0).unwrap_or(true);
         if irq_active && sx126x_emit_packet(host) == 0 { rx_packets = rx_packets.saturating_add(1); }
@@ -794,6 +968,9 @@ mod tests {
             coding_rate: 5,
             preamble: 16,
             crc: 1,
+            cad_rx: 0,
+            cad_interval_ms: 2000,
+            cad_rx_ms: 1000,
         }
     }
 

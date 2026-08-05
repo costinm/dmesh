@@ -62,6 +62,20 @@ impl CommandTransport for LoggingCommandTransport {
 pub fn dispatch_binary_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec<u8> {
     let is_framed = packet.starts_with(&[0, 0xcb, 0, 0]);
     let cbor_bytes = if is_framed { &packet[4..] } else { packet };
+    // The transport envelope can carry more than command CBOR.  UART also
+    // has a fixed DMB1 bootstrap packet, and recovery/ROM paths may leave
+    // text or other binary bytes in the stream.  CBOR's top three bits are
+    // its major type; command packets must begin with a map
+    // (0xa0..0xbf, including indefinite 0xbf).  Do not manufacture an
+    // "invalid CBOR" response for a
+    // packet that was never claiming to be CBOR in the first place.
+    if !is_cbor_map_marker(cbor_bytes) {
+        log::debug!(
+            "ignoring non-command packet: {}",
+            packet_first_byte_summary(cbor_bytes)
+        );
+        return Vec::new();
+    }
     match decode_binary(cbor_bytes) {
         Ok(request) => {
             let response = registry.dispatch(&request);
@@ -81,6 +95,30 @@ pub fn dispatch_binary_packet(registry: &mut CommandRegistry, packet: &[u8]) -> 
             response_bytes
         }
     }
+}
+
+fn is_cbor_map_marker(packet: &[u8]) -> bool {
+    packet
+        .first()
+        .map(|byte| *byte >> 5 == 5)
+        .unwrap_or(false)
+}
+
+fn packet_first_byte_summary(packet: &[u8]) -> String {
+    let Some(&byte) = packet.first() else {
+        return "first_byte=none type=empty".to_string();
+    };
+    let kind = match byte >> 5 {
+        0 => "unsigned",
+        1 => "negative",
+        2 => "bytes",
+        3 => "text",
+        4 => "array",
+        5 => "map",
+        6 => "tag",
+        _ => "simple/float",
+    };
+    format!("first_byte=0x{byte:02x} major_type={kind}")
 }
 
 /// Dispatch a compact-CBOR command for the BLE CoC rendezvous transport.
@@ -115,10 +153,15 @@ pub fn dispatch_coc_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec
 
 /// Dispatch one compact-CBOR UART packet. UART's HDLC/PPP codec is below this
 /// layer; lmesh adds the generic mesh stream envelope on the UDS side.
-/// UART always returns a complete stream record, including malformed input
-/// errors.
+/// Valid command maps return a complete stream record. Non-CBOR packets are
+/// ignored without fabricating a CBOR error response.
 pub fn dispatch_uart_packet(registry: &mut CommandRegistry, packet: &[u8]) -> Vec<u8> {
-    wrap_stream_frame(&dispatch_binary_packet(registry, packet))
+    let response = dispatch_binary_packet(registry, packet);
+    if response.is_empty() {
+        Vec::new()
+    } else {
+        wrap_stream_frame(&response)
+    }
 }
 
 fn wrap_stream_frame(data: &[u8]) -> Vec<u8> {
@@ -145,6 +188,22 @@ fn encode_response_as_binary(method: u16, response: &CommandResponse) -> Vec<u8>
     }
     request.payload = response.payload.clone();
     encode_binary(&request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_cbor_map_marker, packet_first_byte_summary};
+
+    #[test]
+    fn classifies_cbor_major_types_before_command_decode() {
+        assert!(is_cbor_map_marker(&[0xa2]));
+        assert!(is_cbor_map_marker(&[0xb7]));
+        assert!(is_cbor_map_marker(&[0xbf]));
+        assert!(!is_cbor_map_marker(b"status\n"));
+        assert!(!is_cbor_map_marker(b"DMB1"));
+        assert!(!is_cbor_map_marker(&[0x82]));
+        assert_eq!(packet_first_byte_summary(&[0x82]), "first_byte=0x82 major_type=array");
+    }
 }
 
 /// Encode a diagnostic notification using the same binary stream as command

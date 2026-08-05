@@ -28,6 +28,7 @@ extern "C" {
     fn dmesh_flash_tcp_poll();
     fn dmesh_flash_tcp_accept() -> bool;
     fn dmesh_flash_tcp_finished() -> bool;
+    fn dmesh_module_loader_prepare_flash(timeout_ms: u32) -> bool;
 }
 
 struct PendingFlash {
@@ -375,6 +376,9 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
                 "boot" | "stage2" | "partition" | "partition-table" | "recovery" | "nvs" | "data" | "module"
             ) {
                 return Err(anyhow!("unsupported TCP flash target={target}"));
+            }
+            if target == "module" && !unsafe { dmesh_module_loader_prepare_flash(2000) } {
+                return Err(anyhow!("module task did not quiesce before flash"));
             }
             let mut slot = pending_flash().lock().unwrap();
             if slot.is_some() || crate::components::mode::ip_transport_active() {

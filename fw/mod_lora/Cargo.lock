@@ -5,11 +5,3 @@ version = 4
 [[package]]
 name = "dmesh-mod-lora"
 version = "0.1.0"
-
-[[patch.unused]]
-name = "mesh"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "ssh-mesh"
-version = "0.1.0"

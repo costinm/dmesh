@@ -69,7 +69,11 @@ static UART0_HEARTBEAT_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
 
-const RADIO_EVENT_UART_WINDOW_MS: u32 = 250;
+// A received LoRa packet is an authenticated/in-band wake trigger. Keep the
+// managed console available for the same bounded interaction window used by
+// other local wake paths so lmesh can collect the automatic status/stats
+// records without immediately putting the board back behind UART gating.
+const RADIO_EVENT_UART_WINDOW_MS: u32 = DEFAULT_ACTIVE_MS;
 
 const UART_FRAME_QUEUE_LEN: u32 = 8;
 // UART carries compact CBOR directly. The generic mesh stream envelope belongs
@@ -233,9 +237,10 @@ pub fn on_raw_nan_wake(active_ms: u32) -> bool {
 /// Unlike periodic duty wakes this is event-driven: any enabled radio receive
 /// opens one bounded UART window so the following notification can be sent.
 pub fn on_radio_packet_received() -> bool {
-    if UART0_HEARTBEAT_EVERY.load(Ordering::Acquire) == 0 {
-        return false;
-    }
+    // A packet is an explicit in-band wake event, so it overrides the
+    // periodic-heartbeat setting.  `uart.hb_every=0` disables timer wakes;
+    // it must not hide the event window needed by lmesh to collect the
+    // packet's compact stats notification.
     emit_heartbeat(RADIO_EVENT_UART_WINDOW_MS)
 }
 

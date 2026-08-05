@@ -49,6 +49,8 @@ static char uart_ssid[33];
 static char uart_remote[128];
 static uint16_t uart_port;
 
+static void clear_recovery_request(void);
+
 static bool set_unconfigured_defaults(void)
 {
     uint8_t mac[6] = {0};
@@ -99,6 +101,75 @@ static void restart_task(void *arg)
 }
 
 static bool save_sta_request(char *line);
+
+static bool save_sta_packet(const uint8_t *packet, size_t length)
+{
+    if (length < DMESH_BOOT_STA_HEADER_LEN ||
+        !dmesh_boot_is_magic(packet, length) ||
+        packet[4] != DMESH_BOOT_VERSION ||
+        packet[5] != DMESH_BOOT_KIND_COMMAND ||
+        packet[6] != DMESH_BOOT_COMMAND_STA) {
+        return false;
+    }
+    size_t endpoint_length = packet[7];
+    if (length < DMESH_BOOT_STA_HEADER_LEN + endpoint_length + 3) {
+        return false;
+    }
+    size_t cursor = 8;
+    size_t local_length = packet[cursor++];
+    size_t ssid_length = packet[cursor++];
+    size_t password_length = packet[cursor++];
+    size_t fields_length = endpoint_length + local_length + ssid_length + password_length;
+    if (fields_length > length - cursor || fields_length > 220 ||
+        endpoint_length == 0 || local_length == 0 || ssid_length == 0 ||
+        endpoint_length >= 128 || local_length >= 32 || ssid_length >= sizeof(ssid) ||
+        password_length >= 32) {
+        return false;
+    }
+    char line[256];
+    int written = snprintf(line, sizeof(line), "STA %.*s %.*s %.*s %.*s",
+                           (int)endpoint_length, packet + cursor,
+                           (int)local_length, packet + cursor + endpoint_length,
+                           (int)ssid_length, packet + cursor + endpoint_length + local_length,
+                           (int)password_length,
+                           packet + cursor + endpoint_length + local_length + ssid_length);
+    return written > 0 && (size_t)written < sizeof(line) && save_sta_request(line);
+}
+
+static void schedule_recovery_restart(bool reboot_main)
+{
+    if (reboot_main) {
+        /* A normal Recovery completion tells stage2 that the next boot is a
+         * fresh Main attempt.  Clear only the one-shot request marker; keep
+         * the saved STA configuration for a future explicit update. */
+        clear_recovery_request();
+        dmesh_boot_journal_clear();
+        dmesh_boot_health_write(DMESH_BOOT_HEALTH_RECOVERY_OK);
+        const char response[] = "REBOOT_MAIN accepted\n";
+        (void)uart_write_bytes(UART_NUM_0, response, sizeof(response) - 1);
+    } else {
+        /* Leave request_version/request_magic intact.  Stage2 will select
+         * Recovery again and the configured Main transfer will be retried. */
+        const char response[] = "RETRY_MAIN accepted\n";
+        (void)uart_write_bytes(UART_NUM_0, response, sizeof(response) - 1);
+    }
+    xTaskCreate(restart_task, "recovery_restart", 2048, NULL,
+                configMAX_PRIORITIES - 1, NULL);
+    vTaskDelete(NULL);
+}
+
+static bool handle_recovery_command(char *line)
+{
+    if (strcmp(line, "REBOOT_MAIN") == 0) {
+        schedule_recovery_restart(true);
+        return true;
+    }
+    if (strcmp(line, "RETRY_MAIN") == 0) {
+        schedule_recovery_restart(false);
+        return true;
+    }
+    return false;
+}
 
 static void save_sta_and_restart(char *line)
 {
@@ -172,8 +243,17 @@ static void uart_command_task(void *arg)
         if (byte == DMESH_BOOT_WIRE_FLAG) {
             if (in_frame && frame_length != 0) {
                 if (frame_length < sizeof(line)) {
+                    if (save_sta_packet(frame, frame_length)) {
+                        xTaskCreate(restart_task, "recovery_restart", 2048, NULL,
+                                    configMAX_PRIORITIES - 1, NULL);
+                        vTaskDelete(NULL);
+                        return;
+                    }
                     memcpy(line, frame, frame_length);
                     line[frame_length] = '\0';
+                    if (handle_recovery_command(line)) {
+                        return;
+                    }
                     save_sta_and_restart(line);
                 }
             }
@@ -198,6 +278,9 @@ static void uart_command_task(void *arg)
         if (byte == '\n' || byte == '\r') {
             if (length != 0) {
                 line[length] = '\0';
+                if (handle_recovery_command(line)) {
+                    return;
+                }
                 save_sta_and_restart(line);
                 length = 0;
             }
@@ -316,6 +399,26 @@ static void load_request(void)
              have_ssid, have_server, have_local, (unsigned)remote_port,
              esp_err_to_name(port_error));
     nvs_close(nvs);
+}
+
+static bool ensure_recovery_request(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(RECOVERY_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "request ensure open failed error=%s", esp_err_to_name(err));
+        return false;
+    }
+    err = nvs_set_u32(nvs, "request_magic", 0x52455131u);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, "request_version", 1);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "request ensure result=%s", esp_err_to_name(err));
+    return err == ESP_OK;
 }
 
 static bool trust_key_present(void)
@@ -501,6 +604,12 @@ void recovery_app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     dmesh_boot_health_write(DMESH_BOOT_HEALTH_RECOVERY_START);
+    /* Recovery is an update worker, not a passive boot target.  Keep the
+     * stage2 one-shot marker armed until the Main transfer succeeds, so an
+     * AP outage, TCP drop, or board reset returns here for another attempt. */
+    if (!ensure_recovery_request()) {
+        ESP_LOGE(TAG, "cannot arm automatic Main retry marker");
+    }
     read_uart_override();
     send_boot_identity();
     xTaskCreate(uart_command_task, "recovery_uart", 6144, NULL, 5, NULL);

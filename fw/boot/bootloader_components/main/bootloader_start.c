@@ -10,6 +10,8 @@
 #include "esp_rom_serial_output.h"
 #include "esp_rom_sys.h"
 #include "esp_rom_gpio.h"
+#include "esp_efuse.h"
+#include "esp_efuse_table.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
 #include "bootloader_init.h"
@@ -213,6 +215,10 @@ static bool uart_boot_requested(void)
     uint16_t now = (uint16_t)rtc_boot_ticks();
     hello[10] = (uint8_t)(now >> 8);
     hello[11] = (uint8_t)now;
+    /* Recovery/Main identify themselves with the station MAC.  Stage2 runs
+     * before Wi-Fi initialization, so read the factory/base MAC directly
+     * from eFuse rather than using the higher-level interface API. */
+    (void)esp_efuse_read_field_blob(ESP_EFUSE_MAC_FACTORY, hello + 12, 48);
     uint8_t wire[DMESH_BOOT_HELLO_LEN * 2 + 2];
     size_t wire_len = dmesh_boot_frame_encode(hello, sizeof(hello), wire,
                                               sizeof(wire));

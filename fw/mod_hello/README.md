@@ -36,19 +36,22 @@ bash fw/mod_hello/build.sh riscv32imac-esp-espidf
 The RISC-V build uses Rust's PIC relocation model and is checked for an empty
 relocation table before packaging.
 
-This writes `target/modules/xtensa-esp32-espidf/mod_hello.dmod`. The default
-script links at address zero and refuses artifacts with relocations, global
-symbols, data, or BSS. Xtensa Rust does not currently produce a safe generic
-PIC image: a flat image with VMA zero must not be mapped at an arbitrary
-virtual address. The loader's fixed-window experiment can be built explicitly
-with a code VMA 64 bytes after its target window, for example:
+This writes `target/modules/xtensa-esp32-espidf/mod_hello.dmod`. Xtensa builds
+default to the Main-reserved fixed window and refuse artifacts with
+relocations, global symbols, data, or BSS. Xtensa Rust does not currently
+produce a safe generic PIC image: a flat image with VMA zero must not be mapped
+at an arbitrary virtual address. The current loader exposes one canonical
+window per CPU; an override is accepted only when it names that exact window,
+for example:
 
 ```sh
 DMESH_MODULE_VMA=0x43000040 bash fw/mod_hello/build.sh xtensa-esp32s3-espidf
 ```
 
 That sets the DMOD fixed-VMA flag; Main must be built with the corresponding
-reserved MMU window before such an image is deployed.
+reserved MMU window before such an image is deployed. A different slot/window
+requires a coordinated Main loader change and is intentionally rejected by
+the build scripts for now.
 
 The wrapped image is named `hello`. Upload it through DRS2 target `module` at
 a 64 KiB-aligned offset, then invoke it from Main with

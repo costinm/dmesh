@@ -160,8 +160,10 @@ The P-256 trust key is consumed by Recovery, not stage2.
 
 DMB1 is a fixed byte layout, not general CBOR. PPP/HDLC delimiters and escaping
 allow a UART receiver to regain framing. The identity includes version, role,
-partition, reset reason, and a short RTC tick value; remaining bytes are
-reserved. The 500 ms window is deliberately bounded on every boot. The managed
+partition, reset reason, a short RTC tick value, and the factory station MAC
+read directly from eFuse. The MAC is available before Wi-Fi initialization and
+must match the MAC reported by Main and Recovery. The 500 ms window is
+deliberately bounded on every boot. The managed
 lmesh host sends the fixed command immediately after the reset pulse; it does not
 wait for the identity to make the round trip first. This is necessary because the
 old 50 ms window was shorter than the managed forwarding path and caused stage2

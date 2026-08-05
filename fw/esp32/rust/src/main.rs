@@ -253,7 +253,9 @@ fn drain_uart_console(
         }
         components::mode::mark_companion_active(settings, companion_active_ms);
         let response = transports::dispatch_uart_packet(registry, &frame.data);
-        components::serial::write_packet(&response);
+        if !response.is_empty() {
+            components::serial::write_packet(&response);
+        }
         // The manager owns driver deletion. It observes this notification only
         // after the acknowledgement above has been accepted by UART TX.
         let _ = components::serial::finish_pending_uninstall();
@@ -342,11 +344,14 @@ fn poll_raw_wifi_commands(
             command.rssi
         ));
         let response_payload = transports::dispatch_binary_packet(registry, &command.payload);
+        if response_payload.is_empty() {
+            continue;
+        }
         if let Err(err) = components::wifi::send_response_payload_to(
-            command.response,
-            command.source,
-            &response_payload,
-        ) {
+                command.response,
+                command.source,
+                &response_payload,
+            ) {
             components::telemetry::record_log(format!(
                 "event type=wifi.raw_response ok=false msg={}",
                 commands::protocol::escape_value(&err.to_string())
@@ -366,6 +371,9 @@ fn poll_nan_commands(
             command.payload.len()
         ));
         let response_payload = transports::dispatch_binary_packet(registry, &command.payload);
+        if response_payload.is_empty() {
+            continue;
+        }
         if let Err(err) = components::nan::queue_response_payload_to(&command, &response_payload) {
             components::telemetry::record_log(format!(
                 "event type=nan.response ok=false msg={}",

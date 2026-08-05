@@ -336,6 +336,24 @@ pub fn count_packet(transport: &'static str, direction: Direction, len: usize) {
     counter_for(transport).record(direction, len);
 }
 
+/// Compact, event-triggered statistics emitted after a LoRa packet wakes a
+/// sleepy node. Keep this deliberately smaller than `status`/`xstatus` so
+/// long-running tests can consume it without turning the wake report into a
+/// second source of UART framing pressure.
+pub fn lora_wake_stats_text() -> String {
+    let lora = LORA_COUNTER.snapshot();
+    format!(
+        "event type=lora.wake_stats uptime_ms={} {} lora_rx={} lora_rx_bytes={} lora_tx={} lora_tx_bytes={} {}",
+        now_ms(),
+        super::power::compact_status_fields(),
+        lora.rx_packets,
+        lora.rx_bytes,
+        lora.tx_packets,
+        lora.tx_bytes,
+        super::mode::raw_nan_wake_summary(),
+    )
+}
+
 pub fn record_local_packet(
     transport: &'static str,
     direction: Direction,

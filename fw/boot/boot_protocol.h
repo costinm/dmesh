@@ -23,6 +23,7 @@
 #define DMESH_BOOT_KIND_HELLO 1
 #define DMESH_BOOT_KIND_COMMAND 2
 #define DMESH_BOOT_COMMAND_RECOVERY 1
+#define DMESH_BOOT_COMMAND_STA 2
 #define DMESH_BOOT_ROLE_STAGE2 3
 #define DMESH_BOOT_ROLE_MAIN 1
 #define DMESH_BOOT_ROLE_RECOVERY 2
@@ -32,6 +33,9 @@
 
 #define DMESH_BOOT_HELLO_LEN 18
 #define DMESH_BOOT_COMMAND_LEN 8
+/* DMB1 command packet for Recovery's open-STA handoff.  The four length
+ * bytes are followed by endpoint, local IPv4, SSID, and password bytes. */
+#define DMESH_BOOT_STA_HEADER_LEN 11
 
 static inline bool dmesh_boot_is_magic(const uint8_t *p, size_t length)
 {

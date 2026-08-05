@@ -18,8 +18,25 @@ case "$TARGET" in
   riscv32imac-unknown-none-elf|riscv32imac-esp-espidf) tool_prefix=riscv32-esp-elf ;;
   *) echo "unsupported module target: $TARGET" >&2; exit 2 ;;
 esac
+if [[ "$TARGET" == xtensa-esp32s3-espidf ]]; then
+    expected_module_vma=0x43000040
+elif [[ "$TARGET" == xtensa-esp32-espidf ]]; then
+    expected_module_vma=0x40300040
+else
+    expected_module_vma=
+fi
+if [[ "$TARGET" == xtensa-* && -z "${DMESH_MODULE_VMA:-}" ]]; then
+    DMESH_MODULE_VMA="$expected_module_vma"
+elif [[ -n "${DMESH_MODULE_VMA:-}" && -z "$expected_module_vma" ]]; then
+    echo "DMESH_MODULE_VMA is only valid for fixed-VMA Xtensa builds" >&2
+    exit 2
+fi
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then
     module_vma_value=$((DMESH_MODULE_VMA))
+    if (( module_vma_value != expected_module_vma )); then
+        echo "DMESH_MODULE_VMA must be $expected_module_vma; Main currently exposes one canonical MMU window" >&2
+        exit 2
+    fi
     fixed_window=$((module_vma_value - 64))
     if (( fixed_window < 0 || fixed_window % 0x10000 != 0 )); then
         echo "DMESH_MODULE_VMA must be a 64-byte code address after a 64 KiB window" >&2
@@ -28,7 +45,7 @@ if [ -n "${DMESH_MODULE_VMA:-}" ]; then
     if [[ "$TARGET" == xtensa-esp32s3-espidf ]]; then
         module_data_vma=$((0x3c000000 + module_vma_value - 0x42000000))
     elif [[ "$TARGET" == xtensa-esp32-espidf ]]; then
-        module_data_vma=$((0x3f400000 + module_vma_value - 0x400d0000))
+        module_data_vma=$((0x3f700000 + module_vma_value - 0x40300000))
     fi
 fi
 

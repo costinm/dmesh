@@ -121,6 +121,14 @@ The Main module command may target any aligned slot with `offset=...`. When
 the remaining raw region as its bounds, allowing independently deployed
 modules larger than one 64 KiB slot.
 
+Before a module transfer, Main must be running an image that quiesces the
+module task and waits for it to stop before the raw data region is erased. The
+module executes from that same flash mapping; flashing it while its task is
+still running can disable the cache underneath the instruction fetch and
+reset the board before the protocol's final `DONE` frame. If a module session
+ends as `started`/`timed out`, verify the board is running the current Main
+image before retrying the module transfer.
+
 For Rust ESP development, source the same environment. `env.sh` owns
 the repo-local Nix profile, ESP-IDF tools, ESP Python environment, Cargo home,
 rustup home, and Xtensa Rust toolchain paths under `target/esp32-6.0`; do not

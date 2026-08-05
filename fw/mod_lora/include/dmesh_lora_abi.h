@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DMESH_LORA_ABI_VERSION 1u
+#define DMESH_LORA_ABI_VERSION 2u
 #define DMESH_LORA_MAX_PACKET 255u
 
 typedef enum {
@@ -84,9 +84,15 @@ typedef struct {
     int32_t coding_rate;
     int32_t preamble;
     int32_t crc;
+    /* Receiver power policy: zero keeps continuous RX; nonzero uses the
+     * chip's CAD/duty-cycle equivalent. The interval is the total cadence,
+     * and rx_ms is the active receive portion of that cadence. */
+    int32_t cad_rx;
+    uint32_t cad_interval_ms;
+    uint32_t cad_rx_ms;
 } dmesh_lora_config_v1;
 
 #if UINTPTR_MAX == 0xffffffffu
 _Static_assert(sizeof(dmesh_lora_host_v1) == 56, "dmesh_lora_host_v1 ABI size");
-_Static_assert(sizeof(dmesh_lora_config_v1) == 92, "dmesh_lora_config_v1 ABI size");
+_Static_assert(sizeof(dmesh_lora_config_v1) == 104, "dmesh_lora_config_v1 ABI size");
 #endif

@@ -134,6 +134,10 @@ def configure_quiet(
         "ble stop=true",
         "nan stop=true",
         "wifi mode=off",
+        # A previous interactive/infra session can keep the Wi-Fi and UART
+        # no-light-sleep locks held even after the board reports sleepy mode.
+        # Clear that runtime override before taking an idle power baseline.
+        "mode active=false",
         "power profile={}".format(power_profile),
         "lora rx=false",
         "lora preset=medium_fast freq={} apply=true".format(frequency),

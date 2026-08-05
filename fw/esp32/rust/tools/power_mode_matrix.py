@@ -158,6 +158,10 @@ def main() -> int:
                     timeout=args.timeout,
                     wake=True if index and command_index == 0 else False,
                 )
+            # Do not let a persistent interactive session contaminate the
+            # light-sleep profile being measured. This is idempotent when no
+            # active override exists.
+            node.command("mode active=false", timeout=args.timeout)
             node.command("stats reset=true", timeout=args.timeout)
             before = fields(node.command("power status=true", timeout=args.timeout), "power")
             node.command("power quiet=true", timeout=args.timeout)

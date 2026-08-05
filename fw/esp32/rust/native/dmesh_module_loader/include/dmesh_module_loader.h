@@ -19,6 +19,9 @@ int dmesh_module_lora_configure(const dmesh_lora_config_v1 *config);
 int dmesh_module_lora_update_config(const dmesh_lora_config_v1 *config);
 int dmesh_module_lora_command(const uint8_t *args, size_t args_len,
                               const uint8_t *payload, size_t payload_len);
+/* Stop an executing module before the flash transport erases its raw data
+ * region. Returns false if the task does not quiesce within timeout_ms. */
+bool dmesh_module_loader_prepare_flash(uint32_t timeout_ms);
 bool dmesh_module_loader_task_done(void);
 int dmesh_module_loader_last_result(void);
 uint32_t dmesh_module_loader_runtime_ms(void);

@@ -1,18 +1,14 @@
-# DMesh Recovery and DRS2 design
+# DMesh Recovery and flash design
 
-## Status and judgment
+Stage2 is a minimal boot supervisor. Recovery is the smallest image including
+ESP-IDF Wi-Fi, TCP, NVS, and flash APIs. Main is reusing the same flash protocol and the code as a library to flash recovery, stage2, modules. 
 
-Separating Recovery from stage2 is the right design. Stage2 remains a small
-boot supervisor; Recovery gets ESP-IDF tasks, Wi-Fi, TCP, NVS, cryptography,
-and flash APIs. Main can reuse the same flash worker to update a non-running
-Recovery image.
+## Status
 
-The current implementation has repeatedly updated Main over Wi-Fi on ESP32 and
-ESP32-S3 and is operational for lab/bootstrap use. It is not yet a production
-authenticated updater. The protocol contains the required authenticity pieces,
-but current fleet devices have no trust key, the default server selects an
-unsigned-fast mode, caller-specific target permissions are not enforced in the
-shared C worker, and unsigned-fast completion is too permissive.
+Most of the testing and development is with the unsigned blobs - it is faster.
+
+The signed images are in progress - basic P-256 and block verification are implemented but not the image version and anti-rollback, tools to generate/sign
+images offline - or extensive testing on the crypto side.
 
 ## Component boundary
 
@@ -20,17 +16,16 @@ shared C worker, and unsigned-fast completion is too permissive.
 Main
   - decides whether and when to update
   - writes the Recovery request
-  - may use the shared worker for a non-running target
+  - may use the shared worker to flash anything but itself.
 
 stage2
-  - selects Recovery or Main
+  - selects Recovery or Main - based on reboot count, UART in dev.
 
 Recovery
   - loads transport settings and trust key from NVS
-  - joins Wi-Fi as a station
-  - connects to the host flash server
-  - receives and applies DRS2
-  - clears the one-shot request only after success
+  - joins an open (no password) Wi-Fi as a station
+  - connects to the host flash server by IP:port
+  - receives and applies (signed) blobs
   - reboots
 
 host flash server
@@ -49,28 +44,29 @@ the mesh application. This keeps `fw/recovery` movable to another repository.
 Main's CMake integration defaults to the in-tree path and accepts
 `DMESH_RECOVERY_TRANSPORT_DIR` when the transport is supplied by a separate
 checkout or vendored dependency.
-The caller sets up Wi-Fi and starts either an outbound connection or a listener;
-the manifest currently supplies the actual target.
+
+The library connects to the open AP, starts an TCP outbound connection;
+the signed manifest supplies the actual blocks.
 
 There is no HTTP, HTTPS, MQTT, BLE, filesystem, compression, OTA-data state,
 or package manager in Recovery.
 
 ## Normal update flow
 
-The long-running host process is `fw/recovery/tools/flash-server.py`. With no arguments
-it serves CPU-selected resources from `target/flash`, listens on
+The long-running host process is `fw/recovery/tools/flash-server.py`. With no arguments it serves CPU-selected resources from `target/flash`, listens on
 `10.78.0.1:3336`, keeps accepting devices, and enables unsigned-fast only for
-devices reporting no trust key. New clients put the requested target in the
-extended HELLO, allowing one listener to serve Main, Recovery, stage2, and
-named modules. A missing selector falls back to Main for compatibility.
-`docs/lab/recovery-tcp-server.toml` runs it under mesh-init.
+devices reporting no trust key. 
 
-The preferred artifact layout is `target/flash/<cpu>/`, for example
+Clients put the requested target in the extended HELLO, allowing one server to serve Main, Recovery, stage2, and named modules. A missing selector falls back to
+ Main for compatibility.
+
+The artifact layout is `target/flash/<cpu>/`, for example
 `target/flash/esp32/main-app.bin`, `recovery.bin`, and `bootloader.bin`.
 Named module lookup first checks the matching CPU directory and then the
 older shared `target/modules/<rust-target>/` layout. The selector extension is
 reserved for future signed configuration/resource blobs without requiring
 another TCP listener.
+
 That lab service does not currently provide a signing key. Once a device trust
 key is provisioned, the service must be configured with the corresponding
 private signing key or the device will correctly reject its manifests.
@@ -85,24 +81,31 @@ Network defaults live in `target/flash-devices/network.json`. A saved SSID is
 put into the NVS request, avoiding a scan on every update. An absent SSID is a
 fallback that makes Recovery scan for the first open `Direct-*-Dmesh` network.
 The server defaults to `10.78.0.1`, the port to `3336`, and an absent local
-address to `10.78.<MAC[4]>.<MAC[5]>` with a `/16` mask. Recovery is currently
-open-STA only; the NVS password field is retained for ABI compatibility but is
-not applied by the minimal Wi-Fi implementation.
+address to `10.78.<MAC[4]>.<MAC[5]>` with a `/16` mask. 
+
+Recovery is intentionally open-STA only, to keep image small and avoid connecting
+to 'real' networks or seeing passwords. The device and the flash server are both
+completely untrusted. There is no point to use wireless encryption for an image
+that is not encrypted and can be extracted from the device.
+
+The security is based on signing the image manifest, including the list of block
+SHA. We do not sign the entire image because the device can't load it all in
+memory - and we may support incremental updates where only modified blocks are 
+sent.
 
 Human-facing flash tools use the managed direct lmesh forward by default and
 load the saved SSID, netmask, and board address from
 `target/flash-devices/network.json`. The Main control-plane request carries
 the netmask through to its static STA setup; this matters for the lab's
 `10.78.0.0/16` network when a device address is in another third-octet
-subnet, such as `10.78.84.60`.
-NAN-gateway routing is experimental/WIP and is not used for routine flashing.
+subnet, such as `10.78.84.60`. NAN-gateway routing is experimental/WIP and is not used for routine flashing.
 
 Recovery retries association in 30-second windows with a short delay between
 windows. It remains in Recovery while the AP is absent. After association, the
-DRS2 worker retries the numeric IPv4 server for 30 seconds at 200 ms intervals.
+flash worker retries the numeric IPv4 server for 30 seconds at 200 ms intervals.
 Hostnames, DHCP policy, AP mode, and IPv6 are not part of the minimal path.
 
-## DRS2 framing
+## Flash framing
 
 TCP carries raw length-prefixed frames:
 
@@ -198,10 +201,12 @@ and skips initial hashes, per-block hashes/readback, and final SHA verification.
 It is a speed-oriented development/factory path, not an authenticated update.
 
 Current weakness: the receiver does not track that every expected block was
-received exactly once before accepting `DONE`. A buggy or hostile unkeyed host
+received exactly once before accepting `DONE`. A buggy or hostile host
 can therefore cause a partial image to be treated as success and clear the
-request. Add a received-block bitmap (or require strict sequential indices)
-before relying on this mode outside recoverable lab provisioning.
+request. The device will need to check the SHA of each block it has against the
+manifest before considering the upgrade complete.
+
+Also missing/WIP is a protection against reboot selecting an incomplete main.
 
 ## Authentication and trust
 
@@ -228,15 +233,16 @@ That is an availability attack rather than a successful authenticated install.
 Use at least 128-bit block digests in the next protocol version.
 
 There is no anti-rollback counter or freshness token. An attacker able to
-serve an older correctly signed manifest can replay it. If rollback resistance
-is required, add a signed generation/version constrained by monotonic device
-state. Main should still own rollout policy; Recovery should only enforce the
-minimum security floor.
+serve an older correctly signed manifest can replay it. Rollback resistance
+is required, but still WIP, will be added after the rest of the protocol works.
 
-The most serious bootstrap-policy issue is that a missing key always reopens
-unsigned update mode. A production device needs a separate irreversible or
-protected `provisioned` latch so key loss/corruption fails closed instead of
-silently returning to factory trust.
+The protections are for distributing updates over untrusted flash servers and Wifi,
+not for physical access. 
+
+It is technically possible to blow the JTAG fuses and encrypt the 2stage, and
+have 2stage check the signature of the main and recovery. That can protect the 
+device from modifications to some extent, but would not make it a trusted device,
+it's just a modem and controller.
 
 ## Target permissions and self-update
 
@@ -246,7 +252,7 @@ The intended matrix is:
 |---|---|
 | Recovery | Main only |
 | Main | Recovery; optionally data/NVS |
-| factory/emergency flow | stage2 and partition table with explicit authority |
+| factory/emergency flow | stage2 and partition table over UART/esptool |
 
 Main correctly rejects `target=main` at its Rust command surface. The current
 client now sends the requested target in the extended HELLO, and the host

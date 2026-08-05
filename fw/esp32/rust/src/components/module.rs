@@ -54,9 +54,12 @@ struct ModuleLoraConfig {
     coding_rate: i32,
     preamble: i32,
     crc: i32,
+    cad_rx: i32,
+    cad_interval_ms: u32,
+    cad_rx_ms: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<ModuleLoraConfig>() == 92);
+const _: () = assert!(std::mem::size_of::<ModuleLoraConfig>() == 104);
 
 extern "C" {
     fn dmesh_module_loader_init();
@@ -273,7 +276,7 @@ fn lora_config_from_settings(settings: &crate::components::settings::SharedSetti
     let chip = s.get_str("lora.chip").ok().flatten();
     let sx126 = chip.as_deref().map(|v| v.contains("126")).unwrap_or(false);
     ModuleLoraConfig {
-        abi_version: 1,
+        abi_version: 2,
         size: std::mem::size_of::<ModuleLoraConfig>() as u32,
         chip: if sx126 { 2 } else { 1 },
         frequency_hz: s.get_i32("lora.freq", 913_125_000i32).unwrap_or(913_125_000) as u32,
@@ -304,6 +307,9 @@ fn lora_config_from_settings(settings: &crate::components::settings::SharedSetti
         coding_rate: s.get_i32("lora.cr", 5).unwrap_or(5),
         preamble: s.get_i32("lora.preamble", 16).unwrap_or(16),
         crc: if s.get_bool("lora.crc", true).unwrap_or(true) { 1 } else { 0 },
+        cad_rx: if s.get_bool("lora.cad_rx", false).unwrap_or(false) { 1 } else { 0 },
+        cad_interval_ms: s.get_i32("lora.cad_int", 2000).unwrap_or(2000).max(1) as u32,
+        cad_rx_ms: s.get_i32("lora.cad_rxms", 1000).unwrap_or(1000).max(1) as u32,
     }
 }
 
@@ -515,7 +521,13 @@ impl CommandHandler for ModuleCommand {
                 ensure_initialized(&self.settings);
                 Ok(CommandResponse::ok("module initialized"))
             }
-            "status" => Ok(CommandResponse::ok(status_text())),
+            "status" => {
+                // Header inspection is read-only and does not map or execute
+                // the module. Make status reflect the actual flash slot
+                // instead of exposing the deferred-init sentinel values.
+                ensure_initialized(&self.settings);
+                Ok(CommandResponse::ok(status_text()))
+            }
             "psram" => Ok(CommandResponse::ok(psram_text())),
             "stats" => {
                 ensure_initialized(&self.settings);

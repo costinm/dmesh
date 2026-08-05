@@ -74,6 +74,9 @@ pub(crate) struct LoraConfig {
     pub(crate) crc: bool,
     pub(crate) preamble: i32,
     pub(crate) tx_power: i32,
+    pub(crate) cad_rx: bool,
+    pub(crate) cad_interval_ms: i32,
+    pub(crate) cad_rx_ms: i32,
 }
 
 impl Default for LoraConfig {
@@ -107,6 +110,9 @@ impl Default for LoraConfig {
             crc: true,
             preamble: 16,
             tx_power: DEFAULT_TX_POWER,
+            cad_rx: false,
+            cad_interval_ms: 2000,
+            cad_rx_ms: 1000,
         }
     }
 }
@@ -149,21 +155,39 @@ pub fn load_config(settings: &SharedSettings) -> Result<LoraConfig> {
     }
     config.crc = s.get_bool("lora.crc", config.crc)?;
     config.sx1262_dio2_rf_switch = s.get_bool("lora.dio2rf", config.sx1262_dio2_rf_switch)?;
+    config.cad_rx = s.get_bool("lora.cad_rx", config.cad_rx)?;
+    config.cad_interval_ms = s.get_i32("lora.cad_int", config.cad_interval_ms)?;
+    config.cad_rx_ms = s.get_i32("lora.cad_rxms", config.cad_rx_ms)?;
     Ok(config)
 }
 
 pub fn status_text(settings: &SharedSettings) -> String {
     match load_config(settings) {
         Ok(config) => format!(
-            "lora backend=module chip={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} tx_power={} module_authoritative=true",
+            "lora backend=module chip={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} tx_power={} cad_rx={} cad_interval_ms={} cad_rx_ms={} module_authoritative=true",
             config.chip.as_str(), config.frequency_hz, config.bandwidth_hz,
-            config.sf, config.cr, config.sync_word, config.tx_power
+            config.sf, config.cr, config.sync_word, config.tx_power,
+            config.cad_rx, config.cad_interval_ms, config.cad_rx_ms
         ),
         Err(err) => format!("lora backend=module configured=false error={err}"),
     }
 }
 
-pub fn background_rx_running() -> bool { false }
+/// Whether the module currently owns a receive task that can wake the CPU.
+/// The task is deliberately kept alive for CAD/duty-cycle receive during
+/// light sleep; the radio's DIO line is then an asynchronous wake source.
+pub fn background_rx_running() -> bool {
+    super::module::lora_enabled() && !super::module::module_task_done()
+}
+
+/// CAD receivers remain configured across light-sleep intervals. Other radio
+/// modes are stopped by the normal sleep/profile transitions.
+pub fn keep_rx_in_light_sleep(settings: &SharedSettings) -> bool {
+    if !background_rx_running() {
+        return false;
+    }
+    load_config(settings).map(|config| config.cad_rx).unwrap_or(false)
+}
 
 pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::JoinHandle<()>>> {
     if !super::module::lora_enabled() {
@@ -225,14 +249,18 @@ impl CommandHandler for LoraCommand {
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         super::module::ensure_initialized(&self.settings);
+        /* Both spellings are common in the managed command surface.  Keep
+         * status strictly observational: `lora op=status` must not configure
+         * SPI, start a module task, or hand an unknown `status` command to a
+         * stale image. */
+        let status_requested = request.arg("op") == Some("status")
+            || request.arg("status").map(parse_bool).transpose()?.unwrap_or(false);
+        if self.name == "lora" && status_requested {
+            return Ok(CommandResponse::ok(status_text(&self.settings)));
+        }
         if self.name == "lora" {
             persist_settings(&self.settings, request)?;
             super::module::refresh_lora_config(&self.settings)?;
-        }
-        if self.name == "lora"
-            && request.arg("status").map(parse_bool).transpose()?.unwrap_or(false)
-        {
-            return Ok(CommandResponse::ok(status_text(&self.settings)));
         }
         let mut module_request = request.clone();
         let op = match self.name {
@@ -280,12 +308,13 @@ fn persist_settings(settings: &SharedSettings, request: &CommandRequest) -> Resu
         ("spi_host", "lora.spi_host"), ("sck", "lora.sck"),
         ("miso", "lora.miso"), ("mosi", "lora.mosi"), ("cs", "lora.cs"),
         ("rst", "lora.rst"), ("dio0", "lora.dio0"), ("busy", "lora.busy"),
+        ("cad_interval_ms", "lora.cad_int"), ("cad_rx_ms", "lora.cad_rxms"),
     ] {
         if let Some(value) = request.arg(arg) {
             settings.borrow_mut().set_i32(key, parse_i32(value)?)?;
         }
     }
-    for (arg, key) in [("crc", "lora.crc"), ("beacon", "lora.beacon"), ("dio2rf", "lora.dio2rf")] {
+    for (arg, key) in [("crc", "lora.crc"), ("beacon", "lora.beacon"), ("dio2rf", "lora.dio2rf"), ("cad_rx", "lora.cad_rx")] {
         if let Some(value) = request.arg(arg) {
             settings.borrow_mut().set_bool(key, parse_bool(value)?)?;
         }
@@ -313,6 +342,22 @@ pub fn handle_module_packet(data: &[u8], rssi: i32, snr: f32) -> Result<CommandR
     let packet = Packet { data: data.to_vec(), rssi, snr };
     telemetry::record_packet("lora", Direction::Rx, &packet.data,
         format!("source=module rssi={} snr={}", packet.rssi, packet.snr));
+    // A packet is an in-band wake trigger for sleepy receivers. The mode
+    // transition is deferred to the normal Main poll; this callback remains
+    // non-blocking while still making a bounded UART heartbeat/report visible
+    // to lmesh.
+    super::mode::request_lora_packet_active(5_000);
+    super::serial::on_radio_packet_received();
+    telemetry::record_log(format!(
+        "event type=lora.packet_wake len={} rssi={} snr={} active_ms=5000",
+        data.len(), rssi, snr
+    ));
+    let wake_stats = telemetry::lora_wake_stats_text();
+    telemetry::record_log(wake_stats.clone());
+    // Keep the automatic report small and structured.  This is a log
+    // notification, not a full status dump, and is queued non-blockingly by
+    // the transport layer while the bounded UART window is open.
+    telemetry::emit_console(&wake_stats);
     forward_rx_packet(&packet);
     Ok(CommandResponse::ok(format!("module lora rx len={} rssi={} snr={}", data.len(), rssi, snr)))
 }

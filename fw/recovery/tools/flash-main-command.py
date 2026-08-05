@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -292,9 +293,107 @@ def call_control(
     return data
 
 
-def flash_preflight(roles: list[str], gateway: str, port: int, timeout: float) -> dict:
+def process_is_running(name: str) -> bool:
+    """Check the supervised daemon without treating a missing process as UART failure."""
+    try:
+        for entry in Path("/proc").glob("[0-9]*"):
+            try:
+                command = (entry / "cmdline").read_bytes().split(b"\0", 1)[0].decode()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if Path(command).name == name:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def check_unix_socket(path: str, timeout: float) -> tuple[bool, str]:
+    """Verify that a managed socket exists and accepts a connection."""
+    if not path:
+        return False, "forward did not report a socket"
+    socket_path = Path(path)
+    if not socket_path.is_socket():
+        return False, f"socket is unavailable: {path}"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(timeout)
+            probe.connect(path)
+    except OSError as error:
+        return False, f"socket cannot be opened: {path}: {error}"
+    return True, "ok"
+
+
+def local_ipv4_addresses() -> set[str]:
+    """Return host IPv4 addresses for validating the configured recovery AP."""
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True, text=True, timeout=3.0, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    addresses: set[str] = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if "inet" not in fields:
+            continue
+        index = fields.index("inet")
+        if index + 1 < len(fields):
+            addresses.add(fields[index + 1].split("/", 1)[0])
+    return addresses
+
+
+def local_tcp_listener(address: str, port: int) -> dict | None:
+    """Inspect a local listener without consuming an accept slot."""
+    try:
+        result = subprocess.run(
+            ["ss", "-H", "-ltn"],
+            capture_output=True, text=True, timeout=3.0, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    wanted = f"{address}:{port}"
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[0] != "LISTEN":
+            continue
+        if fields[3] != wanted:
+            continue
+        try:
+            return {"recv_queue": int(fields[1]), "backlog": int(fields[2])}
+        except ValueError:
+            return {"recv_queue": fields[1], "backlog": fields[2]}
+    return None
+
+
+def is_legacy_main_protocol_rejection(error: BaseException) -> bool:
+    """Return whether Main rejected the current compact-CBOR command ABI.
+
+    Older Main images are still reachable over the managed UART forward, but
+    their firmware command decoder does not understand the map-based command
+    used by the current flasher.  A reset cannot change that ABI, so these
+    errors should go directly to the stage2 -> Recovery path.
+    """
+    text = str(error).lower()
+    return (
+        "invalid cbor command" in text
+        or "invalid cbor" in text
+        or "expected map" in text
+        or "unsupported cbor command key" in text
+        or "unexpected type array at position 0" in text
+        or "unexpected type bytes at position 0" in text
+        or "unexpected type i8 at position 0" in text
+    )
+
+
+def flash_preflight(
+    roles: list[str], gateway: str, port: int, timeout: float, ssid: str = ""
+) -> dict:
     """Check the complete Main-flash path without touching a device."""
     checks: dict[str, object] = {
+        "lmesh": {"running": False, "control_socket": None},
+        "ap": {"gateway": gateway, "ssid": None, "reachable": False},
         "server": {"endpoint": f"{gateway}:{port}", "reachable": False},
         "forwards": {},
         "images": {},
@@ -302,14 +401,66 @@ def flash_preflight(roles: list[str], gateway: str, port: int, timeout: float) -
     }
     errors: list[str] = []
 
-    try:
-        with socket.create_connection((gateway, port), timeout=min(timeout, 5.0)):
-            checks["server"] = {
-                "endpoint": f"{gateway}:{port}",
-                "reachable": True,
-            }
-    except OSError as error:
-        errors.append(f"flash server {gateway}:{port} is unreachable: {error}")
+    control_path = os.environ.get("LMESH_CONTROL_SOCKET", "/run/mesh/lmesh/mesh.sock")
+    checks["lmesh"] = {
+        "running": process_is_running("lmesh"),
+        "control_socket": control_path,
+        "control_socket_available": Path(control_path).is_socket(),
+    }
+    if not checks["lmesh"]["running"]:
+        errors.append("lmesh daemon is not running")
+    if not checks["lmesh"]["control_socket_available"]:
+        errors.append(f"lmesh control socket is unavailable: {control_path}")
+
+    local_addresses = local_ipv4_addresses()
+    listener = local_tcp_listener(gateway, port) if gateway in local_addresses else None
+    if listener is not None:
+        checks["server"] = {
+            "endpoint": f"{gateway}:{port}",
+            "reachable": True,
+            "listener": listener,
+        }
+        if (
+            isinstance(listener.get("recv_queue"), int)
+            and isinstance(listener.get("backlog"), int)
+            and listener["backlog"] > 0
+            and listener["recv_queue"] >= listener["backlog"]
+        ):
+            checks["server"]["reachable"] = False
+            errors.append(
+                f"flash server {gateway}:{port} accept backlog is saturated "
+                f"({listener['recv_queue']}/{listener['backlog']})"
+            )
+    else:
+        try:
+            with socket.create_connection((gateway, port), timeout=min(timeout, 5.0)):
+                checks["server"] = {
+                    "endpoint": f"{gateway}:{port}",
+                    "reachable": True,
+                }
+        except OSError as error:
+            errors.append(f"flash server {gateway}:{port} is unreachable: {error}")
+
+    config = load_network_config()
+    defaults = config.get("defaults", {})
+    if not isinstance(defaults, dict):
+        defaults = {}
+    configured_ssid = ssid or defaults.get("ssid", "")
+    ap_report = {
+        "gateway": gateway,
+        "ssid": configured_ssid,
+        "gateway_is_local": gateway in local_addresses,
+        "local_ipv4": sorted(local_addresses),
+        "reachable": checks["server"]["reachable"] and gateway in local_addresses,
+    }
+    checks["ap"] = ap_report
+    if not isinstance(configured_ssid, str) or not configured_ssid:
+        errors.append("recovery AP SSID is empty")
+    if gateway not in local_addresses:
+        errors.append(
+            f"recovery AP gateway {gateway} is not assigned locally; "
+            "the configured AP/server path is unavailable"
+        )
 
     try:
         forward_data = call_control(
@@ -327,7 +478,6 @@ def flash_preflight(roles: list[str], gateway: str, port: int, timeout: float) -
         forwards = {}
         errors.append(f"cannot list managed forwards: {error}")
 
-    config = load_network_config()
     boards = config.get("boards", {})
     if not isinstance(boards, dict):
         boards = {}
@@ -336,15 +486,20 @@ def flash_preflight(roles: list[str], gateway: str, port: int, timeout: float) -
     for role in roles:
         forward = forwards.get(role)
         running = isinstance(forward, dict) and forward.get("running") is True
+        socket_path = forward.get("socket") if isinstance(forward, dict) else None
+        socket_ok, socket_error = check_unix_socket(str(socket_path or ""), min(timeout, 2.0))
         forward_report[role] = {
             "running": running,
-            "socket": forward.get("socket") if isinstance(forward, dict) else None,
+            "socket": socket_path,
+            "socket_working": socket_ok,
             "client_drops": (forward.get("stats", {}).get("client_drops")
                               if isinstance(forward, dict) and isinstance(forward.get("stats"), dict)
                               else None),
         }
         if not running:
             errors.append(f"managed forward is not running: {role}")
+        if not socket_ok:
+            errors.append(f"managed forward socket is unavailable for {role}: {socket_error}")
         board = boards.get(role, {})
         board_report[role] = board if isinstance(board, dict) else {}
 
@@ -449,11 +604,78 @@ def wait_for_transfer(role: str, started_at: float, timeout: float = 45.0,
     """Verify the server-side session, not merely the command acknowledgement."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        result = find_transfer(role, started_at, target)
+        # Recovery can create a short-lived failed TCP session before its
+        # retry succeeds. The durable success record is authoritative; do not
+        # let an older failed sibling hide a later successful transfer.
+        result = find_success_transfer(role, started_at, target)
         if result is not None:
             return result
         time.sleep(1.0)
-    raise TimeoutError(f"no completed Main transfer recorded within {timeout:.0f}s")
+    raise TimeoutError(
+        f"no completed {target} transfer recorded within {timeout:.0f}s"
+    )
+
+
+def latest_transfer_record(
+    role: str, started_at: float, target: str = "main"
+) -> dict | None:
+    """Return the newest matching server record, including `started` records."""
+    devices = ROOT / "target" / "flash-devices"
+    newest: tuple[float, dict] | None = None
+    for device_file in devices.glob("*/device.json"):
+        try:
+            device = json.loads(device_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        probe = device.get("probe", {})
+        if not isinstance(probe, dict) or probe.get("port") != role:
+            continue
+        for session in (device_file.parent / "flashes").glob("*.json"):
+            try:
+                if session.stat().st_mtime < started_at:
+                    continue
+                record = json.loads(session.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if record.get("target") != target:
+                continue
+            stamp = session.stat().st_mtime
+            if newest is None or stamp > newest[0]:
+                newest = (stamp, record)
+    return newest[1] if newest is not None else None
+
+
+def wait_after_handoff_error(
+    role: str,
+    started_at: float,
+    target: str = "main",
+    timeout: float = 35.0,
+    initial: float = 10.0,
+) -> dict:
+    """Wait briefly unless the server has accepted a session.
+
+    A lost UART ACK can precede a valid TCP transfer, so an accepted `started`
+    record earns the full observation window. If no session exists, continuing
+    to wait only delays the next bounded fallback and invites duplicate resets.
+    """
+    deadline = time.monotonic() + timeout
+    first_deadline = min(deadline, time.monotonic() + initial)
+    while time.monotonic() < first_deadline:
+        result = find_success_transfer(role, started_at, target)
+        if result is not None:
+            return result
+        time.sleep(0.5)
+    record = latest_transfer_record(role, started_at, target)
+    if record is None:
+        raise TimeoutError(f"no {target} server session accepted after handoff")
+    if record.get("status") in {"failed", "error", "timeout"}:
+        raise RuntimeError(f"server session failed: {record}")
+    while time.monotonic() < deadline:
+        result = find_success_transfer(role, started_at, target)
+        if result is not None:
+            return result
+        time.sleep(0.5)
+    raise TimeoutError(f"no completed {target} transfer recorded within {timeout:.0f}s")
 
 
 def start_recovery_from_stage2(
@@ -471,7 +693,11 @@ def start_recovery_from_stage2(
         request += f" {password}"
     last = None
     for attempt in range(8):
-        time.sleep(1.5 if attempt == 0 else 3.0)
+        # Recovery keeps its UART command task in an explicit 1500 ms grace
+        # window.  Do not send at the exact boundary: the first attempt must
+        # arrive after the task has finished startup, while later attempts
+        # remain spaced to avoid duplicate STA workers.
+        time.sleep(2.25 if attempt == 0 else 3.0)
         # Older Recovery images may accept STA and start TCP without sending
         # the textual acknowledgement that newer images emit.  Check the
         # server first on every pass so a completed transfer wins over a
@@ -480,11 +706,17 @@ def start_recovery_from_stage2(
         if completed is not None:
             print(f"{role}: Recovery transfer already completed while waiting for STA acknowledgement", flush=True)
             return {"server_transfer": completed}
+        accepted = latest_transfer_record(role, started_at)
+        if accepted is not None and accepted.get("status") == "started":
+            # The Recovery TCP worker has already connected. Stop issuing
+            # duplicate STA requests and observe the durable transfer.
+            return {"server_transfer_pending": accepted}
+        wire_request = request if attempt < 2 else request.replace("cmd:STA ", "cmd:STA_TEXT ", 1)
         data = call_control({
             "id": "recovery-sta-after-stage2",
             "method": "usb.serial.handshake",
             "port": role,
-            "profile": request,
+            "profile": wire_request,
             "timeout_sec": 2.0,
             "baud": 115200,
         }, role, "Recovery STA handoff after stage2", 6.0)
@@ -581,7 +813,7 @@ def flash_one(
     password: str,
     direct_adapter: bool,
     use_nan: bool,
-    rapid_reset_last_resort: bool,
+    rapid_reset_last_resort: bool = True,
 ) -> None:
     fields = [
         "recovery",
@@ -649,7 +881,11 @@ def flash_one(
             # reset or selector; otherwise a delayed response creates
             # duplicate flash sessions and unnecessary reboots.
             try:
-                result = wait_for_transfer(role, transfer_started, timeout=35.0)
+                result = wait_after_handoff_error(
+                    role,
+                    transfer_started,
+                    initial=2.0 if is_legacy_main_protocol_rejection(error) else 10.0,
+                )
                 record_attempt(role, f"{transport}-server-confirmed", True)
                 print(
                     f"{role}: transfer was already started by {transport}; "
@@ -662,6 +898,22 @@ def flash_one(
             except (OSError, RuntimeError, TimeoutError, socket.timeout) as transfer_error:
                 print(f"{role}: no completed server transfer after {transport}: {transfer_error}", flush=True)
 
+            # A parser-level CBOR rejection is deterministic for an older Main
+            # image.  Resetting and retrying sends the same incompatible
+            # command again; use the stage2 selector so Recovery can update
+            # Main over Wi-Fi instead.
+            if (
+                direct_adapter
+                and transport == "usb-main"
+                and is_legacy_main_protocol_rejection(error)
+            ):
+                print(
+                    f"{role}: legacy Main command ABI rejected; "
+                    "skipping Main retry and using stage2 Recovery",
+                    flush=True,
+                )
+                break
+
             # A board that was left in the ROM downloader or a crash loop may
             # not have a live Main command window.  The managed lmesh reset is
             # an explicit recovery action (never an implicit runtime
@@ -669,6 +921,20 @@ def flash_one(
             if direct_adapter and transport == "usb-main":
                 retry_started = time.time()
                 try:
+                    # A bridge left with DTR asserted can hold a board in an
+                    # unexpected reset/strap state. Release only; never use
+                    # DTR as a runtime transport or assert/pulse it here.
+                    try:
+                        call_control({
+                            "id": "main-flash-release-dtr",
+                            "method": "usb.serial.dtr",
+                            "port": role,
+                            "asserted": False,
+                            "pulse_ms": 0,
+                        }, role, "release externally asserted DTR", 5.0)
+                        record_attempt(role, "dtr-release", True)
+                    except (OSError, RuntimeError, TimeoutError, socket.timeout) as dtr_error:
+                        print(f"{role}: DTR release unavailable: {dtr_error}", flush=True)
                     reset = reset_and_wait_for_main(
                         role, "managed reset before Main retry"
                     )
@@ -694,55 +960,61 @@ def flash_one(
                     record_attempt(role, "usb-main-reset-retry", False, str(retry_error))
                     print(f"{role}: usb-main-reset-retry failed: {retry_error}", flush=True)
 
-    started_at = time.time()
-    try:
-        if rapid_reset_last_resort:
-            print(f"{role}: trying stage2 rapid-reset Recovery selector (last resort)", flush=True)
-            rapid_reset_recovery(role)
-            record_attempt(role, "stage2-rapid-reset", True)
-            print(f"{role}: stage2 rapid-reset Recovery selector completed", flush=True)
-        else:
-            data = call_control({
-                "id": "main-flash-stage2",
-                "method": "usb.serial.boot",
-                "port": role,
-                "command": "recovery",
-                "reset": True,
-                "timeout_sec": 3.0,
-            }, role, "stage2 recovery", 8.0)
-            record_attempt(role, "stage2", True)
-            print(f"{role}: stage2 RECOVER handoff completed: {data}", flush=True)
+    last_error: BaseException | None = None
+    # Always try the ordinary stage2 selector first. If it or the Recovery
+    # STA handoff fails, automatically use the bounded three-reset selector
+    # and repeat the Recovery request once. This is the normal reliability
+    # policy, not a CLI mode, and never becomes an unbounded reset loop.
+    for selector_name, selector in (
+        ("stage2", lambda: call_control({
+            "id": "main-flash-stage2",
+            "method": "usb.serial.boot",
+            "port": role,
+            "command": "recovery",
+            "reset": True,
+            "timeout_sec": 3.0,
+        }, role, "stage2 recovery", 8.0)),
+        ("stage2-rapid-reset", lambda: rapid_reset_recovery(role)),
+    ):
         started_at = time.time()
-        request = start_recovery_from_stage2(
-            role, gateway, port, board_ip, ssid, password, started_at,
-        )
-        print(f"{role}: Recovery STA request sent after stage2: {request}", flush=True)
-        result = wait_for_transfer(role, started_at)
-        record_attempt(role, "stage2-recovery", True)
-        print(
-            f"{role}: stage2 Recovery transfer verified "
-            f"sha256={result.get('image_sha256', 'unknown')} "
-            f"blocks_sent={result.get('blocks_sent', 'unknown')} "
-            f"elapsed={result.get('elapsed_sec', 'unknown')}s", flush=True,
-        )
-    except (OSError, RuntimeError, TimeoutError, socket.timeout) as error:
-        # Recovery may have accepted the request and rebooted before the final
-        # UART exchange was returned. Confirm the durable server record before
-        # declaring the board failed or attempting another selector.
         try:
-            result = wait_for_transfer(role, started_at, timeout=35.0)
-            record_attempt(role, "stage2-recovery-server-confirmed", True)
+            data = selector()
+            record_attempt(role, selector_name, True)
+            print(f"{role}: {selector_name} selector completed: {data}", flush=True)
+            started_at = time.time()
+            request = start_recovery_from_stage2(
+                role, gateway, port, board_ip, ssid, password, started_at,
+            )
+            print(f"{role}: Recovery STA request sent after {selector_name}: {request}", flush=True)
+            result = wait_for_transfer(role, started_at)
+            record_attempt(role, f"{selector_name}-recovery", True)
             print(
-                f"{role}: stage2 Recovery transfer completed despite handoff error "
+                f"{role}: {selector_name} Recovery transfer verified "
                 f"sha256={result.get('image_sha256', 'unknown')} "
                 f"blocks_sent={result.get('blocks_sent', 'unknown')} "
                 f"elapsed={result.get('elapsed_sec', 'unknown')}s", flush=True,
             )
             return
-        except (OSError, RuntimeError, TimeoutError, socket.timeout) as transfer_error:
-            print(f"{role}: no completed server transfer after stage2 handoff: {transfer_error}", flush=True)
-        record_attempt(role, "stage2", False, str(error))
-        raise RuntimeError(f"{role}: all recovery-start transports failed: {error}") from error
+        except (OSError, RuntimeError, TimeoutError, socket.timeout) as error:
+            last_error = error
+            try:
+                result = wait_for_transfer(role, started_at, timeout=35.0)
+                record_attempt(role, f"{selector_name}-server-confirmed", True)
+                print(
+                    f"{role}: transfer completed despite {selector_name} handoff error "
+                    f"sha256={result.get('image_sha256', 'unknown')} "
+                    f"blocks_sent={result.get('blocks_sent', 'unknown')} "
+                    f"elapsed={result.get('elapsed_sec', 'unknown')}s", flush=True,
+                )
+                return
+            except (OSError, RuntimeError, TimeoutError, socket.timeout) as transfer_error:
+                print(
+                    f"{role}: no completed server transfer after {selector_name}: "
+                    f"{transfer_error}", flush=True,
+                )
+            record_attempt(role, selector_name, False, str(error))
+            print(f"{role}: {selector_name} fallback failed: {error}", flush=True)
+    raise RuntimeError(f"{role}: all recovery-start transports failed: {last_error}")
 
 
 def flash_main_target(
@@ -826,8 +1098,6 @@ def main() -> int:
     )
     parser.add_argument("--use-nan", action="store_true",
                         help="EXPERIMENTAL: try the NAN gateway first (disabled by default)")
-    parser.add_argument("--rapid-reset-last-resort", action="store_true",
-                        help="last resort: use three RTS-only resets to trigger stage2 Recovery")
     parser.add_argument("--gateway",
                         help="Recovery server address (default: 10.78.0.1)")
     parser.add_argument("--netmask",
@@ -864,14 +1134,14 @@ def main() -> int:
             )
         return 0
     if args.check:
-        result = flash_preflight(args.roles, gateway, port, 5.0)
+        result = flash_preflight(args.roles, gateway, port, 5.0, ssid)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result.get("ok") is True else 1
     # Make the safe preflight part of the normal command as well. A human
     # should not have to remember a separate check before a state-changing
     # handoff; this catches a dead managed forward, missing server, or missing
     # CPU image before any reset or NVS write occurs.
-    preflight = flash_preflight(args.roles, gateway, port, 5.0)
+    preflight = flash_preflight(args.roles, gateway, port, 5.0, ssid)
     print(json.dumps(preflight, indent=2, sort_keys=True), flush=True)
     if preflight.get("ok") is not True:
         return 2
@@ -892,19 +1162,29 @@ def main() -> int:
     if (args.ssid is not None or args.gateway is not None or args.port is not None
             or args.netmask is not None or cli_addresses):
         save_network_config(config)
+    failures: list[str] = []
     for role in args.roles:
-        flash_one(
-            role,
-            port,
-            addresses[role],
-            gateway,
-            netmask,
-            ssid,
-            args.password,
-            direct_adapter,
-            args.use_nan,
-            args.rapid_reset_last_resort,
-        )
+        try:
+            flash_one(
+                role,
+                port,
+                addresses[role],
+                gateway,
+                netmask,
+                ssid,
+                args.password,
+                direct_adapter,
+                args.use_nan,
+                True,
+            )
+        except (OSError, RuntimeError, TimeoutError, socket.timeout) as error:
+            failures.append(f"{role}: {error}")
+            print(f"{role}: flash failed; continuing with remaining boards: {error}", flush=True)
+    if failures:
+        print("fleet flash failures:", flush=True)
+        for failure in failures:
+            print(f"  {failure}", flush=True)
+        return 3
     return 0
 
 

@@ -10,7 +10,7 @@ come from Main's persisted `lora.*` settings rather than being baked into the
 module image.
 The module also receives the persisted LoRa coding rate, preamble, and CRC
 settings. Main retains the existing Meshtastic-compatible defaults and frame
-settings: US MediumFast `913125000` Hz, 250 kHz bandwidth, SF9/CR5 profile
+settings: US MediumFast `913125000` Hz, 250 kHz bandwidth, SF10/CR5 profile
 selection, sync word `0x2b`, and the test channel hash `0x1d` with port number
 `256`; those channel/frame values remain Main-owned because they describe the
 Meshtastic payload rather than the SPI radio primitive.
@@ -31,7 +31,10 @@ keeps the module ABI independent of the eventual wire encoding while still
 allowing lmesh to render structured events directly.
 
 The current event IDs are `1=rx_started`, `2=rx_stopped`, `3=tx_done` (bytes),
-`4=reconfigured`, and `5=stats` (two little-endian `u32` counters: RX then TX).
+`4=reconfigured`, `5=stats` (two little-endian `u32` counters: RX then TX),
+and `6=tx_error` (a little-endian `i32` result).  Queued TX is asynchronous,
+so the error event preserves the radio result even though the command itself
+has already been acknowledged as queued.
 
 The first hardware target is `lora3` (SX127x), followed by `lora4` (SX1262).
 The `probe` command selects the correct chip probe from the persisted chip
@@ -59,6 +62,10 @@ then reuses its existing mesh, NAN, Wi-Fi, BLE, and telemetry forwarding path.
 sleep does not retain a polling task or leave the SX1262 rail on. The next
 wake/infra transition starts a new `rx` task; a queued `tx` after a stop uses
 the module's short-lived standalone TX entry path.
+For SX1262, a queued TX from an active RX task temporarily disables DIO1,
+resets and reconfigures the radio, performs TX, and exits that task; Main then
+starts the next RX task. This keeps the asynchronous TX path equivalent to
+the known-good standalone TX path.
 
 Module status exposes current/last/maximum task runtime and invocation count.
 The module header declares its FreeRTOS stack requirement (`16384` words for
@@ -71,11 +78,12 @@ sleep.
 
 Build the Xtensa image with `bash fw/mod_lora/build.sh
 xtensa-esp32s3-espidf`. Xtensa flat images default to the reserved fixed
-window (`0x43000040` on ESP32-S3, `0x400d0040` on classic ESP32); the script
-sets the fixed DMOD flag automatically. A different aligned slot may be
-selected explicitly with `DMESH_MODULE_VMA=<window+64>`, but it must match the
-loader's reserved MMU window in Main. Do not deploy an Xtensa image without
-the fixed flag: it is statically linked and cannot use dynamic mapping.
+window (`0x43000040` on ESP32-S3, `0x40300040` on classic ESP32); the script
+sets the fixed DMOD flag automatically. `DMESH_MODULE_VMA` is accepted only
+when it names that exact canonical window; a different slot requires a
+coordinated Main loader change and is rejected for now. Do not deploy an
+Xtensa image without the fixed flag: it is statically linked and cannot use
+dynamic mapping.
 
 For upcoming RISC-V boards, build the same module with the Espressif RISC-V
 target:

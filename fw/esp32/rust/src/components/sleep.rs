@@ -248,6 +248,10 @@ struct RtcLoraConfig {
     _pad0: u8,
     preamble: i32,
     tx_power: i32,
+    cad_rx: u8,
+    _pad1: [u8; 3],
+    cad_interval_ms: u32,
+    cad_rx_ms: u32,
 }
 
 #[repr(C)]
@@ -319,6 +323,10 @@ impl RtcSleepState {
                 _pad0: 0,
                 preamble: 0,
                 tx_power: 0,
+                cad_rx: 0,
+                _pad1: [0; 3],
+                cad_interval_ms: 2000,
+                cad_rx_ms: 1000,
             },
         }
     }
@@ -536,6 +544,7 @@ fn apply_profile(
                 .map(parse_bool)
                 .transpose()?
                 .unwrap_or(true)
+                && !lora::keep_rx_in_light_sleep(settings)
             {
                 lora::sleep_radio(settings)?;
             }
@@ -1552,6 +1561,10 @@ impl RtcLoraConfig {
             _pad0: 0,
             preamble: config.preamble,
             tx_power: config.tx_power,
+            cad_rx: if config.cad_rx { 1 } else { 0 },
+            _pad1: [0; 3],
+            cad_interval_ms: config.cad_interval_ms.max(1) as u32,
+            cad_rx_ms: config.cad_rx_ms.max(1) as u32,
         }
     }
 
@@ -1589,6 +1602,9 @@ impl RtcLoraConfig {
             crc: self.crc != 0,
             preamble: self.preamble,
             tx_power: self.tx_power,
+            cad_rx: self.cad_rx != 0,
+            cad_interval_ms: self.cad_interval_ms as i32,
+            cad_rx_ms: self.cad_rx_ms as i32,
         }
     }
 }
