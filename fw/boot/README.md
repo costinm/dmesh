@@ -1,5 +1,8 @@
 # DMesh ESP second-stage bootloader
 
+The normative stage2 wire/RTC contract is [API.md](API.md). This README is
+operational/build guidance only.
+
 `fw/boot` is the small supervisor between the ESP ROM and the two application
 partitions. It normally starts Main and selects Recovery when Main requested an
 update, a host responds during the bounded 500 ms UART window, rapid resets are observed,
@@ -60,16 +63,16 @@ reserved for first provisioning or emergency repair. Although Main's shared
 flash worker can technically target stage2, rewriting the only bootloader copy
 has no power-loss rollback and should remain rare and explicitly controlled.
 
-The stage2 UART selector is controlled by `recovery:uart_boot` in NVS. It is
-enabled when the key is missing or nonzero, preserving the lab/default behavior.
-Production provisioning should write `uart_boot=0`; stage2 then emits no DMB1
+The stage2 UART selector is controlled by binary `u32` `recovery:uart_boot` in
+NVS. It is enabled when the key is missing or nonzero, preserving the lab/default behavior.
+Production provisioning should write `uart_boot=0`; stage2 then emits no
 UART identity and performs no UART polling, leaving rapid resets and the RTC
-failure counters as the recovery path. The enabled selector window is 500 ms.
+failure counters as the recovery path. The enabled selector window is 1000 ms.
 For an NVS image made from a dump, use
 `scripts/prepare-nvs-image.py ... --uart-boot 0`.
 
-Implemented triggers are UART (when enabled), the NVS request marker, rapid
-resets, and RTC failure counters. A button trigger is not currently implemented. The intended
+Implemented triggers are UART (when enabled), rapid resets, and RTC failure
+counters. A button trigger is not currently implemented. The intended
 both-images-failed halt and RTC-corruption handling still need the hardening
 listed in [DESIGN.md](DESIGN.md).
 

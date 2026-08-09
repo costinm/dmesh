@@ -12,31 +12,41 @@
 #include "esp_rom_gpio.h"
 #include "esp_efuse.h"
 #include "esp_efuse_table.h"
+#if CONFIG_IDF_TARGET_ESP32C6
+#include "soc/rtc.h"
+#else
 #include "soc/rtc_cntl_reg.h"
+#endif
 #include "soc/soc.h"
 #include "bootloader_init.h"
 #include "bootloader_utility.h"
 #include "bootloader_common.h"
 #include "nvs_bootloader.h"
 #include "boot_health_rtc.h"
-#include "boot_health_flash.h"
 #include "boot_protocol.h"
 #include "bootloader_flash_priv.h"
 
 #define RECOVERY_INDEX FACTORY_INDEX
 #define MAIN_INDEX 0 /* ota_0; factory (-1) is Recovery */
 #define RECOVERY_NAMESPACE "recovery"
-#define REQUEST_MAGIC 0x52455131u /* REQ1 */
 /* The command arrives through managed lmesh, not a locally polled UART
  * client.  It is sent immediately after reset, so the development window can
  * remain short and bounded. */
-#define UART_BOOT_WINDOW_MS 500
+/* The selector is sent through the managed UART forward after the reset
+ * pulse.  CP210x reset/forward scheduling can consume several hundred ms;
+ * keep a bounded but generous window so the packet is not lost while still
+ * returning to normal partition selection promptly on an idle boot. */
+#define UART_BOOT_WINDOW_MS 1000
 #define BOOT_LOOP_WINDOW_TICKS 1000000u /* about 5 s at the ESP32 slow clock */
 #define FAILURE_LIMIT 6
 static const char *TAG = "dmesh-boot";
 
 static void feed_bootloader_wdt(void)
 {
+#if CONFIG_IDF_TARGET_ESP32C6
+    /* C6 does not expose the legacy RTC_CNTL watchdog register block. */
+    return;
+#else
     if (READ_PERI_REG(RTC_CNTL_WDTWPROTECT_REG) != RTC_CNTL_WDT_WKEY_V) {
         WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY_V);
         REG_SET_BIT(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
@@ -44,39 +54,19 @@ static void feed_bootloader_wdt(void)
     } else {
         REG_SET_BIT(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
     }
+#endif
 }
 
 static uint64_t rtc_boot_ticks(void)
 {
+#if CONFIG_IDF_TARGET_ESP32C6
+    return rtc_time_get();
+#else
     return ((uint64_t)(REG_READ(RTC_CNTL_TIME1_REG) & 0xffffu) << 32) |
            REG_READ(RTC_CNTL_TIME0_REG);
+#endif
 }
 
-static uint8_t boot_journal_count(void)
-{
-    uint32_t word = UINT32_MAX;
-    if (bootloader_flash_read(DMESH_BOOT_JOURNAL_BYTE_OFFSET, &word, sizeof(word), false) != ESP_OK) {
-        return 0;
-    }
-    uint8_t marker = (uint8_t)word;
-    if (marker == 0xff) return 0;
-    if (marker == 0xfe) return 1;
-    return 2;
-}
-
-static void boot_journal_record(uint8_t count)
-{
-    if (count > 2) return;
-    uint32_t word = UINT32_MAX;
-    if (bootloader_flash_read(DMESH_BOOT_JOURNAL_BYTE_OFFSET, &word, sizeof(word), false) != ESP_OK) {
-        return;
-    }
-    uint8_t marker = (uint8_t)(0xffu << (count + 1));
-    word = (word & ~0xffu) | marker;
-    (void)bootloader_flash_write(DMESH_BOOT_JOURNAL_BYTE_OFFSET, &word, sizeof(word), false);
-}
-
-#if CONFIG_BOOTLOADER_CUSTOM_RESERVE_RTC
 typedef struct {
     uint8_t magic;
     uint8_t generation;
@@ -104,42 +94,6 @@ static boot_health_state_t *boot_health_state(void)
     }
     return state;
 }
-#endif
-
-static bool parse_u32(const char *text, uint32_t *value)
-{
-    if (text == NULL || *text == '\0') {
-        return false;
-    }
-    uint32_t parsed = 0;
-    unsigned base = 10;
-    const char *cursor = text;
-    if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) {
-        base = 16;
-        cursor += 2;
-    }
-    if (*cursor == '\0') {
-        return false;
-    }
-    for (; *cursor != '\0'; ++cursor) {
-        uint32_t digit;
-        if (*cursor >= '0' && *cursor <= '9') {
-            digit = (uint32_t)(*cursor - '0');
-        } else if (base == 16 && *cursor >= 'a' && *cursor <= 'f') {
-            digit = (uint32_t)(*cursor - 'a' + 10);
-        } else if (base == 16 && *cursor >= 'A' && *cursor <= 'F') {
-            digit = (uint32_t)(*cursor - 'A' + 10);
-        } else {
-            return false;
-        }
-        if (digit >= base || parsed > (UINT32_MAX - digit) / base) {
-            return false;
-        }
-        parsed = parsed * base + digit;
-    }
-    *value = parsed;
-    return true;
-}
 
 static bool read_u32(const char *key, uint32_t *value)
 {
@@ -149,30 +103,9 @@ static bool read_u32(const char *key, uint32_t *value)
         .value_type = NVS_TYPE_U32,
     };
     esp_err_t u32_return = nvs_bootloader_read("nvs", 1, &item);
-    if (u32_return == ESP_OK &&
-        item.result_code == ESP_OK) {
-        *value = item.value.u32_val;
-        return true;
-    }
-
-    char text[24] = {0};
-    item = (nvs_bootloader_read_list_t){
-        .namespace_name = RECOVERY_NAMESPACE,
-        .key_name = key,
-        .value_type = NVS_TYPE_STR,
-        .value.str_val = {
-            .buff_ptr = text,
-            .buff_len = sizeof(text),
-        },
-    };
-    esp_err_t str_return = nvs_bootloader_read("nvs", 1, &item);
-    if (str_return == ESP_OK &&
-        item.result_code == ESP_OK) {
-        text[sizeof(text) - 1] = '\0';
-        bool parsed = parse_u32(text, value);
-        return parsed;
-    }
-    return false;
+    if (u32_return != ESP_OK || item.result_code != ESP_OK) return false;
+    *value = item.value.u32_val;
+    return true;
 }
 
 static bool uart_boot_enabled(void)
@@ -186,41 +119,78 @@ static bool uart_boot_enabled(void)
     return !configured || value != 0;
 }
 
-static bool recovery_requested(void)
+static void boot_identity_rtc_values(uint8_t *handoff, uint8_t *main_failures,
+                                     uint8_t *recovery_failures,
+                                     uint8_t *recent_resets)
 {
-    uint32_t magic = 0;
-    uint32_t version = 0;
-    bool magic_ok = read_u32("request_magic", &magic);
-    bool version_ok = read_u32("request_version", &version);
-    /* Older provisioned images stored request_magic in a form that the
-     * bootloader NVS reader rejects. Version=1 remains an explicit request
-     * marker for those devices; new writers still provide and validate magic. */
-    bool requested = version_ok && version == 1 &&
-                     (!magic_ok || magic == REQUEST_MAGIC);
-    ESP_LOGW(TAG, "request magic_ok=%d magic=0x%08x version_ok=%d version=%u requested=%d",
-             magic_ok, (unsigned)magic, version_ok, (unsigned)version, requested);
-    return requested;
+    *handoff = DMESH_BOOT_HEALTH_HANDOFF_NORMAL;
+    *main_failures = 0;
+    *recovery_failures = 0;
+    *recent_resets = 0;
+    boot_health_state_t *health = boot_health_state();
+    *handoff = DMESH_RTC_HANDOFF;
+    *main_failures = health->main_failures;
+    *recovery_failures = health->recovery_failures;
+    uint64_t now_ticks = rtc_boot_ticks();
+    for (unsigned i = 0; i < 4; ++i) {
+        uint32_t previous = health->boot_times[i];
+        uint32_t delta = (uint32_t)now_ticks - previous;
+        if (previous != 0 && delta <= BOOT_LOOP_WINDOW_TICKS) {
+            ++*recent_resets;
+        }
+    }
 }
 
-static bool uart_boot_requested(void)
+static bool boot_cbor_uint(const uint8_t **cursor, const uint8_t *end,
+                           uint64_t *value)
 {
-    static const char wanted[] = "RECOVER";
-    size_t matched = 0;
-    uint8_t hello[DMESH_BOOT_HELLO_LEN] = {
-        DMESH_BOOT_MAGIC_0, DMESH_BOOT_MAGIC_1, DMESH_BOOT_MAGIC_2,
-        DMESH_BOOT_MAGIC_3, DMESH_BOOT_VERSION, DMESH_BOOT_KIND_HELLO,
-        DMESH_BOOT_ROLE_STAGE2, DMESH_BOOT_PARTITION_BOOTLOADER,
-        (uint8_t)esp_rom_get_reset_reason(0), 0,
-    };
-    uint16_t now = (uint16_t)rtc_boot_ticks();
-    hello[10] = (uint8_t)(now >> 8);
-    hello[11] = (uint8_t)now;
-    /* Recovery/Main identify themselves with the station MAC.  Stage2 runs
-     * before Wi-Fi initialization, so read the factory/base MAC directly
-     * from eFuse rather than using the higher-level interface API. */
-    (void)esp_efuse_read_field_blob(ESP_EFUSE_MAC_FACTORY, hello + 12, 48);
-    uint8_t wire[DMESH_BOOT_HELLO_LEN * 2 + 2];
-    size_t wire_len = dmesh_boot_frame_encode(hello, sizeof(hello), wire,
+    if (*cursor >= end) return false;
+    uint8_t first = *(*cursor)++;
+    uint8_t additional = first & 0x1f;
+    if ((first >> 5) != 0) return false;
+    if (additional < 24) { *value = additional; return true; }
+    size_t width = additional == 24 ? 1 : additional == 25 ? 2 :
+                   additional == 26 ? 4 : additional == 27 ? 8 : 0;
+    if (width == 0 || (size_t)(end - *cursor) < width) return false;
+    uint64_t result = 0;
+    for (size_t i = 0; i < width; ++i) result = (result << 8) | *(*cursor)++;
+    *value = result;
+    return true;
+}
+
+/* Decode only the boot selector envelope: {0:60010,6:[partition]}. */
+static int boot_cbor_selector(const uint8_t *data, size_t length)
+{
+    const uint8_t *cursor = data;
+    const uint8_t *end = data + length;
+    if (cursor >= end || *cursor++ != 0xa2) return 0;
+    uint64_t method = 0, method_id = 0, payload_key = 0;
+    if (!boot_cbor_uint(&cursor, end, &method) || method != 0 ||
+        !boot_cbor_uint(&cursor, end, &method_id) || method_id != DMESH_BOOT_METHOD_SELECT ||
+        !boot_cbor_uint(&cursor, end, &payload_key) || payload_key != 6 ||
+        cursor >= end || *cursor++ != 0x81) return 0;
+    uint64_t partition = 0;
+    if (!boot_cbor_uint(&cursor, end, &partition) || cursor != end) return 0;
+    return partition == DMESH_BOOT_PARTITION_RECOVERY ? 1 :
+           partition == DMESH_BOOT_PARTITION_MAIN ? 2 : 0;
+}
+
+static int uart_boot_requested(void)
+{
+    uint8_t mac[6] = {0};
+    (void)esp_efuse_read_field_blob(ESP_EFUSE_MAC_FACTORY, mac, 48);
+    uint8_t handoff = 0, main_failures = 0, recovery_failures = 0;
+    uint8_t recent_resets = 0;
+    boot_identity_rtc_values(&handoff, &main_failures, &recovery_failures,
+                             &recent_resets);
+    uint8_t payload[128];
+    size_t payload_len = dmesh_boot_identity_event(
+        payload, sizeof(payload), DMESH_BOOT_ROLE_STAGE2,
+        DMESH_BOOT_PARTITION_BOOTLOADER,
+        (uint8_t)esp_rom_get_reset_reason(0), handoff,
+        main_failures, recovery_failures, recent_resets, rtc_boot_ticks(), mac);
+    uint8_t wire[256];
+    size_t wire_len = dmesh_boot_frame_encode(payload, payload_len, wire,
                                               sizeof(wire));
     for (size_t i = 0; i < wire_len; ++i) {
         esp_rom_output_tx_one_char(wire[i]);
@@ -230,7 +200,7 @@ static bool uart_boot_requested(void)
 
     bool in_frame = false;
     bool escaped = false;
-    uint8_t frame[DMESH_BOOT_COMMAND_LEN];
+    uint8_t frame[64];
     size_t frame_len = 0;
     for (uint32_t poll = 0; poll < polls; ++poll) {
         if ((poll & 0x3ffu) == 0) {
@@ -239,12 +209,9 @@ static bool uart_boot_requested(void)
         uint8_t byte = 0;
         if (esp_rom_output_rx_one_char(&byte) == 0) {
             if (byte == DMESH_BOOT_WIRE_FLAG) {
-                if (in_frame && !escaped && frame_len == DMESH_BOOT_COMMAND_LEN &&
-                    dmesh_boot_is_magic(frame, frame_len) &&
-                    frame[4] == DMESH_BOOT_VERSION &&
-                    frame[5] == DMESH_BOOT_KIND_COMMAND &&
-                    frame[6] == DMESH_BOOT_COMMAND_RECOVERY) {
-                    return true;
+                if (in_frame && !escaped) {
+                    int selector = boot_cbor_selector(frame, frame_len);
+                    if (selector != 0) return selector;
                 }
                 in_frame = true; escaped = false; frame_len = 0;
                 continue;
@@ -258,14 +225,6 @@ static bool uart_boot_requested(void)
                 } else if (frame_len < sizeof(frame)) {
                     frame[frame_len++] = byte;
                 }
-            }
-            if (byte == (uint8_t)wanted[matched]) {
-                ++matched;
-                if (matched == sizeof(wanted) - 1) {
-                    return true;
-                }
-            } else {
-                matched = byte == (uint8_t)wanted[0] ? 1 : 0;
             }
         }
         esp_rom_delay_us(1);
@@ -286,21 +245,12 @@ static void halt_for_uart(const char *reason)
 static int select_partition(void)
 {
     bool uart_enabled = uart_boot_enabled();
-    bool uart = uart_enabled && uart_boot_requested();
-    bool request = recovery_requested();
-    uint8_t journal_count = boot_journal_count();
-    /* Some boards, including E5, wire CP210x RTS to EN and report the reset
-     * as POWERON_RESET. Their RTC retention is cleared, so keep only the
-     * small reset streak in the reserved final data sector as a fallback. */
-    if (!request && !uart) {
-        if (journal_count >= 2) {
-            request = true;
-        } else {
-            boot_journal_record((uint8_t)(journal_count + 1));
-        }
-    }
-#if CONFIG_BOOTLOADER_RESERVE_RTC_MEM
+    int uart = uart_enabled ? uart_boot_requested() : 0;
+    /* Partition handoff is volatile RTC state.  Main is the only supported
+     * writer; a stale value is cleared by the next successful transition. */
+    bool request = false;
     boot_health_state_t *health = boot_health_state();
+    uint8_t handoff = DMESH_RTC_HANDOFF;
     uint8_t event = DMESH_RTC_HEALTH_EVENT;
     if (event == DMESH_BOOT_HEALTH_MAIN_OK) {
         health->main_failures = 0;
@@ -310,16 +260,8 @@ static int select_partition(void)
          * ignored by BOOT_LOOP_WINDOW_TICKS and Recovery_OK clears the whole
          * history after a successful update. */
     }
-    if (event == DMESH_BOOT_HEALTH_RECOVERY_OK) {
-        /* Recovery completed its transaction and is about to reboot.  The
-         * next boot must be a fresh Main attempt; retaining the old Main
-         * failure threshold would immediately select Recovery again. */
-        health->recovery_failures = 0;
-        health->main_failures = 0;
-        memset(health->boot_times, 0, sizeof(health->boot_times));
-        memset(health->boot_kinds, 0, sizeof(health->boot_kinds));
-    }
-    /* Consume the volatile handoff marker. No NVS write is needed. */
+    /* Health events are informational/counter updates.  The partition
+     * decision is the separate RTC handoff byte and never touches NVS. */
     DMESH_RTC_HEALTH_EVENT = 0;
     uint64_t now_ticks = rtc_boot_ticks();
     unsigned recent = 0;
@@ -336,8 +278,8 @@ static int select_partition(void)
             sizeof(health->boot_kinds) - sizeof(health->boot_kinds[0]));
     health->boot_times[0] = (uint32_t)now_ticks;
     health->boot_kinds[0] = 1;
-    ESP_LOGW(TAG, "select uart_enabled=%d uart=%d request=%d recent_boots=%u main_failures=%u recovery_failures=%u reset_reason=%d",
-             uart_enabled, uart, request, recent, health->main_failures,
+    ESP_LOGW(TAG, "select uart_enabled=%d uart=%d handoff=%u request=%d recent_boots=%u main_failures=%u recovery_failures=%u reset_reason=%d",
+             uart_enabled, uart, handoff, request, recent, health->main_failures,
              health->recovery_failures,
              esp_rom_get_reset_reason(0));
 
@@ -347,12 +289,24 @@ static int select_partition(void)
     }
 
     /* An explicit physical RECOVER selector is the last-resort repair path.
-     * It must remain usable even when stale RTC health state has exhausted
-     * the automatic Recovery retry budget.  Automatic/NVS requests still
-     * obey the failure limit below. */
-    if (uart) {
+     * It remains usable even when RTC health state has exhausted the
+     * automatic Recovery retry budget. */
+    if (uart == 2) {
+        ESP_LOGW(TAG, "explicit UART Main overrides recovery request");
+        return MAIN_INDEX;
+    }
+    if (uart == 1) {
         ESP_LOGW(TAG, "explicit UART Recovery overrides failure limit");
         return RECOVERY_INDEX;
+    }
+
+    if (handoff == DMESH_BOOT_HEALTH_HANDOFF_MAIN) {
+        ESP_LOGW(TAG, "RTC handoff selects Main");
+        return MAIN_INDEX;
+    }
+    if (handoff == DMESH_BOOT_HEALTH_HANDOFF_RECOVERY) {
+        ESP_LOGW(TAG, "RTC handoff selects Recovery");
+        request = true;
     }
 
     if (request) {
@@ -383,14 +337,6 @@ static int select_partition(void)
     ++health->main_failures;
     ESP_LOGI(TAG, "attempt Main number=%u/%u", health->main_failures, FAILURE_LIMIT);
     return MAIN_INDEX;
-#else
-    ESP_LOGI(TAG, "RTC failure counters unavailable; select recovery=%d uart=%d request=%d",
-             uart || request, uart, request);
-    if (uart || request) {
-        return RECOVERY_INDEX;
-    }
-    return MAIN_INDEX;
-#endif
 }
 
 void __attribute__((noreturn)) call_start_cpu0(void)
