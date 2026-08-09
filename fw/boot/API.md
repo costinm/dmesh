@@ -30,6 +30,11 @@ a partition by itself.
 
 ## Selection state
 
+The retained RTC layout starts at `DMESH_RTC_CUSTOM_OFFSET` (`+12` bytes from
+the RTC retain base). The health event is at custom `+4` (`+16` overall), and
+the partition handoff is at custom `+5` (`+17` overall). These offsets are
+part of the ABI and are defined in `boot_health_rtc.h`.
+
 The RTC handoff byte is authoritative: `0` normal selection, `1` Recovery,
 `2` Main. Main writes Recovery before requesting an update. Recovery writes
 Main only after a verified Main transfer. NVS is not used for this handoff;
@@ -37,3 +42,8 @@ Recovery transport settings supplied over PPP are runtime-only.
 
 Rapid-reset history is only a crash-loop fallback. There is no NVS request
 marker that can trap a healthy board in Recovery.
+
+Stage2 emits event `60004` (`boot.recovery_failed`) when UART boot is enabled.
+Its tuple is `[role, partition, recovery_failures, main_failures]`. A known-
+healthy Main falls back to Main after this event; a Main crash loop remains on
+the Recovery path and eventually enters the terminal UART-repair halt.

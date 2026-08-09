@@ -14,6 +14,7 @@
 #include "esp_efuse_table.h"
 #if CONFIG_IDF_TARGET_ESP32C6
 #include "soc/rtc.h"
+#include "soc/lp_wdt_reg.h"
 #else
 #include "soc/rtc_cntl_reg.h"
 #endif
@@ -39,21 +40,39 @@
 #define UART_BOOT_WINDOW_MS 1000
 #define BOOT_LOOP_WINDOW_TICKS 1000000u /* about 5 s at the ESP32 slow clock */
 #define FAILURE_LIMIT 6
+#define RAPID_RESET_COUNT 3
+#define BOOT_KIND_NORMAL 1u
+#define BOOT_KIND_MAIN_FAILURE 2u
+#define BOOT_KIND_RECOVERY_REQUEST 3u
+#define BOOT_KIND_USER_RESET 4u
+#define BOOT_KIND_DEEP_SLEEP 5u
 static const char *TAG = "dmesh-boot";
 
 static void feed_bootloader_wdt(void)
 {
 #if CONFIG_IDF_TARGET_ESP32C6
-    /* C6 does not expose the legacy RTC_CNTL watchdog register block. */
-    return;
+    REG_WRITE(LP_WDT_WPROTECT_REG, 0x50D83AA1u);
+    REG_SET_BIT(LP_WDT_FEED_REG, LP_WDT_RTC_WDT_FEED);
+    REG_WRITE(LP_WDT_WPROTECT_REG, 0);
 #else
-    if (READ_PERI_REG(RTC_CNTL_WDTWPROTECT_REG) != RTC_CNTL_WDT_WKEY_V) {
-        WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY_V);
-        REG_SET_BIT(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
-        WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
-    } else {
-        REG_SET_BIT(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
-    }
+    WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY_V);
+    REG_SET_BIT(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
+    WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
+#endif
+}
+
+static void disable_bootloader_wdt(void)
+{
+#if CONFIG_IDF_TARGET_ESP32C6
+    REG_WRITE(LP_WDT_WPROTECT_REG, 0x50D83AA1u);
+    REG_WRITE(LP_WDT_CONFIG0_REG, 0);
+    REG_SET_BIT(LP_WDT_FEED_REG, LP_WDT_RTC_WDT_FEED);
+    REG_WRITE(LP_WDT_WPROTECT_REG, 0);
+#else
+    WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, RTC_CNTL_WDT_WKEY_V);
+    WRITE_PERI_REG(RTC_CNTL_WDTCONFIG0_REG, 0);
+    REG_SET_BIT(RTC_CNTL_WDTFEED_REG, RTC_CNTL_WDT_FEED);
+    WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
 #endif
 }
 
@@ -102,8 +121,8 @@ static bool read_u32(const char *key, uint32_t *value)
         .key_name = key,
         .value_type = NVS_TYPE_U32,
     };
-    esp_err_t u32_return = nvs_bootloader_read("nvs", 1, &item);
-    if (u32_return != ESP_OK || item.result_code != ESP_OK) return false;
+    esp_err_t err = nvs_bootloader_read("nvs", 1, &item);
+    if (err != ESP_OK || item.result_code != ESP_OK) return false;
     *value = item.value.u32_val;
     return true;
 }
@@ -123,10 +142,6 @@ static void boot_identity_rtc_values(uint8_t *handoff, uint8_t *main_failures,
                                      uint8_t *recovery_failures,
                                      uint8_t *recent_resets)
 {
-    *handoff = DMESH_BOOT_HEALTH_HANDOFF_NORMAL;
-    *main_failures = 0;
-    *recovery_failures = 0;
-    *recent_resets = 0;
     boot_health_state_t *health = boot_health_state();
     *handoff = DMESH_RTC_HANDOFF;
     *main_failures = health->main_failures;
@@ -135,7 +150,10 @@ static void boot_identity_rtc_values(uint8_t *handoff, uint8_t *main_failures,
     for (unsigned i = 0; i < 4; ++i) {
         uint32_t previous = health->boot_times[i];
         uint32_t delta = (uint32_t)now_ticks - previous;
-        if (previous != 0 && delta <= BOOT_LOOP_WINDOW_TICKS) {
+        uint8_t kind = health->boot_kinds[i];
+        if (previous != 0 && delta <= BOOT_LOOP_WINDOW_TICKS &&
+            kind != BOOT_KIND_RECOVERY_REQUEST &&
+            kind != BOOT_KIND_DEEP_SLEEP) {
             ++*recent_resets;
         }
     }
@@ -158,7 +176,9 @@ static bool boot_cbor_uint(const uint8_t **cursor, const uint8_t *end,
     return true;
 }
 
-/* Decode only the boot selector envelope: {0:60010,6:[partition]}. */
+/* Decode only the boot selector envelope: {0:60010,6:[partition]}.
+ * Selectors deliberately require definite-length CBOR; identity events use
+ * indefinite-length CBOR for compatibility with the lmesh matcher. */
 static int boot_cbor_selector(const uint8_t *data, size_t length)
 {
     const uint8_t *cursor = data;
@@ -232,11 +252,28 @@ static int uart_boot_requested(void)
     return false;
 }
 
+static void uart_recovery_failed(bool uart_enabled, uint8_t recovery_failures,
+                                 uint8_t main_failures)
+{
+    if (!uart_enabled) return;
+    uint8_t payload[64];
+    size_t payload_len = dmesh_boot_recovery_failed_event(
+        payload, sizeof(payload), recovery_failures, main_failures);
+    uint8_t wire[128];
+    size_t wire_len = dmesh_boot_frame_encode(payload, payload_len, wire,
+                                              sizeof(wire));
+    for (size_t i = 0; i < wire_len; ++i) {
+        esp_rom_output_tx_one_char(wire[i]);
+    }
+}
+
 static void halt_for_uart(const char *reason)
 {
     ESP_LOGE(TAG, "HALT uart_flash_required reason=%s reset_reason=%d",
              reason, esp_rom_get_reset_reason(0));
-    /* Do not restart into the same broken image. A UART flash is required. */
+    /* This is reachable only after the Main crash loop has exhausted the
+     * Recovery retry budget. Do not restart into the same broken image. */
+    disable_bootloader_wdt();
     while (true) {
         esp_rom_delay_us(1000000);
     }
@@ -244,6 +281,14 @@ static void halt_for_uart(const char *reason)
 
 static int select_partition(void)
 {
+    /* Main only enters deep sleep after reaching a stable runtime state. Its
+     * wake must therefore be the fastest path and must not be redirected by
+     * stale UART or RTC handoff state. */
+    if (esp_rom_get_reset_reason(0) == RESET_REASON_CORE_DEEP_SLEEP) {
+        ESP_LOGI(TAG, "deep-sleep resume selects Main");
+        return MAIN_INDEX;
+    }
+
     bool uart_enabled = uart_boot_enabled();
     int uart = uart_enabled ? uart_boot_requested() : 0;
     /* Partition handoff is volatile RTC state.  Main is the only supported
@@ -252,6 +297,8 @@ static int select_partition(void)
     boot_health_state_t *health = boot_health_state();
     uint8_t handoff = DMESH_RTC_HANDOFF;
     uint8_t event = DMESH_RTC_HEALTH_EVENT;
+    bool main_was_healthy = event == DMESH_BOOT_HEALTH_MAIN_OK;
+    bool main_crash_loop = !main_was_healthy && health->main_failures != 0;
     if (event == DMESH_BOOT_HEALTH_MAIN_OK) {
         health->main_failures = 0;
         /* Keep rapid-reset timestamps across a healthy Main boot.  A
@@ -268,7 +315,10 @@ static int select_partition(void)
     for (unsigned i = 0; i < 4; ++i) {
         uint32_t previous = health->boot_times[i];
         uint32_t delta = (uint32_t)now_ticks - previous;
-        if (previous != 0 && delta <= BOOT_LOOP_WINDOW_TICKS) {
+        uint8_t kind = health->boot_kinds[i];
+        if (previous != 0 && delta <= BOOT_LOOP_WINDOW_TICKS &&
+            kind != BOOT_KIND_RECOVERY_REQUEST &&
+            kind != BOOT_KIND_DEEP_SLEEP) {
             ++recent;
         }
     }
@@ -277,13 +327,16 @@ static int select_partition(void)
     memmove(&health->boot_kinds[1], &health->boot_kinds[0],
             sizeof(health->boot_kinds) - sizeof(health->boot_kinds[0]));
     health->boot_times[0] = (uint32_t)now_ticks;
-    health->boot_kinds[0] = 1;
+    health->boot_kinds[0] = main_crash_loop ? BOOT_KIND_MAIN_FAILURE :
+                            main_was_healthy ? BOOT_KIND_USER_RESET :
+                            handoff != DMESH_BOOT_HEALTH_HANDOFF_NORMAL || uart == 1 ?
+                                BOOT_KIND_RECOVERY_REQUEST : BOOT_KIND_NORMAL;
     ESP_LOGW(TAG, "select uart_enabled=%d uart=%d handoff=%u request=%d recent_boots=%u main_failures=%u recovery_failures=%u reset_reason=%d",
              uart_enabled, uart, handoff, request, recent, health->main_failures,
              health->recovery_failures,
              esp_rom_get_reset_reason(0));
 
-    if (recent >= 3 && !request && !uart) {
+    if (recent + 1 >= RAPID_RESET_COUNT && !request && !uart) {
         ESP_LOGW(TAG, "rapid reboot history selects Recovery");
         request = true;
     }
@@ -311,11 +364,15 @@ static int select_partition(void)
 
     if (request) {
         if (health->recovery_failures >= FAILURE_LIMIT) {
-            ESP_LOGW(TAG, "recovery failed %u times; falling back to Main",
-                     health->recovery_failures);
-            if (health->main_failures >= FAILURE_LIMIT) {
+            ESP_LOGW(TAG, "recovery failed %u times; %s",
+                     health->recovery_failures,
+                     main_crash_loop ? "halting" : "falling back to Main");
+            uart_recovery_failed(uart_enabled, health->recovery_failures,
+                                 health->main_failures);
+            if (main_crash_loop) {
                 halt_for_uart("main_and_recovery_failed");
             }
+            ESP_LOGW(TAG, "Recovery failure falls back to Main");
             ++health->main_failures;
             return MAIN_INDEX;
         }

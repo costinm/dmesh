@@ -54,10 +54,10 @@ Stage2 reads only this NVS field in namespace `recovery`:
 - A corrupt or non-starting Recovery eventually causes a Main fallback.
 - A corrupt Main and corrupt Recovery are intended to stop in UART-repair mode.
 
-The last item is not fully proven: `halt_for_uart()` loops without feeding or
-disabling the enabled bootloader watchdog. The watchdog may reset the chip,
-turning the intended halt into another boot loop. Fix and test this before
-relying on the six-plus-six terminal policy for power savings.
+The terminal path now disables the applicable bootloader watchdog before its
+low-activity UART-repair halt. It is only used when Main is in a crash loop and
+Recovery has also exhausted its retry budget. A healthy Main falls back to Main
+after Stage2 emits a framed Recovery-failure event.
 
 ## Security boundary
 
@@ -74,8 +74,8 @@ explicit pre-handoff Main/Recovery hash check.
 
 In priority order:
 
-1. Make terminal halt real: disable or feed the bootloader watchdog, enter the
-   lowest safe wait state available, and verify current draw and UART recovery.
+1. Verify terminal halt on each supported chip: watchdog disabled, no reboot
+   loop, and UART repair remains available.
 3. Calibrate the rapid-reset threshold from the RTC slow clock and filter reset
    reasons so planned reboot/deep-sleep cycles do not imitate a crash loop.
 4. Add host tests for the complete state machine: normal boot, healthy marker,

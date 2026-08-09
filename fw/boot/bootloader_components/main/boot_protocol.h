@@ -10,6 +10,7 @@
 #define DMESH_BOOT_WIRE_ESCAPE 0x7d
 #define DMESH_BOOT_WIRE_ESCAPE_XOR 0x20
 #define DMESH_BOOT_EVENT_IDENTITY 60000u
+#define DMESH_BOOT_EVENT_RECOVERY_FAILED 60004u
 #define DMESH_BOOT_METHOD_SELECT 60010u
 #define DMESH_BOOT_ROLE_STAGE2 3
 #define DMESH_BOOT_PARTITION_BOOTLOADER 0
@@ -82,6 +83,31 @@ static inline size_t dmesh_boot_identity_event(uint8_t *payload, size_t capacity
     if (capacity - cursor < 8) return 0;
     payload[cursor++] = 0x46;
     for (size_t i = 0; i < 6; ++i) payload[cursor++] = mac[i];
+    payload[cursor++] = 0xff;
+    payload[cursor++] = 0xff;
+    return cursor;
+}
+
+/* Identity uses indefinite-length CBOR while selectors use definite-length
+ * CBOR intentionally; lmesh::radio::is_boot_identity_payload matches the
+ * former wire shape. */
+static inline size_t dmesh_boot_recovery_failed_event(uint8_t *payload,
+                                                     size_t capacity,
+                                                     uint8_t recovery_failures,
+                                                     uint8_t main_failures)
+{
+    size_t cursor = 0, n;
+    if (capacity < 1) return 0;
+    payload[cursor++] = 0xbf;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, 7); if (!n) return 0; cursor += n;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, DMESH_BOOT_EVENT_RECOVERY_FAILED); if (!n) return 0; cursor += n;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, 6); if (!n) return 0; cursor += n;
+    if (capacity - cursor < 4) return 0;
+    payload[cursor++] = 0x9f;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, DMESH_BOOT_ROLE_STAGE2); if (!n) return 0; cursor += n;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, DMESH_BOOT_PARTITION_RECOVERY); if (!n) return 0; cursor += n;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, recovery_failures); if (!n) return 0; cursor += n;
+    n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, main_failures); if (!n) return 0; cursor += n;
     payload[cursor++] = 0xff;
     payload[cursor++] = 0xff;
     return cursor;

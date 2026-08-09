@@ -1,7 +1,7 @@
 #pragma once
 
-/* Local copy of the RTC layout contract. The schema and offsets are described
- * in fw/boot/API.md; keep the Main/Recovery copies synchronized. */
+/* Local copy of the RTC layout contract. API.md documents the byte offsets;
+ * keep this header and the Main/Recovery copies synchronized. */
 
 #include <stdint.h>
 #include "sdkconfig.h"
