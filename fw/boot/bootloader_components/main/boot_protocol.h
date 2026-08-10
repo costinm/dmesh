@@ -20,6 +20,9 @@
 #define DMESH_BOOT_HEALTH_HANDOFF_RECOVERY 1u
 #define DMESH_BOOT_HEALTH_HANDOFF_MAIN 2u
 #define DMESH_BOOT_HEALTH_MAIN_OK 2u
+#ifndef DMESH_STAGE2_VERSION
+#define DMESH_STAGE2_VERSION 0u
+#endif
 
 static inline size_t dmesh_boot_frame_encode(const uint8_t *payload, size_t length,
                                              uint8_t *out, size_t capacity)
@@ -74,7 +77,8 @@ static inline size_t dmesh_boot_identity_event(uint8_t *payload, size_t capacity
     if (cursor + 1 > capacity) return 0;
     payload[cursor++] = 0x9f;
     uint64_t values[] = {role, partition, reset_reason, handoff, main_failures,
-                         recovery_failures, recent_resets, rtc_tick};
+                         recovery_failures, recent_resets, rtc_tick,
+                         DMESH_STAGE2_VERSION};
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
         n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, values[i]);
         if (!n) return 0;

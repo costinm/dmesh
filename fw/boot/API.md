@@ -22,7 +22,12 @@ its tuple is:
 
 ```text
 [role, partition, reset_reason, rtc_handoff, main_failures,
- recovery_failures, recent_resets, rtc_tick, mac_bytes]
+ recovery_failures, recent_resets, rtc_tick, stage2_version, mac_bytes]
+
+`stage2_version` is a numeric build identifier in `YYYYMMDDNNN` form. The
+fleet build accepts `DMESH_STAGE2_VERSION`; when unset it defaults to the UTC
+build date with sequence `000`. Main and Recovery versions are separate and
+are not represented by this field.
 ```
 
 Stage2 has role `3`, partition `0`. The event is diagnostic and must not select
@@ -39,6 +44,11 @@ The RTC handoff byte is authoritative: `0` normal selection, `1` Recovery,
 `2` Main. Main writes Recovery before requesting an update. Recovery writes
 Main only after a verified Main transfer. NVS is not used for this handoff;
 Recovery transport settings supplied over PPP are runtime-only.
+
+RTC custom byte `+28` is the transient Recovery dry-run request. Main writes it
+with the recovery command, and Recovery advertises the request in its HELLO;
+the persistent flash server only mirrors that HELLO bit into the manifest. A
+zero value means a real flash; the server has no independent dry-run setting.
 
 Rapid-reset history is only a crash-loop fallback. There is no NVS request
 marker that can trap a healthy board in Recovery.
