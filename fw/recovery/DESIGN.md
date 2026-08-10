@@ -15,14 +15,15 @@ images offline - or extensive testing on the crypto side.
 ```text
 Main
   - decides whether and when to update
-  - writes the Recovery request
+  - writes the Recovery handoff byte in RTC memory
   - may use the shared worker to flash anything but itself.
 
 stage2
   - selects Recovery or Main - based on reboot count, UART in dev.
 
 Recovery
-  - loads transport settings and trust key from NVS
+  - receives optional transport settings over PPP and keeps them in RAM
+  - loads the trust key from NVS
   - joins an open (no password) Wi-Fi as a station
   - connects to the host flash server by IP:port
   - receives and applies (signed) blobs
@@ -74,12 +75,12 @@ private signing key or the device will correctly reject its manifests.
 The normal control action is:
 
 ```sh
-fw/recovery/tools/flash-main-command.py <lmesh-role>
+scripts/flash-device.py <lmesh-role> main
 ```
 
 Network defaults live in `target/flash-devices/network.json`. A saved SSID is
-put into the NVS request, avoiding a scan on every update. An absent SSID is a
-fallback that makes Recovery scan for the first open `Direct-*-Dmesh` network.
+sent in the runtime PPP handoff, avoiding a scan on every update. An absent
+SSID makes Recovery scan for the first open `Direct-*-Dmesh` network.
 The server defaults to `10.78.0.1`, the port to `3336`, and an absent local
 address to `10.78.<MAC[4]>.<MAC[5]>` with a `/16` mask. 
 
@@ -121,6 +122,19 @@ flow control; DRS2 supplies message boundaries. No PPP framing is used on TCP.
 The maximum frame payload is 65,535 bytes and the current flash block is 4,096
 bytes.
 
+Type 11 is `FLOW_PULSE`: a four-byte network-order block count sent by the
+host after each group of four blocks. The device consumes it without replying;
+it is an observable packetization marker, not a block acknowledgement.
+
+Type 12 is `PROGRESS`: three network-order `u32` values containing the accepted
+block count, device elapsed milliseconds, and cumulative device block-work
+milliseconds, sent by the device after each group of 64 accepted blocks. The
+work value covers SHA validation and flash work but not time waiting for TCP
+input. The host drains these one-way diagnostic
+packets while waiting for the terminal `DONE`; they are not acknowledgements
+and do not pace the sender. The host-side `FLOW_PULSE` remains every four
+blocks so packet captures can observe the stream without adding a reply.
+
 The device speaks first:
 
 ```text
@@ -145,7 +159,7 @@ default. The extension is intentionally the resource-selection point for
 future signed configuration blobs; they do not require a second listener.
 
 Supported targets are raw stage2/boot, raw partition table, Recovery, NVS,
-data, and Main. `READ_BLOCK`/`BLOCK_DATA` are reserved diagnostic frames.
+data, and Main. `READ_BLOCK`/`BLOCK_DATA` remain reserved diagnostic frames.
 Unknown or malformed frames fail the session.
 
 ## Transfer modes
@@ -199,14 +213,19 @@ DONE          -> DONE
 This mode is accepted only when no trust key is present. It sends every block
 and skips initial hashes, per-block hashes/readback, and final SHA verification.
 It is a speed-oriented development/factory path, not an authenticated update.
+The current capability-advertised variant carries truncated SHA-256 values
+for every block, verifies block readback, requires every block exactly once,
+and checks the final image SHA. It skips only the expensive initial device
+hash scan; TCP flow control remains the only pacing mechanism.
 
-Current weakness: the receiver does not track that every expected block was
-received exactly once before accepting `DONE`. A buggy or hostile host
+The compatibility path still does not track that every expected block was
+received exactly once before accepting `DONE`; capability-advertised Recovery
+uses the verified variant above instead. A buggy or hostile host
 can therefore cause a partial image to be treated as success and clear the
 request. The device will need to check the SHA of each block it has against the
 manifest before considering the upgrade complete.
 
-Also missing/WIP is a protection against reboot selecting an incomplete main.
+Legacy devices remain subject to the existing compatibility limitations.
 
 ## Authentication and trust
 
@@ -221,9 +240,19 @@ For keyed devices:
 - blocks must match the authenticated digest list;
 - the final image must match the authenticated full SHA-256.
 
-For unkeyed devices, compatibility and sparse manifests with an all-zero key
-fingerprint are also accepted unsigned; unsigned-fast is not the only unsigned
-form. This is deliberate bootstrap behavior in the current code.
+For unkeyed devices, compatibility and sparse manifests are accepted without a
+pre-existing trust root. Manifest version 1 carries the complete 65-byte
+uncompressed P-256 public key; Recovery verifies it opportunistically and
+stores it as a TOFU root only after a valid signature. A zero key/signature is
+still accepted for an unkeyed development/bootstrap transfer. Once a trust
+root exists, its key and the manifest signature are checked normally.
+
+Development Recovery images can be built with `DMESH_FLASH_DEV_MODE=1`. In
+that mode signature failures are reported but do not abort the transfer, and
+received-block/final-image SHA checks are skipped. The normal build keeps all
+hash and signature checks enabled. The host's matching `--development` option
+also skips its post-write block-hash query; it does not change partition or
+range validation.
 
 The 32-bit per-block hashes are not a sufficient independent security level.
 The signed full-image SHA-256 prevents a modified complete image from being
@@ -269,20 +298,16 @@ routine Main updates.
 
 ## Request and completion semantics
 
-Main writes request marker version/magic plus SSID, password, server, local IP,
-port, URL placeholder, and flags into namespace `recovery`, commits, and
-reboots. Stage2 reads only the marker. Recovery loads transport values.
+Main arms the RTC Recovery handoff and reboots. The managed host may then send
+the runtime `STA` packet with SSID, password, server, and local IP. Stage2 does
+not parse network settings and Recovery does not persist them.
 
-On success Recovery:
-
-1. receives device-side `DONE` from the shared worker;
-2. clears `request_magic`, `request_version`, and `flags` but retains transport
-   defaults;
-3. writes RTC `RECOVERY_OK`;
-4. reboots.
+On success Recovery receives device-side `DONE`, writes the RTC Main handoff,
+and reboots. A failed session keeps the RTC Recovery handoff and retries.
 
 Any network, framing, signature, range, erase, write, readback, or final-digest
-failure leaves the request marker intact. No NVS write occurs per block.
+failure leaves the device in Recovery. No NVS write occurs per block or for
+transport settings.
 
 ## Size and performance
 
@@ -327,6 +352,14 @@ logs are under `target/recovery-server/` when the wrapper is used; managed UART
 logs are under `target/lmesh-radio-build/log/`.
 
 ## High-value improvements
+
+The long-term protocol direction is a signed object store rather than a
+firmware-only flasher. DRS2 already has the authenticated manifest, resumable
+block transfer, and final digest verification needed for this. Add a versioned
+manifest extension for `(type, name, generation, commit policy)` and keep
+Recovery's job limited to verified writes. Main should own publication and
+index updates for replace/append objects. See
+[`OBJECT_STORE.md`](OBJECT_STORE.md) for the object model and replay rules.
 
 In priority order:
 
