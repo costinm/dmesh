@@ -1,0 +1,34 @@
+[package]
+name = "dmesh-object-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+dmesh-transport = { path = "../dmesh-transport" }
+hex = { version = "0.4", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time", "sync", "fs"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+
+[features]
+default = ["std"]
+std = [
+    "dep:anyhow",
+    "dep:hex",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "dmesh_object_store"

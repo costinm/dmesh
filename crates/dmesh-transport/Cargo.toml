@@ -1,0 +1,13 @@
+[package]
+name = "dmesh-transport"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+
+[lib]
+name = "dmesh_transport"
+path = "src/lib.rs"
+
