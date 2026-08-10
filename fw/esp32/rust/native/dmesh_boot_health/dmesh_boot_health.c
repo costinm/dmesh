@@ -1,12 +1,18 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "boot_health_rtc.h"
-#include "boot_health_flash.h"
+#include <stdbool.h>
 
 void dmesh_boot_health_set(uint8_t event)
 {
     dmesh_boot_health_write(event);
-    if (event == DMESH_BOOT_HEALTH_MAIN_OK ||
-        event == DMESH_BOOT_HEALTH_RECOVERY_OK) {
-        dmesh_boot_journal_clear();
-    }
+}
+
+void dmesh_boot_handoff_set(uint8_t handoff)
+{
+    dmesh_boot_handoff_write(handoff);
+}
+
+void dmesh_boot_dry_run_set(bool dry_run)
+{
+    dmesh_boot_dry_run_write(dry_run);
 }

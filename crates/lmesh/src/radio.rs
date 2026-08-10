@@ -6911,6 +6911,7 @@ fn firmware_arg_tag(name: &str) -> Option<u16> {
         "port" => 191,
         "target" => 346,
         "dry_run" => 257,
+        "object_action_stats" => 272,
         _ => return None,
     })
 }

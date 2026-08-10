@@ -50,8 +50,8 @@ provisioned board. Once stage-2/Recovery are installed, the supported Main updat
 # For a manual development start:
 fw/recovery/tools/flash-server.py
 
-# Then send the Recovery-start command for each board.
-python3 fw/recovery/tools/flash-main-command.py e5
+# Then use the common local development flasher.
+python3 scripts/flash-device.py e5 main
 # server, port, saved SSID, and MAC-derived IP use defaults
 ```
 

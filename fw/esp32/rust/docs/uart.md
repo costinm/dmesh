@@ -54,8 +54,8 @@ CBOR payload across all transports, and may add MAC auth for host-firmware auth.
 
 ## Periodic UART Heartbeat
 
-`uart.hb_every` controls the raw-NAN host rendezvous heartbeat and defaults to
-`16` for battery nodes (one empty frame every sixteenth raw-NAN wake):
+`uart.hb_every` controls the raw-NAN host rendezvous event and defaults to
+`16` for battery nodes (one tagged event every sixteenth raw-NAN wake):
 
 This setting is for non-infrastructure, duty-cycled nodes only. An
 infrastructure/AP owner is powered and always-on: it keeps UART active
@@ -65,9 +65,9 @@ continuously and has no battery heartbeat window or light-sleep schedule.
   until another wake source opens the console. Use only for a deliberate
   power experiment; it is not a usable battery-modem default.
 - `N > 0`: on every Nth raw-NAN Wi-Fi wake, firmware opens UART only for that
-raw-NAN active window (`nan.active_ms`, normally 64 ms) and writes exactly
-  `0x7e 0x7e`. This is an empty UART frame, not a CBOR message. lmesh treats
-  it as permission to flush its pending command queue. A received LoRa/FSK
+raw-NAN active window (`nan.active_ms`, normally 64 ms) and writes one tagged
+  `NAN_SLEEPY_START` CBOR event (`c6 a0` when there are no deltas). lmesh
+  treats it as permission to flush its pending command queue. A received LoRa/FSK
   packet uses the same enabled setting with a 250 ms event window, then emits
   its normal binary notification.
 
@@ -136,7 +136,8 @@ window.
 The managed lmesh diagnostic escape `force_direct=true` applies only to the
 one client connection and writes immediately to an already-awake board. It is
 not the default and must not bypass the sleepy-node heartbeat queue; the
-Python surface exposes it only as `flash-control.py ... --direct`.
+Use the lmesh CLI directly; runtime UART control is never routed through a
+Python flash helper.
 
 On a clean post-boot validation, `power uart_status=true` and `xstatus` should
 show zero `uart_rx_drop`, `uart_rx_err`, `uart_frame_drop`, and
@@ -197,7 +198,7 @@ bootloader/recovery operations.
 If an old local bootstrap run left a forward absent, restore it:
 
 ```bash
-python fw/esp32/rust/tools/flash_test_fleet.py \
+python scripts/flash_test_fleet.py \
   --restore-forwards --skip-build --skip-flash --skip-config --skip-sanity \
   --lmesh-mode local-release
 ```

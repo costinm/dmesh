@@ -1,0 +1,23 @@
+# Numeric module/service allocation. Controller/schema data only.
+version = 1
+tag_min = 43
+tag_max = 100
+slot_size = 65536
+
+[[service]]
+tag = 43
+name = "lora"
+slots = 2
+artifact = "mod_lora"
+
+[[service]]
+tag = 45
+name = "hw"
+slots = 1
+artifact = "mod_hw"
+
+[[service]]
+tag = 46
+name = "hello"
+slots = 1
+artifact = "mod_hello"

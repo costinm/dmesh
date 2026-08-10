@@ -4,6 +4,7 @@ use esp_idf_sys as sys;
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::settings::{parse_i32, SharedSettings};
+use super::bytes::{hex_bytes, parse_bytes};
 
 #[derive(Clone, Debug)]
 struct I2cState {
@@ -39,7 +40,12 @@ impl I2cState {
     fn port_id(&self) -> Result<sys::i2c_port_t> {
         match self.port {
             0 => Ok(sys::i2c_port_t_I2C_NUM_0),
-            1 => Ok(sys::i2c_port_t_I2C_NUM_1),
+            1 => {
+                #[cfg(target_arch = "riscv32")]
+                bail!("I2C port 1 is not available on this RISC-V target");
+                #[cfg(not(target_arch = "riscv32"))]
+                return Ok(sys::i2c_port_t_I2C_NUM_1);
+            }
             _ => bail!("invalid I2C port {}", self.port),
         }
     }
@@ -323,31 +329,6 @@ fn parse_arg_or(request: &CommandRequest, key: &str, default: i32) -> Result<i32
         .map(parse_i32)
         .transpose()
         .map(|v| v.unwrap_or(default))
-}
-
-fn parse_bytes(value: &str) -> Result<Vec<u8>> {
-    let value = value.strip_prefix("hex:").unwrap_or(value);
-    if value.contains(',') {
-        return value
-            .split(',')
-            .map(|v| Ok(parse_i32(v.trim())? as u8))
-            .collect();
-    }
-    if value.len() % 2 != 0 {
-        bail!("hex byte string must have even length");
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).map_err(Into::into))
-        .collect()
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn validate_pin(pin: i32) -> Result<()> {

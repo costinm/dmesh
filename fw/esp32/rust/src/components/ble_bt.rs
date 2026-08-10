@@ -10,7 +10,6 @@ use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::frames::decode_frame;
 use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
@@ -1416,11 +1415,24 @@ fn dmesh_adv_data(
 }
 
 fn dmesh_adv_ids(packet: &[u8]) -> (u32, u32) {
-    decode_frame(packet)
-        .ok()
-        .and_then(|decoded| decoded.meshtastic)
-        .map(|header| (header.from, header.id))
-        .unwrap_or((0, 0))
+    // Main no longer owns the Meshtastic codec. Keep only this tiny wire
+    // compatibility shim for BLE advertisement deduplication; the complete
+    // frame parser/encoder lives with mod_lora.
+    if packet.len() >= 16 {
+        let from = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let id = u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        let to = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+        if to != 0 || from != 0 || id != 0 {
+            return (from, id);
+        }
+    }
+    // Non-Meshtastic/raw packets still get stable opaque identifiers.
+    let mut hash = 0x811c9dc5u32;
+    for byte in packet {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    (0, hash)
 }
 
 fn battery_level() -> u8 {

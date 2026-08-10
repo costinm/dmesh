@@ -1,7 +1,7 @@
 pub mod battery;
 pub mod ble_bt;
+pub mod bytes;
 pub mod button;
-pub mod frames;
 pub mod gpio;
 pub mod i2c;
 pub mod ip_command;
@@ -10,8 +10,10 @@ pub mod lora;
 pub mod mode;
 pub mod module;
 pub mod nan;
+pub mod object_store;
 pub mod nvs;
 pub mod power;
+pub mod peripherals;
 pub mod recovery;
 pub mod reset;
 pub mod rgbled;
@@ -28,10 +30,7 @@ use crate::commands::CommandRegistry;
 use settings::SharedSettings;
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
-    battery::register_commands(registry, settings.clone());
-    button::register_commands(registry, settings.clone());
-    gpio::register_commands(registry);
-    i2c::register_commands(registry, settings.clone());
+    peripherals::register_commands(registry, settings.clone());
     lora::register_commands(registry, settings.clone());
     mode::register_commands(registry, settings.clone());
     module::register_commands(registry, settings.clone());

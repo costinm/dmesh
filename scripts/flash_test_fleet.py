@@ -4,7 +4,7 @@
 Run from the repository root after sourcing the firmware environment:
 
     . env.sh
-    python fw/esp32/rust/tools/flash_test_fleet.py
+    python scripts/flash_test_fleet.py
 
 Defaults:
   * discover devices through lmesh usb.serial.list;
@@ -38,7 +38,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 SSH_MESH_ROOT = Path(
     os.environ.get("DMESH_SSH_MESH_DIR") or ROOT.parent / "rust" / "ssh-mesh"
@@ -47,7 +48,9 @@ sys.path.insert(0, str(SSH_MESH_ROOT / "python"))
 
 from dmesh.radio import RadioClient
 
-from device_flash_archive import append_event, device_dir, record_flash, update_device, utc_now
+from scripts.flash_archive import (
+    append_event, device_dir, record_flash, update_device, utc_now,
+)
 
 FW_RUST = ROOT / "fw" / "esp32" / "rust"
 # build-fw.sh honors the repo-local CARGO_TARGET_DIR. Keep flashing on that
@@ -65,6 +68,7 @@ LORA_PAIR_TEST = FW_RUST / "tools" / "lora_pair_test.py"
 PRESUBMIT = FW_RUST / "tools" / "presubmit.py"
 ESP32_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32" / "dmesh-rs-merged.bin"
 ESP32S3_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32s3" / "dmesh-rs-merged.bin"
+ESP32C6_MERGED_IMAGE = FW_TARGET_ROOT / "flash" / "esp32c6" / "dmesh-rs-merged.bin"
 SPARSE_FLASH_DIR = FW_TARGET_ROOT / "flash" / "sparse"
 FLASH_BAUD = 460_800
 DEFAULT_LMESH_CONFIG = Path("/home/system/etc/lmesh/lmesh.toml")
@@ -101,6 +105,10 @@ class Device:
     @property
     def is_s3(self) -> bool:
         return self.chip == "esp32s3"
+
+    @property
+    def is_c6(self) -> bool:
+        return self.chip == "esp32c6"
 
     @property
     def is_classic(self) -> bool:
@@ -181,7 +189,7 @@ def archive_usb_device(device: Device, port: str, baud: int) -> Path:
     if not device.mac:
         raise RuntimeError(f"{device.port}: probe did not return a MAC address")
     path = device_dir(device.mac)
-    chip = "esp32s3" if device.is_s3 else "esp32"
+    chip = device.chip
     table = path / "partition-table.bin"
     nvs = path / "nvs.bin"
     common = [
@@ -633,7 +641,9 @@ def probe(
         return None
     output = proc.stdout or ""
     chip = None
-    if "ESP32-S3" in output:
+    if "ESP32-C6" in output:
+        chip = "esp32c6"
+    elif "ESP32-S3" in output:
         chip = "esp32s3"
     elif "ESP32" in output:
         chip = "esp32"
@@ -683,12 +693,14 @@ def image_build_env(
 
 def build_targets(env: dict[str, str], devices: list[Device]) -> None:
     """Build the common 4 MiB Main image for each CPU family."""
-    needs_esp32 = any(not device.is_s3 for device in devices)
+    needs_esp32 = any(device.is_classic for device in devices)
     needs_s3 = any(device.is_s3 for device in devices)
+    needs_c6 = any(device.is_c6 for device in devices)
 
     for image, required in (
         (ESP32_MERGED_IMAGE, needs_esp32),
         (ESP32S3_MERGED_IMAGE, needs_s3),
+        (ESP32C6_MERGED_IMAGE, needs_c6),
     ):
         if required:
             image.parent.mkdir(parents=True, exist_ok=True)
@@ -711,6 +723,15 @@ def build_targets(env: dict[str, str], devices: list[Device]) -> None:
         )
         package_main_image(s3_env, "xtensa-esp32s3-espidf", "esp32s3", ESP32S3_MERGED_IMAGE)
 
+    if needs_c6:
+        c6_env = image_build_env(env, "sdkconfig.esp32c6.defaults", "../../boot/partitions.csv")
+        run(
+            ["cargo", "build", "--release", "--target", "riscv32imac-esp-espidf"],
+            cwd=FW_RUST,
+            env=c6_env,
+        )
+        package_main_image(c6_env, "riscv32imac-esp-espidf", "esp32c6", ESP32C6_MERGED_IMAGE)
+
 
 def package_main_image(env: dict[str, str], target: str, chip: str, output: Path) -> None:
     """Create a merged image with esptool; never open a serial port here."""
@@ -724,7 +745,7 @@ def package_main_image(env: dict[str, str], target: str, chip: str, output: Path
         cwd=FW_RUST,
         env=env,
     )
-    boot_offset = "0x0" if chip == "esp32s3" else "0x1000"
+    boot_offset = "0x1000" if chip == "esp32" else "0x0"
     run(
         [esptool_python(), "-m", "esptool", "--chip", chip, "merge_bin",
          "--output", str(output), boot_offset, str(release / "bootloader.bin"),
@@ -735,11 +756,20 @@ def package_main_image(env: dict[str, str], target: str, chip: str, output: Path
 
 
 def merged_image_for(device: Device) -> Path:
-    return ESP32S3_MERGED_IMAGE if device.is_s3 else ESP32_MERGED_IMAGE
+    if device.is_s3:
+        return ESP32S3_MERGED_IMAGE
+    if device.is_c6:
+        return ESP32C6_MERGED_IMAGE
+    return ESP32_MERGED_IMAGE
 
 
 def executable_for(device: Device) -> Path:
-    target = "xtensa-esp32s3-espidf" if device.is_s3 else "xtensa-esp32-espidf"
+    if device.is_s3:
+        target = "xtensa-esp32s3-espidf"
+    elif device.is_c6:
+        target = "riscv32imac-esp-espidf"
+    else:
+        target = "xtensa-esp32-espidf"
     return FW_TARGET_ROOT / target / "release" / "dmesh-rs"
 
 
@@ -764,7 +794,7 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
     # This helper is initial/emergency provisioning only. It uses esptool for
     # the boot/Recovery stage images and deliberately omits NVS.
     archive_usb_device(device, port, args.flash_baud)
-    chip = "esp32s3" if device.is_s3 else "esp32"
+    chip = device.chip
     flash_args, flash_files = sparse_flash_args(device)
     rfc2217 = port.startswith("rfc2217://")
     if args.erase_nvs:
@@ -850,9 +880,9 @@ def flash(device: Device, args: argparse.Namespace, env: dict[str, str], port: s
 def sparse_flash_args(device: Device) -> tuple[list[str], list[tuple[str, Path]]]:
     image = merged_image_for(device)
     flash_size = "4MB"
-    flash_freq = "80m" if device.is_s3 else "40m"
-    boot_offset = 0x0 if device.is_s3 else 0x1000
-    label = "esp32s3" if device.is_s3 else "esp32"
+    flash_freq = "40m" if device.is_classic else "80m"
+    boot_offset = 0x1000 if device.is_classic else 0x0
+    label = device.chip
     data = image.read_bytes()
     chunks = [
         (boot_offset, 0x8000, f"{label}-bootloader.bin"),
@@ -1312,7 +1342,7 @@ def main() -> int:
     if not args.skip_flash:
         print(
             "refusing direct USB firmware flash: Main updates must use "
-            "fw/recovery/tools/flash-main-command.py through managed lmesh; "
+            "scripts/flash-device.py through the managed lmesh forward; "
             "stage-2/Recovery provisioning uses scripts/flash-recovery-fleet.py",
             file=sys.stderr,
         )

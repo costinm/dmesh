@@ -12,11 +12,15 @@ use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandRe
 use crate::components::telemetry;
 
 const MODULE_ALIGN: u32 = 0x10000;
+const MODULE_HW_SLOT: u32 = 1;
 const MAX_SERVICE_CALLS: usize = 8;
 const MAX_SERVICE_BYTES: usize = 4096;
 
 static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MODULE_INIT_ONCE: OnceLock<()> = OnceLock::new();
+// TCP flash temporarily owns the IP STA and must quiesce NAN. Other
+// transports (FSK/NAN/future QUIC-like links) retain their radio owner.
+static FLASH_TCP_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn setting_snapshot() -> &'static Mutex<BTreeMap<String, String>> {
     static SNAPSHOT: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
@@ -63,6 +67,8 @@ const _: () = assert!(std::mem::size_of::<ModuleLoraConfig>() == 104);
 
 extern "C" {
     fn dmesh_module_loader_init();
+    fn dmesh_module_loader_refresh_header() -> bool;
+    fn dmesh_module_loader_prepare_flash(timeout_ms: u32) -> bool;
     fn dmesh_module_flash_supported() -> bool;
     fn dmesh_module_psram_exec_supported() -> bool;
     fn dmesh_module_psram_exec_reason() -> *const u8;
@@ -81,8 +87,25 @@ extern "C" {
     fn dmesh_module_loader_max_runtime_ms() -> u32;
     fn dmesh_module_loader_task_runs() -> u32;
     fn dmesh_module_loader_stack_high_water_words() -> u32;
-    fn dmesh_module_start_task(
-        name: *const u8,
+    fn dmesh_module_loader_stage() -> u32;
+    fn dmesh_module_loader_spi_calls() -> u32;
+    fn dmesh_module_loader_spi_errors() -> u32;
+    fn dmesh_module_loader_lora_poll_count() -> u32;
+    fn dmesh_module_loader_lora_irq_wakes() -> u32;
+    fn dmesh_module_loader_lora_irq_timeouts() -> u32;
+    fn dmesh_module_loader_last_lora_payload_len() -> u32;
+    fn dmesh_module_loader_last_lora_command_len() -> u32;
+    fn dmesh_module_loader_module_event_calls() -> u32;
+    fn dmesh_module_loader_last_module_event_id() -> u32;
+    fn dmesh_module_loader_entry_args_len() -> u32;
+    fn dmesh_module_loader_entry_args() -> *const u8;
+    fn dmesh_module_loader_last_lora_command() -> *const u8;
+    fn dmesh_module_loader_flash_connect_attempts() -> u32;
+    fn dmesh_module_loader_flash_connect_errno() -> i32;
+    fn dmesh_module_loader_flash_connect_port() -> u16;
+    fn dmesh_module_loader_flash_connect_host() -> *const u8;
+    fn dmesh_module_start_service(
+        service_tag: u16,
         offset: u32,
         size: u32,
         payload: *const u8,
@@ -264,7 +287,7 @@ pub unsafe extern "C" fn dmesh_module_emit_event(
     if events.len() >= MAX_SERVICE_CALLS { return -2; }
     if value_type == 1 || value_type == 2 {
         if payload_len != 8 { return -1; }
-    } else if value_type > 4 {
+    } else if value_type > 5 {
         return -1;
     }
     events.push_back(ModuleEvent { event_id, value_type, flags, payload });
@@ -344,11 +367,32 @@ pub fn module_last_result() -> i32 {
     unsafe { dmesh_module_loader_last_result() }
 }
 
+pub fn poll_flash_transport(settings: &crate::components::settings::SharedSettings) {
+    if !FLASH_TCP_TRANSPORT_ACTIVE.load(Ordering::Acquire)
+        || !unsafe { dmesh_module_loader_task_done() }
+    {
+        return;
+    }
+    if !FLASH_TCP_TRANSPORT_ACTIVE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let result = unsafe { dmesh_module_loader_last_result() };
+    telemetry::record_log(format!(
+        "event type=module.flash.transport_complete transport=tcp result={} resume=true",
+        result
+    ));
+    if let Err(error) = crate::components::mode::resume_from_ip_transport(settings) {
+        telemetry::record_log(format!(
+            "event type=module.flash.transport_resume ok=false message={}",
+            crate::commands::protocol::escape_value(&error.to_string())
+        ));
+    }
+}
+
 #[derive(Debug)]
 struct ServiceCall {
-    name: String,
+    service_tag: u16,
     payload: Vec<u8>,
-    args: String,
 }
 
 fn service_calls() -> &'static Mutex<VecDeque<ServiceCall>> {
@@ -360,38 +404,20 @@ fn service_calls() -> &'static Mutex<VecDeque<ServiceCall>> {
 /// queue; `poll_main` dispatches it later on the single Main command loop.
 #[no_mangle]
 pub unsafe extern "C" fn dmesh_module_call_service(
-    service: *const u8,
-    service_len: usize,
+    service_tag: u16,
     payload: *const u8,
     payload_len: usize,
-    args: *const u8,
-    args_len: usize,
+    response: *mut u8,
+    response_capacity: usize,
+    response_len: *mut usize,
+    timeout_ms: u32,
 ) -> i32 {
-    if service.is_null()
-        || service_len == 0
-        || service_len > 15
-        || payload_len > MAX_SERVICE_BYTES
-        || args_len > MAX_SERVICE_BYTES
-        || (payload_len != 0 && payload.is_null())
-        || (args_len != 0 && args.is_null())
-    {
+    if service_tag == 0 || payload_len > MAX_SERVICE_BYTES ||
+        (payload_len != 0 && payload.is_null()) ||
+        (response_capacity != 0 && response.is_null()) || timeout_ms == 0 {
         return -1;
     }
-    let service_bytes = core::slice::from_raw_parts(service, service_len);
-    if !service_bytes
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    {
-        return -1;
-    }
-    let args_bytes = if args_len == 0 {
-        &[]
-    } else {
-        core::slice::from_raw_parts(args, args_len)
-    };
-    let Ok(args) = core::str::from_utf8(args_bytes) else {
-        return -1;
-    };
+    if response_len.is_null() { return -1; }
     let payload = if payload_len == 0 {
         Vec::new()
     } else {
@@ -404,11 +430,8 @@ pub unsafe extern "C" fn dmesh_module_call_service(
     if calls.len() >= MAX_SERVICE_CALLS {
         return -2;
     }
-    calls.push_back(ServiceCall {
-        name: String::from_utf8_lossy(service_bytes).into_owned(),
-        payload,
-        args: args.to_owned(),
-    });
+    calls.push_back(ServiceCall { service_tag, payload });
+    core::ptr::write(response_len, 0);
     0
 }
 
@@ -462,24 +485,31 @@ pub fn poll_main(
         let Some(call) = call else {
             return;
         };
-        let mut request = CommandRequest::new(&call.name);
+        let name = match call.service_tag {
+            101 => "module",
+            43 => "lora",
+            45 => "hw",
+            46 => "hello",
+            _ => {
+                telemetry::record_log(format!(
+                    "event type=module.service rejected=true tag={}", call.service_tag
+                ));
+                continue;
+            }
+        };
+        let mut request = CommandRequest::new(name);
         if request.method == 0 {
             telemetry::record_log(format!(
-                "event type=module.service rejected=true name={}",
-                call.name
+                "event type=module.service rejected=true tag={}",
+                call.service_tag
             ));
             continue;
         }
         request.payload = call.payload;
-        for pair in call.args.split_whitespace() {
-            if let Some((key, value)) = pair.split_once('=') {
-                request = request.arg_pair(key, value);
-            }
-        }
         let response = registry.dispatch(&request);
         telemetry::record_log(format!(
-            "event type=module.service name={} status={:?} message={}",
-            call.name, response.status, response.message
+            "event type=module.service tag={} status={:?} message={}",
+            call.service_tag, response.status, response.message
         ));
     }
 }
@@ -496,6 +526,11 @@ pub fn register_commands(
     registry.register(ModuleCommand {
         name: "hello",
         fixed_name: Some("hello"),
+        settings: settings.clone(),
+    });
+    registry.register(ModuleCommand {
+        name: "hw",
+        fixed_name: Some("hw"),
         settings,
     });
 }
@@ -517,6 +552,14 @@ impl CommandHandler for ModuleCommand {
             return invoke(&self.settings, name, request);
         }
         match request.arg("op").unwrap_or("status") {
+            "stop" => {
+                ensure_initialized(&self.settings);
+                if unsafe { dmesh_module_loader_prepare_flash(1500) } {
+                    Ok(CommandResponse::ok("module stopped"))
+                } else {
+                    Err(anyhow!("module stop timed out"))
+                }
+            }
             "init" => {
                 ensure_initialized(&self.settings);
                 Ok(CommandResponse::ok("module initialized"))
@@ -526,6 +569,7 @@ impl CommandHandler for ModuleCommand {
                 // the module. Make status reflect the actual flash slot
                 // instead of exposing the deferred-init sentinel values.
                 ensure_initialized(&self.settings);
+                unsafe { dmesh_module_loader_refresh_header(); }
                 Ok(CommandResponse::ok(status_text()))
             }
             "psram" => Ok(CommandResponse::ok(psram_text())),
@@ -565,11 +609,32 @@ impl CommandHandler for ModuleCommand {
 }
 
 fn status_text() -> String {
+    let last_lora_command = unsafe {
+        let ptr = dmesh_module_loader_last_lora_command();
+        if ptr.is_null() {
+            "".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(ptr.cast())
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let entry_args = unsafe {
+        let ptr = dmesh_module_loader_entry_args();
+        if ptr.is_null() { "".to_string() }
+        else { std::ffi::CStr::from_ptr(ptr.cast()).to_string_lossy().into_owned() }
+    };
+    let flash_connect_host = unsafe {
+        let ptr = dmesh_module_loader_flash_connect_host();
+        if ptr.is_null() { "".to_string() }
+        else { std::ffi::CStr::from_ptr(ptr.cast()).to_string_lossy().into_owned() }
+    };
     format!(
-        "module initialized={} flash_exec={} align=0x{MODULE_ALIGN:x} offset=0x{:x} target=module header_valid={} required_stack_words={} task_done={} last_result={} runtime_ms={} max_runtime_ms={} task_runs={} stack_high_water_words={} psram_exec={} psram_reason={}",
+        "module initialized={} flash_exec={} align=0x{MODULE_ALIGN:x} offset=0x{:x} hw_slot=0x{:x} target=module header_valid={} required_stack_words={} task_done={} last_result={} runtime_ms={} max_runtime_ms={} task_runs={} stack_high_water_words={} stage={} spi_calls={} spi_errors={} lora_polls={} lora_irq_wakes={} lora_irq_timeouts={} lora_last_command={} lora_last_command_len={} lora_last_payload_len={} module_events={} module_last_event_id={} entry_args_len={} entry_args={} flash_connect_attempts={} flash_connect_host={} flash_connect_port={} flash_connect_errno={} psram_exec={} psram_reason={}",
         MODULE_INITIALIZED.load(Ordering::Acquire),
         unsafe { dmesh_module_flash_supported() },
         unsafe { dmesh_module_loader_offset() },
+        MODULE_HW_SLOT * MODULE_ALIGN,
         unsafe { dmesh_module_loader_header_valid() },
         unsafe { dmesh_module_loader_required_stack_words() },
         unsafe { dmesh_module_loader_task_done() },
@@ -578,6 +643,23 @@ fn status_text() -> String {
         unsafe { dmesh_module_loader_max_runtime_ms() },
         unsafe { dmesh_module_loader_task_runs() },
         unsafe { dmesh_module_loader_stack_high_water_words() },
+        unsafe { dmesh_module_loader_stage() },
+        unsafe { dmesh_module_loader_spi_calls() },
+        unsafe { dmesh_module_loader_spi_errors() },
+        unsafe { dmesh_module_loader_lora_poll_count() },
+        unsafe { dmesh_module_loader_lora_irq_wakes() },
+        unsafe { dmesh_module_loader_lora_irq_timeouts() },
+        last_lora_command,
+        unsafe { dmesh_module_loader_last_lora_command_len() },
+        unsafe { dmesh_module_loader_last_lora_payload_len() },
+        unsafe { dmesh_module_loader_module_event_calls() },
+        unsafe { dmesh_module_loader_last_module_event_id() },
+        unsafe { dmesh_module_loader_entry_args_len() },
+        entry_args,
+        unsafe { dmesh_module_loader_flash_connect_attempts() },
+        flash_connect_host,
+        unsafe { dmesh_module_loader_flash_connect_port() },
+        unsafe { dmesh_module_loader_flash_connect_errno() },
         unsafe { dmesh_module_psram_exec_supported() },
         psram_reason()
     )
@@ -607,7 +689,22 @@ pub fn invoke_module(
     if !crate::components::recovery::command_transport_ready() {
         return Err(anyhow!("module unavailable while flash transfer is active"));
     }
-    if name.is_empty()
+    // A module transfer stops the old task before erasing its flash mapping,
+    // but Main itself keeps running. Refresh the DMOD header before deciding
+    // which ABI/service to invoke so a new image can be loaded immediately
+    // without rebooting Main.
+    unsafe { dmesh_module_loader_refresh_header(); }
+    let service_tag = match name {
+        "lora" => 43u16,
+        /* Development-only flash protocol slot.  It is deliberately not in
+         * the public module registry yet; tag 44 is used while lora is
+         * quiesced and the Rust/lmesh replacement is developed. */
+        "flash" => 44u16,
+        "hw" => 45u16,
+        "hello" => 46u16,
+        _ => 0u16,
+    };
+    if service_tag == 0 || name.is_empty()
         || name.len() > 15
         || !name
             .bytes()
@@ -616,6 +713,29 @@ pub fn invoke_module(
         return Err(anyhow!(
             "module name must be 1..15 ASCII alphanumeric or underscore bytes"
         ));
+    }
+    if name == "flash" {
+        if !unsafe { dmesh_module_flash_supported() } {
+            return Err(anyhow!("flash module host is unavailable"));
+        }
+        let transport = request.arg("transport").unwrap_or("tcp");
+        if transport == "tcp" {
+            // If the caller already prepared the IP STA, do not run another
+            // radio/power transition immediately before the module opens its
+            // socket. This is the normal scripted path: Main first stops NAN,
+            // then configures the static STA, then starts mod_flash. A second
+            // transition here can invalidate the lwIP/Wi-Fi data plane even
+            // though the STA still reports an address.
+            if !crate::components::wifi::ip_sta_ready() {
+                crate::components::mode::stop_for_ip_transport();
+            }
+        }
+        if !unsafe { dmesh_module_loader_prepare_flash(1500) } {
+            if transport == "tcp" {
+                let _ = crate::components::mode::resume_from_ip_transport(settings);
+            }
+            return Err(anyhow!("module did not quiesce before flash module start"));
+        }
     }
     if name == "lora" && unsafe { dmesh_module_loader_is_lora() } {
         configure_lora(settings)?;
@@ -648,7 +768,7 @@ pub fn invoke_module(
         (None, Some(value)) => value
             .parse::<u32>()
             .map_err(|err| anyhow!("invalid module offset: {err}"))?,
-        (None, None) => unsafe { dmesh_module_loader_offset() },
+        (None, None) => (service_tag - 43) as u32 * MODULE_ALIGN,
     };
     let size = request
         .arg("size")
@@ -658,15 +778,32 @@ pub fn invoke_module(
     if offset % MODULE_ALIGN != 0 {
         return Err(anyhow!("module offset must be 0x{MODULE_ALIGN:x}-aligned"));
     }
-    let args = request.arg("args").unwrap_or("").as_bytes();
-    // C owns the task-copying ABI and expects a conventional NUL-terminated
-    // name. `str::as_ptr()` is not terminated and made the C-side `strnlen`
-    // validation read arbitrary bytes beyond a short module name.
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|_| anyhow!("module name contains an interior NUL"))?;
+    let flash_args = if name == "flash" {
+        /* The command tokenizer exposes whitespace-separated `server`,
+         * `port`, and `dry_run` fields as normal request arguments. Repack
+         * them into the module's deliberately tiny ASCII argument ABI. */
+        let mut value = request.arg("args").unwrap_or("").to_owned();
+        for key in ["server", "port", "dry_run", "target"] {
+            if let Some(item) = request.arg(key) {
+                if !value.is_empty() { value.push(' '); }
+                value.push_str(key); value.push('='); value.push_str(item);
+            }
+        }
+        // TCP is the module's default and omitting it avoids duplicating the
+        // common case in the tiny ASCII ABI. Preserve an explicit alternate
+        // transport for future FSK/NAN/QUIC modules.
+        if let Some(item) = request.arg("transport") {
+            if item != "tcp" {
+                if !value.is_empty() { value.push(' '); }
+                value.push_str("transport="); value.push_str(item);
+            }
+        }
+        Some(value)
+    } else { None };
+    let args = flash_args.as_deref().unwrap_or_else(|| request.arg("args").unwrap_or("")).as_bytes();
     let result = unsafe {
-        dmesh_module_start_task(
-            c_name.as_ptr().cast(),
+        dmesh_module_start_service(
+            service_tag,
             offset,
             size,
             request.payload.as_ptr(),
@@ -676,7 +813,13 @@ pub fn invoke_module(
         )
     };
     if result != 0 {
+        if name == "flash" && request.arg("transport").unwrap_or("tcp") == "tcp" {
+            let _ = crate::components::mode::resume_from_ip_transport(settings);
+        }
         return Err(anyhow!("module task could not start result={result}"));
+    }
+    if name == "flash" && request.arg("transport").unwrap_or("tcp") == "tcp" {
+        FLASH_TCP_TRANSPORT_ACTIVE.store(true, Ordering::Release);
     }
     Ok(CommandResponse::ok(format!(
         "module {name} task started offset=0x{offset:x} size=0x{size:x}; see serial log"

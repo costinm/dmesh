@@ -17,6 +17,9 @@ const MAX_RESPONSE_MAX_BYTES: usize = 8192;
 const MAX_DEPTH: usize = 64;
 const MAX_COMPANION_DEPTH: usize = 64;
 const PREVIEW_BYTES: usize = 96;
+const LORA_WAKE_EVENT_INTERVAL_MS: u32 = 1_000;
+
+static LAST_LORA_WAKE_EVENT_MS: AtomicU32 = AtomicU32::new(0);
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
     registry.register(TelemetryCommand::new("status", settings.clone()));
@@ -334,6 +337,32 @@ pub fn record_packet_sample(
 
 pub fn count_packet(transport: &'static str, direction: Direction, len: usize) {
     counter_for(transport).record(direction, len);
+}
+
+pub fn lora_rx_packets() -> u32 {
+    LORA_COUNTER.snapshot().rx_packets
+}
+
+/// Rate-limit per-packet LoRa wake notifications. Packet counters remain
+/// lossless; this only prevents a busy radio from flooding UART and the
+/// bounded event log with one notification per received packet.
+pub fn take_lora_wake_event_slot() -> bool {
+    let now = now_ms().max(0) as u32;
+    let mut previous = LAST_LORA_WAKE_EVENT_MS.load(Ordering::Relaxed);
+    loop {
+        if previous != 0 && now.saturating_sub(previous) < LORA_WAKE_EVENT_INTERVAL_MS {
+            return false;
+        }
+        match LAST_LORA_WAKE_EVENT_MS.compare_exchange_weak(
+            previous,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => previous = observed,
+        }
+    }
 }
 
 /// Compact, event-triggered statistics emitted after a LoRa packet wakes a

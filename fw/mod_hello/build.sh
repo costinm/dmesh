@@ -12,6 +12,8 @@ if [ ! -x "${RUST_ESP_TOOLCHAIN_BIN:-}/cargo" ]; then
 fi
 
 TARGET="${1:-xtensa-esp32-espidf}"
+SERVICE_TAG="${DMESH_MODULE_TAG:-46}"
+SLOT_COUNT="${DMESH_MODULE_SLOTS:-1}"
 case "$TARGET" in
   xtensa-esp32-espidf) tool_prefix=xtensa-esp32-elf ;;
   xtensa-esp32s3-espidf) tool_prefix=xtensa-esp32s3-elf ;;
@@ -31,6 +33,8 @@ elif [[ -n "${DMESH_MODULE_VMA:-}" && -z "$expected_module_vma" ]]; then
     echo "DMESH_MODULE_VMA is only valid for fixed-VMA Xtensa builds" >&2
     exit 2
 fi
+module_data_base=0
+module_data_vma=0
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then
     module_vma_value=$((DMESH_MODULE_VMA))
     if (( module_vma_value != expected_module_vma )); then
@@ -43,10 +47,11 @@ if [ -n "${DMESH_MODULE_VMA:-}" ]; then
         exit 2
     fi
     if [[ "$TARGET" == xtensa-esp32s3-espidf ]]; then
-        module_data_vma=$((0x3c000000 + module_vma_value - 0x42000000))
+        module_data_base=$((0x3d000000 + module_vma_value - expected_module_vma))
     elif [[ "$TARGET" == xtensa-esp32-espidf ]]; then
-        module_data_vma=$((0x3f700000 + module_vma_value - 0x40300000))
+        module_data_base=$((0x3f700000 + module_vma_value - expected_module_vma))
     fi
+    module_data_vma=$module_data_base
 fi
 
 PATH="$RUST_ESP_TOOLCHAIN_BIN:$CARGO_HOME/bin:$PATH"
@@ -88,7 +93,7 @@ build_elf
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then
     text_size_hex="$(${TOOL_BIN}/${tool_prefix}-readelf -S -W "$ELF" | awk '$3 == ".text" { print $7; exit }')"
     text_size=$((0x$text_size_hex))
-    module_data_vma=$((module_data_vma + text_size))
+    module_data_vma=$((module_data_base + text_size))
     link_data_args=(-C "link-arg=-Wl,--defsym=MODULE_DATA_VMA=$module_data_vma")
     touch "$ROOT/fw/mod_hello/src/lib.rs"
     build_elf
@@ -118,6 +123,8 @@ ENTRY_OFFSET=$((ENTRY_OFFSET - MODULE_VMA_BASE))
 DMOD_ENTRY_OFFSET=$((ENTRY_OFFSET + 64))
 DMOD_FLAGS=0
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then DMOD_FLAGS=1; fi
-"$DMESH_PYTHON" "$ROOT/fw/mod_hello/pack.py" --name hello \
+"$DMESH_PYTHON" "$ROOT/fw/mod_hello/pack.py" --service-tag "$SERVICE_TAG" \
+  --slot-count "$SLOT_COUNT" --code-vma "$(( ${DMESH_MODULE_VMA:-0} - 64 ))" \
+  --data-vma "$module_data_base" \
   --entry-offset "$DMOD_ENTRY_OFFSET" --flags "$DMOD_FLAGS" "$RAW" "$IMAGE"
 printf 'module image: %s\n' "$IMAGE"

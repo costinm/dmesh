@@ -10,6 +10,25 @@ cd "$DMESH_REPO"
 profile="${DMESH_NIX_PROFILE:-$DMESH_REPO/target/nix/profile}"
 ssh_mesh_url="${SSH_MESH_GIT_URL:-https://github.com/costinm/ssh-mesh}"
 
+resolve_cargo() {
+    local cargo_bin
+
+    cargo_bin="$(command -v cargo || true)"
+    if [ -z "$cargo_bin" ]; then
+        echo "Missing Cargo in the DMesh environment; run scripts/build.sh deps" >&2
+        return 1
+    fi
+    printf '%s\n' "$cargo_bin"
+}
+
+DMESH_CARGO_BIN="$(resolve_cargo 2>/dev/null || true)"
+
+require_dmesh_cargo() {
+    if [ -z "$DMESH_CARGO_BIN" ]; then
+        DMESH_CARGO_BIN="$(resolve_cargo)"
+    fi
+}
+
 ensure_rust_toolchain() {
     local rustup_bin="$profile/bin/rustup"
 
@@ -77,13 +96,14 @@ configure_musl() {
 }
 
 musl() {
+    require_dmesh_cargo
     ensure_rust_toolchain
     configure_ssh_mesh_override
     configure_musl
     # Android JNI/UI crates are libraries, not Linux MUSL binaries. Build the
     # device services and terminal UI explicitly so NativeActivity backends
     # are not pulled into the static Linux artifact set.
-    cargo build --release --target x86_64-unknown-linux-musl \
+    "$DMESH_CARGO_BIN" build --release --target x86_64-unknown-linux-musl \
         -p lmesh \
         -p mesh-tun \
         -p dmeshtui
@@ -104,18 +124,106 @@ musl() {
         echo "Missing ssh-mesh mesh-cli source; set DMESH_SSH_MESH_DIR" >&2
         return 1
     fi
-    cargo build --manifest-path "$ssh_mesh_dir/Cargo.toml" \
-        --release --target x86_64-unknown-linux-musl -p mesh-cli
+    (
+        cd "$ssh_mesh_dir"
+        # ssh-mesh owns its target directory, Cargo cache, and tool selection.
+        # Do not let the DMesh environment make this sibling build write into
+        # target/ or use a DMesh-local Cargo cache.
+        if [ -f ./env.sh ]; then
+            . ./env.sh
+        fi
+        local ssh_mesh_cargo
+        ssh_mesh_cargo="$(command -v cargo || true)"
+        if [ -z "$ssh_mesh_cargo" ]; then
+            echo "Missing Cargo in the ssh-mesh environment" >&2
+            exit 1
+        fi
+        "$ssh_mesh_cargo" build --release --target x86_64-unknown-linux-musl -p mesh-cli
+    )
 }
 
 check() {
+    require_dmesh_cargo
     configure_ssh_mesh_override
-    cargo check --workspace
+    "$DMESH_CARGO_BIN" check --workspace
+}
+
+lmesh_check() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" check -p lmesh
+}
+
+lmesh_test() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" test -p lmesh
+}
+
+object_store_test() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" test -p dmesh-object-store
+}
+
+recovery_test() {
+    PYTHONPATH="$DMESH_REPO/fw/recovery/tools" "$DMESH_PYTHON" \
+        "$DMESH_REPO/scripts/test_recovery_protocol.py"
+}
+
+object_store_udp() {
+    shift || true
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    DMESH_UDP_SERVER_PORT="${DMESH_UDP_SERVER_PORT:-3336}" \
+    DMESH_UDP_SERVER_BIND="${DMESH_UDP_SERVER_BIND:-0.0.0.0}" \
+    DMESH_OBJECT_STORE_ROOT="${DMESH_OBJECT_STORE_ROOT:-$DMESH_REPO/target/flash}" \
+        "$DMESH_CARGO_BIN" run -p dmesh-object-store --bin udp-server -- "$@"
+}
+
+object_store_udp_status() {
+    shift || true
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    DMESH_UDP_STATUS_PORT="${DMESH_UDP_STATUS_PORT:-3338}" \
+    DMESH_UDP_STATUS_BIND="${DMESH_UDP_STATUS_BIND:-0.0.0.0}" \
+        "$DMESH_CARGO_BIN" run -p dmesh-object-store --bin udp-status-server -- "$@"
+}
+
+lmesh_restart() {
+    local binary="$DMESH_REPO/target/x86_64-unknown-linux-musl/release/lmesh"
+    local old=""
+    local new=""
+    if [ ! -x "$binary" ]; then
+        echo "Missing lmesh binary; run scripts/build.sh musl" >&2
+        return 1
+    fi
+    old="$(pgrep -n -f "^$binary$" || true)"
+    if [ -n "$old" ]; then
+        kill -TERM "$old"
+    fi
+    for _ in $(seq 1 30); do
+        new="$(pgrep -n -f "^$binary$" || true)"
+        if [ -n "$new" ] && [ "$new" != "$old" ]; then
+            echo "lmesh restarted pid=$new"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "lmesh did not restart after pid=${old:-none}" >&2
+    return 1
 }
 
 case "${1:-musl}" in
     deps) deps ;;
     musl) musl ;;
     check) check ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|check}" >&2; exit 2 ;;
+    lmesh-check) lmesh_check ;;
+    lmesh-test) lmesh_test ;;
+    object-store-test) object_store_test ;;
+    object-store-udp) object_store_udp "$@" ;;
+    object-store-udp-status) object_store_udp_status "$@" ;;
+    lmesh-restart) lmesh_restart ;;
+    recovery-test) recovery_test ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|object-store-test|object-store-udp|object-store-udp-status|lmesh-restart|recovery-test}" >&2; exit 2 ;;
 esac

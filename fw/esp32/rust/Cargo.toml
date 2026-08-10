@@ -7,7 +7,11 @@ resolver = "2"
 [workspace]
 
 [dependencies]
+dmesh-rawnan = { path = "../../../crates/rawnan" }
+dmesh-object-store = { path = "../../../crates/dmesh-object-store", default-features = false }
+dmesh-transport = { path = "../../../crates/dmesh-transport" }
 anyhow = "1"
+sha2 = { version = "0.11", default-features = false }
 embedded-svc = "0.29"
 esp-idf-svc = { version = "0.52", default-features = false, features = ["std", "experimental"] }
 esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }

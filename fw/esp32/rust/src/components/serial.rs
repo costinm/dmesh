@@ -2,15 +2,28 @@ use std::ffi::{c_char, c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use esp_idf_sys as sys;
+use minicbor::{Encoder, data::Tag};
 
 use super::settings::SharedSettings;
+
+#[cfg(target_arch = "riscv32")]
+unsafe extern "C" {
+    fn dmesh_usb_serial_install() -> i32;
+    fn dmesh_usb_serial_read(buffer: *mut c_void, length: u32, ticks: u32) -> i32;
+    fn dmesh_usb_serial_write(buffer: *const c_void, length: u32) -> i32;
+}
+
+#[cfg(target_arch = "riscv32")]
+pub fn install_usb_console() -> i32 {
+    unsafe { dmesh_usb_serial_install() }
+}
 
 /// Keep the debug transport usable long enough to issue a command after it wakes.
 ///
 /// UART is re-opened by its next raw-NAN wake window, so an interactive
 /// console window need only cover one command/response exchange.
 pub const DEFAULT_ACTIVE_MS: u32 = 4_000;
-/// Send an empty UART delimiter on every raw-NAN wake unless NVS overrides it.
+/// Send a compact tagged wake event on every raw-NAN wake unless NVS overrides it.
 ///
 /// This is the battery-node host rendezvous: it lets lmesh flush one queued
 /// CBOR command during the already scheduled radio window.  It does not add a
@@ -68,12 +81,6 @@ static UART0_HEARTBEAT_WAKES: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
-
-// A received LoRa packet is an authenticated/in-band wake trigger. Keep the
-// managed console available for the same bounded interaction window used by
-// other local wake paths so lmesh can collect the automatic status/stats
-// records without immediately putting the board back behind UART gating.
-const RADIO_EVENT_UART_WINDOW_MS: u32 = DEFAULT_ACTIVE_MS;
 
 const UART_FRAME_QUEUE_LEN: u32 = 8;
 // UART carries compact CBOR directly. The generic mesh stream envelope belongs
@@ -183,7 +190,7 @@ pub fn configure_active_window(settings: &SharedSettings) {
 /// Configure the raw-NAN wake heartbeat cadence.
 ///
 /// Zero suppresses both periodic heartbeats and radio-event UART activation.
-/// A nonzero value emits one empty delimiter frame on every Nth raw-NAN wake.
+/// A nonzero value emits one tagged event on every Nth raw-NAN wake.
 pub fn set_heartbeat_every(every: u32) {
     let previous = UART0_HEARTBEAT_EVERY.swap(every, Ordering::AcqRel);
     if previous != every {
@@ -191,10 +198,6 @@ pub fn set_heartbeat_every(every: u32) {
     }
 }
 
-/// Open the console window and emit an empty UART delimiter frame.
-///
-/// The empty `0x7e 0x7e` frame is transport activity only: lmesh consumes it
-/// locally and uses it to flush queued host-to-firmware records.
 /// Open the bounded UART console window from an authenticated/in-band wake
 /// trigger such as a targeted NAN service advertisement.
 pub fn activate_window_for(window_ms: u32) {
@@ -210,10 +213,65 @@ pub fn activate_window_for(window_ms: u32) {
     let _ = ensure_power_locks();
 }
 
-fn emit_heartbeat(window_ms: u32) -> bool {
+const NAN_SLEEPY_START_TAG: u64 = 6;
+const NAN_SLEEPY_START_FLAGS: u16 = 0;
+const NAN_SLEEPY_START_RECENT_NAN: u16 = 1 << 0;
+const NAN_SLEEPY_START_RECENT_RADIO: u16 = 1 << 1;
+const NAN_SLEEPY_START_CLUSTER_CHANGED: u16 = 1 << 2;
+
+static LAST_WAKE_LORA_RX: AtomicU32 = AtomicU32::new(0);
+static LAST_WAKE_NAN_BEACON_RX: AtomicU32 = AtomicU32::new(0);
+static LAST_WAKE_NAN_CLUSTER_RESELECTS: AtomicU32 = AtomicU32::new(0);
+
+/// Build the compact DMesh-private NAN sleepy-start event.
+///
+/// Tag 6 is one byte on the wire. The unchanged event is `c6 a0`; optional
+/// integer keys carry only deltas, so an idle 64 ms window remains two CBOR
+/// bytes while useful radio/NAN changes fit without text diagnostics.
+fn nan_sleepy_start_payload() -> Vec<u8> {
+    let lora_rx = super::telemetry::lora_rx_packets();
+    let nan_beacons = super::nan::nan_beacon_snapshot().count;
+    let cluster_reselects = super::nan::nan_cluster_reselects();
+    let lora_delta = lora_rx.saturating_sub(LAST_WAKE_LORA_RX.swap(lora_rx, Ordering::AcqRel));
+    let nan_delta = nan_beacons.saturating_sub(
+        LAST_WAKE_NAN_BEACON_RX.swap(nan_beacons, Ordering::AcqRel),
+    );
+    let cluster_changed = cluster_reselects
+        != LAST_WAKE_NAN_CLUSTER_RESELECTS.swap(cluster_reselects, Ordering::AcqRel);
+    let mut flags = NAN_SLEEPY_START_FLAGS;
+    if nan_delta != 0 {
+        flags |= NAN_SLEEPY_START_RECENT_NAN;
+    }
+    if lora_delta != 0 {
+        flags |= NAN_SLEEPY_START_RECENT_RADIO;
+    }
+    if cluster_changed {
+        flags |= NAN_SLEEPY_START_CLUSTER_CHANGED;
+    }
+
+    let optional_count = usize::from(lora_delta != 0) + usize::from(nan_delta != 0);
+    let field_count = usize::from(flags != 0) + optional_count;
+    let mut payload = Vec::with_capacity(3 + field_count * 3);
+    let mut encoder = Encoder::new(&mut payload);
+    encoder.tag(Tag::new(NAN_SLEEPY_START_TAG)).expect("CBOR tag");
+    encoder.map(field_count as u64).expect("CBOR map");
+    if flags != 0 {
+        encoder.u8(0).expect("CBOR flags").u16(flags).expect("CBOR flags value");
+        if lora_delta != 0 {
+            encoder.u8(1).expect("CBOR lora key").u32(lora_delta).expect("CBOR lora delta");
+        }
+        if nan_delta != 0 {
+            encoder.u8(2).expect("CBOR NAN key").u32(nan_delta).expect("CBOR NAN delta");
+        }
+    }
+    payload
+}
+
+fn emit_nan_sleepy_start(window_ms: u32) -> bool {
     UART0_HEARTBEAT_WINDOW_MS.store(window_ms, Ordering::Relaxed);
     activate_window_for(window_ms);
-    if write_wire_bytes(&[UART_PPP_FLAG, UART_PPP_FLAG]) {
+    let payload = nan_sleepy_start_payload();
+    if write_wire_bytes(&encode_ppp_frame(&payload)) {
         UART0_HEARTBEAT_SENT.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -222,26 +280,23 @@ fn emit_heartbeat(window_ms: u32) -> bool {
     }
 }
 
-/// Account for a raw-NAN duty wake and emit its configured heartbeat.
+/// Account for a raw-NAN duty wake and emit its configured tagged wake event.
 pub fn on_raw_nan_wake(active_ms: u32) -> bool {
     let every = UART0_HEARTBEAT_EVERY.load(Ordering::Acquire);
     if every == 0 {
         return false;
     }
     let wake = UART0_HEARTBEAT_WAKES.fetch_add(1, Ordering::AcqRel) + 1;
-    wake % every == 0 && emit_heartbeat(active_ms)
+    wake % every == 0 && emit_nan_sleepy_start(active_ms)
 }
 
-/// Surface a received LoRa/FSK packet over UART when heartbeat delivery is enabled.
-///
-/// Unlike periodic duty wakes this is event-driven: any enabled radio receive
-/// opens one bounded UART window so the following notification can be sent.
-pub fn on_radio_packet_received() -> bool {
-    // A packet is an explicit in-band wake event, so it overrides the
-    // periodic-heartbeat setting.  `uart.hb_every=0` disables timer wakes;
-    // it must not hide the event window needed by lmesh to collect the
-    // packet's compact stats notification.
-    emit_heartbeat(RADIO_EVENT_UART_WINDOW_MS)
+/// Keep the local UART recovery path alive when NAN synchronization is absent.
+/// This is deliberately independent of `uart.hb_every`: without a beacon the
+/// host has no other way to learn that the device is awake and send a command.
+/// The window is bounded to the current raw-NAN active dwell and is only used
+/// by the sleepy-mode no-sync fallback; it does not make the UART permanent.
+pub fn on_uart_recovery_wake(window_ms: u32) -> bool {
+    emit_nan_sleepy_start(window_ms)
 }
 
 /// Start the single UART ingress task after UART0 has installed an IDF RX
@@ -743,6 +798,29 @@ fn time_after_or_equal(now: u32, deadline: u32) -> bool {
 }
 
 unsafe extern "C" fn uart_manager_task(arg: *mut c_void) {
+    #[cfg(target_arch = "riscv32")]
+    if arg.is_null() {
+        let mut parser = UartParser::default();
+        let mut bytes = [0_u8; 128];
+        loop {
+            let received = dmesh_usb_serial_read(
+                bytes.as_mut_ptr().cast::<c_void>(),
+                bytes.len() as u32,
+                sys::configTICK_RATE_HZ / 10,
+            );
+            if received <= 0 {
+                continue;
+            }
+            UART0_RX_EVENTS.fetch_add(1, Ordering::Relaxed);
+            note_rx_activity();
+            for byte in &bytes[..received as usize] {
+                if let Some(frame) = parser.push(*byte) {
+                    enqueue_frame(frame);
+                }
+            }
+        }
+    }
+
     let event_queue = arg.cast::<sys::QueueDefinition>();
     let mut parser = UartParser::default();
     loop {
@@ -828,6 +906,19 @@ unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
             continue;
         }
         let len = queued.len as usize;
+        #[cfg(target_arch = "riscv32")]
+        {
+            let written = dmesh_usb_serial_write(
+                queued.data.as_ptr().cast::<c_void>(),
+                len as u32,
+            );
+            if written != len as i32 {
+                UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        #[cfg(not(target_arch = "riscv32"))]
         for chunk in queued.data[..len].chunks(UART_TX_FIFO_CHUNK) {
             // `uart_write_bytes` enables TXFIFO_EMPTY when it needs a refill.
             // `uart_wait_tx_done` enables another driver TX interrupt. Both
@@ -978,7 +1069,9 @@ fn encode_ppp_frame(body: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_ppp_frame, UartParser, UART_PPP_ESCAPE, UART_PPP_FLAG};
+    use super::{
+        encode_ppp_frame, nan_sleepy_start_payload, UartParser, UART_PPP_ESCAPE, UART_PPP_FLAG,
+    };
 
     fn framed(payload: &[u8]) -> Vec<u8> {
         encode_ppp_frame(payload)
@@ -1023,8 +1116,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_delimiter_frame_is_a_two_byte_heartbeat() {
-        assert_eq!(encode_ppp_frame(&[]), vec![UART_PPP_FLAG, UART_PPP_FLAG]);
+    fn nan_sleepy_start_without_deltas_is_two_cbor_bytes() {
+        let payload = nan_sleepy_start_payload();
+        assert_eq!(payload, vec![0xc6, 0xa0]);
+        assert_eq!(encode_ppp_frame(&payload), vec![UART_PPP_FLAG, 0xc6, 0xa0, UART_PPP_FLAG]);
     }
 }
 

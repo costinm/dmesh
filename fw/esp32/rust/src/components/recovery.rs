@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -11,23 +12,25 @@ use esp_idf_sys as sys;
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 use crate::components::settings::SharedSettings;
 
-const REQUEST_MAGIC: &str = "0x52455131"; // REQ1
-const RECOVERY_NAMESPACE: &str = "recovery";
 const DEFAULT_RECOVERY_SERVER: &str = "10.78.0.1";
 const DEFAULT_RECOVERY_PORT: u16 = 3336;
 extern "C" {
     static mut esp_flash_default_chip: *mut sys::esp_flash_t;
     fn dmesh_boot_health_set(event: u8);
+    fn dmesh_boot_handoff_set(handoff: u8);
+    fn dmesh_boot_dry_run_set(dry_run: bool);
     fn dmesh_flash_tcp_start_target(
         port: u16,
         remote_ip: *const i8,
         target: *const i8,
         module: *const i8,
+        dry_run: bool,
     ) -> bool;
     fn dmesh_flash_tcp_prepare() -> bool;
     fn dmesh_flash_tcp_poll();
     fn dmesh_flash_tcp_accept() -> bool;
     fn dmesh_flash_tcp_finished() -> bool;
+    fn dmesh_flash_tcp_active() -> bool;
     fn dmesh_module_loader_prepare_flash(timeout_ms: u32) -> bool;
 }
 
@@ -41,6 +44,7 @@ struct PendingFlash {
     netmask: String,
     target: String,
     module: String,
+    dry_run: bool,
 }
 
 static PENDING_FLASH: OnceLock<Mutex<Option<PendingFlash>>> = OnceLock::new();
@@ -79,6 +83,12 @@ pub fn mark_main_boot_start() {
 /// Tell the second-stage bootloader that Main reached its healthy runtime.
 pub fn mark_main_boot_healthy() {
     unsafe { dmesh_boot_health_set(2) };
+    unsafe { dmesh_boot_handoff_set(0) };
+}
+
+pub fn request_recovery_boot(dry_run: bool) {
+    unsafe { dmesh_boot_handoff_set(1) };
+    unsafe { dmesh_boot_dry_run_set(dry_run) };
 }
 
 /// Advance the armed raw TCP flash session from Main's normal task context.
@@ -132,6 +142,7 @@ pub fn poll_flash_tcp(settings: &SharedSettings) {
                             remote_ip.as_ptr().cast(),
                             target.as_ptr().cast(),
                             module.as_ptr().cast(),
+                            pending.dry_run,
                         )
                     } {
                         crate::components::ip_command::start(
@@ -201,6 +212,11 @@ pub fn command_transport_ready() -> bool {
     if !crate::components::mode::ip_transport_active() {
         return true;
     }
+    // Main can keep an IP STA up for a module dry-run. Only an actual DRS2
+    // worker needs to block module invocation for flash-cache safety.
+    if !unsafe { dmesh_flash_tcp_active() } {
+        return true;
+    }
     unsafe { dmesh_flash_tcp_finished() }
 }
 
@@ -250,39 +266,11 @@ impl CommandHandler for RecoveryCommand {
         if request.arg("status").is_some() {
             return Ok(CommandResponse::ok("recovery request command available"));
         }
-        if parse_bool(request.arg("clear").unwrap_or("false"))? {
-            clear_request_marker()?;
-            return Ok(CommandResponse::ok("recovery request marker cleared"));
-        }
         if !parse_bool(request.arg("request").unwrap_or("true"))? {
-            return Ok(CommandResponse::ok("recovery request not written"));
+            return Ok(CommandResponse::ok("recovery handoff not requested"));
         }
-
-        // Empty SSID selects the open Direct-*-Dmesh scan path in Recovery.
-        // Empty IP selects the deterministic MAC-derived 10.78 address.
-        let ssid = request.arg("ssid").unwrap_or("");
-        let server = request
-            .arg("server")
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_RECOVERY_SERVER);
-        let local_ip = request.arg("ip").unwrap_or("");
-        let port: u16 = request
-            .arg("port")
-            .filter(|value| !value.is_empty())
-            .map(str::parse)
-            .transpose()
-            .map_err(|err| anyhow!("invalid recovery port: {err}"))?
-            .unwrap_or(DEFAULT_RECOVERY_PORT);
-        if port == 0 {
-            return Err(anyhow!("recovery port must be nonzero"));
-        }
-        let password = request.arg("password").unwrap_or("");
-        let update_url = request
-            .arg("url")
-            .unwrap_or("tcp://configured-recovery-server");
-        let flags = request.arg("flags").unwrap_or("0");
-
-        write_request(ssid, password, server, local_ip, port, update_url, flags)?;
+        let dry_run = parse_bool(request.arg("dry_run").unwrap_or("false"))?;
+        request_recovery_boot(dry_run);
         let reboot = parse_bool(request.arg("reboot").unwrap_or("true"))?;
         if reboot {
             thread::spawn(|| {
@@ -291,8 +279,7 @@ impl CommandHandler for RecoveryCommand {
             });
         }
         Ok(CommandResponse::ok(format!(
-            "recovery request written server={server} port={port} ssid_scan={} mac_ip={} reboot={reboot}",
-            ssid.is_empty(), local_ip.is_empty()
+            "recovery RTC handoff armed; Recovery will scan Direct-* with device dry_run={dry_run} reboot={reboot}"
         )))
     }
 }
@@ -336,6 +323,7 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             let remote_ip = CString::new("")?;
             let target_c = CString::new(target.as_str())?;
             let module_c = CString::new(request.arg("module").unwrap_or(""))?;
+            let dry_run = parse_bool(request.arg("dry_run").unwrap_or("false"))?;
             // This C entry point creates the FreeRTOS worker and returns; the
             // worker owns the socket, erase, write, and TCP wait. Keep the
             // control-plane handler synchronous only for startup so its CBOR
@@ -346,6 +334,7 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
                     remote_ip.as_ptr().cast(),
                     target_c.as_ptr().cast(),
                     module_c.as_ptr().cast(),
+                    dry_run,
                 )
             };
             if !started {
@@ -363,14 +352,22 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             let port: u16 = required(request, "port")?
                 .parse()
                 .map_err(|err| anyhow!("invalid flash port: {err}"))?;
-            let server = required(request, "server")?;
+            let server = required_network_address(request, "server")?;
             let ssid = required(request, "ssid")?;
-            let local_ip = required(request, "ip")?;
+            let local_ip = required_network_address(request, "ip")?;
             let gateway = request
                 .arg("gateway")
                 .or_else(|| request.arg("server"))
-                .unwrap_or("10.78.0.1");
-            let netmask = request.arg("mask").unwrap_or("255.255.0.0");
+                .map(str::to_owned)
+                .or_else(|| network_address_text(request, "gateway"))
+                .or_else(|| network_address_text(request, "server"))
+                .unwrap_or_else(|| "10.78.0.1".to_owned());
+            let netmask = request
+                .arg("mask")
+                .map(str::to_owned)
+                .or_else(|| network_address_text(request, "mask"))
+                .unwrap_or_else(|| "255.255.0.0".to_owned());
+            let dry_run = parse_bool(request.arg("dry_run").unwrap_or("false"))?;
             if !matches!(
                 target.as_str(),
                 "boot" | "stage2" | "partition" | "partition-table" | "recovery" | "nvs" | "data" | "module"
@@ -386,20 +383,23 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             }
             *slot = Some(PendingFlash {
                 port,
-                server: server.to_owned(),
+                server: server.clone(),
                 ssid: ssid.to_owned(),
                 psk: request.arg("psk").unwrap_or("").to_owned(),
-                ip: local_ip.to_owned(),
-                gateway: gateway.to_owned(),
-                netmask: netmask.to_owned(),
+                ip: local_ip,
+                gateway,
+                netmask,
                 target: target.clone(),
                 module: request.arg("module").unwrap_or("").to_owned(),
+                dry_run,
             });
             if !unsafe { dmesh_flash_tcp_prepare() } {
                 slot.take();
                 return Err(anyhow!("flash control plane already active"));
             }
-            set_control_status(format!("pending server={server} port={port}"));
+            set_control_status(format!(
+                "pending server={server} port={port} device_dry_run={dry_run}"
+            ));
             Ok(CommandResponse::ok(format!(
                 "flash control plane pending server={server} port={port}; NAN remains active until acknowledged"
             )))
@@ -675,113 +675,28 @@ fn required<'a>(request: &'a CommandRequest, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("recovery requires {key}=..."))
 }
 
+fn network_address_text(request: &CommandRequest, key: &str) -> Option<String> {
+    if let Some(value) = request.arg(key).filter(|value| !value.is_empty()) {
+        return Some(value.to_owned());
+    }
+    let bytes = request.arg_bytes(key)?;
+    let address = match bytes.len() {
+        4 => IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+        16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?)),
+        _ => return None,
+    };
+    Some(address.to_string())
+}
+
+fn required_network_address(request: &CommandRequest, key: &str) -> Result<String> {
+    network_address_text(request, key)
+        .ok_or_else(|| anyhow!("recovery requires {key}=... as text or a CBOR byte string"))
+}
+
 fn parse_bool(value: &str) -> Result<bool> {
     match value {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         other => Err(anyhow!("invalid boolean {other}")),
-    }
-}
-
-fn write_request(
-    ssid: &str,
-    password: &str,
-    server: &str,
-    local_ip: &str,
-    port: u16,
-    update_url: &str,
-    flags: &str,
-) -> Result<()> {
-    let namespace = CString::new(RECOVERY_NAMESPACE)?;
-    let mut handle = 0;
-    let ret = unsafe {
-        sys::nvs_open(
-            namespace.as_ptr(),
-            sys::nvs_open_mode_t_NVS_READWRITE,
-            &mut handle,
-        )
-    };
-    if ret != sys::ESP_OK {
-        return Err(anyhow!("nvs_open(recovery) failed err=0x{ret:x}"));
-    }
-
-    let result = (|| {
-        set_str(handle, "request_magic", REQUEST_MAGIC)?;
-        set_str(handle, "request_version", "1")?;
-        set_str(handle, "ssid", ssid)?;
-        set_str(handle, "password", password)?;
-        set_str(handle, "server", server)?;
-        set_str(handle, "ip", local_ip)?;
-        set_str(handle, "update_url", update_url)?;
-        let flags = parse_u32(flags)?;
-        let ret = unsafe { sys::nvs_set_u32(handle, c_string("flags")?.as_ptr(), flags) };
-        if ret != sys::ESP_OK {
-            return Err(anyhow!("nvs_set_u32(flags) failed err=0x{ret:x}"));
-        }
-        let ret = unsafe { sys::nvs_set_u16(handle, c_string("port")?.as_ptr(), port) };
-        if ret != sys::ESP_OK {
-            return Err(anyhow!("nvs_set_u16(port) failed err=0x{ret:x}"));
-        }
-        let ret = unsafe { sys::nvs_commit(handle) };
-        if ret != sys::ESP_OK {
-            return Err(anyhow!("nvs_commit(recovery) failed err=0x{ret:x}"));
-        }
-        Ok(())
-    })();
-    unsafe { sys::nvs_close(handle) };
-    result
-}
-
-fn set_str(handle: sys::nvs_handle_t, key: &str, value: &str) -> Result<()> {
-    let key = c_string(key)?;
-    let value = CString::new(value)?;
-    let ret = unsafe { sys::nvs_set_str(handle, key.as_ptr(), value.as_ptr()) };
-    if ret != sys::ESP_OK {
-        return Err(anyhow!("nvs_set_str({key:?}) failed err=0x{ret:x}"));
-    }
-    Ok(())
-}
-
-fn clear_request_marker() -> Result<()> {
-    let namespace = CString::new(RECOVERY_NAMESPACE)?;
-    let mut handle = 0;
-    let ret = unsafe {
-        sys::nvs_open(
-            namespace.as_ptr(),
-            sys::nvs_open_mode_t_NVS_READWRITE,
-            &mut handle,
-        )
-    };
-    if ret != sys::ESP_OK {
-        return Err(anyhow!("nvs_open(recovery) failed err=0x{ret:x}"));
-    }
-    let result = (|| {
-        for key in ["request_magic", "request_version", "flags"] {
-            let key = c_string(key)?;
-            let ret = unsafe { sys::nvs_erase_key(handle, key.as_ptr()) };
-            if ret != sys::ESP_OK && ret != sys::ESP_ERR_NVS_NOT_FOUND {
-                return Err(anyhow!("nvs_erase_key failed err=0x{ret:x}"));
-            }
-        }
-        let ret = unsafe { sys::nvs_commit(handle) };
-        if ret != sys::ESP_OK {
-            return Err(anyhow!("nvs_commit(recovery) failed err=0x{ret:x}"));
-        }
-        Ok(())
-    })();
-    unsafe { sys::nvs_close(handle) };
-    result
-}
-
-fn c_string(value: &str) -> Result<CString> {
-    Ok(CString::new(value)?)
-}
-
-fn parse_u32(value: &str) -> Result<u32> {
-    let value = value.trim();
-    if let Some(hex) = value.strip_prefix("0x") {
-        Ok(u32::from_str_radix(hex, 16)?)
-    } else {
-        Ok(value.parse()?)
     }
 }

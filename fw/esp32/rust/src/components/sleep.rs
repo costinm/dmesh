@@ -1364,6 +1364,12 @@ fn configure_wake_sources(state: &RtcSleepState) -> Result<()> {
         }
         if let Some(pin) = super::button::configured_gpio() {
             if sys::rtc_gpio_is_valid_gpio(pin) {
+                #[cfg(target_arch = "riscv32")]
+                esp_ok(sys::esp_sleep_enable_ext1_wakeup(
+                    1_u64 << pin,
+                    sys::esp_sleep_ext1_wakeup_mode_t_ESP_EXT1_WAKEUP_ANY_LOW,
+                ))?;
+                #[cfg(not(target_arch = "riscv32"))]
                 esp_ok(sys::esp_sleep_enable_ext0_wakeup(pin as sys::gpio_num_t, 0))?;
             } else {
                 telemetry::record_log(format!(

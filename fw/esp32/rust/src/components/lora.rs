@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::frames::parse_bytes;
+use super::bytes::parse_bytes;
 use super::l3dmesh::{Frame as MeshFrame, Transport};
 use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
@@ -20,6 +20,12 @@ const DEFAULT_FREQUENCY_HZ: u32 = 913_125_000;
 const DEFAULT_BANDWIDTH_HZ: u32 = 250_000;
 const DEFAULT_SYNC_WORD: i32 = 0x2b;
 const DEFAULT_TX_POWER: i32 = 17;
+const RADIO_ESPNOW_MAGIC: [u8; 4] = *b"DRX1";
+const RADIO_ESPNOW_VERSION: u8 = 1;
+// The module callback is shared by LoRa and FSK, so the envelope identifies
+// this as a received radio packet rather than claiming a modulation.
+const RADIO_ESPNOW_KIND_RADIO: u8 = 1;
+const RADIO_ESPNOW_HEADER_LEN: usize = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoraChip {
@@ -342,28 +348,48 @@ pub fn handle_module_packet(data: &[u8], rssi: i32, snr: f32) -> Result<CommandR
     let packet = Packet { data: data.to_vec(), rssi, snr };
     telemetry::record_packet("lora", Direction::Rx, &packet.data,
         format!("source=module rssi={} snr={}", packet.rssi, packet.snr));
-    // A packet is an in-band wake trigger for sleepy receivers. The mode
-    // transition is deferred to the normal Main poll; this callback remains
-    // non-blocking while still making a bounded UART heartbeat/report visible
-    // to lmesh.
+    // A packet is an in-band radio wake trigger. Do not emit a second UART
+    // heartbeat here: the scheduled NAN wake owns the single UART rendezvous
+    // packet, and LoRa activity is included in its compact counters.
     super::mode::request_lora_packet_active(5_000);
-    super::serial::on_radio_packet_received();
-    telemetry::record_log(format!(
-        "event type=lora.packet_wake len={} rssi={} snr={} active_ms=5000",
-        data.len(), rssi, snr
-    ));
-    let wake_stats = telemetry::lora_wake_stats_text();
-    telemetry::record_log(wake_stats.clone());
-    // Keep the automatic report small and structured.  This is a log
-    // notification, not a full status dump, and is queued non-blockingly by
-    // the transport layer while the bounded UART window is open.
-    telemetry::emit_console(&wake_stats);
+    if telemetry::take_lora_wake_event_slot() {
+        telemetry::record_log(format!(
+            "event type=lora.packet_wake len={} rssi={} snr={} active_ms=5000",
+            data.len(), rssi, snr
+        ));
+        let wake_stats = telemetry::lora_wake_stats_text();
+        telemetry::record_log(wake_stats.clone());
+        // Keep the automatic report small and structured. This is a
+        // rate-limited notification, not a full status dump, and is queued
+        // non-blockingly by the transport layer while the bounded UART
+        // window is open. Packet counters remain lossless.
+        telemetry::emit_console(&wake_stats);
+    }
     forward_rx_packet(&packet);
     Ok(CommandResponse::ok(format!("module lora rx len={} rssi={} snr={}", data.len(), rssi, snr)))
 }
 
 fn forward_rx_packet(packet: &Packet) {
     super::mode::observe_lora_ping("lora", &packet.data, packet.rssi);
+    let mut espnow = Vec::with_capacity(RADIO_ESPNOW_HEADER_LEN + packet.data.len());
+    espnow.extend_from_slice(&RADIO_ESPNOW_MAGIC);
+    espnow.push(RADIO_ESPNOW_VERSION);
+    espnow.push(RADIO_ESPNOW_KIND_RADIO);
+    espnow.extend_from_slice(&(packet.rssi.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes());
+    espnow.push(packet.snr.round().clamp(i8::MIN as f32, i8::MAX as f32) as i8 as u8);
+    espnow.extend_from_slice(&(packet.data.len() as u16).to_le_bytes());
+    espnow.extend_from_slice(&packet.data);
+    if let Err(err) = super::wifi::send_espnow_broadcast(&espnow) {
+        telemetry::record_log(format!(
+            "event type=lora.espnow_forward ok=false len={} rssi={} snr={} msg={}",
+            packet.data.len(), packet.rssi, packet.snr, err
+        ));
+    } else {
+        telemetry::record_log(format!(
+            "event type=lora.espnow_forward ok=true len={} rssi={} snr={} envelope_len={}",
+            packet.data.len(), packet.rssi, packet.snr, espnow.len()
+        ));
+    }
     if super::mode::is_companion_mode() {
         let _ = super::ble_bt::announce_lora_packet(&packet.data, packet.rssi, packet.snr);
     }

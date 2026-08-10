@@ -8,8 +8,10 @@ use anyhow::{anyhow, bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
+use dmesh_rawnan as shared_nan;
 
 use super::l3dmesh::{Frame, Transport};
+use super::object_store::NanObjectService;
 use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
@@ -18,6 +20,9 @@ const FRAME_DST: usize = 4;
 const FRAME_SRC: usize = 10;
 const FRAME_BSSID: usize = 16;
 const FRAME_DATA: usize = 24;
+const OBJECT_LLC_SNAP: [u8; 8] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0xb5];
+const OBJECT_DMESH_MARKER: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
+const OBJECT_DMESH_MARKER_TYPE: u8 = 0x04;
 const NAN_ACTION_START: usize = 30;
 const SVC_ID: [u8; 6] = [0x75, 0x94, 0x31, 0x93, 0xea, 0xc9];
 const NAN_BSSID: [u8; 6] = [0x50, 0x6f, 0x9a, 0x01, 0x05, 0x01];
@@ -27,7 +32,10 @@ const NAN_DISCOVERY_MAC: [u8; 6] = [0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00];
 const DEFAULT_SERVICE: &str = "dmesh";
 const DEFAULT_CHANNEL: u8 = 6;
 const NAN_COMMAND_QUEUE_MAX: usize = 8;
-const NAN_OUTGOING_QUEUE_MAX: usize = 8;
+const NAN_OUTGOING_QUEUE_MAX: usize = 10;
+// Do not retain responses beyond two 512-TU NAN intervals. A missing sync
+// source should cause a bounded retry, not unbounded buffer growth.
+const NAN_OUTGOING_MAX_AGE_MS: u64 = 9_000;
 const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
 // Keep a short source-indexed history because an observer can hear several
 // phones at once.  A single "last service descriptor" cannot prove which
@@ -63,21 +71,30 @@ const NAN_CLUSTER_RESELECT_AFTER_US: u64 = 3 * 512 * 1024;
 // NAN beacons, SDFs, and the DMesh action payload all fit below this bound.
 // Drop unusual large management frames in the Wi-Fi callback rather than
 // parsing or allocating in the driver task.
-const NAN_RX_FRAME_MAX: usize = 512;
+// Raw action frames carry up to the 1200-byte DMesh payload plus the
+// 802.11/vendor header. Keep enough room for the complete frame so the NAN
+// queue does not discard bulk transport packets as oversize.
+const NAN_RX_FRAME_MAX: usize = 1536;
 const NAN_TX_DWELL_US: u64 = 32_000;
 
 static NAN_RUNNING: AtomicBool = AtomicBool::new(false);
+static NAN_OBJECT_SERVICE: OnceLock<Mutex<NanObjectService>> = OnceLock::new();
 static NAN_RX_MGMT: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_ACTION: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_BEACON: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_SDF: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_OTHER: AtomicU32 = AtomicU32::new(0);
+static NAN_RX_DATA: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_BYTES: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_MATCHED: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_COMMAND_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_COMMAND_TX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_RX: AtomicU32 = AtomicU32::new(0);
 static NAN_RAW_RESPONSE_TX: AtomicU32 = AtomicU32::new(0);
+static NAN_RAW_COMMAND_PENDING: AtomicU32 = AtomicU32::new(0);
+static NAN_RAW_RESPONSE_PENDING: AtomicU32 = AtomicU32::new(0);
+static NAN_OBJECT_ACTION_DISPATCH: AtomicU32 = AtomicU32::new(0);
+static NAN_OBJECT_ACTION_ACCEPTED: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_RAW_TX_OFFSET_US: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_RAW_TX_SLOT_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_RAW_TX_SLOT_HI: AtomicU32 = AtomicU32::new(0);
@@ -110,6 +127,9 @@ static NAN_LAST_SERVICE_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_ACTION_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_ACTION_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
+static NAN_HW_FILTER_ENABLED: AtomicBool = AtomicBool::new(true);
+static NAN_IPV6_UDP_RX: AtomicU32 = AtomicU32::new(0);
+static NAN_IPV6_UDP_BYTES: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_QUEUE_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_PREFILTER_DROPS: AtomicU32 = AtomicU32::new(0);
 static NAN_RX_OVERSIZE_DROPS: AtomicU32 = AtomicU32::new(0);
@@ -209,6 +229,17 @@ static NAN_FILTER_BSSID: [AtomicU8; 6] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];
+
+// The hardware filter is deliberately a small state machine rather than a
+// permanent setting.  Discovery starts unfiltered, then the first accepted
+// cluster beacon arms the exact BSSID comparator.  If that beacon goes stale,
+// the comparator is released again so a replacement cluster can be learned.
+const NAN_HW_FILTER_DISCOVERY: u8 = 0;
+const NAN_HW_FILTER_ARMED: u8 = 1;
+static NAN_HW_FILTER_STATE: AtomicU8 = AtomicU8::new(NAN_HW_FILTER_DISCOVERY);
+static NAN_HW_FILTER_ARMS: AtomicU32 = AtomicU32::new(0);
+static NAN_HW_FILTER_REPROBES: AtomicU32 = AtomicU32::new(0);
+static NAN_HW_FILTER_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 const FILTER_ALL_MGMT: u32 = 0;
 const FILTER_NAN: u32 = 1;
@@ -318,6 +349,7 @@ struct RawNanOutgoing {
     instance: u8,
     payload: Vec<u8>,
     response: bool,
+    enqueued_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +449,17 @@ struct RawNanRxFrame {
     local_us: u64,
     data: [u8; NAN_RX_FRAME_MAX],
 }
+
+// The promiscuous callback runs on the Wi-Fi task. Keep the large frame
+// scratch buffer out of that task's stack; xQueueGenericSend copies it before
+// the callback returns.
+static mut NAN_RX_SCRATCH: RawNanRxFrame = RawNanRxFrame {
+    len: 0,
+    rssi: 0,
+    _reserved: 0,
+    local_us: 0,
+    data: [0; NAN_RX_FRAME_MAX],
+};
 
 fn nan_command_queue() -> &'static Mutex<VecDeque<NanIncomingCommand>> {
     NAN_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_COMMAND_QUEUE_MAX)))
@@ -690,7 +733,11 @@ fn render_raw_response_history() -> Result<String> {
 }
 
 pub fn take_command() -> Option<NanIncomingCommand> {
-    nan_command_queue().lock().ok()?.pop_front()
+    let command = nan_command_queue().lock().ok()?.pop_front();
+    if command.is_some() {
+        NAN_RAW_COMMAND_PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
+    command
 }
 
 /// Drain management frames copied by the Wi-Fi callback.
@@ -701,22 +748,94 @@ pub fn take_command() -> Option<NanIncomingCommand> {
 pub fn poll_rx() {
     let queue = NAN_RX_QUEUE.load(Ordering::Acquire);
     if queue.is_null() {
+        reconcile_hardware_bssid_filter();
         return;
     }
     loop {
         let mut received = core::mem::MaybeUninit::<RawNanRxFrame>::uninit();
         let ok = unsafe { sys::xQueueReceive(queue, received.as_mut_ptr().cast::<c_void>(), 0) };
         if ok != 1 {
+            reconcile_hardware_bssid_filter();
             return;
         }
         let received = unsafe { received.assume_init() };
         let len = usize::from(received.len).min(NAN_RX_FRAME_MAX);
+        // Object transfer uses the selected NAN cluster as address3 and is
+        // parsed outside the Wi-Fi callback. Data and action frames share the
+        // same bounded envelope; management frames continue through NAN's
+        // discovery parser below.
+        if len >= FRAME_DATA && (received.data[0] & 0x0c) == 0x08 {
+            if let Ok(mut service) = NAN_OBJECT_SERVICE
+                .get_or_init(|| Mutex::new(NanObjectService::new()))
+                .lock()
+            {
+                // Only dispatch frames carrying the explicit DMesh object
+                // wrapper. Other NAN/AP data traffic must not inflate the
+                // object rejection counter or enter the object protocol.
+                let wrapped = &received.data[FRAME_DATA..len];
+                if wrapped.starts_with(&OBJECT_LLC_SNAP)
+                    && wrapped.len() >= OBJECT_LLC_SNAP.len() + 9
+                    && wrapped[OBJECT_LLC_SNAP.len()..]
+                        .starts_with(&OBJECT_DMESH_MARKER)
+                {
+                    let payload = &wrapped[OBJECT_LLC_SNAP.len() + 9..];
+                    let _ = service.observe(payload);
+                }
+                if wrapped.len() >= 8 + 40 + 8
+                    && wrapped[..6] == [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00]
+                    && wrapped[6..8] == [0x86, 0xdd]
+                    && wrapped[8] >> 4 == 6
+                    && wrapped[14] == 17
+                {
+                    let udp_payload_len = u16::from_be_bytes([wrapped[12], wrapped[13]]) as usize;
+                    if udp_payload_len >= 8 && 8 + 40 + udp_payload_len <= wrapped.len() {
+                        NAN_IPV6_UDP_RX.fetch_add(1, Ordering::Relaxed);
+                        NAN_IPV6_UDP_BYTES.fetch_add(
+                            (udp_payload_len - 8).min(u32::MAX as usize) as u32,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+        }
         observe_promiscuous_frame_at(
             &received.data[..len],
             received.rssi as i32,
             received.local_us,
         );
     }
+}
+
+pub fn object_service_start() {
+    NAN_OBJECT_SERVICE.get_or_init(|| Mutex::new(NanObjectService::new())).lock().ok().map(|mut s| s.start());
+}
+
+pub fn object_service_stop() {
+    if let Some(service) = NAN_OBJECT_SERVICE.get() { service.lock().ok().map(|mut s| s.stop()); }
+}
+
+fn object_service_active() -> bool {
+    NAN_OBJECT_SERVICE.get().and_then(|service| service.lock().ok().map(|s| s.active())).unwrap_or(false)
+}
+
+pub fn object_service_stats() -> super::object_store::Stats {
+    NAN_OBJECT_SERVICE.get_or_init(|| Mutex::new(NanObjectService::new())).lock().map(|s| s.stats()).unwrap_or_default()
+}
+
+/// Feed an object-store envelope received on the action-frame bearer into the
+/// same bounded receiver used by NAN data frames.  The action parser runs in
+/// the deferred radio task, never from the Wi-Fi callback.
+pub fn object_service_observe_action(frame: &[u8]) -> bool {
+    let accepted = NAN_OBJECT_SERVICE
+        .get_or_init(|| Mutex::new(NanObjectService::new()))
+        .lock()
+        .ok()
+        .and_then(|mut service| service.observe(frame))
+        .is_some();
+    if accepted {
+        NAN_OBJECT_ACTION_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    }
+    accepted
 }
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
@@ -798,6 +917,10 @@ pub fn nan_beacon_snapshot() -> super::wifi::BeaconSnapshot {
         local_us: last_beacon_local_us(),
         tsf_us: last_beacon_tsf_us(),
     }
+}
+
+pub fn nan_cluster_reselects() -> u32 {
+    NAN_CLUSTER_RESELECTS.load(Ordering::Relaxed)
 }
 
 /// Render the bounded TSF/local history used by the sleepy scheduler. This is
@@ -1132,79 +1255,18 @@ fn raw_command_info(frame: &[u8]) -> Option<RawNanCommandInfo<'_>> {
 
 /// Return the publish/subscribe/follow-up kind of the first DMesh SDA.
 fn dmesh_service_descriptor_kind(frame: &[u8]) -> Option<u8> {
-    if !is_nan_sdf(frame) {
-        return None;
-    }
-    let mut offset = NAN_ACTION_START;
-    while offset + 3 <= frame.len() {
-        let attr_id = frame[offset];
-        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
-        let body_start = offset + 3;
-        let body_end = body_start.checked_add(len)?;
-        let body = frame.get(body_start..body_end)?;
-        if attr_id == 0x03
-            && body.len() >= 10
-            && body[..SVC_ID.len()] == SVC_ID
-            && is_dmesh_nan_service_info(&body[10..])
-        {
-            return Some(body[8] & 0x03);
-        }
-        offset = body_end;
-    }
-    None
+    shared_nan::service_descriptor(frame, shared_nan::DMESH_SERVICE_ID)
+        .filter(|descriptor| shared_nan::is_dmesh_service_info(descriptor.payload))
+        .map(|descriptor| descriptor.control & 0x03)
 }
 
 fn is_nan_followup(frame: &[u8]) -> bool {
-    if !is_nan_sdf(frame) {
-        return false;
-    }
-    let mut offset = NAN_ACTION_START;
-    while offset + 3 <= frame.len() {
-        let attr_id = frame[offset];
-        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
-        let body_start = offset + 3;
-        let Some(body_end) = body_start.checked_add(len) else {
-            return false;
-        };
-        if body_end > frame.len() {
-            return false;
-        }
-        let body = &frame[body_start..body_end];
-        if attr_id == 0x03 && body.len() >= 9 && body[..SVC_ID.len()] == SVC_ID {
-            return body[8] == 0x12;
-        }
-        offset = body_end;
-    }
-    false
+    shared_nan::is_nan_followup(frame)
 }
 
 fn raw_service_descriptor_payload(body: &[u8]) -> Option<(u8, u8, &[u8])> {
-    if body.len() < 10 || body[..SVC_ID.len()] != SVC_ID {
-        return None;
-    }
-    // Service descriptor body:
-    //   service_id[6], instance_id, requestor_instance_id,
-    //   service_control, ssi_len, service_specific_info...
-    // Android Wi-Fi Aware uses the standard publish/subscribe controls (0x10
-    // and 0x11) for discovery and 0x12 for follow-ups.  The old raw parser
-    // accepted only 0x12, which made the ESP invisible to Android service
-    // advertisements and discarded otherwise conforming descriptors.
-    if !matches!(body[8], 0x10..=0x12) {
-        return None;
-    }
-    let instance = body[6];
-    let requestor_instance = body[7];
-    let len = body[9] as usize;
-    let payload_start = 10_usize;
-    let payload_end = payload_start.checked_add(len)?;
-    if payload_end > body.len() {
-        return None;
-    }
-    Some((
-        instance,
-        requestor_instance,
-        &body[payload_start..payload_end],
-    ))
+    let descriptor = shared_nan::service_descriptor_body(body, shared_nan::DMESH_SERVICE_ID)?;
+    Some((descriptor.instance, descriptor.requestor_instance, descriptor.payload))
 }
 
 /// Parse the shared DMesh v1 NAN follow-up envelope.  It is deliberately
@@ -1212,32 +1274,18 @@ fn raw_service_descriptor_payload(body: &[u8]) -> Option<(u8, u8, &[u8])> {
 /// uses this envelope for hello/ack and packet hints, whereas control traffic
 /// remains compact CBOR.
 fn parse_dmesh_nan_followup(data: &[u8]) -> Option<DmeshNanFollowup<'_>> {
-    if data.len() < DMESH_NAN_FOLLOWUP_HEADER_LEN
-        || data[..2] != DMESH_MAGIC
-        || data[2] != DMESH_VERSION
-    {
-        return None;
-    }
-    let mut device_id = [0_u8; 6];
-    device_id.copy_from_slice(&data[6..12]);
-    let mut target_id = [0_u8; 6];
-    target_id.copy_from_slice(&data[12..18]);
-    let payload_len = u16::from_le_bytes([data[18], data[19]]) as usize;
-    let payload_end = DMESH_NAN_FOLLOWUP_HEADER_LEN.checked_add(payload_len)?;
-    if payload_end > data.len() {
-        return None;
-    }
+    let followup = shared_nan::parse_dmesh_nan_followup(data)?;
     Some(DmeshNanFollowup {
-        msg_type: data[3],
-        seq: u16::from_le_bytes([data[4], data[5]]),
-        device_id,
-        target_id,
-        payload: &data[DMESH_NAN_FOLLOWUP_HEADER_LEN..payload_end],
+        msg_type: followup.msg_type,
+        seq: followup.seq,
+        device_id: followup.device_id,
+        target_id: followup.target_id,
+        payload: followup.payload,
     })
 }
 
 fn is_dmesh_nan_service_info(data: &[u8]) -> bool {
-    data.len() == NAN_SERVICE_INFO_LEN && data[..2] == DMESH_MAGIC && data[2] == DMESH_VERSION
+    shared_nan::is_dmesh_service_info(data)
 }
 
 fn wake_request_for_service(data: &[u8]) -> Option<(u32, u8)> {
@@ -1291,9 +1339,7 @@ fn dmesh_nan_followup_frame(
 }
 
 fn fnv1a32(data: &[u8]) -> u32 {
-    data.iter().fold(0x811c9dc5_u32, |hash, byte| {
-        (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
-    })
+    shared_nan::fnv1a32(data)
 }
 
 /// Queue a response for a raw-NAN peer.
@@ -1365,6 +1411,7 @@ pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -
             // gateway filters by source/sequence in response history.
             let _ = mac;
             let queued = enqueue_outgoing_raw([0xff; 6], *instance, &bounded, true)?;
+            NAN_RAW_RESPONSE_PENDING.fetch_add(1, Ordering::Relaxed);
             if (!super::mode::raw_nan_duty_enabled() || super::mode::raw_nan_interactive_active())
                 && NAN_RUNNING.load(Ordering::Relaxed)
             {
@@ -1390,6 +1437,24 @@ pub fn raw_queue_pending() -> bool {
 pub fn drain_raw_queue() -> usize {
     drain_outgoing_raw()
 }
+
+/// True while addressed work is queued, being dispatched, or awaiting its
+/// response transmission. The mode scheduler uses this to keep a sleepy node
+/// awake across the command/response exchange.
+pub fn raw_work_pending() -> bool {
+    NAN_RAW_COMMAND_PENDING.load(Ordering::Relaxed) != 0
+        || NAN_RAW_RESPONSE_PENDING.load(Ordering::Relaxed) != 0
+        || raw_queue_pending()
+}
+
+pub fn raw_command_pending_count() -> u32 {
+    NAN_RAW_COMMAND_PENDING.load(Ordering::Relaxed)
+}
+
+pub fn raw_response_pending_count() -> u32 {
+    NAN_RAW_RESPONSE_PENDING.load(Ordering::Relaxed)
+}
+
 
 /// Emit one queued service descriptor only immediately after a newly observed
 /// NAN cluster beacon. Called by the mode task, never the Wi-Fi callback.
@@ -1634,6 +1699,10 @@ impl CommandHandler for NanCommand {
                 NAN_FILTER_BSSID_ENABLED.store(true, Ordering::Relaxed);
             }
         }
+        if let Some(enabled) = request.arg("hw_filter") {
+            NAN_HW_FILTER_ENABLED.store(parse_bool(enabled)?, Ordering::Relaxed);
+            reconcile_hardware_bssid_filter();
+        }
         if request.arg("cycle").is_some() {
             return self.raw_cycle_test(request);
         }
@@ -1644,6 +1713,17 @@ impl CommandHandler for NanCommand {
             super::wifi::stop_raw_monitor()?;
             self.maybe_save_settings(request, false)?;
             return Ok(CommandResponse::ok("nan stopped"));
+        }
+        if request.arg("stats") == Some("object") {
+            let object_stats = object_service_stats();
+            return Ok(CommandResponse::ok(format!(
+                "nan object_stats frames={} bytes={} rejected={} action_dispatch={} action_accepted={}",
+                object_stats.frames,
+                object_stats.bytes,
+                object_stats.rejected,
+                NAN_OBJECT_ACTION_DISPATCH.load(Ordering::Relaxed),
+                NAN_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
+            )));
         }
         if request.arg("stats").is_some() {
             return Ok(CommandResponse::ok(stats()));
@@ -1784,6 +1864,30 @@ impl CommandHandler for NanCommand {
                 interval_ms,
                 format_mac(&nan_cluster_bssid()),
                 frame_len
+            )));
+        }
+        let frame_data = request.arg("frame").or_else(|| request.arg("data"));
+        if let Some(data) = frame_data {
+            let payload = parse_bytes(data)?;
+            if payload.len() > NAN_COMMAND_MAX_LEN {
+                bail!("nan data exceeds {NAN_COMMAND_MAX_LEN} bytes");
+            }
+            self.ensure_raw_started()?;
+            let destination = request
+                .arg("destination")
+                .or_else(|| request.arg("dst"))
+                .map(parse_mac)
+                .transpose()?
+                .unwrap_or(NAN_DISCOVERY_MAC);
+            let source = station_mac()?;
+            let bssid = nan_cluster_bssid();
+            let frame = nan_data_frame(destination, source, bssid, &payload);
+            raw_tx(&frame, true)?;
+            return Ok(CommandResponse::ok(format!(
+                "nan data sent=true bytes={} dst={} bssid={}",
+                payload.len(),
+                format_mac(&destination),
+                format_mac(&bssid)
             )));
         }
         // A gateway sends an already-encoded addressed command as binary
@@ -2292,6 +2396,10 @@ fn rx_timing_fields(local_us: u64) -> String {
 fn start_raw_sniffer(channel: u8) -> Result<()> {
     ensure_rx_queue()?;
     super::wifi::ensure_raw_wifi_started(channel)?;
+    // Discovery starts without a comparator. Once a beacon has been accepted,
+    // reconcile_hardware_bssid_filter() arms the exact cluster comparator;
+    // stale timing releases it before the next discovery interval.
+    reconcile_hardware_bssid_filter();
     unsafe {
         // Include data frames for the first-frame timing marker.  NAN still
         // queues/parses management frames only; a data frame merely proves
@@ -2309,7 +2417,85 @@ fn start_raw_sniffer(channel: u8) -> Result<()> {
         esp_ok(sys::esp_wifi_set_promiscuous(true))?;
     }
     NAN_RUNNING.store(true, Ordering::Relaxed);
+    object_service_start();
     Ok(())
+}
+
+fn configured_hardware_filter_bssid() -> Option<[u8; 6]> {
+    if !NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(configured_filter_bssid())
+}
+
+/// Keep the MAC prefilter aligned with the cluster-selection state machine.
+/// This runs from the normal Main task (never the Wi-Fi callback), so changing
+/// the internal driver comparator cannot block the RX interrupt path.
+fn reconcile_hardware_bssid_filter() {
+    if !NAN_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
+    let manual = configured_hardware_filter_bssid();
+    let desired = if let Some(bssid) = manual {
+        Some(bssid)
+    } else if !NAN_HW_FILTER_ENABLED.load(Ordering::Relaxed) {
+        None
+    } else {
+        let last = last_beacon_local_us();
+        let fresh = last != 0 && now_us().saturating_sub(last) < NAN_CLUSTER_RESELECT_AFTER_US;
+        if fresh && NAN_CLUSTER_LOCKED.load(Ordering::Acquire) {
+            Some(nan_cluster_bssid())
+        } else {
+            None
+        }
+    };
+    let currently_armed = NAN_HW_FILTER_STATE.load(Ordering::Acquire) == NAN_HW_FILTER_ARMED;
+    let current_bssid = nan_cluster_bssid();
+    let needs_change = match desired {
+        Some(bssid) => !currently_armed || current_bssid != bssid,
+        None => currently_armed,
+    };
+    if !needs_change {
+        return;
+    }
+    let result = match desired {
+        Some(bssid) => {
+            let result = super::wifi::set_hardware_bssid_filter(bssid, true);
+            if result.is_ok() {
+                NAN_HW_FILTER_STATE.store(NAN_HW_FILTER_ARMED, Ordering::Release);
+                NAN_HW_FILTER_ARMS.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
+        None => {
+            let result = super::wifi::set_hardware_bssid_filter([0; 6], false);
+            if result.is_ok() {
+                NAN_HW_FILTER_STATE.store(NAN_HW_FILTER_DISCOVERY, Ordering::Release);
+                NAN_HW_FILTER_REPROBES.fetch_add(1, Ordering::Relaxed);
+                if last_beacon_local_us() != 0
+                    && now_us().saturating_sub(last_beacon_local_us())
+                        >= NAN_CLUSTER_RESELECT_AFTER_US
+                {
+                    NAN_CLUSTER_LOCKED.store(false, Ordering::Release);
+                }
+            }
+            result
+        }
+    };
+    if let Err(err) = result {
+        NAN_HW_FILTER_ERRORS.fetch_add(1, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=nan.hw_bssid_filter ok=false state={} error={}",
+            if desired.is_some() { "armed" } else { "discovery" },
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+    } else {
+        telemetry::record_log(format!(
+            "event type=nan.hw_bssid_filter ok=true state={} bssid={}",
+            if desired.is_some() { "armed" } else { "discovery" },
+            desired.map(|bssid| format_mac(&bssid)).unwrap_or_else(|| "none".to_string())
+        ));
+    }
 }
 
 fn ensure_rx_queue() -> Result<()> {
@@ -2455,6 +2641,7 @@ fn enqueue_raw_command(source: [u8; 6], instance: u8, payload: &[u8]) -> bool {
         },
         payload: payload.to_vec(),
     });
+    NAN_RAW_COMMAND_PENDING.fetch_add(1, Ordering::Relaxed);
     NAN_RAW_COMMAND_RX.fetch_add(1, Ordering::Relaxed);
     super::wake::notify();
     true
@@ -2487,6 +2674,16 @@ fn enqueue_outgoing_raw(
     payload: &[u8],
     response: bool,
 ) -> Result<usize> {
+    enqueue_outgoing_raw_at(dst, instance, payload, response, now_us() / 1_000)
+}
+
+fn enqueue_outgoing_raw_at(
+    dst: [u8; 6],
+    instance: u8,
+    payload: &[u8],
+    response: bool,
+    enqueued_ms: u64,
+) -> Result<usize> {
     if payload.len() > NAN_COMMAND_MAX_LEN {
         bail!("raw NAN payload exceeds {NAN_COMMAND_MAX_LEN} bytes");
     }
@@ -2494,11 +2691,18 @@ fn enqueue_outgoing_raw(
         let Ok(mut queue) = nan_outgoing_queue().lock() else {
             bail!("nan outgoing queue lock failed")
         };
-        if queue.len() >= NAN_OUTGOING_QUEUE_MAX {
-            queue.pop_front();
+        let now_ms = now_us() / 1_000;
+        expire_outgoing_queue_locked(&mut queue, now_ms);
+        while queue.len() >= NAN_OUTGOING_QUEUE_MAX {
+            let dropped = queue.pop_front();
             NAN_RAW_OUTGOING_DROPS.fetch_add(1, Ordering::Relaxed);
+            if dropped.as_ref().is_some_and(|item| item.response)
+                && NAN_RAW_RESPONSE_PENDING.load(Ordering::Relaxed) != 0
+            {
+                NAN_RAW_RESPONSE_PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
             telemetry::record_log(format!(
-                "event type=nan.queue_drop kind=outgoing limit={NAN_OUTGOING_QUEUE_MAX}"
+                "event type=nan.queue_drop kind=outgoing reason=limit limit={NAN_OUTGOING_QUEUE_MAX}"
             ));
         }
         // Add continuation metadata to command records at the gateway.  It
@@ -2523,12 +2727,42 @@ fn enqueue_outgoing_raw(
             instance,
             payload: wire_payload,
             response,
+            enqueued_ms,
         });
         queue.len()
     };
     // The mode poller drains this queue while a beacon-opened DW permit is
     // valid. Never call Wi-Fi TX from the promiscuous receive callback.
     Ok(queued)
+}
+
+fn expire_outgoing_queue_locked(queue: &mut VecDeque<RawNanOutgoing>, now_ms: u64) {
+    let mut expired = 0usize;
+    while queue.front().is_some_and(|item| {
+        now_ms.saturating_sub(item.enqueued_ms) >= NAN_OUTGOING_MAX_AGE_MS
+    }) {
+        if let Some(dropped) = queue.pop_front() {
+            expired += 1;
+            NAN_RAW_OUTGOING_DROPS.fetch_add(1, Ordering::Relaxed);
+            if dropped.response && NAN_RAW_RESPONSE_PENDING.load(Ordering::Relaxed) != 0 {
+                NAN_RAW_RESPONSE_PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if expired != 0 {
+        telemetry::record_log(format!(
+            "event type=nan.queue_drop kind=outgoing reason=age count={expired} age_ms={NAN_OUTGOING_MAX_AGE_MS}"
+        ));
+    }
+}
+
+/// Expire unsent raw frames even when no new frame is being queued. This is
+/// called by the mode poller so an unavailable NAN cluster cannot retain old
+/// responses until an unrelated future command arrives.
+pub fn expire_raw_queue() {
+    if let Ok(mut queue) = nan_outgoing_queue().lock() {
+        expire_outgoing_queue_locked(&mut queue, now_us() / 1_000);
+    }
 }
 
 fn add_dw_control(payload: &[u8], control: u8) -> Vec<u8> {
@@ -2644,6 +2878,7 @@ fn drain_outgoing_raw() -> usize {
                 NAN_LAST_RAW_TX_SLOT_HI.store((tx_slot >> 32) as u32, Ordering::Relaxed);
                 if item.response {
                     NAN_RAW_RESPONSE_TX.fetch_add(1, Ordering::Relaxed);
+                    NAN_RAW_RESPONSE_PENDING.fetch_sub(1, Ordering::Relaxed);
                 } else {
                     NAN_RAW_COMMAND_TX.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2661,7 +2896,13 @@ fn drain_outgoing_raw() -> usize {
                     item.payload.len(),
                     crate::commands::protocol::escape_value(&err.to_string())
                 ));
-                let _ = enqueue_outgoing_raw(item.dst, item.instance, &item.payload, item.response);
+                let _ = enqueue_outgoing_raw_at(
+                    item.dst,
+                    item.instance,
+                    &item.payload,
+                    item.response,
+                    item.enqueued_ms,
+                );
                 return sent;
             }
         }
@@ -2679,7 +2920,9 @@ pub fn stop_nan() -> Result<()> {
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
     }
+    NAN_HW_FILTER_STATE.store(NAN_HW_FILTER_DISCOVERY, Ordering::Release);
     NAN_RUNNING.store(false, Ordering::Relaxed);
+    object_service_stop();
     Ok(())
 }
 
@@ -2724,6 +2967,57 @@ fn nan_sync_beacon_frame() -> Result<Vec<u8>> {
     }
     let tsf_us = observed_tsf_us.saturating_add(now_us().saturating_sub(local_us));
     nan_sync_beacon_frame_for(&template, &station_mac()?, &nan_cluster_bssid(), tsf_us)
+}
+
+fn nan_data_frame(
+    destination: [u8; 6],
+    source: [u8; 6],
+    bssid: [u8; 6],
+    payload: &[u8],
+) -> Vec<u8> {
+    let body_len = payload.len().min(1200);
+    let mut frame = Vec::with_capacity(FRAME_DATA + 8 + 40 + 8 + body_len);
+    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x86, 0xdd]);
+    let src_ip = nan_link_local(source);
+    let dst_ip = nan_link_local(destination);
+    let udp_len = 8 + body_len;
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&(body_len as u16 + 8).to_be_bytes());
+    frame.extend_from_slice(&[0, 17, 1]);
+    frame.extend_from_slice(&src_ip);
+    frame.extend_from_slice(&dst_ip);
+    frame.extend_from_slice(&4242u16.to_be_bytes());
+    frame.extend_from_slice(&4243u16.to_be_bytes());
+    frame.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(&payload[..body_len]);
+    let checksum = ipv6_udp_checksum(&src_ip, &dst_ip, &frame[FRAME_DATA + 8 + 40..]);
+    let checksum_offset = FRAME_DATA + 8 + 40 + 6;
+    frame[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+fn nan_link_local(mac: [u8; 6]) -> [u8; 16] {
+    [0xfe, 0x80, 0, 0, 0, 0, 0, 0, mac[0] ^ 0x02, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]
+}
+
+fn ipv6_udp_checksum(src: &[u8; 16], dst: &[u8; 16], udp: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for bytes in [src.as_slice(), dst.as_slice()] {
+        for pair in bytes.chunks_exact(2) { sum += u32::from(u16::from_be_bytes([pair[0], pair[1]])); }
+    }
+    sum += udp.len() as u32;
+    sum += 17;
+    for pair in udp.chunks(2) {
+        sum += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
+    }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    !(sum as u16)
 }
 
 fn nan_sync_beacon_frame_for(
@@ -3284,7 +3578,10 @@ unsafe extern "C" fn sniffer_cb(
     if !buf.is_null() {
         super::wifi::mark_raw_first_frame(unsafe { sys::esp_timer_get_time().max(0) as u64 });
     }
-    if type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_MGMT || buf.is_null() {
+    if buf.is_null()
+        || (type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_MGMT
+            && type_ != sys::wifi_promiscuous_pkt_type_t_WIFI_PKT_DATA)
+    {
         NAN_RX_OTHER.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -3304,6 +3601,9 @@ unsafe extern "C" fn sniffer_cb(
     // Otherwise unrelated SDF/action traffic fills the queue before the main
     // task can reach a directed raw-NAN command.
     let frame = unsafe { core::slice::from_raw_parts(payload, len) };
+    if frame.first().map(|value| value & 0x0c) == Some(0x08) {
+        NAN_RX_DATA.fetch_add(1, Ordering::Relaxed);
+    }
     // Keep NAN beacons long enough for the worker to make the bounded
     // cluster-reselection decision.  Filtering a foreign beacon here would
     // prevent recovery after the selected cluster disappears.
@@ -3320,28 +3620,24 @@ unsafe extern "C" fn sniffer_cb(
         NAN_RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let mut received = RawNanRxFrame {
-        len: len as u16,
-        rssi: pkt.rx_ctrl.rssi() as i8,
-        _reserved: 0,
-        local_us: now_us(),
-        data: [0; NAN_RX_FRAME_MAX],
-    };
     unsafe {
-        core::ptr::copy_nonoverlapping(payload, received.data.as_mut_ptr(), len);
-    }
-    let sent = unsafe {
-        sys::xQueueGenericSend(
+        let received = core::ptr::addr_of_mut!(NAN_RX_SCRATCH);
+        (*received).len = len as u16;
+        (*received).rssi = pkt.rx_ctrl.rssi() as i8;
+        (*received)._reserved = 0;
+        (*received).local_us = now_us();
+        core::ptr::copy_nonoverlapping(payload, (*received).data.as_mut_ptr(), len);
+        let sent = sys::xQueueGenericSend(
             queue,
-            (&received as *const RawNanRxFrame).cast::<c_void>(),
+            received.cast::<c_void>(),
             0,
             0,
-        )
-    };
-    if sent == 1 {
-        super::wake::notify();
-    } else {
-        NAN_RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+        );
+        if sent == 1 {
+            super::wake::notify();
+        } else {
+            NAN_RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -3425,6 +3721,7 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                 );
             }
             if let Some((source, payload)) = custom_raw_action {
+                NAN_OBJECT_ACTION_DISPATCH.fetch_add(1, Ordering::Relaxed);
                 super::wifi::observe_raw_action_payload(source, payload, rssi);
             } else if is_nan_sdf(frame) {
                 NAN_RX_SDF.fetch_add(1, Ordering::Relaxed);
@@ -3811,22 +4108,30 @@ fn nan_cluster_bssid() -> [u8; 6] {
     bssid
 }
 
+/// Return the current NAN cluster BSSID for out-of-band data frames. The
+/// value is only exposed while the selected cluster is fresh; callers should
+/// fall back to their normal destination/BSSID when this returns `None`.
+pub(crate) fn selected_cluster_bssid() -> Option<[u8; 6]> {
+    if NAN_CLUSTER_LOCKED.load(Ordering::Acquire)
+        && last_beacon_local_us() != 0
+        && now_us().saturating_sub(last_beacon_local_us()) < NAN_CLUSTER_RESELECT_AFTER_US
+    {
+        Some(nan_cluster_bssid())
+    } else {
+        None
+    }
+}
+
 fn is_nan_bssid(frame: &[u8]) -> bool {
-    frame.len() > FRAME_BSSID + 3
-        && frame[FRAME_BSSID] == 0x50
-        && frame[FRAME_BSSID + 1] == 0x6f
-        && frame[FRAME_BSSID + 2] == 0x9a
+    shared_nan::is_nan_bssid(frame)
 }
 
 fn beacon_tsf_us(frame: &[u8]) -> Option<u64> {
-    let tsf = frame.get(FRAME_DATA..FRAME_DATA + 8)?;
-    Some(u64::from_le_bytes(tsf.try_into().ok()?))
+    shared_nan::beacon_tsf_us(frame)
 }
 
 fn beacon_interval_tu(frame: &[u8]) -> Option<u32> {
-    let bytes = frame.get(FRAME_DATA + 8..FRAME_DATA + 10)?;
-    let interval = u16::from_le_bytes(bytes.try_into().ok()?) as u32;
-    (interval >= 1).then_some(interval)
+    shared_nan::beacon_interval_tu(frame)
 }
 
 fn is_direct_dmesh_ssid(frame: &[u8]) -> bool {
@@ -3850,14 +4155,7 @@ fn is_direct_dmesh_ssid(frame: &[u8]) -> bool {
 }
 
 fn is_nan_sdf(frame: &[u8]) -> bool {
-    frame.len() > NAN_ACTION_START
-        && is_nan_bssid(frame)
-        && frame[FRAME_DATA] == 0x04
-        && frame[FRAME_DATA + 1] == 0x09
-        && frame[FRAME_DATA + 2] == 0x50
-        && frame[FRAME_DATA + 3] == 0x6f
-        && frame[FRAME_DATA + 4] == 0x9a
-        && frame[FRAME_DATA + 5] == 0x13
+    shared_nan::is_nan_sdf(frame)
 }
 
 fn matches_filter(frame: &[u8]) -> bool {
@@ -3914,16 +4212,28 @@ fn stats() -> String {
         .unwrap_or_else(|| "none".to_string());
     let cluster_bssid = format_mac(&nan_cluster_bssid());
     let last_raw_tx_slot = load_u64(&NAN_LAST_RAW_TX_SLOT_LO, &NAN_LAST_RAW_TX_SLOT_HI);
+    let object_stats = object_service_stats();
     format!(
-        "nan support=raw running={} filter={} bssid_filter={} cluster_bssid={} cluster_locked={} cluster_foreign_drop={} cluster_reselects={} raw_mgmt={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_cmd_tx={} raw_cmd_drop={} raw_resp_rx={} raw_resp_tx={} raw_outgoing_drop={} raw_last_tx_offset_us={} raw_last_tx_slot={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={} publish_dw_tx={} publish_dw_skipped_slot={} publish_dw_local_guard_drop={} publish_dw_last_slot={} publish_dw_last_offset_us={}",
+        "nan dispatch={} accepted={} support=raw running={} filter={} bssid_filter={} hw_bssid_state={} hw_bssid_arms={} hw_bssid_reprobes={} hw_bssid_errors={} cluster_bssid={} cluster_locked={} cluster_foreign_drop={} cluster_reselects={} raw_mgmt={} raw_data={} raw_matched={} raw_action={} raw_beacon={} sync_beacon_tx={} ap_beacon={} ap_bssid={} ap_direct={} ap_interval_tu={} ap_rssi={} ap_age_ms={} raw_sdf={} raw_other={} raw_bytes={} raw_cmd_rx={} raw_cmd_tx={} raw_cmd_drop={} raw_resp_rx={} raw_resp_tx={} raw_outgoing_drop={} raw_last_tx_offset_us={} raw_last_tx_slot={} dmesh_service_rx={} dmesh_followup_rx={} dmesh_followup_tx={} rx_prefilter_drop={} rx_queue_drop={} rx_oversize_drop={} ipv6_udp_rx={} ipv6_udp_bytes={} object_active={} object_frames={} object_bytes={} object_rejected={} last_beacon_local_us={} last_beacon_tsf_us={} beacon_age_ms={} queue_len={} publish_queue_len={} publish_last_beacon={} publish_dw_tx={} publish_dw_skipped_slot={} publish_dw_guard_drops={} publish_dw_last_slot={} publish_dw_last_offset_us={}",
+        NAN_OBJECT_ACTION_DISPATCH.load(Ordering::Relaxed),
+        NAN_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
         NAN_RUNNING.load(Ordering::Relaxed),
         filter_name(),
         NAN_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
+        if NAN_HW_FILTER_STATE.load(Ordering::Relaxed) == NAN_HW_FILTER_ARMED {
+            "armed"
+        } else {
+            "discovery"
+        },
+        NAN_HW_FILTER_ARMS.load(Ordering::Relaxed),
+        NAN_HW_FILTER_REPROBES.load(Ordering::Relaxed),
+        NAN_HW_FILTER_ERRORS.load(Ordering::Relaxed),
         cluster_bssid,
         NAN_CLUSTER_LOCKED.load(Ordering::Relaxed),
         NAN_CLUSTER_FOREIGN_DROPS.load(Ordering::Relaxed),
         NAN_CLUSTER_RESELECTS.load(Ordering::Relaxed),
         NAN_RX_MGMT.load(Ordering::Relaxed),
+        NAN_RX_DATA.load(Ordering::Relaxed),
         NAN_RX_MATCHED.load(Ordering::Relaxed),
         NAN_RX_ACTION.load(Ordering::Relaxed),
         NAN_RX_BEACON.load(Ordering::Relaxed),
@@ -3951,6 +4261,12 @@ fn stats() -> String {
         NAN_RX_PREFILTER_DROPS.load(Ordering::Relaxed),
         NAN_RX_QUEUE_DROPS.load(Ordering::Relaxed),
         NAN_RX_OVERSIZE_DROPS.load(Ordering::Relaxed),
+        NAN_IPV6_UDP_RX.load(Ordering::Relaxed),
+        NAN_IPV6_UDP_BYTES.load(Ordering::Relaxed),
+        object_service_active(),
+        object_stats.frames,
+        object_stats.bytes,
+        object_stats.rejected,
         last_beacon_local_us,
         last_beacon_tsf_us,
         beacon_age_ms,

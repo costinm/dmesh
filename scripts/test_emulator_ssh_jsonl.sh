@@ -11,6 +11,7 @@ export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$SCRIPT_DIR/target/.gradle}"
 
 APP_DMESH_PKG="${APP_DMESH_PKG:-com.github.costinm.dmesh.lm}"
 APP_CHAT_PKG="${APP_CHAT_PKG:-com.github.costinm.dmesh.chat}"
+APP_WEB_PKG="${APP_WEB_PKG:-com.github.costinm.dmesh.web}"
 DMESH_HOST_SSH_PORT="${DMESH_HOST_SSH_PORT:-11522}"
 DMESH_SSH_USER="${DMESH_SSH_USER:-dmesh}"
 KEY_DIR="$SCRIPT_DIR/target/ssh-jsonl-smoke"
@@ -53,6 +54,7 @@ adb_cmd=(adb -s "$serial")
 echo "Installing temporary SSH CA for app-dmesh"
 "${adb_cmd[@]}" shell am force-stop "$APP_DMESH_PKG" >/dev/null 2>&1 || true
 "${adb_cmd[@]}" shell am force-stop "$APP_CHAT_PKG" >/dev/null 2>&1 || true
+"${adb_cmd[@]}" shell am force-stop "$APP_WEB_PKG" >/dev/null 2>&1 || true
 "${adb_cmd[@]}" push "$CA_KEY.pub" "$REMOTE_CA" >/dev/null
 "${adb_cmd[@]}" shell run-as "$APP_DMESH_PKG" mkdir -p \
     "$APP_FILES/ssh-mesh"
@@ -63,13 +65,15 @@ echo "Installing temporary SSH CA for app-dmesh"
 "${adb_cmd[@]}" shell rm -f "$REMOTE_CA" >/dev/null 2>&1 || true
 
 send_bridge_lines() {
-    echo "Sending JSONL, human, and app-chat commands over ssh -W dmesh-msg:1"
+    echo "Sending JSONL, human, telemetry, app-chat, and app-web commands over ssh -W dmesh-msg:1"
     set +e
     out="$(
         {
             printf '%s\n' '{"id":"jsonl-smoke-1","method":"wifi.scan","data":{"reason":"ssh-jsonl-smoke"}}'
             printf '%s\n' 'wifi.scan --id human-smoke-1 --reason ssh-human-smoke'
             printf '%s\n' 'app.chat.send --id chat-smoke-1 --text ssh-to-chat'
+            printf '%s\n' 'app.web.open --id web-smoke-1 --url https://example.invalid/dmesh-smoke'
+            printf '%s\n' 'telemetry.history --id telemetry-smoke-1 --limit 8'
         } | timeout "${DMESH_JSONL_TIMEOUT:-12}" ssh \
         -i "$KEY" \
         -p "$DMESH_HOST_SSH_PORT" \
@@ -88,7 +92,7 @@ send_bridge_lines() {
     set -e
 
     echo "$out"
-    for expect in '"id":"jsonl-smoke-1".*"ok":true' '"id":"human-smoke-1".*"ok":true' 'chat[.]message'; do
+    for expect in '"id":"jsonl-smoke-1".*"ok":true' '"id":"human-smoke-1".*"ok":true' 'chat[.]message' 'web[.]received' '"id":"telemetry-smoke-1".*"method":"telemetry.history"'; do
         if printf '%s\n' "$out" | grep -Eq "$expect"; then
             continue
         fi

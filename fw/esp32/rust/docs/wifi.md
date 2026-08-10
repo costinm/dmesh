@@ -36,6 +36,13 @@ or normal STA association for mesh control traffic.
   debug-only and must not become the battery transport.
 - The receive callback performs an early DMesh/NAN filter before queuing work.
   It does not make promiscuous reception a hardware destination filter.
+- The native `dmesh_wifi_filter` wrapper exposes Espressif's internal
+  `ic_set_bssid` and BSSID-check hooks. An explicit `nan bssid=...` override
+  is programmed into the MAC before raw capture, reducing unrelated RX DMA
+  and callback traffic. The custom parser still uses promiscuous capture
+  because the normal `esp_wifi_internal_reg_rxcb` path delivers netstack
+  frames, not the raw NAN management headers it needs. Removing promiscuous
+  capture entirely requires a separate NAN-interface callback path.
 - Official Espressif NAN is not the low-power default. The raw implementation
   owns the Wi-Fi-on window and explicitly powers Wi-Fi down between windows.
 

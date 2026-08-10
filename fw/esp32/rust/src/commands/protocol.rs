@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use minicbor::{data::Type, Decoder, Encoder};
+use std::net::IpAddr;
 
 use super::CommandRequest;
 
@@ -51,6 +52,28 @@ fn decode_text_bytes(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+fn network_address_bytes(tag: u16, value: &str) -> Option<Vec<u8>> {
+    if !matches!(tag, 246 | 247 | 255 | 256 | 407) {
+        return None;
+    }
+    value.parse::<IpAddr>().ok().map(|address| match address {
+        IpAddr::V4(address) => address.octets().to_vec(),
+        IpAddr::V6(address) => address.octets().to_vec(),
+    })
+}
+
+fn network_address_text(tag: u16, bytes: &[u8]) -> Option<String> {
+    if !matches!(tag, 246 | 247 | 255 | 256 | 407) {
+        return None;
+    }
+    let address = match bytes.len() {
+        4 => IpAddr::V4(std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+        16 => IpAddr::V6(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?)),
+        _ => return None,
+    };
+    Some(address.to_string())
+}
+
 /// Firmware-local command identifiers. These are two-byte CBOR values and are
 /// documented in `crates/lmesh/ESP_FIRMWARE_API.md`.
 pub fn command_id(name: &str) -> Option<u16> {
@@ -97,6 +120,7 @@ pub fn command_id(name: &str) -> Option<u16> {
         "reset" | "rst" => 69,
         "module" => 70,
         "hello" => 71,
+        "hw" => 72,
         _ => return None,
     })
 }
@@ -142,6 +166,7 @@ pub fn command_name(id: u16) -> Option<&'static str> {
         69 => "reset",
         70 => "module",
         71 => "hello",
+        72 => "hw",
         _ => return None,
     })
 }
@@ -157,6 +182,10 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "tx" => 38,
         "data" | "payload" => 39,
         "text" => 40,
+        // Raw NAN data-frame injection. Keep this distinct from `data`,
+        // which is the generic binary command payload on text transports.
+        "frame" => 333,
+        "hw_filter" => 334,
         "timeout" => 41,
         "mode" => 42,
         "preset" => 43,
@@ -324,6 +353,7 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "ap_ssid" => 128,
         "apply" => 129,
         "backend" => 130,
+        "bytes" => 2,
         "beacon_ms" => 131,
         "ble" => 132,
         "ble_scan" => 133,
@@ -404,6 +434,9 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "raw_nan" => 208,
         "raw_payload" => 209,
         "raw_stats" => 210,
+        // Keep diagnostic-only fields outside the established network
+        // address range; 272 is reserved for this diagnostic selector.
+        "object_action_stats" => 272,
         "raw_stop" => 211,
         "raw_tx" => 212,
         "raw_wifi" => 213,
@@ -452,6 +485,24 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "size" => 254,
         "gw" => 255,
         "mask" => 256,
+        // Flash-control mode is a typed boolean in the compact CBOR payload.
+        // Keep it outside the legacy 0..256 argument range so this field can
+        // be added without renumbering existing firmware arguments.
+        "dry_run" => 257,
+        "bench_stats" => 258,
+        "bench_stream_send" => 259,
+        "bench_send" => 260,
+        "bench_reset" => 261,
+        "delay_us" => 262,
+        "udp_hello" => 263,
+        "udp_hello_status" => 264,
+        "udp_dry_run" => 265,
+        "udp_dry_run_status" => 266,
+        "udp_status_probe" => 267,
+        "udp_status_probe_status" => 268,
+        "udp_status_server" => 269,
+        "udp_status_server_status" => 270,
+        "verify_sha" => 271,
         _ => return None,
     })
 }
@@ -469,6 +520,13 @@ pub fn encode_binary(request: &CommandRequest) -> Vec<u8> {
         .iter()
         .filter(|(&k, _)| k != CBOR_STATUS && k != CBOR_ERROR)
         .count()
+        + request
+            .binary_args
+            .keys()
+            .filter(|&&k| {
+                k != CBOR_STATUS && k != CBOR_ERROR && !request.args.contains_key(&k)
+            })
+            .count()
         + usize::from(!request.payload.is_empty());
 
     let entries =
@@ -493,7 +551,17 @@ pub fn encode_binary(request: &CommandRequest) -> Vec<u8> {
         for (&tag, value) in &request.args {
             if tag != CBOR_STATUS && tag != CBOR_ERROR {
                 encoder.u16(tag).expect("Vec CBOR encode");
-                encoder.str(value).expect("Vec CBOR encode");
+                if let Some(bytes) = request.binary_args.get(&tag) {
+                    encoder.bytes(bytes).expect("Vec CBOR encode");
+                } else {
+                    encoder.str(value).expect("Vec CBOR encode");
+                }
+            }
+        }
+        for (&tag, bytes) in &request.binary_args {
+            if tag != CBOR_STATUS && tag != CBOR_ERROR && !request.args.contains_key(&tag) {
+                encoder.u16(tag).expect("Vec CBOR encode");
+                encoder.bytes(bytes).expect("Vec CBOR encode");
             }
         }
         if !request.payload.is_empty() {
@@ -522,6 +590,7 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
     let mut method_id = 0;
     let mut method_name = None;
     let mut args = std::collections::BTreeMap::new();
+    let mut binary_args = std::collections::BTreeMap::new();
     let mut payload = Vec::new();
     let mut entries = 0u64;
     loop {
@@ -594,7 +663,29 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
                             kind => bail!("unexpected payload data type {kind:?}; expected bytes or hex string"),
                         }
                     } else {
-                        args.insert(tag, decoder.str()?.to_owned());
+                        let value = match decoder.datatype()? {
+                            Type::String => decoder.str()?.to_owned(),
+                            Type::Bool => decoder.bool()?.to_string(),
+                            Type::Bytes => {
+                                let bytes = decoder.bytes()?.to_vec();
+                                if let Some(value) = network_address_text(tag, &bytes) {
+                                    // Keep the printable view for existing
+                                    // handlers while retaining the canonical
+                                    // bytes for the next encode.
+                                    args.insert(tag, value);
+                                }
+                                binary_args.insert(tag, bytes);
+                                continue;
+                            }
+                            kind => bail!("unsupported payload value type {kind:?}"),
+                        };
+                        if let Some(bytes) = network_address_bytes(tag, &value) {
+                            // Preserve the text spelling for handlers and
+                            // diagnostics, but make every re-encoded packet
+                            // use the canonical network-order byte string.
+                            binary_args.insert(tag, bytes);
+                        }
+                        args.insert(tag, value);
                     }
                 }
             }
@@ -609,6 +700,7 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
         request.name = method_name;
     }
     request.args = args;
+    request.binary_args = binary_args;
     request.payload = payload;
     Ok(request)
 }
@@ -693,6 +785,19 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_is_a_typed_boolean_payload_field() {
+        assert_eq!(arg_tag("dry_run"), Some(257));
+        let mut bytes = Vec::new();
+        Encoder::new(&mut bytes)
+            .map(2).unwrap()
+            .u16(0).unwrap().str("recovery").unwrap()
+            .u16(6).unwrap()
+            .map(1).unwrap().str("dry_run").unwrap().bool(true).unwrap();
+        let request = decode_binary(&bytes).unwrap();
+        assert_eq!(request.arg("dry_run"), Some("true"));
+    }
+
+    #[test]
     fn text_payload_data_is_decoded_as_hex_bytes() {
         let mut bytes = Vec::new();
         Encoder::new(&mut bytes)
@@ -714,5 +819,37 @@ mod tests {
         let request = decode_binary(&bytes).unwrap();
         assert_eq!(request.name, "mode");
         assert_eq!(request.args.get(&80).map(String::as_str), Some("1000"));
+    }
+
+    #[test]
+    fn network_addresses_use_byte_strings_and_accept_ipv6() {
+        let mut bytes = Vec::new();
+        Encoder::new(&mut bytes)
+            .map(2)
+            .unwrap()
+            .u16(0)
+            .unwrap()
+            .str("wifi")
+            .unwrap()
+            .u16(6)
+            .unwrap()
+            .map(2)
+            .unwrap()
+            .u16(247)
+            .unwrap()
+            .str("10.78.0.200")
+            .unwrap()
+            .u16(255)
+            .unwrap()
+            .bytes(&[0x20, 0x01, 0xdb, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+            .unwrap();
+        let request = decode_binary(&bytes).unwrap();
+        assert_eq!(request.arg("ip"), Some("10.78.0.200"));
+        assert_eq!(request.arg_bytes("ip"), Some(&[10, 78, 0, 200][..]));
+        assert_eq!(request.arg_bytes("gw"), Some(&[0x20, 0x01, 0xdb, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..]));
+        let encoded = encode_binary(&request);
+        assert!(encoded
+            .windows(7)
+            .any(|window| window == [0x18, 0xf7, 0x44, 10, 78, 0, 200]));
     }
 }

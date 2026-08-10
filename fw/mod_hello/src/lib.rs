@@ -2,24 +2,25 @@
 
 //! Minimal dynamic-module ABI experiment.
 //!
-//! This crate deliberately has no allocation, statics, imported functions, or
-//! target-specific dependencies.  The deployment wrapper supplies a context
+//! This crate deliberately has no linked allocator, statics, imported
+//! functions, or target-specific dependencies.  The deployment wrapper supplies a context
 //! containing the host callbacks and calls `dmesh_module_entry` directly.
 
 use core::ffi::c_void;
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 4;
 const ERR_CONTEXT_ABI: i32 = -100;
 
 pub type LogLine = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 pub type CallService = unsafe extern "C" fn(
     *mut c_void,
+    u16,
     *const u8,
     usize,
-    *const u8,
+    *mut u8,
     usize,
-    *const u8,
-    usize,
+    *mut usize,
+    u32,
 ) -> i32;
 pub type GetSetting = unsafe extern "C" fn(
     *mut c_void, *const u8, usize, *mut u8, usize, *mut usize,
@@ -49,10 +50,11 @@ pub struct ModuleContext {
     pub emit_event: Option<EmitEvent>,
     pub lora_host: *const c_void,
     pub lora_config: *const c_void,
+    pub host: *const c_void,
 }
 
 #[cfg(target_pointer_width = "32")]
-const _: () = assert!(core::mem::size_of::<ModuleContext>() == 40);
+const _: () = assert!(core::mem::size_of::<ModuleContext>() == 44);
 
 /// Module implementation used by the flat-image entry stub.
 ///

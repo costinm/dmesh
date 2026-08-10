@@ -20,6 +20,9 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_pm/dmesh_pm.c");
     println!("cargo:rerun-if-changed=native/dmesh_pm/include/dmesh_pm.h");
     println!("cargo:rerun-if-changed=native/dmesh_pm/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=native/dmesh_wifi_filter/dmesh_wifi_filter.c");
+    println!("cargo:rerun-if-changed=native/dmesh_wifi_filter/include/dmesh_wifi_filter.h");
+    println!("cargo:rerun-if-changed=native/dmesh_wifi_filter/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/dmesh_boot_health.c");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/CMakeLists.txt");
     println!("cargo:rerun-if-env-changed=DMESH_RECOVERY_TRANSPORT_DIR");
@@ -36,7 +39,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_module_loader/include/dmesh_module_loader.h");
     println!("cargo:rerun-if-changed=native/dmesh_module_loader/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../mod_hello/include/dmesh_module_abi.h");
+    println!("cargo:rerun-if-changed=../../modules/include/dmesh_hw_abi.h");
     println!("cargo:rerun-if-changed=../../mod_lora/include/dmesh_lora_abi.h");
-    println!("cargo:rerun-if-changed=../../boot/boot_health_rtc.h");
+    println!("cargo:rerun-if-changed=native/dmesh_boot_health/boot_health_rtc.h");
     embuild::espidf::sysenv::output();
 }

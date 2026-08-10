@@ -37,9 +37,12 @@ const DEFAULT_NAN_DW_OFFSET_TU: u32 = 0;
 // Keep the last NAN TSF usable across the normal 4 s duty interval and a
 // delayed UART/active window, while still forcing recovery when the cluster
 // has been absent for a bounded period.
-const DEFAULT_AP_LOSS_MS: u32 = 15_000;
-const DEFAULT_AP_RECOVERY_MS: u32 = 32_000;
-const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = 1_200;
+// In sleepy mode three normal 4 s duty intervals without a beacon are enough
+// to declare the cluster unavailable.  Recovery first listens for the AP (or
+// another NAN sync source), then repeats a short scan every 16 s.
+const DEFAULT_AP_LOSS_MS: u32 = 12_000;
+const DEFAULT_AP_RECOVERY_MS: u32 = 16_000;
+const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = 600;
 // ESP-IDF requires SoftAP beacon intervals to be multiples of 100 TU. The AP
 // timestamp still samples the same TSF clock used to select the separate
 // 512-TU NAN DW grid below.
@@ -425,7 +428,14 @@ fn poll_infra_active_session() {
 }
 
 fn infra_radio_hold_active() -> bool {
-    infra_active_session_enabled() || targeted_wake_active() || super::serial::is_active()
+    infra_active_session_enabled()
+        || targeted_wake_active()
+        || super::serial::is_active()
+        // A queued response is retried from the next bounded recovery/DW
+        // window. It must not keep an unsynchronised sleepy node awake
+        // indefinitely (lora4's old pending-response deadlock).
+        || (PRODUCT_MODE.load(Ordering::Relaxed) != MODE_SLEEPY
+            && super::nan::raw_work_pending())
 }
 
 /// An explicit "I want to talk" window permits immediate raw command/response
@@ -1097,10 +1107,20 @@ pub fn stop_for_ip_transport() {
     // raw-NAN normally enables automatic light sleep between discovery
     // windows, which is not compatible with starting a BSD listener.
     super::power::configure_for_light_sleep(false).ok();
-    stop_ap_owner().ok();
+    // This must happen even when the STA is already configured.  Keeping the
+    // association avoids a needless reconnect, but leaving the NAN duty
+    // scheduler armed lets the board enter a sleepy window while the TCP
+    // module is opening its socket.
     stop_raw_nan_duty();
-    super::nan::stop_nan().ok();
-    super::wifi::stop_raw_monitor().ok();
+    // A preceding `wifi ... ip=...` command may already have established the
+    // STA for a module-owned TCP session. In that case the NAN teardown below
+    // would stop the same Wi-Fi driver and make the module's connect() time
+    // out. Only tear down the radio owner when IP STA is not already ready.
+    if !super::wifi::ip_sta_ready() {
+        stop_ap_owner().ok();
+        super::nan::stop_nan().ok();
+        super::wifi::stop_raw_monitor().ok();
+    }
     telemetry::record_log("event type=mode.ip_transport scheduler=stopped");
 }
 
@@ -1448,6 +1468,9 @@ fn pending_expected_remaining_ms(
 }
 
 fn poll_raw_nan_duty(settings: &SharedSettings) {
+    // Keep the response queue bounded even while the cluster is unavailable;
+    // stale entries must not survive until an unrelated future command.
+    super::nan::expire_raw_queue();
     if !RAW_NAN_DUTY_ENABLED.load(Ordering::Relaxed) {
         return;
     }
@@ -1754,7 +1777,11 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                     let queued_sent = super::nan::drain_raw_queue();
                     record_raw_nan_dw_start(dw_offset_tu, sync_plan.is_some(), true);
                     set_raw_nan_window_start_us(radio_on_start_us);
-                    let uart_heartbeat = super::serial::on_raw_nan_wake(active_ms);
+                    let uart_heartbeat = if sync_plan.is_none() && source_before_window.is_none() {
+                        super::serial::on_uart_recovery_wake(active_ms)
+                    } else {
+                        super::serial::on_raw_nan_wake(active_ms)
+                    };
                     RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
                     RAW_NAN_MISS_PROBE_ACTIVE.store(false, Ordering::Release);
                     RAW_NAN_RECOVERY_ACTIVE.store(recovery_due, Ordering::Relaxed);
@@ -1763,12 +1790,6 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                     }
                     RAW_NAN_DUTY_NEXT_MS
                         .store(now_ms().wrapping_add(window_active_ms), Ordering::Relaxed);
-                    if uart_heartbeat {
-                        telemetry::emit_console(&format!(
-                            "event type=mode.state active={} infra_active=true phase=active_window",
-                            mode_name()
-                        ));
-                    }
                     telemetry::record_log(format!(
                         "event type=nan.duty phase=active channel={} active_ms={} listen_floor_ms={} wake=light recovery={} queued_sent={} uart_heartbeat={}",
                         channel,
@@ -1805,7 +1826,11 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             // active window itself was entered from the light-sleep path.
             record_raw_nan_dw_start(dw_offset_tu, false, false);
             set_raw_nan_window_start_us(radio_on_start_us);
-            let uart_heartbeat = super::serial::on_raw_nan_wake(active_ms);
+            let uart_heartbeat = if source_before_window.is_none() {
+                super::serial::on_uart_recovery_wake(active_ms)
+            } else {
+                super::serial::on_raw_nan_wake(active_ms)
+            };
             RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
             RAW_NAN_MISS_PROBE_ACTIVE.store(false, Ordering::Release);
             RAW_NAN_RECOVERY_ACTIVE.store(recovery_due, Ordering::Relaxed);
@@ -1813,12 +1838,6 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                 RAW_NAN_RECOVERY_RUNS.fetch_add(1, Ordering::Relaxed);
             }
             RAW_NAN_DUTY_NEXT_MS.store(now.wrapping_add(window_active_ms), Ordering::Relaxed);
-            if uart_heartbeat {
-                telemetry::emit_console(&format!(
-                    "event type=mode.state active={} infra_active=true phase=active_window",
-                    mode_name()
-                ));
-            }
             telemetry::record_log(format!(
                 "event type=nan.duty phase=active channel={} active_ms={} listen_floor_ms={} recovery={} queued_sent={} uart_heartbeat={}",
                 channel,
@@ -2155,7 +2174,7 @@ pub fn raw_nan_status_fields() -> String {
     let last_miss_now_us = (u64::from(RAW_NAN_LAST_MISS_NOW_HI.load(Ordering::Relaxed)) << 32)
         | u64::from(RAW_NAN_LAST_MISS_NOW_LO.load(Ordering::Relaxed));
     format!(
-        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_wake_early_ms={} nan_miss_probes={} nan_raw_cmd_rx={} nan_raw_resp_tx={} nan_raw_queue_len={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_expected_tsf_us={} nan_expected_slot_period_us={} nan_selected_stride={} nan_expected_slot_index={} nan_expected_slot_phase_us={} nan_last_beacon_tsf_us={} nan_last_beacon_slot_index={} nan_last_beacon_slot_phase_us={} nan_last_wake_to_first_frame_us={} nan_last_wake_to_beacon_us={} nan_last_beacon_to_sleep_us={} nan_last_miss_wake_to_first_frame_us={} nan_last_miss_expected_tsf_us={} nan_last_miss_tsf_us={} nan_last_miss_local_us={} nan_last_miss_now_us={} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
+        "nan_dw_total={} nan_dw0_total={} nan_dw_sync_total={} nan_dw_early_wake_total={} nan_wake_early_ms={} nan_miss_probes={} nan_raw_cmd_rx={} nan_raw_resp_tx={} nan_raw_queue_len={} nan_raw_cmd_pending={} nan_raw_resp_pending={} nan_dw_recent=seq:start_ms:beacons:flags:{} nan_expected_tsf_us={} nan_expected_period_us={} nan_selected_stride={} nan_expected_slot_index={} nan_expected_slot_phase_us={} nan_last_beacon_tsf_us={} nan_last_beacon_slot_index={} nan_last_beacon_slot_phase_us={} nan_last_wake_to_first_frame_us={} nan_last_wake_to_beacon_us={} nan_last_beacon_to_sleep_us={} nan_last_miss_wake_to_first_frame_us={} nan_last_miss_expected_tsf_us={} nan_last_miss_tsf_us={} nan_last_miss_local_us={} nan_last_miss_now_us={} nan_beacon_seen={} nan_beacon_missed={} nan_beacon_late={} nan_beacon_late_next_dw={} nan_beacon_drift={} nan_miss_backoff_ms={} sync_source={} ap_owner={} ap_active={} sleep_inhibited={} ap_owner_start={} ap_owner_stop={} ap_recovery_runs={} ap_recovery_next_ms={}",
         RAW_NAN_DW_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW0_TOTAL.load(Ordering::Relaxed),
         RAW_NAN_DW_SYNC_TOTAL.load(Ordering::Relaxed),
@@ -2165,6 +2184,8 @@ pub fn raw_nan_status_fields() -> String {
         super::nan::raw_command_rx_count(),
         super::nan::raw_response_tx_count(),
         super::nan::raw_queue_len(),
+        super::nan::raw_command_pending_count(),
+        super::nan::raw_response_pending_count(),
         raw_nan_dw_recent_fields(),
         expected_tsf_us,
         expected_period_us,

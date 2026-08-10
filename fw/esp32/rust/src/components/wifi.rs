@@ -1,21 +1,39 @@
 use std::collections::VecDeque;
 use std::ffi::c_char;
-use std::net::Ipv4Addr;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
+// Main creates the default STA netif before initializing the Wi-Fi driver,
+// matching Recovery's C startup sequence. The normal ESP-IDF event handlers
+// own link-up and route transitions after association.
+extern "C" {
+    fn dmesh_module_loader_ip_netif_flags(esp_netif: *mut sys::esp_netif_t) -> u8;
+    fn dmesh_module_loader_ip_netif_default(esp_netif: *mut sys::esp_netif_t) -> u8;
+    fn dmesh_module_loader_ip_netif_io_state(esp_netif: *mut sys::esp_netif_t) -> u8;
+    fn dmesh_module_loader_ip_netif_addr(esp_netif: *mut sys::esp_netif_t, which: u8) -> u32;
+}
+
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
+use dmesh_object_store::protocol::{decode_udp_manifest, encode_udp_hello};
+use dmesh_transport::{decode_frame, ConnectionId, Frame, ShortHeader, StreamFrame, FLAG_FIXED};
+use esp_idf_svc::espnow::{EspNow, PeerInfo, BROADCAST as ESPNOW_BROADCAST};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::frames::{hex_bytes, parse_bytes};
+use super::bytes::{hex_bytes, parse_bytes};
 use super::settings::{parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
 
 unsafe extern "C" {
     fn esp_wifi_connectionless_module_set_wake_interval(wake_interval: u16) -> sys::esp_err_t;
+    fn dmesh_wifi_filter_set_bssid(interface_id: u8, bssid: *const u8, enabled: bool) -> i32;
+    fn dmesh_wifi_filter_supported() -> bool;
 }
 
 const FRAME_ADDR1: usize = 4;
@@ -59,12 +77,34 @@ const DMESH_DATA_MARKER_LEN: usize = 9;
 /// limit. The complete 802.11 frame remains below the firmware's 1500-byte
 /// raw transmit/receive bound.
 pub const RAW_ACTION_MAX_PAYLOAD: usize = 1200;
+const BENCH_STREAM_MAGIC: [u8; 4] = *b"DMTB";
+const BENCH_STREAM_DCID: u64 = 0x1234;
+const BENCH_STREAM_ID: u64 = 0;
+// Minimum recognizable benchmark envelope: magic plus the encoded transport
+// header. The actual short-header/frame size is variable.
+// Leave room for the DMTB tag, QUIC-like short header, and stream-frame
+// varints. The exact encoded size is checked before sending.
+// Keep benchmark action frames comfortably below the monitor driver's large
+// management-frame edge cases. The transport itself is independent of this
+// chunk size and can be raised after the reliable path is established.
+const BENCH_STREAM_DATA_MAX: usize = 512;
 const DMESH_FIXED_MESH_DST4: [u8; 4] = [0xff; 4];
 const IEEE80211_LLC_SNAP_IPV4: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static IP_STA_NETIF: OnceLock<usize> = OnceLock::new();
+// Set only after the static STA has associated and has a non-zero address.
+// `mode::stop_for_ip_transport()` is also called by a module that is already
+// using this STA; it must not tear that working data plane down again.
+static IP_STA_READY: AtomicBool = AtomicBool::new(false);
+static IP_STA_STARTING: AtomicBool = AtomicBool::new(false);
+// The ESP-IDF default netif handlers publish link state, but they do not
+// reconnect a station after every disconnect on all supported IDF versions.
+// Keep reconnect bounded and only active while Main has explicitly handed the
+// radio to the IP transport.
+static IP_STA_NEXT_RECONNECT_MS: AtomicU32 = AtomicU32::new(0);
+static IP_STA_RECONNECTS: AtomicU32 = AtomicU32::new(0);
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
 static RAW_FILTER_BSSID_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_BSSID: [AtomicU8; 6] = [
@@ -83,6 +123,14 @@ static RAW_RX_LAST_RSSI: AtomicI32 = AtomicI32::new(0);
 static RAW_TX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_DROPPED: AtomicU32 = AtomicU32::new(0);
+static RAW_OBJECT_ACTION_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static RAW_OBJECT_ACTION_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+// Receive-path diagnostics for custom DMesh action frames. These distinguish
+// an action frame reaching Main from one carrying the expected marker and
+// from one actually being accepted for command dispatch.
+static RAW_ACTION_CANDIDATES: AtomicU32 = AtomicU32::new(0);
+static RAW_ACTION_MARKER_MISSES: AtomicU32 = AtomicU32::new(0);
+static RAW_ACTION_ACCEPTED: AtomicU32 = AtomicU32::new(0);
 static WIFI_CONNECTIONLESS_WAKE_INTERVAL_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_WIFI_INIT: AtomicBool = AtomicBool::new(false);
 static WIFI_NETIF_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -99,11 +147,166 @@ static RAW_LAST_COMMAND_PEER: [AtomicU8; 6] = [
 static RAW_LAST_COMMAND_PEER_VALID: AtomicBool = AtomicBool::new(false);
 static RAW_LAST_COMMAND_RESPONSE: AtomicU8 = AtomicU8::new(0);
 static WIFI_NOTIFY_FORWARDING: AtomicBool = AtomicBool::new(false);
+static ESPNOW_SERVICE: OnceLock<EspNow<'static>> = OnceLock::new();
 static WIFI_BEACON_COUNT: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_TSF_LO: AtomicU32 = AtomicU32::new(0);
 static WIFI_BEACON_TSF_HI: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_BYTES: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_FRAMES: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_EXPECTED_BYTES: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_EXPECTED_FRAMES: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_DELAY_US: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_SEEN: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_DECODE_ERRORS: AtomicU32 = AtomicU32::new(0);
+static BENCH_RX_LENGTH_ERRORS: AtomicU32 = AtomicU32::new(0);
+static mut BENCH_TX_ENCODED: [u8; RAW_ACTION_MAX_PAYLOAD] = [0; RAW_ACTION_MAX_PAYLOAD];
+static mut BENCH_TX_DATA: [u8; BENCH_STREAM_DATA_MAX] = [0; BENCH_STREAM_DATA_MAX];
+struct UdpHelloProbe {
+    socket: UdpSocket,
+    server: String,
+    port: u16,
+    target: u8,
+    started_ms: u64,
+    timeout_ms: u32,
+    sent_bytes: usize,
+    // Keep the large datagram buffer off Main's small task stack. The shared
+    // encoder/parser remains no-std and allocation-free; this is only the
+    // platform-owned socket adapter storage.
+    response: Box<[u8; 2048]>,
+}
+
+// Small bidirectional UDP health exchange. This intentionally has no object
+// or QUIC semantics: it answers one request with a fixed status record so a
+// failed test can be attributed to socket send, host receive, device receive,
+// or the return path.
+const UDP_STATUS_MAGIC: [u8; 4] = *b"DMSU";
+const UDP_STATUS_VERSION: u8 = 1;
+const UDP_STATUS_REQUEST: u8 = 1;
+const UDP_STATUS_RESPONSE: u8 = 2;
+const UDP_STATUS_REQUEST_LEN: usize = 14;
+const UDP_STATUS_RESPONSE_LEN: usize = 26;
+
+struct UdpStatusProbe {
+    socket: UdpSocket,
+    peer: SocketAddr,
+    server: String,
+    port: u16,
+    started_ms: u64,
+    timeout_ms: u32,
+    nonce: u64,
+    sent_bytes: usize,
+    response: Box<[u8; 128]>,
+}
+
+struct UdpStatusServer {
+    socket: UdpSocket,
+    port: u16,
+    requests: u32,
+    responses: u32,
+}
+
+fn udp_status_probe_state() -> &'static Mutex<Option<UdpStatusProbe>> {
+    static STATE: OnceLock<Mutex<Option<UdpStatusProbe>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn udp_status_probe_last() -> &'static Mutex<String> {
+    static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new("wifi udp_status_probe idle".to_owned()))
+}
+
+fn udp_status_server_state() -> &'static Mutex<Option<UdpStatusServer>> {
+    static STATE: OnceLock<Mutex<Option<UdpStatusServer>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn udp_status_server_last() -> &'static Mutex<String> {
+    static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new("wifi udp_status_server stopped".to_owned()))
+}
+
+fn udp_status_nonce() -> u64 {
+    now_ms() ^ ((unsafe { sys::esp_random() }) as u64) << 32
+}
+
+fn encode_udp_status_request(nonce: u64, out: &mut [u8; UDP_STATUS_REQUEST_LEN]) {
+    out[..4].copy_from_slice(&UDP_STATUS_MAGIC);
+    out[4] = UDP_STATUS_VERSION;
+    out[5] = UDP_STATUS_REQUEST;
+    out[6..14].copy_from_slice(&nonce.to_be_bytes());
+}
+
+fn encode_udp_status_response(nonce: u64, out: &mut [u8; UDP_STATUS_RESPONSE_LEN]) {
+    out[..4].copy_from_slice(&UDP_STATUS_MAGIC);
+    out[4] = UDP_STATUS_VERSION;
+    out[5] = UDP_STATUS_RESPONSE;
+    out[6..14].copy_from_slice(&nonce.to_be_bytes());
+    out[14..22].copy_from_slice(&now_ms().to_be_bytes());
+    let ip = IP_STA_NETIF
+        .get()
+        .map(|value| unsafe { dmesh_module_loader_ip_netif_addr(*value as *mut sys::esp_netif_t, 0) })
+        .unwrap_or(0);
+    // esp_netif exposes the IPv4 address in the native u32 representation;
+    // normalize the octets before putting them on the network wire.
+    out[22..26].copy_from_slice(&ip.to_ne_bytes());
+}
+
+const DRS2_MAGIC: u32 = 0x4452_5332;
+const DRS2_FRAME_MANIFEST: u16 = 6;
+const DRS2_FRAME_BLOCK: u16 = 8;
+const DRS2_FRAME_DONE: u16 = 10;
+const DRS2_FRAME_MANIFEST_OK: u16 = 13;
+const UDP_MANIFEST_STREAM: u64 = 3;
+const UDP_BLOCK_STREAM: u64 = 7;
+
+struct UdpDryRun {
+    socket: UdpSocket,
+    peer: SocketAddr,
+    hello: Box<[u8; 256]>,
+    hello_len: usize,
+    hello_sent: bool,
+    server: String,
+    port: u16,
+    target: u8,
+    started_ms: u64,
+    timeout_ms: u32,
+    packet: Box<[u8; 2048]>,
+    stream: Vec<u8>,
+    stream_received: u64,
+    image_bytes: u64,
+    packets: u32,
+    image_size: u64,
+    block_count: u32,
+    phase: u8,
+    verify_sha: bool,
+    block_hashes: Vec<[u8; 4]>,
+    sha_blocks: u32,
+    duplicate_packets: u32,
+    acks_sent: u32,
+}
+
+fn udp_dry_run_state() -> &'static Mutex<Option<UdpDryRun>> {
+    static STATE: OnceLock<Mutex<Option<UdpDryRun>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn udp_dry_run_last() -> &'static Mutex<String> {
+    static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new("wifi udp_dry_run idle".to_owned()))
+}
+
+fn udp_hello_probe_state() -> &'static Mutex<Option<UdpHelloProbe>> {
+    static STATE: OnceLock<Mutex<Option<UdpHelloProbe>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn udp_hello_probe_last() -> &'static Mutex<String> {
+    static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new("wifi udp_hello idle".to_owned()))
+}
 static RAW_FIRST_FRAME_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static RAW_FIRST_FRAME_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static mut RAW_RX_LAST: [u8; 256] = [0; 256];
@@ -302,7 +505,9 @@ pub fn register_commands(registry: &mut CommandRegistry) {
 }
 
 pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
-    ensure_raw_wifi_started(6)?;
+    if !super::nan::raw_tx_active() {
+        ensure_raw_wifi_started(6)?;
+    }
     let frame = nan_sdf_action_frame(RAW_BROADCAST, packet)?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -310,9 +515,74 @@ pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Initialize the real ESP-NOW service and its broadcast peer on the active
+/// Wi-Fi interface. This is separate from the existing injected action-frame
+/// path: receivers that use the ESP-NOW API can consume these packets without
+/// knowing the DMesh raw-action framing.
+fn ensure_espnow() -> Result<&'static EspNow<'static>> {
+    if let Some(service) = ESPNOW_SERVICE.get() {
+        return Ok(service);
+    }
+    let service = EspNow::take().map_err(|err| anyhow!("esp-now init failed: {err}"))?;
+    let peer = espnow_peer_info();
+    if let Err(err) = service.add_peer(peer) {
+        return Err(anyhow!("esp-now broadcast peer failed: {err}"));
+    }
+    ESPNOW_SERVICE
+        .set(service)
+        .map_err(|_| anyhow!("esp-now service initialized concurrently"))?;
+    ESPNOW_SERVICE
+        .get()
+        .ok_or_else(|| anyhow!("esp-now service unavailable after init"))
+}
+
+fn espnow_peer_info() -> PeerInfo {
+    let mut peer = PeerInfo::default();
+    peer.peer_addr = ESPNOW_BROADCAST;
+    peer.channel = 0; // use the active Wi-Fi channel
+    peer.ifidx = raw_tx_interface();
+    peer.encrypt = false;
+    peer
+}
+
+/// Send a broadcast ESP-NOW payload. The caller supplies the complete binary
+/// envelope; ESP-NOW v2 supports the full 1470-byte IDF limit.
+pub fn send_espnow_broadcast(payload: &[u8]) -> Result<()> {
+    const ESPNOW_MAX_DATA_LEN_V2: usize = 1470;
+    if payload.is_empty() || payload.len() > ESPNOW_MAX_DATA_LEN_V2 {
+        bail!("ESP-NOW payload length must be 1..={ESPNOW_MAX_DATA_LEN_V2}");
+    }
+    prepare_raw_tx(6)?;
+    let service = ensure_espnow()?;
+    if let Err(first) = service.send(ESPNOW_BROADCAST, payload) {
+        // Main can change between STA/AP/NAN ownership while the service is
+        // alive. ESP-NOW peers retain the interface selected at add time, so
+        // refresh the broadcast peer once before reporting a real send error.
+        service
+            .mod_peer(espnow_peer_info())
+            .map_err(|err| anyhow!("esp-now peer refresh failed after {first}: {err}"))?;
+        service
+            .send(ESPNOW_BROADCAST, payload)
+            .map_err(|err| anyhow!("esp-now send failed after peer refresh: {err}"))?;
+    }
+    RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    telemetry::record_packet("wifi", Direction::Tx, payload, "source=espnow_broadcast");
+    Ok(())
+}
+
 pub fn send_raw_action_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
-    ensure_raw_wifi_started(6)?;
-    let frame = custom_raw_action_frame(destination, payload)?;
+    // NAN already initialized and owns the raw monitor/channel. Re-running
+    // esp_wifi_set_channel from every transport packet returns ESP_ERR_INVALID_STATE
+    // on IDF 6.x and aborts the stream. Only initialize the bearer when NAN is
+    // not active (standalone raw-NAN diagnostic mode).
+    if !super::nan::raw_tx_active() {
+        ensure_raw_wifi_started(6)?;
+    }
+    let frame = custom_raw_action_frame_with_bssid(
+        destination,
+        super::nan::selected_cluster_bssid().unwrap_or(destination),
+        payload,
+    )?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
@@ -391,6 +661,22 @@ pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
         payload.len()
     ));
     telemetry::record_packet("wifi", Direction::Rx, payload, "source=raw_action");
+    // Object-store envelopes use the same bearer-independent format on NAN
+    // action and data frames.  Dispatch them before the command/diagnostic
+    // paths so a DRS2 transport packet is not mistaken for a text command.
+    RAW_OBJECT_ACTION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if super::nan::object_service_observe_action(payload) {
+        RAW_OBJECT_ACTION_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        telemetry::record_log(format!(
+            "event type=wifi.object_action_rx peer={} len={}",
+            format_mac(source),
+            payload.len()
+        ));
+        return;
+    }
+    if observe_bench_stream(payload) {
+        return;
+    }
     if is_wifi_terminal_payload(payload) {
         let response = RawWifiResponse {
             local_us: unsafe { sys::esp_timer_get_time().max(0) as u64 },
@@ -412,8 +698,705 @@ pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
     enqueue_command(source, payload, rssi, WifiResponsePath::Action);
 }
 
+/// Consume the bounded diagnostic stream used for transport throughput tests.
+/// This deliberately lives below the command/object-store layers: each action
+/// frame is self-describing and the receiver only accounts for bytes.
+fn observe_bench_stream(payload: &[u8]) -> bool {
+    if payload.len() < 8 || payload[..4] != BENCH_STREAM_MAGIC {
+        return false;
+    }
+    BENCH_RX_SEEN.fetch_add(1, Ordering::Relaxed);
+    let Ok((header, header_len)) = ShortHeader::decode(&payload[4..]) else {
+        BENCH_RX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    };
+    let Ok((frame, used)) = decode_frame(&payload[4 + header_len..]) else {
+        BENCH_RX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    };
+    let Frame::Stream(stream) = frame else { return true; };
+    if header.dcid.value() != BENCH_STREAM_DCID || stream.id != BENCH_STREAM_ID {
+        return true;
+    }
+    let end = stream.offset.saturating_add(stream.data.len() as u64);
+    let encoded_len = used + header_len + 4;
+    // Some ESP-IDF receive paths retain the 802.11 FCS after the vendor
+    // payload. `custom_raw_action_payload` strips it when the CRC is
+    // verifiable, but accept the four-byte form as well for chips/drivers
+    // that expose an unchecked monitor trailer.
+    if payload.len() != encoded_len && payload.len() != encoded_len + 4 {
+        BENCH_RX_LENGTH_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    if stream.fin {
+        BENCH_RX_EXPECTED_BYTES.store(end as u32, Ordering::Relaxed);
+        BENCH_RX_EXPECTED_FRAMES.store(
+            header.packet_number.saturating_add(1),
+            Ordering::Relaxed,
+        );
+    }
+    let frames = BENCH_RX_FRAMES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    let before = BENCH_RX_BYTES.fetch_max(end as u32, Ordering::Relaxed);
+    BENCH_RX_LAST_SEQ.store(header.packet_number, Ordering::Relaxed);
+    let delay_us = BENCH_RX_DELAY_US.load(Ordering::Relaxed);
+    if delay_us != 0 && (before / 4096) != ((end as u32) / 4096) {
+        task_delay(Duration::from_micros(u64::from(delay_us)));
+    }
+    let total = BENCH_RX_EXPECTED_BYTES.load(Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "event type=bench.transport_rx pn={} bytes={} frames={} total={}",
+        header.packet_number,
+        end,
+        frames,
+        total
+    ));
+    true
+}
+
+fn bench_stats() -> String {
+    format!(
+        "bench_obj attempts={} accepted={} bench_rx bytes={} frames={} expected_bytes={} expected_frames={} last_seq={} delay_us={} seen={} decode_errors={} length_errors={}",
+        RAW_OBJECT_ACTION_ATTEMPTS.load(Ordering::Relaxed),
+        RAW_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
+        BENCH_RX_BYTES.load(Ordering::Relaxed),
+        BENCH_RX_FRAMES.load(Ordering::Relaxed),
+        BENCH_RX_EXPECTED_BYTES.load(Ordering::Relaxed),
+        BENCH_RX_EXPECTED_FRAMES.load(Ordering::Relaxed),
+        BENCH_RX_LAST_SEQ.load(Ordering::Relaxed),
+        BENCH_RX_DELAY_US.load(Ordering::Relaxed),
+        BENCH_RX_SEEN.load(Ordering::Relaxed),
+        BENCH_RX_DECODE_ERRORS.load(Ordering::Relaxed),
+        BENCH_RX_LENGTH_ERRORS.load(Ordering::Relaxed),
+    )
+}
+
+fn bench_reset(delay_us: u32) {
+    BENCH_RX_BYTES.store(0, Ordering::Relaxed);
+    BENCH_RX_FRAMES.store(0, Ordering::Relaxed);
+    BENCH_RX_LAST_SEQ.store(0, Ordering::Relaxed);
+    BENCH_RX_EXPECTED_BYTES.store(0, Ordering::Relaxed);
+    BENCH_RX_EXPECTED_FRAMES.store(0, Ordering::Relaxed);
+    BENCH_RX_DELAY_US.store(delay_us, Ordering::Relaxed);
+    BENCH_RX_SEEN.store(0, Ordering::Relaxed);
+    BENCH_RX_DECODE_ERRORS.store(0, Ordering::Relaxed);
+    BENCH_RX_LENGTH_ERRORS.store(0, Ordering::Relaxed);
+}
+
+fn bench_stream_send(destination: [u8; 6], total_bytes: usize, delay_us: u32) -> Result<String> {
+    if total_bytes == 0 || total_bytes > 16 * 1024 * 1024 {
+        bail!("bench bytes must be in 1..=16777216");
+    }
+    if !super::nan::raw_tx_active() {
+        ensure_raw_wifi_started(6)?;
+    }
+    let started = unsafe { sys::esp_timer_get_time().max(0) as u64 };
+    let frame_count = total_bytes.div_ceil(BENCH_STREAM_DATA_MAX);
+    for seq in 0..frame_count {
+        let offset = seq * BENCH_STREAM_DATA_MAX;
+        let data_len = (total_bytes - offset).min(BENCH_STREAM_DATA_MAX);
+        let encoded_ptr = core::ptr::addr_of_mut!(BENCH_TX_ENCODED);
+        let data_ptr = core::ptr::addr_of_mut!(BENCH_TX_DATA);
+        unsafe {
+            core::slice::from_raw_parts_mut(encoded_ptr.cast::<u8>(), RAW_ACTION_MAX_PAYLOAD)
+                [..4]
+                .copy_from_slice(&BENCH_STREAM_MAGIC);
+        let header = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(BENCH_STREAM_DCID).unwrap(),
+            packet_number: seq as u32,
+            packet_number_len: 2,
+        };
+        let encoded = core::slice::from_raw_parts_mut(encoded_ptr.cast::<u8>(), RAW_ACTION_MAX_PAYLOAD);
+        let data = core::slice::from_raw_parts_mut(data_ptr.cast::<u8>(), BENCH_STREAM_DATA_MAX);
+        let p = 4 + header.encode(&mut encoded[4..]).unwrap();
+        for index in 0..data_len {
+            data[index] = ((offset + index) & 0xff) as u8;
+        }
+        let stream = Frame::Stream(StreamFrame {
+            id: BENCH_STREAM_ID,
+            offset: offset as u64,
+            fin: seq + 1 == frame_count,
+            data: &data[..data_len],
+        });
+        let n = p + stream.encode(&mut encoded[p..]).unwrap();
+        let mut sent = false;
+        let mut last_error = None;
+        for _attempt in 0..20 {
+            match send_raw_action_payload_to(destination, &encoded[..n]) {
+                Ok(()) => {
+                    sent = true;
+                    break;
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    task_delay(Duration::from_millis(5));
+                }
+            }
+        }
+        if !sent {
+            return Err(last_error.unwrap_or_else(|| anyhow!("benchmark transmit failed")));
+        }
+        n
+        };
+        // esp_wifi_80211_tx is asynchronous and its bounded TX queue can
+        // return ESP_ERR_INVALID_ARG/STATE when a long burst is submitted
+        // without yielding. One RTOS tick keeps NAN ownership intact while
+        // avoiding an unbounded busy loop in the benchmark.
+        task_delay(Duration::from_millis(1));
+        if delay_us != 0 {
+            task_delay(Duration::from_micros(u64::from(delay_us)));
+        }
+    }
+    let elapsed_ms = (unsafe { sys::esp_timer_get_time().max(0) as u64 } - started) / 1000;
+    Ok(format!(
+        "bench_stream sent_bytes={} frames={} elapsed_ms={} delay_us={} dst={}",
+        total_bytes, frame_count, elapsed_ms, delay_us, format_mac(destination)
+    ))
+}
+
+fn now_ms() -> u64 {
+    unsafe { sys::esp_timer_get_time().max(0) as u64 / 1_000 }
+}
+
+fn start_udp_status_probe(server: &str, port: u16, timeout_ms: u32) -> Result<String> {
+    let address = server
+        .parse::<Ipv4Addr>()
+        .map_err(|error| anyhow!("UDP status server must be IPv4: {error}"))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_nonblocking(true)?;
+    let peer = SocketAddrV4::new(address, port);
+    let nonce = udp_status_nonce();
+    let mut request = [0u8; UDP_STATUS_REQUEST_LEN];
+    encode_udp_status_request(nonce, &mut request);
+    let sent_bytes = socket.send_to(&request, peer)?;
+    let mut state = udp_status_probe_state()
+        .lock()
+        .map_err(|_| anyhow!("UDP status probe state lock poisoned"))?;
+    if state.is_some() {
+        bail!("UDP status probe already active");
+    }
+    *state = Some(UdpStatusProbe {
+        socket,
+        peer: SocketAddr::V4(peer),
+        server: server.to_owned(),
+        port,
+        started_ms: now_ms(),
+        timeout_ms,
+        nonce,
+        sent_bytes,
+        response: Box::new([0u8; 128]),
+    });
+    Ok(format!(
+        "wifi udp_status_probe started=true server={} port={} nonce={} sent_bytes={} timeout_ms={}",
+        server, port, nonce, sent_bytes, timeout_ms
+    ))
+}
+
+pub fn poll_udp_status_probe() {
+    let mut probe = match udp_status_probe_state().lock() {
+        Ok(mut state) => state.take(),
+        Err(_) => return,
+    };
+    let Some(mut probe_value) = probe.take() else { return };
+    let result = match probe_value.socket.recv_from(&mut probe_value.response[..]) {
+        Ok((received, peer)) if peer == probe_value.peer && received == UDP_STATUS_RESPONSE_LEN
+            && probe_value.response[..4] == UDP_STATUS_MAGIC
+            && probe_value.response[4] == UDP_STATUS_VERSION
+            && probe_value.response[5] == UDP_STATUS_RESPONSE
+            && u64::from_be_bytes(probe_value.response[6..14].try_into().unwrap()) == probe_value.nonce =>
+        {
+            let elapsed = now_ms().saturating_sub(probe_value.started_ms);
+            let server_uptime = u64::from_be_bytes(probe_value.response[14..22].try_into().unwrap());
+            Some(format!(
+                "wifi udp_status_probe ok=true server={} port={} nonce={} sent_bytes={} received_bytes={} server_uptime_ms={} elapsed_ms={}",
+                probe_value.server, probe_value.port, probe_value.nonce, probe_value.sent_bytes,
+                received, server_uptime, elapsed
+            ))
+        }
+        Ok((received, peer)) => Some(format!(
+            "wifi udp_status_probe ok=false server={} port={} nonce={} peer={} received_bytes={} error=invalid_response",
+            probe_value.server, probe_value.port, probe_value.nonce, peer, received
+        )),
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            if now_ms().saturating_sub(probe_value.started_ms) >= u64::from(probe_value.timeout_ms) {
+                Some(format!(
+                    "wifi udp_status_probe ok=false server={} port={} nonce={} sent_bytes={} error=timeout elapsed_ms={}",
+                    probe_value.server, probe_value.port, probe_value.nonce, probe_value.sent_bytes,
+                    now_ms().saturating_sub(probe_value.started_ms)
+                ))
+            } else {
+                None
+            }
+        }
+        Err(error) => Some(format!(
+            "wifi udp_status_probe ok=false server={} port={} nonce={} error=recv:{}",
+            probe_value.server, probe_value.port, probe_value.nonce, error
+        )),
+    };
+    if let Some(result) = result {
+        if let Ok(mut last) = udp_status_probe_last().lock() { *last = result.clone(); }
+        telemetry::record_log(format!("event type=wifi.udp_status_probe {result}"));
+    } else if let Ok(mut state) = udp_status_probe_state().lock() {
+        *state = Some(probe_value);
+    }
+}
+
+fn start_udp_status_server(port: u16) -> Result<String> {
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
+    socket.set_nonblocking(true)?;
+    let mut state = udp_status_server_state()
+        .lock()
+        .map_err(|_| anyhow!("UDP status server state lock poisoned"))?;
+    if state.is_some() { bail!("UDP status server already active"); }
+    *state = Some(UdpStatusServer { socket, port, requests: 0, responses: 0 });
+    let result = format!("wifi udp_status_server started=true port={port}");
+    if let Ok(mut last) = udp_status_server_last().lock() { *last = result.clone(); }
+    Ok(result)
+}
+
+pub fn poll_udp_status_server() {
+    let mut server = match udp_status_server_state().lock() {
+        Ok(mut state) => state.take(),
+        Err(_) => return,
+    };
+    let Some(mut server_value) = server.take() else { return };
+    let mut request = [0u8; 128];
+    match server_value.socket.recv_from(&mut request) {
+        Ok((received, peer)) => {
+            if received == UDP_STATUS_REQUEST_LEN
+                && request[..4] == UDP_STATUS_MAGIC
+                && request[4] == UDP_STATUS_VERSION
+                && request[5] == UDP_STATUS_REQUEST
+            {
+                let nonce = u64::from_be_bytes(request[6..14].try_into().unwrap());
+                let mut response = [0u8; UDP_STATUS_RESPONSE_LEN];
+                encode_udp_status_response(nonce, &mut response);
+                server_value.requests = server_value.requests.saturating_add(1);
+                match server_value.socket.send_to(&response, peer) {
+                    Ok(_sent) => server_value.responses = server_value.responses.saturating_add(1),
+                    Err(error) => telemetry::record_log(format!(
+                        "event type=wifi.udp_status_server send_error peer={} error={}", peer, error
+                    )),
+                }
+            } else {
+                telemetry::record_log(format!(
+                    "event type=wifi.udp_status_server invalid_request peer={} bytes={}", peer, received
+                ));
+            }
+        }
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+        Err(error) => telemetry::record_log(format!(
+            "event type=wifi.udp_status_server recv_error error={}", error
+        )),
+    }
+    if let Ok(mut state) = udp_status_server_state().lock() { *state = Some(server_value); }
+}
+
+fn udp_status_probe_status() -> String {
+    let active = udp_status_probe_state().lock().map(|state| state.is_some()).unwrap_or(false);
+    let last = udp_status_probe_last().lock().map(|value| value.clone()).unwrap_or_else(|_| "state_lock_poisoned".to_owned());
+    format!("active={active} last={last}")
+}
+
+fn udp_status_server_status() -> String {
+    let state = udp_status_server_state().lock().ok();
+    match state.as_deref().and_then(|value| value.as_ref()) {
+        Some(server) => format!("active=true port={} requests={} responses={}", server.port, server.requests, server.responses),
+        None => udp_status_server_last().lock().map(|value| value.clone()).unwrap_or_else(|_| "state_lock_poisoned".to_owned()),
+    }
+}
+
+/// Start a non-blocking, read-only UDP HELLO probe. The socket is polled from
+/// Main's normal loop; this command never waits for the network or performs
+/// any flash/object operation.
+fn start_udp_hello_probe(server: &str, port: u16, timeout_ms: u32, target: u8) -> Result<String> {
+    let address = server
+        .parse::<Ipv4Addr>()
+        .map_err(|error| anyhow!("UDP server must be an IPv4 address: {error}"))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_nonblocking(true)?;
+    let mut packet = [0u8; 256];
+    let packet_len = encode_udp_hello(1, target, false, &mut packet)
+        .map_err(|error| anyhow!("UDP HELLO encode failed: {error:?}"))?;
+    let peer = SocketAddrV4::new(address, port);
+    let sent_bytes = socket.send_to(&packet[..packet_len], peer)?;
+    socket.connect(peer)?;
+    let mut state = udp_hello_probe_state()
+        .lock()
+        .map_err(|_| anyhow!("UDP HELLO state lock poisoned"))?;
+    if state.is_some() {
+        bail!("UDP HELLO probe already active");
+    }
+    *state = Some(UdpHelloProbe {
+        socket,
+        server: server.to_owned(),
+        port,
+        target,
+        started_ms: now_ms(),
+        timeout_ms,
+        sent_bytes,
+        response: Box::new([0u8; 2048]),
+    });
+    Ok(format!(
+        "wifi udp_hello started=true server={} port={} target={} sent_bytes={} timeout_ms={}",
+        server, port, target, sent_bytes, timeout_ms
+    ))
+}
+
+/// Poll the non-blocking UDP HELLO probe. This is deliberately separate from
+/// command dispatch so a slow or unreachable server cannot block UART/Main.
+pub fn poll_udp_hello() {
+    let mut probe = match udp_hello_probe_state().lock() {
+        Ok(mut state) => state.take(),
+        Err(_) => return,
+    };
+    let Some(mut probe_value) = probe.take() else { return };
+    let result = match probe_value.socket.recv(&mut probe_value.response[..]) {
+        Ok(received) => match decode_udp_manifest(&probe_value.response[..received]) {
+            Ok(manifest) => Some(format!(
+                "wifi udp_hello ok=true server={} port={} target={} sent_bytes={} received_bytes={} response_dcid={} manifest_bytes={} elapsed_ms={}",
+                probe_value.server,
+                probe_value.port,
+                probe_value.target,
+                probe_value.sent_bytes,
+                received,
+                manifest.dcid.value(),
+                manifest.payload.len(),
+                now_ms().saturating_sub(probe_value.started_ms)
+            )),
+            Err(error) => Some(format!(
+                "wifi udp_hello ok=false server={} port={} error=manifest_decode:{error:?}",
+                probe_value.server, probe_value.port
+            )),
+        },
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            if now_ms().saturating_sub(probe_value.started_ms) >= u64::from(probe_value.timeout_ms) {
+                Some(format!(
+                    "wifi udp_hello ok=false server={} port={} error=timeout elapsed_ms={}",
+                    probe_value.server,
+                    probe_value.port,
+                    now_ms().saturating_sub(probe_value.started_ms)
+                ))
+            } else {
+                None
+            }
+        }
+        Err(error) => Some(format!(
+            "wifi udp_hello ok=false server={} port={} error=recv:{error}",
+            probe_value.server, probe_value.port
+        )),
+    };
+    if let Some(result) = result {
+        if let Ok(mut last) = udp_hello_probe_last().lock() {
+            *last = result.clone();
+        }
+        telemetry::record_log(format!("event type=wifi.udp_hello {}", result));
+    } else if let Ok(mut state) = udp_hello_probe_state().lock() {
+        *state = Some(probe_value);
+    }
+}
+
+fn encode_udp_ack(header: ShortHeader, out: &mut [u8; 128]) -> Result<usize> {
+    let mut p = header.encode(out).map_err(|error| anyhow!("UDP ACK header: {error:?}"))?;
+    p += Frame::Ack { largest: header.packet_number, delay: 0 }
+        .encode(&mut out[p..])
+        .map_err(|error| anyhow!("UDP ACK frame: {error:?}"))?;
+    Ok(p)
+}
+
+fn encode_udp_manifest_ok(header: ShortHeader, out: &mut [u8; 256]) -> Result<usize> {
+    let mut body = [0u8; 8];
+    body[..4].copy_from_slice(&DRS2_MAGIC.to_be_bytes());
+    body[4..6].copy_from_slice(&DRS2_FRAME_MANIFEST_OK.to_be_bytes());
+    let mut p = header.encode(out).map_err(|error| anyhow!("UDP manifest header: {error:?}"))?;
+    p += Frame::Stream(StreamFrame { id: 0, offset: 0, fin: true, data: &body })
+        .encode(&mut out[p..])
+        .map_err(|error| anyhow!("UDP manifest response: {error:?}"))?;
+    Ok(p)
+}
+
+fn parse_dry_run_manifest(bytes: &[u8]) -> Result<(u64, Vec<[u8; 4]>)> {
+    // DRS2 manifest wire layout is documented in dmesh-object-store. Only the
+    // size and block count are needed by a receive-only benchmark.
+    if bytes.len() < 149 || u32::from_be_bytes(bytes[0..4].try_into()?) != DRS2_MAGIC
+        || u16::from_be_bytes(bytes[4..6].try_into()?) != DRS2_FRAME_MANIFEST {
+        bail!("invalid DRS2 manifest");
+    }
+    let body = &bytes[8..];
+    if body.len() < 20 { bail!("truncated DRS2 manifest"); }
+    let block_count = u32::from_be_bytes(body[12..16].try_into()?);
+    let image_size = u32::from_be_bytes(body[16..20].try_into()?) as u64;
+    if block_count == 0 || image_size == 0 { bail!("empty DRS2 manifest"); }
+    let hashes_start = 8 + 145;
+    let hashes_len = (block_count as usize).checked_mul(4).ok_or_else(|| anyhow!("block hash table overflow"))?;
+    if bytes.len() < hashes_start + hashes_len {
+        bail!("truncated DRS2 block hash table");
+    }
+    let mut hashes = Vec::with_capacity(block_count as usize);
+    for chunk in bytes[hashes_start..hashes_start + hashes_len].chunks_exact(4) {
+        hashes.push([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    Ok((image_size, hashes))
+}
+
+fn start_udp_dry_run(server: &str, port: u16, timeout_ms: u32, target: u8, verify_sha: bool) -> Result<String> {
+    if !ip_sta_ready() {
+        bail!("UDP dry-run requires STA to be ready (wait for wifi.sta state=ready and ip_up=true)");
+    }
+    let address = server.parse::<Ipv4Addr>()
+        .map_err(|error| anyhow!("UDP server must be an IPv4 address: {error}"))?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_nonblocking(true)?;
+    let mut hello = [0u8; 256];
+    let hello_len = encode_udp_hello(1, target, true, &mut hello)
+        .map_err(|error| anyhow!("UDP HELLO encode failed: {error:?}"))?;
+    let peer = SocketAddrV4::new(address, port);
+    let mut state = udp_dry_run_state().lock().map_err(|_| anyhow!("UDP dry-run state lock poisoned"))?;
+    if state.is_some() { bail!("UDP dry-run already active"); }
+    *state = Some(UdpDryRun {
+        socket, peer: SocketAddr::V4(peer), hello: Box::new(hello), hello_len, hello_sent: false,
+        server: server.to_owned(), port, target, started_ms: now_ms(), timeout_ms,
+        packet: Box::new([0u8; 2048]), stream: Vec::with_capacity(8192), stream_received: 0,
+        image_bytes: 0, packets: 0, image_size: 0, block_count: 0, phase: 1,
+        verify_sha, block_hashes: Vec::new(), sha_blocks: 0, duplicate_packets: 0, acks_sent: 0,
+    });
+    Ok(format!("wifi udp_dry_run started=true server={} port={} target={} verify_sha={} hello_bytes={} timeout_ms={}", server, port, target, verify_sha, hello_len, timeout_ms))
+}
+
+fn udp_dry_send(run: &UdpDryRun, packet: &[u8]) -> Result<()> {
+    run.socket.send_to(packet, run.peer)?;
+    Ok(())
+}
+
+fn udp_dry_run_result(run: &UdpDryRun, ok: bool, error: &str) -> String {
+    let elapsed = now_ms().saturating_sub(run.started_ms).max(1);
+    let bps = run.image_bytes.saturating_mul(8_000) / elapsed;
+    format!("wifi udp_dry_run ok={} server={} port={} target={} verify_sha={} image_bytes={} image_size={} packets={} blocks={} sha_blocks={} duplicate_packets={} acks_sent={} elapsed_ms={} bitrate_kbps={} error={}", ok, run.server, run.port, run.target, run.verify_sha, run.image_bytes, run.image_size, run.packets, run.block_count, run.sha_blocks, run.duplicate_packets, run.acks_sent, elapsed, bps / 1000, error)
+}
+
+fn consume_udp_dry_run_stream(run: &mut UdpDryRun) -> Result<bool> {
+    loop {
+        if run.stream.len() < 8 { return Ok(false); }
+        let magic = u32::from_be_bytes(run.stream[0..4].try_into()?);
+        let kind = u16::from_be_bytes(run.stream[4..6].try_into()?);
+        let length = u16::from_be_bytes(run.stream[6..8].try_into()?) as usize;
+        if magic != DRS2_MAGIC || run.stream.len() < 8 + length { return Ok(false); }
+        let frame = run.stream.drain(..8 + length).collect::<Vec<_>>();
+        match kind {
+            DRS2_FRAME_BLOCK => {
+                if frame.len() < 20 { bail!("truncated DRS2 block"); }
+                let block_bytes = u32::from_be_bytes(frame[16..20].try_into()?) as u64;
+                if block_bytes > (frame.len() - 20) as u64 { bail!("invalid DRS2 block length"); }
+                if run.verify_sha {
+                    let index = u32::from_be_bytes(frame[12..16].try_into()?) as usize;
+                    let expected = run.block_hashes.get(index).ok_or_else(|| anyhow!("block hash index out of range index={index}"))?;
+                    let digest = Sha256::digest(&frame[20..20 + block_bytes as usize]);
+                    if digest[..4] != expected[..] {
+                        bail!("block SHA prefix mismatch index={index}");
+                    }
+                    run.sha_blocks = run.sha_blocks.saturating_add(1);
+                }
+                run.image_bytes = run.image_bytes.saturating_add(block_bytes);
+            }
+            DRS2_FRAME_DONE => return Ok(true),
+            _ => bail!("unexpected DRS2 stream frame kind={kind}"),
+        }
+    }
+}
+
+pub fn poll_udp_dry_run() {
+    let mut run = match udp_dry_run_state().lock() { Ok(mut state) => state.take(), Err(_) => return };
+    let Some(mut run_value) = run.take() else { return };
+    let result: Result<Option<String>> = (|| {
+        if !run_value.hello_sent {
+            match run_value.socket.send_to(&run_value.hello[..run_value.hello_len], run_value.peer) {
+                Ok(_) => run_value.hello_sent = true,
+                Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => return Ok(None),
+                Err(error) => return Ok(Some(udp_dry_run_result(&run_value, false, &format!("hello_send:{error}")))),
+            }
+        }
+        match run_value.socket.recv_from(&mut run_value.packet[..]) {
+        Ok((received, peer)) if peer == run_value.peer => {
+            run_value.packets = run_value.packets.saturating_add(1);
+            let parsed = ShortHeader::decode(&run_value.packet[..received]);
+            match parsed {
+                Ok((header, header_len)) => match decode_frame(&run_value.packet[header_len..]) {
+                    Ok((Frame::Stream(stream), _)) if stream.id == UDP_MANIFEST_STREAM || stream.id == UDP_BLOCK_STREAM => {
+                        if stream.offset > run_value.stream_received {
+                            Err(anyhow!("UDP stream gap expected={} received={}", run_value.stream_received, stream.offset))
+                        } else if stream.offset < run_value.stream_received {
+                            // The server retransmits the initial HELLO response
+                            // once. More generally, an older packet may arrive
+                            // after its ACK; acknowledge it again but never
+                            // append duplicate stream bytes.
+                            let mut ack = [0u8; 128];
+                            let ack_len = encode_udp_ack(header, &mut ack)?;
+                            udp_dry_send(&run_value, &ack[..ack_len])?;
+                            run_value.duplicate_packets = run_value.duplicate_packets.saturating_add(1);
+                            run_value.acks_sent = run_value.acks_sent.saturating_add(1);
+                            Ok(None)
+                        } else {
+                            run_value.stream.extend_from_slice(stream.data);
+                            run_value.stream_received += stream.data.len() as u64;
+                            let mut ack = [0u8; 128];
+                            let ack_len = encode_udp_ack(header, &mut ack)?;
+                            udp_dry_send(&run_value, &ack[..ack_len])?;
+                            run_value.acks_sent = run_value.acks_sent.saturating_add(1);
+                            if run_value.phase == 1 && stream.id == UDP_MANIFEST_STREAM && stream.fin {
+                                let (size, hashes) = parse_dry_run_manifest(&run_value.stream)?;
+                                run_value.image_size = size;
+                                run_value.block_count = hashes.len() as u32;
+                                run_value.block_hashes = hashes;
+                                run_value.stream.clear();
+                                run_value.stream_received = 0;
+                                let mut ok = [0u8; 256];
+                                let ok_len = encode_udp_manifest_ok(header, &mut ok)?;
+                                udp_dry_send(&run_value, &ok[..ok_len])?;
+                                run_value.phase = 2;
+                                Ok(None)
+                            } else if run_value.phase == 2 && stream.id == UDP_BLOCK_STREAM && consume_udp_dry_run_stream(&mut run_value)? {
+                                if run_value.image_bytes != run_value.image_size {
+                                    bail!("image byte count mismatch received={} expected={}", run_value.image_bytes, run_value.image_size);
+                                }
+                                Ok(Some(udp_dry_run_result(&run_value, true, "")))
+                            } else { Ok(None) }
+                        }
+                    }
+                    Ok(_) => bail!("unexpected UDP frame"),
+                    Err(error) => bail!("UDP frame decode: {error:?}"),
+                },
+                Err(error) => bail!("UDP header decode: {error:?}"),
+            }
+        }
+        Ok((_received, peer)) => Err(anyhow!("UDP packet from unexpected peer={peer}")),
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            if now_ms().saturating_sub(run_value.started_ms) >= u64::from(run_value.timeout_ms) {
+                Ok(Some(udp_dry_run_result(&run_value, false, "timeout")))
+            } else { Ok(None) }
+        }
+        Err(error) => Ok(Some(udp_dry_run_result(&run_value, false, &format!("recv:{error}")))),
+        }
+    })();
+    match result {
+        Ok(Some(result)) => {
+            if let Ok(mut last) = udp_dry_run_last().lock() { *last = result.clone(); }
+            telemetry::record_log(format!("event type=wifi.udp_dry_run {result}"));
+        }
+        Ok(None) => if let Ok(mut state) = udp_dry_run_state().lock() { *state = Some(run_value); },
+        Err(error) => {
+            let result = udp_dry_run_result(&run_value, false, &format!("protocol:{error}"));
+            if let Ok(mut last) = udp_dry_run_last().lock() { *last = result.clone(); }
+            telemetry::record_log(format!("event type=wifi.udp_dry_run {result}"));
+        }
+    }
+}
+
+fn udp_dry_run_status() -> String {
+    if let Ok(state) = udp_dry_run_state().lock() {
+        if let Some(run) = state.as_ref() {
+            return format!(
+                "wifi udp_dry_run active=true server={} port={} phase={} packets={} stream_received={} image_bytes={} image_size={} blocks={} sha_blocks={} duplicate_packets={} acks_sent={} verify_sha={}",
+                run.server, run.port, run.phase, run.packets, run.stream_received,
+                run.image_bytes, run.image_size, run.block_count, run.sha_blocks,
+                run.duplicate_packets, run.acks_sent, run.verify_sha
+            );
+        }
+    }
+    udp_dry_run_last().lock().map(|last| last.clone()).unwrap_or_else(|_| "wifi udp_dry_run state lock poisoned".to_owned())
+}
+
+/// Keep the explicit IP STA lease alive after an AP-side or RF disconnect.
+/// This is deliberately a small, nonblocking poll: the Wi-Fi task performs
+/// association asynchronously and Main remains available for UART/control
+/// traffic while it retries.
+pub fn poll_ip_sta() {
+    if IP_STA_STARTING.load(Ordering::Acquire)
+        || !IP_STA_READY.load(Ordering::Acquire)
+        || !super::mode::ip_transport_active()
+    {
+        return;
+    }
+    let now = now_ms();
+    let now32 = now as u32;
+    let next = IP_STA_NEXT_RECONNECT_MS.load(Ordering::Acquire);
+    if next != 0 && (now32.wrapping_sub(next) as i32) < 0 {
+        return;
+    }
+    IP_STA_NEXT_RECONNECT_MS.store(now32.wrapping_add(1_000), Ordering::Release);
+
+    let netif = IP_STA_NETIF
+        .get()
+        .copied()
+        .map(|value| value as *mut sys::esp_netif_t);
+    let Some(netif) = netif else { return; };
+    let associated = unsafe {
+        let mut ap = sys::wifi_ap_record_t::default();
+        sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK
+    };
+    let netif_up = unsafe { sys::esp_netif_is_netif_up(netif) };
+    if associated && netif_up {
+        return;
+    }
+
+    IP_STA_READY.store(false, Ordering::Release);
+    let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
+    unsafe {
+        let _ = sys::esp_wifi_get_mode(&mut mode);
+        if mode == sys::wifi_mode_t_WIFI_MODE_NULL {
+            let _ = sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA);
+        }
+        let _ = sys::esp_wifi_start();
+        let _ = sys::esp_netif_set_default_netif(netif);
+        let _ = sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE);
+        let result = sys::esp_wifi_connect();
+        if result != sys::ESP_OK && result != sys::ESP_ERR_WIFI_CONN {
+            telemetry::record_log(format!(
+                "event type=wifi.sta_reconnect ok=false result=0x{result:x} associated={} netif_up={}",
+                associated, netif_up
+            ));
+        } else {
+            let count = IP_STA_RECONNECTS.fetch_add(1, Ordering::Relaxed) + 1;
+            telemetry::record_log(format!(
+                "event type=wifi.sta_reconnect ok=true count={} associated={} netif_up={}",
+                count, associated, netif_up
+            ));
+        }
+    }
+}
+
+fn udp_hello_status() -> String {
+    let active = udp_hello_probe_state()
+        .lock()
+        .map(|state| state.is_some())
+        .unwrap_or(false);
+    let last = udp_hello_probe_last()
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_else(|_| "wifi udp_hello state lock poisoned".to_owned());
+    format!("active={} last={}", active, last)
+}
+
+
 pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
     start_raw_only(channel, filter)
+}
+
+/// Apply the Wi-Fi MAC's internal BSSID comparator. This is a hardware
+/// prefilter, unlike `RAW_FILTER_BSSID`, which discards a frame in software
+/// after the promiscuous callback has already run.
+pub(crate) fn set_hardware_bssid_filter(bssid: [u8; 6], enabled: bool) -> Result<()> {
+    if !unsafe { dmesh_wifi_filter_supported() } {
+        bail!("hardware Wi-Fi BSSID filter is unavailable")
+    }
+    // Raw-NAN owns the NAN receive policy, not the public STA/AP profiles.
+    // Using the STA comparator here can leave NAN action frames outside the
+    // intended hardware-filter path on targets that expose a separate NAN
+    // interface slot (notably ESP32-C6).
+    let rc = unsafe { dmesh_wifi_filter_set_bssid(2, bssid.as_ptr(), enabled) };
+    if rc != 0 {
+        bail!("hardware Wi-Fi BSSID filter failed result={rc}")
+    }
+    Ok(())
 }
 
 pub fn start_light_sleep_test_mode(mode: &str, channel: u8) -> Result<()> {
@@ -566,6 +1549,135 @@ impl CommandHandler for WifiCommand {
         }
         if request.arg("raw_stats").is_some() {
             return Ok(CommandResponse::ok(raw_stats()));
+        }
+        if request.arg("object_action_stats").is_some() {
+            return Ok(CommandResponse::ok(format!(
+                "wifi object_action attempts={} accepted={}",
+                RAW_OBJECT_ACTION_ATTEMPTS.load(Ordering::Relaxed),
+                RAW_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
+            )));
+        }
+        if request.arg("bench_stats").is_some() {
+            if request
+                .arg("reset")
+                .or_else(|| request.arg("bench_reset"))
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                let delay_us = request
+                    .arg_i32("delay_us")?
+                    .unwrap_or(0)
+                    .clamp(0, 1_000_000) as u32;
+                bench_reset(delay_us);
+            }
+            return Ok(CommandResponse::ok(bench_stats()));
+        }
+        if request.arg("udp_hello_status").is_some() {
+            return Ok(CommandResponse::ok(format!("wifi udp_hello {}", udp_hello_status())));
+        }
+        if request.arg("udp_dry_run_status").is_some() {
+            return Ok(CommandResponse::ok(udp_dry_run_status()));
+        }
+        if request.arg("udp_status_probe_status").is_some() {
+            return Ok(CommandResponse::ok(format!("wifi udp_status_probe {}", udp_status_probe_status())));
+        }
+        if request.arg("udp_status_server_status").is_some() {
+            return Ok(CommandResponse::ok(format!("wifi udp_status_server {}", udp_status_server_status())));
+        }
+        if request
+            .arg("udp_status_server")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let port = request.arg_i32("port")?.unwrap_or(3338).clamp(1, u16::MAX as i32) as u16;
+            return Ok(CommandResponse::ok(start_udp_status_server(port)?));
+        }
+        if request
+            .arg("udp_status_probe")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let server = request.arg("server").unwrap_or("10.78.0.1");
+            let port = request.arg_i32("port")?.unwrap_or(3338).clamp(1, u16::MAX as i32) as u16;
+            let timeout_ms = request.arg_i32("timeout_ms")?.or(request.arg_i32("timeout")?).unwrap_or(3_000).clamp(1, 60_000) as u32;
+            return Ok(CommandResponse::ok(start_udp_status_probe(server, port, timeout_ms)?));
+        }
+        if request
+            .arg("udp_dry_run")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let server = request.arg("server").unwrap_or("10.78.0.1");
+            let port = request.arg_i32("port")?.unwrap_or(3337).clamp(1, u16::MAX as i32) as u16;
+            let timeout_ms = request.arg_i32("timeout_ms")?.or(request.arg_i32("timeout")?).unwrap_or(60_000).clamp(1, 300_000) as u32;
+            let verify_sha = request.arg("verify_sha").map(parse_bool).transpose()?.unwrap_or(false);
+            let target = match request.arg("target").unwrap_or("main") {
+                "main" => 6,
+                "module" => 7,
+                value => value.parse::<u8>().map_err(|error| anyhow!("invalid UDP target={value}: {error}"))?,
+            };
+            return Ok(CommandResponse::ok(start_udp_dry_run(server, port, timeout_ms, target, verify_sha)?));
+        }
+        if request
+            .arg("udp_hello")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let server = request.arg("server").unwrap_or("10.78.0.1");
+            let port = request
+                .arg_i32("port")?
+                .unwrap_or(3337)
+                .clamp(1, u16::MAX as i32) as u16;
+            let timeout_ms = request
+                .arg_i32("timeout_ms")?
+                .or(request.arg_i32("timeout")?)
+                .unwrap_or(3_000)
+                .clamp(1, 60_000) as u32;
+            let target = match request.arg("target").unwrap_or("main") {
+                "main" => 6,
+                "module" => 7,
+                value => value
+                    .parse::<u8>()
+                    .map_err(|error| anyhow!("invalid UDP target={value}: {error}"))?,
+            };
+            return Ok(CommandResponse::ok(start_udp_hello_probe(
+                server,
+                port,
+                timeout_ms,
+                target,
+            )?));
+        }
+        if request
+            .arg("bench_stream_send")
+            .or_else(|| request.arg("bench_send"))
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            let total_bytes = request
+                .arg_i32("bytes")?
+                .unwrap_or(2 * 1024 * 1024)
+                .max(1) as usize;
+            let delay_us = request
+                .arg_i32("delay_us")?
+                .unwrap_or(0)
+                .clamp(0, 1_000_000) as u32;
+            let destination = request
+                .arg("dst")
+                .or_else(|| request.arg("destination"))
+                .map(parse_mac)
+                .transpose()?
+                .ok_or_else(|| anyhow!("bench_stream_send requires dst=<mac>"))?;
+            return Ok(CommandResponse::ok(bench_stream_send(
+                destination,
+                total_bytes,
+                delay_us,
+            )?));
         }
         if request.arg("netif_stats").is_some() {
             return Ok(CommandResponse::ok(netif_probe_stats()));
@@ -1054,9 +2166,11 @@ fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         let ip_mode = request
             .arg("ip")
             .or_else(|| request.arg("local_ip"))
-            .is_some();
+            .is_some()
+            || request.arg_bytes("ip").is_some()
+            || request.arg_bytes("local_ip").is_some();
         if ip_mode {
-            start_ip_sta(request, ssid, psk, channel)?;
+            start_ip_sta_async(request.clone(), ssid.to_owned(), psk.to_owned(), channel)?;
         } else {
             low_level_start_sta(ssid, psk, channel)?;
         }
@@ -1067,16 +2181,17 @@ fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         if !ip_mode {
             start_raw_after_wifi(channel, raw_filter_name())?;
         }
-        if timeout_ms > 0 {
+        if timeout_ms > 0 && !ip_mode {
             task_delay(Duration::from_millis(timeout_ms as u64));
             disable_mesh_ip_services();
         }
         self.mode = WifiMode::RawSta;
         Ok(CommandResponse::ok(format!(
-            "wifi mode=RawSta ssid={} channel={} timeout_ms={} {}",
+            "wifi mode=RawSta ssid={} channel={} timeout_ms={}{} {}",
             self.ssid.as_deref().unwrap_or(""),
             channel,
             timeout_ms,
+            if ip_mode { " starting=true" } else { "" },
             wifi_net_status()
     )))
 }
@@ -1187,22 +2302,39 @@ pub fn start_flash_sta(
     gateway: &str,
     netmask: &str,
 ) -> Result<()> {
+    let ip_bytes = parse_ipv4_bytes(ip, "local")?;
+    let gateway_bytes = parse_ipv4_bytes(gateway, "gateway")?;
+    let netmask_bytes = parse_ipv4_bytes(netmask, "netmask")?;
     let request = CommandRequest::new("wifi")
         .arg_pair("ssid", ssid)
         .arg_pair("psk", psk)
-        .arg_pair("ip", ip)
-        .arg_pair("gw", gateway)
-        .arg_pair("mask", netmask)
+        .arg_bytes_pair("ip", &ip_bytes)
+        .arg_bytes_pair("gw", &gateway_bytes)
+        .arg_bytes_pair("mask", &netmask_bytes)
         .arg_pair("timeout", "0");
-    let mut command = WifiCommand::default();
-    command.start_sta(&request).map(|_| ())
+    start_ip_sta_sync(&request, ssid, psk, 0)
 }
 
 pub fn stop_flash_sta() {
+    if let Ok(mut state) = udp_dry_run_state().lock() {
+        if let Some(run) = state.take() {
+            let result = udp_dry_run_result(&run, false, "cancelled: STA stopped");
+            if let Ok(mut last) = udp_dry_run_last().lock() {
+                *last = result;
+            }
+        }
+    }
+    IP_STA_READY.store(false, Ordering::Release);
+    IP_STA_STARTING.store(false, Ordering::Release);
+    IP_STA_NEXT_RECONNECT_MS.store(0, Ordering::Release);
     unsafe {
         let _ = sys::esp_wifi_disconnect();
         let _ = sys::esp_wifi_stop();
     }
+}
+
+pub fn ip_sta_ready() -> bool {
+    IP_STA_READY.load(Ordering::Acquire)
 }
 
 fn command_channel(request: &CommandRequest, default: u8) -> Result<u8> {
@@ -1316,21 +2448,92 @@ fn ensure_ip_sta_netif() -> Result<*mut sys::esp_netif_t> {
     Ok(*IP_STA_NETIF.get().unwrap_or(&value) as *mut sys::esp_netif_t)
 }
 
+/// Create the default STA netif before Main initializes the Wi-Fi driver.
+/// This is the same order used by Recovery: esp_netif_init/event-loop,
+/// create_default_wifi_sta, then esp_wifi_init. The netif is inert until
+/// `start_ip_sta`, but the early creation lets ESP-IDF attach the driver and
+/// install its normal event actions without a later raw-NAN handoff.
+pub fn prepare_ip_sta_netif() -> Result<()> {
+    let _ = ensure_ip_sta_netif()?;
+    Ok(())
+}
+
 fn parse_ipv4(value: &str, name: &str) -> Result<u32> {
     let address = value
         .parse::<Ipv4Addr>()
         .map_err(|error| anyhow!("invalid {name} address {value}: {error}"))?;
+    // esp_netif_ip_info_t uses the lwIP/IDF htonl representation in its
+    // u32 field (the same representation used by ESP_IP4TOADDR).
     Ok(u32::from_ne_bytes(address.octets()))
 }
 
-fn start_ip_sta(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -> Result<()> {
+fn parse_ipv4_bytes(value: &str, name: &str) -> Result<[u8; 4]> {
+    value
+        .parse::<Ipv4Addr>()
+        .map(|address| address.octets())
+        .map_err(|error| anyhow!("invalid {name} address {value}: {error}"))
+}
+
+fn request_ipv4(request: &CommandRequest, key: &str, default: &str) -> Result<u32> {
+    if let Some(bytes) = request.arg_bytes(key) {
+        if bytes.len() != 4 {
+            bail!("{key} must be a 4-byte IPv4 CBOR byte string, got {} bytes", bytes.len());
+        }
+        // The CBOR representation is network order.  esp_netif's u32 field
+        // is the lwIP/IDF native representation, so preserve those octets.
+        return Ok(u32::from_ne_bytes(bytes.try_into().unwrap()));
+    }
+    parse_ipv4(request.arg(key).unwrap_or(default), key)
+}
+
+fn start_ip_sta_async(
+    request: CommandRequest,
+    ssid: String,
+    psk: String,
+    channel: u8,
+) -> Result<()> {
+    if IP_STA_STARTING.swap(true, Ordering::AcqRel) {
+        bail!("IP STA start already in progress");
+    }
+    thread::Builder::new()
+        .name("wifi-sta-start".to_owned())
+        .spawn(move || {
+            let result = start_ip_sta_sync(&request, &ssid, &psk, channel);
+            IP_STA_STARTING.store(false, Ordering::Release);
+            match result {
+                Ok(()) => telemetry::emit_console(
+                    "event type=wifi.sta state=ready ip_transport=true",
+                ),
+                Err(error) => telemetry::emit_console(&format!(
+                    "event type=wifi.sta state=error message={}",
+                    crate::commands::protocol::escape_value(&error.to_string())
+                )),
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            IP_STA_STARTING.store(false, Ordering::Release);
+            anyhow!("spawn STA worker: {error}")
+        })
+}
+
+fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -> Result<()> {
     // Establish the lwIP/tcpip stack and its default netif before handing the
     // radio away from raw NAN. This matches Recovery's initialization order;
     // stopping the raw driver first can leave a later BSD socket with an
     // invalid tcpip mailbox on ESP32.
     init_ip_stack()?;
-    ensure_low_level_wifi()?;
     let netif = ensure_ip_sta_netif()?;
+    // Raw-NAN mode may have changed the active/default netif since Main
+    // created the STA object at boot.  `ip_up` can still be true while lwIP
+    // has no default route for sockets, which surfaces as EHOSTUNREACH from
+    // connect(). Publish the STA as the default again before configuring the
+    // static address and opening the TCP data plane.
+    esp_ok(unsafe { sys::esp_netif_set_default_netif(netif) })?;
+    // Recovery creates the default STA netif before initializing the Wi-Fi
+    // driver. Preserve that IDF ordering in Main: creating it after the raw
+    // radio has already initialized can produce an associated STA with no
+    // usable lwIP link, so ARP never reaches the AP.
     // Main normally owns a sleepy raw-NAN scheduler. IP STA is a dedicated
     // bulk-transfer mode, so stop that scheduler after the IP stack exists.
     super::mode::stop_for_ip_transport();
@@ -1339,30 +2542,30 @@ fn start_ip_sta(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -
     // was started on a different channel.
     configure_sta(ssid, psk, 0)?;
 
-    let local_ip = request
-        .arg("ip")
-        .or_else(|| request.arg("local_ip"))
-        .context("wifi STA IP mode requires ip=...")?;
-    let gateway = request.arg("gw").unwrap_or("10.78.0.1");
-    let netmask = request.arg("mask").unwrap_or("255.255.255.0");
+    if request.arg("ip").is_none() && request.arg_bytes("ip").is_none()
+        && request.arg("local_ip").is_none()
+    {
+        bail!("wifi STA IP mode requires ip=... or a 4-byte ip CBOR value");
+    }
     let mut info = sys::esp_netif_ip_info_t::default();
-    info.ip.addr = parse_ipv4(local_ip, "local")?;
-    info.gw.addr = parse_ipv4(gateway, "gateway")?;
-    info.netmask.addr = parse_ipv4(netmask, "netmask")?;
+    info.ip.addr = request_ipv4(request, "ip", "0.0.0.0")?;
+    info.gw.addr = request_ipv4(request, "gw", "10.78.0.1")?;
+    // The DMesh local AP uses the shared 10.78.0.0/16 network.  Keep this
+    // default in firmware so every STA command does not need to repeat a
+    // transport detail; an explicit mask remains supported for diagnostics.
+    info.netmask.addr = request_ipv4(request, "mask", "255.255.0.0")?;
+    // Match Recovery's working C sequence: stop DHCP and install the static
+    // address before esp_wifi_start(), then let the normal IDF Wi-Fi event
+    // handler bring the netif up on association. This preserves the route and
+    // ARP setup instead of reconstructing it after the link is already up.
     unsafe {
-        // The STA netif is cached across control-plane sessions.  The first
-        // session stops DHCP for the static address, so subsequent sessions
-        // legitimately report DHCP_ALREADY_STOPPED.  Treat that state as
-        // idempotent; otherwise a valid recovery request fails before the
-        // radio can associate or open its TCP socket.
         esp_ok_allow_dhcp_already_stopped(sys::esp_netif_dhcpc_stop(netif))?;
         esp_ok(sys::esp_netif_set_ip_info(netif, &info))?;
-    }
-    // Configure the static address before starting the station. This is the
-    // same ordering used by Recovery and prevents the DHCP/netif event path
-    // from replacing the address while the association is coming up.
-    unsafe {
         esp_ok(sys::esp_wifi_start())?;
+        // A module dry-run is a bulk TCP session, just like Recovery. Do not
+        // let modem power-save create multi-second gaps or collapse the TCP
+        // congestion window while the module is receiving blocks.
+        esp_ok(sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE))?;
         esp_ok(sys::esp_wifi_connect())?;
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1370,10 +2573,29 @@ fn start_ip_sta(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -
         let mut ap = sys::wifi_ap_record_t::default();
         let mut current = sys::esp_netif_ip_info_t::default();
         let associated = unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK };
-        let has_ip = unsafe {
-            sys::esp_netif_get_ip_info(netif, &mut current) == sys::ESP_OK && current.ip.addr != 0
-        };
-        if associated && has_ip {
+        if associated {
+            // The default STA netif is created before esp_wifi_init(), just as
+            // in Recovery. Reassert the default and static address after the
+            // link-up event as well: on this IDF path the pre-start static
+            // address is visible through esp_netif_get_ip_info(), but the
+            // connected route is not published until the address is applied
+            // to an already-up netif. Without this, BSD connect() returns
+            // EHOSTUNREACH even though the STA is associated.
+            esp_ok(unsafe { sys::esp_netif_set_default_netif(netif) })?;
+            esp_ok(unsafe { sys::esp_netif_set_ip_info(netif, &info) })?;
+            std::thread::sleep(Duration::from_millis(20));
+            let stable = unsafe {
+                sys::esp_netif_get_ip_info(netif, &mut current) == sys::ESP_OK
+                    && current.ip.addr == info.ip.addr
+                    && current.gw.addr == info.gw.addr
+                    && current.netmask.addr == info.netmask.addr
+                    && sys::esp_netif_is_netif_up(netif)
+            };
+            if !stable {
+                continue;
+            }
+            esp_ok(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
+            IP_STA_READY.store(true, Ordering::Release);
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -1402,7 +2624,6 @@ fn low_level_start_ap_with_beacon_tu(
     channel: u8,
     beacon_tu: u16,
 ) -> Result<()> {
-    ensure_low_level_wifi()?;
     unsafe {
         let _ = sys::esp_wifi_stop();
         let _ = sys::esp_wifi_set_promiscuous(false);
@@ -1636,6 +2857,7 @@ fn low_level_scan() -> Result<Vec<ScanAp>> {
 }
 
 fn low_level_stop_wifi() -> Result<()> {
+    let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         let _ = sys::esp_wifi_disconnect();
         let _ = sys::esp_wifi_set_promiscuous(false);
@@ -1696,6 +2918,8 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
 }
 
 pub fn stop_raw_monitor() -> Result<()> {
+    // Clear the comparator while the driver is still initialized.
+    let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
         let stopped = sys::esp_wifi_stop();
@@ -1723,6 +2947,7 @@ pub fn stop_raw_monitor() -> Result<()> {
 pub fn stop_raw_wifi_for_sleep() -> Result<()> {
     #[cfg(target_feature = "esp32s3ops")]
     {
+        let _ = set_hardware_bssid_filter([0; 6], false);
         unsafe {
             let _ = sys::esp_wifi_disconnect();
             let _ = sys::esp_wifi_set_promiscuous(false);
@@ -1826,6 +3051,12 @@ fn start_netif_probe(iface: &str) -> Result<()> {
 
 /// Build the DMesh custom vendor-action frame shared with host lmesh.
 pub fn custom_raw_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
+    custom_raw_action_frame_with_bssid(destination, destination, payload)
+}
+
+fn custom_raw_action_frame_with_bssid(
+    destination: [u8; 6], bssid: [u8; 6], payload: &[u8]
+) -> Result<Vec<u8>> {
     if payload.len() > RAW_ACTION_MAX_PAYLOAD {
         bail!(
             "raw action payload exceeds {} bytes: {}",
@@ -1838,7 +3069,7 @@ pub fn custom_raw_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<V
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
-    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&[0x00, 0x00]);
     frame.extend_from_slice(&dmesh_data_marker(destination));
     frame.extend_from_slice(payload);
@@ -1852,13 +3083,74 @@ fn nan_sdf_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>>
 /// Return the source and binary payload of a DMesh custom vendor-action frame.
 pub fn custom_raw_action_payload(frame: &[u8]) -> Option<([u8; 6], &[u8])> {
     const IEEE80211_HEADER_LEN: usize = 24;
+    if frame.first() == Some(&0xd0) {
+        RAW_ACTION_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+    }
     if frame.first() != Some(&0xd0) {
         return None;
     }
     let source = frame_address(frame, FRAME_ADDR2)?;
     let body = frame.get(IEEE80211_HEADER_LEN..)?;
-    let header = dmesh_data_header(body)?;
-    Some((source, &body[header.len..]))
+    let Some(header) = dmesh_data_header(body) else {
+        RAW_ACTION_MARKER_MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    RAW_ACTION_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    Some((source, strip_valid_fcs(frame, &body[header.len..])))
+}
+
+/// Some monitor transmitters (including Linux nl80211) let the radio append
+/// an 802.11 FCS. ESP raw management RX may expose that FCS as part of the
+/// action body, so remove it only when the CRC verifies. This keeps the CBOR
+/// command boundary intact without truncating payloads on drivers that omit
+/// FCS.
+fn strip_valid_fcs<'a>(frame: &[u8], payload: &'a [u8]) -> &'a [u8] {
+    if payload.len() <= 4 {
+        return payload;
+    }
+    let split = payload.len() - 4;
+    let expected = u32::from_le_bytes([
+        payload[split],
+        payload[split + 1],
+        payload[split + 2],
+        payload[split + 3],
+    ]);
+    // The IEEE 802.11 FCS covers the complete MAC frame, not just the
+    // vendor body.  `frame` is the received frame without any radiotap
+    // prefix; append-free frames remain unchanged when the driver omits FCS.
+    let frame_split = frame.len().saturating_sub(4);
+    if frame_split >= 24
+        && frame.len() >= 4
+        && crc32_ieee(&frame[..frame_split]) == expected
+    {
+        return &payload[..split];
+    }
+    // Some ESP-IDF raw-management paths report sig_len without the FCS while
+    // still leaving the FCS bytes in the copied action body. In that case the
+    // frame-wide CRC check cannot succeed. Prefer the shorter candidate only
+    // when it is a valid DMesh CBOR command and the full body is not; this
+    // preserves support for drivers that omit FCS entirely.
+    if crate::commands::protocol::decode_binary(payload).is_err()
+        && crate::commands::protocol::decode_binary(&payload[..split]).is_ok()
+    {
+        return &payload[..split];
+    }
+    payload
+}
+
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 fn dmesh_data_frame(
@@ -2539,7 +3831,7 @@ fn raw_stats() -> String {
         .unwrap_or_else(|| "none".to_string());
     let (channel, second) = wifi_channel_status();
     format!(
-        "raw_monitor={} filter={} bssid_filter={} ch={} second={} conn_wake_ms={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} last_peer={} last_response={} last_len={} last_rssi={} last={}",
+        "raw_monitor={} filter={} bssid_filter={} ch={} second={} conn_wake_ms={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} action_candidates={} action_marker_misses={} action_accepted={} object_attempts={} object_accepted={} last_peer={} last_response={} last_len={} last_rssi={} last={}",
         RAW_MONITOR_RUNNING.load(Ordering::Relaxed),
         raw_filter_name(),
         RAW_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -2552,6 +3844,11 @@ fn raw_stats() -> String {
         RAW_TX_TOTAL.load(Ordering::Relaxed),
         RAW_CMD_RX_TOTAL.load(Ordering::Relaxed),
         RAW_CMD_DROPPED.load(Ordering::Relaxed),
+        RAW_ACTION_CANDIDATES.load(Ordering::Relaxed),
+        RAW_ACTION_MARKER_MISSES.load(Ordering::Relaxed),
+        RAW_ACTION_ACCEPTED.load(Ordering::Relaxed),
+        RAW_OBJECT_ACTION_ATTEMPTS.load(Ordering::Relaxed),
+        RAW_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
         peer,
         last_response_path().name(),
         last_len,
@@ -2670,27 +3967,46 @@ fn auth_name(auth: sys::wifi_auth_mode_t) -> &'static str {
 
 fn wifi_net_status() -> String {
     let (channel, second) = wifi_channel_status();
-    let ip = IP_STA_NETIF
+    let (ip, ip_up, netif_flags, lwip_flags, lwip_default, lwip_io, lwip_ip, lwip_mask, lwip_gw) = IP_STA_NETIF
         .get()
         .and_then(|value| unsafe {
             let mut info = sys::esp_netif_ip_info_t::default();
-            if sys::esp_netif_get_ip_info(*value as *mut sys::esp_netif_t, &mut info) == sys::ESP_OK
-                && info.ip.addr != 0
-            {
-                Some(format!(
+            let netif = *value as *mut sys::esp_netif_t;
+            let result = sys::esp_netif_get_ip_info(netif, &mut info);
+            if result == sys::ESP_OK && info.ip.addr != 0 {
+                let ip = format!(
                     "{}.{}.{}.{}",
                     info.ip.addr.to_ne_bytes()[0],
                     info.ip.addr.to_ne_bytes()[1],
                     info.ip.addr.to_ne_bytes()[2],
                     info.ip.addr.to_ne_bytes()[3]
+                );
+                Some((
+                    ip,
+                    sys::esp_netif_is_netif_up(netif),
+                    sys::esp_netif_get_flags(netif),
+                    dmesh_module_loader_ip_netif_flags(netif),
+                    dmesh_module_loader_ip_netif_default(netif),
+                    dmesh_module_loader_ip_netif_io_state(netif),
+                    dmesh_module_loader_ip_netif_addr(netif, 0),
+                    dmesh_module_loader_ip_netif_addr(netif, 1),
+                    dmesh_module_loader_ip_netif_addr(netif, 2),
                 ))
             } else {
                 None
             }
         })
-        .unwrap_or_else(|| "disabled".to_string());
+        .unwrap_or_else(|| ("disabled".to_string(), false, 0, 0, 0, 0, 0, 0, 0));
+    let (ap_bssid, ap_rssi) = unsafe {
+        let mut ap = sys::wifi_ap_record_t::default();
+        if sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK {
+            (format_mac(ap.bssid), ap.rssi.to_string())
+        } else {
+            ("none".to_string(), "0".to_string())
+        }
+    };
     format!(
-        "sta_mac={} ap_mac={} ch={} second={} country={} ip={} ap_stations={}",
+        "sta_mac={} ap_mac={} ch={} second={} country={} ip={} ip_up={} netif_flags={} lwip_flags={} lwip_default={} lwip_io={} lwip_ip={} lwip_mask={} lwip_gw={} ap_bssid={} ap_rssi={} ap_stations={}",
         station_mac()
             .map(format_mac)
             .unwrap_or_else(|_| "unknown".to_string()),
@@ -2701,8 +4017,23 @@ fn wifi_net_status() -> String {
         second,
         wifi_country_code(),
         ip,
+        ip_up,
+        netif_flags,
+        lwip_flags,
+        lwip_default,
+        lwip_io,
+        format_ipv4_u32(lwip_ip),
+        format_ipv4_u32(lwip_mask),
+        format_ipv4_u32(lwip_gw),
+        ap_bssid,
+        ap_rssi,
         ap_station_count()
     )
+}
+
+fn format_ipv4_u32(value: u32) -> String {
+    let octets = value.to_ne_bytes();
+    format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
 }
 
 /// Read the ESP-IDF effective two-character regulatory country code.

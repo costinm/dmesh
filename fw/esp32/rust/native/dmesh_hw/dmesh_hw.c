@@ -8,6 +8,36 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "hal/gpio_types.h"
+#include "driver/usb_serial_jtag.h"
+
+int32_t dmesh_usb_serial_install(void) {
+#if CONFIG_IDF_TARGET_ESP32C6
+    usb_serial_jtag_driver_config_t config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    config.rx_buffer_size = 2048;
+    config.tx_buffer_size = 2048;
+    return usb_serial_jtag_driver_install(&config);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+int32_t dmesh_usb_serial_read(void *buffer, uint32_t length, uint32_t ticks) {
+#if CONFIG_IDF_TARGET_ESP32C6
+    return usb_serial_jtag_read_bytes(buffer, length, ticks);
+#else
+    (void)buffer; (void)length; (void)ticks;
+    return -1;
+#endif
+}
+
+int32_t dmesh_usb_serial_write(const void *buffer, uint32_t length) {
+#if CONFIG_IDF_TARGET_ESP32C6
+    return usb_serial_jtag_write_bytes(buffer, length, 0);
+#else
+    (void)buffer; (void)length;
+    return -1;
+#endif
+}
 
 static void cleanup_rmt(rmt_channel_handle_t channel,
                         rmt_encoder_handle_t encoder) {

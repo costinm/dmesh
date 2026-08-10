@@ -30,10 +30,12 @@ pub extern "C" fn app_main() {
 fn run() -> Result<()> {
     boot_print("dm-rs boot step=link_patches");
     esp_idf_sys::link_patches();
+    boot_print("dm-rs boot step=link_patches_done");
     if let Err(err) = components::recovery::configure_flash_size_from_hardware() {
         boot_print("dm-rs flash size override failed");
         eprintln!("flash size override failed: {err}");
     }
+    boot_print("dm-rs boot step=flash_size_done");
     components::recovery::mark_main_boot_start();
     components::wake::register_main_task();
     init_console_uart();
@@ -41,6 +43,11 @@ fn run() -> Result<()> {
     if let Err(err) = components::wifi::init_ip_stack() {
         components::telemetry::record_log(format!(
             "event type=wifi.ip_stack_init ok=false message={}",
+            commands::protocol::escape_value(&err.to_string())
+        ));
+    } else if let Err(err) = components::wifi::prepare_ip_sta_netif() {
+        components::telemetry::record_log(format!(
+            "event type=wifi.ip_netif_init ok=false message={}",
             commands::protocol::escape_value(&err.to_string())
         ));
     }
@@ -68,7 +75,7 @@ fn run() -> Result<()> {
     }
 
     boot_print("dm-rs boot step=button\n");
-    if let Err(err) = components::button::initialize(&settings) {
+    if let Err(err) = components::peripherals::initialize_button(&settings) {
         components::telemetry::record_log(format!(
             "ev=button.err op=init err={}",
             commands::protocol::escape_value(&err.to_string())
@@ -175,7 +182,7 @@ fn run() -> Result<()> {
         // GPIO0/PRG must be handled before the raw-NAN scheduler. Otherwise
         // the scheduler can try to enter light sleep while the PRG level
         // is still asserted, and ESP-IDF rejects that sleep request.
-        if components::button::take_console_wakes() > 0 {
+        if components::peripherals::take_console_wakes() > 0 {
             components::serial::rearm_after_wake();
             // GPIO0/PRG is the explicit console wake source. Rearming RX on
             // its own is insufficient: command responses remain TX-gated
@@ -185,12 +192,12 @@ fn run() -> Result<()> {
             components::telemetry::record_log("event type=uart.wake source=button");
             components::telemetry::emit_console("event type=uart.wake source=button");
         }
-        if components::button::take_long_presses() > 0 {
+        if components::peripherals::take_long_presses() > 0 {
             components::serial::set_debug_enabled(true);
             components::serial::activate_window();
             components::mode::mark_companion_active(&settings, companion_active_ms);
         }
-        for _ in 0..components::button::take_sync_requests() {
+        for _ in 0..components::peripherals::take_sync_requests() {
             components::mode::send_button_sync(&settings);
         }
         if first_loop_trace {
@@ -202,9 +209,15 @@ fn run() -> Result<()> {
         }
         components::ble_bt::poll_text_commands(&mut registry);
         poll_raw_wifi_commands(&mut registry, &settings);
+        components::wifi::poll_udp_hello();
+        components::wifi::poll_udp_dry_run();
+        components::wifi::poll_udp_status_probe();
+        components::wifi::poll_udp_status_server();
+        components::wifi::poll_ip_sta();
         poll_nan_commands(&mut registry, &settings);
         components::ip_command::poll(&mut registry);
         components::module::poll_main(&mut registry, &settings);
+        components::module::poll_flash_transport(&settings);
         components::test::poll_main();
         drain_uart_console(&mut registry, &settings, companion_active_ms);
         // The CBOR recovery command only arms the raw TCP session. The worker
@@ -244,10 +257,9 @@ fn drain_uart_console(
     companion_active_ms: u32,
 ) {
     while let Some(frame) = components::serial::take_frame() {
-        // `0x7e 0x7e` is the scheduled empty UART heartbeat. It only grants
-        // lmesh permission to flush a queued command and must not extend the
-        // radio/infra session; otherwise a heartbeat every Nth NAN wake keeps
-        // a sleepy node powered indefinitely and contaminates timing tests.
+        // A tagged NAN_SLEEPY_START event is a transport wake notification,
+        // not a command. It is emitted by the UART wake scheduler and must
+        // never be dispatched through the command registry.
         if frame.data.is_empty() {
             continue;
         }
@@ -343,7 +355,21 @@ fn poll_raw_wifi_commands(
             command.payload.len(),
             command.rssi
         ));
-        let response_payload = transports::dispatch_binary_packet(registry, &command.payload);
+        // A few ESP-IDF raw-management paths append the 802.11 FCS to the
+        // action body but report a sig_len that excludes it. The Wi-Fi layer
+        // normally removes it; repeat the bounded validation here so a
+        // command can never reach the dispatcher with trailing non-CBOR
+        // bytes when the driver metadata is inconsistent.
+        let dispatch_payload = if command.payload.len() > 4
+            && commands::protocol::decode_binary(&command.payload).is_err()
+            && commands::protocol::decode_binary(&command.payload[..command.payload.len() - 4])
+                .is_ok()
+        {
+            &command.payload[..command.payload.len() - 4]
+        } else {
+            &command.payload
+        };
+        let response_payload = transports::dispatch_binary_packet(registry, dispatch_payload);
         if response_payload.is_empty() {
             continue;
         }
@@ -407,6 +433,30 @@ unsafe extern "C" {
 fn init_console_uart() {
     const UART0: esp_idf_sys::uart_port_t = esp_idf_sys::uart_port_t_UART_NUM_0;
     unsafe {
+        #[cfg(target_arch = "riscv32")]
+        {
+            let install = components::serial::install_usb_console();
+            if install != 0 {
+                components::telemetry::record_log(format!(
+                    "event type=usb_serial.state=failed err={install}"
+                ));
+                return;
+            }
+            match components::serial::start_ingress_task(core::ptr::null_mut()) {
+                Ok(()) => {
+                    components::serial::activate_window();
+                    FRAMED_UART_READY.store(true, Ordering::Release);
+                    components::telemetry::record_log(
+                        "event type=usb_serial state=ready rx=true tx=true",
+                    );
+                }
+                Err(err) => components::telemetry::record_log(format!(
+                    "event type=usb_serial state=failed err={err}"
+                )),
+            }
+            return;
+        }
+
         // RX uses ESP-IDF's proven interrupt/event queue. TX has no driver
         // buffer or TX-empty interrupt; serial.rs owns it with direct FIFO
         // writes, avoiding the classic ESP32 UART TX ISR watchdog failure.
@@ -497,12 +547,12 @@ fn preserve_uart0_pins_in_light_sleep() {
 #[cfg(not(target_feature = "esp32s3ops"))]
 fn preserve_uart0_pins_in_light_sleep() {}
 
-#[cfg(target_feature = "esp32s3ops")]
+#[cfg(any(target_feature = "esp32s3ops", target_arch = "riscv32"))]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
     esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
 }
 
-#[cfg(not(target_feature = "esp32s3ops"))]
+#[cfg(all(not(target_feature = "esp32s3ops"), not(target_arch = "riscv32")))]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
     esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_APB
 }
