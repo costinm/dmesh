@@ -1,7 +1,10 @@
-use anyhow::{Context, Result};
-use lmesh::{LmeshService, LocalDiscovery};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use dmesh_object_store::{ObjectServer, ServerConfig};
+use lmesh::{LmeshService, LocalDiscovery};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
@@ -14,6 +17,8 @@ const NAN_AUTOSTART_ENV: &str = "LMESH_NAN_AUTOSTART";
 const NAN_EVENT_LOG_ENV: &str = "LMESH_NAN_EVENT_LOG";
 const AP_AUTOSTART_ENV: &str = "LMESH_AP_AUTOSTART";
 const AP_IFACE_ENV: &str = "LMESH_AP_IFACE";
+const AP_ADDRESS_ENV: &str = "LMESH_AP_ADDRESS";
+const AP_NETWORK_ENV: &str = "LMESH_AP_NETWORK";
 const DEFAULT_AP_IFACE: &str = "wlan0";
 
 #[tokio::main]
@@ -31,6 +36,13 @@ async fn run_server() -> Result<()> {
 
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
+    if let Some(config) = object_server_config() {
+        tokio::spawn(async move {
+            if let Err(error) = ObjectServer::new(config).run().await {
+                error!(%error, "object_store_server_failed");
+            }
+        });
+    }
     let nan_socket_available =
         nan_autostart_enabled() && service.default_nan_control_socket_exists();
     let nan_started = if nan_socket_available {
@@ -49,10 +61,14 @@ async fn run_server() -> Result<()> {
     } else if nan_autostart_enabled() {
         debug!("nan_autostart_skipped_no_wpa_control_socket");
     }
-    if nan_started && ap_autostart_enabled() {
+    // The Recovery AP is useful even when NAN/WPA is unavailable.  Keep the
+    // coexistence guard only when NAN actually started; otherwise there is no
+    // second radio operation to conflict with the AP interface.
+    if ap_autostart_enabled() {
         let nan_iface = wifi_iface();
         let ap_iface = ap_iface();
-        if ap_can_coexist_with_nan(&nan_iface, &ap_iface) {
+        if !nan_started || ap_can_coexist_with_nan(&nan_iface, &ap_iface) {
+            configure_ap_network(&ap_iface);
             let result = service.start_default_open_ap(ap_iface);
             debug!(?result, "open_ap_autostarted");
         } else {
@@ -100,6 +116,32 @@ async fn run_server() -> Result<()> {
     Ok(())
 }
 
+fn object_server_config() -> Option<ServerConfig> {
+    // NAN object transfer is the active path. The legacy IP listener is
+    // retained only for explicit compatibility/dry-run comparisons.
+    let enabled = std::env::var("LMESH_OBJECT_SERVER_TCP")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(false);
+    let root = std::env::var_os("LMESH_OBJECT_STORE_ROOT");
+    if !enabled && root.is_none() {
+        return None;
+    }
+    Some(ServerConfig {
+        bind: std::env::var("LMESH_OBJECT_SERVER_BIND")
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        port: std::env::var("LMESH_OBJECT_SERVER_PORT")
+            .ok().and_then(|value| value.parse().ok()).unwrap_or(3337),
+        artifact_root: root.map(PathBuf::from).unwrap_or_else(|| {
+            std::env::var_os("DMESH_REPO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/ws/dmesh"))
+                .join("target/flash")
+        }),
+        archive_root: std::env::var_os("DMESH_FLASH_ARCHIVE_DIR").map(PathBuf::from),
+        ..ServerConfig::default()
+    })
+}
+
 fn announce_interval() -> Duration {
     let secs = std::env::var(ANNOUNCE_INTERVAL_ENV)
         .ok()
@@ -131,6 +173,31 @@ fn wifi_iface() -> String {
 
 fn ap_iface() -> String {
     std::env::var(AP_IFACE_ENV).unwrap_or_else(|_| DEFAULT_AP_IFACE.to_string())
+}
+
+fn configure_ap_network(iface: &str) {
+    let Some(address) = std::env::var_os(AP_ADDRESS_ENV) else {
+        return;
+    };
+    let address = address.to_string_lossy();
+    let mut address_cmd = Command::new("ip");
+    address_cmd.args(["addr", "replace", address.as_ref(), "dev", iface]);
+    match address_cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!(iface, address = %address, ?status, "ap_address_configuration_failed"),
+        Err(error) => warn!(iface, address = %address, %error, "ap_address_configuration_failed"),
+    }
+    let Some(network) = std::env::var_os(AP_NETWORK_ENV) else {
+        return;
+    };
+    let network = network.to_string_lossy();
+    let mut route_cmd = Command::new("ip");
+    route_cmd.args(["route", "replace", network.as_ref(), "dev", iface]);
+    match route_cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!(iface, network = %network, ?status, "ap_route_configuration_failed"),
+        Err(error) => warn!(iface, network = %network, %error, "ap_route_configuration_failed"),
+    }
 }
 
 fn ap_can_coexist_with_nan(nan_iface: &str, ap_iface: &str) -> bool {

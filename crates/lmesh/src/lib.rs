@@ -25,14 +25,60 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 use tracing::{debug, error, info, instrument, warn};
+use dmesh_object_store::protocol::{encode_envelope, PeerKey};
+use dmesh_transport::{ConnectionId, Frame, ShortHeader, StreamFrame};
 
 pub mod radio;
 pub mod radio_protocol;
+mod schema;
 
 const MULTICAST_PORT: u16 = 5227;
 const MULTICAST_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
 const MULTICAST_IPV6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
 const MAX_STORED_ANNOUNCES: usize = 16;
+const NAN_UDP_PORT: u16 = 15009;
+const NAN_UDP_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
+const NAN_UDP_HEADER_LEN: usize = 12;
+const NAN_UDP_FRAME_MAX: usize = 512;
+
+/// Build a bearer-independent NAN transfer trace. This is deliberately a
+/// dry-run: it exercises packet sizing and envelope overhead without opening
+/// TCP/UDP or touching a device.
+pub fn nan_object_dry_run(image_size: usize, mtu: usize) -> serde_json::Value {
+    let mtu = mtu.clamp(256, 2_304);
+    let block_size = mtu.saturating_sub(96).max(64);
+    let cid = ConnectionId::new(1).expect("constant CID");
+    let key = PeerKey { wifi_mac: [0x50, 0x6f, 0x9a, 0, 0, 1], dcid: cid };
+    let mut packet = vec![0u8; mtu];
+    let mut envelope = vec![0u8; mtu];
+    let mut offset = 0usize;
+    let mut packets = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut wire_bytes = 0usize;
+    while offset < image_size {
+        let len = block_size.min(image_size - offset);
+        let header = ShortHeader { flags: 0, dcid: cid, packet_number: packets as u32, packet_number_len: 2 };
+        let header_len = header.encode(&mut packet).unwrap_or(0);
+        let frame = Frame::Stream(StreamFrame { id: 0, offset: offset as u64, fin: offset + len == image_size, data: &vec![0u8; len] });
+        let frame_len = frame.encode(&mut packet[header_len..]).unwrap_or(0);
+        let wire_len = encode_envelope(key, 1, &packet[..header_len + frame_len], &mut envelope).unwrap_or(0);
+        if wire_len == 0 { break; }
+        packets += 1; payload_bytes += len; wire_bytes += wire_len; offset += len;
+    }
+    serde_json::json!({
+        "ok": offset == image_size,
+        "bearer": "nan-data",
+        "fallback": "nan-action-compatible",
+        "image_bytes": image_size,
+        "mtu": mtu,
+        "block_bytes": block_size,
+        "packets": packets,
+        "payload_bytes": payload_bytes,
+        "wire_bytes": wire_bytes,
+        "connection_key": "wifi_mac+dcid",
+        "ip_dependency": false,
+    })
+}
 
 /// Announcement message sent over multicast
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +240,19 @@ impl LocalDiscovery {
             debug!("mcast_none");
         }
 
+        match Self::setup_nan_udp_v4().await {
+            Ok(socket) => {
+                tokio::spawn(async move {
+                    if let Err(e) = Self::nan_udp_receive_loop(socket).await {
+                        error!(error = %e, "nan_udp_receive_loop_failed");
+                    }
+                });
+                info!(multicast_ip = %NAN_UDP_IPV4, multicast_port = NAN_UDP_PORT,
+                      "nan_udp_listener_started");
+            }
+            Err(e) => warn!(error = %e, "nan_udp_listener_unavailable"),
+        }
+
         // Start receiver tasks
         if let Some(socket) = &self.socket_v4 {
             let nodes = self.nodes.clone();
@@ -258,6 +317,61 @@ impl LocalDiscovery {
             .context("Failed to join IPv6 multicast group")?;
 
         Ok(socket)
+    }
+
+    async fn setup_nan_udp_v4() -> Result<UdpSocket> {
+        let socket = UdpSocket::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            NAN_UDP_PORT,
+        ))
+        .await
+        .context("Failed to bind NAN UDP socket")?;
+        socket
+            .join_multicast_v4(NAN_UDP_IPV4, Ipv4Addr::UNSPECIFIED)
+            .context("Failed to join NAN UDP multicast group")?;
+        Ok(socket)
+    }
+
+    async fn nan_udp_receive_loop(socket: UdpSocket) -> Result<()> {
+        let mut buf = [0u8; NAN_UDP_HEADER_LEN + NAN_UDP_FRAME_MAX];
+        loop {
+            let (len, addr) = socket
+                .recv_from(&mut buf)
+                .await
+                .context("Failed to receive NAN UDP packet")?;
+            if len < NAN_UDP_HEADER_LEN || buf[0] != b'R' || buf[1] != 1 || !matches!(buf[2], 1 | 2)
+            {
+                debug!(source = %addr, len, "nan_udp_packet_ignored");
+                continue;
+            }
+            let frame_len = u16::from_be_bytes([buf[10], buf[11]]) as usize;
+            if frame_len == 0
+                || frame_len > NAN_UDP_FRAME_MAX
+                || frame_len + NAN_UDP_HEADER_LEN != len
+            {
+                debug!(source = %addr, len, frame_len, "nan_udp_packet_invalid");
+                continue;
+            }
+            let origin = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]
+            );
+            info!(
+                target: "lmesh::nan_udp",
+                source = %addr,
+                origin = %origin,
+                kind = buf[2],
+                rssi_dbm = buf[3] as i8,
+                frame_len,
+                "nan_udp_rx"
+            );
+            debug!(
+                target: "lmesh::nan_udp",
+                source = %addr,
+                frame_prefix = ?&buf[NAN_UDP_HEADER_LEN..NAN_UDP_HEADER_LEN + frame_len.min(16)],
+                "nan_udp_frame_prefix"
+            );
+        }
     }
 
     /// Receive and process announcements
@@ -635,6 +749,12 @@ pub enum Request {
     /// List managed USB serial byte forwards.
     #[serde(rename = "usb.serial.forward.list")]
     UsbSerialForwardList,
+    /// Flush bytes queued for a sleepy/unknown firmware forward to UART.
+    #[serde(rename = "usb.serial.forward.flush")]
+    UsbSerialForwardFlush {
+        #[serde(default)]
+        port: Option<String>,
+    },
     /// Pulse RTS to reset a board through a USB-UART bridge (explicit recovery tool).
     #[serde(rename = "usb.serial.rst", alias = "usb.serial.reset")]
     UsbSerialReset {
@@ -676,6 +796,11 @@ pub enum Request {
         /// normal commands then avoid the gateway UART path.
         #[serde(default)]
         tcp: Option<String>,
+        /// Force one managed-forward request through immediately. This is a
+        /// diagnostic escape for a board already known to be awake; normal
+        /// callers must leave it unset so sleepy-node queueing is preserved.
+        #[serde(default)]
+        force_direct: Option<bool>,
     },
     /// Enter or leave the runtime-only ESP powered/transfer radio mode.
     #[serde(rename = "esp.active")]
@@ -821,6 +946,9 @@ pub enum Request {
         tx_variant: Option<String>,
         #[serde(default)]
         tx_duration_ms: Option<u32>,
+        /// Optional NAN cluster BSSID for data-frame experiments.
+        #[serde(default)]
+        bssid: Option<String>,
         payload: String,
     },
     /// Send a raw Wi-Fi DMesh status ping and collect replies.
@@ -838,6 +966,31 @@ pub enum Request {
         wait_ms: Option<u64>,
         #[serde(default)]
         nonce: Option<String>,
+    },
+    /// Start the host raw-NAN monitor backend, send one monitor frame, and return
+    /// shared NAN classification/filter evidence from captured frames.
+    #[serde(rename = "wifi.rawnan.ping")]
+    WifiRawNanPing {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        destination: Option<String>,
+        /// Explicit NAN cluster BSSID for a host monitor probe.
+        #[serde(default)]
+        bssid: Option<String>,
+        payload: String,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+    },
+    /// Size a NAN object transfer without opening an IP socket or touching a
+    /// device. The same envelope is used by data frames and action diagnostics.
+    #[serde(rename = "object.nan.dry_run")]
+    ObjectNanDryRun {
+        image_size: usize,
+        #[serde(default)]
+        mtu: Option<usize>,
     },
     /// Listen for DMesh Ethernet frames on the normal AP/STA netdev path.
     #[serde(rename = "wifi.data.listen")]
@@ -1232,6 +1385,9 @@ impl LmeshService {
             Request::UsbSerialForwardList => {
                 mesh::protocol::Response::ok_with_data(self.radio.serial_forward_list())
             }
+            Request::UsbSerialForwardFlush { port } => {
+                mesh::protocol::Response::ok_with_data(self.radio.serial_forward_flush(port))
+            }
             Request::UsbSerialReset { port } => {
                 mesh::protocol::Response::ok_with_data(self.radio.serial_modem_reset(port))
             }
@@ -1251,6 +1407,7 @@ impl LmeshService {
                 target,
                 active_ms,
                 tcp,
+                force_direct,
             } => {
                 let default_route = gateway
                     .is_none()
@@ -1268,8 +1425,13 @@ impl LmeshService {
                     self.radio
                         .esp_remote_command(gateway, target, command, timeout_sec, active_ms)
                 } else {
-                    self.radio
-                        .esp_serial_command(adapter, port, command, timeout_sec)
+                    self.radio.esp_serial_command_with_options(
+                        adapter,
+                        port,
+                        command,
+                        timeout_sec,
+                        force_direct.unwrap_or(false),
+                    )
                 })
             }
             Request::EspActive {
@@ -1374,6 +1536,7 @@ impl LmeshService {
                 source,
                 tx_variant,
                 tx_duration_ms,
+                bssid,
                 payload,
             } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_send(
                 iface,
@@ -1384,6 +1547,7 @@ impl LmeshService {
                 source,
                 tx_variant,
                 tx_duration_ms,
+                bssid,
                 payload,
             )),
             Request::WifiRawPing {
@@ -1396,6 +1560,24 @@ impl LmeshService {
             } => mesh::protocol::Response::ok_with_data(
                 self.radio
                     .wifi_raw_ping(iface, ctrl_dir, channel, listen_sec, wait_ms, nonce),
+            ),
+            Request::WifiRawNanPing {
+                iface,
+                channel,
+                destination,
+                bssid,
+                payload,
+                wait_ms,
+            } => mesh::protocol::Response::ok_with_data(self.radio.rawnan_ping(
+                iface,
+                channel,
+                destination,
+                bssid,
+                payload,
+                wait_ms,
+            )),
+            Request::ObjectNanDryRun { image_size, mtu } => mesh::protocol::Response::ok_with_data(
+                nan_object_dry_run(image_size, mtu.unwrap_or(1_200)),
             ),
             Request::WifiDataListen { iface, listen_sec } => {
                 mesh::protocol::Response::ok_with_data(
@@ -1623,6 +1805,16 @@ fn base64_url_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nan_object_dry_run_is_ip_free_and_sizes_frames() {
+        let result = super::nan_object_dry_run(10_000, 1_200);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["bearer"], "nan-data");
+        assert_eq!(result["ip_dependency"], false);
+        assert!(result["packets"].as_u64().unwrap() > 1);
+        assert!(result["wire_bytes"].as_u64().unwrap() >= 10_000);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

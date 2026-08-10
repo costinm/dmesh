@@ -26,7 +26,7 @@ rate, or minimum power.
 | Group cipher attr | WEP40 (`00-0f-ac:1`), matching hostapd's open-AP nl80211 call |
 | WPA/RSN attrs | not sent |
 | Probe response attr | not sent for the selected profile |
-| Extra IEs | extended capabilities `7f 08 04 00 00 00 00 00 00 40` |
+| Extra IEs | extended capabilities `7f 08 04 00 00 00 00 00 00 40`; WMM Parameter IE is included in the manual association response |
 | Socket lifetime | `NL80211_ATTR_SOCKET_OWNER`; lmesh keeps the owner socket alive |
 
 `wifi.ap.start_open` also registers AP SME management frame delivery for auth,
@@ -34,6 +34,20 @@ assoc, reassoc, disassoc, deauth, probe request, and selected action-frame
 categories. lmesh records received frames as `wifi.ap.mgmt` with parsed source,
 destination, BSSID, subtype, fixed fields, IEs, raw frame hex, and
 `rx_signal_dbm` when the driver reports it.
+
+The beacon and probe templates advertise WMM, and the manually generated
+association response now carries the matching WMM Parameter element. This is
+required for stations to report WMM/WME enabled; otherwise the AP advertises
+QoS but the station remains on the non-WMM data path.
+
+HT20 remains the default because it is the correct high-throughput behavior
+for normal stations. For a station whose driver/firmware has a broken HT
+aggregation or Block-ACK path, lmesh supports a targeted legacy association:
+set `LMESH_WIFI_AP_NO_HT_STATIONS` to a comma-separated list of station MAC
+addresses (for example `84:0d:8e:07:42:c4`). lmesh omits HT capabilities for
+those stations in both the association response and the nl80211 station entry;
+other stations keep HT20. This is a per-station workaround, not a global AP
+fallback.
 
 ## Raw Wi-Fi defaults
 
@@ -43,6 +57,11 @@ The custom raw-action transport is its unassociated bulk supplement during the
 same active window; the SDF payload length does not constrain custom raw-action
 payloads. Monitor mode remains reserved for explicit debug or raw 802.11
 data-frame experiments.
+
+Operational fallback: use the NAN SDF/follow-up action-frame path for device
+and host control traffic. The IPv6/UDP data-frame variants are diagnostic
+only until independent over-the-air delivery is proven; seeing a frame on the
+same Linux monitor interface is only AF_PACKET loopback evidence.
 
 | Setting | Current value |
 |---|---|

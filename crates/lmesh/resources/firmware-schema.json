@@ -1,0 +1,84 @@
+{
+  "version": 2,
+  "namespace": "dmesh.firmware",
+  "components": [
+    {"id": 1, "name": "main", "api": "fw/esp32/rust/docs/README.md"},
+    {"id": 2, "name": "recovery", "api": "fw/recovery/API.md"},
+    {"id": 3, "name": "stage2", "api": "fw/boot/API.md"},
+    {"id": 4, "name": "mod_lora", "api": "fw/mod_lora/API.md"}
+  ],
+  "events": [
+    {"id": 60000, "name": "boot.identity", "owner": "stage2/recovery/main"},
+    {"id": 60001, "name": "flash.complete", "owner": "recovery/main"},
+    {"id": 60002, "name": "flash.error", "owner": "recovery/main"}
+  ],
+  "methods": [
+    {"id": 0, "name": "event", "fields": [
+      {"id": 32, "name": "message", "kind": "text"}
+    ]},
+    {"id": 33, "name": "status"},
+    {"id": 34, "name": "xstatus"},
+    {"id": 35, "name": "stats"},
+    {"id": 36, "name": "logs"},
+    {"id": 37, "name": "messages"},
+    {"id": 38, "name": "local_messages"},
+    {"id": 39, "name": "test"},
+    {"id": 40, "name": "wifi"},
+    {"id": 41, "name": "nan"},
+    {"id": 42, "name": "ble"},
+    {"id": 43, "name": "lora", "kind": "service", "slot_count": 2},
+    {"id": 44, "name": "lorasend"},
+    {"id": 45, "name": "loralisten"},
+    {"id": 46, "name": "loradump"},
+    {"id": 47, "name": "loraprobe"},
+    {"id": 48, "name": "sleep"},
+    {"id": 49, "name": "mode"},
+    {"id": 50, "name": "power"},
+    {"id": 51, "name": "battery"},
+    {"id": 52, "name": "adcprobe"},
+    {"id": 53, "name": "namespace"},
+    {"id": 54, "name": "set"},
+    {"id": 55, "name": "get"},
+    {"id": 56, "name": "list"},
+    {"id": 57, "name": "rgbled"},
+    {"id": 58, "name": "gpio"},
+    {"id": 59, "name": "i2cconfig"},
+    {"id": 60, "name": "i2cprobe"},
+    {"id": 61, "name": "i2cdetect"},
+    {"id": 62, "name": "i2cget"},
+    {"id": 63, "name": "i2cset"},
+    {"id": 64, "name": "i2cdump"},
+    {"id": 65, "name": "button"},
+    {"id": 66, "name": "nvs"},
+    {"id": 67, "name": "radio"},
+    {"id": 68, "name": "recovery"},
+    {"id": 69, "name": "reset"},
+    {"id": 70, "name": "module"},
+    {"id": 71, "name": "hello"}
+  ],
+  "module_services": {
+    "tag_range": [43, 100],
+    "slot_size": 65536,
+    "slot_formula": "service_tag - 43",
+    "services": [
+      {"tag": 43, "name": "lora", "slot_count": 2},
+      {"tag": 45, "name": "hw", "slot_count": 1},
+      {"tag": 46, "name": "hello", "slot_count": 1}
+    ]
+  },
+  "messages": [
+    {"name": "event.boot.state", "format": "kv", "fields": [
+      {"name": "type", "kind": "string"},
+      {"name": "rebooted", "kind": "bool"},
+      {"name": "mode", "kind": "string"},
+      {"name": "active", "kind": "string"},
+      {"name": "infra_active", "kind": "bool"}
+    ]},
+    {"name": "event.mode.state", "format": "kv", "fields": [
+      {"name": "type", "kind": "string"},
+      {"name": "active", "kind": "string"},
+      {"name": "infra_active", "kind": "bool"},
+      {"name": "phase", "kind": "string"}
+    ]}
+  ]
+}

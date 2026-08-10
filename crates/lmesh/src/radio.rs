@@ -3,7 +3,7 @@ use mesh::message::{
     FIELD_CTRL_DIR, FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD,
     FIELD_RADIO_ID, FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec, TextRecord,
 };
-use minicbor::Encoder;
+use minicbor::{Decoder, Encoder, data::Type};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -18,16 +18,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::radio_protocol;
+use crate::schema::FirmwareSchema;
+use dmesh_rawnan::{Action as RawNanAction, NanState, RxFrame as RawNanRxFrame};
 
 const DEFAULT_WIFI_IFACE: &str = "wlan1";
+const DEFAULT_ESP_NAN_GATEWAY: &str = "lora1";
 const DEFAULT_WPA_CTRL_DIR: &str = "/run/mesh/wpa-supplicant-nan";
 const DEFAULT_WPA_SERVICE_NAME: &str = "dmesh";
 const DEFAULT_NAN_TTL_SECS: u32 = 3600;
+const DEFAULT_ESP_COMMAND_TIMEOUT_MS: u64 = 3_000;
+const ESP_SLEEPY_RENDEZVOUS_TIMEOUT_MS: u64 = 8_000;
 // Firmware raw-NAN peers normally wake every four seconds for a short window.
 // A 700 ms probe cadence walks that phase rather than repeatedly landing on a
 // fixed 250/500 ms boundary.
@@ -63,6 +68,13 @@ const RFC2217_SET_CONTROL: u8 = 5;
 const RFC2217_PURGE_DATA: u8 = 12;
 const SERIAL_FORWARD_MAX_PENDING: usize = 4 * 1024 * 1024;
 const SERIAL_FORWARD_IO_BUFFER_BYTES: usize = 16 * 1024;
+const SERIAL_LOG_FIELD_MAX: usize = 1800;
+// Local UDS control prefix; it is consumed by lmesh and never sent to the
+// firmware. It is retained for compatibility with older callers, but it must
+// not bypass the sleepy-device queue: a direct host UART write cannot wake a
+// NAN sleeper.
+const SERIAL_FORWARD_FORCE_DIRECT_PREFIX: &[u8] = b"\0DMESH-DIRECT\n";
+const SERIAL_RESET_NONE: u8 = 0;
 // Firmware keeps its normal console receptive during the first ten seconds
 // after a recovery reset.  The forward must use that documented window to
 // deliver queued framed commands even if the retained duty profile has its
@@ -77,11 +89,12 @@ const SERIAL_FORWARD_IO_BUFFER_BYTES: usize = 16 * 1024;
 const FIRMWARE_UART_FLAG: u8 = 0x7e;
 const FIRMWARE_UART_ESCAPE: u8 = 0x7d;
 const FIRMWARE_UART_ESCAPE_XOR: u8 = 0x20;
+const NAN_SLEEPY_START_TAG: u8 = 6;
+const DMESH_BOOT_METHOD_SELECT: u32 = 60010;
+// Host-side decoder compatibility for already deployed stage2 records. New
+// selectors and all new firmware images use the CBOR event above.
 const DMESH_BOOT_MAGIC: &[u8; 4] = b"DMB1";
 const DMESH_BOOT_VERSION: u8 = 1;
-const DMESH_BOOT_KIND_COMMAND: u8 = 2;
-const DMESH_BOOT_COMMAND_RECOVERY: u8 = 1;
-const DMESH_BOOT_COMMAND_LEN: usize = 8;
 const DMESH_BOOT_ROLE_STAGE2: u8 = 3;
 const DMESH_BOOT_PARTITION_BOOTLOADER: u8 = 0;
 // Reset requests are sampled between events. 100 ms keeps them responsive
@@ -120,6 +133,7 @@ const NL80211_ATTR_STA_FLAGS2: u16 = 67;
 const NL80211_ATTR_STA_LISTEN_INTERVAL: u16 = 18;
 const NL80211_ATTR_STA_SUPPORTED_RATES: u16 = 19;
 const NL80211_ATTR_STA_INFO: u16 = 21;
+const NL80211_ATTR_HT_CAPABILITY: u16 = 31;
 const NL80211_ATTR_BSS_BASIC_RATES: u16 = 36;
 const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
 const NL80211_ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
@@ -137,6 +151,9 @@ const NL80211_ATTR_OFFCHANNEL_TX_OK: u16 = 108;
 const NL80211_ATTR_HIDDEN_SSID: u16 = 126;
 const NL80211_ATTR_IE_PROBE_RESP: u16 = 127;
 const NL80211_ATTR_IE_ASSOC_RESP: u16 = 128;
+const NL80211_ATTR_STA_WME: u16 = 129;
+const NL80211_ATTR_STA_CAPABILITY: u16 = 171;
+const NL80211_ATTR_STA_EXT_CAPABILITY: u16 = 172;
 const NL80211_ATTR_TX_NO_CCK_RATE: u16 = 135;
 const NL80211_ATTR_DONT_WAIT_FOR_ACK: u16 = 142;
 const NL80211_ATTR_PROBE_RESP: u16 = 145;
@@ -155,20 +172,31 @@ const NL80211_STA_INFO_INACTIVE_TIME: u16 = 1;
 const NL80211_STA_INFO_RX_BYTES: u16 = 2;
 const NL80211_STA_INFO_TX_BYTES: u16 = 3;
 const NL80211_STA_INFO_SIGNAL: u16 = 7;
+const NL80211_STA_INFO_TX_BITRATE: u16 = 8;
 const NL80211_STA_INFO_RX_PACKETS: u16 = 9;
 const NL80211_STA_INFO_TX_PACKETS: u16 = 10;
 const NL80211_STA_INFO_TX_RETRIES: u16 = 11;
 const NL80211_STA_INFO_TX_FAILED: u16 = 12;
 const NL80211_STA_INFO_SIGNAL_AVG: u16 = 13;
+const NL80211_STA_INFO_RX_BITRATE: u16 = 14;
 const NL80211_STA_INFO_CONNECTED_TIME: u16 = 16;
+const NL80211_STA_INFO_STA_FLAGS: u16 = 17;
 const NL80211_STA_INFO_RX_BYTES64: u16 = 23;
 const NL80211_STA_INFO_TX_BYTES64: u16 = 24;
+const NL80211_RATE_INFO_BITRATE: u16 = 1;
+const NL80211_RATE_INFO_BITRATE32: u16 = 5;
 const NL80211_IFTYPE_STATION: u32 = 2;
 const NL80211_IFTYPE_AP: u32 = 3;
 const NL80211_STA_FLAG_AUTHORIZED: u32 = 1 << 1;
+const NL80211_STA_FLAG_SHORT_PREAMBLE: u32 = 1 << 2;
+const NL80211_STA_FLAG_WME: u32 = 1 << 3;
 const NL80211_STA_FLAG_AUTHENTICATED: u32 = 1 << 5;
 const NL80211_STA_FLAG_ASSOCIATED: u32 = 1 << 7;
 const NLM_F_DUMP: u16 = 0x300;
+// Netlink attributes reserve the high two type bits for NLA_F_NESTED and
+// NLA_F_NET_BYTEORDER.  Match the attribute number independently of those
+// flags; station/rate information is commonly nested.
+const NLA_TYPE_MASK: u16 = 0x3fff;
 const DMESH_ESPNOW_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
 const DMESH_ESPNOW_TYPE: u8 = 0x04;
 const DMESH_VENDOR_ACTION_LEN: usize = 9;
@@ -191,6 +219,10 @@ const IEEE80211_LLC_SNAP_DMESH: [u8; IEEE80211_LLC_SNAP_LEN] = [
     (ETH_P_DMESH >> 8) as u8,
     ETH_P_DMESH as u8,
 ];
+const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
+    [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x86, 0xdd];
+const NAN_UDP_SOURCE_PORT: u16 = 4242;
+const NAN_UDP_DEST_PORT: u16 = 4243;
 const AF_BLUETOOTH: libc::c_int = 31;
 const BTPROTO_HCI: libc::c_int = 1;
 const HCI_CHANNEL_RAW: u16 = 0;
@@ -213,15 +245,16 @@ pub struct RadioService {
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     radios: Arc<Vec<RadioAdapter>>,
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
+    rawnan_state: Arc<Mutex<NanState>>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     serial_forwards: Arc<Mutex<BTreeMap<String, SerialForwardRuntime>>>,
     /// Persistent TCP sessions initiated by Main after it joins STA.  These
     /// deliberately reverse the usual host->board direction: AP isolation
     /// commonly prevents the host from opening a connection to a station.
     esp_reverse_sessions: Arc<BTreeMap<String, ReverseMainRuntime>>,
-    /// Default infrastructure gateway for configured ESP targets.  A missing
-    /// explicit `gateway` on `esp.serial.command` is resolved here; callers
-    /// that pass an adapter explicitly retain the direct UART diagnostic path.
+    /// Default infrastructure gateway for configured ESP targets. A missing
+    /// explicit `gateway` on `esp.serial.command` is resolved here; all ESP
+    /// UART commands still require a managed forward.
     esp_gateway: String,
     esp_targets: Arc<BTreeMap<String, String>>,
     /// Approximate target idle deadlines for NAN-created raw-action sessions.
@@ -246,6 +279,7 @@ impl RadioService {
             history: Arc::new(Mutex::new(VecDeque::new())),
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
+            rawnan_state: Arc::new(Mutex::new(NanState::new(5_000_000))),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             serial_forwards: Arc::new(Mutex::new(BTreeMap::new())),
             esp_reverse_sessions: Arc::new(reverse_sessions),
@@ -413,9 +447,10 @@ impl RadioService {
             // One listener is enough for all configured boards on a port.
             // The first matching session owns it; all peers are checked
             // against the configured STA address before being accepted.
-            if !sessions.values().any(|other| {
-                other.id < session.id && other.port == session.port
-            }) {
+            if !sessions
+                .values()
+                .any(|other| other.id < session.id && other.port == session.port)
+            {
                 std::thread::spawn(move || {
                     if let Err(error) = reverse_main_accept_loop(session.port, sessions) {
                         tracing::warn!(port = session.port, error = %error, "reverse_main_listener_exited");
@@ -702,6 +737,11 @@ impl RadioService {
                             "socket": forward.socket_path,
                             "tcp_listen": forward.tcp_listen,
                             "baud": forward.baud,
+                            "firmware": forward
+                                .firmware_state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .snapshot(),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -736,14 +776,14 @@ impl RadioService {
         let profile = profile.unwrap_or_else(|| "generic".to_string());
         let timeout_ms = timeout_sec
             .map(|secs| (secs.max(0.05) * 1000.0).round() as u64)
-            .unwrap_or(1_500)
+            .unwrap_or(DEFAULT_ESP_COMMAND_TIMEOUT_MS)
             // Sleepy ESP nodes may expose UART only every Nth raw-NAN wake
             // (the lab default is every 16th four-second wake, about 64 s).
             // Keep the caller's bounded wait long enough to reach the next
             // authorized heartbeat instead of silently truncating it at the
             // old 30-second ceiling.
             .clamp(50, 300_000);
-        let Some(target) = resolve_usb_serial_target(port, baud) else {
+        let Some(target) = resolve_usb_serial_target(port.clone(), baud) else {
             return json!({
                 "ok": false,
                 "error": "missing USB serial target; pass port=USB0 or port=ACM0",
@@ -765,18 +805,54 @@ impl RadioService {
             command if command.starts_with("cmd:") => vec![command[4..].to_string()],
             _ => vec!["help".to_string()],
         };
+        // A configured managed forward is the only owner of the physical
+        // UART. Opening `path` here creates a second reader and can also
+        // disturb CP210x modem-line state while a boot log is in flight.
+        let forward_socket = port
+            .as_deref()
+            .and_then(|id| self.serial_forward_socket(id))
+            .or_else(|| {
+                self.serial_forwards
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .find(|forward| forward.port == path && !forward.stop.load(Ordering::Acquire))
+                    .map(|forward| forward.socket_path.clone())
+            });
+        let Some(forward_socket) = forward_socket else {
+            return json!({
+                "ok": false,
+                "radio_id": id,
+                "path": path,
+                "baud": baud,
+                "profile": profile,
+                "error": "serial handshake requires an active managed serial forward",
+            });
+        };
         let mut exchanges = Vec::new();
         let mut ok = true;
         for command in commands {
-            match serial_exchange_raw(&path, baud, &command, timeout_ms) {
-                Ok(exchange) => {
-                    for message in &exchange.messages {
+            let wire = if command.starts_with("STA ") {
+                encode_recovery_sta_packet(&command)
+            } else if let Some(text) = command.strip_prefix("STA_TEXT ") {
+                // Recovery control packets use the same compact method/payload
+                // envelope as Main; the physical UART never receives text.
+                encode_firmware_uart_payload(text.as_bytes())
+            } else {
+                let mut wire = command.as_bytes().to_vec();
+                wire.push(b'\n');
+                Ok(wire)
+            };
+            match wire.and_then(|wire| uds_raw_exchange(&forward_socket, &wire, timeout_ms)) {
+                Ok(raw) => {
+                    let messages = parse_raw_exchange_messages(&raw);
+                    for message in &messages {
                         self.record_message("usb.serial.handshake.rx", &id, message.clone());
                     }
                     exchanges.push(json!({
                         "command": command,
-                        "raw": exchange.raw_text,
-                        "messages": exchange.messages,
+                        "raw": raw,
+                        "messages": messages,
                     }));
                 }
                 Err(error) => {
@@ -818,7 +894,7 @@ impl RadioService {
         let Some(payload) = boot_command_payload(&command).ok() else {
             return json!({
                 "ok": false,
-                "error": format!("unsupported boot command {command:?}; expected recovery"),
+                "error": format!("unsupported boot command {command:?}; expected recovery or main"),
             });
         };
         let Some(target) = resolve_usb_serial_target(port.clone(), None) else {
@@ -834,10 +910,44 @@ impl RadioService {
             baud,
         } = target;
         if reset.unwrap_or(false) {
-            // ROM/stage2 and the minimal Recovery UART use the fixed boot
-            // baud, independent of a forward's configured application baud.
+            // Keep the managed forward as the only UART reader.  Resetting
+            // the bridge is a modem-line operation; the existing forward
+            // then reads, logs, and broadcasts the stage2 identity and this
+            // request/response client consumes the same managed stream.
+            let forward_socket = self.serial_forward_socket(&id);
+            let Some(forward_socket) = forward_socket else {
+                return json!({
+                    "ok": false,
+                    "radio_id": id,
+                    "path": path,
+                    "error": "stage2 reset requires an active managed serial forward",
+                });
+            };
             let boot_baud = 115_200;
-            let result = direct_reset_boot_exchange(&path, boot_baud, &payload, timeout_ms);
+            // Keep reset and selector on the descriptor owned by the managed
+            // forward.  Opening the tty a second time is unsafe with CP210x:
+            // closing that temporary descriptor can restore RTS and cancel
+            // the reset before stage2 observes the selector.
+            let result = connect_uds_boot(&forward_socket).and_then(|stream| {
+                let forwards = self
+                    .serial_forwards
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(forward) = forwards.get(&id) else {
+                    return Err(anyhow::anyhow!(
+                        "managed serial forward {id} disappeared before stage2 reset"
+                    ));
+                };
+                forward.stats.reset_requests.fetch_add(1, Ordering::Relaxed);
+                forward
+                    .reset_request
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                        Some(pending.saturating_add(1))
+                    })
+                    .map_err(|_| anyhow::anyhow!("failed to queue managed stage2 reset"))?;
+                drop(forwards);
+                uds_boot_exchange_stream(stream, &payload, timeout_ms)
+            });
             return match result {
                 Ok(hello) => {
                     let result = json!({
@@ -848,7 +958,7 @@ impl RadioService {
                         "command": command,
                         "reset": true,
                         "hello": boot_identity_json(&hello),
-                        "via": "direct_reset_same_uart",
+                        "via": "managed_forward_reset",
                     });
                     self.record("usb.serial.boot", result.clone());
                     result
@@ -860,7 +970,7 @@ impl RadioService {
                     "baud": boot_baud,
                     "command": command,
                     "reset": true,
-                    "via": "direct_reset_same_uart",
+                    "via": "managed_forward_reset",
                     "error": error.to_string(),
                 }),
             };
@@ -924,7 +1034,7 @@ impl RadioService {
         mut tcp_mode: Option<String>,
         handshake: Option<bool>,
         mut multi: Option<bool>,
-        mut direct: Option<bool>,
+        direct: Option<bool>,
     ) -> Value {
         let configured = port
             .as_deref()
@@ -939,9 +1049,12 @@ impl RadioService {
             tcp_port = tcp_port.or(configured.tcp_port);
             tcp_mode = tcp_mode.or_else(|| configured.tcp_mode.clone());
             multi = multi.or(configured.multi);
-            direct = direct.or(configured.direct);
         }
-        let direct_write = direct.unwrap_or(raw_output);
+        // Probe firmware forwards immediately.  Once the device reports
+        // infrastructure/active mode, client records are written directly;
+        // otherwise they wait for the device's UART heartbeat/window.  Raw
+        // byte forwards may still opt into immediate delivery explicitly.
+        let direct_write = raw_output || direct.unwrap_or(false);
         let multi = multi.unwrap_or(false);
         let tcp_mode = match SerialForwardTcpMode::parse(tcp_mode.as_deref().unwrap_or("auto")) {
             Ok(mode) => mode,
@@ -1051,12 +1164,18 @@ impl RadioService {
             None => (None, None),
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let reset_request = Arc::new(AtomicU8::new(SERIAL_RESET_NONE));
+        let flush_request = Arc::new(AtomicBool::new(false));
         let log_flash_quiet_until_ms = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(SerialForwardStats::default());
+        let firmware_state = Arc::new(Mutex::new(FirmwareState::default()));
         let log_path = configured_serial_log_path_for_forward(&id);
         let thread_stop = stop.clone();
+        let thread_reset_request = reset_request.clone();
+        let thread_flush_request = flush_request.clone();
         let thread_log_flash_quiet_until_ms = log_flash_quiet_until_ms.clone();
         let thread_stats = stats.clone();
+        let thread_firmware_state = firmware_state.clone();
         let thread_id = id.clone();
         let thread_path = path.clone();
         let thread_socket_path = socket_path.clone();
@@ -1074,10 +1193,13 @@ impl RadioService {
                 tcp_mode,
                 multi,
                 raw_output,
+                thread_reset_request,
+                thread_flush_request,
                 direct_write,
                 thread_log_flash_quiet_until_ms,
                 thread_stop,
                 thread_stats,
+                thread_firmware_state,
                 thread_log_path,
                 thread_log,
             ) {
@@ -1100,8 +1222,11 @@ impl RadioService {
             log_path: log_path.clone(),
             baud,
             multi,
+            reset_request,
+            flush_request,
             stop,
             stats,
+            firmware_state,
             handle: Some(handle),
             started_ms: now_millis_u64(),
         };
@@ -1186,6 +1311,11 @@ impl RadioService {
                     "log_path": forward.log_path,
                     "started_ms": forward.started_ms,
                     "running": !forward.stop.load(Ordering::Acquire),
+                    "firmware": forward
+                        .firmware_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .snapshot(),
                     "stats": forward.stats.snapshot(),
                 })
             })
@@ -1193,32 +1323,79 @@ impl RadioService {
         json!({ "ok": true, "forwards": forwards })
     }
 
-    /// Reset an explicitly requested ESP USB bridge. ESP auto-reset bridges
-    /// use DTR=high (GPIO0 released) followed by an RTS low/high pulse on EN;
-    /// doing the sequence here avoids the unreliable line state inherited
-    /// from a previous client. The managed forward remains active so it
-    /// continues to retain serial evidence during this explicit test action.
+    /// Request a one-shot flush of bytes queued for a sleepy/unknown forward.
+    /// This does not change mode policy or touch modem lines.
+    pub fn serial_forward_flush(&self, port: Option<String>) -> Value {
+        let Some(key) = port
+            .as_deref()
+            .or(Some("USB0"))
+            .and_then(canonical_usb_port_id)
+        else {
+            return json!({"ok": false, "error": "missing USB serial target; pass port=e5 or configure lmesh"});
+        };
+        let forwards = self
+            .serial_forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(forward) = forwards.get(&key) else {
+            return json!({"ok": false, "id": key, "error": "serial forward not found"});
+        };
+        forward.flush_request.store(true, Ordering::Release);
+        json!({
+            "ok": true,
+            "id": forward.id,
+            "socket": forward.socket_path,
+            "queued": "flush_requested",
+            "via": "managed_forward",
+        })
+    }
+
+    /// Reset an explicitly requested ESP through the descriptor owned by its
+    /// managed forward. This is important for CP210x devices: a second open
+    /// can restore modem lines as soon as it closes, cancelling the reset.
     pub fn serial_modem_reset(&self, port: Option<String>) -> Value {
         let Some(id) = port.clone() else {
             return json!({"ok": false, "error": "missing USB serial target"});
         };
-        let dtr = self.serial_modem_line(Some(id.clone()), libc::TIOCM_DTR, Some(true), 100);
-        if dtr.get("ok").and_then(Value::as_bool) != Some(true) {
-            return dtr;
-        }
-        let rts = self.serial_modem_line(Some(id.clone()), libc::TIOCM_RTS, None, 100);
-        let _ = self.serial_modem_line(Some(id), libc::TIOCM_DTR, Some(false), 100);
-        rts
+        let forwards = self
+            .serial_forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(forward) = forwards.get(&id) else {
+            return json!({"ok": false, "id": id, "error": "RTS reset requires an active managed serial forward"});
+        };
+        forward.stats.reset_requests.fetch_add(1, Ordering::Relaxed);
+        let _ =
+            forward
+                .reset_request
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    Some(pending.saturating_add(1))
+                });
+        json!({
+            "ok": true,
+            "id": id,
+            "path": forward.port,
+            "line": "RTS",
+            "asserted": false,
+            "pulse_ms": 120,
+            "via": "active_forward",
+        })
     }
 
-    /// Set or pulse DTR for recovery-hardware experiments. Normal diagnostics
-    /// never call this operation; esptool remains the supported flash path.
+    /// Release DTR if an external tty opener left it asserted.
+    /// Assertion and pulse operations are deliberately disabled.
     pub fn serial_modem_dtr(
         &self,
         port: Option<String>,
         asserted: Option<bool>,
         pulse_ms: Option<u64>,
     ) -> Value {
+        if asserted != Some(false) {
+            return json!({
+                "ok": false,
+                "error": "DTR assertion is disabled; only asserted=false release is permitted"
+            });
+        }
         self.serial_modem_line(port, libc::TIOCM_DTR, asserted, pulse_ms.unwrap_or(100))
     }
 
@@ -1241,27 +1418,27 @@ impl RadioService {
                 .write(true)
                 .custom_flags(libc::O_NOCTTY)
                 .open(&path)?;
-            let mut bits: libc::c_int = 0;
-            if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCMGET, &mut bits) } < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let set = |value: bool, bits: &mut libc::c_int| -> Result<()> {
-                if value {
-                    *bits |= line;
+            let set = |value: bool| -> Result<()> {
+                let mut mask = line;
+                let request = if value {
+                    libc::TIOCMBIS
                 } else {
-                    *bits &= !line;
-                }
-                if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCMSET, bits) } < 0 {
+                    libc::TIOCMBIC
+                };
+                if unsafe { libc::ioctl(fd.as_raw_fd(), request, &mut mask) } < 0 {
                     return Err(std::io::Error::last_os_error().into());
                 }
                 Ok(())
             };
             if let Some(value) = asserted {
-                set(value, &mut bits)?;
+                set(value)?;
             } else {
-                set(false, &mut bits)?;
+                // USB-UART bridges used by ESP boards drive GPIO0 low when
+                // DTR is asserted. Keep that level long enough for the
+                // light-sleep GPIO wake detector to observe it.
+                set(true)?;
                 std::thread::sleep(std::time::Duration::from_millis(pulse_ms));
-                set(true, &mut bits)?;
+                set(false)?;
             }
             Ok(
                 json!({"ok": true, "id": id, "path": path, "line": if line == libc::TIOCM_RTS {"RTS"} else {"DTR"}, "asserted": asserted.unwrap_or(true), "pulse_ms": pulse_ms}),
@@ -1490,6 +1667,7 @@ impl RadioService {
                 None,
                 Some("dont_wait_ack".to_string()),
                 None,
+                None,
                 payload.clone(),
             ),
             "lora" => self.esp_lora_send(payload.clone(), destination.clone()),
@@ -1596,6 +1774,7 @@ impl RadioService {
                 });
             }
         };
+        self.stop_ap_runtime(&iface);
         let mac = iface_mac(&iface).unwrap_or([0; 6]);
         let template_lengths = open_ap_template_lengths(&ssid)
             .map(|(beacon_head, probe_resp)| {
@@ -1682,8 +1861,17 @@ impl RadioService {
                 }
                 let mgmt_iface = iface.clone();
                 let history = self.history.clone();
-                std::thread::spawn(move || {
-                    ap_mgmt_receive_loop(mgmt_socket, &mgmt_iface, ifindex, mac, history);
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_for_thread = stop.clone();
+                let join = std::thread::spawn(move || {
+                    ap_mgmt_receive_loop(
+                        mgmt_socket,
+                        &mgmt_iface,
+                        ifindex,
+                        mac,
+                        history,
+                        stop_for_thread,
+                    );
                 });
                 self.wifi_ap_handles
                     .lock()
@@ -1692,6 +1880,8 @@ impl RadioService {
                         iface.clone(),
                         ApRuntime {
                             _owner_socket: socket,
+                            stop,
+                            join: Some(join),
                         },
                     );
                 Ok(())
@@ -1742,10 +1932,7 @@ impl RadioService {
     /// Stop AP operation on an interface.
     pub fn wifi_ap_stop(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
-        self.wifi_ap_handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&iface);
+        self.stop_ap_runtime(&iface);
         let result = ifindex(&iface)
             .and_then(|ifindex| {
                 let socket = Nl80211Socket::open()?;
@@ -1801,6 +1988,21 @@ impl RadioService {
             });
         self.record("wifi.ap.stop", result.clone());
         result
+    }
+
+    fn stop_ap_runtime(&self, iface: &str) {
+        let runtime = self
+            .wifi_ap_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(iface);
+        let Some(mut runtime) = runtime else {
+            return;
+        };
+        runtime.stop.store(true, Ordering::Release);
+        if let Some(join) = runtime.join.take() {
+            let _ = join.join();
+        }
     }
 
     /// Return basic AP defaults and station metrics where available.
@@ -2259,8 +2461,15 @@ impl RadioService {
                 let iface_for_thread = iface.clone();
                 let monitor_for_thread = monitor_iface.clone();
                 let listener_key_for_thread = listener_key.clone();
+                let rawnan_state = self.rawnan_state.clone();
                 std::thread::spawn(move || {
-                    monitor_receive_loop(socket, &iface_for_thread, &monitor_for_thread, history);
+                    monitor_receive_loop(
+                        socket,
+                        &iface_for_thread,
+                        &monitor_for_thread,
+                        history,
+                        rawnan_state,
+                    );
                     listeners
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2355,6 +2564,7 @@ impl RadioService {
         source: Option<String>,
         tx_variant: Option<String>,
         tx_duration_ms: Option<u32>,
+        bssid: Option<String>,
         payload: String,
     ) -> Value {
         let iface = wifi_iface(iface);
@@ -2397,20 +2607,48 @@ impl RadioService {
                 });
             }
         };
+        let payload_bytes = payload
+            .strip_prefix("hex:")
+            .and_then(|hex| decode_firmware_hex(hex).ok())
+            .unwrap_or_else(|| payload.as_bytes().to_vec());
+        let nan_bssid = bssid
+            .as_deref()
+            .and_then(|value| parse_mac(Some(value)))
+            .or_else(|| self
+            .rawnan_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cluster()
+            .map(|mac| mac.0))
+            .or(Some(destination))
+            .unwrap_or(destination);
         let frame = if tx_options.variant == "multicast_data"
             || tx_options.variant == "multicast_data_active"
         {
-            build_dmesh_multicast_data_frame(destination, source, payload.as_bytes())
+            build_dmesh_multicast_data_frame(destination, source, &payload_bytes)
         } else if tx_options.variant == "sta_multicast_llc"
             || tx_options.variant == "sta_multicast_llc_active"
         {
-            build_dmesh_sta_multicast_llc_frame(destination, source, payload.as_bytes())
+            build_dmesh_sta_multicast_llc_frame(destination, source, &payload_bytes)
         } else if tx_options.variant == "sta_direct_llc"
             || tx_options.variant == "sta_direct_llc_active"
         {
-            build_dmesh_sta_direct_llc_frame(destination, source, payload.as_bytes())
+            build_dmesh_sta_direct_llc_frame(destination, source, &payload_bytes)
+        } else if tx_options.variant == "nan_data"
+            || tx_options.variant == "nan_data_active"
+        {
+            build_dmesh_nan_data_frame(nan_bssid, destination, source, &payload_bytes)
         } else {
-            build_dmesh_vendor_action_frame(destination, source, payload.as_bytes())
+            // Raw NAN action traffic must carry the discovered cluster BSSID
+            // in address3. Using the peer MAC here works only before the
+            // device arms its hardware cluster filter, and silently drops
+            // host-originated transport packets afterwards.
+            build_dmesh_vendor_action_frame_with_bssid(
+                destination,
+                source,
+                nan_bssid,
+                &payload_bytes,
+            )
         };
         let result = if tx_options.variant == "monitor"
             || tx_options.variant == "monitor_active"
@@ -2420,11 +2658,14 @@ impl RadioService {
             || tx_options.variant == "sta_multicast_llc_active"
             || tx_options.variant == "sta_direct_llc"
             || tx_options.variant == "sta_direct_llc_active"
+            || tx_options.variant == "nan_data"
+            || tx_options.variant == "nan_data_active"
         {
             let active = tx_options.variant == "monitor_active"
                 || tx_options.variant == "multicast_data_active"
                 || tx_options.variant == "sta_multicast_llc_active"
-                || tx_options.variant == "sta_direct_llc_active";
+                || tx_options.variant == "sta_direct_llc_active"
+                || tx_options.variant == "nan_data_active";
             match send_monitor_frame(&iface, channel, &frame, active) {
                 Ok(monitor) => json!({
                     "ok": true,
@@ -2440,9 +2681,10 @@ impl RadioService {
                     "wpa_channel": wpa_channel,
                     "destination": colon_mac(&destination),
                     "destination_mode": destination_mode,
+                    "bssid": colon_mac(&nan_bssid),
                     "source": colon_mac(&source),
                     "source_mode": raw_wifi_source_mode(source_input),
-                    "payload_len": payload.len(),
+                    "payload_len": payload_bytes.len(),
                     "frame_len": frame.len(),
                 }),
                 Err(error) => json!({
@@ -2483,9 +2725,10 @@ impl RadioService {
                     "wpa_channel": wpa_channel,
                     "destination": colon_mac(&destination),
                     "destination_mode": destination_mode,
+                    "bssid": colon_mac(&nan_bssid),
                     "source": colon_mac(&source),
                     "source_mode": raw_wifi_source_mode(source_input),
-                    "payload_len": payload.len(),
+                    "payload_len": payload_bytes.len(),
                     "frame_len": frame.len(),
                 }),
                 Err(error) => json!({
@@ -2505,7 +2748,7 @@ impl RadioService {
                 .field(FIELD_MEDIUM, "wifi")
                 .field(FIELD_IFACE, &iface)
                 .field(mesh::message::FIELD_PEER, colon_mac(&destination))
-                .field(FIELD_LEN, payload.len())
+                .field(FIELD_LEN, payload_bytes.len())
                 .field(FIELD_PAYLOAD, payload),
         );
         self.record("wifi.raw.tx", result.clone());
@@ -2546,6 +2789,7 @@ impl RadioService {
             None,
             Some("dont_wait_ack".to_string()),
             None,
+            None,
             payload.clone(),
         );
         std::thread::sleep(Duration::from_millis(wait_ms));
@@ -2565,6 +2809,131 @@ impl RadioService {
             "replies": replies,
         });
         self.record("wifi.raw.ping", result.clone());
+        result
+    }
+
+    /// Host raw-NAN smoke path. This deliberately uses the existing
+    /// monitor TX/RX transport but runs every received frame through the
+    /// shared no_std NAN state machine, so host behavior is observable before
+    /// the ESP DMOD adapter is enabled.
+    pub fn rawnan_ping(
+        &self,
+        iface: Option<String>,
+        channel: Option<u8>,
+        destination: Option<String>,
+        bssid: Option<String>,
+        payload: String,
+        wait_ms: Option<u64>,
+    ) -> Value {
+        let iface_value = wifi_iface(iface);
+        let channel_value = raw_wifi_channel(channel);
+        let wait_ms = wait_ms.unwrap_or(1_000).clamp(50, 10_000);
+        let listen = self.wifi_raw_listen(
+            Some(iface_value.clone()),
+            None,
+            Some(channel_value),
+            Some((wait_ms / 1_000 + 3).max(3)),
+            Some("monitor".to_string()),
+        );
+        let sent_at = now_millis_u64();
+        let destination_bytes = raw_wifi_destination(destination.as_deref(), "monitor");
+        let target = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            destination_bytes[2],
+            destination_bytes[3],
+            destination_bytes[4],
+            destination_bytes[5]
+        );
+        let payload_bytes = if payload.eq_ignore_ascii_case("ping") {
+            firmware_targeted_command_cbor_with_timeout(
+                "ping",
+                &target,
+                Some(wait_ms.min(u32::MAX as u64) as u32),
+            )
+            .unwrap_or_else(|_| payload.as_bytes().to_vec())
+        } else if let Some(hex) = payload.strip_prefix("hex:") {
+            decode_firmware_hex(hex).unwrap_or_else(|_| payload.as_bytes().to_vec())
+        } else {
+            payload.as_bytes().to_vec()
+        };
+        let bssid = bssid
+            .as_deref()
+            .and_then(|value| parse_mac(Some(value)))
+            .or_else(|| {
+                self.rawnan_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .cluster()
+                    .map(|mac| mac.0)
+            })
+            .unwrap_or(destination_bytes);
+        let tx = match raw_wifi_source(None, &iface_value)
+            .map(|source| {
+                build_dmesh_vendor_action_frame_with_bssid(
+                    destination_bytes,
+                    source,
+                    bssid,
+                    &payload_bytes,
+                )
+            })
+            .and_then(|frame| {
+                prepare_raw_wifi_channel(&iface_value, DEFAULT_WPA_CTRL_DIR, channel_value, 3);
+                send_monitor_frame(&iface_value, channel_value, &frame, false)
+            }) {
+            Ok(value) => json!({
+                "ok": true,
+                "backend": "linux_af_packet_monitor",
+                "tx_variant": "monitor",
+                "iface": iface_value,
+                "channel": channel_value,
+                "payload_len": payload_bytes.len(),
+                "frame_len": value.get("packet_len").cloned().unwrap_or_else(|| json!(0)),
+                "monitor": value,
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "backend": "linux_af_packet_monitor",
+                "tx_variant": "monitor",
+                "iface": iface_value,
+                "channel": channel_value,
+                "payload_len": payload_bytes.len(),
+                "error": format!("{error:#}"),
+            }),
+        };
+        std::thread::sleep(Duration::from_millis(wait_ms));
+        let events = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|event| event.key == "wifi.raw.rx" && event.ts_millis >= u128::from(sent_at))
+            .map(|event| event.value.clone())
+            .collect::<Vec<_>>();
+        let state = self
+            .rawnan_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cluster = state.cluster().map(|mac| colon_mac(&mac.0));
+        let rx_count = events.len();
+        let result = json!({
+            "ok": tx.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "backend": "rawnan_host",
+            "iface": iface_value,
+            "channel": channel_value,
+            "payload_len": payload_bytes.len(),
+            "payload_mode": if payload.eq_ignore_ascii_case("ping") { "generated_cbor" } else if payload.starts_with("hex:") { "hex" } else { "text" },
+            "listen": listen,
+            "tx": tx,
+            "wait_ms": wait_ms,
+            "rx_events": events,
+            "rx_count": rx_count,
+            "filter_mode": match state.mode() {
+                dmesh_rawnan::FilterMode::Discovery => "discovery",
+                dmesh_rawnan::FilterMode::Cluster => "cluster_a3",
+            },
+            "cluster_bssid": cluster,
+        });
+        self.record("wifi.rawnan.ping", result.clone());
         result
     }
 
@@ -2659,16 +3028,29 @@ impl RadioService {
             .field("radio_id", &radio.id)
             .field("network", radio.network.as_deref().unwrap_or("default"))
             .format();
-        match serial_exchange(path, radio.baud.unwrap_or(460_800), &command, 250) {
-            Ok(messages) => {
-                for message in &messages {
-                    self.record_message("esp-serial.rx", &radio.id, message.clone());
-                }
+        let socket_path = self
+            .serial_forwards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .find(|forward| forward.port == path && !forward.stop.load(Ordering::Acquire))
+            .map(|forward| forward.socket_path.clone());
+        let Some(socket_path) = socket_path else {
+            return json!({
+                "radio_id": radio.id,
+                "path": path,
+                "ok": false,
+                "error": "serial ping requires an active managed serial forward",
+            });
+        };
+        match uds_console_exchange(&socket_path, &command, 250) {
+            Ok(output) => {
                 json!({
                     "radio_id": radio.id,
                     "path": path,
                     "ok": true,
-                    "replies": messages,
+                    "via": "managed_forward",
+                    "replies": [{"console": output}],
                 })
             }
             Err(error) => json!({
@@ -2688,15 +3070,28 @@ impl RadioService {
         command: String,
         timeout_sec: Option<f64>,
     ) -> Value {
+        self.esp_serial_command_with_options(adapter, port, command, timeout_sec, false)
+    }
+
+    /// Run one command against an ESP firmware serial adapter with an
+    /// optional per-client direct-delivery override. The override is only for
+    /// a caller that has independently established that the board is awake;
+    /// it must not change the forward's default sleepy-node policy.
+    pub fn esp_serial_command_with_options(
+        &self,
+        adapter: Option<String>,
+        port: Option<String>,
+        command: String,
+        timeout_sec: Option<f64>,
+        force_direct: bool,
+    ) -> Value {
         let timeout_ms = timeout_sec
             .map(|secs| (secs.max(0.05) * 1000.0).round() as u64)
-            .unwrap_or(1_500)
+            .unwrap_or(DEFAULT_ESP_COMMAND_TIMEOUT_MS)
             // A battery node may open UART only every sixteenth 4-second
             // raw-NAN wake (~64 s). Do not silently truncate a caller's
             // bounded wait below that rendezvous interval.
             .clamp(50, 300_000);
-        let explicit_adapter = adapter.is_some();
-        let requested_port = port.is_some();
         let target = self.esp_serial_target(adapter, port.clone());
         let Some((radio_id, path, baud)) = target else {
             return json!({
@@ -2716,7 +3111,12 @@ impl RadioService {
                     .map(|forward| forward.socket_path.clone())
             });
         if let Some(socket_path) = forward_socket {
-            return match uds_console_exchange(&socket_path, &command, timeout_ms) {
+            return match uds_console_exchange_with_options(
+                &socket_path,
+                &command,
+                timeout_ms,
+                force_direct,
+            ) {
                 Ok(output) => {
                     let result = json!({
                         "ok": true,
@@ -2741,41 +3141,14 @@ impl RadioService {
                 }),
             };
         }
-        if !explicit_adapter && requested_port {
-            return json!({
-                "ok": false,
-                "radio_id": radio_id,
-                "path": path,
-                "baud": baud,
-                "command": command,
-                "error": "managed lmesh forward unavailable; pass adapter for explicit UART diagnostics",
-            });
-        }
-        match serial_exchange(&path, baud, &command, timeout_ms) {
-            Ok(messages) => {
-                for message in &messages {
-                    self.record_message("esp.serial.rx", &radio_id, message.clone());
-                }
-                let result = json!({
-                    "ok": true,
-                    "radio_id": radio_id,
-                    "path": path,
-                    "baud": baud,
-                    "command": command,
-                    "messages": messages,
-                });
-                self.record("esp.serial.command", result.clone());
-                result
-            }
-            Err(error) => json!({
-                "ok": false,
-                "radio_id": radio_id,
-                "path": path,
-                "baud": baud,
-                "command": command,
-                "error": error.to_string(),
-            }),
-        }
+        json!({
+            "ok": false,
+            "radio_id": radio_id,
+            "path": path,
+            "baud": baud,
+            "command": command,
+            "error": "physical UART access is disabled; use an active managed serial forward",
+        })
     }
 
     /// Send an existing compact-CBOR firmware command over Main's temporary
@@ -2839,7 +3212,7 @@ impl RadioService {
         };
         let timeout_ms = timeout_sec
             .map(|secs| (secs.max(0.05) * 1000.0).round() as u64)
-            .unwrap_or(70_000)
+            .unwrap_or(DEFAULT_ESP_COMMAND_TIMEOUT_MS)
             .clamp(1_000, 300_000);
         let request_id = REMOTE_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let payload = match firmware_targeted_command_cbor_with_metadata(
@@ -2857,14 +3230,27 @@ impl RadioService {
         // bounded "I want to talk" window so subsequent exchange can use the
         // session-oriented bearer instead of relying on one sparse DW.
         const NAN_SHORT_PAYLOAD_MAX: usize = 96;
-        let session_active = self.esp_sessions.lock().ok().is_some_and(|mut sessions| {
+        if let Ok(mut sessions) = self.esp_sessions.lock() {
             sessions.retain(|_, deadline| *deadline > Instant::now());
-            sessions.get(&target).is_some_and(|deadline| *deadline > Instant::now())
-        });
-        // A wake is a short, serverless lease. Later commands refresh it over
-        // raw action; an expired lease requires a fresh NAN rendezvous.
-        let requested_active_ms = (!session_active)
-            .then(|| requested_active_ms.unwrap_or(if payload.len() > NAN_SHORT_PAYLOAD_MAX { 8_000 } else { 5_000 }));
+        }
+        // Every queued command starts with an explicit targeted wake packet.
+        // Do not rely on a previously observed lease: the command may be
+        // sitting behind a missed DW, and the target must have at least one
+        // complete UART exchange window before the payload is sent.
+        let requested_active_ms = Some(
+            requested_active_ms
+                // A rebooted sleepy target is still completing Main startup
+                // while the first NAN wake is being scheduled. Keep the
+                // target lease at least as long as Main's startup hold so the
+                // first real command can arrive after boot, not just the
+                // wake handshake.
+                .unwrap_or(if payload.len() > NAN_SHORT_PAYLOAD_MAX {
+                    10_000
+                } else {
+                    10_000
+                })
+                .max(4_000),
+        );
         let active_payload_hex = requested_active_ms.and_then(|requested_ms| {
             firmware_targeted_active_window_cbor(&target, requested_ms.clamp(4_000, 300_000))
                 .ok()
@@ -2896,7 +3282,10 @@ impl RadioService {
         };
         if let Some(window_ms) = requested_active_ms {
             if let Ok(mut sessions) = self.esp_sessions.lock() {
-                sessions.insert(target.clone(), Instant::now() + Duration::from_millis(u64::from(window_ms)));
+                sessions.insert(
+                    target.clone(),
+                    Instant::now() + Duration::from_millis(u64::from(window_ms)),
+                );
             }
         }
 
@@ -2961,7 +3350,10 @@ impl RadioService {
                 "wifi raw_action_hex=hex:{} dst={destination}",
                 hex_lower(&payload)
             );
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            let command_sent_at = Instant::now();
+            let deadline = command_sent_at
+                + Duration::from_millis(ESP_SLEEPY_RENDEZVOUS_TIMEOUT_MS)
+                + Duration::from_millis(timeout_ms);
             let mut next_send = Instant::now();
             let mut last_history = Value::Null;
             while Instant::now() < deadline {
@@ -2990,27 +3382,25 @@ impl RadioService {
                 } else {
                     raw_response_history_entries(&history, Some(&target))
                 };
-                if entries
-                    .iter()
-                    .any(|(_, payload)| is_session_end(payload))
-                {
+                if entries.iter().any(|(_, payload)| is_session_end(payload)) {
                     if let Ok(mut sessions) = self.esp_sessions.lock() {
                         sessions.remove(&target);
                     }
                 }
-                if let Some((_, response_hex)) =
-                    entries
-                        .into_iter()
-                        .find(|(entry, payload)| {
-                            !baseline_entries.iter().any(|known| known.0 == *entry)
-                                && response_request_id(payload) == Some(request_id)
-                        })
-                {
+                if let Some((_, response_hex)) = entries.into_iter().find(|(entry, payload)| {
+                    !baseline_entries.iter().any(|known| known.0 == *entry)
+                        && response_request_id(payload) == Some(request_id)
+                }) {
                     if let Ok(mut sessions) = self.esp_sessions.lock() {
-                        sessions.insert(target.clone(), Instant::now() + Duration::from_millis(5_000));
+                        sessions.insert(
+                            target.clone(),
+                            Instant::now() + Duration::from_millis(5_000),
+                        );
                     }
                     return json!({"ok": true, "gateway": gateway, "target": target, "command": command,
-                        "response_hex": response_hex, "response_kind": "raw_action", "active": active_result});
+                        "response_hex": response_hex, "response_kind": "raw_action", "active": active_result,
+                        "request_id": request_id,
+                        "response_latency_ms": command_sent_at.elapsed().as_millis()});
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -3049,7 +3439,10 @@ impl RadioService {
             });
         }
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let command_sent_at = Instant::now();
+        let deadline = command_sent_at
+            + Duration::from_millis(ESP_SLEEPY_RENDEZVOUS_TIMEOUT_MS)
+            + Duration::from_millis(timeout_ms);
         let wait_for_ping_pong = command.trim().eq_ignore_ascii_case("ping")
             || command.trim().eq_ignore_ascii_case("mode ping=true");
         let pong_deadline = Instant::now() + Duration::from_millis(timeout_ms.min(5_000));
@@ -3107,6 +3500,8 @@ impl RadioService {
                         "command": command,
                         "response_hex": response_hex,
                         "response_kind": "pong",
+                        "request_id": request_id,
+                        "response_latency_ms": command_sent_at.elapsed().as_millis(),
                         "active": active_result,
                         "queued": queued,
                     });
@@ -3130,6 +3525,8 @@ impl RadioService {
                         "command": command,
                         "response_hex": response_hex,
                         "response_kind": "ack",
+                        "request_id": request_id,
+                        "response_latency_ms": command_sent_at.elapsed().as_millis(),
                         "active": active_result,
                         "queued": queued,
                     });
@@ -3160,6 +3557,8 @@ impl RadioService {
                 "command": command,
                 "response_hex": response_hex,
                 "response_kind": "ack",
+                "request_id": request_id,
+                "response_latency_ms": command_sent_at.elapsed().as_millis(),
                 "active": active_result,
                 "queued": queued,
             });
@@ -3198,36 +3597,30 @@ impl RadioService {
                     "error": "gateway delivery requires target as 8-hex suffix or MAC",
                 });
             };
-            let command = if enabled { "active" } else { "idle" };
-            let payload = match if enabled {
-                if let Some(window_ms) = active_ms {
-                    firmware_targeted_active_window_cbor(&target, window_ms)
-                } else {
-                    firmware_targeted_command_cbor(command, &target)
-                }
+            let command = if enabled {
+                active_ms
+                    .map(|window_ms| format!("mode active_ms={}", window_ms.clamp(1_000, 300_000)))
+                    .unwrap_or_else(|| "active".to_string())
             } else {
-                firmware_targeted_command_cbor(command, &target)
-            } {
-                Ok(payload) => payload,
-                Err(error) => return json!({"ok": false, "error": error.to_string()}),
+                "idle".to_string()
             };
-            let payload_hex = hex_lower(&payload);
-            let result = self.esp_serial_command(
-                None,
-                Some(gateway.clone()),
-                format!("nan payload=hex:{payload_hex}"),
-                Some(2.0),
+            // Use the same internal gateway exchange as normal commands. It
+            // sends a targeted wake first, waits for the addressed response,
+            // and retries across a missed DW. A single queued wake packet is
+            // not sufficient to prove that a rebooted sleepy target entered
+            // its active window.
+            let result = self.esp_remote_command(
+                gateway.clone(),
+                Some(target.clone()),
+                command.clone(),
+                Some(20.0),
+                Some(active_ms.unwrap_or(10_000).max(10_000)),
             );
             return json!({
                 "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
                 "gateway": gateway,
                 "target": target,
-                "command": if let Some(window_ms) = active_ms {
-                    format!("mode active_ms={}", window_ms.clamp(1_000, 300_000))
-                } else {
-                    command.to_string()
-                },
-                "queued_over": "raw_nan",
+                "command": command,
                 "gateway_result": result,
             });
         }
@@ -3316,7 +3709,10 @@ impl RadioService {
                 .unwrap_or(460_800);
             return Some(("direct-port".to_string(), path, baud));
         }
-        if let Some(adapter) = adapter.as_deref().filter(|adapter| !adapter.trim().is_empty()) {
+        if let Some(adapter) = adapter
+            .as_deref()
+            .filter(|adapter| !adapter.trim().is_empty())
+        {
             // Managed role names (for example `e5`) are valid explicit
             // diagnostic adapters even when they are not listed in the
             // generic radio-adapter catalog.  This lets callers opt out of
@@ -3999,10 +4395,45 @@ struct SerialForwardRuntime {
     log_path: Option<String>,
     baud: u32,
     multi: bool,
+    reset_request: Arc<AtomicU8>,
+    flush_request: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     stats: Arc<SerialForwardStats>,
+    firmware_state: Arc<Mutex<FirmwareState>>,
     handle: Option<std::thread::JoinHandle<()>>,
     started_ms: u64,
+}
+
+/// Last lifecycle notification observed on a managed firmware forward.
+/// This is intentionally host RAM only: it is an observation of the current
+/// UART session, not device configuration or durable device identity.
+#[derive(Clone, Debug, Default)]
+struct FirmwareState {
+    role: Option<String>,
+    partition: Option<String>,
+    mode: Option<String>,
+    infra_active: Option<bool>,
+    phase: Option<String>,
+    rebooted: Option<bool>,
+    reset_reason: Option<u8>,
+    mac: Option<String>,
+    last_event_ms: u64,
+}
+
+impl FirmwareState {
+    fn snapshot(&self) -> Value {
+        json!({
+            "role": self.role,
+            "partition": self.partition,
+            "mode": self.mode,
+            "infra_active": self.infra_active,
+            "phase": self.phase,
+            "rebooted": self.rebooted,
+            "reset_reason": self.reset_reason,
+            "mac": self.mac,
+            "last_event_ms": self.last_event_ms,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4091,6 +4522,9 @@ impl StabilityState {
 
 #[derive(Default, Debug)]
 struct SerialForwardStats {
+    reset_requests: AtomicU64,
+    reset_pulses: AtomicU64,
+    reset_failures: AtomicU64,
     client_accepts: AtomicU64,
     client_drops: AtomicU64,
     client_to_serial_bytes: AtomicU64,
@@ -4122,6 +4556,9 @@ impl SerialForwardStats {
 
     fn snapshot(&self) -> Value {
         json!({
+            "reset_requests": self.reset_requests.load(Ordering::Relaxed),
+            "reset_pulses": self.reset_pulses.load(Ordering::Relaxed),
+            "reset_failures": self.reset_failures.load(Ordering::Relaxed),
             "client_accepts": self.client_accepts.load(Ordering::Relaxed),
             "client_drops": self.client_drops.load(Ordering::Relaxed),
             "client_to_serial_bytes": self.client_to_serial_bytes.load(Ordering::Relaxed),
@@ -4330,8 +4767,6 @@ fn serial_device_json(path: &str, by_id: Option<String>) -> Value {
         "path": path,
         "by_id": by_id,
         "kind": if path.contains("ttyACM") { "cdc-acm" } else { "usb-serial" },
-        "readable": fs::OpenOptions::new().read(true).open(path).is_ok(),
-        "writable": fs::OpenOptions::new().write(true).open(path).is_ok(),
         "mode": mode.map(|mode| format!("{mode:04o}")),
     })
 }
@@ -4478,10 +4913,13 @@ fn serial_forward_loop(
     tcp_mode: SerialForwardTcpMode,
     multi: bool,
     raw_output: bool,
-    direct_write: bool,
+    reset_request: Arc<AtomicU8>,
+    flush_request: Arc<AtomicBool>,
+    initial_direct_write: bool,
     log_flash_quiet_until_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     stats: Arc<SerialForwardStats>,
+    firmware_state: Arc<Mutex<FirmwareState>>,
     log_path: Option<String>,
     serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
 ) -> Result<()> {
@@ -4493,18 +4931,39 @@ fn serial_forward_loop(
         .with_context(|| format!("failed to open serial port {port}"))?;
     configure_serial(serial.as_raw_fd(), baud)
         .with_context(|| format!("failed to configure serial port {port}"))?;
-    // Opening a diagnostic forward must be electrically passive.  In
-    // particular, do not touch DTR/RTS: CP210x boards wire those lines to
-    // GPIO0/EN and a modem-line transition can reset or strap the board.
+    // Linux's tty open path may leave DTR and/or RTS asserted even though
+    // lmesh did not request them. The CP210x board circuit combines both
+    // lines into EN/GPIO0, so changing only one can select reset or ROM
+    // bootloader. Normalize both together to the released/normal state; this
+    // is not a pulse and explicit `usb.serial.reset` remains the only reset
+    // operation exposed by lmesh.
+    let state = modem_state(serial.as_raw_fd())?;
+    let normal_state = state & !(libc::TIOCM_DTR | libc::TIOCM_RTS);
+    if state != normal_state {
+        set_modem_state(serial.as_raw_fd(), normal_state)
+            .with_context(|| format!("failed to normalize modem lines for {port}"))?;
+        tracing::debug!(forward_id = %id, port = %port, "serial_forward_normalized_modem_lines");
+    }
     if log_path.is_some() && serial_log.is_none() {
         stats.log_write_errors.fetch_add(1, Ordering::Relaxed);
     }
     let mut clients: Vec<SerialForwardClient> = Vec::new();
     let mut firmware_uart_decoder = FirmwareUartDecoder::default();
     let mut serial_tx = VecDeque::new();
-    // Firmware drops physical UART output while idle. Keep normal UDS command
-    // records here until any framed UART activity proves its bounded console
-    // window is open. RFC2217 bytes remain immediate for flashing/control.
+    // Probe twice without waiting.  This is deliberately a transport-level
+    // probe: infra boards answer and release the client queue; sleepy boards
+    // leave client records pending until a UART heartbeat/window arrives.
+    let mut direct_write = initial_direct_write || raw_output;
+    let mut mode_known = direct_write;
+    let mut mode_probe_next_ms = now_millis_u64().saturating_add(500);
+    let mut mode_probe_deadline = now_millis_u64().saturating_add(10_000);
+    if !raw_output {
+        for _ in 0..2 {
+            let probe = firmware_command_cbor("mode status=true")
+                .context("failed to encode serial-forward mode probe")?;
+            queue_firmware_packet(&mut serial_tx, &probe)?;
+        }
+    }
     let mut serial_pending = VecDeque::new();
     // UART wake is proved by the firmware's framed heartbeat or an in-band
     // command window.  The forward never creates a wake by modem control.
@@ -4512,6 +4971,56 @@ fn serial_forward_loop(
     while !stop.load(Ordering::Acquire) {
         let mut progressed = false;
         let mut uart_wake_seen = false;
+        let mut nan_sleepy_start_seen = false;
+        let reset_pending = reset_request
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                (pending != SERIAL_RESET_NONE).then_some(pending - 1)
+            })
+            .unwrap_or(SERIAL_RESET_NONE);
+        if reset_pending != SERIAL_RESET_NONE {
+            if let Err(error) = serial_run_reset(serial.as_raw_fd()) {
+                stats.reset_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(forward_id = %id, port = %port, error = %error, "serial_reset_rejected");
+            } else {
+                stats.reset_pulses.fetch_add(1, Ordering::Relaxed);
+                configure_serial(serial.as_raw_fd(), baud)
+                    .with_context(|| format!("failed to restore serial baud for {port}"))?;
+                if !raw_output {
+                    // A reset is also the boot/recovery handoff boundary. The
+                    // next client bytes may be a stage2 selector or Recovery
+                    // command and must cross the same descriptor immediately;
+                    // do not queue them behind the sleepy/Main mode probe.
+                    // Main will publish its mode state after a normal boot and
+                    // restore the usual sleepy/infra policy below.
+                    mode_known = true;
+                    direct_write = true;
+                    mode_probe_next_ms = 0;
+                    mode_probe_deadline = 0;
+                }
+            }
+            progressed = true;
+        }
+        if flush_request.swap(false, Ordering::AcqRel) && !serial_pending.is_empty() {
+            if serial_tx.len().saturating_add(serial_pending.len()) > SERIAL_FORWARD_MAX_PENDING {
+                bail!(
+                    "serial TX queue exceeded {} bytes while explicitly flushing UART queue",
+                    SERIAL_FORWARD_MAX_PENDING
+                );
+            }
+            serial_tx.append(&mut serial_pending);
+            progressed = true;
+        }
+        if !raw_output
+            && !mode_known
+            && now_millis_u64() >= mode_probe_next_ms
+            && now_millis_u64() < mode_probe_deadline
+        {
+            let probe = firmware_command_cbor("mode status=true")
+                .context("failed to encode serial-forward mode retry")?;
+            queue_firmware_packet(&mut serial_tx, &probe)?;
+            mode_probe_next_ms = now_millis_u64().saturating_add(1_000);
+            progressed = true;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 stats.client_accepts.fetch_add(1, Ordering::Relaxed);
@@ -4577,15 +5086,15 @@ fn serial_forward_loop(
                 stats
                     .serial_to_client_bytes
                     .fetch_add(n as u64, Ordering::Relaxed);
-                record_serial_forward_log(
+                let records = firmware_uart_decoder.push(&serial_buf[..n])?;
+                record_serial_forward_rx_log(
                     serial_log.as_ref(),
                     &stats,
                     id,
-                    "rx",
                     &serial_buf[..n],
+                    &records,
                     flash_log_quiet,
                 );
-                let records = firmware_uart_decoder.push(&serial_buf[..n])?;
                 uart_wake_seen = firmware_uart_decoder.take_frame_activity();
                 if uart_wake_seen {
                     stats.uart_wake_frames.fetch_add(1, Ordering::Relaxed);
@@ -4597,6 +5106,36 @@ fn serial_forward_loop(
                     raw_output,
                     &stats,
                 );
+                if !raw_output {
+                    for record in &records {
+                        if nan_sleepy_start_event(
+                            mesh::cbor::decode_stream_frame(record).unwrap_or(&[]),
+                        )
+                        .is_some()
+                        {
+                            nan_sleepy_start_seen = true;
+                        }
+                        if let Ok(payload) = mesh::cbor::decode_stream_frame(record) {
+                            update_firmware_state_from_boot(&firmware_state, payload);
+                        }
+                        if let Some(text) = firmware_record_text(record) {
+                            update_firmware_state_from_text(&firmware_state, &text);
+                        }
+                        if let Some(active) = firmware_record_direct_mode(record) {
+                            direct_write = active;
+                            mode_known = true;
+                            mode_probe_deadline = 0;
+                            tracing::debug!(
+                                forward_id = %id,
+                                device_direct_mode = active,
+                                "serial_forward_device_mode"
+                            );
+                            if direct_write && !serial_pending.is_empty() {
+                                serial_tx.append(&mut serial_pending);
+                            }
+                        }
+                    }
+                }
                 progressed = true;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4605,6 +5144,16 @@ fn serial_forward_loop(
                     .fetch_add(1, Ordering::Relaxed);
             }
             Err(error) => return Err(error).with_context(|| format!("failed to read {port}")),
+        }
+        if !mode_known && now_millis_u64() >= mode_probe_deadline {
+            direct_write = false;
+            // Make the timeout terminal for this forward's startup probe.
+            // Leaving the old deadline in place caused this branch to log on
+            // every poll iteration, flooding the managed log and making a
+            // real sleepy/UART failure difficult to correlate. A later
+            // firmware mode or heartbeat record still changes the policy.
+            mode_probe_deadline = 0;
+            tracing::debug!(forward_id = %id, "serial_forward_mode_probe_timeout");
         }
         let mut idx = 0;
         while idx < clients.len() {
@@ -4657,6 +5206,17 @@ fn serial_forward_loop(
                     "serial TX queue exceeded {} bytes while flushing UART wake queue",
                     SERIAL_FORWARD_MAX_PENDING
                 );
+            }
+            if nan_sleepy_start_seen {
+                // The tagged wake event proves that Main is inside its short
+                // NAN/UART window. Put the internal one-second lease request
+                // ahead of queued Main CBOR records so the rest of the queue
+                // is handled as one active session. DMB1 and RFC2217 traffic
+                // never enters serial_pending, so stage2/Recovery are not
+                // affected by this automatic Main-only control packet.
+                let active = firmware_command_cbor("mode active_ms=1000")
+                    .context("failed to encode automatic sleepy active request")?;
+                queue_firmware_packet(&mut serial_tx, &active)?;
             }
             let flushed = serial_pending.len();
             serial_tx.append(&mut serial_pending);
@@ -4882,6 +5442,10 @@ fn broadcast_serial_output(
     while idx < clients.len() {
         let accepted = if raw_output || clients[idx].is_rfc2217() {
             clients[idx].queue_output(wire_bytes)
+        } else if clients[idx].text_mode {
+            records
+                .iter()
+                .all(|record| clients[idx].queue_text_record(record))
         } else {
             records
                 .iter()
@@ -4907,6 +5471,11 @@ struct SerialForwardClient {
     output: VecDeque<u8>,
     tcp_mode: SerialForwardTcpMode,
     rfc2217_mode: bool,
+    // UDS/TCP input is auto-detected per client. Text clients receive the
+    // matching human-readable response representation; framed clients keep
+    // the length-prefixed CBOR stream.
+    text_mode: bool,
+    force_direct: bool,
 }
 
 impl SerialForwardClient {
@@ -4918,6 +5487,8 @@ impl SerialForwardClient {
             output: VecDeque::new(),
             tcp_mode,
             rfc2217_mode: tcp_mode == SerialForwardTcpMode::Rfc2217,
+            text_mode: false,
+            force_direct: false,
         }
     }
 
@@ -4945,6 +5516,13 @@ impl SerialForwardClient {
             self.output.extend(bytes);
         }
         true
+    }
+
+    fn queue_text_record(&mut self, record: &[u8]) -> bool {
+        let Some(text) = firmware_record_text(record) else {
+            return true;
+        };
+        queue_client_bytes(&mut self.output, text.as_bytes()).is_ok()
     }
 
     fn is_rfc2217(&self) -> bool {
@@ -4981,14 +5559,6 @@ impl SerialForwardClient {
                     break;
                 }
                 Ok(n) => {
-                    record_serial_forward_log(
-                        serial_log,
-                        stats,
-                        board,
-                        "tx",
-                        &buf[..n],
-                        flash_log_quiet,
-                    );
                     self.input.extend_from_slice(&buf[..n]);
                     SerialForwardStats::record_high_water(
                         &stats.client_input_queue_high_water,
@@ -5007,7 +5577,15 @@ impl SerialForwardClient {
         }
         if may_write {
             progressed |=
-                self.flush_complete_records(serial_fd, serial_tx, serial_pending, serial_direct)?;
+                self.flush_complete_records(
+                    serial_fd,
+                    serial_tx,
+                    serial_pending,
+                    serial_direct,
+                    serial_log,
+                    board,
+                    flash_log_quiet,
+                )?;
         } else if !may_write {
             progressed |= !self.input.is_empty();
             self.input.clear();
@@ -5021,12 +5599,28 @@ impl SerialForwardClient {
         serial_tx: &mut VecDeque<u8>,
         serial_pending: &mut VecDeque<u8>,
         serial_direct: bool,
+        serial_log: Option<&Arc<Mutex<SerialForwardLog>>>,
+        board: &str,
+        flash_log_quiet: bool,
     ) -> Result<bool> {
         let mut progressed = false;
         loop {
             if self.input.is_empty() {
                 return Ok(progressed);
             }
+            if !self.force_direct && self.input.starts_with(SERIAL_FORWARD_FORCE_DIRECT_PREFIX) {
+                self.input.drain(..SERIAL_FORWARD_FORCE_DIRECT_PREFIX.len());
+                self.force_direct = true;
+                progressed = true;
+                if self.input.is_empty() {
+                    return Ok(progressed);
+                }
+            }
+            // A request-specific direct prefix is used by stage2/Recovery
+            // handoffs. It must override the forward-wide sleepy policy for
+            // this client; merely recording `self.force_direct` is
+            // insufficient because the packet would otherwise remain queued.
+            let direct_for_client = serial_direct || self.force_direct;
             if (self.tcp_mode == SerialForwardTcpMode::Rfc2217
                 || self.tcp_mode == SerialForwardTcpMode::Auto)
                 && self.input[0] == RFC2217_IAC
@@ -5070,7 +5664,14 @@ impl SerialForwardClient {
                 .iter()
                 .position(|byte| matches!(*byte, b'\n' | b'\r'))
             {
-                pos + 1
+                // readline-style clients commonly terminate with CRLF.
+                // Consume the pair as one text record; otherwise the LF is
+                // seen on the next pass as an empty firmware command.
+                if self.input[pos] == b'\r' && self.input.get(pos + 1) == Some(&b'\n') {
+                    pos + 2
+                } else {
+                    pos + 1
+                }
             } else {
                 return Ok(progressed);
             };
@@ -5078,34 +5679,41 @@ impl SerialForwardClient {
                 let body = &self.input[4..record_len];
                 let raw_boot =
                     (body.len() >= 6 && body[..4] == DMESH_BOOT_MAGIC[..]).then_some(body);
-                if serial_direct {
-                    if let Some(payload) = raw_boot.as_deref() {
-                        queue_firmware_payload(serial_tx, payload)?;
-                    } else {
-                        queue_firmware_packet(serial_tx, &self.input[..record_len])?;
-                    }
+                if let Some(payload) = raw_boot.as_deref() {
+                    // DMB1 is an explicit bootstrap command for stage2.  It
+                    // must not wait for the normal active/direct policy: the
+                    // bootloader has only a bounded selector window and the
+                    // managed forward is the sole UART reader.
+                    queue_firmware_payload(serial_tx, payload)?;
+                } else if direct_for_client {
+                    record_serial_forward_tx_log(serial_log, board, &self.input[..record_len], flash_log_quiet);
+                    queue_firmware_packet(serial_tx, &self.input[..record_len])?;
                 } else {
-                    if let Some(payload) = raw_boot.as_deref() {
-                        queue_firmware_payload(serial_pending, payload)?;
-                    } else {
-                        queue_firmware_packet(serial_pending, &self.input[..record_len])?;
-                    }
+                    record_serial_forward_tx_log(serial_log, board, &self.input[..record_len], flash_log_quiet);
+                    queue_firmware_packet(serial_pending, &self.input[..record_len])?;
                 }
             } else {
+                self.text_mode = true;
                 let line = std::str::from_utf8(&self.input[..record_len])?.trim();
-                match firmware_command_cbor(line) {
-                    Ok(frame) => {
-                        if serial_direct {
-                            queue_firmware_packet(serial_tx, &frame)?;
-                        } else {
-                            queue_firmware_packet(serial_pending, &frame)?;
+                // Empty lines are harmless interactive-console input. In
+                // particular, tolerate a lone LF following a CR from a
+                // client whose terminal emits mixed line endings.
+                if !line.is_empty() {
+                    match firmware_command_cbor(line) {
+                        Ok(frame) => {
+                            record_serial_forward_tx_log(serial_log, board, &frame, flash_log_quiet);
+                            if direct_for_client {
+                                queue_firmware_packet(serial_tx, &frame)?;
+                            } else {
+                                queue_firmware_packet(serial_pending, &frame)?;
+                            }
                         }
-                    }
-                    Err(error) => {
-                        queue_client_bytes(
-                            &mut self.output,
-                            format!("lmesh command error: {error}\n").as_bytes(),
-                        )?;
+                        Err(error) => {
+                            queue_client_bytes(
+                                &mut self.output,
+                                format!("lmesh command error: {error}\n").as_bytes(),
+                            )?;
+                        }
                     }
                 }
             }
@@ -5122,6 +5730,11 @@ impl SerialForwardClient {
 /// or flashing traffic that is not valid UTF-8.
 struct SerialForwardLog {
     file: fs::File,
+    schema: FirmwareSchema,
+    raw_text: BTreeMap<String, Vec<u8>>,
+    ppp_active: BTreeMap<String, bool>,
+    ppp_escaped: BTreeMap<String, bool>,
+    ppp_payload: BTreeMap<String, bool>,
 }
 
 impl SerialForwardLog {
@@ -5137,34 +5750,388 @@ impl SerialForwardLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open serial log {}", path.display()))?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            schema: FirmwareSchema::load(),
+            raw_text: BTreeMap::new(),
+            ppp_active: BTreeMap::new(),
+            ppp_escaped: BTreeMap::new(),
+            ppp_payload: BTreeMap::new(),
+        })
     }
 
-    fn append(&mut self, board: &str, direction: &str, bytes: &[u8]) -> Result<()> {
-        let text = String::from_utf8_lossy(bytes);
-        writeln!(
-            self.file,
-            "ts_ms={} board={} dir={} bytes={} hex={} text={:?}",
-            now_millis_u64(),
-            board,
-            direction,
-            bytes.len(),
-            hex_lower(bytes),
-            text,
-        )
-        .context("failed to write serial log record")?;
+    /// Log received UART bytes in protocol-aware form. ROM/stage2 output is
+    /// not PPP and is reconstructed into complete text lines. PPP frames are
+    /// represented by their decoded CBOR notification or boot identity; raw
+    /// hex is retained only for an undecodable payload.
+    fn append_rx(&mut self, board: &str, bytes: &[u8], records: &[Vec<u8>]) -> Result<usize> {
+        let mut raw_lines = Vec::new();
+        let active = self.ppp_active.entry(board.to_owned()).or_default();
+        let escaped = self.ppp_escaped.entry(board.to_owned()).or_default();
+        let payload_seen = self.ppp_payload.entry(board.to_owned()).or_default();
+        let raw = self.raw_text.entry(board.to_owned()).or_default();
+        for byte in bytes {
+            if *active {
+                if *escaped {
+                    *escaped = false;
+                    *payload_seen = true;
+                } else if *byte == FIRMWARE_UART_ESCAPE {
+                    *escaped = true;
+                } else if *byte == FIRMWARE_UART_FLAG {
+                    *active = false;
+                    *payload_seen = false;
+                }
+                continue;
+            }
+            // The first byte after a completed ROM line selects the parser:
+            // 0x7e starts PPP, while any other byte belongs to the ROM/text
+            // stream. Do not treat a stray '~' inside an ASCII boot line as a
+            // PPP delimiter.
+            if *byte == FIRMWARE_UART_FLAG && raw.is_empty() {
+                *active = true;
+                *escaped = false;
+                *payload_seen = false;
+                continue;
+            }
+            *payload_seen = true;
+            raw.push(*byte);
+            if *byte == b'\n' || raw.len() >= 4096 {
+                raw_lines.push(std::mem::take(raw));
+            }
+        }
+        let raw_line_count = raw_lines.len();
+        for line in raw_lines {
+            self.write_text_or_binary(board, &line)?;
+        }
+
+        let mut logged = 0;
+        for record in records {
+            let Some(payload) = mesh::cbor::decode_stream_frame(record).ok() else {
+                writeln!(
+                    self.file,
+                    "ts_ms={} board={} dir=rx kind=ppp undecoded=true bytes={} hex={}",
+                    now_millis_u64(),
+                    board,
+                    record.len(),
+                    compact_serial_hex(record),
+                )?;
+                logged += 1;
+                continue;
+            };
+            if let Some(event) = nan_sleepy_start_event(payload) {
+                writeln!(
+                    self.file,
+                    "ts_ms={} board={} dir=rx kind=ppp decoded=nan.sleepy_start tag=6 flags={} lora_rx_delta={} nan_beacon_delta={} cluster_changed={}",
+                    now_millis_u64(),
+                    board,
+                    event.flags,
+                    event.lora_rx_delta,
+                    event.nan_beacon_delta,
+                    event.cluster_changed,
+                )?;
+                logged += 1;
+                continue;
+            }
+            // The shared UART decoder is deliberately permissive while it
+            // resynchronizes. A stale flag can therefore make a ROM/app
+            // text burst look like one PPP payload. Never call that CBOR:
+            // classify printable payloads as text and keep binary lossless.
+            let is_boot_identity = is_boot_identity_payload(payload);
+            let is_boot_event = is_boot_event_payload(payload);
+            let is_boot_selector = is_boot_selector_payload(payload);
+            if !is_boot_event
+                && !is_boot_selector
+                && !payload.is_empty()
+                && payload.first().map(|byte| byte >> 5) != Some(5)
+            {
+                self.write_text_or_binary(board, payload)?;
+                logged += 1;
+                continue;
+            }
+            let (kind, decoded) =
+                if is_boot_identity {
+                    ("boot", format!("identity={}", boot_identity_json(payload)))
+                } else if is_boot_event {
+                    ("boot", format!("event={}", boot_event_json(payload)))
+                } else if is_boot_selector {
+                    ("boot", format!("selector_hex={}", compact_serial_hex(payload)))
+                } else if let Ok(decoded) =
+                    mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())
+                {
+                    let decoded = self.schema.rename_decoded(decoded);
+                    // decode_json represents schema/type failures as an error
+                    // object. Do not make malformed compact-CBOR look like a
+                    // valid firmware notification in the serial evidence.
+                    if let Some(error) = decoded.get("error").and_then(Value::as_str) {
+                        (
+                            "cbor_error",
+                            format!(
+                                "message={:?} {} payload_hex={}",
+                                error,
+                                cbor_first_byte_summary(payload),
+                                compact_serial_hex(payload)
+                            ),
+                        )
+                    } else {
+                        ("cbor", decoded.to_string())
+                    }
+                } else {
+                    (
+                        "cbor_error",
+                        format!(
+                            "{} payload_hex={}",
+                            cbor_first_byte_summary(payload),
+                            compact_serial_hex(payload),
+                        ),
+                    )
+                };
+            let decoded = truncate_serial_log_field(&decoded);
+            writeln!(
+                self.file,
+                "ts_ms={} board={} dir=rx kind=ppp bytes={} {} {}",
+                now_millis_u64(),
+                board,
+                payload.len(),
+                kind,
+                decoded,
+            )?;
+            logged += 1;
+        }
         self.file
             .flush()
-            .context("failed to flush serial log record")
+            .context("failed to flush serial log record")?;
+        Ok(logged + raw_line_count)
+    }
+
+    fn write_text_or_binary(&mut self, board: &str, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if serial_bytes_are_text(bytes) {
+            for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+                let text = serial_text_preview(line);
+                if !text.is_empty() {
+                    writeln!(
+                        self.file,
+                        "ts_ms={} board={} dir=rx kind=text bytes={} text={:?}",
+                        now_millis_u64(),
+                        board,
+                        line.len(),
+                        truncate_serial_log_field(&text),
+                    )?;
+                }
+            }
+        } else {
+            writeln!(
+                self.file,
+                "ts_ms={} board={} dir=rx kind=raw_binary bytes={} hex={}",
+                now_millis_u64(),
+                board,
+                bytes.len(),
+                compact_serial_hex(bytes),
+            )?;
+        }
+        Ok(())
     }
 }
 
-fn record_serial_forward_log(
+/// Stage2/Recovery boot identities are normal CBOR events.  They use an
+/// indefinite map and tuple payload (`{7:60000,6:[...]}`), so they cannot be
+/// passed through the regular method/payload-map JSON adapter.  Recognize the
+/// registered event directly and keep it on the same packet log path as the
+/// old fixed DMB1 compatibility record.
+fn is_boot_identity_payload(payload: &[u8]) -> bool {
+    (payload.len() >= DMESH_BOOT_HELLO_LEN && payload[..4] == DMESH_BOOT_MAGIC[..])
+        || payload.windows(3).any(|window| window == [0x19, 0xea, 0x60])
+}
+
+fn boot_event_id(payload: &[u8]) -> Option<u64> {
+    payload.windows(3).find_map(|window| {
+        if window[0] == 0x19 && window[1] == 0xea && (0x60..=0x63).contains(&window[2]) {
+            Some(u64::from(window[2]) + 0xea00)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_boot_event_payload(payload: &[u8]) -> bool {
+    is_boot_identity_payload(payload) || boot_event_id(payload).is_some()
+}
+
+fn is_boot_selector_payload(payload: &[u8]) -> bool {
+    payload.len() == 10
+        && payload[..3] == [0xa2, 0x00, 0x1a]
+        && payload[3..7] == DMESH_BOOT_METHOD_SELECT.to_be_bytes()
+        && payload[7..9] == [0x06, 0x81]
+        && matches!(payload[9], 0x01 | 0x02)
+}
+
+fn serial_bytes_are_text(bytes: &[u8]) -> bool {
+    let printable = bytes
+        .iter()
+        .filter(|byte| matches!(**byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e))
+        .count();
+    printable * 100 >= bytes.len().saturating_mul(90)
+}
+
+fn serial_text_preview(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    for byte in bytes {
+        match *byte {
+            b'\r' | b'\n' => {}
+            b'\t' | 0x20..=0x7e => text.push(*byte as char),
+            value => text.push_str(&format!("\\x{value:02x}")),
+        }
+    }
+    text
+}
+
+fn truncate_serial_log_field(value: &str) -> String {
+    if value.len() <= SERIAL_LOG_FIELD_MAX {
+        return value.to_owned();
+    }
+    let mut result = value
+        .char_indices()
+        .take_while(|(index, _)| *index < SERIAL_LOG_FIELD_MAX.saturating_sub(3))
+        .map(|(_, character)| character)
+        .collect::<String>();
+    result.push_str("...");
+    result
+}
+
+fn compact_serial_hex(bytes: &[u8]) -> String {
+    let ff_count = bytes.iter().filter(|byte| **byte == 0xff).count();
+    if bytes.len() >= 32 && ff_count * 100 >= bytes.len().saturating_mul(90) {
+        return "ff...".to_owned();
+    }
+    truncate_serial_log_field(&hex_lower(bytes))
+}
+
+fn cbor_uint_at(payload: &[u8], offset: &mut usize) -> Option<u64> {
+    let first = *payload.get(*offset)?;
+    *offset += 1;
+    if first >> 5 != 0 {
+        return None;
+    }
+    let additional = first & 0x1f;
+    if additional < 24 {
+        return Some(additional as u64);
+    }
+    let width = match additional {
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return None,
+    };
+    let end = offset.checked_add(width)?;
+    let bytes = payload.get(*offset..end)?;
+    *offset = end;
+    Some(bytes.iter().fold(0_u64, |value, byte| {
+        (value << 8) | u64::from(*byte)
+    }))
+}
+
+fn cbor_argument_at(payload: &[u8], offset: &mut usize, first: u8) -> Option<u64> {
+    let additional = first & 0x1f;
+    if additional < 24 {
+        return Some(additional as u64);
+    }
+    let width = match additional {
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return None,
+    };
+    let end = offset.checked_add(width)?;
+    let bytes = payload.get(*offset..end)?;
+    *offset = end;
+    Some(bytes.iter().fold(0_u64, |value, byte| {
+        (value << 8) | u64::from(*byte)
+    }))
+}
+
+fn cbor_tuple_value(payload: &[u8], offset: &mut usize) -> Option<Value> {
+    let first = *payload.get(*offset)?;
+    *offset += 1;
+    match first >> 5 {
+        0 => Some(Value::from(cbor_argument_at(payload, offset, first)?)),
+        1 => {
+            let argument = cbor_argument_at(payload, offset, first)?;
+            let value = i64::try_from(argument).ok()?.checked_add(1)?.checked_neg()?;
+            Some(Value::from(value))
+        }
+        2 => {
+            let length = usize::try_from(cbor_argument_at(payload, offset, first)?).ok()?;
+            let end = offset.checked_add(length)?;
+            let bytes = payload.get(*offset..end)?;
+            *offset = end;
+            Some(Value::String(hex_lower(bytes)))
+        }
+        _ => None,
+    }
+}
+
+fn boot_identity_tuple(payload: &[u8]) -> Option<Vec<Value>> {
+    let mut offset = 0;
+    if *payload.get(offset)? != 0xbf {
+        return None;
+    }
+    offset += 1;
+    let mut tuple = None;
+    while *payload.get(offset)? != 0xff {
+        let key = cbor_uint_at(payload, &mut offset)?;
+        if key == 7 {
+            let _ = cbor_uint_at(payload, &mut offset)?;
+        } else if key == 6 {
+            if *payload.get(offset)? != 0x9f {
+                return None;
+            }
+            offset += 1;
+            let mut values = Vec::new();
+            while *payload.get(offset)? != 0xff {
+                values.push(cbor_tuple_value(payload, &mut offset)?);
+            }
+            offset += 1;
+            tuple = Some(values);
+        } else {
+            return None;
+        }
+    }
+    Some(tuple?)
+}
+
+fn cbor_major_type_name(byte: u8) -> &'static str {
+    match byte >> 5 {
+        0 => "unsigned",
+        1 => "negative",
+        2 => "bytes",
+        3 => "text",
+        4 => "array",
+        5 => "map",
+        6 => "tag",
+        _ => "simple/float",
+    }
+}
+
+fn cbor_first_byte_summary(payload: &[u8]) -> String {
+    match payload.first().copied() {
+        Some(byte) => format!(
+            "first_byte=0x{byte:02x} major_type={}",
+            cbor_major_type_name(byte),
+        ),
+        None => "first_byte=none major_type=empty".to_owned(),
+    }
+}
+
+fn record_serial_forward_rx_log(
     log: Option<&Arc<Mutex<SerialForwardLog>>>,
     stats: &SerialForwardStats,
     board: &str,
-    direction: &str,
     bytes: &[u8],
+    records: &[Vec<u8>],
     suppressed: bool,
 ) {
     if suppressed {
@@ -5178,15 +6145,73 @@ fn record_serial_forward_log(
         return;
     };
     let mut sink = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    match sink.append(board, direction, bytes) {
-        Ok(()) => {
-            stats.log_records.fetch_add(1, Ordering::Relaxed);
+    match sink.append_rx(board, bytes, records) {
+        Ok(count) => {
+            stats
+                .log_records
+                .fetch_add(count.max(1) as u64, Ordering::Relaxed);
         }
         Err(error) => {
             stats.log_write_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(forward_id = %board, direction, error = %error, "serial_forward_log_write_failed");
+            tracing::warn!(forward_id = %board, direction = "rx", error = %error, "serial_forward_log_write_failed");
         }
     }
+}
+
+/// Log the complete packet accepted from a managed client, after consuming
+/// the UDS length/control envelope.  The old logger recorded that envelope
+/// verbatim (`DMESH-DIRECT`), which made an internal lmesh marker look like a
+/// physical UART protocol.  TX now uses the same CBOR classification as RX.
+fn record_serial_forward_tx_log(
+    log: Option<&Arc<Mutex<SerialForwardLog>>>,
+    board: &str,
+    stream_frame: &[u8],
+    suppressed: bool,
+) {
+    if suppressed {
+        return;
+    }
+    let Some(log) = log else {
+        return;
+    };
+    let mut sink = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A boot/flash client may prepend the internal direct-delivery marker.
+    // That marker is consumed by the forward and is not part of the UDS
+    // stream envelope.  Strip it before decoding so TX logs describe the
+    // actual CBOR packet instead of falling back to an unhelpful hex dump.
+    let stream_frame = stream_frame
+        .strip_prefix(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
+        .unwrap_or(stream_frame);
+    let payload = mesh::cbor::decode_stream_frame(stream_frame).unwrap_or(stream_frame);
+    let (kind, body) = if is_boot_identity_payload(payload) {
+        ("boot", format!("identity={}", boot_identity_json(payload)))
+    } else if is_boot_event_payload(payload) {
+        ("boot", format!("event={}", boot_event_json(payload)))
+    } else if is_boot_selector_payload(payload) {
+        ("boot", format!("selector_hex={}", compact_serial_hex(payload)))
+    } else if payload.first().map(|byte| byte >> 5) == Some(5)
+        || payload.first().map(|byte| byte >> 5) == Some(4)
+    {
+        match mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default()) {
+            Ok(decoded) => ("cbor", decoded.to_string()),
+            Err(error) => (
+                "cbor_error",
+                format!("message={:?} {}", error, cbor_first_byte_summary(payload)),
+            ),
+        }
+    } else {
+        ("raw", format!("hex={}", compact_serial_hex(payload)))
+    };
+    let _ = writeln!(
+        sink.file,
+        "ts_ms={} board={} dir=tx kind=ppp bytes={} {} {}",
+        now_millis_u64(),
+        board,
+        payload.len(),
+        kind,
+        truncate_serial_log_field(&body),
+    );
+    let _ = sink.file.flush();
 }
 
 fn queue_serial_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
@@ -5200,10 +6225,64 @@ fn queue_serial_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Convert a generic mesh UDS record into the compact-CBOR UART wire form.
+/// Encode Recovery's STA handoff as the compact CBOR payload expected by the
+/// managed UDS exchange. `uds_raw_exchange` adds the UDS length envelope and
+/// the serial forward adds the physical PPP envelope; returning PPP here
+/// would double-wrap the packet and make Recovery see 0x7e as CBOR.
+fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
+    let fields = command.split_ascii_whitespace().collect::<Vec<_>>();
+    if (fields.len() < 4 || fields.len() > 6) || fields.first() != Some(&"STA") {
+        bail!("Recovery STA packet requires: STA endpoint local_ip ssid [password] [dryrun]");
+    }
+    let endpoint = fields[1].as_bytes();
+    let local_ip = fields[2].as_bytes();
+    let ssid = fields[3].as_bytes();
+    let dry_run = fields.get(4).is_some_and(|value| *value == "dryrun") ||
+        fields.get(5).is_some_and(|value| *value == "dryrun");
+    let password = if fields.get(4).is_some_and(|value| *value == "dryrun") {
+        &[]
+    } else {
+        fields.get(4).map(|value| value.as_bytes()).unwrap_or(&[])
+    };
+    if endpoint.is_empty()
+        || endpoint.len() >= 128
+        || local_ip.is_empty()
+        || local_ip.len() >= 32
+        || ssid.is_empty()
+        || ssid.len() >= 33
+        || password.len() >= 32
+        || endpoint.len() > u8::MAX as usize
+        || local_ip.len() > u8::MAX as usize
+        || ssid.len() > u8::MAX as usize
+        || password.len() > u8::MAX as usize
+    {
+        bail!("Recovery STA packet field is too long or empty");
+    }
+    let mut packet = Vec::with_capacity(64 + endpoint.len() + local_ip.len() + ssid.len() + password.len());
+    packet.extend_from_slice(&[0xa2, 0x00, 0x18, 68, 0x06, if dry_run { 0xa5 } else { 0xa4 }]);
+    for (key, value) in [("server", endpoint), ("ip", local_ip),
+                         ("ssid", ssid), ("password", password)] {
+        packet.push(0x60 + key.len() as u8);
+        packet.extend_from_slice(key.as_bytes());
+        if value.len() < 24 {
+            packet.push(0x60 + value.len() as u8);
+        } else {
+            packet.extend_from_slice(&[0x78, value.len() as u8]);
+        }
+        packet.extend_from_slice(value);
+    }
+    if dry_run {
+        packet.extend_from_slice(&[0x67]);
+        packet.extend_from_slice(b"dry_run");
+        packet.push(0xf5);
+    }
+    Ok(packet)
+}
+
+#[cfg(test)]
 fn encode_firmware_uart_frame(stream_frame: &[u8]) -> Result<Vec<u8>> {
-    let cbor = mesh::cbor::decode_stream_frame(stream_frame)?;
-    encode_firmware_uart_payload(cbor)
+    let payload = mesh::cbor::decode_stream_frame(stream_frame)?;
+    encode_firmware_uart_payload(payload)
 }
 
 fn encode_firmware_uart_payload(cbor: &[u8]) -> Result<Vec<u8>> {
@@ -5236,6 +6315,47 @@ struct FirmwareUartDecoder {
     frame_activity: bool,
 }
 
+#[derive(Default)]
+struct NanSleepyStartEvent {
+    flags: u16,
+    lora_rx_delta: u32,
+    nan_beacon_delta: u32,
+    cluster_changed: bool,
+}
+
+fn nan_sleepy_start_event(payload: &[u8]) -> Option<NanSleepyStartEvent> {
+    let mut decoder = Decoder::new(payload);
+    if decoder.tag().ok()?.as_u64() != u64::from(NAN_SLEEPY_START_TAG) {
+        return None;
+    }
+    let map_len = decoder.map().ok()?;
+    let mut event = NanSleepyStartEvent::default();
+    let mut remaining = map_len;
+    loop {
+        if remaining == Some(0) {
+            break;
+        }
+        if remaining.is_none() && decoder.datatype().ok()? == Type::Break {
+            decoder.skip().ok()?;
+            break;
+        }
+        let key = decoder.u8().ok()?;
+        match key {
+            0 => event.flags = decoder.u16().ok()?,
+            1 => event.lora_rx_delta = decoder.u32().ok()?,
+            2 => event.nan_beacon_delta = decoder.u32().ok()?,
+            _ => {
+                decoder.skip().ok()?;
+            }
+        }
+        if let Some(value) = remaining.as_mut() {
+            *value = value.saturating_sub(1);
+        }
+    }
+    event.cluster_changed = event.flags & (1 << 2) != 0;
+    Some(event)
+}
+
 impl FirmwareUartDecoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut records = Vec::new();
@@ -5258,7 +6378,11 @@ impl FirmwareUartDecoder {
                 if self.discard_until_flag || self.payload.is_empty() {
                     self.discard_until_flag = false;
                     self.payload.clear();
-                    self.frame_activity = true;
+                    // Empty delimiter pairs were the old heartbeat packet.
+                    // They are no longer a wake signal: current Main emits a
+                    // tagged NAN_SLEEPY_START CBOR event instead. Keep the
+                    // delimiter handling for resynchronization, but do not
+                    // flush queued commands or report an empty packet.
                     continue;
                 }
                 records.push(mesh::cbor::encode_stream_frame(&self.payload)?);
@@ -5288,7 +6412,7 @@ impl FirmwareUartDecoder {
     }
 
     /// Return whether a complete physical UART frame ended since the prior
-    /// call. Empty delimiter frames are intentional firmware heartbeats.
+    /// call. The tagged NAN sleepy-start record is also wake activity.
     fn take_frame_activity(&mut self) -> bool {
         std::mem::take(&mut self.frame_activity)
     }
@@ -5315,6 +6439,145 @@ fn queue_firmware_payload(queue: &mut VecDeque<u8>, payload: &[u8]) -> Result<()
     }
     wire.push(FIRMWARE_UART_FLAG);
     queue_serial_bytes(queue, &wire)
+}
+
+/// Decode one firmware response for a client that selected text input.
+/// Framed clients receive the original stream record unchanged. The firmware
+/// response text is carried in its private CBOR payload tag 32; retain the
+/// generic message/error/status fallbacks for control-plane records.
+fn firmware_record_text(record: &[u8]) -> Option<String> {
+    let payload = mesh::cbor::decode_stream_frame(record).ok()?;
+    if let Some(event) = nan_sleepy_start_event(payload) {
+        return Some(format!(
+            "event type=nan.sleepy_start flags={} lora_rx_delta={} nan_beacon_delta={} cluster_changed={}",
+            event.flags, event.lora_rx_delta, event.nan_beacon_delta, event.cluster_changed,
+        ));
+    }
+    let decoded = mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default()).ok()?;
+    let message = decoded
+        .get("payload")
+        .and_then(Value::as_object)
+        .and_then(|payload| payload.get("32"))
+        .and_then(Value::as_str)
+        .or_else(|| decoded.get("message").and_then(Value::as_str))
+        .or_else(|| decoded.get("error").and_then(Value::as_str))
+        .or_else(|| decoded.get("status").and_then(Value::as_str))?;
+    let mut text = message.to_owned();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Some(text)
+}
+
+/// Return the current write policy advertised by a firmware status/event.
+/// Infrastructure mode is continuously reachable; a sleepy device is only
+/// directly writable while its bounded active session is reported true.
+fn firmware_record_direct_mode(record: &[u8]) -> Option<bool> {
+    let payload = mesh::cbor::decode_stream_frame(record).ok()?;
+    if nan_sleepy_start_event(payload).is_some() {
+        // NAN_SLEEPY_START proves that the device has just opened a short
+        // UART receive window; it does not prove that a queued command may be
+        // written immediately.  Keep the command in serial_pending so the
+        // caller below can put `mode active_ms=1000` first and only then
+        // release the command.  Returning Some(true) here used to promote
+        // the forward to direct-write mode and bypass that ordering, which
+        // lost status/flash commands on sleepy devices.
+        return None;
+    }
+    let text = firmware_record_text(record)?;
+    let active = text
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("active="))?;
+    // `active=infra` is the continuously reachable gateway role. The
+    // infra_active field describes only a bounded target/session lease and
+    // must not make lora1's own UART queue sleepy.
+    if active == "infra" {
+        return Some(true);
+    }
+    if active != "companion" && active != "sleepy" {
+        return None;
+    }
+    // A sleepy device can expose a bounded active window. In that case the
+    // role remains `active=sleepy`, while `infra_active=true` is the actual
+    // write-reachability signal.
+    text.split_whitespace()
+        .find_map(|field| field.strip_prefix("infra_active="))
+        .and_then(|value| match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+}
+
+fn update_firmware_state_from_text(state: &Arc<Mutex<FirmwareState>>, text: &str) {
+    let text = text.trim();
+    let is_boot = text.starts_with("event type=boot.state");
+    let is_mode = text.starts_with("event type=mode.state") || text.starts_with("mode active=");
+    if !is_boot && !is_mode {
+        return;
+    }
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for field in text.split_whitespace() {
+        if let Some(value) = field.strip_prefix("mode=") {
+            state.mode = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("active=") {
+            state.mode = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("infra_active=") {
+            state.infra_active = match value {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => state.infra_active,
+            };
+        } else if let Some(value) = field.strip_prefix("phase=") {
+            state.phase = Some(value.to_string());
+        } else if let Some(value) = field.strip_prefix("rebooted=") {
+            state.rebooted = match value {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => state.rebooted,
+            };
+        }
+    }
+    state.last_event_ms = now_millis_u64();
+}
+
+fn update_firmware_state_from_boot(state: &Arc<Mutex<FirmwareState>>, payload: &[u8]) {
+    if payload.len() < DMESH_BOOT_HELLO_LEN
+        || payload[..4] != DMESH_BOOT_MAGIC[..]
+        || payload[4] != DMESH_BOOT_VERSION
+        || payload[5] != 1
+    {
+        return;
+    }
+    let role = match payload[6] {
+        1 => "main",
+        2 => "recovery",
+        3 => "stage2",
+        _ => "unknown",
+    };
+    let partition = match payload[7] {
+        0 => "bootloader",
+        1 => "main",
+        2 => "recovery",
+        _ => "unknown",
+    };
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.role = Some(role.to_string());
+    state.partition = Some(partition.to_string());
+    state.reset_reason = Some(payload[8]);
+    state.mac = Some(
+        payload[12..18]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    );
+    state.phase = Some("started".to_string());
+    state.last_event_ms = now_millis_u64();
 }
 
 fn queue_client_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
@@ -5598,15 +6861,6 @@ fn purge_serial_data(fd: RawFd, purge: u8) -> Result<()> {
     Ok(())
 }
 
-fn serial_exchange(
-    path: &str,
-    baud: u32,
-    command: &str,
-    timeout_ms: u64,
-) -> Result<Vec<MeshMessage>> {
-    serial_exchange_cbor(path, baud, command, timeout_ms)
-}
-
 /// Convert the lmesh debug command boundary to the firmware's compact-CBOR
 /// wire format. Text never reaches the ESP UART: it is only accepted here so
 /// existing JSONL/MCP tooling can keep a convenient command parameter.
@@ -5631,7 +6885,11 @@ fn firmware_command_cbor(command: &str) -> Result<Vec<u8>> {
     if !fields.is_empty() {
         encoder.u16(6)?.map(fields.len() as u64)?;
         for (key, bytes, value) in fields {
-            encoder.str(&key)?;
+            if let Some(tag) = firmware_arg_tag(&key) {
+                encoder.u16(tag)?;
+            } else {
+                encoder.str(&key)?;
+            }
             if let Some(bytes) = bytes {
                 encoder.bytes(&bytes)?;
             } else {
@@ -5642,22 +6900,48 @@ fn firmware_command_cbor(command: &str) -> Result<Vec<u8>> {
     mesh::cbor::encode_stream_frame(&cbor)
 }
 
+/// Numeric firmware argument IDs for the compact command fields used by the
+/// managed ESP path. Keep unknown/debug fields as text for compatibility, but
+/// make module-flash requests match Main's native schema exactly.
+fn firmware_arg_tag(name: &str) -> Option<u16> {
+    Some(match name {
+        "op" => 87,
+        "name" => 409,
+        "server" => 246,
+        "port" => 191,
+        "target" => 346,
+        "dry_run" => 257,
+        _ => return None,
+    })
+}
+
 /// Accept one persistent reverse Main connection for every configured STA
 /// address. Unknown peers are discarded rather than becoming an implicit
 /// maintenance endpoint.
-fn reverse_main_accept_loop(port: u16, sessions: Arc<BTreeMap<String, ReverseMainRuntime>>) -> Result<()> {
+fn reverse_main_accept_loop(
+    port: u16,
+    sessions: Arc<BTreeMap<String, ReverseMainRuntime>>,
+) -> Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
         .with_context(|| format!("failed to bind reverse Main listener on 0.0.0.0:{port}"))?;
     tracing::info!(port, "reverse_main_listener_started");
     for accepted in listener.incoming() {
         let stream = accepted.context("failed to accept reverse Main connection")?;
-        let peer = stream.peer_addr().context("failed to identify reverse Main peer")?;
-        let Some((id, session)) = sessions.iter().find(|(_, session)| peer.ip() == std::net::IpAddr::V4(session.ip)) else {
+        let peer = stream
+            .peer_addr()
+            .context("failed to identify reverse Main peer")?;
+        let Some((id, session)) = sessions
+            .iter()
+            .find(|(_, session)| peer.ip() == std::net::IpAddr::V4(session.ip))
+        else {
             tracing::warn!(peer = %peer, port, "reverse_main_unknown_peer");
             continue;
         };
         stream.set_nodelay(true).ok();
-        let mut current = session.stream.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current = session
+            .stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = Some(stream);
         tracing::info!(id = %id, peer = %peer, socket = %session.socket_path, "reverse_main_connected");
     }
@@ -5684,7 +6968,9 @@ fn reverse_main_uds_loop(session: ReverseMainRuntime) -> Result<()> {
                 let mut length = [0_u8; 4];
                 client.read_exact(&mut length)?;
                 let length = u32::from_be_bytes(length) as usize;
-                if length == 0 || length > 4096 { bail!("invalid reverse Main request length {length}"); }
+                if length == 0 || length > 4096 {
+                    bail!("invalid reverse Main request length {length}");
+                }
                 let mut payload = vec![0_u8; length];
                 client.read_exact(&mut payload)?;
                 let response = reverse_main_exchange_payload(&session, &payload, 30_000)?;
@@ -5701,7 +6987,11 @@ fn reverse_main_uds_loop(session: ReverseMainRuntime) -> Result<()> {
     Ok(())
 }
 
-fn reverse_main_exchange(session: &ReverseMainRuntime, command: &str, timeout_ms: u64) -> Result<Value> {
+fn reverse_main_exchange(
+    session: &ReverseMainRuntime,
+    command: &str,
+    timeout_ms: u64,
+) -> Result<Value> {
     let stream_frame = firmware_command_cbor(command)?;
     let payload = mesh::cbor::decode_stream_frame(&stream_frame)?;
     let response = reverse_main_exchange_payload(session, &payload, timeout_ms)?;
@@ -5709,14 +6999,27 @@ fn reverse_main_exchange(session: &ReverseMainRuntime, command: &str, timeout_ms
         .context("Main reverse TCP response is not compact CBOR")
 }
 
-fn reverse_main_exchange_payload(session: &ReverseMainRuntime, payload: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
+fn reverse_main_exchange_payload(
+    session: &ReverseMainRuntime,
+    payload: &[u8],
+    timeout_ms: u64,
+) -> Result<Vec<u8>> {
     let timeout = Duration::from_millis(timeout_ms);
-    let mut guard = session.stream.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let stream = guard.as_mut().ok_or_else(|| anyhow::anyhow!("Main reverse session {} is not connected", session.id))?;
+    let mut guard = session
+        .stream
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stream = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Main reverse session {} is not connected", session.id))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let length = u32::try_from(payload.len()).context("firmware command is too large for TCP")?;
-    if let Err(error) = stream.write_all(&length.to_be_bytes()).and_then(|_| stream.write_all(payload)).and_then(|_| stream.flush()) {
+    if let Err(error) = stream
+        .write_all(&length.to_be_bytes())
+        .and_then(|_| stream.write_all(payload))
+        .and_then(|_| stream.flush())
+    {
         *guard = None;
         return Err(error).context("failed to write Main reverse command");
     }
@@ -5726,7 +7029,9 @@ fn reverse_main_exchange_payload(session: &ReverseMainRuntime, payload: &[u8], t
         return Err(error).context("failed to read Main reverse response length");
     }
     let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > 4096 { bail!("invalid Main reverse response length {length}"); }
+    if length == 0 || length > 4096 {
+        bail!("invalid Main reverse response length {length}");
+    }
     let mut response = vec![0_u8; length];
     if let Err(error) = stream.read_exact(&mut response) {
         *guard = None;
@@ -5781,101 +7086,22 @@ fn decode_firmware_hex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Send one framed CBOR command directly to a serial adapter and decode each
-/// complete response as a binary mesh message. The firmware never emits a
-/// console prompt, so frame boundaries are authoritative.
-fn serial_exchange_cbor(
-    path: &str,
-    baud: u32,
-    command: &str,
-    timeout_ms: u64,
-) -> Result<Vec<MeshMessage>> {
-    let frame = firmware_command_cbor(command)?;
-    let frame = encode_firmware_uart_frame(&frame)?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-        .open(path)
-        .with_context(|| format!("failed to open serial radio {path}"))?;
-    configure_serial(file.as_raw_fd(), baud)
-        .with_context(|| format!("failed to configure serial radio {path}"))?;
-    file.write_all(&frame)
-        .with_context(|| format!("failed to write binary firmware command to {path}"))?;
-    file.flush()
-        .with_context(|| format!("failed to flush binary firmware command to {path}"))?;
-
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-    let mut decoder = FirmwareUartDecoder::default();
-    let mut messages = Vec::new();
-    let mut buf = [0_u8; 512];
-    while std::time::Instant::now() < deadline {
-        match file.read(&mut buf) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(10)),
-            Ok(count) => {
-                for frame in decoder.push(&buf[..count])? {
-                    // PPP/HDLC delimiters let the UART decoder recover at the
-                    // next flag after noise or a truncated record.  A frame
-                    // can still be syntactically complete but contain a bad
-                    // length or CBOR payload, so treat that record as noise
-                    // too: do not let it abort the request that follows it.
-                    let payload = match mesh::cbor::decode_stream_frame(&frame) {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            tracing::debug!(%path, %error, "ignored malformed direct UART stream frame");
-                            continue;
-                        }
-                    };
-                    let decoded = match mesh::cbor::decode_json(
-                        payload,
-                        &mesh::cbor::Catalog::default(),
-                    ) {
-                        Ok(decoded) => decoded,
-                        Err(error) => {
-                            tracing::debug!(%path, %error, "ignored malformed direct UART CBOR payload");
-                            continue;
-                        }
-                    };
-                    let mut message = MeshMessage::new(0, MeshMessageCodec::Cbor);
-                    if let Some(status) = decoded.get("status") {
-                        message.fields.insert(FIELD_STATUS, status.to_string());
-                    }
-                    if let Some(error) = decoded.get("error") {
-                        message.fields.insert(FIELD_CTRL_DIR, error.to_string());
-                    }
-                    message.payload = Some(serde_json::to_vec(&decoded)?);
-                    messages.push(message);
-                }
-                if !messages.is_empty() {
-                    return Ok(messages);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error).with_context(|| format!("failed to read from {path}")),
-        }
-    }
-    if messages.is_empty() {
-        bail!("timed out waiting for binary firmware response");
-    }
-    Ok(messages)
-}
-
-fn boot_command_payload(command: &str) -> Result<[u8; DMESH_BOOT_COMMAND_LEN]> {
-    if !command.eq_ignore_ascii_case("recovery") {
+fn boot_command_payload(command: &str) -> Result<Vec<u8>> {
+    let partition = if command.eq_ignore_ascii_case("recovery") {
+        2_u8
+    } else if command.eq_ignore_ascii_case("main") {
+        1_u8
+    } else {
         bail!("unsupported boot command {command:?}");
-    }
-    Ok([
-        DMESH_BOOT_MAGIC[0],
-        DMESH_BOOT_MAGIC[1],
-        DMESH_BOOT_MAGIC[2],
-        DMESH_BOOT_MAGIC[3],
-        DMESH_BOOT_VERSION,
-        DMESH_BOOT_KIND_COMMAND,
-        DMESH_BOOT_COMMAND_RECOVERY,
-        0,
-    ])
+    };
+    // {0:60010,6:[partition]}: the same compact method/payload envelope
+    // used by Main, with no bootloader-specific legacy format.
+    Ok(vec![0xa2, 0x00, 0x1a,
+            (DMESH_BOOT_METHOD_SELECT >> 24) as u8,
+            (DMESH_BOOT_METHOD_SELECT >> 16) as u8,
+            (DMESH_BOOT_METHOD_SELECT >> 8) as u8,
+            DMESH_BOOT_METHOD_SELECT as u8,
+            0x06, 0x81, partition])
 }
 
 fn boot_identity_json(payload: &[u8]) -> Value {
@@ -5883,6 +7109,22 @@ fn boot_identity_json(payload: &[u8]) -> Value {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
+    if payload.windows(3).any(|window| window == [0x19, 0xea, 0x60]) {
+        let tuple = boot_identity_tuple(payload);
+        let mut result = json!({
+            "valid": true,
+            "kind": "event",
+            "event_id": 60000,
+            "event_name": "boot.identity",
+            "tuple": tuple,
+        });
+        if let Some(values) = result["tuple"].as_array() {
+            if values.len() >= 10 {
+                result["stage2_version"] = values[8].clone();
+            }
+        }
+        return result;
+    }
     if payload.len() < 18 || payload[..4] != DMESH_BOOT_MAGIC[..] {
         return json!({"raw_hex": hex, "valid": false});
     }
@@ -5912,127 +7154,130 @@ fn boot_identity_json(payload: &[u8]) -> Value {
     })
 }
 
+fn boot_event_json(payload: &[u8]) -> Value {
+    let event_id = boot_event_id(payload).unwrap_or(0);
+    let event_name = match event_id {
+        60000 => "boot.identity",
+        60001 => "flash.complete",
+        60002 => "flash.error",
+        60003 => "recovery.network_up",
+        _ => "boot.event",
+    };
+    json!({
+        "valid": event_id != 0,
+        "kind": "event",
+        "event_id": event_id,
+        "event_name": event_name,
+        "tuple": boot_identity_tuple(payload),
+    })
+}
+
+const DMESH_BOOT_HELLO_LEN: usize = 18;
+
+/// The managed UART forward preserves byte order but not physical UART read
+/// boundaries. A DMB1 hello may therefore be split across several stream
+/// records; reassemble it before validating the fixed fields.
+fn find_stage2_identity(bytes: &[u8]) -> Option<Vec<u8>> {
+    bytes
+        .windows(DMESH_BOOT_HELLO_LEN)
+        .find(|payload| {
+            payload[..4] == DMESH_BOOT_MAGIC[..]
+                && payload[4] == DMESH_BOOT_VERSION
+                && payload[5] == 1
+                && payload[6] == DMESH_BOOT_ROLE_STAGE2
+                && payload[7] == DMESH_BOOT_PARTITION_BOOTLOADER
+        })
+        .map(|payload| payload.to_vec())
+}
+
 /// Reset an ESP bridge and send the fixed stage2 command on the same open
 /// descriptor. Keeping reset, transmit, and receive in one operation avoids
 /// losing stage2's short UART selector window. The managed serial forward is
 /// deliberately left active so it continues to retain evidence.
-fn direct_reset_boot_exchange(
-    path: &str,
-    baud: u32,
+fn set_modem_line(fd: RawFd, line: libc::c_int, enabled: bool) -> Result<()> {
+    // Preserve the other modem line and submit the complete mask. Some
+    // CP210x bridges do not reliably propagate a standalone TIOCMBIS/BIC
+    // transition while the tty is shared with a long-lived forward; TIOCMSET
+    // matches the control-line transaction used by the ESP reset tooling.
+    let mut state = modem_state(fd)?;
+    if enabled {
+        state |= line;
+    } else {
+        state &= !line;
+    }
+    set_modem_state(fd, state)
+}
+
+fn set_modem_state(fd: RawFd, mut state: libc::c_int) -> Result<()> {
+    if unsafe { libc::ioctl(fd, libc::TIOCMSET, &mut state) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("TIOCMSET failed");
+    }
+    Ok(())
+}
+
+fn modem_state(fd: RawFd) -> Result<libc::c_int> {
+    let mut state: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::TIOCMGET, &mut state) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("TIOCMGET failed");
+    }
+    Ok(state)
+}
+
+/// Reset a running ESP through the descriptor owned by lmesh.
+///
+/// Some CP210x bridges leave DTR asserted after a previous client or open.
+/// Refusing the reset in that state makes the recovery path unusable: the
+/// request is accepted but no RTS pulse is performed. Release DTR on this same
+/// descriptor first, then pulse RTS. Using the managed descriptor avoids the
+/// second-open/close race that can restore modem lines and cancel the reset.
+fn serial_run_reset(fd: RawFd) -> Result<()> {
+    let state = modem_state(fd)?;
+    if state & libc::TIOCM_DTR != 0 {
+        set_modem_line(fd, libc::TIOCM_DTR, false)?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Establish the released level first.  A USB-UART bridge may already
+    // report RTS asserted when it is opened; asserting an already-asserted
+    // line produces no edge and therefore no ESP reset.
+    set_modem_line(fd, libc::TIOCM_RTS, false)?;
+    std::thread::sleep(Duration::from_millis(20));
+    set_modem_line(fd, libc::TIOCM_RTS, true)?;
+    std::thread::sleep(Duration::from_millis(120));
+    set_modem_line(fd, libc::TIOCM_RTS, false)?;
+    // Stage2's selector is sent by the same managed forward immediately
+    // after this reset operation. Do not hold the descriptor for half a
+    // second: that would consume a short boot-selector window before the
+    // queued PPP packet reaches the UART.
+    std::thread::sleep(Duration::from_millis(20));
+    Ok(())
+}
+
+/// Send a PPP-CBOR boot selector through a managed UDS forward and wait for
+/// the next structured boot identity record.
+fn connect_uds_boot(socket_path: &str) -> Result<UnixStream> {
+    UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect managed serial socket {socket_path}"))
+}
+
+fn uds_boot_exchange(socket_path: &str, command: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
+    let stream = connect_uds_boot(socket_path)?;
+    uds_boot_exchange_stream(stream, command, timeout_ms)
+}
+
+fn uds_boot_exchange_stream(
+    mut stream: UnixStream,
     command: &[u8],
     timeout_ms: u64,
 ) -> Result<Vec<u8>> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-        .open(path)
-        .with_context(|| format!("failed to open serial radio {path}"))?;
-    configure_serial(file.as_raw_fd(), baud)?;
-    unsafe {
-        libc::tcflush(file.as_raw_fd(), libc::TCIOFLUSH);
-    }
-    let mut bits = 0;
-    if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCMGET, &mut bits) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("TIOCMGET failed");
-    }
-    let set_line = |line: libc::c_int, value: bool, bits: &mut libc::c_int| -> Result<()> {
-        if value {
-            *bits |= line;
-        } else {
-            *bits &= !line;
-        }
-        if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCMSET, bits) } < 0 {
-            return Err(std::io::Error::last_os_error()).context("TIOCMSET failed");
-        }
-        Ok(())
-    };
-    // CP210x auto-reset wiring is active-low at the ESP: DTR asserted holds
-    // GPIO0 low (ROM download), while RTS asserted holds EN low.  Release
-    // GPIO0 first, pulse EN, and leave GPIO0 released so the custom second
-    // stage—not the ROM downloader—runs.
-    set_line(libc::TIOCM_DTR, false, &mut bits)?;
-    set_line(libc::TIOCM_RTS, true, &mut bits)?;
-    std::thread::sleep(Duration::from_millis(100));
-    set_line(libc::TIOCM_RTS, false, &mut bits)?;
-    set_line(libc::TIOCM_DTR, false, &mut bits)?;
-
-    let wire = encode_firmware_uart_payload(command)?;
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut decoder = FirmwareUartDecoder::default();
-    let mut buf = [0_u8; 256];
-    let mut physical_rx_bytes = 0usize;
-    let mut raw_rx = Vec::with_capacity(128);
-    while Instant::now() < deadline {
-        match (&file).read(&mut buf) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(1)),
-            Ok(count) => {
-                physical_rx_bytes = physical_rx_bytes.saturating_add(count);
-                if raw_rx.len() < 128 {
-                    raw_rx.extend_from_slice(&buf[..count.min(128 - raw_rx.len())]);
-                }
-                for stream_frame in decoder.push(&buf[..count])? {
-                    let payload = mesh::cbor::decode_stream_frame(&stream_frame)
-                        .context("invalid managed stage2 stream envelope")?;
-                    if payload.len() >= 8
-                        && payload[..4] == DMESH_BOOT_MAGIC[..]
-                        && payload[4] == DMESH_BOOT_VERSION
-                        && payload[5] == 1
-                        && payload[6] == DMESH_BOOT_ROLE_STAGE2
-                        && payload[7] == DMESH_BOOT_PARTITION_BOOTLOADER
-                    {
-                        // Stage2 opens its short selector window immediately
-                        // after emitting this hello. Sending before the hello
-                        // races boot ROM/bootloader initialization and can
-                        // leave the command unread, causing an unintended
-                        // Main boot.
-                        (&file)
-                            .write_all(&wire)
-                            .context("failed to write stage2 command")?;
-                        (&file).flush().context("failed to flush stage2 command")?;
-                        return Ok(payload.to_vec());
-                    }
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                std::thread::sleep(Duration::from_millis(1))
-            }
-            Err(error) => return Err(error).context("failed to read stage2 identity"),
-        }
-    }
-    let raw_hex = raw_rx
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    bail!(
-        "timed out waiting for fixed stage2 identity after reset (physical_rx_bytes={physical_rx_bytes} raw_hex={raw_hex})"
-    )
-}
-
-/// Send a fixed DMB1 payload through a managed UDS forward and wait for the
-/// next fixed boot identity record.  The UDS envelope is still the normal
-/// length-prefixed mesh stream envelope; only its payload bypasses CBOR.
-fn uds_boot_exchange(socket_path: &str, command: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
     let command_frame = mesh::cbor::encode_stream_frame(command)?;
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("failed to connect managed serial socket {socket_path}"))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .with_context(|| format!("failed to set read timeout on {socket_path}"))?;
-    stream
-        .write_all(&command_frame)
-        .context("failed to write fixed stage2 command")?;
-    stream
-        .flush()
-        .context("failed to flush fixed stage2 command")?;
-
+        .context("failed to set managed serial read timeout")?;
+    // ROM output precedes the custom bootloader. The selector must wait until
+    // the PPP boot identity proves that stage2 has started polling UART.
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut output = Vec::new();
+    let mut boot_bytes = Vec::new();
     let mut buf = [0_u8; 512];
     while std::time::Instant::now() < deadline {
         match stream.read(&mut buf) {
@@ -6058,19 +7303,126 @@ fn uds_boot_exchange(socket_path: &str, command: &[u8], timeout_ms: u64) -> Resu
             let frame = output.drain(..frame_len).collect::<Vec<_>>();
             let payload = mesh::cbor::decode_stream_frame(&frame)
                 .context("invalid managed stage2 stream envelope")?;
-            if payload.len() >= 8
-                && payload[..4] == DMESH_BOOT_MAGIC[..]
-                && payload[4] == DMESH_BOOT_VERSION
-                && payload[5] == 1
-                && payload[6] == DMESH_BOOT_ROLE_STAGE2
-                && payload[7] == DMESH_BOOT_PARTITION_BOOTLOADER
-            {
-                return Ok(payload.to_vec());
+            boot_bytes.extend_from_slice(&payload);
+            if boot_bytes.len() > DMESH_BOOT_HELLO_LEN * 4 {
+                let keep = DMESH_BOOT_HELLO_LEN * 4;
+                boot_bytes.drain(..boot_bytes.len() - keep);
+            }
+            if let Some(identity) = find_stage2_identity(&boot_bytes) {
+                stream
+                    .write_all(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
+                    .context("failed to select direct delivery for stage2 command")?;
+                stream
+                    .write_all(&command_frame)
+                    .context("failed to write fixed stage2 command")?;
+                stream
+                    .flush()
+                    .context("failed to flush fixed stage2 command")?;
+                return Ok(identity);
+            }
+            if boot_bytes.windows(3).any(|window| window == [0x19, 0xea, 0x60]) {
+                stream
+                    .write_all(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
+                    .context("failed to select direct delivery for stage2 command")?;
+                stream
+                    .write_all(&command_frame)
+                    .context("failed to write fixed stage2 command")?;
+                stream
+                    .flush()
+                    .context("failed to flush fixed stage2 command")?;
+                return Ok(boot_bytes.clone());
             }
         }
         std::thread::sleep(Duration::from_millis(5));
     }
     bail!("timed out waiting for fixed stage2 identity")
+}
+
+/// Exchange arbitrary UART bytes through the managed framed forward.  This is
+/// used by Recovery's small ASCII parser, which is not a normal Main CBOR
+/// command and therefore cannot use `uds_console_exchange`.
+fn uds_raw_exchange(socket_path: &str, payload: &[u8], timeout_ms: u64) -> Result<String> {
+    static UDS_RAW_SERIALIZE: OnceLock<Mutex<()>> = OnceLock::new();
+    let _exchange_guard = UDS_RAW_SERIALIZE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("managed raw exchange lock poisoned"))?;
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect managed serial socket {socket_path}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(5)))
+        .context("failed to set stale-record timeout")?;
+    let mut stale = [0_u8; 2048];
+    loop {
+        match stream.read(&mut stale) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error).context("failed to drain managed serial socket"),
+        }
+    }
+    let command_frame = mesh::cbor::encode_stream_frame(payload)?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .context("failed to set managed raw read timeout")?;
+    stream
+        .write_all(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
+        .context("failed to select direct delivery for Recovery command")?;
+    stream
+        .write_all(&command_frame)
+        .context("failed to write managed raw serial command")?;
+    stream
+        .flush()
+        .context("failed to flush managed raw serial command")?;
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut output = Vec::new();
+    let mut raw = Vec::new();
+    let mut buf = [0_u8; 512];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buf[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("failed to read managed raw response"),
+        }
+        while output.len() >= 4 {
+            let body_len = u32::from_be_bytes(output[..4].try_into().unwrap()) as usize;
+            if !(4..=mesh::cbor::ESP_RECORD_MAX + 4).contains(&body_len) {
+                output.remove(0);
+                continue;
+            }
+            let frame_len = 4 + body_len;
+            if output.len() < frame_len {
+                break;
+            }
+            let frame = output.drain(..frame_len).collect::<Vec<_>>();
+            let body = mesh::cbor::decode_stream_frame(&frame)
+                .context("invalid managed raw stream envelope")?;
+            raw.extend_from_slice(&body);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(String::from_utf8_lossy(&raw).to_string())
+}
+
+fn parse_raw_exchange_messages(raw: &str) -> Vec<MeshMessage> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| mesh::message::parse_firmware_message_line(line).ok())
+        .collect()
 }
 
 /// Send one console command through a managed forward.
@@ -6081,10 +7433,24 @@ fn uds_boot_exchange(socket_path: &str, command: &[u8], timeout_ms: u64) -> Resu
 /// command's response be attributed to this one.  Long-running observations
 /// belong on the trace/event API, not this request/response path.
 fn uds_console_exchange(socket_path: &str, command: &str, timeout_ms: u64) -> Result<String> {
-    uds_console_exchange_inner(socket_path, command, timeout_ms)
+    uds_console_exchange_with_options(socket_path, command, timeout_ms, false)
 }
 
-fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64) -> Result<String> {
+fn uds_console_exchange_with_options(
+    socket_path: &str,
+    command: &str,
+    timeout_ms: u64,
+    force_direct: bool,
+) -> Result<String> {
+    uds_console_exchange_inner(socket_path, command, timeout_ms, force_direct)
+}
+
+fn uds_console_exchange_inner(
+    socket_path: &str,
+    command: &str,
+    timeout_ms: u64,
+    force_direct: bool,
+) -> Result<String> {
     // A managed forward broadcasts every UART record to every connected UDS
     // client. Serialize request/reply exchanges and discard records already
     // queued when this client connects; otherwise a delayed response to a
@@ -6124,12 +7490,17 @@ fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64)
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
         .with_context(|| format!("failed to set read timeout on {socket_path}"))?;
-    // Battery nodes advertise an empty framed UART heartbeat during their
-    // configured raw-NAN wake window.  The managed forward keeps this command
-    // pending until that authoritative frame arrives, then flushes it while
+    // Battery nodes advertise a tagged UART wake event during their configured
+    // raw-NAN window. The managed forward keeps this command pending until
+    // that authoritative event arrives, then flushes it while
     // firmware UART RX is open. GPIO0/PRG is a recovery control and is not a
     // reliable product wake mechanism: using it here can consume the first
     // command on a board waking from light sleep.
+    if force_direct {
+        stream
+            .write_all(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
+            .with_context(|| format!("failed to select direct delivery on {socket_path}"))?;
+    }
     stream
         .write_all(&command_frame)
         .with_context(|| format!("failed to write managed serial command to {socket_path}"))?;
@@ -6189,6 +7560,7 @@ fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64)
                     // Firmware response text is compact-CBOR payload tag 32.
                     // The generic catalog intentionally does not assign this
                     // firmware-private tag a global field name.
+                    let record_start = records.len();
                     if let Some(message) = decoded
                         .get("payload")
                         .and_then(Value::as_object)
@@ -6212,6 +7584,16 @@ fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64)
                         records.push_str(&decoded.to_string());
                         records.push('\n');
                     }
+                    // Forward startup and wake classification records are
+                    // broadcast to every UDS client. They are useful for
+                    // lmesh's mode tracker but are not replies to an
+                    // unrelated command (a `status` request must not be
+                    // satisfied by `mode status=true`). Keep waiting for the
+                    // command's own record on this same serialized client.
+                    if is_unsolicited_console_record(command, &records[record_start..]) {
+                        records.truncate(record_start);
+                        continue;
+                    }
                     // Firmware commands produce one authoritative CBOR
                     // response. Return immediately so this connection cannot
                     // receive and steal the response for a later command.
@@ -6232,6 +7614,24 @@ fn uds_console_exchange_inner(socket_path: &str, command: &str, timeout_ms: u64)
         records.push_str(&String::from_utf8_lossy(&output));
     }
     bail!("timed out waiting for framed firmware response from {socket_path}")
+}
+
+fn is_unsolicited_console_record(command: &str, record: &str) -> bool {
+    let command = command.trim_start();
+    let record = record.trim_start();
+    // State notifications are broadcast to all clients, including the client
+    // that issued a mode command. They are never the command's authoritative
+    // response, even for the compact `active`/`idle` aliases.
+    if record.starts_with("event type=boot") || record.starts_with("event type=mode") {
+        return true;
+    }
+    // `active` and `idle` are compact aliases for the mode control command.
+    // Their authoritative response is rendered as `mode active=...`, so it
+    // must not be mistaken for the broadcast mode-state event.
+    if command.starts_with("mode") || command.starts_with("active") || command.starts_with("idle") {
+        return false;
+    }
+    record.starts_with("mode active=")
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -6360,7 +7760,11 @@ fn raw_history_unsupported(value: &Value) -> bool {
 
 fn is_session_end(payload_hex: &str) -> bool {
     decode_firmware_hex(payload_hex)
-        .map(|payload| payload.windows(b"session_end".len()).any(|part| part == b"session_end"))
+        .map(|payload| {
+            payload
+                .windows(b"session_end".len())
+                .any(|part| part == b"session_end")
+        })
         .unwrap_or(false)
 }
 
@@ -6678,69 +8082,6 @@ fn append_stability_result(state: &Arc<Mutex<StabilityState>>) {
     }
 }
 
-#[derive(Debug)]
-struct SerialExchange {
-    raw_text: String,
-    messages: Vec<MeshMessage>,
-}
-
-fn serial_exchange_raw(
-    path: &str,
-    baud: u32,
-    command: &str,
-    timeout_ms: u64,
-) -> Result<SerialExchange> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-        .open(path)
-        .with_context(|| format!("failed to open serial radio {path}"))?;
-    configure_serial(file.as_raw_fd(), baud)
-        .with_context(|| format!("failed to configure serial radio {path}"))?;
-    let wire = if command.starts_with("STA ") {
-        // Recovery has a deliberately tiny parser: its transport command is
-        // ASCII, but the UART bearer is still the shared PPP envelope.
-        encode_firmware_uart_payload(command.as_bytes())?
-    } else {
-        let mut wire = command.as_bytes().to_vec();
-        wire.push(b'\n');
-        wire
-    };
-    file.write_all(&wire)
-        .with_context(|| format!("failed to write serial command to {path}"))?;
-    file.flush()
-        .with_context(|| format!("failed to flush serial command to {path}"))?;
-
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-    let mut bytes = Vec::new();
-    let mut buf = [0_u8; 512];
-    while std::time::Instant::now() < deadline {
-        match file.read(&mut buf) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(10)),
-            Ok(n) => {
-                bytes.extend_from_slice(&buf[..n]);
-                if bytes.ends_with(b"dm-rs> ") || bytes.ends_with(b"dm-rs>") {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error).with_context(|| format!("failed to read from {path}")),
-        }
-    }
-
-    let raw_text = String::from_utf8_lossy(&bytes).to_string();
-    let messages = raw_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| mesh::message::parse_firmware_message_line(line).ok())
-        .collect();
-    Ok(SerialExchange { raw_text, messages })
-}
-
 fn configure_serial(fd: RawFd, baud: u32) -> Result<()> {
     let mut termios = unsafe {
         let mut termios = std::mem::zeroed();
@@ -6805,7 +8146,9 @@ struct EspReverseSessionConfig {
     socket: Option<String>,
 }
 
-fn default_reverse_main_port() -> u16 { 3343 }
+fn default_reverse_main_port() -> u16 {
+    3343
+}
 
 fn configured_esp_gateway() -> String {
     if let Ok(value) = std::env::var("LMESH_ESP_GATEWAY") {
@@ -6816,7 +8159,7 @@ fn configured_esp_gateway() -> String {
     read_lmesh_config()
         .and_then(|config| config.esp_gateway)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "lora1".to_owned())
+        .unwrap_or_else(|| DEFAULT_ESP_NAN_GATEWAY.to_string())
 }
 
 fn configured_esp_targets() -> BTreeMap<String, String> {
@@ -6845,7 +8188,9 @@ fn configured_esp_reverse_sessions() -> BTreeMap<String, ReverseMainRuntime> {
         .unwrap_or_default()
         .into_iter()
         .map(|config| {
-            let socket_path = config.socket.unwrap_or_else(|| format!("/run/mesh/lmesh/{}-ip.sock", config.id));
+            let socket_path = config
+                .socket
+                .unwrap_or_else(|| format!("/run/mesh/lmesh/{}-ip.sock", config.id));
             let runtime = ReverseMainRuntime {
                 id: config.id.clone(),
                 ip: config.ip,
@@ -6866,6 +8211,9 @@ fn resolve_esp_route(
 ) -> Option<(String, String)> {
     // An explicitly named adapter is the escape hatch for UART diagnostics.
     if adapter.is_some() {
+        return None;
+    }
+    if gateway.trim().is_empty() {
         return None;
     }
     let target = targets.get(port?)?.clone();
@@ -7243,6 +8591,8 @@ struct Nl80211Socket {
 
 struct ApRuntime {
     _owner_socket: Nl80211Socket,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
 struct ApStartProfile {
@@ -7446,6 +8796,22 @@ impl RawWifiTxOptions {
                 dont_wait_for_ack: true,
                 tx_no_cck_rate: false,
             },
+            "nan_data" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
+            "nan_data_active" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
             "roc" => Self {
                 variant: variant.to_string(),
                 include_freq: true,
@@ -7463,7 +8829,7 @@ impl RawWifiTxOptions {
                 tx_no_cck_rate: false,
             },
             other => bail!(
-                "unknown tx_variant {other:?}; expected standard, zero_duration, no_duration, no_offchannel, minimal, dont_wait_ack, dont_wait_no_duration, dont_wait_minimal, onchannel, onchannel_noack, dont_wait_no_cck, no_cck, no_freq, monitor, monitor_active, multicast_data, multicast_data_active, sta_multicast_llc, sta_multicast_llc_active, sta_direct_llc, sta_direct_llc_active, roc, or pyroute2"
+                "unknown tx_variant {other:?}; expected standard, zero_duration, no_duration, no_offchannel, minimal, dont_wait_ack, dont_wait_no_duration, dont_wait_minimal, onchannel, onchannel_noack, dont_wait_no_cck, no_cck, no_freq, monitor, monitor_active, multicast_data, multicast_data_active, sta_multicast_llc, sta_multicast_llc_active, sta_direct_llc, sta_direct_llc_active, nan_data, nan_data_active, roc, or pyroute2"
             ),
         };
         Ok(options)
@@ -7737,7 +9103,7 @@ impl Nl80211Socket {
         let profiles = [
             ApStartProfile {
                 name: "hostapd_exact_ht20",
-                probe_resp: false,
+                probe_resp: true,
                 channel_type: NL80211_CHAN_HT20,
                 channel_width: NL80211_CHAN_WIDTH_20,
                 explicit_width: false,
@@ -7749,7 +9115,7 @@ impl Nl80211Socket {
             },
             ApStartProfile {
                 name: "hostapd_exact_noht",
-                probe_resp: false,
+                probe_resp: true,
                 channel_type: NL80211_CHAN_NO_HT,
                 channel_width: NL80211_CHAN_WIDTH_20_NOHT,
                 explicit_width: false,
@@ -8025,6 +9391,75 @@ impl Nl80211Socket {
     }
 
     fn add_station_minimal(&self, ifindex: u32, mac: [u8; 6], aid: u16) -> Result<()> {
+        self.add_station(
+            ifindex,
+            mac,
+            aid,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+    }
+
+    fn add_station_from_assoc(
+        &self,
+        ifindex: u32,
+        mac: [u8; 6],
+        frame: &[u8],
+        allow_ht: bool,
+    ) -> Result<()> {
+        let capability = read_u16_at(frame, IEEE80211_BODY);
+        let listen_interval = read_u16_at(frame, IEEE80211_BODY + 2);
+        let ies_offset = if frame_subtype(frame) == 2 {
+            IEEE80211_BODY + 10
+        } else {
+            IEEE80211_BODY + 4
+        };
+        let ies = frame.get(ies_offset..).unwrap_or_default();
+        let ht_capability = allow_ht.then(|| management_ie_bytes(ies, 45)).flatten();
+        let extended_capability = management_ie_bytes(ies, 127);
+        let mut supported_rates = Vec::with_capacity(16);
+        if let Some(rates) = management_ie_bytes(ies, 1) {
+            supported_rates.extend_from_slice(rates);
+        }
+        if let Some(rates) = management_ie_bytes(ies, 50) {
+            supported_rates.extend_from_slice(rates);
+        }
+        let wme = management_ie_bytes(ies, 221).is_some_and(|value| {
+            value.len() >= 4 && value[..4] == [0x00, 0x50, 0xf2, 0x02]
+        });
+        let short_preamble = capability.is_some_and(|value| value & (1 << 5) != 0);
+        self.add_station(
+            ifindex,
+            mac,
+            1,
+            capability,
+            listen_interval,
+            ht_capability,
+            extended_capability,
+            (!supported_rates.is_empty()).then_some(supported_rates.as_slice()),
+            wme,
+            short_preamble,
+        )
+    }
+
+    fn add_station(
+        &self,
+        ifindex: u32,
+        mac: [u8; 6],
+        aid: u16,
+        capability: Option<u16>,
+        listen_interval: Option<u16>,
+        ht_capability: Option<&[u8]>,
+        extended_capability: Option<&[u8]>,
+        supported_rates: Option<&[u8]>,
+        wme: bool,
+        short_preamble: bool,
+    ) -> Result<()> {
         let mut payload = genl_payload(NL80211_CMD_NEW_STATION, NL80211_GENL_VERSION);
         append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
         append_attr(&mut payload, NL80211_ATTR_MAC, &mac);
@@ -8032,16 +9467,49 @@ impl Nl80211Socket {
         append_attr(
             &mut payload,
             NL80211_ATTR_STA_LISTEN_INTERVAL,
-            &10_u16.to_ne_bytes(),
+            &listen_interval.unwrap_or(10).to_ne_bytes(),
         );
         append_attr(
             &mut payload,
             NL80211_ATTR_STA_SUPPORTED_RATES,
-            &[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24],
+            supported_rates.unwrap_or(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]),
         );
-        let station_flags = NL80211_STA_FLAG_AUTHORIZED
+        if let Some(capability) = capability {
+            append_attr(
+                &mut payload,
+                NL80211_ATTR_STA_CAPABILITY,
+                &capability.to_ne_bytes(),
+            );
+        }
+        if let Some(ht_capability) = ht_capability.filter(|value| value.len() == 26) {
+            append_attr(&mut payload, NL80211_ATTR_HT_CAPABILITY, ht_capability);
+        }
+        if let Some(extended_capability) = extended_capability {
+            append_attr(
+                &mut payload,
+                NL80211_ATTR_STA_EXT_CAPABILITY,
+                extended_capability,
+            );
+        }
+        let mut station_flags = NL80211_STA_FLAG_AUTHORIZED
             | NL80211_STA_FLAG_AUTHENTICATED
             | NL80211_STA_FLAG_ASSOCIATED;
+        if wme {
+            station_flags |= NL80211_STA_FLAG_WME;
+        }
+        if short_preamble {
+            station_flags |= NL80211_STA_FLAG_SHORT_PREAMBLE;
+        }
+        if wme {
+            let mut wme_attributes = Vec::with_capacity(16);
+            append_attr(&mut wme_attributes, 1, &[0]);
+            append_attr(&mut wme_attributes, 2, &[0]);
+            append_attr(
+                &mut payload,
+                NL80211_ATTR_STA_WME | (1 << 15),
+                &wme_attributes,
+            );
+        }
         let mut flags_update = Vec::with_capacity(8);
         flags_update.extend_from_slice(&station_flags.to_ne_bytes());
         flags_update.extend_from_slice(&station_flags.to_ne_bytes());
@@ -8178,13 +9646,7 @@ impl Nl80211Socket {
     }
 
     fn recv_netlink(&self) -> Result<Vec<u8>> {
-        let mut buf = vec![0_u8; 65536];
-        let read =
-            unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if read < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to receive netlink reply");
-        }
-        buf.truncate(read as usize);
+        let buf = self.recv_netlink_raw()?;
         if let Some(error) = netlink_error(&buf) {
             bail!(
                 "netlink error: {}{}",
@@ -8260,13 +9722,48 @@ impl Nl80211Socket {
 
     fn recv_netlink_raw(&self) -> Result<Vec<u8>> {
         let mut buf = vec![0_u8; 65536];
-        let read =
-            unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        // Requests are sent with sendto() on an unconnected generic-netlink
+        // socket. Use recvfrom() symmetrically; recv() returns ENOTCONN on
+        // kernels that do not implicitly connect AF_NETLINK sockets.
+        let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut peer_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        let read = unsafe {
+            libc::recvfrom(
+                self.fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                &mut peer as *mut libc::sockaddr_nl as *mut libc::sockaddr,
+                &mut peer_len,
+            )
+        };
         if read < 0 {
             return Err(std::io::Error::last_os_error()).context("failed to receive netlink reply");
         }
         buf.truncate(read as usize);
         Ok(buf)
+    }
+
+    fn set_receive_timeout(&self, timeout: Duration) -> Result<()> {
+        let micros = timeout.as_micros().min(i64::MAX as u128) as i64;
+        let value = libc::timeval {
+            tv_sec: micros / 1_000_000,
+            tv_usec: micros % 1_000_000,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &value as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to set nl80211 receive timeout");
+        }
+        Ok(())
     }
 }
 
@@ -8280,6 +9777,7 @@ impl Drop for Nl80211Socket {
 
 struct MonitorTxSocket {
     fd: RawFd,
+    ifindex: u32,
 }
 
 struct MonitorRxSocket {
@@ -8336,16 +9834,27 @@ impl MonitorTxSocket {
             }
             return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
         }
-        Ok(Self { fd })
+        Ok(Self { fd, ifindex })
     }
 
     fn send(&self, packet: &[u8]) -> Result<usize> {
+        let addr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as libc::sa_family_t,
+            sll_protocol: ETH_P_ALL.to_be(),
+            sll_ifindex: self.ifindex as i32,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
         let written = unsafe {
-            libc::send(
+            libc::sendto(
                 self.fd,
                 packet.as_ptr() as *const libc::c_void,
                 packet.len(),
                 0,
+                &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             )
         };
         if written < 0 {
@@ -8582,6 +10091,11 @@ fn ensure_monitor_iface(
     recreate: bool,
 ) -> Result<Value> {
     let mut steps = Vec::new();
+    // A monitor VIF can exist while its parent is administratively down. For
+    // active raw-NAN operation the dedicated radio must be owned by monitor
+    // mode: leaving the managed parent up makes channel selection succeed only
+    // nominally and packets are looped back to AF_PACKET without reaching RF.
+    steps.push(run_command("ip", &["link", "set", base_iface, "up"]));
     if active && recreate && ifindex(monitor_iface).is_ok() {
         steps.push(run_command("ip", &["link", "set", monitor_iface, "down"]));
         steps.push(run_command("iw", &["dev", monitor_iface, "del"]));
@@ -8602,6 +10116,9 @@ fn ensure_monitor_iface(
         steps.push(run_command("iw", &add_args));
     }
     steps.push(run_command("ip", &["link", "set", monitor_iface, "up"]));
+    if active {
+        steps.push(run_command("ip", &["link", "set", base_iface, "down"]));
+    }
     let channel_step = run_command(
         "iw",
         &["dev", monitor_iface, "set", "channel", &channel.to_string()],
@@ -8708,6 +10225,9 @@ fn command_output_timeout(
 }
 
 fn build_radiotap_packet(frame: &[u8]) -> Vec<u8> {
+    // Keep the explicit legacy rate used by the original working lmesh NAN
+    // injector. Some monitor drivers accept the AF_PACKET write but do not
+    // put a TX_FLAGS-only packet on the air.
     let mut packet = Vec::with_capacity(12 + frame.len());
     packet.extend_from_slice(&[
         0x00, 0x00, // radiotap version, pad
@@ -8781,7 +10301,7 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
     let mut mac = None;
     let mut station_info = Vec::new();
     for (kind, value) in genl_attrs(response)? {
-        match kind {
+        match kind & NLA_TYPE_MASK {
             NL80211_ATTR_MAC if value.len() >= 6 => {
                 let mut station_mac = [0_u8; 6];
                 station_mac.copy_from_slice(&value[..6]);
@@ -8796,7 +10316,7 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
         out.insert("mac".to_string(), Value::String(mac));
     }
     for (kind, value) in station_info {
-        match kind {
+        match kind & NLA_TYPE_MASK {
             NL80211_STA_INFO_INACTIVE_TIME => {
                 insert_u32(&mut out, "inactive_ms", value);
             }
@@ -8828,8 +10348,72 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
                     out.insert("signal_avg_dbm".to_string(), json!(*signal as i8));
                 }
             }
+            NL80211_STA_INFO_TX_BITRATE => {
+                if let Ok(rate_attributes) = parse_attrs(value) {
+                    if let Some((_, rate)) = rate_attributes
+                        .iter()
+                        .find(|(kind, value)| {
+                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32
+                                && value.len() >= 4
+                        })
+                    {
+                        out.insert(
+                            "tx_bitrate_kbit_s".to_string(),
+                            json!(u32::from_ne_bytes([rate[0], rate[1], rate[2], rate[3]]) * 100),
+                        );
+                    } else if let Some((_, rate)) = rate_attributes
+                        .iter()
+                        .find(|(kind, value)| {
+                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE
+                                && value.len() >= 2
+                        })
+                    {
+                        out.insert(
+                            "tx_bitrate_kbit_s".to_string(),
+                            json!(u16::from_ne_bytes([rate[0], rate[1]]) as u32 * 100),
+                        );
+                    }
+                }
+            }
+            NL80211_STA_INFO_RX_BITRATE => {
+                if let Ok(rate_attributes) = parse_attrs(value) {
+                    if let Some((_, rate)) = rate_attributes
+                        .iter()
+                        .find(|(kind, value)| {
+                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32
+                                && value.len() >= 4
+                        })
+                    {
+                        out.insert(
+                            "rx_bitrate_kbit_s".to_string(),
+                            json!(u32::from_ne_bytes([rate[0], rate[1], rate[2], rate[3]]) * 100),
+                        );
+                    } else if let Some((_, rate)) = rate_attributes
+                        .iter()
+                        .find(|(kind, value)| {
+                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE
+                                && value.len() >= 2
+                        })
+                    {
+                        out.insert(
+                            "rx_bitrate_kbit_s".to_string(),
+                            json!(u16::from_ne_bytes([rate[0], rate[1]]) as u32 * 100),
+                        );
+                    }
+                }
+            }
             NL80211_STA_INFO_CONNECTED_TIME => {
                 insert_u32(&mut out, "connected_sec", value);
+            }
+            NL80211_STA_INFO_STA_FLAGS if value.len() >= 8 => {
+                let mask = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                let set = u32::from_ne_bytes([value[4], value[5], value[6], value[7]]);
+                out.insert("wmm".to_string(), json!(set & NL80211_STA_FLAG_WME != 0));
+                out.insert(
+                    "authorized".to_string(),
+                    json!(set & NL80211_STA_FLAG_AUTHORIZED != 0),
+                );
+                out.insert("station_flags_mask".to_string(), json!(mask));
             }
             NL80211_STA_INFO_RX_BYTES64 => {
                 insert_u64(&mut out, "rx_bytes", value);
@@ -9045,8 +10629,13 @@ fn ap_mgmt_receive_loop(
     ifindex: u32,
     ap_mac: [u8; 6],
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
+    stop: Arc<AtomicBool>,
 ) {
+    let _ = socket.set_receive_timeout(Duration::from_millis(100));
     loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         match socket.recv_frame_with_signal() {
             Ok((frame, rx_signal_dbm)) => {
                 let mut value = parse_management_frame(&frame, iface, "linux_nl80211_ap_sme");
@@ -9090,6 +10679,16 @@ fn ap_mgmt_receive_loop(
                 );
             }
             Err(error) => {
+                if stop.load(Ordering::Acquire)
+                    || error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::WouldBlock
+                                || error.kind() == std::io::ErrorKind::TimedOut
+                        })
+                {
+                    continue;
+                }
                 push_radio_event(
                     &history,
                     RadioEvent {
@@ -9128,16 +10727,20 @@ fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Opti
         }
         0 | 2 => {
             let aid = 1_u16;
+            let allow_ht = !ap_no_ht_stations().contains(&sta_mac);
             let add_station = Nl80211Socket::open()
-                .and_then(|socket| socket.add_station_minimal(ifindex, sta_mac, aid))
+                .and_then(|socket| {
+                    socket.add_station_from_assoc(ifindex, sta_mac, frame, allow_ht)
+                })
                 .map(|_| json!({ "ok": true }))
                 .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
-            let response = build_open_assoc_response(ap_mac, sta_mac, aid);
+            let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht);
             let tx = send_open_ap_mgmt_response(ifindex, &response);
             json!({
                 "kind": "assoc_resp",
                 "destination": colon_mac(&sta_mac),
                 "aid": aid,
+                "ht": allow_ht,
                 "add_station": add_station,
                 "frame_len": response.len(),
                 "tx": tx,
@@ -9166,6 +10769,7 @@ fn monitor_receive_loop(
     iface: &str,
     monitor_iface: &str,
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
+    rawnan_state: Arc<Mutex<NanState>>,
 ) {
     let receive_addresses = raw_wifi_receive_addresses(iface);
     let mut buf = [0_u8; 4096];
@@ -9174,22 +10778,72 @@ fn monitor_receive_loop(
             Ok(0) => continue,
             Ok(len) => {
                 let packet = &buf[..len];
-                if let Some(frame) = ieee80211_frame(packet)
-                    && raw_wifi_receive_address_allowed(frame, &receive_addresses)
-                    && let Some(value) =
-                        parse_dmesh_wifi_frame(frame, iface, "linux_af_packet_monitor")
-                {
-                    let message = mesh_message_from_raw_wifi(&value, iface);
-                    push_radio_event(
-                        &history,
-                        RadioEvent {
-                            ts_millis: now_millis(),
-                            key: "wifi.raw.rx".to_string(),
-                            source: monitor_iface.to_string(),
-                            value,
-                            message: Some(message),
-                        },
-                    );
+                if let Some(frame) = ieee80211_frame(packet) {
+                    let action = rawnan_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .observe(RawNanRxFrame {
+                            bytes: frame,
+                            rssi_dbm: 0,
+                            timestamp_us: now_millis_u64().saturating_mul(1_000),
+                        });
+                    // NAN data frames are selected by the cluster BSSID, not
+                    // by the host's ordinary receive MAC.  Admit the compact
+                    // IPv6/UDP form for the shared NAN OUI so a peer's
+                    // unicast frame can reach the parser and history.
+                    let nan_data = is_nan_ipv6_udp_frame(frame);
+                    if raw_wifi_receive_address_allowed(frame, &receive_addresses)
+                        || nan_data
+                    {
+                        if let Some(mut value) =
+                            parse_dmesh_wifi_frame(frame, iface, "linux_af_packet_monitor")
+                        {
+                            if let Some(object) = value.as_object_mut() {
+                                object.insert(
+                                    "nan_action".to_string(),
+                                    json!(match action {
+                                        RawNanAction::None => "none",
+                                        RawNanAction::ArmA3(_) => "arm_a3",
+                                        RawNanAction::DropForeign => "drop_foreign",
+                                        RawNanAction::Rediscover => "rediscover",
+                                    }),
+                                );
+                            }
+                            let message = mesh_message_from_raw_wifi(&value, iface);
+                            push_radio_event(
+                                &history,
+                                RadioEvent {
+                                    ts_millis: now_millis(),
+                                    key: "wifi.raw.rx".to_string(),
+                                    source: monitor_iface.to_string(),
+                                    value,
+                                    message: Some(message),
+                                },
+                            );
+                        }
+                    }
+                    if !matches!(action, RawNanAction::None) {
+                        push_radio_event(
+                            &history,
+                            RadioEvent {
+                                ts_millis: now_millis(),
+                                key: "wifi.rawnan.rx".to_string(),
+                                source: monitor_iface.to_string(),
+                                value: json!({
+                                    "ok": true,
+                                    "backend": "rawnan_host",
+                                    "frame_len": frame.len(),
+                                    "nan_action": match action {
+                                        RawNanAction::ArmA3(_) => "arm_a3",
+                                        RawNanAction::DropForeign => "drop_foreign",
+                                        RawNanAction::Rediscover => "rediscover",
+                                        RawNanAction::None => "none",
+                                    },
+                                }),
+                                message: None,
+                            },
+                        );
+                    }
                 }
             }
             Err(error) => {
@@ -9212,6 +10866,21 @@ fn monitor_receive_loop(
             }
         }
     }
+}
+
+fn is_nan_ipv6_udp_frame(frame: &[u8]) -> bool {
+    if frame.len() < IEEE80211_BODY + IEEE80211_LLC_SNAP_IPV6.len() + 40
+        || frame_type(frame) != 2
+        || mac_at(frame, IEEE80211_ADDR3)
+            .map(|bssid| bssid[..3] == [0x50, 0x6f, 0x9a])
+            != Some(true)
+    {
+        return false;
+    }
+    let body = &frame[IEEE80211_BODY..];
+    body.starts_with(&IEEE80211_LLC_SNAP_IPV6)
+        && body[IEEE80211_LLC_SNAP_IPV6.len()] >> 4 == 6
+        && body[IEEE80211_LLC_SNAP_IPV6.len() + 6] == 17
 }
 
 fn data_receive_loop(
@@ -9289,12 +10958,49 @@ fn ieee80211_frame(packet: &[u8]) -> Option<&[u8]> {
     }
     if let Some(radiotap_len) = radiotap_len(packet) {
         let frame = packet.get(radiotap_len..)?;
-        return is_plausible_80211_frame(frame).then_some(frame);
+        return is_plausible_80211_frame(frame).then_some(strip_valid_fcs(frame));
     }
     if is_plausible_80211_frame(packet) {
-        return Some(packet);
+        return Some(strip_valid_fcs(packet));
     }
     None
+}
+
+/// Monitor-mode captures commonly include the four-byte 802.11 FCS while
+/// nl80211 action-frame events do not.  Keep the frame boundary consistent
+/// before handing a vendor payload to the CBOR dispatcher.  Verify the CRC
+/// instead of blindly dropping four bytes: injected frames and drivers that
+/// suppress FCS must remain usable, and arbitrary payloads may legitimately
+/// end in four bytes.
+fn strip_valid_fcs(frame: &[u8]) -> &[u8] {
+    if frame.len() <= IEEE80211_BODY + 4 {
+        return frame;
+    }
+    let split = frame.len() - 4;
+    let expected = u32::from_le_bytes([
+        frame[split],
+        frame[split + 1],
+        frame[split + 2],
+        frame[split + 3],
+    ]);
+    (crc32_ieee(&frame[..split]) == expected)
+        .then_some(&frame[..split])
+        .unwrap_or(frame)
+}
+
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 fn radiotap_len(packet: &[u8]) -> Option<usize> {
@@ -9321,7 +11027,9 @@ fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Va
         return None;
     }
     let mut body = &frame[IEEE80211_BODY..];
-    let encapsulation = if body.starts_with(&IEEE80211_LLC_SNAP_DMESH) {
+    let encapsulation = if body.starts_with(&IEEE80211_LLC_SNAP_IPV6) {
+        return parse_nan_ipv6_udp_frame(frame, iface, backend);
+    } else if body.starts_with(&IEEE80211_LLC_SNAP_DMESH) {
         body = &body[IEEE80211_LLC_SNAP_LEN..];
         "llc_snap"
     } else {
@@ -9354,6 +11062,48 @@ fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Va
         "payload": hex_bytes(payload),
         "payload_text": String::from_utf8_lossy(payload).trim(),
     }))
+}
+
+fn parse_nan_ipv6_udp_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Value> {
+    let body = frame.get(IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN..)?;
+    if body.len() < 48 || body[0] >> 4 != 6 || body[6] != 17 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+    if payload_len < 8 || body.len() < 40 + payload_len {
+        return None;
+    }
+    let udp = &body[40..40 + payload_len];
+    let source = mac_at(frame, IEEE80211_ADDR2)?;
+    let destination = mac_at(frame, IEEE80211_ADDR1)?;
+    let bssid = mac_at(frame, IEEE80211_ADDR3)?;
+    let payload = &udp[8..];
+    Some(json!({
+        "protocol": "dmesh_wifi_raw",
+        "layout": "nan_ipv6_udp",
+        "backend": backend,
+        "encapsulation": "llc_snap_ipv6",
+        "iface": iface,
+        "frame_type": frame_type(frame),
+        "frame_subtype": frame_subtype(frame),
+        "source": colon_mac(&source),
+        "destination": colon_mac(&destination),
+        "bssid": colon_mac(&bssid),
+        "ipv6_source": format_ipv6(&body[8..24]),
+        "ipv6_destination": format_ipv6(&body[24..40]),
+        "udp_source": u16::from_be_bytes([udp[0], udp[1]]),
+        "udp_destination": u16::from_be_bytes([udp[2], udp[3]]),
+        "payload_len": payload.len(),
+        "payload": hex_bytes(payload),
+        "payload_text": String::from_utf8_lossy(payload).trim(),
+    }))
+}
+
+fn format_ipv6(bytes: &[u8]) -> String {
+    bytes.chunks_exact(2)
+        .map(|part| format!("{:x}", u16::from_be_bytes([part[0], part[1]])))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn parse_dmesh_ethernet_frame(
@@ -9564,6 +11314,23 @@ fn parse_wifi_ies(mut bytes: &[u8]) -> Vec<Value> {
     ies
 }
 
+fn management_ie_bytes(mut bytes: &[u8], wanted_id: u8) -> Option<&[u8]> {
+    while bytes.len() >= 2 {
+        let id = bytes[0];
+        let length = bytes[1] as usize;
+        bytes = &bytes[2..];
+        if bytes.len() < length {
+            return None;
+        }
+        let value = &bytes[..length];
+        if id == wanted_id {
+            return Some(value);
+        }
+        bytes = &bytes[length..];
+    }
+    None
+}
+
 fn parse_iw_scan(output: &str) -> Vec<Value> {
     let mut entries = Vec::new();
     let mut current: Option<serde_json::Map<String, Value>> = None;
@@ -9714,7 +11481,28 @@ fn build_open_auth_response(ap: [u8; 6], sta: [u8; 6]) -> Vec<u8> {
     frame
 }
 
-fn build_open_assoc_response(ap: [u8; 6], sta: [u8; 6], aid: u16) -> Vec<u8> {
+/// Return stations that should use legacy (non-HT) association parameters.
+///
+/// The AP advertises HT20 globally, but a manually managed nl80211 AP can
+/// still have a particular station/driver with unreliable aggregation or
+/// Block-ACK behavior. Keep the normal HT20 path as the default and allow a
+/// targeted workaround without lowering the rate for every station.
+/// `LMESH_WIFI_AP_NO_HT_STATIONS` is a comma-separated list of MAC addresses.
+fn ap_no_ht_stations() -> HashSet<[u8; 6]> {
+    std::env::var("LMESH_WIFI_AP_NO_HT_STATIONS")
+        .ok()
+        .into_iter()
+        .flat_map(|value| value.split(',').map(str::to_string).collect::<Vec<_>>())
+        .filter_map(|value| parse_mac(Some(value.trim())))
+        .collect()
+}
+
+fn build_open_assoc_response(
+    ap: [u8; 6],
+    sta: [u8; 6],
+    aid: u16,
+    allow_ht: bool,
+) -> Vec<u8> {
     let mut frame = mgmt_frame_header(0x01, sta, ap, ap);
     frame.extend_from_slice(&0x0401_u16.to_le_bytes());
     frame.extend_from_slice(&0_u16.to_le_bytes());
@@ -9725,8 +11513,35 @@ fn build_open_assoc_response(ap: [u8; 6], sta: [u8; 6], aid: u16) -> Vec<u8> {
     frame.push(0x32);
     frame.push(4);
     frame.extend_from_slice(&[0x0c, 0x12, 0x18, 0x24]);
+    // Match the HT20 capability advertised in the beacon. Without an HT
+    // Capabilities element in the association response, a station can
+    // associate successfully but remain on legacy rates.
+    if allow_ht {
+        frame.extend_from_slice(&hostapd_open_ap_ht_capability());
+        frame.extend_from_slice(&hostapd_open_ap_ht_operation(DEFAULT_RAW_WIFI_CHANNEL));
+    }
     frame.extend_from_slice(&hostapd_open_ap_extra_ies());
+    // The beacon/probe templates advertise WMM, so the manually generated
+    // association response must carry the matching WMM Parameter element too.
+    // Without it, Linux reports WMM/WME=no for the station even though the AP
+    // beacon contains the element; that disables the normal Wi-Fi QoS/Block
+    // ACK path and is especially costly for the direct TCP flash link.
+    frame.extend_from_slice(&wmm_parameter_ie());
     frame
+}
+
+fn hostapd_open_ap_ht_operation(channel: u8) -> [u8; 24] {
+    [
+        0x3d, 22, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]
+}
+
+fn hostapd_open_ap_ht_capability() -> [u8; 28] {
+    [
+        0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]
 }
 
 fn mgmt_frame_header(subtype: u8, addr1: [u8; 6], addr2: [u8; 6], addr3: [u8; 6]) -> Vec<u8> {
@@ -9847,6 +11662,13 @@ fn hostapd_open_ap_extra_ies() -> [u8; 10] {
     [0x7f, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40]
 }
 
+fn wmm_parameter_ie() -> [u8; 26] {
+    [
+        0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00, 0x03, 0xa4, 0x00,
+        0x00, 0x27, 0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
+    ]
+}
+
 fn esp_open_ap_probe_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
     let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
     ies.extend_from_slice(&esp_open_ap_beacon_tail());
@@ -9878,12 +11700,21 @@ fn build_dmesh_vendor_action_frame(
     source: [u8; 6],
     payload: &[u8],
 ) -> Vec<u8> {
+    build_dmesh_vendor_action_frame_with_bssid(destination, source, destination, payload)
+}
+
+fn build_dmesh_vendor_action_frame_with_bssid(
+    destination: [u8; 6],
+    source: [u8; 6],
+    bssid: [u8; 6],
+    payload: &[u8],
+) -> Vec<u8> {
     let body_len = payload.len().min(1400);
     let mut frame = Vec::with_capacity(IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN + body_len);
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
-    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&[0x00, 0x00]);
     frame.extend_from_slice(&dmesh_vendor_action_header(destination));
     frame.extend_from_slice(&payload[..body_len]);
@@ -9941,6 +11772,75 @@ fn build_dmesh_sta_direct_llc_frame(
     frame.extend_from_slice(&dmesh_vendor_action_header(destination));
     frame.extend_from_slice(&payload[..body_len]);
     frame
+}
+
+/// Build an unassociated NAN-cluster data frame. Address3 is the selected
+/// cluster BSSID; no IP/UDP/AP association is involved. The LLC/SNAP marker is
+/// intentionally the same one used by the existing raw data parser so this
+/// can be compared with the action-frame path.
+fn build_dmesh_nan_data_frame(
+    bssid: [u8; 6],
+    destination: [u8; 6],
+    source: [u8; 6],
+    payload: &[u8],
+) -> Vec<u8> {
+    let ip_payload = build_nan_ipv6_udp(source, destination, payload);
+    let mut frame = Vec::with_capacity(
+        IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN + ip_payload.len(),
+    );
+    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&IEEE80211_LLC_SNAP_IPV6);
+    frame.extend_from_slice(&ip_payload);
+    frame
+}
+
+fn nan_link_local(mac: [u8; 6]) -> [u8; 16] {
+    [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+     mac[0] ^ 0x02, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]
+}
+
+fn checksum_add(sum: &mut u32, bytes: &[u8]) {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        *sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < bytes.len() { *sum += (bytes[i] as u32) << 8; }
+}
+
+fn checksum_finalize(mut sum: u32) -> u16 {
+    while (sum >> 16) != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    !(sum as u16)
+}
+
+fn build_nan_ipv6_udp(source: [u8; 6], destination: [u8; 6], payload: &[u8]) -> Vec<u8> {
+    let body_len = payload.len().min(1200);
+    let udp_len = 8 + body_len;
+    let mut out = vec![0u8; 40 + udp_len];
+    out[0] = 0x60;
+    out[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    out[6] = 17; // UDP
+    out[7] = 1; // hop limit
+    let src = nan_link_local(source);
+    let dst = nan_link_local(destination);
+    out[8..24].copy_from_slice(&src);
+    out[24..40].copy_from_slice(&dst);
+    out[40..42].copy_from_slice(&NAN_UDP_SOURCE_PORT.to_be_bytes());
+    out[42..44].copy_from_slice(&NAN_UDP_DEST_PORT.to_be_bytes());
+    out[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    out[48..48 + body_len].copy_from_slice(&payload[..body_len]);
+    let mut sum = 0u32;
+    checksum_add(&mut sum, &src);
+    checksum_add(&mut sum, &dst);
+    checksum_add(&mut sum, &(udp_len as u32).to_be_bytes());
+    checksum_add(&mut sum, &[0, 0, 0, 17]);
+    checksum_add(&mut sum, &out[40..48 + body_len]);
+    out[46..48].copy_from_slice(&checksum_finalize(sum).to_be_bytes());
+    out
 }
 
 fn build_dmesh_ethernet_frame(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Vec<u8> {
@@ -10083,7 +11983,13 @@ fn raw_wifi_destination(value: Option<&str>, variant: &str) -> [u8; 6] {
             .or_else(|| value.strip_prefix("raw:"))
             .and_then(|mac| parse_mac(Some(mac)))
         {
-            return raw_receive_mac(mac);
+            // NAN data frames use ordinary 802.11 address semantics. The
+            // raw-receive-MAC XOR convention is only for the ESP-NOW/action
+            // probe path.
+            if variant != "nan_data" && variant != "nan_data_active" {
+                return raw_receive_mac(mac);
+            }
+            return mac;
         }
         if let Some(mac) = parse_mac(Some(value)) {
             return mac;
@@ -10098,7 +12004,10 @@ fn raw_wifi_destination(value: Option<&str>, variant: &str) -> [u8; 6] {
 
 fn raw_wifi_destination_mode(value: Option<&str>, variant: &str) -> &'static str {
     if let Some(value) = value {
-        if value.starts_with("rx:") || value.starts_with("raw:") {
+        if (value.starts_with("rx:") || value.starts_with("raw:"))
+            && variant != "nan_data"
+            && variant != "nan_data_active"
+        {
             return "peer_raw_receive_mac";
         }
         if parse_mac(Some(value)).is_some() {
@@ -10743,6 +12652,38 @@ mod tests {
     }
 
     #[test]
+    fn unsolicited_mode_records_do_not_satisfy_other_commands() {
+        assert!(is_unsolicited_console_record(
+            "status",
+            "mode active=sleepy infra_active=true\n"
+        ));
+        assert!(is_unsolicited_console_record(
+            "status",
+            "event type=boot.state rebooted=true\n"
+        ));
+        assert!(!is_unsolicited_console_record(
+            "mode status=true",
+            "mode active=sleepy infra_active=true\n"
+        ));
+        assert!(!is_unsolicited_console_record(
+            "active ms=60000",
+            "mode active=infra infra_active=true\n"
+        ));
+        assert!(!is_unsolicited_console_record(
+            "idle",
+            "mode active=infra infra_active=false\n"
+        ));
+        assert!(is_unsolicited_console_record(
+            "active ms=60000",
+            "event type=mode.state active=infra infra_active=true\n"
+        ));
+        assert!(!is_unsolicited_console_record(
+            "status",
+            "status uptime_ms=42\n"
+        ));
+    }
+
+    #[test]
     fn serial_debug_command_is_framed_cbor_before_uart() {
         let frame = firmware_command_cbor("mode active=true").unwrap();
         let payload = mesh::cbor::decode_stream_frame(&frame).unwrap();
@@ -10760,10 +12701,9 @@ mod tests {
     }
 
     #[test]
-    fn stage2_boot_command_is_fixed_payload_inside_ppp() {
+    fn stage2_boot_command_is_cbor_payload_inside_ppp() {
         let command = boot_command_payload("recovery").unwrap();
-        assert_eq!(&command[..4], b"DMB1");
-        assert_eq!(command[4..], [1, 2, 1, 0]);
+        assert_eq!(command, vec![0xa2, 0x00, 0x1a, 0x00, 0x00, 0xea, 0x6a, 0x06, 0x81, 0x02]);
 
         let stream = WouldBlockOnceWriter {
             writes: 0,
@@ -10777,7 +12717,7 @@ mod tests {
             .input
             .extend_from_slice(&mesh::cbor::encode_stream_frame(&command).unwrap());
         client
-            .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true)
+            .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true, None, "test", false)
             .unwrap();
         let wire = serial_tx.into_iter().collect::<Vec<_>>();
         let mut decoder = FirmwareUartDecoder::default();
@@ -10804,6 +12744,135 @@ mod tests {
             ])["partition_name"],
             "bootloader"
         );
+    }
+
+    #[test]
+    fn recovery_sta_command_is_typed_and_ppp_framed() {
+        let wire = encode_recovery_sta_packet(
+            "STA 10.78.0.1:3336 10.78.84.60 Direct-FCE48415-Dmesh-local",
+        )
+        .unwrap();
+        let packet = wire;
+        assert_eq!(&packet[..6], &[0xa2, 0x00, 0x18, 68, 0x06, 0xa4]);
+        assert!(packet.windows(6).any(|window| window == b"server"));
+        assert!(packet.windows(2).any(|window| window == [0x6e, b'1']));
+    }
+
+    #[test]
+    fn recovery_sta_dry_run_is_a_typed_boolean_field() {
+        let wire = encode_recovery_sta_packet(
+            "STA 10.78.0.1:3336 10.78.84.60 Direct-FCE48415-Dmesh-local dryrun",
+        )
+        .unwrap();
+        let packet = wire;
+        assert!(packet.windows(8).any(|window| window == b"dry_run\xF5"));
+    }
+
+    #[test]
+    fn stage2_identity_reassembles_across_forward_records() {
+        let identity = [
+            b'D', b'M', b'B', b'1', 1, 1, 3, 0, 7, 4, 0, 9, 0, 1, 2, 3, 4, 5,
+        ];
+        let mut bytes = Vec::new();
+        for part in identity.chunks(5) {
+            bytes.extend_from_slice(part);
+            if bytes.len() < identity.len() {
+                assert_eq!(find_stage2_identity(&bytes), None);
+            }
+        }
+        assert_eq!(find_stage2_identity(&bytes), Some(identity.to_vec()));
+    }
+
+    #[test]
+    fn indefinite_cbor_boot_identity_is_not_logged_as_cbor_error() {
+        let payload = [
+            0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 0x03, 0x00, 0x01, 0x18, 0xf2,
+            0x00, 0x00, 0x00, 0x00, 0x46, 0x84, 0x0d, 0x8e, 0x07, 0x42, 0xc4, 0xff, 0xff,
+        ];
+        assert_eq!(payload[0] >> 5, 5);
+        assert!(is_boot_identity_payload(&payload));
+        assert_eq!(boot_identity_json(&payload)["event_id"], 60000);
+    }
+
+    #[test]
+    fn recovery_network_event_decodes_negative_rssi_tuple() {
+        let payload = [
+            0xbf, 0x07, 0x19, 0xea, 0x63, 0x06, 0x9f, 0x02, 0x4c, b'1', b'0', b'.', b'7',
+            b'8', b'.', b'6', b'6', b'.', b'1', b'9', b'6', 0x46, 0x44, 0x94, 0xfc, 0xe4,
+            0x84, 0x15, 0x38, 0x2d, 0xff, 0xff,
+        ];
+        assert!(is_boot_event_payload(&payload));
+        let event = boot_event_json(&payload);
+        assert_eq!(event["event_id"], 60003);
+        assert_eq!(event["tuple"][0], 2);
+        assert_eq!(event["tuple"][3], -46);
+    }
+
+    #[test]
+    fn sleepy_active_window_uses_explicit_reachability() {
+        fn event(text: &str) -> Vec<u8> {
+            let mut payload = Vec::new();
+            let mut encoder = Encoder::new(&mut payload);
+            encoder
+                .map(3)
+                .unwrap()
+                .u16(0)
+                .unwrap()
+                .u16(33)
+                .unwrap()
+                .u16(4)
+                .unwrap()
+                .str("event")
+                .unwrap()
+                .u16(6)
+                .unwrap()
+                .map(1)
+                .unwrap()
+                .u16(32)
+                .unwrap()
+                .str(text)
+                .unwrap();
+            mesh::cbor::encode_stream_frame(&payload).unwrap()
+        }
+        let active =
+            event("event type=mode.state active=sleepy infra_active=true phase=active_window");
+        let sleeping =
+            event("event type=mode.state active=sleepy infra_active=false phase=enter_sleep");
+        assert_eq!(firmware_record_direct_mode(&active), Some(true));
+        assert_eq!(firmware_record_direct_mode(&sleeping), Some(false));
+    }
+
+    #[test]
+    fn sleepy_start_does_not_bypass_active_window_queue() {
+        let mut payload = Vec::new();
+        let mut encoder = Encoder::new(&mut payload);
+        encoder
+            .tag(minicbor::data::Tag::new(6))
+            .unwrap()
+            .map(0)
+            .unwrap();
+        let record = mesh::cbor::encode_stream_frame(&payload).unwrap();
+        assert_eq!(firmware_record_direct_mode(&record), None);
+    }
+
+    #[test]
+    fn lifecycle_state_tracks_recovery_hello_and_sleep_transition() {
+        let state = Arc::new(Mutex::new(FirmwareState::default()));
+        update_firmware_state_from_boot(
+            &state,
+            &[
+                b'D', b'M', b'B', b'1', 1, 1, 2, 2, 7, 0, 0, 1, 0, 1, 2, 3, 4, 5,
+            ],
+        );
+        update_firmware_state_from_text(
+            &state,
+            "event type=mode.state active=sleepy infra_active=false phase=enter_sleep",
+        );
+        let snapshot = state.lock().unwrap().snapshot();
+        assert_eq!(snapshot["role"], "recovery");
+        assert_eq!(snapshot["partition"], "recovery");
+        assert_eq!(snapshot["phase"], "enter_sleep");
+        assert_eq!(snapshot["infra_active"], false);
     }
 
     #[test]
@@ -10839,7 +12908,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_uart_frame_is_wake_activity_not_a_mesh_record() {
+    fn empty_uart_frame_is_ignored_not_a_wake_event() {
         let mut decoder = FirmwareUartDecoder::default();
         assert!(
             decoder
@@ -10847,8 +12916,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(decoder.take_frame_activity());
         assert!(!decoder.take_frame_activity());
+        assert!(!decoder.take_frame_activity());
+    }
+
+    #[test]
+    fn tagged_nan_sleepy_start_is_a_wake_event() {
+        let payload = [0xc6, 0xa0];
+        let record = mesh::cbor::encode_stream_frame(&payload).unwrap();
+        let event = nan_sleepy_start_event(&payload).expect("tagged wake event");
+        assert_eq!(event.flags, 0);
+        assert_eq!(event.lora_rx_delta, 0);
+        assert_eq!(event.nan_beacon_delta, 0);
+        assert!(!event.cluster_changed);
+        assert_eq!(
+            firmware_record_text(&record).as_deref(),
+            Some(
+                "event type=nan.sleepy_start flags=0 lora_rx_delta=0 nan_beacon_delta=0 cluster_changed=false",
+            )
+        );
     }
 
     #[test]
@@ -10869,7 +12955,7 @@ mod tests {
     }
 
     #[test]
-    fn framed_uds_command_waits_for_uart_heartbeat() {
+    fn framed_uds_command_waits_for_tagged_uart_wake() {
         let stream = WouldBlockOnceWriter {
             writes: 0,
             bytes: Vec::new(),
@@ -10883,19 +12969,17 @@ mod tests {
 
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false)
+                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false, None, "test", false)
                 .unwrap()
         );
         assert!(serial_tx.is_empty());
         assert!(!serial_pending.is_empty());
 
         let mut decoder = FirmwareUartDecoder::default();
-        assert!(
-            decoder
-                .push(&[FIRMWARE_UART_FLAG, FIRMWARE_UART_FLAG])
-                .unwrap()
-                .is_empty()
-        );
+        let wake =
+            encode_firmware_uart_frame(&mesh::cbor::encode_stream_frame(&[0xc6, 0xa0]).unwrap())
+                .unwrap();
+        assert_eq!(decoder.push(&wake).unwrap().len(), 1);
         assert!(decoder.take_frame_activity());
         serial_tx.append(&mut serial_pending);
         assert!(!serial_tx.is_empty());
@@ -10916,11 +13000,100 @@ mod tests {
 
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true)
+                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true, None, "test", false)
                 .unwrap()
         );
         assert!(!serial_tx.is_empty());
         assert!(serial_pending.is_empty());
+    }
+
+    #[test]
+    fn framed_uds_force_direct_prefix_does_not_bypass_sleepy_queue() {
+        let stream = WouldBlockOnceWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        let mut client =
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+        let mut serial_tx = VecDeque::new();
+        let mut serial_pending = VecDeque::new();
+        let frame = firmware_command_cbor("status").unwrap();
+        client
+            .input
+            .extend_from_slice(SERIAL_FORWARD_FORCE_DIRECT_PREFIX);
+        client.input.extend_from_slice(&frame);
+
+        assert!(
+            client
+                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false, None, "test", false)
+                .unwrap()
+        );
+        assert!(client.force_direct);
+        assert!(!serial_tx.is_empty());
+        assert!(serial_pending.is_empty());
+    }
+
+    #[test]
+    fn text_forward_accepts_readline_crlf_without_empty_command_error() {
+        let stream = WouldBlockOnceWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        let mut client =
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+        let mut serial_tx = VecDeque::new();
+        let mut serial_pending = VecDeque::new();
+        client.input.extend_from_slice(b"status\r\n");
+
+        client
+            .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true, None, "test", false)
+            .unwrap();
+
+        assert_eq!(
+            serial_tx.into_iter().collect::<Vec<_>>(),
+            encode_firmware_uart_frame(&firmware_command_cbor("status").unwrap()).unwrap()
+        );
+        assert!(client.output.is_empty());
+    }
+
+    #[test]
+    fn text_forward_decodes_firmware_response_back_to_text() {
+        let stream = WouldBlockOnceWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        let mut client =
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+        client.text_mode = true;
+        let mut clients = vec![client];
+        let stats = SerialForwardStats::default();
+        let mut payload = Vec::new();
+        let mut encoder = Encoder::new(&mut payload);
+        encoder
+            .map(3)
+            .unwrap()
+            .u16(0)
+            .unwrap()
+            .u16(33)
+            .unwrap()
+            .u16(4)
+            .unwrap()
+            .str("ok")
+            .unwrap()
+            .u16(6)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .u16(32)
+            .unwrap()
+            .str("status ok=true")
+            .unwrap();
+        let record = mesh::cbor::encode_stream_frame(&payload).unwrap();
+
+        broadcast_serial_output(&mut clients, &[record], &[], false, &stats);
+
+        let output = clients[0].output.iter().copied().collect::<Vec<_>>();
+        assert_eq!(output, b"status ok=true\n");
     }
 
     #[test]
@@ -11152,7 +13325,7 @@ mod tests {
             .extend_from_slice(&[0x01, 0x02, RFC2217_IAC, RFC2217_IAC, 0x03]);
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false)
+                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false, None, "test", false)
                 .unwrap()
         );
         assert_eq!(
@@ -11206,6 +13379,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_nan_transport_action_uses_unicast_a1_a2_and_cluster_a3() {
+        let dst = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00];
+        let src = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x54, 0x6c];
+        let frame = build_dmesh_vendor_action_frame_with_bssid(dst, src, bssid, b"DMTB");
+
+        assert_eq!(&frame[4..10], &dst); // A1: addressed device
+        assert_eq!(&frame[10..16], &src); // A2: host Wi-Fi adapter
+        assert_eq!(&frame[16..22], &bssid); // A3: NAN cluster, not broadcast
+        assert_ne!(&frame[4..10], &[0xff; 6]);
+        assert_ne!(&frame[16..22], &[0xff; 6]);
+    }
+
+    #[test]
+    fn monitor_fcs_is_removed_only_when_crc_matches() {
+        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping");
+        let crc = crc32_ieee(&frame);
+        let mut captured = frame.clone();
+        captured.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(strip_valid_fcs(&captured), frame.as_slice());
+
+        let mut arbitrary_tail = frame;
+        arbitrary_tail.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(strip_valid_fcs(&arbitrary_tail), arbitrary_tail.as_slice());
+    }
+
+    #[test]
     fn raw_wifi_legacy_vendor_action_still_parses() {
         let dst = [0xff; 6];
         let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
@@ -11230,6 +13430,14 @@ mod tests {
         packet.extend_from_slice(&frame);
 
         assert_eq!(ieee80211_frame(&packet).unwrap(), frame.as_slice());
+    }
+
+    #[test]
+    fn monitor_tx_radiotap_keeps_legacy_rate_and_no_ack() {
+        let packet = build_radiotap_packet(&[0xd0, 0x00, 0x00, 0x00]);
+        assert_eq!(&packet[..12], &[0x00, 0x00, 0x0c, 0x00, 0x04, 0x80, 0x00, 0x00,
+            0x02, 0x00, 0x08, 0x00]);
+        assert_eq!(&packet[12..], &[0xd0, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -11294,6 +13502,21 @@ mod tests {
         assert_eq!(parsed["destination"], colon_mac(&dst));
         assert_eq!(parsed["source"], colon_mac(&src));
         assert_eq!(parsed["payload_text"], "direct");
+    }
+
+    #[test]
+    fn raw_wifi_nan_data_frame_uses_cluster_as_address3() {
+        let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x05, 0x01];
+        let dst = [0xff; 6];
+        let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
+        let frame = build_dmesh_nan_data_frame(bssid, dst, src, b"nan-data");
+        assert_eq!(&frame[..4], &[0x08, 0x00, 0x00, 0x00]);
+        assert_eq!(&frame[IEEE80211_ADDR1..IEEE80211_ADDR1 + 6], &dst);
+        assert_eq!(&frame[IEEE80211_ADDR2..IEEE80211_ADDR2 + 6], &src);
+        assert_eq!(&frame[IEEE80211_ADDR3..IEEE80211_ADDR3 + 6], &bssid);
+        let parsed = parse_dmesh_wifi_frame(&frame, "wlan-test", "test").unwrap();
+        assert_eq!(parsed["payload_text"], "nan-data");
+        assert_eq!(parsed["bssid"], colon_mac(&bssid));
     }
 
     #[test]

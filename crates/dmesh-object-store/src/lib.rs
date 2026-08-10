@@ -42,6 +42,8 @@ pub struct ServerConfig {
     pub archive_root: Option<PathBuf>,
     pub idle_timeout: Duration,
     pub udp_mtu: usize,
+    pub udp_hello_duplicate_delay: Duration,
+    pub udp_send_delay: Duration,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -52,6 +54,8 @@ impl Default for ServerConfig {
             archive_root: None,
             idle_timeout: Duration::from_secs(900),
             udp_mtu: 1200,
+            udp_hello_duplicate_delay: Duration::from_millis(20),
+            udp_send_delay: Duration::ZERO,
         }
     }
 }
@@ -352,6 +356,16 @@ impl ObjectServer {
         let mut input = [0u8; 2048];
         loop {
             let (n, peer) = socket.recv_from(&mut input).await?;
+            // A device may reboot and reuse the same ephemeral UDP source
+            // port. Treat a fresh HELLO as a new session even when the old
+            // peer entry is still present; otherwise an abandoned transfer
+            // silently consumes all later HELLOs from that device.
+            if sessions.contains_key(&peer)
+                && matches!(udp_hello(&input[..n]), Ok(Some(_)))
+            {
+                tracing::info!(%peer, "object UDP HELLO replaced stale session");
+                sessions.remove(&peer);
+            }
             let Some(session) = sessions.get_mut(&peer) else {
                 let hello = match udp_hello(&input[..n]) {
                     Ok(Some(hello)) => hello,
@@ -405,9 +419,9 @@ impl ObjectServer {
                         // yet. Send one bounded duplicate so a single lost
                         // Wi-Fi datagram does not turn a healthy server into
                         // a false transport timeout.
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::time::sleep(self.config.udp_hello_duplicate_delay).await;
                         let _ = socket.send_to(&packet, peer).await?;
-                        tracing::info!(%peer, bytes=sent, target=hello.1.target, "object UDP HELLO accepted");
+                        tracing::info!(%peer, bytes=sent, target=hello.1.target, hello_copies=2, hello_retransmits=1, data_retransmits=0, "object UDP HELLO accepted");
                         sessions.insert(peer, state);
                     }
                     Err(error) => tracing::warn!(%peer, %error, "object UDP manifest packet encoding failed"),
@@ -416,6 +430,18 @@ impl ObjectServer {
             };
             if let Some(header) = udp_header(&input[..n]) {
                 if udp_has_ack(&input[..n], header.1) {
+                    session.acks_received = session.acks_received.saturating_add(1);
+                    if session.phase == UdpPhase::Done {
+                        tracing::info!(
+                            %peer,
+                            packets_sent=session.packets_sent,
+                            acks_received=session.acks_received,
+                            hello_retransmits=1,
+                            data_retransmits=0,
+                            "object UDP transfer complete"
+                        );
+                        continue;
+                    }
                     tracing::debug!(%peer, phase=?session.phase, packet_bytes=n, "object UDP ACK received");
                     if session.phase == UdpPhase::Manifest {
                         session.offset = session.offset.saturating_add(session.in_flight);
@@ -424,14 +450,16 @@ impl ObjectServer {
                     }
                     if session.phase == UdpPhase::Blocks { session.advance_block()?; }
                     if session.phase == UdpPhase::Manifest || session.phase == UdpPhase::Blocks || session.phase == UdpPhase::Done {
+                        tokio::time::sleep(self.config.udp_send_delay).await;
                         let packet = session.next_packet(header.0.dcid, self.config.udp_mtu)?;
                         let sent = socket.send_to(&packet, peer).await?;
-                        tracing::debug!(%peer, phase=?session.phase, bytes=sent, "object UDP packet sent after ACK");
+                        tracing::debug!(%peer, phase=?session.phase, bytes=sent, packets_sent=session.packets_sent, acks_received=session.acks_received, "object UDP packet sent after ACK");
                     }
                 } else if session.phase == UdpPhase::AwaitManifestOk && udp_manifest_ok(&input[..n], header.1) {
                     tracing::debug!(%peer, packet_bytes=n, "object UDP manifest accepted by device");
                     session.phase = UdpPhase::Blocks;
                     session.prepare_block()?;
+                    tokio::time::sleep(self.config.udp_send_delay).await;
                     let packet = session.next_packet(header.0.dcid, self.config.udp_mtu)?;
                     let sent = socket.send_to(&packet, peer).await?;
                     tracing::debug!(%peer, bytes=sent, "object UDP first block sent");
@@ -507,11 +535,13 @@ struct UdpSession {
     in_flight: usize,
     block_index: u32,
     packet_number: u32,
+    packets_sent: u32,
+    acks_received: u32,
 }
 
 impl UdpSession {
     fn new(source: PathBuf, manifest: Vec<u8>) -> Self {
-        Self { source, manifest, block: Vec::new(), phase: UdpPhase::Manifest, offset: 0, stream_offset: 0, in_flight: 0, block_index: 0, packet_number: 0 }
+        Self { source, manifest, block: Vec::new(), phase: UdpPhase::Manifest, offset: 0, stream_offset: 0, in_flight: 0, block_index: 0, packet_number: 0, packets_sent: 0, acks_received: 0 }
     }
 
     fn prepare_block(&mut self) -> Result<()> {
@@ -543,7 +573,7 @@ impl UdpSession {
         let header = ShortHeader { flags: dmesh_transport::FLAG_FIXED, dcid, packet_number: self.packet_number, packet_number_len: 2 };
         let mut p = header.encode(&mut out).map_err(|e| anyhow::anyhow!("encode UDP header: {e:?}"))?;
         p += Frame::Stream(StreamFrame { id: stream, offset: if stream == 3 { self.offset as u64 } else { (self.stream_offset + self.offset) as u64 }, fin: end == bytes.len(), data: chunk }).encode(&mut out[p..]).map_err(|e| anyhow::anyhow!("encode UDP stream frame: {e:?}"))?;
-        out.truncate(p); self.packet_number = self.packet_number.wrapping_add(1); self.in_flight = chunk.len(); Ok(out)
+        out.truncate(p); self.packet_number = self.packet_number.wrapping_add(1); self.in_flight = chunk.len(); self.packets_sent = self.packets_sent.saturating_add(1); Ok(out)
     }
 }
 

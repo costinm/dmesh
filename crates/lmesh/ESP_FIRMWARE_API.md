@@ -19,6 +19,12 @@ and never open a raw tty or toggle modem-control lines. UART recovery is
 reserved for `esptool` while flashing the bootloader, second-stage, or recovery
 image; older DTR wake notes below are historical only.
 
+Boot, Recovery, and module-owned structs are documented with their owning
+component in `fw/boot/API.md`, `fw/recovery/API.md`, `fw/mod_lora/API.md`, and
+`crates/rawnan`. The central registry in
+`resources/firmware-schema.json` owns globally allocated IDs and component
+names, preventing collisions without duplicating component ABI details here.
+
 ## Compact CBOR command IDs
 
 The outer CBOR envelope uses the IDs documented in `API.md`; command arguments
@@ -103,6 +109,26 @@ codec. A diagnostic is a CBOR notification with `status="event"` and its text
 stored as payload data; applications should treat it as structured event data,
 not console output.
 
+After the startup hold, Main emits one `event type=boot.state
+rebooted=<true|false> mode=<infra|sleepy|companion> active=<...>
+infra_active=<true|false>` packet, followed by the normal mode state event.
+Recovery and stage2 emit the fixed DMB1 hello on startup; its role and
+partition identify which image owns the UART. The managed lmesh forward keeps
+the latest boot identity and lifecycle state in `usb.serial.forward.list`.
+
+Main emits a tagged CBOR `NAN_SLEEPY_START` event (`c6 a0` when there are no
+radio/NAN deltas) when a sleepy raw-NAN wake opens a UART window. It does not
+emit an empty PPP frame. Main still emits the same mode event with
+`infra_active=false phase=enter_sleep` immediately before returning to the
+duty-cycle sleep path. Explicit persistent/temporary mode changes emit the
+same event without a phase. lmesh uses `infra_active`, rather than the role
+name alone, to decide whether queued records can be written immediately.
+
+lmesh sends two immediate `mode status=true` probes when a firmware forward
+starts. An infrastructure/active response releases client records directly;
+sleepy devices keep them pending until a UART heartbeat or active-window
+response.
+
 Parsing guidance:
 
 - parse command prefix, optional positional debug tokens, and `key=value`
@@ -137,31 +163,20 @@ forwarding. Deployed updates use Main/Recovery Wi-Fi DRS2 while the managed
 forward remains active for evidence. Physical USB-UART is only initial
 provisioning or P0 stage-2/Recovery repair; it is not an RFC2217 transport.
 
-Local recovery flash for classic ESP32:
+Build Main with `scripts/build-fw.sh`; it publishes the CPU-specific artifact
+under `target/flash/` and the persistent Recovery server serves it. lmesh does
+not build or flash Main over USB. USB/esptool is
+reserved for initial stage2 provisioning or emergency stage2 repair.
 
-```bash
-cargo espflash flash --release --port /dev/ttyUSBX \
-  --chip esp32 --flash-size 4mb --non-interactive
-```
-
-Flash an 8 MB ESP32-S3 board such as `lora4`:
-
-```bash
-ESP_IDF_SDKCONFIG_DEFAULTS=sdkconfig.heltec_v3.defaults \
-  cargo espflash flash --release --target xtensa-esp32s3-espidf \
-  --port /dev/serial/by-id/<s3-bridge> --chip esp32s3 --flash-size 8mb --non-interactive
-```
-
-The ESP32-S3 partition profile keeps the first 4 MB layout compatible with the
-classic ESP32 image and adds `dmesh_store` at `0x400000`. Larger S3 flash parts
-may reserve remaining capacity for future logs, message payloads, and radio-store
-experiments; do not assume every lab S3 has 16 MB.
+Main uses the common `fw/boot/partitions.csv` layout on both CPU families. The
+module/data loader extends the data region to the detected physical flash end;
+the larger physical S3 capacity does not select another Main image.
 
 Fleet flash helper:
 
 ```bash
 LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock \
-  python tools/flash_test_fleet.py --lmesh-mode=local-release \
+  python scripts/flash_test_fleet.py --lmesh-mode=local-release \
     --port lora1 --port lora2 --port lora3 --port lora4 --port e5
 ```
 
@@ -195,6 +210,21 @@ Run direct firmware commands through the lmesh control service:
 ```bash
 mesh lmesh esp.serial.command port=USB0 command=status
 ```
+
+For a configured sleepy target, `esp.serial.command` automatically opens the
+NAN/UART rendezvous and retries the addressed packet across two wake windows.
+The default response budget is 3 seconds after the command is sent; if the
+target is not reached, the rendezvous expires after 8 seconds, so the default
+end-to-end limit is approximately 11 seconds (`8 + 3`). This applies to both
+local managed-forward commands and commands routed through the NAN gateway.
+`active_ms` is not required for normal commands; it remains available only for
+an explicitly requested standalone active session.
+
+The per-device managed forward socket also accepts either length-prefixed
+mesh/CBOR records or newline-delimited text. lmesh auto-detects the client
+input format and converts in both directions: a text client such as `socat`
+receives decoded firmware text, while framed clients retain framed CBOR.
+CRLF and blank input lines are accepted.
 
 NAN/LoRa command payloads should include explicit mesh addressing:
 `to=<last4>` and `from=<last4>`, where each value is the last four bytes of the
@@ -258,7 +288,7 @@ reliably stored in NVS on all targets.
 | `mode` | Persisted operating mode: `infra` is powered/always-on; `companion` is the battery/duty-cycled role. |
 | `power.profile` | Boot PM profile: `dfs`, `perf`, `low`, or `auto`. |
 | `uart.active_ms` | UART debug input/output window after boot, PRG/button, or UART input. Minimum/default: 2000 ms. |
-| `uart.hb_every` | UART heartbeat cadence for non-infrastructure raw-NAN duty wakes. `0` (default) disables periodic and LoRa/FSK-triggered UART output. `N>0` opens UART only for `nan.active_ms` and emits one empty `0x7e 0x7e` frame on every Nth raw-NAN wake; LoRa/FSK receive uses a 250 ms event window. Infrastructure mode keeps UART continuously active and does not use this cadence. |
+| `uart.hb_every` | Tagged wake-event cadence for non-infrastructure raw-NAN duty wakes. `0` (default) disables periodic and LoRa/FSK-triggered UART output. `N>0` opens UART only for `nan.active_ms` and emits one tagged `NAN_SLEEPY_START` event on every Nth raw-NAN wake; LoRa/FSK receive uses a 250 ms event window. Infrastructure mode keeps UART continuously active and does not use this cadence. |
 | `wifi.mode` | Boot Wi-Fi policy; battery nodes use raw/custom NAN duty cycle, while `mode=infra` remains continuously powered. |
 | `wifi.ssid` | Saved Wi-Fi SSID for explicit STA/AP experiments. |
 | `nan.enabled` | Enable raw/custom NAN at boot; `mode=infra` keeps it continuously active, while battery nodes use the duty cycle. |
@@ -468,6 +498,13 @@ Current behavior:
 | `wifi` | `netif_stats=true` | Reports disabled counters; the old esp-netif probe is removed from the normal firmware profile. |
 | `wifi` | `scan=true` | Scan visible Wi-Fi networks. |
 
+Flash/control-plane address fields (`server`, `ip`, `gateway`/`gw`, and
+`mask`) use CBOR byte strings rather than text: IPv4 is four octets and IPv6
+is sixteen octets, always in network order. Firmware keeps accepting dotted
+text while older tools are retired, and canonicalizes it to bytes when a
+packet is re-encoded. The static STA implementation currently consumes IPv4;
+the protocol representation is already shared with IPv6-capable transports.
+
 Default raw mode must stay management/action-frame only. Promiscuous data-frame
 receive can flood the ESP32 and belongs only in explicit test modes:
 `raw_data`, `raw_sta_data`, `raw_ap_data`, and `raw_ap_sta_data`.
@@ -624,7 +661,7 @@ Raw NAN timing instrumentation:
   off/on test. With official NAN beacons from USB0/USB2 on channel 6, the first
   beacon after raw radio start was usually seen within about 60-160 ms.
 
-ESP-IDF 5.5 official NAN exposes `op_channel`, `master_pref`, `scan_time`, and
+ESP-IDF 6.0 official NAN exposes `op_channel`, `master_pref`, `scan_time`, and
 `warm_up_sec` in the public `wifi_nan_config_t`. It does not expose a public
 awake Discovery Window interval or an 8 second NAN radio-off schedule knob in
 the headers we build against. Official NAN power behavior must therefore be
@@ -760,7 +797,7 @@ unless explicitly started for testing.
 | `power` | `uart_uninstall=true` | One-boot power-test operation: acknowledge first, then remove UART0's driver. Reset is required to restore the console. It is never part of normal boot or radio profiles. |
 | `power` | `profile=dfs\|perf\|low\|auto save=true min_mhz=... max_mhz=... light=true\|false` | Configure ESP-IDF PM. Default boot profile is `dfs`: dynamic frequency scaling enabled, automatic light sleep disabled. `light=true` permits automatic light sleep; it does not force immediate sleep if UART, Wi-Fi, BLE, LoRa, timers, or tasks hold the chip active. |
 | `nvs` | `op=set uart.active_ms=2000` | Configure the debug UART input/output window in milliseconds (minimum/default: 2000 ms). A scheduled UART/radio rendezvous or UART RX opens/extends the window. RX wake remains armed while idle; firmware output is dropped while idle. Modem-line control is reserved for direct esptool recovery flashing. |
-| `nvs` | `op=set uart.hb_every=N` | Configure the disabled-by-default periodic UART heartbeat. `0` suppresses raw-NAN wake and LoRa/FSK-triggered UART output; `N>0` writes an empty UART frame and opens the bounded console window on every Nth raw-NAN wake. lmesh flushes queued command frames after receiving any firmware UART frame. |
+| `nvs` | `op=set uart.hb_every=N` | Configure the disabled-by-default periodic UART wake event. `0` suppresses raw-NAN wake and LoRa/FSK-triggered UART output; `N>0` writes a tagged `NAN_SLEEPY_START` event and opens the bounded console window on every Nth raw-NAN wake. lmesh flushes pending command frames after receiving that event. |
 | `sleep` | `status=true` | Sleep/PM/radio state and counters. |
 | `sleep` | `test=ble\|raw\|raw_data\|sta\|ap\|nan ms=... restore=true` | Bounded light-sleep experiment with timer recovery. |
 | `sleep` | `mode=deep wake_ms=... active_ms=... lora=true|false start=true` | Enter deep sleep with timer and button wake. LoRa deep-sleep listen is opt-in with `lora=true`. |

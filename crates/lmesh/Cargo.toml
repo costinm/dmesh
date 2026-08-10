@@ -4,6 +4,9 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+dmesh-rawnan = { path = "../rawnan" }
+dmesh-object-store = { path = "../dmesh-object-store" }
+dmesh-transport = { path = "../dmesh-transport" }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 tracing = "0.1"
 serde = {version = "1.0.130", features = ["derive"]}

@@ -2,7 +2,8 @@
 #
 # lmesh normally reads /home/system/etc/lmesh/lmesh.toml. Use stable
 # /dev/serial/by-id paths and role names; ttyUSB/ttyACM numbering is transient.
-# ACM0 is Android and USB4 is the USB1 power-meter stream, so neither is an ESP
+# ACM0 is Android; ACM1 is the ESP32-C6 USB-Serial/JTAG test board. USB4 is the
+# USB1 power-meter stream, so neither the Android nor meter interface is an ESP
 # flash target.
 
 # One chronological log for UART TX/RX from every forward. Each record includes
@@ -11,9 +12,9 @@
 # board capture in the checkout-level target directory, never lmesh's CWD.
 serial_log_path = "../../../target/lmesh-radio-build/log/serial.log"
 
-# Normal ESP commands route through the continuously powered infrastructure
-# node.  The target suffixes are stable station-MAC identities; callers that
-# explicitly provide `adapter=` retain the direct UART diagnostic path.
+# lmesh internally routes mapped ESP roles through the powered lora1 NAN
+# gateway. Callers still use the normal role name (for example lora2); direct
+# USB/UART is an explicit diagnostic fallback inside lmesh.
 esp_gateway = "lora1"
 [esp_targets]
 lora2 = "1d4c5e1d"
@@ -21,65 +22,58 @@ lora3 = "8e0742c5"
 lora4 = "f6fc543c"
 e5 = "fcf5c40ef1e8"
 
-# Main joins the local AP only for a bounded maintenance session. It opens this
-# TCP connection back to lmesh; the AP may isolate stations, so lmesh must not
-# try to connect to the station. The managed UDS socket parallels e5.sock.
-[[esp_reverse_sessions]]
-id = "e5"
-ip = "10.78.0.201"
-port = 3343
-socket = "/run/mesh/lmesh/e5-ip.sock"
-
 [[serial_forwards]]
 port = "lora1"
 path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA1-840D8E074170-if00-port0"
 baud = 115200
-tcp_port = 3330
-tcp_mode = "framed"
 # lora1 is the powered raw-NAN gateway. It is activated after reset with the
 # binary `active` command; managed diagnostic clients never toggle modem lines.
 multi = true
 raw = false
-direct = true
 
 [[serial_forwards]]
 port = "lora2"
 path = "/dev/serial/by-id/usb-Silicon_Labs_CP2104_USB_to_UART_Bridge_Controller_01DC99BB-if00-port0"
 baud = 115200
-tcp_port = 3331
-tcp_mode = "framed"
 multi = true
 
 [[serial_forwards]]
 port = "lora3"
 path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA3-D8A01D4C5E1C-if00-port0"
 baud = 115200
-tcp_port = 3332
-tcp_mode = "framed"
 multi = true
 
 [[serial_forwards]]
 port = "lora4"
 path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA4-441BF6FC543C-if00-port0"
 baud = 115200
-tcp_port = 3333
-tcp_mode = "framed"
 multi = true
 
 [[serial_forwards]]
 port = "e5"
 path = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-E5-FCF5C40EF1E8-if00-port0"
 baud = 115200
-tcp_port = 3335
-tcp_mode = "framed"
+multi = true
+
+[[serial_forwards]]
+port = "e7"
+path = "/dev/serial/by-id/usb-1a86_USB2.0-Serial-if00-port0"
+baud = 115200
 multi = true
 
 [[serial_forwards]]
 port = "s3-1"
 path = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C82104982-if00"
 baud = 115200
-tcp_port = 3334
-tcp_mode = "framed"
+multi = true
+
+[[serial_forwards]]
+# ESP32-C6 inventory member. The current DMesh Main build supports only
+# classic ESP32 and ESP32-S3; keep this forward available for bring-up without
+# allowing the ESP32/S3 flasher to select a mismatched image.
+port = "e6"
+path = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_14:C1:9F:E5:98:00-if00"
+baud = 115200
 multi = true
 
 [[serial_forwards]]

@@ -1316,7 +1316,7 @@
     "name": "esp.serial.command",
     "title": "ESP Serial Command",
     "group": "ESP32 Debug",
-    "description": "Run one ESP command. Configured target roles route through the default lora1 infrastructure gateway when adapter is omitted; explicit adapter selects direct UART/BLE/raw-Wi-Fi diagnostics. DW-gated delivery is the default and active_ms requests a bounded I-want-to-talk window.",
+    "description": "Run one ESP command. Configured target roles route through the default lora1 infrastructure gateway when adapter is omitted; sleepy delivery automatically retries across two NAN wake windows. The default response budget is 3 seconds after send, with an approximately 8+3 second maximum rendezvous. active_ms is only for an explicit standalone active session.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1343,7 +1343,7 @@
         "timeout_sec": {
           "type": "number",
           "title": "Timeout seconds",
-          "default": 5
+          "default": 3
         },
         "gateway": {
           "type": ["string", "null"],

@@ -1,21 +1,60 @@
 # Local mesh messaging and discovery
 
+Interact at low level with 'modem' devices and wifi for 'local' discovery and communication, with a Mesh-like protocol at a higher level.
+
+The 'mesh' handles end-to-end encryption and will support QUIC or a QUIC-like
+protocol adjusted for low-speed/small packets radios. Modems and middle boxes
+are not trusted - will operate on 'destination connection/circuit ID' for
+forwarding. The mesh will also have a 'control plane' that will aggregate the
+local discovered nodes and push both (signed) configs, discovery and circuit
+initiations, to simplify the modems. Multiple meshes may coexist and cooperate
+in forwarding without trusting each other. This will be handled in other crates,
+but important for context. 
+
+LMesh runs as regular user but with CAP_NET_ADMIN. It may register a monitor
+interface on wifi or take over a wifi interface, based on configuration, and use
+it for NAN discovery, follow-ups and as a non-DS communication medium.
+
+It also owns interaction with USB/UART connected ESP32 devices, using the associated
+firmware, which use the same 'raw-NAN' code and may provide LoRA and FSK radios.
+
+Lmesh is only concerned with accepting and sending packets locally, based on 
+control plane and config it may forward packets as well, but is not involved in
+routing protocols.
+
+Discovery and packets will track RSSI - and sending config may adjust the transmit
+power and the radio used, for example use FSK or LoRA if the destination can't 
+be reached with Wifi, or use a very low Wifi power if the destination is very close.
+
+Lmesh is not meant for high-speed communication, but messaging and 'chat-like' 
+sessions (including ssh/TUI/agents). If source and destination are close, they can
+use P2P/Direct AP/STA - or if a chain of AP/STA gateways can be established to 
+an internet point, it is also possible for high-speed.
+
+Lmesh may configure the wifi in open AP/STA mode - zero trust, only QUIC packets
+encrypted E2E accepted with the control plane handling auth out of band (similar
+to TURN auth). 
+
+The core idea (regarding Wifi) is that a mesh model - with zero trust in infra - does not require the complexity and limitations of WPA, can handle its own encryption
+and ACK using QUIC - and build multiple paths for communication, providing a secure
+IPv6 overlay network on top.
+
+## Details 
+
+Default:
 - Listens on multicast UDP - ff02::5227 on port 5227. Older IPv4 multicast
-  support may exist for host compatibility, but DMesh raw Wi-Fi discovery uses
+  support exists for host compatibility, but DMesh raw Wi-Fi discovery uses
   the IPv6-derived multicast MAC 33:33:00:00:52:27.
+  Not using DNS-SD because it is too noisy, and the signed UDP is not standard.
+
 - Send/Receive signed announcements, including the public key, cert and IPs
-- respond to multicasts with directed signed response.
+  Respond to multicasts with directed signed response.
+
 - send and receive signed unicast messages, using the discovery data.
 
-This is not using DNS-SD because it is too noisy, and the signed UDP is not standard.
+
 
 ## Implementation
-
-This is also a test to verify the UDS and 'job' style. The server
-may run permanently, periodically or may be included in another app.
-
-The primitive operations - start, announce and callbacks - are very 
-simple and can be exposed as JSON commands over UDS or JNI/native.
 
 `lmesh::radio_protocol` also owns the DMesh BLE/NAN `DM` v1 wire format used by
 Android and firmware-adjacent tests. Keep hardware access outside this module:
