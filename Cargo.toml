@@ -2,9 +2,12 @@
 members = [
     "crates/dmesh",
     "crates/dmesh-store",
+    "crates/dmesh-object-store",
+    "crates/dmesh-transport",
     "crates/dmeshtui",
     "crates/dmeshui",
     "crates/lmesh",
+    "crates/rawnan",
     "crates/tun",
 ]
 resolver = "2"
