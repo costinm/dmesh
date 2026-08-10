@@ -1,5 +1,12 @@
 # mod_lora
 
+The module-owned ABI is documented in [API.md](API.md); this file provides
+implementation and hardware notes.
+
+Service tag `43`, starting at slot `0`, spanning two adjacent 64-KiB slots.
+The DMOD v4 header contains numeric identity and placement metadata; `lora`
+is a controller/schema name, not a device-side module identifier.
+
 Static-VMA or host-window-mapped, `no_std` LoRa module. Xtensa Rust does not
 currently provide a safe generic PIC image; the fixed-VMA loader mode maps the
 image into Main's reserved instruction window. The SX127x/SX126x radio drivers,
@@ -9,11 +16,11 @@ configuration includes the SPI host and SCK/MISO/MOSI/CS/reset/IRQ pins; these
 come from Main's persisted `lora.*` settings rather than being baked into the
 module image.
 The module also receives the persisted LoRa coding rate, preamble, and CRC
-settings. Main retains the existing Meshtastic-compatible defaults and frame
-settings: US MediumFast `913125000` Hz, 250 kHz bandwidth, SF10/CR5 profile
-selection, sync word `0x2b`, and the test channel hash `0x1d` with port number
-`256`; those channel/frame values remain Main-owned because they describe the
-Meshtastic payload rather than the SPI radio primitive.
+settings. Meshtastic framing policy and its codec now live in
+`src/frames.rs` beside the radio implementation. The established defaults
+remain US MediumFast `913125000` Hz, 250 kHz bandwidth, SF10/CR5 profile
+selection, sync word `0x2b`, and test channel hash `0x1d` with port number
+`256`; Main passes radio payloads opaquely and does not parse this format.
 For SX1262, Main also supplies reset/BUSY pins; the host SPI primitive waits
 for BUSY to clear with a bounded timeout before each command. Board power
 (`lora.pwrpin`/`lora.pwrlvl`) and SX1262 TCXO, DIO2 RF-switch, PA, and sync-word
@@ -43,10 +50,16 @@ diagnostics.
 
 When the module image is named `lora`, Main passes its persisted radio
 configuration and starts the module task. On SX127x and SX1262 the task
-configures continuous LoRa RX, polls the FIFO/IRQ registers, emits packets
-through the host event callback, and accepts queued `stop` and `tx` commands.
-The module also carries the chip-specific FSK setup commands. A selected
-module is authoritative; Main does not fall back to its old radio backend.
+configures continuous LoRa RX, waits on the host GPIO/DIO interrupt
+notification, samples the FIFO/IRQ registers, emits packets through the host
+event callback, and accepts queued `stop` and `tx` commands. The host also
+arms the DIO GPIO as an automatic light-sleep wake source while the receiver
+is active.
+The module also carries the chip-specific FSK packet path. `radio` selects
+the common 100 kbit/s FSK/GFSK profile; its frequency, FIFO packet length,
+carrier parameters, and TX/RX interrupts are configured in the module. A
+selected module is authoritative; Main does not fall back to its old radio
+backend.
 
 Module discovery and `module op=status` are deliberately side-effect-free:
 Main only reads the module header and cached loader counters. SPI/GPIO setup is
@@ -71,10 +84,14 @@ Module status exposes current/last/maximum task runtime and invocation count.
 The module header declares its FreeRTOS stack requirement (`16384` words for
 this RX implementation). Main clamps that request to the loader's supported
 range and reports the observed minimum remaining stack words in module status.
-The module ABI is intentionally not based on Tokio or another executor: the
-flat image is `no_std`/allocation-free and runs as a host-created FreeRTOS
-task. Host callbacks are bounded; only the radio task's finite IRQ wait may
-sleep.
+The module ABI is intentionally not based on Tokio or another executor. The
+flat image has no linked heap allocator and runs as a host-created FreeRTOS
+task. Main exposes an optional `alloc(size, align)` callback backed by a
+32-KiB bump arena in Main RAM. Allocation is monotonic and there is no
+`free`; the arena is reset before and after a module invocation. A module may
+use the returned memory only for the lifetime of that invocation (a persistent
+radio task holds it until that task stops). Host callbacks are bounded; only
+the radio task's finite IRQ wait may sleep.
 
 Build the Xtensa image with `bash fw/mod_lora/build.sh
 xtensa-esp32s3-espidf`. Xtensa flat images default to the reserved fixed
@@ -98,21 +115,24 @@ writing the DMOD artifact.
 
 For a clean module-store experiment, Main's existing recovery command can
 erase the complete raw data range with `recovery op=erase target=data`.
-The current experiment reads only the first 64 KiB-aligned slot; an erased
-first slot therefore makes status fast and reports no deployed module.
-Multi-slot index discovery is intentionally deferred. Explicit module calls
-can select a later location with `slot=N` (64 KiB units), or a byte `offset=`;
-the two forms are mutually exclusive.
+The loader does not scan the module region. An explicit numeric service request
+selects slot `service_tag - 43`; the image header's slot span is validated
+before mapping. Explicit byte offsets remain a host/debug compatibility form,
+but must equal the service's fixed slot base.
 
 There is no compiled Main-radio fallback when a `lora` module is selected;
 module failure is reported through module status/logs and is repaired by a
-module deployment. Deploy through the negotiated Recovery server only:
-`python3 fw/recovery/tools/flash-module-command.py lora4 --module lora`.
-The helper uses the named local lmesh adapter by default, and the server
-chooses the CPU-specific DMOD from the HELLO;
-do not issue a raw `recovery target=module` command or copy the classic image
-to an S3 board.
+module deployment. Deploy through the verified local flasher:
+`scripts/flash-device.py lora4 module --module lora`.
+The helper chooses the CPU-specific DMOD and fixed service slot; do not copy
+the classic image to an S3 board.
 
 For a managed-device smoke test (no physical UART, flash, or reset), run
 `python3 fw/esp32/rust/tools/mod_lora_test.py --port lora3.lmesh`; use
 `lora4.lmesh` for the SX1262 board.
+
+FSK validation uses a common channel and short fixed payloads; rendezvous/
+hopping is intentionally not part of this initial experiment. SX127x packet
+exchange, GPIO interrupt notification, light-sleep wake compatibility, and
+clean stop have been exercised on lora1/lora3. Variable-length framing and
+CRC remain a follow-up after this fixed-frame carrier test.

@@ -2,8 +2,15 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$ROOT/env.sh"
-build_started_ms="$(date +%s%3N)"
+now_ms() { "$DMESH_PYTHON" -c 'import time; print(time.time_ns() // 1_000_000)'; }
+build_started_ms="$(now_ms)"
 TARGET="${1:-xtensa-esp32-espidf}"
+SERVICE_TAG="${DMESH_MODULE_TAG:-43}"
+SLOT_COUNT="${DMESH_MODULE_SLOTS:-2}"
+if (( SERVICE_TAG < 43 || SERVICE_TAG > 100 )); then
+  echo "DMESH_MODULE_TAG must be in 43..100" >&2; exit 2
+fi
+SLOT=$((SERVICE_TAG - 43))
 case "$TARGET" in
   xtensa-esp32-espidf) tool_prefix=xtensa-esp32-elf ;;
   xtensa-esp32s3-espidf) tool_prefix=xtensa-esp32s3-elf ;;
@@ -11,12 +18,13 @@ case "$TARGET" in
   *) echo "unsupported module target: $TARGET" >&2; exit 2 ;;
 esac
 if [[ "$TARGET" == xtensa-esp32s3-espidf ]]; then
-  expected_module_vma=0x43000040
+  code_base=0x43000000; data_base=0x3d000000; vma_stride=0x40000
 elif [[ "$TARGET" == xtensa-esp32-espidf ]]; then
-  expected_module_vma=0x40300040
+  code_base=0x40300000; data_base=0x3f700000; vma_stride=0x20000
 else
-  expected_module_vma=
+  code_base=0; data_base=0; vma_stride=0
 fi
+expected_module_vma=$((code_base + SLOT * vma_stride + 64))
 # Xtensa flat images are statically linked and must use the reserved fixed
 # execution window.  Keep an explicit override for reproducible builds, but do
 # not allow the command to silently produce an image at a window Main does not
@@ -32,7 +40,7 @@ fi
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then
   module_vma_value=$((DMESH_MODULE_VMA))
   if (( module_vma_value != expected_module_vma )); then
-    echo "DMESH_MODULE_VMA must be $expected_module_vma; Main currently exposes one canonical MMU window" >&2
+    echo "DMESH_MODULE_VMA must be $expected_module_vma for service tag $SERVICE_TAG" >&2
     exit 2
   fi
   fixed_window=$((module_vma_value - 64))
@@ -41,9 +49,9 @@ if [ -n "${DMESH_MODULE_VMA:-}" ]; then
     exit 2
   fi
   if [[ "$TARGET" == xtensa-esp32s3-espidf ]]; then
-    module_data_vma=$((0x3c000000 + module_vma_value - 0x42000000))
+    module_data_vma=$((data_base + SLOT * vma_stride))
   elif [[ "$TARGET" == xtensa-esp32-espidf ]]; then
-    module_data_vma=$((0x3f700000 + module_vma_value - 0x40300000))
+    module_data_vma=$((data_base + SLOT * vma_stride))
   fi
 fi
 PATH="$RUST_ESP_TOOLCHAIN_BIN:$CARGO_HOME/bin:$PATH"
@@ -68,6 +76,7 @@ else
     -C llvm-args=--min-jump-table-entries=1000000
   )
 fi
+module_data_vma=0
 link_data_args=()
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then
   link_data_args=(-C "link-arg=-Wl,--defsym=MODULE_DATA_VMA=$module_data_vma")
@@ -78,6 +87,7 @@ build_elf() {
     -Zbuild-std-features=compiler-builtins-mem \
     --config "target.$TARGET.linker=\"${tool_prefix}-gcc\"" -- \
     -C relocation-model="$relocation_model" -C opt-level=s \
+    -C lto=fat -C codegen-units=1 \
     "${extra_llvm_args[@]}" \
     ${DMESH_MODULE_VMA:+-C} ${DMESH_MODULE_VMA:+link-arg=-Wl,--defsym=MODULE_VMA=$DMESH_MODULE_VMA} \
     "${link_data_args[@]}" \
@@ -116,10 +126,12 @@ ENTRY_OFFSET=$((ENTRY_OFFSET - MODULE_VMA_BASE))
 DMOD_ENTRY_OFFSET=$((ENTRY_OFFSET + 64))
 DMOD_FLAGS=0
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then DMOD_FLAGS=1; fi
-"$DMESH_PYTHON" "$ROOT/fw/mod_hello/pack.py" --name lora --stack-words 16384 \
+"$DMESH_PYTHON" "$ROOT/fw/mod_hello/pack.py" --service-tag "$SERVICE_TAG" \
+  --slot-count "$SLOT_COUNT" --code-vma "$(( ${DMESH_MODULE_VMA:-0} - 64 ))" \
+  --data-vma "$module_data_vma" --stack-words 16384 \
   --entry-offset "$DMOD_ENTRY_OFFSET" --flags "$DMOD_FLAGS" "$RAW" "$IMAGE"
 printf 'module image: %s\n' "$IMAGE"
-build_elapsed_ms=$(( $(date +%s%3N) - build_started_ms ))
+build_elapsed_ms=$(( $(now_ms) - build_started_ms ))
 image_size="$(stat -c '%s' "$IMAGE")"
 image_sha256="$(sha256sum "$IMAGE" | awk '{print $1}')"
 mkdir -p "$DMESH_TIMING_DIR"
