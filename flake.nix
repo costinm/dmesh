@@ -38,6 +38,21 @@
           androidSdk = android.androidsdk;
           androidHome = "${androidSdk}/libexec/android-sdk";
 
+          # Keep the real-hardware NAN/USD test binary in the DMesh flake.
+          # The ordinary nixpkgs build does not enable the wpa_cli NAN
+          # control surface used by the lmesh compatibility path.
+          wpa-supplicant-nan = pkgs.wpa_supplicant.overrideAttrs (old: {
+            pname = "wpa-supplicant-nan";
+            extraConfig = (old.extraConfig or "") + ''
+
+              CONFIG_CTRL_IFACE=y
+              CONFIG_DRIVER_NL80211=y
+              CONFIG_LIBNL32=y
+              CONFIG_NAN_USD=y
+              CONFIG_P2P=y
+            '';
+          });
+
           dmeshSetenv = pkgs.writeShellScriptBin "dmesh-setenv" ''
             _dmesh_repo="''${DMESH_REPO:-$PWD}"
             _dmesh_sdk="''${DMESH_ANDROID_SDK:-$_dmesh_repo/target/android-sdk}"
@@ -108,6 +123,7 @@
               pkgs.gnugrep
               pkgs.gnused
               pkgs.gradle
+              pkgs.iw
               pkgs.jdk17
               pkgs.openssh
               pkgs.python3
@@ -117,6 +133,7 @@
               pkgs.rustup
               pkgs.unzip
               pkgs.which
+              wpa-supplicant-nan
               pkgs.zip
               musl-toolchain
             ];
@@ -137,7 +154,7 @@
           '';
         in
         {
-          inherit deps musl-toolchain;
+          inherit deps musl-toolchain wpa-supplicant-nan;
           default = deps;
         }
       );
