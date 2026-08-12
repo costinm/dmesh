@@ -1,0 +1,26 @@
+[package]
+name = "lmesh-wifi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+dmesh-rawnan = { path = "../rawnan" }
+dmesh-transport = { path = "../dmesh-transport" }
+libc = "0.2"
+minicbor = "2.2"
+sha2 = "0.11"
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uart-codec = { path = "../uart-codec" }
+mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+
+[lib]
+name = "lmesh_wifi"
+
+[[bin]]
+name = "lmesh-wifi"
+path = "src/main.rs"

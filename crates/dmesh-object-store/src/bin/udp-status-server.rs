@@ -44,6 +44,8 @@ async fn main() -> Result<()> {
         response[22..26].copy_from_slice(&[0, 0, 0, 0]);
         let sent = socket.send_to(&response, peer).await?;
         responses += 1;
-        println!("udp-status request peer={peer} bytes={received} response_bytes={sent} responses={responses} uptime_ms={uptime_ms}");
+        println!(
+            "udp-status request peer={peer} bytes={received} response_bytes={sent} responses={responses} uptime_ms={uptime_ms}"
+        );
     }
 }

@@ -6,6 +6,7 @@ use mesh::message::{
 use minicbor::{Decoder, Encoder, data::Type};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
@@ -22,9 +23,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::radio_protocol;
 use crate::schema::FirmwareSchema;
+use dmesh_rawnan::protocol as radio_protocol;
 use dmesh_rawnan::{Action as RawNanAction, NanState, RxFrame as RawNanRxFrame};
+use dmesh_transport::{encode_bench_stream, ConnectionId, FLAG_FIXED, Frame, ShortHeader, StreamFrame};
+use uart_codec::codec::{UART_ESCAPE, UART_FLAG};
 
 const DEFAULT_WIFI_IFACE: &str = "wlan1";
 const DEFAULT_ESP_NAN_GATEWAY: &str = "lora1";
@@ -43,7 +46,10 @@ const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
 const DEFAULT_LMESH_CONFIG_FILE: &str = "/home/system/etc/lmesh/lmesh.toml";
 const REMOTE_REQUEST_ID_KEY: u16 = 333;
 static REMOTE_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const MAX_HISTORY: usize = 128;
+// Raw monitor traffic is high volume (especially with an APSTA ESP peer), so
+// a short global ring could evict the semantic NAN event before a diagnostic
+// client reads it. Keep enough history for one discovery/benchmark interval.
+const MAX_HISTORY: usize = 4096;
 const ETH_P_ALL: u16 = 0x0003;
 const ETH_P_DMESH: u16 = 0x88b5;
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -86,9 +92,30 @@ const SERIAL_RESET_NONE: u8 = 0;
 // transition is complete.
 // UART is an HDLC/PPP-style byte stream. Its payload is compact CBOR; the
 // generic mesh stream envelope remains at the lmesh UDS boundary.
-const FIRMWARE_UART_FLAG: u8 = 0x7e;
-const FIRMWARE_UART_ESCAPE: u8 = 0x7d;
-const FIRMWARE_UART_ESCAPE_XOR: u8 = 0x20;
+const FIRMWARE_UART_FLAG: u8 = UART_FLAG;
+const FIRMWARE_UART_ESCAPE: u8 = UART_ESCAPE;
+
+/// Host-side adapter from the no-std UART codec's raw payloads to the shared
+/// mesh CBOR stream-frame representation used by the Linux service.
+#[derive(Default)]
+struct FirmwareUartDecoder {
+    codec: uart_codec::codec::Decoder,
+}
+
+impl FirmwareUartDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.codec
+            .push(bytes)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .into_iter()
+            .map(|payload| mesh::cbor::encode_stream_frame(&payload))
+            .collect()
+    }
+
+    fn take_frame_activity(&mut self) -> bool {
+        self.codec.take_frame_activity()
+    }
+}
 const NAN_SLEEPY_START_TAG: u8 = 6;
 const DMESH_BOOT_METHOD_SELECT: u32 = 60010;
 // Host-side decoder compatibility for already deployed stage2 records. New
@@ -111,6 +138,9 @@ const NLMSGERR_ATTR_OFFS: u16 = 2;
 const NLMSGERR_ATTR_MISS_TYPE: u16 = 5;
 const NL80211_GENL_VERSION: u8 = 1;
 const NL80211_CMD_SET_WIPHY: u8 = 2;
+const NL80211_CMD_NEW_INTERFACE: u8 = 7;
+const NL80211_CMD_DEL_INTERFACE: u8 = 8;
+const NL80211_CMD_GET_INTERFACE: u8 = 5;
 const NL80211_CMD_SET_INTERFACE: u8 = 6;
 const NL80211_CMD_REMAIN_ON_CHANNEL: u8 = 55;
 const NL80211_CMD_REGISTER_FRAME: u8 = 58;
@@ -121,8 +151,14 @@ const NL80211_CMD_GET_STATION: u8 = 17;
 const NL80211_CMD_NEW_STATION: u8 = 19;
 const NL80211_CMD_DEL_STATION: u8 = 20;
 const NL80211_CMD_CONNECT: u8 = 46;
+const NL80211_CMD_START_NAN: u8 = 66;
+const NL80211_CMD_STOP_NAN: u8 = 67;
+const NL80211_CMD_ADD_NAN_FUNCTION: u8 = 68;
+const NL80211_CMD_DEL_NAN_FUNCTION: u8 = 69;
 const NL80211_ATTR_IFINDEX: u16 = 3;
 const NL80211_ATTR_IFTYPE: u16 = 5;
+const NL80211_ATTR_WIPHY: u16 = 1;
+const NL80211_ATTR_IFNAME: u16 = 4;
 const NL80211_ATTR_MAC: u16 = 6;
 const NL80211_ATTR_BEACON_INTERVAL: u16 = 12;
 const NL80211_ATTR_DTIM_PERIOD: u16 = 13;
@@ -155,12 +191,20 @@ const NL80211_ATTR_STA_WME: u16 = 129;
 const NL80211_ATTR_STA_CAPABILITY: u16 = 171;
 const NL80211_ATTR_STA_EXT_CAPABILITY: u16 = 172;
 const NL80211_ATTR_TX_NO_CCK_RATE: u16 = 135;
+const NL80211_ATTR_RECEIVE_MULTICAST: u16 = 289;
 const NL80211_ATTR_DONT_WAIT_FOR_ACK: u16 = 142;
 const NL80211_ATTR_PROBE_RESP: u16 = 145;
 const NL80211_ATTR_RX_SIGNAL_DBM: u16 = 151;
 const NL80211_ATTR_CHANNEL_WIDTH: u16 = 159;
 const NL80211_ATTR_CENTER_FREQ1: u16 = 160;
 const NL80211_ATTR_SOCKET_OWNER: u16 = 204;
+const NL80211_ATTR_WDEV: u16 = 153;
+const NL80211_ATTR_COOKIE: u16 = 88;
+const NL80211_ATTR_NAN_MASTER_PREF: u16 = 238;
+const NL80211_ATTR_BANDS: u16 = 239;
+const NL80211_ATTR_NAN_FUNC: u16 = 240;
+const NL80211_ATTR_NAN_MATCH: u16 = 241;
+const NL80211_ATTR_NAN_FUNC_INST_ID: u16 = 242;
 const NL80211_AUTHTYPE_OPEN_SYSTEM: u32 = 0;
 const NL80211_HIDDEN_SSID_NOT_IN_USE: u32 = 0;
 const NL80211_CHAN_NO_HT: u32 = 0;
@@ -187,6 +231,8 @@ const NL80211_RATE_INFO_BITRATE: u16 = 1;
 const NL80211_RATE_INFO_BITRATE32: u16 = 5;
 const NL80211_IFTYPE_STATION: u32 = 2;
 const NL80211_IFTYPE_AP: u32 = 3;
+const NL80211_IFTYPE_OCB: u32 = 11;
+const NL80211_IFTYPE_NAN: u32 = 12;
 const NL80211_STA_FLAG_AUTHORIZED: u32 = 1 << 1;
 const NL80211_STA_FLAG_SHORT_PREAMBLE: u32 = 1 << 2;
 const NL80211_STA_FLAG_WME: u32 = 1 << 3;
@@ -221,6 +267,10 @@ const IEEE80211_LLC_SNAP_DMESH: [u8; IEEE80211_LLC_SNAP_LEN] = [
 ];
 const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x86, 0xdd];
+// Private experimental marker for raw NAN data tests.  The payload after
+// this eight-byte LLC value is dmesh-transport directly, not IPv6/UDP.
+const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
+    [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
 const NAN_UDP_SOURCE_PORT: u16 = 4242;
 const NAN_UDP_DEST_PORT: u16 = 4243;
 const AF_BLUETOOTH: libc::c_int = 31;
@@ -246,6 +296,7 @@ pub struct RadioService {
     radios: Arc<Vec<RadioAdapter>>,
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
     rawnan_state: Arc<Mutex<NanState>>,
+    native_nan: Arc<Mutex<BTreeMap<String, NativeNanRuntime>>>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     serial_forwards: Arc<Mutex<BTreeMap<String, SerialForwardRuntime>>>,
     /// Persistent TCP sessions initiated by Main after it joins STA.  These
@@ -261,13 +312,29 @@ pub struct RadioService {
     esp_sessions: Arc<Mutex<BTreeMap<String, Instant>>>,
     serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
     stability: Arc<Mutex<Option<StabilityRuntime>>>,
+    uart_enabled: bool,
 }
 
 impl RadioService {
     /// Create a radio service from environment and optional MESH_HOME/lmesh.toml config.
     pub fn from_environment() -> Self {
-        let serial_log =
-            configured_serial_log_path().and_then(|path| match SerialForwardLog::open(&path) {
+        Self::from_environment_with_uart(true)
+    }
+
+    /// Create a Wi-Fi-only backend without opening configured serial forwards.
+    ///
+    /// The full lmesh process and lmesh-uart use [`Self::from_environment`].
+    /// The standalone Wi-Fi service uses this constructor so it can own AP,
+    /// STA, and NAN interfaces without taking UART devices or serial sockets.
+    pub fn from_environment_without_uart() -> Self {
+        Self::from_environment_with_uart(false)
+    }
+
+    fn from_environment_with_uart(enable_uart: bool) -> Self {
+        let serial_log = enable_uart
+            .then(configured_serial_log_path)
+            .flatten()
+            .and_then(|path| match SerialForwardLog::open(&path) {
                 Ok(log) => Some(Arc::new(Mutex::new(log))),
                 Err(error) => {
                     tracing::warn!(path = %path, error = %error, "serial_forward_log_disabled");
@@ -280,6 +347,7 @@ impl RadioService {
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
             rawnan_state: Arc::new(Mutex::new(NanState::new(5_000_000))),
+            native_nan: Arc::new(Mutex::new(BTreeMap::new())),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             serial_forwards: Arc::new(Mutex::new(BTreeMap::new())),
             esp_reverse_sessions: Arc::new(reverse_sessions),
@@ -288,13 +356,21 @@ impl RadioService {
             esp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_log,
             stability: Arc::new(Mutex::new(None)),
+            uart_enabled: enable_uart,
         };
-        service.start_configured_serial_forwards();
-        service.start_configured_esp_reverse_sessions();
+        if enable_uart {
+            service.start_configured_serial_forwards();
+            service.start_configured_esp_reverse_sessions();
+        }
         service
     }
 
-    pub(crate) fn default_esp_route(
+    /// Report whether this backend owns UART forwards and serial logging.
+    pub fn uart_enabled(&self) -> bool {
+        self.uart_enabled
+    }
+
+    pub fn default_esp_route(
         &self,
         port: Option<&str>,
         adapter: Option<&str>,
@@ -667,6 +743,7 @@ impl RadioService {
 
         json!({
             "wifi_iface": iface,
+            "uart_enabled": self.uart_enabled,
             "wpa_ctrl_dir": ctrl_dir,
             "radios": self.radios.as_ref(),
             "capabilities": process_caps(),
@@ -677,6 +754,210 @@ impl RadioService {
                 "driver_flags2": command_result_json(wpa_driver_flags2),
             }
         })
+    }
+
+    /// Return the shared raw-NAN filter state used by the Linux monitor.
+    /// This is deliberately independent of wpa_supplicant: the monitor
+    /// observes NAN beacons and feeds them to dmesh-rawnan::NanState.
+    pub fn rawnan_status(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let state = self
+            .rawnan_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cluster = state.cluster().map(|mac| colon_mac(&mac.0));
+        let events = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|event| event.key == "wifi.rawnan.rx")
+            .count();
+        json!({
+            "ok": true,
+            "backend": "dmesh-rawnan",
+            "iface": iface,
+            "listener": self.raw_wifi_listeners.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&format!("{iface}:monitor")),
+            "filter_mode": match state.mode() {
+                dmesh_rawnan::FilterMode::Discovery => "discovery",
+                dmesh_rawnan::FilterMode::Cluster => "cluster_a3",
+            },
+            "cluster_bssid": cluster,
+            "sync_bssid": state.sync_bssid().map(|mac| colon_mac(&mac.0)),
+            "last_beacon_tsf_us": state.last_beacon_tsf_us(),
+            "beacon_interval_tu": state.beacon_interval_tu(),
+            "nan_events": events,
+        })
+    }
+
+    /// Return the administrative/carrier state without changing the
+    /// interface. This is intentionally a small host diagnostic used before
+    /// nl80211 frame tests.
+    pub fn wifi_interface_status(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let link = run_command("ip", &["link", "show", &iface]);
+        json!({ "ok": link.get("ok").and_then(Value::as_bool).unwrap_or(false), "iface": iface, "link": link })
+    }
+
+    pub fn wifi_interface_up(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let result = run_command("ip", &["link", "set", &iface, "up"]);
+        json!({ "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false), "iface": iface, "link": result })
+    }
+
+    /// Replace the owned interface with an 802.11 OCB (outside-context-of-a-
+    /// BSS) interface and join the requested frequency.  OCB has no AP,
+    /// association, WPA, or BSSID; it is useful for the shared open-medium
+    /// experiments.  This intentionally operates only on the lmesh-owned
+    /// interface.
+    pub fn wifi_ocb_start(&self, iface: Option<String>, freq: Option<u32>, bandwidth: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let freq = freq.unwrap_or_else(|| channel_to_freq(DEFAULT_RAW_WIFI_CHANNEL));
+        let bandwidth = bandwidth.unwrap_or_else(|| "10MHz".to_owned());
+        let mut steps = Vec::new();
+        steps.push(run_command("ip", &["link", "set", &iface, "down"]));
+        let set_type = ifindex(&iface).and_then(|ifindex| {
+            let socket = Nl80211Socket::open()?;
+            socket.set_interface_type(ifindex, NL80211_IFTYPE_OCB)
+        });
+        steps.push(match &set_type {
+            Ok(()) => json!({"program": "nl80211", "operation": "set_interface", "type": "ocb", "ok": true}),
+            Err(error) => json!({"program": "nl80211", "operation": "set_interface", "type": "ocb", "ok": false, "error": format!("{error:#}")}),
+        });
+        if set_type.is_ok() {
+            // Some drivers require JOIN_OCB while the netdev is administratively
+            // down, while others require it up. Try the documented iw operation
+            // first and only then raise the carrier.
+            let freq_text = freq.to_string();
+            let args = ["dev", iface.as_str(), "ocb", "join", freq_text.as_str(), bandwidth.as_str()];
+            let join = run_command("iw", &args);
+            let joined = join.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            steps.push(join);
+            steps.push(run_command("ip", &["link", "set", &iface, "up"]));
+            if !joined {
+                // Preserve the failed join and leave the interface state
+                // visible to the caller; do not silently fall back to AP/STA.
+            }
+        }
+        let ok = set_type.is_ok()
+            && steps.iter().all(|step| step.get("ok").and_then(Value::as_bool).unwrap_or(false));
+        let result = json!({
+            "ok": ok,
+            "backend": "linux_nl80211",
+            "iface": iface,
+            "type": "ocb",
+            "freq": freq,
+            "bandwidth": bandwidth,
+            "steps": steps,
+        });
+        self.record("wifi.ocb.start", result.clone());
+        result
+    }
+
+    /// Pin an owned interface to a 2.4 GHz channel using nl80211.  This is
+    /// deliberately explicit: it changes only the requested lmesh interface
+    /// and does not touch wlan0 or the lmesh-wifi service.
+    pub fn wifi_interface_set_channel(&self, iface: Option<String>, channel: u8) -> Value {
+        let iface = wifi_iface(iface);
+        let channel = channel.clamp(1, 13);
+        let freq = channel_to_freq(channel);
+        let mut steps = Vec::new();
+        // lmesh owns this interface, so release lmesh's own radio users before
+        // asking nl80211 to retune it.  Merely bringing a managed netdev down
+        // leaves monitor/NAN/AP state (and their nl80211 registrations) alive,
+        // which makes an otherwise valid SET_WIPHY request return EBUSY.
+        steps.push(json!({
+            "operation": "stop_nan",
+            "result": self.nan_native_stop(Some(iface.clone())),
+        }));
+        steps.push(json!({
+            "operation": "stop_raw",
+            "result": self.wifi_raw_stop(Some(iface.clone())),
+        }));
+        steps.push(json!({
+            "operation": "stop_ap",
+            "result": self.wifi_ap_stop(Some(iface.clone())),
+        }));
+        // Drivers commonly reject SET_WIPHY while a managed VIF is up. Keep
+        // the transition bounded and restore administrative-up afterwards.
+        steps.push(run_command("ip", &["link", "set", &iface, "down"]));
+        let result = if steps.last().and_then(|step| step.get("ok")).and_then(Value::as_bool) != Some(true) {
+            json!({
+                "ok": false,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "channel": channel,
+                "freq": freq,
+                "steps": steps,
+                "error": "interface could not be brought up",
+            })
+        } else {
+            let set_result = ifindex(&iface).and_then(|ifindex| {
+                let socket = Nl80211Socket::open()?;
+                // ath9k_htc rejects SET_WIPHY on a down managed VIF. Match
+                // the existing AP setup path's transient AP type while
+                // selecting the channel, then restore the lmesh-owned
+                // managed interface without starting an AP.
+                socket.set_interface_type(ifindex, NL80211_IFTYPE_AP)?;
+                let channel_result = socket.set_channel_ht20(ifindex, freq);
+                let restore_result = socket.set_interface_type(ifindex, NL80211_IFTYPE_STATION);
+                channel_result.and(restore_result)
+            });
+            steps.push(match &set_result {
+                Ok(()) => json!({"program": "nl80211", "ok": true, "channel": channel, "freq": freq}),
+                Err(error) => json!({"program": "nl80211", "ok": false, "channel": channel, "freq": freq, "error": format!("{error:#}")}),
+            });
+            steps.push(run_command("ip", &["link", "set", &iface, "up"]));
+            match set_result {
+                Ok(()) => {
+                    let link = run_command("ip", &["link", "show", &iface]);
+                    let result = json!({
+                        "ok": true,
+                        "backend": "linux_nl80211",
+                        "iface": iface,
+                        "channel": channel,
+                        "freq": freq,
+                        "steps": steps,
+                        "link": link,
+                    });
+                    result
+                }
+                Err(error) => json!({
+                    "ok": false,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                    "channel": channel,
+                    "freq": freq,
+                    "steps": steps,
+                    "error": format!("{error:#}"),
+                }),
+            }
+        };
+        self.record("wifi.interface.channel", result.clone());
+        result
+    }
+
+    /// Stop the experimental monitor VIF owned by lmesh. This never touches
+    /// wlan0 or the lmesh-wifi service; it is needed before changing the
+    /// channel or switching wlan1 into AP/IBSS/P2P mode.
+    pub fn wifi_raw_stop(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let monitor = monitor_iface_name(&iface);
+        self.raw_wifi_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key| !key.starts_with(&format!("{iface}:")));
+        let down = run_command("ip", &["link", "set", &monitor, "down"]);
+        let delete = run_command("/sbin/iw", &["dev", &monitor, "del"]);
+        let result = json!({
+            "ok": delete.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "backend": "linux_nl80211",
+            "iface": iface,
+            "monitor_iface": monitor,
+            "steps": [down, delete],
+        });
+        self.record("wifi.raw.stop", result.clone());
+        result
     }
 
     /// Return recent radio method results and observed notifications.
@@ -1668,6 +1949,7 @@ impl RadioService {
                 Some("dont_wait_ack".to_string()),
                 None,
                 None,
+                None,
                 payload.clone(),
             ),
             "lora" => self.esp_lora_send(payload.clone(), destination.clone()),
@@ -1813,6 +2095,7 @@ impl RadioService {
                 let registrations = mgmt_socket.register_open_ap_sme_frames(ifindex);
                 let registrations_ok = registrations.iter().all(|registration| {
                     registration.get("ok").and_then(Value::as_bool) == Some(true)
+                        || registration.get("required").and_then(Value::as_bool) == Some(false)
                 });
                 steps.push(json!({
                     "program": "nl80211",
@@ -1861,6 +2144,7 @@ impl RadioService {
                 }
                 let mgmt_iface = iface.clone();
                 let history = self.history.clone();
+                let rawnan_state = self.rawnan_state.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let stop_for_thread = stop.clone();
                 let join = std::thread::spawn(move || {
@@ -1870,6 +2154,7 @@ impl RadioService {
                         ifindex,
                         mac,
                         history,
+                        rawnan_state,
                         stop_for_thread,
                     );
                 });
@@ -2119,6 +2404,63 @@ impl RadioService {
         result
     }
 
+    /// Remove one associated station without stopping the AP.
+    pub fn wifi_ap_station_remove(&self, iface: Option<String>, mac: String) -> Value {
+        let iface = wifi_iface(iface);
+        let Some(mac_bytes) = parse_mac(Some(&mac)) else {
+            return json!({
+                "ok": false,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "mac": mac,
+                "error": "invalid station MAC",
+            });
+        };
+        let result = ifindex(&iface)
+            .and_then(|ifindex| {
+                let socket = Nl80211Socket::open()?;
+                socket.remove_station(ifindex, mac_bytes)
+            })
+            .map(|_| json!({
+                "ok": true,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "mac": colon_mac(&mac_bytes),
+            }))
+            .unwrap_or_else(|error| json!({
+                "ok": false,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "mac": colon_mac(&mac_bytes),
+                "error": format!("{error:#}"),
+            }));
+        self.record("wifi.ap.station.remove", result.clone());
+        result
+    }
+
+    /// Remove all associated stations without stopping the AP.
+    pub fn wifi_ap_station_remove_all(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let result = ifindex(&iface)
+            .and_then(|ifindex| {
+                let socket = Nl80211Socket::open()?;
+                socket.flush_stations(ifindex)
+            })
+            .map(|_| json!({
+                "ok": true,
+                "backend": "linux_nl80211",
+                "iface": iface,
+            }))
+            .unwrap_or_else(|error| json!({
+                "ok": false,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "error": format!("{error:#}"),
+            }));
+        self.record("wifi.ap.station.remove_all", result.clone());
+        result
+    }
+
     /// Scan for nearby Wi-Fi BSS entries through the lmesh radio process.
     pub fn wifi_scan(&self, iface: Option<String>, ssid: Option<String>) -> Value {
         let iface = wifi_iface(iface);
@@ -2242,8 +2584,8 @@ impl RadioService {
         result
     }
 
-    /// Configure a static IPv4 address through the capability-bearing lmesh
-    /// process. This is intentionally small: callers own route/DHCP policy.
+    /// Configure a static IPv4 address through the capability-bearing service
+    /// using rtnetlink. Callers own route/DHCP policy.
     pub fn wifi_sta_configure_ipv4(
         &self,
         iface: Option<String>,
@@ -2265,15 +2607,19 @@ impl RadioService {
         };
         let prefix = prefix.unwrap_or(24).min(32);
         let address_cidr = format!("{parsed}/{prefix}");
-        let link = run_command("ip", &["link", "set", "dev", &iface, "up"]);
-        let configured = run_command("ip", &["addr", "replace", &address_cidr, "dev", &iface]);
+        let link = set_link_up(&iface);
+        let configured = set_ipv4_address(&iface, parsed, prefix);
         let result = json!({
-            "ok": link.get("ok").and_then(Value::as_bool) == Some(true)
-                && configured.get("ok").and_then(Value::as_bool) == Some(true),
+            "ok": link.is_ok() && configured.is_ok(),
             "backend": "ip",
             "iface": iface,
             "address": address_cidr,
-            "steps": [link, configured],
+            "steps": [
+                link.map(|step| json!({"ok": true, "stdout": step.stdout}))
+                    .unwrap_or_else(|error| json!({"ok": false, "error": error})),
+                configured.map(|step| json!({"ok": true, "stdout": step.stdout}))
+                    .unwrap_or_else(|error| json!({"ok": false, "error": error})),
+            ],
         });
         self.record("wifi.sta.configure_ipv4", result.clone());
         result
@@ -2428,8 +2774,12 @@ impl RadioService {
         let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let channel = raw_wifi_channel(channel);
         let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
-        let wpa_channel = prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec);
         let rx_variant = rx_variant.unwrap_or_else(|| "nl80211".to_string());
+        let wpa_channel = if rx_variant == "monitor" || rx_variant == "monitor_active" {
+            json!({"skipped": true, "reason": "raw-NAN monitor does not use wpa_supplicant"})
+        } else {
+            prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec)
+        };
         let listener_key = format!("{iface}:{rx_variant}");
         {
             let mut listeners = self
@@ -2565,6 +2915,7 @@ impl RadioService {
         tx_variant: Option<String>,
         tx_duration_ms: Option<u32>,
         bssid: Option<String>,
+        llc: Option<String>,
         payload: String,
     ) -> Value {
         let iface = wifi_iface(iface);
@@ -2584,10 +2935,21 @@ impl RadioService {
                     });
                 }
             };
-        let wpa_channel = if tx_options.variant == "roc" {
+        let wpa_channel = if tx_options.variant == "roc"
+            || tx_options.variant == "action"
+            || tx_options.variant == "send_action"
+            || tx_options.variant == "monitor"
+            || tx_options.variant == "monitor_active"
+            || tx_options.variant == "nan_data"
+            || tx_options.variant == "nan_data_active"
+            || tx_options.variant == "nan_data_raw"
+            || tx_options.variant == "nan_data_raw_active"
+            || tx_options.variant == "nan_data_multicast"
+            || tx_options.variant == "nan_data_multicast_active"
+        {
             json!({
                 "skipped": true,
-                "reason": "tx_variant=roc owns nl80211 remain-on-channel directly",
+                "reason": "raw frame transport does not use wpa_supplicant",
             })
         } else {
             prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec)
@@ -2614,14 +2976,16 @@ impl RadioService {
         let nan_bssid = bssid
             .as_deref()
             .and_then(|value| parse_mac(Some(value)))
-            .or_else(|| self
-            .rawnan_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .cluster()
-            .map(|mac| mac.0))
+            .or_else(|| {
+                self.rawnan_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .cluster()
+                    .map(|mac| mac.0)
+            })
             .or(Some(destination))
             .unwrap_or(destination);
+        let llc = parse_experimental_llc(llc.as_deref()).unwrap_or(RAWNAN_LLC_DEFAULT);
         let frame = if tx_options.variant == "multicast_data"
             || tx_options.variant == "multicast_data_active"
         {
@@ -2634,10 +2998,21 @@ impl RadioService {
             || tx_options.variant == "sta_direct_llc_active"
         {
             build_dmesh_sta_direct_llc_frame(destination, source, &payload_bytes)
-        } else if tx_options.variant == "nan_data"
-            || tx_options.variant == "nan_data_active"
-        {
+        } else if tx_options.variant == "nan_data" || tx_options.variant == "nan_data_active" {
             build_dmesh_nan_data_frame(nan_bssid, destination, source, &payload_bytes)
+        } else if tx_options.variant == "nan_data_raw"
+            || tx_options.variant == "nan_data_raw_active"
+            || tx_options.variant == "nan_data_multicast"
+            || tx_options.variant == "nan_data_multicast_active"
+        {
+            let data_destination = if tx_options.variant == "nan_data_multicast"
+                || tx_options.variant == "nan_data_multicast_active"
+            {
+                RAW_WIFI_MULTICAST
+            } else {
+                destination
+            };
+            build_dmesh_nan_raw_data_frame(nan_bssid, data_destination, source, &llc, &payload_bytes)
         } else {
             // Raw NAN action traffic must carry the discovered cluster BSSID
             // in address3. Using the peer MAC here works only before the
@@ -2660,12 +3035,19 @@ impl RadioService {
             || tx_options.variant == "sta_direct_llc_active"
             || tx_options.variant == "nan_data"
             || tx_options.variant == "nan_data_active"
+            || tx_options.variant == "nan_data_raw"
+            || tx_options.variant == "nan_data_raw_active"
+            || tx_options.variant == "nan_data_multicast"
+            || tx_options.variant == "nan_data_multicast_active"
         {
             let active = tx_options.variant == "monitor_active"
                 || tx_options.variant == "multicast_data_active"
                 || tx_options.variant == "sta_multicast_llc_active"
                 || tx_options.variant == "sta_direct_llc_active"
-                || tx_options.variant == "nan_data_active";
+                || tx_options.variant == "nan_data_active"
+                || tx_options.variant == "nan_data_raw_active"
+                || tx_options.variant == "nan_data_multicast_active";
+
             match send_monitor_frame(&iface, channel, &frame, active) {
                 Ok(monitor) => json!({
                     "ok": true,
@@ -2682,6 +3064,7 @@ impl RadioService {
                     "destination": colon_mac(&destination),
                     "destination_mode": destination_mode,
                     "bssid": colon_mac(&nan_bssid),
+                    "llc": hex_bytes(&llc),
                     "source": colon_mac(&source),
                     "source_mode": raw_wifi_source_mode(source_input),
                     "payload_len": payload_bytes.len(),
@@ -2697,6 +3080,24 @@ impl RadioService {
                 }),
             }
         } else {
+            // Monitor experiments intentionally take the parent down in some
+            // drivers. NL80211_CMD_FRAME targets the managed/base interface,
+            // so restore only this service-owned interface first.
+            let interface_up = run_command("ip", &["link", "set", &iface, "up"]);
+            if !interface_up
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return json!({
+                    "ok": false,
+                    "backend": "linux_nl80211",
+                    "tx_variant": tx_options.variant,
+                    "iface": iface,
+                    "interface_up": interface_up,
+                    "error": "failed to bring interface up",
+                });
+            }
             match Nl80211Socket::open().and_then(|socket| {
                 if tx_options.variant == "roc" {
                     socket.remain_on_channel(
@@ -2705,12 +3106,16 @@ impl RadioService {
                         tx_options.duration_ms.unwrap_or(10),
                     )?;
                 }
-                socket.send_frame(
-                    ifindex(&iface)?,
-                    channel_to_freq(channel),
-                    &tx_options,
-                    &frame,
-                )
+                if tx_options.variant == "action" || tx_options.variant == "send_action" {
+                    socket.send_mgmt_frame(ifindex(&iface)?, &frame)
+                } else {
+                    socket.send_frame(
+                        ifindex(&iface)?,
+                        channel_to_freq(channel),
+                        &tx_options,
+                        &frame,
+                    )
+                }
             }) {
                 Ok(()) => json!({
                     "ok": true,
@@ -2723,6 +3128,7 @@ impl RadioService {
                     "listen_sec": listen_sec,
                     "tx_duration_ms": tx_duration_ms,
                     "wpa_channel": wpa_channel,
+                    "interface_up": interface_up,
                     "destination": colon_mac(&destination),
                     "destination_mode": destination_mode,
                     "bssid": colon_mac(&nan_bssid),
@@ -2737,6 +3143,7 @@ impl RadioService {
                     "tx_variant": tx_options.variant,
                     "tx_options": tx_options.as_json(),
                     "iface": iface,
+                    "interface_up": interface_up,
                     "error": format!("{error:#}"),
                 }),
             }
@@ -2753,6 +3160,223 @@ impl RadioService {
         );
         self.record("wifi.raw.tx", result.clone());
         result
+    }
+
+    /// Inject a caller-supplied 802.11 management or data frame. The input is
+    /// the frame beginning at the 802.11 header (no radiotap); lmesh adds the
+    /// radiotap wrapper required by the monitor VIF. This deliberately uses
+    /// The `monitor` bearer expects an 802.11 frame without radiotap. The
+    /// `af_packet` bearer expects a complete Ethernet frame and writes it
+    /// directly to the named netdev (useful for AP/STA data-path tests).
+    pub fn wifi_raw_send_frame(
+        &self,
+        iface: Option<String>,
+        channel: Option<u8>,
+        tx_variant: Option<String>,
+        frame_hex: String,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let channel = raw_wifi_channel(channel);
+        let variant = tx_variant.unwrap_or_else(|| "monitor".to_string());
+        if variant != "monitor" && variant != "monitor_active" && variant != "af_packet" {
+            return json!({
+                "ok": false,
+                "backend": "linux_af_packet_monitor",
+                "iface": iface,
+                "tx_variant": variant,
+                "error": "arbitrary frame injection requires tx_variant=monitor, monitor_active, or af_packet",
+            });
+        }
+        let frame = match decode_firmware_hex(frame_hex.trim_start_matches("hex:")) {
+            Ok(frame) if variant == "af_packet" && frame.len() >= 14 => frame,
+            Ok(frame) if variant != "af_packet" && frame.len() >= 10 => frame,
+            Ok(_) => {
+                return json!({"ok": false, "iface": iface, "error": "frame_hex is shorter than an 802.11 header"});
+            }
+            Err(error) => {
+                return json!({"ok": false, "iface": iface, "error": format!("invalid frame_hex: {error:#}")});
+            }
+        };
+        let result = if variant == "af_packet" {
+            match DataSocket::open(&iface).and_then(|socket| socket.send(&frame)) {
+                Ok(written) => json!({
+                    "ok": true,
+                    "backend": "linux_af_packet_data",
+                    "iface": iface,
+                    "channel": channel,
+                    "tx_variant": variant,
+                    "frame_len": frame.len(),
+                    "written": written,
+                    "note": "frame_hex is a complete Ethernet frame; no radiotap was added",
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "backend": "linux_af_packet_data",
+                    "iface": iface,
+                    "channel": channel,
+                    "tx_variant": variant,
+                    "frame_len": frame.len(),
+                    "error": format!("{error:#}"),
+                }),
+            }
+        } else {
+            let active = variant == "monitor_active";
+            match send_monitor_frame(&iface, channel, &frame, active) {
+                Ok(monitor) => json!({
+                "ok": true,
+                "backend": "linux_af_packet_monitor",
+                "iface": iface,
+                "channel": channel,
+                "tx_variant": variant,
+                "frame_len": frame.len(),
+                "monitor": monitor,
+                "note": "frame_hex is an 802.11 header/body; radiotap was added by lmesh",
+                }),
+                Err(error) => json!({
+                "ok": false,
+                "backend": "linux_af_packet_monitor",
+                "iface": iface,
+                "channel": channel,
+                "tx_variant": variant,
+                "frame_len": frame.len(),
+                "error": format!("{error:#}"),
+                }),
+            }
+        };
+        self.record("wifi.raw.tx.frame", result.clone());
+        result
+    }
+
+    /// Send a QUIC-shaped DMTB stream burst while preparing the monitor VIF
+    /// only once. The ordinary `wifi.raw.send` method is intentionally a
+    /// single-frame diagnostic and re-runs interface setup for each call;
+    /// using it in a tight loop distorted the transport benchmark and could
+    /// wedge some drivers while toggling the parent interface.
+    pub fn wifi_raw_bench_send(
+        &self,
+        iface: Option<String>,
+        channel: Option<u8>,
+        destination: String,
+        bssid: Option<String>,
+        total_bytes: usize,
+        chunk_bytes: Option<usize>,
+        tx_variant: Option<String>,
+        llc: Option<String>,
+        multicast: bool,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let channel = raw_wifi_channel(channel);
+        let destination = match parse_mac(Some(&destination)) {
+            Some(mac) => mac,
+            None => return json!({"ok": false, "error": "destination must be a MAC address"}),
+        };
+        let bssid = bssid
+            .as_deref()
+            .and_then(|value| parse_mac(Some(value)))
+            .unwrap_or(destination);
+        let tx_variant = tx_variant.unwrap_or_else(|| "monitor_active".to_string());
+        let llc = parse_experimental_llc(llc.as_deref()).unwrap_or(RAWNAN_LLC_DEFAULT);
+        let chunk_bytes = chunk_bytes.unwrap_or(512).clamp(64, 900);
+        if total_bytes == 0 || total_bytes > 16 * 1024 * 1024 {
+            return json!({"ok": false, "error": "bytes must be in 1..=16777216"});
+        }
+        let monitor_iface = monitor_iface_name(&iface);
+        let setup = match ensure_monitor_iface(&iface, &monitor_iface, channel, true, false) {
+            Ok(value) => value,
+            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
+        };
+        let socket = match MonitorTxSocket::open(&monitor_iface) {
+            Ok(socket) => socket,
+            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
+        };
+        let source = match iface_mac(&iface) {
+            Ok(mac) => mac,
+            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
+        };
+        let frame_count = total_bytes.div_ceil(chunk_bytes);
+        let started = Instant::now();
+        let mut stream_bytes = 0usize;
+        let mut wire_bytes = 0usize;
+        for sequence in 0..frame_count {
+            let offset = sequence * chunk_bytes;
+            let data_len = (total_bytes - offset).min(chunk_bytes);
+            let mut data = vec![0u8; data_len];
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = ((offset + index) & 0xff) as u8;
+            }
+            let mut payload = vec![0u8; 1200];
+            let body_len = match encode_bench_stream(
+                sequence as u32,
+                offset as u64,
+                sequence + 1 == frame_count,
+                &data,
+                &mut payload,
+            ) {
+                Ok(length) => length,
+                Err(error) => {
+                    return json!({"ok": false, "error": format!("stream encode: {error:?}")});
+                }
+            };
+            let frame = if tx_variant == "nan_data_raw" || tx_variant == "nan_data_raw_active" {
+                let data_destination = if multicast { RAW_WIFI_MULTICAST } else { destination };
+                build_dmesh_nan_raw_data_frame(
+                    bssid,
+                    data_destination,
+                    source,
+                    &llc,
+                    &payload[..body_len],
+                )
+            } else {
+                build_dmesh_vendor_action_frame_with_bssid(
+                    if multicast { RAW_WIFI_MULTICAST } else { destination },
+                    source,
+                    bssid,
+                    &payload[..body_len],
+                )
+            };
+            let packet = build_radiotap_packet(&frame);
+            if let Err(error) = socket.send(&packet).and_then(|written| {
+                if written == packet.len() {
+                    Ok(())
+                } else {
+                    bail!(
+                        "short monitor frame write: wrote {written}, expected {}",
+                        packet.len()
+                    )
+                }
+            }) {
+                return json!({
+                    "ok": false,
+                    "error": format!("frame {sequence}: {error:#}"),
+                    "frames_sent": sequence,
+                    "stream_bytes": stream_bytes,
+                    "wire_bytes": wire_bytes,
+                });
+            }
+            stream_bytes += data_len;
+            wire_bytes += packet.len();
+        }
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        json!({
+            "ok": true,
+            "backend": "linux_af_packet_monitor",
+            "iface": iface,
+            "monitor_iface": monitor_iface,
+            "channel": channel,
+            "destination": colon_mac(&destination),
+            "source": colon_mac(&source),
+            "bssid": colon_mac(&bssid),
+            "tx_variant": tx_variant,
+            "llc": hex_bytes(&llc),
+            "multicast": multicast,
+            "frames_sent": frame_count,
+            "stream_bytes": stream_bytes,
+            "wire_bytes": wire_bytes,
+            "elapsed_ms": elapsed_ms,
+            "stream_kbps": if elapsed_ms > 0.0 { stream_bytes as f64 * 8.0 / elapsed_ms } else { 0.0 },
+            "wire_kbps": if elapsed_ms > 0.0 { wire_bytes as f64 * 8.0 / elapsed_ms } else { 0.0 },
+            "setup": setup,
+        })
     }
 
     /// Send a DMesh raw Wi-Fi ping and return replies observed by the nl80211 listener.
@@ -2788,6 +3412,7 @@ impl RadioService {
             None,
             None,
             Some("dont_wait_ack".to_string()),
+            None,
             None,
             None,
             payload.clone(),
@@ -2839,10 +3464,7 @@ impl RadioService {
         let destination_bytes = raw_wifi_destination(destination.as_deref(), "monitor");
         let target = format!(
             "{:02x}{:02x}{:02x}{:02x}",
-            destination_bytes[2],
-            destination_bytes[3],
-            destination_bytes[4],
-            destination_bytes[5]
+            destination_bytes[2], destination_bytes[3], destination_bytes[4], destination_bytes[5]
         );
         let payload_bytes = if payload.eq_ignore_ascii_case("ping") {
             firmware_targeted_command_cbor_with_timeout(
@@ -3902,6 +4524,241 @@ impl RadioService {
         std::fs::metadata(std::path::Path::new(&ctrl_dir).join(iface))
             .map(|metadata| metadata.file_type().is_socket())
             .unwrap_or(false)
+    }
+
+    /// Start Linux's native cfg80211/mac80211 NAN implementation.  This is
+    /// intentionally a debug service: it may replace the selected interface
+    /// mode and leaves all replies/events visible through mesh.sock history.
+    pub fn nan_native_start(
+        &self,
+        iface: Option<String>,
+        service_name: Option<String>,
+        subscribe: bool,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let service_name = service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string());
+        let result = (|| -> Result<Value> {
+            let wiphy = wifi_wiphy_index(&iface)?;
+            let nan_name = format!("dnan{}", iface.trim_start_matches("wlan"));
+            let socket = Nl80211Socket::open()?;
+            // Some drivers reject creation of an NL80211_IFTYPE_NAN VIF even
+            // though they still expose a normal wdev.  Probe START_NAN on the
+            // existing interface as well, so the debug service distinguishes
+            // a VIF-only restriction from a complete lack of NAN support.
+            let (wdev, ifindex, ifname, created, already_started) = match socket.new_nan_interface(wiphy, &nan_name) {
+                Ok(created) => {
+                    let wdev = created
+                        .get("wdev")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("native NAN NEW_INTERFACE returned no wdev"))?;
+                    (wdev, created.get("ifindex").and_then(Value::as_u64).map(|v| v as u32), nan_name.clone(), true, false)
+                }
+                Err(new_error) => {
+                    let base_ifindex = ifindex(&iface)?;
+                    let base_wdev = socket
+                        .interface_wdev(base_ifindex)
+                        .with_context(|| format!("native NAN NEW_INTERFACE failed ({new_error:#}); GET_INTERFACE on {iface} also failed"))?;
+                    socket.start_nan(base_wdev, 100).with_context(|| {
+                        format!("native NAN NEW_INTERFACE failed ({new_error:#}); native NAN START_NAN on existing {iface} also failed")
+                    })?;
+                    (base_wdev, Some(base_ifindex), iface.clone(), false, true)
+                }
+            };
+            if !already_started {
+                socket
+                    .start_nan(wdev, 100)
+                    .context("native NAN START_NAN")?;
+            }
+            let service_id = nan_service_id(&service_name);
+            let service_info = radio_protocol::build_nan_service_info(
+                "android",
+                &local_device_id()?,
+                0,
+            )?;
+            let function = socket.add_nan_function(
+                wdev,
+                if subscribe { 1 } else { 0 },
+                service_id,
+                &service_info,
+                subscribe,
+            )
+            .context("native NAN ADD_NAN_FUNCTION")?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let event_history = self.history.clone();
+            let event_stop = stop.clone();
+            let event_iface = iface.clone();
+            std::thread::spawn(move || {
+                native_nan_event_loop(socket, event_iface, event_history, event_stop);
+            });
+            self.native_nan.lock().unwrap().insert(
+                iface.clone(),
+                NativeNanRuntime {
+                    wdev,
+                    ifindex,
+                    ifname: ifname.clone(),
+                    wiphy,
+                    kernel_nan: created,
+                    stop,
+                },
+            );
+            Ok(json!({
+                "ok": true,
+                "backend": "linux_nl80211_native_nan",
+                "iface": iface,
+                "nan_iface": ifname,
+                "created_nan_interface": created,
+                "wiphy": wiphy,
+                "wdev": wdev,
+                "service_name": service_name,
+                "service_id": hex_bytes(&service_id),
+                "function": function,
+                "note": "native NAN debug service; events are available in messages.history",
+            }))
+        })();
+        let value = result.unwrap_or_else(|error| json!({
+            "ok": false,
+            "backend": "linux_nl80211_native_nan",
+            "iface": iface,
+            "error": format!("{error:#}"),
+        }));
+        self.record("wifi.nan.native.start", value.clone());
+        value
+    }
+
+    /// Reproduce wpa_supplicant CONFIG_NAN_USD directly: managed-interface
+    /// action registration, userspace SDF construction, ROC, and NL80211
+    /// FRAME injection. This intentionally does not request an NAN VIF.
+    pub fn nan_usd_start(
+        &self,
+        iface: Option<String>,
+        service_name: Option<String>,
+        subscribe: bool,
+        infra: bool,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let service_name = service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string());
+        let result = (|| -> Result<Value> {
+            let ifidx = ifindex(&iface)?;
+            let source = iface_mac(&iface)?;
+            let service_id = nan_service_id(&service_name);
+            let service_info = radio_protocol::build_nan_service_info(
+                "android", &local_device_id()?, 0,
+            )?;
+            let socket = Nl80211Socket::open()?;
+            socket.register_wpa_nan_usd_and_dmesh(ifidx)?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let event_history = self.history.clone();
+            let event_stop = stop.clone();
+            let event_iface = iface.clone();
+            let tx_frame = dmesh_rawnan::build_nan_publish_sdf(
+                dmesh_rawnan::NAN_DISCOVERY_MAC,
+                source,
+                [0; 6],
+                service_id,
+                if subscribe { 2 } else { 1 },
+                &service_info,
+            );
+            let frame_len = tx_frame.len();
+            let event_service_id = service_id;
+            let event_rawnan_state = self.rawnan_state.clone();
+            std::thread::spawn(move || {
+                nan_usd_event_tx_loop(
+                    socket, event_iface, event_history, event_stop, ifidx, tx_frame,
+                    event_service_id, event_rawnan_state, infra,
+                );
+            });
+            self.native_nan.lock().unwrap().insert(
+                iface.clone(),
+                NativeNanRuntime {
+                    wdev: 0,
+                    ifindex: Some(ifidx),
+                    ifname: iface.clone(),
+                    wiphy: wifi_wiphy_index(&iface)?,
+                    kernel_nan: false,
+                    stop,
+                },
+            );
+            Ok(json!({
+                "ok": true,
+                "backend": "linux_nl80211_nan_usd",
+                "iface": iface,
+                "service_name": service_name,
+                "service_id": hex_bytes(&service_id),
+                "subscribe": subscribe,
+                "infra": infra,
+                "frame_len": frame_len,
+                "note": "wpa_supplicant-compatible userspace USD; events are available in messages.history",
+            }))
+        })();
+        let value = result.unwrap_or_else(|error| json!({
+            "ok": false, "backend": "linux_nl80211_nan_usd", "iface": iface,
+            "error": format!("{error:#}"),
+        }));
+        self.record("wifi.nan.usd.start", value.clone());
+        value
+    }
+
+    pub fn nan_native_status(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let runtime = self.native_nan.lock().unwrap().get(&iface).map(|r| {
+            json!({"wdev": r.wdev, "ifindex": r.ifindex, "nan_iface": r.ifname,
+                   "wiphy": r.wiphy, "running": !r.stop.load(Ordering::Acquire)})
+        });
+        let events = self.history.lock().unwrap().iter()
+            .filter(|event| event.key == "wifi.nan.native.event" && event.source == iface)
+            .count();
+        json!({"ok": true, "backend": "linux_nl80211_native_nan", "iface": iface,
+               "runtime": runtime, "event_count": events})
+    }
+
+    pub fn nan_native_transmit(
+        &self,
+        iface: Option<String>,
+        destination: String,
+        instance_id: u8,
+        requestor_id: u8,
+        payload_text: String,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let result = (|| -> Result<Value> {
+            let wdev = self.native_nan.lock().unwrap().get(&iface)
+                .map(|runtime| runtime.wdev)
+                .ok_or_else(|| anyhow::anyhow!("native NAN is not running on {iface}"))?;
+            let destination = parse_mac(Some(&destination))
+                .ok_or_else(|| anyhow::anyhow!("invalid destination MAC"))?;
+            let socket = Nl80211Socket::open()?;
+            let info = socket.add_nan_followup(wdev, instance_id, requestor_id, destination, payload_text.as_bytes())?;
+            Ok(json!({"ok": true, "backend": "linux_nl80211_native_nan", "iface": iface,
+                       "destination": colon_mac(&destination), "function": info}))
+        })();
+        let value = result.unwrap_or_else(|error| json!({"ok": false, "backend": "linux_nl80211_native_nan", "iface": iface, "error": format!("{error:#}")}));
+        self.record("wifi.nan.native.transmit", value.clone());
+        value
+    }
+
+    pub fn nan_native_stop(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let runtime = self.native_nan.lock().unwrap().remove(&iface);
+        let Some(runtime) = runtime else {
+            return json!({"ok": true, "iface": iface, "already_stopped": true});
+        };
+        runtime.stop.store(true, Ordering::Release);
+        let result = Nl80211Socket::open()
+            .and_then(|socket| {
+                if runtime.kernel_nan {
+                    socket.stop_nan(runtime.wdev)?;
+                    if runtime.ifname != iface {
+                        if let Some(ifindex) = runtime.ifindex {
+                            socket.del_interface(ifindex)?;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .map(|_| json!({"ok": true, "backend": "linux_nl80211_native_nan", "iface": iface, "wdev": runtime.wdev}))
+            .unwrap_or_else(|error| json!({"ok": false, "backend": "linux_nl80211_native_nan", "iface": iface, "wdev": runtime.wdev, "error": format!("{error:#}")}));
+        self.record("wifi.nan.native.stop", result.clone());
+        result
     }
 
     /// Attach to NAN through the repo-built wpa_supplicant control socket.
@@ -5086,7 +5943,9 @@ fn serial_forward_loop(
                 stats
                     .serial_to_client_bytes
                     .fetch_add(n as u64, Ordering::Relaxed);
-                let records = firmware_uart_decoder.push(&serial_buf[..n])?;
+                let records = firmware_uart_decoder
+                    .push(&serial_buf[..n])
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 record_serial_forward_rx_log(
                     serial_log.as_ref(),
                     &stats,
@@ -5576,16 +6435,15 @@ impl SerialForwardClient {
             }
         }
         if may_write {
-            progressed |=
-                self.flush_complete_records(
-                    serial_fd,
-                    serial_tx,
-                    serial_pending,
-                    serial_direct,
-                    serial_log,
-                    board,
-                    flash_log_quiet,
-                )?;
+            progressed |= self.flush_complete_records(
+                serial_fd,
+                serial_tx,
+                serial_pending,
+                serial_direct,
+                serial_log,
+                board,
+                flash_log_quiet,
+            )?;
         } else if !may_write {
             progressed |= !self.input.is_empty();
             self.input.clear();
@@ -5686,10 +6544,20 @@ impl SerialForwardClient {
                     // managed forward is the sole UART reader.
                     queue_firmware_payload(serial_tx, payload)?;
                 } else if direct_for_client {
-                    record_serial_forward_tx_log(serial_log, board, &self.input[..record_len], flash_log_quiet);
+                    record_serial_forward_tx_log(
+                        serial_log,
+                        board,
+                        &self.input[..record_len],
+                        flash_log_quiet,
+                    );
                     queue_firmware_packet(serial_tx, &self.input[..record_len])?;
                 } else {
-                    record_serial_forward_tx_log(serial_log, board, &self.input[..record_len], flash_log_quiet);
+                    record_serial_forward_tx_log(
+                        serial_log,
+                        board,
+                        &self.input[..record_len],
+                        flash_log_quiet,
+                    );
                     queue_firmware_packet(serial_pending, &self.input[..record_len])?;
                 }
             } else {
@@ -5701,7 +6569,12 @@ impl SerialForwardClient {
                 if !line.is_empty() {
                     match firmware_command_cbor(line) {
                         Ok(frame) => {
-                            record_serial_forward_tx_log(serial_log, board, &frame, flash_log_quiet);
+                            record_serial_forward_tx_log(
+                                serial_log,
+                                board,
+                                &frame,
+                                flash_log_quiet,
+                            );
                             if direct_for_client {
                                 queue_firmware_packet(serial_tx, &frame)?;
                             } else {
@@ -5848,43 +6721,45 @@ impl SerialForwardLog {
                 logged += 1;
                 continue;
             }
-            let (kind, decoded) =
-                if is_boot_identity {
-                    ("boot", format!("identity={}", boot_identity_json(payload)))
-                } else if is_boot_event {
-                    ("boot", format!("event={}", boot_event_json(payload)))
-                } else if is_boot_selector {
-                    ("boot", format!("selector_hex={}", compact_serial_hex(payload)))
-                } else if let Ok(decoded) =
-                    mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())
-                {
-                    let decoded = self.schema.rename_decoded(decoded);
-                    // decode_json represents schema/type failures as an error
-                    // object. Do not make malformed compact-CBOR look like a
-                    // valid firmware notification in the serial evidence.
-                    if let Some(error) = decoded.get("error").and_then(Value::as_str) {
-                        (
-                            "cbor_error",
-                            format!(
-                                "message={:?} {} payload_hex={}",
-                                error,
-                                cbor_first_byte_summary(payload),
-                                compact_serial_hex(payload)
-                            ),
-                        )
-                    } else {
-                        ("cbor", decoded.to_string())
-                    }
-                } else {
+            let (kind, decoded) = if is_boot_identity {
+                ("boot", format!("identity={}", boot_identity_json(payload)))
+            } else if is_boot_event {
+                ("boot", format!("event={}", boot_event_json(payload)))
+            } else if is_boot_selector {
+                (
+                    "boot",
+                    format!("selector_hex={}", compact_serial_hex(payload)),
+                )
+            } else if let Ok(decoded) =
+                mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())
+            {
+                let decoded = self.schema.rename_decoded(decoded);
+                // decode_json represents schema/type failures as an error
+                // object. Do not make malformed compact-CBOR look like a
+                // valid firmware notification in the serial evidence.
+                if let Some(error) = decoded.get("error").and_then(Value::as_str) {
                     (
                         "cbor_error",
                         format!(
-                            "{} payload_hex={}",
+                            "message={:?} {} payload_hex={}",
+                            error,
                             cbor_first_byte_summary(payload),
-                            compact_serial_hex(payload),
+                            compact_serial_hex(payload)
                         ),
                     )
-                };
+                } else {
+                    ("cbor", decoded.to_string())
+                }
+            } else {
+                (
+                    "cbor_error",
+                    format!(
+                        "{} payload_hex={}",
+                        cbor_first_byte_summary(payload),
+                        compact_serial_hex(payload),
+                    ),
+                )
+            };
             let decoded = truncate_serial_log_field(&decoded);
             writeln!(
                 self.file,
@@ -5942,7 +6817,9 @@ impl SerialForwardLog {
 /// old fixed DMB1 compatibility record.
 fn is_boot_identity_payload(payload: &[u8]) -> bool {
     (payload.len() >= DMESH_BOOT_HELLO_LEN && payload[..4] == DMESH_BOOT_MAGIC[..])
-        || payload.windows(3).any(|window| window == [0x19, 0xea, 0x60])
+        || payload
+            .windows(3)
+            .any(|window| window == [0x19, 0xea, 0x60])
 }
 
 fn boot_event_id(payload: &[u8]) -> Option<u64> {
@@ -6028,9 +6905,11 @@ fn cbor_uint_at(payload: &[u8], offset: &mut usize) -> Option<u64> {
     let end = offset.checked_add(width)?;
     let bytes = payload.get(*offset..end)?;
     *offset = end;
-    Some(bytes.iter().fold(0_u64, |value, byte| {
-        (value << 8) | u64::from(*byte)
-    }))
+    Some(
+        bytes
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte)),
+    )
 }
 
 fn cbor_argument_at(payload: &[u8], offset: &mut usize, first: u8) -> Option<u64> {
@@ -6048,9 +6927,11 @@ fn cbor_argument_at(payload: &[u8], offset: &mut usize, first: u8) -> Option<u64
     let end = offset.checked_add(width)?;
     let bytes = payload.get(*offset..end)?;
     *offset = end;
-    Some(bytes.iter().fold(0_u64, |value, byte| {
-        (value << 8) | u64::from(*byte)
-    }))
+    Some(
+        bytes
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte)),
+    )
 }
 
 fn cbor_tuple_value(payload: &[u8], offset: &mut usize) -> Option<Value> {
@@ -6060,7 +6941,10 @@ fn cbor_tuple_value(payload: &[u8], offset: &mut usize) -> Option<Value> {
         0 => Some(Value::from(cbor_argument_at(payload, offset, first)?)),
         1 => {
             let argument = cbor_argument_at(payload, offset, first)?;
-            let value = i64::try_from(argument).ok()?.checked_add(1)?.checked_neg()?;
+            let value = i64::try_from(argument)
+                .ok()?
+                .checked_add(1)?
+                .checked_neg()?;
             Some(Value::from(value))
         }
         2 => {
@@ -6188,7 +7072,10 @@ fn record_serial_forward_tx_log(
     } else if is_boot_event_payload(payload) {
         ("boot", format!("event={}", boot_event_json(payload)))
     } else if is_boot_selector_payload(payload) {
-        ("boot", format!("selector_hex={}", compact_serial_hex(payload)))
+        (
+            "boot",
+            format!("selector_hex={}", compact_serial_hex(payload)),
+        )
     } else if payload.first().map(|byte| byte >> 5) == Some(5)
         || payload.first().map(|byte| byte >> 5) == Some(4)
     {
@@ -6237,8 +7124,8 @@ fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
     let endpoint = fields[1].as_bytes();
     let local_ip = fields[2].as_bytes();
     let ssid = fields[3].as_bytes();
-    let dry_run = fields.get(4).is_some_and(|value| *value == "dryrun") ||
-        fields.get(5).is_some_and(|value| *value == "dryrun");
+    let dry_run = fields.get(4).is_some_and(|value| *value == "dryrun")
+        || fields.get(5).is_some_and(|value| *value == "dryrun");
     let password = if fields.get(4).is_some_and(|value| *value == "dryrun") {
         &[]
     } else {
@@ -6258,10 +7145,22 @@ fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
     {
         bail!("Recovery STA packet field is too long or empty");
     }
-    let mut packet = Vec::with_capacity(64 + endpoint.len() + local_ip.len() + ssid.len() + password.len());
-    packet.extend_from_slice(&[0xa2, 0x00, 0x18, 68, 0x06, if dry_run { 0xa5 } else { 0xa4 }]);
-    for (key, value) in [("server", endpoint), ("ip", local_ip),
-                         ("ssid", ssid), ("password", password)] {
+    let mut packet =
+        Vec::with_capacity(64 + endpoint.len() + local_ip.len() + ssid.len() + password.len());
+    packet.extend_from_slice(&[
+        0xa2,
+        0x00,
+        0x18,
+        68,
+        0x06,
+        if dry_run { 0xa5 } else { 0xa4 },
+    ]);
+    for (key, value) in [
+        ("server", endpoint),
+        ("ip", local_ip),
+        ("ssid", ssid),
+        ("password", password),
+    ] {
         packet.push(0x60 + key.len() as u8);
         packet.extend_from_slice(key.as_bytes());
         if value.len() < 24 {
@@ -6286,33 +7185,8 @@ fn encode_firmware_uart_frame(stream_frame: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn encode_firmware_uart_payload(cbor: &[u8]) -> Result<Vec<u8>> {
-    if cbor.is_empty() || cbor.len() > mesh::cbor::ESP_RECORD_MAX {
-        bail!(
-            "firmware UART CBOR record must be 1..={} bytes",
-            mesh::cbor::ESP_RECORD_MAX
-        );
-    }
-    let mut wire = Vec::with_capacity(cbor.len() * 2 + 2);
-    wire.push(FIRMWARE_UART_FLAG);
-    for byte in cbor {
-        if matches!(*byte, FIRMWARE_UART_FLAG | FIRMWARE_UART_ESCAPE) {
-            wire.push(FIRMWARE_UART_ESCAPE);
-            wire.push(*byte ^ FIRMWARE_UART_ESCAPE_XOR);
-        } else {
-            wire.push(*byte);
-        }
-    }
-    wire.push(FIRMWARE_UART_FLAG);
-    Ok(wire)
-}
-
-#[derive(Default)]
-struct FirmwareUartDecoder {
-    in_frame: bool,
-    escaped: bool,
-    discard_until_flag: bool,
-    payload: Vec<u8>,
-    frame_activity: bool,
+    uart_codec::codec::encode_payload(cbor, mesh::cbor::ESP_RECORD_MAX)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 #[derive(Default)]
@@ -6356,68 +7230,6 @@ fn nan_sleepy_start_event(payload: &[u8]) -> Option<NanSleepyStartEvent> {
     Some(event)
 }
 
-impl FirmwareUartDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut records = Vec::new();
-        for byte in bytes {
-            if *byte == FIRMWARE_UART_FLAG {
-                if !self.in_frame {
-                    self.in_frame = true;
-                    self.escaped = false;
-                    self.discard_until_flag = false;
-                    self.payload.clear();
-                    continue;
-                }
-                if self.escaped {
-                    self.payload.clear();
-                    self.escaped = false;
-                    self.discard_until_flag = false;
-                    continue;
-                }
-                self.escaped = false;
-                if self.discard_until_flag || self.payload.is_empty() {
-                    self.discard_until_flag = false;
-                    self.payload.clear();
-                    // Empty delimiter pairs were the old heartbeat packet.
-                    // They are no longer a wake signal: current Main emits a
-                    // tagged NAN_SLEEPY_START CBOR event instead. Keep the
-                    // delimiter handling for resynchronization, but do not
-                    // flush queued commands or report an empty packet.
-                    continue;
-                }
-                records.push(mesh::cbor::encode_stream_frame(&self.payload)?);
-                self.payload.clear();
-                self.frame_activity = true;
-                continue;
-            }
-            if !self.in_frame || self.discard_until_flag {
-                continue;
-            }
-            if self.escaped {
-                self.payload.push(*byte ^ FIRMWARE_UART_ESCAPE_XOR);
-                self.escaped = false;
-            } else if *byte == FIRMWARE_UART_ESCAPE {
-                self.escaped = true;
-                continue;
-            } else {
-                self.payload.push(*byte);
-            }
-            if self.payload.len() > mesh::cbor::ESP_RECORD_MAX {
-                self.payload.clear();
-                self.escaped = false;
-                self.discard_until_flag = true;
-            }
-        }
-        Ok(records)
-    }
-
-    /// Return whether a complete physical UART frame ended since the prior
-    /// call. The tagged NAN sleepy-start record is also wake activity.
-    fn take_frame_activity(&mut self) -> bool {
-        std::mem::take(&mut self.frame_activity)
-    }
-}
-
 fn queue_firmware_packet(queue: &mut VecDeque<u8>, stream_frame: &[u8]) -> Result<()> {
     let payload = mesh::cbor::decode_stream_frame(stream_frame)?;
     queue_firmware_payload(queue, payload)
@@ -6427,17 +7239,8 @@ fn queue_firmware_packet(queue: &mut VecDeque<u8>, stream_frame: &[u8]) -> Resul
 /// are compact CBOR, but stage2 uses a fixed DMB1 payload so it can run without
 /// a CBOR implementation.  Both payload kinds use the same PPP envelope.
 fn queue_firmware_payload(queue: &mut VecDeque<u8>, payload: &[u8]) -> Result<()> {
-    let mut wire = Vec::with_capacity(payload.len().saturating_mul(2).saturating_add(2));
-    wire.push(FIRMWARE_UART_FLAG);
-    for byte in payload {
-        if matches!(*byte, FIRMWARE_UART_FLAG | FIRMWARE_UART_ESCAPE) {
-            wire.push(FIRMWARE_UART_ESCAPE);
-            wire.push(*byte ^ FIRMWARE_UART_ESCAPE_XOR);
-        } else {
-            wire.push(*byte);
-        }
-    }
-    wire.push(FIRMWARE_UART_FLAG);
+    let wire = uart_codec::codec::encode_payload(payload, mesh::cbor::ESP_RECORD_MAX)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     queue_serial_bytes(queue, &wire)
 }
 
@@ -7097,12 +7900,18 @@ fn boot_command_payload(command: &str) -> Result<Vec<u8>> {
     };
     // {0:60010,6:[partition]}: the same compact method/payload envelope
     // used by Main, with no bootloader-specific legacy format.
-    Ok(vec![0xa2, 0x00, 0x1a,
-            (DMESH_BOOT_METHOD_SELECT >> 24) as u8,
-            (DMESH_BOOT_METHOD_SELECT >> 16) as u8,
-            (DMESH_BOOT_METHOD_SELECT >> 8) as u8,
-            DMESH_BOOT_METHOD_SELECT as u8,
-            0x06, 0x81, partition])
+    Ok(vec![
+        0xa2,
+        0x00,
+        0x1a,
+        (DMESH_BOOT_METHOD_SELECT >> 24) as u8,
+        (DMESH_BOOT_METHOD_SELECT >> 16) as u8,
+        (DMESH_BOOT_METHOD_SELECT >> 8) as u8,
+        DMESH_BOOT_METHOD_SELECT as u8,
+        0x06,
+        0x81,
+        partition,
+    ])
 }
 
 fn boot_identity_json(payload: &[u8]) -> Value {
@@ -7110,7 +7919,10 @@ fn boot_identity_json(payload: &[u8]) -> Value {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    if payload.windows(3).any(|window| window == [0x19, 0xea, 0x60]) {
+    if payload
+        .windows(3)
+        .any(|window| window == [0x19, 0xea, 0x60])
+    {
         let tuple = boot_identity_tuple(payload);
         let mut result = json!({
             "valid": true,
@@ -7321,7 +8133,10 @@ fn uds_boot_exchange_stream(
                     .context("failed to flush fixed stage2 command")?;
                 return Ok(identity);
             }
-            if boot_bytes.windows(3).any(|window| window == [0x19, 0xea, 0x60]) {
+            if boot_bytes
+                .windows(3)
+                .any(|window| window == [0x19, 0xea, 0x60])
+            {
                 stream
                     .write_all(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
                     .context("failed to select direct delivery for stage2 command")?;
@@ -8596,6 +9411,15 @@ struct ApRuntime {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+struct NativeNanRuntime {
+    wdev: u64,
+    ifindex: Option<u32>,
+    ifname: String,
+    wiphy: u32,
+    kernel_nan: bool,
+    stop: Arc<AtomicBool>,
+}
+
 struct ApStartProfile {
     name: &'static str,
     probe_resp: bool,
@@ -8749,6 +9573,14 @@ impl RawWifiTxOptions {
                 dont_wait_for_ack: true,
                 tx_no_cck_rate: false,
             },
+            "action" | "send_action" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: false,
+                tx_no_cck_rate: false,
+            },
             "multicast_data" => Self {
                 variant: variant.to_string(),
                 include_freq: false,
@@ -8813,6 +9645,14 @@ impl RawWifiTxOptions {
                 dont_wait_for_ack: true,
                 tx_no_cck_rate: false,
             },
+            "nan_data_raw" | "nan_data_raw_active" | "nan_data_multicast" | "nan_data_multicast_active" => Self {
+                variant: variant.to_string(),
+                include_freq: false,
+                duration_ms: None,
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            },
             "roc" => Self {
                 variant: variant.to_string(),
                 include_freq: true,
@@ -8830,7 +9670,7 @@ impl RawWifiTxOptions {
                 tx_no_cck_rate: false,
             },
             other => bail!(
-                "unknown tx_variant {other:?}; expected standard, zero_duration, no_duration, no_offchannel, minimal, dont_wait_ack, dont_wait_no_duration, dont_wait_minimal, onchannel, onchannel_noack, dont_wait_no_cck, no_cck, no_freq, monitor, monitor_active, multicast_data, multicast_data_active, sta_multicast_llc, sta_multicast_llc_active, sta_direct_llc, sta_direct_llc_active, nan_data, nan_data_active, roc, or pyroute2"
+                "unknown tx_variant {other:?}; expected standard, zero_duration, no_duration, no_offchannel, minimal, dont_wait_ack, dont_wait_no_duration, dont_wait_minimal, onchannel, onchannel_noack, action, send_action, dont_wait_no_cck, no_cck, no_freq, monitor, monitor_active, multicast_data, multicast_data_active, sta_multicast_llc, sta_multicast_llc_active, sta_direct_llc, sta_direct_llc_active, nan_data, nan_data_active, nan_data_raw, nan_data_raw_active, nan_data_multicast, nan_data_multicast_active, roc, or pyroute2"
             ),
         };
         Ok(options)
@@ -8925,6 +9765,8 @@ impl Nl80211Socket {
         for frame_match in matches {
             match self.register_frame(ifindex, IEEE80211_ACTION_FRAME_TYPE, &frame_match) {
                 Ok(()) => registered += 1,
+                Err(error)
+                    if error.to_string().contains("Match already configured") => {}
                 Err(error) if registered == 0 => return Err(error),
                 Err(_) => {}
             }
@@ -8932,14 +9774,63 @@ impl Nl80211Socket {
         Ok(())
     }
 
+    /// Match wpa_supplicant's CONFIG_NAN_USD registration while retaining the
+    /// ESP-NOW/DMesh vendor-action registrations on the same nl80211 socket.
+    fn register_wpa_nan_usd_and_dmesh(&self, ifindex: u32) -> Result<()> {
+        let nan_match = [0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13];
+        let mut multicast_error = None;
+        let mut registered = false;
+        for multicast in [true, false] {
+            let mut payload = genl_payload(NL80211_CMD_REGISTER_FRAME, NL80211_GENL_VERSION);
+            append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+            if multicast {
+                append_attr(&mut payload, NL80211_ATTR_RECEIVE_MULTICAST, &[]);
+            }
+            append_attr(
+                &mut payload,
+                NL80211_ATTR_FRAME_TYPE,
+                &IEEE80211_ACTION_FRAME_TYPE.to_ne_bytes(),
+            );
+            append_attr(&mut payload, NL80211_ATTR_FRAME_MATCH, &nan_match);
+            self.send_genl(
+                self.family_id,
+                (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+                77 + u32::from(!multicast),
+                &payload,
+            )?;
+            match self.recv_ack() {
+                Ok(()) => { registered = true; break; }
+                // A long-lived AP/monitor owner may already hold this exact
+                // nl80211 match.  That is sufficient for receive delivery;
+                // do not prevent the beacon-gated sender from starting.
+                Err(error) if error.to_string().contains("Match already configured") => {
+                    registered = true;
+                    break;
+                }
+                Err(error) if multicast => multicast_error = Some(error),
+                Err(error) => return Err(error).context("nl80211 NAN USD frame registration failed"),
+            }
+        }
+        if !registered {
+            return Err(multicast_error.unwrap_or_else(|| anyhow::anyhow!("NAN USD frame registration failed")));
+        }
+        self.register_dmesh_action(ifindex)
+    }
+
     fn register_open_ap_sme_frames(&self, ifindex: u32) -> Vec<Value> {
-        let registrations: [(&str, u16, &[u8]); 16] = [
+        // AP SME, NAN public, and DMesh/ESP-NOW vendor actions share this
+        // nl80211 receive socket; the broad public/vendor matches cover all
+        // of them without duplicate registrations.
+        let registrations: [(&str, u16, &[u8]); 17] = [
             ("auth_open", 0x00b0, &[0x00, 0x00]),
             ("assoc_req", 0x0000, &[]),
             ("reassoc_req", 0x0020, &[]),
             ("disassoc", 0x00a0, &[]),
             ("deauth", 0x00c0, &[]),
             ("probe_req", 0x0040, &[]),
+            // NAN discovery/beacon frames are ordinary management beacons;
+            // receive them on the same AP-SME socket as AP management.
+            ("beacon", 0x0080, &[]),
             ("action_public", IEEE80211_ACTION_FRAME_TYPE, &[0x04]),
             (
                 "action_radio_measurement",
@@ -8985,6 +9876,21 @@ impl Nl80211Socket {
                     "frame_type": format!("0x{frame_type:04x}"),
                     "match_hex": hex_bytes(frame_match),
                 })),
+                Err(error) if *name == "beacon" => reports.push(json!({
+                    "name": name,
+                    "ok": false,
+                    "required": false,
+                    "frame_type": format!("0x{frame_type:04x}"),
+                    "match_hex": hex_bytes(frame_match),
+                    "error": format!("{error:#}"),
+                })),
+                Err(error) if format!("{error:#}").contains("Operation already in progress") => reports.push(json!({
+                    "name": name,
+                    "ok": true,
+                    "already_registered": true,
+                    "frame_type": format!("0x{frame_type:04x}"),
+                    "match_hex": hex_bytes(frame_match),
+                })),
                 Err(error) => reports.push(json!({
                     "name": name,
                     "ok": false,
@@ -9025,7 +9931,7 @@ impl Nl80211Socket {
         self.recv_ack()
     }
 
-    fn remain_on_channel(&self, ifindex: u32, freq: u32, duration_ms: u32) -> Result<()> {
+    fn remain_on_channel(&self, ifindex: u32, freq: u32, duration_ms: u32) -> Result<u64> {
         let mut payload = genl_payload(NL80211_CMD_REMAIN_ON_CHANNEL, NL80211_GENL_VERSION);
         append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
         append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
@@ -9040,11 +9946,14 @@ impl Nl80211Socket {
             4,
             &payload,
         )?;
-        self.recv_ack()
-            .context("nl80211 remain-on-channel failed")?;
+        let response = self.recv_reply().context("nl80211 remain-on-channel failed")?;
+        let cookie = genl_attrs(&response)?.into_iter()
+            .find_map(|(kind, value)| (kind & NLA_TYPE_MASK == NL80211_ATTR_COOKIE && value.len() >= 8)
+                .then(|| u64::from_ne_bytes(value[..8].try_into().unwrap())))
+            .ok_or_else(|| anyhow::anyhow!("nl80211 remain-on-channel returned no cookie"))?;
         let settle_ms = duration_ms.saturating_div(2).clamp(1, 20);
         std::thread::sleep(Duration::from_millis(settle_ms as u64));
-        Ok(())
+        Ok(cookie)
     }
 
     fn set_interface_type(&self, ifindex: u32, iftype: u32) -> Result<()> {
@@ -9058,6 +9967,139 @@ impl Nl80211Socket {
             &payload,
         )?;
         self.recv_ack().context("nl80211 set interface type failed")
+    }
+
+    fn new_nan_interface(&self, wiphy: u32, ifname: &str) -> Result<Value> {
+        let mut payload = genl_payload(NL80211_CMD_NEW_INTERFACE, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_IFNAME, format!("{ifname}\0").as_bytes());
+        append_attr(&mut payload, NL80211_ATTR_IFTYPE, &NL80211_IFTYPE_NAN.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 70, &payload)?;
+        let response = self.recv_reply()?;
+        let mut out = serde_json::Map::new();
+        for (kind, value) in genl_attrs(&response)? {
+            match kind & NLA_TYPE_MASK {
+                NL80211_ATTR_IFINDEX if value.len() >= 4 => {
+                    out.insert("ifindex".to_string(), json!(u32::from_ne_bytes(value[..4].try_into()?)));
+                }
+                NL80211_ATTR_WDEV if value.len() >= 8 => {
+                    out.insert("wdev".to_string(), json!(u64::from_ne_bytes(value[..8].try_into()?)));
+                }
+                _ => {}
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    fn interface_wdev(&self, ifindex: u32) -> Result<u64> {
+        let mut payload = genl_payload(NL80211_CMD_GET_INTERFACE, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 76, &payload)?;
+        let response = self.recv_reply()?;
+        for (attr, value) in genl_attrs(&response)? {
+            if attr & NLA_TYPE_MASK == NL80211_ATTR_WDEV && value.len() >= 8 {
+                return Ok(u64::from_ne_bytes(value[..8].try_into()?));
+            }
+        }
+        bail!("nl80211 GET_INTERFACE returned no wdev for ifindex {ifindex}")
+    }
+
+    fn start_nan(&self, wdev: u64, master_pref: u8) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_START_NAN, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_NAN_MASTER_PREF, &[master_pref]);
+        append_attr(&mut payload, NL80211_ATTR_BANDS, &1_u32.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 71, &payload)?;
+        self.recv_ack().context("nl80211 native NAN start failed")
+    }
+
+    fn add_nan_function(
+        &self,
+        wdev: u64,
+        kind: u8,
+        service_id: [u8; 6],
+        service_info: &[u8],
+        active_subscribe: bool,
+    ) -> Result<Value> {
+        let mut function = Vec::new();
+        append_attr(&mut function, 1, &[kind]);
+        append_attr(&mut function, 2, &service_id);
+        if kind == 0 {
+            append_attr(&mut function, 3, &[2]); // unsolicited publish
+        } else if active_subscribe {
+            append_attr(&mut function, 6, &[]);
+        }
+        append_attr(&mut function, 11, &3600_u32.to_ne_bytes());
+        append_attr(&mut function, 12, service_info);
+        let mut payload = genl_payload(NL80211_CMD_ADD_NAN_FUNCTION, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_NAN_FUNC | (1 << 15), &function);
+        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 72, &payload)?;
+        let response = self.recv_reply()?;
+        let mut out = serde_json::Map::new();
+        for (attr, value) in genl_attrs(&response)? {
+            match attr & NLA_TYPE_MASK {
+                NL80211_ATTR_NAN_FUNC_INST_ID if !value.is_empty() => {
+                    out.insert("instance_id".to_string(), json!(value[0]));
+                }
+                NL80211_ATTR_COOKIE if value.len() >= 8 => {
+                    out.insert("cookie".to_string(), json!(u64::from_ne_bytes(value[..8].try_into()?)));
+                }
+                _ => {}
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    fn add_nan_followup(&self, wdev: u64, instance_id: u8, requestor_id: u8, destination: [u8; 6], payload_bytes: &[u8]) -> Result<Value> {
+        let mut function = Vec::new();
+        append_attr(&mut function, 1, &[2]);
+        append_attr(&mut function, 7, &[instance_id]);
+        append_attr(&mut function, 8, &[requestor_id]);
+        append_attr(&mut function, 9, &destination);
+        append_attr(&mut function, 12, payload_bytes);
+        let mut payload = genl_payload(NL80211_CMD_ADD_NAN_FUNCTION, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_NAN_FUNC | (1 << 15), &function);
+        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 75, &payload)?;
+        let response = self.recv_reply()?;
+        let mut out = serde_json::Map::new();
+        for (attr, value) in genl_attrs(&response)? {
+            if attr & NLA_TYPE_MASK == NL80211_ATTR_COOKIE && value.len() >= 8 {
+                out.insert("cookie".to_string(), json!(u64::from_ne_bytes(value[..8].try_into()?)));
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    fn stop_nan(&self, wdev: u64) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_STOP_NAN, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 73, &payload)?;
+        self.recv_ack().context("nl80211 native NAN stop failed")
+    }
+
+    fn del_interface(&self, ifindex: u32) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_DEL_INTERFACE, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 74, &payload)?;
+        self.recv_ack().context("nl80211 native NAN interface delete failed")
+    }
+
+    fn recv_reply(&self) -> Result<Vec<u8>> {
+        loop {
+            let response = self.recv_netlink_raw()?;
+            if let Some(error) = netlink_error(&response) {
+                bail!("netlink error: {}{}", std::io::Error::from_raw_os_error(error), netlink_extack_message(&response));
+            }
+            if genl_header(&response).is_some() {
+                return Ok(response);
+            }
+        }
     }
 
     fn set_channel_ht20(&self, ifindex: u32, freq: u32) -> Result<()> {
@@ -9359,6 +10401,19 @@ impl Nl80211Socket {
             .context("nl80211 flush station table failed")
     }
 
+    fn remove_station(&self, ifindex: u32, mac: [u8; 6]) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_DEL_STATION, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_MAC, &mac);
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            18,
+            &payload,
+        )?;
+        self.recv_ack().context("nl80211 remove station failed")
+    }
+
     fn connect_open(&self, ifindex: u32, ssid: &str, freq: u32) -> Result<()> {
         let mut payload = genl_payload(NL80211_CMD_CONNECT, NL80211_GENL_VERSION);
         append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
@@ -9393,16 +10448,7 @@ impl Nl80211Socket {
 
     fn add_station_minimal(&self, ifindex: u32, mac: [u8; 6], aid: u16) -> Result<()> {
         self.add_station(
-            ifindex,
-            mac,
-            aid,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
+            ifindex, mac, aid, None, None, None, None, None, false, false,
         )
     }
 
@@ -9430,9 +10476,8 @@ impl Nl80211Socket {
         if let Some(rates) = management_ie_bytes(ies, 50) {
             supported_rates.extend_from_slice(rates);
         }
-        let wme = management_ie_bytes(ies, 221).is_some_and(|value| {
-            value.len() >= 4 && value[..4] == [0x00, 0x50, 0xf2, 0x02]
-        });
+        let wme = management_ie_bytes(ies, 221)
+            .is_some_and(|value| value.len() >= 4 && value[..4] == [0x00, 0x50, 0xf2, 0x02]);
         let short_preamble = capability.is_some_and(|value| value & (1 << 5) != 0);
         self.add_station(
             ifindex,
@@ -10202,6 +11247,175 @@ fn run_command(program: &str, args: &[&str]) -> Value {
     }
 }
 
+fn wifi_wiphy_index(iface: &str) -> Result<u32> {
+    let path = format!("/sys/class/net/{iface}/phy80211/name");
+    let name = fs::read_to_string(&path)
+        .with_context(|| format!("failed to resolve PHY for {iface} via {path}"))?;
+    name.trim()
+        .strip_prefix("phy")
+        .ok_or_else(|| anyhow::anyhow!("unexpected PHY name {:?}", name.trim()))?
+        .parse()
+        .with_context(|| format!("invalid PHY name {:?}", name.trim()))
+}
+
+fn nan_service_id(service_name: &str) -> [u8; 6] {
+    // wpa_supplicant's NAN Discovery Engine lowercases the service name
+    // before hashing it (nan_de_derive_service_id()).  Match that ABI so a
+    // native/raw publisher and the working CONFIG_NAN_USD path share IDs.
+    let normalized = service_name.to_ascii_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut id = [0_u8; 6];
+    id.copy_from_slice(&digest[..6]);
+    id
+}
+
+fn native_nan_event_loop(
+    socket: Nl80211Socket,
+    iface: String,
+    history: Arc<Mutex<VecDeque<RadioEvent>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = socket.set_receive_timeout(Duration::from_millis(250));
+    while !stop.load(Ordering::Acquire) {
+        let response = match socket.recv_netlink_raw() {
+            Ok(response) => response,
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)) => continue,
+            Err(error) => {
+                push_radio_event(&history, RadioEvent {
+                    ts_millis: now_millis(), key: "wifi.nan.native.error".to_string(), source: iface.clone(),
+                    value: json!({"ok": false, "error": format!("{error:#}")}), message: None,
+                });
+                break;
+            }
+        };
+        let Some(header) = genl_header(&response) else { continue };
+        if header.cmd != 69 && header.cmd != 71 { continue; }
+        let mut attrs = serde_json::Map::new();
+        if let Ok(values) = genl_attrs(&response) {
+            for (kind, value) in values {
+                let key = format!("attr_{}", kind & NLA_TYPE_MASK);
+                attrs.insert(key, json!(hex_bytes(value)));
+            }
+        }
+        push_radio_event(&history, RadioEvent {
+            ts_millis: now_millis(), key: "wifi.nan.native.event".to_string(), source: iface.clone(),
+            value: json!({"ok": true, "backend": "linux_nl80211_native_nan", "command": header.cmd, "attrs": attrs}),
+            message: None,
+        });
+    }
+}
+
+fn nan_usd_event_tx_loop(
+    rx_socket: Nl80211Socket,
+    iface: String,
+    history: Arc<Mutex<VecDeque<RadioEvent>>>,
+    stop: Arc<AtomicBool>,
+    ifindex: u32,
+    frame: Vec<u8>,
+    service_id: [u8; 6],
+    rawnan_state: Arc<Mutex<NanState>>,
+    infra: bool,
+) {
+    // Poll frequently enough to catch the short post-beacon rendezvous.
+    let _ = rx_socket.set_receive_timeout(Duration::from_millis(5));
+    let tx_socket = match Nl80211Socket::open() {
+        Ok(socket) => socket,
+        Err(error) => {
+            push_radio_event(&history, RadioEvent {
+                ts_millis: now_millis(), key: "wifi.nan.usd.error".to_string(), source: iface,
+                value: json!({"ok": false, "stage": "tx_socket", "error": format!("{error:#}")}), message: None,
+            });
+            return;
+        }
+    };
+    let options = RawWifiTxOptions {
+        variant: "nan_usd".to_string(),
+        include_freq: true,
+        duration_ms: Some(100),
+        offchannel_tx_ok: true,
+        dont_wait_for_ack: false,
+        tx_no_cck_rate: true,
+    };
+    let mut last_slot_tsf = 0_u64;
+    let mut next_infra_tx = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        let timing = rawnan_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .nan_sync_timing();
+        if let Some((beacon_local_us, beacon_tsf_us, period_us)) = timing {
+            let now_us = now_micros_u64();
+            let age_us = now_us.saturating_sub(beacon_local_us);
+            // NAN beacons define the rendezvous.  Permit a bounded post-beacon
+            // dwell, and never emit a second frame for the same TSF slot.
+            let slot = beacon_tsf_us / period_us.max(1);
+            if (age_us <= 32_000 && slot != last_slot_tsf)
+                || (infra && Instant::now() >= next_infra_tx)
+            {
+                let mut tx_frame = frame.clone();
+                if let Some(cluster) = rawnan_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .cluster()
+                {
+                    tx_frame[16..22].copy_from_slice(&cluster.0);
+                }
+                let result = tx_socket
+                    .remain_on_channel(ifindex, 2437, 40)
+                    .and_then(|_| tx_socket.send_frame(ifindex, 2437, &options, &tx_frame));
+                push_radio_event(&history, RadioEvent {
+                    ts_millis: now_millis(), key: "wifi.nan.usd.tx".to_string(), source: iface.clone(),
+                    value: json!({"ok": result.is_ok(), "frame_len": frame.len(), "slot_tsf": beacon_tsf_us, "beacon_age_us": age_us, "sync": "nan", "error": result.err().map(|e| format!("{e:#}"))}), message: None,
+                });
+                last_slot_tsf = slot;
+                if infra {
+                    next_infra_tx = Instant::now() + Duration::from_millis(500);
+                }
+            }
+        } else if infra && Instant::now() >= next_infra_tx {
+            let result = tx_socket
+                .remain_on_channel(ifindex, 2437, 40)
+                .and_then(|_| tx_socket.send_frame(ifindex, 2437, &options, &frame));
+            push_radio_event(&history, RadioEvent {
+                ts_millis: now_millis(), key: "wifi.nan.usd.tx".to_string(), source: iface.clone(),
+                value: json!({"ok": result.is_ok(), "frame_len": frame.len(), "sync": "infra", "error": result.err().map(|e| format!("{e:#}"))}), message: None,
+            });
+            next_infra_tx = Instant::now() + Duration::from_millis(500);
+        }
+        let response = match rx_socket.recv_netlink_raw() {
+            Ok(response) => response,
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)) => continue,
+            Err(error) => {
+                push_radio_event(&history, RadioEvent {
+                    ts_millis: now_millis(), key: "wifi.nan.usd.error".to_string(), source: iface.clone(),
+                    value: json!({"ok": false, "stage": "rx", "error": format!("{error:#}")}), message: None,
+                });
+                break;
+            }
+        };
+        let Some(header) = genl_header(&response) else { continue };
+        if header.cmd != NL80211_CMD_FRAME { continue; }
+        let frame_value = genl_attrs(&response).ok().and_then(|attrs| attrs.into_iter()
+            .find(|(kind, _)| kind & NLA_TYPE_MASK == NL80211_ATTR_FRAME)
+            .map(|(_, value)| value));
+        if let Some(frame_value) = frame_value {
+            let service_match = dmesh_rawnan::service_descriptor(&frame_value, service_id);
+            push_radio_event(&history, RadioEvent {
+                ts_millis: now_millis(), key: "wifi.nan.usd.rx".to_string(), source: iface.clone(),
+                value: json!({"ok": true, "frame_len": frame_value.len(), "frame_hex": hex_bytes(&frame_value[..frame_value.len().min(256)]), "kind": format!("{:?}", dmesh_rawnan::classify(&frame_value))}), message: None,
+            });
+            if let Some(descriptor) = service_match {
+                let peer = frame_value.get(dmesh_rawnan::FRAME_SRC..dmesh_rawnan::FRAME_SRC + 6)
+                    .map(|bytes| hex_bytes(bytes));
+                push_radio_event(&history, RadioEvent {
+                    ts_millis: now_millis(), key: "wifi.nan.usd.discovery".to_string(), source: iface.clone(),
+                    value: json!({"ok": true, "peer": peer, "instance_id": descriptor.instance, "requestor_instance_id": descriptor.requestor_instance, "control": descriptor.control, "peer_availability": peer_availability_name(dmesh_rawnan::peer_availability(&frame_value)), "service_id": hex_bytes(&service_id)}), message: None,
+                });
+            }
+        }
+    }
+}
+
 fn command_output_timeout(
     program: &str,
     args: &[&str],
@@ -10351,24 +11565,16 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
             }
             NL80211_STA_INFO_TX_BITRATE => {
                 if let Ok(rate_attributes) = parse_attrs(value) {
-                    if let Some((_, rate)) = rate_attributes
-                        .iter()
-                        .find(|(kind, value)| {
-                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32
-                                && value.len() >= 4
-                        })
-                    {
+                    if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
+                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32 && value.len() >= 4
+                    }) {
                         out.insert(
                             "tx_bitrate_kbit_s".to_string(),
                             json!(u32::from_ne_bytes([rate[0], rate[1], rate[2], rate[3]]) * 100),
                         );
-                    } else if let Some((_, rate)) = rate_attributes
-                        .iter()
-                        .find(|(kind, value)| {
-                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE
-                                && value.len() >= 2
-                        })
-                    {
+                    } else if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
+                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE && value.len() >= 2
+                    }) {
                         out.insert(
                             "tx_bitrate_kbit_s".to_string(),
                             json!(u16::from_ne_bytes([rate[0], rate[1]]) as u32 * 100),
@@ -10378,24 +11584,16 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
             }
             NL80211_STA_INFO_RX_BITRATE => {
                 if let Ok(rate_attributes) = parse_attrs(value) {
-                    if let Some((_, rate)) = rate_attributes
-                        .iter()
-                        .find(|(kind, value)| {
-                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32
-                                && value.len() >= 4
-                        })
-                    {
+                    if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
+                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32 && value.len() >= 4
+                    }) {
                         out.insert(
                             "rx_bitrate_kbit_s".to_string(),
                             json!(u32::from_ne_bytes([rate[0], rate[1], rate[2], rate[3]]) * 100),
                         );
-                    } else if let Some((_, rate)) = rate_attributes
-                        .iter()
-                        .find(|(kind, value)| {
-                            *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE
-                                && value.len() >= 2
-                        })
-                    {
+                    } else if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
+                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE && value.len() >= 2
+                    }) {
                         out.insert(
                             "rx_bitrate_kbit_s".to_string(),
                             json!(u16::from_ne_bytes([rate[0], rate[1]]) as u32 * 100),
@@ -10630,6 +11828,7 @@ fn ap_mgmt_receive_loop(
     ifindex: u32,
     ap_mac: [u8; 6],
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
+    rawnan_state: Arc<Mutex<NanState>>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = socket.set_receive_timeout(Duration::from_millis(100));
@@ -10640,6 +11839,18 @@ fn ap_mgmt_receive_loop(
         match socket.recv_frame_with_signal() {
             Ok((frame, rx_signal_dbm)) => {
                 let mut value = parse_management_frame(&frame, iface, "linux_nl80211_ap_sme");
+                if frame_subtype(&frame) == 8
+                    && let Some(beacon) = handle_beacon_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.insert("beacon_sync".to_string(), beacon);
+                }
+                if frame_subtype(&frame) == 13
+                    && let Some(action) = handle_action_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.insert("action_frame".to_string(), action);
+                }
                 if let Some(response) = handle_open_ap_sme_frame(ifindex, ap_mac, &frame)
                     && let Some(object) = value.as_object_mut()
                 {
@@ -10668,6 +11879,9 @@ fn ap_mgmt_receive_loop(
                 if let Some(signal) = rx_signal_dbm {
                     message = message.field(FIELD_RSSI, signal.to_string());
                 }
+                let beacon_sync = (frame_subtype(&frame) == 8)
+                    .then(|| value.get("beacon_sync").cloned())
+                    .flatten();
                 push_radio_event(
                     &history,
                     RadioEvent {
@@ -10678,15 +11892,27 @@ fn ap_mgmt_receive_loop(
                         message: Some(message),
                     },
                 );
+                if dmesh_rawnan::is_nan_beacon(&frame) {
+                    if let Some(beacon_sync) = beacon_sync {
+                    push_radio_event(
+                        &history,
+                        RadioEvent {
+                            ts_millis: now_millis(),
+                            key: "wifi.nan.beacon".to_string(),
+                            source: iface.to_string(),
+                            value: beacon_sync,
+                            message: None,
+                        },
+                    );
+                    }
+                }
             }
             Err(error) => {
                 if stop.load(Ordering::Acquire)
-                    || error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| {
-                            error.kind() == std::io::ErrorKind::WouldBlock
-                                || error.kind() == std::io::ErrorKind::TimedOut
-                        })
+                    || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut
+                    })
                 {
                     continue;
                 }
@@ -10704,6 +11930,66 @@ fn ap_mgmt_receive_loop(
             }
         }
     }
+}
+
+/// Classify every received 802.11 action frame in one place. AP management
+/// responses remain handled by `handle_open_ap_sme_frame`; this function is
+/// deliberately receive-only and covers NAN public/vendor actions and the
+/// DMesh/ESP-NOW action marker without creating a second read loop.
+fn handle_action_frame(
+    frame: &[u8],
+    iface: &str,
+    rx_signal_dbm: Option<i32>,
+    rawnan_state: &Arc<Mutex<NanState>>,
+) -> Option<Value> {
+    if frame_type(frame) != 0 || frame_subtype(frame) != 13 {
+        return None;
+    }
+    let nan_kind = dmesh_rawnan::classify(frame);
+    let nan_action = rawnan_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .observe(RawNanRxFrame {
+            bytes: frame,
+            rssi_dbm: rx_signal_dbm.unwrap_or(0).clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+            timestamp_us: now_micros_u64(),
+        });
+    let source = mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac));
+    let destination = mac_at(frame, IEEE80211_ADDR1).map(|mac| colon_mac(&mac));
+    let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
+    let mut result = json!({
+        "ok": true,
+        "protocol": "80211_action",
+        "iface": iface,
+        "source": source,
+        "destination": destination,
+        "bssid": bssid,
+        "frame_len": frame.len(),
+        "category": frame.get(IEEE80211_BODY).copied(),
+        "nan_kind": match nan_kind {
+            dmesh_rawnan::FrameKind::Beacon => "beacon",
+            dmesh_rawnan::FrameKind::Sdf => "service_discovery",
+            dmesh_rawnan::FrameKind::Followup => "followup",
+            dmesh_rawnan::FrameKind::Other => "other",
+        },
+        "nan_filter_action": match nan_action {
+            RawNanAction::None => "none",
+            RawNanAction::ArmA3(_) => "arm_a3",
+            RawNanAction::DropForeign => "drop_foreign",
+            RawNanAction::Rediscover => "rediscover",
+        },
+    });
+    if let Some(signal) = rx_signal_dbm
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert("rx_signal_dbm".to_string(), json!(signal));
+    }
+    if let Some(vendor) = parse_dmesh_wifi_frame(frame, iface, "linux_nl80211_ap_sme")
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert("dmesh".to_string(), vendor);
+    }
+    Some(result)
 }
 
 fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Option<Value> {
@@ -10730,9 +12016,7 @@ fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Opti
             let aid = 1_u16;
             let allow_ht = !ap_no_ht_stations().contains(&sta_mac);
             let add_station = Nl80211Socket::open()
-                .and_then(|socket| {
-                    socket.add_station_from_assoc(ifindex, sta_mac, frame, allow_ht)
-                })
+                .and_then(|socket| socket.add_station_from_assoc(ifindex, sta_mac, frame, allow_ht))
                 .map(|_| json!({ "ok": true }))
                 .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
             let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht);
@@ -10780,22 +12064,70 @@ fn monitor_receive_loop(
             Ok(len) => {
                 let packet = &buf[..len];
                 if let Some(frame) = ieee80211_frame(packet) {
+                    if frame_subtype(frame) == 8 && dmesh_rawnan::is_nan_beacon(frame) {
+                        if let Some(beacon) = handle_beacon_frame(
+                            frame,
+                            iface,
+                            None,
+                            &rawnan_state,
+                        ) {
+                            push_radio_event(
+                                &history,
+                                RadioEvent {
+                                    ts_millis: now_millis(),
+                                    key: "wifi.nan.beacon".to_string(),
+                                    source: monitor_iface.to_string(),
+                                    value: beacon,
+                                    message: None,
+                                },
+                            );
+                        }
+                    }
                     let action = rawnan_state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .observe(RawNanRxFrame {
                             bytes: frame,
                             rssi_dbm: 0,
-                            timestamp_us: now_millis_u64().saturating_mul(1_000),
+                            timestamp_us: now_micros_u64(),
                         });
-                    // NAN data frames are selected by the cluster BSSID, not
-                    // by the host's ordinary receive MAC.  Admit the compact
-                    // IPv6/UDP form for the shared NAN OUI so a peer's
-                    // unicast frame can reach the parser and history.
-                    let nan_data = is_nan_ipv6_udp_frame(frame);
-                    if raw_wifi_receive_address_allowed(frame, &receive_addresses)
-                        || nan_data
+                    // Same-cluster synchronized SDFs are valid even when the
+                    // filter action is None. Preserve a semantic discovery
+                    // event so host-only tests can attribute wlan1 replies.
+                    if frame_subtype(frame) == 13
+                        && let Some(descriptor) = dmesh_rawnan::service_descriptor(
+                            frame,
+                            dmesh_rawnan::DMESH_SERVICE_ID,
+                        )
                     {
+                        push_radio_event(
+                            &history,
+                            RadioEvent {
+                                ts_millis: now_millis(),
+                                key: "wifi.nan.usd.discovery".to_string(),
+                                source: monitor_iface.to_string(),
+                                value: json!({
+                                    "ok": true,
+                                    "backend": "rawnan_host",
+                                    "iface": iface,
+                                    "synchronized": true,
+                                    "peer": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
+                                    "bssid": mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac)),
+                                    "frame_len": frame.len(),
+                                    "frame_hex": hex_bytes(&frame[..frame.len().min(256)]),
+                                    "control": descriptor.control,
+                                    "peer_availability": peer_availability_name(dmesh_rawnan::peer_availability(frame)),
+                                    "service_id": hex_bytes(&dmesh_rawnan::DMESH_SERVICE_ID),
+                                }),
+                                message: None,
+                            },
+                        );
+                    }
+                    // NAN data frames are selected by the cluster BSSID, not
+                    // by the host's ordinary receive MAC.  Admit raw data
+                    // payloads as well as the legacy IPv6/UDP diagnostic.
+                    let nan_data = is_nan_data_frame(frame);
+                    if raw_wifi_receive_address_allowed(frame, &receive_addresses) || nan_data {
                         if let Some(mut value) =
                             parse_dmesh_wifi_frame(frame, iface, "linux_af_packet_monitor")
                         {
@@ -10834,6 +12166,15 @@ fn monitor_receive_loop(
                                     "ok": true,
                                     "backend": "rawnan_host",
                                     "frame_len": frame.len(),
+                                    "frame_hex": hex_bytes(&frame[..frame.len().min(256)]),
+                                    "addr1": mac_at(frame, IEEE80211_ADDR1).map(|mac| colon_mac(&mac)),
+                                    "addr2": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
+                                    "addr3": mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac)),
+                                    "cluster_bssid": rawnan_state
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .cluster()
+                                        .map(|mac| colon_mac(&mac.0)),
                                     "nan_action": match action {
                                         RawNanAction::ArmA3(_) => "arm_a3",
                                         RawNanAction::DropForeign => "drop_foreign",
@@ -10869,19 +12210,67 @@ fn monitor_receive_loop(
     }
 }
 
-fn is_nan_ipv6_udp_frame(frame: &[u8]) -> bool {
-    if frame.len() < IEEE80211_BODY + IEEE80211_LLC_SNAP_IPV6.len() + 40
+/// Consume management beacons for the shared raw-NAN synchronization state.
+/// USD action frames are intentionally not treated as a timing source: sleepy
+/// peers need the cluster/AP beacon TSF and interval to schedule their wake
+/// window and follow-up transmission.
+fn handle_beacon_frame(
+    frame: &[u8],
+    iface: &str,
+    rx_signal_dbm: Option<i32>,
+    rawnan_state: &Arc<Mutex<NanState>>,
+) -> Option<Value> {
+    if frame_type(frame) != 0 || frame_subtype(frame) != 8 {
+        return None;
+    }
+    let rx = RawNanRxFrame {
+            bytes: frame,
+            rssi_dbm: rx_signal_dbm.unwrap_or(0).clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+            timestamp_us: now_micros_u64(),
+        };
+    let action = if dmesh_rawnan::is_nan_beacon(frame) {
+        rawnan_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(rx)
+    } else {
+        rawnan_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_ap_beacon(rx);
+        RawNanAction::None
+    };
+    let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
+    let nan = dmesh_rawnan::is_nan_beacon(frame);
+    Some(json!({
+        "ok": true,
+        "backend": "rawnan_host",
+        "iface": iface,
+        "source": mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac)),
+        "bssid": bssid,
+        "sync_source": if nan { "nan_cluster" } else { "ap_anchor" },
+        "nan_beacon": nan,
+        "tsf_us": dmesh_rawnan::beacon_tsf_us(frame),
+        "beacon_interval_tu": dmesh_rawnan::beacon_interval_tu(frame),
+        "rx_signal_dbm": rx_signal_dbm,
+        "nan_action": match action {
+            RawNanAction::None => "none",
+            RawNanAction::ArmA3(_) => "arm_a3",
+            RawNanAction::DropForeign => "drop_foreign",
+            RawNanAction::Rediscover => "rediscover",
+        },
+    }))
+}
+
+fn is_nan_data_frame(frame: &[u8]) -> bool {
+    if frame.len() < IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN
         || frame_type(frame) != 2
-        || mac_at(frame, IEEE80211_ADDR3)
-            .map(|bssid| bssid[..3] == [0x50, 0x6f, 0x9a])
+        || mac_at(frame, IEEE80211_ADDR3).map(|bssid| bssid[..3] == [0x50, 0x6f, 0x9a])
             != Some(true)
     {
         return false;
     }
-    let body = &frame[IEEE80211_BODY..];
-    body.starts_with(&IEEE80211_LLC_SNAP_IPV6)
-        && body[IEEE80211_LLC_SNAP_IPV6.len()] >> 4 == 6
-        && body[IEEE80211_LLC_SNAP_IPV6.len() + 6] == 17
+    true
 }
 
 fn data_receive_loop(
@@ -11034,7 +12423,30 @@ fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Va
         body = &body[IEEE80211_LLC_SNAP_LEN..];
         "llc_snap"
     } else {
-        "raw_body"
+        if body.len() < IEEE80211_LLC_SNAP_LEN {
+            return None;
+        }
+        let llc = &body[..IEEE80211_LLC_SNAP_LEN];
+        body = &body[IEEE80211_LLC_SNAP_LEN..];
+        let source = mac_at(frame, IEEE80211_ADDR2)?;
+        let destination = mac_at(frame, IEEE80211_ADDR1)?;
+        let bssid = mac_at(frame, IEEE80211_ADDR3)?;
+        return Some(json!({
+            "protocol": "dmesh_wifi_raw",
+            "layout": "nan_raw_data",
+            "backend": backend,
+            "encapsulation": "llc_experimental",
+            "iface": iface,
+            "frame_type": frame_type(frame),
+            "frame_subtype": frame_subtype(frame),
+            "source": colon_mac(&source),
+            "destination": colon_mac(&destination),
+            "bssid": colon_mac(&bssid),
+            "llc": hex_bytes(llc),
+            "payload_len": body.len(),
+            "payload": hex_bytes(body),
+            "payload_text": String::from_utf8_lossy(body).trim(),
+        }));
     };
     let header = parse_dmesh_vendor_action_header(body)?;
     let payload = &body[header.header_len..];
@@ -11101,7 +12513,8 @@ fn parse_nan_ipv6_udp_frame(frame: &[u8], iface: &str, backend: &str) -> Option<
 }
 
 fn format_ipv6(bytes: &[u8]) -> String {
-    bytes.chunks_exact(2)
+    bytes
+        .chunks_exact(2)
         .map(|part| format!("{:x}", u16::from_be_bytes([part[0], part[1]])))
         .collect::<Vec<_>>()
         .join(":")
@@ -11498,12 +12911,7 @@ fn ap_no_ht_stations() -> HashSet<[u8; 6]> {
         .collect()
 }
 
-fn build_open_assoc_response(
-    ap: [u8; 6],
-    sta: [u8; 6],
-    aid: u16,
-    allow_ht: bool,
-) -> Vec<u8> {
+fn build_open_assoc_response(ap: [u8; 6], sta: [u8; 6], aid: u16, allow_ht: bool) -> Vec<u8> {
     let mut frame = mgmt_frame_header(0x01, sta, ap, ap);
     frame.extend_from_slice(&0x0401_u16.to_le_bytes());
     frame.extend_from_slice(&0_u16.to_le_bytes());
@@ -11533,15 +12941,15 @@ fn build_open_assoc_response(
 
 fn hostapd_open_ap_ht_operation(channel: u8) -> [u8; 24] {
     [
-        0x3d, 22, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x3d, 22, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ]
 }
 
 fn hostapd_open_ap_ht_capability() -> [u8; 28] {
     [
-        0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ]
 }
 
@@ -11665,8 +13073,8 @@ fn hostapd_open_ap_extra_ies() -> [u8; 10] {
 
 fn wmm_parameter_ie() -> [u8; 26] {
     [
-        0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00, 0x03, 0xa4, 0x00,
-        0x00, 0x27, 0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
+        0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27,
+        0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
     ]
 }
 
@@ -11786,9 +13194,7 @@ fn build_dmesh_nan_data_frame(
     payload: &[u8],
 ) -> Vec<u8> {
     let ip_payload = build_nan_ipv6_udp(source, destination, payload);
-    let mut frame = Vec::with_capacity(
-        IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN + ip_payload.len(),
-    );
+    let mut frame = Vec::with_capacity(IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN + ip_payload.len());
     frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
@@ -11799,9 +13205,58 @@ fn build_dmesh_nan_data_frame(
     frame
 }
 
+fn build_dmesh_nan_raw_data_frame(
+    bssid: [u8; 6],
+    destination: [u8; 6],
+    source: [u8; 6],
+    llc: &[u8; IEEE80211_LLC_SNAP_LEN],
+    payload: &[u8],
+) -> Vec<u8> {
+    let body_len = payload.len().min(1400);
+    let mut frame = Vec::with_capacity(IEEE80211_BODY + llc.len() + body_len);
+    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&destination);
+    frame.extend_from_slice(&source);
+    frame.extend_from_slice(&bssid);
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(llc);
+    frame.extend_from_slice(&payload[..body_len]);
+    frame
+}
+
+fn parse_experimental_llc(value: Option<&str>) -> Option<[u8; IEEE80211_LLC_SNAP_LEN]> {
+    let value = value?;
+    let value = value.strip_prefix("hex:").unwrap_or(value);
+    let compact = value.replace([':', '-', ' ', '_'], "");
+    if compact.len() != IEEE80211_LLC_SNAP_LEN * 2 {
+        return None;
+    }
+    let mut out = [0u8; IEEE80211_LLC_SNAP_LEN];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 fn nan_link_local(mac: [u8; 6]) -> [u8; 16] {
-    [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
-     mac[0] ^ 0x02, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]
+    [
+        0xfe,
+        0x80,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
 }
 
 fn checksum_add(sum: &mut u32, bytes: &[u8]) {
@@ -11810,11 +13265,15 @@ fn checksum_add(sum: &mut u32, bytes: &[u8]) {
         *sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
         i += 2;
     }
-    if i < bytes.len() { *sum += (bytes[i] as u32) << 8; }
+    if i < bytes.len() {
+        *sum += (bytes[i] as u32) << 8;
+    }
 }
 
 fn checksum_finalize(mut sum: u32) -> u16 {
-    while (sum >> 16) != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
     !(sum as u16)
 }
 
@@ -11882,6 +13341,12 @@ fn mesh_message_from_raw_wifi(value: &Value, iface: &str) -> MeshMessage {
 }
 
 fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEvent) {
+    // Keep radio, discovery, beacon, data, and trace records on the shared
+    // mesh pub/sub stream. The trace subscriber adds the common `event_type`
+    // envelope field and can filter it per connection.
+    let event_type = event.key.clone();
+    let source = event.source.clone();
+    let data = event.value.to_string();
     let mut history = history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -11889,6 +13354,14 @@ fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEven
     while history.len() > MAX_HISTORY {
         history.pop_front();
     }
+    drop(history);
+    tracing::info!(
+        target: "dmesh.event",
+        event_type = %event_type,
+        source = %source,
+        data = %data,
+        message = "event"
+    );
 }
 
 fn mac_at(frame: &[u8], offset: usize) -> Option<[u8; 6]> {
@@ -12104,6 +13577,29 @@ struct IfInfoMsg {
     ifi_change: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IfAddrMsg {
+    ifa_family: u8,
+    ifa_prefixlen: u8,
+    ifa_flags: u8,
+    ifa_scope: u8,
+    ifa_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RtAttrHdr {
+    rta_len: u16,
+    rta_type: u16,
+}
+
+const NLM_F_CREATE: u16 = 0x400;
+const NLM_F_REPLACE: u16 = 0x100;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const IFA_BROADCAST: u16 = 4;
+
 fn set_link_up(iface: &str) -> std::result::Result<CommandOutput, String> {
     let iface_c = std::ffi::CString::new(iface.as_bytes())
         .map_err(|_| format!("interface name contains NUL byte: {iface:?}"))?;
@@ -12138,6 +13634,95 @@ fn set_link_up(iface: &str) -> std::result::Result<CommandOutput, String> {
         stdout: format!("set {iface} up via rtnetlink"),
         stderr: String::new(),
     })
+}
+
+fn set_ipv4_address(
+    iface: &str,
+    address: std::net::Ipv4Addr,
+    prefix: u8,
+) -> std::result::Result<CommandOutput, String> {
+    let ifindex = ifindex(iface).map_err(|error| error.to_string())?;
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("failed to open rtnetlink socket: {}", std::io::Error::last_os_error()));
+    }
+
+    let result = unsafe { send_setaddr(fd, ifindex, address, prefix) };
+    unsafe { libc::close(fd); }
+    result.map(|()| CommandOutput {
+        status: Some(0),
+        stdout: format!("set {iface} IPv4 address {address}/{prefix} via rtnetlink"),
+        stderr: String::new(),
+    })
+}
+
+unsafe fn send_setaddr(
+    fd: RawFd,
+    ifindex: u32,
+    address: std::net::Ipv4Addr,
+    prefix: u8,
+) -> std::result::Result<(), String> {
+    let header_len = std::mem::size_of::<NlMsgHdr>();
+    let info_len = std::mem::size_of::<IfAddrMsg>();
+    let mut request = Vec::with_capacity(header_len + info_len + 16);
+    let header = NlMsgHdr {
+        nlmsg_len: 0,
+        nlmsg_type: libc::RTM_NEWADDR,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        nlmsg_seq: 2,
+        nlmsg_pid: 0,
+    };
+    let info = IfAddrMsg {
+        ifa_family: libc::AF_INET as u8,
+        ifa_prefixlen: prefix,
+        ifa_flags: 0,
+        ifa_scope: 0,
+        ifa_index: ifindex,
+    };
+    append_struct(&mut request, &header);
+    append_struct(&mut request, &info);
+    let bytes = address.octets();
+    append_rt_attr(&mut request, IFA_ADDRESS, &bytes);
+    append_rt_attr(&mut request, IFA_LOCAL, &bytes);
+    let ip = u32::from_be_bytes(bytes);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) };
+    append_rt_attr(&mut request, IFA_BROADCAST, &((ip & mask) | !mask).to_be_bytes());
+    let message_len = request.len() as u32;
+    let header_ptr = request.as_mut_ptr() as *mut NlMsgHdr;
+    unsafe { (*header_ptr).nlmsg_len = message_len; }
+
+    let written = unsafe {
+        libc::send(fd, request.as_ptr() as *const libc::c_void, request.len(), 0)
+    };
+    if written < 0 {
+        return Err(format!("failed to send RTM_NEWADDR: {}", std::io::Error::last_os_error()));
+    }
+    if written as usize != request.len() {
+        return Err(format!("short RTM_NEWADDR write: wrote {written}, expected {}", request.len()));
+    }
+    let mut response = [0u8; 4096];
+    let read = unsafe {
+        libc::recv(fd, response.as_mut_ptr() as *mut libc::c_void, response.len(), 0)
+    };
+    if read < 0 {
+        return Err(format!("failed to read RTM_NEWADDR ACK: {}", std::io::Error::last_os_error()));
+    }
+    parse_netlink_ack(&response[..read as usize])
+}
+
+fn append_rt_attr(out: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
+    let raw_len = std::mem::size_of::<RtAttrHdr>() + payload.len();
+    let aligned_len = (raw_len + 3) & !3;
+    let header = RtAttrHdr { rta_len: raw_len as u16, rta_type: attr_type };
+    append_struct(out, &header);
+    out.extend_from_slice(payload);
+    out.resize(out.len() + aligned_len - raw_len, 0);
 }
 
 unsafe fn send_setlink_up(fd: RawFd, ifindex: i32) -> std::result::Result<(), String> {
@@ -12580,6 +14165,13 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn peer_availability_name(availability: dmesh_rawnan::PeerAvailability) -> &'static str {
+    match availability {
+        dmesh_rawnan::PeerAvailability::Infra => "infra",
+        dmesh_rawnan::PeerAvailability::Dw0Dw8 => "dw0_dw8",
+    }
+}
+
 fn parse_hex_bytes(value: &str) -> Result<Vec<u8>> {
     let value = value.trim();
     if value.len() % 2 != 0 {
@@ -12631,9 +14223,22 @@ fn now_millis_u64() -> u64 {
     now_millis().min(u64::MAX as u128) as u64
 }
 
+fn now_micros_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wifi_only_backend_does_not_enable_uart_ownership() {
+        assert!(!RadioService::from_environment_without_uart().uart_enabled());
+    }
     use std::io::{Error, ErrorKind};
 
     #[test]
@@ -12704,7 +14309,10 @@ mod tests {
     #[test]
     fn stage2_boot_command_is_cbor_payload_inside_ppp() {
         let command = boot_command_payload("recovery").unwrap();
-        assert_eq!(command, vec![0xa2, 0x00, 0x1a, 0x00, 0x00, 0xea, 0x6a, 0x06, 0x81, 0x02]);
+        assert_eq!(
+            command,
+            vec![0xa2, 0x00, 0x1a, 0x00, 0x00, 0xea, 0x6a, 0x06, 0x81, 0x02]
+        );
 
         let stream = WouldBlockOnceWriter {
             writes: 0,
@@ -12718,7 +14326,15 @@ mod tests {
             .input
             .extend_from_slice(&mesh::cbor::encode_stream_frame(&command).unwrap());
         client
-            .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true, None, "test", false)
+            .flush_complete_records(
+                -1,
+                &mut serial_tx,
+                &mut serial_pending,
+                true,
+                None,
+                "test",
+                false,
+            )
             .unwrap();
         let wire = serial_tx.into_iter().collect::<Vec<_>>();
         let mut decoder = FirmwareUartDecoder::default();
@@ -12787,8 +14403,8 @@ mod tests {
     #[test]
     fn indefinite_cbor_boot_identity_is_not_logged_as_cbor_error() {
         let payload = [
-            0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 0x03, 0x00, 0x01, 0x18, 0xf2,
-            0x00, 0x00, 0x00, 0x00, 0x46, 0x84, 0x0d, 0x8e, 0x07, 0x42, 0xc4, 0xff, 0xff,
+            0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 0x03, 0x00, 0x01, 0x18, 0xf2, 0x00, 0x00,
+            0x00, 0x00, 0x46, 0x84, 0x0d, 0x8e, 0x07, 0x42, 0xc4, 0xff, 0xff,
         ];
         assert_eq!(payload[0] >> 5, 5);
         assert!(is_boot_identity_payload(&payload));
@@ -12798,9 +14414,9 @@ mod tests {
     #[test]
     fn recovery_network_event_decodes_negative_rssi_tuple() {
         let payload = [
-            0xbf, 0x07, 0x19, 0xea, 0x63, 0x06, 0x9f, 0x02, 0x4c, b'1', b'0', b'.', b'7',
-            b'8', b'.', b'6', b'6', b'.', b'1', b'9', b'6', 0x46, 0x44, 0x94, 0xfc, 0xe4,
-            0x84, 0x15, 0x38, 0x2d, 0xff, 0xff,
+            0xbf, 0x07, 0x19, 0xea, 0x63, 0x06, 0x9f, 0x02, 0x4c, b'1', b'0', b'.', b'7', b'8',
+            b'.', b'6', b'6', b'.', b'1', b'9', b'6', 0x46, 0x44, 0x94, 0xfc, 0xe4, 0x84, 0x15,
+            0x38, 0x2d, 0xff, 0xff,
         ];
         assert!(is_boot_event_payload(&payload));
         let event = boot_event_json(&payload);
@@ -12940,18 +14556,25 @@ mod tests {
 
     #[test]
     fn serial_log_path_resolves_from_symlink_target_directory() {
-        let config = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/lab-forwards.toml")
-            .canonicalize()
-            .expect("lab forward example exists");
+        // `radio.rs` is also compiled into the service crates while the
+        // extraction is in progress.  Resolve the example from either the
+        // owning lmesh crate or a service crate's sibling path so the test is
+        // independent of the build working directory.
+        let config = [
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/lab-forwards.toml"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lmesh/examples/lab-forwards.toml"),
+        ]
+        .into_iter()
+        .find_map(|path| path.canonicalize().ok())
+        .expect("lab forward example exists");
         let path = resolve_config_relative_path(
             &config,
-            "../../../target/lmesh-radio-build/log/serial.log",
+            "../../../target/lmesh-wifi-build/log/serial.log",
         );
         let expected = config
             .parent()
             .expect("lab forward parent")
-            .join("../../../target/lmesh-radio-build/log/serial.log");
+            .join("../../../target/lmesh-wifi-build/log/serial.log");
         assert_eq!(path, expected.to_string_lossy());
     }
 
@@ -12970,7 +14593,15 @@ mod tests {
 
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false, None, "test", false)
+                .flush_complete_records(
+                    -1,
+                    &mut serial_tx,
+                    &mut serial_pending,
+                    false,
+                    None,
+                    "test",
+                    false
+                )
                 .unwrap()
         );
         assert!(serial_tx.is_empty());
@@ -13001,7 +14632,15 @@ mod tests {
 
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true, None, "test", false)
+                .flush_complete_records(
+                    -1,
+                    &mut serial_tx,
+                    &mut serial_pending,
+                    true,
+                    None,
+                    "test",
+                    false
+                )
                 .unwrap()
         );
         assert!(!serial_tx.is_empty());
@@ -13026,7 +14665,15 @@ mod tests {
 
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false, None, "test", false)
+                .flush_complete_records(
+                    -1,
+                    &mut serial_tx,
+                    &mut serial_pending,
+                    false,
+                    None,
+                    "test",
+                    false
+                )
                 .unwrap()
         );
         assert!(client.force_direct);
@@ -13047,7 +14694,15 @@ mod tests {
         client.input.extend_from_slice(b"status\r\n");
 
         client
-            .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, true, None, "test", false)
+            .flush_complete_records(
+                -1,
+                &mut serial_tx,
+                &mut serial_pending,
+                true,
+                None,
+                "test",
+                false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -13326,7 +14981,15 @@ mod tests {
             .extend_from_slice(&[0x01, 0x02, RFC2217_IAC, RFC2217_IAC, 0x03]);
         assert!(
             client
-                .flush_complete_records(-1, &mut serial_tx, &mut serial_pending, false, None, "test", false)
+                .flush_complete_records(
+                    -1,
+                    &mut serial_tx,
+                    &mut serial_pending,
+                    false,
+                    None,
+                    "test",
+                    false
+                )
                 .unwrap()
         );
         assert_eq!(
@@ -13436,8 +15099,12 @@ mod tests {
     #[test]
     fn monitor_tx_radiotap_keeps_legacy_rate_and_no_ack() {
         let packet = build_radiotap_packet(&[0xd0, 0x00, 0x00, 0x00]);
-        assert_eq!(&packet[..12], &[0x00, 0x00, 0x0c, 0x00, 0x04, 0x80, 0x00, 0x00,
-            0x02, 0x00, 0x08, 0x00]);
+        assert_eq!(
+            &packet[..12],
+            &[
+                0x00, 0x00, 0x0c, 0x00, 0x04, 0x80, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00
+            ]
+        );
         assert_eq!(&packet[12..], &[0xd0, 0x00, 0x00, 0x00]);
     }
 
@@ -13457,6 +15124,30 @@ mod tests {
             &dmesh_vendor_action_header(RAW_WIFI_MULTICAST)
         );
         assert_eq!(&frame[IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN..], b"stats");
+    }
+
+    #[test]
+    fn raw_nan_data_frame_keeps_private_llc_and_direct_payload() {
+        let bssid = [0x50, 0x6f, 0x9a, 1, 2, 3];
+        let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
+        let dst = RAW_WIFI_MULTICAST;
+        let payload = b"DMTB-test";
+        let frame = build_dmesh_nan_raw_data_frame(bssid, dst, src, &RAWNAN_LLC_DEFAULT, payload);
+        assert_eq!(&frame[IEEE80211_ADDR1..IEEE80211_ADDR1 + 6], &dst);
+        assert_eq!(&frame[IEEE80211_ADDR3..IEEE80211_ADDR3 + 6], &bssid);
+        assert_eq!(
+            &frame[IEEE80211_BODY..IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN],
+            &RAWNAN_LLC_DEFAULT
+        );
+        let parsed = parse_dmesh_wifi_frame(&frame, "wlan1", "test").unwrap();
+        assert_eq!(parsed["layout"], "nan_raw_data");
+        assert_eq!(parsed["payload_text"], "DMTB-test");
+    }
+
+    #[test]
+    fn experimental_llc_parser_requires_eight_bytes() {
+        assert_eq!(parse_experimental_llc(Some("hex:aAaA03d04d455348")), Some(RAWNAN_LLC_DEFAULT));
+        assert!(parse_experimental_llc(Some("hex:1234")).is_none());
     }
 
     #[test]
@@ -13574,5 +15265,14 @@ BSS 44:94:fc:e4:84:15(on wlan1)
             RAW_WIFI_MULTICAST
         );
         assert_eq!(raw_wifi_destination(None, "standard"), RAW_WIFI_BROADCAST);
+    }
+
+    #[test]
+    fn native_nan_service_id_is_six_byte_sha256_prefix() {
+        let first = nan_service_id("dmesh");
+        assert_eq!(first.len(), 6);
+        assert_eq!(first, nan_service_id("dmesh"));
+        assert_eq!(first, nan_service_id("DMESH"));
+        assert_ne!(first, nan_service_id("other"));
     }
 }

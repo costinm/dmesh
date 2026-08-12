@@ -175,7 +175,7 @@ the larger physical S3 capacity does not select another Main image.
 Fleet flash helper:
 
 ```bash
-LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock \
+LMESH_UART_CONTROL_SOCKET=/run/mesh/lmesh-uart/mesh.sock \
   python scripts/flash_test_fleet.py --lmesh-mode=local-release \
     --port lora1 --port lora2 --port lora3 --port lora4 --port e5
 ```
@@ -208,7 +208,7 @@ lmesh-first workflow.
 Run direct firmware commands through the lmesh control service:
 
 ```bash
-mesh lmesh esp.serial.command port=USB0 command=status
+mesh lmesh-uart esp.serial.command port=USB0 command=status
 ```
 
 For a configured sleepy target, `esp.serial.command` automatically opens the
@@ -238,9 +238,9 @@ device accepts.
 Run multiple checks through lmesh:
 
 ```bash
-mesh lmesh esp.serial.command port=USB0 command='lora status=true'
-mesh lmesh esp.serial.command port=USB0 command='nan stats=true'
-mesh lmesh esp.serial.command port=USB0 command=stats
+mesh lmesh-uart esp.serial.command port=USB0 command='lora status=true'
+mesh lmesh-uart esp.serial.command port=USB0 command='nan stats=true'
+mesh lmesh-uart esp.serial.command port=USB0 command=stats
 ```
 
 ## Core Commands

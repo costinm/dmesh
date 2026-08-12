@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-const CORE_SCHEMA: &str = include_str!("../resources/firmware-schema.json");
+// Keep the firmware schema artifact in lmesh's resources while the generic
+// schema search/loading policy remains in ssh-mesh's mesh crate.
+const CORE_SCHEMA: &str = include_str!("../../lmesh/resources/firmware-schema.json");
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct FirmwareSchemaFile {
@@ -174,30 +176,21 @@ impl FirmwareSchema {
 }
 
 fn configured_schema_files() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(files) = std::env::var("LMESH_SCHEMA_FILES") {
-        paths.extend(
-            files
-                .split(':')
-                .filter(|path| !path.trim().is_empty())
-                .map(PathBuf::from),
-        );
+    let mut files = Vec::new();
+    if let Ok(value) = std::env::var("MESH_SCHEMA_FILES")
+        .or_else(|_| std::env::var("LMESH_SCHEMA_FILES"))
+    {
+        files.extend(value.split(':').filter(|v| !v.is_empty()).map(PathBuf::from));
     }
-    let directory = std::env::var_os("LMESH_SCHEMA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from("/etc/dmesh/lmesh/schemas")));
-    if let Some(directory) = directory {
-        if let Ok(entries) = fs::read_dir(&directory) {
-            let mut files = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-                .collect::<Vec<_>>();
-            files.sort();
-            paths.extend(files);
-        }
+    let dir = std::env::var("MESH_SCHEMA_DIR")
+        .or_else(|_| std::env::var("LMESH_SCHEMA_DIR"))
+        .unwrap_or_else(|_| "/etc/dmesh/lmesh/schemas".to_owned());
+    if let Ok(entries) = fs::read_dir(dir) {
+        files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        }));
     }
-    paths
+    files
 }
 
 #[cfg(test)]

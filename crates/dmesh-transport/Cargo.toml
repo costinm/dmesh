@@ -11,3 +11,5 @@ default = []
 name = "dmesh_transport"
 path = "src/lib.rs"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }

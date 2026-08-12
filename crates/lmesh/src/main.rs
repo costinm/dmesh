@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -13,23 +12,17 @@ const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 const DEFAULT_STANDALONE_SOCKET: &str = "lmesh/mesh.sock";
 const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
 const CONTROL_SOCKET_ENV: &str = "LMESH_CONTROL_SOCKET";
-const NAN_AUTOSTART_ENV: &str = "LMESH_NAN_AUTOSTART";
-const NAN_EVENT_LOG_ENV: &str = "LMESH_NAN_EVENT_LOG";
-const AP_AUTOSTART_ENV: &str = "LMESH_AP_AUTOSTART";
-const AP_IFACE_ENV: &str = "LMESH_AP_IFACE";
-const AP_ADDRESS_ENV: &str = "LMESH_AP_ADDRESS";
-const AP_NETWORK_ENV: &str = "LMESH_AP_NETWORK";
-const DEFAULT_AP_IFACE: &str = "wlan0";
+const RAWNAN_AUTOSTART_ENV: &str = "LMESH_RAWNAN_AUTOSTART";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let (trace_buffer, _trace_guard) = mesh::local_trace::init("lmesh");
-    mesh::local_trace::serve("lmesh", trace_buffer);
+    mesh::local_trace::serve("lmesh", trace_buffer.clone());
 
-    run_server().await
+    run_server(trace_buffer).await
 }
 
-async fn run_server() -> Result<()> {
+async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
     let mut discovery = LocalDiscovery::new(None).await?;
     discovery.start().await?;
     discovery.announce().await?;
@@ -43,40 +36,15 @@ async fn run_server() -> Result<()> {
             }
         });
     }
-    let nan_socket_available =
-        nan_autostart_enabled() && service.default_nan_control_socket_exists();
-    let nan_started = if nan_socket_available {
-        let result = service.start_default_nan();
-        debug!(?result, "nan_default_started");
-        nan_start_succeeded(&result)
+    let rawnan_started = if rawnan_autostart_enabled() {
+        let result = service.start_default_rawnan();
+        debug!(?result, "rawnan_default_started");
+        result.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false)
     } else {
         false
     };
-    if nan_started {
-        if nan_event_log_enabled() {
-            spawn_nan_event_logger(service.clone());
-        }
-    } else if nan_socket_available {
-        warn!("nan_autostart_failed");
-    } else if nan_autostart_enabled() {
-        debug!("nan_autostart_skipped_no_wpa_control_socket");
-    }
-    // The Recovery AP is useful even when NAN/WPA is unavailable.  Keep the
-    // coexistence guard only when NAN actually started; otherwise there is no
-    // second radio operation to conflict with the AP interface.
-    if ap_autostart_enabled() {
-        let nan_iface = wifi_iface();
-        let ap_iface = ap_iface();
-        if !nan_started || ap_can_coexist_with_nan(&nan_iface, &ap_iface) {
-            configure_ap_network(&ap_iface);
-            let result = service.start_default_open_ap(ap_iface);
-            debug!(?result, "open_ap_autostarted");
-        } else {
-            debug!(
-                nan_iface,
-                ap_iface, "open_ap_autostart_skipped_no_safe_coexistence"
-            );
-        }
+    if !rawnan_started && rawnan_autostart_enabled() {
+        warn!("rawnan_autostart_failed");
     }
     debug!(
         public_key = %service.public_key_b64(),
@@ -106,8 +74,9 @@ async fn run_server() -> Result<()> {
     {
         let service = service.clone();
         let mcp = mcp.clone();
+        let trace_buffer = trace_buffer.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, service, mcp).await {
+            if let Err(e) = handle_connection(stream, service, mcp, trace_buffer.clone()).await {
                 error!("lmesh JSONL connection error: {}", e);
             }
         });
@@ -127,10 +96,11 @@ fn object_server_config() -> Option<ServerConfig> {
         return None;
     }
     Some(ServerConfig {
-        bind: std::env::var("LMESH_OBJECT_SERVER_BIND")
-            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        bind: std::env::var("LMESH_OBJECT_SERVER_BIND").unwrap_or_else(|_| "0.0.0.0".to_string()),
         port: std::env::var("LMESH_OBJECT_SERVER_PORT")
-            .ok().and_then(|value| value.parse().ok()).unwrap_or(3337),
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3337),
         artifact_root: root.map(PathBuf::from).unwrap_or_else(|| {
             std::env::var_os("DMESH_REPO")
                 .map(PathBuf::from)
@@ -149,135 +119,10 @@ fn announce_interval() -> Duration {
     Duration::from_secs(secs.unwrap_or(DEFAULT_ANNOUNCE_INTERVAL_SECS))
 }
 
-fn nan_autostart_enabled() -> bool {
-    std::env::var(NAN_AUTOSTART_ENV)
+fn rawnan_autostart_enabled() -> bool {
+    std::env::var(RAWNAN_AUTOSTART_ENV)
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
         .unwrap_or(true)
-}
-
-fn nan_event_log_enabled() -> bool {
-    std::env::var(NAN_EVENT_LOG_ENV)
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-        .unwrap_or(true)
-}
-
-fn ap_autostart_enabled() -> bool {
-    std::env::var(AP_AUTOSTART_ENV)
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-        .unwrap_or(true)
-}
-
-fn wifi_iface() -> String {
-    std::env::var("LMESH_WIFI_IFACE").unwrap_or_else(|_| "wlan1".to_string())
-}
-
-fn ap_iface() -> String {
-    std::env::var(AP_IFACE_ENV).unwrap_or_else(|_| DEFAULT_AP_IFACE.to_string())
-}
-
-fn configure_ap_network(iface: &str) {
-    let Some(address) = std::env::var_os(AP_ADDRESS_ENV) else {
-        return;
-    };
-    let address = address.to_string_lossy();
-    let mut address_cmd = Command::new("ip");
-    address_cmd.args(["addr", "replace", address.as_ref(), "dev", iface]);
-    match address_cmd.status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => warn!(iface, address = %address, ?status, "ap_address_configuration_failed"),
-        Err(error) => warn!(iface, address = %address, %error, "ap_address_configuration_failed"),
-    }
-    let Some(network) = std::env::var_os(AP_NETWORK_ENV) else {
-        return;
-    };
-    let network = network.to_string_lossy();
-    let mut route_cmd = Command::new("ip");
-    route_cmd.args(["route", "replace", network.as_ref(), "dev", iface]);
-    match route_cmd.status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => warn!(iface, network = %network, ?status, "ap_route_configuration_failed"),
-        Err(error) => warn!(iface, network = %network, %error, "ap_route_configuration_failed"),
-    }
-}
-
-fn ap_can_coexist_with_nan(nan_iface: &str, ap_iface: &str) -> bool {
-    if nan_iface == ap_iface {
-        return false;
-    }
-    let nan_phy = std::fs::read_link(format!("/sys/class/net/{nan_iface}/phy80211"));
-    let ap_phy = std::fs::read_link(format!("/sys/class/net/{ap_iface}/phy80211"));
-    matches!((nan_phy, ap_phy), (Ok(nan_phy), Ok(ap_phy)) if nan_phy != ap_phy)
-}
-
-fn spawn_nan_event_logger(service: Arc<LmeshService>) {
-    tokio::spawn(async move {
-        let mut consecutive_errors = 0_u32;
-        loop {
-            let service = service.clone();
-            let poll_service = service.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                poll_service.collect_default_nan_events(30_000, 128)
-            })
-            .await;
-            match result {
-                Ok(value) => {
-                    let should_restart = nan_events_need_restart(&value);
-                    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-                        consecutive_errors = consecutive_errors.saturating_add(1);
-                        if consecutive_errors == 1 || consecutive_errors % 12 == 0 {
-                            warn!(?value, consecutive_errors, "nan_event_poll_failed");
-                        }
-                    } else {
-                        consecutive_errors = 0;
-                        if should_restart || nan_events_count(&value) > 0 {
-                            debug!(?value, should_restart, "nan_events_polled");
-                        }
-                    }
-                    if should_restart {
-                        let result = service.start_default_nan();
-                        warn!(?result, "nan_default_restarted_after_termination");
-                    }
-                }
-                Err(error) => {
-                    consecutive_errors = consecutive_errors.saturating_add(1);
-                    if consecutive_errors == 1 || consecutive_errors % 12 == 0 {
-                        warn!("NAN event logger task failed: {}", error);
-                    }
-                }
-            }
-            let idle = if consecutive_errors == 0 {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_secs(5)
-            };
-            sleep(idle).await;
-        }
-    });
-}
-
-fn nan_events_count(value: &serde_json::Value) -> usize {
-    value
-        .get("events")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0)
-}
-
-fn nan_events_need_restart(value: &serde_json::Value) -> bool {
-    value
-        .get("events")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|event| event.get("event").and_then(serde_json::Value::as_str))
-        .any(|event| event == "NAN-PUBLISH-TERMINATED" || event == "NAN-SUBSCRIBE-TERMINATED")
-}
-
-fn nan_start_succeeded(value: &serde_json::Value) -> bool {
-    value
-        .pointer("/start/nan_capability/ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 fn parse_announce_interval_secs(value: &str) -> Option<u64> {
@@ -311,6 +156,7 @@ async fn handle_connection(
     stream: mesh::server::MeshStream,
     service: Arc<LmeshService>,
     mcp: Arc<mesh::jsonl::McpRegistry>,
+    trace_buffer: mesh::local_trace::LogBuffer,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -329,6 +175,62 @@ async fn handle_connection(
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+
+        if let Ok(request) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && request
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|method| {
+                    matches!(method, "subscribe" | "trace.subscribe" | "events.subscribe")
+                        || method.ends_with(".subscribe")
+                })
+        {
+            let mut params = request.get("params").cloned().unwrap_or(request);
+            if let Some(object) = params.as_object_mut() {
+                if let Some(serde_json::Value::Array(values)) = object.remove("params") {
+                    for value in values {
+                        if let Some(value) = value.as_str()
+                            && let Some((key, value)) = value.split_once('=')
+                        {
+                            object.insert(
+                                key.to_owned(),
+                                serde_json::Value::String(value.to_owned()),
+                            );
+                        }
+                    }
+                }
+                if let Some(serde_json::Value::String(targets)) = object.get("targets").cloned() {
+                    object.insert(
+                        "targets".to_owned(),
+                        serde_json::Value::Array(
+                            targets
+                                .split(',')
+                                .filter(|target| !target.is_empty())
+                                .map(|target| serde_json::Value::String(target.to_owned()))
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+            let config: mesh::local_trace::TraceConfig = serde_json::from_value(params)
+                .context("invalid trace subscription configuration")?;
+            let ack = serde_json::json!({
+                "success": true,
+                "data": {"subscribed": true, "service": "lmesh", "targets": config.targets.clone()}
+            });
+            writer.write_all(ack.to_string().as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            let _ = mesh::local_trace::stream_logs_filtered(
+                &trace_buffer,
+                &mesh::jsonl::ProtocolFormat::FlatJson { id: None },
+                &mut writer,
+                "lmesh",
+                &config,
+            )
+            .await;
+            break;
         }
 
         let service = service.clone();
@@ -369,37 +271,6 @@ mod tests {
     fn parse_announce_interval_rejects_zero_and_invalid_values() {
         assert_eq!(parse_announce_interval_secs("0"), None);
         assert_eq!(parse_announce_interval_secs("nope"), None);
-    }
-
-    #[test]
-    fn nan_autostart_defaults_on() {
-        unsafe {
-            std::env::remove_var(NAN_AUTOSTART_ENV);
-        }
-        assert!(nan_autostart_enabled());
-    }
-
-    #[test]
-    fn nan_event_log_defaults_on() {
-        unsafe {
-            std::env::remove_var(NAN_EVENT_LOG_ENV);
-        }
-        assert!(nan_event_log_enabled());
-    }
-
-    #[test]
-    fn ap_does_not_coexist_on_the_nan_interface() {
-        assert!(!ap_can_coexist_with_nan("wlan1", "wlan1"));
-    }
-
-    #[test]
-    fn nan_start_requires_a_successful_wpa_response() {
-        assert!(!nan_start_succeeded(&serde_json::json!({
-            "start": {"nan_capability": {"ok": false}}
-        })));
-        assert!(nan_start_succeeded(&serde_json::json!({
-            "start": {"nan_capability": {"ok": true}}
-        })));
     }
 
     #[test]

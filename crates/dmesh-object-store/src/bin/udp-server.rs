@@ -25,6 +25,8 @@ async fn main() -> Result<()> {
     let udp_mtu = value("DMESH_UDP_MTU", "1200").parse::<usize>()?;
     let hello_delay = value("DMESH_UDP_HELLO_DUPLICATE_DELAY_MS", "20").parse::<u64>()?;
     let send_delay = value("DMESH_UDP_SEND_DELAY_MS", "0").parse::<u64>()?;
+    let window_packets = value("DMESH_UDP_WINDOW_PACKETS", "1").parse::<usize>()?;
+    let retransmit_ms = value("DMESH_UDP_RETRANSMIT_MS", "100").parse::<u64>()?;
     let root = PathBuf::from(value("DMESH_OBJECT_STORE_ROOT", "target/flash"));
     let server = ObjectServer::new(ServerConfig {
         bind: bind.clone(),
@@ -33,9 +35,14 @@ async fn main() -> Result<()> {
         udp_mtu,
         udp_hello_duplicate_delay: Duration::from_millis(hello_delay),
         udp_send_delay: Duration::from_millis(send_delay),
+        udp_window_packets: window_packets.max(1),
+        udp_retransmit_timeout: Duration::from_millis(retransmit_ms.max(1)),
         ..ServerConfig::default()
     });
     let socket = UdpSocket::bind((&*bind, port)).await?;
-    println!("dmesh UDP object server bind={bind}:{port} root={}", root.display());
+    println!(
+        "dmesh UDP object server bind={bind}:{port} root={}",
+        root.display()
+    );
     server.run_udp(socket).await
 }

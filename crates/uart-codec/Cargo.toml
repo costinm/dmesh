@@ -1,0 +1,8 @@
+[package]
+name = "uart-codec"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "uart_codec"

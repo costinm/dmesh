@@ -15,8 +15,9 @@ LMesh runs as regular user but with CAP_NET_ADMIN. It may register a monitor
 interface on wifi or take over a wifi interface, based on configuration, and use
 it for NAN discovery, follow-ups and as a non-DS communication medium.
 
-It also owns interaction with USB/UART connected ESP32 devices, using the associated
-firmware, which use the same 'raw-NAN' code and may provide LoRA and FSK radios.
+UART forwarding is owned by the separate `lmesh-uart` service. The full lmesh
+process retains the shared dispatcher API but does not open or start USB/UART
+forwards; it can still use the shared raw-NAN code for mesh operations.
 
 Lmesh is only concerned with accepting and sending packets locally, based on 
 control plane and config it may forward packets as well, but is not involved in
@@ -56,11 +57,14 @@ Default:
 
 ## Implementation
 
-`lmesh::radio_protocol` also owns the DMesh BLE/NAN `DM` v1 wire format used by
-Android and firmware-adjacent tests. Keep hardware access outside this module:
+`dmesh-rawnan::protocol` owns the shared DMesh BLE/NAN `DM` v1 wire format used
+by Android and firmware-adjacent tests. `lmesh::radio_protocol` is a
+compatibility re-export. Keep hardware access outside the protocol module:
 Android Java owns Android BLE/WiFi Aware permissions and callbacks, while
-future mesh-init Linux support should own `wpa_supplicant` and BLE adapter
-control and call the shared protocol helpers.
+`lmesh-wifi` owns the stable `wlan0` open AP and raw-NAN monitor. The full
+`lmesh` service owns the experimental `wlan1` interface and starts the same
+shared raw-NAN monitor there. WPA-supplicant NAN is retained only as a
+compatibility test surface and is disabled from normal startup.
 
 Local adapters should use message/pubsub style boundaries with text command
 metadata, raw byte payloads, and optional FDs. CBOR is a good future fit for

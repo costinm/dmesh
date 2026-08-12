@@ -10,8 +10,6 @@
 # the role name, host timestamp, escaped text, and exact bytes as hex.
 # Relative paths are resolved from this (symlink-safe) config file. Keep every
 # board capture in the checkout-level target directory, never lmesh's CWD.
-serial_log_path = "../../../target/lmesh-radio-build/log/serial.log"
-
 # lmesh internally routes mapped ESP roles through the powered lora1 NAN
 # gateway. Callers still use the normal role name (for example lora2); direct
 # USB/UART is an explicit diagnostic fallback inside lmesh.
@@ -64,15 +62,6 @@ multi = true
 [[serial_forwards]]
 port = "s3-1"
 path = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5C82104982-if00"
-baud = 115200
-multi = true
-
-[[serial_forwards]]
-# ESP32-C6 inventory member. The current DMesh Main build supports only
-# classic ESP32 and ESP32-S3; keep this forward available for bring-up without
-# allowing the ESP32/S3 flasher to select a mismatched image.
-port = "e6"
-path = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_14:C1:9F:E5:98:00-if00"
 baud = 115200
 multi = true
 

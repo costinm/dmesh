@@ -292,6 +292,43 @@
     }
   },
   {
+    "name": "wifi.raw.bench_send",
+    "title": "Benchmark Raw Wi-Fi Stream",
+    "group": "Radio",
+    "description": "Send a QUIC-shaped DMTB stream for throughput and framing tests without retries or acknowledgements.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": { "type": "string", "default": "wlan1" },
+        "channel": { "type": "integer", "default": 6, "minimum": 1, "maximum": 13 },
+        "destination": { "type": "string", "description": "Destination MAC address." },
+        "bssid": { "type": "string", "description": "NAN cluster BSSID." },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "chunk_bytes": { "type": "integer", "default": 512, "minimum": 64, "maximum": 900 },
+        "tx_variant": { "type": "string", "default": "monitor_active" },
+        "llc": { "type": "string" },
+        "multicast": { "type": "boolean", "default": false }
+      },
+      "required": ["destination", "bytes"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "object.nan.dry_run",
+    "title": "Dry-run NAN Object Transfer",
+    "group": "Transport",
+    "description": "Calculate QUIC-shaped NAN stream framing and rates without opening a socket.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "image_size": { "type": "integer", "minimum": 1 },
+        "mtu": { "type": "integer", "default": 1200, "minimum": 256, "maximum": 2304 }
+      },
+      "required": ["image_size"],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "wifi.raw.listen",
     "title": "Listen Raw Wi-Fi",
     "group": "Radio",
@@ -667,6 +704,34 @@
       "required": [
         "mac"
       ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.ap.station.remove",
+    "title": "Remove AP Station",
+    "group": "Wi-Fi",
+    "description": "Disconnect one associated station without stopping the AP.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": { "type": "string", "default": "wlan1" },
+        "mac": { "type": "string", "title": "Station MAC" }
+      },
+      "required": ["mac"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.ap.station.remove_all",
+    "title": "Remove All AP Stations",
+    "group": "Wi-Fi",
+    "description": "Disconnect all associated stations without stopping the AP.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": { "type": "string", "default": "wlan1" }
+      },
       "additionalProperties": false
     }
   },
