@@ -1,5 +1,8 @@
 # DMesh Recovery
 
+*This is in process of replacement with a Rust recovery using the same code as Main,
+i.e. QUIC-lite over multiple datagram transports instead of TCP *
+
 The normative Recovery UART, event, and manifest-extension contract is
 [API.md](API.md). This README is operational/build guidance only.
 
@@ -67,11 +70,10 @@ unit is boot-enabled. The socket listens on TCP port 3336 and activates the
 server only when a Recovery connection arrives.
 
 The lab host AP and route can be bootstrapped with
-`fw/recovery/tools/bootstrap-ap-route.sh`. The preferred deployment configures
-lmesh itself with `LMESH_AP_AUTOSTART=1`, `LMESH_AP_IFACE=wlan0`,
-`LMESH_AP_ADDRESS=10.78.0.1/16`, and `LMESH_AP_NETWORK=10.78.0.0/16`.
-lmesh then owns the address, route, and open AP on every service start. With
-no environment overrides lmesh uses
+`fw/recovery/tools/bootstrap-ap-route.sh`. The preferred deployment installs
+`docs/lab/lmesh-wifi.toml` and sets `LMESH_INTERFACES=wlan0` (or the host's
+owned AP interface). `lmesh-wifi` owns the open AP on every service start.
+With no environment overrides it uses
 its MAC-derived `Direct-XXXXXXXX-Dmesh-local` SSID, which Recovery can find.
 The corresponding mesh-init definition is
 `fw/recovery/tools/recovery-bootstrap-ap.toml`; install it only on the host
@@ -121,7 +123,7 @@ sleepy devices on the NAN active-window path:
 
 ```sh
 source ./env.sh
-mesh lmesh esp.serial.command port=lora4 command=status
+mesh lmesh-uart esp.serial.command port=lora4 command=status
 ```
 
 When `timeout_sec` is omitted, lmesh uses a 3-second response budget after
@@ -214,7 +216,7 @@ Before an authorized canary or fleet update, run the read-only Main-flash
 preflight:
 
 ```sh
-mesh lmesh usb.serial.forward.list
+mesh lmesh-uart usb.serial.forward.list
 ```
 
 It verifies the saved board entry, managed forward, server listener, and both
@@ -329,7 +331,7 @@ before accepting `DONE`; duplicate and out-of-range block indexes are errors.
 - per-device state: `target/flash-devices/<mac>/`
 - saved network defaults: `target/flash-devices/network.json`
 - flash service logs: `target/recovery-server/`
-- managed serial capture: `target/lmesh-radio-build/log/serial.log`
+- managed serial capture: `$HOME/logs/<device>.log`
 - USB provisioning/emergency incidents: `target/evidence/flash/`
 
 Each per-device directory includes HELLO/device metadata, the observed

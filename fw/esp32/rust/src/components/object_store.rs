@@ -4,8 +4,7 @@
 //! bounded envelope/session parsing and can therefore be exercised without
 //! TCP/IP. A future flash sink can be attached to the same protocol receiver.
 
-use dmesh_object_store::protocol::{decode_envelope, PeerKey};
-use dmesh_transport::ConnectionId;
+use dmesh_transport::{decode_envelope, ConnectionId, PeerKey};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
@@ -45,4 +44,3 @@ impl NanObjectService {
         Some(PeerKey { wifi_mac: mac, dcid: ConnectionId::new(dcid)? })
     }
 }
-

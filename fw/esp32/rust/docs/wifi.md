@@ -297,15 +297,15 @@ adb -s <serial> shell "content call \
   --arg 'wifi.nan.probe text=BITMAP count=16 interval_ms=512'"
 
 # Managed lmesh forward only
-mesh lmesh esp.serial.command port=<radio> command='nan action_dump=true'
-mesh lmesh esp.serial.command port=<radio> command='xstatus'
+mesh lmesh-uart esp.serial.command port=<radio> command='nan action_dump=true'
+mesh lmesh-uart esp.serial.command port=<radio> command='xstatus'
 ```
 
 For an ESP-to-Android discovery failure, inspect the exact bounded descriptor
 that the firmware handed to raw Wi-Fi TX before changing timing or UART:
 
 ```bash
-mesh lmesh esp.serial.command port=<radio> command='nan publish_dump=true'
+mesh lmesh-uart esp.serial.command port=<radio> command='nan publish_dump=true'
 ```
 
 The required Service Descriptor, Device Capability, Availability, and optional
@@ -354,20 +354,20 @@ Use lmesh logical forwards, never a raw physical TTY, for normal testing:
 
 ```bash
 source env.sh
-export LMESH_CONTROL_SOCKET=/run/mesh/lmesh/mesh.sock
+export LMESH_UART_CONTROL_SOCKET=/run/mesh/lmesh-uart/mesh.sock
 export PYTHONPATH="${SSH_MESH_PYTHON:?set SSH_MESH_PYTHON to the ssh-mesh Python directory}"
 
 # Persist the powered fallback role on lora1, then reinitialize infra radios.
 # `reset` is not a firmware CBOR command; do not use DTR as a substitute.
-mesh lmesh esp.serial.command port=lora1 command='nvs op=set nan.ap_owner=true nan.sync_source=auto'
-mesh lmesh esp.serial.command port=lora1 command='mode infra=true'
+mesh lmesh-uart esp.serial.command port=lora1 command='nvs op=set nan.ap_owner=true nan.sync_source=auto'
+mesh lmesh-uart esp.serial.command port=lora1 command='mode infra=true'
 
 # Lab observer: retain the AP (512 TU) and raw NAN management/action receiver
 # even when NAN beacons are present. This is a powered-gateway test role, not
 # the normal `auto` fallback policy.
-mesh lmesh esp.serial.command port=lora1 \
+mesh lmesh-uart esp.serial.command port=lora1 \
   command='nvs op=set nan.ap_owner=true nan.sync_source=ap_only nan.ap_beacon_tu=512'
-mesh lmesh esp.serial.command port=lora1 command='mode infra=true'
+mesh lmesh-uart esp.serial.command port=lora1 command='mode infra=true'
 
 # Deterministic AP fallback validation. The runner restores normal auto policy.
 python fw/esp32/rust/tools/presubmit.py \
@@ -400,3 +400,26 @@ part of the gate.
   later if ambient AP density makes that unsafe.
 - A powered AP does not sleep. It is an explicit infrastructure role; battery
   devices remain duty-cycled and only use it for synchronization.
+
+## Raw TX interface experiments
+
+Raw action/data commands select the driver interface automatically by default:
+`WIFI_IF_STA` for STA and APSTA modes, and `WIFI_IF_AP` for pure AP mode. For
+APSTA experiments the interface can be selected explicitly without changing
+the Wi-Fi mode:
+
+```text
+wifi raw_action_hex=hex:dmesh... dst=<mac> tx_if=sta sys_seq=true
+wifi raw_action_hex=hex:dmesh... dst=<mac> tx_if=ap  sys_seq=true
+wifi raw_data=payload dst=<mac> bssid=<mac> tx_if=sta sys_seq=false
+wifi bench_stream_send=true dst=<mac> bytes=1048576 tx_if=sta sys_seq=true
+```
+
+`tx_if=sta|ap` chooses `esp_wifi_80211_tx`'s interface and also uses the
+corresponding STA or SoftAP source MAC when constructing custom action frames.
+Selecting `ap` when no AP netif is active is expected to return an ESP Wi-Fi
+interface error; it must not be treated as a firmware crash. `sys_seq=true`
+lets the ESP driver assign the 802.11 sequence number and is the default.
+With `sys_seq=false`, the caller owns Sequence Control and should provide a
+changing value when testing duplicate/ACK behavior. This option only changes
+the TX path; RX filtering and NAN cluster selection are unchanged.

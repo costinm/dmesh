@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -119,6 +119,12 @@ static NAN_LAST_PUBLISH_SLOT: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_PUBLISH_LOCAL_LO: AtomicU32 = AtomicU32::new(0);
 static NAN_LAST_PUBLISH_LOCAL_HI: AtomicU32 = AtomicU32::new(0);
 static NAN_PUBLISH_DW_LOCAL_GUARD_DROPS: AtomicU32 = AtomicU32::new(0);
+// Infrastructure peers advertise periodically even when no console command
+// has primed the publish queue.  This makes the lmesh-wifi discovery test and
+// sleepy-peer rendezvous self-starting while retaining the DW retransmission
+// path for devices that were asleep during the immediate transmission.
+static NAN_LAST_INFRA_AUTO_PUBLISH_LO: AtomicU32 = AtomicU32::new(0);
+static NAN_LAST_INFRA_AUTO_PUBLISH_HI: AtomicU32 = AtomicU32::new(0);
 // Bounded timing evidence for the last Android DMesh service descriptor and
 // follow-up. A powered observer uses these fields to place Android traffic on
 // the NAN 512-TU timeline without retaining packet history.
@@ -892,7 +898,15 @@ pub fn raw_followup_frame(dst: &[u8; 6], data: &[u8]) -> Result<Vec<u8>> {
 pub fn start_raw_window(channel: u8, filter: &str) -> Result<()> {
     NAN_FILTER_MODE.store(parse_filter_mode(filter)?, Ordering::Relaxed);
     super::wifi::reset_raw_first_frame();
-    start_raw_sniffer(channel.max(1))
+    start_raw_sniffer(channel.max(1))?;
+    // A direct Wi-Fi mode transition also starts NAN, bypassing NanCommand's
+    // settings-bearing path. Prime several infrastructure publishes here so
+    // the first lmesh-wifi USD interval is self-starting; DW draining repeats
+    // the retained frames even if the immediate TX is missed.
+    if super::mode::infra_mode() {
+        prime_infra_publish();
+    }
+    Ok(())
 }
 
 /// The most recent NAN synchronization beacon, if one has been received.
@@ -1513,7 +1527,10 @@ pub fn drain_publish_on_discovery_window() -> usize {
         captured.clear();
         captured.extend_from_slice(&frame);
     }
-    match raw_tx(&frame, true) {
+    // Unassociated APSTA SoftAP injection must let IDF allocate the sequence
+    // number; forcing station system sequencing is accepted but suppressed
+    // by the driver. Associated STA/data paths retain `true` elsewhere.
+    match raw_tx_publish(&frame, super::wifi::raw_tx_sys_seq()) {
         Ok(()) => {
             let offset_us = now_us().saturating_sub(last_beacon_local_us());
             NAN_LAST_PUBLISH_BEACON.store(beacon, Ordering::Relaxed);
@@ -1540,6 +1557,139 @@ pub fn drain_publish_on_discovery_window() -> usize {
             0
         }
     }
+}
+
+/// Send one queued publication immediately for an infrastructure node.
+///
+/// Infrastructure radios are continuously powered and are explicitly allowed
+/// to advertise outside a sleepy peer's DW.  Keep the existing synchronized
+/// path for sleepy nodes; this helper is only called after the command path
+/// has established `mode=infra`.
+pub fn drain_publish_infra_immediate() -> usize {
+    if !super::mode::infra_mode() || !NAN_RUNNING.load(Ordering::Relaxed) {
+        return 0;
+    }
+    // Keep the queued copy: the immediate broadcast is only an early hint.
+    // The same publication must be retransmitted in the next synchronized
+    // DW0/DW4 so sleepy peers that missed the active send can receive it.
+    let frame = nan_publish_queue()
+        .lock()
+        .ok()
+        .and_then(|queue| queue.front().cloned());
+    let Some(frame) = frame else {
+        return 0;
+    };
+    if let Ok(mut captured) = last_publish_frame().lock() {
+        captured.clear();
+        captured.extend_from_slice(&frame);
+    }
+    match raw_tx_publish(&frame, super::wifi::raw_tx_sys_seq()) {
+        Ok(()) => {
+            NAN_PUBLISH_DW_TX.fetch_add(1, Ordering::Relaxed);
+            telemetry::record_log(format!(
+                "event type=nan.publish_infra ok=true bytes={}",
+                frame.len()
+            ));
+            1
+        }
+        Err(error) => {
+            telemetry::record_log(format!(
+                "event type=nan.publish_infra ok=false message={}",
+                crate::commands::protocol::escape_value(&error.to_string())
+            ));
+            0
+        }
+    }
+}
+
+/// Keep an infrastructure ESP discoverable without a one-shot UART command.
+/// The queued frame is sent immediately and remains available for the next
+/// synchronized discovery window, matching the active-plus-DW policy.
+pub fn ensure_infra_publish(settings: &SharedSettings) {
+    if !super::mode::infra_mode() || !NAN_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
+    const PERIOD_US: u64 = 4_000_000;
+    let now = now_us();
+    let last = load_u64(&NAN_LAST_INFRA_AUTO_PUBLISH_LO, &NAN_LAST_INFRA_AUTO_PUBLISH_HI);
+    if last != 0 && now.saturating_sub(last) < PERIOD_US {
+        return;
+    }
+    let queued = nan_publish_queue()
+        .lock()
+        .ok()
+        .and_then(|queue| queue.front().cloned());
+    if let Some(frame) = queued {
+        store_u64(&NAN_LAST_INFRA_AUTO_PUBLISH_LO, &NAN_LAST_INFRA_AUTO_PUBLISH_HI, now);
+        let _ = raw_tx_publish(&frame, super::wifi::raw_tx_sys_seq());
+        return;
+    }
+    let Ok((availability, device_capabilities)) = nan_publish_attributes(settings, 1) else {
+        return;
+    };
+    let Ok(frame) = nan_publish_frame(&availability, &device_capabilities, true, 2) else {
+        return;
+    };
+    if let Ok(mut queue) = nan_publish_queue().lock() {
+        queue.push_back(frame);
+    } else {
+        return;
+    }
+    store_u64(&NAN_LAST_INFRA_AUTO_PUBLISH_LO, &NAN_LAST_INFRA_AUTO_PUBLISH_HI, now);
+    let _ = drain_publish_infra_immediate();
+}
+
+fn prime_infra_publish() {
+    if !NAN_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(availability) = dmesh_rawnan::build_nan_availability_attribute(512, 0, 1, 64, 1) else { return; };
+    let Ok(device_capabilities) = dmesh_rawnan::build_nan_device_capability_attribute(1) else { return; };
+    let Ok(frame) = nan_publish_frame(&availability, &device_capabilities, true, 2) else {
+        return;
+    };
+    if let Ok(mut queue) = nan_publish_queue().lock() {
+        if !queue.is_empty() {
+            return;
+        }
+        for _ in 0..4 {
+            queue.push_back(frame.clone());
+        }
+    } else {
+        return;
+    }
+    let now = now_us();
+    store_u64(&NAN_LAST_INFRA_AUTO_PUBLISH_LO, &NAN_LAST_INFRA_AUTO_PUBLISH_HI, now);
+    let _ = drain_publish_infra_immediate();
+    // A freshly-created APSTA context can drop the first management TX while
+    // its beacon scheduler settles. Repeat a bounded burst; keep one queued
+    // copy for the next synchronized DW instead of free-running forever.
+    for _ in 0..3 {
+        task_delay(Duration::from_millis(120));
+        let frame = nan_publish_queue()
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front());
+        let Some(frame) = frame else { break; };
+        let _ = raw_tx_publish(&frame, super::wifi::raw_tx_sys_seq());
+    }
+}
+
+/// Prime an infrastructure publisher when Wi-Fi mode setup, rather than the
+/// `nan` command, owns startup. Hardware setup supplies only the channel;
+/// frame policy and encoding remain in this module/shared `dmesh-rawnan`.
+pub fn prime_infra_publish_for_wifi(channel: u8) -> Result<()> {
+    if !NAN_RUNNING.load(Ordering::Relaxed) {
+        start_raw_sniffer(channel.max(1))?;
+    }
+    if super::mode::infra_mode() {
+        // IDF reports APSTA started before the SoftAP injection context is
+        // actually ready. Give the hardware task a bounded settle interval;
+        // this is deliberately adapter timing, not NAN wire policy.
+        task_delay(Duration::from_millis(500));
+        prime_infra_publish();
+    }
+    Ok(())
 }
 
 pub fn raw_response_rx_count() -> u32 {
@@ -1775,6 +1925,19 @@ impl CommandHandler for NanCommand {
                 encode_hex(&frame)
             )));
         }
+        if request.arg("publish_dump").is_some() {
+            let frame = last_publish_frame()
+                .lock()
+                .map_err(|_| anyhow!("NAN publish capture lock poisoned"))?;
+            if frame.is_empty() {
+                return Ok(CommandResponse::ok("nan publish_dump=empty"));
+            }
+            return Ok(CommandResponse::ok(format!(
+                "nan publish_dump bytes={} hex={}",
+                frame.len(),
+                encode_hex(&frame)
+            )));
+        }
         if let Some(service_history_request) = request.arg("service_history") {
             if service_history_request == "clear" {
                 service_history()
@@ -1933,10 +2096,15 @@ impl CommandHandler for NanCommand {
         if let Some(raw) = request.arg("raw") {
             let bytes = parse_bytes(raw)?;
             self.ensure_raw_started()?;
-            raw_tx(&bytes, true)?;
+            let en_sys_seq = request
+                .arg("sys_seq")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(true);
+            raw_tx(&bytes, en_sys_seq)?;
             return Ok(CommandResponse::ok(format!(
-                "nan raw sent bytes={}",
-                bytes.len()
+                "nan raw sent bytes={} sys_seq={}",
+                bytes.len(), en_sys_seq
             )));
         }
         if let Some(target) = request
@@ -2096,8 +2264,17 @@ impl CommandHandler for NanCommand {
                 }
                 queue.push_back(frame);
             }
+            // A powered infrastructure node may advertise immediately; a
+            // sleepy node leaves the queue for the synchronized DW poller.
+            let immediate = if super::mode::infra_mode() {
+                drop(queue);
+                drain_publish_infra_immediate()
+            } else {
+                0
+            };
             return Ok(CommandResponse::ok(format!(
-                "nan publish queued=true backend={} service={} count={} sdea={} sdea_update={} availability_map={} dst={} bssid={} bytes={}",
+                "nan publish queued=true immediate={} backend={} service={} count={} sdea={} sdea_update={} availability_map={} dst={} bssid={} bytes={}",
+                immediate,
                 self.backend.name(),
                 self.service,
                 count,
@@ -2282,6 +2459,9 @@ impl NanCommand {
 
     fn start_raw(&mut self) -> Result<()> {
         start_raw_sniffer(self.channel.max(1))?;
+        if super::mode::infra_mode() {
+            prime_infra_publish();
+        }
         if self.dump {
             log::info!(
                 "nan raw monitor started channel={} filter={}",
@@ -2394,8 +2574,8 @@ fn rx_timing_fields(local_us: u64) -> String {
 }
 
 fn start_raw_sniffer(channel: u8) -> Result<()> {
-    ensure_rx_queue()?;
-    super::wifi::ensure_raw_wifi_started(channel)?;
+    ensure_rx_queue().context("nan rx queue")?;
+    super::wifi::ensure_raw_wifi_started(channel).context("nan wifi start")?;
     // Discovery starts without a comparator. Once a beacon has been accepted,
     // reconcile_hardware_bssid_filter() arms the exact cluster comparator;
     // stale timing releases it before the next discovery interval.
@@ -2407,14 +2587,18 @@ fn start_raw_sniffer(channel: u8) -> Result<()> {
         let mut filter = sys::wifi_promiscuous_filter_t {
             filter_mask: sys::WIFI_PROMIS_FILTER_MASK_MGMT | sys::WIFI_PROMIS_FILTER_MASK_DATA,
         };
-        esp_ok(sys::esp_wifi_set_promiscuous(false))?;
-        esp_ok(sys::esp_wifi_set_promiscuous_rx_cb(Some(sniffer_cb)))?;
-        esp_ok(sys::esp_wifi_set_promiscuous_filter(&mut filter))?;
-        esp_ok(sys::esp_wifi_set_channel(
-            channel,
-            sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-        ))?;
-        esp_ok(sys::esp_wifi_set_promiscuous(true))?;
+        esp_ok(sys::esp_wifi_set_promiscuous(false))
+            .context("nan promiscuous disable")?;
+        esp_ok(sys::esp_wifi_set_promiscuous_rx_cb(Some(sniffer_cb)))
+            .context("nan promiscuous callback")?;
+        esp_ok(sys::esp_wifi_set_promiscuous_filter(&mut filter))
+            .context("nan promiscuous filter")?;
+        // Keep an established STA/AP on its beacon channel. NAN and the
+        // infrastructure profile share this radio; retuning here breaks the
+        // host-STA contract. Unassociated raw mode is retuned by the helper.
+        super::wifi::prepare_nan_channel(channel).context("nan channel")?;
+        esp_ok(sys::esp_wifi_set_promiscuous(true))
+            .context("nan promiscuous enable")?;
     }
     NAN_RUNNING.store(true, Ordering::Relaxed);
     object_service_start();
@@ -2950,6 +3134,19 @@ fn raw_tx(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
     Ok(())
 }
 
+/// Inject an autonomous NAN publication with the address of the interface
+/// that is live at the instant of TX. APSTA may associate after the publish
+/// frame was built; keeping a SoftAP address in addr2 while injecting through
+/// STA is silently discarded by IDF/firmware on some targets.
+fn raw_tx_publish(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
+    if bytes.len() < 16 {
+        return raw_tx(bytes, en_sys_seq);
+    }
+    let mut frame = bytes.to_vec();
+    frame[10..16].copy_from_slice(&super::wifi::raw_tx_source_mac()?);
+    raw_tx(&frame, en_sys_seq)
+}
+
 /// Re-emit a captured Android NAN synchronization beacon as a bounded raw
 /// interoperability probe. The NAN vendor IE and its cluster/master
 /// attributes are preserved byte-for-byte: they are live on-air state, not a
@@ -3157,8 +3354,8 @@ fn nan_publish_attributes(
     };
     let active_ms = settings.get_i32("nan.active_ms", 64)?.clamp(16, 8_000) as u32;
     Ok((
-        nan_availability_attribute(dw_tu, offset_tu, stride, active_ms, availability_map)?,
-        nan_device_capability_attribute(stride)?,
+        dmesh_rawnan::build_nan_availability_attribute(dw_tu, offset_tu, stride, active_ms, availability_map)?,
+        dmesh_rawnan::build_nan_device_capability_attribute(stride)?,
     ))
 }
 

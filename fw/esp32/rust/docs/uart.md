@@ -152,8 +152,8 @@ TCP/RFC byte-stream endpoint, bounded queues, and per-forward counters. It is
 passive: it never owns or changes modem-control lines.
 
 ```bash
-mesh lmesh usb.serial.forward.list
-mesh lmesh esp.serial.command port=lora2 command=status
+mesh lmesh-uart usb.serial.forward.list
+mesh lmesh-uart esp.serial.command port=lora2 command=status
 ```
 
 Forward connections are passive: lmesh never toggles DTR/RTS or sends a
@@ -211,13 +211,13 @@ Never use `write_flash 0x0 dmesh-rs-merged.bin`: that merged image contains
 1. Check the managed forward first:
 
    ```bash
-   mesh lmesh usb.serial.forward.list
+   mesh lmesh-uart usb.serial.forward.list
    ```
 
 2. Request a framed status through lmesh:
 
    ```bash
-   mesh lmesh esp.serial.command port=lora2 command=status timeout_sec=8
+   mesh lmesh-uart esp.serial.command port=lora2 command=status timeout_sec=8
    ```
 
 3. If the ready marker never arrives, preserve the managed forward and its
@@ -243,7 +243,7 @@ Never use `write_flash 0x0 dmesh-rs-merged.bin`: that merged image contains
 
 The managed lab profile records every forwarded board TX/RX record, including
 role, host timestamp, escaped text, and exact bytes in hex, in
-`target/lmesh-radio-build/log/serial.log`. Before changing a forward, resetting
+`$HOME/logs/<device>.log`. Before changing a forward, resetting
 a board, or reflashing after any UART timeout/framing error, inspect the
 relevant role's records in that file and retain the excerpt with the test
 artifact. A timeout without this log evidence is not a firmware-crash claim.
@@ -287,10 +287,10 @@ Remote recovery was then verified from powered `lora3`:
 For a deployed-board reset/bootloader failure, preserve the managed evidence
 and hand it off; do not use USB as a fallback. Issue framed commands through
 lmesh when the board is reachable.
-mesh lmesh esp.serial.command port=lora2 command='mode raw_nan=true channel=6'
-mesh lmesh esp.active port=lora3 active=true
-mesh lmesh esp.active gateway=lora3 target=1d4c5e1c active=true
-mesh lmesh esp.serial.command port=lora2 command='mode status=true'
+mesh lmesh-uart esp.serial.command port=lora2 command='mode raw_nan=true channel=6'
+mesh lmesh-uart esp.active port=lora3 active=true
+mesh lmesh-uart esp.active gateway=lora3 target=1d4c5e1c active=true
+mesh lmesh-uart esp.serial.command port=lora2 command='mode status=true'
 ```
 
 The target reported `infra_active=true` and

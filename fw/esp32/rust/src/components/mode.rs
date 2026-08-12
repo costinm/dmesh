@@ -324,6 +324,11 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
 }
 
 pub fn poll(settings: &SharedSettings) {
+    // NAN remains a control-plane service even when the IP transport owns the
+    // main poll path. Infrastructure ESPs must keep advertising in that case.
+    if infra_mode() {
+        super::nan::ensure_infra_publish(settings);
+    }
     if IP_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
@@ -335,8 +340,17 @@ pub fn poll(settings: &SharedSettings) {
     if PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA {
         super::serial::set_always_on(true);
     }
+    // Raw AP/APSTA infrastructure profiles may not use the normal AP-owner
+    // state machine, but they still need the periodic NAN advertisement.
+    if infra_mode() {
+        super::nan::ensure_infra_publish(settings);
+    }
     if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
         poll_ap_owner(settings);
+        // Keep an infrastructure ESP discoverable without requiring a
+        // one-shot UART `nan publish` command. The helper sends immediately
+        // and retains the frame for the next synchronized DW retransmission.
+        super::nan::ensure_infra_publish(settings);
         // The powered AP owner does not run the sleepy raw-NAN duty loop, but
         // it still observes the same Android NAN beacons. Release one queued
         // raw NAN publish in the common post-beacon dwell guard so its ESP
@@ -1159,6 +1173,13 @@ pub fn raw_nan_duty_active() -> bool {
 /// observed discovery window; it does not use the battery-node duty state.
 pub fn ap_owner_running() -> bool {
     AP_OWNER_RUNNING.load(Ordering::Relaxed)
+}
+
+/// Infrastructure nodes have a continuously powered radio and may emit
+/// discovery/publication frames outside a sleepy peer's selected DW.  Sleepy
+/// nodes must continue to use the synchronized DW scheduler.
+pub fn infra_mode() -> bool {
+    PRODUCT_MODE.load(Ordering::Relaxed) == MODE_INFRA
 }
 
 /// Infrastructure-to-sleepy traffic uses the default advertised stride even

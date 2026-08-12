@@ -21,7 +21,7 @@ def run_lmesh_commands(port: str, commands: list[str], timeout: float) -> str:
     mesh = ROOT / "scripts" / "with-env.sh"
     for command in commands:
         proc = subprocess.run(
-            [str(mesh), "mesh", "lmesh", "esp.serial.command", f"port={port}",
+            [str(mesh), "mesh", "lmesh-uart", "esp.serial.command", f"port={port}",
              f"command={command}", f"timeout_sec={timeout}"],
             cwd=ROOT,
             check=False,

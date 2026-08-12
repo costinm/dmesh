@@ -11,6 +11,7 @@ pub mod mode;
 pub mod module;
 pub mod nan;
 pub mod object_store;
+pub mod object_transfer;
 pub mod nvs;
 pub mod power;
 pub mod peripherals;
@@ -43,6 +44,6 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     sleep::register_commands(registry, settings.clone());
     test::register_commands(registry);
     telemetry::register_commands(registry, settings.clone());
-    nvs::register_commands(registry, settings);
-    wifi::register_commands(registry);
+    nvs::register_commands(registry, settings.clone());
+    wifi::register_commands(registry, settings);
 }

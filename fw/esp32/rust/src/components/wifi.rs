@@ -18,16 +18,14 @@ extern "C" {
 }
 
 use anyhow::{anyhow, bail, Context, Result};
-use sha2::{Digest, Sha256};
-use dmesh_object_store::protocol::{decode_udp_manifest, encode_udp_hello};
-use dmesh_transport::{decode_frame, ConnectionId, Frame, ShortHeader, StreamFrame, FLAG_FIXED};
+use dmesh_transport::{decode_bench_stream, decode_frame, encode_bench_stream, ConnectionId, Frame, ShortHeader, StreamFrame, FLAG_FIXED};
 use esp_idf_svc::espnow::{EspNow, PeerInfo, BROADCAST as ESPNOW_BROADCAST};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::{hex_bytes, parse_bytes};
-use super::settings::{parse_bool, parse_i32};
+use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
 unsafe extern "C" {
@@ -77,9 +75,9 @@ const DMESH_DATA_MARKER_LEN: usize = 9;
 /// limit. The complete 802.11 frame remains below the firmware's 1500-byte
 /// raw transmit/receive bound.
 pub const RAW_ACTION_MAX_PAYLOAD: usize = 1200;
-const BENCH_STREAM_MAGIC: [u8; 4] = *b"DMTB";
-const BENCH_STREAM_DCID: u64 = 0x1234;
-const BENCH_STREAM_ID: u64 = 0;
+const BENCH_STREAM_MAGIC: [u8; 4] = dmesh_transport::BENCH_MAGIC;
+const BENCH_STREAM_DCID: u64 = dmesh_transport::BENCH_CONNECTION_ID;
+const BENCH_STREAM_ID: u64 = dmesh_transport::BENCH_STREAM_ID;
 // Minimum recognizable benchmark envelope: magic plus the encoded transport
 // header. The actual short-header/frame size is variable.
 // Leave room for the DMTB tag, QUIC-like short header, and stream-frame
@@ -91,6 +89,8 @@ const BENCH_STREAM_DATA_MAX: usize = 512;
 const DMESH_FIXED_MESH_DST4: [u8; 4] = [0xff; 4];
 const IEEE80211_LLC_SNAP_IPV4: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00];
+const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
+    [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static IP_STA_NETIF: OnceLock<usize> = OnceLock::new();
@@ -125,6 +125,8 @@ static RAW_CMD_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_DROPPED: AtomicU32 = AtomicU32::new(0);
 static RAW_OBJECT_ACTION_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 static RAW_OBJECT_ACTION_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+static RAW_OBJECT_ACTION_LAST_LEN: AtomicU32 = AtomicU32::new(0);
+static RAW_OBJECT_ACTION_LAST_PREFIX: AtomicU32 = AtomicU32::new(0);
 // Receive-path diagnostics for custom DMesh action frames. These distinguish
 // an action frame reaching Main from one carrying the expected marker and
 // from one actually being accepted for command dispatch.
@@ -255,37 +257,37 @@ fn encode_udp_status_response(nonce: u64, out: &mut [u8; UDP_STATUS_RESPONSE_LEN
 }
 
 const DRS2_MAGIC: u32 = 0x4452_5332;
+const DRS2_FRAME_HELLO: u16 = 1;
 const DRS2_FRAME_MANIFEST: u16 = 6;
-const DRS2_FRAME_BLOCK: u16 = 8;
-const DRS2_FRAME_DONE: u16 = 10;
 const DRS2_FRAME_MANIFEST_OK: u16 = 13;
 const UDP_MANIFEST_STREAM: u64 = 3;
-const UDP_BLOCK_STREAM: u64 = 7;
+const UDP_HELLO_STREAM: u64 = 0;
+const UDP_HELLO_LEN: usize = 90;
 
+const UDP_RX_WINDOW_MAX: usize = 64;
+// The object-store sender uses a 1200-byte UDP payload. Keep a little room
+// for the transport header while making the reassembly storage fixed-size;
+// allocating one Vec per datagram eventually fragments the small ESP heap.
+const UDP_PACKET_MAX: usize = 1200;
 struct UdpDryRun {
     socket: UdpSocket,
     peer: SocketAddr,
     hello: Box<[u8; 256]>,
     hello_len: usize,
     hello_sent: bool,
+    hello_sent_ms: u64,
+    hello_retransmits: u32,
     server: String,
     port: u16,
     target: u8,
     started_ms: u64,
     timeout_ms: u32,
-    packet: Box<[u8; 2048]>,
-    stream: Vec<u8>,
-    stream_received: u64,
-    image_bytes: u64,
-    packets: u32,
-    image_size: u64,
-    block_count: u32,
+    packet: Box<[u8; UDP_PACKET_MAX]>,
     phase: u8,
-    verify_sha: bool,
-    block_hashes: Vec<[u8; 4]>,
-    sha_blocks: u32,
-    duplicate_packets: u32,
     acks_sent: u32,
+    rx_window_packets: usize,
+    write_flash: bool,
+    receiver: crate::components::object_transfer::ObjectReceiver<crate::components::object_transfer::TransferSink>,
 }
 
 fn udp_dry_run_state() -> &'static Mutex<Option<UdpDryRun>> {
@@ -500,8 +502,8 @@ struct RawWifiResponse {
 
 static RAW_RESPONSE_HISTORY: OnceLock<Mutex<VecDeque<RawWifiResponse>>> = OnceLock::new();
 
-pub fn register_commands(registry: &mut CommandRegistry) {
-    registry.register(WifiCommand::default());
+pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
+    registry.register(WifiCommand::new(settings));
 }
 
 pub fn forward_management_packet(packet: &[u8]) -> Result<()> {
@@ -571,6 +573,15 @@ pub fn send_espnow_broadcast(payload: &[u8]) -> Result<()> {
 }
 
 pub fn send_raw_action_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
+    send_raw_action_payload_to_with_options(destination, payload, true, None)
+}
+
+fn send_raw_action_payload_to_with_options(
+    destination: [u8; 6],
+    payload: &[u8],
+    en_sys_seq: bool,
+    tx_if: Option<sys::wifi_interface_t>,
+) -> Result<()> {
     // NAN already initialized and owns the raw monitor/channel. Re-running
     // esp_wifi_set_channel from every transport packet returns ESP_ERR_INVALID_STATE
     // on IDF 6.x and aborts the stream. Only initialize the bearer when NAN is
@@ -578,12 +589,13 @@ pub fn send_raw_action_payload_to(destination: [u8; 6], payload: &[u8]) -> Resul
     if !super::nan::raw_tx_active() {
         ensure_raw_wifi_started(6)?;
     }
-    let frame = custom_raw_action_frame_with_bssid(
+    let frame = custom_raw_action_frame_with_bssid_for(
         destination,
         super::nan::selected_cluster_bssid().unwrap_or(destination),
         payload,
+        tx_if,
     )?;
-    raw_tx_frame(&frame, true)?;
+    raw_tx_frame_on(&frame, en_sys_seq, tx_if)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
         "wifi",
@@ -665,6 +677,12 @@ pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
     // action and data frames.  Dispatch them before the command/diagnostic
     // paths so a DRS2 transport packet is not mistaken for a text command.
     RAW_OBJECT_ACTION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    let mut prefix = 0u32;
+    for byte in payload.iter().take(4) {
+        prefix = (prefix << 8) | u32::from(*byte);
+    }
+    RAW_OBJECT_ACTION_LAST_LEN.store(payload.len() as u32, Ordering::Relaxed);
+    RAW_OBJECT_ACTION_LAST_PREFIX.store(prefix, Ordering::Relaxed);
     if super::nan::object_service_observe_action(payload) {
         RAW_OBJECT_ACTION_ACCEPTED.fetch_add(1, Ordering::Relaxed);
         telemetry::record_log(format!(
@@ -706,20 +724,12 @@ fn observe_bench_stream(payload: &[u8]) -> bool {
         return false;
     }
     BENCH_RX_SEEN.fetch_add(1, Ordering::Relaxed);
-    let Ok((header, header_len)) = ShortHeader::decode(&payload[4..]) else {
+    let Ok((header, stream, used)) = decode_bench_stream(payload) else {
         BENCH_RX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
         return true;
     };
-    let Ok((frame, used)) = decode_frame(&payload[4 + header_len..]) else {
-        BENCH_RX_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-        return true;
-    };
-    let Frame::Stream(stream) = frame else { return true; };
-    if header.dcid.value() != BENCH_STREAM_DCID || stream.id != BENCH_STREAM_ID {
-        return true;
-    }
     let end = stream.offset.saturating_add(stream.data.len() as u64);
-    let encoded_len = used + header_len + 4;
+    let encoded_len = used;
     // Some ESP-IDF receive paths retain the 802.11 FCS after the vendor
     // payload. `custom_raw_action_payload` strips it when the CRC is
     // verifiable, but accept the four-byte form as well for chips/drivers
@@ -782,7 +792,13 @@ fn bench_reset(delay_us: u32) {
     BENCH_RX_LENGTH_ERRORS.store(0, Ordering::Relaxed);
 }
 
-fn bench_stream_send(destination: [u8; 6], total_bytes: usize, delay_us: u32) -> Result<String> {
+fn bench_stream_send(
+    destination: [u8; 6],
+    total_bytes: usize,
+    delay_us: u32,
+    en_sys_seq: bool,
+    tx_if: Option<sys::wifi_interface_t>,
+) -> Result<String> {
     if total_bytes == 0 || total_bytes > 16 * 1024 * 1024 {
         bail!("bench bytes must be in 1..=16777216");
     }
@@ -796,33 +812,32 @@ fn bench_stream_send(destination: [u8; 6], total_bytes: usize, delay_us: u32) ->
         let data_len = (total_bytes - offset).min(BENCH_STREAM_DATA_MAX);
         let encoded_ptr = core::ptr::addr_of_mut!(BENCH_TX_ENCODED);
         let data_ptr = core::ptr::addr_of_mut!(BENCH_TX_DATA);
-        unsafe {
-            core::slice::from_raw_parts_mut(encoded_ptr.cast::<u8>(), RAW_ACTION_MAX_PAYLOAD)
-                [..4]
-                .copy_from_slice(&BENCH_STREAM_MAGIC);
-        let header = ShortHeader {
-            flags: FLAG_FIXED,
-            dcid: ConnectionId::new(BENCH_STREAM_DCID).unwrap(),
-            packet_number: seq as u32,
-            packet_number_len: 2,
+        let (encoded, data) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(encoded_ptr.cast::<u8>(), RAW_ACTION_MAX_PAYLOAD),
+                core::slice::from_raw_parts_mut(data_ptr.cast::<u8>(), BENCH_STREAM_DATA_MAX),
+            )
         };
-        let encoded = core::slice::from_raw_parts_mut(encoded_ptr.cast::<u8>(), RAW_ACTION_MAX_PAYLOAD);
-        let data = core::slice::from_raw_parts_mut(data_ptr.cast::<u8>(), BENCH_STREAM_DATA_MAX);
-        let p = 4 + header.encode(&mut encoded[4..]).unwrap();
         for index in 0..data_len {
             data[index] = ((offset + index) & 0xff) as u8;
         }
-        let stream = Frame::Stream(StreamFrame {
-            id: BENCH_STREAM_ID,
-            offset: offset as u64,
-            fin: seq + 1 == frame_count,
-            data: &data[..data_len],
-        });
-        let n = p + stream.encode(&mut encoded[p..]).unwrap();
+        let n = encode_bench_stream(
+            seq as u32,
+            offset as u64,
+            seq + 1 == frame_count,
+            &data[..data_len],
+            encoded,
+        )
+        .map_err(|error| anyhow!("benchmark stream encode: {error:?}"))?;
         let mut sent = false;
         let mut last_error = None;
         for _attempt in 0..20 {
-            match send_raw_action_payload_to(destination, &encoded[..n]) {
+            match send_raw_action_payload_to_with_options(
+                destination,
+                &encoded[..n],
+                en_sys_seq,
+                tx_if,
+            ) {
                 Ok(()) => {
                     sent = true;
                     break;
@@ -836,8 +851,6 @@ fn bench_stream_send(destination: [u8; 6], total_bytes: usize, delay_us: u32) ->
         if !sent {
             return Err(last_error.unwrap_or_else(|| anyhow!("benchmark transmit failed")));
         }
-        n
-        };
         // esp_wifi_80211_tx is asynchronous and its bounded TX queue can
         // return ESP_ERR_INVALID_ARG/STATE when a long burst is submitted
         // without yielding. One RTOS tick keeps NAN ownership intact while
@@ -1009,6 +1022,46 @@ fn udp_status_server_status() -> String {
 /// Start a non-blocking, read-only UDP HELLO probe. The socket is polled from
 /// Main's normal loop; this command never waits for the network or performs
 /// any flash/object operation.
+fn encode_udp_hello(model: u8, target: u8, dry_run: bool, out: &mut [u8]) -> Result<usize> {
+    let mut hello = [0u8; UDP_HELLO_LEN];
+    hello[0] = model;
+    hello[71] = target;
+    hello[89] = 0x07 | if dry_run { 0x08 } else { 0 };
+    let mut drs = [0u8; 8 + UDP_HELLO_LEN];
+    drs[..4].copy_from_slice(&DRS2_MAGIC.to_be_bytes());
+    drs[4..6].copy_from_slice(&DRS2_FRAME_HELLO.to_be_bytes());
+    drs[6..8].copy_from_slice(&(UDP_HELLO_LEN as u16).to_be_bytes());
+    drs[8..].copy_from_slice(&hello);
+    let header = ShortHeader {
+        flags: FLAG_FIXED,
+        dcid: ConnectionId::new(1).unwrap(),
+        packet_number: 0,
+        packet_number_len: 2,
+    };
+    let header_len = header.encode(out).map_err(|error| anyhow!("HELLO header: {error:?}"))?;
+    let frame_len = Frame::Stream(StreamFrame { id: UDP_HELLO_STREAM, offset: 0, fin: true, data: &drs })
+        .encode(&mut out[header_len..])
+        .map_err(|error| anyhow!("HELLO frame: {error:?}"))?;
+    Ok(header_len + frame_len)
+}
+
+struct UdpManifestProbe<'a> { dcid: ConnectionId, payload: &'a [u8] }
+
+fn decode_udp_manifest(input: &[u8]) -> Result<UdpManifestProbe<'_>> {
+    let (header, header_len) = ShortHeader::decode(input).map_err(|error| anyhow!("header: {error:?}"))?;
+    let (frame, _) = decode_frame(&input[header_len..]).map_err(|error| anyhow!("frame: {error:?}"))?;
+    let Frame::Stream(stream) = frame else { bail!("manifest response was not a stream") };
+    if stream.id != UDP_MANIFEST_STREAM || stream.offset != 0 || stream.data.len() < 8 {
+        bail!("invalid manifest stream");
+    }
+    if u32::from_be_bytes(stream.data[..4].try_into()?) != DRS2_MAGIC
+        || u16::from_be_bytes(stream.data[4..6].try_into()?) != DRS2_FRAME_MANIFEST
+    { bail!("invalid manifest frame"); }
+    let length = u16::from_be_bytes(stream.data[6..8].try_into()?) as usize;
+    if stream.data.len() > 8 + length { bail!("manifest response overran declared length"); }
+    Ok(UdpManifestProbe { dcid: header.dcid, payload: &stream.data[8..] })
+}
+
 fn start_udp_hello_probe(server: &str, port: u16, timeout_ms: u32, target: u8) -> Result<String> {
     let address = server
         .parse::<Ipv4Addr>()
@@ -1096,14 +1149,6 @@ pub fn poll_udp_hello() {
     }
 }
 
-fn encode_udp_ack(header: ShortHeader, out: &mut [u8; 128]) -> Result<usize> {
-    let mut p = header.encode(out).map_err(|error| anyhow!("UDP ACK header: {error:?}"))?;
-    p += Frame::Ack { largest: header.packet_number, delay: 0 }
-        .encode(&mut out[p..])
-        .map_err(|error| anyhow!("UDP ACK frame: {error:?}"))?;
-    Ok(p)
-}
-
 fn encode_udp_manifest_ok(header: ShortHeader, out: &mut [u8; 256]) -> Result<usize> {
     let mut body = [0u8; 8];
     body[..4].copy_from_slice(&DRS2_MAGIC.to_be_bytes());
@@ -1115,7 +1160,8 @@ fn encode_udp_manifest_ok(header: ShortHeader, out: &mut [u8; 256]) -> Result<us
     Ok(p)
 }
 
-fn parse_dry_run_manifest(bytes: &[u8]) -> Result<(u64, Vec<[u8; 4]>)> {
+/*
+fn parse_dry_run_manifest(bytes: &[u8], retain_hashes: bool) -> Result<(u64, Vec<[u8; 4]>)> {
     // DRS2 manifest wire layout is documented in dmesh-object-store. Only the
     // size and block count are needed by a receive-only benchmark.
     if bytes.len() < 149 || u32::from_be_bytes(bytes[0..4].try_into()?) != DRS2_MAGIC
@@ -1127,10 +1173,18 @@ fn parse_dry_run_manifest(bytes: &[u8]) -> Result<(u64, Vec<[u8; 4]>)> {
     let block_count = u32::from_be_bytes(body[12..16].try_into()?);
     let image_size = u32::from_be_bytes(body[16..20].try_into()?) as u64;
     if block_count == 0 || image_size == 0 { bail!("empty DRS2 manifest"); }
-    let hashes_start = 8 + 145;
+    // The manifest body has 149 bytes before the 4-byte block-hash prefixes:
+    // fixed header (20), table digest (32), image SHA-256 (32), and the
+    // 65-byte signing slot.  Include the eight-byte DRS2 frame header here.
+    // Starting at 145 would read the final four bytes of the signature slot
+    // and make every verified transfer fail at block zero.
+    let hashes_start = 8 + 149;
     let hashes_len = (block_count as usize).checked_mul(4).ok_or_else(|| anyhow!("block hash table overflow"))?;
     if bytes.len() < hashes_start + hashes_len {
         bail!("truncated DRS2 block hash table");
+    }
+    if !retain_hashes {
+        return Ok((image_size, Vec::new()));
     }
     let mut hashes = Vec::with_capacity(block_count as usize);
     for chunk in bytes[hashes_start..hashes_start + hashes_len].chunks_exact(4) {
@@ -1138,8 +1192,18 @@ fn parse_dry_run_manifest(bytes: &[u8]) -> Result<(u64, Vec<[u8; 4]>)> {
     }
     Ok((image_size, hashes))
 }
+*/
 
-fn start_udp_dry_run(server: &str, port: u16, timeout_ms: u32, target: u8, verify_sha: bool) -> Result<String> {
+fn start_udp_dry_run(
+    server: &str,
+    port: u16,
+    timeout_ms: u32,
+    target: u8,
+    verify_sha: bool,
+    rx_window_packets: usize,
+    write_flash: bool,
+    settings: &crate::components::settings::SharedSettings,
+) -> Result<String> {
     if !ip_sta_ready() {
         bail!("UDP dry-run requires STA to be ready (wait for wifi.sta state=ready and ip_up=true)");
     }
@@ -1148,61 +1212,145 @@ fn start_udp_dry_run(server: &str, port: u16, timeout_ms: u32, target: u8, verif
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_nonblocking(true)?;
     let mut hello = [0u8; 256];
-    let hello_len = encode_udp_hello(1, target, true, &mut hello)
+    if write_flash && target == 7 {
+        crate::components::module::prepare_udp_flash(settings)?;
+    }
+    let hello_len = encode_udp_hello(1, target, !write_flash, &mut hello)
         .map_err(|error| anyhow!("UDP HELLO encode failed: {error:?}"))?;
     let peer = SocketAddrV4::new(address, port);
     let mut state = udp_dry_run_state().lock().map_err(|_| anyhow!("UDP dry-run state lock poisoned"))?;
     if state.is_some() { bail!("UDP dry-run already active"); }
+    let rx_window_packets = rx_window_packets.clamp(1, UDP_RX_WINDOW_MAX);
     *state = Some(UdpDryRun {
         socket, peer: SocketAddr::V4(peer), hello: Box::new(hello), hello_len, hello_sent: false,
+        hello_sent_ms: 0, hello_retransmits: 0,
         server: server.to_owned(), port, target, started_ms: now_ms(), timeout_ms,
-        packet: Box::new([0u8; 2048]), stream: Vec::with_capacity(8192), stream_received: 0,
-        image_bytes: 0, packets: 0, image_size: 0, block_count: 0, phase: 1,
-        verify_sha, block_hashes: Vec::new(), sha_blocks: 0, duplicate_packets: 0, acks_sent: 0,
+        packet: Box::new([0u8; UDP_PACKET_MAX]),
+        phase: 1, acks_sent: 0, rx_window_packets, write_flash,
+        receiver: crate::components::object_transfer::ObjectReceiver::new_with_sink(
+            verify_sha,
+            UDP_PACKET_MAX as u64,
+            if write_flash && target == 6 {
+                crate::components::object_transfer::TransferSink::Main(
+                    crate::components::object_transfer::MainFlashSink::new(),
+                )
+            } else if write_flash {
+                crate::components::object_transfer::TransferSink::Module(
+                    crate::components::object_transfer::ModuleFlashSink::new(),
+                )
+            } else {
+                crate::components::object_transfer::TransferSink::Null(
+                    crate::components::object_transfer::NullSink,
+                )
+            },
+        ),
     });
-    Ok(format!("wifi udp_dry_run started=true server={} port={} target={} verify_sha={} hello_bytes={} timeout_ms={}", server, port, target, verify_sha, hello_len, timeout_ms))
+    Ok(format!("wifi udp_transfer started=true write_flash={} server={} port={} target={} verify_sha={} rx_window_packets={} hello_bytes={} timeout_ms={}", write_flash, server, port, target, verify_sha, rx_window_packets, hello_len, timeout_ms))
 }
 
 fn udp_dry_send(run: &UdpDryRun, packet: &[u8]) -> Result<()> {
-    run.socket.send_to(packet, run.peer)?;
+    // lwIP can briefly run out of pbufs while the receive task is draining a
+    // sustained stream.  Treat that as transient, but keep the retry bounded
+    // so a genuinely broken socket still terminates the dry run.
+    for attempt in 0..8 {
+        match run.socket.send_to(packet, run.peer) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if attempt < 7
+                    && (error.kind() == ErrorKind::WouldBlock
+                        || error.kind() == ErrorKind::Interrupted
+                        || error.raw_os_error() == Some(12)) =>
+            {
+                task_delay(Duration::from_millis(1));
+            }
+            Err(error) => return Err(anyhow!("udp_send: {error}")),
+        }
+    }
+    bail!("udp_send: retry limit exceeded")
+}
+
+/*
+fn udp_dry_ack(run: &mut UdpDryRun, header: ShortHeader, stream_id: u64) -> Result<()> {
+    let mut ack = [0u8; 256];
+    let largest = run.endpoint.largest_received().ok_or_else(|| anyhow!("ACK range is empty"))?;
+    let mut p = header.encode(&mut ack).map_err(|error| anyhow!("UDP ACK header: {error:?}"))?;
+    p += Frame::AckRanges { largest, delay: 0, ranges: run.endpoint.received_packets }
+        .encode(&mut ack[p..]).map_err(|error| anyhow!("UDP ACK frame: {error:?}"))?;
+    p += Frame::MaxData(run.endpoint.receive.connection.max_data)
+        .encode(&mut ack[p..]).map_err(|error| anyhow!("UDP MAX_DATA frame: {error:?}"))?;
+    if let Some(max_data) = run.endpoint.receive.stream_max_data(stream_id) {
+        p += Frame::MaxStreamData { id: stream_id, max: max_data }
+            .encode(&mut ack[p..]).map_err(|error| anyhow!("UDP MAX_STREAM_DATA frame: {error:?}"))?;
+    }
+    let ack_len = p;
+    udp_dry_send(run, &ack[..ack_len])?;
+    run.acks_sent = run.acks_sent.saturating_add(1);
     Ok(())
 }
+*/
 
 fn udp_dry_run_result(run: &UdpDryRun, ok: bool, error: &str) -> String {
+    let stats = run.receiver.stats();
     let elapsed = now_ms().saturating_sub(run.started_ms).max(1);
-    let bps = run.image_bytes.saturating_mul(8_000) / elapsed;
-    format!("wifi udp_dry_run ok={} server={} port={} target={} verify_sha={} image_bytes={} image_size={} packets={} blocks={} sha_blocks={} duplicate_packets={} acks_sent={} elapsed_ms={} bitrate_kbps={} error={}", ok, run.server, run.port, run.target, run.verify_sha, run.image_bytes, run.image_size, run.packets, run.block_count, run.sha_blocks, run.duplicate_packets, run.acks_sent, elapsed, bps / 1000, error)
+    let bps = stats.image_bytes.saturating_mul(8_000) / elapsed;
+    format!("wifi udp_transfer ok={} write_flash={} server={} port={} target={} verify_sha={} image_bytes={} image_size={} packets={} blocks={} sha_blocks={} duplicate_packets={} acks_sent={} hello_retransmits={} rx_window_packets={} elapsed_ms={} bitrate_kbps={} error={}", ok, run.write_flash, run.server, run.port, run.target, run.receiver.verify_sha(), stats.image_bytes, stats.image_size, stats.packets, stats.block_count, stats.sha_blocks, stats.duplicate_packets, run.acks_sent, run.hello_retransmits, run.rx_window_packets, elapsed, bps / 1000, error)
 }
 
+/*
 fn consume_udp_dry_run_stream(run: &mut UdpDryRun) -> Result<bool> {
     loop {
-        if run.stream.len() < 8 { return Ok(false); }
+        if run.stream_len < 8 { return Ok(false); }
         let magic = u32::from_be_bytes(run.stream[0..4].try_into()?);
         let kind = u16::from_be_bytes(run.stream[4..6].try_into()?);
         let length = u16::from_be_bytes(run.stream[6..8].try_into()?) as usize;
-        if magic != DRS2_MAGIC || run.stream.len() < 8 + length { return Ok(false); }
-        let frame = run.stream.drain(..8 + length).collect::<Vec<_>>();
+        let frame_len = 8 + length;
+        if magic != DRS2_MAGIC || run.stream_len < frame_len { return Ok(false); }
         match kind {
             DRS2_FRAME_BLOCK => {
-                if frame.len() < 20 { bail!("truncated DRS2 block"); }
-                let block_bytes = u32::from_be_bytes(frame[16..20].try_into()?) as u64;
-                if block_bytes > (frame.len() - 20) as u64 { bail!("invalid DRS2 block length"); }
+                if frame_len < 20 { bail!("truncated DRS2 block"); }
+                let block_bytes = u32::from_be_bytes(run.stream[16..20].try_into()?) as usize;
+                if block_bytes > frame_len - 20 { bail!("invalid DRS2 block length"); }
                 if run.verify_sha {
-                    let index = u32::from_be_bytes(frame[12..16].try_into()?) as usize;
+                    let index = u32::from_be_bytes(run.stream[12..16].try_into()?) as usize;
                     let expected = run.block_hashes.get(index).ok_or_else(|| anyhow!("block hash index out of range index={index}"))?;
-                    let digest = Sha256::digest(&frame[20..20 + block_bytes as usize]);
+                    let digest = Sha256::digest(&run.stream[20..20 + block_bytes]);
                     if digest[..4] != expected[..] {
                         bail!("block SHA prefix mismatch index={index}");
                     }
                     run.sha_blocks = run.sha_blocks.saturating_add(1);
                 }
-                run.image_bytes = run.image_bytes.saturating_add(block_bytes);
+                run.image_bytes = run.image_bytes.saturating_add(block_bytes as u64);
             }
             DRS2_FRAME_DONE => return Ok(true),
             _ => bail!("unexpected DRS2 stream frame kind={kind}"),
         }
+        let remaining = run.stream_len - frame_len;
+        run.stream.copy_within(frame_len..run.stream_len, 0);
+        run.stream_len = remaining;
     }
 }
+
+fn append_udp_stream(run: &mut UdpDryRun, data: &[u8]) -> Result<()> {
+    if data.len() > UDP_STREAM_BUFFER_MAX - run.stream_len {
+        bail!("UDP stream buffer full capacity={} used={} append={}", UDP_STREAM_BUFFER_MAX, run.stream_len, data.len());
+    }
+    let end = run.stream_len + data.len();
+    run.stream[run.stream_len..end].copy_from_slice(data);
+    run.stream_len = end;
+    Ok(())
+}
+
+fn append_udp_scratch(run: &mut UdpDryRun, len: usize) -> Result<()> {
+    if len > UDP_PACKET_MAX { bail!("UDP scratch length too large bytes={len}"); }
+    if len > UDP_STREAM_BUFFER_MAX - run.stream_len {
+        bail!("UDP stream buffer full capacity={} used={} append={}", UDP_STREAM_BUFFER_MAX, run.stream_len, len);
+    }
+    let end = run.stream_len + len;
+    run.stream[run.stream_len..end].copy_from_slice(&run.scratch[..len]);
+    run.stream_len = end;
+    Ok(())
+}
+*/
 
 pub fn poll_udp_dry_run() {
     let mut run = match udp_dry_run_state().lock() { Ok(mut state) => state.take(), Err(_) => return };
@@ -1210,66 +1358,44 @@ pub fn poll_udp_dry_run() {
     let result: Result<Option<String>> = (|| {
         if !run_value.hello_sent {
             match run_value.socket.send_to(&run_value.hello[..run_value.hello_len], run_value.peer) {
-                Ok(_) => run_value.hello_sent = true,
+                Ok(_) => {
+                    run_value.hello_sent = true;
+                    run_value.hello_sent_ms = now_ms();
+                },
                 Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => return Ok(None),
                 Err(error) => return Ok(Some(udp_dry_run_result(&run_value, false, &format!("hello_send:{error}")))),
             }
         }
         match run_value.socket.recv_from(&mut run_value.packet[..]) {
         Ok((received, peer)) if peer == run_value.peer => {
-            run_value.packets = run_value.packets.saturating_add(1);
-            let parsed = ShortHeader::decode(&run_value.packet[..received]);
-            match parsed {
-                Ok((header, header_len)) => match decode_frame(&run_value.packet[header_len..]) {
-                    Ok((Frame::Stream(stream), _)) if stream.id == UDP_MANIFEST_STREAM || stream.id == UDP_BLOCK_STREAM => {
-                        if stream.offset > run_value.stream_received {
-                            Err(anyhow!("UDP stream gap expected={} received={}", run_value.stream_received, stream.offset))
-                        } else if stream.offset < run_value.stream_received {
-                            // The server retransmits the initial HELLO response
-                            // once. More generally, an older packet may arrive
-                            // after its ACK; acknowledge it again but never
-                            // append duplicate stream bytes.
-                            let mut ack = [0u8; 128];
-                            let ack_len = encode_udp_ack(header, &mut ack)?;
-                            udp_dry_send(&run_value, &ack[..ack_len])?;
-                            run_value.duplicate_packets = run_value.duplicate_packets.saturating_add(1);
-                            run_value.acks_sent = run_value.acks_sent.saturating_add(1);
-                            Ok(None)
-                        } else {
-                            run_value.stream.extend_from_slice(stream.data);
-                            run_value.stream_received += stream.data.len() as u64;
-                            let mut ack = [0u8; 128];
-                            let ack_len = encode_udp_ack(header, &mut ack)?;
-                            udp_dry_send(&run_value, &ack[..ack_len])?;
-                            run_value.acks_sent = run_value.acks_sent.saturating_add(1);
-                            if run_value.phase == 1 && stream.id == UDP_MANIFEST_STREAM && stream.fin {
-                                let (size, hashes) = parse_dry_run_manifest(&run_value.stream)?;
-                                run_value.image_size = size;
-                                run_value.block_count = hashes.len() as u32;
-                                run_value.block_hashes = hashes;
-                                run_value.stream.clear();
-                                run_value.stream_received = 0;
-                                let mut ok = [0u8; 256];
-                                let ok_len = encode_udp_manifest_ok(header, &mut ok)?;
-                                udp_dry_send(&run_value, &ok[..ok_len])?;
-                                run_value.phase = 2;
-                                Ok(None)
-                            } else if run_value.phase == 2 && stream.id == UDP_BLOCK_STREAM && consume_udp_dry_run_stream(&mut run_value)? {
-                                if run_value.image_bytes != run_value.image_size {
-                                    bail!("image byte count mismatch received={} expected={}", run_value.image_bytes, run_value.image_size);
-                                }
-                                Ok(Some(udp_dry_run_result(&run_value, true, "")))
-                            } else { Ok(None) }
-                        }
-                    }
-                    Ok(_) => bail!("unexpected UDP frame"),
-                    Err(error) => bail!("UDP frame decode: {error:?}"),
-                },
-                Err(error) => bail!("UDP header decode: {error:?}"),
+            let event = run_value.receiver.receive(&run_value.packet[..received])?;
+            let mut ack = [0u8; 256];
+            let ack_len = run_value.receiver.encode_ack(&mut ack, event)?;
+            udp_dry_send(&run_value, &ack[..ack_len])?;
+            run_value.acks_sent = run_value.acks_sent.saturating_add(1);
+            if event.manifest_complete {
+                let mut ok = [0u8; 256];
+                let ok_len = encode_udp_manifest_ok(event.header, &mut ok)?;
+                udp_dry_send(&run_value, &ok[..ok_len])?;
+                run_value.phase = 2;
             }
+            if event.complete {
+                return Ok(Some(udp_dry_run_result(&run_value, true, "")));
+            }
+            Ok(None)
         }
         Ok((_received, peer)) => Err(anyhow!("UDP packet from unexpected peer={peer}")),
         Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            if run_value.phase == 1
+                && run_value.receiver.stats().packets == 0
+                && run_value.hello_retransmits < 3
+                && now_ms().saturating_sub(run_value.hello_sent_ms) >= 100
+            {
+                if run_value.socket.send_to(&run_value.hello[..run_value.hello_len], run_value.peer).is_ok() {
+                    run_value.hello_retransmits = run_value.hello_retransmits.saturating_add(1);
+                    run_value.hello_sent_ms = now_ms();
+                }
+            }
             if now_ms().saturating_sub(run_value.started_ms) >= u64::from(run_value.timeout_ms) {
                 Ok(Some(udp_dry_run_result(&run_value, false, "timeout")))
             } else { Ok(None) }
@@ -1294,11 +1420,13 @@ pub fn poll_udp_dry_run() {
 fn udp_dry_run_status() -> String {
     if let Ok(state) = udp_dry_run_state().lock() {
         if let Some(run) = state.as_ref() {
+            let stats = run.receiver.stats();
             return format!(
-                "wifi udp_dry_run active=true server={} port={} phase={} packets={} stream_received={} image_bytes={} image_size={} blocks={} sha_blocks={} duplicate_packets={} acks_sent={} verify_sha={}",
-                run.server, run.port, run.phase, run.packets, run.stream_received,
-                run.image_bytes, run.image_size, run.block_count, run.sha_blocks,
-                run.duplicate_packets, run.acks_sent, run.verify_sha
+                "wifi udp_transfer active=true write_flash={} server={} port={} phase={} packets={} stream_received={} image_bytes={} image_size={} blocks={} sha_blocks={} duplicate_packets={} acks_sent={} hello_retransmits={} verify_sha={} rx_window_packets={} pending_segments={}",
+                run.write_flash, run.server, run.port, run.phase, stats.packets, stats.stream_received,
+                stats.image_bytes, stats.image_size, stats.block_count, stats.sha_blocks,
+                stats.duplicate_packets, run.acks_sent, run.hello_retransmits, run.receiver.verify_sha(),
+                run.rx_window_packets, stats.pending_segments
             );
         }
     }
@@ -1436,10 +1564,9 @@ fn start_raw_after_wifi(channel: u8, filter: &str) -> Result<()> {
         let mut promisc_filter = sys::wifi_promiscuous_filter_t {
             filter_mask: promiscuous_filter_mask(filter_mode),
         };
-        let _ = sys::esp_wifi_set_channel(
-            channel.clamp(1, 13),
-            sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-        );
+        // Never retune an established STA/APSTA link here. The single ESP
+        // radio must stay on the AP/NAN channel (channel 6 in the lab); an
+        // unassociated APSTA profile is retuned by prepare_nan_channel below.
         esp_ok(sys::esp_wifi_set_promiscuous(false))?;
         esp_ok(sys::esp_wifi_set_promiscuous_rx_cb(Some(raw_wifi_cb)))?;
         esp_ok(sys::esp_wifi_set_promiscuous_filter(&mut promisc_filter))?;
@@ -1450,7 +1577,13 @@ fn start_raw_after_wifi(channel: u8, filter: &str) -> Result<()> {
         esp_ok(sys::esp_wifi_set_promiscuous_ctrl_filter(&ctrl_filter))?;
         esp_ok(sys::esp_wifi_set_promiscuous(true))?;
     }
+    prepare_nan_channel(channel.clamp(1, 13))?;
     RAW_MONITOR_RUNNING.store(true, Ordering::Relaxed);
+    // A direct wifi mode transition bypasses NanCommand; let the NAN adapter
+    // install its callback and prime the shared infrastructure SDF publisher.
+    if super::mode::infra_mode() {
+        super::nan::prime_infra_publish_for_wifi(channel)?;
+    }
     Ok(())
 }
 
@@ -1513,12 +1646,18 @@ impl Default for WifiMode {
     }
 }
 
-#[derive(Default)]
 struct WifiCommand {
     mode: WifiMode,
     ssid: Option<String>,
     psk: Option<String>,
     timeout_ms: u32,
+    settings: SharedSettings,
+}
+
+impl WifiCommand {
+    fn new(settings: SharedSettings) -> Self {
+        Self { mode: WifiMode::default(), ssid: None, psk: None, timeout_ms: 0, settings }
+    }
 }
 
 impl CommandHandler for WifiCommand {
@@ -1552,9 +1691,11 @@ impl CommandHandler for WifiCommand {
         }
         if request.arg("object_action_stats").is_some() {
             return Ok(CommandResponse::ok(format!(
-                "wifi object_action attempts={} accepted={}",
+                "wifi object_action attempts={} accepted={} last_len={} last_prefix={:08x}",
                 RAW_OBJECT_ACTION_ATTEMPTS.load(Ordering::Relaxed),
                 RAW_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
+                RAW_OBJECT_ACTION_LAST_LEN.load(Ordering::Relaxed),
+                RAW_OBJECT_ACTION_LAST_PREFIX.load(Ordering::Relaxed),
             )));
         }
         if request.arg("bench_stats").is_some() {
@@ -1615,12 +1756,26 @@ impl CommandHandler for WifiCommand {
             let port = request.arg_i32("port")?.unwrap_or(3337).clamp(1, u16::MAX as i32) as u16;
             let timeout_ms = request.arg_i32("timeout_ms")?.or(request.arg_i32("timeout")?).unwrap_or(60_000).clamp(1, 300_000) as u32;
             let verify_sha = request.arg("verify_sha").map(parse_bool).transpose()?.unwrap_or(false);
+            let rx_window_packets = self
+                .settings
+                .borrow()
+                .get_i32("udp.win", 1)?
+                .clamp(1, UDP_RX_WINDOW_MAX as i32) as usize;
             let target = match request.arg("target").unwrap_or("main") {
                 "main" => 6,
                 "module" => 7,
                 value => value.parse::<u8>().map_err(|error| anyhow!("invalid UDP target={value}: {error}"))?,
             };
-            return Ok(CommandResponse::ok(start_udp_dry_run(server, port, timeout_ms, target, verify_sha)?));
+            let write_flash = request.arg("write_flash").map(parse_bool).transpose()?.unwrap_or(false);
+            return Ok(CommandResponse::ok(start_udp_dry_run(server, port, timeout_ms, target, verify_sha, rx_window_packets, write_flash, &self.settings)?));
+        }
+        if request.arg("udp_flash").map(parse_bool).transpose()?.unwrap_or(false) {
+            let server = request.arg("server").unwrap_or("10.78.0.1");
+            let port = request.arg_i32("port")?.unwrap_or(3337).clamp(1, u16::MAX as i32) as u16;
+            let timeout_ms = request.arg_i32("timeout_ms")?.or(request.arg_i32("timeout")?).unwrap_or(300_000).clamp(1, 600_000) as u32;
+            let verify_sha = request.arg("verify_sha").map(parse_bool).transpose()?.unwrap_or(true);
+            let rx_window_packets = self.settings.borrow().get_i32("udp.win", 1)?.clamp(1, UDP_RX_WINDOW_MAX as i32) as usize;
+            return Ok(CommandResponse::ok(start_udp_dry_run(server, port, timeout_ms, 7, verify_sha, rx_window_packets, true, &self.settings)?));
         }
         if request
             .arg("udp_hello")
@@ -1673,10 +1828,18 @@ impl CommandHandler for WifiCommand {
                 .map(parse_mac)
                 .transpose()?
                 .ok_or_else(|| anyhow!("bench_stream_send requires dst=<mac>"))?;
+            let en_sys_seq = request
+                .arg("sys_seq")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(true);
+            let tx_if = parse_raw_tx_interface(request.arg("tx_if").or_else(|| request.arg("wifi_if")))?;
             return Ok(CommandResponse::ok(bench_stream_send(
                 destination,
                 total_bytes,
                 delay_us,
+                en_sys_seq,
+                tx_if,
             )?));
         }
         if request.arg("netif_stats").is_some() {
@@ -1777,7 +1940,9 @@ impl CommandHandler for WifiCommand {
                 }
                 (None, _) => dmesh_data_frame(destination, source, payload.as_bytes())?,
             };
-            raw_tx_frame(&frame, true)?;
+            let en_sys_seq = request.arg("sys_seq").map(parse_bool).transpose()?.unwrap_or(true);
+            let tx_if = parse_raw_tx_interface(request.arg("tx_if").or_else(|| request.arg("wifi_if")))?;
+            raw_tx_frame_on(&frame, en_sys_seq, tx_if)?;
             RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
             telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_data=true");
             return Ok(CommandResponse::ok(format!(
@@ -1804,8 +1969,10 @@ impl CommandHandler for WifiCommand {
                 .unwrap_or(RAW_BROADCAST);
             prepare_raw_tx(channel)?;
             let payload = parse_bytes(payload)?;
-            let frame = custom_raw_action_frame(destination, &payload)?;
-            raw_tx_frame(&frame, true)?;
+            let en_sys_seq = request.arg("sys_seq").map(parse_bool).transpose()?.unwrap_or(true);
+            let tx_if = parse_raw_tx_interface(request.arg("tx_if").or_else(|| request.arg("wifi_if")))?;
+            let frame = custom_raw_action_frame_with_bssid_for(destination, destination, &payload, tx_if)?;
+            raw_tx_frame_on(&frame, en_sys_seq, tx_if)?;
             RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
             telemetry::record_packet(
                 "wifi",
@@ -1838,8 +2005,10 @@ impl CommandHandler for WifiCommand {
                 .transpose()?
                 .unwrap_or(RAW_BROADCAST);
             prepare_raw_tx(channel)?;
-            let frame = custom_raw_action_frame(destination, payload.as_bytes())?;
-            raw_tx_frame(&frame, true)?;
+            let en_sys_seq = request.arg("sys_seq").map(parse_bool).transpose()?.unwrap_or(true);
+            let tx_if = parse_raw_tx_interface(request.arg("tx_if").or_else(|| request.arg("wifi_if")))?;
+            let frame = custom_raw_action_frame_with_bssid_for(destination, destination, payload.as_bytes(), tx_if)?;
+            raw_tx_frame_on(&frame, en_sys_seq, tx_if)?;
             RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
             telemetry::record_packet("wifi", Direction::Tx, payload.as_bytes(), "raw_action=true");
             return Ok(CommandResponse::ok(format!(
@@ -2334,7 +2503,32 @@ pub fn stop_flash_sta() {
 }
 
 pub fn ip_sta_ready() -> bool {
-    IP_STA_READY.load(Ordering::Acquire)
+    if IP_STA_READY.load(Ordering::Acquire) {
+        return true;
+    }
+
+    // The association and static address can become valid through the IDF
+    // event path before the STA worker gets its final scheduling turn.  Do a
+    // non-blocking read of the same invariants used by the worker and latch
+    // readiness so a UDP/TCP transfer is not rejected after the network is
+    // already demonstrably usable.
+    let Some(value) = IP_STA_NETIF.get().copied() else {
+        return false;
+    };
+    let netif = value as *mut sys::esp_netif_t;
+    let associated = unsafe {
+        let mut ap = sys::wifi_ap_record_t::default();
+        sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK
+    };
+    let mut info = sys::esp_netif_ip_info_t::default();
+    let ready = associated
+        && unsafe { sys::esp_netif_get_ip_info(netif, &mut info) == sys::ESP_OK }
+        && info.ip.addr != 0
+        && unsafe { sys::esp_netif_is_netif_up(netif) };
+    if ready {
+        IP_STA_READY.store(true, Ordering::Release);
+    }
+    ready
 }
 
 fn command_channel(request: &CommandRequest, default: u8) -> Result<u8> {
@@ -2372,10 +2566,44 @@ pub fn ensure_raw_wifi_started(channel: u8) -> Result<()> {
             esp_ok_allow_invalid_state(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
         }
         esp_ok_allow_invalid_state(sys::esp_wifi_start())?;
-        esp_ok(sys::esp_wifi_set_channel(
-            channel.max(1),
-            sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-        ))?;
+        // Channel selection is applied by start_raw_after_wifi after the
+        // historical APSTA profile has been created.
+        let _ = channel;
+    }
+    Ok(())
+}
+
+/// Prepare the raw NAN callback without disrupting an existing STA/AP link.
+/// NAN shares the radio with the infrastructure profile; retuning a connected
+/// STA here silently drops its association on several ESP-IDF targets.
+pub fn prepare_nan_channel(channel: u8) -> Result<()> {
+    unsafe {
+        let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
+        let _ = sys::esp_wifi_get_mode(&mut mode);
+        let associated = {
+            let mut ap = sys::wifi_ap_record_t::default();
+            sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK
+        };
+        // Channel 6 is the 2.4 GHz social channel used by the NAN lab and is
+        // the only channel assumed by the Linux/ESP cluster. These radios do
+        // not switch quickly enough for useful per-frame channel hopping, and
+        // hopping would defeat sleepy-device timing and waste power. A
+        // SoftAP-only profile already owns its configured channel. An
+        // unassociated APSTA profile can have been retuned by the STA scan,
+        // so restore the requested channel before NAN injection; an
+        // associated STA must remain on its AP channel.
+        let unassociated_apsta = mode == sys::wifi_mode_t_WIFI_MODE_APSTA && !associated;
+        if unassociated_apsta || (!associated && mode != sys::wifi_mode_t_WIFI_MODE_AP) {
+            let mut current = 0_u8;
+            let mut second = sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE;
+            let current_ok = sys::esp_wifi_get_channel(&mut current, &mut second) == sys::ESP_OK;
+            if !current_ok || current != channel.clamp(1, 13) {
+                esp_ok_allow_invalid_state(sys::esp_wifi_set_channel(
+                    channel.clamp(1, 13),
+                    sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+                ))?;
+            }
+        }
     }
     Ok(())
 }
@@ -2708,6 +2936,20 @@ fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
         esp_ok(sys::esp_wifi_connect())?;
         disable_mesh_ip_services();
     }
+    // Let the association complete before arming promiscuous/raw reception.
+    // Starting the monitor immediately after esp_wifi_connect() can win the
+    // channel-control race and leave the STA unassociated on ESP-IDF.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let associated = unsafe {
+            let mut ap = sys::wifi_ap_record_t::default();
+            sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK
+        };
+        if associated || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
     Ok(())
@@ -2987,7 +3229,8 @@ fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
         .map(parse_bool)
         .transpose()?
         .unwrap_or(true);
-    raw_tx_frame(bytes, en_sys_seq)?;
+    let tx_if = parse_raw_tx_interface(request.arg("tx_if").or_else(|| request.arg("wifi_if")))?;
+    raw_tx_frame_on(bytes, en_sys_seq, tx_if)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
         "wifi",
@@ -3003,7 +3246,15 @@ fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
 }
 
 fn raw_tx_frame(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
-    let iface = raw_tx_interface();
+    raw_tx_frame_on(bytes, en_sys_seq, None)
+}
+
+fn raw_tx_frame_on(
+    bytes: &[u8],
+    en_sys_seq: bool,
+    requested: Option<sys::wifi_interface_t>,
+) -> Result<()> {
+    let iface = requested.unwrap_or_else(raw_tx_interface);
     unsafe {
         esp_ok(sys::esp_wifi_80211_tx(
             iface,
@@ -3021,11 +3272,32 @@ fn raw_tx_frame(bytes: &[u8], en_sys_seq: bool) -> Result<()> {
 /// with `ESP_ERR_WIFI_IF`.
 pub(crate) fn raw_tx_interface() -> sys::wifi_interface_t {
     let mut mode = sys::wifi_mode_t_WIFI_MODE_NULL;
-    let ret = unsafe { sys::esp_wifi_get_mode(&mut mode) };
-    if ret == sys::ESP_OK && mode == sys::wifi_mode_t_WIFI_MODE_AP {
+    let _ = unsafe { sys::esp_wifi_get_mode(&mut mode) };
+    select_raw_tx_interface(mode)
+}
+
+fn select_raw_tx_interface(mode: sys::wifi_mode_t) -> sys::wifi_interface_t {
+    if mode == sys::wifi_mode_t_WIFI_MODE_AP
+        || mode == sys::wifi_mode_t_WIFI_MODE_APSTA
+    {
         sys::wifi_interface_t_WIFI_IF_AP
     } else {
         sys::wifi_interface_t_WIFI_IF_STA
+    }
+}
+
+/// APSTA's SoftAP injection path uses the driver's sequence allocator. This
+/// is the default for autonomous NAN publications in the APSTA lab profile.
+pub(crate) fn raw_tx_sys_seq() -> bool {
+    true
+}
+
+fn parse_raw_tx_interface(value: Option<&str>) -> Result<Option<sys::wifi_interface_t>> {
+    let Some(value) = value else { return Ok(None); };
+    match value {
+        "sta" | "STA" => Ok(Some(sys::wifi_interface_t_WIFI_IF_STA)),
+        "ap" | "AP" | "softap" => Ok(Some(sys::wifi_interface_t_WIFI_IF_AP)),
+        other => bail!("invalid tx_if={other}; expected sta or ap"),
     }
 }
 
@@ -3033,7 +3305,11 @@ pub(crate) fn raw_tx_interface() -> sys::wifi_interface_t {
 /// management/action frames. The 802.11 source address must match the active
 /// interface: a SoftAP raw transmitter cannot advertise a STA source address.
 pub(crate) fn raw_tx_source_mac() -> Result<[u8; 6]> {
-    let mac_type = if raw_tx_interface() == sys::wifi_interface_t_WIFI_IF_AP {
+    raw_tx_source_mac_for(None)
+}
+
+fn raw_tx_source_mac_for(iface: Option<sys::wifi_interface_t>) -> Result<[u8; 6]> {
+    let mac_type = if iface.unwrap_or_else(raw_tx_interface) == sys::wifi_interface_t_WIFI_IF_AP {
         sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP
     } else {
         sys::esp_mac_type_t_ESP_MAC_WIFI_STA
@@ -3051,11 +3327,20 @@ fn start_netif_probe(iface: &str) -> Result<()> {
 
 /// Build the DMesh custom vendor-action frame shared with host lmesh.
 pub fn custom_raw_action_frame(destination: [u8; 6], payload: &[u8]) -> Result<Vec<u8>> {
-    custom_raw_action_frame_with_bssid(destination, destination, payload)
+    custom_raw_action_frame_with_bssid_for(destination, destination, payload, None)
 }
 
 fn custom_raw_action_frame_with_bssid(
     destination: [u8; 6], bssid: [u8; 6], payload: &[u8]
+) -> Result<Vec<u8>> {
+    custom_raw_action_frame_with_bssid_for(destination, bssid, payload, None)
+}
+
+fn custom_raw_action_frame_with_bssid_for(
+    destination: [u8; 6],
+    bssid: [u8; 6],
+    payload: &[u8],
+    tx_if: Option<sys::wifi_interface_t>,
 ) -> Result<Vec<u8>> {
     if payload.len() > RAW_ACTION_MAX_PAYLOAD {
         bail!(
@@ -3064,7 +3349,7 @@ fn custom_raw_action_frame_with_bssid(
             payload.len()
         );
     }
-    let source = station_mac()?;
+    let source = raw_tx_source_mac_for(tx_if)?;
     let mut frame = Vec::with_capacity(24 + DMESH_DATA_MARKER_LEN + payload.len());
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
@@ -3515,8 +3800,11 @@ fn dmesh_raw_payload(frame: &[u8]) -> Option<&[u8]> {
         return None;
     }
     if frame_type(frame) == 2 {
-        if !frame_matches_dmesh_data_destination(frame) {
+        if !frame_matches_nan_data_destination(frame) {
             return None;
+        }
+        if let Some(payload) = raw_nan_data_payload(&frame[24..]) {
+            return Some(payload);
         }
         let (header, payload) = dmesh_payload_from_body(&frame[24..])?;
         if !mesh_dst4_allowed(header.mesh_dst4) {
@@ -3527,6 +3815,11 @@ fn dmesh_raw_payload(frame: &[u8]) -> Option<&[u8]> {
         return None;
     }
     super::nan::raw_payload(frame)
+}
+
+fn raw_nan_data_payload(body: &[u8]) -> Option<&[u8]> {
+    body.starts_with(&RAWNAN_LLC_DEFAULT)
+        .then_some(&body[IEEE80211_LLC_SNAP_LEN..])
 }
 
 fn dmesh_payload_from_body(body: &[u8]) -> Option<(DmeshDataHeader, &[u8])> {
@@ -3667,6 +3960,16 @@ fn frame_matches_dmesh_data_destination(frame: &[u8]) -> bool {
     device_multicast_mac()
         .map(|mac| destination == mac)
         .unwrap_or(false)
+}
+
+fn frame_matches_nan_data_destination(frame: &[u8]) -> bool {
+    let Some(destination) = frame_address(frame, FRAME_ADDR1) else {
+        return false;
+    };
+    // Experimental raw NAN accepts unicast to this device and any IEEE
+    // multicast destination.  The cluster-BSSID filter remains the primary
+    // admission boundary, so multicast is never enabled globally.
+    destination[0] & 1 != 0 || frame_matches_dmesh_data_destination(frame)
 }
 
 fn raw_destination_name(frame: &[u8]) -> &'static str {

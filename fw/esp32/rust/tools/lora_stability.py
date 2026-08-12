@@ -52,7 +52,7 @@ def main():
     }
     if args.expected:
         params["expected"] = args.expected
-    with MeshClient("lmesh") as client:
+    with MeshClient("lmesh-uart") as client:
         response_data(client.request("esp.stability.start", params))
         deadline = time.monotonic() + args.timeout_sec
         while time.monotonic() < deadline:

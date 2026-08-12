@@ -393,22 +393,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmesh-object-store"
-version = "0.1.0"
-dependencies = [
- "dmesh-transport",
-]
-
-[[package]]
 name = "dmesh-rawnan"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
 
 [[package]]
 name = "dmesh-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dmesh-object-store",
  "dmesh-rawnan",
  "dmesh-transport",
  "embedded-svc",
@@ -419,6 +415,7 @@ dependencies = [
  "log",
  "minicbor",
  "sha2",
+ "uart-codec",
 ]
 
 [[package]]
@@ -1523,6 +1520,10 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "uart-codec"
+version = "0.1.0"
 
 [[package]]
 name = "uncased"

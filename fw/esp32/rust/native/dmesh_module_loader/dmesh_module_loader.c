@@ -1256,6 +1256,49 @@ static int32_t flash_write(void *user, uint32_t address, const uint8_t *data, si
     return error == ESP_OK ? 0 : -(int32_t)error;
 }
 
+uint32_t dmesh_module_loader_partition_size(void)
+{
+    return cached_partition == NULL ? 0 : cached_partition->size;
+}
+
+int dmesh_module_loader_flash_erase(uint32_t address, uint32_t length)
+{
+    if (cached_partition == NULL || address > cached_partition->size ||
+        length > cached_partition->size - address ||
+        (address & 0xfffu) != 0 || (length & 0xfffu) != 0) return -1;
+    return flash_erase(NULL, cached_partition->address + address, length);
+}
+
+int dmesh_module_loader_flash_write(uint32_t address, const uint8_t *data,
+                                    size_t length)
+{
+    if (cached_partition == NULL || data == NULL || address > cached_partition->size ||
+        length > cached_partition->size - address) return -1;
+    return flash_write(NULL, cached_partition->address + address, data, length);
+}
+
+static const esp_partition_t *dmesh_main_partition(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                    ESP_PARTITION_SUBTYPE_ANY, "main");
+}
+
+int dmesh_main_flash_erase(uint32_t length)
+{
+    const esp_partition_t *partition = dmesh_main_partition();
+    if (partition == NULL || length == 0 || length > partition->size) return -1;
+    uint32_t erase = (length + 0xfffu) & ~0xfffu;
+    return esp_partition_erase_range(partition, 0, erase);
+}
+
+int dmesh_main_flash_write(uint32_t offset, const uint8_t *data, size_t length)
+{
+    const esp_partition_t *partition = dmesh_main_partition();
+    if (partition == NULL || data == NULL || offset > partition->size ||
+        length > partition->size - offset) return -1;
+    return esp_partition_write(partition, offset, data, length);
+}
+
 static uint64_t flash_now_ms(void *user)
 {
     (void)user;

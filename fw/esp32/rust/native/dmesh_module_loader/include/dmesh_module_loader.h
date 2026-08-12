@@ -26,6 +26,15 @@ int dmesh_module_lora_command(const uint8_t *args, size_t args_len,
 /* Stop an executing module before the flash transport erases its raw data
  * region. Returns false if the task does not quiesce within timeout_ms. */
 bool dmesh_module_loader_prepare_flash(uint32_t timeout_ms);
+/* Raw module-slot primitives used by the bearer-neutral object receiver.
+ * The caller must quiesce the module first and stay within the reported
+ * partition size. */
+uint32_t dmesh_module_loader_partition_size(void);
+int dmesh_module_loader_flash_erase(uint32_t address, uint32_t length);
+int dmesh_module_loader_flash_write(uint32_t address, const uint8_t *data,
+                                    size_t length);
+int dmesh_main_flash_erase(uint32_t length);
+int dmesh_main_flash_write(uint32_t offset, const uint8_t *data, size_t length);
 bool dmesh_module_loader_task_done(void);
 int dmesh_module_loader_last_result(void);
 uint32_t dmesh_module_loader_runtime_ms(void);

@@ -142,6 +142,9 @@ impl Settings {
                 "power.profile",
                 "uart.active_ms",
                 "uart.hb_every",
+                // UDP object-store receive window in packets.  Keep this
+                // short because ESP-IDF NVS keys are limited to 15 bytes.
+                "udp.win",
             ],
         }
     }

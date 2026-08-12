@@ -61,7 +61,7 @@ class ManagedRadioClient:
             [
                 str(ROOT / "scripts" / "with-env.sh"),
                 "mesh",
-                "lmesh",
+                "lmesh-uart",
                 "esp.serial.command",
                 f"port={self.role}",
                 f"command={command}",

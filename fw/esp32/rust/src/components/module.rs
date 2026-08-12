@@ -120,7 +120,7 @@ extern "C" {
 /// Initialize the optional module exactly once, on an explicit module/LoRa
 /// command. Main must remain bootable even when a module image is stale or
 /// incompatible with the current firmware ABI.
-pub fn ensure_initialized(settings: &crate::components::settings::SharedSettings) {
+pub fn ensure_initialized(_settings: &crate::components::settings::SharedSettings) {
     MODULE_INIT_ONCE.get_or_init(|| {
         unsafe { dmesh_module_loader_init() };
         // Do not let boot-time capability checks call into the loader before
@@ -133,6 +133,20 @@ pub fn ensure_initialized(settings: &crate::components::settings::SharedSettings
         // the module must only own the radio after an explicit `lora`/`module
         // run` command asks it to do so.
     });
+}
+
+/// Quiesce the mapped module before a bearer-neutral object transfer writes
+/// its raw slot.  The transfer itself is owned by the transport adapter; this
+/// helper only handles Main/module cache safety.
+pub fn prepare_udp_flash(settings: &crate::components::settings::SharedSettings) -> Result<()> {
+    ensure_initialized(settings);
+    if !unsafe { dmesh_module_flash_supported() } {
+        return Err(anyhow!("module flash host is unavailable"));
+    }
+    if !unsafe { dmesh_module_loader_prepare_flash(1500) } {
+        return Err(anyhow!("module did not quiesce before UDP flash"));
+    }
+    Ok(())
 }
 
 fn configure_lora(settings: &crate::components::settings::SharedSettings) -> Result<()> {
