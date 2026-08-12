@@ -1582,6 +1582,10 @@ dependencies = [
 [[package]]
 name = "dmesh-rawnan"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
 
 [[package]]
 name = "dmesh-store"
@@ -1599,6 +1603,9 @@ dependencies = [
 [[package]]
 name = "dmesh-transport"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "dmeshtui"
@@ -3323,6 +3330,8 @@ dependencies = [
  "dmesh-rawnan",
  "dmesh-transport",
  "libc",
+ "lmesh-uart",
+ "lmesh-wifi",
  "mesh",
  "minicbor",
  "p256",
@@ -3333,6 +3342,44 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "lmesh-uart"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dmesh-rawnan",
+ "dmesh-transport",
+ "libc",
+ "mesh",
+ "minicbor",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "toml",
+ "tracing",
+ "uart-codec",
+]
+
+[[package]]
+name = "lmesh-wifi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dmesh-rawnan",
+ "dmesh-transport",
+ "libc",
+ "mesh",
+ "minicbor",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "toml",
+ "tracing",
+ "uart-codec",
 ]
 
 [[package]]
@@ -6899,6 +6946,10 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "uart-codec"
+version = "0.1.0"
 
 [[package]]
 name = "ucd-trie"

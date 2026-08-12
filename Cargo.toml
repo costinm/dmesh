@@ -7,6 +7,9 @@ members = [
     "crates/dmeshtui",
     "crates/dmeshui",
     "crates/lmesh",
+    "crates/lmesh-wifi",
+    "crates/uart-codec",
+    "crates/lmesh-uart",
     "crates/rawnan",
     "crates/tun",
 ]
