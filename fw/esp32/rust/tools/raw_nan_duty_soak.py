@@ -94,7 +94,7 @@ RAW_NAN_SETTINGS = (
     "nan.backend=raw nan.boot=true nan.role=both nan.service=dmesh nan.channel={channel} "
     "nan.wake_ms={wake_ms} nan.active_ms={active_ms} nan.light_sleep=true "
     "nan.early_ms={early_ms} nan.dw_tu=512 nan.dw_off_tu=0 nan.dw_stride={dw_stride} "
-    "nan.ap_owner={ap_owner} uart.hb_every={hb_every} lora.enabled=false"
+    "uart.hb_every={hb_every} lora.enabled=false"
 )
 
 
@@ -175,7 +175,6 @@ def configure(client: ManagedRadioClient, args: argparse.Namespace, *, infra: bo
         client,
         RAW_NAN_SETTINGS.format(
             mode=mode,
-            ap_owner="true" if infra else "false",
             hb_every=1 if infra else 16,
             channel=args.channel,
             wake_ms=args.wake_ms,

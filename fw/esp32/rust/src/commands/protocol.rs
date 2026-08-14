@@ -301,7 +301,6 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "nan.dw_tu" => 161,
         "nan.dw_off_tu" => 162,
         "nan.sync_source" => 380,
-        "nan.ap_owner" => 381,
         "nan.ap_loss_ms" => 382,
         "nan.ap_recovery_ms" => 383,
         "nan.ap_recovery_listen_ms" => 384,
@@ -503,6 +502,15 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "udp_status_server" => 269,
         "udp_status_server_status" => 270,
         "verify_sha" => 271,
+        // UDP object-transfer mode: receive/verify only when false, or
+        // commit the received image when true.  This is deliberately a
+        // typed command field so the managed flash helper and the text
+        // command path use the same wire representation.
+        "write_flash" => 273,
+        // Stream-transport session selector. Keep this typed field stable so
+        // remote two-connection diagnostics can select a local CID without
+        // falling back to positional text arguments.
+        "cid" => 274,
         _ => return None,
     })
 }
@@ -782,6 +790,48 @@ mod tests {
     #[test]
     fn role_has_a_stable_cbor_tag() {
         assert_eq!(arg_tag("role"), Some(219));
+    }
+
+    #[test]
+    fn transport_cid_has_a_stable_cbor_tag() {
+        assert_eq!(arg_tag("cid"), Some(274));
+    }
+
+    #[test]
+    fn nan_transport_request_decodes_cid_selector() {
+        let mut bytes = Vec::new();
+        Encoder::new(&mut bytes)
+            .map(2)
+            .unwrap()
+            .u16(0)
+            .unwrap()
+            .str("nan")
+            .unwrap()
+            .u16(6)
+            .unwrap()
+            .map(4)
+            .unwrap()
+            .str("transport")
+            .unwrap()
+            .str("request")
+            .unwrap()
+            .str("peer")
+            .unwrap()
+            .str("840d8e074170")
+            .unwrap()
+            .str("cid")
+            .unwrap()
+            .str("1281")
+            .unwrap()
+            .str("service")
+            .unwrap()
+            .str("metrics")
+            .unwrap();
+        let request = decode_binary(&bytes).unwrap();
+        assert_eq!(request.arg("transport"), Some("request"));
+        assert_eq!(request.arg("peer"), Some("840d8e074170"));
+        assert_eq!(request.arg("cid"), Some("1281"));
+        assert_eq!(request.arg("service"), Some("metrics"));
     }
 
     #[test]

@@ -314,7 +314,11 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
     stop_ap_owner().ok();
     stop_raw_nan_duty();
     super::nan::stop_nan().ok();
-    super::wifi::stop_raw_monitor().ok();
+    // Leave an already-running STA driver attached to its esp-netif. The raw
+    // NAN callback is disabled below, but stopping/restarting the driver here
+    // invalidates the lwIP Wi-Fi glue on this IDF build and drops STA TX while
+    // RX/association still appear healthy.
+    super::wifi::stop_raw_capture().ok();
     super::lora::sleep_radio(settings).ok();
     telemetry::record_log(format!(
         "event type=mode active=companion state=pairing_recovery window_ms={}",
@@ -324,14 +328,13 @@ pub fn enter_pairing_recovery(settings: &SharedSettings, window_ms: u32) {
 }
 
 pub fn poll(settings: &SharedSettings) {
-    // NAN remains a control-plane service even when the IP transport owns the
-    // main poll path. Infrastructure ESPs must keep advertising in that case.
-    if infra_mode() {
-        super::nan::ensure_infra_publish(settings);
-    }
     if IP_TRANSPORT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
+    // NAN remains a control-plane service whenever the normal mode poll owns
+    // the radio. IP STA transport is the explicit exception: it must not
+    // re-arm promiscuous/raw NAN capture behind the driver's netif while a
+    // socket session is active.
     poll_infra_active_session();
     poll_targeted_wake_session_end();
     // Infrastructure mode is continuously powered even while AP ownership is
@@ -509,6 +512,10 @@ fn poll_targeted_wake_session_end() {
 
 /// Keep raw Wi-Fi active after a matching NAN service advertisement.
 pub fn request_targeted_wake(duration_ms: u32) {
+    // The mode layer is the wake dispatcher. NAN only requests a bounded
+    // active interval; transport handlers (UART today, future BLE/LoRa
+    // handlers) are activated here after the light-sleep policy is updated.
+    super::serial::activate_window_for(duration_ms);
     let deadline = now_ms().wrapping_add(duration_ms.clamp(1_000, 300_000));
     let current = RAW_NAN_TARGET_WAKE_UNTIL_MS.load(Ordering::Acquire);
     if current == 0 || deadline_is_due(current, deadline) {
@@ -989,7 +996,7 @@ fn start_raw_nan_duty(
     reason: &'static str,
     default_channel: u8,
 ) -> Result<()> {
-    if get_bool(settings, "nan.ap_owner", false) {
+    if infra_mode() {
         return start_ap_owner(settings, reason, default_channel);
     }
     #[cfg(target_feature = "esp32s3ops")]
@@ -1112,27 +1119,25 @@ pub fn stop_raw_nan_duty() {
 /// is intentionally not persisted in NVS.
 pub fn stop_for_ip_transport() {
     IP_TRANSPORT_ACTIVE.store(true, Ordering::Release);
-    // Main remains the control-plane owner while the STA/TCP worker is
-    // active. Keep its managed UART available for status, handoff errors,
-    // and an emergency firmware reset for the entire transfer; the normal
-    // bounded UART window must not expire halfway through a flash session.
     super::serial::set_always_on(true);
-    // Keep the tcpip task scheduled while the update data plane is active;
-    // raw-NAN normally enables automatic light sleep between discovery
-    // windows, which is not compatible with starting a BSD listener.
     super::power::configure_for_light_sleep(false).ok();
-    // This must happen even when the STA is already configured.  Keeping the
-    // association avoids a needless reconnect, but leaving the NAN duty
-    // scheduler armed lets the board enter a sleepy window while the TCP
-    // module is opening its socket.
+    // Only stop the scheduler here. This function runs from the runtime STA
+    // worker while the UART dispatcher is active; tearing down serial state
+    // or another Wi-Fi owner here can deadlock the control plane. The STA
+    // transition below owns the driver stop/start, and resume_from_ip_transport
+    // restores the NAN scheduler after the data-plane session.
     stop_raw_nan_duty();
-    // A preceding `wifi ... ip=...` command may already have established the
-    // STA for a module-owned TCP session. In that case the NAN teardown below
-    // would stop the same Wi-Fi driver and make the module's connect() time
-    // out. Only tear down the radio owner when IP STA is not already ready.
+    // `mode active=true` may have promoted the infrastructure profile to the
+    // temporary AP-owner watcher. Stop that owner as well: leaving its poll
+    // loop alive can recreate/stop the SoftAP while the STA is associated,
+    // producing the misleading RX-only IP state seen by UDP diagnostics.
+    stop_ap_owner().ok();
+    // Stop the active NAN receiver before reconfiguring the driver as STA.
+    // Merely clearing the scheduler flags leaves the promiscuous/raw callback
+    // alive; on ESP-IDF that callback can issue a late disconnect while the
+    // new association is already complete.
+    super::nan::stop_nan().ok();
     if !super::wifi::ip_sta_ready() {
-        stop_ap_owner().ok();
-        super::nan::stop_nan().ok();
         super::wifi::stop_raw_monitor().ok();
     }
     telemetry::record_log("event type=mode.ip_transport scheduler=stopped");
@@ -1694,6 +1699,16 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
                 }
             }
         }
+        // A control command may have handed the radio to IP STA while this
+        // scheduler iteration was already in progress.  Re-check ownership
+        // immediately before the destructive sleep/stop sequence; otherwise
+        // the stale iteration can disconnect a freshly associated STA a few
+        // milliseconds after its static address becomes usable.
+        if IP_TRANSPORT_ACTIVE.load(Ordering::Acquire)
+            || !RAW_NAN_DUTY_ENABLED.load(Ordering::Acquire)
+        {
+            return;
+        }
         let recovery_window = RAW_NAN_RECOVERY_ACTIVE.swap(false, Ordering::AcqRel);
         // Notify the managed UART forward before handing the radio and CPU
         // back to the duty-cycle sleep path.  This is deliberately a state
@@ -1705,6 +1720,11 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         ));
         if RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed) == SYNC_SOURCE_NAN {
             finish_raw_nan_beacon_window();
+        }
+        if IP_TRANSPORT_ACTIVE.load(Ordering::Acquire)
+            || !RAW_NAN_DUTY_ENABLED.load(Ordering::Acquire)
+        {
+            return;
         }
         let queued_sent = super::nan::drain_raw_queue();
         super::nan::stop_nan().ok();
@@ -2512,6 +2532,13 @@ impl CommandHandler for ModeCommand {
         }
         if let Some(raw_nan) = request.arg("raw_nan").map(parse_bool).transpose()? {
             if raw_nan {
+                // Explicitly returning to raw NAN is also the public end of
+                // an IP-STA/UDP session. Tear down the static transport and
+                // restart the synchronized duty-cycle receiver before
+                // applying any requested raw-NAN options.
+                if ip_transport_active() {
+                    resume_from_ip_transport(&self.settings)?;
+                }
                 PRODUCT_MODE.store(MODE_SLEEPY, Ordering::Relaxed);
                 let channel = request.arg_i32("channel")?.unwrap_or(6).clamp(1, 13) as u8;
                 start_raw_nan_duty(&self.settings, "command", channel)?;

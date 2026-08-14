@@ -182,7 +182,6 @@ fn nvs_key(tag: u16) -> Option<&'static str> {
         167 => "identity.meshtastic",
         301 => "lora.enabled",
         380 => "nan.sync_source",
-        381 => "nan.ap_owner",
         382 => "nan.ap_loss_ms",
         383 => "nan.ap_recovery_ms",
         384 => "nan.ap_recovery_listen_ms",

@@ -32,6 +32,7 @@
 #include "lwip/ip4.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
+#include "lwip/netif.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "dmesh_module_abi.h"
@@ -120,6 +121,9 @@ uint8_t dmesh_module_loader_ip_netif_flags(void *esp_netif)
     return netif == NULL ? 0 : netif->flags;
 }
 
+
+
+
 uint8_t dmesh_module_loader_ip_netif_default(void *esp_netif)
 {
     if (esp_netif == NULL) return 0;
@@ -150,6 +154,7 @@ uint32_t dmesh_module_loader_ip_netif_addr(void *esp_netif, uint8_t which)
     if (which == 2) return netif->gw.u_addr.ip4.addr;
     return 0;
 }
+
 
 static dmesh_module_header_t cached_header;
 static uint32_t cached_offset;

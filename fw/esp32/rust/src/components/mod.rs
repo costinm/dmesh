@@ -10,6 +10,7 @@ pub mod lora;
 pub mod mode;
 pub mod module;
 pub mod nan;
+pub mod nan_stream;
 pub mod object_store;
 pub mod object_transfer;
 pub mod nvs;
@@ -23,6 +24,7 @@ pub mod settings;
 pub mod sleep;
 pub mod telemetry;
 pub mod test;
+pub mod udp;
 pub mod wake;
 pub mod wifi;
 
@@ -38,7 +40,7 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
     ble_bt::register_commands(registry, settings.clone());
     nan::register_commands(registry, settings.clone());
     power::register_commands(registry, settings.clone());
-    recovery::register_commands(registry);
+    recovery::register_commands(registry, settings.clone());
     reset::register_commands(registry);
     rgbled::register_commands(registry);
     sleep::register_commands(registry, settings.clone());

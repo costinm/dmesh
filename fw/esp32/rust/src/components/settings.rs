@@ -122,7 +122,6 @@ impl Settings {
                 "nan.active_ms",
                 "nan.ap_beacon_tu",
                 "nan.ap_loss_ms",
-                "nan.ap_owner",
                 "nan.ap_recovery_listen_ms",
                 "nan.ap_recovery_ms",
                 "nan.ap_slot_tu",
@@ -145,6 +144,13 @@ impl Settings {
                 // UDP object-store receive window in packets.  Keep this
                 // short because ESP-IDF NVS keys are limited to 15 bytes.
                 "udp.win",
+                "recovery.ssid",
+                "recovery.server",
+                "recovery.ip",
+                "recovery.gw",
+                "recovery.mask",
+                "recovery.port",
+                "recovery.dry",
             ],
         }
     }

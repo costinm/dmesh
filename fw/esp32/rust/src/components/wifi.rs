@@ -7,6 +7,14 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+unsafe extern "C" {
+    fn esp_wifi_internal_set_fix_rate(
+        ifx: sys::wifi_interface_t,
+        en: bool,
+        rate: sys::wifi_phy_rate_t,
+    ) -> sys::esp_err_t;
+}
+
 // Main creates the default STA netif before initializing the Wi-Fi driver,
 // matching Recovery's C startup sequence. The normal ESP-IDF event handlers
 // own link-up and route transitions after association.
@@ -93,6 +101,16 @@ const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
 
 static RAW_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+// Serialize all Wi-Fi driver stop/start transitions. The NAN duty loop and
+// an explicit IP-STA command can otherwise interleave `esp_wifi_stop()` with
+// a just-completed association, producing a station-originated reason-8
+// disassociation.
+static WIFI_DRIVER_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn wifi_driver_transition() -> &'static Mutex<()> {
+    WIFI_DRIVER_TRANSITION.get_or_init(|| Mutex::new(()))
+}
+
 static IP_STA_NETIF: OnceLock<usize> = OnceLock::new();
 // Set only after the static STA has associated and has a non-zero address.
 // `mode::stop_for_ip_transport()` is also called by a module that is already
@@ -105,6 +123,10 @@ static IP_STA_STARTING: AtomicBool = AtomicBool::new(false);
 // radio to the IP transport.
 static IP_STA_NEXT_RECONNECT_MS: AtomicU32 = AtomicU32::new(0);
 static IP_STA_RECONNECTS: AtomicU32 = AtomicU32::new(0);
+// 0=unknown, 1=associated+IP, 2=associated without usable netif,
+// 3=not associated.  Only transitions are logged so a failed STA does not
+// flood the serial stream while the bounded reconnect loop is running.
+static IP_STA_LAST_STATE: AtomicU8 = AtomicU8::new(0);
 static RAW_FILTER_MODE: AtomicU32 = AtomicU32::new(RAW_FILTER_MGMT);
 static RAW_FILTER_BSSID_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_FILTER_BSSID: [AtomicU8; 6] = [
@@ -208,6 +230,8 @@ struct UdpStatusServer {
     port: u16,
     requests: u32,
     responses: u32,
+    last_peer: Option<SocketAddr>,
+    last_sent: usize,
 }
 
 fn udp_status_probe_state() -> &'static Mutex<Option<UdpStatusProbe>> {
@@ -961,7 +985,14 @@ fn start_udp_status_server(port: u16) -> Result<String> {
         .lock()
         .map_err(|_| anyhow!("UDP status server state lock poisoned"))?;
     if state.is_some() { bail!("UDP status server already active"); }
-    *state = Some(UdpStatusServer { socket, port, requests: 0, responses: 0 });
+    *state = Some(UdpStatusServer {
+        socket,
+        port,
+        requests: 0,
+        responses: 0,
+        last_peer: None,
+        last_sent: 0,
+    });
     let result = format!("wifi udp_status_server started=true port={port}");
     if let Ok(mut last) = udp_status_server_last().lock() { *last = result.clone(); }
     Ok(result)
@@ -985,8 +1016,20 @@ pub fn poll_udp_status_server() {
                 let mut response = [0u8; UDP_STATUS_RESPONSE_LEN];
                 encode_udp_status_response(nonce, &mut response);
                 server_value.requests = server_value.requests.saturating_add(1);
+                server_value.last_peer = Some(peer);
+                telemetry::record_log(format!(
+                    "event type=wifi.udp_status_server request=true peer={} bytes={received}",
+                    peer,
+                ));
                 match server_value.socket.send_to(&response, peer) {
-                    Ok(_sent) => server_value.responses = server_value.responses.saturating_add(1),
+                    Ok(sent) => {
+                        server_value.responses = server_value.responses.saturating_add(1);
+                        server_value.last_sent = sent;
+                        telemetry::record_log(format!(
+                            "event type=wifi.udp_status_server response=true peer={} bytes={sent}",
+                            peer,
+                        ));
+                    }
                     Err(error) => telemetry::record_log(format!(
                         "event type=wifi.udp_status_server send_error peer={} error={}", peer, error
                     )),
@@ -1014,7 +1057,14 @@ fn udp_status_probe_status() -> String {
 fn udp_status_server_status() -> String {
     let state = udp_status_server_state().lock().ok();
     match state.as_deref().and_then(|value| value.as_ref()) {
-        Some(server) => format!("active=true port={} requests={} responses={}", server.port, server.requests, server.responses),
+        Some(server) => format!(
+            "active=true port={} requests={} responses={} last_peer={} last_sent={}",
+            server.port,
+            server.requests,
+            server.responses,
+            server.last_peer.map(|peer| peer.to_string()).unwrap_or_else(|| "none".to_owned()),
+            server.last_sent,
+        ),
         None => udp_status_server_last().lock().map(|value| value.clone()).unwrap_or_else(|_| "state_lock_poisoned".to_owned()),
     }
 }
@@ -1252,16 +1302,26 @@ fn udp_dry_send(run: &UdpDryRun, packet: &[u8]) -> Result<()> {
     // lwIP can briefly run out of pbufs while the receive task is draining a
     // sustained stream.  Treat that as transient, but keep the retry bounded
     // so a genuinely broken socket still terminates the dry run.
-    for attempt in 0..8 {
+    for attempt in 0..32 {
         match run.socket.send_to(packet, run.peer) {
             Ok(_) => return Ok(()),
             Err(error)
-                if attempt < 7
+                if attempt < 31
                     && (error.kind() == ErrorKind::WouldBlock
                         || error.kind() == ErrorKind::Interrupted
-                        || error.raw_os_error() == Some(12)) =>
+                        || error.raw_os_error() == Some(12)
+                        // lwIP reports an unresolved first-hop ARP lookup as
+                        // EHOSTUNREACH.  The status-probe path normally
+                        // primes this cache, but a fresh STA association can
+                        // race the first QUIC hello; retry while ARP resolves.
+                        || error.raw_os_error() == Some(118)) =>
             {
-                task_delay(Duration::from_millis(1));
+                // ESP-IDF's UDP send path can need several scheduler turns
+                // to recycle pbufs while the receive loop is committing a
+                // sustained QUIC-like stream. A 1 ms retry was too short and
+                // made otherwise healthy 1 MiB STA transfers fail with
+                // ENOMEM.
+                task_delay(Duration::from_millis(5));
             }
             Err(error) => return Err(anyhow!("udp_send: {error}")),
         }
@@ -1371,6 +1431,11 @@ pub fn poll_udp_dry_run() {
             let event = run_value.receiver.receive(&run_value.packet[..received])?;
             let mut ack = [0u8; 256];
             let ack_len = run_value.receiver.encode_ack(&mut ack, event)?;
+            // Let lwIP recycle the RX/TX pbufs from the just-consumed
+            // datagram before allocating the ACK. Without this yield, a
+            // sustained object stream can exhaust the ESP-IDF UDP pool even
+            // though the stop-and-wait peer has only one packet in flight.
+            task_delay(Duration::from_millis(5));
             udp_dry_send(&run_value, &ack[..ack_len])?;
             run_value.acks_sent = run_value.acks_sent.saturating_add(1);
             if event.manifest_complete {
@@ -1462,6 +1527,20 @@ pub fn poll_ip_sta() {
         sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK
     };
     let netif_up = unsafe { sys::esp_netif_is_netif_up(netif) };
+    let state = if associated && netif_up { 1 } else if associated { 2 } else { 3 };
+    if IP_STA_LAST_STATE.swap(state, Ordering::AcqRel) != state {
+        let mut ap = sys::wifi_ap_record_t::default();
+        let mut info = sys::esp_netif_ip_info_t::default();
+        let (bssid, rssi) = if associated && unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK } {
+            (format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]), ap.rssi)
+        } else { ("none".to_owned(), 0) };
+        let ip = unsafe { sys::esp_netif_get_ip_info(netif, &mut info) };
+        telemetry::record_log(format!(
+            "event type=wifi.sta state={} associated={} ip_up={} ip={} bssid={} rssi={}",
+            if state == 1 { "connected" } else if state == 2 { "associated" } else { "disconnected" },
+            associated, netif_up, if ip == sys::ESP_OK { format_ipv4_u32(info.ip.addr) } else { "none".to_owned() }, bssid, rssi
+        ));
+    }
     if associated && netif_up {
         return;
     }
@@ -1630,6 +1709,7 @@ enum WifiMode {
     Off,
     StaIdle,
     ApIdle,
+    IpSta,
     Raw,
     RawData,
     RawSta,
@@ -1759,7 +1839,11 @@ impl CommandHandler for WifiCommand {
             let rx_window_packets = self
                 .settings
                 .borrow()
-                .get_i32("udp.win", 1)?
+                // A one-packet window is useful for bring-up but causes
+                // stop-and-wait behavior and excessive retransmits on an
+                // otherwise healthy STA link. Keep the protocol bounded,
+                // while defaulting to a small multi-packet flight.
+                .get_i32("udp.win", 8)?
                 .clamp(1, UDP_RX_WINDOW_MAX as i32) as usize;
             let target = match request.arg("target").unwrap_or("main") {
                 "main" => 6,
@@ -1774,7 +1858,7 @@ impl CommandHandler for WifiCommand {
             let port = request.arg_i32("port")?.unwrap_or(3337).clamp(1, u16::MAX as i32) as u16;
             let timeout_ms = request.arg_i32("timeout_ms")?.or(request.arg_i32("timeout")?).unwrap_or(300_000).clamp(1, 600_000) as u32;
             let verify_sha = request.arg("verify_sha").map(parse_bool).transpose()?.unwrap_or(true);
-            let rx_window_packets = self.settings.borrow().get_i32("udp.win", 1)?.clamp(1, UDP_RX_WINDOW_MAX as i32) as usize;
+            let rx_window_packets = self.settings.borrow().get_i32("udp.win", 8)?.clamp(1, UDP_RX_WINDOW_MAX as i32) as usize;
             return Ok(CommandResponse::ok(start_udp_dry_run(server, port, timeout_ms, 7, verify_sha, rx_window_packets, true, &self.settings)?));
         }
         if request
@@ -2339,7 +2423,10 @@ fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
             || request.arg_bytes("ip").is_some()
             || request.arg_bytes("local_ip").is_some();
         if ip_mode {
-            start_ip_sta_async(request.clone(), ssid.to_owned(), psk.to_owned(), channel)?;
+            // Keep the bounded association sequence in the command context.
+            // A detached worker could be starved behind the raw-NAN scheduler,
+            // leaving only a static address with no STA attempt or failure.
+            start_ip_sta_sync(request, ssid, psk, channel)?;
         } else {
             low_level_start_sta(ssid, psk, channel)?;
         }
@@ -2354,13 +2441,14 @@ fn start_sta(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
             task_delay(Duration::from_millis(timeout_ms as u64));
             disable_mesh_ip_services();
         }
-        self.mode = WifiMode::RawSta;
+        self.mode = if ip_mode { WifiMode::IpSta } else { WifiMode::RawSta };
         Ok(CommandResponse::ok(format!(
-            "wifi mode=RawSta ssid={} channel={} timeout_ms={}{} {}",
+            "wifi mode={} ssid={} channel={} timeout_ms={}{} {}",
+            if ip_mode { "IpSta" } else { "RawSta" },
             self.ssid.as_deref().unwrap_or(""),
             channel,
             timeout_ms,
-            if ip_mode { " starting=true" } else { "" },
+            if ip_mode { " ready=true" } else { "" },
             wifi_net_status()
     )))
 }
@@ -2498,7 +2586,13 @@ pub fn stop_flash_sta() {
     IP_STA_NEXT_RECONNECT_MS.store(0, Ordering::Release);
     unsafe {
         let _ = sys::esp_wifi_disconnect();
-        let _ = sys::esp_wifi_stop();
+        // Do not synchronously stop the driver from the UART command
+        // dispatcher.  ESP-IDF can wait for the lwIP RX/TX task here while a
+        // just-failed UDP hello is still unwinding, which strands the
+        // dispatcher and prevents the public `mode raw_nan=true` recovery
+        // command from returning.  The next raw-NAN start owns the normal
+        // driver transition; disconnecting first is sufficient to release
+        // the STA association without deadlocking control traffic.
     }
 }
 
@@ -2663,6 +2757,10 @@ fn ensure_ip_sta_netif() -> Result<*mut sys::esp_netif_t> {
     if let Some(value) = IP_STA_NETIF.get() {
         return Ok(*value as *mut sys::esp_netif_t);
     }
+    // The default helper creates and attaches the Wi-Fi netif driver. Ensure
+    // esp_wifi_init has completed before creating it; otherwise the object
+    // can expose valid IP bookkeeping while its TX attachment is inert.
+    ensure_low_level_wifi()?;
     let value = unsafe {
         esp_ok_allow_invalid_state(sys::esp_netif_init())?;
         let netif = sys::esp_netif_create_default_wifi_sta();
@@ -2676,11 +2774,8 @@ fn ensure_ip_sta_netif() -> Result<*mut sys::esp_netif_t> {
     Ok(*IP_STA_NETIF.get().unwrap_or(&value) as *mut sys::esp_netif_t)
 }
 
-/// Create the default STA netif before Main initializes the Wi-Fi driver.
-/// This is the same order used by Recovery: esp_netif_init/event-loop,
-/// create_default_wifi_sta, then esp_wifi_init. The netif is inert until
-/// `start_ip_sta`, but the early creation lets ESP-IDF attach the driver and
-/// install its normal event actions without a later raw-NAN handoff.
+/// Prepare the default STA netif after the Wi-Fi driver is initialized, so
+/// ESP-IDF can attach the actual station data driver at creation time.
 pub fn prepare_ip_sta_netif() -> Result<()> {
     let _ = ensure_ip_sta_netif()?;
     Ok(())
@@ -2729,11 +2824,34 @@ fn start_ip_sta_async(
             let result = start_ip_sta_sync(&request, &ssid, &psk, channel);
             IP_STA_STARTING.store(false, Ordering::Release);
             match result {
-                Ok(()) => telemetry::emit_console(
-                    "event type=wifi.sta state=ready ip_transport=true",
-                ),
-                Err(error) => telemetry::emit_console(&format!(
-                    "event type=wifi.sta state=error message={}",
+                Ok(()) => {
+                    let mut ap = sys::wifi_ap_record_t::default();
+                    let mut info = sys::esp_netif_ip_info_t::default();
+                    let (associated, ip_up) = IP_STA_NETIF
+                        .get()
+                        .copied()
+                        .map(|value| unsafe {
+                            let netif = value as *mut sys::esp_netif_t;
+                            (
+                                sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK,
+                                sys::esp_netif_get_ip_info(netif, &mut info) == sys::ESP_OK
+                                    && sys::esp_netif_is_netif_up(netif),
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    telemetry::record_log(format!(
+                        "event type=wifi.sta state=connected associated={} ip_up={} ip={} gw={} mask={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}",
+                        associated,
+                        ip_up,
+                        format_ipv4_u32(info.ip.addr),
+                        format_ipv4_u32(info.gw.addr),
+                        format_ipv4_u32(info.netmask.addr),
+                        ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                        ap.rssi,
+                    ));
+                }
+                Err(error) => telemetry::record_log(format!(
+                    "event type=wifi.sta state=failed associated=false ip_up=false message={}",
                     crate::commands::protocol::escape_value(&error.to_string())
                 )),
             }
@@ -2745,12 +2863,17 @@ fn start_ip_sta_async(
         })
 }
 
-fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, _channel: u8) -> Result<()> {
-    // Establish the lwIP/tcpip stack and its default netif before handing the
-    // radio away from raw NAN. This matches Recovery's initialization order;
-    // stopping the raw driver first can leave a later BSD socket with an
-    // invalid tcpip mailbox on ESP32.
+fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, channel: u8) -> Result<()> {
+    IP_STA_LAST_STATE.store(0, Ordering::Release);
+    telemetry::record_log(format!("event type=wifi.sta phase=begin ssid={} channel={}", crate::commands::protocol::escape_value(ssid), channel));
+    // Keep the Recovery ordering explicit at the handoff too.  The boot path
+    // normally initializes these objects, but raw-NAN builds can be entered
+    // before that path has completed on a warm reset; IDF treats repeated
+    // init calls as INVALID_STATE and leaves the existing mailbox intact.
     init_ip_stack()?;
+    // The lwIP/event loop and STA netif are created once during Main boot,
+    // before raw NAN starts. Re-running esp_netif_init/event-loop creation
+    // from this worker can block the IDF tcpip task while NAN is active.
     let netif = ensure_ip_sta_netif()?;
     // Raw-NAN mode may have changed the active/default netif since Main
     // created the STA object at boot.  `ip_up` can still be true while lwIP
@@ -2768,7 +2891,11 @@ fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, _channel: 
     // Let the STA scan for the AP.  Recovery uses channel 0 here as well;
     // forcing the raw-radio channel can prevent association when the host AP
     // was started on a different channel.
-    configure_sta(ssid, psk, 0)?;
+    // Let IDF scan for the named AP. The lab AP is fixed to channel 6, but
+    // channel 0 is the proven Recovery/STA sequence and avoids leaving the
+    // station in a raw-NAN channel state during the handoff.
+    let _ = channel;
+    configure_sta(ssid, psk, 0, None)?;
 
     if request.arg("ip").is_none() && request.arg_bytes("ip").is_none()
         && request.arg("local_ip").is_none()
@@ -2794,13 +2921,26 @@ fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, _channel: 
         // let modem power-save create multi-second gaps or collapse the TCP
         // congestion window while the module is receiving blocks.
         esp_ok(sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE))?;
-        esp_ok(sys::esp_wifi_connect())?;
+        let connect_ret = sys::esp_wifi_connect();
+        telemetry::record_log(format!(
+            "event type=wifi.sta attempt ssid={} channel={} bssid=auto connect_ret=0x{:x}",
+            crate::commands::protocol::escape_value(ssid),
+            0,
+            connect_ret
+        ));
+        esp_ok(connect_ret)?;
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let mut ap = sys::wifi_ap_record_t::default();
         let mut current = sys::esp_netif_ip_info_t::default();
         let associated = unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK };
+        if associated {
+            telemetry::record_log(format!(
+                "event type=wifi.sta associated=true bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}",
+                ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5], ap.rssi
+            ));
+        }
         if associated {
             // The default STA netif is created before esp_wifi_init(), just as
             // in Recovery. Reassert the default and static address after the
@@ -2823,7 +2963,20 @@ fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, _channel: 
                 continue;
             }
             esp_ok(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
+            // Raw NAN discovery/action TX fixes this interface at its control
+            // rate.  Restore normal rate control only after the STA is fully
+            // started and associated; doing it before esp_wifi_start() is
+            // rejected by IDF and leaves the data path at the raw-NAN rate.
             IP_STA_READY.store(true, Ordering::Release);
+            // The IDF Wi-Fi event path can briefly report the old link state
+            // immediately after the static address is installed.  Do not let
+            // the first Main-loop poll call esp_wifi_connect() again and
+            // tear down a freshly completed association; give the link a
+            // bounded settling window before recovery is allowed to run.
+            IP_STA_NEXT_RECONNECT_MS.store(
+                now_ms().saturating_add(5_000) as u32,
+                Ordering::Release,
+            );
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -2904,17 +3057,28 @@ fn command_beacon_tu(request: &CommandRequest) -> Result<u16> {
     Ok(beacon_ms_to_tu(beacon_ms.max(1) as u32))
 }
 
-fn configure_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
+fn configure_sta(ssid: &str, psk: &str, channel: u8, bssid: Option<[u8; 6]>) -> Result<()> {
+    let _transition = wifi_driver_transition()
+        .lock()
+        .map_err(|_| anyhow!("Wi-Fi driver transition lock poisoned"))?;
     ensure_low_level_wifi()?;
     unsafe {
         let _ = sys::esp_wifi_disconnect();
         let _ = sys::esp_wifi_set_promiscuous(false);
+        // Always perform the full stop/set-mode transition. Raw NAN uses the
+        // same STA hardware profile but leaves monitor callbacks and channel
+        // state behind; preserving a nominal STA mode here can associate
+        // successfully while the normal lwIP TX path remains detached.
         let _ = sys::esp_wifi_stop();
         esp_ok(sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA))?;
         let mut sta = sys::wifi_sta_config_t::default();
         copy_cstr_bytes(&mut sta.ssid, ssid.as_bytes());
         copy_cstr_bytes(&mut sta.password, psk.as_bytes());
         sta.channel = channel;
+        if let Some(bssid) = bssid {
+            sta.bssid_set = true;
+            sta.bssid.copy_from_slice(&bssid);
+        }
         sta.threshold.authmode = if psk.is_empty() {
             sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
         } else {
@@ -2930,9 +3094,9 @@ fn configure_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
 }
 
 fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
-    configure_sta(ssid, psk, channel)?;
+    configure_sta(ssid, psk, channel, None)?;
     unsafe {
-        esp_ok(sys::esp_wifi_start())?;
+        esp_ok_allow_invalid_state(sys::esp_wifi_start())?;
         esp_ok(sys::esp_wifi_connect())?;
         disable_mesh_ip_services();
     }
@@ -3142,7 +3306,11 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
         cache_tx_buf_num: sys::WIFI_CACHE_TX_BUFFER_NUM as i32,
         csi_enable: sys::WIFI_CSI_ENABLED as i32,
         ampdu_rx_enable: sys::WIFI_AMPDU_RX_ENABLED as i32,
-        ampdu_tx_enable: sys::WIFI_AMPDU_TX_ENABLED as i32,
+        // Keep management/NAN operation independent of AMPDU aggregation.
+        // The ESP32-C6 driver has a known failure mode where an associated
+        // STA receives frames but its first non-aggregated UDP response never
+        // leaves the TX queue when AMPDU TX is enabled.
+        ampdu_tx_enable: 0,
         amsdu_tx_enable: sys::WIFI_AMSDU_TX_ENABLED as i32,
         nvs_enable: sys::WIFI_NVS_ENABLED as i32,
         nano_enable: sys::WIFI_NANO_FORMAT_ENABLED as i32,
@@ -3177,6 +3345,16 @@ pub fn stop_raw_monitor() -> Result<()> {
     Ok(())
 }
 
+/// Disable raw-NAN capture without stopping an already-running STA driver.
+/// The esp-netif Wi-Fi attachment is stateful on ESP-IDF; preserving it is
+/// required when switching an active raw-NAN STA into the IP data plane.
+pub fn stop_raw_capture() -> Result<()> {
+    let _ = set_hardware_bssid_filter([0; 6], false);
+    unsafe { esp_ok(sys::esp_wifi_set_promiscuous(false))?; }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Stop raw Wi-Fi for a bounded raw-NAN sleep interval.
 ///
 /// Stop raw Wi-Fi for an explicit light-sleep interval.
@@ -3187,6 +3365,14 @@ pub fn stop_raw_monitor() -> Result<()> {
 /// driver because repeatedly recreating it there has previously left UART0
 /// unusable; the target-specific split is intentional.
 pub fn stop_raw_wifi_for_sleep() -> Result<()> {
+    let _transition = wifi_driver_transition()
+        .lock()
+        .map_err(|_| anyhow!("Wi-Fi driver transition lock poisoned"))?;
+    // IP transport may claim ownership while the duty loop is waiting for
+    // this transition lock. Do not stop the driver after that handoff.
+    if super::mode::ip_transport_active() {
+        return Ok(());
+    }
     #[cfg(target_feature = "esp32s3ops")]
     {
         let _ = set_hardware_bssid_filter([0; 6], false);
@@ -3230,6 +3416,9 @@ fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
         .transpose()?
         .unwrap_or(true);
     let tx_if = parse_raw_tx_interface(request.arg("tx_if").or_else(|| request.arg("wifi_if")))?;
+    if let Some(rate) = request.arg("tx_rate") {
+        configure_fixed_tx_rate(rate, tx_if.unwrap_or_else(raw_tx_interface), request.arg("disable_11b").map(parse_bool).transpose()?.unwrap_or(true))?;
+    }
     raw_tx_frame_on(bytes, en_sys_seq, tx_if)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet(
@@ -3242,6 +3431,32 @@ fn raw_tx(bytes: &[u8], request: &CommandRequest) -> Result<()> {
             frame_subtype(bytes)
         ),
     );
+    Ok(())
+}
+
+pub(crate) fn configure_fixed_tx_rate(name: &str, iface: sys::wifi_interface_t, disable_11b: bool) -> Result<()> {
+    let rate = match name.to_ascii_lowercase().as_str() {
+        "6" | "6m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_6M,
+        "9" | "9m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_9M,
+        "12" | "12m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_12M,
+        "18" | "18m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_18M,
+        "24" | "24m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_24M,
+        "36" | "36m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_36M,
+        "48" | "48m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_48M,
+        "54" | "54m" => sys::wifi_phy_rate_t_WIFI_PHY_RATE_54M,
+        "auto" | "default" | "reset" => {
+            unsafe {
+                esp_ok(esp_wifi_internal_set_fix_rate(iface, false, sys::wifi_phy_rate_t_WIFI_PHY_RATE_12M))?;
+                esp_ok(sys::esp_wifi_config_11b_rate(iface, false))?;
+            }
+            return Ok(());
+        }
+        other => bail!("unsupported tx_rate={other}; expected auto, 6, 9, 12, 18, 24, 36, 48, or 54"),
+    };
+    unsafe {
+        esp_ok(esp_wifi_internal_set_fix_rate(iface, true, rate))?;
+        esp_ok(sys::esp_wifi_config_11b_rate(iface, disable_11b))?;
+    }
     Ok(())
 }
 

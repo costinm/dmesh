@@ -69,8 +69,8 @@ fn control_status() -> String {
         .unwrap_or_else(|_| "status lock poisoned".to_owned())
 }
 
-pub fn register_commands(registry: &mut CommandRegistry) {
-    registry.register(RecoveryCommand);
+pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
+    registry.register(RecoveryCommand { settings });
 }
 
 /// Tell the second-stage bootloader that Main has started a new attempt.
@@ -252,7 +252,33 @@ pub fn configure_flash_size_from_hardware() -> Result<(usize, usize)> {
     Ok((configured_size, physical_size))
 }
 
-struct RecoveryCommand;
+struct RecoveryCommand {
+    settings: SharedSettings,
+}
+
+impl RecoveryCommand {
+    fn persist_transport_profile(&self, request: &CommandRequest) -> Result<()> {
+        let values = [
+            ("ssid", "recovery.ssid"),
+            ("server", "recovery.server"),
+            ("ip", "recovery.ip"),
+            ("gateway", "recovery.gw"),
+            ("gw", "recovery.gw"),
+            ("mask", "recovery.mask"),
+            ("port", "recovery.port"),
+        ];
+        let mut settings = self.settings.borrow_mut();
+        for (argument, key) in values {
+            if let Some(value) = request.arg(argument) {
+                settings.set_str(key, value)?;
+            }
+        }
+        if let Some(dry_run) = request.arg("dry_run") {
+            settings.set_str("recovery.dry", dry_run)?;
+        }
+        Ok(())
+    }
+}
 
 impl CommandHandler for RecoveryCommand {
     fn name(&self) -> &'static str {
@@ -270,6 +296,7 @@ impl CommandHandler for RecoveryCommand {
             return Ok(CommandResponse::ok("recovery handoff not requested"));
         }
         let dry_run = parse_bool(request.arg("dry_run").unwrap_or("false"))?;
+        self.persist_transport_profile(request)?;
         request_recovery_boot(dry_run);
         let reboot = parse_bool(request.arg("reboot").unwrap_or("true"))?;
         if reboot {

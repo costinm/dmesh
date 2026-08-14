@@ -20,12 +20,6 @@ const DEFAULT_FREQUENCY_HZ: u32 = 913_125_000;
 const DEFAULT_BANDWIDTH_HZ: u32 = 250_000;
 const DEFAULT_SYNC_WORD: i32 = 0x2b;
 const DEFAULT_TX_POWER: i32 = 17;
-const RADIO_ESPNOW_MAGIC: [u8; 4] = *b"DRX1";
-const RADIO_ESPNOW_VERSION: u8 = 1;
-// The module callback is shared by LoRa and FSK, so the envelope identifies
-// this as a received radio packet rather than claiming a modulation.
-const RADIO_ESPNOW_KIND_RADIO: u8 = 1;
-const RADIO_ESPNOW_HEADER_LEN: usize = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoraChip {
@@ -371,14 +365,14 @@ pub fn handle_module_packet(data: &[u8], rssi: i32, snr: f32) -> Result<CommandR
 
 fn forward_rx_packet(packet: &Packet) {
     super::mode::observe_lora_ping("lora", &packet.data, packet.rssi);
-    let mut espnow = Vec::with_capacity(RADIO_ESPNOW_HEADER_LEN + packet.data.len());
-    espnow.extend_from_slice(&RADIO_ESPNOW_MAGIC);
-    espnow.push(RADIO_ESPNOW_VERSION);
-    espnow.push(RADIO_ESPNOW_KIND_RADIO);
-    espnow.extend_from_slice(&(packet.rssi.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes());
-    espnow.push(packet.snr.round().clamp(i8::MIN as f32, i8::MAX as f32) as i8 as u8);
-    espnow.extend_from_slice(&(packet.data.len() as u16).to_le_bytes());
-    espnow.extend_from_slice(&packet.data);
+    let Ok(espnow) = dmesh_rawnan::espnow::build_radio_packet(&packet.data, packet.rssi, packet.snr)
+    else {
+        telemetry::record_log(format!(
+            "event type=lora.espnow_forward ok=false len={} rssi={} snr={} msg=payload-too-large",
+            packet.data.len(), packet.rssi, packet.snr
+        ));
+        return;
+    };
     if let Err(err) = super::wifi::send_espnow_broadcast(&espnow) {
         telemetry::record_log(format!(
             "event type=lora.espnow_forward ok=false len={} rssi={} snr={} msg={}",

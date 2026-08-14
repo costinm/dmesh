@@ -391,6 +391,12 @@ fn poll_nan_commands(
     _settings: &components::settings::SharedSettings,
 ) {
     components::nan::poll_rx();
+    if let Err(err) = components::nan_stream::poll() {
+        components::telemetry::record_log(format!(
+            "event type=nan.transport_poll ok=false msg={}",
+            commands::protocol::escape_value(&err.to_string())
+        ));
+    }
     while let Some(command) = components::nan::take_command() {
         components::telemetry::record_log(format!(
             "event type=nan.command len={}",

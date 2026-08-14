@@ -7,7 +7,7 @@ resolver = "2"
 [workspace]
 
 [dependencies]
-dmesh-rawnan = { path = "../../../crates/rawnan" }
+dmesh-rawnan = { path = "../../../crates/rawnan", default-features = false }
 dmesh-transport = { path = "../../../crates/dmesh-transport" }
 uart-codec = { path = "../../../crates/uart-codec" }
 anyhow = "1"

@@ -86,6 +86,23 @@ open evidence, not a general interoperability claim.
 
 ## Normal Battery Profile
 
+### Explicit STA/IP maintenance path
+
+The `wifi mode=sta ... ip=<address>` command is a deliberate, temporary
+infrastructure profile for bulk/control traffic. It keeps the static address
+on the shared `10.78.0.0/16` lab network (DHCP is not required), disables
+power-save, and leaves the normal NAN scheduler stopped while the IP bearer is
+active. Management/NAN operation is kept independent of aggregation by
+disabling AMPDU TX on the ESP32-C6; this avoids the observed state where the
+station associates and receives but its first UDP response remains queued.
+
+The first UDP hello may race ARP immediately after association. The firmware
+retries `EHOSTUNREACH` briefly so the normal ARP resolution window is not
+mistaken for a broken QUIC-shaped transfer. Returning with `mode raw_nan=true`
+must cancel the UDP state, disconnect the STA, and re-arm the synchronized NAN
+duty receiver; it must not synchronously wait for the lwIP/Wi-Fi task while the
+UART command dispatcher is handling the transition.
+
 The saved battery-node defaults are:
 
 | Setting | Default | Rationale |
@@ -243,8 +260,8 @@ they do not retune the scheduler.
 
 ## Powered AP Fallback
 
-Set `nan.ap_owner=true` only on a powered gateway, normally `lora1`. It keeps
-Wi-Fi on and watches for NAN. If NAN has been absent for `nan.ap_loss_ms`, it
+Use `mode infra=true` on a powered gateway, normally `lora1`. It keeps Wi-Fi
+on and watches for NAN. If NAN has been absent for `nan.ap_loss_ms`, it
 starts an open AP:
 
 ```text
@@ -269,12 +286,11 @@ used to infer an AP owner's reachability cadence.
 
 The `mode`, NAN, and heartbeat settings are stored in the writable `dmesh`
 NVS namespace. After changing a profile, verify it after reset; a sleepy node
-must report `mode=sleepy`, `nan.ap_owner=false`, and its configured heartbeat
+must report `mode=sleepy` and its configured heartbeat
 cadence before starting a timing run.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `nan.ap_owner` | `false` | Legacy profile hint; `mode=infra` is always the powered owner. Use `nan.sync_source=ap_only` to force the fallback AP immediately. |
 | `nan.ap_loss_ms` | 5000 ms | NAN absence before starting the fallback AP. |
 | `nan.ap_beacon_tu` | 500 TU | AP beacon interval. ESP-IDF requires a multiple of 100 TU. In AP fallback, `TSF / beacon_interval mod nan.dw_stride` defines AP-DW0 and subsequent selected slots; a fresh NAN beacon replaces this with the 512-TU NAN grid. |
 | `nan.dw_stride` | 8 | Use DW0 and every eighth source slot: NAN-DW0/NAN-DW0+8 or AP-DW0/AP-DW0+8 (about 4.19 seconds at 512 TU). |
@@ -359,14 +375,13 @@ export PYTHONPATH="${SSH_MESH_PYTHON:?set SSH_MESH_PYTHON to the ssh-mesh Python
 
 # Persist the powered fallback role on lora1, then reinitialize infra radios.
 # `reset` is not a firmware CBOR command; do not use DTR as a substitute.
-mesh lmesh-uart esp.serial.command port=lora1 command='nvs op=set nan.ap_owner=true nan.sync_source=auto'
 mesh lmesh-uart esp.serial.command port=lora1 command='mode infra=true'
 
 # Lab observer: retain the AP (512 TU) and raw NAN management/action receiver
 # even when NAN beacons are present. This is a powered-gateway test role, not
 # the normal `auto` fallback policy.
 mesh lmesh-uart esp.serial.command port=lora1 \
-  command='nvs op=set nan.ap_owner=true nan.sync_source=ap_only nan.ap_beacon_tu=512'
+  command='nvs op=set nan.sync_source=ap_only nan.ap_beacon_tu=512'
 mesh lmesh-uart esp.serial.command port=lora1 command='mode infra=true'
 
 # Deterministic AP fallback validation. The runner restores normal auto policy.
@@ -378,7 +393,7 @@ python fw/esp32/rust/tools/presubmit.py \
 The AP-sync scenario makes the powered owner use `ap_only`, makes battery
 participants use `ap_only`, verifies owner AP activation and each participant's
 AP timing counters, then restores all participants to `auto`; it leaves the
-owner configured as `nan.ap_owner=true`, `nan.sync_source=auto`.
+owner configured as `mode=infra`, `nan.sync_source=auto`.
 
 The standard lab topology also declares `power1` as a raw serial forward. The
 runner records its 10 Hz samples in `power/power1.jsonl` and summarizes each
@@ -423,3 +438,16 @@ lets the ESP driver assign the 802.11 sequence number and is the default.
 With `sys_seq=false`, the caller owns Sequence Control and should provide a
 changing value when testing duplicate/ACK behavior. This option only changes
 the TX path; RX filtering and NAN cluster selection are unchanged.
+
+NAN synchronization/discovery beacons are transmitted at fixed 6 Mbps, as
+required by Wi-Fi Aware. NAN public action/SDF frames use the mandatory OFDM
+family (6/9/12/18/24/36/48/54 Mbps). For a targeted close-peer PHY-rate
+experiment, add `tx_rate=12`, `24`, `48`, or `54` to the raw command. The
+firmware uses the ESP-IDF fixed-rate adapter and can disable 802.11b for the
+trial with `disable_11b=true`; use `tx_rate=auto` afterward to restore rate
+control. Keep the radio on channel 6 and verify the peer's raw RX/semantic NAN
+event--the UART acknowledgement only proves API acceptance.
+
+AMPDU is an initialization-time ESP-IDF setting in this build, not a safe
+per-frame switch. It is therefore a separate build/profile experiment and is
+not changed by the fixed-rate command.
