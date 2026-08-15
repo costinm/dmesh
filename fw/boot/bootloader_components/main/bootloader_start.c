@@ -29,7 +29,7 @@
 
 #define RECOVERY_INDEX FACTORY_INDEX
 #define MAIN_INDEX 0 /* ota_0; factory (-1) is Recovery */
-#define RECOVERY_NAMESPACE "recovery"
+#define STAGE2_NAMESPACE "stg2"
 /* The command arrives through managed lmesh, not a locally polled UART
  * client.  It is sent immediately after reset, so the development window can
  * remain short and bounded. */
@@ -37,7 +37,7 @@
  * pulse.  CP210x reset/forward scheduling can consume several hundred ms;
  * keep a bounded but generous window so the packet is not lost while still
  * returning to normal partition selection promptly on an idle boot. */
-#define UART_BOOT_WINDOW_MS 1000
+#define UART_BOOT_WINDOW_MS 3000
 #define BOOT_LOOP_WINDOW_TICKS 1000000u /* about 5 s at the ESP32 slow clock */
 #define FAILURE_LIMIT 6
 #define RAPID_RESET_COUNT 3
@@ -117,7 +117,7 @@ static boot_health_state_t *boot_health_state(void)
 static bool read_u32(const char *key, uint32_t *value)
 {
     nvs_bootloader_read_list_t item = {
-        .namespace_name = RECOVERY_NAMESPACE,
+        .namespace_name = STAGE2_NAMESPACE,
         .key_name = key,
         .value_type = NVS_TYPE_U32,
     };
@@ -132,7 +132,7 @@ static bool uart_boot_enabled(void)
     uint32_t value = 1;
     bool configured = read_u32("uart_boot", &value);
     /* Missing or malformed configuration is development-safe for existing
-     * boards. Production provisioning must write recovery:uart_boot=0. */
+     * boards. Production provisioning must write stg2:uart_boot=0. */
     ESP_LOGI(TAG, "uart_boot configured=%d value=%u enabled=%d",
              configured, (unsigned)value, configured ? (value != 0) : 1);
     return !configured || value != 0;
@@ -222,12 +222,28 @@ static int uart_boot_requested(void)
     bool escaped = false;
     uint8_t frame[64];
     size_t frame_len = 0;
+    /* Managed USB/UART forwards normally preserve the PPP delimiters. Keep a
+     * tiny rolling window as well: a forward which has already consumed or
+     * normalized delimiters must not make the exact, self-delimiting selector
+     * disappear during the short boot handoff. */
+    uint8_t raw_selector[10] = {0};
+    size_t raw_selector_len = 0;
     for (uint32_t poll = 0; poll < polls; ++poll) {
         if ((poll & 0x3ffu) == 0) {
             feed_bootloader_wdt();
         }
         uint8_t byte = 0;
         if (esp_rom_output_rx_one_char(&byte) == 0) {
+            if (raw_selector_len < sizeof(raw_selector)) {
+                raw_selector[raw_selector_len++] = byte;
+            } else {
+                memmove(raw_selector, raw_selector + 1, sizeof(raw_selector) - 1);
+                raw_selector[sizeof(raw_selector) - 1] = byte;
+            }
+            if (raw_selector_len == sizeof(raw_selector)) {
+                int selector = boot_cbor_selector(raw_selector, sizeof(raw_selector));
+                if (selector != 0) return selector;
+            }
             if (byte == DMESH_BOOT_WIRE_FLAG) {
                 if (in_frame && !escaped) {
                     int selector = boot_cbor_selector(frame, frame_len);
@@ -281,6 +297,22 @@ static void halt_for_uart(const char *reason)
 
 static int select_partition(void)
 {
+    /* Explicit lab/operator override. Unlike the UART selector, this is read
+     * before the boot window, so repeated Recovery diagnostics neither wait
+     * for UART nor accidentally fall through to Main. Values are partition
+     * IDs: 1=Main, 2=Recovery; missing or invalid values preserve policy. */
+    uint32_t boot_target = 0;
+    if (read_u32("boot_target", &boot_target)) {
+        if (boot_target == DMESH_BOOT_PARTITION_RECOVERY) {
+            ESP_LOGW(TAG, "NVS boot_target selects Recovery");
+            return RECOVERY_INDEX;
+        }
+        if (boot_target == DMESH_BOOT_PARTITION_MAIN) {
+            ESP_LOGW(TAG, "NVS boot_target selects Main");
+            return MAIN_INDEX;
+        }
+        ESP_LOGW(TAG, "ignoring invalid NVS boot_target=%u", (unsigned)boot_target);
+    }
     /* Main only enters deep sleep after reaching a stable runtime state. Its
      * wake must therefore be the fastest path and must not be redirected by
      * stale UART or RTC handoff state. */

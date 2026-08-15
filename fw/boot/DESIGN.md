@@ -41,7 +41,8 @@ Stage2 reads only this NVS field in namespace `recovery`:
 
 | Key | Accepted type | Meaning |
 |---|---|---|
-| `uart_boot` | `u32` | missing/nonzero enables the stage2 UART selector; `0` disables it |
+| `stg2:uart_boot` | `u32` | missing/nonzero enables the stage2 UART selector; `0` disables it |
+| `stg2:boot_target` | `u32` | lab-only unconditional target: `1` Main, `2` Recovery |
 
 ## Failure behavior and power loss
 

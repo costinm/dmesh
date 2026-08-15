@@ -27,11 +27,11 @@ Current release artifacts:
 Build both fleet variants from the repository root:
 
 ```sh
-scripts/build-recovery-fleet.sh all
+scripts/build-stage2.sh all
 ```
 
-Outputs are under `target/recovery-fleet/<chip>/`. The same build also produces
-the matching partition table and Recovery image.
+Outputs are under `target/stage2/<chip>/` and contain only the matching
+bootloader and partition table. Rust Recovery is built separately.
 
 The application images are deliberately built against the common 4 MiB
 layout in [`partitions.csv`](partitions.csv). Recovery and Main keep those
@@ -63,7 +63,7 @@ reserved for first provisioning or emergency repair. Although Main's shared
 flash worker can technically target stage2, rewriting the only bootloader copy
 has no power-loss rollback and should remain rare and explicitly controlled.
 
-The stage2 UART selector is controlled by binary `u32` `recovery:uart_boot` in
+The stage2 UART selector is controlled by binary `u32` `stg2:uart_boot` in
 NVS. It is enabled when the key is missing or nonzero, preserving the lab/default behavior.
 Production provisioning should write `uart_boot=0`; stage2 then emits no
 UART identity and performs no UART polling, leaving rapid resets and the RTC

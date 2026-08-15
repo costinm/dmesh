@@ -8,9 +8,14 @@ meaning and compatibility rules live here.
 
 UART carries PPP/HDLC frames: `0x7e` delimits a packet and `0x7d` escapes the
 following byte with XOR `0x20`. There is no DMB1 packet and no plaintext
-selector. Stage2 emits `boot.identity` when `recovery:uart_boot` is enabled
+selector. Stage2 emits `boot.identity` when `stg2:uart_boot` is enabled
 and accepts the definite CBOR selector `{0:60010,6:[partition]}`. Partition
 `1` selects Main and partition `2` selects Recovery.
+
+For bounded lab diagnostics, binary NVS `u32` `stg2:boot_target` overrides
+normal selection before the UART window: `1` always boots Main and `2` always
+boots Recovery. Omit the key for normal policy; it must not be provisioned in
+production images.
 
 The selector window is 1000 ms after reset. ROM text is not a stage2 protocol;
 the managed lmesh forward may classify and suppress it.
