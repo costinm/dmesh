@@ -9,4 +9,3 @@ crate-type = ["rlib"]
 
 [dependencies]
 anyhow = "1"
-serde_json = "1"
