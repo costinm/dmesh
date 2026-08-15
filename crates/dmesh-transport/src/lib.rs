@@ -11,10 +11,13 @@
 extern crate alloc;
 #[cfg(any(feature = "std", test))]
 use alloc::vec::Vec;
+#[cfg(not(any(feature = "std", test)))]
+use alloc::{alloc::{alloc, dealloc, Layout}, boxed::Box};
 
 #[cfg(all(any(feature = "udp", feature = "std"), not(test)))]
 extern crate std;
 
+pub mod callback;
 pub mod handlers;
 pub mod ledger;
 
@@ -53,6 +56,9 @@ pub const SERVICE_STREAM: u8 = 4;
 pub const SERVICE_IPERF: u8 = 5;
 pub const SERVICE_METRICS: u8 = 6;
 pub const SERVICE_EVENTS: u8 = 7;
+/// Recovery command/log exchange. Payloads are compact CBOR records owned by
+/// Recovery; transport only carries the stream and never interprets them.
+pub const SERVICE_CONTROL: u8 = 8;
 pub const CONTROL_STREAM_ID: u64 = 0;
 pub const FIRST_CLIENT_BIDI_STREAM_ID: u64 = 4;
 pub const FIRST_SERVER_BIDI_STREAM_ID: u64 = 1;
@@ -60,6 +66,20 @@ pub const FIRST_CLIENT_UNI_STREAM_ID: u64 = 2;
 pub const FIRST_SERVER_UNI_STREAM_ID: u64 = 3;
 /// Default bearer payload bound used by the host profile and radio adapters.
 pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1400;
+/// Production Recovery's explicit maximum sender window. The host Wi-Fi
+/// profile must not exceed this without an association-level receive-budget
+/// negotiation.
+pub const RECOVERY_MAX_HISTORY_PACKETS: usize = 32;
+/// Callback/reassembly storage is deliberately larger than the send window:
+/// it retains ordered bytes while an earlier Wi-Fi datagram is repaired.
+pub const RECOVERY_REORDER_CAPACITY_BYTES: usize = 64 * DEFAULT_MAX_DATAGRAM_SIZE;
+/// Recovery advertises only storage it can retain while an earlier stream
+/// range is missing.  Keep one full datagram free so a gap-filling packet can
+/// be accepted instead of turning ordinary Wi-Fi reordering into a callback
+/// capacity error.
+pub const RECOVERY_INITIAL_MAX_DATA: u64 =
+    (RECOVERY_REORDER_CAPACITY_BYTES
+        - RECOVERY_MAX_HISTORY_PACKETS * DEFAULT_MAX_DATAGRAM_SIZE) as u64;
 
 /// Minimal synchronous bearer contract used by deterministic conformance
 /// drivers. UDP, NAN, BLE, and device adapters own the actual I/O and peer
@@ -222,6 +242,37 @@ pub enum Error {
     BootstrapInvalid,
     HistoryFull,
     RetransmissionTooLarge,
+}
+
+/// Result metadata for a bearer datagram after transport processing. The
+/// bearer may use this for diagnostics, but it never needs to inspect ACKs,
+/// packet numbers, or other transport frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportReceiveInfo {
+    pub stream: bool,
+    pub duplicate: bool,
+}
+
+/// Transport-owned diagnostics. Bearers may report this snapshot without
+/// inspecting ACK frames, packet numbers, or other transport mechanics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportStats {
+    pub received_datagrams: u64,
+    pub stream_datagrams: u64,
+    pub control_datagrams: u64,
+    pub duplicate_datagrams: u64,
+    pub out_of_order_datagrams: u64,
+    pub inferred_missing_packets: u64,
+    pub sent_datagrams: u64,
+    pub retransmitted_datagrams: u64,
+    pub ack_datagrams: u64,
+    pub ack_immediate_datagrams: u64,
+    pub ack_threshold_datagrams: u64,
+    pub ack_timer_datagrams: u64,
+    pub receive_interpacket_samples: u64,
+    pub receive_interpacket_total: u64,
+    pub receive_interpacket_min: u64,
+    pub receive_interpacket_max: u64,
 }
 
 /// Version-0 connection bootstrap carried as complete data on stream 0.
@@ -520,7 +571,7 @@ pub fn encode_bootstrap_open_packet(
         flags: FLAG_FIXED,
         dcid: ConnectionId::new(0).ok_or(Error::BootstrapInvalid)?,
         packet_number,
-        packet_number_len: 4,
+        packet_number_len: 1,
     }
     .encode(out)?;
     let frame_len = Frame::Stream(StreamFrame {
@@ -535,7 +586,7 @@ pub fn encode_bootstrap_open_packet(
 
 /// Decode a complete stream-0/DCID-0 version-0 OPEN datagram.
 pub fn decode_bootstrap_open_packet(input: &[u8]) -> Result<(ShortHeader, ConnectionId), Error> {
-    let (header, header_len) = ShortHeader::decode(input)?;
+    let (header, header_len) = ShortHeader::decode_with_expected(input, 0)?;
     if header.dcid.value() != 0 {
         return Err(Error::BootstrapInvalid);
     }
@@ -575,7 +626,7 @@ pub fn encode_bootstrap_open_ack_packet(
         flags: FLAG_FIXED,
         dcid: client_cid,
         packet_number,
-        packet_number_len: 4,
+        packet_number_len: 1,
     }
     .encode(out)?;
     let frame_len = Frame::Stream(StreamFrame {
@@ -665,6 +716,50 @@ pub struct ShortHeader {
     pub packet_number_len: u8,
 }
 
+/// The header prefix decoded before a connection is selected. The packet
+/// number is intentionally only the truncated wire value until the bearer
+/// supplies that connection's expected next packet number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShortHeaderPrefix {
+    pub flags: u8,
+    pub dcid: ConnectionId,
+    pub truncated_packet_number: u32,
+    pub packet_number_len: u8,
+    pub header_len: usize,
+}
+
+impl ShortHeaderPrefix {
+    /// Reconstruct the packet number nearest to `expected`, following the
+    /// QUIC packet-number window rule. Version 0 uses a u32 full number and
+    /// closes before it wraps.
+    pub fn reconstruct(self, expected: u32) -> Result<ShortHeader, Error> {
+        let pn_len = self.packet_number_len as usize;
+        let window = 1u64 << (pn_len * 8);
+        let half_window = window / 2;
+        let truncated = u64::from(self.truncated_packet_number);
+        let expected = u64::from(expected);
+        let epoch = expected & !(window - 1);
+        let mut candidate = epoch | truncated;
+        if candidate + half_window <= expected && candidate + window <= u64::from(u32::MAX) {
+            candidate += window;
+        } else if candidate > expected + half_window {
+            if candidate < window {
+                return Err(Error::PacketNumberExhausted);
+            }
+            candidate -= window;
+        }
+        if candidate > u64::from(u32::MAX) {
+            return Err(Error::PacketNumberExhausted);
+        }
+        Ok(ShortHeader {
+            flags: self.flags,
+            dcid: self.dcid,
+            packet_number: candidate as u32,
+            packet_number_len: self.packet_number_len,
+        })
+    }
+}
+
 impl ShortHeader {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
         let pn_len = self.packet_number_len.clamp(1, 4) as usize;
@@ -682,7 +777,7 @@ impl ShortHeader {
         Ok(1 + n + pn_len)
     }
 
-    pub fn decode(input: &[u8]) -> Result<(Self, usize), Error> {
+    pub fn decode_prefix(input: &[u8]) -> Result<ShortHeaderPrefix, Error> {
         if input.is_empty() {
             return Err(Error::Truncated);
         }
@@ -701,15 +796,52 @@ impl ShortHeader {
         for &b in &input[1 + cid_len..1 + cid_len + pn_len] {
             pn = (pn << 8) | b as u32;
         }
+        Ok(ShortHeaderPrefix {
+            flags: input[0],
+            dcid,
+            truncated_packet_number: pn,
+            packet_number_len: pn_len as u8,
+            header_len: 1 + cid_len + pn_len,
+        })
+    }
+
+    /// Decode with a connection-specific expected packet number.
+    pub fn decode_with_expected(input: &[u8], expected: u32) -> Result<(Self, usize), Error> {
+        let prefix = Self::decode_prefix(input)?;
+        Ok((prefix.reconstruct(expected)?, prefix.header_len))
+    }
+
+    /// Decode the truncated value without reconstruction. This is retained
+    /// only for wire/codec inspection; connection receive paths must use
+    /// `decode_with_expected`.
+    pub fn decode(input: &[u8]) -> Result<(Self, usize), Error> {
+        let prefix = Self::decode_prefix(input)?;
         Ok((
             Self {
-                flags: input[0],
-                dcid,
-                packet_number: pn,
-                packet_number_len: pn_len as u8,
+                flags: prefix.flags,
+                dcid: prefix.dcid,
+                packet_number: prefix.truncated_packet_number,
+                packet_number_len: prefix.packet_number_len,
             },
-            1 + cid_len + pn_len,
+            prefix.header_len,
         ))
+    }
+}
+
+/// Select the shortest packet-number encoding whose reconstruction window is
+/// unambiguous relative to the largest packet acknowledged by the peer.
+pub fn packet_number_len(next: u32, largest_acked: Option<u32>) -> u8 {
+    let baseline = largest_acked.unwrap_or(0);
+    let distance = next.saturating_sub(baseline) as u64;
+    let needed = distance.saturating_mul(2).max(1);
+    if needed < (1 << 8) {
+        1
+    } else if needed < (1 << 16) {
+        2
+    } else if needed < (1 << 24) {
+        3
+    } else {
+        4
     }
 }
 
@@ -936,7 +1068,7 @@ pub fn decode_frame<'a>(input: &'a [u8]) -> Result<(Frame<'a>, usize), Error> {
             if largest > u64::from(u32::MAX) || first_range > largest {
                 return Err(Error::Invalid);
             }
-            if range_count == 0 {
+            if range_count == 0 && first_range == 0 {
                 return Ok((
                     Frame::Ack {
                         largest: largest as u32,
@@ -1349,6 +1481,14 @@ impl CongestionController {
         true
     }
 
+    /// Account for one bounded loss/PTO probe.  A retransmission replaces
+    /// information already declared lost, so it must remain possible even
+    /// when the reduced congestion window is temporarily below data still in
+    /// flight.  The caller's retained-packet bound limits the probe rate.
+    pub fn on_retransmission_sent(&mut self, bytes: u64) {
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(bytes);
+    }
+
     pub fn on_ack(&mut self, acked_bytes: u64) {
         let acked = min(acked_bytes, self.bytes_in_flight);
         self.bytes_in_flight -= acked;
@@ -1427,7 +1567,10 @@ pub struct ConnectionLimits {
 }
 
 pub const INITIAL_MAX_DATA: u64 = 256 * 1024;
-pub const INITIAL_MAX_STREAM_DATA: u64 = 64 * 1024;
+// Keep the live Recovery window large enough to cover several flash blocks
+// while remaining bounded for the device. The host regression deliberately
+// exercises the smaller credit-extension boundary.
+pub const INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
 
 impl Default for ConnectionLimits {
     fn default() -> Self {
@@ -1441,6 +1584,7 @@ impl Default for ConnectionLimits {
 }
 
 /// Bounded stream accounting. Packet scheduling and bearer I/O remain in the caller.
+#[derive(Clone)]
 pub struct ConnectionState<const N: usize> {
     pub role: Role,
     pub connection: FlowControl,
@@ -1560,17 +1704,15 @@ impl<const N: usize> ConnectionState<N> {
     }
 
     pub fn extend_connection_credit(&mut self, credit: u64) {
-        self.connection
-            .extend(self.received_data.saturating_add(credit));
+        self.connection.extend(credit);
     }
 
     pub fn extend_stream_credit(&mut self, id: u64, credit: u64) -> Result<(), Error> {
         let i = self.find(id).ok_or(Error::Invalid)?;
-        let consumed = self.streams[i].ok_or(Error::Invalid)?.consumed;
         self.streams[i]
             .as_mut()
             .ok_or(Error::Invalid)?
-            .extend(consumed.saturating_add(credit));
+            .extend(credit);
         Ok(())
     }
 
@@ -1596,12 +1738,14 @@ impl<const N: usize> ConnectionState<N> {
 /// protocol state that must not diverge between implementations: packet
 /// acknowledgement ranges, receive credit, peer-advertised send credit, and
 /// congestion control.
+#[derive(Clone)]
 pub struct EndpointState<const N: usize, const H: usize = 16, const P: usize = 1400> {
     pub send: SendFlowControl<N>,
     pub receive: ConnectionState<N>,
     pub congestion: CongestionController,
     pub received_packets: AckRangeSet,
     pub next_packet_number: u32,
+    pub largest_acked_by_peer: Option<u32>,
     #[cfg(any(feature = "std", test))]
     sent_packets: Vec<Option<SentPacket<P>>>,
     #[cfg(not(any(feature = "std", test)))]
@@ -1609,11 +1753,21 @@ pub struct EndpointState<const N: usize, const H: usize = 16, const P: usize = 1
     local_cid: Option<ConnectionId>,
     peer_cid: Option<ConnectionId>,
     control_pending: bool,
+    ack_pending: bool,
+    ack_packets: u8,
+    ack_frequency: u8,
+    last_ack_time: u64,
+    largest_received_at: u64,
+    max_ack_delay_ms: u64,
+    peer_max_ack_delay_ms: u64,
     pending_stream_id: Option<u64>,
     send_clock: u64,
     rtt: RttEstimator,
     close_code: Option<u64>,
     history_limit: usize,
+    stats: TransportStats,
+    highest_received_packet: Option<u32>,
+    last_receive_time: Option<u64>,
 }
 
 /// Named memory profiles used by the current products. They are type-level
@@ -1628,9 +1782,38 @@ pub type Esp32Endpoint<const N: usize = 8> = EndpointState<N, 4, 512>;
 /// selected per connection, so this ceiling is not allocated unless chosen.
 pub type HostEndpoint<const N: usize = 8> = EndpointState<N, 512, 1400>;
 
+/// Directional connection identifiers. `local_receive` is the CID this
+/// endpoint accepts on inbound packets; `peer_receive` is the CID placed in
+/// every outbound packet. They are deliberately separate so a received DCID
+/// can never be mistaken for the sender's CID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionIds {
+    pub local_receive: ConnectionId,
+    pub peer_receive: ConnectionId,
+}
+
+impl ConnectionIds {
+    pub fn new(local_receive: ConnectionId, peer_receive: ConnectionId) -> Result<Self, Error> {
+        if local_receive.value() == 0 || peer_receive.value() == 0 || local_receive == peer_receive
+        {
+            return Err(Error::WrongConnectionId);
+        }
+        Ok(Self {
+            local_receive,
+            peer_receive,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SentPacket<const P: usize> {
     packet_number: u32,
+    // A retransmission has a fresh packet number, but an ACK for any prior
+    // transmission still proves that this logical stream range was delivered.
+    // Keep a bounded no_std ledger so a delayed ACK retires the range instead
+    // of needlessly retransmitting it again.
+    prior_packet_numbers: [u32; 16],
+    prior_packet_count: u8,
     bytes: u64,
     stream_id: u64,
     offset: u64,
@@ -1638,11 +1821,45 @@ struct SentPacket<const P: usize> {
     payload_len: usize,
     payload: [u8; P],
     sent_at: u64,
+    lost: bool,
+}
+
+impl<const P: usize> SentPacket<P> {
+    fn acknowledged_by(&self, acknowledged: &AckRangeSet) -> bool {
+        acknowledged.contains(self.packet_number)
+            || self.prior_packet_numbers[..self.prior_packet_count as usize]
+                .iter()
+                .any(|packet_number| acknowledged.contains(*packet_number))
+    }
+
+    fn add_prior_packet_number(&mut self, packet_number: u32) {
+        let count = self.prior_packet_count as usize;
+        if count < self.prior_packet_numbers.len() {
+            self.prior_packet_numbers[count] = packet_number;
+            self.prior_packet_count += 1;
+        } else {
+            self.prior_packet_numbers.rotate_left(1);
+            let last = self.prior_packet_numbers.len() - 1;
+            self.prior_packet_numbers[last] = packet_number;
+        }
+    }
 }
 
 impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     pub fn new(role: Role, limits: ConnectionLimits, max_datagram_size: u64) -> Self {
         Self::new_with_history_capacity(role, limits, max_datagram_size, H)
+    }
+
+    pub fn new_established(
+        role: Role,
+        limits: ConnectionLimits,
+        max_datagram_size: u64,
+        ids: ConnectionIds,
+    ) -> Self {
+        let mut endpoint = Self::new(role, limits, max_datagram_size);
+        endpoint.local_cid = Some(ids.local_receive);
+        endpoint.peer_cid = Some(ids.peer_receive);
+        endpoint
     }
 
     /// Construct an endpoint with a selected retransmission ledger size.
@@ -1664,6 +1881,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             congestion: CongestionController::new(max_datagram_size),
             received_packets: AckRangeSet::new(),
             next_packet_number: 0,
+            largest_acked_by_peer: None,
             #[cfg(any(feature = "std", test))]
             sent_packets: alloc::vec![None; history_capacity],
             #[cfg(not(any(feature = "std", test)))]
@@ -1671,16 +1889,67 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             local_cid: None,
             peer_cid: None,
             control_pending: false,
+            ack_pending: false,
+            ack_packets: 0,
+            ack_frequency: 2,
+            last_ack_time: 0,
+            largest_received_at: 0,
+            max_ack_delay_ms: 25,
+            peer_max_ack_delay_ms: 25,
             pending_stream_id: None,
             send_clock: 0,
             rtt: RttEstimator::default(),
             close_code: None,
             history_limit: history_capacity,
+            stats: TransportStats::default(),
+            highest_received_packet: None,
+            last_receive_time: None,
         }
     }
 
     pub fn observe_packet(&mut self, packet_number: u32) {
+        if !self.received_packets.contains(packet_number) {
+            let previous_highest = self.highest_received_packet;
+            if let Some(highest) = self.highest_received_packet {
+                let next = highest.saturating_add(1);
+                if packet_number < next {
+                    self.stats.out_of_order_datagrams += 1;
+                } else if packet_number > next {
+                    self.stats.inferred_missing_packets += u64::from(packet_number - next);
+                }
+            }
+            self.highest_received_packet = Some(
+                self.highest_received_packet
+                    .map_or(packet_number, |highest| highest.max(packet_number)),
+            );
+            if previous_highest.map_or(true, |highest| packet_number > highest) {
+                self.largest_received_at = self.send_clock;
+            }
+            if let Some(previous) = self.last_receive_time {
+                let delta = self.send_clock.saturating_sub(previous);
+                self.stats.receive_interpacket_samples += 1;
+                self.stats.receive_interpacket_total += delta;
+                if self.stats.receive_interpacket_samples == 1 {
+                    self.stats.receive_interpacket_min = delta;
+                } else {
+                    self.stats.receive_interpacket_min =
+                        self.stats.receive_interpacket_min.min(delta);
+                }
+                self.stats.receive_interpacket_max = self.stats.receive_interpacket_max.max(delta);
+            }
+            self.last_receive_time = Some(self.send_clock);
+        }
         self.received_packets.insert(packet_number);
+    }
+
+    pub fn expected_packet_number(&self) -> u32 {
+        self.largest_received()
+            .and_then(|value| value.checked_add(1))
+            .unwrap_or(0)
+    }
+
+    pub fn next_packet_number_len(&self) -> u8 {
+        packet_number_len(self.next_packet_number, self.largest_acked_by_peer)
     }
 
     pub fn largest_received(&self) -> Option<u32> {
@@ -1691,14 +1960,12 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.send.open_stream(id, max_data)
     }
 
-    pub fn set_connection_ids(
+    pub fn install_connection_ids(
         &mut self,
         local: ConnectionId,
         peer: ConnectionId,
     ) -> Result<(), Error> {
-        if local.value() == 0 || peer.value() == 0 {
-            return Err(Error::WrongConnectionId);
-        }
+        let _ = ConnectionIds::new(local, peer)?;
         self.local_cid = Some(local);
         self.peer_cid = Some(peer);
         Ok(())
@@ -1776,6 +2043,9 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     pub fn received_packet_count(&self) -> usize {
         self.received_packets.len()
     }
+    pub fn has_received_packet(&self, packet_number: u32) -> bool {
+        self.received_packets.contains(packet_number)
+    }
     pub fn bytes_in_flight(&self) -> u64 {
         self.congestion.bytes_in_flight
     }
@@ -1802,6 +2072,34 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
 
     pub fn set_time(&mut self, now: u64) {
         self.send_clock = now;
+    }
+
+    /// Select how many newly received stream packets may be coalesced before
+    /// an ACK/window datagram is emitted. The transport still owns the ACK
+    /// contents and scheduling; the bearer/profile selects this policy.
+    pub fn set_ack_frequency(&mut self, packets: u8) {
+        self.ack_frequency = packets.clamp(1, ACK_RANGE_CAPACITY as u8);
+    }
+
+    /// Install the out-of-band association ACK policy. Version 0 has no
+    /// authenticated ACK_FREQUENCY frame, so both peers must receive these
+    /// values from the association/bootstrap owner before data is sent.
+    pub fn set_ack_policy(&mut self, packets: u8, max_ack_delay_ms: u64) {
+        self.set_ack_frequency(packets);
+        self.max_ack_delay_ms = max_ack_delay_ms;
+        self.peer_max_ack_delay_ms = max_ack_delay_ms;
+    }
+
+    /// Return transport diagnostics for the current measurement interval.
+    pub const fn stats(&self) -> TransportStats {
+        self.stats
+    }
+
+    /// Start a fresh diagnostics interval without disturbing protocol state.
+    pub fn reset_stats(&mut self) {
+        self.stats = TransportStats::default();
+        self.highest_received_packet = None;
+        self.last_receive_time = None;
     }
 
     pub const fn latest_rtt(&self) -> Option<u64> {
@@ -1847,7 +2145,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             flags: FLAG_FIXED,
             dcid,
             packet_number: self.next_packet_number,
-            packet_number_len: 4,
+            packet_number_len: self.next_packet_number_len(),
         }
         .encode(out)?;
         used += Frame::Close { code }.encode(&mut out[used..])?;
@@ -1881,12 +2179,11 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         &mut self,
         input: &'a [u8],
     ) -> Result<(ShortHeader, StreamFrame<'a>), Error> {
-        let (header, header_len) = ShortHeader::decode(input)?;
-        let infer_peer = self.local_cid.is_none() && self.peer_cid.is_none();
-        if let Some(local) = self.local_cid {
-            if header.dcid != local {
-                return Err(Error::WrongConnectionId);
-            }
+        let (header, header_len) =
+            ShortHeader::decode_with_expected(input, self.expected_packet_number())?;
+        let local = self.local_cid.ok_or(Error::WrongConnectionId)?;
+        if header.dcid != local {
+            return Err(Error::WrongConnectionId);
         }
         let (frame, _) = decode_frame(&input[header_len..])?;
         let Frame::Stream(stream) = frame else {
@@ -1894,12 +2191,6 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         };
         self.receive
             .accept(stream.id, stream.offset, stream.data.len(), stream.fin)?;
-        if infer_peer {
-            // Compatibility mode for the pre-bootstrap API. New endpoints
-            // install both directional CIDs before receiving traffic. Delay
-            // inference until parsing and credit validation have succeeded.
-            self.peer_cid = Some(header.dcid);
-        }
         self.observe_packet(header.packet_number);
         Ok((header, stream))
     }
@@ -1911,12 +2202,18 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         if self.is_closed() {
             return Err(Error::Invalid);
         }
-        let (header, header_len) = ShortHeader::decode(input)?;
-        let infer_peer = self.local_cid.is_none() && self.peer_cid.is_none();
-        if let Some(local) = self.local_cid {
-            if header.dcid != local {
-                return Err(Error::WrongConnectionId);
-            }
+        let expected_packet_number = self.expected_packet_number();
+        let (header, header_len) =
+            ShortHeader::decode_with_expected(input, expected_packet_number)?;
+        // Packet numbers are allowed to arrive out of order within the
+        // sender's bounded retransmission window.  A lower-than-expected
+        // number is not necessarily a duplicate: it may be a delayed packet
+        // filling a selective-ACK gap.  Only a number already present in the
+        // receive ACK ranges is a duplicate.
+        let duplicate = self.received_packets.contains(header.packet_number);
+        let local = self.local_cid.ok_or(Error::WrongConnectionId)?;
+        if header.dcid != local {
+            return Err(Error::WrongConnectionId);
         }
         // Decode the complete frame list before mutating endpoint state. This
         // keeps a malformed trailing frame from partially applying an ACK or
@@ -1926,7 +2223,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         if offset == input.len() {
             return Err(Error::Truncated);
         }
-        let mut stream = None;
+        let mut streams = [None; 8];
+        let mut stream_count = 0usize;
         let mut has_ack = false;
         let mut close_code = None;
         while offset < input.len() {
@@ -1937,10 +2235,11 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             match frame {
                 Frame::Ack { .. } | Frame::AckRanges { .. } => has_ack = true,
                 Frame::Stream(value) => {
-                    if stream.is_some() {
+                    if stream_count >= streams.len() {
                         return Err(Error::Invalid);
                     }
-                    stream = Some(value);
+                    streams[stream_count] = Some(value);
+                    stream_count += 1;
                 }
                 Frame::Close { code } => {
                     if close_code.is_some() {
@@ -1955,7 +2254,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         if offset != input.len() {
             return Err(Error::Invalid);
         }
-        if close_code.is_some() && stream.is_some() {
+        if close_code.is_some() && stream_count != 0 {
             return Err(Error::Invalid);
         }
         if has_ack {
@@ -1963,24 +2262,114 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         }
         if let Some(code) = close_code {
             self.close_code = Some(code);
+            self.control_pending = true;
+            self.ack_pending = true;
         }
-        if infer_peer {
-            // Do not let malformed or flow-rejected packets establish a
-            // compatibility peer route as a side effect.
-            self.peer_cid = Some(header.dcid);
+        self.stats.received_datagrams += 1;
+        if duplicate {
+            // A lost ACK causes the peer to retransmit the same packet
+            // number. Re-ack it without delivering its stream bytes again.
+            self.control_pending = true;
+            self.ack_pending = true;
+            self.stats.duplicate_datagrams += 1;
+            self.stats.control_datagrams += 1;
+            return Ok(TransportPacket::Control);
         }
-        let Some(stream) = stream else {
+        let Some(stream) = streams[0] else {
+            // ACK/control packets still consume receive packet numbers. They
+            // are not themselves ACK-eliciting, so record them without
+            // generating an ACK response. Failing to observe them leaves the
+            // receive packet-number space at zero and breaks coalesced ACKs.
+            self.observe_packet(header.packet_number);
+            self.stats.control_datagrams += 1;
             return Ok(TransportPacket::Control);
         };
-        self.receive
-            .accept(stream.id, stream.offset, stream.data.len(), stream.fin)?;
+        for stream in streams[..stream_count].iter().flatten() {
+            self.receive
+                .accept(stream.id, stream.offset, stream.data.len(), stream.fin)?;
+        }
+        // Selective ACK gaps are loss signals. Do not wait for the normal
+        // coalescing threshold when a packet creates or fills a gap.
+        if let Some(highest) = self.highest_received_packet {
+            if header.packet_number != highest.saturating_add(1) {
+                self.control_pending = true;
+            }
+        }
         self.observe_packet(header.packet_number);
-        self.control_pending = true;
+        self.ack_pending = true;
+        self.ack_packets = self.ack_packets.saturating_add(1);
         self.pending_stream_id = Some(stream.id);
+        self.stats.stream_datagrams += 1;
         Ok(TransportPacket::Stream {
             header,
             frame: stream,
         })
+    }
+
+    /// Process one bearer datagram and emit any transport responses through a
+    /// callback. Application code supplies only a stream callback and the
+    /// bearer send callback; ACKs, duplicate handling, flow credit, and
+    /// response scheduling remain entirely inside transport.
+    pub fn receive_with_callbacks<S, O>(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+        mut emit: O,
+        mut on_stream: S,
+    ) -> Result<TransportReceiveInfo, Error>
+    where
+        S: FnMut(StreamFrame<'_>) -> Result<usize, Error>,
+        O: FnMut(&[u8]),
+    {
+        let (header, _) = ShortHeader::decode_with_expected(input, self.expected_packet_number())?;
+        let duplicate = self.has_received_packet(header.packet_number);
+        // Stream delivery can apply bounded application backpressure. Do not
+        // let a rejection consume packet numbers, ACK ranges, or flow credit.
+        // The embedded endpoint contains a fixed packet ledger larger than
+        // Recovery's main stack, so copy its checkpoint directly into heap
+        // storage instead of materialising `self.clone()` on that stack.
+        #[cfg(any(feature = "std", test))]
+        let checkpoint = self.clone();
+        #[cfg(not(any(feature = "std", test)))]
+        let checkpoint = {
+            let layout = Layout::new::<Self>();
+            let raw = unsafe { alloc(layout) as *mut Self };
+            if raw.is_null() {
+                return Err(Error::Invalid);
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(self, raw, 1);
+                Box::from_raw(raw)
+            }
+        };
+        let packet = self.receive_datagram(input)?;
+        let mut stream = false;
+        if let TransportPacket::Stream { frame, .. } = packet {
+            stream = true;
+            let consumed = match on_stream(frame) {
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    #[cfg(any(feature = "std", test))]
+                    {
+                        *self = checkpoint;
+                    }
+                    #[cfg(not(any(feature = "std", test)))]
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(checkpoint.as_ref(), self, 1);
+                        let raw = Box::into_raw(checkpoint);
+                        dealloc(raw.cast(), Layout::new::<Self>());
+                    }
+                    return Err(error);
+                }
+            };
+            if consumed != 0 {
+                self.stream_consumed_deferred(frame.id, consumed)?;
+            }
+        }
+        if let Some(used) = self.poll_transmit(out)? {
+            emit(&out[..used]);
+        }
+        Ok(TransportReceiveInfo { stream, duplicate })
     }
 }
 
@@ -1989,7 +2378,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     /// need to inspect a datagram before dispatch can use this inexpensive
     /// transaction check.
     pub fn validate_datagram(input: &[u8]) -> Result<(), Error> {
-        let (_, mut offset) = ShortHeader::decode(input)?;
+        let (_, mut offset) =
+            ShortHeader::decode_prefix(input).map(|prefix| (prefix, prefix.header_len))?;
         if offset == input.len() {
             return Err(Error::Truncated);
         }
@@ -2007,11 +2397,32 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     /// accounting call a stream consumer makes; transport decides when the
     /// resulting ACK/window update is emitted by `poll_transmit`.
     pub fn stream_consumed(&mut self, stream_id: u64, bytes: usize) -> Result<(), Error> {
+        self.stream_consumed_inner(stream_id, bytes, true)
+    }
+
+    fn stream_consumed_deferred(&mut self, stream_id: u64, bytes: usize) -> Result<(), Error> {
+        self.stream_consumed_inner(stream_id, bytes, false)
+    }
+
+    fn stream_consumed_inner(
+        &mut self,
+        stream_id: u64,
+        bytes: usize,
+        force_control: bool,
+    ) -> Result<(), Error> {
         self.receive.consume(stream_id, bytes as u64)?;
-        self.receive.extend_connection_credit(INITIAL_MAX_DATA);
+        // Keep the advertised sliding window equal to the connection's
+        // negotiated receive budget. Recovery deliberately uses a smaller
+        // budget than the generic host default so it can retain a reordered
+        // sender burst. Never silently grow it to INITIAL_MAX_* here.
         self.receive
-            .extend_stream_credit(stream_id, INITIAL_MAX_STREAM_DATA)?;
-        self.control_pending = true;
+            .extend_connection_credit(self.receive.limits.max_data);
+        self.receive
+            .extend_stream_credit(stream_id, self.receive.limits.max_stream_data)?;
+        if force_control {
+            self.control_pending = true;
+        }
+        self.ack_pending = true;
         self.pending_stream_id = Some(stream_id);
         Ok(())
     }
@@ -2019,39 +2430,53 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     /// Let the transport decide whether an ACK/window packet is due. The
     /// bearer only sends the returned datagram and never inspects its frames.
     pub fn poll_transmit(&mut self, out: &mut [u8]) -> Result<Option<usize>, Error> {
-        if !self.control_pending {
+        let ack_threshold_due = self.ack_pending && self.ack_packets >= self.ack_frequency;
+        let ack_timer_due = self.ack_pending
+            && self.send_clock.saturating_sub(self.largest_received_at) >= self.max_ack_delay_ms;
+        let delayed_ack_due = ack_threshold_due || ack_timer_due;
+        if !self.control_pending && !delayed_ack_due {
             return Ok(None);
         }
+        let immediate_ack = self.control_pending;
         let dcid = self.peer_cid.ok_or(Error::WrongConnectionId)?;
         let largest = self.largest_received().ok_or(Error::Invalid)?;
         let mut p = ShortHeader {
             flags: FLAG_FIXED,
             dcid,
             packet_number: self.next_packet_number,
-            packet_number_len: 4,
+            packet_number_len: self.next_packet_number_len(),
         }
         .encode(out)?;
         p += Frame::AckRanges {
             largest,
-            delay: 0,
+            delay: self
+                .send_clock
+                .saturating_sub(self.largest_received_at)
+                .min(self.max_ack_delay_ms),
             ranges: self.received_packets,
         }
         .encode(&mut out[p..])?;
-        p += Frame::MaxData(
-            self.receive
-                .connection
-                .consumed
-                .saturating_add(INITIAL_MAX_DATA),
-        )
-        .encode(&mut out[p..])?;
+        p += Frame::MaxData(self.receive.connection.max_data).encode(&mut out[p..])?;
         if let Some(stream_id) = self.pending_stream_id.take() {
             let max = self
                 .receive
                 .stream_max_data(stream_id)
-                .unwrap_or(INITIAL_MAX_STREAM_DATA);
+                .unwrap_or(self.receive.limits.max_stream_data);
             p += Frame::MaxStreamData { id: stream_id, max }.encode(&mut out[p..])?;
         }
         self.control_pending = false;
+        self.ack_pending = false;
+        self.ack_packets = 0;
+        self.last_ack_time = self.send_clock;
+        self.stats.sent_datagrams += 1;
+        self.stats.ack_datagrams += 1;
+        if immediate_ack {
+            self.stats.ack_immediate_datagrams += 1;
+        } else if ack_threshold_due {
+            self.stats.ack_threshold_datagrams += 1;
+        } else if ack_timer_due {
+            self.stats.ack_timer_datagrams += 1;
+        }
         self.next_packet_number = self
             .next_packet_number
             .checked_add(1)
@@ -2066,16 +2491,19 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         let (_, header_len) = ShortHeader::decode(input)?;
         let mut offset = header_len;
         let mut acknowledged = AckRangeSet::new();
+        let mut reported_ack_delay = 0u64;
         while offset < input.len() {
             let (frame, used) = decode_frame(&input[offset..])?;
             if used == 0 {
                 return Err(Error::Invalid);
             }
             match frame {
-                Frame::Ack { largest, .. } => {
+                Frame::Ack { largest, delay } => {
                     acknowledged.insert(largest);
+                    reported_ack_delay = delay;
                 }
-                Frame::AckRanges { ranges, .. } => {
+                Frame::AckRanges { ranges, delay, .. } => {
+                    reported_ack_delay = delay;
                     for i in 0..ranges.len() {
                         if let Some(range) = ranges.get(i) {
                             acknowledged.insert_range(range);
@@ -2091,19 +2519,37 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         if acknowledged.len() == 0 {
             return Err(Error::Invalid);
         }
+        self.largest_acked_by_peer = acknowledged.get(0).map(|range| range.end);
+        let largest_acked = acknowledged.get(0).map(|range| range.end);
         let mut rtt_sample = None;
         for slot in &mut self.sent_packets {
             if let Some(sent) = *slot {
-                if acknowledged.contains(sent.packet_number) {
-                    rtt_sample = Some(self.send_clock.saturating_sub(sent.sent_at));
+                if sent.acknowledged_by(&acknowledged) {
+                    if largest_acked.is_some_and(|packet| {
+                        sent.packet_number == packet
+                            || sent.prior_packet_numbers[..sent.prior_packet_count as usize]
+                                .contains(&packet)
+                    }) {
+                        rtt_sample = Some(self.send_clock.saturating_sub(sent.sent_at));
+                    }
                     self.congestion.on_ack(sent.bytes);
                     *slot = None;
                 }
             }
         }
         if let Some(sample) = rtt_sample {
-            self.rtt.update(sample);
+            let ack_delay = reported_ack_delay.min(self.peer_max_ack_delay_ms);
+            // Never reduce a sample below the observed minimum RTT; this is
+            // QUIC's safeguard against an implausible or stale ACK delay.
+            let adjusted = match self.rtt.minimum() {
+                Some(minimum) if sample > minimum.saturating_add(ack_delay) => {
+                    sample.saturating_sub(ack_delay)
+                }
+                _ => sample,
+            };
+            self.rtt.update(adjusted);
         }
+        self.detect_ack_losses(acknowledged.get(0).map(|range| range.end));
         Ok(())
     }
 
@@ -2131,10 +2577,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             flags: FLAG_FIXED,
             dcid,
             packet_number: self.next_packet_number,
-            // Keep the full packet number on this bounded protocol.  It avoids
-            // a 16-bit wrap during large object transfers and removes packet
-            // number reconstruction from the embedded bearers.
-            packet_number_len: 4,
+            packet_number_len: self.next_packet_number_len(),
         };
         let mut p = header.encode(out)?;
         p += Frame::Stream(StreamFrame {
@@ -2169,11 +2612,16 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             .next_packet_number
             .checked_add(1)
             .ok_or(Error::PacketNumberExhausted)?;
-        let slot = self.sent_packets.iter_mut().take(self.history_limit)
+        let slot = self
+            .sent_packets
+            .iter_mut()
+            .take(self.history_limit)
             .find(|slot| slot.is_none())
             .ok_or(Error::HistoryFull)?;
         *slot = Some(SentPacket {
             packet_number,
+            prior_packet_numbers: [0; 16],
+            prior_packet_count: 0,
             bytes: p as u64,
             stream_id,
             offset,
@@ -2185,14 +2633,18 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                 payload
             },
             sent_at: self.send_clock,
+            lost: false,
         });
+        self.stats.sent_datagrams += 1;
         Ok((p, packet_number))
     }
 
     /// Re-encode one outstanding stream frame with a fresh packet number.
-    /// Loss removes the old ledger entry and congestion bytes before the new
-    /// transmission is accounted, so retransmission does not double-charge
-    /// flow credit or redeliver application bytes.
+    ///
+    /// Packet numbers are never reused within a connection. A retransmission
+    /// carries the same stream range, which the receive stream reassembler
+    /// deduplicates, but it is a new transport packet and must receive a new
+    /// number.
     pub fn retransmit_stream_packet(
         &mut self,
         packet_number: u32,
@@ -2206,32 +2658,58 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         };
         let peer_cid = self.peer_cid.ok_or(Error::WrongConnectionId)?;
         let sent = self.sent_packets[index].take().ok_or(Error::Invalid)?;
-        if self.next_packet_number == u32::MAX {
-            self.sent_packets[index] = Some(sent);
-            return Err(Error::PacketNumberExhausted);
-        }
         let previous_congestion = self.congestion;
-        self.congestion.on_loss(sent.bytes);
+        if !sent.lost {
+            self.congestion.on_loss(sent.bytes);
+        }
         let payload = &sent.payload[..sent.payload_len];
-        let result = self.encode_stream_packet(
-            peer_cid,
-            sent.stream_id,
-            sent.offset,
-            sent.fin,
-            payload,
-            out,
-        );
-        match result {
-            Ok(result) => Ok(Some(result)),
+        let packet_number = self.next_packet_number;
+        let header = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: peer_cid,
+            packet_number,
+            packet_number_len: self.next_packet_number_len(),
+        };
+        let mut used = match header.encode(out) {
+            Ok(used) => used,
             Err(error) => {
-                // Retransmission is transactional. A too-small output buffer,
-                // temporary flow/congestion backpressure, or any other encode
-                // failure must not discard the only retained copy.
                 self.congestion = previous_congestion;
                 self.sent_packets[index] = Some(sent);
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        used = match Frame::Stream(StreamFrame {
+            id: sent.stream_id,
+            offset: sent.offset,
+            fin: sent.fin,
+            data: payload,
+        })
+        .encode(&mut out[used..])
+        {
+            Ok(used_frame) => used + used_frame,
+            Err(error) => {
+                self.congestion = previous_congestion;
+                self.sent_packets[index] = Some(sent);
+                return Err(error);
+            }
+        };
+        self.congestion.on_retransmission_sent(used as u64);
+        self.next_packet_number = self
+            .next_packet_number
+            .checked_add(1)
+            .ok_or(Error::PacketNumberExhausted)?;
+        let mut replacement = SentPacket {
+            packet_number,
+            bytes: used as u64,
+            sent_at: self.send_clock,
+            ..sent
+        };
+        replacement.add_prior_packet_number(sent.packet_number);
+        replacement.lost = false;
+        self.sent_packets[index] = Some(replacement);
+        self.stats.sent_datagrams += 1;
+        self.stats.retransmitted_datagrams += 1;
+        Ok(Some((used, packet_number)))
     }
 
     pub fn retransmit_due(
@@ -2244,12 +2722,60 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             .sent_packets
             .iter()
             .flatten()
-            .filter(|packet| now.saturating_sub(packet.sent_at) >= pto)
+            .filter(|packet| packet.lost || now.saturating_sub(packet.sent_at) >= pto)
             .min_by_key(|packet| packet.sent_at)
             .map(|packet| packet.packet_number);
         match packet_number {
             Some(packet_number) => self.retransmit_stream_packet(packet_number, out),
             None => Ok(None),
+        }
+    }
+
+    /// Mark packets inferred lost from selective ACK gaps before waiting for
+    /// PTO. The bearer simply polls normal transport output for the resulting
+    /// fresh-number retransmission.
+    fn detect_ack_losses(&mut self, largest_acked: Option<u32>) {
+        const PACKET_THRESHOLD: u32 = 3;
+        let Some(largest_acked) = largest_acked else {
+            return;
+        };
+        let base_rtt = self
+            .rtt
+            .latest()
+            .or(self.rtt.smoothed())
+            .unwrap_or(25)
+            .max(1);
+        // RFC 9002's 9/8 time threshold, rounded up in millisecond clocks.
+        // `base_rtt` is ACK-delay compensated, while an outstanding sibling
+        // packet may still be waiting for the peer's negotiated delayed ACK.
+        // Include that association parameter here: otherwise a normal
+        // delayed ACK makes a same-burst packet appear lost and collapses the
+        // congestion window into stop-and-wait pacing.
+        let time_threshold = base_rtt
+            .saturating_mul(9)
+            .saturating_add(7)
+            / 8
+            + self.peer_max_ack_delay_ms;
+        let mut lost_bytes = 0u64;
+        for slot in &mut self.sent_packets {
+            let Some(packet) = slot.as_mut() else {
+                continue;
+            };
+            if packet.lost || packet.packet_number > largest_acked {
+                continue;
+            }
+            let packet_threshold_lost = packet
+                .packet_number
+                .saturating_add(PACKET_THRESHOLD)
+                <= largest_acked;
+            let time_threshold_lost = self.send_clock.saturating_sub(packet.sent_at) >= time_threshold;
+            if packet_threshold_lost || time_threshold_lost {
+                packet.lost = true;
+                lost_bytes = lost_bytes.saturating_add(packet.bytes);
+            }
+        }
+        if lost_bytes != 0 {
+            self.congestion.on_loss(lost_bytes);
         }
     }
 
@@ -2284,7 +2810,7 @@ mod tests {
             EndpointState::<8, 4, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
         let local = ConnectionId::new(0x1234).unwrap();
         let peer = ConnectionId::new(0x5678).unwrap();
-        state.set_connection_ids(local, peer).unwrap();
+        state.install_connection_ids(local, peer).unwrap();
         let mut seed = 0x8f31_2a77_u64;
         for iteration in 0..20_000u32 {
             // Deterministic xorshift input makes failures reproducible without
@@ -2411,6 +2937,23 @@ mod tests {
     }
 
     #[test]
+    fn quic_ack_range_with_contiguous_packets_preserves_first_range() {
+        let mut ranges = AckRangeSet::new();
+        for packet_number in [10, 9, 8] {
+            ranges.insert(packet_number);
+        }
+        let frame = Frame::AckRanges {
+            largest: 10,
+            delay: 0,
+            ranges,
+        };
+        let mut encoded = [0u8; 64];
+        let used = frame.encode(&mut encoded).unwrap();
+        let (decoded, _) = decode_frame(&encoded[..used]).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
     fn short_header_round_trip_uses_variable_cid() {
         for value in [1, 0x1234, 0x1234_5678, 0x1234_5678_9abc_def0] {
             let mut b = [0u8; 32];
@@ -2461,6 +3004,27 @@ mod tests {
         assert!(c.accept(0, 0, 5, false).is_ok());
         assert_eq!(c.accept(0, 5, 4, false), Err(Error::FlowControl));
         assert!(c.consume(0, 5).is_ok());
+    }
+
+    #[test]
+    fn consumed_stream_keeps_the_negotiated_receive_budget() {
+        let limits = ConnectionLimits {
+            max_data: RECOVERY_INITIAL_MAX_DATA,
+            max_stream_data: RECOVERY_INITIAL_MAX_DATA,
+            max_streams_bidi: 1,
+            max_streams_uni: 1,
+        };
+        let mut endpoint = EndpointState::<2>::new(Role::Client, limits, 1400);
+        endpoint.receive.accept(3, 0, 1200, false).unwrap();
+        endpoint.stream_consumed(3, 1200).unwrap();
+        assert_eq!(
+            endpoint.receive.connection.max_data,
+            1200 + RECOVERY_INITIAL_MAX_DATA
+        );
+        assert_eq!(
+            endpoint.receive.stream_max_data(3),
+            Some(1200 + RECOVERY_INITIAL_MAX_DATA)
+        );
     }
 
     #[test]
@@ -2573,9 +3137,7 @@ mod tests {
         let used = largest.encode(&mut encoded).unwrap();
         assert_eq!(
             &encoded[..used],
-            &[
-                0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
-            ]
+            &[0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]
         );
 
         let smallest_ack = BootstrapOpenAck {
@@ -2590,9 +3152,7 @@ mod tests {
         let used = largest_ack.encode(&mut encoded).unwrap();
         assert_eq!(
             &encoded[..used],
-            &[
-                0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
-            ]
+            &[0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]
         );
     }
 
@@ -2696,8 +3256,12 @@ mod tests {
             EndpointState::<4, 2>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut server =
             EndpointState::<4, 2>::new(Role::Server, ConnectionLimits::default(), 1200);
-        client.set_connection_ids(client_cid, server_cid).unwrap();
-        server.set_connection_ids(server_cid, client_cid).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
         assert_eq!(client.history_capacity(), 2);
         client.set_history_capacity(1).unwrap();
         assert_eq!(client.history_capacity(), 1);
@@ -2758,8 +3322,12 @@ mod tests {
             EndpointState::<4, 4>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut server =
             EndpointState::<4, 4>::new(Role::Server, ConnectionLimits::default(), 1200);
-        client.set_connection_ids(client_cid, server_cid).unwrap();
-        server.set_connection_ids(server_cid, client_cid).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
         client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut request = [0u8; 256];
         let (request_len, _) = client
@@ -2795,7 +3363,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_peer_inference_waits_for_valid_datagram() {
+    fn packets_require_explicit_directional_cids() {
         let mut endpoint =
             EndpointState::<2, 2>::new(Role::Server, ConnectionLimits::default(), 1200);
         let cid = ConnectionId::new(0x44).unwrap();
@@ -2808,21 +3376,18 @@ mod tests {
         let mut malformed = [0u8; 64];
         let header_len = header.encode(&mut malformed).unwrap();
         malformed[header_len] = FRAME_STREAM_BASE as u8 | 0x04 | 0x02 | 1;
-        assert!(
-            endpoint
-                .receive_datagram(&malformed[..header_len + 1])
-                .is_err()
-        );
+        assert!(endpoint
+            .receive_datagram(&malformed[..header_len + 1])
+            .is_err());
         assert_eq!(endpoint.peer_connection_id(), None);
 
         let frame_len = Frame::Ping.encode(&mut malformed[header_len..]).unwrap();
         assert_eq!(
             endpoint
                 .receive_datagram(&malformed[..header_len + frame_len])
-                .unwrap(),
-            TransportPacket::Control
+                .unwrap_err(),
+            Error::WrongConnectionId
         );
-        assert_eq!(endpoint.peer_connection_id(), Some(cid));
     }
 
     #[test]
@@ -2871,20 +3436,23 @@ mod tests {
     #[test]
     fn host_ledger_cannot_shrink_below_live_entries() {
         let cid = ConnectionId::new(0x4711).unwrap();
+        let peer = ConnectionId::new(0x4712).unwrap();
         let mut endpoint = EndpointState::<4, 16, 64>::new_with_history_capacity(
             Role::Client,
             ConnectionLimits::default(),
             1200,
             8,
         );
-        endpoint.set_connection_ids(cid, cid).unwrap();
-        endpoint.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        endpoint.install_connection_ids(cid, peer).unwrap();
+        endpoint
+            .open_send_stream(4, INITIAL_MAX_STREAM_DATA)
+            .unwrap();
         let mut packet = [0u8; 256];
         endpoint
-            .encode_stream_packet(cid, 4, 0, false, b"one", &mut packet)
+            .encode_stream_packet(peer, 4, 0, false, b"one", &mut packet)
             .unwrap();
         endpoint
-            .encode_stream_packet(cid, 4, 3, true, b"two", &mut packet)
+            .encode_stream_packet(peer, 4, 3, true, b"two", &mut packet)
             .unwrap();
         assert_eq!(endpoint.set_history_capacity(1), Err(Error::HistoryFull));
         assert_eq!(endpoint.history_capacity(), 8);
@@ -2903,8 +3471,8 @@ mod tests {
                 capacity,
             );
             let mut receiver = EndpointState::<512, 8, 64>::new(Role::Server, limits, 1200);
-            sender.set_connection_ids(local, peer).unwrap();
-            receiver.set_connection_ids(peer, local).unwrap();
+            sender.install_connection_ids(local, peer).unwrap();
+            receiver.install_connection_ids(peer, local).unwrap();
             sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
             sender.congestion.congestion_window = (capacity as u64) * 1200;
             sender.congestion.slow_start_threshold = sender.congestion.congestion_window;
@@ -2955,13 +3523,12 @@ mod tests {
         let peer = ConnectionId::new(52).unwrap();
         let mut sender =
             EndpointState::<4, 2, 64>::new(Role::Client, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(local, peer).unwrap();
+        sender.install_connection_ids(local, peer).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut packet = [0u8; 256];
-        let (used, first_pn) = sender
+        let (_used, first_pn) = sender
             .encode_stream_packet(peer, 4, 0, true, b"reliable", &mut packet)
             .unwrap();
-        let original = packet[..used].to_vec();
         let before = sender.send.sent_data;
         let (retransmitted, second_pn) = sender
             .retransmit_stream_packet(first_pn, &mut packet)
@@ -2970,6 +3537,13 @@ mod tests {
         assert_ne!(first_pn, second_pn);
         assert_eq!(sender.send.sent_data, before);
         let (_, header_len) = ShortHeader::decode(&packet[..retransmitted]).unwrap();
+        assert_eq!(
+            ShortHeader::decode(&packet[..retransmitted])
+                .unwrap()
+                .0
+                .packet_number,
+            second_pn
+        );
         let (frame, _) = decode_frame(&packet[header_len..retransmitted]).unwrap();
         assert_eq!(
             frame,
@@ -2980,7 +3554,289 @@ mod tests {
                 data: b"reliable"
             })
         );
-        assert_ne!(original, packet[..retransmitted]);
+    }
+
+    #[test]
+    fn ack_for_original_packet_retires_retransmitted_stream_range() {
+        let local = ConnectionId::new(53).unwrap();
+        let peer = ConnectionId::new(54).unwrap();
+        let mut sender =
+            EndpointState::<4, 4, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 4, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, original_pn) = sender
+            .encode_stream_packet(peer, 4, 0, true, b"logical delivery", &mut packet)
+            .unwrap();
+        receiver.receive_datagram(&packet[..used]).unwrap();
+        let (_, replacement_pn) = sender
+            .retransmit_stream_packet(original_pn, &mut packet)
+            .unwrap()
+            .unwrap();
+        assert_ne!(original_pn, replacement_pn);
+
+        // The peer's delayed ACK covers the original transmission, not the
+        // replacement. It must still retire the one logical stream range.
+        receiver.set_time(25);
+        let mut ack = [0u8; 256];
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_datagram(&ack[..ack_len]).unwrap();
+        assert_eq!(sender.history_len(), 0);
+    }
+
+    #[test]
+    fn delayed_ack_emits_on_timer_tick_without_another_datagram() {
+        let local = ConnectionId::new(57).unwrap();
+        let peer = ConnectionId::new(58).unwrap();
+        let mut sender =
+            EndpointState::<4, 4, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 4, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        receiver.set_ack_frequency(8);
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, _) = sender
+            .encode_stream_packet(peer, 4, 0, true, b"one packet", &mut packet)
+            .unwrap();
+        receiver.receive_datagram(&packet[..used]).unwrap();
+        let mut ack = [0u8; 256];
+        assert!(receiver.poll_transmit(&mut ack).unwrap().is_none());
+        receiver.set_time(25);
+        assert!(receiver.poll_transmit(&mut ack).unwrap().is_some());
+    }
+
+    #[test]
+    fn delayed_ack_budget_prevents_spurious_time_loss() {
+        let local = ConnectionId::new(59).unwrap();
+        let peer = ConnectionId::new(60).unwrap();
+        let mut sender =
+            EndpointState::<4, 4, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        sender.set_ack_policy(8, 25);
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+
+        let mut packet = [0u8; 256];
+        sender.set_time(35);
+        let (_, first) = sender
+            .encode_stream_packet(peer, 4, 0, false, b"first", &mut packet)
+            .unwrap();
+        sender.set_time(60);
+        let (_, second) = sender
+            .encode_stream_packet(peer, 4, 5, false, b"second", &mut packet)
+            .unwrap();
+
+        // The ACK for the later packet carries the peer's permitted 25 ms
+        // delay. It does not prove the earlier packet was lost: on a busy
+        // Wi-Fi receive path it can be merely reordered. Do not halve cwnd
+        // before that delayed-ACK budget has elapsed.
+        let mut ack = [0u8; 256];
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: local,
+            packet_number: 0,
+            packet_number_len: 1,
+        }
+        .encode(&mut ack)
+        .unwrap();
+        used += Frame::Ack {
+            largest: second,
+            delay: 25,
+        }
+        .encode(&mut ack[used..])
+        .unwrap();
+        sender.set_time(85);
+        sender.receive_datagram(&ack[..used]).unwrap();
+
+        assert!(sender
+            .sent_packets
+            .iter()
+            .flatten()
+            .any(|packet| packet.packet_number == first && !packet.lost));
+    }
+
+    #[test]
+    fn recovery_ack_frequency_batches_eight_consumed_stream_packets() {
+        let local = ConnectionId::new(59).unwrap();
+        let peer = ConnectionId::new(60).unwrap();
+        let mut sender = EndpointState::<4, 8, 128>::new(
+            Role::Client,
+            ConnectionLimits::default(),
+            1200,
+        );
+        let mut receiver = EndpointState::<4, 8, 128>::new(
+            Role::Server,
+            ConnectionLimits::default(),
+            1200,
+        );
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        receiver.set_ack_frequency(8);
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 128];
+        let mut ack = [0u8; 128];
+        for offset in 0..8 {
+            let (used, _) = sender
+                .encode_stream_packet(peer, 4, offset, false, b"x", &mut packet)
+                .unwrap();
+            receiver.receive_datagram(&packet[..used]).unwrap();
+            receiver.stream_consumed_deferred(4, 1).unwrap();
+            assert_eq!(
+                receiver.poll_transmit(&mut ack).unwrap().is_some(),
+                offset == 7
+            );
+        }
+        let stats = receiver.stats();
+        assert_eq!(stats.ack_datagrams, 1);
+        assert_eq!(stats.ack_threshold_datagrams, 1);
+        assert_eq!(stats.ack_immediate_datagrams, 0);
+        assert_eq!(stats.ack_timer_datagrams, 0);
+    }
+
+    #[test]
+    fn delayed_ack_encodes_observed_wait_and_gap_is_immediate() {
+        let local = ConnectionId::new(65).unwrap();
+        let peer = ConnectionId::new(66).unwrap();
+        let mut sender =
+            EndpointState::<4, 8, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 8, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        receiver.set_ack_policy(8, 25);
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, _) = sender
+            .encode_stream_packet(peer, 4, 0, false, b"a", &mut packet)
+            .unwrap();
+        receiver.set_time(100);
+        receiver.receive_datagram(&packet[..used]).unwrap();
+        receiver.set_time(117);
+        receiver.stream_consumed(4, 1).unwrap();
+        let mut ack = [0u8; 256];
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        let (_, header_len) = ShortHeader::decode(&ack[..ack_len]).unwrap();
+        let (frame, _) = decode_frame(&ack[header_len..ack_len]).unwrap();
+        assert!(matches!(
+            frame,
+            Frame::Ack { delay: 17, .. } | Frame::AckRanges { delay: 17, .. }
+        ));
+
+        // Packet 2 after packet 0 creates a selective-ACK gap and must not
+        // wait for ACK frequency or max_ack_delay.
+        sender
+            .encode_stream_packet(peer, 4, 1, false, b"lost", &mut packet)
+            .unwrap();
+        let (used, _) = sender
+            .encode_stream_packet(peer, 4, 2, false, b"b", &mut packet)
+            .unwrap();
+        receiver.receive_datagram(&packet[..used]).unwrap();
+        assert!(receiver.poll_transmit(&mut ack).unwrap().is_some());
+    }
+
+    #[test]
+    fn selective_ack_gap_retransmits_before_pto() {
+        let local = ConnectionId::new(63).unwrap();
+        let peer = ConnectionId::new(64).unwrap();
+        let mut sender =
+            EndpointState::<4, 8, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 8, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        sender.set_time(10);
+        let mut packet = [0u8; 256];
+        let mut delivered = [[0u8; 256]; 2];
+        let mut delivered_len = [0usize; 2];
+        for index in 0..5u64 {
+            let (used, _) = sender
+                .encode_stream_packet(peer, 4, index, false, &[index as u8], &mut packet)
+                .unwrap();
+            if index >= 3 {
+                let slot = (index - 3) as usize;
+                delivered[slot][..used].copy_from_slice(&packet[..used]);
+                delivered_len[slot] = used;
+            }
+        }
+        receiver.receive_datagram(&delivered[0][..delivered_len[0]]).unwrap();
+        receiver.receive_datagram(&delivered[1][..delivered_len[1]]).unwrap();
+        let mut ack = [0u8; 256];
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        sender.receive_datagram(&ack[..ack_len]).unwrap();
+
+        // No 250 ms PTO elapsed: packet-threshold loss makes the missing
+        // early range eligible immediately.
+        let (_, retransmitted_pn) = sender
+            .retransmit_due(10, 250, &mut packet)
+            .unwrap()
+            .unwrap();
+        assert!(retransmitted_pn >= 5);
+    }
+
+    #[test]
+    fn duplicate_packet_is_reacked_without_duplicate_stream_delivery() {
+        let local = ConnectionId::new(59).unwrap();
+        let peer = ConnectionId::new(60).unwrap();
+        let mut sender =
+            EndpointState::<4, 4, 64>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 4, 64>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, _) = sender
+            .encode_stream_packet(peer, 4, 0, true, b"once", &mut packet)
+            .unwrap();
+        assert!(matches!(
+            receiver.receive_datagram(&packet[..used]).unwrap(),
+            TransportPacket::Stream { .. }
+        ));
+        receiver.stream_consumed(4, 4).unwrap();
+        let mut ack = [0u8; 256];
+        assert!(receiver.poll_transmit(&mut ack).unwrap().is_some());
+        assert_eq!(
+            receiver.receive_datagram(&packet[..used]).unwrap(),
+            TransportPacket::Control
+        );
+        assert!(receiver.poll_transmit(&mut ack).unwrap().is_some());
+    }
+
+    #[test]
+    fn selective_ack_accepts_a_delayed_packet_below_largest_received() {
+        let local = ConnectionId::new(61).unwrap();
+        let peer = ConnectionId::new(62).unwrap();
+        let mut sender =
+            EndpointState::<4, 4, 64>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 4, 64>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut first = [0u8; 256];
+        let mut second = [0u8; 256];
+        let (first_len, first_number) = sender
+            .encode_stream_packet(peer, 4, 0, false, b"first", &mut first)
+            .unwrap();
+        let (second_len, second_number) = sender
+            .encode_stream_packet(peer, 4, 5, true, b"second", &mut second)
+            .unwrap();
+        assert_eq!(first_number + 1, second_number);
+        assert!(matches!(
+            receiver.receive_datagram(&second[..second_len]).unwrap(),
+            TransportPacket::Stream { .. }
+        ));
+        assert!(matches!(
+            receiver.receive_datagram(&first[..first_len]).unwrap(),
+            TransportPacket::Stream { .. }
+        ));
+        assert!(receiver.has_received_packet(first_number));
+        assert!(receiver.has_received_packet(second_number));
     }
 
     #[test]
@@ -2989,7 +3845,7 @@ mod tests {
         let peer = ConnectionId::new(58).unwrap();
         let mut sender =
             EndpointState::<4, 4, 64>::new(Role::Client, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(local, peer).unwrap();
+        sender.install_connection_ids(local, peer).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut packet = [0u8; 256];
         let (_, packet_number) = sender
@@ -3023,8 +3879,8 @@ mod tests {
             EndpointState::<4, 4, 64>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut receiver =
             EndpointState::<4, 4, 64>::new(Role::Server, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(local, peer).unwrap();
-        receiver.set_connection_ids(peer, local).unwrap();
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
         sender.close(0x42);
         let mut packet = [0u8; 128];
         let used = sender.poll_close(&mut packet).unwrap().unwrap();
@@ -3054,14 +3910,15 @@ mod tests {
     #[test]
     fn retransmission_payload_limit_is_explicit_for_embedded_profiles() {
         let cid = ConnectionId::new(53).unwrap();
+        let peer = ConnectionId::new(54).unwrap();
         let mut sender =
             EndpointState::<2, 2, 4>::new(Role::Client, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(cid, cid).unwrap();
+        sender.install_connection_ids(cid, peer).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut packet = [0u8; 128];
         assert_eq!(
             sender
-                .encode_stream_packet(cid, 4, 0, true, b"12345", &mut packet)
+                .encode_stream_packet(peer, 4, 0, true, b"12345", &mut packet)
                 .unwrap_err(),
             Error::RetransmissionTooLarge
         );
@@ -3070,27 +3927,56 @@ mod tests {
     #[test]
     fn retransmission_due_uses_fake_clock_and_pto() {
         let cid = ConnectionId::new(54).unwrap();
+        let peer = ConnectionId::new(55).unwrap();
         let mut sender =
             EndpointState::<2, 2, 32>::new(Role::Client, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(cid, cid).unwrap();
+        sender.install_connection_ids(cid, peer).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         sender.set_time(100);
         let mut packet = [0u8; 128];
         let (_, pn) = sender
-            .encode_stream_packet(cid, 4, 0, true, b"clock", &mut packet)
+            .encode_stream_packet(peer, 4, 0, true, b"clock", &mut packet)
             .unwrap();
         sender.set_time(109);
-        assert!(
-            sender
-                .retransmit_due(109, 10, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+        assert!(sender
+            .retransmit_due(109, 10, &mut packet)
+            .unwrap()
+            .is_none());
         let (_, retransmitted) = sender
             .retransmit_due(110, 10, &mut packet)
             .unwrap()
             .unwrap();
         assert_ne!(pn, retransmitted);
+    }
+
+    #[test]
+    fn retransmission_probe_survives_reduced_congestion_window() {
+        let cid = ConnectionId::new(0x71).unwrap();
+        let peer = ConnectionId::new(0x72).unwrap();
+        let mut sender =
+            EndpointState::<2, 2, 32>::new(Role::Client, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(cid, peer).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let mut packet = [0u8; 128];
+        let (_, packet_number) = sender
+            .encode_stream_packet(peer, 4, 0, true, b"probe", &mut packet)
+            .unwrap();
+        // Simulate loss recovery after cwnd was reduced below unrelated data
+        // still in flight.  Rejecting the replacement here killed the live
+        // UDP connection instead of performing its bounded PTO probe.
+        sender.congestion.congestion_window = 1;
+        sender.congestion.bytes_in_flight = 1;
+        sender
+            .sent_packets
+            .iter_mut()
+            .flatten()
+            .find(|sent| sent.packet_number == packet_number)
+            .unwrap()
+            .lost = true;
+        assert!(sender
+            .retransmit_stream_packet(packet_number, &mut packet)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -3101,8 +3987,8 @@ mod tests {
             EndpointState::<4, 4, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut receiver =
             EndpointState::<4, 4, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(local, peer).unwrap();
-        receiver.set_connection_ids(peer, local).unwrap();
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         sender.set_time(100);
         let mut packet = [0u8; 256];
@@ -3137,8 +4023,8 @@ mod tests {
             EndpointState::<4, 4, 128>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut receiver =
             EndpointState::<4, 8, 128>::new(Role::Server, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(local, peer).unwrap();
-        receiver.set_connection_ids(peer, local).unwrap();
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         sender.open_send_stream(8, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut link = crate::fake::FakeDatagramLink::new(crate::fake::FaultConfig {
@@ -3184,8 +4070,8 @@ mod tests {
             EndpointState::<4, 4, 256>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut receiver =
             EndpointState::<4, 8, 256>::new(Role::Server, ConnectionLimits::default(), 1200);
-        sender.set_connection_ids(local, peer).unwrap();
-        receiver.set_connection_ids(peer, local).unwrap();
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let object_record = [SERVICE_OBJECT, 0, 0, 0, 3, 0xa1, 0x01, 0x02];
         let mut link = crate::fake::FakeDatagramLink::new(crate::fake::FaultConfig {
@@ -3208,10 +4094,11 @@ mod tests {
             .unwrap();
         link.send(7, &packet[..second_len]);
         assert!(link.poll(14).is_empty());
-        let (retry_len, _) = sender
+        let (retry_len, retry_pn) = sender
             .retransmit_stream_packet(second_pn, &mut packet)
             .unwrap()
             .unwrap();
+        assert_ne!(retry_pn, second_pn);
         link.send(14, &packet[..retry_len]);
         let mut delivered = 0;
         for datagram in link.poll(21) {
@@ -3236,8 +4123,8 @@ mod tests {
                 EndpointState::<512, 8, 64>::new(Role::Server, ConnectionLimits::default(), 1200);
             sender.congestion.congestion_window = (H as u64).saturating_mul(1200);
             sender.congestion.slow_start_threshold = sender.congestion.congestion_window;
-            sender.set_connection_ids(local, peer).unwrap();
-            receiver.set_connection_ids(peer, local).unwrap();
+            sender.install_connection_ids(local, peer).unwrap();
+            receiver.install_connection_ids(peer, local).unwrap();
             sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
             let mut link = crate::fake::FakeDatagramLink::new(crate::fake::FaultConfig {
                 latency_ticks: 10,
@@ -3370,8 +4257,8 @@ mod tests {
             limits.max_stream_data = 2 * 1024 * 1024;
             let mut sender = EndpointState::<512, H, P>::new(Role::Client, limits, 1200);
             let mut receiver = EndpointState::<512, 8, P>::new(Role::Server, limits, 1200);
-            sender.set_connection_ids(local, peer).unwrap();
-            receiver.set_connection_ids(peer, local).unwrap();
+            sender.install_connection_ids(local, peer).unwrap();
+            receiver.install_connection_ids(peer, local).unwrap();
             sender.open_send_stream(4, limits.max_stream_data).unwrap();
             sender.congestion.congestion_window = (H as u64).saturating_mul(1500);
             sender.congestion.slow_start_threshold = sender.congestion.congestion_window;
@@ -3433,16 +4320,25 @@ mod tests {
     #[test]
     fn packet_numbers_increase_for_stream_and_control_output() {
         let cid = ConnectionId::new(7).unwrap();
-        let mut sender =
-            EndpointState::<4, 4>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let sender_cid = ConnectionId::new(8).unwrap();
+        let mut sender = EndpointState::<4, 4>::new_established(
+            Role::Client,
+            ConnectionLimits::default(),
+            1200,
+            ConnectionIds::new(sender_cid, cid).unwrap(),
+        );
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut packet = [0u8; 256];
         let (_, first) = sender
             .encode_stream_packet(cid, 4, 0, true, b"x", &mut packet)
             .unwrap();
         assert_eq!(first, 0);
-        let mut receiver =
-            EndpointState::<4, 4>::new(Role::Server, ConnectionLimits::default(), 1200);
+        let mut receiver = EndpointState::<4, 4>::new_established(
+            Role::Server,
+            ConnectionLimits::default(),
+            1200,
+            ConnectionIds::new(cid, sender_cid).unwrap(),
+        );
         let used = sender
             .encode_stream_packet(cid, 4, 1, true, b"y", &mut packet)
             .unwrap()
@@ -3471,22 +4367,30 @@ mod tests {
     fn established_packet_numbers_continue_after_bootstrap() {
         let cid = ConnectionId::new(70).unwrap();
         let peer = ConnectionId::new(71).unwrap();
-        let mut endpoint = EndpointState::<4, 4>::new(
-            Role::Client,
-            ConnectionLimits::default(),
-            1200,
-        );
-        endpoint.set_connection_ids(cid, peer).unwrap();
+        let mut endpoint =
+            EndpointState::<4, 4>::new(Role::Client, ConnectionLimits::default(), 1200);
+        endpoint.install_connection_ids(cid, peer).unwrap();
         endpoint.continue_packet_numbers_from(3).unwrap();
-        endpoint.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        endpoint
+            .open_send_stream(4, INITIAL_MAX_STREAM_DATA)
+            .unwrap();
         let mut packet = [0u8; 256];
         let (used, packet_number) = endpoint
             .encode_stream_packet(peer, 4, 0, true, b"bootstrap-continuation", &mut packet)
             .unwrap();
         assert_eq!(packet_number, 3);
-        assert_eq!(ShortHeader::decode(&packet[..used]).unwrap().0.packet_number, 3);
+        assert_eq!(
+            ShortHeader::decode(&packet[..used])
+                .unwrap()
+                .0
+                .packet_number,
+            3
+        );
         assert_eq!(endpoint.next_packet_number, 4);
-        assert_eq!(endpoint.continue_packet_numbers_from(2), Err(Error::Invalid));
+        assert_eq!(
+            endpoint.continue_packet_numbers_from(2),
+            Err(Error::Invalid)
+        );
     }
 
     #[test]
@@ -3864,5 +4768,44 @@ mod tests {
             elapsed_ms,
             bitrate_kbps,
         );
+    }
+
+    #[test]
+    fn packet_number_length_uses_strict_half_window() {
+        assert_eq!(packet_number_len(0, None), 1);
+        assert_eq!(packet_number_len(127, Some(0)), 1);
+        assert_eq!(packet_number_len(128, Some(0)), 2);
+        assert_eq!(packet_number_len(32_767, Some(0)), 2);
+        assert_eq!(packet_number_len(32_768, Some(0)), 3);
+    }
+
+    #[test]
+    fn packet_number_reconstruction_wraps_each_wire_width() {
+        for (expected, number, len) in [
+            (256u32, 256u32, 1u8),
+            (65_536, 65_536, 2),
+            (16_777_216, 16_777_216, 3),
+        ] {
+            let prefix = ShortHeaderPrefix {
+                flags: FLAG_FIXED,
+                dcid: ConnectionId::new(7).unwrap(),
+                truncated_packet_number: number & ((1u32 << (len * 8)) - 1),
+                packet_number_len: len,
+                header_len: 0,
+            };
+            assert_eq!(prefix.reconstruct(expected).unwrap().packet_number, number);
+        }
+    }
+
+    #[test]
+    fn packet_number_outside_initial_window_is_rejected() {
+        let prefix = ShortHeaderPrefix {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(7).unwrap(),
+            truncated_packet_number: 255,
+            packet_number_len: 1,
+            header_len: 0,
+        };
+        assert_eq!(prefix.reconstruct(0), Err(Error::PacketNumberExhausted));
     }
 }

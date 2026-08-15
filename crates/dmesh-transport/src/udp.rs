@@ -7,29 +7,36 @@
 //! additional host-test services on other stream IDs.
 
 pub use crate::handlers::{StreamHandler, StreamRegistry};
-use crate::mux::StreamMux;
 use crate::ledger::{
     select_capacity, system_memory_snapshot, LedgerCapacityController, LedgerMemoryPolicy,
     LedgerMemorySnapshot,
 };
-use crate::{ConnectionLimits, EndpointState, INITIAL_MAX_STREAM_DATA, Role};
-use anyhow::{Context, Result, bail};
-use dmesh_object_store::{ObjectServer, RECORD_DONE, RECORD_MANIFEST, ServerConfig};
+use crate::mux::StreamMux;
+use crate::{ConnectionLimits, EndpointState, Role, INITIAL_MAX_STREAM_DATA};
+use anyhow::{bail, Context, Result};
+use dmesh_object_store::{ObjectServer, ServerConfig, RECORD_DONE, RECORD_MANIFEST};
 use std::boxed::Box;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::string::ToString;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{timeout, Duration, Instant};
 
 const MTU: usize = 1400;
-const MANIFEST_STREAM: u64 = 3;
-const BLOCK_STREAM: u64 = 7;
+// Keep Recovery object datagrams below the Wi-Fi driver's large-frame edge
+// while retaining normal UDP/IP overhead. This is deliberately independent
+// of the bearer MTU: object transfer favors reliable small frames over
+// packing a whole 4 KiB record into three large Wi-Fi aggregates.
+const OBJECT_CHUNK: usize = 512;
+const MAX_OBJECT_CHUNK: usize = MTU - 64;
+const UDP_MIN_RETRANSMIT_PTO_MS: u64 = 250;
+/// One ordered object-response stream: manifest, blobs, then done.
+const OBJECT_STREAM: u64 = 3;
 const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const BOOTSTRAP_ATTEMPTS: u32 = 4;
 const STREAM_ATTEMPTS: u32 = 4;
@@ -40,13 +47,63 @@ static NEXT_SERVER_CID: AtomicU64 = AtomicU64::new(0x100);
 /// First byte on an application stream selects the connection service.
 /// Remaining bytes belong to that service's schema.
 pub use crate::{
-    SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS,
-    SERVICE_STREAM,
+    SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_METRICS,
+    SERVICE_OBJECT, SERVICE_STATUS, SERVICE_STREAM,
 };
+
+const CONTROL_LOG: u8 = 0;
+const CONTROL_POLL: u8 = 1;
+const CONTROL_RESPONSE: u8 = 2;
+const CONTROL_QUEUE_CAPACITY: usize = 64;
+
+/// Bounded command/log bridge for a transport test scaffold or a future
+/// managed control service. Its contents are opaque compact CBOR records;
+/// only Recovery's shared command parser interprets commands.
+#[derive(Debug, Default)]
+pub struct TransportControl {
+    commands: Mutex<VecDeque<Vec<u8>>>,
+    logs: Mutex<VecDeque<Vec<u8>>>,
+}
+
+impl TransportControl {
+    pub fn queue_command(&self, record: Vec<u8>) {
+        let mut commands = self.commands.lock().expect("control commands lock");
+        if commands.len() == CONTROL_QUEUE_CAPACITY { commands.pop_front(); }
+        commands.push_back(record);
+    }
+
+    pub fn take_log(&self) -> Option<Vec<u8>> {
+        self.logs.lock().expect("control logs lock").pop_front()
+    }
+
+    fn receive_log(&self, record: &[u8]) {
+        let mut logs = self.logs.lock().expect("control logs lock");
+        if logs.len() == CONTROL_QUEUE_CAPACITY { logs.pop_front(); }
+        logs.push_back(record.to_vec());
+    }
+
+    fn next_response(&self) -> Vec<u8> {
+        let command = self.commands.lock().expect("control commands lock").pop_front();
+        let mut response = Vec::with_capacity(2 + command.as_ref().map_or(0, Vec::len));
+        response.push(SERVICE_CONTROL);
+        response.push(CONTROL_RESPONSE);
+        if let Some(command) = command { response.extend_from_slice(&command); }
+        response
+    }
+}
 
 struct ConnectionDatagram {
     peer: SocketAddr,
     bytes: Vec<u8>,
+}
+
+/// Bootstrap shares the endpoint packet-number space until the first
+/// established packet is processed. The listener owns OPEN_ACK retries, while
+/// the persistent task raises its sender floor from this state before emitting
+/// application traffic.
+struct BootstrapPacketNumbers {
+    next: AtomicU32,
+    application_started: AtomicBool,
 }
 
 struct PendingObjectTransfer {
@@ -55,23 +112,44 @@ struct PendingObjectTransfer {
     current: Vec<u8>,
     current_kind: u8,
     current_offset: usize,
-    stream_offsets: [u64; 2],
+    stream_offset: u64,
+    sent_bytes: usize,
+    chunk_size: usize,
+}
+
+/// Transport-only response source for IPERF. It deliberately has no object
+/// record header, manifest, store lookup, or flash semantics.
+struct PendingByteTransfer {
+    stream_id: u64,
+    offset: u64,
+    remaining: usize,
+    chunk_size: usize,
+    packet_id: u32,
+}
+
+impl PendingByteTransfer {
+    fn new(stream_id: u64, bytes: usize, chunk_size: usize) -> Self {
+        Self { stream_id, offset: 0, remaining: bytes, chunk_size, packet_id: 0 }
+    }
 }
 
 impl PendingObjectTransfer {
     fn new(records: Vec<(u8, Vec<u8>)>) -> Self {
+        Self::with_chunk(records, OBJECT_CHUNK)
+    }
+
+    fn with_chunk(records: Vec<(u8, Vec<u8>)>, chunk_size: usize) -> Self {
+        assert!((1..=MAX_OBJECT_CHUNK).contains(&chunk_size));
         Self {
             records,
             record_index: 0,
             current: Vec::new(),
             current_kind: RECORD_MANIFEST,
             current_offset: 0,
-            stream_offsets: [0, 0],
+            stream_offset: 0,
+            sent_bytes: 0,
+            chunk_size,
         }
-    }
-
-    fn stream_index(kind: u8) -> usize {
-        if kind == RECORD_MANIFEST { 0 } else { 1 }
     }
 
     fn load_current(&mut self) -> bool {
@@ -113,6 +191,13 @@ pub struct UdpConfig {
     pub receive_timeout: Duration,
     /// Host ledger memory resampling interval. Zero disables runtime resizing.
     pub ledger_resize_interval: Duration,
+    /// Application payload size for object datagrams. This is independent of
+    /// the transport window: 512-byte records must still be sent in flight as
+    /// a window, not as stop-and-wait packets.
+    pub object_chunk: usize,
+    /// Optional opaque Recovery command/log mailbox. Normal object serving
+    /// leaves it unset; host hardware tests can install it on a third port.
+    pub control: Option<Arc<TransportControl>>,
 }
 
 impl Default for UdpConfig {
@@ -127,6 +212,8 @@ impl Default for UdpConfig {
             idle_timeout: IDLE_TIMEOUT,
             receive_timeout: Duration::from_secs(1),
             ledger_resize_interval: Duration::from_secs(5),
+            object_chunk: OBJECT_CHUNK,
+            control: None,
         }
     }
 }
@@ -138,7 +225,7 @@ pub struct UdpClient {
     socket: UdpSocket,
     peer: SocketAddr,
     endpoint: EndpointState<8, 512>,
-    dcid: crate::ConnectionId,
+    local_cid: crate::ConnectionId,
 }
 
 impl UdpClient {
@@ -148,39 +235,6 @@ impl UdpClient {
         self.endpoint
             .set_history_capacity(limit)
             .map_err(|error| anyhow::anyhow!("UDP history capacity: {error:?}"))
-    }
-
-    pub async fn bind(
-        bind: SocketAddr,
-        peer: SocketAddr,
-        dcid: crate::ConnectionId,
-    ) -> Result<Self> {
-        Self::bind_with_history_capacity(bind, peer, dcid, 512).await
-    }
-
-    /// Bind a client with an explicit retransmission-ledger capacity. This is
-    /// useful for constrained peers and deterministic fault tests; zero is
-    /// rejected because the endpoint must retain at least one packet.
-    pub async fn bind_with_history_capacity(
-        bind: SocketAddr,
-        peer: SocketAddr,
-        dcid: crate::ConnectionId,
-        history_capacity: usize,
-    ) -> Result<Self> {
-        if !(1..=512).contains(&history_capacity) {
-            bail!("UDP history capacity must be in 1..=512");
-        }
-        Ok(Self {
-            socket: UdpSocket::bind(bind).await?,
-            peer,
-            endpoint: EndpointState::new_with_history_capacity(
-                Role::Client,
-                ConnectionLimits::default(),
-                MTU as u64,
-                history_capacity,
-            ),
-            dcid,
-        })
     }
 
     /// Establish a directional-CID connection using the version-0 short
@@ -215,7 +269,7 @@ impl UdpClient {
                 MTU as u64,
                 history_capacity,
             ),
-            dcid: local_cid,
+            local_cid: local_cid,
         };
         let mut response = [0u8; MTU];
         for packet_number in 0..BOOTSTRAP_ATTEMPTS {
@@ -237,7 +291,7 @@ impl UdpClient {
             }
             client
                 .endpoint
-                .set_connection_ids(local_cid, server_cid)
+                .install_connection_ids(local_cid, server_cid)
                 .map_err(|error| anyhow::anyhow!("install bootstrap CIDs: {error:?}"))?;
             client
                 .endpoint
@@ -258,7 +312,7 @@ impl UdpClient {
         let (used, _) = self
             .endpoint
             .encode_stream_packet(
-                self.endpoint.peer_connection_id().unwrap_or(self.dcid),
+                self.endpoint.peer_connection_id().unwrap_or(self.local_cid),
                 stream_id,
                 0,
                 fin,
@@ -301,7 +355,7 @@ impl UdpClient {
         let (used, _) = self
             .endpoint
             .encode_stream_packet(
-                self.endpoint.peer_connection_id().unwrap_or(self.dcid),
+                self.endpoint.peer_connection_id().unwrap_or(self.local_cid),
                 stream_id,
                 0,
                 fin,
@@ -309,8 +363,7 @@ impl UdpClient {
                 &mut packet,
             )
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
-        let request = packet[..used].to_vec();
-        self.socket.send_to(&request, self.peer).await?;
+        self.socket.send_to(&packet[..used], self.peer).await?;
         let started = Instant::now();
         for attempt in 0..STREAM_ATTEMPTS {
             let deadline = Instant::now() + ACK_TIMEOUT;
@@ -359,15 +412,14 @@ impl UdpClient {
             self.endpoint.set_time(now);
             let mut retry = [0u8; MTU];
             let pto = self.endpoint.pto_timeout();
-            if let Some((retry_len, _)) = self
+            let retransmission = self
                 .endpoint
                 .retransmit_due(now, pto, &mut retry)
-                .map_err(|error| anyhow::anyhow!("client stream retransmission: {error:?}"))?
-            {
-                self.socket.send_to(&retry[..retry_len], self.peer).await?;
-            } else {
-                self.socket.send_to(&request, self.peer).await?;
-            }
+                .map_err(|error| anyhow::anyhow!("client stream retransmission: {error:?}"))?;
+            let Some((retry_len, _packet_number)) = retransmission else {
+                continue;
+            };
+            self.socket.send_to(&retry[..retry_len], self.peer).await?;
         }
         bail!("UDP stream request timeout after {STREAM_ATTEMPTS} attempts")
     }
@@ -409,8 +461,14 @@ impl UdpClient {
 /// The returned task owns the socket; calling the lmesh-wifi command again is
 /// rejected by the caller so the service can remain up while artifacts change.
 pub async fn run(config: UdpConfig) -> Result<()> {
+    if config.max_active_connections == 0 {
+        bail!("UDP max active connections must be at least one");
+    }
     if config.history_capacity > 512 {
         bail!("UDP history capacity must be at most 512");
+    }
+    if !(1..=MAX_OBJECT_CHUNK).contains(&config.object_chunk) {
+        bail!("UDP object chunk must be between 1 and {MAX_OBJECT_CHUNK} bytes");
     }
     if config.ledger_memory_policy.min_packets > 512
         || config.ledger_memory_policy.max_packets > 512
@@ -434,7 +492,16 @@ pub async fn run(config: UdpConfig) -> Result<()> {
     } else {
         config.history_capacity
     };
+    // A non-zero history is an explicit bearer profile. Do not let the
+    // memory-policy resizer silently widen it later; embedded receivers may
+    // be sized for exactly that burst and cannot advertise a larger budget.
+    let ledger_resize_interval = if config.history_capacity == 0 {
+        config.ledger_resize_interval
+    } else {
+        Duration::ZERO
+    };
     let socket = Arc::new(UdpSocket::bind(config.bind).await?);
+    tracing::info!(bind = %config.bind, "object_udp_bound");
     let server = ObjectServer::new(ServerConfig {
         bind: config.bind.ip().to_string(),
         port: config.bind.port(),
@@ -447,7 +514,8 @@ pub async fn run(config: UdpConfig) -> Result<()> {
     let mut connection_peers: HashMap<u64, SocketAddr> = HashMap::new();
     let mut pending_opens: HashMap<(SocketAddr, u64), u64> = HashMap::new();
     let mut pending_open_bytes: HashMap<(SocketAddr, u64), Vec<u8>> = HashMap::new();
-    let mut pending_open_packet_numbers: HashMap<(SocketAddr, u64), u32> = HashMap::new();
+    let mut bootstrap_packet_numbers: HashMap<(SocketAddr, u64), Arc<BootstrapPacketNumbers>> =
+        HashMap::new();
     let mut last_activity: HashMap<u64, Instant> = HashMap::new();
     let closed_routes = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     loop {
@@ -459,7 +527,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             }
             pending_opens.retain(|_, cid| connections.contains_key(cid));
             pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
-            pending_open_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
+            bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
         }
         let (len, peer) =
             match timeout(config.receive_timeout, socket.recv_from(&mut datagram)).await {
@@ -478,7 +546,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                     }
                     pending_opens.retain(|_, cid| connections.contains_key(cid));
                     pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
-                    pending_open_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
+                    bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
                     continue;
                 }
             };
@@ -517,7 +585,11 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 let open_payload = decode_bootstrap_open_payload(&packet)
                     .ok_or_else(|| anyhow::anyhow!("bootstrap payload disappeared"))?;
                 pending_open_bytes.insert(key, open_payload.to_vec());
-                pending_open_packet_numbers.insert(key, 0);
+                let bootstrap_numbers = Arc::new(BootstrapPacketNumbers {
+                    next: AtomicU32::new(0),
+                    application_started: AtomicBool::new(false),
+                });
+                bootstrap_packet_numbers.insert(key, bootstrap_numbers.clone());
                 let (sender, receiver) = mpsc::channel(128);
                 connections.insert(allocated.value(), sender);
                 connection_peers.insert(allocated.value(), peer);
@@ -525,6 +597,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 let socket_for_connection = socket.clone();
                 let registry_for_connection = registry.clone();
                 let server_for_connection = server.clone();
+                let control_for_connection = config.control.clone();
                 let closed_routes_for_connection = closed_routes.clone();
                 tokio::spawn(async move {
                     let result = serve_persistent_peer_with_ids(
@@ -537,11 +610,13 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         allocated,
                         client_cid,
                         history_capacity,
-                        1,
+                        bootstrap_numbers,
                         config.max_active_connections,
                         config.ledger_memory_policy,
                         config.ledger_memory,
-                        config.ledger_resize_interval,
+                        ledger_resize_interval,
+                        config.object_chunk,
+                        control_for_connection,
                     )
                     .await;
                     if let Ok(mut closed) = closed_routes_for_connection.lock() {
@@ -553,16 +628,40 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 });
                 allocated
             };
+            tracing::info!(%peer, client_cid = client_cid.value(), server_cid = server_cid.value(),
+                "object_udp_bootstrap_open");
+            let Some(bootstrap_numbers) = bootstrap_packet_numbers.get(&key) else {
+                continue;
+            };
+            if bootstrap_numbers.application_started.load(Ordering::Acquire) {
+                // A delayed Initial/Open after application traffic started is
+                // stale. Re-ACKing it would require a lower packet number and
+                // violate the connection's monotonic sender space.
+                tracing::debug!(%peer, client_cid = client_cid.value(), "udp_transport_stale_bootstrap");
+                continue;
+            }
+            let packet_number = bootstrap_numbers
+                .next
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| anyhow::anyhow!("bootstrap packet number exhausted"))?;
             let mut ack = [0u8; MTU];
-            let packet_number = pending_open_packet_numbers.entry(key).or_insert(0);
-            let used = encode_bootstrap_ack(client_cid, *packet_number, server_cid, &mut ack)?;
+            let used = encode_bootstrap_ack(client_cid, packet_number, server_cid, &mut ack)?;
             socket.send_to(&ack[..used], peer).await?;
+            tracing::info!(%peer, client_cid = client_cid.value(), server_cid = server_cid.value(),
+                packet_number, "object_udp_bootstrap_ack");
             continue;
         }
         let key = header.dcid.value();
         if let Some(sender) = connections.get(&key) {
             if connection_peers.get(&key) != Some(&peer) {
-                tracing::debug!(%peer, dcid = key, "udp_transport_wrong_peer");
+                tracing::warn!(
+                    %peer,
+                    dcid = key,
+                    expected_peer = ?connection_peers.get(&key),
+                    "udp_transport_wrong_peer"
+                );
                 continue;
             }
             last_activity.insert(key, Instant::now());
@@ -582,7 +681,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
         // Non-zero CIDs are routable only after bootstrap allocated them.
         // Unknown labels are dropped instead of creating an implicit
         // symmetric-CID connection.
-        tracing::debug!(%peer, dcid = key, "udp_transport_unknown_cid");
+        tracing::warn!(%peer, dcid = key, "udp_transport_unknown_cid");
     }
 }
 
@@ -596,11 +695,13 @@ async fn serve_persistent_peer_with_ids(
     local_cid: crate::ConnectionId,
     peer_cid: crate::ConnectionId,
     history_capacity: usize,
-    bootstrap_next_packet_number: u32,
+    bootstrap_packet_numbers: Arc<BootstrapPacketNumbers>,
     max_active_connections: usize,
     ledger_memory_policy: LedgerMemoryPolicy,
     ledger_memory: Option<LedgerMemorySnapshot>,
     ledger_resize_interval: Duration,
+    object_chunk: usize,
+    control: Option<Arc<TransportControl>>,
 ) -> Result<()> {
     let mut mux = Box::new(StreamMux::<8, 512>::new_with_history_capacity(
         Role::Server,
@@ -612,17 +713,24 @@ async fn serve_persistent_peer_with_ids(
         history_capacity,
     ));
     mux.registry = registry;
-    mux.set_connection_ids(local_cid, peer_cid)
+    mux.install_connection_ids(local_cid, peer_cid)
         .map_err(|error| anyhow::anyhow!("persistent CIDs: {error:?}"))?;
-    mux.endpoint
-        .continue_packet_numbers_from(bootstrap_next_packet_number)
-        .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
     let mut response_stream = crate::FIRST_SERVER_BIDI_STREAM_ID;
     let mut object_transfer = None;
+    let mut byte_transfer = None;
     let started = Instant::now();
     let mut ledger_controller = LedgerCapacityController::new(history_capacity, 2);
     let mut next_ledger_resize = Instant::now() + ledger_resize_interval;
     if let Some(first_packet) = first_packet {
+        let next = bootstrap_packet_numbers.next.load(Ordering::Acquire);
+        if next > mux.endpoint.next_packet_number {
+            mux.endpoint
+                .continue_packet_numbers_from(next)
+                .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
+        }
+        bootstrap_packet_numbers
+            .application_started
+            .store(true, Ordering::Release);
         process_persistent_packet(
             &socket,
             peer,
@@ -631,7 +739,10 @@ async fn serve_persistent_peer_with_ids(
             &mut mux,
             &mut response_stream,
             &mut object_transfer,
+            &mut byte_transfer,
             started,
+            object_chunk,
+            control.as_deref(),
         )
         .await
         .context("initial persistent packet")?;
@@ -642,6 +753,15 @@ async fn serve_persistent_peer_with_ids(
     loop {
         match timeout(Duration::from_millis(50), receiver.recv()).await {
             Ok(Some(datagram)) if datagram.peer == peer => {
+                let next = bootstrap_packet_numbers.next.load(Ordering::Acquire);
+                if next > mux.endpoint.next_packet_number {
+                    mux.endpoint
+                        .continue_packet_numbers_from(next)
+                        .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
+                }
+                bootstrap_packet_numbers
+                    .application_started
+                    .store(true, Ordering::Release);
                 if let Err(error) = process_persistent_packet(
                     &socket,
                     peer,
@@ -650,7 +770,10 @@ async fn serve_persistent_peer_with_ids(
                     &mut mux,
                     &mut response_stream,
                     &mut object_transfer,
+                    &mut byte_transfer,
                     started,
+                    object_chunk,
+                    control.as_deref(),
                 )
                 .await
                 {
@@ -665,6 +788,17 @@ async fn serve_persistent_peer_with_ids(
                         "udp_transport_connection_datagram_dropped"
                     );
                 }
+                if !ledger_resize_interval.is_zero() {
+                    maybe_resize_ledger(
+                        &mut mux,
+                        &mut ledger_controller,
+                        &mut next_ledger_resize,
+                        ledger_resize_interval,
+                        max_active_connections,
+                        ledger_memory_policy,
+                        ledger_memory,
+                    );
+                }
                 if mux.is_closed() {
                     break;
                 }
@@ -672,40 +806,92 @@ async fn serve_persistent_peer_with_ids(
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => {
-                retransmit_due_packet(&socket, peer, &mut mux, started).await?;
-                if ledger_resize_interval != Duration::ZERO
-                    && Instant::now() >= next_ledger_resize
-                {
-                    let memory = ledger_memory
-                        .or_else(system_memory_snapshot)
-                        .unwrap_or(LedgerMemorySnapshot {
-                            total_bytes: 512 * 1024 * 1024,
-                            available_bytes: 256 * 1024 * 1024,
-                        });
-                    if let Some(target) = ledger_controller.observe(
-                        memory,
-                        max_active_connections,
-                        MTU,
-                        ledger_memory_policy,
-                        mux.endpoint.history_len(),
-                    ) {
-                        if mux.endpoint.set_history_capacity(target).is_err() {
-                            // A live entry may occupy a ring slot above the
-                            // requested limit even when the count fits. Keep
-                            // the existing allocation and retry after the
-                            // next stable memory sample.
-                            ledger_controller = LedgerCapacityController::new(
-                                mux.endpoint.history_capacity(),
-                                2,
-                            );
-                        }
+                // Object production must also be driven by the connection
+                // clock.  Waiting for an inbound datagram to call
+                // `send_next_object_packet` couples application progress to
+                // a peer ACK/control packet and can stall a Recovery sender
+                // after the first record when that packet is delayed or
+                // consumed by the bearer boundary. Fill any available window
+                // slots; the normal bounded PTO path owns retransmission for
+                // retained packets.
+                if let Some(transfer) = object_transfer.as_mut() {
+                    // Transport scheduling is independent of object records:
+                    // ACK processing may mark a missing packet lost while
+                    // the congestion window is full but the ledger is not.
+                    // Repair that range before considering fresh bytes.
+                    // A marked-loss repair consumes one slot but must not
+                    // turn this scheduler pass into stop-and-wait. Refill
+                    // every remaining congestion/history slot immediately.
+                    let _ = retransmit_due_packet(&socket, peer, &mut mux, started).await?;
+                    let mut packet = [0u8; MTU];
+                    let filled =
+                        fill_object_window(&socket, peer, &mut mux, transfer, &mut packet).await?;
+                    let sent = filled
+                        && transfer.record_index >= transfer.records.len()
+                        && transfer.current.is_empty();
+                    if sent {
+                        object_transfer = None;
                     }
-                    next_ledger_resize = Instant::now() + ledger_resize_interval;
+                } else if let Some(transfer) = byte_transfer.as_mut() {
+                    let _ = retransmit_due_packet(&socket, peer, &mut mux, started).await?;
+                    let mut packet = [0u8; MTU];
+                    if fill_byte_window(&socket, peer, &mut mux, transfer, &mut packet).await?
+                        && transfer.remaining == 0 {
+                        byte_transfer = None;
+                    }
+                } else {
+                    let _ = retransmit_due_packet(&socket, peer, &mut mux, started).await?;
+                }
+                if !ledger_resize_interval.is_zero() {
+                    maybe_resize_ledger(
+                        &mut mux,
+                        &mut ledger_controller,
+                        &mut next_ledger_resize,
+                        ledger_resize_interval,
+                        max_active_connections,
+                        ledger_memory_policy,
+                        ledger_memory,
+                    );
                 }
             }
         }
     }
     Ok(())
+}
+
+fn maybe_resize_ledger<const H: usize>(
+    mux: &mut StreamMux<8, H>,
+    controller: &mut LedgerCapacityController,
+    next_resize: &mut Instant,
+    interval: Duration,
+    max_active_connections: usize,
+    policy: LedgerMemoryPolicy,
+    injected_memory: Option<LedgerMemorySnapshot>,
+) {
+    if interval == Duration::ZERO || Instant::now() < *next_resize {
+        return;
+    }
+    let memory = injected_memory
+        .or_else(system_memory_snapshot)
+        .unwrap_or(LedgerMemorySnapshot {
+            total_bytes: 512 * 1024 * 1024,
+            available_bytes: 256 * 1024 * 1024,
+        });
+    if let Some(target) = controller.observe(
+        memory,
+        max_active_connections,
+        MTU,
+        policy,
+        mux.endpoint.history_len(),
+    ) {
+        if mux.endpoint.set_history_capacity(target).is_err() {
+            // A live entry may occupy a ring slot above the requested limit
+            // even when the count fits. Keep the existing allocation and
+            // retry after the next stable memory sample.
+            *controller = LedgerCapacityController::new(mux.endpoint.history_capacity(), 2);
+        }
+    }
+    *next_resize = Instant::now() + interval;
 }
 
 fn allocate_server_cid(
@@ -776,15 +962,38 @@ async fn process_persistent_packet<const H: usize>(
     mux: &mut StreamMux<8, H>,
     response_stream: &mut u64,
     object_transfer: &mut Option<PendingObjectTransfer>,
+    byte_transfer: &mut Option<PendingByteTransfer>,
     started: Instant,
+    object_chunk: usize,
+    control: Option<&TransportControl>,
 ) -> Result<()> {
     mux.endpoint.set_time(started.elapsed().as_millis() as u64);
     let mut packet = [0u8; MTU];
-    if let Some(request) = mux
+    let request = mux
         .receive_request(bytes)
-        .map_err(|error| anyhow::anyhow!("persistent input: {error:?}"))?
-    {
-        if request.data.first() == Some(&SERVICE_OBJECT) {
+        .map_err(|error| anyhow::anyhow!("persistent input: {error:?}"))?;
+    if let Some(request) = request {
+        if request.data.first() == Some(&SERVICE_CONTROL) {
+            let record = request.data.get(2..).unwrap_or_default();
+            match request.data.get(1).copied() {
+                Some(CONTROL_LOG) => {
+                    if let Some(control) = control { control.receive_log(record); }
+                }
+                Some(CONTROL_POLL) => {}
+                _ => bail!("invalid control record"),
+            }
+            mux.complete_request(request.stream_id, request.data.len())
+                .map_err(|error| anyhow::anyhow!("control request accounting: {error:?}"))?;
+            let response = control.map_or_else(
+                || Vec::from([SERVICE_CONTROL, CONTROL_RESPONSE]),
+                TransportControl::next_response,
+            );
+            let (used, _) = mux.encode_response(*response_stream, &response, true, &mut packet)
+                .map_err(|error| anyhow::anyhow!("control response: {error:?}"))?;
+            socket.send_to(&packet[..used], peer).await?;
+            *response_stream = response_stream.saturating_add(4);
+            return Ok(());
+        } else if request.data.first() == Some(&SERVICE_OBJECT) {
             if object_transfer.is_some() {
                 bail!("object transfer already active");
             }
@@ -794,9 +1003,29 @@ async fn process_persistent_packet<const H: usize>(
                 bail!("invalid bootstrapped object target");
             }
             let records = server.response_records(get)?;
-            *object_transfer = Some(PendingObjectTransfer::new(records));
+            tracing::info!(%peer, stream = request.stream_id, records = records.len(),
+                "object_udp_get_accepted");
+            *object_transfer = Some(PendingObjectTransfer::with_chunk(records, object_chunk));
             mux.complete_request(request.stream_id, request.data.len())
                 .map_err(|error| anyhow::anyhow!("object request accounting: {error:?}"))?;
+        } else if request.data.first() == Some(&SERVICE_IPERF) {
+            if byte_transfer.is_some() {
+                bail!("iperf transfer already active");
+            }
+            let requested = request.data.get(1..9)
+                .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0)
+                .clamp(1, 64 * 1024 * 1024) as usize;
+            let packet_size = request.data.get(9..11)
+                .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()) as usize)
+                .unwrap_or(object_chunk)
+                .clamp(8, MAX_OBJECT_CHUNK);
+            mux.complete_request(request.stream_id, request.data.len())
+                .map_err(|error| anyhow::anyhow!("iperf request accounting: {error:?}"))?;
+            *byte_transfer = Some(PendingByteTransfer::new(
+                *response_stream, requested, packet_size,
+            ));
+            *response_stream = response_stream.saturating_add(4);
         } else {
             let connection = mux
                 .endpoint
@@ -830,10 +1059,27 @@ async fn process_persistent_packet<const H: usize>(
         }
     }
     if let Some(transfer) = object_transfer.as_mut() {
-        if send_next_object_packet(socket, peer, mux, transfer, &mut packet).await? {
+        // Fill the bounded transport window. Object chunk size is an
+        // application choice; it must not turn the reliable transport into
+        // stop-and-wait. ACK ranges let the receiver acknowledge gaps while
+        // the retained history supplies selective retransmission.
+        // An ACK can make a packet-threshold loss immediately eligible.  Do
+        // not wait for a full history ledger or the next timeout tick before
+        // retransmitting it.
+        // A selective-ACK repair is ordered before new bytes, not instead of
+        // them. This is the transport scheduler; object records do not form
+        // an application pacing boundary.
+        let _ = retransmit_due_packet(socket, peer, mux, started).await?;
+        if fill_object_window(socket, peer, mux, transfer, &mut packet).await? {
             if transfer.record_index >= transfer.records.len() && transfer.current.is_empty() {
                 *object_transfer = None;
             }
+        }
+    } else if let Some(transfer) = byte_transfer.as_mut() {
+        let _ = retransmit_due_packet(socket, peer, mux, started).await?;
+        if fill_byte_window(socket, peer, mux, transfer, &mut packet).await?
+            && transfer.remaining == 0 {
+            *byte_transfer = None;
         }
     } else if let Some(used) = mux
         .endpoint
@@ -845,23 +1091,59 @@ async fn process_persistent_packet<const H: usize>(
     Ok(())
 }
 
+async fn fill_byte_window<const H: usize>(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    mux: &mut StreamMux<8, H>,
+    transfer: &mut PendingByteTransfer,
+    packet: &mut [u8; MTU],
+) -> Result<bool> {
+    let mut sent = false;
+    while transfer.remaining != 0
+        && mux.endpoint.history_len() < mux.endpoint.history_capacity()
+        && mux.endpoint.congestion.can_send(MTU as u64)
+    {
+        mux.endpoint.open_send_stream(transfer.stream_id, INITIAL_MAX_STREAM_DATA).ok();
+        let length = transfer.remaining.min(transfer.chunk_size);
+        let mut payload = [0u8; MAX_OBJECT_CHUNK];
+        payload[..4].copy_from_slice(&transfer.packet_id.to_be_bytes());
+        for (index, byte) in payload[4..length].iter_mut().enumerate() {
+            *byte = transfer.offset.wrapping_add(4 + index as u64) as u8;
+        }
+        let fin = length == transfer.remaining;
+        let (used, _) = mux.endpoint.encode_stream_packet(
+            mux.endpoint.peer_connection_id().ok_or(crate::Error::WrongConnectionId)
+                .map_err(|error| anyhow::anyhow!("iperf peer CID: {error:?}"))?,
+            transfer.stream_id, transfer.offset, fin, &payload[..length], packet,
+        ).map_err(|error| anyhow::anyhow!("iperf response packet: {error:?}"))?;
+        socket.send_to(&packet[..used], peer).await?;
+        transfer.offset = transfer.offset.saturating_add(length as u64);
+        transfer.remaining -= length;
+        transfer.packet_id = transfer.packet_id.wrapping_add(1);
+        sent = true;
+    }
+    Ok(sent)
+}
+
 async fn retransmit_due_packet<const H: usize>(
     socket: &UdpSocket,
     peer: SocketAddr,
     mux: &mut StreamMux<8, H>,
     started: Instant,
-) -> Result<()> {
+) -> Result<bool> {
     let now = started.elapsed().as_millis() as u64;
     mux.endpoint.set_time(now);
     let mut packet = [0u8; MTU];
-    if let Some((used, _)) = mux
+    let pto = mux.endpoint.pto_timeout().max(UDP_MIN_RETRANSMIT_PTO_MS);
+    if let Some((used, _packet_number)) = mux
         .endpoint
-        .retransmit_due(now, mux.endpoint.pto_timeout(), &mut packet)
+        .retransmit_due(now, pto, &mut packet)
         .map_err(|error| anyhow::anyhow!("persistent retransmission: {error:?}"))?
     {
         socket.send_to(&packet[..used], peer).await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn send_next_object_packet<const H: usize>(
@@ -874,12 +1156,7 @@ async fn send_next_object_packet<const H: usize>(
     if !transfer.load_current() {
         return Ok(false);
     }
-    let stream_id = if transfer.current_kind == RECORD_MANIFEST {
-        MANIFEST_STREAM
-    } else {
-        BLOCK_STREAM
-    };
-    let stream_index = PendingObjectTransfer::stream_index(transfer.current_kind);
+    let stream_id = OBJECT_STREAM;
     mux.endpoint
         .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
         .ok();
@@ -887,10 +1164,10 @@ async fn send_next_object_packet<const H: usize>(
         .current
         .len()
         .saturating_sub(transfer.current_offset);
-    let chunk = remaining.min(MTU.saturating_sub(64));
+    let chunk = remaining.min(transfer.chunk_size);
     let end = transfer.current_offset + chunk;
     let fin = transfer.current_kind == RECORD_DONE && end == transfer.current.len();
-    let offset = transfer.stream_offsets[stream_index];
+    let offset = transfer.stream_offset;
     let (used, _) = mux
         .endpoint
         .encode_stream_packet(
@@ -904,11 +1181,27 @@ async fn send_next_object_packet<const H: usize>(
             &transfer.current[transfer.current_offset..end],
             packet,
         )
-        .map_err(|error| anyhow::anyhow!("object response packet: {error:?}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "object response packet: {error:?} history={} bytes_in_flight={} congestion_window={} stream_credit={:?} connection_credit={} stream_offset={} chunk={}",
+                mux.endpoint.history_len(),
+                mux.endpoint.bytes_in_flight(),
+                mux.endpoint.congestion.congestion_window,
+                mux.endpoint.send.stream_credit(stream_id),
+                mux.endpoint.send.max_data,
+                offset,
+                chunk,
+            )
+        })?;
     socket.send_to(&packet[..used], peer).await?;
     transfer.current_offset = end;
-    transfer.stream_offsets[stream_index] =
-        transfer.stream_offsets[stream_index].saturating_add(chunk as u64);
+    transfer.stream_offset = transfer.stream_offset.saturating_add(chunk as u64);
+    let previous_bytes = transfer.sent_bytes;
+    transfer.sent_bytes = transfer.sent_bytes.saturating_add(chunk);
+    if transfer.sent_bytes / (64 * 1024) != previous_bytes / (64 * 1024) {
+        tracing::info!(%peer, stream = stream_id, record = transfer.record_index,
+            sent_bytes = transfer.sent_bytes, "object_udp_transfer_progress");
+    }
     if end == transfer.current.len() {
         transfer.current.clear();
         transfer.record_index += 1;
@@ -916,17 +1209,62 @@ async fn send_next_object_packet<const H: usize>(
     Ok(true)
 }
 
+async fn fill_object_window<const H: usize>(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    mux: &mut StreamMux<8, H>,
+    transfer: &mut PendingObjectTransfer,
+    packet: &mut [u8; MTU],
+) -> Result<bool> {
+    let mut sent_any = false;
+    let mut sent_packets = 0usize;
+    while mux.endpoint.history_len() < mux.endpoint.history_capacity()
+        && mux.endpoint.congestion.can_send(MTU as u64)
+    {
+        if !send_next_object_packet(socket, peer, mux, transfer, packet).await? {
+            break;
+        }
+        sent_any = true;
+        sent_packets += 1;
+        // The manifest is on a separate stream and must be accepted before a
+        // block can be verified. It is therefore a one-time application
+        // barrier. Blocks are all on the same ordered stream and independent
+        // once the manifest is accepted: stopping at every 4 KiB block would
+        // force a Wi-Fi round trip per record and collapse throughput.
+    }
+    if sent_any {
+        tracing::info!(
+            %peer,
+            sent_packets,
+            history = mux.endpoint.history_len(),
+            history_capacity = mux.endpoint.history_capacity(),
+            bytes_in_flight = mux.endpoint.bytes_in_flight(),
+            congestion_window = mux.endpoint.congestion.congestion_window,
+            "object_udp_window_fill"
+        );
+    }
+    Ok(sent_any)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::eprintln;
+
     use super::*;
+    use crate::callback::{CallbackStreams, CopyingStreamEvents};
     use crate::handlers::handle_stream;
-    use crate::{ConnectionId, EndpointState, FLAG_FIXED, Frame, ShortHeader};
+    use crate::{
+        ConnectionId, EndpointState, Frame, RecoveryEndpoint, ShortHeader,
+        FIRST_CLIENT_BIDI_STREAM_ID, FLAG_FIXED, RECOVERY_MAX_HISTORY_PACKETS,
+        RECOVERY_REORDER_CAPACITY_BYTES,
+    };
     use dmesh_object_store::protocol::{
-        ImageEvent, ImageManifest, ImageReceiver, ImageSink, RECORD_BLOB, RECORD_DONE,
-        RECORD_MANIFEST, RecordBuffer, encode_get,
+        encode_get, ImageEvent, ImageManifest, ImageReceiver, ImageSink, RecordBuffer, RECORD_BLOB,
+        RECORD_DONE, RECORD_MANIFEST,
     };
     use std::format;
     use std::string::String;
+    use std::sync::Arc;
     use std::vec;
     use tempfile::tempdir;
 
@@ -937,13 +1275,11 @@ mod tests {
     #[test]
     fn two_connections_register_and_report_multiple_service_streams() {
         let registry = StreamRegistry::default();
-        assert_eq!(registry.handlers().len(), 7);
-        assert!(
-            registry
-                .handlers()
-                .iter()
-                .any(|handler| handler.tag == SERVICE_IPERF)
-        );
+        assert_eq!(registry.handlers().len(), 8);
+        assert!(registry
+            .handlers()
+            .iter()
+            .any(|handler| handler.tag == SERVICE_IPERF));
         for (client_value, server_value) in [(11u64, 22u64), (33u64, 44u64)] {
             let client_cid = ConnectionId::new(client_value).unwrap();
             let server_cid = ConnectionId::new(server_value).unwrap();
@@ -951,8 +1287,12 @@ mod tests {
                 EndpointState::<8, 8>::new(Role::Client, ConnectionLimits::default(), MTU as u64);
             let mut server =
                 EndpointState::<8, 8>::new(Role::Server, ConnectionLimits::default(), MTU as u64);
-            client.set_connection_ids(client_cid, server_cid).unwrap();
-            server.set_connection_ids(server_cid, client_cid).unwrap();
+            client
+                .install_connection_ids(client_cid, server_cid)
+                .unwrap();
+            server
+                .install_connection_ids(server_cid, client_cid)
+                .unwrap();
             for (stream_id, service) in [
                 (4u64, SERVICE_ECHO),
                 (8, SERVICE_STATUS),
@@ -991,6 +1331,13 @@ mod tests {
                     body,
                 )
                 .unwrap();
+                if service == SERVICE_IPERF {
+                    assert_eq!(response.len(), 49);
+                    assert_eq!(response[0], 1);
+                    assert_eq!(u64::from_be_bytes(response[1..9].try_into().unwrap()), 128);
+                    assert_eq!(u64::from_be_bytes(response[9..17].try_into().unwrap()), 32);
+                    continue;
+                }
                 let response_text = String::from_utf8(response).unwrap();
                 assert!(response_text.contains(&format!("connection_dcid={server_value}")));
                 assert!(response_text.contains(&format!("stream_id={stream_id}")));
@@ -1040,15 +1387,13 @@ mod tests {
     async fn udp_connect_rejects_zero_and_invalid_bootstrap_responses() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
-        assert!(
-            UdpClient::connect(
-                "127.0.0.1:0".parse().unwrap(),
-                server_addr,
-                ConnectionId::new(0).unwrap(),
-            )
-            .await
-            .is_err()
-        );
+        assert!(UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            ConnectionId::new(0).unwrap(),
+        )
+        .await
+        .is_err());
 
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
@@ -1063,15 +1408,13 @@ mod tests {
             .unwrap();
             server.send_to(&output[..used], source).await.unwrap();
         });
-        assert!(
-            UdpClient::connect(
-                "127.0.0.1:0".parse().unwrap(),
-                server_addr,
-                ConnectionId::new(7).unwrap(),
-            )
-            .await
-            .is_err()
-        );
+        assert!(UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            ConnectionId::new(7).unwrap(),
+        )
+        .await
+        .is_err());
         task.await.unwrap();
     }
 
@@ -1120,8 +1463,7 @@ mod tests {
         pending.record_index = 1;
         assert!(pending.load_current());
         assert_eq!(pending.current_kind, RECORD_BLOB);
-        assert_eq!(PendingObjectTransfer::stream_index(RECORD_MANIFEST), 0);
-        assert_eq!(PendingObjectTransfer::stream_index(RECORD_BLOB), 1);
+        assert_eq!(pending.stream_offset, 0);
         pending.current.clear();
         pending.record_index = 2;
         assert!(!pending.load_current());
@@ -1131,16 +1473,15 @@ mod tests {
     async fn udp_client_send_stream_accepts_transport_control() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client = UdpClient::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            server_addr,
-            ConnectionId::new(1).unwrap(),
-        )
-        .await
-        .unwrap();
         let local = ConnectionId::new(1).unwrap();
         let peer = ConnectionId::new(2).unwrap();
-        client.endpoint.set_connection_ids(local, peer).unwrap();
+        let mut client = UdpClient {
+            socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            peer: server_addr,
+            endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
+            local_cid: local,
+        };
+        client.endpoint.install_connection_ids(local, peer).unwrap();
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
             let (_, source) = server.recv_from(&mut input).await.unwrap();
@@ -1164,22 +1505,21 @@ mod tests {
     async fn udp_client_send_stream_rejects_application_stream_response() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
-        let mut client = UdpClient::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            server_addr,
-            ConnectionId::new(1).unwrap(),
-        )
-        .await
-        .unwrap();
         let local = ConnectionId::new(1).unwrap();
         let peer = ConnectionId::new(2).unwrap();
-        client.endpoint.set_connection_ids(local, peer).unwrap();
+        let mut client = UdpClient {
+            socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            peer: server_addr,
+            endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
+            local_cid: local,
+        };
+        client.endpoint.install_connection_ids(local, peer).unwrap();
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
             let (_, source) = server.recv_from(&mut input).await.unwrap();
             let mut endpoint =
                 EndpointState::<4>::new(Role::Server, ConnectionLimits::default(), MTU as u64);
-            endpoint.set_connection_ids(peer, local).unwrap();
+            endpoint.install_connection_ids(peer, local).unwrap();
             endpoint
                 .open_send_stream(8, INITIAL_MAX_STREAM_DATA)
                 .unwrap();
@@ -1203,9 +1543,11 @@ mod tests {
         }
 
         fn write_block(&mut self, _index: u32, data: &[u8]) -> Result<(), Self::Error> {
-            // Simulate the synchronous erase/write cost of Recovery's flash
-            // sink while keeping this entirely on the host.
-            std::thread::sleep(Duration::from_micros(50));
+            // Simulate a bounded synchronous erase/write cost of Recovery's
+            // flash sink while keeping this entirely on the host. The live
+            // adapter is still covered separately because this does not model
+            // ESP-IDF flash-cache stalls.
+            std::thread::sleep(Duration::from_micros(500));
             self.bytes.extend_from_slice(data);
             Ok(())
         }
@@ -1216,7 +1558,7 @@ mod tests {
         fn abort(&mut self) {}
     }
 
-    async fn run_object_transfer(size: usize) {
+    async fn run_object_transfer(size: usize, object_chunk: usize) {
         let directory = tempdir().unwrap();
         let artifact_root = directory.path().join("flash");
         let artifact = artifact_root.join("esp32c6/main-app.bin");
@@ -1225,7 +1567,8 @@ mod tests {
         std::fs::write(&artifact, &expected).unwrap();
 
         let mut request_body = [0u8; 64];
-        let encoded_len = encode_get(&mut request_body[1..], None, 13, 6, true).unwrap();
+        // Exercise the real Main-flash request path.
+        let encoded_len = encode_get(&mut request_body[1..], None, 13, 6).unwrap();
         request_body[0] = SERVICE_OBJECT;
         let request_len = encoded_len + 1;
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1234,18 +1577,23 @@ mod tests {
         let server_task = tokio::spawn(run(UdpConfig {
             bind,
             artifact_root,
+            // Match the bounded Recovery-side ledger used by the managed
+            // flash bearer. This keeps the regression sensitive to the
+            // one-packet-in-flight and sliding-credit rules.
+            history_capacity: 2,
+            object_chunk,
             ..UdpConfig::default()
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let mut client = UdpClient::connect(
+        let mut client = UdpClient::connect_with_history_capacity(
             "127.0.0.1:0".parse().unwrap(),
             bind,
             ConnectionId::new(0xa1).unwrap(),
+            2,
         )
         .await
         .unwrap();
-        let mut manifest_records = RecordBuffer::new();
-        let mut block_records = RecordBuffer::new();
+        let mut records = RecordBuffer::new();
         let mut receiver = ImageReceiver::new(FakeFlash { bytes: Vec::new() });
         let (stream_id, first, fin) = client
             .request_stream(
@@ -1255,18 +1603,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(stream_id, MANIFEST_STREAM);
+        assert_eq!(stream_id, OBJECT_STREAM);
         assert!(!fin);
-        let mut records = vec![(stream_id, first, fin)];
-        while let Some((id, data, finished)) = records.pop() {
-            let stream = id;
-            let target = if stream == MANIFEST_STREAM {
-                &mut manifest_records
-            } else {
-                &mut block_records
-            };
-            target.push(&data);
-            while let Some((kind, body)) = target.next() {
+        let mut packets = vec![(stream_id, first, fin)];
+        while let Some((id, data, finished)) = packets.pop() {
+            assert_eq!(id, OBJECT_STREAM);
+            records.push(&data);
+            while let Some((kind, body)) = records.next() {
                 match kind {
                     RECORD_MANIFEST => {
                         receiver.on_manifest(&body).unwrap();
@@ -1280,22 +1623,374 @@ mod tests {
                     other => panic!("unexpected object record {other}"),
                 }
             }
-            if stream == BLOCK_STREAM && finished {
+            if finished {
                 break;
             }
-            if !finished || stream != BLOCK_STREAM {
-                let next = client.recv_stream().await.unwrap();
-                records.push(next);
-            }
+            packets.push(client.recv_stream().await.unwrap());
         }
         server_task.abort();
         assert!(receiver.is_complete());
         assert_eq!(receiver.sink_mut().bytes, expected);
     }
 
+    struct RecoveryMirrorSink<'a> {
+        records: &'a mut RecordBuffer,
+        bytes: usize,
+    }
+
+    impl CopyingStreamEvents for RecoveryMirrorSink<'_> {
+        type Error = ();
+
+        fn stream_chunk(
+            &mut self,
+            stream: u64,
+            _offset: u64,
+            _end: bool,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            if stream != OBJECT_STREAM { return Err(()); }
+            self.records.push(bytes);
+            self.bytes = self.bytes.saturating_add(bytes.len());
+            Ok(())
+        }
+    }
+
+    struct RecoveryMirror {
+        endpoint: RecoveryEndpoint<2>,
+        ordered: CallbackStreams<Arc<Vec<u8>>>,
+        records: RecordBuffer,
+        receiver: ImageReceiver<FakeFlash>,
+        drop_outbound_control: usize,
+    }
+
+    impl RecoveryMirror {
+        fn new() -> Self {
+            Self {
+                endpoint: RecoveryEndpoint::<2>::new(
+                    Role::Client,
+                    ConnectionLimits {
+                        max_data: crate::RECOVERY_INITIAL_MAX_DATA,
+                        max_stream_data: crate::RECOVERY_INITIAL_MAX_DATA,
+                        ..ConnectionLimits::default()
+                    },
+                    MTU as u64,
+                ),
+                // Match fw/recovery-rust/src/udp_flash.rs. This is deliberately
+                // not UdpClient: the test must exercise Recovery's callback,
+                // flow-credit, and two-stage ACK behavior.
+                ordered: CallbackStreams::new(2, RECOVERY_REORDER_CAPACITY_BYTES),
+                records: RecordBuffer::new(),
+                receiver: ImageReceiver::new(FakeFlash { bytes: Vec::new() }),
+                drop_outbound_control: 0,
+            }
+        }
+
+        fn accept_recovery_records(
+            stream: u64,
+            records: &mut RecordBuffer,
+            receiver: &mut ImageReceiver<FakeFlash>,
+        ) {
+            assert_eq!(stream, OBJECT_STREAM);
+            while let Some((kind, body)) = records.next() {
+                let event = match kind {
+                    RECORD_MANIFEST => receiver.on_manifest(&body).unwrap(),
+                    RECORD_BLOB => receiver.on_block(&body).unwrap(),
+                    RECORD_DONE => receiver.on_done().unwrap(),
+                    other => panic!("unexpected Recovery mirror record {other}"),
+                };
+                if kind == RECORD_DONE {
+                    assert_eq!(event, ImageEvent::Complete);
+                }
+            }
+        }
+
+        async fn receive_one(
+            &mut self,
+            socket: &UdpSocket,
+            peer: SocketAddr,
+            packet: &[u8],
+        ) -> Result<()> {
+            let mut transport_out = [0u8; MTU];
+            let mut outputs: Vec<Vec<u8>> = Vec::new();
+            let (endpoint, ordered, records, receiver) = (
+                &mut self.endpoint,
+                &mut self.ordered,
+                &mut self.records,
+                &mut self.receiver,
+            );
+            endpoint
+                .receive_with_callbacks(
+                    packet,
+                    &mut transport_out,
+                    |out| {
+                        // The bearer test only forwards opaque transport
+                        // output. It must not know which frames it contains.
+                        outputs.push(out.to_vec());
+                    },
+                    |stream| {
+                        let consumed = {
+                            let mut sink = RecoveryMirrorSink {
+                                records,
+                                bytes: 0,
+                            };
+                            ordered
+                                .receive_copying(
+                                    stream.id,
+                                    Arc::new(stream.data.to_vec()),
+                                    stream.offset,
+                                    0..stream.data.len(),
+                                    stream.fin,
+                                    &mut sink,
+                                )
+                                .map_err(|_| crate::Error::Invalid)?;
+                            sink.bytes
+                        };
+                        if consumed != 0 {
+                            Self::accept_recovery_records(stream.id, records, receiver);
+                        }
+                        Ok(consumed)
+                    },
+                )
+                .map_err(|error| anyhow::anyhow!("Recovery mirror input: {error:?}"))?;
+            for output in outputs {
+                if self.drop_outbound_control != 0 {
+                    self.drop_outbound_control -= 1;
+                } else {
+                    socket.send_to(&output, peer).await?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Mirror Recovery's bounded `recvfrom` timeout.  Delayed ACKs and
+        /// other transport control are clock-driven; they must not depend on
+        /// another application datagram arriving.  This deliberately emits
+        /// opaque transport output only, matching `fw/recovery-rust`.
+        async fn poll_timer(
+            &mut self,
+            socket: &UdpSocket,
+            peer: SocketAddr,
+            now_ms: u64,
+        ) -> Result<()> {
+            self.endpoint.set_time(now_ms);
+            let mut output = [0u8; MTU];
+            if let Some(used) = self
+                .endpoint
+                .poll_transmit(&mut output)
+                .map_err(|error| anyhow::anyhow!("Recovery mirror timer: {error:?}"))?
+            {
+                if self.drop_outbound_control != 0 {
+                    self.drop_outbound_control -= 1;
+                } else {
+                    socket.send_to(&output[..used], peer).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    async fn run_recovery_mirror(
+        size: usize,
+        object_chunk: usize,
+        history_capacity: usize,
+        ack_frequency: u8,
+        drop_first_control: bool,
+        drop_first_stream: bool,
+        late_loss_burst: bool,
+    ) {
+        let directory = tempdir().unwrap();
+        let artifact_root = directory.path().join("flash");
+        let artifact = artifact_root.join("esp32c6/main-app.bin");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        let expected = (0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&artifact, &expected).unwrap();
+
+        let mut request_body = [0u8; 64];
+        let encoded_len = encode_get(&mut request_body[1..], None, 13, 6).unwrap();
+        request_body[0] = SERVICE_OBJECT;
+        let request_len = encoded_len + 1;
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root,
+            history_capacity,
+            object_chunk,
+            // Exercise the explicit Recovery profile while the automatic
+            // memory-policy tick is active. A regression must not widen the
+            // four-packet service profile behind the test's back.
+            ledger_resize_interval: Duration::from_millis(1),
+            ledger_memory: Some(LedgerMemorySnapshot {
+                total_bytes: 512 * 1024 * 1024,
+                available_bytes: 512 * 1024 * 1024,
+            }),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_cid = ConnectionId::new(1).unwrap();
+        let mut open = [0u8; MTU];
+        let open_len = encode_bootstrap_open(client_cid, 0, &mut open).unwrap();
+        socket.send_to(&open[..open_len], bind).await.unwrap();
+        let mut input = [0u8; MTU];
+        let server_cid = loop {
+            let (len, peer) =
+                tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut input))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if peer == bind {
+                if let Ok((_, cid)) = decode_bootstrap_ack(&input[..len], client_cid) {
+                    break cid;
+                }
+            }
+        };
+        let mut mirror = RecoveryMirror::new();
+        mirror
+            .endpoint
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        mirror
+            .endpoint
+            .set_ack_frequency(ack_frequency);
+        mirror.drop_outbound_control = usize::from(drop_first_control);
+        mirror
+            .endpoint
+            .open_send_stream(FIRST_CLIENT_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA)
+            .unwrap();
+        let mut request = [0u8; MTU];
+        let (request_used, _) = mirror
+            .endpoint
+            .encode_stream_packet(
+                server_cid,
+                FIRST_CLIENT_BIDI_STREAM_ID,
+                0,
+                true,
+                &request_body[..request_len],
+                &mut request,
+            )
+            .unwrap();
+        socket
+            .send_to(&request[..request_used], bind)
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(20);
+        let mut mirror_datagrams = 0usize;
+        let mut drop_first_stream = drop_first_stream;
+        let mut stream_datagrams = 0usize;
+        let mut late_drops_remaining = if late_loss_burst { 3usize } else { 0 };
+        while !mirror.receiver.is_complete() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "Recovery mirror transfer timed out after {mirror_datagrams} datagrams");
+            match tokio::time::timeout(remaining.min(Duration::from_millis(10)), socket.recv_from(&mut input)).await {
+                Ok(Ok((len, peer))) => {
+                    assert_eq!(peer, bind);
+                    mirror_datagrams += 1;
+                    let (_, header_len) = ShortHeader::decode(&input[..len]).unwrap();
+                    let (frame, _) = crate::decode_frame(&input[header_len..]).unwrap();
+                    if drop_first_stream && matches!(frame, Frame::Stream(_)) {
+                        drop_first_stream = false;
+                        continue;
+                    }
+                    if matches!(frame, Frame::Stream(_)) {
+                        stream_datagrams += 1;
+                        if stream_datagrams >= 849 && late_drops_remaining != 0 {
+                            late_drops_remaining -= 1;
+                            continue;
+                        }
+                    }
+                    match mirror.receive_one(&socket, peer, &input[..len]).await {
+                        Ok(()) => {}
+                        // Recovery keeps its socket loop alive when the
+                        // bounded callback credit rejects far-ahead data.
+                        // Earlier selective ACKs make the sender repair the
+                        // missing range; this is backpressure, not a session
+                        // failure.
+                        Err(error)
+                            if error.to_string().contains("FlowControl")
+                                || error.to_string().contains("Invalid") => {}
+                        Err(error) => panic!("Recovery mirror input failed: {error}"),
+                    }
+                }
+                Ok(Err(error)) => panic!("Recovery mirror receive failed: {error}"),
+                Err(_) => mirror
+                    .poll_timer(&socket, bind, started.elapsed().as_millis() as u64)
+                    .await
+                    .unwrap(),
+            }
+        }
+        server_task.abort();
+        assert_eq!(mirror.receiver.sink_mut().bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn recovery_receive_loop_matrix_matches_device_profiles() {
+        for history_capacity in [2, 4, 16, 32] {
+            for object_chunk in [OBJECT_CHUNK, 1200] {
+                run_recovery_mirror(128 * 1024 + 123, object_chunk, history_capacity, 2, false, false, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_benchmark_matches_esp32_dry_run_size() {
+        let size = 2_122_528;
+        let started = Instant::now();
+        let object_chunk = 1200;
+        run_recovery_mirror(size, object_chunk, 32, 8, false, false, false).await;
+        let elapsed = started.elapsed();
+        let mib_per_second = size as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        eprintln!(
+            "recovery host benchmark size={} chunk={} history=32 ack_frequency=8 elapsed_ms={} speed_mib_s={:.3}",
+            size,
+            object_chunk,
+            elapsed.as_millis(),
+            mib_per_second
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_recovers_when_first_delayed_ack_is_lost() {
+        // A 2 MiB image has a manifest larger than the initial congestion
+        // window.  Drop the first timer-driven ACK exactly as Wi-Fi can; the
+        // server must PTO a retained packet even though its history is not
+        // yet full, then resume the same ordered response stream.
+        run_recovery_mirror(2_122_528, 1200, 16, 8, true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_recovers_from_late_three_packet_loss_burst() {
+        // Matches the device stall boundary: do not let a late selective-ACK
+        // gap turn an otherwise healthy 2 MiB Recovery transfer into silence.
+        run_recovery_mirror(2_122_528, 1200, 32, 8, false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_reorders_one_stream_packet_with_bounded_credit() {
+        // This mirrors the Wi-Fi fault that previously let the server send
+        // roughly 256 KiB past a missing early range, overflowing Recovery's
+        // callback buffer.  The receiver must advertise only its bounded
+        // reorder budget and the sender must repair the gap.
+        run_recovery_mirror(2_122_528, 1200, 16, 8, false, true, false).await;
+    }
+
+    #[test]
+    fn recovery_production_window_fits_callback_reorder_budget() {
+        const HOST_HISTORY_PACKETS: usize = RECOVERY_MAX_HISTORY_PACKETS;
+        const HOST_PAYLOAD_BYTES: usize = 1200;
+        assert!(
+            HOST_HISTORY_PACKETS * HOST_PAYLOAD_BYTES <= RECOVERY_REORDER_CAPACITY_BYTES,
+            "Recovery callback reassembly must cover every outstanding host payload"
+        );
+    }
+
     #[tokio::test]
     async fn udp_bearer_streams_object_records_with_transport_ack() {
-        run_object_transfer(512 * 1024 + 123).await;
+        run_object_transfer(512 * 1024 + 123, OBJECT_CHUNK).await;
     }
 
     #[tokio::test]
@@ -1304,8 +1999,10 @@ mod tests {
         // control/data boundaries and at a multi-megabyte transfer size. The
         // fake flash sink keeps this deterministic and bounded without
         // touching a real device.
-        for size in [4 * 1024, 64 * 1024, 512 * 1024, 2 * 1024 * 1024] {
-            run_object_transfer(size).await;
+        for object_chunk in [OBJECT_CHUNK, 1200] {
+            for size in [4 * 1024, 64 * 1024, 512 * 1024, 2 * 1024 * 1024] {
+                run_object_transfer(size, object_chunk).await;
+            }
         }
     }
 
@@ -1339,16 +2036,12 @@ mod tests {
             .await
             .unwrap();
         assert!(fin);
-        assert!(
-            core::str::from_utf8(&response)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
-        assert!(
-            core::str::from_utf8(&response)
-                .unwrap()
-                .contains("history_capacity=2")
-        );
+        assert!(core::str::from_utf8(&response)
+            .unwrap()
+            .contains("metrics_version=1"));
+        assert!(core::str::from_utf8(&response)
+            .unwrap()
+            .contains("history_capacity=2"));
         assert!(core::str::from_utf8(&response)
             .unwrap()
             .contains("next_packet_number=1"));
@@ -1405,7 +2098,9 @@ mod tests {
         let server_task = tokio::spawn(run(UdpConfig {
             bind,
             artifact_root: root.path().to_path_buf(),
-            history_capacity: 4,
+            // Zero selects the memory-aware policy; an explicit capacity is
+            // intentionally fixed for embedded-compatible profiles.
+            history_capacity: 0,
             max_active_connections: 1,
             ledger_memory_policy: crate::ledger::LedgerMemoryPolicy {
                 min_packets: 4,
@@ -1428,14 +2123,19 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let (_, metrics, _) = client
-            .request_stream(crate::FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
-            .await
-            .unwrap();
-        let metrics = core::str::from_utf8(&metrics).unwrap();
-        assert!(metrics.contains("history_capacity=16"));
-        assert!(metrics.contains("history_storage_slots=16"));
+        let mut final_metrics = String::new();
+        for (index, stream_id) in [4_u64, 8, 12, 16].into_iter().enumerate() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let (_, metrics, _) = client
+                .request_stream(stream_id, &[SERVICE_METRICS], true)
+                .await
+                .unwrap();
+            if index == 3 {
+                final_metrics = String::from_utf8(metrics).unwrap();
+            }
+        }
+        assert!(final_metrics.contains("history_capacity=16"));
+        assert!(final_metrics.contains("history_storage_slots=16"));
         server_task.abort();
     }
 
@@ -1471,21 +2171,17 @@ mod tests {
                 .request_stream(stream, &[SERVICE_METRICS], true)
                 .await
                 .unwrap();
-            assert!(
-                core::str::from_utf8(&metrics)
-                    .unwrap()
-                    .contains("metrics_version=1")
-            );
+            assert!(core::str::from_utf8(&metrics)
+                .unwrap()
+                .contains("metrics_version=1"));
             let event_stream = stream + 4;
             let (_, events, _) = client
                 .request_stream(event_stream, &[SERVICE_EVENTS], true)
                 .await
                 .unwrap();
-            assert!(
-                core::str::from_utf8(&events)
-                    .unwrap()
-                    .contains("events_version=")
-            );
+            assert!(core::str::from_utf8(&events)
+                .unwrap()
+                .contains("events_version="));
             assert!(core::str::from_utf8(&events).unwrap().contains("events="));
             let echo_stream = event_stream + 4;
             let (_, echo, _) = client
@@ -1498,15 +2194,33 @@ mod tests {
             assert!(echo_text.contains("stream_id="));
             let iperf_stream = echo_stream + 4;
             let mut iperf_request = Vec::from([SERVICE_IPERF]);
-            iperf_request.extend_from_slice(&64u64.to_be_bytes());
-            iperf_request.extend_from_slice(&[0xa5; 64]);
-            let (_, iperf, _) = client
+            iperf_request.extend_from_slice(&4096u64.to_be_bytes());
+            iperf_request.extend_from_slice(&512u16.to_be_bytes());
+            let (_, first, mut iperf_finished) = client
                 .request_stream(iperf_stream, &iperf_request, true)
                 .await
                 .unwrap();
-            let iperf_text = core::str::from_utf8(&iperf).unwrap();
-            assert!(iperf_text.contains("service=iperf"));
-            assert!(iperf_text.contains("requested_bytes=64"));
+            let mut iperf = first;
+            while !iperf_finished {
+                let (_, bytes, finished) = client.recv_stream().await.unwrap();
+                iperf.extend_from_slice(&bytes);
+                iperf_finished = finished;
+            }
+            assert_eq!(iperf.len(), 4096);
+            let mut offset = 0usize;
+            let mut packet_id = 0u32;
+            while offset < iperf.len() {
+                let used = (iperf.len() - offset).min(512);
+                assert_eq!(
+                    u32::from_be_bytes(iperf[offset..offset + 4].try_into().unwrap()),
+                    packet_id,
+                );
+                assert!(iperf[offset + 4..offset + used].iter().enumerate().all(|(index, byte)| {
+                    *byte == (offset + 4 + index) as u8
+                }));
+                offset += used;
+                packet_id = packet_id.wrapping_add(1);
+            }
             let registry_stream = iperf_stream + 4;
             let (_, registry, _) = client
                 .request_stream(registry_stream, &[SERVICE_STREAM], true)
@@ -1517,6 +2231,33 @@ mod tests {
             assert!(registry_text.contains("events"));
         }
         assert_ne!(server_cids[0], server_cids[1]);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_control_carries_opaque_log_and_queued_command() {
+        let root = tempdir().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let control = Arc::new(TransportControl::default());
+        control.queue_command(vec![0xa1, 0x00, 0x18, 0x44]);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            control: Some(control.clone()),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(), bind, ConnectionId::new(0x8c).unwrap(),
+        ).await.unwrap();
+        let log = [SERVICE_CONTROL, CONTROL_LOG, 0xa1, 0x04, 0x62, b'o', b'k'];
+        let (_, response, finished) = client
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &log, true).await.unwrap();
+        assert!(finished);
+        assert_eq!(response, [SERVICE_CONTROL, CONTROL_RESPONSE, 0xa1, 0x00, 0x18, 0x44]);
+        assert_eq!(control.take_log().as_deref(), Some(&log[2..]));
         server_task.abort();
     }
 
@@ -1545,7 +2286,7 @@ mod tests {
         let mut endpoint =
             EndpointState::<4>::new(Role::Client, ConnectionLimits::default(), MTU as u64);
         endpoint
-            .set_connection_ids(ConnectionId::new(0xc1).unwrap(), server_cid)
+            .install_connection_ids(ConnectionId::new(0xc1).unwrap(), server_cid)
             .unwrap();
         endpoint
             .open_send_stream(4, INITIAL_MAX_STREAM_DATA)
@@ -1556,24 +2297,20 @@ mod tests {
             .unwrap();
         attacker.send_to(&packet[..used], bind).await.unwrap();
         let mut response = [0u8; MTU];
-        assert!(
-            timeout(
-                Duration::from_millis(100),
-                attacker.recv_from(&mut response)
-            )
-            .await
-            .is_err()
-        );
+        assert!(timeout(
+            Duration::from_millis(100),
+            attacker.recv_from(&mut response)
+        )
+        .await
+        .is_err());
 
         let (_, metrics, _) = legitimate
             .request_stream(crate::FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
             .await
             .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        assert!(core::str::from_utf8(&metrics)
+            .unwrap()
+            .contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -1618,11 +2355,9 @@ mod tests {
             .request_stream(crate::FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
             .await
             .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        assert!(core::str::from_utf8(&metrics)
+            .unwrap()
+            .contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -1660,11 +2395,9 @@ mod tests {
             .request_stream(crate::FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
             .await
             .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        assert!(core::str::from_utf8(&metrics)
+            .unwrap()
+            .contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -1690,20 +2423,22 @@ mod tests {
         let first_bytes = response[..first_len].to_vec();
         let (first_header, first_server) =
             decode_bootstrap_ack(&response[..first_len], cid).unwrap();
-        client.send_to(&open[..used], bind).await.unwrap();
+        let mut retry_open = [0u8; MTU];
+        let retry_open_len = encode_bootstrap_open(cid, 1, &mut retry_open).unwrap();
+        client.send_to(&retry_open[..retry_open_len], bind).await.unwrap();
         let (second_len, _) = client.recv_from(&mut response).await.unwrap();
         let (second_header, second_server) =
             decode_bootstrap_ack(&response[..second_len], cid).unwrap();
         assert_eq!(first_server, second_server);
-        assert_eq!(second_header.packet_number, first_header.packet_number);
-        assert_eq!(&response[..second_len], first_bytes.as_slice());
+        assert_eq!(second_header.packet_number, first_header.packet_number + 1);
+        assert_ne!(&response[..second_len], first_bytes.as_slice());
 
         // The pending key is the peer plus advertised client CID, not the
         // outer DCID or packet number. A retry with a new OPEN packet number
-        // has the same stream-0 payload and must replay the byte-identical
-        // OPEN_ACK without consuming the established packet-number space.
+        // has the same stream-0 payload and must keep the server CID while
+        // receiving a fresh, monotonic OPEN_ACK packet number.
         let mut conflicting = [0u8; MTU];
-        let conflicting_len = encode_bootstrap_open(cid, 1, &mut conflicting).unwrap();
+        let conflicting_len = encode_bootstrap_open(cid, 2, &mut conflicting).unwrap();
         client
             .send_to(&conflicting[..conflicting_len], bind)
             .await
@@ -1715,7 +2450,7 @@ mod tests {
         let (retry_header, retry_server) =
             decode_bootstrap_ack(&response[..retry_len], cid).unwrap();
         assert_eq!(retry_server, first_server);
-        assert_eq!(retry_header.packet_number, first_header.packet_number);
+        assert_eq!(retry_header.packet_number, second_header.packet_number + 1);
         // Malformed and unknown non-zero-CID traffic must not terminate the
         // listener or poison another connection.
         client.send_to(&[0], bind).await.unwrap();
@@ -1760,11 +2495,9 @@ mod tests {
             .request_stream(crate::FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
             .await
             .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        assert!(core::str::from_utf8(&metrics)
+            .unwrap()
+            .contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -1852,14 +2585,16 @@ mod tests {
             .await
             .unwrap();
         let mut response = [0u8; MTU];
-        assert!(
-            timeout(
-                Duration::from_millis(50),
-                client.socket.recv_from(&mut response)
-            )
+        // Close/path-control is ACKed promptly, but the route still stays
+        // closed: the following Ping must not revive an application session.
+        let (response_len, _) = timeout(Duration::from_millis(50), client.socket.recv_from(&mut response))
             .await
-            .is_err()
-        );
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ShortHeader::decode(&response[..response_len]),
+            Ok((_, _))
+        ));
         server_task.abort();
     }
 
@@ -1936,7 +2671,7 @@ mod tests {
         .await
         .unwrap();
         let mut request = [0u8; 128];
-        let get_len = encode_get(&mut request[1..], None, 13, 6, true).unwrap();
+        let get_len = encode_get(&mut request[1..], None, 13, 6).unwrap();
         request[0] = SERVICE_OBJECT;
         let (stream_id, first, fin) = client
             .request_stream(
@@ -1947,28 +2682,21 @@ mod tests {
             .await
             .unwrap();
         assert!(!fin);
-        assert_eq!(stream_id, MANIFEST_STREAM);
+        assert_eq!(stream_id, OBJECT_STREAM);
         assert_eq!(first[0], RECORD_MANIFEST);
-        let mut manifest = RecordBuffer::new();
-        let mut blocks = RecordBuffer::new();
-        manifest.push(&first);
+        let mut records = RecordBuffer::new();
+        records.push(&first);
         let mut saw_done = false;
         for _ in 0..16 {
             let (id, data, finished) = client.recv_stream().await.unwrap();
-            if id == MANIFEST_STREAM {
-                manifest.push(&data);
-                while let Some((kind, _)) = manifest.next() {
-                    assert_eq!(kind, RECORD_MANIFEST);
-                }
-            } else {
-                blocks.push(&data);
-                while let Some((kind, _)) = blocks.next() {
-                    if kind == RECORD_DONE {
-                        saw_done = true;
-                    }
+            assert_eq!(id, OBJECT_STREAM);
+            records.push(&data);
+            while let Some((kind, _)) = records.next() {
+                if kind == RECORD_DONE {
+                    saw_done = true;
                 }
             }
-            if saw_done || (id == BLOCK_STREAM && finished) {
+            if saw_done || finished {
                 break;
             }
         }

@@ -5,8 +5,8 @@
 //! the returned response on its own transport.
 
 use crate::{
-    ConnectionId, EndpointState, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_METRICS,
-    SERVICE_OBJECT, SERVICE_STATUS, SERVICE_STREAM,
+    ConnectionId, EndpointState, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF,
+    SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS, SERVICE_STREAM,
 };
 use alloc::format;
 use alloc::vec::Vec;
@@ -97,6 +97,7 @@ impl Default for StreamRegistry {
         registry.register(SERVICE_IPERF, b"iperf");
         registry.register(SERVICE_METRICS, b"metrics");
         registry.register(SERVICE_EVENTS, b"events");
+        registry.register(SERVICE_CONTROL, b"control");
         registry
     }
 }
@@ -177,6 +178,9 @@ pub fn handle_stream_with_events<const N: usize, const H: usize, const P: usize>
             }
             Ok(list)
         }
+        // The UDP adapter supplies the command mailbox. Keep a harmless
+        // registered fallback for bearer tests which use handlers directly.
+        SERVICE_CONTROL => Ok(Vec::new()),
         SERVICE_OBJECT => Err("object service belongs to object-store adapter"),
         _ => Err("unknown stream service"),
     }
@@ -199,8 +203,8 @@ fn connection_status<const N: usize, const H: usize, const P: usize>(
 
 fn iperf_status<const N: usize, const H: usize, const P: usize>(
     endpoint: &EndpointState<N, H, P>,
-    cid: ConnectionId,
-    stream_id: u64,
+    _cid: ConnectionId,
+    _stream_id: u64,
     data: &[u8],
 ) -> Vec<u8> {
     let requested = data
@@ -208,11 +212,22 @@ fn iperf_status<const N: usize, const H: usize, const P: usize>(
         .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
         .unwrap_or(data.len() as u64);
     let received = data.len().saturating_sub(8) as u64;
-    format!(
-        "service=iperf;connection_dcid={cid};stream_id={stream_id};requested_bytes={requested};received_bytes={received};next_packet_number={};bytes_in_flight={};history={}/{}",
-        endpoint.next_packet_number, endpoint.bytes_in_flight(), endpoint.history_len(), endpoint.history_capacity(),
-        cid = cid.value(),
-    ).into_bytes()
+    // Fixed binary response: version, requested, received, packet number,
+    // in-flight bytes, congestion window, and history occupancy.  A benchmark
+    // must not depend on text formatting or a parser on either endpoint.
+    let mut response = Vec::with_capacity(1 + 6 * 8);
+    response.push(1);
+    for value in [
+        requested,
+        received,
+        endpoint.next_packet_number as u64,
+        endpoint.bytes_in_flight(),
+        endpoint.congestion.congestion_window,
+        endpoint.history_len() as u64,
+    ] {
+        response.extend_from_slice(&value.to_be_bytes());
+    }
+    response
 }
 
 fn metrics_status<const N: usize, const H: usize, const P: usize>(
@@ -371,8 +386,12 @@ mod tests {
             EndpointState::<8, 4>::new(Role::Server, ConnectionLimits::default(), 1200);
         let client_cid = ConnectionId::new(11).unwrap();
         let server_cid = ConnectionId::new(22).unwrap();
-        client.set_connection_ids(client_cid, server_cid).unwrap();
-        server.set_connection_ids(server_cid, client_cid).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
         let mut now = 0u64;
         let mut delivered = 0usize;
         for (packet_number, (stream_id, service)) in [
@@ -430,8 +449,12 @@ mod tests {
             EndpointState::<8, 8>::new(Role::Server, ConnectionLimits::default(), 1200);
         let client_cid = ConnectionId::new(31).unwrap();
         let server_cid = ConnectionId::new(32).unwrap();
-        client.set_connection_ids(client_cid, server_cid).unwrap();
-        server.set_connection_ids(server_cid, client_cid).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
         let mut link = crate::fake::FakeDatagramLink::new(crate::fake::FaultConfig {
             latency_ticks: 3,
             drop_every: Some(4),

@@ -156,10 +156,10 @@ where
         16 * 1024,
     );
     client
-        .set_connection_ids(client_cid, server_cid)
+        .install_connection_ids(client_cid, server_cid)
         .map_err(OperationHarnessError::Transport)?;
     server
-        .set_connection_ids(server_cid, client_cid)
+        .install_connection_ids(server_cid, client_cid)
         .map_err(OperationHarnessError::Transport)?;
     let mut results = Vec::new();
     let mut now = 0;
@@ -421,7 +421,10 @@ mod tests {
         .unwrap_or_else(|error| panic!("operation failed: {error:?}"));
         assert_eq!(results.len(), 5);
         assert!(String::from_utf8_lossy(&results[0].response).contains("service=2"));
-        assert!(String::from_utf8_lossy(&results[1].response).contains("service=iperf"));
+        assert_eq!(results[1].response.len(), 49);
+        assert_eq!(results[1].response[0], 1);
+        assert_eq!(u64::from_be_bytes(results[1].response[1..9].try_into().unwrap()), 32);
+        assert_eq!(u64::from_be_bytes(results[1].response[9..17].try_into().unwrap()), 7);
         assert!(String::from_utf8_lossy(&results[2].response).contains("metrics_version=1"));
         assert!(String::from_utf8_lossy(&results[3].response).contains("events_version="));
         assert!(String::from_utf8_lossy(&results[4].response).contains("echo"));
