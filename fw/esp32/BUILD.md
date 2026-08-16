@@ -37,20 +37,19 @@ Build the current Rust fleet images from the repository root:
 . env.sh
 scripts/build-fw.sh e5          # classic ESP32 Main
 scripts/build-fw.sh recovery-s3 # ESP32-S3 Main, common 4 MiB image
-scripts/build-recovery-fleet.sh all
+scripts/build-stage2.sh all
+scripts/build-recovery-rust.sh esp32c6
 ```
 
-Artifacts are kept under `target/flash/` and `target/recovery-fleet/`.
+Artifacts are kept under `target/flash/`, `target/stage2/`, and
+`target/recovery-rust/`.
 USB flashing is limited to initial provisioning or emergency repair of the
 stage-2 and Recovery partitions. Never use USB or esptool to replace Main on a
 provisioned board. Once stage-2/Recovery are installed, the supported Main update is:
 
 ```bash
-# mesh-init should run docs/lab/recovery-tcp-server.toml continuously.
-# For a manual development start:
-fw/recovery/tools/flash-server.py
-
-# Then use the common local development flasher.
+# lmesh-wifi owns the persistent UDP object bearer under mesh-init.
+# Use the common local development flasher.
 python3 scripts/flash-device.py e5 main
 # server, port, saved SSID, and MAC-derived IP use defaults
 ```
@@ -63,15 +62,10 @@ subsequent commands reuse them. An example is in
 The helper sends only the recovery-start command through managed lmesh; the
 Main image is transferred over Wi-Fi by Recovery. It reuses port 3336 for
 successive boards. Do not invoke `idf.py flash`, `flash-fw.sh`, or an esptool
-Main-image command for routine updates. The older
-`update-main-wifi-fleet.py` remains a per-board/temporary-listener test helper,
-not the canonical persistent-server procedure.
+Main-image command for routine updates.
 
 Main-update logs are available in:
 
-- `target/recovery-server/all-3336.log` when using
-  `fw/recovery/tools/start-server.sh` (or the compatibility wrapper
-  `scripts/start-recovery-server.sh`);
 - `target/flash-devices/<mac-without-colons>/`, especially `device.json`,
   `flashes/*.json`, `current.sha256`, and `flash-history.jsonl`;
 - `target/evidence/flash/` and the active managed serial capture at
@@ -83,33 +77,16 @@ be identified but cannot be read, use one bounded attempt with the checked-in
 SDK6 artifacts and the known partition table:
 
 ```sh
-python3 scripts/flash-recovery-fleet.py --stage-only --skip-build \
-  --skip-archive --flash-baud 115200 --flash-freq 20m lora2
+scripts/flash-device.py lora2 stage
 ```
 
 `--skip-archive` does not bypass esptool flash verification; it only omits the
 pre-write reads. Stop if the write still reports flash-chip communication
 failure. Do not use this path for Main images.
 
-The same persistent Recovery flash server can serve a module in the raw data
-region. New Main clients select the requested resource in HELLO, so this does
-not require a second port or a server restart. The module build outputs under
-`target/modules/` are discovered automatically (CPU-specific copies under
-`target/flash/esp32/modules/` or `target/flash/esp32s3/modules/` take
-precedence); inspect them with:
-
-```sh
-python3 fw/recovery/tools/flash-server.py --list-modules
-python3 fw/recovery/tools/flash-server.py --module lora
-```
-
-`--module NAME` sets the fallback target to `module` for older clients. New
-clients request `module` plus its name directly, while the server keeps the
-normal sparse/hash or unsigned-fast transfer protocol. The server remains
-persistent and can serve Main, Recovery, stage2, data, or a module on the same
-listener.
-Build output under `target/modules/<rust-target>/` is discovered automatically
-as well.
+The managed object service discovers module outputs under `target/modules/`.
+Use `scripts/flash-device.py <role> module --module NAME` for local
+provisioning.
 
 The target resolves both legacy `data` and current Rust `dmesh_store` partition
 labels. On larger flash parts the module region begins at the selected
