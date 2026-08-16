@@ -1,0 +1,10 @@
+[package]
+name = "lmesh-ble-hci"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+libc = "0.2"
+

@@ -1,20 +1,19 @@
 use anyhow::{Context, Result, bail};
 use mesh::message::{
-    FIELD_CTRL_DIR, FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD,
-    FIELD_RADIO_ID, FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec, TextRecord,
+    FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD, FIELD_RADIO_ID,
+    FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec, TextRecord,
 };
 use minicbor::{Decoder, Encoder, data::Type};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -23,28 +22,28 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::radio_protocol;
 use crate::schema::FirmwareSchema;
-use dmesh_rawnan::protocol as radio_protocol;
+use dmesh_rawnan::service::FollowupDedup;
 use dmesh_rawnan::{Action as RawNanAction, NanState, RxFrame as RawNanRxFrame};
-use dmesh_transport::{encode_bench_stream, ConnectionId, FLAG_FIXED, Frame, ShortHeader, StreamFrame};
+use dmesh_transport::encode_bench_stream;
 use uart_codec::codec::{UART_ESCAPE, UART_FLAG};
 
 const DEFAULT_WIFI_IFACE: &str = "wlan1";
 const DEFAULT_ESP_NAN_GATEWAY: &str = "lora1";
-const DEFAULT_WPA_CTRL_DIR: &str = "/run/mesh/wpa-supplicant-nan";
-const DEFAULT_WPA_SERVICE_NAME: &str = "dmesh";
-const DEFAULT_NAN_TTL_SECS: u32 = 3600;
 const DEFAULT_ESP_COMMAND_TIMEOUT_MS: u64 = 3_000;
 const ESP_SLEEPY_RENDEZVOUS_TIMEOUT_MS: u64 = 8_000;
 // Firmware raw-NAN peers normally wake every four seconds for a short window.
 // A 700 ms probe cadence walks that phase rather than repeatedly landing on a
 // fixed 250/500 ms boundary.
-const STABILITY_HOST_NAN_RETRY_MS: u64 = 700;
 const DEFAULT_HCI_DEV: u16 = 0;
 const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
 const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
 const DEFAULT_LMESH_CONFIG_FILE: &str = "/home/system/etc/lmesh/lmesh.toml";
 const REMOTE_REQUEST_ID_KEY: u16 = 333;
+const RAW_UDP_DIAGNOSTIC_PORT: u16 = 3337;
+const RAW_UDP_FLOOD_BYTES: usize = 2 * 1024 * 1024;
+const RAW_UDP_FLOOD_PAYLOAD: usize = 1200;
 static REMOTE_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // Raw monitor traffic is high volume (especially with an APSTA ESP peer), so
 // a short global ring could evict the semantic NAN event before a diagnostic
@@ -95,6 +94,48 @@ const SERIAL_RESET_NONE: u8 = 0;
 const FIRMWARE_UART_FLAG: u8 = UART_FLAG;
 const FIRMWARE_UART_ESCAPE: u8 = UART_ESCAPE;
 
+/// Serve one raw diagnostic command. Wire values are numeric only:
+/// 1 -> `[0x81, 1]`; `[2, packet_size_be_u16]` -> a fixed flood followed by
+/// `[0x83, packets, bytes]`. Every data packet starts with a u32 packet ID.
+async fn raw_udp_handle(socket: &tokio::net::UdpSocket, peer: SocketAddr, request: &[u8]) {
+    raw_udp_handle_with_size(socket, peer, request, RAW_UDP_FLOOD_BYTES).await;
+}
+
+async fn raw_udp_handle_with_size(
+    socket: &tokio::net::UdpSocket,
+    peer: SocketAddr,
+    request: &[u8],
+    flood_bytes: usize,
+) {
+    match request {
+        [1] => { let _ = socket.send_to(&[0x81, 1], peer).await; }
+        [2] | [2, _, _] => {
+            let payload_size = match request {
+                [2, high, low] => u16::from_be_bytes([*high, *low]) as usize,
+                _ => RAW_UDP_FLOOD_PAYLOAD,
+            }.clamp(8, RAW_UDP_FLOOD_PAYLOAD);
+            let mut packet = [0u8; RAW_UDP_FLOOD_PAYLOAD + 5];
+            packet[0] = 0x82;
+            let mut sent = 0usize;
+            let mut sequence = 0u32;
+            while sent < flood_bytes {
+                packet[1..5].copy_from_slice(&sequence.to_be_bytes());
+                let body = (flood_bytes - sent).min(payload_size);
+                packet[5..5 + body].fill(sequence as u8);
+                if socket.send_to(&packet[..5 + body], peer).await.is_err() { break; }
+                sent += body;
+                sequence = sequence.wrapping_add(1);
+            }
+            let mut done = [0u8; 13];
+            done[0] = 0x83;
+            done[1..5].copy_from_slice(&sequence.to_be_bytes());
+            done[5..13].copy_from_slice(&(sent as u64).to_be_bytes());
+            let _ = socket.send_to(&done, peer).await;
+        }
+        _ => { let _ = socket.send_to(&[0xff], peer).await; }
+    }
+}
+
 /// Host-side adapter from the no-std UART codec's raw payloads to the shared
 /// mesh CBOR stream-frame representation used by the Linux service.
 #[derive(Default)]
@@ -138,10 +179,8 @@ const NLMSGERR_ATTR_OFFS: u16 = 2;
 const NLMSGERR_ATTR_MISS_TYPE: u16 = 5;
 const NL80211_GENL_VERSION: u8 = 1;
 const NL80211_CMD_SET_WIPHY: u8 = 2;
-const NL80211_CMD_NEW_INTERFACE: u8 = 7;
-const NL80211_CMD_DEL_INTERFACE: u8 = 8;
-const NL80211_CMD_GET_INTERFACE: u8 = 5;
 const NL80211_CMD_SET_INTERFACE: u8 = 6;
+const NL80211_CMD_SET_POWER_SAVE: u8 = 61;
 const NL80211_CMD_REMAIN_ON_CHANNEL: u8 = 55;
 const NL80211_CMD_REGISTER_FRAME: u8 = 58;
 const NL80211_CMD_FRAME: u8 = 59;
@@ -151,14 +190,12 @@ const NL80211_CMD_GET_STATION: u8 = 17;
 const NL80211_CMD_NEW_STATION: u8 = 19;
 const NL80211_CMD_DEL_STATION: u8 = 20;
 const NL80211_CMD_CONNECT: u8 = 46;
-const NL80211_CMD_START_NAN: u8 = 66;
-const NL80211_CMD_STOP_NAN: u8 = 67;
-const NL80211_CMD_ADD_NAN_FUNCTION: u8 = 68;
-const NL80211_CMD_DEL_NAN_FUNCTION: u8 = 69;
 const NL80211_ATTR_IFINDEX: u16 = 3;
 const NL80211_ATTR_IFTYPE: u16 = 5;
-const NL80211_ATTR_WIPHY: u16 = 1;
-const NL80211_ATTR_IFNAME: u16 = 4;
+const NL80211_ATTR_PS_STATE: u16 = 93;
+// NL80211_ATTR_TX_RATES is the nested per-band rate policy used by `iw
+// set bitrates`.  Keep the values local rather than depending on libnl/iw.
+const NL80211_ATTR_TX_RATES: u16 = 90;
 const NL80211_ATTR_MAC: u16 = 6;
 const NL80211_ATTR_BEACON_INTERVAL: u16 = 12;
 const NL80211_ATTR_DTIM_PERIOD: u16 = 13;
@@ -191,22 +228,17 @@ const NL80211_ATTR_STA_WME: u16 = 129;
 const NL80211_ATTR_STA_CAPABILITY: u16 = 171;
 const NL80211_ATTR_STA_EXT_CAPABILITY: u16 = 172;
 const NL80211_ATTR_TX_NO_CCK_RATE: u16 = 135;
-const NL80211_ATTR_RECEIVE_MULTICAST: u16 = 289;
 const NL80211_ATTR_DONT_WAIT_FOR_ACK: u16 = 142;
 const NL80211_ATTR_PROBE_RESP: u16 = 145;
 const NL80211_ATTR_RX_SIGNAL_DBM: u16 = 151;
 const NL80211_ATTR_CHANNEL_WIDTH: u16 = 159;
 const NL80211_ATTR_CENTER_FREQ1: u16 = 160;
 const NL80211_ATTR_SOCKET_OWNER: u16 = 204;
-const NL80211_ATTR_WDEV: u16 = 153;
 const NL80211_ATTR_COOKIE: u16 = 88;
-const NL80211_ATTR_NAN_MASTER_PREF: u16 = 238;
-const NL80211_ATTR_BANDS: u16 = 239;
-const NL80211_ATTR_NAN_FUNC: u16 = 240;
-const NL80211_ATTR_NAN_MATCH: u16 = 241;
-const NL80211_ATTR_NAN_FUNC_INST_ID: u16 = 242;
 const NL80211_AUTHTYPE_OPEN_SYSTEM: u32 = 0;
 const NL80211_HIDDEN_SSID_NOT_IN_USE: u32 = 0;
+const NL80211_PS_DISABLED: u32 = 0;
+const NL80211_PS_ENABLED: u32 = 1;
 const NL80211_CHAN_NO_HT: u32 = 0;
 const NL80211_CHAN_HT20: u32 = 1;
 const NL80211_CHAN_WIDTH_20_NOHT: u32 = 0;
@@ -227,17 +259,48 @@ const NL80211_STA_INFO_CONNECTED_TIME: u16 = 16;
 const NL80211_STA_INFO_STA_FLAGS: u16 = 17;
 const NL80211_STA_INFO_RX_BYTES64: u16 = 23;
 const NL80211_STA_INFO_TX_BYTES64: u16 = 24;
+const NL80211_STA_INFO_EXPECTED_THROUGHPUT: u16 = 28;
+const NL80211_STA_INFO_RX_DROP_MISC: u16 = 29;
+const NL80211_STA_INFO_RX_DURATION: u16 = 32;
+const NL80211_STA_INFO_ACK_SIGNAL: u16 = 34;
+const NL80211_STA_INFO_ACK_SIGNAL_AVG: u16 = 35;
+const NL80211_STA_INFO_RX_MPDUS: u16 = 36;
+const NL80211_STA_INFO_FCS_ERROR_COUNT: u16 = 37;
+const NL80211_STA_INFO_TX_DURATION: u16 = 39;
 const NL80211_RATE_INFO_BITRATE: u16 = 1;
+const NL80211_RATE_INFO_MCS: u16 = 2;
+const NL80211_RATE_INFO_40_MHZ_WIDTH: u16 = 3;
+const NL80211_RATE_INFO_SHORT_GI: u16 = 4;
 const NL80211_RATE_INFO_BITRATE32: u16 = 5;
+const NL80211_RATE_INFO_VHT_MCS: u16 = 6;
+const NL80211_RATE_INFO_VHT_NSS: u16 = 7;
+const NL80211_TXRATE_LEGACY: u16 = 1;
+const NL80211_TXRATE_HT: u16 = 2;
 const NL80211_IFTYPE_STATION: u32 = 2;
 const NL80211_IFTYPE_AP: u32 = 3;
 const NL80211_IFTYPE_OCB: u32 = 11;
-const NL80211_IFTYPE_NAN: u32 = 12;
 const NL80211_STA_FLAG_AUTHORIZED: u32 = 1 << 1;
 const NL80211_STA_FLAG_SHORT_PREAMBLE: u32 = 1 << 2;
 const NL80211_STA_FLAG_WME: u32 = 1 << 3;
 const NL80211_STA_FLAG_AUTHENTICATED: u32 = 1 << 5;
 const NL80211_STA_FLAG_ASSOCIATED: u32 = 1 << 7;
+// The stable Recovery AP is a bulk-data HT20 network.  Do not admit CCK or
+// low OFDM fallbacks. The ESP C6 refuses association when 24 Mbps is present
+// in this AP's basic-rate set, so retain mandatory 6 Mbps solely for
+// BSS/control compatibility while excluding 9/12/18 Mbps and all CCK rates.
+// Optional data rates remain 24/36/48/54 plus HT. This rate set applies to
+// beacon, probe, association, and the nl80211 AP profile.
+const OPEN_AP_OFDM_BASIC_RATES: [u8; 1] = [0x8c];
+const OPEN_AP_OFDM_EXTENDED_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6c];
+const HOSTAPD_HT20_CAPABILITY: [u8; 28] = [
+    0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+fn open_ap_basic_rates() -> &'static [u8] {
+    &OPEN_AP_OFDM_BASIC_RATES
+}
+
 const NLM_F_DUMP: u16 = 0x300;
 // Netlink attributes reserve the high two type bits for NLA_F_NESTED and
 // NLA_F_NET_BYTEORDER.  Match the attribute number independently of those
@@ -271,19 +334,6 @@ const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
 // this eight-byte LLC value is dmesh-transport directly, not IPv6/UDP.
 const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
-const NAN_UDP_SOURCE_PORT: u16 = 4242;
-const NAN_UDP_DEST_PORT: u16 = 4243;
-const AF_BLUETOOTH: libc::c_int = 31;
-const BTPROTO_HCI: libc::c_int = 1;
-const HCI_CHANNEL_RAW: u16 = 0;
-const HCI_COMMAND_PKT: u8 = 0x01;
-const HCIDEVUP: libc::c_int = 0x400448c9_u32 as libc::c_int;
-const OGF_LE_CTL: u16 = 0x08;
-const OCF_LE_SET_ADV_PARAMETERS: u16 = 0x0006;
-const OCF_LE_SET_ADV_DATA: u16 = 0x0008;
-const OCF_LE_SET_ADV_ENABLE: u16 = 0x000a;
-const OCF_LE_SET_SCAN_PARAMETERS: u16 = 0x000b;
-const OCF_LE_SET_SCAN_ENABLE: u16 = 0x000c;
 const NLMSG_ERROR: u16 = 2;
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
@@ -295,9 +345,10 @@ pub struct RadioService {
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     radios: Arc<Vec<RadioAdapter>>,
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
+    rawnan_subscribers: Arc<Mutex<HashMap<String, usize>>>,
     rawnan_state: Arc<Mutex<NanState>>,
-    native_nan: Arc<Mutex<BTreeMap<String, NativeNanRuntime>>>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
+    ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
     serial_forwards: Arc<Mutex<BTreeMap<String, SerialForwardRuntime>>>,
     /// Persistent TCP sessions initiated by Main after it joins STA.  These
     /// deliberately reverse the usual host->board direction: AP isolation
@@ -312,10 +363,116 @@ pub struct RadioService {
     esp_sessions: Arc<Mutex<BTreeMap<String, Instant>>>,
     serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
     stability: Arc<Mutex<Option<StabilityRuntime>>>,
+    object_udp_started: Arc<AtomicBool>,
+    transport_control: Arc<dmesh_transport::udp::TransportControl>,
+    raw_udp_started: Arc<AtomicBool>,
     uart_enabled: bool,
 }
 
 impl RadioService {
+    /// Apply the startup TX-rate policy to every interface owned by this
+    /// service.  The default is the driver's standard/automatic policy so
+    /// Android-compatible NAN management and discovery are not forced to a
+    /// DMesh-specific rate.  Targeted frames can opt into 12/24/54 Mbps.
+    pub fn apply_startup_rate_profile(&self, interfaces: &[String]) -> Vec<Value> {
+        let profile =
+            std::env::var("LMESH_WIFI_RATE_PROFILE").unwrap_or_else(|_| "auto".to_owned());
+        let disable_b = std::env::var("LMESH_WIFI_DISABLE_80211B")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        interfaces
+            .iter()
+            .map(|iface| self.wifi_rate_profile(Some(iface.clone()), profile.clone(), disable_b))
+            .collect()
+    }
+
+    /// Apply an owned-interface Linux rate profile for controlled NAN trials.
+    /// This is a direct nl80211 request (the same operation as `iw set
+    /// bitrates`) so the service does not need to exec a helper or inherit
+    /// CAP_NET_* state through a child process. `auto` restores driver rate
+    /// selection; `12` and `24` restrict legacy 2.4 GHz rates to the requested
+    /// Mbps value, while `ht2`, `ht3`, and `ht4` are temporary exact HT-MCS
+    /// diagnostics. `ht3-24` permits MCS3 plus a 24 Mbps OFDM association
+    /// fallback, while still excluding lower HT and CCK data rates. Errors
+    /// retain the kernel errno/extack text.
+    pub fn wifi_rate_profile(
+        &self,
+        iface: Option<String>,
+        profile: String,
+        disable_b: bool,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let profile = profile.trim().to_ascii_lowercase();
+        let (rate_mbps, ht_mcs) = match profile.as_str() {
+            "auto" | "default" | "reset" => (None, None),
+            "12" | "12m" => (Some(12_u8), None),
+            "24" | "24m" => (Some(24_u8), None),
+            "ht2" => (None, Some(2_u8)),
+            "ht3" => (None, Some(3_u8)),
+            "ht4" => (None, Some(4_u8)),
+            "ht3-24" | "ht3_24" => (Some(24_u8), Some(3_u8)),
+            _ => {
+                return json!({"ok": false, "backend": "linux_nl80211", "iface": iface, "profile": profile, "error": "profile must be auto, 12, 24, ht2, ht3, ht4, or ht3-24"});
+            }
+        };
+        let effective_disable_b = disable_b || rate_mbps.is_some() || ht_mcs.is_some();
+        let result = (|| -> Result<()> {
+            let ifindex = ifindex(&iface)?;
+            let socket = Nl80211Socket::open()?;
+            socket.set_tx_rate_profile(ifindex, rate_mbps, ht_mcs, effective_disable_b)
+        })();
+        let (ok, error) = match result {
+            Ok(()) => (true, Value::Null),
+            Err(error) => (false, json!(format!("{error:#}"))),
+        };
+        let value = json!({"ok": ok, "backend": "linux_nl80211", "iface": iface, "profile": profile, "rate_mbps": rate_mbps, "ht_mcs": ht_mcs, "disable_80211b": effective_disable_b, "error": error});
+        self.record("wifi.rate.profile", value.clone());
+        value
+    }
+
+    /// Set the driver power-save policy through the same nl80211 owner that
+    /// starts the AP.  AP throughput tests must never depend on an
+    /// out-of-band `iw` command with different privileges.
+    pub fn wifi_power_save(&self, iface: Option<String>, enabled: bool) -> Value {
+        let iface = wifi_iface(iface);
+        let result = (|| -> Result<()> {
+            let ifindex = ifindex(&iface)?;
+            Nl80211Socket::open()?.set_power_save(ifindex, enabled)
+        })();
+        let (ok, error) = match result {
+            Ok(()) => (true, Value::Null),
+            Err(error) => (false, json!(format!("{error:#}"))),
+        };
+        let value = json!({
+            "ok": ok,
+            "backend": "linux_nl80211",
+            "iface": iface,
+            "power_save": enabled,
+            "error": error,
+        });
+        self.record("wifi.power_save", value.clone());
+        value
+    }
+
+    /// Select HT or legacy association parameters for one AP station. The
+    /// setting takes effect on that station's next association.
+    pub fn wifi_ap_station_profile(&self, mac: String, ht: bool) -> Value {
+        let Some(mac) = parse_mac(Some(mac.trim())) else {
+            return json!({"ok": false, "error": "invalid station MAC"});
+        };
+        let mut stations = self.ap_no_ht_stations.lock().unwrap_or_else(|p| p.into_inner());
+        if ht { stations.remove(&mac); } else { stations.insert(mac); }
+        let value = json!({"ok": true, "station": colon_mac(&mac), "ht": ht,
+            "reassociate_required": true});
+        self.record("wifi.ap.station.profile", value.clone());
+        value
+    }
+
     /// Create a radio service from environment and optional MESH_HOME/lmesh.toml config.
     pub fn from_environment() -> Self {
         Self::from_environment_with_uart(true)
@@ -346,9 +503,10 @@ impl RadioService {
             history: Arc::new(Mutex::new(VecDeque::new())),
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
+            rawnan_subscribers: Arc::new(Mutex::new(HashMap::new())),
             rawnan_state: Arc::new(Mutex::new(NanState::new(5_000_000))),
-            native_nan: Arc::new(Mutex::new(BTreeMap::new())),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
+            ap_no_ht_stations: Arc::new(Mutex::new(ap_no_ht_stations())),
             serial_forwards: Arc::new(Mutex::new(BTreeMap::new())),
             esp_reverse_sessions: Arc::new(reverse_sessions),
             esp_gateway: configured_esp_gateway(),
@@ -356,6 +514,9 @@ impl RadioService {
             esp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             serial_log,
             stability: Arc::new(Mutex::new(None)),
+            object_udp_started: Arc::new(AtomicBool::new(false)),
+            transport_control: Arc::new(dmesh_transport::udp::TransportControl::default()),
+            raw_udp_started: Arc::new(AtomicBool::new(false)),
             uart_enabled: enable_uart,
         };
         if enable_uart {
@@ -368,6 +529,141 @@ impl RadioService {
     /// Report whether this backend owns UART forwards and serial logging.
     pub fn uart_enabled(&self) -> bool {
         self.uart_enabled
+    }
+
+    /// Start the object-store UDP bearer without restarting lmesh-wifi. UDP
+    /// terminates here, while dmesh-transport and dmesh-object-store remain
+    /// separate layers inside the adapter.
+    pub fn object_udp_start(
+        &self,
+        bind: Option<String>,
+        port: Option<u16>,
+        root: Option<String>,
+    ) -> Value {
+        if self.object_udp_started.swap(true, Ordering::AcqRel) {
+            return json!({"ok": true, "already_running": true, "bearer": "udp"});
+        }
+        let bind = bind.unwrap_or_else(|| "0.0.0.0".to_owned());
+        let port = port.unwrap_or(3336);
+        let address = match format!("{bind}:{port}").parse::<SocketAddr>() {
+            Ok(address) => address,
+            Err(error) => {
+                self.object_udp_started.store(false, Ordering::Release);
+                return json!({"ok": false, "bearer": "udp", "error": format!("invalid bind address: {error}")});
+            }
+        };
+        if let Err(error) = std::net::UdpSocket::bind(address) {
+            self.object_udp_started.store(false, Ordering::Release);
+            return json!({"ok": false, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "error": format!("UDP bind failed: {error}")});
+        }
+        let root = root
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("DMESH_REPO")
+                    .map(PathBuf::from)
+                    .map(|path| path.join("target/flash"))
+            })
+            // The managed service does not necessarily run with the checkout
+            // as its cwd. Keep the default usable for the source-tree build
+            // and let deployments override it with DMESH_REPO or `root=`.
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/flash")
+            });
+        let started = self.object_udp_started.clone();
+        let mut udp_config = dmesh_transport::udp::UdpConfig {
+            bind: address,
+            artifact_root: root,
+            // The host retains the sender window. Recovery processes receive
+            // callbacks immediately and does not mirror this payload ledger,
+            // so use a window large enough to cover Wi-Fi ACK latency. Four
+            // slots accidentally imposed one round trip per 4 KiB block.
+            history_capacity: std::env::var("DMESH_UDP_HISTORY_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| (1..=dmesh_transport::RECOVERY_MAX_HISTORY_PACKETS).contains(value))
+                .unwrap_or(dmesh_transport::RECOVERY_MAX_HISTORY_PACKETS),
+            // 512 bytes remains in the host fault matrix, but production
+            // Recovery uses a near-MTU application chunk. This reduces the
+            // number of transport/ACK cycles while staying below the 1400
+            // byte bearer MTU.
+            object_chunk: std::env::var("DMESH_UDP_OBJECT_CHUNK")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1200),
+            control: Some(self.transport_control.clone()),
+            ..dmesh_transport::udp::UdpConfig::default()
+        };
+        // Keep deployment tuning outside the transport implementation while
+        // allowing operators to select an explicit host ledger or leave it at
+        // the memory-aware automatic policy (zero).
+        if let Ok(value) = std::env::var("DMESH_UDP_MAX_ACTIVE_CONNECTIONS") {
+            if let Ok(limit) = value.parse::<usize>() {
+                udp_config.max_active_connections = limit.max(1);
+            }
+        }
+        tokio::spawn(async move {
+            let result = dmesh_transport::udp::run(udp_config).await;
+            started.store(false, Ordering::Release);
+            if let Err(error) = result {
+                tracing::warn!(%error, "object_udp_stopped");
+            }
+        });
+        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "dmesh-transport", "object_store": "dmesh-object-store"})
+    }
+
+    /// Transport-owned aggregates for the stable object listener.  This is
+    /// intentionally a status snapshot, not an ACK/frame debugging API.
+    pub fn object_udp_status(&self) -> Value {
+        let stats = self.transport_control.server_stats();
+        json!({
+            "ok": self.object_udp_started.load(Ordering::Acquire),
+            "transport": stats.map(|value| json!({
+                "history": value.history_len,
+                "history_capacity": value.history_capacity,
+                "peer_max_in_flight": value.peer_max_in_flight_packets,
+                "inflight": value.bytes_in_flight,
+                "cwnd": value.congestion_window,
+                "rx": value.transport.received_datagrams,
+                "rx_stream": value.transport.stream_datagrams,
+                "rx_control": value.transport.control_datagrams,
+                "tx": value.transport.sent_datagrams,
+                "tx_stream": value.transport.sent_stream_datagrams,
+                "tx_control": value.transport.sent_control_datagrams,
+                "retx": value.transport.retransmitted_datagrams,
+                "duplicate": value.transport.duplicate_datagrams,
+                "out_of_order": value.transport.out_of_order_datagrams,
+                "missing": value.transport.inferred_missing_packets,
+                "loss_packet": value.transport.loss_packet_threshold_datagrams,
+                "loss_time": value.transport.loss_time_threshold_datagrams,
+                "loss_events": value.transport.loss_events,
+                "pto": value.transport.pto_retransmitted_datagrams,
+            })),
+            "events": self.transport_control.events(),
+            "errors": self.transport_control.errors(),
+        })
+    }
+
+    /// Raw radio/lwIP benchmark on a separate UDP port. This is intentionally
+    /// not a transport service: its one-byte commands and fixed binary replies
+    /// isolate AP/STA and socket throughput from stream/object processing.
+    pub fn raw_udp_start(&self) -> Value {
+        if self.raw_udp_started.swap(true, Ordering::AcqRel) {
+            return json!({"ok": true, "already_running": true, "port": RAW_UDP_DIAGNOSTIC_PORT});
+        }
+        let started = self.raw_udp_started.clone();
+        tokio::spawn(async move {
+            let socket = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, RAW_UDP_DIAGNOSTIC_PORT)).await {
+                Ok(socket) => socket,
+                Err(error) => { tracing::warn!(%error, "raw_udp_bind_failed"); started.store(false, Ordering::Release); return; }
+            };
+            let mut request = [0u8; 64];
+            loop {
+                let Ok((length, peer)) = socket.recv_from(&mut request).await else { break; };
+                raw_udp_handle(&socket, peer, &request[..length]).await;
+            }
+            started.store(false, Ordering::Release);
+        });
+        json!({"ok": true, "port": RAW_UDP_DIAGNOSTIC_PORT, "bytes": RAW_UDP_FLOOD_BYTES, "payload": RAW_UDP_FLOOD_PAYLOAD})
     }
 
     pub fn default_esp_route(
@@ -394,7 +690,7 @@ impl RadioService {
         let wait_sec = wait_sec.unwrap_or(12).clamp(2, 60);
         // Sleeping ESPs only listen in their own raw-NAN window. A host NAN
         // follow-up cannot be scheduled against that window through the
-        // public WPA API, so direct host-to-sleepy-ESP NAN remains opt-in
+        // public host API, so direct host-to-sleepy-ESP raw-NAN remains opt-in
         // diagnostics rather than the gateway stability default.
         let host_nan = host_nan.unwrap_or(false);
         let expected = expected
@@ -589,89 +885,14 @@ impl RadioService {
         expected_macs: &BTreeMap<String, Option<String>>,
         wait_sec: u64,
     ) -> Value {
-        let start = self.nan_start(None, None);
-        let available = start
-            .get("nan_capability")
-            .and_then(|value| value.get("ok"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !available {
-            return json!({
-                "available": false,
-                "ok": false,
-                "start": start,
-                "error": "host NAN/USD is unavailable",
-            });
-        }
-
-        let payload = match firmware_mode_ping_cbor() {
-            Ok(payload) => payload,
-            Err(error) => {
-                return json!({"available": true, "ok": false, "error": error.to_string()});
-            }
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(wait_sec);
-        let mut transmits = Vec::new();
-        let mut all_events = Vec::new();
-        while std::time::Instant::now() < deadline {
-            transmits.push(self.nan_transmit(
-                None,
-                None,
-                1,
-                "ff:ff:ff:ff:ff:ff".to_string(),
-                None,
-                Some(hex_bytes(&payload)),
-                None,
-                None,
-            ));
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let wait_ms = remaining
-                .as_millis()
-                .min(STABILITY_HOST_NAN_RETRY_MS as u128) as u64;
-            if wait_ms == 0 {
-                break;
-            }
-            let events = self.nan_events(None, None, Some(wait_ms), Some(64));
-            if let Some(events) = events.get("events").and_then(Value::as_array) {
-                all_events.extend(events.iter().cloned());
-            }
-        }
-        let events = json!({"events": all_events});
-        let responses = host_nan_responses(&events);
-        let observed_ids = responses
-            .iter()
-            .filter_map(|event| event.get("device_id").and_then(Value::as_str))
-            .map(str::to_ascii_lowercase)
-            .collect::<HashSet<_>>();
-        let missing = expected_macs
-            .iter()
-            .filter_map(|(id, mac)| match mac {
-                Some(mac)
-                    if !observed_ids
-                        .iter()
-                        .any(|device_id| device_id.ends_with(mac)) =>
-                {
-                    Some(id.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let unresolved = expected_macs
-            .iter()
-            .filter_map(|(id, mac)| mac.is_none().then_some(id))
-            .collect::<Vec<_>>();
+        let status = self.rawnan_status(None);
         json!({
-            "available": true,
-            "ok": !responses.is_empty() && missing.is_empty(),
-            "command": "mode ping=true",
-            "command_cbor_bytes": payload.len(),
-            "retry_interval_ms": STABILITY_HOST_NAN_RETRY_MS,
-            "transmit_attempts": transmits.len(),
-            "transmits": transmits,
-            "responses": responses,
-            "response_observed": !observed_ids.is_empty(),
-            "missing": missing,
-            "unresolved": unresolved,
+            "available": status.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "ok": false,
+            "status": status,
+            "expected": expected_macs,
+            "wait_sec": wait_sec,
+            "error": "host stability cycle requires a raw-NAN peer stream; no control-daemon transmit path is installed",
         })
     }
 
@@ -737,27 +958,19 @@ impl RadioService {
     /// Return interface, capability, process-capability, and control status.
     pub fn status(&self) -> Value {
         let iface = wifi_iface(None);
-        let ctrl_dir = wpa_ctrl_dir(None);
-        let wpa_status = wpa_command(&iface, &ctrl_dir, "STATUS");
-        let wpa_driver_flags2 = wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS2");
 
         json!({
             "wifi_iface": iface,
             "uart_enabled": self.uart_enabled,
-            "wpa_ctrl_dir": ctrl_dir,
             "radios": self.radios.as_ref(),
             "capabilities": process_caps(),
-            "hci": hci_probe(DEFAULT_HCI_DEV),
-            "wpa": {
-                "backend": "ctrl_uds",
-                "status": command_result_json(wpa_status),
-                "driver_flags2": command_result_json(wpa_driver_flags2),
-            }
+            "hci": json!({"ok": false, "backend": "lmesh-wifi", "reason": "BLE is owned by lmesh"}),
+            "rawnan": self.rawnan_status(Some(iface)),
         })
     }
 
     /// Return the shared raw-NAN filter state used by the Linux monitor.
-    /// This is deliberately independent of wpa_supplicant: the monitor
+    /// This is deliberately independent of any control daemon: the monitor
     /// observes NAN beacons and feeds them to dmesh-rawnan::NanState.
     pub fn rawnan_status(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
@@ -810,7 +1023,12 @@ impl RadioService {
     /// association, WPA, or BSSID; it is useful for the shared open-medium
     /// experiments.  This intentionally operates only on the lmesh-owned
     /// interface.
-    pub fn wifi_ocb_start(&self, iface: Option<String>, freq: Option<u32>, bandwidth: Option<String>) -> Value {
+    pub fn wifi_ocb_start(
+        &self,
+        iface: Option<String>,
+        freq: Option<u32>,
+        bandwidth: Option<String>,
+    ) -> Value {
         let iface = wifi_iface(iface);
         let freq = freq.unwrap_or_else(|| channel_to_freq(DEFAULT_RAW_WIFI_CHANNEL));
         let bandwidth = bandwidth.unwrap_or_else(|| "10MHz".to_owned());
@@ -829,7 +1047,14 @@ impl RadioService {
             // down, while others require it up. Try the documented iw operation
             // first and only then raise the carrier.
             let freq_text = freq.to_string();
-            let args = ["dev", iface.as_str(), "ocb", "join", freq_text.as_str(), bandwidth.as_str()];
+            let args = [
+                "dev",
+                iface.as_str(),
+                "ocb",
+                "join",
+                freq_text.as_str(),
+                bandwidth.as_str(),
+            ];
             let join = run_command("iw", &args);
             let joined = join.get("ok").and_then(Value::as_bool).unwrap_or(false);
             steps.push(join);
@@ -840,7 +1065,9 @@ impl RadioService {
             }
         }
         let ok = set_type.is_ok()
-            && steps.iter().all(|step| step.get("ok").and_then(Value::as_bool).unwrap_or(false));
+            && steps
+                .iter()
+                .all(|step| step.get("ok").and_then(Value::as_bool).unwrap_or(false));
         let result = json!({
             "ok": ok,
             "backend": "linux_nl80211",
@@ -867,10 +1094,6 @@ impl RadioService {
         // leaves monitor/NAN/AP state (and their nl80211 registrations) alive,
         // which makes an otherwise valid SET_WIPHY request return EBUSY.
         steps.push(json!({
-            "operation": "stop_nan",
-            "result": self.nan_native_stop(Some(iface.clone())),
-        }));
-        steps.push(json!({
             "operation": "stop_raw",
             "result": self.wifi_raw_stop(Some(iface.clone())),
         }));
@@ -881,7 +1104,12 @@ impl RadioService {
         // Drivers commonly reject SET_WIPHY while a managed VIF is up. Keep
         // the transition bounded and restore administrative-up afterwards.
         steps.push(run_command("ip", &["link", "set", &iface, "down"]));
-        let result = if steps.last().and_then(|step| step.get("ok")).and_then(Value::as_bool) != Some(true) {
+        let result = if steps
+            .last()
+            .and_then(|step| step.get("ok"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
             json!({
                 "ok": false,
                 "backend": "linux_nl80211",
@@ -1877,11 +2105,11 @@ impl RadioService {
                 serial_results.push(self.ping_serial_radio(adapter));
             }
             if adapter.medium == "wifi" || adapter.kind == "host-wifi" || radio == "nan" {
-                wifi_results.push(self.nan_default(None, None, None, Some(0)));
+                wifi_results.push(self.rawnan_status(None));
             }
         }
         if (radio == "all" || radio == "nan" || radio == "best") && wifi_results.is_empty() {
-            wifi_results.push(self.nan_default(None, None, None, Some(0)));
+            wifi_results.push(self.rawnan_status(None));
         }
         let unavailable = unavailable_radios(&radio);
         let result = json!({
@@ -1922,15 +2150,13 @@ impl RadioService {
                         payload.as_bytes(),
                     )
                 }) {
-                    Ok(frame) => self.nan_transmit(
+                    Ok(frame) => self.rawnan_ping(
                         None,
                         None,
-                        1,
-                        destination,
+                        Some(destination),
                         None,
-                        Some(hex_bytes(&frame)),
-                        None,
-                        None,
+                        format!("hex:{}", hex_bytes(&frame)),
+                        Some(900),
                     ),
                     Err(error) => json!({
                         "ok": false,
@@ -1943,7 +2169,6 @@ impl RadioService {
                 None,
                 None,
                 None,
-                None,
                 destination,
                 None,
                 Some("dont_wait_ack".to_string()),
@@ -1951,6 +2176,7 @@ impl RadioService {
                 None,
                 None,
                 payload.clone(),
+                None,
             ),
             "lora" => self.esp_lora_send(payload.clone(), destination.clone()),
             "sta" | "ble" | "serial" => json!({
@@ -2037,11 +2263,34 @@ impl RadioService {
         result
     }
 
-    /// Start an open AP on channel 6 using direct nl80211.
+    /// Start an open AP on the default channel using direct nl80211.
     pub fn wifi_ap_start_open(&self, iface: Option<String>, ssid: Option<String>) -> Value {
+        self.wifi_ap_start_open_on_channel(iface, ssid, None)
+    }
+
+    /// Start an open AP on a 2.4 GHz channel using direct nl80211.
+    ///
+    /// Keep the selected channel with the AP runtime: the manually generated
+    /// management responses must describe the same channel as the beacon.
+    pub fn wifi_ap_start_open_on_channel(
+        &self,
+        iface: Option<String>,
+        ssid: Option<String>,
+        requested_channel: Option<u8>,
+    ) -> Value {
         let iface = wifi_iface(iface);
         let ssid = ssid.unwrap_or_else(|| default_open_ap_ssid(&iface));
-        let channel = DEFAULT_RAW_WIFI_CHANNEL;
+        let channel = requested_channel.unwrap_or(DEFAULT_RAW_WIFI_CHANNEL);
+        if !(1..=13).contains(&channel) {
+            return json!({
+                "ok": false,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "ssid": ssid,
+                "channel": channel,
+                "error": "2.4 GHz AP channel must be in 1..=13",
+            });
+        }
         let freq = channel_to_freq(channel);
         let ifindex = match ifindex(&iface) {
             Ok(ifindex) => ifindex,
@@ -2058,11 +2307,11 @@ impl RadioService {
         };
         self.stop_ap_runtime(&iface);
         let mac = iface_mac(&iface).unwrap_or([0; 6]);
-        let template_lengths = open_ap_template_lengths(&ssid)
+        let template_lengths = open_ap_template_lengths(&ssid, channel)
             .map(|(beacon_head, probe_resp)| {
                 json!({
                     "beacon_head": beacon_head,
-                    "beacon_tail": esp_open_ap_beacon_tail().len(),
+                    "beacon_tail": esp_open_ap_beacon_tail(channel).len(),
                     "probe_resp": probe_resp,
                     "profile": "esp32_open_ap",
                 })
@@ -2145,6 +2394,7 @@ impl RadioService {
                 let mgmt_iface = iface.clone();
                 let history = self.history.clone();
                 let rawnan_state = self.rawnan_state.clone();
+                let ap_no_ht_stations = self.ap_no_ht_stations.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let stop_for_thread = stop.clone();
                 let join = std::thread::spawn(move || {
@@ -2155,6 +2405,8 @@ impl RadioService {
                         mac,
                         history,
                         rawnan_state,
+                        ap_no_ht_stations,
+                        channel,
                         stop_for_thread,
                     );
                 });
@@ -2165,6 +2417,7 @@ impl RadioService {
                         iface.clone(),
                         ApRuntime {
                             _owner_socket: socket,
+                            channel,
                             stop,
                             join: Some(join),
                         },
@@ -2300,13 +2553,20 @@ impl RadioService {
                 socket.station_dump(ifindex)
             })
             .ok();
+        let channel = self
+            .wifi_ap_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&iface)
+            .map(|runtime| runtime.channel)
+            .unwrap_or(DEFAULT_RAW_WIFI_CHANNEL);
         let result = json!({
             "ok": true,
             "backend": "linux_nl80211",
             "iface": iface,
             "ssid_default": default_open_ap_ssid(&iface),
-            "channel": DEFAULT_RAW_WIFI_CHANNEL,
-            "freq": channel_to_freq(DEFAULT_RAW_WIFI_CHANNEL),
+            "channel": channel,
+            "freq": channel_to_freq(channel),
             "bssid": mac.map(|mac| colon_mac(&mac)),
             "auth": "open",
             "stations": stations,
@@ -2421,19 +2681,23 @@ impl RadioService {
                 let socket = Nl80211Socket::open()?;
                 socket.remove_station(ifindex, mac_bytes)
             })
-            .map(|_| json!({
-                "ok": true,
-                "backend": "linux_nl80211",
-                "iface": iface,
-                "mac": colon_mac(&mac_bytes),
-            }))
-            .unwrap_or_else(|error| json!({
-                "ok": false,
-                "backend": "linux_nl80211",
-                "iface": iface,
-                "mac": colon_mac(&mac_bytes),
-                "error": format!("{error:#}"),
-            }));
+            .map(|_| {
+                json!({
+                    "ok": true,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                    "mac": colon_mac(&mac_bytes),
+                })
+            })
+            .unwrap_or_else(|error| {
+                json!({
+                    "ok": false,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                    "mac": colon_mac(&mac_bytes),
+                    "error": format!("{error:#}"),
+                })
+            });
         self.record("wifi.ap.station.remove", result.clone());
         result
     }
@@ -2446,17 +2710,21 @@ impl RadioService {
                 let socket = Nl80211Socket::open()?;
                 socket.flush_stations(ifindex)
             })
-            .map(|_| json!({
-                "ok": true,
-                "backend": "linux_nl80211",
-                "iface": iface,
-            }))
-            .unwrap_or_else(|error| json!({
-                "ok": false,
-                "backend": "linux_nl80211",
-                "iface": iface,
-                "error": format!("{error:#}"),
-            }));
+            .map(|_| {
+                json!({
+                    "ok": true,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                })
+            })
+            .unwrap_or_else(|error| {
+                json!({
+                    "ok": false,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                    "error": format!("{error:#}"),
+                })
+            });
         self.record("wifi.ap.station.remove_all", result.clone());
         result
     }
@@ -2765,21 +3033,15 @@ impl RadioService {
     pub fn wifi_raw_listen(
         &self,
         iface: Option<String>,
-        ctrl_dir: Option<String>,
         channel: Option<u8>,
         listen_sec: Option<u64>,
         rx_variant: Option<String>,
     ) -> Value {
         let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let channel = raw_wifi_channel(channel);
         let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
         let rx_variant = rx_variant.unwrap_or_else(|| "nl80211".to_string());
-        let wpa_channel = if rx_variant == "monitor" || rx_variant == "monitor_active" {
-            json!({"skipped": true, "reason": "raw-NAN monitor does not use wpa_supplicant"})
-        } else {
-            prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec)
-        };
+        let channel_setup = json!({"backend": "linux_nl80211", "ok": true});
         let listener_key = format!("{iface}:{rx_variant}");
         {
             let mut listeners = self
@@ -2791,11 +3053,10 @@ impl RadioService {
                     "ok": true,
                     "backend": "linux_nl80211",
                     "iface": iface,
-                    "ctrl_dir": ctrl_dir,
                     "channel": channel,
                     "listen_sec": listen_sec,
                     "rx_variant": rx_variant,
-                    "wpa_channel": wpa_channel,
+                    "channel_setup": channel_setup,
                     "already_running": true,
                 });
             }
@@ -2830,12 +3091,11 @@ impl RadioService {
                     "backend": "linux_af_packet_monitor",
                     "iface": iface,
                     "monitor_iface": monitor_iface,
-                    "ctrl_dir": ctrl_dir,
                     "channel": channel,
                     "listen_sec": listen_sec,
                     "rx_variant": rx_variant,
                     "monitor": setup,
-                    "wpa_channel": wpa_channel,
+                    "channel_setup": channel_setup,
                     "note": "monitor listener records DMesh action and multicast data frames visible on this interface",
                 }))
             })
@@ -2861,11 +3121,10 @@ impl RadioService {
                         "ok": true,
                         "backend": "linux_nl80211",
                         "iface": iface,
-                        "ctrl_dir": ctrl_dir,
                         "channel": channel,
                         "listen_sec": listen_sec,
                         "rx_variant": rx_variant,
-                        "wpa_channel": wpa_channel,
+                        "channel_setup": channel_setup,
                         "note": "listener records ESP32 DMesh vendor action frames visible on this interface",
                     })
                 })
@@ -2903,11 +3162,71 @@ impl RadioService {
         }
     }
 
+    /// Acquire the monitor needed to publish raw-NAN events to a live
+    /// subscriber. The monitor is intentionally not started at service boot:
+    /// it is a radio resource and its packet stream belongs to the subscriber
+    /// that requested it.
+    pub fn rawnan_subscription_start(
+        &self,
+        config: &mesh::local_trace::TraceConfig,
+    ) -> Option<String> {
+        let target = config.targets.iter().find(|target| {
+            target.starts_with("dmesh.event.wifi.rawnan")
+        })?;
+        let _ = target;
+        let iface = wifi_iface(None);
+        let mut subscribers = self
+            .rawnan_subscribers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = subscribers.entry(iface.clone()).or_insert(0);
+        *count += 1;
+        let first = *count == 1;
+        drop(subscribers);
+        if first {
+            let result = self.wifi_raw_listen(
+                Some(iface.clone()),
+                Some(6),
+                Some(DEFAULT_RAW_WIFI_LISTEN_SECS),
+                Some("monitor".to_owned()),
+            );
+            if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                self.rawnan_subscription_stop(&iface);
+                return None;
+            }
+        }
+        Some(iface)
+    }
+
+    /// Release a live raw-NAN subscription and tear down the monitor when no
+    /// subscriber remains. Explicit `wifi.rawnan.listen` requests are not
+    /// reference-counted and retain their existing control semantics.
+    pub fn rawnan_subscription_stop(&self, iface: &str) {
+        let last = {
+            let mut subscribers = self
+                .rawnan_subscribers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(count) = subscribers.get_mut(iface) else {
+                return;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                subscribers.remove(iface);
+                true
+            } else {
+                false
+            }
+        };
+        if last {
+            let _ = self.wifi_raw_stop(Some(iface.to_owned()));
+        }
+    }
+
     /// Send an ESP32-compatible DMesh vendor action frame.
     pub fn wifi_raw_send(
         &self,
         iface: Option<String>,
-        ctrl_dir: Option<String>,
         channel: Option<u8>,
         listen_sec: Option<u64>,
         destination: Option<String>,
@@ -2917,9 +3236,9 @@ impl RadioService {
         bssid: Option<String>,
         llc: Option<String>,
         payload: String,
+        tx_rate_mbps: Option<u8>,
     ) -> Value {
         let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let channel = raw_wifi_channel(channel);
         let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
         let tx_options =
@@ -2935,25 +3254,7 @@ impl RadioService {
                     });
                 }
             };
-        let wpa_channel = if tx_options.variant == "roc"
-            || tx_options.variant == "action"
-            || tx_options.variant == "send_action"
-            || tx_options.variant == "monitor"
-            || tx_options.variant == "monitor_active"
-            || tx_options.variant == "nan_data"
-            || tx_options.variant == "nan_data_active"
-            || tx_options.variant == "nan_data_raw"
-            || tx_options.variant == "nan_data_raw_active"
-            || tx_options.variant == "nan_data_multicast"
-            || tx_options.variant == "nan_data_multicast_active"
-        {
-            json!({
-                "skipped": true,
-                "reason": "raw frame transport does not use wpa_supplicant",
-            })
-        } else {
-            prepare_raw_wifi_channel(&iface, &ctrl_dir, channel, listen_sec)
-        };
+        let channel_setup = json!({"backend": "linux_nl80211", "ok": true});
         let destination_input = destination.as_deref();
         let destination = raw_wifi_destination(destination_input, &tx_options.variant);
         let destination_mode = raw_wifi_destination_mode(destination_input, &tx_options.variant);
@@ -3012,7 +3313,13 @@ impl RadioService {
             } else {
                 destination
             };
-            build_dmesh_nan_raw_data_frame(nan_bssid, data_destination, source, &llc, &payload_bytes)
+            build_dmesh_nan_raw_data_frame(
+                nan_bssid,
+                data_destination,
+                source,
+                &llc,
+                &payload_bytes,
+            )
         } else {
             // Raw NAN action traffic must carry the discovered cluster BSSID
             // in address3. Using the peer MAC here works only before the
@@ -3025,6 +3332,28 @@ impl RadioService {
                 &payload_bytes,
             )
         };
+        if is_nan_control_frame(&frame)
+            && tx_rate_mbps.is_some_and(|rate| !matches!(rate, 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54))
+        {
+            return json!({
+                "ok": false,
+                "backend": "linux_nl80211",
+                "iface": iface,
+                "error": "NAN beacon/action rate must be a mandatory OFDM rate: 6, 9, 12, 18, 24, 36, 48, or 54 Mbps",
+            });
+        }
+        // NAN discovery/synchronization beacons and NAN public action frames
+        // have a distinct interoperability rate policy.  The Wi-Fi Aware
+        // specification fixes beacons at 6 Mbps and permits SDF/NAF action
+        // frames only at mandatory OFDM rates.  Do not let the monitor
+        // injector's historical 1 Mbps default leak onto those frames.
+        let effective_tx_rate_mbps = tx_rate_mbps.or_else(|| {
+            if is_nan_control_frame(&frame) {
+                Some(6)
+            } else {
+                None
+            }
+        });
         let result = if tx_options.variant == "monitor"
             || tx_options.variant == "monitor_active"
             || tx_options.variant == "multicast_data"
@@ -3048,19 +3377,19 @@ impl RadioService {
                 || tx_options.variant == "nan_data_raw_active"
                 || tx_options.variant == "nan_data_multicast_active";
 
-            match send_monitor_frame(&iface, channel, &frame, active) {
+            match send_monitor_frame(&iface, channel, &frame, active, effective_tx_rate_mbps) {
                 Ok(monitor) => json!({
                     "ok": true,
                     "backend": "linux_af_packet_monitor",
                     "tx_variant": tx_options.variant,
                     "tx_options": tx_options.as_json(),
+                    "tx_rate_mbps": effective_tx_rate_mbps,
                     "monitor": monitor,
                     "iface": iface,
-                    "ctrl_dir": ctrl_dir,
                     "channel": channel,
                     "listen_sec": listen_sec,
                     "tx_duration_ms": tx_duration_ms,
-                    "wpa_channel": wpa_channel,
+                    "channel_setup": channel_setup,
                     "destination": colon_mac(&destination),
                     "destination_mode": destination_mode,
                     "bssid": colon_mac(&nan_bssid),
@@ -3075,6 +3404,7 @@ impl RadioService {
                     "backend": "linux_af_packet_monitor",
                     "tx_variant": tx_options.variant,
                     "tx_options": tx_options.as_json(),
+                    "tx_rate_mbps": effective_tx_rate_mbps,
                     "iface": iface,
                     "error": format!("{error:#}"),
                 }),
@@ -3107,13 +3437,14 @@ impl RadioService {
                     )?;
                 }
                 if tx_options.variant == "action" || tx_options.variant == "send_action" {
-                    socket.send_mgmt_frame(ifindex(&iface)?, &frame)
+                    socket.send_mgmt_frame(ifindex(&iface)?, &frame, effective_tx_rate_mbps)
                 } else {
                     socket.send_frame(
                         ifindex(&iface)?,
                         channel_to_freq(channel),
                         &tx_options,
                         &frame,
+                        effective_tx_rate_mbps,
                     )
                 }
             }) {
@@ -3122,12 +3453,12 @@ impl RadioService {
                     "backend": "linux_nl80211",
                     "tx_variant": tx_options.variant,
                     "tx_options": tx_options.as_json(),
+                    "tx_rate_mbps": effective_tx_rate_mbps,
                     "iface": iface,
-                    "ctrl_dir": ctrl_dir,
                     "channel": channel,
                     "listen_sec": listen_sec,
                     "tx_duration_ms": tx_duration_ms,
-                    "wpa_channel": wpa_channel,
+                    "channel_setup": channel_setup,
                     "interface_up": interface_up,
                     "destination": colon_mac(&destination),
                     "destination_mode": destination_mode,
@@ -3221,7 +3552,7 @@ impl RadioService {
             }
         } else {
             let active = variant == "monitor_active";
-            match send_monitor_frame(&iface, channel, &frame, active) {
+            match send_monitor_frame(&iface, channel, &frame, active, None) {
                 Ok(monitor) => json!({
                 "ok": true,
                 "backend": "linux_af_packet_monitor",
@@ -3318,7 +3649,11 @@ impl RadioService {
                 }
             };
             let frame = if tx_variant == "nan_data_raw" || tx_variant == "nan_data_raw_active" {
-                let data_destination = if multicast { RAW_WIFI_MULTICAST } else { destination };
+                let data_destination = if multicast {
+                    RAW_WIFI_MULTICAST
+                } else {
+                    destination
+                };
                 build_dmesh_nan_raw_data_frame(
                     bssid,
                     data_destination,
@@ -3328,7 +3663,11 @@ impl RadioService {
                 )
             } else {
                 build_dmesh_vendor_action_frame_with_bssid(
-                    if multicast { RAW_WIFI_MULTICAST } else { destination },
+                    if multicast {
+                        RAW_WIFI_MULTICAST
+                    } else {
+                        destination
+                    },
                     source,
                     bssid,
                     &payload[..body_len],
@@ -3383,14 +3722,12 @@ impl RadioService {
     pub fn wifi_raw_ping(
         &self,
         iface: Option<String>,
-        ctrl_dir: Option<String>,
         channel: Option<u8>,
         listen_sec: Option<u64>,
         wait_ms: Option<u64>,
         nonce: Option<String>,
     ) -> Value {
         let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
         let channel = raw_wifi_channel(channel);
         let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
         let wait_ms = wait_ms.unwrap_or(900).clamp(50, 10_000);
@@ -3398,7 +3735,6 @@ impl RadioService {
         let payload = format!("dmesh.ping type=status source=lmesh nonce={nonce}");
         let listen = self.wifi_raw_listen(
             Some(iface.clone()),
-            Some(ctrl_dir.clone()),
             Some(channel),
             Some(listen_sec),
             Some("nl80211".to_string()),
@@ -3406,7 +3742,6 @@ impl RadioService {
         let sent_at = now_millis_u64();
         let tx = self.wifi_raw_send(
             Some(iface.clone()),
-            Some(ctrl_dir.clone()),
             Some(channel),
             Some(listen_sec),
             None,
@@ -3416,13 +3751,13 @@ impl RadioService {
             None,
             None,
             payload.clone(),
+            None,
         );
         std::thread::sleep(Duration::from_millis(wait_ms));
         let replies = self.raw_wifi_ping_replies(sent_at, &iface);
         let result = json!({
             "ok": tx.get("ok").and_then(Value::as_bool).unwrap_or(false),
             "iface": iface,
-            "ctrl_dir": ctrl_dir,
             "channel": channel,
             "listen_sec": listen_sec,
             "wait_ms": wait_ms,
@@ -3455,7 +3790,6 @@ impl RadioService {
         let wait_ms = wait_ms.unwrap_or(1_000).clamp(50, 10_000);
         let listen = self.wifi_raw_listen(
             Some(iface_value.clone()),
-            None,
             Some(channel_value),
             Some((wait_ms / 1_000 + 3).max(3)),
             Some("monitor".to_string()),
@@ -3498,10 +3832,8 @@ impl RadioService {
                     &payload_bytes,
                 )
             })
-            .and_then(|frame| {
-                prepare_raw_wifi_channel(&iface_value, DEFAULT_WPA_CTRL_DIR, channel_value, 3);
-                send_monitor_frame(&iface_value, channel_value, &frame, false)
-            }) {
+            .and_then(|frame| send_monitor_frame(&iface_value, channel_value, &frame, false, None))
+        {
             Ok(value) => json!({
                 "ok": true,
                 "backend": "linux_af_packet_monitor",
@@ -4369,821 +4701,6 @@ impl RadioService {
                     )
                 })
             })
-    }
-
-    /// Start a raw Linux HCI BLE scan for DMesh service advertisements.
-    pub fn ble_scan(
-        &self,
-        dev_id: Option<u16>,
-        reason: Option<String>,
-        scan_ms: Option<u64>,
-    ) -> Result<Value> {
-        let dev_id = dev_id.unwrap_or(DEFAULT_HCI_DEV);
-        let scan_ms = scan_ms.unwrap_or(1_500).clamp(100, 30_000);
-        let hci_up = hci_dev_up(dev_id).map_err(|error| format!("{error:#}"));
-        if hci_up.as_deref() == Ok("brought_up") {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        let socket = HciSocket::open(dev_id)?;
-        socket
-            .send_le_command(
-                OCF_LE_SET_SCAN_PARAMETERS,
-                &[0x00, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00],
-            )
-            .with_context(|| format!("hci_up={}", result_string_json(hci_up.clone())))?;
-        socket
-            .send_le_command(OCF_LE_SET_SCAN_ENABLE, &[0x01, 0x00])
-            .with_context(|| format!("hci_up={}", result_string_json(hci_up.clone())))?;
-        let deadline = std::time::Instant::now() + Duration::from_millis(scan_ms);
-        let mut reports = Vec::new();
-        let mut dmesh = Vec::new();
-        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-            if remaining.is_zero() {
-                break;
-            }
-            let Some(packet) = socket.recv_timeout(remaining.min(Duration::from_millis(250)))?
-            else {
-                continue;
-            };
-            for report in parse_hci_le_adv_reports(&packet) {
-                if let Some(parsed) = parse_dmesh_ble_report(&report) {
-                    if let Ok(parsed) = parsed {
-                        let message =
-                            MeshMessage::new(mesh::message::KIND_BLE_SCAN, MeshMessageCodec::Text)
-                                .field(FIELD_MEDIUM, "ble")
-                                .field(FIELD_RADIO_ID, format!("hci{dev_id}"))
-                                .field(FIELD_STATUS, "rx")
-                                .field(
-                                    FIELD_NODE,
-                                    parsed
-                                        .get("address")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("unknown"),
-                                )
-                                .field(
-                                    FIELD_RSSI,
-                                    parsed
-                                        .get("scan_rssi")
-                                        .and_then(Value::as_i64)
-                                        .unwrap_or(0)
-                                        .to_string(),
-                                );
-                        self.record_message("BLE.rx", "host-ble", message);
-                        dmesh.push(parsed);
-                    }
-                }
-                reports.push(report);
-            }
-        }
-        let disable_result = socket
-            .send_le_command(OCF_LE_SET_SCAN_ENABLE, &[0x00, 0x00])
-            .map(|_| true)
-            .unwrap_or(false);
-        let result = json!({
-            "ok": true,
-            "backend": "linux_hci_raw",
-            "dev_id": dev_id,
-            "hci_up": result_string_json(hci_up),
-            "scan_ms": scan_ms,
-            "service_uuid16": format!("0x{:04x}", radio_protocol::DMESH_BLE_SERVICE_UUID16),
-            "operational_uuid": "5f6b6f80-4f2a-4a6f-8c42-4d6573680002",
-            "reason": reason.unwrap_or_else(|| "jsonl".to_string()),
-            "disable_sent": disable_result,
-            "report_count": reports.len(),
-            "dmesh_count": dmesh.len(),
-            "reports": reports,
-            "dmesh": dmesh,
-        });
-        self.record_message(
-            "BLE.scan",
-            "host-ble",
-            MeshMessage::new(mesh::message::KIND_BLE_SCAN, MeshMessageCodec::Text)
-                .field(FIELD_MEDIUM, "ble")
-                .field(FIELD_RADIO_ID, format!("hci{dev_id}"))
-                .field(FIELD_STATUS, "complete"),
-        );
-        self.record("BLE.scan", result.clone());
-        Ok(result)
-    }
-
-    /// Enable or disable raw Linux HCI BLE advertising with DMesh service data.
-    pub fn ble_adv(
-        &self,
-        dev_id: Option<u16>,
-        on: Option<bool>,
-        payload: Option<String>,
-    ) -> Result<Value> {
-        let dev_id = dev_id.unwrap_or(DEFAULT_HCI_DEV);
-        let on = on.unwrap_or(true);
-        let socket = HciSocket::open(dev_id)?;
-        let payload_text = payload.unwrap_or_else(|| "lmesh".to_string());
-        if on {
-            let device_id = local_device_id()?;
-            let service_data = radio_protocol::build_ble_service_data(
-                radio_protocol::BleEvent::IdleHello,
-                &device_id,
-                payload_text.as_bytes(),
-                0,
-                0,
-            )?;
-            socket.send_le_command(
-                OCF_LE_SET_ADV_PARAMETERS,
-                &[
-                    0xa0, 0x00, 0xa0, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00,
-                    0x00, 0x00,
-                ],
-            )?;
-            socket.send_le_command(OCF_LE_SET_ADV_DATA, &adv_data(&service_data)?)?;
-            socket.send_le_command(OCF_LE_SET_ADV_ENABLE, &[0x01])?;
-        } else {
-            socket.send_le_command(OCF_LE_SET_ADV_ENABLE, &[0x00])?;
-        }
-        let result = json!({
-            "ok": true,
-            "backend": "linux_hci_raw",
-            "dev_id": dev_id,
-            "on": on,
-        });
-        self.record_message(
-            "BLE.adv",
-            "host-ble",
-            MeshMessage::new(mesh::message::KIND_BLE_ADV, MeshMessageCodec::Text)
-                .field(FIELD_MEDIUM, "ble")
-                .field(FIELD_RADIO_ID, format!("hci{dev_id}"))
-                .field(FIELD_STATUS, if on { "enabled" } else { "disabled" })
-                .field(FIELD_PAYLOAD, payload_text),
-        );
-        self.record("BLE.adv", result.clone());
-        Ok(result)
-    }
-
-    /// Attach to NAN through the repo-built wpa_supplicant control socket.
-    pub fn default_nan_control_socket_exists(&self) -> bool {
-        let iface = wifi_iface(None);
-        let ctrl_dir = wpa_ctrl_dir(None);
-        std::fs::metadata(std::path::Path::new(&ctrl_dir).join(iface))
-            .map(|metadata| metadata.file_type().is_socket())
-            .unwrap_or(false)
-    }
-
-    /// Start Linux's native cfg80211/mac80211 NAN implementation.  This is
-    /// intentionally a debug service: it may replace the selected interface
-    /// mode and leaves all replies/events visible through mesh.sock history.
-    pub fn nan_native_start(
-        &self,
-        iface: Option<String>,
-        service_name: Option<String>,
-        subscribe: bool,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let service_name = service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string());
-        let result = (|| -> Result<Value> {
-            let wiphy = wifi_wiphy_index(&iface)?;
-            let nan_name = format!("dnan{}", iface.trim_start_matches("wlan"));
-            let socket = Nl80211Socket::open()?;
-            // Some drivers reject creation of an NL80211_IFTYPE_NAN VIF even
-            // though they still expose a normal wdev.  Probe START_NAN on the
-            // existing interface as well, so the debug service distinguishes
-            // a VIF-only restriction from a complete lack of NAN support.
-            let (wdev, ifindex, ifname, created, already_started) = match socket.new_nan_interface(wiphy, &nan_name) {
-                Ok(created) => {
-                    let wdev = created
-                        .get("wdev")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| anyhow::anyhow!("native NAN NEW_INTERFACE returned no wdev"))?;
-                    (wdev, created.get("ifindex").and_then(Value::as_u64).map(|v| v as u32), nan_name.clone(), true, false)
-                }
-                Err(new_error) => {
-                    let base_ifindex = ifindex(&iface)?;
-                    let base_wdev = socket
-                        .interface_wdev(base_ifindex)
-                        .with_context(|| format!("native NAN NEW_INTERFACE failed ({new_error:#}); GET_INTERFACE on {iface} also failed"))?;
-                    socket.start_nan(base_wdev, 100).with_context(|| {
-                        format!("native NAN NEW_INTERFACE failed ({new_error:#}); native NAN START_NAN on existing {iface} also failed")
-                    })?;
-                    (base_wdev, Some(base_ifindex), iface.clone(), false, true)
-                }
-            };
-            if !already_started {
-                socket
-                    .start_nan(wdev, 100)
-                    .context("native NAN START_NAN")?;
-            }
-            let service_id = nan_service_id(&service_name);
-            let service_info = radio_protocol::build_nan_service_info(
-                "android",
-                &local_device_id()?,
-                0,
-            )?;
-            let function = socket.add_nan_function(
-                wdev,
-                if subscribe { 1 } else { 0 },
-                service_id,
-                &service_info,
-                subscribe,
-            )
-            .context("native NAN ADD_NAN_FUNCTION")?;
-            let stop = Arc::new(AtomicBool::new(false));
-            let event_history = self.history.clone();
-            let event_stop = stop.clone();
-            let event_iface = iface.clone();
-            std::thread::spawn(move || {
-                native_nan_event_loop(socket, event_iface, event_history, event_stop);
-            });
-            self.native_nan.lock().unwrap().insert(
-                iface.clone(),
-                NativeNanRuntime {
-                    wdev,
-                    ifindex,
-                    ifname: ifname.clone(),
-                    wiphy,
-                    kernel_nan: created,
-                    stop,
-                },
-            );
-            Ok(json!({
-                "ok": true,
-                "backend": "linux_nl80211_native_nan",
-                "iface": iface,
-                "nan_iface": ifname,
-                "created_nan_interface": created,
-                "wiphy": wiphy,
-                "wdev": wdev,
-                "service_name": service_name,
-                "service_id": hex_bytes(&service_id),
-                "function": function,
-                "note": "native NAN debug service; events are available in messages.history",
-            }))
-        })();
-        let value = result.unwrap_or_else(|error| json!({
-            "ok": false,
-            "backend": "linux_nl80211_native_nan",
-            "iface": iface,
-            "error": format!("{error:#}"),
-        }));
-        self.record("wifi.nan.native.start", value.clone());
-        value
-    }
-
-    /// Reproduce wpa_supplicant CONFIG_NAN_USD directly: managed-interface
-    /// action registration, userspace SDF construction, ROC, and NL80211
-    /// FRAME injection. This intentionally does not request an NAN VIF.
-    pub fn nan_usd_start(
-        &self,
-        iface: Option<String>,
-        service_name: Option<String>,
-        subscribe: bool,
-        infra: bool,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let service_name = service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string());
-        let result = (|| -> Result<Value> {
-            let ifidx = ifindex(&iface)?;
-            let source = iface_mac(&iface)?;
-            let service_id = nan_service_id(&service_name);
-            let service_info = radio_protocol::build_nan_service_info(
-                "android", &local_device_id()?, 0,
-            )?;
-            let socket = Nl80211Socket::open()?;
-            socket.register_wpa_nan_usd_and_dmesh(ifidx)?;
-            let stop = Arc::new(AtomicBool::new(false));
-            let event_history = self.history.clone();
-            let event_stop = stop.clone();
-            let event_iface = iface.clone();
-            let tx_frame = dmesh_rawnan::build_nan_publish_sdf(
-                dmesh_rawnan::NAN_DISCOVERY_MAC,
-                source,
-                [0; 6],
-                service_id,
-                if subscribe { 2 } else { 1 },
-                &service_info,
-            );
-            let frame_len = tx_frame.len();
-            let event_service_id = service_id;
-            let event_rawnan_state = self.rawnan_state.clone();
-            std::thread::spawn(move || {
-                nan_usd_event_tx_loop(
-                    socket, event_iface, event_history, event_stop, ifidx, tx_frame,
-                    event_service_id, event_rawnan_state, infra,
-                );
-            });
-            self.native_nan.lock().unwrap().insert(
-                iface.clone(),
-                NativeNanRuntime {
-                    wdev: 0,
-                    ifindex: Some(ifidx),
-                    ifname: iface.clone(),
-                    wiphy: wifi_wiphy_index(&iface)?,
-                    kernel_nan: false,
-                    stop,
-                },
-            );
-            Ok(json!({
-                "ok": true,
-                "backend": "linux_nl80211_nan_usd",
-                "iface": iface,
-                "service_name": service_name,
-                "service_id": hex_bytes(&service_id),
-                "subscribe": subscribe,
-                "infra": infra,
-                "frame_len": frame_len,
-                "note": "wpa_supplicant-compatible userspace USD; events are available in messages.history",
-            }))
-        })();
-        let value = result.unwrap_or_else(|error| json!({
-            "ok": false, "backend": "linux_nl80211_nan_usd", "iface": iface,
-            "error": format!("{error:#}"),
-        }));
-        self.record("wifi.nan.usd.start", value.clone());
-        value
-    }
-
-    pub fn nan_native_status(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let runtime = self.native_nan.lock().unwrap().get(&iface).map(|r| {
-            json!({"wdev": r.wdev, "ifindex": r.ifindex, "nan_iface": r.ifname,
-                   "wiphy": r.wiphy, "running": !r.stop.load(Ordering::Acquire)})
-        });
-        let events = self.history.lock().unwrap().iter()
-            .filter(|event| event.key == "wifi.nan.native.event" && event.source == iface)
-            .count();
-        json!({"ok": true, "backend": "linux_nl80211_native_nan", "iface": iface,
-               "runtime": runtime, "event_count": events})
-    }
-
-    pub fn nan_native_transmit(
-        &self,
-        iface: Option<String>,
-        destination: String,
-        instance_id: u8,
-        requestor_id: u8,
-        payload_text: String,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let result = (|| -> Result<Value> {
-            let wdev = self.native_nan.lock().unwrap().get(&iface)
-                .map(|runtime| runtime.wdev)
-                .ok_or_else(|| anyhow::anyhow!("native NAN is not running on {iface}"))?;
-            let destination = parse_mac(Some(&destination))
-                .ok_or_else(|| anyhow::anyhow!("invalid destination MAC"))?;
-            let socket = Nl80211Socket::open()?;
-            let info = socket.add_nan_followup(wdev, instance_id, requestor_id, destination, payload_text.as_bytes())?;
-            Ok(json!({"ok": true, "backend": "linux_nl80211_native_nan", "iface": iface,
-                       "destination": colon_mac(&destination), "function": info}))
-        })();
-        let value = result.unwrap_or_else(|error| json!({"ok": false, "backend": "linux_nl80211_native_nan", "iface": iface, "error": format!("{error:#}")}));
-        self.record("wifi.nan.native.transmit", value.clone());
-        value
-    }
-
-    pub fn nan_native_stop(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let runtime = self.native_nan.lock().unwrap().remove(&iface);
-        let Some(runtime) = runtime else {
-            return json!({"ok": true, "iface": iface, "already_stopped": true});
-        };
-        runtime.stop.store(true, Ordering::Release);
-        let result = Nl80211Socket::open()
-            .and_then(|socket| {
-                if runtime.kernel_nan {
-                    socket.stop_nan(runtime.wdev)?;
-                    if runtime.ifname != iface {
-                        if let Some(ifindex) = runtime.ifindex {
-                            socket.del_interface(ifindex)?;
-                        }
-                    }
-                }
-                Ok(())
-            })
-            .map(|_| json!({"ok": true, "backend": "linux_nl80211_native_nan", "iface": iface, "wdev": runtime.wdev}))
-            .unwrap_or_else(|error| json!({"ok": false, "backend": "linux_nl80211_native_nan", "iface": iface, "wdev": runtime.wdev, "error": format!("{error:#}")}));
-        self.record("wifi.nan.native.stop", result.clone());
-        result
-    }
-
-    /// Attach to NAN through the repo-built wpa_supplicant control socket.
-    pub fn nan_start(&self, iface: Option<String>, ctrl_dir: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let link_up = set_link_up(&iface);
-        let interface_add = if wpa_command(&iface, &ctrl_dir, "STATUS")
-            .is_ok_and(|output| output.status == Some(0))
-        {
-            Ok(CommandOutput {
-                status: Some(0),
-                stdout: "already attached".to_string(),
-                stderr: String::new(),
-            })
-        } else {
-            let global_dir = std::env::var("LMESH_WPA_GLOBAL_CTRL_DIR")
-                .unwrap_or_else(|_| "/run/mesh/wpa-supplicant".to_string());
-            wpa_global_command(
-                &global_dir,
-                &format!("INTERFACE_ADD {iface}\t\tnl80211\tDIR={ctrl_dir} GROUP=plugdev\t\t"),
-            )
-        };
-        let nan_capability = wpa_raw_command(&iface, &ctrl_dir, "GET_CAPABILITY nan");
-        let status = wpa_command(&iface, &ctrl_dir, "STATUS");
-        let driver_flags2 = wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS2");
-        let result = json!({
-            "link_up": command_result_json(link_up),
-            "interface_add": command_result_json(interface_add),
-            "nan_capability": command_result_json(nan_capability),
-            "status": command_result_json(status),
-            "driver_flags2": command_result_json(driver_flags2),
-        });
-        self.record_message(
-            "N.start",
-            "host-nan",
-            MeshMessage::new(mesh::message::KIND_NAN_START, MeshMessageCodec::WpaText)
-                .field(FIELD_MEDIUM, "nan")
-                .field(FIELD_IFACE, &iface)
-                .field(FIELD_CTRL_DIR, &ctrl_dir),
-        );
-        self.record("N.start", result.clone());
-        result
-    }
-
-    /// Start the default DMesh NAN publish/subscribe service.
-    pub fn nan_default(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        service_name: Option<String>,
-        ttl: Option<u32>,
-    ) -> Value {
-        let iface_value = wifi_iface(iface);
-        let ctrl_dir_value = wpa_ctrl_dir(ctrl_dir);
-        let service_name = service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string());
-        let ttl = ttl.unwrap_or(DEFAULT_NAN_TTL_SECS);
-        let start = self.nan_start(Some(iface_value.clone()), Some(ctrl_dir_value.clone()));
-        let publish = self.nan_publish(
-            Some(iface_value.clone()),
-            Some(ctrl_dir_value.clone()),
-            Some(service_name.clone()),
-            None,
-            Some(ttl),
-            Some(2437),
-            Some(0),
-        );
-        let subscribe = self.nan_subscribe(
-            Some(iface_value.clone()),
-            Some(ctrl_dir_value.clone()),
-            Some(service_name.clone()),
-            None,
-            Some(ttl),
-            Some(2437),
-            Some(true),
-            Some(0),
-        );
-        let events = self.nan_events(
-            Some(iface_value.clone()),
-            Some(ctrl_dir_value.clone()),
-            Some(50),
-            Some(16),
-        );
-        let result = json!({
-            "ok": true,
-            "iface": iface_value,
-            "ctrl_dir": ctrl_dir_value,
-            "service_name": service_name,
-            "ttl": ttl,
-            "start": start,
-            "publish": publish,
-            "subscribe": subscribe,
-            "events": events,
-        });
-        self.record("N.default", result.clone());
-        result
-    }
-
-    /// Return NAN status and recent events.
-    pub fn nan_status(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        events_ms: Option<u64>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let result = json!({
-            "iface": iface,
-            "ctrl_dir": ctrl_dir,
-            "status": command_result_json(wpa_command(&iface, &ctrl_dir, "STATUS")),
-            "driver_flags": command_result_json(wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS")),
-            "driver_flags2": command_result_json(wpa_command(&iface, &ctrl_dir, "DRIVER_FLAGS2")),
-            "nan_capability": command_result_json(wpa_command(&iface, &ctrl_dir, "GET_CAPABILITY nan")),
-            "events": self.nan_events(Some(iface.clone()), Some(ctrl_dir.clone()), events_ms.or(Some(100)), Some(64)),
-        });
-        self.record("N.status", result.clone());
-        result
-    }
-
-    /// Stop NAN sessions through wpa_supplicant.
-    pub fn nan_stop(&self, iface: Option<String>, ctrl_dir: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let publish = wpa_raw_command(&iface, &ctrl_dir, "NAN_CANCEL_PUBLISH publish_id=1");
-        let subscribe = wpa_raw_command(&iface, &ctrl_dir, "NAN_CANCEL_SUBSCRIBE subscribe_id=1");
-        let flush = wpa_raw_command(&iface, &ctrl_dir, "NAN_FLUSH");
-        let result = json!({
-            "publish": command_result_json(publish),
-            "subscribe": command_result_json(subscribe),
-            "flush": command_result_json(flush),
-        });
-        self.record("N.stop", result.clone());
-        result
-    }
-
-    /// Start a NAN publish and return the assigned handle when available.
-    #[allow(clippy::too_many_arguments)]
-    pub fn nan_publish(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        service_name: Option<String>,
-        ssi_hex: Option<String>,
-        ttl: Option<u32>,
-        freq: Option<u32>,
-        srv_proto_type: Option<u8>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let _ = set_link_up(&iface);
-        let ssi_hex = ssi_hex.unwrap_or_else(|| {
-            radio_protocol::build_nan_service_info(
-                "android",
-                &local_device_id().unwrap_or([0; 6]),
-                0,
-            )
-            .map(|bytes| hex_bytes(&bytes))
-            .unwrap_or_default()
-        });
-        let cmd = format!(
-            "NAN_PUBLISH service_name={} ttl={} freq={} srv_proto_type={} ssi={}",
-            service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string()),
-            ttl.unwrap_or(DEFAULT_NAN_TTL_SECS),
-            freq.unwrap_or(2437),
-            srv_proto_type.unwrap_or(0),
-            ssi_hex
-        );
-        let raw = wpa_raw_command(&iface, &ctrl_dir, &cmd);
-        let handle = raw
-            .as_ref()
-            .ok()
-            .and_then(|out| out.stdout.trim().parse::<u32>().ok());
-        let result = json!({
-            "command": cmd,
-            "handle": handle,
-            "result": command_result_json(raw),
-        });
-        self.record("N.publish", result.clone());
-        result
-    }
-
-    /// Start a NAN subscribe and return the assigned handle when available.
-    #[allow(clippy::too_many_arguments)]
-    pub fn nan_subscribe(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        service_name: Option<String>,
-        ssi_hex: Option<String>,
-        ttl: Option<u32>,
-        freq: Option<u32>,
-        active: Option<bool>,
-        srv_proto_type: Option<u8>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let _ = set_link_up(&iface);
-        let mut cmd = format!(
-            "NAN_SUBSCRIBE service_name={} ttl={} freq={} srv_proto_type={}",
-            service_name.unwrap_or_else(|| DEFAULT_WPA_SERVICE_NAME.to_string()),
-            ttl.unwrap_or(DEFAULT_NAN_TTL_SECS),
-            freq.unwrap_or(2437),
-            srv_proto_type.unwrap_or(0)
-        );
-        if active.unwrap_or(true) {
-            cmd.push_str(" active=1");
-        }
-        if let Some(ssi_hex) = ssi_hex {
-            cmd.push_str(&format!(" ssi={ssi_hex}"));
-        }
-        let raw = wpa_raw_command(&iface, &ctrl_dir, &cmd);
-        let handle = raw
-            .as_ref()
-            .ok()
-            .and_then(|out| out.stdout.trim().parse::<u32>().ok());
-        let result = json!({
-            "command": cmd,
-            "handle": handle,
-            "result": command_result_json(raw),
-        });
-        self.record("N.subscribe", result.clone());
-        result
-    }
-
-    /// Send a NAN follow-up.
-    #[allow(clippy::too_many_arguments)]
-    pub fn nan_transmit(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        handle: u32,
-        address: String,
-        req_instance_id: Option<u32>,
-        ssi_hex: Option<String>,
-        payload: Option<String>,
-        cookie: Option<u32>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let ssi_hex = ssi_hex.or_else(|| payload.map(|payload| hex_bytes(payload.as_bytes())));
-        let mut cmd = format!("NAN_TRANSMIT handle={handle} address={address}");
-        if let Some(req_instance_id) = req_instance_id {
-            cmd.push_str(&format!(" req_instance_id={req_instance_id}"));
-        }
-        if let Some(ssi_hex) = ssi_hex {
-            cmd.push_str(&format!(" ssi={ssi_hex}"));
-        }
-        if let Some(cookie) = cookie {
-            cmd.push_str(&format!(" cookie={cookie}"));
-        }
-        let raw = wpa_raw_command(&iface, &ctrl_dir, &cmd);
-        let result = json!({
-            "command": cmd,
-            "result": command_result_json(raw),
-        });
-        self.record("N.transmit", result.clone());
-        result
-    }
-
-    /// Collect NAN events by attaching to the WPA control socket.
-    pub fn nan_events(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        wait_ms: Option<u64>,
-        max_events: Option<usize>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let events = wpa_ctrl_events(
-            &format!("{ctrl_dir}/{iface}"),
-            wait_ms.unwrap_or(250),
-            max_events.unwrap_or(64),
-        );
-        match events {
-            Ok(events) => {
-                for event in &events {
-                    self.record("N.event.raw", event.clone());
-                    if let Some(message) = nan_event_message(event) {
-                        let event_name = event
-                            .get("event")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("NAN");
-                        tracing::info!(
-                            event = event_name,
-                            peer = message
-                                .fields
-                                .get(&mesh::message::FIELD_PEER)
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                            node = message
-                                .fields
-                                .get(&FIELD_NODE)
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                            payload = message
-                                .fields
-                                .get(&FIELD_PAYLOAD)
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                            "nan_event"
-                        );
-                        self.record_message("N.event", "host-nan", message);
-                    }
-                }
-                json!({ "ok": true, "events": events })
-            }
-            Err(error) => json!({ "ok": false, "error": error }),
-        }
-    }
-
-    /// Probe what service-info sizes wpa_supplicant accepts at the control/API layer.
-    pub fn nan_size_probe(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        sizes: Option<String>,
-        mode: Option<String>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let sizes = parse_size_list(sizes.as_deref())
-            .unwrap_or_else(|| vec![64, 128, 192, 224, 230, 255, 384, 512, 1024]);
-        let mode = mode.unwrap_or_else(|| "publish".to_string());
-        let mut results = Vec::new();
-        for size in sizes {
-            let ssi_hex = "aa".repeat(size);
-            let command = if mode == "transmit" {
-                format!("NAN_TRANSMIT handle=1 address=ff:ff:ff:ff:ff:ff ssi={ssi_hex}")
-            } else {
-                format!(
-                    "NAN_PUBLISH service_name={} ttl=0 freq=2437 srv_proto_type=0 ssi={}",
-                    DEFAULT_WPA_SERVICE_NAME, ssi_hex
-                )
-            };
-            let output = wpa_raw_command(&iface, &ctrl_dir, &command);
-            let ok = output
-                .as_ref()
-                .map(|out| out.status == Some(0))
-                .unwrap_or(false);
-            results.push(json!({
-                "size": size,
-                "ok": ok,
-                "result": command_result_json(output),
-            }));
-        }
-        let max_ok = results
-            .iter()
-            .filter(|entry| entry.get("ok").and_then(Value::as_bool) == Some(true))
-            .filter_map(|entry| entry.get("size").and_then(Value::as_u64))
-            .max();
-        let result = json!({
-            "ok": true,
-            "mode": mode,
-            "note": "This probes wpa_supplicant/control acceptance. Over-the-air DW success still needs peer observation.",
-            "max_ok": max_ok,
-            "results": results,
-        });
-        self.record("N.size_probe", result.clone());
-        result
-    }
-
-    /// Start a NAN publish using DMesh service info.
-    pub fn nan_adv(&self, iface: Option<String>, ctrl_dir: Option<String>) -> Result<Value> {
-        let result = self.nan_publish(iface, ctrl_dir, None, None, None, None, None);
-        self.record_message(
-            "N.publish",
-            "host-nan",
-            MeshMessage::new(mesh::message::KIND_NAN_PUBLISH, MeshMessageCodec::WpaText)
-                .field(FIELD_MEDIUM, "nan")
-                .field(FIELD_STATUS, "legacy_adv"),
-        );
-        Ok(result)
-    }
-
-    /// Start a NAN subscribe using the DMesh service name.
-    pub fn nan_sub(&self, iface: Option<String>, ctrl_dir: Option<String>) -> Value {
-        let result = self.nan_subscribe(iface, ctrl_dir, None, None, None, None, Some(true), None);
-        self.record_message(
-            "N.subscribe",
-            "host-nan",
-            MeshMessage::new(mesh::message::KIND_NAN_SUBSCRIBE, MeshMessageCodec::WpaText)
-                .field(FIELD_MEDIUM, "nan")
-                .field(FIELD_STATUS, "legacy_sub"),
-        );
-        result
-    }
-
-    /// Send a NAN follow-up ping/probe.
-    pub fn nan_ping(
-        &self,
-        iface: Option<String>,
-        ctrl_dir: Option<String>,
-        peer: Option<String>,
-        payload: Option<String>,
-    ) -> Result<Value> {
-        let iface = wifi_iface(iface);
-        let ctrl_dir = wpa_ctrl_dir(ctrl_dir);
-        let _ = set_link_up(&iface);
-        let target = parse_device_id(peer.as_deref()).unwrap_or([0xff; 6]);
-        let payload_text = payload.unwrap_or_else(|| "ping".to_string());
-        let followup = radio_protocol::build_nan_followup(
-            "hello",
-            &local_device_id()?,
-            &target,
-            payload_text.as_bytes(),
-        )?;
-        let cmd = format!(
-            "NAN_TRANSMIT handle=1 address={} ssi={}",
-            colon_mac(&target),
-            hex_bytes(&followup)
-        );
-        let result = command_result_json(wpa_raw_command(&iface, &ctrl_dir, &cmd));
-        self.record_message(
-            "N.transmit",
-            "host-nan",
-            MeshMessage::new(mesh::message::KIND_NAN_FOLLOWUP, MeshMessageCodec::WpaText)
-                .field(FIELD_MEDIUM, "nan")
-                .field(FIELD_IFACE, &iface)
-                .field(FIELD_CTRL_DIR, &ctrl_dir)
-                .field(FIELD_PAYLOAD, payload_text),
-        );
-        self.record("N.transmit", result.clone());
-        Ok(result)
     }
 
     fn record(&self, key: &str, value: Value) {
@@ -7119,14 +6636,19 @@ fn queue_serial_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
 fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
     let fields = command.split_ascii_whitespace().collect::<Vec<_>>();
     if (fields.len() < 4 || fields.len() > 6) || fields.first() != Some(&"STA") {
-        bail!("Recovery STA packet requires: STA endpoint local_ip ssid [password] [dryrun]");
+        bail!("Recovery STA packet requires: STA endpoint local_ip ssid [password] [benchmark]");
     }
     let endpoint = fields[1].as_bytes();
     let local_ip = fields[2].as_bytes();
     let ssid = fields[3].as_bytes();
-    let dry_run = fields.get(4).is_some_and(|value| *value == "dryrun")
-        || fields.get(5).is_some_and(|value| *value == "dryrun");
-    let password = if fields.get(4).is_some_and(|value| *value == "dryrun") {
+    let gateway = endpoint
+        .split(|byte| *byte == b':')
+        .next()
+        .unwrap_or(endpoint);
+    let mask = b"255.255.0.0";
+    let benchmark = fields.get(4).is_some_and(|value| *value == "benchmark")
+        || fields.get(5).is_some_and(|value| *value == "benchmark");
+    let password = if fields.get(4).is_some_and(|value| *value == "benchmark") {
         &[]
     } else {
         fields.get(4).map(|value| value.as_bytes()).unwrap_or(&[])
@@ -7137,6 +6659,8 @@ fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
         || local_ip.len() >= 32
         || ssid.is_empty()
         || ssid.len() >= 33
+        || gateway.is_empty()
+        || gateway.len() >= 32
         || password.len() >= 32
         || endpoint.len() > u8::MAX as usize
         || local_ip.len() > u8::MAX as usize
@@ -7145,20 +6669,24 @@ fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
     {
         bail!("Recovery STA packet field is too long or empty");
     }
-    let mut packet =
-        Vec::with_capacity(64 + endpoint.len() + local_ip.len() + ssid.len() + password.len());
+    let mut packet = Vec::with_capacity(
+        96 + endpoint.len() + local_ip.len() + ssid.len() + gateway.len() + mask.len()
+            + password.len(),
+    );
     packet.extend_from_slice(&[
         0xa2,
         0x00,
         0x18,
         68,
         0x06,
-        if dry_run { 0xa5 } else { 0xa4 },
+        if benchmark { 0xa7 } else { 0xa6 },
     ]);
     for (key, value) in [
         ("server", endpoint),
         ("ip", local_ip),
         ("ssid", ssid),
+        ("gateway", gateway),
+        ("mask", mask.as_slice()),
         ("password", password),
     ] {
         packet.push(0x60 + key.len() as u8);
@@ -7170,9 +6698,9 @@ fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
         }
         packet.extend_from_slice(value);
     }
-    if dry_run {
-        packet.extend_from_slice(&[0x67]);
-        packet.extend_from_slice(b"dry_run");
+    if benchmark {
+        packet.push(0x69);
+        packet.extend_from_slice(b"benchmark");
         packet.push(0xf5);
     }
     Ok(packet)
@@ -7713,7 +7241,6 @@ fn firmware_arg_tag(name: &str) -> Option<u16> {
         "server" => 246,
         "port" => 191,
         "target" => 346,
-        "dry_run" => 257,
         "object_action_stats" => 272,
         _ => return None,
     })
@@ -8438,7 +7965,10 @@ fn is_unsolicited_console_record(command: &str, record: &str) -> bool {
     // State notifications are broadcast to all clients, including the client
     // that issued a mode command. They are never the command's authoritative
     // response, even for the compact `active`/`idle` aliases.
-    if record.starts_with("event type=boot") || record.starts_with("event type=mode") {
+    // Events are broadcast diagnostics rather than command replies.  Ignore
+    // raw-NAN and other event records as well as boot/mode notifications so a
+    // busy gateway cannot satisfy a request with a stale event.
+    if record.starts_with("event type=") {
         return true;
     }
     // `active` and `idle` are compact aliases for the mode control command.
@@ -8762,34 +8292,6 @@ fn firmware_mode_ping_cbor() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Extract DMesh follow-up replies delivered by wpa_supplicant as
-/// `NAN-RECEIVE` events. The DMesh header's device ID is the stable firmware
-/// identity; the WPA peer address may be randomized by platform NAN stacks.
-fn host_nan_responses(events: &Value) -> Vec<Value> {
-    events
-        .get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|event| event.get("event").and_then(Value::as_str) == Some("NAN-RECEIVE"))
-        .filter_map(|event| {
-            let fields = event.get("fields")?;
-            let dmesh = fields.get("ssi_dmesh")?;
-            (dmesh.get("protocol").and_then(Value::as_str) == Some("dmesh_nan_followup")).then(
-                || {
-                    json!({
-                        "device_id": dmesh.get("device_id"),
-                        "target_id": dmesh.get("target_id"),
-                        "msg_type": dmesh.get("msg_type"),
-                        "payload": dmesh.get("payload_text"),
-                        "peer": fields.get("address"),
-                    })
-                },
-            )
-        })
-        .collect()
-}
-
 fn parse_stability_pongs(output: &str) -> Vec<Value> {
     output
         .lines()
@@ -9089,7 +8591,7 @@ fn load_radio_adapters() -> Vec<RadioAdapter> {
             id: "host-nan".to_string(),
             kind: "host-nan".to_string(),
             medium: "nan".to_string(),
-            path: Some(format!("{}/{}", wpa_ctrl_dir(None), wifi_iface(None))),
+            path: Some(format!("rawnan:{}", wifi_iface(None))),
             network: None,
             baud: None,
             enabled: true,
@@ -9184,207 +8686,6 @@ fn monitor_iface_name(iface: &str) -> String {
     }
 }
 
-fn parse_hci_le_adv_reports(packet: &[u8]) -> Vec<Value> {
-    if packet.len() < 4 || packet[0] != 0x04 || packet[1] != 0x3e || packet[3] != 0x02 {
-        return Vec::new();
-    }
-    let mut offset = 5;
-    let mut reports = Vec::new();
-    let count = packet.get(4).copied().unwrap_or(0) as usize;
-    for _ in 0..count {
-        if offset + 9 > packet.len() {
-            break;
-        }
-        let event_type = packet[offset];
-        let addr_type = packet[offset + 1];
-        let address = mac_string_reversed(&packet[offset + 2..offset + 8]);
-        let data_len = packet[offset + 8] as usize;
-        offset += 9;
-        if offset + data_len + 1 > packet.len() {
-            break;
-        }
-        let data = packet[offset..offset + data_len].to_vec();
-        offset += data_len;
-        let rssi = packet[offset] as i8;
-        offset += 1;
-        reports.push(json!({
-            "event_type": event_type,
-            "addr_type": addr_type,
-            "address": address,
-            "scan_rssi": rssi,
-            "data": hex_bytes(&data),
-            "fields": ble_ad_fields_json(&data),
-        }));
-    }
-    reports
-}
-
-fn parse_dmesh_ble_report(report: &Value) -> Option<Result<Value>> {
-    let address = report.get("address")?.as_str()?;
-    let scan_rssi = report.get("scan_rssi")?.as_i64()? as i32;
-    let data_hex = report.get("data")?.as_str()?;
-    let data = parse_hex_bytes(data_hex).ok()?;
-    let mut offset = 0;
-    while offset < data.len() {
-        let field_len = data[offset] as usize;
-        offset += 1;
-        if field_len == 0 {
-            break;
-        }
-        if offset + field_len > data.len() {
-            break;
-        }
-        let field_type = data[offset];
-        let field_data = &data[offset + 1..offset + field_len];
-        if field_type == 0x16 || field_type == 0x21 {
-            let parsed = radio_protocol::parse_ble_service_data(field_data, scan_rssi, address);
-            if parsed.is_ok() {
-                return Some(parsed);
-            }
-        }
-        offset += field_len;
-    }
-    None
-}
-
-fn ble_ad_fields_json(data: &[u8]) -> Vec<Value> {
-    let mut offset = 0;
-    let mut fields = Vec::new();
-    while offset < data.len() {
-        let field_len = data[offset] as usize;
-        offset += 1;
-        if field_len == 0 {
-            break;
-        }
-        if offset + field_len > data.len() {
-            break;
-        }
-        let field_type = data[offset];
-        let field_data = &data[offset + 1..offset + field_len];
-        fields.push(json!({
-            "type": format!("0x{field_type:02x}"),
-            "data": hex_bytes(field_data),
-        }));
-        offset += field_len;
-    }
-    fields
-}
-
-#[repr(C)]
-struct SockaddrHci {
-    hci_family: libc::sa_family_t,
-    hci_dev: u16,
-    hci_channel: u16,
-}
-
-struct HciSocket {
-    fd: RawFd,
-}
-
-impl HciSocket {
-    fn open(dev_id: u16) -> Result<Self> {
-        let fd = unsafe {
-            libc::socket(
-                AF_BLUETOOTH,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                BTPROTO_HCI,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context(
-                "failed to open AF_BLUETOOTH raw HCI socket; CAP_NET_RAW is usually required",
-            );
-        }
-        let addr = SockaddrHci {
-            hci_family: AF_BLUETOOTH as libc::sa_family_t,
-            hci_dev: dev_id,
-            hci_channel: HCI_CHANNEL_RAW,
-        };
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                &addr as *const SockaddrHci as *const libc::sockaddr,
-                std::mem::size_of::<SockaddrHci>() as libc::socklen_t,
-            )
-        };
-        if rc < 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(error).with_context(|| format!("failed to bind HCI device {dev_id}"));
-        }
-        Ok(Self { fd })
-    }
-
-    fn send_le_command(&self, ocf: u16, params: &[u8]) -> Result<()> {
-        if params.len() > u8::MAX as usize {
-            bail!("HCI command parameters too large: {}", params.len());
-        }
-        let opcode = (OGF_LE_CTL << 10) | ocf;
-        let mut packet = Vec::with_capacity(4 + params.len());
-        packet.push(HCI_COMMAND_PKT);
-        packet.extend_from_slice(&opcode.to_le_bytes());
-        packet.push(params.len() as u8);
-        packet.extend_from_slice(params);
-        let written = unsafe {
-            libc::send(
-                self.fd,
-                packet.as_ptr() as *const libc::c_void,
-                packet.len(),
-                0,
-            )
-        };
-        if written < 0 {
-            let error = std::io::Error::last_os_error();
-            bail!("failed to send HCI command: {error}");
-        }
-        Ok(())
-    }
-
-    fn recv_timeout(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        let timeout_ms = timeout
-            .as_millis()
-            .min(libc::c_int::MAX as u128)
-            .try_into()
-            .unwrap_or(libc::c_int::MAX);
-        let mut poll_fd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-        if ready < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to poll HCI socket");
-        }
-        if ready == 0 || (poll_fd.revents & libc::POLLIN) == 0 {
-            return Ok(None);
-        }
-        let mut packet = vec![0_u8; 260];
-        let read = unsafe {
-            libc::recv(
-                self.fd,
-                packet.as_mut_ptr() as *mut libc::c_void,
-                packet.len(),
-                0,
-            )
-        };
-        if read < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to receive HCI event");
-        }
-        packet.truncate(read as usize);
-        Ok(Some(packet))
-    }
-}
-
-impl Drop for HciSocket {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GenlMsgHdr {
@@ -9400,6 +8701,38 @@ struct NlAttrHdr {
     nla_type: u16,
 }
 
+/// Build the nested 2.4 GHz rate attributes used by `NL80211_ATTR_TX_RATES`.
+/// This is kept independent of the socket so host tests cover the exact
+/// no-legacy HT diagnostic payload before it is sent to the live AP.
+fn tx_rate_profile_band(
+    rate_mbps: Option<u8>,
+    ht_mcs: Option<u8>,
+    disable_b: bool,
+) -> Option<Vec<u8>> {
+    if rate_mbps.is_none() && ht_mcs.is_none() && !disable_b {
+        return None;
+    }
+    let mut band = Vec::new();
+    if let Some(rate) = rate_mbps {
+        append_attr(&mut band, NL80211_TXRATE_LEGACY, &[rate.saturating_mul(2)]);
+    } else if disable_b && ht_mcs.is_none() {
+        // OFDM-only 2.4 GHz policy: exclude 1/2/5.5/11 Mbps CCK while
+        // retaining the normal OFDM fallback ladder.
+        let rates: Vec<u8> = [6_u8, 9, 12, 18, 24, 36, 48, 54]
+            .into_iter()
+            .map(|rate| rate.saturating_mul(2))
+            .collect();
+        append_attr(&mut band, NL80211_TXRATE_LEGACY, &rates);
+    }
+    if let Some(mcs) = ht_mcs {
+        // Exact HT-only diagnostic: leave legacy data rates out of this
+        // rate-control profile so rate fallback cannot hide a low-MCS result.
+        // AP management/control retains its BSS basic-rate policy separately.
+        append_attr(&mut band, NL80211_TXRATE_HT, &[mcs]);
+    }
+    Some(band)
+}
+
 struct Nl80211Socket {
     fd: RawFd,
     family_id: u16,
@@ -9407,17 +8740,9 @@ struct Nl80211Socket {
 
 struct ApRuntime {
     _owner_socket: Nl80211Socket,
+    channel: u8,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
-}
-
-struct NativeNanRuntime {
-    wdev: u64,
-    ifindex: Option<u32>,
-    ifname: String,
-    wiphy: u32,
-    kernel_nan: bool,
-    stop: Arc<AtomicBool>,
 }
 
 struct ApStartProfile {
@@ -9645,7 +8970,10 @@ impl RawWifiTxOptions {
                 dont_wait_for_ack: true,
                 tx_no_cck_rate: false,
             },
-            "nan_data_raw" | "nan_data_raw_active" | "nan_data_multicast" | "nan_data_multicast_active" => Self {
+            "nan_data_raw"
+            | "nan_data_raw_active"
+            | "nan_data_multicast"
+            | "nan_data_multicast_active" => Self {
                 variant: variant.to_string(),
                 include_freq: false,
                 duration_ms: None,
@@ -9765,8 +9093,7 @@ impl Nl80211Socket {
         for frame_match in matches {
             match self.register_frame(ifindex, IEEE80211_ACTION_FRAME_TYPE, &frame_match) {
                 Ok(()) => registered += 1,
-                Err(error)
-                    if error.to_string().contains("Match already configured") => {}
+                Err(error) if error.to_string().contains("Match already configured") => {}
                 Err(error) if registered == 0 => return Err(error),
                 Err(_) => {}
             }
@@ -9774,49 +9101,8 @@ impl Nl80211Socket {
         Ok(())
     }
 
-    /// Match wpa_supplicant's CONFIG_NAN_USD registration while retaining the
+    /// Match raw-NAN USD frames while retaining the
     /// ESP-NOW/DMesh vendor-action registrations on the same nl80211 socket.
-    fn register_wpa_nan_usd_and_dmesh(&self, ifindex: u32) -> Result<()> {
-        let nan_match = [0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13];
-        let mut multicast_error = None;
-        let mut registered = false;
-        for multicast in [true, false] {
-            let mut payload = genl_payload(NL80211_CMD_REGISTER_FRAME, NL80211_GENL_VERSION);
-            append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-            if multicast {
-                append_attr(&mut payload, NL80211_ATTR_RECEIVE_MULTICAST, &[]);
-            }
-            append_attr(
-                &mut payload,
-                NL80211_ATTR_FRAME_TYPE,
-                &IEEE80211_ACTION_FRAME_TYPE.to_ne_bytes(),
-            );
-            append_attr(&mut payload, NL80211_ATTR_FRAME_MATCH, &nan_match);
-            self.send_genl(
-                self.family_id,
-                (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-                77 + u32::from(!multicast),
-                &payload,
-            )?;
-            match self.recv_ack() {
-                Ok(()) => { registered = true; break; }
-                // A long-lived AP/monitor owner may already hold this exact
-                // nl80211 match.  That is sufficient for receive delivery;
-                // do not prevent the beacon-gated sender from starting.
-                Err(error) if error.to_string().contains("Match already configured") => {
-                    registered = true;
-                    break;
-                }
-                Err(error) if multicast => multicast_error = Some(error),
-                Err(error) => return Err(error).context("nl80211 NAN USD frame registration failed"),
-            }
-        }
-        if !registered {
-            return Err(multicast_error.unwrap_or_else(|| anyhow::anyhow!("NAN USD frame registration failed")));
-        }
-        self.register_dmesh_action(ifindex)
-    }
-
     fn register_open_ap_sme_frames(&self, ifindex: u32) -> Vec<Value> {
         // AP SME, NAN public, and DMesh/ESP-NOW vendor actions share this
         // nl80211 receive socket; the broad public/vendor matches cover all
@@ -9884,13 +9170,15 @@ impl Nl80211Socket {
                     "match_hex": hex_bytes(frame_match),
                     "error": format!("{error:#}"),
                 })),
-                Err(error) if format!("{error:#}").contains("Operation already in progress") => reports.push(json!({
-                    "name": name,
-                    "ok": true,
-                    "already_registered": true,
-                    "frame_type": format!("0x{frame_type:04x}"),
-                    "match_hex": hex_bytes(frame_match),
-                })),
+                Err(error) if format!("{error:#}").contains("Operation already in progress") => {
+                    reports.push(json!({
+                        "name": name,
+                        "ok": true,
+                        "already_registered": true,
+                        "frame_type": format!("0x{frame_type:04x}"),
+                        "match_hex": hex_bytes(frame_match),
+                    }))
+                }
                 Err(error) => reports.push(json!({
                     "name": name,
                     "ok": false,
@@ -9946,10 +9234,15 @@ impl Nl80211Socket {
             4,
             &payload,
         )?;
-        let response = self.recv_reply().context("nl80211 remain-on-channel failed")?;
-        let cookie = genl_attrs(&response)?.into_iter()
-            .find_map(|(kind, value)| (kind & NLA_TYPE_MASK == NL80211_ATTR_COOKIE && value.len() >= 8)
-                .then(|| u64::from_ne_bytes(value[..8].try_into().unwrap())))
+        let response = self
+            .recv_reply()
+            .context("nl80211 remain-on-channel failed")?;
+        let cookie = genl_attrs(&response)?
+            .into_iter()
+            .find_map(|(kind, value)| {
+                (kind & NLA_TYPE_MASK == NL80211_ATTR_COOKIE && value.len() >= 8)
+                    .then(|| u64::from_ne_bytes(value[..8].try_into().unwrap()))
+            })
             .ok_or_else(|| anyhow::anyhow!("nl80211 remain-on-channel returned no cookie"))?;
         let settle_ms = duration_ms.saturating_div(2).clamp(1, 20);
         std::thread::sleep(Duration::from_millis(settle_ms as u64));
@@ -9969,132 +9262,15 @@ impl Nl80211Socket {
         self.recv_ack().context("nl80211 set interface type failed")
     }
 
-    fn new_nan_interface(&self, wiphy: u32, ifname: &str) -> Result<Value> {
-        let mut payload = genl_payload(NL80211_CMD_NEW_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_IFNAME, format!("{ifname}\0").as_bytes());
-        append_attr(&mut payload, NL80211_ATTR_IFTYPE, &NL80211_IFTYPE_NAN.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 70, &payload)?;
-        let response = self.recv_reply()?;
-        let mut out = serde_json::Map::new();
-        for (kind, value) in genl_attrs(&response)? {
-            match kind & NLA_TYPE_MASK {
-                NL80211_ATTR_IFINDEX if value.len() >= 4 => {
-                    out.insert("ifindex".to_string(), json!(u32::from_ne_bytes(value[..4].try_into()?)));
-                }
-                NL80211_ATTR_WDEV if value.len() >= 8 => {
-                    out.insert("wdev".to_string(), json!(u64::from_ne_bytes(value[..8].try_into()?)));
-                }
-                _ => {}
-            }
-        }
-        Ok(Value::Object(out))
-    }
-
-    fn interface_wdev(&self, ifindex: u32) -> Result<u64> {
-        let mut payload = genl_payload(NL80211_CMD_GET_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 76, &payload)?;
-        let response = self.recv_reply()?;
-        for (attr, value) in genl_attrs(&response)? {
-            if attr & NLA_TYPE_MASK == NL80211_ATTR_WDEV && value.len() >= 8 {
-                return Ok(u64::from_ne_bytes(value[..8].try_into()?));
-            }
-        }
-        bail!("nl80211 GET_INTERFACE returned no wdev for ifindex {ifindex}")
-    }
-
-    fn start_nan(&self, wdev: u64, master_pref: u8) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_START_NAN, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_NAN_MASTER_PREF, &[master_pref]);
-        append_attr(&mut payload, NL80211_ATTR_BANDS, &1_u32.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 71, &payload)?;
-        self.recv_ack().context("nl80211 native NAN start failed")
-    }
-
-    fn add_nan_function(
-        &self,
-        wdev: u64,
-        kind: u8,
-        service_id: [u8; 6],
-        service_info: &[u8],
-        active_subscribe: bool,
-    ) -> Result<Value> {
-        let mut function = Vec::new();
-        append_attr(&mut function, 1, &[kind]);
-        append_attr(&mut function, 2, &service_id);
-        if kind == 0 {
-            append_attr(&mut function, 3, &[2]); // unsolicited publish
-        } else if active_subscribe {
-            append_attr(&mut function, 6, &[]);
-        }
-        append_attr(&mut function, 11, &3600_u32.to_ne_bytes());
-        append_attr(&mut function, 12, service_info);
-        let mut payload = genl_payload(NL80211_CMD_ADD_NAN_FUNCTION, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_NAN_FUNC | (1 << 15), &function);
-        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 72, &payload)?;
-        let response = self.recv_reply()?;
-        let mut out = serde_json::Map::new();
-        for (attr, value) in genl_attrs(&response)? {
-            match attr & NLA_TYPE_MASK {
-                NL80211_ATTR_NAN_FUNC_INST_ID if !value.is_empty() => {
-                    out.insert("instance_id".to_string(), json!(value[0]));
-                }
-                NL80211_ATTR_COOKIE if value.len() >= 8 => {
-                    out.insert("cookie".to_string(), json!(u64::from_ne_bytes(value[..8].try_into()?)));
-                }
-                _ => {}
-            }
-        }
-        Ok(Value::Object(out))
-    }
-
-    fn add_nan_followup(&self, wdev: u64, instance_id: u8, requestor_id: u8, destination: [u8; 6], payload_bytes: &[u8]) -> Result<Value> {
-        let mut function = Vec::new();
-        append_attr(&mut function, 1, &[2]);
-        append_attr(&mut function, 7, &[instance_id]);
-        append_attr(&mut function, 8, &[requestor_id]);
-        append_attr(&mut function, 9, &destination);
-        append_attr(&mut function, 12, payload_bytes);
-        let mut payload = genl_payload(NL80211_CMD_ADD_NAN_FUNCTION, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
-        append_attr(&mut payload, NL80211_ATTR_NAN_FUNC | (1 << 15), &function);
-        append_attr(&mut payload, NL80211_ATTR_SOCKET_OWNER, &[]);
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 75, &payload)?;
-        let response = self.recv_reply()?;
-        let mut out = serde_json::Map::new();
-        for (attr, value) in genl_attrs(&response)? {
-            if attr & NLA_TYPE_MASK == NL80211_ATTR_COOKIE && value.len() >= 8 {
-                out.insert("cookie".to_string(), json!(u64::from_ne_bytes(value[..8].try_into()?)));
-            }
-        }
-        Ok(Value::Object(out))
-    }
-
-    fn stop_nan(&self, wdev: u64) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_STOP_NAN, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_WDEV, &wdev.to_ne_bytes());
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 73, &payload)?;
-        self.recv_ack().context("nl80211 native NAN stop failed")
-    }
-
-    fn del_interface(&self, ifindex: u32) -> Result<()> {
-        let mut payload = genl_payload(NL80211_CMD_DEL_INTERFACE, NL80211_GENL_VERSION);
-        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
-        self.send_genl(self.family_id, (NLM_F_REQUEST | NLM_F_ACK) as u16, 74, &payload)?;
-        self.recv_ack().context("nl80211 native NAN interface delete failed")
-    }
-
     fn recv_reply(&self) -> Result<Vec<u8>> {
         loop {
             let response = self.recv_netlink_raw()?;
             if let Some(error) = netlink_error(&response) {
-                bail!("netlink error: {}{}", std::io::Error::from_raw_os_error(error), netlink_extack_message(&response));
+                bail!(
+                    "netlink error: {}{}",
+                    std::io::Error::from_raw_os_error(error),
+                    netlink_extack_message(&response)
+                );
             }
             if genl_header(&response).is_some() {
                 return Ok(response);
@@ -10126,6 +9302,51 @@ impl Nl80211Socket {
         self.recv_ack().context("nl80211 set HT20 channel failed")
     }
 
+    /// Set the per-wiphy 2.4 GHz TX-rate allow-list. Legacy rates are encoded
+    /// in 500-kbit/s units; HT rates are MCS indexes. Omitting both restores
+    /// the driver's automatic rate policy.
+    fn set_tx_rate_profile(
+        &self,
+        ifindex: u32,
+        rate_mbps: Option<u8>,
+        ht_mcs: Option<u8>,
+        disable_b: bool,
+    ) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_SET_WIPHY, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        if let Some(band) = tx_rate_profile_band(rate_mbps, ht_mcs, disable_b) {
+            let mut bands = Vec::new();
+            append_attr(&mut bands, 1 << 15, &band); // NL80211_BAND_2GHZ | NLA_F_NESTED
+            append_attr(&mut payload, NL80211_ATTR_TX_RATES | (1 << 15), &bands);
+        }
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            17,
+            &payload,
+        )?;
+        self.recv_ack()
+            .context("nl80211 set TX rate profile failed")
+    }
+
+    fn set_power_save(&self, ifindex: u32, enabled: bool) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_SET_POWER_SAVE, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        let state = if enabled {
+            NL80211_PS_ENABLED
+        } else {
+            NL80211_PS_DISABLED
+        };
+        append_attr(&mut payload, NL80211_ATTR_PS_STATE, &state.to_ne_bytes());
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            18,
+            &payload,
+        )?;
+        self.recv_ack().context("nl80211 set power-save failed")
+    }
+
     fn start_open_ap(
         &self,
         ifindex: u32,
@@ -10139,10 +9360,20 @@ impl Nl80211Socket {
         let hostapd_beacon_head =
             build_open_beacon_head_with_capability(mac, ssid, channel, 0x0401)
                 .map_err(|error| (error, Vec::new()))?;
-        let esp_beacon_tail = esp_open_ap_beacon_tail();
+        let esp_beacon_tail = esp_open_ap_beacon_tail(channel);
         let hostapd_beacon_tail = hostapd_open_ap_beacon_tail(channel);
-        let probe_resp =
+        let esp_probe_resp =
             build_open_probe_resp(mac, ssid, channel).map_err(|error| (error, Vec::new()))?;
+        let hostapd_probe_ies =
+            hostapd_open_ap_probe_ies(ssid, channel).map_err(|error| (error, Vec::new()))?;
+        let hostapd_probe_resp = build_open_probe_resp_with_ies(
+            mac,
+            ssid,
+            channel,
+            0x0401,
+            &hostapd_probe_ies,
+        )
+        .map_err(|error| (error, Vec::new()))?;
         let profiles = [
             ApStartProfile {
                 name: "hostapd_exact_ht20",
@@ -10282,7 +9513,12 @@ impl Nl80211Socket {
             append_attr(&mut payload, NL80211_ATTR_BEACON_HEAD, beacon_head);
             append_attr(&mut payload, NL80211_ATTR_BEACON_TAIL, beacon_tail);
             if profile.probe_resp {
-                append_attr(&mut payload, NL80211_ATTR_PROBE_RESP, &probe_resp);
+                let probe_resp = if profile.hostapd_tail {
+                    &hostapd_probe_resp
+                } else {
+                    &esp_probe_resp
+                };
+                append_attr(&mut payload, NL80211_ATTR_PROBE_RESP, probe_resp);
             }
             if profile.hostapd_ies {
                 let ies = hostapd_open_ap_extra_ies();
@@ -10309,7 +9545,7 @@ impl Nl80211Socket {
             append_attr(
                 &mut payload,
                 NL80211_ATTR_BSS_BASIC_RATES,
-                &[0x02, 0x04, 0x0b, 0x16],
+                open_ap_basic_rates(),
             );
             if profile.hostapd_crypto {
                 append_attr(
@@ -10518,7 +9754,7 @@ impl Nl80211Socket {
         append_attr(
             &mut payload,
             NL80211_ATTR_STA_SUPPORTED_RATES,
-            supported_rates.unwrap_or(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]),
+            supported_rates.unwrap_or(&OPEN_AP_OFDM_BASIC_RATES),
         );
         if let Some(capability) = capability {
             append_attr(
@@ -10576,6 +9812,7 @@ impl Nl80211Socket {
         freq: u32,
         options: &RawWifiTxOptions,
         frame: &[u8],
+        tx_rate_mbps: Option<u8>,
     ) -> Result<()> {
         let mut payload = genl_payload(NL80211_CMD_FRAME, NL80211_GENL_VERSION);
         append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
@@ -10599,6 +9836,16 @@ impl Nl80211Socket {
         if options.tx_no_cck_rate {
             append_attr(&mut payload, NL80211_ATTR_TX_NO_CCK_RATE, &[]);
         }
+        if let Some(rate) = tx_rate_mbps {
+            if !matches!(rate, 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
+                bail!("unsupported per-frame legacy rate {rate} Mbps");
+            }
+            let mut band = Vec::new();
+            append_attr(&mut band, 1, &[rate.saturating_mul(2)]); // TXRATE_LEGACY, 500 kbit/s units
+            let mut bands = Vec::new();
+            append_attr(&mut bands, 1 << 15, &band); // 2 GHz band, nested
+            append_attr(&mut payload, NL80211_ATTR_TX_RATES | (1 << 15), &bands);
+        }
         self.send_genl(
             self.family_id,
             (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
@@ -10608,18 +9855,54 @@ impl Nl80211Socket {
         self.recv_ack().context("nl80211 frame TX failed")
     }
 
-    fn send_mgmt_frame(&self, ifindex: u32, frame: &[u8]) -> Result<()> {
+    fn send_mgmt_frame(&self, ifindex: u32, frame: &[u8], tx_rate_mbps: Option<u8>) -> Result<()> {
         let mut payload = genl_payload(NL80211_CMD_FRAME, NL80211_GENL_VERSION);
         append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        // The AP SME response is emitted while the phy is also carrying the
+        // NAN monitor path.  Supplying the already-owned channel and a short
+        // on-channel duration makes this an explicit managed-interface TX
+        // request; mt76 otherwise intermittently returns ENOMEM for the
+        // otherwise valid frame while it is draining monitor traffic.
+        let freq = channel_to_freq(DEFAULT_RAW_WIFI_CHANNEL);
+        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_DURATION, &100_u32.to_ne_bytes());
         append_attr(&mut payload, NL80211_ATTR_FRAME, frame);
-        self.send_genl(
-            self.family_id,
-            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
-            18,
-            &payload,
-        )?;
-        self.recv_ack()
-            .context("nl80211 management frame TX failed")
+        if let Some(rate) = tx_rate_mbps {
+            if !matches!(rate, 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
+                bail!("unsupported per-frame legacy rate {rate} Mbps");
+            }
+            let mut band = Vec::new();
+            append_attr(&mut band, 1, &[rate.saturating_mul(2)]);
+            let mut bands = Vec::new();
+            append_attr(&mut bands, 1 << 15, &band);
+            append_attr(&mut payload, NL80211_ATTR_TX_RATES | (1 << 15), &bands);
+        }
+        // Management TX is transiently rejected with ENOMEM when the driver
+        // is draining a burst of NAN/raw frames. Auth/association responses
+        // must not be lost in that window: retry the same bounded request so
+        // an ESP STA can complete its open-AP handshake.
+        for attempt in 0..20 {
+            self.send_genl(
+                self.family_id,
+                (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+                18 + attempt,
+                &payload,
+            )?;
+            match self.recv_ack() {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < 19
+                        && (error.to_string().contains("Out of memory")
+                            || error.to_string().contains("os error 12")) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => {
+                    return Err(error).context("nl80211 management frame TX failed");
+                }
+            }
+        }
+        unreachable!()
     }
 
     fn recv_frame(&self) -> Result<Vec<u8>> {
@@ -11110,10 +10393,16 @@ impl Drop for DataSocket {
     }
 }
 
-fn send_monitor_frame(iface: &str, channel: u8, frame: &[u8], active: bool) -> Result<Value> {
+fn send_monitor_frame(
+    iface: &str,
+    channel: u8,
+    frame: &[u8],
+    active: bool,
+    tx_rate_mbps: Option<u8>,
+) -> Result<Value> {
     let monitor_iface = monitor_iface_name(iface);
     let setup = ensure_monitor_iface(iface, &monitor_iface, channel, active, false)?;
-    let packet = build_radiotap_packet(frame);
+    let packet = build_radiotap_packet_at_rate(frame, tx_rate_mbps)?;
     let socket = MonitorTxSocket::open(&monitor_iface)?;
     let written = socket.send(&packet)?;
     if written != packet.len() {
@@ -11247,175 +10536,6 @@ fn run_command(program: &str, args: &[&str]) -> Value {
     }
 }
 
-fn wifi_wiphy_index(iface: &str) -> Result<u32> {
-    let path = format!("/sys/class/net/{iface}/phy80211/name");
-    let name = fs::read_to_string(&path)
-        .with_context(|| format!("failed to resolve PHY for {iface} via {path}"))?;
-    name.trim()
-        .strip_prefix("phy")
-        .ok_or_else(|| anyhow::anyhow!("unexpected PHY name {:?}", name.trim()))?
-        .parse()
-        .with_context(|| format!("invalid PHY name {:?}", name.trim()))
-}
-
-fn nan_service_id(service_name: &str) -> [u8; 6] {
-    // wpa_supplicant's NAN Discovery Engine lowercases the service name
-    // before hashing it (nan_de_derive_service_id()).  Match that ABI so a
-    // native/raw publisher and the working CONFIG_NAN_USD path share IDs.
-    let normalized = service_name.to_ascii_lowercase();
-    let digest = Sha256::digest(normalized.as_bytes());
-    let mut id = [0_u8; 6];
-    id.copy_from_slice(&digest[..6]);
-    id
-}
-
-fn native_nan_event_loop(
-    socket: Nl80211Socket,
-    iface: String,
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-    stop: Arc<AtomicBool>,
-) {
-    let _ = socket.set_receive_timeout(Duration::from_millis(250));
-    while !stop.load(Ordering::Acquire) {
-        let response = match socket.recv_netlink_raw() {
-            Ok(response) => response,
-            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)) => continue,
-            Err(error) => {
-                push_radio_event(&history, RadioEvent {
-                    ts_millis: now_millis(), key: "wifi.nan.native.error".to_string(), source: iface.clone(),
-                    value: json!({"ok": false, "error": format!("{error:#}")}), message: None,
-                });
-                break;
-            }
-        };
-        let Some(header) = genl_header(&response) else { continue };
-        if header.cmd != 69 && header.cmd != 71 { continue; }
-        let mut attrs = serde_json::Map::new();
-        if let Ok(values) = genl_attrs(&response) {
-            for (kind, value) in values {
-                let key = format!("attr_{}", kind & NLA_TYPE_MASK);
-                attrs.insert(key, json!(hex_bytes(value)));
-            }
-        }
-        push_radio_event(&history, RadioEvent {
-            ts_millis: now_millis(), key: "wifi.nan.native.event".to_string(), source: iface.clone(),
-            value: json!({"ok": true, "backend": "linux_nl80211_native_nan", "command": header.cmd, "attrs": attrs}),
-            message: None,
-        });
-    }
-}
-
-fn nan_usd_event_tx_loop(
-    rx_socket: Nl80211Socket,
-    iface: String,
-    history: Arc<Mutex<VecDeque<RadioEvent>>>,
-    stop: Arc<AtomicBool>,
-    ifindex: u32,
-    frame: Vec<u8>,
-    service_id: [u8; 6],
-    rawnan_state: Arc<Mutex<NanState>>,
-    infra: bool,
-) {
-    // Poll frequently enough to catch the short post-beacon rendezvous.
-    let _ = rx_socket.set_receive_timeout(Duration::from_millis(5));
-    let tx_socket = match Nl80211Socket::open() {
-        Ok(socket) => socket,
-        Err(error) => {
-            push_radio_event(&history, RadioEvent {
-                ts_millis: now_millis(), key: "wifi.nan.usd.error".to_string(), source: iface,
-                value: json!({"ok": false, "stage": "tx_socket", "error": format!("{error:#}")}), message: None,
-            });
-            return;
-        }
-    };
-    let options = RawWifiTxOptions {
-        variant: "nan_usd".to_string(),
-        include_freq: true,
-        duration_ms: Some(100),
-        offchannel_tx_ok: true,
-        dont_wait_for_ack: false,
-        tx_no_cck_rate: true,
-    };
-    let mut last_slot_tsf = 0_u64;
-    let mut next_infra_tx = Instant::now();
-    while !stop.load(Ordering::Acquire) {
-        let timing = rawnan_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .nan_sync_timing();
-        if let Some((beacon_local_us, beacon_tsf_us, period_us)) = timing {
-            let now_us = now_micros_u64();
-            let age_us = now_us.saturating_sub(beacon_local_us);
-            // NAN beacons define the rendezvous.  Permit a bounded post-beacon
-            // dwell, and never emit a second frame for the same TSF slot.
-            let slot = beacon_tsf_us / period_us.max(1);
-            if (age_us <= 32_000 && slot != last_slot_tsf)
-                || (infra && Instant::now() >= next_infra_tx)
-            {
-                let mut tx_frame = frame.clone();
-                if let Some(cluster) = rawnan_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .cluster()
-                {
-                    tx_frame[16..22].copy_from_slice(&cluster.0);
-                }
-                let result = tx_socket
-                    .remain_on_channel(ifindex, 2437, 40)
-                    .and_then(|_| tx_socket.send_frame(ifindex, 2437, &options, &tx_frame));
-                push_radio_event(&history, RadioEvent {
-                    ts_millis: now_millis(), key: "wifi.nan.usd.tx".to_string(), source: iface.clone(),
-                    value: json!({"ok": result.is_ok(), "frame_len": frame.len(), "slot_tsf": beacon_tsf_us, "beacon_age_us": age_us, "sync": "nan", "error": result.err().map(|e| format!("{e:#}"))}), message: None,
-                });
-                last_slot_tsf = slot;
-                if infra {
-                    next_infra_tx = Instant::now() + Duration::from_millis(500);
-                }
-            }
-        } else if infra && Instant::now() >= next_infra_tx {
-            let result = tx_socket
-                .remain_on_channel(ifindex, 2437, 40)
-                .and_then(|_| tx_socket.send_frame(ifindex, 2437, &options, &frame));
-            push_radio_event(&history, RadioEvent {
-                ts_millis: now_millis(), key: "wifi.nan.usd.tx".to_string(), source: iface.clone(),
-                value: json!({"ok": result.is_ok(), "frame_len": frame.len(), "sync": "infra", "error": result.err().map(|e| format!("{e:#}"))}), message: None,
-            });
-            next_infra_tx = Instant::now() + Duration::from_millis(500);
-        }
-        let response = match rx_socket.recv_netlink_raw() {
-            Ok(response) => response,
-            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)) => continue,
-            Err(error) => {
-                push_radio_event(&history, RadioEvent {
-                    ts_millis: now_millis(), key: "wifi.nan.usd.error".to_string(), source: iface.clone(),
-                    value: json!({"ok": false, "stage": "rx", "error": format!("{error:#}")}), message: None,
-                });
-                break;
-            }
-        };
-        let Some(header) = genl_header(&response) else { continue };
-        if header.cmd != NL80211_CMD_FRAME { continue; }
-        let frame_value = genl_attrs(&response).ok().and_then(|attrs| attrs.into_iter()
-            .find(|(kind, _)| kind & NLA_TYPE_MASK == NL80211_ATTR_FRAME)
-            .map(|(_, value)| value));
-        if let Some(frame_value) = frame_value {
-            let service_match = dmesh_rawnan::service_descriptor(&frame_value, service_id);
-            push_radio_event(&history, RadioEvent {
-                ts_millis: now_millis(), key: "wifi.nan.usd.rx".to_string(), source: iface.clone(),
-                value: json!({"ok": true, "frame_len": frame_value.len(), "frame_hex": hex_bytes(&frame_value[..frame_value.len().min(256)]), "kind": format!("{:?}", dmesh_rawnan::classify(&frame_value))}), message: None,
-            });
-            if let Some(descriptor) = service_match {
-                let peer = frame_value.get(dmesh_rawnan::FRAME_SRC..dmesh_rawnan::FRAME_SRC + 6)
-                    .map(|bytes| hex_bytes(bytes));
-                push_radio_event(&history, RadioEvent {
-                    ts_millis: now_millis(), key: "wifi.nan.usd.discovery".to_string(), source: iface.clone(),
-                    value: json!({"ok": true, "peer": peer, "instance_id": descriptor.instance, "requestor_instance_id": descriptor.requestor_instance, "control": descriptor.control, "peer_availability": peer_availability_name(dmesh_rawnan::peer_availability(&frame_value)), "service_id": hex_bytes(&service_id)}), message: None,
-                });
-            }
-        }
-    }
-}
-
 fn command_output_timeout(
     program: &str,
     args: &[&str],
@@ -11443,17 +10563,44 @@ fn build_radiotap_packet(frame: &[u8]) -> Vec<u8> {
     // Keep the explicit legacy rate used by the original working lmesh NAN
     // injector. Some monitor drivers accept the AF_PACKET write but do not
     // put a TX_FLAGS-only packet on the air.
+    build_radiotap_packet_at_rate(frame, None).expect("default radiotap rate is valid")
+}
+
+/// Return true for NAN beacons and NAN public action frames.  NAN uses the
+/// Wi-Fi Alliance OUI in address3 (the cluster BSSID); ordinary AP beacons and
+/// unrelated public actions must retain the caller/driver rate policy.
+fn is_nan_control_frame(frame: &[u8]) -> bool {
+    frame.len() >= 24
+        && frame_type(frame) == 0
+        && matches!(frame_subtype(frame), 8 | 13)
+        && frame[16..19] == [0x50, 0x6f, 0x9a]
+}
+
+fn build_radiotap_packet_at_rate(frame: &[u8], rate_mbps: Option<u8>) -> Result<Vec<u8>> {
+    let rate_mbps = rate_mbps.unwrap_or(1);
+    if !matches!(
+        rate_mbps,
+        1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54
+    ) {
+        bail!("unsupported radiotap legacy rate {rate_mbps} Mbps");
+    }
     let mut packet = Vec::with_capacity(12 + frame.len());
     packet.extend_from_slice(&[
-        0x00, 0x00, // radiotap version, pad
-        0x0c, 0x00, // radiotap length
-        0x04, 0x80, 0x00, 0x00, // present: RATE and TX_FLAGS
-        0x02, // RATE: 1 Mbps, in 500 kbps units
-        0x00, // pad TX_FLAGS to u16 alignment
-        0x08, 0x00, // TX_FLAGS: no ACK
+        0x00,
+        0x00, // radiotap version, pad
+        0x0c,
+        0x00, // radiotap length
+        0x04,
+        0x80,
+        0x00,
+        0x00,                        // present: RATE and TX_FLAGS
+        rate_mbps.saturating_mul(2), // RATE in 500 kbps units
+        0x00,                        // pad TX_FLAGS to u16 alignment
+        0x08,
+        0x00, // TX_FLAGS: no ACK
     ]);
     packet.extend_from_slice(frame);
-    packet
+    Ok(packet)
 }
 
 fn genl_payload(cmd: u8, version: u8) -> Vec<u8> {
@@ -11565,40 +10712,12 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
             }
             NL80211_STA_INFO_TX_BITRATE => {
                 if let Ok(rate_attributes) = parse_attrs(value) {
-                    if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
-                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32 && value.len() >= 4
-                    }) {
-                        out.insert(
-                            "tx_bitrate_kbit_s".to_string(),
-                            json!(u32::from_ne_bytes([rate[0], rate[1], rate[2], rate[3]]) * 100),
-                        );
-                    } else if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
-                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE && value.len() >= 2
-                    }) {
-                        out.insert(
-                            "tx_bitrate_kbit_s".to_string(),
-                            json!(u16::from_ne_bytes([rate[0], rate[1]]) as u32 * 100),
-                        );
-                    }
+                    insert_station_rate_info(&mut out, "tx", &rate_attributes);
                 }
             }
             NL80211_STA_INFO_RX_BITRATE => {
                 if let Ok(rate_attributes) = parse_attrs(value) {
-                    if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
-                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE32 && value.len() >= 4
-                    }) {
-                        out.insert(
-                            "rx_bitrate_kbit_s".to_string(),
-                            json!(u32::from_ne_bytes([rate[0], rate[1], rate[2], rate[3]]) * 100),
-                        );
-                    } else if let Some((_, rate)) = rate_attributes.iter().find(|(kind, value)| {
-                        *kind & NLA_TYPE_MASK == NL80211_RATE_INFO_BITRATE && value.len() >= 2
-                    }) {
-                        out.insert(
-                            "rx_bitrate_kbit_s".to_string(),
-                            json!(u16::from_ne_bytes([rate[0], rate[1]]) as u32 * 100),
-                        );
-                    }
+                    insert_station_rate_info(&mut out, "rx", &rate_attributes);
                 }
             }
             NL80211_STA_INFO_CONNECTED_TIME => {
@@ -11620,10 +10739,89 @@ fn parse_station_dump_message(response: &[u8]) -> Result<Value> {
             NL80211_STA_INFO_TX_BYTES64 => {
                 insert_u64(&mut out, "tx_bytes", value);
             }
+            // These driver-maintained aggregates explain why application
+            // goodput can be far below the last selected MCS.  They are
+            // intentionally reported only by the command-rate AP status
+            // endpoint, never from a packet hot path.
+            NL80211_STA_INFO_EXPECTED_THROUGHPUT => {
+                insert_u32(&mut out, "expected_throughput_kbit_s", value);
+            }
+            NL80211_STA_INFO_RX_DROP_MISC => {
+                insert_u64(&mut out, "rx_drop_misc", value);
+            }
+            NL80211_STA_INFO_RX_DURATION => {
+                insert_u64(&mut out, "rx_airtime_us", value);
+            }
+            NL80211_STA_INFO_ACK_SIGNAL => {
+                if let Some(signal) = value.first() {
+                    out.insert("ack_signal_dbm".to_string(), json!(*signal as i8));
+                }
+            }
+            NL80211_STA_INFO_ACK_SIGNAL_AVG => {
+                if let Some(signal) = value.first() {
+                    out.insert("ack_signal_avg_dbm".to_string(), json!(*signal as i8));
+                }
+            }
+            NL80211_STA_INFO_RX_MPDUS => {
+                insert_u32(&mut out, "rx_mpdus", value);
+            }
+            NL80211_STA_INFO_FCS_ERROR_COUNT => {
+                insert_u32(&mut out, "rx_fcs_errors", value);
+            }
+            NL80211_STA_INFO_TX_DURATION => {
+                insert_u64(&mut out, "tx_airtime_us", value);
+            }
             _ => {}
         }
     }
     Ok(Value::Object(out))
+}
+
+/// Preserve PHY metadata alongside the calculated rate.  A value such as
+/// 26 Mbps is ambiguous on its own: it can be legacy or HT MCS 3.  Exposing
+/// this in the stable AP status avoids using a legacy-rate assumption to tune
+/// the Recovery data path.
+fn insert_station_rate_info(
+    out: &mut serde_json::Map<String, Value>,
+    direction: &str,
+    attributes: &[(u16, &[u8])],
+) {
+    let attr = |kind| {
+        attributes
+            .iter()
+            .find(|(attribute_kind, _)| *attribute_kind & NLA_TYPE_MASK == kind)
+            .map(|(_, value)| *value)
+    };
+    let bitrate = attr(NL80211_RATE_INFO_BITRATE32)
+        .filter(|value| value.len() >= 4)
+        .map(|value| u32::from_ne_bytes([value[0], value[1], value[2], value[3]]) * 100)
+        .or_else(|| {
+            attr(NL80211_RATE_INFO_BITRATE)
+                .filter(|value| value.len() >= 2)
+                .map(|value| u16::from_ne_bytes([value[0], value[1]]) as u32 * 100)
+        });
+    if let Some(bitrate) = bitrate {
+        out.insert(format!("{direction}_bitrate_kbit_s"), json!(bitrate));
+    }
+    if let Some(mcs) = attr(NL80211_RATE_INFO_MCS).and_then(|value| value.first()) {
+        out.insert(format!("{direction}_phy"), json!("ht"));
+        out.insert(format!("{direction}_mcs"), json!(*mcs));
+        out.insert(
+            format!("{direction}_width_mhz"),
+            json!(if attr(NL80211_RATE_INFO_40_MHZ_WIDTH).is_some() { 40 } else { 20 }),
+        );
+        out.insert(
+            format!("{direction}_short_gi"),
+            json!(attr(NL80211_RATE_INFO_SHORT_GI).is_some()),
+        );
+    } else if let (Some(mcs), Some(nss)) = (
+        attr(NL80211_RATE_INFO_VHT_MCS).and_then(|value| value.first()),
+        attr(NL80211_RATE_INFO_VHT_NSS).and_then(|value| value.first()),
+    ) {
+        out.insert(format!("{direction}_phy"), json!("vht"));
+        out.insert(format!("{direction}_mcs"), json!(*mcs));
+        out.insert(format!("{direction}_nss"), json!(*nss));
+    }
 }
 
 fn insert_u32(out: &mut serde_json::Map<String, Value>, key: &str, value: &[u8]) {
@@ -11829,6 +11027,8 @@ fn ap_mgmt_receive_loop(
     ap_mac: [u8; 6],
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     rawnan_state: Arc<Mutex<NanState>>,
+    ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
+    channel: u8,
     stop: Arc<AtomicBool>,
 ) {
     let _ = socket.set_receive_timeout(Duration::from_millis(100));
@@ -11840,18 +11040,44 @@ fn ap_mgmt_receive_loop(
             Ok((frame, rx_signal_dbm)) => {
                 let mut value = parse_management_frame(&frame, iface, "linux_nl80211_ap_sme");
                 if frame_subtype(&frame) == 8
-                    && let Some(beacon) = handle_beacon_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
+                    && let Some(beacon) =
+                        handle_beacon_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
                     && let Some(object) = value.as_object_mut()
                 {
                     object.insert("beacon_sync".to_string(), beacon);
                 }
                 if frame_subtype(&frame) == 13
-                    && let Some(action) = handle_action_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
+                    && let Some(action) =
+                        handle_action_frame(&frame, iface, rx_signal_dbm, &rawnan_state)
                     && let Some(object) = value.as_object_mut()
                 {
                     object.insert("action_frame".to_string(), action);
                 }
-                if let Some(response) = handle_open_ap_sme_frame(ifindex, ap_mac, &frame)
+                if ap_sme_station_departed(frame_subtype(&frame))
+                    && let Some(sta_mac) = mac_at(&frame, IEEE80211_ADDR2)
+                    && let Some(object) = value.as_object_mut()
+                {
+                    // nl80211's AP SME does not remove a userspace-added
+                    // station entry when the STA sends disassoc/deauth.  A
+                    // retained entry made the next ESP association unreliable
+                    // until an operator manually removed it.  The operation
+                    // is idempotent, and association still replaces any
+                    // remaining entry as its separate recovery path.
+                    let removed = Nl80211Socket::open()
+                        .and_then(|socket| socket.remove_station(ifindex, sta_mac))
+                        .is_ok();
+                    object.insert("station_removed".to_string(), json!(removed));
+                }
+                if let Some(response) =
+                    handle_open_ap_sme_frame(
+                        &socket,
+                        iface,
+                        ifindex,
+                        ap_mac,
+                        &frame,
+                        &ap_no_ht_stations,
+                        channel,
+                    )
                     && let Some(object) = value.as_object_mut()
                 {
                     object.insert("sme_response".to_string(), response);
@@ -11894,16 +11120,16 @@ fn ap_mgmt_receive_loop(
                 );
                 if dmesh_rawnan::is_nan_beacon(&frame) {
                     if let Some(beacon_sync) = beacon_sync {
-                    push_radio_event(
-                        &history,
-                        RadioEvent {
-                            ts_millis: now_millis(),
-                            key: "wifi.nan.beacon".to_string(),
-                            source: iface.to_string(),
-                            value: beacon_sync,
-                            message: None,
-                        },
-                    );
+                        push_radio_event(
+                            &history,
+                            RadioEvent {
+                                ts_millis: now_millis(),
+                                key: "wifi.rawnan.beacon".to_string(),
+                                source: iface.to_string(),
+                                value: beacon_sync,
+                                message: None,
+                            },
+                        );
                     }
                 }
             }
@@ -11951,7 +11177,9 @@ fn handle_action_frame(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .observe(RawNanRxFrame {
             bytes: frame,
-            rssi_dbm: rx_signal_dbm.unwrap_or(0).clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+            rssi_dbm: rx_signal_dbm
+                .unwrap_or(0)
+                .clamp(i8::MIN as i32, i8::MAX as i32) as i8,
             timestamp_us: now_micros_u64(),
         });
     let source = mac_at(frame, IEEE80211_ADDR2).map(|mac| colon_mac(&mac));
@@ -11992,7 +11220,21 @@ fn handle_action_frame(
     Some(result)
 }
 
-fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Option<Value> {
+/// A user-space AP must retire its nl80211 station entry when a peer leaves.
+/// Auth/association are handled separately by `handle_open_ap_sme_frame`.
+fn ap_sme_station_departed(subtype: u8) -> bool {
+    matches!(subtype, 10 | 12)
+}
+
+fn handle_open_ap_sme_frame(
+    socket: &Nl80211Socket,
+    iface: &str,
+    ifindex: u32,
+    ap_mac: [u8; 6],
+    frame: &[u8],
+    ap_no_ht_stations: &Arc<Mutex<HashSet<[u8; 6]>>>,
+    channel: u8,
+) -> Option<Value> {
     if frame_type(frame) != 0 {
         return None;
     }
@@ -12004,9 +11246,10 @@ fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Opti
                 return None;
             }
             let response = build_open_auth_response(ap_mac, sta_mac);
-            let tx = send_open_ap_mgmt_response(ifindex, &response);
+            let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
             json!({
                 "kind": "auth_resp",
+                "association_attempt": true,
                 "destination": colon_mac(&sta_mac),
                 "frame_len": response.len(),
                 "tx": tx,
@@ -12014,15 +11257,24 @@ fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Opti
         }
         0 | 2 => {
             let aid = 1_u16;
-            let allow_ht = !ap_no_ht_stations().contains(&sta_mac);
+            let allow_ht = !ap_no_ht_stations.lock().unwrap_or_else(|p| p.into_inner()).contains(&sta_mac);
             let add_station = Nl80211Socket::open()
-                .and_then(|socket| socket.add_station_from_assoc(ifindex, sta_mac, frame, allow_ht))
+                .and_then(|socket| {
+                    // A station entry can survive an ESP reset or a prior
+                    // monitor-fallback association. Replace it before
+                    // applying the new association parameters; otherwise
+                    // mt76x2u accepts the response but sends reason-8
+                    // disassociation about a second later.
+                    let _ = socket.remove_station(ifindex, sta_mac);
+                    socket.add_station_from_assoc(ifindex, sta_mac, frame, allow_ht)
+                })
                 .map(|_| json!({ "ok": true }))
                 .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
-            let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht);
-            let tx = send_open_ap_mgmt_response(ifindex, &response);
+            let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht, channel);
+            let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
             json!({
                 "kind": "assoc_resp",
+                "association_attempt": true,
                 "destination": colon_mac(&sta_mac),
                 "aid": aid,
                 "ht": allow_ht,
@@ -12036,17 +11288,71 @@ fn handle_open_ap_sme_frame(ifindex: u32, ap_mac: [u8; 6], frame: &[u8]) -> Opti
     Some(response)
 }
 
-fn send_open_ap_mgmt_response(ifindex: u32, frame: &[u8]) -> Value {
-    Nl80211Socket::open()
-        .and_then(|socket| socket.send_mgmt_frame(ifindex, frame))
-        .map(|_| json!({ "ok": true, "backend": "linux_nl80211" }))
-        .unwrap_or_else(|error| {
-            json!({
-                "ok": false,
-                "backend": "linux_nl80211",
-                "error": format!("{error:#}"),
-            })
-        })
+fn send_open_ap_mgmt_response(
+    socket: &Nl80211Socket,
+    iface: &str,
+    ifindex: u32,
+    channel: u8,
+    frame: &[u8],
+) -> Value {
+    match socket.send_mgmt_frame(ifindex, frame, None) {
+        Ok(()) => json!({ "ok": true, "backend": "linux_nl80211" }),
+        Err(error) => {
+            // Some mac80211 drivers reject the minimal CMD_FRAME form while
+            // an AP SME is active, but accept the fully-qualified on-channel
+            // form used by the normal raw TX path. Try that before falling
+            // back to monitor injection (which may be looped back rather than
+            // emitted when the managed AP owns the parent interface).
+            let options = RawWifiTxOptions {
+                variant: "ap_sme".to_owned(),
+                include_freq: true,
+                duration_ms: Some(100),
+                offchannel_tx_ok: false,
+                dont_wait_for_ack: true,
+                tx_no_cck_rate: false,
+            };
+            // mt76x2u can reject NL80211_CMD_FRAME with ENOMEM while its
+            // management-TX context is busy.  The same physical radio can
+            // still inject a short on-channel control frame through a
+            // monitor VIF, which is also the NAN raw-frame path. Keep this a
+            // narrow fallback for AP SME responses rather than changing the
+            // normal NAN TX policy.
+            match send_monitor_frame(iface, channel, frame, false, None) {
+                Ok(monitor) => json!({
+                    "ok": true,
+                    "backend": "linux_monitor_ap_sme_fallback",
+                    "nl80211_error": format!("{error:#}"),
+                    "monitor": monitor,
+                }),
+                Err(monitor_error) => {
+                    if socket
+                        .send_frame(
+                            ifindex,
+                            channel_to_freq(channel),
+                            &options,
+                            frame,
+                            None,
+                        )
+                        .is_ok()
+                    {
+                        json!({
+                            "ok": true,
+                            "backend": "linux_nl80211_ap_sme_explicit_channel",
+                            "nl80211_error": format!("{error:#}"),
+                            "monitor_error": format!("{monitor_error:#}"),
+                        })
+                    } else {
+                        json!({
+                            "ok": false,
+                            "backend": "linux_nl80211",
+                            "error": format!("{error:#}"),
+                            "monitor_fallback_error": format!("{monitor_error:#}"),
+                        })
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn monitor_receive_loop(
@@ -12057,6 +11363,7 @@ fn monitor_receive_loop(
     rawnan_state: Arc<Mutex<NanState>>,
 ) {
     let receive_addresses = raw_wifi_receive_addresses(iface);
+    let mut followup_dedup = FollowupDedup::new(256);
     let mut buf = [0_u8; 4096];
     loop {
         match socket.recv(&mut buf) {
@@ -12065,17 +11372,13 @@ fn monitor_receive_loop(
                 let packet = &buf[..len];
                 if let Some(frame) = ieee80211_frame(packet) {
                     if frame_subtype(frame) == 8 && dmesh_rawnan::is_nan_beacon(frame) {
-                        if let Some(beacon) = handle_beacon_frame(
-                            frame,
-                            iface,
-                            None,
-                            &rawnan_state,
-                        ) {
+                        if let Some(beacon) = handle_beacon_frame(frame, iface, None, &rawnan_state)
+                        {
                             push_radio_event(
                                 &history,
                                 RadioEvent {
                                     ts_millis: now_millis(),
-                                    key: "wifi.nan.beacon".to_string(),
+                                    key: "wifi.rawnan.beacon".to_string(),
                                     source: monitor_iface.to_string(),
                                     value: beacon,
                                     message: None,
@@ -12095,16 +11398,23 @@ fn monitor_receive_loop(
                     // filter action is None. Preserve a semantic discovery
                     // event so host-only tests can attribute wlan1 replies.
                     if frame_subtype(frame) == 13
-                        && let Some(descriptor) = dmesh_rawnan::service_descriptor(
-                            frame,
-                            dmesh_rawnan::DMESH_SERVICE_ID,
-                        )
+                        && let Some(descriptor) =
+                            dmesh_rawnan::service_descriptor(frame, dmesh_rawnan::DMESH_SERVICE_ID)
                     {
+                        let followup = dmesh_rawnan::parse_dmesh_nan_followup(descriptor.payload);
+                        let duplicate = followup.as_ref().is_some_and(|item| {
+                            followup_dedup.is_duplicate(
+                                item.device_id,
+                                item.seq,
+                                item.msg_type,
+                                item.payload,
+                            )
+                        });
                         push_radio_event(
                             &history,
                             RadioEvent {
                                 ts_millis: now_millis(),
-                                key: "wifi.nan.usd.discovery".to_string(),
+                                key: "wifi.rawnan.discovery".to_string(),
                                 source: monitor_iface.to_string(),
                                 value: json!({
                                     "ok": true,
@@ -12116,6 +11426,15 @@ fn monitor_receive_loop(
                                     "frame_len": frame.len(),
                                     "frame_hex": hex_bytes(&frame[..frame.len().min(256)]),
                                     "control": descriptor.control,
+                                    "duplicate": duplicate,
+                                    "followup": followup.map(|item| json!({
+                                        "msg_type": item.msg_type,
+                                        "seq": item.seq,
+                                        "device_id": colon_mac(&item.device_id),
+                                        "target_id": colon_mac(&item.target_id),
+                                        "payload_len": item.payload.len(),
+                                        "payload_hex": hex_bytes(item.payload),
+                                    })),
                                     "peer_availability": peer_availability_name(dmesh_rawnan::peer_availability(frame)),
                                     "service_id": hex_bytes(&dmesh_rawnan::DMESH_SERVICE_ID),
                                 }),
@@ -12224,10 +11543,12 @@ fn handle_beacon_frame(
         return None;
     }
     let rx = RawNanRxFrame {
-            bytes: frame,
-            rssi_dbm: rx_signal_dbm.unwrap_or(0).clamp(i8::MIN as i32, i8::MAX as i32) as i8,
-            timestamp_us: now_micros_u64(),
-        };
+        bytes: frame,
+        rssi_dbm: rx_signal_dbm
+            .unwrap_or(0)
+            .clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+        timestamp_us: now_micros_u64(),
+    };
     let action = if dmesh_rawnan::is_nan_beacon(frame) {
         rawnan_state
             .lock()
@@ -12273,6 +11594,22 @@ fn is_nan_data_frame(frame: &[u8]) -> bool {
     true
 }
 
+fn parse_ethernet_trace(packet: &[u8], iface: &str) -> Option<Value> {
+    if packet.len() < ETHERNET_HEADER_LEN {
+        return None;
+    }
+    Some(json!({
+        "ok": true,
+        "backend": "linux_af_packet_data",
+        "iface": iface,
+        "source": colon_mac(&packet[6..12].try_into().ok()?),
+        "destination": colon_mac(&packet[..6].try_into().ok()?),
+        "ethertype": format!("0x{:04x}", u16::from_be_bytes([packet[12], packet[13]])),
+        "frame_len": packet.len(),
+        "payload_prefix": hex_bytes(&packet[ETHERNET_HEADER_LEN..packet.len().min(ETHERNET_HEADER_LEN + 128)]),
+    }))
+}
+
 fn data_receive_loop(
     socket: DataSocket,
     iface: &str,
@@ -12303,6 +11640,21 @@ fn data_receive_loop(
                             source: iface.to_string(),
                             value,
                             message: Some(message),
+                        },
+                    );
+                } else if let Some(value) = parse_ethernet_trace(packet, iface) {
+                    // Keep ordinary ARP/IP traffic visible during STA/AP
+                    // diagnostics without pretending it is a DMesh payload.
+                    // The listener is explicitly requested and bounded, so
+                    // this does not add a permanent packet-history flood.
+                    push_radio_event(
+                        &history,
+                        RadioEvent {
+                            ts_millis: now_millis(),
+                            key: "wifi.data.trace".to_string(),
+                            source: iface.to_string(),
+                            value,
+                            message: None,
                         },
                     );
                 }
@@ -12422,10 +11774,10 @@ fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Va
     } else if body.starts_with(&IEEE80211_LLC_SNAP_DMESH) {
         body = &body[IEEE80211_LLC_SNAP_LEN..];
         "llc_snap"
-    } else {
-        if body.len() < IEEE80211_LLC_SNAP_LEN {
-            return None;
-        }
+    } else if body.len() >= IEEE80211_LLC_SNAP_LEN && body[..3] == [0xaa, 0xaa, 0x03] {
+        // Experimental NAN data uses an LLC/SNAP prefix. Do not treat every
+        // unknown action body as LLC: the ESP-NOW-compatible vendor action
+        // header starts with 7f and must continue to the marker parser below.
         let llc = &body[..IEEE80211_LLC_SNAP_LEN];
         body = &body[IEEE80211_LLC_SNAP_LEN..];
         let source = mac_at(frame, IEEE80211_ADDR2)?;
@@ -12447,6 +11799,8 @@ fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Va
             "payload": hex_bytes(body),
             "payload_text": String::from_utf8_lossy(body).trim(),
         }));
+    } else {
+        "vendor_action"
     };
     let header = parse_dmesh_vendor_action_header(body)?;
     let payload = &body[header.header_len..];
@@ -12871,6 +12225,22 @@ fn build_open_beacon_head_with_capability(
 }
 
 fn build_open_probe_resp(mac: [u8; 6], ssid: &str, channel: u8) -> Result<Vec<u8>> {
+    build_open_probe_resp_with_ies(
+        mac,
+        ssid,
+        channel,
+        0x0421,
+        &esp_open_ap_probe_ies(ssid, channel)?,
+    )
+}
+
+fn build_open_probe_resp_with_ies(
+    mac: [u8; 6],
+    ssid: &str,
+    _channel: u8,
+    capability: u16,
+    ies: &[u8],
+) -> Result<Vec<u8>> {
     if ssid.len() > 32 {
         bail!("SSID is too long for 802.11 probe response: {}", ssid.len());
     }
@@ -12882,8 +12252,8 @@ fn build_open_probe_resp(mac: [u8; 6], ssid: &str, channel: u8) -> Result<Vec<u8
     frame.extend_from_slice(&[0x00, 0x00]);
     frame.extend_from_slice(&[0; 8]);
     frame.extend_from_slice(&100_u16.to_le_bytes());
-    frame.extend_from_slice(&0x0421_u16.to_le_bytes());
-    frame.extend_from_slice(&esp_open_ap_probe_ies(ssid, channel)?);
+    frame.extend_from_slice(&capability.to_le_bytes());
+    frame.extend_from_slice(ies);
     Ok(frame)
 }
 
@@ -12911,23 +12281,29 @@ fn ap_no_ht_stations() -> HashSet<[u8; 6]> {
         .collect()
 }
 
-fn build_open_assoc_response(ap: [u8; 6], sta: [u8; 6], aid: u16, allow_ht: bool) -> Vec<u8> {
+fn build_open_assoc_response(
+    ap: [u8; 6],
+    sta: [u8; 6],
+    aid: u16,
+    allow_ht: bool,
+    channel: u8,
+) -> Vec<u8> {
     let mut frame = mgmt_frame_header(0x01, sta, ap, ap);
     frame.extend_from_slice(&0x0401_u16.to_le_bytes());
     frame.extend_from_slice(&0_u16.to_le_bytes());
     frame.extend_from_slice(&(0xc000 | (aid & 0x3fff)).to_le_bytes());
     frame.push(0x01);
-    frame.push(4);
-    frame.extend_from_slice(&[0x82, 0x84, 0x8b, 0x96]);
+    frame.push(OPEN_AP_OFDM_BASIC_RATES.len() as u8);
+    frame.extend_from_slice(&OPEN_AP_OFDM_BASIC_RATES);
     frame.push(0x32);
-    frame.push(4);
-    frame.extend_from_slice(&[0x0c, 0x12, 0x18, 0x24]);
+    frame.push(OPEN_AP_OFDM_EXTENDED_RATES.len() as u8);
+    frame.extend_from_slice(&OPEN_AP_OFDM_EXTENDED_RATES);
     // Match the HT20 capability advertised in the beacon. Without an HT
     // Capabilities element in the association response, a station can
     // associate successfully but remain on legacy rates.
     if allow_ht {
         frame.extend_from_slice(&hostapd_open_ap_ht_capability());
-        frame.extend_from_slice(&hostapd_open_ap_ht_operation(DEFAULT_RAW_WIFI_CHANNEL));
+        frame.extend_from_slice(&hostapd_open_ap_ht_operation(channel));
     }
     frame.extend_from_slice(&hostapd_open_ap_extra_ies());
     // The beacon/probe templates advertise WMM, so the manually generated
@@ -12947,10 +12323,7 @@ fn hostapd_open_ap_ht_operation(channel: u8) -> [u8; 24] {
 }
 
 fn hostapd_open_ap_ht_capability() -> [u8; 28] {
-    [
-        0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]
+    HOSTAPD_HT20_CAPABILITY
 }
 
 fn mgmt_frame_header(subtype: u8, addr1: [u8; 6], addr2: [u8; 6], addr3: [u8; 6]) -> Vec<u8> {
@@ -12974,22 +12347,22 @@ fn esp_open_ap_beacon_head_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
     ies.push(ssid.len() as u8);
     ies.extend_from_slice(ssid.as_bytes());
     ies.push(0x01);
-    ies.push(8);
-    ies.extend_from_slice(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]);
+    ies.push(OPEN_AP_OFDM_BASIC_RATES.len() as u8);
+    ies.extend_from_slice(&OPEN_AP_OFDM_BASIC_RATES);
     ies.push(0x03);
     ies.push(1);
     ies.push(channel);
     Ok(ies)
 }
 
-fn esp_open_ap_beacon_tail() -> Vec<u8> {
+fn esp_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     let mut ies = Vec::with_capacity(92);
     ies.push(0x2a);
     ies.push(1);
     ies.push(0x00);
     ies.push(0x32);
-    ies.push(4);
-    ies.extend_from_slice(&[0x6c, 0x12, 0x24, 0x48]);
+    ies.push(OPEN_AP_OFDM_EXTENDED_RATES.len() as u8);
+    ies.extend_from_slice(&OPEN_AP_OFDM_EXTENDED_RATES);
     ies.push(0x2d);
     ies.push(26);
     ies.extend_from_slice(&[
@@ -12999,7 +12372,7 @@ fn esp_open_ap_beacon_tail() -> Vec<u8> {
     ies.push(0x3d);
     ies.push(22);
     ies.extend_from_slice(&[
-        DEFAULT_RAW_WIFI_CHANNEL,
+        channel,
         0x00,
         0x00,
         0x00,
@@ -13040,17 +12413,12 @@ fn hostapd_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     ies.push(1);
     ies.push(0x04);
     ies.push(0x32);
-    ies.push(4);
-    ies.extend_from_slice(&[0x30, 0x48, 0x60, 0x6c]);
+    ies.push(OPEN_AP_OFDM_EXTENDED_RATES.len() as u8);
+    ies.extend_from_slice(&OPEN_AP_OFDM_EXTENDED_RATES);
     ies.push(0x3b);
     ies.push(2);
     ies.extend_from_slice(&[0x51, 0x00]);
-    ies.push(0x2d);
-    ies.push(26);
-    ies.extend_from_slice(&[
-        0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
+    ies.extend_from_slice(&HOSTAPD_HT20_CAPABILITY);
     ies.push(0x3d);
     ies.push(22);
     ies.extend_from_slice(&[
@@ -13067,6 +12435,12 @@ fn hostapd_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     ies
 }
 
+fn hostapd_open_ap_probe_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
+    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
+    ies.extend_from_slice(&hostapd_open_ap_beacon_tail(channel));
+    Ok(ies)
+}
+
 fn hostapd_open_ap_extra_ies() -> [u8; 10] {
     [0x7f, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40]
 }
@@ -13080,12 +12454,11 @@ fn wmm_parameter_ie() -> [u8; 26] {
 
 fn esp_open_ap_probe_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
     let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
-    ies.extend_from_slice(&esp_open_ap_beacon_tail());
+    ies.extend_from_slice(&esp_open_ap_beacon_tail(channel));
     Ok(ies)
 }
 
-fn open_ap_template_lengths(ssid: &str) -> Result<(usize, usize)> {
-    let channel = DEFAULT_RAW_WIFI_CHANNEL;
+fn open_ap_template_lengths(ssid: &str, channel: u8) -> Result<(usize, usize)> {
     let mac = [0; 6];
     Ok((
         build_open_beacon_head(mac, ssid, channel)?.len(),
@@ -13118,16 +12491,7 @@ fn build_dmesh_vendor_action_frame_with_bssid(
     bssid: [u8; 6],
     payload: &[u8],
 ) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN + body_len);
-    frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&bssid);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&dmesh_vendor_action_header(destination));
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
+    dmesh_rawnan::build_espnow_action_frame(destination, source, bssid, payload)
 }
 
 fn build_dmesh_multicast_data_frame(
@@ -13193,16 +12557,7 @@ fn build_dmesh_nan_data_frame(
     source: [u8; 6],
     payload: &[u8],
 ) -> Vec<u8> {
-    let ip_payload = build_nan_ipv6_udp(source, destination, payload);
-    let mut frame = Vec::with_capacity(IEEE80211_BODY + IEEE80211_LLC_SNAP_LEN + ip_payload.len());
-    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&bssid);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(&IEEE80211_LLC_SNAP_IPV6);
-    frame.extend_from_slice(&ip_payload);
-    frame
+    dmesh_rawnan::build_nan_ipv6_udp_frame(bssid, destination, source, payload)
 }
 
 fn build_dmesh_nan_raw_data_frame(
@@ -13212,16 +12567,7 @@ fn build_dmesh_nan_raw_data_frame(
     llc: &[u8; IEEE80211_LLC_SNAP_LEN],
     payload: &[u8],
 ) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(IEEE80211_BODY + llc.len() + body_len);
-    frame.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
-    frame.extend_from_slice(&destination);
-    frame.extend_from_slice(&source);
-    frame.extend_from_slice(&bssid);
-    frame.extend_from_slice(&[0x00, 0x00]);
-    frame.extend_from_slice(llc);
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
+    dmesh_rawnan::build_nan_raw_data_frame(bssid, destination, source, *llc, payload)
 }
 
 fn parse_experimental_llc(value: Option<&str>) -> Option<[u8; IEEE80211_LLC_SNAP_LEN]> {
@@ -13238,71 +12584,6 @@ fn parse_experimental_llc(value: Option<&str>) -> Option<[u8; IEEE80211_LLC_SNAP
     Some(out)
 }
 
-fn nan_link_local(mac: [u8; 6]) -> [u8; 16] {
-    [
-        0xfe,
-        0x80,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        mac[0] ^ 0x02,
-        mac[1],
-        mac[2],
-        0xff,
-        0xfe,
-        mac[3],
-        mac[4],
-        mac[5],
-    ]
-}
-
-fn checksum_add(sum: &mut u32, bytes: &[u8]) {
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        *sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < bytes.len() {
-        *sum += (bytes[i] as u32) << 8;
-    }
-}
-
-fn checksum_finalize(mut sum: u32) -> u16 {
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn build_nan_ipv6_udp(source: [u8; 6], destination: [u8; 6], payload: &[u8]) -> Vec<u8> {
-    let body_len = payload.len().min(1200);
-    let udp_len = 8 + body_len;
-    let mut out = vec![0u8; 40 + udp_len];
-    out[0] = 0x60;
-    out[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    out[6] = 17; // UDP
-    out[7] = 1; // hop limit
-    let src = nan_link_local(source);
-    let dst = nan_link_local(destination);
-    out[8..24].copy_from_slice(&src);
-    out[24..40].copy_from_slice(&dst);
-    out[40..42].copy_from_slice(&NAN_UDP_SOURCE_PORT.to_be_bytes());
-    out[42..44].copy_from_slice(&NAN_UDP_DEST_PORT.to_be_bytes());
-    out[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    out[48..48 + body_len].copy_from_slice(&payload[..body_len]);
-    let mut sum = 0u32;
-    checksum_add(&mut sum, &src);
-    checksum_add(&mut sum, &dst);
-    checksum_add(&mut sum, &(udp_len as u32).to_be_bytes());
-    checksum_add(&mut sum, &[0, 0, 0, 17]);
-    checksum_add(&mut sum, &out[40..48 + body_len]);
-    out[46..48].copy_from_slice(&checksum_finalize(sum).to_be_bytes());
-    out
-}
-
 fn build_dmesh_ethernet_frame(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Vec<u8> {
     let body_len = payload.len().min(1400);
     let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + DMESH_VENDOR_ACTION_LEN + body_len);
@@ -13315,12 +12596,8 @@ fn build_dmesh_ethernet_frame(destination: [u8; 6], source: [u8; 6], payload: &[
 }
 
 fn dmesh_vendor_action_header(destination: [u8; 6]) -> [u8; DMESH_VENDOR_ACTION_LEN] {
-    let mut header = [0_u8; DMESH_VENDOR_ACTION_LEN];
-    header[..DMESH_ESPNOW_PREFIX.len()].copy_from_slice(&DMESH_ESPNOW_PREFIX);
     let _ = destination;
-    header[4..8].copy_from_slice(&DMESH_MESH_DST4_BROADCAST);
-    header[8] = DMESH_ESPNOW_TYPE;
-    header
+    dmesh_rawnan::espnow_action_header()
 }
 
 fn mesh_message_from_raw_wifi(value: &Value, iface: &str) -> MeshMessage {
@@ -13347,14 +12624,17 @@ fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEven
     let event_type = event.key.clone();
     let source = event.source.clone();
     let data = event.value.to_string();
-    let mut history = history
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    history.push_back(event);
-    while history.len() > MAX_HISTORY {
-        history.pop_front();
+    let monitor_event = event.source.ends_with("mon")
+        && (event.key.starts_with("wifi.rawnan") || event.key.starts_with("wifi.raw."));
+    if !monitor_event {
+        let mut history = history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        history.push_back(event);
+        while history.len() > MAX_HISTORY {
+            history.pop_front();
+        }
     }
-    drop(history);
     tracing::info!(
         target: "dmesh.event",
         event_type = %event_type,
@@ -13533,22 +12813,6 @@ fn json_scalar_string(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-fn adv_data(service_data: &[u8]) -> Result<Vec<u8>> {
-    let field_len = 1 + service_data.len();
-    if field_len > 0x1f {
-        bail!("BLE advertisement service data too large: {}", field_len);
-    }
-    let mut adv = Vec::with_capacity(32);
-    adv.push(field_len as u8);
-    adv.push(0x16);
-    adv.extend_from_slice(service_data);
-    let mut out = Vec::with_capacity(32);
-    out.push(adv.len() as u8);
-    out.extend_from_slice(&adv);
-    out.resize(32, 0);
-    Ok(out)
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NlMsgHdr {
@@ -13650,11 +12914,16 @@ fn set_ipv4_address(
         )
     };
     if fd < 0 {
-        return Err(format!("failed to open rtnetlink socket: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "failed to open rtnetlink socket: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     let result = unsafe { send_setaddr(fd, ifindex, address, prefix) };
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
     result.map(|()| CommandOutput {
         status: Some(0),
         stdout: format!("set {iface} IPv4 address {address}/{prefix} via rtnetlink"),
@@ -13691,27 +12960,56 @@ unsafe fn send_setaddr(
     append_rt_attr(&mut request, IFA_ADDRESS, &bytes);
     append_rt_attr(&mut request, IFA_LOCAL, &bytes);
     let ip = u32::from_be_bytes(bytes);
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) };
-    append_rt_attr(&mut request, IFA_BROADCAST, &((ip & mask) | !mask).to_be_bytes());
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    append_rt_attr(
+        &mut request,
+        IFA_BROADCAST,
+        &((ip & mask) | !mask).to_be_bytes(),
+    );
     let message_len = request.len() as u32;
     let header_ptr = request.as_mut_ptr() as *mut NlMsgHdr;
-    unsafe { (*header_ptr).nlmsg_len = message_len; }
+    unsafe {
+        (*header_ptr).nlmsg_len = message_len;
+    }
 
     let written = unsafe {
-        libc::send(fd, request.as_ptr() as *const libc::c_void, request.len(), 0)
+        libc::send(
+            fd,
+            request.as_ptr() as *const libc::c_void,
+            request.len(),
+            0,
+        )
     };
     if written < 0 {
-        return Err(format!("failed to send RTM_NEWADDR: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "failed to send RTM_NEWADDR: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     if written as usize != request.len() {
-        return Err(format!("short RTM_NEWADDR write: wrote {written}, expected {}", request.len()));
+        return Err(format!(
+            "short RTM_NEWADDR write: wrote {written}, expected {}",
+            request.len()
+        ));
     }
     let mut response = [0u8; 4096];
     let read = unsafe {
-        libc::recv(fd, response.as_mut_ptr() as *mut libc::c_void, response.len(), 0)
+        libc::recv(
+            fd,
+            response.as_mut_ptr() as *mut libc::c_void,
+            response.len(),
+            0,
+        )
     };
     if read < 0 {
-        return Err(format!("failed to read RTM_NEWADDR ACK: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "failed to read RTM_NEWADDR ACK: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     parse_netlink_ack(&response[..read as usize])
 }
@@ -13719,7 +13017,10 @@ unsafe fn send_setaddr(
 fn append_rt_attr(out: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
     let raw_len = std::mem::size_of::<RtAttrHdr>() + payload.len();
     let aligned_len = (raw_len + 3) & !3;
-    let header = RtAttrHdr { rta_len: raw_len as u16, rta_type: attr_type };
+    let header = RtAttrHdr {
+        rta_len: raw_len as u16,
+        rta_type: attr_type,
+    };
     append_struct(out, &header);
     out.extend_from_slice(payload);
     out.resize(out.len() + aligned_len - raw_len, 0);
@@ -13815,207 +13116,6 @@ fn parse_netlink_ack(response: &[u8]) -> std::result::Result<(), String> {
     }
 }
 
-fn wpa_command(
-    iface: &str,
-    ctrl_dir: &str,
-    command: &str,
-) -> std::result::Result<CommandOutput, String> {
-    wpa_ctrl_command(iface, ctrl_dir, command)
-}
-
-fn wpa_raw_command(
-    iface: &str,
-    ctrl_dir: &str,
-    command: &str,
-) -> std::result::Result<CommandOutput, String> {
-    wpa_ctrl_command(iface, ctrl_dir, command)
-}
-
-fn wpa_ctrl_command(
-    iface: &str,
-    ctrl_dir: &str,
-    command: &str,
-) -> std::result::Result<CommandOutput, String> {
-    let server_path = format!("{ctrl_dir}/{iface}");
-    wpa_ctrl_command_path(&server_path, command)
-}
-
-fn wpa_global_command(
-    global_dir: &str,
-    command: &str,
-) -> std::result::Result<CommandOutput, String> {
-    let server_path = format!("{global_dir}/global");
-    wpa_ctrl_command_path(&server_path, command)
-}
-
-fn wpa_ctrl_command_path(
-    server_path: &str,
-    command: &str,
-) -> std::result::Result<CommandOutput, String> {
-    let client_path = format!(
-        "/tmp/lmesh-wpa-{}-{}-{}.sock",
-        unsafe { libc::getuid() },
-        std::process::id(),
-        now_millis()
-    );
-    let socket = UnixDatagram::bind(&client_path)
-        .map_err(|error| format!("failed to bind WPA client socket {client_path}: {error}"))?;
-    let _unlink_client = UnlinkOnDrop(client_path.clone());
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| format!("failed to set WPA read timeout: {error}"))?;
-    socket
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| format!("failed to set WPA write timeout: {error}"))?;
-    socket
-        .connect(&server_path)
-        .map_err(|error| format!("failed to connect WPA control socket {server_path}: {error}"))?;
-    socket
-        .send(command.as_bytes())
-        .map_err(|error| format!("failed to send WPA command {command:?}: {error}"))?;
-    let mut response = vec![0_u8; 8192];
-    let len = socket
-        .recv(&mut response)
-        .map_err(|error| format!("failed to receive WPA response for {command:?}: {error}"))?;
-    response.truncate(len);
-    let stdout = String::from_utf8_lossy(&response).trim().to_string();
-    let ok = !(stdout.starts_with("FAIL") || stdout.starts_with("UNKNOWN COMMAND"));
-    Ok(CommandOutput {
-        status: Some(if ok { 0 } else { 1 }),
-        stdout,
-        stderr: String::new(),
-    })
-}
-
-fn wpa_ctrl_events(
-    server_path: &str,
-    wait_ms: u64,
-    max_events: usize,
-) -> std::result::Result<Vec<Value>, String> {
-    let client_path = format!(
-        "/tmp/lmesh-wpa-events-{}-{}-{}.sock",
-        unsafe { libc::getuid() },
-        std::process::id(),
-        now_millis()
-    );
-    let socket = UnixDatagram::bind(&client_path)
-        .map_err(|error| format!("failed to bind WPA event socket {client_path}: {error}"))?;
-    let _unlink_client = UnlinkOnDrop(client_path.clone());
-    socket
-        .set_read_timeout(Some(Duration::from_millis(wait_ms.max(1))))
-        .map_err(|error| format!("failed to set WPA event read timeout: {error}"))?;
-    socket
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| format!("failed to set WPA event write timeout: {error}"))?;
-    socket
-        .connect(server_path)
-        .map_err(|error| format!("failed to connect WPA control socket {server_path}: {error}"))?;
-    socket
-        .send(b"ATTACH")
-        .map_err(|error| format!("failed to ATTACH WPA event socket: {error}"))?;
-    let mut buf = vec![0_u8; 8192];
-    let _ = socket.recv(&mut buf);
-    let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.max(1));
-    let mut events = Vec::new();
-    while events.len() < max_events && std::time::Instant::now() < deadline {
-        match socket.recv(&mut buf) {
-            Ok(len) => {
-                let line = String::from_utf8_lossy(&buf[..len]).trim().to_string();
-                if let Some(event) = parse_wpa_event_line(&line) {
-                    events.push(event);
-                }
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                break;
-            }
-            Err(error) => return Err(format!("failed to read WPA event: {error}")),
-        }
-    }
-    let _ = socket.send(b"DETACH");
-    Ok(events)
-}
-
-fn parse_wpa_event_line(line: &str) -> Option<Value> {
-    let line = line.strip_prefix("<3>").unwrap_or(line);
-    let line = line.strip_prefix("<2>").unwrap_or(line);
-    let line = line.strip_prefix("<1>").unwrap_or(line);
-    if !line.starts_with("NAN-") {
-        return None;
-    }
-    let mut parts = line.split_whitespace();
-    let event = parts.next()?.trim_end_matches(':').to_string();
-    let mut fields = serde_json::Map::new();
-    for part in parts {
-        if let Some((key, value)) = part.split_once('=') {
-            fields.insert(key.to_string(), text_json_value(value));
-            if key == "ssi"
-                && let Ok(bytes) = parse_hex_bytes(value)
-            {
-                fields.insert("ssi_len".to_string(), json!(bytes.len()));
-                if let Ok(parsed) = radio_protocol::parse_nan_service_info(&bytes) {
-                    fields.insert("ssi_dmesh".to_string(), parsed);
-                } else if let Ok(parsed) = radio_protocol::parse_nan_followup(&bytes) {
-                    fields.insert("ssi_dmesh".to_string(), parsed);
-                }
-            }
-        }
-    }
-    Some(json!({
-        "event": event,
-        "raw": line,
-        "fields": fields,
-    }))
-}
-
-fn nan_event_message(event: &Value) -> Option<MeshMessage> {
-    let name = event.get("event").and_then(Value::as_str)?;
-    let fields = event.get("fields").and_then(Value::as_object);
-    let mut message = MeshMessage::new(mesh::message::KIND_NAN_FOLLOWUP, MeshMessageCodec::WpaText)
-        .field(FIELD_MEDIUM, "nan")
-        .field(FIELD_STATUS, name);
-    if let Some(fields) = fields {
-        if let Some(address) = fields.get("address").and_then(Value::as_str) {
-            message = message.field(mesh::message::FIELD_PEER, address);
-        }
-        if let Some(ssi) = fields.get("ssi_dmesh") {
-            if let Some(device_id) = ssi.get("device_id").and_then(Value::as_str) {
-                message = message.field(FIELD_NODE, device_id);
-            }
-            if let Some(payload) = ssi.get("payload_text").and_then(Value::as_str) {
-                message = message.field(FIELD_PAYLOAD, payload);
-            }
-        }
-    }
-    Some(message)
-}
-
-fn text_json_value(value: &str) -> Value {
-    if value.eq_ignore_ascii_case("true") {
-        return Value::Bool(true);
-    }
-    if value.eq_ignore_ascii_case("false") {
-        return Value::Bool(false);
-    }
-    if let Ok(number) = value.parse::<i64>() {
-        return json!(number);
-    }
-    if let Ok(number) = value.parse::<f64>() {
-        return json!(number);
-    }
-    Value::String(value.to_string())
-}
-
-struct UnlinkOnDrop(String);
-
-impl Drop for UnlinkOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 #[derive(Debug)]
 struct CommandOutput {
     status: Option<i32>,
@@ -14048,29 +13148,8 @@ fn wifi_iface(value: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_WIFI_IFACE.to_string())
 }
 
-fn wpa_ctrl_dir(value: Option<String>) -> String {
-    value
-        .or_else(|| std::env::var("LMESH_WPA_CTRL_DIR").ok())
-        .unwrap_or_else(|| DEFAULT_WPA_CTRL_DIR.to_string())
-}
-
 fn raw_wifi_channel(value: Option<u8>) -> u8 {
     value.unwrap_or(DEFAULT_RAW_WIFI_CHANNEL).clamp(1, 13)
-}
-
-fn prepare_raw_wifi_channel(iface: &str, ctrl_dir: &str, channel: u8, listen_sec: u64) -> Value {
-    let set_channel = wpa_raw_command(
-        iface,
-        ctrl_dir,
-        &format!("P2P_SET listen_channel {channel}"),
-    );
-    let disallow_freq = wpa_raw_command(iface, ctrl_dir, "P2P_SET disallow_freq ");
-    let listen = wpa_raw_command(iface, ctrl_dir, &format!("P2P_LISTEN {listen_sec}"));
-    json!({
-        "set_channel": command_result_json(set_channel),
-        "disallow_freq": command_result_json(disallow_freq),
-        "listen": command_result_json(listen),
-    })
 }
 
 fn process_caps() -> Value {
@@ -14092,48 +13171,6 @@ fn process_caps() -> Value {
         })
         .collect::<serde_json::Map<_, _>>();
     Value::Object(caps)
-}
-
-fn hci_probe(dev_id: u16) -> Value {
-    match HciSocket::open(dev_id) {
-        Ok(_) => json!({ "ok": true, "dev_id": dev_id, "backend": "linux_hci_raw" }),
-        Err(error) => json!({ "ok": false, "dev_id": dev_id, "error": error.to_string() }),
-    }
-}
-
-fn result_string_json(output: std::result::Result<String, String>) -> Value {
-    match output {
-        Ok(value) => json!({ "ok": true, "value": value }),
-        Err(error) => json!({ "ok": false, "error": error }),
-    }
-}
-
-fn hci_dev_up(dev_id: u16) -> Result<String> {
-    let fd = unsafe {
-        libc::socket(
-            AF_BLUETOOTH,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            BTPROTO_HCI,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to open HCI control socket");
-    }
-    let rc = unsafe { libc::ioctl(fd, HCIDEVUP as libc::Ioctl, dev_id as libc::c_int) };
-    let result = if rc < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EALREADY) {
-            Ok("already_up".to_string())
-        } else {
-            Err(error).with_context(|| format!("failed to bring hci{dev_id} up"))
-        }
-    } else {
-        Ok("brought_up".to_string())
-    };
-    unsafe {
-        libc::close(fd);
-    }
-    result
 }
 
 fn local_device_id() -> Result<[u8; 6]> {
@@ -14165,36 +13202,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn peer_availability_name(availability: dmesh_rawnan::PeerAvailability) -> &'static str {
-    match availability {
-        dmesh_rawnan::PeerAvailability::Infra => "infra",
-        dmesh_rawnan::PeerAvailability::Dw0Dw8 => "dw0_dw8",
-    }
-}
-
-fn parse_hex_bytes(value: &str) -> Result<Vec<u8>> {
-    let value = value.trim();
-    if value.len() % 2 != 0 {
-        bail!("hex byte string must have even length");
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|idx| {
-            u8::from_str_radix(&value[idx..idx + 2], 16)
-                .with_context(|| format!("invalid hex byte at offset {idx}"))
-        })
-        .collect()
-}
-
-fn parse_size_list(value: Option<&str>) -> Option<Vec<usize>> {
-    let value = value?;
-    let sizes = value
-        .split(',')
-        .filter_map(|part| part.trim().parse::<usize>().ok())
-        .collect::<Vec<_>>();
-    (!sizes.is_empty()).then_some(sizes)
-}
-
 fn colon_mac(bytes: &[u8; 6]) -> String {
     bytes
         .iter()
@@ -14203,13 +13210,11 @@ fn colon_mac(bytes: &[u8; 6]) -> String {
         .join(":")
 }
 
-fn mac_string_reversed(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .rev()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
+fn peer_availability_name(availability: dmesh_rawnan::PeerAvailability) -> &'static str {
+    match availability {
+        dmesh_rawnan::PeerAvailability::Infra => "infra",
+        dmesh_rawnan::PeerAvailability::Dw0Dw8 => "dw0_dw8",
+    }
 }
 
 fn now_millis() -> u128 {
@@ -14234,6 +13239,107 @@ fn now_micros_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ap_sme_retires_station_on_disassociation_or_deauthentication() {
+        assert!(ap_sme_station_departed(10));
+        assert!(ap_sme_station_departed(12));
+        assert!(!ap_sme_station_departed(0));
+        assert!(!ap_sme_station_departed(11));
+    }
+
+    #[test]
+    fn open_ap_templates_advertise_ofdm_rates_without_cck() {
+        let ies = esp_open_ap_probe_ies("Direct-test", 11).unwrap();
+        assert_eq!(
+            management_ie_bytes(&ies, 1),
+            Some(OPEN_AP_OFDM_BASIC_RATES.as_slice())
+        );
+        assert_eq!(
+            management_ie_bytes(&ies, 50),
+            Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice())
+        );
+
+        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, 11);
+        let assoc_ies = &assoc[IEEE80211_BODY + 6..];
+        assert_eq!(
+            management_ie_bytes(assoc_ies, 1),
+            Some(OPEN_AP_OFDM_BASIC_RATES.as_slice())
+        );
+        assert_eq!(
+            management_ie_bytes(assoc_ies, 50),
+            Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice())
+        );
+        assert_eq!(management_ie_bytes(&ies, 3), Some(&[11][..]));
+        assert_eq!(management_ie_bytes(assoc_ies, 61).map(|ie| ie[0]), Some(11));
+        assert_eq!(OPEN_AP_OFDM_BASIC_RATES, [0x8c]);
+        assert_eq!(OPEN_AP_OFDM_EXTENDED_RATES, [0x30, 0x48, 0x60, 0x6c]);
+        assert_eq!(open_ap_basic_rates(), &[0x8c]);
+    }
+
+    #[test]
+    fn hostapd_ht20_probe_response_matches_beacon_and_association_capabilities() {
+        let channel = 6;
+        let probe = build_open_probe_resp_with_ies(
+            [1; 6],
+            "Direct-test",
+            channel,
+            0x0401,
+            &hostapd_open_ap_probe_ies("Direct-test", channel).unwrap(),
+        )
+        .unwrap();
+        let probe_ies = &probe[IEEE80211_BODY + 12..];
+        let beacon_ies = hostapd_open_ap_probe_ies("Direct-test", channel).unwrap();
+        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, channel);
+        let assoc_ies = &assoc[IEEE80211_BODY + 6..];
+
+        assert_eq!(read_u16_at(&probe, IEEE80211_BODY + 10), Some(0x0401));
+        assert_eq!(probe_ies, beacon_ies);
+        assert_eq!(management_ie_bytes(probe_ies, 1), Some(&[0x8c][..]));
+        assert_eq!(management_ie_bytes(probe_ies, 50), Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice()));
+        assert_eq!(management_ie_bytes(probe_ies, 45), management_ie_bytes(assoc_ies, 45));
+        assert_eq!(management_ie_bytes(probe_ies, 61), management_ie_bytes(assoc_ies, 61));
+        assert!(management_ie_bytes(probe_ies, 221).is_some());
+    }
+
+    #[test]
+    fn station_rate_status_distinguishes_ht_from_legacy() {
+        let mut status = serde_json::Map::new();
+        insert_station_rate_info(
+            &mut status,
+            "tx",
+            &[
+                (NL80211_RATE_INFO_BITRATE, &[0x04, 0x01]),
+                (NL80211_RATE_INFO_MCS, &[3]),
+                (NL80211_RATE_INFO_SHORT_GI, &[]),
+            ],
+        );
+        assert_eq!(status["tx_bitrate_kbit_s"], json!(26_000));
+        assert_eq!(status["tx_phy"], json!("ht"));
+        assert_eq!(status["tx_mcs"], json!(3));
+        assert_eq!(status["tx_width_mhz"], json!(20));
+        assert_eq!(status["tx_short_gi"], json!(true));
+    }
+
+    #[test]
+    fn ht_rate_profile_is_exact_mcs_without_legacy_fallback() {
+        assert!(tx_rate_profile_band(None, None, false).is_none());
+        let band = tx_rate_profile_band(None, Some(3), true).unwrap();
+        let attrs = parse_attrs(&band).unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0], (NL80211_TXRATE_HT, &[3][..]));
+
+        let high_fallback = tx_rate_profile_band(Some(24), Some(3), true).unwrap();
+        let attrs = parse_attrs(&high_fallback).unwrap();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0], (NL80211_TXRATE_LEGACY, &[48][..]));
+        assert_eq!(attrs[1], (NL80211_TXRATE_HT, &[3][..]));
+
+        let ofdm_only = tx_rate_profile_band(None, None, true).unwrap();
+        let attrs = parse_attrs(&ofdm_only).unwrap();
+        assert_eq!(attrs[0].0, NL80211_TXRATE_LEGACY);
+        assert_eq!(attrs[0].1, &[12, 18, 24, 36, 48, 72, 96, 108]);
+    }
 
     #[test]
     fn wifi_only_backend_does_not_enable_uart_ownership() {
@@ -14266,6 +13372,10 @@ mod tests {
         assert!(is_unsolicited_console_record(
             "status",
             "event type=boot.state rebooted=true\n"
+        ));
+        assert!(is_unsolicited_console_record(
+            "nan transport=request peer=aa cid=1 service=echo",
+            "event type=wifi.raw_frame source=dmesh_nan\n"
         ));
         assert!(!is_unsolicited_console_record(
             "mode status=true",
@@ -14370,19 +13480,60 @@ mod tests {
         )
         .unwrap();
         let packet = wire;
-        assert_eq!(&packet[..6], &[0xa2, 0x00, 0x18, 68, 0x06, 0xa4]);
+        assert_eq!(&packet[..6], &[0xa2, 0x00, 0x18, 68, 0x06, 0xa6]);
         assert!(packet.windows(6).any(|window| window == b"server"));
         assert!(packet.windows(2).any(|window| window == [0x6e, b'1']));
+        assert!(!packet.windows(7).any(|window| window == b"dry_run"));
     }
 
     #[test]
-    fn recovery_sta_dry_run_is_a_typed_boolean_field() {
+    fn recovery_sta_benchmark_is_a_typed_boolean_field() {
         let wire = encode_recovery_sta_packet(
-            "STA 10.78.0.1:3336 10.78.84.60 Direct-FCE48415-Dmesh-local dryrun",
+            "STA 10.78.0.1:3336 10.78.84.60 Direct-FCE48415-Dmesh-local benchmark",
         )
         .unwrap();
-        let packet = wire;
-        assert!(packet.windows(8).any(|window| window == b"dry_run\xF5"));
+        assert!(wire.windows(10).any(|window| window == b"benchmark\xF5"));
+    }
+
+    #[tokio::test]
+    async fn raw_udp_handlers_are_binary_and_host_executable() {
+        let server = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let client = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client.send_to(&[1], server.local_addr().unwrap()).await.unwrap();
+        let mut request = [0u8; 8];
+        let (length, peer) = server.recv_from(&mut request).await.unwrap();
+        raw_udp_handle(&server, peer, &request[..length]).await;
+        let mut reply = [0u8; RAW_UDP_FLOOD_PAYLOAD + 5];
+        let (length, _) = client.recv_from(&mut reply).await.unwrap();
+        assert_eq!(&reply[..length], &[0x81, 1]);
+
+        client.send_to(&[0], server.local_addr().unwrap()).await.unwrap();
+        let (length, peer) = server.recv_from(&mut request).await.unwrap();
+        raw_udp_handle(&server, peer, &request[..length]).await;
+        let (length, _) = client.recv_from(&mut reply).await.unwrap();
+        assert_eq!(&reply[..length], &[0xff]);
+
+        client.send_to(&[2, 0x02, 0x00], server.local_addr().unwrap()).await.unwrap();
+        let (length, peer) = server.recv_from(&mut request).await.unwrap();
+        raw_udp_handle_with_size(&server, peer, &request[..length], 1300).await;
+        let mut data_packets = 0;
+        let mut bytes = 0usize;
+        let mut expected_id = 0u32;
+        loop {
+            let (length, _) = client.recv_from(&mut reply).await.unwrap();
+            match reply[0] {
+                0x82 => {
+                    assert_eq!(u32::from_be_bytes(reply[1..5].try_into().unwrap()), expected_id);
+                    expected_id = expected_id.wrapping_add(1);
+                    data_packets += 1;
+                    bytes += length - 5;
+                }
+                0x83 => break,
+                value => panic!("unexpected raw opcode {value}"),
+            }
+        }
+        assert_eq!(data_packets, 3);
+        assert_eq!(bytes, 1300);
     }
 
     #[test]
@@ -14841,27 +13992,6 @@ mod tests {
     }
 
     #[test]
-    fn host_nan_response_parser_keeps_dmesh_device_id() {
-        let events = json!({"events": [{
-            "event": "NAN-RECEIVE",
-            "fields": {
-                "address": "84:0d:8e:07:41:70",
-                "ssi_dmesh": {
-                    "protocol": "dmesh_nan_followup",
-                    "device_id": "840d8e074170",
-                    "target_id": "001122334455",
-                    "msg_type": "response",
-                    "payload_text": "ok"
-                }
-            }
-        }]});
-        let responses = host_nan_responses(&events);
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["device_id"], "840d8e074170");
-        assert_eq!(responses[0]["peer"], "84:0d:8e:07:41:70");
-    }
-
-    #[test]
     fn response_history_keys_include_timestamp_and_filter_target() {
         let history = json!({"messages": [{"console":
             "nan response_history count=2 entries=local_us:10:source:d8:a0:1d:4c:5e:1d:payload_hex:a20018210464706f6e67,local_us:11:source:44:1b:f6:fc:54:3d:payload_hex:a20018210464706f6e67\n"
@@ -15109,6 +14239,37 @@ mod tests {
     }
 
     #[test]
+    fn nan_control_frames_are_identified_for_six_mbps_policy() {
+        let action = build_dmesh_vendor_action_frame_with_bssid(
+            [0xff; 6],
+            [2, 0, 0, 0xaa, 0xbb, 0xcc],
+            [0x50, 0x6f, 0x9a, 1, 2, 3],
+            b"probe",
+        );
+        assert!(is_nan_control_frame(&action));
+
+        let ordinary =
+            build_dmesh_vendor_action_frame([0xff; 6], [2, 0, 0, 0xaa, 0xbb, 0xcc], b"probe");
+        assert!(!is_nan_control_frame(&ordinary));
+    }
+
+    #[test]
+    fn nan_radiotap_rate_is_six_mbps() {
+        let mut beacon = vec![0x80, 0x00, 0, 0];
+        beacon.extend_from_slice(
+            &[
+                [0xff; 6],
+                [2, 0, 0, 0xaa, 0xbb, 0xcc],
+                [0x50, 0x6f, 0x9a, 1, 2, 3],
+            ]
+            .concat(),
+        );
+        beacon.extend_from_slice(&[0, 0]);
+        let packet = build_radiotap_packet_at_rate(&beacon, Some(6)).unwrap();
+        assert_eq!(packet[8], 12); // 6 Mbps in 500-kbps radiotap units.
+    }
+
+    #[test]
     fn raw_wifi_multicast_data_frame_has_dmesh_body() {
         let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
         let frame = build_dmesh_multicast_data_frame(RAW_WIFI_MULTICAST, src, b"stats");
@@ -15146,7 +14307,10 @@ mod tests {
 
     #[test]
     fn experimental_llc_parser_requires_eight_bytes() {
-        assert_eq!(parse_experimental_llc(Some("hex:aAaA03d04d455348")), Some(RAWNAN_LLC_DEFAULT));
+        assert_eq!(
+            parse_experimental_llc(Some("hex:aAaA03d04d455348")),
+            Some(RAWNAN_LLC_DEFAULT)
+        );
         assert!(parse_experimental_llc(Some("hex:1234")).is_none());
     }
 
@@ -15265,14 +14429,5 @@ BSS 44:94:fc:e4:84:15(on wlan1)
             RAW_WIFI_MULTICAST
         );
         assert_eq!(raw_wifi_destination(None, "standard"), RAW_WIFI_BROADCAST);
-    }
-
-    #[test]
-    fn native_nan_service_id_is_six_byte_sha256_prefix() {
-        let first = nan_service_id("dmesh");
-        assert_eq!(first.len(), 6);
-        assert_eq!(first, nan_service_id("dmesh"));
-        assert_eq!(first, nan_service_id("DMESH"));
-        assert_ne!(first, nan_service_id("other"));
     }
 }

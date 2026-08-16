@@ -3,7 +3,7 @@
   "namespace": "dmesh.firmware",
   "components": [
     {"id": 1, "name": "main", "api": "fw/esp32/rust/docs/README.md"},
-    {"id": 2, "name": "recovery", "api": "fw/recovery/API.md"},
+    {"id": 2, "name": "recovery", "api": "fw/recovery-rust/README.md"},
     {"id": 3, "name": "stage2", "api": "fw/boot/API.md"},
     {"id": 4, "name": "mod_lora", "api": "fw/mod_lora/API.md"}
   ],

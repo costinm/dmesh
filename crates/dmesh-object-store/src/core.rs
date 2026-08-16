@@ -437,7 +437,13 @@ impl ImageManifest {
                     if major != 4 || length > 4096 {
                         return Err(ImageError::InvalidManifest);
                     }
-                    let mut hashes = Vec::with_capacity(length as usize);
+                    // Embedded Recovery must reject a manifest it cannot
+                    // retain rather than invoking Rust's allocation-failure
+                    // abort after a valid transport delivery.
+                    let mut hashes = Vec::new();
+                    hashes
+                        .try_reserve_exact(length as usize)
+                        .map_err(|_| ImageError::InvalidManifest)?;
                     for _ in 0..length {
                         let bytes = decoder.bytes_ref().ok_or(ImageError::Truncated)?;
                         if bytes.len() != 32 {

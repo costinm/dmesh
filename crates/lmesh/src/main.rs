@@ -1,8 +1,6 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dmesh_object_store::{ObjectServer, ServerConfig};
 use lmesh::{LmeshService, LocalDiscovery};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, sleep};
@@ -29,17 +27,16 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
 
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
-    if let Some(config) = object_server_config() {
-        tokio::spawn(async move {
-            if let Err(error) = ObjectServer::new(config).run().await {
-                error!(%error, "object_store_server_failed");
-            }
-        });
+    if service.start_object_store() {
+        debug!("object_store_started_by_wifi_service");
     }
     let rawnan_started = if rawnan_autostart_enabled() {
         let result = service.start_default_rawnan();
         debug!(?result, "rawnan_default_started");
-        result.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        result
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     } else {
         false
     };
@@ -83,33 +80,6 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn object_server_config() -> Option<ServerConfig> {
-    // NAN object transfer is the active path. The legacy IP listener is
-    // retained only for explicit compatibility/dry-run comparisons.
-    let enabled = std::env::var("LMESH_OBJECT_SERVER_TCP")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-        .unwrap_or(false);
-    let root = std::env::var_os("LMESH_OBJECT_STORE_ROOT");
-    if !enabled && root.is_none() {
-        return None;
-    }
-    Some(ServerConfig {
-        bind: std::env::var("LMESH_OBJECT_SERVER_BIND").unwrap_or_else(|_| "0.0.0.0".to_string()),
-        port: std::env::var("LMESH_OBJECT_SERVER_PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3337),
-        artifact_root: root.map(PathBuf::from).unwrap_or_else(|| {
-            std::env::var_os("DMESH_REPO")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/ws/dmesh"))
-                .join("target/flash")
-        }),
-        archive_root: std::env::var_os("DMESH_FLASH_ARCHIVE_DIR").map(PathBuf::from),
-        ..ServerConfig::default()
-    })
 }
 
 fn announce_interval() -> Duration {
@@ -222,14 +192,24 @@ async fn handle_connection(
             writer.write_all(ack.to_string().as_bytes()).await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
-            let _ = mesh::local_trace::stream_logs_filtered(
-                &trace_buffer,
-                &mesh::jsonl::ProtocolFormat::FlatJson { id: None },
-                &mut writer,
-                "lmesh",
-                &config,
-            )
-            .await;
+            for entry in trace_buffer.get_all() {
+                if config.matches(&entry) {
+                    writer
+                        .write_all(serde_json::to_string(&entry).unwrap_or_default().as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                }
+            }
+            let mut events = trace_buffer.subscribe();
+            while let Ok(entry) = events.recv().await {
+                if config.matches(&entry) {
+                    writer
+                        .write_all(serde_json::to_string(&entry).unwrap_or_default().as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                }
+            }
             break;
         }
 
@@ -282,3 +262,4 @@ mod tests {
         );
     }
 }
+use std::path::PathBuf;

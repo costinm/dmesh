@@ -5,8 +5,9 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+dmesh-object-store = { path = "../dmesh-object-store" }
 dmesh-rawnan = { path = "../rawnan" }
-dmesh-transport = { path = "../dmesh-transport" }
+dmesh-transport = { path = "../dmesh-transport", features = ["udp"] }
 libc = "0.2"
 minicbor = "2.2"
 sha2 = "0.11"
@@ -20,6 +21,9 @@ tracing = "0.1"
 
 [lib]
 name = "lmesh_wifi"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "lmesh-wifi"

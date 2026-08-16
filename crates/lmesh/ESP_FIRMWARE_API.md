@@ -20,7 +20,7 @@ reserved for `esptool` while flashing the bootloader, second-stage, or recovery
 image; older DTR wake notes below are historical only.
 
 Boot, Recovery, and module-owned structs are documented with their owning
-component in `fw/boot/API.md`, `fw/recovery/API.md`, `fw/mod_lora/API.md`, and
+component in `fw/boot/API.md`, `fw/recovery-rust/README.md`, `fw/mod_lora/API.md`, and
 `crates/rawnan`. The central registry in
 `resources/firmware-schema.json` owns globally allocated IDs and component
 names, preventing collisions without duplicating component ABI details here.
@@ -884,10 +884,9 @@ tokens in each command payload, and validate `raw_cmd_rx`, `raw_resp_tx`, and
 For fleet discovery, send a broadcast command such as
 `dmesh.ping type=status to=ffffffff from=<host-last4>`. Each awake firmware node
 should respond directly to the sender with its compact status/pong. Host
-`lmesh` currently exposes `ping`, `send`, `wifi.nan.default`,
-`wifi.nan.status`, `wifi.nan.events`, `wifi.nan.transmit`, and
-`wifi.nan.ping`; the host queue that holds follow-up traffic for sleepy ESPs
-for the next 8 second wake cycle is a host-side TODO, not firmware behavior yet.
+`lmesh` exposes raw-NAN monitor/status and bounded raw-frame commands; the host
+queue that holds follow-up traffic for sleepy ESPs for the next 8 second wake
+cycle is a host-side TODO, not firmware behavior yet.
 
 Firmware send-test helper:
 

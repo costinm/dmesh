@@ -61,10 +61,8 @@ Default:
 by Android and firmware-adjacent tests. `lmesh::radio_protocol` is a
 compatibility re-export. Keep hardware access outside the protocol module:
 Android Java owns Android BLE/WiFi Aware permissions and callbacks, while
-`lmesh-wifi` owns the stable `wlan0` open AP and raw-NAN monitor. The full
-`lmesh` service owns the experimental `wlan1` interface and starts the same
-shared raw-NAN monitor there. WPA-supplicant NAN is retained only as a
-compatibility test surface and is disabled from normal startup.
+`lmesh-wifi` owns the Wi-Fi bearer and raw-NAN monitor. The full `lmesh`
+service uses the shared raw-NAN monitor through that bearer.
 
 Local adapters should use message/pubsub style boundaries with text command
 metadata, raw byte payloads, and optional FDs. CBOR is a good future fit for

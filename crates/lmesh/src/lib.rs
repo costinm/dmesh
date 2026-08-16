@@ -29,7 +29,8 @@ use tracing::{debug, error, info, instrument, warn};
 
 // The Wi-Fi crate owns the radio implementation. Re-export the wire protocol
 // here so existing Android/JNI callers keep the established lmesh path.
-pub use dmesh_rawnan::protocol as radio_protocol;
+pub use lmesh_wifi::radio_protocol;
+mod ble;
 
 const MULTICAST_PORT: u16 = 5227;
 const MULTICAST_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
@@ -657,6 +658,10 @@ impl From<Node> for NodeInfo {
 }
 
 /// JSON-lines request methods for lmesh.
+fn default_rate_profile() -> String {
+    "auto".to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum Request {
@@ -963,13 +968,21 @@ pub enum Request {
         #[serde(default)]
         iface: Option<String>,
     },
+    /// Set or restore the fixed Linux 2.4 GHz rate profile for experiments.
+    #[serde(rename = "wifi.rate.profile")]
+    WifiRateProfile {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default = "default_rate_profile")]
+        profile: String,
+        #[serde(default)]
+        disable_80211b: bool,
+    },
     /// Listen for ESP32-compatible raw DMesh Wi-Fi action frames.
     #[serde(rename = "wifi.raw.listen")]
     WifiRawListen {
         #[serde(default)]
         iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
         #[serde(default)]
         channel: Option<u8>,
         #[serde(default)]
@@ -982,8 +995,6 @@ pub enum Request {
     WifiRawSend {
         #[serde(default)]
         iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
         #[serde(default)]
         channel: Option<u8>,
         #[serde(default)]
@@ -1004,6 +1015,9 @@ pub enum Request {
         llc: Option<String>,
         #[serde(default)]
         payload: String,
+        /// Optional per-frame legacy 2.4 GHz TX rate in Mbps (6..54).
+        #[serde(default)]
+        tx_rate_mbps: Option<u8>,
         /// Optional complete frame. With this set, tx_variant selects
         /// `monitor`/`monitor_active` (802.11) or `af_packet` (Ethernet).
         #[serde(default)]
@@ -1012,7 +1026,7 @@ pub enum Request {
     /// Send a burst of QUIC-shaped DMTB stream frames through one persistent
     /// monitor interface. This is a host-to-device NAN action-frame benchmark;
     /// it deliberately does not add retries or acknowledgements.
-    #[serde(rename = "wifi.raw.bench_send")]
+    #[serde(rename = "wifi.raw.bench_send", alias = "transport.bench.start")]
     WifiRawBenchSend {
         #[serde(default)]
         iface: Option<String>,
@@ -1036,8 +1050,6 @@ pub enum Request {
     WifiRawPing {
         #[serde(default)]
         iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
         #[serde(default)]
         channel: Option<u8>,
         #[serde(default)]
@@ -1064,7 +1076,7 @@ pub enum Request {
         #[serde(default)]
         wait_ms: Option<u64>,
     },
-    /// Start the shared raw-NAN monitor without using WPA control.
+    /// Start the shared raw-NAN monitor.
     #[serde(rename = "wifi.rawnan.listen")]
     WifiRawNanListen {
         #[serde(default)]
@@ -1204,164 +1216,6 @@ pub enum Request {
         #[serde(default)]
         payload: Option<String>,
     },
-    /// Probe/attach NAN through wpa_supplicant control.
-    #[serde(rename = "wifi.nan.start")]
-    WifiNanStart {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-    },
-    /// Reproduce wpa_supplicant CONFIG_NAN_USD over direct nl80211.
-    #[serde(rename = "wifi.nan.usd.start")]
-    WifiNanUsdStart {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        service_name: Option<String>,
-        #[serde(default)]
-        subscribe: Option<bool>,
-        #[serde(default)]
-        infra: Option<bool>,
-    },
-    /// Return NAN status, capabilities, and recent control events.
-    #[serde(rename = "wifi.nan.status")]
-    WifiNanStatus {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        events_ms: Option<u64>,
-    },
-    /// Apply the default DMesh NAN configuration and start publish/subscribe.
-    #[serde(rename = "wifi.nan.default")]
-    WifiNanDefault {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        service_name: Option<String>,
-        #[serde(default)]
-        ttl: Option<u32>,
-    },
-    /// Stop NAN publish/subscribe sessions through wpa_supplicant control.
-    #[serde(rename = "wifi.nan.stop")]
-    WifiNanStop {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-    },
-    /// Start NAN publish through wpa_supplicant control with optional custom SSI.
-    #[serde(rename = "wifi.nan.publish")]
-    WifiNanPublish {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        service_name: Option<String>,
-        #[serde(default)]
-        ssi_hex: Option<String>,
-        #[serde(default)]
-        ttl: Option<u32>,
-        #[serde(default)]
-        freq: Option<u32>,
-        #[serde(default)]
-        srv_proto_type: Option<u8>,
-    },
-    /// Start NAN subscribe through wpa_supplicant control with optional custom SSI.
-    #[serde(rename = "wifi.nan.subscribe")]
-    WifiNanSubscribe {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        service_name: Option<String>,
-        #[serde(default)]
-        ssi_hex: Option<String>,
-        #[serde(default)]
-        ttl: Option<u32>,
-        #[serde(default)]
-        freq: Option<u32>,
-        #[serde(default)]
-        active: Option<bool>,
-        #[serde(default)]
-        srv_proto_type: Option<u8>,
-    },
-    /// Send one NAN follow-up through wpa_supplicant control.
-    #[serde(rename = "wifi.nan.transmit")]
-    WifiNanTransmit {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        handle: u32,
-        address: String,
-        #[serde(default)]
-        req_instance_id: Option<u32>,
-        #[serde(default)]
-        ssi_hex: Option<String>,
-        #[serde(default)]
-        payload: Option<String>,
-        #[serde(default)]
-        cookie: Option<u32>,
-    },
-    /// Attach to the WPA control socket and collect NAN events.
-    #[serde(rename = "wifi.nan.events")]
-    WifiNanEvents {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        max_events: Option<usize>,
-    },
-    /// Probe NAN service-info and follow-up payload sizes through wpa_supplicant.
-    #[serde(rename = "wifi.nan.size_probe")]
-    WifiNanSizeProbe {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        sizes: Option<String>,
-        #[serde(default)]
-        mode: Option<String>,
-    },
-    /// Start NAN publish through wpa_supplicant control.
-    #[serde(rename = "wifi.nan.adv")]
-    WifiNanAdv {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-    },
-    /// Start NAN subscribe through wpa_supplicant control.
-    #[serde(rename = "wifi.nan.sub")]
-    WifiNanSub {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-    },
-    /// Send a NAN follow-up ping through wpa_supplicant control.
-    #[serde(rename = "wifi.nan.ping")]
-    WifiNanPing {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        ctrl_dir: Option<String>,
-        #[serde(default)]
-        peer: Option<String>,
-        #[serde(default)]
-        payload: Option<String>,
-    },
 }
 
 /// Reusable lmesh command service.
@@ -1379,6 +1233,12 @@ fn uart_dispatch_response(value: serde_json::Value) -> mesh::protocol::Response 
 
 pub struct LmeshService {
     discovery: Arc<LocalDiscovery>,
+    ble: ble::BleService,
+    /// Embedded canary Wi-Fi instance.  It is constructed through the same
+    /// reusable library object as the standalone lmesh-wifi launcher; this
+    /// process owns the interfaces named by its own LMESH_INTERFACES (normally
+    /// wlan1), while lmesh-wifi remains an independent wlan0 instance.
+    wifi_service: lmesh_wifi::WifiService,
     radio: lmesh_wifi::RadioService,
     uart: lmesh_uart::UartService,
     wifi: lmesh_wifi::WifiNetd,
@@ -1387,62 +1247,41 @@ pub struct LmeshService {
 impl LmeshService {
     /// Create a service around an initialized discovery instance.
     pub fn new(discovery: Arc<LocalDiscovery>) -> Self {
+        let wifi_service = lmesh_wifi::WifiService::from_environment();
+        let radio = wifi_service.radio().clone();
+        let wifi = wifi_service.netd().clone();
+        for result in radio.apply_startup_rate_profile(wifi.owned_interfaces().names()) {
+            tracing::info!(
+                ok = result
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                iface = result
+                    .get("iface")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                profile = result
+                    .get("profile")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                error = result
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                "wifi_startup_rate_profile"
+            );
+        }
         Self {
             discovery,
+            ble: ble::BleService,
+            wifi_service,
             // UART ownership is isolated in lmesh-uart. Keep the full lmesh
             // service's UART API available for compatibility, but do not
             // open serial devices or start configured forwards here.
-            radio: lmesh_wifi::RadioService::from_environment_without_uart(),
+            radio,
             uart: lmesh_uart::UartService::from_environment_without_uart(),
-            wifi: lmesh_wifi::WifiNetd::from_environment(),
+            wifi,
         }
-    }
-
-    /// Start the default host NAN control-plane setup.
-    pub fn start_default_nan(&self) -> serde_json::Value {
-        let Some(iface) = lmesh_wifi::default_interface() else {
-            return serde_json::json!({
-                "success": false,
-                "error": "LMESH_INTERFACES must name an owned Wi-Fi interface"
-            });
-        };
-        if let Err(error) = self.wifi.authorize(lmesh_wifi::Operation::Nan, &iface) {
-            return serde_json::json!({"success": false, "error": error.to_string()});
-        }
-        self.radio.nan_default(Some(iface), None, None, None)
-    }
-
-    /// Start the shared raw-NAN monitor on the interface owned by the full
-    /// experimental service. This is the default host NAN path; the older
-    /// WPA control methods remain available only for compatibility tests.
-    pub fn start_default_rawnan(&self) -> serde_json::Value {
-        let Some(iface) = lmesh_wifi::default_interface() else {
-            return serde_json::json!({
-                "ok": false,
-                "backend": "dmesh-rawnan",
-                "error": "LMESH_INTERFACES must name an owned Wi-Fi interface"
-            });
-        };
-        if let Err(error) = self.wifi.authorize(lmesh_wifi::Operation::Nan, &iface) {
-            return serde_json::json!({
-                "ok": false,
-                "backend": "dmesh-rawnan",
-                "iface": iface,
-                "error": error.to_string()
-            });
-        }
-        self.radio.wifi_raw_listen(
-            Some(iface),
-            None,
-            Some(6),
-            Some(86_400),
-            Some("monitor".to_owned()),
-        )
-    }
-
-    /// Report whether the configured WPA control socket is available for NAN startup.
-    pub fn default_nan_control_socket_exists(&self) -> bool {
-        self.radio.default_nan_control_socket_exists()
     }
 
     /// Start the default open channel-6 access point on the supplied interface.
@@ -1451,6 +1290,18 @@ impl LmeshService {
             return serde_json::json!({"success": false, "error": error.to_string()});
         }
         self.radio.wifi_ap_start_open(Some(iface), None)
+    }
+
+    /// Start the experimental raw-NAN monitor on this service's owned
+    /// interface (normally wlan1).
+    pub fn start_default_rawnan(&self) -> serde_json::Value {
+        self.wifi_service.start_canary_rawnan(None)
+    }
+
+    /// Start device-flashing object-store services through the shared Wi-Fi
+    /// library. The stable lmesh-wifi process uses the same path.
+    pub fn start_object_store(&self) -> bool {
+        self.wifi_service.start_object_store()
     }
 
     fn owned_wifi_iface(
@@ -1465,12 +1316,6 @@ impl LmeshService {
             .authorize(operation, &iface)
             .map_err(|error| error.to_string())?;
         Ok(iface)
-    }
-
-    /// Collect and record NAN events from the default host control socket.
-    pub fn collect_default_nan_events(&self, wait_ms: u64, max_events: usize) -> serde_json::Value {
-        self.radio
-            .nan_events(None, None, Some(wait_ms), Some(max_events))
     }
 
     /// Return the local public key used for announcements.
@@ -1756,14 +1601,18 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error.to_string()),
                 }
             }
-            Request::WifiOcbStart { iface, freq, bandwidth } => {
-                match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
-                    Ok(iface) => mesh::protocol::Response::ok_with_data(
-                        self.radio.wifi_ocb_start(Some(iface), freq, bandwidth),
-                    ),
-                    Err(error) => mesh::protocol::Response::err(error.to_string()),
-                }
-            }
+            Request::WifiOcbStart {
+                iface,
+                freq,
+                bandwidth,
+            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => mesh::protocol::Response::ok_with_data(self.radio.wifi_ocb_start(
+                    Some(iface),
+                    freq,
+                    bandwidth,
+                )),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::WifiRawStop { iface } => {
                 match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
                     Ok(iface) => mesh::protocol::Response::ok_with_data(
@@ -1772,19 +1621,29 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error.to_string()),
                 }
             }
+            Request::WifiRateProfile {
+                iface,
+                profile,
+                disable_80211b,
+            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => mesh::protocol::Response::ok_with_data(self.radio.wifi_rate_profile(
+                    Some(iface),
+                    profile,
+                    disable_80211b,
+                )),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::WifiRawListen {
                 iface,
-                ctrl_dir,
                 channel,
                 listen_sec,
                 rx_variant,
             } => mesh::protocol::Response::ok_with_data(
                 self.radio
-                    .wifi_raw_listen(iface, ctrl_dir, channel, listen_sec, rx_variant),
+                    .wifi_raw_listen(iface, channel, listen_sec, rx_variant),
             ),
             Request::WifiRawSend {
                 iface,
-                ctrl_dir,
                 channel,
                 listen_sec,
                 destination,
@@ -1795,13 +1654,24 @@ impl LmeshService {
                 llc,
                 payload,
                 frame_hex,
+                tx_rate_mbps,
             } => {
                 let result = if let Some(frame_hex) = frame_hex {
-                    self.radio.wifi_raw_send_frame(iface, channel, tx_variant, frame_hex)
+                    self.radio
+                        .wifi_raw_send_frame(iface, channel, tx_variant, frame_hex)
                 } else {
                     self.radio.wifi_raw_send(
-                        iface, ctrl_dir, channel, listen_sec, destination, source,
-                        tx_variant, tx_duration_ms, bssid, llc, payload,
+                        iface,
+                        channel,
+                        listen_sec,
+                        destination,
+                        source,
+                        tx_variant,
+                        tx_duration_ms,
+                        bssid,
+                        llc,
+                        payload,
+                        tx_rate_mbps,
                     )
                 };
                 mesh::protocol::Response::ok_with_data(result)
@@ -1829,14 +1699,13 @@ impl LmeshService {
             )),
             Request::WifiRawPing {
                 iface,
-                ctrl_dir,
                 channel,
                 listen_sec,
                 wait_ms,
                 nonce,
             } => mesh::protocol::Response::ok_with_data(
                 self.radio
-                    .wifi_raw_ping(iface, ctrl_dir, channel, listen_sec, wait_ms, nonce),
+                    .wifi_raw_ping(iface, channel, listen_sec, wait_ms, nonce),
             ),
             Request::WifiRawNanPing {
                 iface,
@@ -1859,7 +1728,6 @@ impl LmeshService {
                 listen_sec,
             } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_listen(
                 iface,
-                None,
                 channel,
                 listen_sec,
                 Some("monitor".to_owned()),
@@ -1959,7 +1827,7 @@ impl LmeshService {
                 dev_id,
                 reason,
                 scan_ms,
-            } => match self.radio.ble_scan(dev_id, reason, scan_ms) {
+            } => match self.ble.scan(dev_id, reason, scan_ms) {
                 Ok(data) => mesh::protocol::Response::ok_with_data(data),
                 Err(e) => mesh::protocol::Response::err(e.to_string()),
             },
@@ -1967,123 +1835,7 @@ impl LmeshService {
                 dev_id,
                 on,
                 payload,
-            } => match self.radio.ble_adv(dev_id, on, payload) {
-                Ok(data) => mesh::protocol::Response::ok_with_data(data),
-                Err(e) => mesh::protocol::Response::err(e.to_string()),
-            },
-            Request::WifiNanStart { iface, ctrl_dir } => {
-                mesh::protocol::Response::ok_with_data(self.radio.nan_start(iface, ctrl_dir))
-            }
-            Request::WifiNanUsdStart { iface, service_name, subscribe, infra } => {
-                mesh::protocol::Response::ok_with_data(self.radio.nan_usd_start(
-                    iface, service_name, subscribe.unwrap_or(false), infra.unwrap_or(false),
-                ))
-            }
-            Request::WifiNanStatus {
-                iface,
-                ctrl_dir,
-                events_ms,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio.nan_status(iface, ctrl_dir, events_ms),
-            ),
-            Request::WifiNanDefault {
-                iface,
-                ctrl_dir,
-                service_name,
-                ttl,
-            } => mesh::protocol::Response::ok_with_data(self.radio.nan_default(
-                iface,
-                ctrl_dir,
-                service_name,
-                ttl,
-            )),
-            Request::WifiNanStop { iface, ctrl_dir } => {
-                mesh::protocol::Response::ok_with_data(self.radio.nan_stop(iface, ctrl_dir))
-            }
-            Request::WifiNanPublish {
-                iface,
-                ctrl_dir,
-                service_name,
-                ssi_hex,
-                ttl,
-                freq,
-                srv_proto_type,
-            } => mesh::protocol::Response::ok_with_data(self.radio.nan_publish(
-                iface,
-                ctrl_dir,
-                service_name,
-                ssi_hex,
-                ttl,
-                freq,
-                srv_proto_type,
-            )),
-            Request::WifiNanSubscribe {
-                iface,
-                ctrl_dir,
-                service_name,
-                ssi_hex,
-                ttl,
-                freq,
-                active,
-                srv_proto_type,
-            } => mesh::protocol::Response::ok_with_data(self.radio.nan_subscribe(
-                iface,
-                ctrl_dir,
-                service_name,
-                ssi_hex,
-                ttl,
-                freq,
-                active,
-                srv_proto_type,
-            )),
-            Request::WifiNanTransmit {
-                iface,
-                ctrl_dir,
-                handle,
-                address,
-                req_instance_id,
-                ssi_hex,
-                payload,
-                cookie,
-            } => mesh::protocol::Response::ok_with_data(self.radio.nan_transmit(
-                iface,
-                ctrl_dir,
-                handle,
-                address,
-                req_instance_id,
-                ssi_hex,
-                payload,
-                cookie,
-            )),
-            Request::WifiNanEvents {
-                iface,
-                ctrl_dir,
-                wait_ms,
-                max_events,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio.nan_events(iface, ctrl_dir, wait_ms, max_events),
-            ),
-            Request::WifiNanSizeProbe {
-                iface,
-                ctrl_dir,
-                sizes,
-                mode,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio.nan_size_probe(iface, ctrl_dir, sizes, mode),
-            ),
-            Request::WifiNanAdv { iface, ctrl_dir } => match self.radio.nan_adv(iface, ctrl_dir) {
-                Ok(data) => mesh::protocol::Response::ok_with_data(data),
-                Err(e) => mesh::protocol::Response::err(e.to_string()),
-            },
-            Request::WifiNanSub { iface, ctrl_dir } => {
-                mesh::protocol::Response::ok_with_data(self.radio.nan_sub(iface, ctrl_dir))
-            }
-            Request::WifiNanPing {
-                iface,
-                ctrl_dir,
-                peer,
-                payload,
-            } => match self.radio.nan_ping(iface, ctrl_dir, peer, payload) {
+            } => match self.ble.adv(dev_id, on, payload) {
                 Ok(data) => mesh::protocol::Response::ok_with_data(data),
                 Err(e) => mesh::protocol::Response::err(e.to_string()),
             },
@@ -2138,6 +1890,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn benchmark_transport_alias_deserializes() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "method": "transport.bench.start",
+            "iface": "wlan1",
+            "destination": "ff:ff:ff:ff:ff:ff",
+            "bytes": 64
+        }))
+        .expect("transport benchmark alias should remain script-compatible");
+        assert!(matches!(request, Request::WifiRawBenchSend { .. }));
+    }
 
     #[test]
     fn test_base64_url_encode() {

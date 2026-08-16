@@ -17,8 +17,11 @@ use anyhow::{bail, Context, Result};
 use dmesh_object_store::{ObjectServer, ServerConfig, RECORD_DONE, RECORD_MANIFEST};
 use std::boxed::Box;
 use std::collections::{HashMap, VecDeque};
+use std::eprintln;
+use std::format;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::string::String;
 use std::string::ToString;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,12 +32,23 @@ use tokio::time::{timeout, Duration, Instant};
 
 const MTU: usize = 1400;
 // Keep Recovery object datagrams below the Wi-Fi driver's large-frame edge
-// while retaining normal UDP/IP overhead. This is deliberately independent
-// of the bearer MTU: object transfer favors reliable small frames over
-// packing a whole 4 KiB record into three large Wi-Fi aggregates.
-const OBJECT_CHUNK: usize = 512;
+// while retaining normal UDP/IP overhead. 1,200 bytes leaves frame/control
+// headroom within the 1,400-byte bearer budget and avoids making the normal
+// object service a 512-byte diagnostic profile.
+const OBJECT_CHUNK: usize = 1200;
 const MAX_OBJECT_CHUNK: usize = MTU - 64;
 const UDP_MIN_RETRANSMIT_PTO_MS: u64 = 250;
+// A sender that has just declared loss needs a small amount of temporal
+// separation between subsequent new datagrams.  This is scheduler policy
+// derived from transport feedback, not a bearer ACK/retry mechanism.  Keep
+// it bounded: Wi-Fi needs microsecond-scale spacing, while a long fixed delay
+// would recreate stop-and-wait on a clean link.
+const ADAPTIVE_PACING_MIN: Duration = Duration::from_micros(125);
+const ADAPTIVE_PACING_MAX: Duration = Duration::from_millis(2);
+const ADAPTIVE_PACING_CLEAN_ACKS: u64 = 32;
+// An object transfer must keep its connection scheduler responsive to a
+// delayed ACK/window update. This is a wakeup bound, not sender pacing.
+const ACTIVE_OBJECT_SCHEDULER_TICK: Duration = Duration::from_millis(1);
 /// One ordered object-response stream: manifest, blobs, then done.
 const OBJECT_STREAM: u64 = 3;
 const ACK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -47,14 +61,37 @@ static NEXT_SERVER_CID: AtomicU64 = AtomicU64::new(0x100);
 /// First byte on an application stream selects the connection service.
 /// Remaining bytes belong to that service's schema.
 pub use crate::{
-    SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_METRICS,
-    SERVICE_OBJECT, SERVICE_STATUS, SERVICE_STREAM,
+    SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_METRICS, SERVICE_OBJECT,
+    SERVICE_STATUS, SERVICE_STREAM,
 };
 
 const CONTROL_LOG: u8 = 0;
 const CONTROL_POLL: u8 = 1;
+/// Object streaming is the normal Recovery workload. ACK=8 keeps reverse
+/// traffic sparse enough to preserve a useful forward burst, while the 5 ms
+/// cap repairs a short/cwnd-limited burst promptly.
+const RECOVERY_OBJECT_ACK_FREQUENCY: u8 = 8;
+const RECOVERY_MAX_ACK_DELAY_US: u64 = 5_000;
 const CONTROL_RESPONSE: u8 = 2;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
+
+/// Decode the transport-service envelope for an object GET.  The CBOR bytes
+/// themselves remain the canonical object-store request; the optional byte
+/// before them is an association parameter selected for this connection.
+/// Older `[SERVICE_OBJECT, CBOR-GET...]` clients remain valid.
+fn object_request_envelope(request: &[u8]) -> Result<(u8, &[u8])> {
+    let Some((&service, body)) = request.split_first() else {
+        bail!("empty object request");
+    };
+    if service != SERVICE_OBJECT {
+        bail!("not an object request");
+    }
+    match body.first().copied() {
+        Some(1..=32) => Ok((body[0], &body[1..])),
+        Some(_) => Ok((RECOVERY_OBJECT_ACK_FREQUENCY, body)),
+        None => bail!("missing object GET"),
+    }
+}
 
 /// Bounded command/log bridge for a transport test scaffold or a future
 /// managed control service. Its contents are opaque compact CBOR records;
@@ -63,12 +100,93 @@ const CONTROL_QUEUE_CAPACITY: usize = 64;
 pub struct TransportControl {
     commands: Mutex<VecDeque<Vec<u8>>>,
     logs: Mutex<VecDeque<Vec<u8>>>,
+    stats: Mutex<Option<ServerTransportStats>>,
+    errors: Mutex<VecDeque<String>>,
+    events: Mutex<VecDeque<String>>,
+}
+
+/// Opaque sender-side snapshot for a bearer status surface.  It deliberately
+/// exposes aggregates only: callers must not parse ACKs, packet numbers, or
+/// transport frames to diagnose a live transfer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServerTransportStats {
+    pub history_len: usize,
+    pub history_capacity: usize,
+    pub peer_max_in_flight_packets: usize,
+    pub bytes_in_flight: u64,
+    pub congestion_window: u64,
+    pub transport: crate::TransportStats,
 }
 
 impl TransportControl {
+    pub fn server_stats(&self) -> Option<ServerTransportStats> {
+        *self.stats.lock().ok()?
+    }
+    fn record_server_stats<const H: usize>(&self, endpoint: &EndpointState<8, H>) {
+        if let Ok(mut stats) = self.stats.lock() {
+            *stats = Some(ServerTransportStats {
+                history_len: endpoint.history_len(),
+                history_capacity: endpoint.history_capacity(),
+                peer_max_in_flight_packets: endpoint.peer_max_in_flight_packets(),
+                bytes_in_flight: endpoint.bytes_in_flight(),
+                congestion_window: endpoint.congestion.congestion_window,
+                transport: endpoint.stats(),
+            });
+        }
+    }
+    fn record_error(&self, error: impl Into<String>) {
+        let mut errors = self.errors.lock().expect("control errors lock");
+        if errors.len() == CONTROL_QUEUE_CAPACITY {
+            errors.pop_front();
+        }
+        errors.push_back(error.into());
+    }
+    pub fn take_errors(&self) -> Vec<String> {
+        self.errors
+            .lock()
+            .expect("control errors lock")
+            .drain(..)
+            .collect()
+    }
+    fn record_event(&self, event: impl Into<String>) {
+        let mut events = self.events.lock().expect("control events lock");
+        if events.len() == CONTROL_QUEUE_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(event.into());
+    }
+    pub fn take_events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("control events lock")
+            .drain(..)
+            .collect()
+    }
+
+    /// Non-destructive bounded diagnostics for a long-running listener.
+    pub fn errors(&self) -> Vec<String> {
+        self.errors
+            .lock()
+            .expect("control errors lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Non-destructive bounded events for a long-running listener.
+    pub fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .expect("control events lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
     pub fn queue_command(&self, record: Vec<u8>) {
         let mut commands = self.commands.lock().expect("control commands lock");
-        if commands.len() == CONTROL_QUEUE_CAPACITY { commands.pop_front(); }
+        if commands.len() == CONTROL_QUEUE_CAPACITY {
+            commands.pop_front();
+        }
         commands.push_back(record);
     }
 
@@ -78,16 +196,24 @@ impl TransportControl {
 
     fn receive_log(&self, record: &[u8]) {
         let mut logs = self.logs.lock().expect("control logs lock");
-        if logs.len() == CONTROL_QUEUE_CAPACITY { logs.pop_front(); }
+        if logs.len() == CONTROL_QUEUE_CAPACITY {
+            logs.pop_front();
+        }
         logs.push_back(record.to_vec());
     }
 
     fn next_response(&self) -> Vec<u8> {
-        let command = self.commands.lock().expect("control commands lock").pop_front();
+        let command = self
+            .commands
+            .lock()
+            .expect("control commands lock")
+            .pop_front();
         let mut response = Vec::with_capacity(2 + command.as_ref().map_or(0, Vec::len));
         response.push(SERVICE_CONTROL);
         response.push(CONTROL_RESPONSE);
-        if let Some(command) = command { response.extend_from_slice(&command); }
+        if let Some(command) = command {
+            response.extend_from_slice(&command);
+        }
         response
     }
 }
@@ -115,6 +241,9 @@ struct PendingObjectTransfer {
     stream_offset: u64,
     sent_bytes: usize,
     chunk_size: usize,
+    pacer: AdaptivePacer,
+    first_send: Option<Instant>,
+    sent_datagrams: u64,
 }
 
 /// Transport-only response source for IPERF. It deliberately has no object
@@ -125,15 +254,253 @@ struct PendingByteTransfer {
     remaining: usize,
     chunk_size: usize,
     packet_id: u32,
+    pace: Duration,
+    burst_packets: usize,
+    burst_delay: Duration,
+    pacer: AdaptivePacer,
+    /// Host-side scheduler evidence for one transport IPERF response.  This
+    /// is deliberately aggregate-only: logging a datagram would itself
+    /// perturb the Wi-Fi benchmark.
+    first_send: Option<Instant>,
+    last_send: Option<Instant>,
+    sent_datagrams: u64,
+    window_fills: u64,
+    max_window_fill: u64,
+    interpacket_gaps: [u64; 6],
 }
 
-impl PendingByteTransfer {
-    fn new(stream_id: u64, bytes: usize, chunk_size: usize) -> Self {
-        Self { stream_id, offset: 0, remaining: bytes, chunk_size, packet_id: 0 }
+/// Conservative feedback pacer shared by object and byte response streams.
+/// It starts disabled. A transport-declared repair enables a bounded delay
+/// based on the observed RTT and current congestion window; clean ACK
+/// progress progressively removes it. The scheduler merely decides when to
+/// call `send_to`; all ACK, loss, credit, and retransmission semantics remain
+/// in `EndpointState`.
+#[derive(Clone, Copy, Debug)]
+struct AdaptivePacer {
+    delay: Duration,
+    next_send: Instant,
+    seen_loss_repairs: u64,
+    seen_control_datagrams: u64,
+    clean_acks: u64,
+    activations: u64,
+}
+
+impl AdaptivePacer {
+    fn new() -> Self {
+        Self {
+            delay: Duration::ZERO,
+            next_send: Instant::now(),
+            seen_loss_repairs: 0,
+            seen_control_datagrams: 0,
+            clean_acks: 0,
+            activations: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        stats: crate::TransportStats,
+        smoothed_rtt_ms: Option<u64>,
+        congestion_window: u64,
+        max_datagram_size: u64,
+    ) {
+        let repairs = stats.loss_retransmitted_datagrams.saturating_add(stats.pto_retransmitted_datagrams);
+        let new_repairs = repairs.saturating_sub(self.seen_loss_repairs);
+        self.seen_loss_repairs = repairs;
+        let controls = stats.control_datagrams;
+        let new_controls = controls.saturating_sub(self.seen_control_datagrams);
+        self.seen_control_datagrams = controls;
+        if new_repairs != 0 {
+            let packets = (congestion_window / max_datagram_size.max(1)).max(1);
+            let target = Duration::from_micros(
+                smoothed_rtt_ms
+                    .unwrap_or(5)
+                    .saturating_mul(1_000)
+                    .saturating_div(packets),
+            )
+            .clamp(ADAPTIVE_PACING_MIN, ADAPTIVE_PACING_MAX);
+            self.delay = self.delay.saturating_mul(2).max(target).min(ADAPTIVE_PACING_MAX);
+            self.clean_acks = 0;
+            self.activations = self.activations.saturating_add(1);
+            return;
+        }
+        if self.delay.is_zero() || new_controls == 0 {
+            return;
+        }
+        self.clean_acks = self.clean_acks.saturating_add(new_controls);
+        while self.clean_acks >= ADAPTIVE_PACING_CLEAN_ACKS {
+            self.clean_acks -= ADAPTIVE_PACING_CLEAN_ACKS;
+            let relaxed = self.delay / 2;
+            self.delay = if relaxed <= ADAPTIVE_PACING_MIN {
+                Duration::ZERO
+            } else {
+                relaxed
+            };
+            if self.delay.is_zero() {
+                self.clean_acks = 0;
+                break;
+            }
+        }
+    }
+
+    fn ready(&self) -> bool {
+        Instant::now() >= self.next_send
+    }
+
+    fn sent(&mut self, explicit_delay: Duration) {
+        let delay = if explicit_delay.is_zero() {
+            self.delay
+        } else {
+            explicit_delay
+        };
+        self.next_send = Instant::now() + delay;
+    }
+
+    fn next_delay(&self, explicit_delay: Duration) -> Option<Duration> {
+        if explicit_delay.is_zero() && self.delay.is_zero() {
+            return None;
+        }
+        Some(self.next_send.saturating_duration_since(Instant::now()))
     }
 }
 
+fn interpacket_gap_bucket(gap: Duration) -> usize {
+    match gap.as_micros() {
+        0..=999 => 0,
+        1_000..=4_999 => 1,
+        5_000..=9_999 => 2,
+        10_000..=24_999 => 3,
+        25_000..=49_999 => 4,
+        _ => 5,
+    }
+}
+
+/// Read optional, request-scoped IPERF scheduling controls.  The fixed first
+/// 11 bytes remain the compatibility schema (`service`, byte count, packet
+/// size); absent trailing fields deliberately inherit the listener defaults.
+fn iperf_schedule(
+    request: &[u8],
+    default_pace: Duration,
+    default_burst_packets: usize,
+    default_burst_delay: Duration,
+) -> (Duration, usize, Duration, u8, u64) {
+    let pace = request
+        .get(11..15)
+        .map(|bytes| Duration::from_micros(u32::from_be_bytes(bytes.try_into().unwrap()) as u64))
+        .unwrap_or(default_pace);
+    let burst_packets = request
+        .get(15)
+        .copied()
+        .map(usize::from)
+        .unwrap_or(default_burst_packets);
+    let burst_delay = request
+        .get(16..20)
+        .map(|bytes| Duration::from_micros(u32::from_be_bytes(bytes.try_into().unwrap()) as u64))
+        .unwrap_or(default_burst_delay);
+    // ACK_FREQUENCY's wire threshold is one below the human-facing packet
+    // ratio. Keep it request-scoped so a benchmark does not depend on a
+    // local-only Recovery setting that the peer can silently overwrite.
+    // ACK_FREQUENCY encodes the threshold as `frequency - 1`; the endpoint
+    // can retain at most ACK_RANGE_CAPACITY ranges. Clamp at the same bound
+    // as Recovery's command parser so a malformed request cannot start an
+    // IPERF transfer while silently failing to install its advertised policy.
+    let ack_frequency = request
+        .get(20)
+        .copied()
+        .unwrap_or(2)
+        .clamp(1, crate::ACK_RANGE_CAPACITY as u8);
+    let ack_delay_us = request
+        .get(21)
+        .copied()
+        .map(|milliseconds| u64::from(milliseconds.clamp(1, 25)) * 1_000)
+        .unwrap_or(RECOVERY_MAX_ACK_DELAY_US);
+    (pace, burst_packets, burst_delay, ack_frequency, ack_delay_us)
+}
+
+impl PendingByteTransfer {
+    fn new(
+        stream_id: u64,
+        bytes: usize,
+        chunk_size: usize,
+        pace: Duration,
+        burst_packets: usize,
+        burst_delay: Duration,
+    ) -> Self {
+        Self {
+            stream_id,
+            offset: 0,
+            remaining: bytes,
+            chunk_size,
+            packet_id: 0,
+            pace,
+            burst_packets,
+            burst_delay,
+            pacer: AdaptivePacer::new(),
+            first_send: None,
+            last_send: None,
+            sent_datagrams: 0,
+            window_fills: 0,
+            max_window_fill: 0,
+            interpacket_gaps: [0; 6],
+        }
+    }
+}
+
+fn report_byte_transfer(transfer: &PendingByteTransfer, stats: crate::TransportStats) {
+    let elapsed_us = transfer
+        .first_send
+        .map(|first| first.elapsed().as_micros())
+        .unwrap_or(0);
+    eprintln!(
+        "iperf_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} fills={} max_fill={} pace_us={} pace_activations={} elapsed_us={} \
+         gaps=<1ms:{},1-5ms:{},5-10ms:{},10-25ms:{},25-50ms:{},>=50ms:{} \
+         loss=gap:{} time:{} events:{} loss_retx:{} pto_retx:{}",
+        transfer.stream_id,
+        transfer.sent_datagrams,
+        stats.sent_stream_datagrams,
+        stats.sent_control_datagrams,
+        transfer.window_fills,
+        transfer.max_window_fill,
+        transfer.pacer.delay.as_micros(),
+        transfer.pacer.activations,
+        elapsed_us,
+        transfer.interpacket_gaps[0],
+        transfer.interpacket_gaps[1],
+        transfer.interpacket_gaps[2],
+        transfer.interpacket_gaps[3],
+        transfer.interpacket_gaps[4],
+        transfer.interpacket_gaps[5],
+        stats.loss_packet_threshold_datagrams,
+        stats.loss_time_threshold_datagrams,
+        stats.loss_events,
+        stats.loss_retransmitted_datagrams,
+        stats.pto_retransmitted_datagrams,
+    );
+}
+
+fn report_object_transfer(transfer: &PendingObjectTransfer, stats: crate::TransportStats) {
+    let elapsed_us = transfer
+        .first_send
+        .map(|first| first.elapsed().as_micros())
+        .unwrap_or(0);
+    eprintln!(
+        "object_udp_send_summary bytes={} datagrams={} endpoint_stream={} endpoint_control={} pace_us={} pace_activations={} elapsed_us={} loss=gap:{} time:{} loss_retx:{} pto_retx:{}",
+        transfer.sent_bytes,
+        transfer.sent_datagrams,
+        stats.sent_stream_datagrams,
+        stats.sent_control_datagrams,
+        transfer.pacer.delay.as_micros(),
+        transfer.pacer.activations,
+        elapsed_us,
+        stats.loss_packet_threshold_datagrams,
+        stats.loss_time_threshold_datagrams,
+        stats.loss_retransmitted_datagrams,
+        stats.pto_retransmitted_datagrams,
+    );
+}
+
 impl PendingObjectTransfer {
+    #[cfg(test)]
     fn new(records: Vec<(u8, Vec<u8>)>) -> Self {
         Self::with_chunk(records, OBJECT_CHUNK)
     }
@@ -149,6 +516,9 @@ impl PendingObjectTransfer {
             stream_offset: 0,
             sent_bytes: 0,
             chunk_size,
+            pacer: AdaptivePacer::new(),
+            first_send: None,
+            sent_datagrams: 0,
         }
     }
 
@@ -192,9 +562,21 @@ pub struct UdpConfig {
     /// Host ledger memory resampling interval. Zero disables runtime resizing.
     pub ledger_resize_interval: Duration,
     /// Application payload size for object datagrams. This is independent of
-    /// the transport window: 512-byte records must still be sent in flight as
-    /// a window, not as stop-and-wait packets.
+    /// the transport window: even small diagnostic records must still be sent
+    /// in flight as a window, not as stop-and-wait packets.
     pub object_chunk: usize,
+    /// Optional host-only interval between transport IPERF response packets.
+    /// Zero preserves flood behavior. This is a diagnostic knob, not a
+    /// transport reliability mechanism.
+    pub iperf_pace: Duration,
+    /// Test-only maximum IPERF datagrams in one sender pass. Zero preserves
+    /// the normal unlimited congestion-window fill.
+    pub iperf_burst_packets: usize,
+    /// Test-only wait after an IPERF burst. Zero preserves unpaced sending.
+    pub iperf_burst_delay: Duration,
+    /// Optional IPv4 DSCP/TOS applied to this listener's outbound datagrams.
+    /// It is a host-bearer diagnostic only; `None` preserves best-effort.
+    pub ip_tos: Option<u8>,
     /// Optional opaque Recovery command/log mailbox. Normal object serving
     /// leaves it unset; host hardware tests can install it on a third port.
     pub control: Option<Arc<TransportControl>>,
@@ -213,9 +595,59 @@ impl Default for UdpConfig {
             receive_timeout: Duration::from_secs(1),
             ledger_resize_interval: Duration::from_secs(5),
             object_chunk: OBJECT_CHUNK,
+            iperf_pace: Duration::ZERO,
+            iperf_burst_packets: 0,
+            iperf_burst_delay: Duration::ZERO,
+            ip_tos: None,
             control: None,
         }
     }
+}
+
+#[cfg(unix)]
+fn configure_ipv4_tos(socket: &UdpSocket, tos: u8) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let value = libc::c_int::from(tos);
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            (&value as *const libc::c_int).cast(),
+            core::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        bail!("set IP_TOS=0x{tos:02x}: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_ipv4_tos(_socket: &UdpSocket, tos: u8) -> Result<()> {
+    bail!("IP_TOS=0x{tos:02x} is unsupported on this host")
+}
+
+#[cfg(all(test, unix))]
+fn socket_ipv4_tos(socket: &UdpSocket) -> Result<u8> {
+    use std::os::fd::AsRawFd;
+
+    let mut value = 0i32;
+    let mut size = core::mem::size_of_val(&value) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut size,
+        )
+    };
+    if result != 0 {
+        bail!("get IP_TOS: {}", std::io::Error::last_os_error());
+    }
+    Ok(value as u8)
 }
 
 /// Minimal host client for the feature-gated UDP QUIC bearer. It owns one
@@ -229,6 +661,12 @@ pub struct UdpClient {
 }
 
 impl UdpClient {
+    /// Set the local delayed-ACK packet threshold for a diagnostic client.
+    /// The wire ACK logic remains in `EndpointState`.
+    pub fn set_ack_frequency(&mut self, frequency: u8) {
+        self.endpoint.set_ack_frequency(frequency);
+    }
+
     /// Lower the active retransmission ledger for this side. The endpoint's
     /// static host profile remains the upper bound.
     pub fn set_history_capacity(&mut self, limit: usize) -> Result<()> {
@@ -253,6 +691,25 @@ impl UdpClient {
         local_cid: crate::ConnectionId,
         history_capacity: usize,
     ) -> Result<Self> {
+        Self::connect_with_limits(
+            bind,
+            peer,
+            local_cid,
+            history_capacity,
+            ConnectionLimits::default(),
+        )
+        .await
+    }
+
+    /// Connect with an explicit local receive window. This mirrors Recovery's
+    /// bounded bootstrap profile in host regression tests.
+    pub async fn connect_with_limits(
+        bind: SocketAddr,
+        peer: SocketAddr,
+        local_cid: crate::ConnectionId,
+        history_capacity: usize,
+        limits: ConnectionLimits,
+    ) -> Result<Self> {
         if local_cid.value() == 0 {
             bail!("bootstrap local CID must be non-zero");
         }
@@ -265,7 +722,7 @@ impl UdpClient {
             peer,
             endpoint: EndpointState::new_with_history_capacity(
                 Role::Client,
-                ConnectionLimits::default(),
+                limits,
                 MTU as u64,
                 history_capacity,
             ),
@@ -274,7 +731,13 @@ impl UdpClient {
         let mut response = [0u8; MTU];
         for packet_number in 0..BOOTSTRAP_ATTEMPTS {
             let mut open = [0u8; MTU];
-            let used = encode_bootstrap_open(local_cid, packet_number, &mut open)?;
+            let used = crate::encode_bootstrap_open_packet_with_limits(
+                local_cid,
+                packet_number,
+                limits,
+                &mut open,
+            )
+            .map_err(|error| anyhow::anyhow!("bootstrap OPEN: {error:?}"))?;
             client.socket.send_to(&open[..used], client.peer).await?;
             let received = timeout(ACK_TIMEOUT, client.socket.recv_from(&mut response)).await;
             let Ok(Ok((len, response_peer))) = received else {
@@ -283,9 +746,12 @@ impl UdpClient {
             if response_peer != client.peer {
                 continue;
             }
-            let Ok((header, server_cid)) = decode_bootstrap_ack(&response[..len], local_cid) else {
+            let Ok((header, ack)) =
+                crate::decode_bootstrap_open_ack_packet_with_limits(&response[..len], local_cid)
+            else {
                 continue;
             };
+            let server_cid = ack.server_receive_cid;
             if header.dcid != local_cid || server_cid.value() == 0 {
                 continue;
             }
@@ -293,6 +759,10 @@ impl UdpClient {
                 .endpoint
                 .install_connection_ids(local_cid, server_cid)
                 .map_err(|error| anyhow::anyhow!("install bootstrap CIDs: {error:?}"))?;
+            client
+                .endpoint
+                .set_initial_peer_credit(ack.max_data, ack.max_stream_data)
+                .map_err(|error| anyhow::anyhow!("bootstrap peer credit: {error:?}"))?;
             client
                 .endpoint
                 .continue_packet_numbers_from(packet_number.saturating_add(1))
@@ -501,6 +971,9 @@ pub async fn run(config: UdpConfig) -> Result<()> {
         Duration::ZERO
     };
     let socket = Arc::new(UdpSocket::bind(config.bind).await?);
+    if let Some(tos) = config.ip_tos {
+        configure_ipv4_tos(&socket, tos)?;
+    }
     tracing::info!(bind = %config.bind, "object_udp_bound");
     let server = ObjectServer::new(ServerConfig {
         bind: config.bind.ip().to_string(),
@@ -529,26 +1002,28 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
             bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
         }
+        // Do this for every listener iteration, not only after an empty
+        // recv timeout. A new benchmark can otherwise keep an old, stalled
+        // route alive forever; its PTO retransmissions then contaminate the
+        // otherwise independent next run on the same AP.
+        let now = Instant::now();
+        let expired: Vec<u64> = last_activity
+            .iter()
+            .filter(|(_, when)| now.duration_since(**when) >= config.idle_timeout)
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in expired {
+            connections.remove(&cid);
+            connection_peers.remove(&cid);
+            last_activity.remove(&cid);
+        }
+        pending_opens.retain(|_, cid| connections.contains_key(cid));
+        pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
+        bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
         let (len, peer) =
             match timeout(config.receive_timeout, socket.recv_from(&mut datagram)).await {
                 Ok(result) => result?,
-                Err(_) => {
-                    let now = Instant::now();
-                    let expired: Vec<u64> = last_activity
-                        .iter()
-                        .filter(|(_, when)| now.duration_since(**when) >= config.idle_timeout)
-                        .map(|(cid, _)| *cid)
-                        .collect();
-                    for cid in expired {
-                        connections.remove(&cid);
-                        connection_peers.remove(&cid);
-                        last_activity.remove(&cid);
-                    }
-                    pending_opens.retain(|_, cid| connections.contains_key(cid));
-                    pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
-                    bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
-                    continue;
-                }
+                Err(_) => continue,
             };
         let packet = datagram[..len].to_vec();
         let (header, _) = match crate::ShortHeader::decode(&packet) {
@@ -559,10 +1034,11 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             }
         };
         if header.dcid.value() == 0 {
-            let Some(client_cid) = decode_bootstrap_open(&packet) else {
+            let Ok((_, open)) = crate::decode_bootstrap_open_packet_with_limits(&packet) else {
                 tracing::warn!(%peer, "udp_transport_invalid_bootstrap");
                 continue;
             };
+            let client_cid = open.client_receive_cid;
             let key = (peer, client_cid.value());
             if let Some(previous) = pending_open_bytes.get(&key) {
                 if decode_bootstrap_open_payload(&packet)
@@ -609,6 +1085,9 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         None,
                         allocated,
                         client_cid,
+                        open.max_data,
+                        open.max_stream_data,
+                        open.max_in_flight_packets,
                         history_capacity,
                         bootstrap_numbers,
                         config.max_active_connections,
@@ -616,6 +1095,9 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         config.ledger_memory,
                         ledger_resize_interval,
                         config.object_chunk,
+                        config.iperf_pace,
+                        config.iperf_burst_packets,
+                        config.iperf_burst_delay,
                         control_for_connection,
                     )
                     .await;
@@ -633,7 +1115,10 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             let Some(bootstrap_numbers) = bootstrap_packet_numbers.get(&key) else {
                 continue;
             };
-            if bootstrap_numbers.application_started.load(Ordering::Acquire) {
+            if bootstrap_numbers
+                .application_started
+                .load(Ordering::Acquire)
+            {
                 // A delayed Initial/Open after application traffic started is
                 // stale. Re-ACKing it would require a lower packet number and
                 // violate the connection's monotonic sender space.
@@ -694,6 +1179,9 @@ async fn serve_persistent_peer_with_ids(
     first_packet: Option<Vec<u8>>,
     local_cid: crate::ConnectionId,
     peer_cid: crate::ConnectionId,
+    peer_max_data: u64,
+    peer_max_stream_data: u64,
+    peer_max_in_flight_packets: u16,
     history_capacity: usize,
     bootstrap_packet_numbers: Arc<BootstrapPacketNumbers>,
     max_active_connections: usize,
@@ -701,6 +1189,9 @@ async fn serve_persistent_peer_with_ids(
     ledger_memory: Option<LedgerMemorySnapshot>,
     ledger_resize_interval: Duration,
     object_chunk: usize,
+    iperf_pace: Duration,
+    iperf_burst_packets: usize,
+    iperf_burst_delay: Duration,
     control: Option<Arc<TransportControl>>,
 ) -> Result<()> {
     let mut mux = Box::new(StreamMux::<8, 512>::new_with_history_capacity(
@@ -715,6 +1206,13 @@ async fn serve_persistent_peer_with_ids(
     mux.registry = registry;
     mux.install_connection_ids(local_cid, peer_cid)
         .map_err(|error| anyhow::anyhow!("persistent CIDs: {error:?}"))?;
+    mux.endpoint
+        .set_initial_peer_budget(
+            peer_max_data,
+            peer_max_stream_data,
+            peer_max_in_flight_packets,
+        )
+        .map_err(|error| anyhow::anyhow!("bootstrap peer credit: {error:?}"))?;
     let mut response_stream = crate::FIRST_SERVER_BIDI_STREAM_ID;
     let mut object_transfer = None;
     let mut byte_transfer = None;
@@ -742,6 +1240,9 @@ async fn serve_persistent_peer_with_ids(
             &mut byte_transfer,
             started,
             object_chunk,
+            iperf_pace,
+            iperf_burst_packets,
+            iperf_burst_delay,
             control.as_deref(),
         )
         .await
@@ -751,13 +1252,34 @@ async fn serve_persistent_peer_with_ids(
         }
     }
     loop {
-        match timeout(Duration::from_millis(50), receiver.recv()).await {
+        if let Some(control) = control.as_deref() {
+            control.record_server_stats(&mux.endpoint);
+        }
+        let object_next_send = object_transfer
+            .as_ref()
+            .and_then(|transfer| transfer.pacer.next_delay(Duration::ZERO));
+        let byte_next_send = byte_transfer
+            .as_ref()
+            .and_then(|transfer| transfer.pacer.next_delay(transfer.pace));
+        let next_send = match (object_next_send, byte_next_send) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        let receive_wait = connection_receive_wait(
+            object_transfer.is_some(),
+            byte_transfer.is_some(),
+            next_send,
+        );
+        match timeout(receive_wait, receiver.recv()).await {
             Ok(Some(datagram)) if datagram.peer == peer => {
                 let next = bootstrap_packet_numbers.next.load(Ordering::Acquire);
                 if next > mux.endpoint.next_packet_number {
                     mux.endpoint
                         .continue_packet_numbers_from(next)
-                        .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
+                        .map_err(|error| {
+                            anyhow::anyhow!("continue bootstrap packet numbers: {error:?}")
+                        })?;
                 }
                 bootstrap_packet_numbers
                     .application_started
@@ -773,6 +1295,9 @@ async fn serve_persistent_peer_with_ids(
                     &mut byte_transfer,
                     started,
                     object_chunk,
+                    iperf_pace,
+                    iperf_burst_packets,
+                    iperf_burst_delay,
                     control.as_deref(),
                 )
                 .await
@@ -787,6 +1312,12 @@ async fn serve_persistent_peer_with_ids(
                         error = %error,
                         "udp_transport_connection_datagram_dropped"
                     );
+                    if let Some(control) = control.as_deref() {
+                        control.record_error(format!(
+                            "peer={peer} dcid={} packet={error}",
+                            local_cid.value()
+                        ));
+                    }
                 }
                 if !ledger_resize_interval.is_zero() {
                     maybe_resize_ledger(
@@ -830,13 +1361,17 @@ async fn serve_persistent_peer_with_ids(
                         && transfer.record_index >= transfer.records.len()
                         && transfer.current.is_empty();
                     if sent {
+                        report_object_transfer(transfer, mux.endpoint.stats());
                         object_transfer = None;
                     }
                 } else if let Some(transfer) = byte_transfer.as_mut() {
                     let _ = retransmit_due_packet(&socket, peer, &mut mux, started).await?;
                     let mut packet = [0u8; MTU];
-                    if fill_byte_window(&socket, peer, &mut mux, transfer, &mut packet).await?
-                        && transfer.remaining == 0 {
+                    let filled = fill_byte_window(&socket, peer, &mut mux, transfer, &mut packet).await?;
+                    if filled
+                        && transfer.remaining == 0
+                    {
+                        report_byte_transfer(transfer, mux.endpoint.stats());
                         byte_transfer = None;
                     }
                 } else {
@@ -857,6 +1392,24 @@ async fn serve_persistent_peer_with_ids(
         }
     }
     Ok(())
+}
+
+fn connection_receive_wait(
+    object_active: bool,
+    byte_active: bool,
+    next_send: Option<Duration>,
+) -> Duration {
+    if object_active || byte_active {
+        // An unpaced transfer has no next-send deadline. Keep the active
+        // clock running so a briefly ACK/cwnd-limited sender never falls back
+        // to the 50 ms idle wait; paced transfers wake at their bounded
+        // scheduler deadline instead.
+        next_send
+            .map(|delay| delay.min(ACTIVE_OBJECT_SCHEDULER_TICK))
+            .unwrap_or(ACTIVE_OBJECT_SCHEDULER_TICK)
+    } else {
+        Duration::from_millis(50)
+    }
 }
 
 fn maybe_resize_ledger<const H: usize>(
@@ -908,6 +1461,7 @@ fn allocate_server_cid(
     bail!("CID allocation exhausted")
 }
 
+#[cfg(test)]
 fn decode_bootstrap_open(packet: &[u8]) -> Option<crate::ConnectionId> {
     crate::decode_bootstrap_open_packet(packet)
         .ok()
@@ -927,6 +1481,7 @@ fn decode_bootstrap_open_payload(packet: &[u8]) -> Option<&[u8]> {
         .then_some(stream.data)
 }
 
+#[cfg(test)]
 fn encode_bootstrap_open(
     client_cid: crate::ConnectionId,
     packet_number: u32,
@@ -936,6 +1491,7 @@ fn encode_bootstrap_open(
         .map_err(|error| anyhow::anyhow!("bootstrap OPEN: {error:?}"))
 }
 
+#[cfg(test)]
 fn decode_bootstrap_ack(
     packet: &[u8],
     expected_dcid: crate::ConnectionId,
@@ -965,6 +1521,9 @@ async fn process_persistent_packet<const H: usize>(
     byte_transfer: &mut Option<PendingByteTransfer>,
     started: Instant,
     object_chunk: usize,
+    iperf_pace: Duration,
+    iperf_burst_packets: usize,
+    iperf_burst_delay: Duration,
     control: Option<&TransportControl>,
 ) -> Result<()> {
     mux.endpoint.set_time(started.elapsed().as_millis() as u64);
@@ -973,11 +1532,21 @@ async fn process_persistent_packet<const H: usize>(
         .receive_request(bytes)
         .map_err(|error| anyhow::anyhow!("persistent input: {error:?}"))?;
     if let Some(request) = request {
+        if let Some(control) = control {
+            control.record_event(format!(
+                "request peer={peer} stream={} service={} bytes={}",
+                request.stream_id,
+                request.data.first().copied().unwrap_or_default(),
+                request.data.len(),
+            ));
+        }
         if request.data.first() == Some(&SERVICE_CONTROL) {
             let record = request.data.get(2..).unwrap_or_default();
             match request.data.get(1).copied() {
                 Some(CONTROL_LOG) => {
-                    if let Some(control) = control { control.receive_log(record); }
+                    if let Some(control) = control {
+                        control.receive_log(record);
+                    }
                 }
                 Some(CONTROL_POLL) => {}
                 _ => bail!("invalid control record"),
@@ -988,7 +1557,8 @@ async fn process_persistent_packet<const H: usize>(
                 || Vec::from([SERVICE_CONTROL, CONTROL_RESPONSE]),
                 TransportControl::next_response,
             );
-            let (used, _) = mux.encode_response(*response_stream, &response, true, &mut packet)
+            let (used, _) = mux
+                .encode_response(*response_stream, &response, true, &mut packet)
                 .map_err(|error| anyhow::anyhow!("control response: {error:?}"))?;
             socket.send_to(&packet[..used], peer).await?;
             *response_stream = response_stream.saturating_add(4);
@@ -997,33 +1567,93 @@ async fn process_persistent_packet<const H: usize>(
             if object_transfer.is_some() {
                 bail!("object transfer already active");
             }
-            let get = dmesh_object_store::protocol::decode_get(&request.data[1..])
+            let (ack_frequency, get_bytes) = object_request_envelope(&request.data)?;
+            let get = dmesh_object_store::protocol::decode_get(get_bytes)
                 .ok_or_else(|| anyhow::anyhow!("invalid bootstrapped object GET"))?;
             if get.target == 0 || get.name.as_ref().is_some_and(|name| name.len() > 128) {
                 bail!("invalid bootstrapped object target");
             }
             let records = server.response_records(get)?;
+            if let Some(control) = control {
+                control.record_event(format!(
+                    "object accepted peer={peer} records={}",
+                    records.len()
+                ));
+            }
             tracing::info!(%peer, stream = request.stream_id, records = records.len(),
                 "object_udp_get_accepted");
             *object_transfer = Some(PendingObjectTransfer::with_chunk(records, object_chunk));
             mux.complete_request(request.stream_id, request.data.len())
                 .map_err(|error| anyhow::anyhow!("object request accounting: {error:?}"))?;
+            // Object and IPERF use the same bearer. Make the object policy
+            // explicit too; otherwise a Recovery client silently remains at
+            // its local default and host/device diagnostics disagree.
+            mux.endpoint.request_ack_frequency(
+                0,
+                u64::from(ack_frequency - 1),
+                RECOVERY_MAX_ACK_DELAY_US,
+                1,
+            )
+                .map_err(|error| anyhow::anyhow!("object ACK_FREQUENCY: {error:?}"))?;
+            if let Some(used) = mux
+                .endpoint
+                .poll_transmit(&mut packet)
+                .map_err(|error| anyhow::anyhow!("object ACK_FREQUENCY send: {error:?}"))?
+            {
+                socket.send_to(&packet[..used], peer).await?;
+            }
         } else if request.data.first() == Some(&SERVICE_IPERF) {
             if byte_transfer.is_some() {
                 bail!("iperf transfer already active");
             }
-            let requested = request.data.get(1..9)
+            let requested = request
+                .data
+                .get(1..9)
                 .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
                 .unwrap_or(0)
                 .clamp(1, 64 * 1024 * 1024) as usize;
-            let packet_size = request.data.get(9..11)
+            let packet_size = request
+                .data
+                .get(9..11)
                 .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()) as usize)
                 .unwrap_or(object_chunk)
                 .clamp(8, MAX_OBJECT_CHUNK);
+            // The optional fields are diagnostic-only, scoped to this
+            // IPERF request. Normal object transfers keep UdpConfig's
+            // default unpaced scheduling, and an older Recovery request
+            // (11 bytes) still uses the listener defaults.
+            let (request_pace, request_burst, request_burst_delay, request_ack_frequency, request_ack_delay_us) = iperf_schedule(
+                &request.data,
+                iperf_pace,
+                iperf_burst_packets,
+                iperf_burst_delay,
+            );
             mux.complete_request(request.stream_id, request.data.len())
                 .map_err(|error| anyhow::anyhow!("iperf request accounting: {error:?}"))?;
+            // Default to RFC 9000's every-other-ack-eliciting-packet policy.
+            // The selected ratio is carried in ACK_FREQUENCY, rather than
+            // relying on a local Recovery setting the host cannot observe.
+            mux.endpoint.request_ack_frequency(
+                0,
+                u64::from(request_ack_frequency.saturating_sub(1)),
+                request_ack_delay_us,
+                1,
+            )
+                .map_err(|error| anyhow::anyhow!("iperf ACK_FREQUENCY: {error:?}"))?;
+            if let Some(used) = mux
+                .endpoint
+                .poll_transmit(&mut packet)
+                .map_err(|error| anyhow::anyhow!("iperf ACK_FREQUENCY send: {error:?}"))?
+            {
+                socket.send_to(&packet[..used], peer).await?;
+            }
             *byte_transfer = Some(PendingByteTransfer::new(
-                *response_stream, requested, packet_size,
+                *response_stream,
+                requested,
+                packet_size,
+                request_pace,
+                request_burst,
+                request_burst_delay,
             ));
             *response_stream = response_stream.saturating_add(4);
         } else {
@@ -1070,15 +1700,20 @@ async fn process_persistent_packet<const H: usize>(
         // them. This is the transport scheduler; object records do not form
         // an application pacing boundary.
         let _ = retransmit_due_packet(socket, peer, mux, started).await?;
-        if fill_object_window(socket, peer, mux, transfer, &mut packet).await? {
+        let filled = fill_object_window(socket, peer, mux, transfer, &mut packet).await?;
+        if filled {
             if transfer.record_index >= transfer.records.len() && transfer.current.is_empty() {
+                report_object_transfer(transfer, mux.endpoint.stats());
                 *object_transfer = None;
             }
         }
     } else if let Some(transfer) = byte_transfer.as_mut() {
         let _ = retransmit_due_packet(socket, peer, mux, started).await?;
-        if fill_byte_window(socket, peer, mux, transfer, &mut packet).await?
-            && transfer.remaining == 0 {
+        let filled = fill_byte_window(socket, peer, mux, transfer, &mut packet).await?;
+        if filled
+            && transfer.remaining == 0
+        {
+            report_byte_transfer(transfer, mux.endpoint.stats());
             *byte_transfer = None;
         }
     } else if let Some(used) = mux
@@ -1098,12 +1733,21 @@ async fn fill_byte_window<const H: usize>(
     transfer: &mut PendingByteTransfer,
     packet: &mut [u8; MTU],
 ) -> Result<bool> {
+    transfer.pacer.observe(
+        mux.endpoint.stats(),
+        mux.endpoint.smoothed_rtt(),
+        mux.endpoint.congestion.congestion_window,
+        mux.endpoint.congestion.max_datagram_size,
+    );
     let mut sent = false;
+    let mut burst_sent = 0usize;
     while transfer.remaining != 0
+        && transfer.pacer.ready()
         && mux.endpoint.history_len() < mux.endpoint.history_capacity()
-        && mux.endpoint.congestion.can_send(MTU as u64)
     {
-        mux.endpoint.open_send_stream(transfer.stream_id, INITIAL_MAX_STREAM_DATA).ok();
+        mux.endpoint
+            .open_send_stream(transfer.stream_id, INITIAL_MAX_STREAM_DATA)
+            .ok();
         let length = transfer.remaining.min(transfer.chunk_size);
         let mut payload = [0u8; MAX_OBJECT_CHUNK];
         payload[..4].copy_from_slice(&transfer.packet_id.to_be_bytes());
@@ -1111,16 +1755,61 @@ async fn fill_byte_window<const H: usize>(
             *byte = transfer.offset.wrapping_add(4 + index as u64) as u8;
         }
         let fin = length == transfer.remaining;
-        let (used, _) = mux.endpoint.encode_stream_packet(
-            mux.endpoint.peer_connection_id().ok_or(crate::Error::WrongConnectionId)
+        let encoded = mux.endpoint.encode_stream_packet(
+            mux.endpoint
+                .peer_connection_id()
+                .ok_or(crate::Error::WrongConnectionId)
                 .map_err(|error| anyhow::anyhow!("iperf peer CID: {error:?}"))?,
-            transfer.stream_id, transfer.offset, fin, &payload[..length], packet,
-        ).map_err(|error| anyhow::anyhow!("iperf response packet: {error:?}"))?;
+            transfer.stream_id,
+            transfer.offset,
+            fin,
+            &payload[..length],
+            packet,
+        );
+        let (used, _) = match encoded {
+            // Credit is a normal asynchronous send blocker.  Do not tear
+            // down the persistent connection; the next MAX_* control frame
+            // will re-enter this filler and resume the same stream offset.
+            Err(crate::Error::FlowControl) => break,
+            // `encode_stream_packet` checks congestion using the actual
+            // encoded packet length. Reserving MTU here made a 512-byte
+            // benchmark consume 1200 bytes of cwnd per datagram and turned
+            // a windowed sender into an unnecessarily tiny burst.
+            Err(crate::Error::Invalid) => break,
+            Err(error) => return Err(anyhow::anyhow!("iperf response packet: {error:?}")),
+            Ok(packet) => packet,
+        };
         socket.send_to(&packet[..used], peer).await?;
+        let sent_at = Instant::now();
+        if let Some(previous) = transfer.last_send {
+            let bucket = interpacket_gap_bucket(sent_at.saturating_duration_since(previous));
+            transfer.interpacket_gaps[bucket] = transfer.interpacket_gaps[bucket].saturating_add(1);
+        } else {
+            transfer.first_send = Some(sent_at);
+        }
+        transfer.last_send = Some(sent_at);
+        transfer.sent_datagrams = transfer.sent_datagrams.saturating_add(1);
         transfer.offset = transfer.offset.saturating_add(length as u64);
         transfer.remaining -= length;
         transfer.packet_id = transfer.packet_id.wrapping_add(1);
         sent = true;
+        burst_sent = burst_sent.saturating_add(1);
+        let adaptive_active = !transfer.pacer.delay.is_zero();
+        transfer.pacer.sent(transfer.pace);
+        if !transfer.pace.is_zero() {
+            break;
+        }
+        if adaptive_active {
+            break;
+        }
+        if transfer.burst_packets != 0 && burst_sent >= transfer.burst_packets {
+            transfer.pacer.sent(transfer.burst_delay);
+            break;
+        }
+    }
+    if sent {
+        transfer.window_fills = transfer.window_fills.saturating_add(1);
+        transfer.max_window_fill = transfer.max_window_fill.max(burst_sent as u64);
     }
     Ok(sent)
 }
@@ -1131,14 +1820,33 @@ async fn retransmit_due_packet<const H: usize>(
     mux: &mut StreamMux<8, H>,
     started: Instant,
 ) -> Result<bool> {
+    // Loss detection has already established these stream ranges are missing,
+    // so repair a bounded flight before admitting fresh bytes. PTO is
+    // deliberately different: with no declared loss, emit one probe only.
+    const MAX_LOSS_REPAIRS_PER_PASS: usize = 8;
     let now = started.elapsed().as_millis() as u64;
     mux.endpoint.set_time(now);
     let mut packet = [0u8; MTU];
     let pto = mux.endpoint.pto_timeout().max(UDP_MIN_RETRANSMIT_PTO_MS);
+    let mut sent = false;
+    for _ in 0..MAX_LOSS_REPAIRS_PER_PASS {
+        let Some((used, _packet_number)) = mux
+            .endpoint
+            .retransmit_marked_loss(&mut packet)
+            .map_err(|error| anyhow::anyhow!("persistent loss retransmission: {error:?}"))?
+        else {
+            break;
+        };
+        socket.send_to(&packet[..used], peer).await?;
+        sent = true;
+    }
+    if sent {
+        return Ok(true);
+    }
     if let Some((used, _packet_number)) = mux
         .endpoint
-        .retransmit_due(now, pto, &mut packet)
-        .map_err(|error| anyhow::anyhow!("persistent retransmission: {error:?}"))?
+        .retransmit_pto_probe(now, pto, &mut packet)
+        .map_err(|error| anyhow::anyhow!("persistent PTO retransmission: {error:?}"))?
     {
         socket.send_to(&packet[..used], peer).await?;
         return Ok(true);
@@ -1168,21 +1876,22 @@ async fn send_next_object_packet<const H: usize>(
     let end = transfer.current_offset + chunk;
     let fin = transfer.current_kind == RECORD_DONE && end == transfer.current.len();
     let offset = transfer.stream_offset;
-    let (used, _) = mux
-        .endpoint
-        .encode_stream_packet(
-            mux.endpoint
-                .peer_connection_id()
-                .ok_or(crate::Error::WrongConnectionId)
-                .map_err(|error| anyhow::anyhow!("object peer CID: {error:?}"))?,
-            stream_id,
-            offset,
-            fin,
-            &transfer.current[transfer.current_offset..end],
-            packet,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!(
+    let encoded = mux.endpoint.encode_stream_packet(
+        mux.endpoint
+            .peer_connection_id()
+            .ok_or(crate::Error::WrongConnectionId)
+            .map_err(|error| anyhow::anyhow!("object peer CID: {error:?}"))?,
+        stream_id,
+        offset,
+        fin,
+        &transfer.current[transfer.current_offset..end],
+        packet,
+    );
+    let (used, _) = match encoded {
+        // Flow/congestion blockers are normal persistent-transfer states;
+        // the next ACK/MAX_* control packet resumes this same offset.
+        Err(crate::Error::FlowControl | crate::Error::Invalid) => return Ok(false),
+        Err(error) => return Err(anyhow::anyhow!(
                 "object response packet: {error:?} history={} bytes_in_flight={} congestion_window={} stream_credit={:?} connection_credit={} stream_offset={} chunk={}",
                 mux.endpoint.history_len(),
                 mux.endpoint.bytes_in_flight(),
@@ -1191,9 +1900,15 @@ async fn send_next_object_packet<const H: usize>(
                 mux.endpoint.send.max_data,
                 offset,
                 chunk,
-            )
-        })?;
+            )),
+        Ok(packet) => packet,
+    };
     socket.send_to(&packet[..used], peer).await?;
+    transfer.pacer.sent(Duration::ZERO);
+    if transfer.first_send.is_none() {
+        transfer.first_send = Some(Instant::now());
+    }
+    transfer.sent_datagrams = transfer.sent_datagrams.saturating_add(1);
     transfer.current_offset = end;
     transfer.stream_offset = transfer.stream_offset.saturating_add(chunk as u64);
     let previous_bytes = transfer.sent_bytes;
@@ -1216,16 +1931,26 @@ async fn fill_object_window<const H: usize>(
     transfer: &mut PendingObjectTransfer,
     packet: &mut [u8; MTU],
 ) -> Result<bool> {
+    transfer.pacer.observe(
+        mux.endpoint.stats(),
+        mux.endpoint.smoothed_rtt(),
+        mux.endpoint.congestion.congestion_window,
+        mux.endpoint.congestion.max_datagram_size,
+    );
+    if !transfer.pacer.ready() {
+        return Ok(false);
+    }
     let mut sent_any = false;
     let mut sent_packets = 0usize;
-    while mux.endpoint.history_len() < mux.endpoint.history_capacity()
-        && mux.endpoint.congestion.can_send(MTU as u64)
-    {
+    while mux.endpoint.history_len() < mux.endpoint.history_capacity() {
         if !send_next_object_packet(socket, peer, mux, transfer, packet).await? {
             break;
         }
         sent_any = true;
         sent_packets += 1;
+        if !transfer.pacer.delay.is_zero() {
+            break;
+        }
         // The manifest is on a separate stream and must be accepted before a
         // block can be verified. It is therefore a one-time application
         // barrier. Blocks are all on the same ordered stream and independent
@@ -1248,9 +1973,144 @@ async fn fill_object_window<const H: usize>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::eprintln;
 
     use super::*;
+    use crate::CommittedStreamDisposition;
+
+    #[test]
+    fn active_object_scheduler_never_waits_the_idle_50ms_tick() {
+        assert_eq!(
+            connection_receive_wait(true, false, Some(Duration::from_secs(1))),
+            ACTIVE_OBJECT_SCHEDULER_TICK,
+        );
+        assert_eq!(
+            connection_receive_wait(false, false, None),
+            Duration::from_millis(50),
+        );
+    }
+
+    #[test]
+    fn adaptive_pacer_uses_transport_loss_then_relaxes_after_clean_acks() {
+        let mut pacer = AdaptivePacer::new();
+        let mut stats = crate::TransportStats::default();
+        // Clean startup remains a full-window, unpaced sender.
+        pacer.observe(stats, Some(5), 32 * 1200, 1200);
+        assert!(pacer.delay.is_zero());
+
+        // A declared retransmission enables RTT/cwnd-derived pacing. With a
+        // 5 ms RTT and 32 packets in cwnd the target is 156 us, above the
+        // 125 us lower bound.
+        stats.loss_retransmitted_datagrams = 1;
+        stats.control_datagrams = 1;
+        pacer.observe(stats, Some(5), 32 * 1200, 1200);
+        assert_eq!(pacer.delay, Duration::from_micros(156));
+        assert_eq!(pacer.activations, 1);
+
+        // Thirty-two clean peer control/ACK packets remove this small delay;
+        // an adaptive policy must not permanently pace a recovered link.
+        stats.control_datagrams = ADAPTIVE_PACING_CLEAN_ACKS + 1;
+        pacer.observe(stats, Some(5), 32 * 1200, 1200);
+        assert!(pacer.delay.is_zero());
+    }
+
+    #[test]
+    fn active_scheduler_honors_sub_millisecond_pacing_deadline() {
+        assert_eq!(
+            connection_receive_wait(true, false, Some(Duration::from_micros(250))),
+            Duration::from_micros(250),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn udp_listener_tos_round_trips_for_wmm_diagnostics() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        configure_ipv4_tos(&socket, 0x88).unwrap();
+        assert_eq!(socket_ipv4_tos(&socket).unwrap(), 0x88);
+    }
+
+    #[test]
+    fn active_unpaced_iperf_never_falls_back_to_idle_50ms_tick() {
+        // `None` is the normal unpaced state: `next_send` is already due.
+        // It must not become the listener's 50 ms idle wait.
+        assert_eq!(
+            connection_receive_wait(false, true, None),
+            ACTIVE_OBJECT_SCHEDULER_TICK,
+        );
+        assert_eq!(
+            connection_receive_wait(false, true, Some(Duration::from_millis(20))),
+            ACTIVE_OBJECT_SCHEDULER_TICK,
+        );
+    }
+
+    #[test]
+    fn iperf_request_schedule_is_scoped_and_backward_compatible() {
+        let defaults = (Duration::from_micros(17), 3, Duration::from_micros(29));
+        let legacy = [SERVICE_IPERF; 11];
+        assert_eq!(
+            iperf_schedule(&legacy, defaults.0, defaults.1, defaults.2),
+            (defaults.0, defaults.1, defaults.2, 2, RECOVERY_MAX_ACK_DELAY_US)
+        );
+
+        let mut request = [0u8; 22];
+        request[0] = SERVICE_IPERF;
+        request[11..15].copy_from_slice(&250u32.to_be_bytes());
+        request[15] = 4;
+        request[16..20].copy_from_slice(&1_000u32.to_be_bytes());
+        request[20] = 8;
+        request[21] = 1;
+        assert_eq!(
+            iperf_schedule(&request, defaults.0, defaults.1, defaults.2),
+            (Duration::from_micros(250), 4, Duration::from_micros(1_000), 8, 1_000)
+        );
+        request[20] = u8::MAX;
+        assert_eq!(
+            iperf_schedule(&request, defaults.0, defaults.1, defaults.2).3,
+            crate::ACK_RANGE_CAPACITY as u8
+        );
+    }
+
+    #[test]
+    fn object_transfer_negotiates_lan_ack_policy() {
+        let local = ConnectionId::new(0x31).unwrap();
+        let peer = ConnectionId::new(0x32).unwrap();
+        let mut endpoint = EndpointState::<4, 4>::new(
+            Role::Server,
+            ConnectionLimits::default(),
+            MTU as u64,
+        );
+        endpoint.install_connection_ids(local, peer).unwrap();
+        endpoint.request_ack_frequency(
+            0,
+            u64::from(RECOVERY_OBJECT_ACK_FREQUENCY - 1),
+            RECOVERY_MAX_ACK_DELAY_US,
+            1,
+        ).unwrap();
+        let mut packet = [0u8; MTU];
+        let used = endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let (_, header_len) = crate::ShortHeader::decode(&packet[..used]).unwrap();
+        assert_eq!(
+            crate::decode_frame(&packet[header_len..used]).unwrap().0,
+            crate::Frame::AckFrequency {
+                sequence: 0,
+                packet_threshold: 7,
+                max_ack_delay_us: RECOVERY_MAX_ACK_DELAY_US,
+                reordering_threshold: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn iperf_send_gap_bins_have_the_compact_numeric_order() {
+        assert_eq!(interpacket_gap_bucket(Duration::from_micros(999)), 0);
+        assert_eq!(interpacket_gap_bucket(Duration::from_micros(1_000)), 1);
+        assert_eq!(interpacket_gap_bucket(Duration::from_micros(5_000)), 2);
+        assert_eq!(interpacket_gap_bucket(Duration::from_micros(10_000)), 3);
+        assert_eq!(interpacket_gap_bucket(Duration::from_micros(25_000)), 4);
+        assert_eq!(interpacket_gap_bucket(Duration::from_micros(50_000)), 5);
+    }
     use crate::callback::{CallbackStreams, CopyingStreamEvents};
     use crate::handlers::handle_stream;
     use crate::{
@@ -1259,8 +2119,8 @@ mod tests {
         RECOVERY_REORDER_CAPACITY_BYTES,
     };
     use dmesh_object_store::protocol::{
-        encode_get, ImageEvent, ImageManifest, ImageReceiver, ImageSink, RecordBuffer, RECORD_BLOB,
-        RECORD_DONE, RECORD_MANIFEST,
+        encode_get, ImageEvent, ImageManifest, ImageReceiver, ImageSink, RecordBuffer, BLOCK_SIZE,
+        RECORD_BLOB, RECORD_DONE, RECORD_MANIFEST,
     };
     use std::format;
     use std::string::String;
@@ -1648,7 +2508,9 @@ mod tests {
             _end: bool,
             bytes: &[u8],
         ) -> Result<(), Self::Error> {
-            if stream != OBJECT_STREAM { return Err(()); }
+            if stream != OBJECT_STREAM {
+                return Err(());
+            }
             self.records.push(bytes);
             self.bytes = self.bytes.saturating_add(bytes.len());
             Ok(())
@@ -1661,6 +2523,24 @@ mod tests {
         records: RecordBuffer,
         receiver: ImageReceiver<FakeFlash>,
         drop_outbound_control: usize,
+        /// Production Recovery drains completed flash slots from its bounded
+        /// socket-timeout path.  Keep accepted record credit pending until
+        /// that path runs; otherwise a host test can hide the exact
+        /// sender-waits-for-MAX_* deadlock that a full initial window exposes.
+        pending_flash_credit: usize,
+        /// Mirror the real-flash bootstrap erase barrier. Recovery must ACK
+        /// the full advertised application window before flash erase pauses
+        /// Wi-Fi; until then completed records retain their storage credit.
+        hold_credit_until_bootstrap: bool,
+        delivered_stream_bytes: usize,
+        timer_credit_updates: usize,
+        /// Bearer-only ACK/control latency. The stream callback and transport
+        /// policy remain unchanged, so this models the measured Wi-Fi
+        /// refill-cycle delay without inventing Recovery-side ACK logic.
+        outbound_control_delay: Duration,
+        /// Control waiting in the simulated bearer. Delaying a packet on the
+        /// air must not suspend Recovery's receive loop.
+        pending_outbound: Vec<(Instant, Vec<u8>)>,
     }
 
     impl RecoveryMirror {
@@ -1682,15 +2562,45 @@ mod tests {
                 records: RecordBuffer::new(),
                 receiver: ImageReceiver::new(FakeFlash { bytes: Vec::new() }),
                 drop_outbound_control: 0,
+                pending_flash_credit: 0,
+                hold_credit_until_bootstrap: false,
+                delivered_stream_bytes: 0,
+                timer_credit_updates: 0,
+                outbound_control_delay: Duration::ZERO,
+                pending_outbound: Vec::new(),
             }
+        }
+
+        fn queue_outbound(&mut self, output: Vec<u8>) {
+            if self.drop_outbound_control != 0 {
+                self.drop_outbound_control -= 1;
+                return;
+            }
+            self.pending_outbound
+                .push((Instant::now() + self.outbound_control_delay, output));
+        }
+
+        async fn flush_outbound(&mut self, socket: &UdpSocket, peer: SocketAddr) -> Result<()> {
+            let now = Instant::now();
+            let mut index = 0;
+            while index < self.pending_outbound.len() {
+                if self.pending_outbound[index].0 > now {
+                    index += 1;
+                    continue;
+                }
+                let (_, output) = self.pending_outbound.swap_remove(index);
+                socket.send_to(&output, peer).await?;
+            }
+            Ok(())
         }
 
         fn accept_recovery_records(
             stream: u64,
             records: &mut RecordBuffer,
             receiver: &mut ImageReceiver<FakeFlash>,
-        ) {
+        ) -> usize {
             assert_eq!(stream, OBJECT_STREAM);
+            let mut released = 0usize;
             while let Some((kind, body)) = records.next() {
                 let event = match kind {
                     RECORD_MANIFEST => receiver.on_manifest(&body).unwrap(),
@@ -1701,7 +2611,12 @@ mod tests {
                 if kind == RECORD_DONE {
                     assert_eq!(event, ImageEvent::Complete);
                 }
+                // Match Recovery's fixed record sink: durable/reusable
+                // storage returns exactly the framed record bytes, never an
+                // arbitrary transport-packet size.
+                released = released.saturating_add(5 + body.len());
             }
+            released
         }
 
         async fn receive_one(
@@ -1709,7 +2624,14 @@ mod tests {
             socket: &UdpSocket,
             peer: SocketAddr,
             packet: &[u8],
+            now_ms: u64,
         ) -> Result<()> {
+            self.flush_outbound(socket, peer).await?;
+            // Match Recovery's receive loop: packet arrival advances the
+            // transport clock before delayed ACK eligibility is evaluated.
+            // Without this, a continuously nonempty host socket can leave a
+            // mirror's ACK timer at its old value indefinitely.
+            self.endpoint.set_time(now_ms);
             let mut transport_out = [0u8; MTU];
             let mut outputs: Vec<Vec<u8>> = Vec::new();
             let (endpoint, ordered, records, receiver) = (
@@ -1718,21 +2640,12 @@ mod tests {
                 &mut self.records,
                 &mut self.receiver,
             );
+            let mut released_credit = 0usize;
+            let mut delivered_bytes = 0usize;
             endpoint
-                .receive_with_callbacks(
-                    packet,
-                    &mut transport_out,
-                    |out| {
-                        // The bearer test only forwards opaque transport
-                        // output. It must not know which frames it contains.
-                        outputs.push(out.to_vec());
-                    },
-                    |stream| {
+                .receive_with_committed_callback_dispositions(packet, |stream| {
                         let consumed = {
-                            let mut sink = RecoveryMirrorSink {
-                                records,
-                                bytes: 0,
-                            };
+                            let mut sink = RecoveryMirrorSink { records, bytes: 0 };
                             ordered
                                 .receive_copying(
                                     stream.id,
@@ -1746,19 +2659,40 @@ mod tests {
                             sink.bytes
                         };
                         if consumed != 0 {
-                            Self::accept_recovery_records(stream.id, records, receiver);
+                            delivered_bytes = delivered_bytes.saturating_add(consumed);
+                            released_credit = released_credit.saturating_add(
+                                Self::accept_recovery_records(stream.id, records, receiver),
+                            );
                         }
-                        Ok(consumed)
-                    },
-                )
+                        Ok(if consumed == 0 {
+                            CommittedStreamDisposition::Reack
+                        } else {
+                            // Recovery first ACKs the drained burst, then
+                            // returns credit only after its record storage is
+                            // reusable. This catches a benchmark path that
+                            // accidentally retains bootstrap credit forever.
+                            CommittedStreamDisposition::Deferred
+                        })
+                    })
                 .map_err(|error| anyhow::anyhow!("Recovery mirror input: {error:?}"))?;
-            for output in outputs {
-                if self.drop_outbound_control != 0 {
-                    self.drop_outbound_control -= 1;
-                } else {
-                    socket.send_to(&output, peer).await?;
-                }
+            self.delivered_stream_bytes = self
+                .delivered_stream_bytes
+                .saturating_add(delivered_bytes);
+            if let Some(used) = endpoint
+                .poll_transmit(&mut transport_out)
+                .map_err(|error| anyhow::anyhow!("Recovery mirror ACK: {error:?}"))?
+            {
+                outputs.push(transport_out[..used].to_vec());
             }
+            if released_credit != 0 {
+                self.pending_flash_credit = self
+                    .pending_flash_credit
+                    .saturating_add(released_credit);
+            }
+            for output in outputs {
+                self.queue_outbound(output);
+            }
+            self.flush_outbound(socket, peer).await?;
             Ok(())
         }
 
@@ -1772,21 +2706,54 @@ mod tests {
             peer: SocketAddr,
             now_ms: u64,
         ) -> Result<()> {
+            self.flush_outbound(socket, peer).await?;
             self.endpoint.set_time(now_ms);
+            let released_credit = if self.hold_credit_until_bootstrap
+                // Object transfer opens another record only when that whole
+                // record fits. It can be credit-blocked just below the byte
+                // limit; mirror the sink's bounded record reserve.
+                && self.delivered_stream_bytes
+                    < crate::RECOVERY_INITIAL_MAX_DATA as usize - (5 + 12 + BLOCK_SIZE)
+            {
+                0
+            } else {
+                core::mem::take(&mut self.pending_flash_credit)
+            };
+            if released_credit != 0 {
+                self.timer_credit_updates = self.timer_credit_updates.saturating_add(1);
+                self.endpoint
+                    .stream_consumed_deferred(OBJECT_STREAM, released_credit)
+                    .map_err(|error| anyhow::anyhow!("Recovery mirror timer credit: {error:?}"))?;
+            }
             let mut output = [0u8; MTU];
             if let Some(used) = self
                 .endpoint
                 .poll_transmit(&mut output)
                 .map_err(|error| anyhow::anyhow!("Recovery mirror timer: {error:?}"))?
             {
-                if self.drop_outbound_control != 0 {
-                    self.drop_outbound_control -= 1;
-                } else {
-                    socket.send_to(&output[..used], peer).await?;
-                }
+                self.queue_outbound(output[..used].to_vec());
             }
+            self.flush_outbound(socket, peer).await?;
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecoveryMirrorResult {
+        /// Stream datagrams intentionally withheld before Recovery's
+        /// transport.  This is a bearer fault, not an application fault.
+        dropped_streams: usize,
+        /// A withheld stream offset later observed in a fresh-number packet.
+        /// The sender has no other reason to emit the same stream range, so
+        /// this is direct host-side proof of a transport retransmission.
+        recovered_streams: usize,
+        /// A repeated server stream offset in a fresh packet number that was
+        /// not intentionally withheld. It is host-side evidence of a
+        /// retransmission caused solely by ACK/refill timing.
+        unexpected_retransmissions: usize,
+        /// Completed record storage first became reusable while the socket
+        /// was empty, so Recovery had to advertise MAX_* from its timer path.
+        timer_credit_updates: usize,
     }
 
     async fn run_recovery_mirror(
@@ -1794,10 +2761,39 @@ mod tests {
         object_chunk: usize,
         history_capacity: usize,
         ack_frequency: u8,
-        drop_first_control: bool,
+        drop_outbound_control: usize,
         drop_first_stream: bool,
         late_loss_burst: bool,
-    ) {
+        drop_initial_alternate: bool,
+        outbound_control_delay: Duration,
+    ) -> RecoveryMirrorResult {
+        run_recovery_mirror_with_bootstrap_erase(
+            size,
+            object_chunk,
+            history_capacity,
+            ack_frequency,
+            drop_outbound_control,
+            drop_first_stream,
+            late_loss_burst,
+            drop_initial_alternate,
+            outbound_control_delay,
+            false,
+        )
+        .await
+    }
+
+    async fn run_recovery_mirror_with_bootstrap_erase(
+        size: usize,
+        object_chunk: usize,
+        history_capacity: usize,
+        ack_frequency: u8,
+        drop_outbound_control: usize,
+        drop_first_stream: bool,
+        late_loss_burst: bool,
+        drop_initial_alternate: bool,
+        outbound_control_delay: Duration,
+        hold_credit_until_bootstrap: bool,
+    ) -> RecoveryMirrorResult {
         let directory = tempdir().unwrap();
         let artifact_root = directory.path().join("flash");
         let artifact = artifact_root.join("esp32c6/main-app.bin");
@@ -1806,9 +2802,13 @@ mod tests {
         std::fs::write(&artifact, &expected).unwrap();
 
         let mut request_body = [0u8; 64];
-        let encoded_len = encode_get(&mut request_body[1..], None, 13, 6).unwrap();
+        let encoded_len = encode_get(&mut request_body[2..], None, 13, 6).unwrap();
         request_body[0] = SERVICE_OBJECT;
-        let request_len = encoded_len + 1;
+        // Match Recovery's transport-service envelope. The host must not
+        // silently select its listener default when this test requests a
+        // specific delayed-ACK profile.
+        request_body[1] = ack_frequency.clamp(1, crate::ACK_RANGE_CAPACITY as u8);
+        let request_len = encoded_len + 2;
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind = probe.local_addr().unwrap();
         drop(probe);
@@ -1848,14 +2848,14 @@ mod tests {
             }
         };
         let mut mirror = RecoveryMirror::new();
+        mirror.hold_credit_until_bootstrap = hold_credit_until_bootstrap;
         mirror
             .endpoint
             .install_connection_ids(client_cid, server_cid)
             .unwrap();
-        mirror
-            .endpoint
-            .set_ack_frequency(ack_frequency);
-        mirror.drop_outbound_control = usize::from(drop_first_control);
+        mirror.endpoint.set_ack_frequency(ack_frequency);
+        mirror.drop_outbound_control = drop_outbound_control;
+        mirror.outbound_control_delay = outbound_control_delay;
         mirror
             .endpoint
             .open_send_stream(FIRST_CLIENT_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA)
@@ -1878,32 +2878,103 @@ mod tests {
             .unwrap();
 
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(20);
+        // The host suite runs several Recovery fault profiles concurrently.
+        // Keep a generous absolute cap, but fail a real transport deadlock on
+        // lack of delivered stream progress rather than scheduler contention.
+        let deadline = started + Duration::from_secs(60);
+        let mut last_delivery = started;
+        let mut last_delivered_bytes = 0usize;
         let mut mirror_datagrams = 0usize;
         let mut drop_first_stream = drop_first_stream;
         let mut stream_datagrams = 0usize;
         let mut late_drops_remaining = if late_loss_burst { 3usize } else { 0 };
+        let mut dropped_streams = Vec::new();
+        let mut delivered_stream_offsets = HashMap::new();
+        // The injected alternating-loss burst models loss of the first flight.
+        // A retransmission carries the same stream offset in a fresh packet and
+        // must be admitted; otherwise the test fault model can discard repairs
+        // indefinitely instead of testing recovery.
+        let mut initial_stream_offsets = HashSet::new();
+        let mut result = RecoveryMirrorResult::default();
         while !mirror.receiver.is_complete() {
+            if mirror.delivered_stream_bytes != last_delivered_bytes {
+                last_delivered_bytes = mirror.delivered_stream_bytes;
+                last_delivery = Instant::now();
+            }
+            assert!(
+                last_delivery.elapsed() < Duration::from_secs(10),
+                "Recovery mirror made no delivery progress for 10 seconds after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
+                mirror.delivered_stream_bytes,
+                mirror.pending_flash_credit,
+            );
             let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "Recovery mirror transfer timed out after {mirror_datagrams} datagrams");
-            match tokio::time::timeout(remaining.min(Duration::from_millis(10)), socket.recv_from(&mut input)).await {
+            assert!(
+                !remaining.is_zero(),
+                "Recovery mirror transfer timed out after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
+                mirror.delivered_stream_bytes,
+                mirror.pending_flash_credit,
+            );
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(10)),
+                socket.recv_from(&mut input),
+            )
+            .await
+            {
                 Ok(Ok((len, peer))) => {
                     assert_eq!(peer, bind);
                     mirror_datagrams += 1;
-                    let (_, header_len) = ShortHeader::decode(&input[..len]).unwrap();
+                    let (header, header_len) = ShortHeader::decode(&input[..len]).unwrap();
                     let (frame, _) = crate::decode_frame(&input[header_len..]).unwrap();
-                    if drop_first_stream && matches!(frame, Frame::Stream(_)) {
-                        drop_first_stream = false;
-                        continue;
-                    }
-                    if matches!(frame, Frame::Stream(_)) {
+                    if let Frame::Stream(stream) = &frame {
+                        if let Some(index) =
+                            dropped_streams.iter().position(|(offset, packet_number)| {
+                                *offset == stream.offset && *packet_number != header.packet_number
+                            })
+                        {
+                            dropped_streams.swap_remove(index);
+                            result.recovered_streams += 1;
+                        }
                         stream_datagrams += 1;
-                        if stream_datagrams >= 849 && late_drops_remaining != 0 {
-                            late_drops_remaining -= 1;
+                        let first_stream_drop = drop_first_stream;
+                        let late_stream_drop = stream_datagrams >= 849 && late_drops_remaining != 0;
+                        // A bounded alternating initial burst models the
+                        // ESP/lwIP overflow seen live: the AP reports the
+                        // frames transmitted, while Recovery observes only
+                        // about half. This must recover through selective
+                        // ACK/loss repair, not require another application
+                        // record or a service restart.
+                        let first_stream_offset = initial_stream_offsets.insert(stream.offset);
+                        let initial_alternate_drop = drop_initial_alternate
+                            && first_stream_offset
+                            && initial_stream_offsets.len() <= 64
+                            && initial_stream_offsets.len() % 2 == 0;
+                        let drop_packet = first_stream_drop || late_stream_drop || initial_alternate_drop;
+                        if drop_packet {
+                            drop_first_stream = false;
+                            if late_stream_drop {
+                                late_drops_remaining -= 1;
+                            }
+                            dropped_streams.push((stream.offset, header.packet_number));
+                            result.dropped_streams += 1;
                             continue;
                         }
+                        if let Some(previous_packet_number) =
+                            delivered_stream_offsets.insert(stream.offset, header.packet_number)
+                        {
+                            if previous_packet_number != header.packet_number {
+                                result.unexpected_retransmissions += 1;
+                            }
+                        }
                     }
-                    match mirror.receive_one(&socket, peer, &input[..len]).await {
+                    match mirror
+                        .receive_one(
+                            &socket,
+                            peer,
+                            &input[..len],
+                            started.elapsed().as_millis() as u64,
+                        )
+                        .await
+                    {
                         Ok(()) => {}
                         // Recovery keeps its socket loop alive when the
                         // bounded callback credit rejects far-ahead data.
@@ -1925,13 +2996,34 @@ mod tests {
         }
         server_task.abort();
         assert_eq!(mirror.receiver.sink_mut().bytes, expected);
+        assert!(
+            dropped_streams.is_empty(),
+            "host did not retransmit {} intentionally withheld stream ranges",
+            dropped_streams.len()
+        );
+        result.timer_credit_updates = mirror.timer_credit_updates;
+        result
     }
 
     #[tokio::test]
     async fn recovery_receive_loop_matrix_matches_device_profiles() {
         for history_capacity in [2, 4, 16, 32] {
-            for object_chunk in [OBJECT_CHUNK, 1200] {
-                run_recovery_mirror(128 * 1024 + 123, object_chunk, history_capacity, 2, false, false, false).await;
+            // Exercise both the 512-byte diagnostic profile and the normal
+            // MTU-friendly production profile.
+            for object_chunk in [512, OBJECT_CHUNK] {
+                let result = run_recovery_mirror(
+                    128 * 1024 + 123,
+                    object_chunk,
+                    history_capacity,
+                    2,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Duration::ZERO,
+                )
+                .await;
+                assert_eq!(result.dropped_streams, 0);
             }
         }
     }
@@ -1941,7 +3033,23 @@ mod tests {
         let size = 2_122_528;
         let started = Instant::now();
         let object_chunk = 1200;
-        run_recovery_mirror(size, object_chunk, 32, 8, false, false, false).await;
+        let result = run_recovery_mirror(
+            size,
+            object_chunk,
+            32,
+            8,
+            0,
+            false,
+            false,
+            false,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 0);
+        assert!(
+            result.timer_credit_updates != 0,
+            "the full Recovery profile must exercise timer-driven flash credit",
+        );
         let elapsed = started.elapsed();
         let mib_per_second = size as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
         eprintln!(
@@ -1959,14 +3067,39 @@ mod tests {
         // window.  Drop the first timer-driven ACK exactly as Wi-Fi can; the
         // server must PTO a retained packet even though its history is not
         // yet full, then resume the same ordered response stream.
-        run_recovery_mirror(2_122_528, 1200, 16, 8, true, false, false).await;
+        let result = run_recovery_mirror(
+            2_122_528,
+            1200,
+            16,
+            8,
+            1,
+            false,
+            false,
+            false,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 0);
     }
 
     #[tokio::test]
     async fn recovery_profile_recovers_from_late_three_packet_loss_burst() {
         // Matches the device stall boundary: do not let a late selective-ACK
         // gap turn an otherwise healthy 2 MiB Recovery transfer into silence.
-        run_recovery_mirror(2_122_528, 1200, 32, 8, false, false, true).await;
+        let result = run_recovery_mirror(
+            2_122_528,
+            1200,
+            32,
+            8,
+            0,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 3);
+        assert_eq!(result.recovered_streams, 3);
     }
 
     #[tokio::test]
@@ -1975,16 +3108,135 @@ mod tests {
         // roughly 256 KiB past a missing early range, overflowing Recovery's
         // callback buffer.  The receiver must advertise only its bounded
         // reorder budget and the sender must repair the gap.
-        run_recovery_mirror(2_122_528, 1200, 16, 8, false, true, false).await;
+        let result = run_recovery_mirror(
+            2_122_528,
+            1200,
+            16,
+            8,
+            0,
+            true,
+            false,
+            false,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 1);
+        assert_eq!(result.recovered_streams, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_delayed_ack_refills_without_spurious_retransmission() {
+        // The live AP shows roughly one sender refill per ACK and recurrent
+        // 10--25 ms gaps.  Model only that bearer delay: Recovery continues
+        // to use its normal callback, flow credit, and transport-owned ACK
+        // policy. A contiguous delayed ACK must refill the sender without a
+        // replacement stream packet or congestion-loss episode.
+        let result = run_recovery_mirror(
+            128 * 1024,
+            1200,
+            16,
+            4,
+            0,
+            false,
+            false,
+            false,
+            Duration::from_millis(18),
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 0);
+        assert_eq!(result.unexpected_retransmissions, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_real_flash_acks_bootstrap_before_erase_credit_barrier() {
+        // Mirror MainSink's real-flash ordering: receive and ACK the whole
+        // initial 76 KiB application window, withhold MAX_* while erase owns
+        // the radio, then resume only through returned storage slots. This
+        // must resume by the timer-driven MAX_* update rather than deadlock
+        // below a partial record boundary.
+        let result = run_recovery_mirror_with_bootstrap_erase(
+            2_122_528,
+            1200,
+            32,
+            8,
+            0,
+            false,
+            false,
+            false,
+            Duration::ZERO,
+            true,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 0);
+        assert_eq!(result.recovered_streams, 0);
+        assert!(result.timer_credit_updates > 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_recovers_after_a_full_window_of_lost_acks() {
+        // This is the exact host-side analogue of a live sender retaining a
+        // full 32-packet flight while Recovery emits no usable ACKs. Once a
+        // PTO probe reaches the receiver, duplicate re-ACK and normal window
+        // refill must complete the stream; the connection may not wait for a
+        // new application record or an external socket event.
+        let result = run_recovery_mirror(
+            128 * 1024,
+            1200,
+            32,
+            8,
+            4,
+            false,
+            false,
+            false,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_profile_recovers_from_initial_alternating_loss_burst() {
+        // The fault is confined to the first 64 stream datagrams (32 drops).
+        // 128 KiB leaves enough post-repair data to verify resumed progress
+        // without making this host determinism gate compete with the larger
+        // multi-megabyte Recovery benchmark tests.
+        let result = run_recovery_mirror(
+            128 * 1024,
+            1200,
+            32,
+            8,
+            0,
+            false,
+            false,
+            true,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.dropped_streams, 32);
+        assert_eq!(result.recovered_streams, 32);
     }
 
     #[test]
     fn recovery_production_window_fits_callback_reorder_budget() {
-        const HOST_HISTORY_PACKETS: usize = RECOVERY_MAX_HISTORY_PACKETS;
+        const RECEIVER_PACKET_BUDGET: usize =
+            crate::RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS as usize;
         const HOST_PAYLOAD_BYTES: usize = 1200;
         assert!(
-            HOST_HISTORY_PACKETS * HOST_PAYLOAD_BYTES <= RECOVERY_REORDER_CAPACITY_BYTES,
+            RECEIVER_PACKET_BUDGET * HOST_PAYLOAD_BYTES <= RECOVERY_REORDER_CAPACITY_BYTES,
             "Recovery callback reassembly must cover every outstanding host payload"
+        );
+        assert!(
+            RECOVERY_MAX_HISTORY_PACKETS >= RECEIVER_PACKET_BUDGET,
+            "host retransmission ledger must cover Recovery's packet budget"
+        );
+        // Packet history and byte credit are deliberately independent. The
+        // C6 can retain/reorder a 64-packet sender history, while its fixed
+        // application pool admits eight complete 4 KiB records before flash
+        // releases credit.  Requiring both at startup would overcommit
+        // internal RAM and turn a valid manifest into an allocator abort.
+        assert!(
+            crate::RECOVERY_INITIAL_MAX_DATA as usize >= 8 * (5 + 12 + 4096),
+            "initial byte credit must cover the fixed Recovery blob pool"
         );
     }
 
@@ -1999,7 +3251,7 @@ mod tests {
         // control/data boundaries and at a multi-megabyte transfer size. The
         // fake flash sink keeps this deterministic and bounded without
         // touching a real device.
-        for object_chunk in [OBJECT_CHUNK, 1200] {
+        for object_chunk in [512, OBJECT_CHUNK] {
             for size in [4 * 1024, 64 * 1024, 512 * 1024, 2 * 1024 * 1024] {
                 run_object_transfer(size, object_chunk).await;
             }
@@ -2148,6 +3400,10 @@ mod tests {
         let server_task = tokio::spawn(run(UdpConfig {
             bind,
             artifact_root: root.path().to_path_buf(),
+            // Exercise a bounded diagnostic burst. The default (exercised
+            // by the Recovery profile tests) remains unpaced/unlimited.
+            iperf_burst_packets: 2,
+            iperf_burst_delay: Duration::from_micros(100),
             ..UdpConfig::default()
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2215,9 +3471,10 @@ mod tests {
                     u32::from_be_bytes(iperf[offset..offset + 4].try_into().unwrap()),
                     packet_id,
                 );
-                assert!(iperf[offset + 4..offset + used].iter().enumerate().all(|(index, byte)| {
-                    *byte == (offset + 4 + index) as u8
-                }));
+                assert!(iperf[offset + 4..offset + used]
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| { *byte == (offset + 4 + index) as u8 }));
                 offset += used;
                 packet_id = packet_id.wrapping_add(1);
             }
@@ -2231,6 +3488,107 @@ mod tests {
             assert!(registry_text.contains("events"));
         }
         assert_ne!(server_cids[0], server_cids[1]);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_recovery_command_mode_reconnects_on_same_tuple_with_fresh_cid() {
+        // Recovery keeps its UDP source port stable.  A completed connection
+        // remains routable for delayed packets, so a second command-mode run
+        // must use a new client CID rather than trying to bootstrap over the
+        // old connection's monotonic packet-number space.
+        let root = tempdir().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Reuse exactly one local UDP tuple, as Recovery does on hardware.
+        let client_probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_bind = client_probe.local_addr().unwrap();
+        drop(client_probe);
+        let mut first =
+            UdpClient::connect(client_bind, bind, ConnectionId::new(0x1_0000_0001).unwrap())
+                .await
+                .unwrap();
+        let (_, first_metrics, _) = first
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
+            .await
+            .unwrap();
+        assert!(core::str::from_utf8(&first_metrics)
+            .unwrap()
+            .contains("metrics_version=1"));
+        drop(first);
+
+        // This is the old Recovery behavior: CID=1 on every command. The
+        // listener correctly treats it as a stale bootstrap rather than
+        // reusing a packet-number space after application traffic.
+        assert!(
+            UdpClient::connect(client_bind, bind, ConnectionId::new(0x1_0000_0001).unwrap(),)
+                .await
+                .is_err()
+        );
+
+        let mut second =
+            UdpClient::connect(client_bind, bind, ConnectionId::new(0x1_0000_0002).unwrap())
+                .await
+                .unwrap();
+        let (_, second_metrics, _) = second
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
+            .await
+            .unwrap();
+        assert!(core::str::from_utf8(&second_metrics)
+            .unwrap()
+            .contains("metrics_version=1"));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_iperf_honors_recovery_bootstrap_credit_before_first_ack() {
+        let root = tempdir().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let limits = ConnectionLimits {
+            max_data: crate::RECOVERY_INITIAL_MAX_DATA,
+            max_stream_data: crate::RECOVERY_INITIAL_MAX_DATA,
+            ..ConnectionLimits::default()
+        };
+        let mut client = UdpClient::connect_with_limits(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0xb5).unwrap(),
+            4,
+            limits,
+        )
+        .await
+        .unwrap();
+        client.set_ack_frequency(4);
+        let mut request = Vec::from([SERVICE_IPERF]);
+        request.extend_from_slice(&120_000u64.to_be_bytes());
+        request.extend_from_slice(&1200u16.to_be_bytes());
+        let (_, first, mut finished) = client.request_stream(4, &request, true).await.unwrap();
+        let mut received = first.len();
+        while !finished {
+            let (_, bytes, fin) = timeout(Duration::from_secs(2), client.recv_stream())
+                .await
+                .unwrap()
+                .unwrap();
+            received += bytes.len();
+            finished = fin;
+        }
+        assert_eq!(received, 120_000);
         server_task.abort();
     }
 
@@ -2250,14 +3608,30 @@ mod tests {
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
         let mut client = UdpClient::connect(
-            "127.0.0.1:0".parse().unwrap(), bind, ConnectionId::new(0x8c).unwrap(),
-        ).await.unwrap();
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0x8c).unwrap(),
+        )
+        .await
+        .unwrap();
         let log = [SERVICE_CONTROL, CONTROL_LOG, 0xa1, 0x04, 0x62, b'o', b'k'];
         let (_, response, finished) = client
-            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &log, true).await.unwrap();
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &log, true)
+            .await
+            .unwrap();
         assert!(finished);
-        assert_eq!(response, [SERVICE_CONTROL, CONTROL_RESPONSE, 0xa1, 0x00, 0x18, 0x44]);
+        assert_eq!(
+            response,
+            [SERVICE_CONTROL, CONTROL_RESPONSE, 0xa1, 0x00, 0x18, 0x44]
+        );
         assert_eq!(control.take_log().as_deref(), Some(&log[2..]));
+        // The same opaque control handle used by a live Wi-Fi listener must
+        // expose a current sender snapshot without requiring a packet trace.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let stats = control.server_stats().expect("listener transport stats");
+        assert!(stats.transport.received_datagrams >= 1);
+        assert!(stats.transport.sent_datagrams >= 1);
+        assert!(stats.transport.sent_stream_datagrams >= 1);
         server_task.abort();
     }
 
@@ -2425,7 +3799,10 @@ mod tests {
             decode_bootstrap_ack(&response[..first_len], cid).unwrap();
         let mut retry_open = [0u8; MTU];
         let retry_open_len = encode_bootstrap_open(cid, 1, &mut retry_open).unwrap();
-        client.send_to(&retry_open[..retry_open_len], bind).await.unwrap();
+        client
+            .send_to(&retry_open[..retry_open_len], bind)
+            .await
+            .unwrap();
         let (second_len, _) = client.recv_from(&mut response).await.unwrap();
         let (second_header, second_server) =
             decode_bootstrap_ack(&response[..second_len], cid).unwrap();
@@ -2511,7 +3888,9 @@ mod tests {
             bind,
             artifact_root: root.path().to_path_buf(),
             idle_timeout: Duration::from_millis(2),
-            receive_timeout: Duration::from_millis(1),
+            // Keep the listener continuously busy below so expiry must not
+            // depend on this timeout firing.
+            receive_timeout: Duration::from_millis(20),
             ..UdpConfig::default()
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2526,7 +3905,23 @@ mod tests {
             .unwrap()
             .unwrap();
         let (_, first_server) = decode_bootstrap_ack(&response[..first_len], cid).unwrap();
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        let mut noise = [0u8; 64];
+        let noise_header = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(0xabcd).unwrap(),
+            packet_number: 0,
+            packet_number_len: 1,
+        }
+        .encode(&mut noise)
+        .unwrap();
+        let noise_len = noise_header + Frame::Ping.encode(&mut noise[noise_header..]).unwrap();
+        // Before the fix the listener only swept idle routes following an
+        // empty recv timeout. These valid but unknown packets prevent that
+        // timeout while the old route ages past its configured limit.
+        for _ in 0..8 {
+            client.send_to(&noise[..noise_len], bind).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         client.send_to(&open[..used], bind).await.unwrap();
         let (second_len, _) = timeout(Duration::from_millis(100), client.recv_from(&mut response))
             .await
@@ -2587,10 +3982,13 @@ mod tests {
         let mut response = [0u8; MTU];
         // Close/path-control is ACKed promptly, but the route still stays
         // closed: the following Ping must not revive an application session.
-        let (response_len, _) = timeout(Duration::from_millis(50), client.socket.recv_from(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
+        let (response_len, _) = timeout(
+            Duration::from_millis(50),
+            client.socket.recv_from(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             ShortHeader::decode(&response[..response_len]),
             Ok((_, _))
@@ -2702,5 +4100,19 @@ mod tests {
         }
         assert!(saw_done);
         server_task.abort();
+    }
+
+    #[test]
+    fn object_request_envelope_keeps_get_bytes_and_negotiates_ack_ratio() {
+        let legacy = [SERVICE_OBJECT, 0xa2, 0x01, 0x0d, 0x02, 0x06];
+        let (legacy_ack, legacy_get) = object_request_envelope(&legacy).unwrap();
+        assert_eq!(legacy_ack, RECOVERY_OBJECT_ACK_FREQUENCY);
+        assert_eq!(legacy_get, &legacy[1..]);
+
+        let configured = [SERVICE_OBJECT, 4, 0xa2, 0x01, 0x0d, 0x02, 0x06];
+        let (ack, get) = object_request_envelope(&configured).unwrap();
+        assert_eq!(ack, 4);
+        assert_eq!(get, &configured[2..]);
+        assert!(dmesh_object_store::protocol::decode_get(get).is_some());
     }
 }

@@ -1,8 +1,8 @@
 # lmesh-wifi API
 
 `lmesh-wifi` is the host Wi-Fi/netd ownership crate used by the full `lmesh`
-service and the isolated `lmesh-wifi` service. Linux Wi-Fi, AP/STA, and host
-NAN operations are implemented in this crate.
+service and the isolated `lmesh-wifi` service. Linux Wi-Fi, AP/STA, and raw-NAN
+operations are implemented in this crate.
 
 ## Ownership
 
@@ -23,68 +23,65 @@ The crate provides the common ownership and authorization layer for:
 
 - direct nl80211 open-AP operations and station inspection;
 - STA join/status/address test operations;
-- legacy WPA-supplicant NAN publish, subscribe, follow-up, and event operations
-  (compatibility only; not started by either service);
 - raw-NAN diagnostics and sleepy-device wake/control traffic;
 - NAN object-store bearer primitives already exposed by lmesh.
 
 The shared DM v1 NAN/BLE wire format and raw frame state machine live in
 [`dmesh-rawnan/API.md`](../rawnan/API.md). This crate owns only the Linux
-interface operations and their AP/STA/NAN orchestration.
+interface operations and their AP/STA/raw-NAN orchestration.
 
 UART forwarding is implemented by the independent `lmesh-uart` service. This
 crate owns no UART service lifecycle or control socket.
+
+Experimental BLE HCI operations are owned by `lmesh` and are intentionally
+outside this stable library.
 
 The full AP command names remain `wifi.ap.*`. Host raw-NAN operations are
 `wifi.rawnan.*` and use the shared `dmesh-rawnan` state machine. Frame
 transmission is selectable: `monitor`/`monitor_active` inject through a
 monitor VIF, while `onchannel`, `onchannel_noack`, and `roc` use
-`NL80211_CMD_FRAME` on the owned base interface. Neither path requires
-`wpa_supplicant`. The older
-`wifi.nan.*` commands are WPA-supplicant compatibility operations and are not
-the AP/raw-NAN startup path. The Wi-Fi-only binary exposes the service socket selected by mesh-init, normally
+`NL80211_CMD_FRAME` on the owned base interface. The Wi-Fi-only binary exposes
+the service socket selected by mesh-init, normally
 `/run/mesh/lmesh-wifi/mesh.sock`.
 
-At startup the service starts the open AP and an all-day raw-NAN monitor on
-each owned default interface. `wifi.rawnan.status` reports whether that
-monitor is active and whether a NAN cluster BSSID has been learned. Use
-`wifi.rawnan.ping` for the bounded raw-frame smoke test.
+At startup the service starts the open AP, but does not create a raw-NAN
+monitor. A monitor is acquired only while a live raw-NAN-specific subscription
+such as `dmesh.event.wifi.rawnan.rx`, `.beacon`, or `.discovery` is connected;
+a broad `dmesh.event.wifi` subscription does not start it. The monitor is
+released when the last such subscriber disconnects. Explicit
+`wifi.rawnan.listen` and `wifi.rawnan.ping` requests may still acquire it for a
+bounded diagnostic. `wifi.rawnan.status` reports
+whether that monitor is active and whether a NAN cluster BSSID has been
+learned.
 
 The host experiment commands are available on the service socket:
 
-Native Linux NAN is exposed as a long-lived debug service on the same socket.
-It may replace the selected interface mode while the experiment is running;
-events remain available through `messages.history`:
+## Object-store UDP bearer
 
-The compatibility `wpa_supplicant` binary is reproducibly built from the DMesh
-flake (the package was recovered from the historical ssh-mesh flake):
-
-```sh
-nix build .#wpa-supplicant-nan
-./result/bin/wpa_supplicant \
-  -g /run/mesh/wpa-supplicant/global \
-  -G plugdev \
-  -c /ws/rust/ssh-mesh/crates/mesh-init/examples/wpa-supplicant-nan.conf \
-  -dd
-```
+The Wi-Fi service starts the feature-gated host QUIC/UDP server from
+`dmesh-transport`. It can also be started on the existing service socket
+without restarting `lmesh-wifi`:
 
 ```text
-wifi.nan.native.start iface=wlan0 service_name=dmesh subscribe=false
-wifi.nan.native.status iface=wlan0
-messages.history keys=wifi.nan.native.event,wifi.nan.native.error limit=40
-wifi.nan.native.stop iface=wlan0
-
-# wpa_supplicant-compatible userspace USD over nl80211 (no monitor VIF)
-wifi.nan.usd.start iface=wlan0 service_name=dmesh subscribe=false
-messages.history keys=wifi.nan.usd.tx,wifi.nan.usd.rx,wifi.nan.usd.error limit=40
-wifi.nan.native.stop iface=wlan0
+mesh lmesh-wifi wifi.object.udp.start bind=0.0.0.0 port=3336 root=/ws/dmesh/target/flash
 ```
 
-The `wifi.nan.usd.start` service reproduces wpa_supplicant's userspace
-`CONFIG_NAN_USD` path: it registers the NAN SDF public action alongside the
-DMesh/ESP-NOW vendor action, requests ROC, injects complete SDF action frames,
-and keeps the nl80211 event reader alive. The older `wifi.nan.native.start`
-command remains the kernel `NL80211_CMD_*_NAN` experiment.
+The bearer is also started automatically by `lmesh-wifi` at port 3336. The
+explicit command is idempotent and remains useful for selecting another
+artifact root.
+
+The server routes datagrams by opaque DCID to a transport connection, then
+passes stream data to the installed object-store service. It accepts a binary
+CBOR GET and returns manifest/blob records on transport streams. UDP is only
+the datagram bearer; `dmesh-object-store` itself has no socket or UDP code. The
+The stable `lmesh-wifi` launcher also starts the object-store TCP compatibility
+listener on port 3337 when configured. The embedded `lmesh` superset delegates
+to this same library startup path and does not create a second listener.
+
+Raw NAN currently uses the same `dmesh-transport` envelope for packet and
+filter validation, but the ESP receiver is still a bounded envelope/object
+receiver rather than a complete host-served object stream. Do not treat NAN
+envelope counters as flashing completion evidence.
 
 ```text
 wifi.interface.status iface=wlan1
@@ -218,6 +215,46 @@ rejected.
 For repeatable captures, use `scripts/capture-rawnan.sh`. Set
 `DMESH_CAPTURE_IFACE`, `DMESH_SSID`, `DMESH_NAN_BSSID`, `DMESH_SRC`, and
 `DMESH_DST` as needed, then run `show`, `tcpdump`, or `tshark`.
+
+For fixed-rate NAN experiments, use `wifi.rate.profile` on an owned interface:
+
+```text
+wifi.rate.profile iface=wlan0 profile=12 disable_80211b=true
+wifi.rate.profile iface=wlan0 profile=24 disable_80211b=true
+wifi.rate.profile iface=wlan0 profile=ht3
+wifi.rate.profile iface=wlan0 profile=ht3-24
+wifi.rate.profile iface=wlan0 profile=auto
+```
+
+Inspect or request the owned interface's power-save policy through the same
+service (rather than an out-of-band `iw` command). Drivers can reject this in
+AP mode; the result preserves the exact nl80211 error for diagnosis:
+
+```text
+wifi.power_save iface=wlan0 enabled=false
+wifi.power_save iface=wlan0 enabled=true
+```
+
+The 12/24 profiles restrict legacy 2.4 GHz rates and remove 802.11b/CCK
+rates. `ht2`, `ht3`, and `ht4` are exact HT-MCS diagnostics: they omit legacy
+data fallback so station status can prove the selected MCS. `ht3-24` is the
+association-safe version: MCS3 plus only a 24 Mbps OFDM fallback. They are
+intended for bounded throughput trials, not as a startup default. `auto`
+restores driver-selected rates. The service sends the nested
+`NL80211_ATTR_TX_RATES` request directly, so no `iw` executable or inherited
+child-process capability is required; kernel errno/extack text is returned on
+failure. Restore it after each trial. The Linux single-frame matrix is
+`scripts/test-nan-fixed-rates.sh` and defaults to 12 and 24 Mbps.
+
+Service startup defaults to the standard driver/automatic policy
+(`LMESH_WIFI_RATE_PROFILE=auto`) for ordinary Wi-Fi traffic. NAN
+synchronization/discovery beacons are forced to 6 Mbps, and NAN public
+action/SDF frames use the mandatory OFDM family. For targeted close-peer
+traffic, add `tx_rate_mbps=12|24|48|54` to a monitor-based `wifi.raw.send`;
+this is encoded in the monitor radiotap RATE field and does not change the
+interface-wide NAN policy. The nl80211 action-frame path rejects a per-frame
+rate attribute, so it reports that kernel error rather than silently falling
+back.
 
 To recover one stale client without interrupting the AP, use:
 

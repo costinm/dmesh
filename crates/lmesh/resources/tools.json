@@ -299,17 +299,51 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "iface": { "type": "string", "default": "wlan1" },
-        "channel": { "type": "integer", "default": 6, "minimum": 1, "maximum": 13 },
-        "destination": { "type": "string", "description": "Destination MAC address." },
-        "bssid": { "type": "string", "description": "NAN cluster BSSID." },
-        "bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
-        "chunk_bytes": { "type": "integer", "default": 512, "minimum": 64, "maximum": 900 },
-        "tx_variant": { "type": "string", "default": "monitor_active" },
-        "llc": { "type": "string" },
-        "multicast": { "type": "boolean", "default": false }
+        "iface": {
+          "type": "string",
+          "default": "wlan1"
+        },
+        "channel": {
+          "type": "integer",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 13
+        },
+        "destination": {
+          "type": "string",
+          "description": "Destination MAC address."
+        },
+        "bssid": {
+          "type": "string",
+          "description": "NAN cluster BSSID."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "chunk_bytes": {
+          "type": "integer",
+          "default": 512,
+          "minimum": 64,
+          "maximum": 900
+        },
+        "tx_variant": {
+          "type": "string",
+          "default": "monitor_active"
+        },
+        "llc": {
+          "type": "string"
+        },
+        "multicast": {
+          "type": "boolean",
+          "default": false
+        }
       },
-      "required": ["destination", "bytes"],
+      "required": [
+        "destination",
+        "bytes"
+      ],
       "additionalProperties": false
     }
   },
@@ -321,10 +355,20 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "image_size": { "type": "integer", "minimum": 1 },
-        "mtu": { "type": "integer", "default": 1200, "minimum": 256, "maximum": 2304 }
+        "image_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mtu": {
+          "type": "integer",
+          "default": 1200,
+          "minimum": 256,
+          "maximum": 2304
+        }
       },
-      "required": ["image_size"],
+      "required": [
+        "image_size"
+      ],
       "additionalProperties": false
     }
   },
@@ -340,11 +384,6 @@
           "type": "string",
           "title": "Interface",
           "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
         },
         "channel": {
           "type": "integer",
@@ -386,11 +425,6 @@
           "type": "string",
           "title": "Interface",
           "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
         },
         "channel": {
           "type": "integer",
@@ -476,11 +510,6 @@
           "type": "string",
           "title": "Interface",
           "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
         },
         "channel": {
           "type": "integer",
@@ -715,10 +744,18 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "iface": { "type": "string", "default": "wlan1" },
-        "mac": { "type": "string", "title": "Station MAC" }
+        "iface": {
+          "type": "string",
+          "default": "wlan1"
+        },
+        "mac": {
+          "type": "string",
+          "title": "Station MAC"
+        }
       },
-      "required": ["mac"],
+      "required": [
+        "mac"
+      ],
       "additionalProperties": false
     }
   },
@@ -730,7 +767,10 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "iface": { "type": "string", "default": "wlan1" }
+        "iface": {
+          "type": "string",
+          "default": "wlan1"
+        }
       },
       "additionalProperties": false
     }
@@ -885,249 +925,6 @@
     }
   },
   {
-    "name": "wifi.nan.start",
-    "title": "Attach NAN",
-    "group": "NAN",
-    "description": "Attach to Wi-Fi Aware/NAN through wpa_supplicant and apply DMesh defaults.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": {
-          "type": "string",
-          "title": "Interface",
-          "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.default",
-    "title": "Default NAN",
-    "group": "NAN",
-    "description": "Start host DMesh NAN: service dmesh, publish with solicited and unsolicited transmissions, active subscribe, and DMesh NAN v1 service info.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "service_name": { "type": "string", "title": "Service name", "default": "dmesh" },
-        "ttl": { "type": "integer", "title": "TTL seconds", "default": 3600, "minimum": 0 }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.status",
-    "title": "NAN Status",
-    "group": "NAN",
-    "description": "Return wpa_supplicant NAN status, driver flags, and recent NAN events.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "events_ms": { "type": "integer", "title": "Event wait milliseconds", "default": 100, "minimum": 1 }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.events",
-    "title": "NAN Events",
-    "group": "NAN",
-    "description": "Attach to the WPA control socket and collect NAN-DISCOVERY-RESULT, NAN-RECEIVE, and related events.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "wait_ms": { "type": "integer", "title": "Wait milliseconds", "default": 250, "minimum": 1 },
-        "max_events": { "type": "integer", "title": "Max events", "default": 64, "minimum": 1 }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.stop",
-    "title": "Detach NAN",
-    "group": "NAN",
-    "description": "Detach from Wi-Fi Aware/NAN through the local adapter.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": {
-          "type": "string",
-          "title": "Interface",
-          "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.publish",
-    "title": "Publish NAN",
-    "group": "NAN",
-    "description": "Start NAN publish for service dmesh with solicited and unsolicited transmissions. Alias/debug predecessor: wifi.nan.adv.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "service_name": { "type": "string", "title": "Service name", "default": "dmesh" },
-        "ssi_hex": { "type": "string", "title": "Service-specific info hex" },
-        "ttl": { "type": "integer", "title": "TTL seconds", "default": 3600, "minimum": 0 },
-        "freq": { "type": "integer", "title": "Frequency MHz", "default": 2437 },
-        "srv_proto_type": { "type": "integer", "title": "Service protocol type", "default": 0, "minimum": 0 }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.subscribe",
-    "title": "Subscribe NAN",
-    "group": "NAN",
-    "description": "Start active NAN subscribe for service dmesh. Alias/debug predecessor: wifi.nan.sub.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "service_name": { "type": "string", "title": "Service name", "default": "dmesh" },
-        "ssi_hex": { "type": "string", "title": "Service-specific info hex" },
-        "ttl": { "type": "integer", "title": "TTL seconds", "default": 3600, "minimum": 0 },
-        "freq": { "type": "integer", "title": "Frequency MHz", "default": 2437 },
-        "active": { "type": "boolean", "title": "Active subscribe", "default": true },
-        "srv_proto_type": { "type": "integer", "title": "Service protocol type", "default": 0, "minimum": 0 }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.transmit",
-    "title": "NAN Follow-up",
-    "group": "NAN",
-    "description": "Send one NAN follow-up through wpa_supplicant NAN_TRANSMIT.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "handle": { "type": "integer", "title": "Publish or subscribe handle", "minimum": 1 },
-        "address": { "type": "string", "title": "Peer MAC" },
-        "req_instance_id": { "type": "integer", "title": "Peer instance ID", "minimum": 1 },
-        "ssi_hex": { "type": "string", "title": "Follow-up SSI hex" },
-        "payload": { "type": "string", "title": "Text payload" },
-        "cookie": { "type": "integer", "title": "Transmit cookie", "minimum": 1 }
-      },
-      "required": ["handle", "address"],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.size_probe",
-    "title": "NAN Size Probe",
-    "group": "NAN",
-    "description": "Probe what NAN SSI/follow-up payload sizes wpa_supplicant accepts at the control/API layer.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": { "type": "string", "title": "Interface", "default": "wlan1" },
-        "ctrl_dir": { "type": "string", "title": "WPA control dir", "default": "/run/mesh/wpa-supplicant-nan" },
-        "sizes": { "type": "string", "title": "Comma-separated byte sizes", "default": "64,128,192,224,230,255,384,512,1024" },
-        "mode": { "type": "string", "title": "Probe mode", "enum": ["publish", "transmit"], "default": "publish" }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.ping",
-    "title": "NAN Ping",
-    "group": "NAN",
-    "description": "Send a NAN ping/probe message through the local adapter.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "peer": {
-          "type": "string",
-          "title": "Peer",
-          "description": "Optional peer identifier."
-        },
-        "payload": {
-          "type": "string",
-          "title": "Payload",
-          "default": "ping"
-        },
-        "iface": {
-          "type": "string",
-          "title": "Interface",
-          "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.adv",
-    "title": "Publish NAN",
-    "group": "NAN",
-    "description": "Start NAN publish/advertise through the local adapter.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": {
-          "type": "string",
-          "title": "Interface",
-          "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "wifi.nan.sub",
-    "title": "Subscribe NAN",
-    "group": "NAN",
-    "description": "Start NAN subscribe/discovery through the local adapter.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "iface": {
-          "type": "string",
-          "title": "Interface",
-          "default": "wlan1"
-        },
-        "ctrl_dir": {
-          "type": "string",
-          "title": "WPA control dir",
-          "default": "/run/mesh/wpa-supplicant-nan"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
     "name": "ble.scan",
     "title": "BLE Scan",
     "group": "BLE",
@@ -1249,7 +1046,9 @@
         "command": {
           "type": "string",
           "title": "Boot command",
-          "enum": ["recovery"],
+          "enum": [
+            "recovery"
+          ],
           "default": "recovery"
         },
         "timeout_sec": {
@@ -1282,12 +1081,18 @@
           "default": "USB0"
         },
         "baud": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "title": "Baud",
           "default": 460800
         },
         "tcp_port": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "title": "TCP listen port",
           "description": "Optional localhost TCP port to expose the same serial forward, for example 3333 for esptool rfc2217://127.0.0.1:3333.",
           "minimum": 0,
@@ -1298,7 +1103,11 @@
           "type": "string",
           "title": "TCP mode",
           "description": "How TCP clients are interpreted. Use rfc2217 for flasher tools, framed for newline or 0x00+length binary records, and auto for backwards-compatible RFC2217 auto-detect.",
-          "enum": ["auto", "framed", "rfc2217"],
+          "enum": [
+            "auto",
+            "framed",
+            "rfc2217"
+          ],
           "default": "auto"
         },
         "handshake": {
@@ -1354,7 +1163,10 @@
       "type": "object",
       "properties": {
         "port": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "USB port",
           "description": "Logical USB serial token such as lora1 or USB0."
         }
@@ -1370,9 +1182,27 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "port": {"type": ["string", "null"], "title": "USB port"},
-        "asserted": {"type": ["boolean", "null"], "title": "Asserted"},
-        "pulse_ms": {"type": ["integer", "null"], "title": "Pulse milliseconds"}
+        "port": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "title": "USB port"
+        },
+        "asserted": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "title": "Asserted"
+        },
+        "pulse_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "title": "Pulse milliseconds"
+        }
       },
       "additionalProperties": false
     }
@@ -1411,17 +1241,26 @@
           "default": 3
         },
         "gateway": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "Infrastructure gateway",
           "description": "Optional infrastructure gateway override; configured target roles default to lora1."
         },
         "target": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "Target ESP",
           "description": "Target MAC or eight-hex device suffix; configured roles supply this automatically."
         },
         "active_ms": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "title": "Active window milliseconds",
           "description": "Optional bounded I-want-to-talk wake window before the command."
         }
@@ -1444,20 +1283,32 @@
       "type": "object",
       "properties": {
         "adapter": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "Adapter"
         },
         "port": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "Logical serial port"
         },
         "gateway": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "Infrastructure gateway",
           "description": "Optional gateway override; configured target roles default to lora1."
         },
         "target": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "title": "Target ESP",
           "description": "Target suffix or MAC; configured roles supply this automatically."
         },
@@ -1467,7 +1318,10 @@
           "default": true
         },
         "active_ms": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "title": "Bounded active duration",
           "description": "1,000 through 300,000 milliseconds. Omit for active-until-released."
         }

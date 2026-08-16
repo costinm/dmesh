@@ -366,9 +366,7 @@ impl<P: PacketLease> CallbackStreams<P> {
         let end = offset
             .checked_add(len)
             .ok_or(CopyingError::Transport(CallbackError::InvalidFin))?;
-        let state = self
-            .stream_mut(stream)
-            .map_err(CopyingError::Transport)?;
+        let state = self.stream_mut(stream).map_err(CopyingError::Transport)?;
 
         // Only a packet exactly at the application cursor can be borrowed:
         // retained ranges must remain owned until their preceding gap closes.

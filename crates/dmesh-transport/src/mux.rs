@@ -154,10 +154,10 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             input,
             self.endpoint.expected_packet_number(),
         )?;
-        // Validate the complete datagram before consulting or mutating mux
-        // state. In particular, an ACK followed by a malformed trailing
-        // frame must not advance stream/accounting state.
-        EndpointState::<N, H, P>::validate_datagram(input)?;
+        // This complete dispatch parse validates every frame boundary before
+        // consulting or mutating mux state. Do not call `validate_datagram`
+        // first: that was a third full parse for STREAM traffic (validation,
+        // inspection, endpoint application).
         let mut offset = header_len;
         let mut parsed_streams = Vec::new();
         while offset < input.len() {

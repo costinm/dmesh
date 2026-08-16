@@ -4,23 +4,19 @@
 //! exchange, modem control, and firmware framing. It has no Wi-Fi dependency.
 
 use anyhow::{Context, Result, bail};
-use mesh::message::{
-    FIELD_CTRL_DIR, FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD,
-    FIELD_RADIO_ID, FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec, TextRecord,
-};
+use mesh::message::MeshMessage;
 use minicbor::{Decoder, Encoder, data::Type};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -28,37 +24,12 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::schema::FirmwareSchema;
-use dmesh_rawnan::protocol as radio_protocol;
-use dmesh_rawnan::{Action as RawNanAction, NanState, RxFrame as RawNanRxFrame};
-use dmesh_transport::{ConnectionId, FLAG_FIXED, Frame, ShortHeader, StreamFrame};
 use uart_codec::codec::{UART_ESCAPE, UART_FLAG};
 
-const DEFAULT_WIFI_IFACE: &str = "wlan1";
 const DEFAULT_ESP_NAN_GATEWAY: &str = "lora1";
-const DEFAULT_WPA_CTRL_DIR: &str = "/run/mesh/wpa-supplicant-nan";
-const DEFAULT_WPA_SERVICE_NAME: &str = "dmesh";
-const DEFAULT_NAN_TTL_SECS: u32 = 3600;
 const DEFAULT_ESP_COMMAND_TIMEOUT_MS: u64 = 3_000;
-const ESP_SLEEPY_RENDEZVOUS_TIMEOUT_MS: u64 = 8_000;
-// Firmware raw-NAN peers normally wake every four seconds for a short window.
-// A 700 ms probe cadence walks that phase rather than repeatedly landing on a
-// fixed 250/500 ms boundary.
-const STABILITY_HOST_NAN_RETRY_MS: u64 = 700;
-const DEFAULT_HCI_DEV: u16 = 0;
-const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
-const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
-const DEFAULT_LMESH_CONFIG_FILE: &str = "/home/system/etc/lmesh/lmesh.toml";
-const DEFAULT_SERVICE_HOME: &str = "/home/lmesh-uart";
 const SERVICE_CONFIG_RELATIVE_PATH: &str = "etc/lmesh-uart/lmesh.toml";
 const REMOTE_REQUEST_ID_KEY: u16 = 333;
-static REMOTE_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const MAX_HISTORY: usize = 128;
-const ETH_P_ALL: u16 = 0x0003;
-const ETH_P_DMESH: u16 = 0x88b5;
-const ETHERNET_HEADER_LEN: usize = 14;
-const IEEE80211_LLC_SNAP_LEN: usize = 8;
-const PACKET_ADD_MEMBERSHIP: libc::c_int = 1;
-const PACKET_MR_MULTICAST: libc::c_ushort = 0;
 const RFC2217_IAC: u8 = 0xff;
 const RFC2217_DONT: u8 = 0xfe;
 const RFC2217_DO: u8 = 0xfd;
@@ -131,8 +102,6 @@ const DMESH_BOOT_PARTITION_BOOTLOADER: u8 = 0;
 // Reset requests are sampled between events. 100 ms keeps them responsive
 // without making every idle managed forward wake one hundred times per second.
 const SERIAL_FORWARD_POLL_TIMEOUT_MS: i32 = 100;
-const NETLINK_GENERIC: libc::c_int = 16;
-
 /// Host-side UART service and its managed forward state.
 #[derive(Clone)]
 pub struct UartService {
@@ -140,7 +109,6 @@ pub struct UartService {
     esp_reverse_sessions: Arc<BTreeMap<String, ReverseMainRuntime>>,
     esp_gateway: String,
     esp_targets: Arc<BTreeMap<String, String>>,
-    esp_sessions: Arc<Mutex<BTreeMap<String, Instant>>>,
 }
 
 struct SerialForwardRuntime {
@@ -200,81 +168,6 @@ struct ReverseMainRuntime {
     port: u16,
     socket_path: String,
     stream: Arc<Mutex<Option<TcpStream>>>,
-}
-
-struct StabilityRuntime {
-    stop: Arc<AtomicBool>,
-    state: Arc<Mutex<StabilityState>>,
-}
-
-impl StabilityRuntime {
-    fn running(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .running
-    }
-
-    fn snapshot(&self) -> Value {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .snapshot()
-    }
-}
-
-#[derive(Debug)]
-struct StabilityState {
-    running: bool,
-    source: String,
-    expected: Vec<String>,
-    interval_sec: u64,
-    wait_sec: u64,
-    cycles_requested: Option<u32>,
-    host_nan: bool,
-    cycles_completed: u32,
-    last_completed_ms: u64,
-    last: Value,
-}
-
-impl StabilityState {
-    fn new(
-        source: String,
-        expected: Vec<String>,
-        interval_sec: u64,
-        wait_sec: u64,
-        cycles_requested: Option<u32>,
-        host_nan: bool,
-    ) -> Self {
-        Self {
-            running: true,
-            source,
-            expected,
-            interval_sec,
-            wait_sec,
-            cycles_requested,
-            host_nan,
-            cycles_completed: 0,
-            last_completed_ms: 0,
-            last: Value::Null,
-        }
-    }
-
-    fn snapshot(&self) -> Value {
-        json!({
-            "ok": true,
-            "running": self.running,
-            "source": self.source,
-            "expected": self.expected,
-            "interval_sec": self.interval_sec,
-            "wait_sec": self.wait_sec,
-            "cycles_requested": self.cycles_requested,
-            "host_nan": self.host_nan,
-            "cycles_completed": self.cycles_completed,
-            "last_completed_ms": self.last_completed_ms,
-            "last": self.last,
-        })
-    }
 }
 
 #[derive(Default, Debug)]
@@ -509,7 +402,7 @@ fn configured_serial_log_path_for_forward(id: &str) -> Option<String> {
     }
     let log_dir = std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join("logs"))
-        .unwrap_or_else(|| PathBuf::from("/home/lmesh-uart/logs"));
+        .unwrap_or_else(|| PathBuf::from("logs"));
     Some(
         log_dir
             .join(format!("{id}.log"))
@@ -1436,13 +1329,13 @@ impl SerialForwardLog {
     /// not PPP and is reconstructed into complete text lines. PPP frames are
     /// represented by their decoded CBOR notification or boot identity; raw
     /// hex is retained only for an undecodable payload.
-    fn append_rx(&mut self, board: &str, bytes: &[u8], records: &[Vec<u8>]) -> Result<usize> {
+    fn append_rx(&mut self, host: &str, bytes: &[u8], records: &[Vec<u8>]) -> Result<usize> {
         self.rotate_if_needed()?;
         let mut raw_lines = Vec::new();
-        let active = self.ppp_active.entry(board.to_owned()).or_default();
-        let escaped = self.ppp_escaped.entry(board.to_owned()).or_default();
-        let payload_seen = self.ppp_payload.entry(board.to_owned()).or_default();
-        let raw = self.raw_text.entry(board.to_owned()).or_default();
+        let active = self.ppp_active.entry(host.to_owned()).or_default();
+        let escaped = self.ppp_escaped.entry(host.to_owned()).or_default();
+        let payload_seen = self.ppp_payload.entry(host.to_owned()).or_default();
+        let raw = self.raw_text.entry(host.to_owned()).or_default();
         for byte in bytes {
             if *active {
                 if *escaped {
@@ -1474,7 +1367,7 @@ impl SerialForwardLog {
         }
         let raw_line_count = raw_lines.len();
         for line in raw_lines {
-            self.write_text_or_binary(board, &line)?;
+            self.write_text_or_binary(host, &line)?;
         }
 
         let mut logged = 0;
@@ -1482,9 +1375,9 @@ impl SerialForwardLog {
             let Some(payload) = mesh::cbor::decode_stream_frame(record).ok() else {
                 writeln!(
                     self.file,
-                    "ts_ms={} board={} dir=rx kind=ppp undecoded=true bytes={} hex={}",
+                    "ts_ms={} host={} dir=rx undecoded=true bytes={} hex={}",
                     now_millis_u64(),
-                    board,
+                    host,
                     record.len(),
                     compact_serial_hex(record),
                 )?;
@@ -1494,9 +1387,9 @@ impl SerialForwardLog {
             if let Some(event) = nan_sleepy_start_event(payload) {
                 writeln!(
                     self.file,
-                    "ts_ms={} board={} dir=rx kind=ppp decoded=nan.sleepy_start tag=6 flags={} lora_rx_delta={} nan_beacon_delta={} cluster_changed={}",
+                    "ts_ms={} host={} dir=rx event=nan.sleepy_start tag=6 flags={} lora_rx_delta={} nan_beacon_delta={} cluster_changed={}",
                     now_millis_u64(),
-                    board,
+                    host,
                     event.flags,
                     event.lora_rx_delta,
                     event.nan_beacon_delta,
@@ -1517,58 +1410,45 @@ impl SerialForwardLog {
                 && !payload.is_empty()
                 && payload.first().map(|byte| byte >> 5) != Some(5)
             {
-                self.write_text_or_binary(board, payload)?;
+                self.write_text_or_binary(host, payload)?;
                 logged += 1;
                 continue;
             }
-            let (kind, decoded) = if is_boot_identity {
-                ("boot", format!("identity={}", boot_identity_json(payload)))
+            let fields = if is_boot_identity {
+                format!("kind=boot identity={}", boot_identity_json(payload))
             } else if is_boot_event {
-                ("boot", format!("event={}", boot_event_json(payload)))
+                format!("kind=boot event={}", boot_event_json(payload))
             } else if is_boot_selector {
-                (
-                    "boot",
-                    format!("selector_hex={}", compact_serial_hex(payload)),
-                )
-            } else if let Ok(decoded) =
-                mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())
-            {
-                let decoded = self.schema.rename_decoded(decoded);
+                format!("kind=boot selector_hex={}", compact_serial_hex(payload))
+            } else if let Ok(decoded) = self.schema.decode_packet(payload) {
                 // decode_json represents schema/type failures as an error
                 // object. Do not make malformed compact-CBOR look like a
                 // valid firmware notification in the serial evidence.
                 if let Some(error) = decoded.get("error").and_then(Value::as_str) {
-                    (
-                        "cbor_error",
-                        format!(
-                            "message={:?} {} payload_hex={}",
-                            error,
-                            cbor_first_byte_summary(payload),
-                            compact_serial_hex(payload)
-                        ),
+                    format!(
+                        "kind=cbor_error message={:?} {} payload_hex={}",
+                        error,
+                        cbor_first_byte_summary(payload),
+                        compact_serial_hex(payload)
                     )
                 } else {
-                    ("cbor", decoded.to_string())
+                    cbor_log_fields(&decoded)
                 }
             } else {
-                (
-                    "cbor_error",
-                    format!(
-                        "{} payload_hex={}",
-                        cbor_first_byte_summary(payload),
-                        compact_serial_hex(payload),
-                    ),
+                format!(
+                    "kind=cbor_error {} payload_hex={}",
+                    cbor_first_byte_summary(payload),
+                    compact_serial_hex(payload),
                 )
             };
-            let decoded = truncate_serial_log_field(&decoded);
+            let fields = truncate_serial_log_field(&fields);
             writeln!(
                 self.file,
-                "ts_ms={} board={} dir=rx kind=ppp bytes={} {} {}",
+                "ts_ms={} host={} dir=rx bytes={} {}",
                 now_millis_u64(),
-                board,
+                host,
                 payload.len(),
-                kind,
-                decoded,
+                fields,
             )?;
             logged += 1;
         }
@@ -1578,7 +1458,7 @@ impl SerialForwardLog {
         Ok(logged + raw_line_count)
     }
 
-    fn write_text_or_binary(&mut self, board: &str, bytes: &[u8]) -> Result<()> {
+    fn write_text_or_binary(&mut self, host: &str, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -1588,9 +1468,9 @@ impl SerialForwardLog {
                 if !text.is_empty() {
                     writeln!(
                         self.file,
-                        "ts_ms={} board={} dir=rx kind=text bytes={} text={:?}",
+                        "ts_ms={} host={} dir=rx kind=text bytes={} text={:?}",
                         now_millis_u64(),
-                        board,
+                        host,
                         line.len(),
                         truncate_serial_log_field(&text),
                     )?;
@@ -1599,9 +1479,9 @@ impl SerialForwardLog {
         } else {
             writeln!(
                 self.file,
-                "ts_ms={} board={} dir=rx kind=raw_binary bytes={} hex={}",
+                "ts_ms={} host={} dir=rx kind=raw_binary bytes={} hex={}",
                 now_millis_u64(),
-                board,
+                host,
                 bytes.len(),
                 compact_serial_hex(bytes),
             )?;
@@ -1662,6 +1542,62 @@ fn serial_text_preview(bytes: &[u8]) -> String {
         }
     }
     text
+}
+
+/// Render the decoded compact-CBOR envelope as logfmt. The serial header is
+/// already flat, so keeping the CBOR map nested as JSON makes common fields
+/// such as `method` and `payload.message` hard to scan with standard tools.
+/// `status=ok` is deliberately omitted: it is the normal firmware response
+/// value, not a transport or delivery assertion.
+fn cbor_log_fields(value: &Value) -> String {
+    let mut fields = Vec::new();
+    flatten_cbor_log_value(&mut fields, None, value, true);
+    fields.join(" ")
+}
+
+fn flatten_cbor_log_value(
+    fields: &mut Vec<String>,
+    prefix: Option<&str>,
+    value: &Value,
+    top_level: bool,
+) {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                if top_level && key == "status" && value.as_str() == Some("ok") {
+                    continue;
+                }
+                let key = prefix
+                    .map(|prefix| format!("{prefix}.{key}"))
+                    .unwrap_or_else(|| key.clone());
+                flatten_cbor_log_value(fields, Some(&key), value, false);
+            }
+        }
+        Value::Array(_) => {
+            if let Some(key) = prefix {
+                fields.push(format!("{key}={}", logfmt_json_value(value)));
+            }
+        }
+        _ => {
+            if let Some(key) = prefix {
+                fields.push(format!("{key}={}", logfmt_json_value(value)));
+            }
+        }
+    }
+}
+
+fn logfmt_json_value(value: &Value) -> String {
+    match value {
+        Value::String(value)
+            if !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'=' | b'"')) =>
+        {
+            value.clone()
+        }
+        _ => value.to_string(),
+    }
 }
 
 fn truncate_serial_log_field(value: &str) -> String {
@@ -1852,7 +1788,7 @@ fn record_serial_forward_rx_log(
 /// physical UART protocol.  TX now uses the same CBOR classification as RX.
 fn record_serial_forward_tx_log(
     log: Option<&Arc<Mutex<SerialForwardLog>>>,
-    board: &str,
+    host: &str,
     stream_frame: &[u8],
     suppressed: bool,
 ) {
@@ -1871,36 +1807,33 @@ fn record_serial_forward_tx_log(
         .strip_prefix(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
         .unwrap_or(stream_frame);
     let payload = mesh::cbor::decode_stream_frame(stream_frame).unwrap_or(stream_frame);
-    let (kind, body) = if is_boot_identity_payload(payload) {
-        ("boot", format!("identity={}", boot_identity_json(payload)))
+    let fields = if is_boot_identity_payload(payload) {
+        format!("kind=boot identity={}", boot_identity_json(payload))
     } else if is_boot_event_payload(payload) {
-        ("boot", format!("event={}", boot_event_json(payload)))
+        format!("kind=boot event={}", boot_event_json(payload))
     } else if is_boot_selector_payload(payload) {
-        (
-            "boot",
-            format!("selector_hex={}", compact_serial_hex(payload)),
-        )
+        format!("kind=boot selector_hex={}", compact_serial_hex(payload))
     } else if payload.first().map(|byte| byte >> 5) == Some(5)
         || payload.first().map(|byte| byte >> 5) == Some(4)
     {
-        match mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default()) {
-            Ok(decoded) => ("cbor", decoded.to_string()),
-            Err(error) => (
-                "cbor_error",
-                format!("message={:?} {}", error, cbor_first_byte_summary(payload)),
+        match sink.schema.decode_packet(payload) {
+            Ok(decoded) => cbor_log_fields(&decoded),
+            Err(error) => format!(
+                "kind=cbor_error message={:?} {}",
+                error,
+                cbor_first_byte_summary(payload)
             ),
         }
     } else {
-        ("raw", format!("hex={}", compact_serial_hex(payload)))
+        format!("kind=raw hex={}", compact_serial_hex(payload))
     };
     let _ = writeln!(
         sink.file,
-        "ts_ms={} board={} dir=tx kind=ppp bytes={} {} {}",
+        "ts_ms={} host={} dir=tx bytes={} {}",
         now_millis_u64(),
-        board,
+        host,
         payload.len(),
-        kind,
-        truncate_serial_log_field(&body),
+        truncate_serial_log_field(&fields),
     );
     let _ = sink.file.flush();
 }
@@ -1914,83 +1847,6 @@ fn queue_serial_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
     }
     queue.extend(bytes);
     Ok(())
-}
-
-/// Encode Recovery's STA handoff as the compact CBOR payload expected by the
-/// managed UDS exchange. `uds_raw_exchange` adds the UDS length envelope and
-/// the serial forward adds the physical PPP envelope; returning PPP here
-/// would double-wrap the packet and make Recovery see 0x7e as CBOR.
-fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
-    let fields = command.split_ascii_whitespace().collect::<Vec<_>>();
-    if (fields.len() < 4 || fields.len() > 6) || fields.first() != Some(&"STA") {
-        bail!("Recovery STA packet requires: STA endpoint local_ip ssid [password] [dryrun]");
-    }
-    let endpoint = fields[1].as_bytes();
-    let local_ip = fields[2].as_bytes();
-    let ssid = fields[3].as_bytes();
-    let dry_run = fields.get(4).is_some_and(|value| *value == "dryrun")
-        || fields.get(5).is_some_and(|value| *value == "dryrun");
-    let password = if fields.get(4).is_some_and(|value| *value == "dryrun") {
-        &[]
-    } else {
-        fields.get(4).map(|value| value.as_bytes()).unwrap_or(&[])
-    };
-    if endpoint.is_empty()
-        || endpoint.len() >= 128
-        || local_ip.is_empty()
-        || local_ip.len() >= 32
-        || ssid.is_empty()
-        || ssid.len() >= 33
-        || password.len() >= 32
-        || endpoint.len() > u8::MAX as usize
-        || local_ip.len() > u8::MAX as usize
-        || ssid.len() > u8::MAX as usize
-        || password.len() > u8::MAX as usize
-    {
-        bail!("Recovery STA packet field is too long or empty");
-    }
-    let mut packet =
-        Vec::with_capacity(64 + endpoint.len() + local_ip.len() + ssid.len() + password.len());
-    packet.extend_from_slice(&[
-        0xa2,
-        0x00,
-        0x18,
-        68,
-        0x06,
-        if dry_run { 0xa5 } else { 0xa4 },
-    ]);
-    for (key, value) in [
-        ("server", endpoint),
-        ("ip", local_ip),
-        ("ssid", ssid),
-        ("password", password),
-    ] {
-        packet.push(0x60 + key.len() as u8);
-        packet.extend_from_slice(key.as_bytes());
-        if value.len() < 24 {
-            packet.push(0x60 + value.len() as u8);
-        } else {
-            packet.extend_from_slice(&[0x78, value.len() as u8]);
-        }
-        packet.extend_from_slice(value);
-    }
-    if dry_run {
-        packet.extend_from_slice(&[0x67]);
-        packet.extend_from_slice(b"dry_run");
-        packet.push(0xf5);
-    }
-    Ok(packet)
-}
-
-#[cfg(test)]
-fn encode_firmware_uart_frame(stream_frame: &[u8]) -> Result<Vec<u8>> {
-    let payload = mesh::cbor::decode_stream_frame(stream_frame)?;
-    encode_firmware_uart_payload(payload)
-}
-
-fn encode_firmware_uart_payload(cbor: &[u8]) -> Result<Vec<u8>> {
-    uart_codec::codec::encode_payload(cbor, mesh::cbor::ESP_RECORD_MAX)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 #[derive(Default)]
@@ -2517,7 +2373,6 @@ fn firmware_arg_tag(name: &str) -> Option<u16> {
         "server" => 246,
         "port" => 191,
         "target" => 346,
-        "dry_run" => 257,
         "object_action_stats" => 272,
         _ => return None,
     })
@@ -2728,6 +2583,9 @@ fn boot_identity_json(payload: &[u8]) -> Value {
         .any(|window| window == [0x19, 0xea, 0x60])
     {
         let tuple = boot_identity_tuple(payload);
+        let stage2_version = tuple.as_ref().and_then(|values| values.get(8)).cloned();
+        let boot_target_configured = tuple.as_ref().and_then(|values| values.get(9)).cloned();
+        let boot_target = tuple.as_ref().and_then(|values| values.get(10)).cloned();
         let mut result = json!({
             "valid": true,
             "kind": "event",
@@ -2735,10 +2593,14 @@ fn boot_identity_json(payload: &[u8]) -> Value {
             "event_name": "boot.identity",
             "tuple": tuple,
         });
-        if let Some(values) = result["tuple"].as_array() {
-            if values.len() >= 10 {
-                result["stage2_version"] = values[8].clone();
-            }
+        if let Some(stage2_version) = stage2_version {
+            result["stage2_version"] = stage2_version;
+        }
+        if let (Some(boot_target_configured), Some(boot_target)) =
+            (boot_target_configured, boot_target)
+        {
+            result["boot_target_configured"] = boot_target_configured;
+            result["boot_target"] = boot_target;
         }
         return result;
     }
@@ -2958,15 +2820,15 @@ fn uds_boot_exchange_stream(
     bail!("timed out waiting for fixed stage2 identity")
 }
 
-/// Exchange arbitrary UART bytes through the managed framed forward.  This is
-/// used by Recovery's small ASCII parser, which is not a normal Main CBOR
-/// command and therefore cannot use `uds_console_exchange`.
-fn uds_raw_exchange(socket_path: &str, payload: &[u8], timeout_ms: u64) -> Result<String> {
+/// Exchange one compact-CBOR payload through the managed framed forward.
+/// The UDS and physical UART envelopes are applied here; callers never put
+/// text commands directly on the firmware UART.
+fn uds_cbor_exchange(socket_path: &str, payload: &[u8], timeout_ms: u64) -> Result<String> {
     static UDS_RAW_SERIALIZE: OnceLock<Mutex<()>> = OnceLock::new();
     let _exchange_guard = UDS_RAW_SERIALIZE
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| anyhow::anyhow!("managed raw exchange lock poisoned"))?;
+        .map_err(|_| anyhow::anyhow!("managed CBOR exchange lock poisoned"))?;
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("failed to connect managed serial socket {socket_path}"))?;
     stream
@@ -2994,13 +2856,13 @@ fn uds_raw_exchange(socket_path: &str, payload: &[u8], timeout_ms: u64) -> Resul
         .context("failed to set managed raw read timeout")?;
     stream
         .write_all(SERIAL_FORWARD_FORCE_DIRECT_PREFIX)
-        .context("failed to select direct delivery for Recovery command")?;
+        .context("failed to select direct delivery for CBOR command")?;
     stream
         .write_all(&command_frame)
-        .context("failed to write managed raw serial command")?;
+        .context("failed to write managed CBOR serial command")?;
     stream
         .flush()
-        .context("failed to flush managed raw serial command")?;
+        .context("failed to flush managed CBOR serial command")?;
 
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut output = Vec::new();
@@ -3045,13 +2907,8 @@ fn parse_raw_exchange_messages(raw: &str) -> Vec<MeshMessage> {
         .collect()
 }
 
-/// Send one console command through a managed forward.
-///
-/// The forward broadcasts UART records to its connected clients.  A command
-/// request must therefore disconnect as soon as it has its first complete
-/// firmware response: keeping it alive for the entire timeout lets a later
-/// command's response be attributed to this one.  Long-running observations
-/// belong on the trace/event API, not this request/response path.
+/// Send one compact-CBOR console command through a managed forward.
+#[allow(dead_code)]
 fn uds_console_exchange(socket_path: &str, command: &str, timeout_ms: u64) -> Result<String> {
     uds_console_exchange_with_options(socket_path, command, timeout_ms, false)
 }
@@ -3242,7 +3099,11 @@ fn is_unsolicited_console_record(command: &str, record: &str) -> bool {
     // State notifications are broadcast to all clients, including the client
     // that issued a mode command. They are never the command's authoritative
     // response, even for the compact `active`/`idle` aliases.
-    if record.starts_with("event type=boot") || record.starts_with("event type=mode") {
+    // All event records are broadcast diagnostics, not the command reply.
+    // This includes raw-NAN frame events, which can race a transport command
+    // on a busy managed forward and otherwise make the caller observe a stale
+    // event as its response.
+    if record.starts_with("event type=") {
         return true;
     }
     // `active` and `idle` are compact aliases for the mode control command.
@@ -3254,6 +3115,7 @@ fn is_unsolicited_console_record(command: &str, record: &str) -> bool {
     record.starts_with("mode active=")
 }
 
+#[allow(dead_code)]
 fn split_csv(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -3263,6 +3125,7 @@ fn split_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn normalize_mac_suffix(value: &str) -> Option<String> {
     let hex = value
         .bytes()
@@ -3276,6 +3139,7 @@ fn normalize_mac_suffix(value: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn response_history_entries(value: &Value, target: Option<&str>) -> Vec<(String, String)> {
     let mut entries = Vec::new();
     let Some(messages) = value.get("messages").and_then(Value::as_array) else {
@@ -3323,6 +3187,7 @@ fn response_history_entries(value: &Value, target: Option<&str>) -> Vec<(String,
 
 /// Parse lora1's bounded custom-action response history. The source spelling
 /// may be the ESP SoftAP MAC (station + 1), just like NAN response history.
+#[allow(dead_code)]
 fn raw_response_history_entries(value: &Value, target: Option<&str>) -> Vec<(String, String)> {
     let mut entries = Vec::new();
     let Some(messages) = value.get("messages").and_then(Value::as_array) else {
@@ -3368,6 +3233,7 @@ fn raw_response_history_entries(value: &Value, target: Option<&str>) -> Vec<(Str
 /// Returns true when an older gateway has no dedicated action-frame history
 /// command. Such gateways expose the same received replies through the NAN
 /// response history during the compatibility rollout.
+#[allow(dead_code)]
 fn raw_history_unsupported(value: &Value) -> bool {
     value
         .get("messages")
@@ -3378,6 +3244,7 @@ fn raw_history_unsupported(value: &Value) -> bool {
         .any(|console| console.contains("unknown payload key string: raw_response_history"))
 }
 
+#[allow(dead_code)]
 fn is_session_end(payload_hex: &str) -> bool {
     decode_firmware_hex(payload_hex)
         .map(|payload| {
@@ -3388,6 +3255,7 @@ fn is_session_end(payload_hex: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn response_request_id(payload_hex: &str) -> Option<u64> {
     let payload = decode_firmware_hex(payload_hex).ok()?;
     let decoded = mesh::cbor::decode_json(&payload, &mesh::cbor::Catalog::default()).ok()?;
@@ -3403,6 +3271,7 @@ fn response_request_id(payload_hex: &str) -> Option<u64> {
 /// Return true for the compact firmware-level NAN ping response.  Ping
 /// replies are transport observations and intentionally do not carry the
 /// command request-id used by the command acknowledgement.
+#[allow(dead_code)]
 fn is_firmware_pong(payload_hex: &str) -> bool {
     decode_firmware_hex(payload_hex).is_ok_and(|payload| {
         payload.as_slice() == [0xa2, 0x00, 0x18, 0x21, 0x04, 0x64, b'p', b'o', b'n', b'g']
@@ -3412,6 +3281,7 @@ fn is_firmware_pong(payload_hex: &str) -> bool {
 /// ESP32 exposes the station MAC in some command paths and the AP MAC in raw
 /// NAN frames. They differ only in the final byte (AP = STA + 1), so response
 /// history matching must accept both forms for one addressed node.
+#[allow(dead_code)]
 fn mac_suffix_variants(value: &str) -> Vec<String> {
     let Some(normalized) = normalize_mac_suffix(value) else {
         return Vec::new();
@@ -3432,10 +3302,12 @@ fn mac_suffix_variants(value: &str) -> Vec<String> {
 /// Encode a raw-NAN command for one ESP target. The receiver applies the
 /// normal `to=` filter before dispatching the method, so a broadcast follow-up
 /// from the gateway cannot activate unrelated battery nodes.
+#[allow(dead_code)]
 fn firmware_targeted_command_cbor(command: &str, target: &str) -> Result<Vec<u8>> {
     firmware_targeted_command_cbor_with_metadata(command, target, None, None)
 }
 
+#[allow(dead_code)]
 fn firmware_targeted_command_cbor_with_timeout(
     command: &str,
     target: &str,
@@ -3444,6 +3316,7 @@ fn firmware_targeted_command_cbor_with_timeout(
     firmware_targeted_command_cbor_with_metadata(command, target, timeout_ms, None)
 }
 
+#[allow(dead_code)]
 fn firmware_targeted_command_cbor_with_metadata(
     command: &str,
     target: &str,
@@ -3530,6 +3403,7 @@ fn firmware_targeted_command_cbor_with_metadata(
 /// Encode a bounded target wake. The target receives the regular `mode`
 /// command with `active_ms`, entering command/transfer mode without requiring
 /// a second UART or USB intervention.
+#[allow(dead_code)]
 fn firmware_targeted_active_window_cbor(target: &str, active_ms: u32) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(48);
     let mut encoder = Encoder::new(&mut bytes);
@@ -3551,6 +3425,7 @@ fn firmware_targeted_active_window_cbor(target: &str, active_ms: u32) -> Result<
 /// of the documented ESP firmware ABI: method 49 (`mode`) and argument 190
 /// (`ping`). Keep host NAN command traffic binary even while UART debug text
 /// remains supported.
+#[allow(dead_code)]
 fn firmware_mode_ping_cbor() -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(16);
     let mut encoder = Encoder::new(&mut bytes);
@@ -3566,34 +3441,7 @@ fn firmware_mode_ping_cbor() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Extract DMesh follow-up replies delivered by wpa_supplicant as
-/// `NAN-RECEIVE` events. The DMesh header's device ID is the stable firmware
-/// identity; the WPA peer address may be randomized by platform NAN stacks.
-fn host_nan_responses(events: &Value) -> Vec<Value> {
-    events
-        .get("events")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|event| event.get("event").and_then(Value::as_str) == Some("NAN-RECEIVE"))
-        .filter_map(|event| {
-            let fields = event.get("fields")?;
-            let dmesh = fields.get("ssi_dmesh")?;
-            (dmesh.get("protocol").and_then(Value::as_str) == Some("dmesh_nan_followup")).then(
-                || {
-                    json!({
-                        "device_id": dmesh.get("device_id"),
-                        "target_id": dmesh.get("target_id"),
-                        "msg_type": dmesh.get("msg_type"),
-                        "payload": dmesh.get("payload_text"),
-                        "peer": fields.get("address"),
-                    })
-                },
-            )
-        })
-        .collect()
-}
-
+#[allow(dead_code)]
 fn parse_stability_pongs(output: &str) -> Vec<Value> {
     output
         .lines()
@@ -3630,6 +3478,7 @@ fn parse_stability_pongs(output: &str) -> Vec<Value> {
 /// The stability cycle takes a snapshot before and after its ping observation
 /// window, making raw-NAN response delivery observable independently of the
 /// LoRa console packet that carries the human-readable pong.
+#[allow(dead_code)]
 fn stability_nan_stats(socket: &str) -> Option<BTreeMap<String, u64>> {
     // A sleepy console may miss the first heartbeat at a duty-window boundary.
     // Retry once so the stability monitor does not turn that normal boundary
@@ -3662,6 +3511,7 @@ fn stability_nan_stats(socket: &str) -> Option<BTreeMap<String, u64>> {
     None
 }
 
+#[allow(dead_code)]
 fn stability_nan_cycle(
     before: Option<&BTreeMap<String, u64>>,
     after: Option<&BTreeMap<String, u64>>,
@@ -3684,22 +3534,6 @@ fn stability_nan_cycle(
         "queue_drop_delta": delta("rx_queue_drop"),
         "response_observed": response_rx_delta.is_some_and(|value| value > 0),
     })
-}
-
-fn append_stability_result(state: &Arc<Mutex<StabilityState>>) {
-    let snapshot = state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .snapshot();
-    let directory = std::env::var("MESH_LOG_DIR").unwrap_or_else(|_| "/run/mesh/lmesh".to_string());
-    let path = PathBuf::from(directory).join("lora-stability.jsonl");
-    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
-        tracing::warn!(path = %path.display(), "stability_log_open_failed");
-        return;
-    };
-    if let Err(error) = writeln!(file, "{}", snapshot) {
-        tracing::warn!(path = %path.display(), error = %error, "stability_log_write_failed");
-    }
 }
 
 fn configure_serial(fd: RawFd, baud: u32) -> Result<()> {
@@ -3742,8 +3576,6 @@ fn baud_to_speed(baud: u32) -> Result<libc::speed_t> {
 
 #[derive(Debug, Deserialize)]
 struct LmeshToml {
-    #[serde(default)]
-    radios: Vec<RadioConfig>,
     #[serde(default)]
     serial_forwards: Vec<SerialForwardConfig>,
     #[serde(default)]
@@ -3838,17 +3670,6 @@ fn resolve_esp_route(
     Some((gateway.to_owned(), target))
 }
 
-#[derive(Debug, Deserialize)]
-struct RadioConfig {
-    id: Option<String>,
-    kind: String,
-    medium: Option<String>,
-    path: Option<String>,
-    network: Option<String>,
-    baud: Option<u32>,
-    enabled: Option<bool>,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 struct SerialForwardConfig {
     port: String,
@@ -3868,31 +3689,22 @@ struct SerialForwardConfig {
 }
 
 fn read_lmesh_config() -> Option<LmeshToml> {
-    let path = lmesh_config_path();
+    let path = lmesh_config_path()?;
     let data = fs::read_to_string(path).ok()?;
     toml::from_str(&data).ok()
 }
 
-fn lmesh_config_path() -> PathBuf {
+fn lmesh_config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("LMESH_UART_CONFIG_FILE") {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
 
     // Each service gets an independent HOME. Keeping its configuration below
     // that HOME makes a target/... service instance self-contained and avoids
     // silently sharing forwards with the full lmesh process.
-    let service_home = std::env::var_os("HOME")
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SERVICE_HOME));
-    let path = service_home.join(SERVICE_CONFIG_RELATIVE_PATH);
-    if path.exists() {
-        return path;
-    }
-
-    // Retain the generic override and old system path for existing hosts.
-    std::env::var_os("LMESH_CONFIG_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LMESH_CONFIG_FILE))
+        .map(|service_home| service_home.join(SERVICE_CONFIG_RELATIVE_PATH))
 }
 
 fn now_millis() -> u128 {
@@ -3966,7 +3778,6 @@ impl UartService {
             esp_reverse_sessions: Arc::new(reverse_sessions),
             esp_gateway: configured_esp_gateway(),
             esp_targets: Arc::new(configured_esp_targets()),
-            esp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         };
         if enable_uart {
             service.start_configured_serial_forwards();
@@ -4184,18 +3995,11 @@ impl UartService {
         let mut exchanges = Vec::new();
         let mut ok = true;
         for command in commands {
-            let wire = if command.starts_with("STA ") {
-                encode_recovery_sta_packet(&command)
-            } else if let Some(text) = command.strip_prefix("STA_TEXT ") {
-                // Recovery control packets use the same compact method/payload
-                // envelope as Main; the physical UART never receives text.
-                encode_firmware_uart_payload(text.as_bytes())
-            } else {
-                let mut wire = command.as_bytes().to_vec();
-                wire.push(b'\n');
-                Ok(wire)
-            };
-            match wire.and_then(|wire| uds_raw_exchange(&forward_socket, &wire, timeout_ms)) {
+            let payload = firmware_command_cbor(&command)
+                .and_then(|frame| mesh::cbor::decode_stream_frame(&frame).map(Vec::from));
+            match payload
+                .and_then(|payload| uds_cbor_exchange(&forward_socket, &payload, timeout_ms))
+            {
                 Ok(raw) => {
                     let messages = parse_raw_exchange_messages(&raw);
                     for message in &messages {
@@ -5059,5 +4863,61 @@ impl UartService {
         };
         self.record("esp.serial.command", result.clone());
         result
+    }
+}
+
+#[cfg(test)]
+mod log_fields_tests {
+    use super::{boot_identity_json, cbor_log_fields};
+    use serde_json::json;
+
+    #[test]
+    fn cbor_log_fields_flattens_and_omits_normal_status() {
+        let fields = cbor_log_fields(&json!({
+            "method": "event",
+            "payload": {
+                "message": "event type=mode.state active=infra",
+                "data": {"infra_active": true}
+            },
+            "status": "ok"
+        }));
+        assert_eq!(
+            fields,
+            "method=event payload.data.infra_active=true payload.message=\"event type=mode.state active=infra\""
+        );
+    }
+
+    #[test]
+    fn cbor_log_fields_retains_non_default_status() {
+        assert_eq!(
+            cbor_log_fields(&json!({"method": "status", "status": "error"})),
+            "method=status status=error"
+        );
+    }
+
+    #[test]
+    fn boot_identity_exposes_rtc_and_persisted_boot_target() {
+        // {7: 60000, 6: [role, partition, reset, handoff, main_failures,
+        // recovery_failures, recent_resets, rtc_tick, stage2_version,
+        // boot_target_configured, boot_target, mac]}
+        let payload = [
+            0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x1a, 0x12, 0x34, 0x56, 0x78, 0x18, 0x2a, 0x01, 0x02, 0x46,
+            0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00, 0xff, 0xff,
+        ];
+
+        assert_eq!(
+            boot_identity_json(&payload),
+            json!({
+                "valid": true,
+                "kind": "event",
+                "event_id": 60000,
+                "event_name": "boot.identity",
+                "tuple": [0, 0, 0, 0, 0, 0, 0, 0x12345678_u64, 42, 1, 2, "14c19fe59800"],
+                "stage2_version": 42,
+                "boot_target_configured": 1,
+                "boot_target": 2,
+            })
+        );
     }
 }

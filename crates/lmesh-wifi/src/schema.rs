@@ -177,18 +177,26 @@ impl FirmwareSchema {
 
 fn configured_schema_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Ok(value) = std::env::var("MESH_SCHEMA_FILES")
-        .or_else(|_| std::env::var("LMESH_SCHEMA_FILES"))
+    if let Ok(value) =
+        std::env::var("MESH_SCHEMA_FILES").or_else(|_| std::env::var("LMESH_SCHEMA_FILES"))
     {
-        files.extend(value.split(':').filter(|v| !v.is_empty()).map(PathBuf::from));
+        files.extend(
+            value
+                .split(':')
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+        );
     }
     let dir = std::env::var("MESH_SCHEMA_DIR")
         .or_else(|_| std::env::var("LMESH_SCHEMA_DIR"))
         .unwrap_or_else(|_| "/etc/dmesh/lmesh/schemas".to_owned());
     if let Ok(entries) = fs::read_dir(dir) {
-        files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("json")
-        }));
+        files.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json")),
+        );
     }
     files
 }

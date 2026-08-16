@@ -1,13 +1,14 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-// Keep the firmware schema artifact in lmesh's resources while the generic
-// schema search/loading policy remains in ssh-mesh's mesh crate.
+// The canonical schema is compiled in. `SCHEMA_DIR` supplies every
+// optional schema that lmesh-uart should translate at runtime.
 const CORE_SCHEMA: &str = include_str!("../../lmesh/resources/firmware-schema.json");
+const SCHEMA_DIRECTORY_RELATIVE_PATH: &str = "schemas";
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct FirmwareSchemaFile {
@@ -138,6 +139,14 @@ impl FirmwareSchema {
         value
     }
 
+    /// Decode a firmware compact-CBOR payload into a schema-labelled value.
+    /// Unknown method and field IDs remain numeric, so diagnostics stay
+    /// structured and lossless when a host has not yet installed a schema.
+    pub(crate) fn decode_packet(&self, payload: &[u8]) -> Result<Value> {
+        let value = mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())?;
+        Ok(self.rename_decoded(value))
+    }
+
     fn decode_message(&self, message: &str) -> Option<Map<String, Value>> {
         let mut fields = message.split_whitespace();
         let _kind = fields.next()?;
@@ -176,26 +185,43 @@ impl FirmwareSchema {
 }
 
 fn configured_schema_files() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(value) = std::env::var("MESH_SCHEMA_FILES")
-        .or_else(|_| std::env::var("LMESH_SCHEMA_FILES"))
-    {
-        files.extend(value.split(':').filter(|v| !v.is_empty()).map(PathBuf::from));
-    }
-    let dir = std::env::var("MESH_SCHEMA_DIR")
-        .or_else(|_| std::env::var("LMESH_SCHEMA_DIR"))
-        .unwrap_or_else(|_| "/etc/dmesh/lmesh/schemas".to_owned());
+    let Some(dir) = std::env::var_os("SCHEMA_DIR")
+        .map(PathBuf::from)
+        .and_then(resolve_schema_directory)
+        .or_else(default_schema_directory)
+    else {
+        return Vec::new();
+    };
     if let Ok(entries) = fs::read_dir(dir) {
-        files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("json")
-        }));
+        return entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
     }
-    files
+    Vec::new()
+}
+
+fn default_schema_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(SCHEMA_DIRECTORY_RELATIVE_PATH))
+}
+
+fn resolve_schema_directory(path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(path))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::FirmwareSchema;
+    use minicbor::Encoder;
     use serde_json::json;
 
     #[test]
@@ -213,5 +239,37 @@ mod tests {
         );
         assert_eq!(decoded["payload"]["data"]["type"], "mode.state");
         assert_eq!(decoded["payload"]["data"]["infra_active"], false);
+    }
+
+    #[test]
+    fn compact_cbor_is_rendered_with_schema_names() {
+        let mut packet = Vec::new();
+        let mut encoder = Encoder::new(&mut packet);
+        encoder.map(2).unwrap();
+        encoder.u16(0).unwrap().u16(0).unwrap();
+        encoder.u16(6).unwrap().map(1).unwrap();
+        encoder
+            .u16(32)
+            .unwrap()
+            .str("event type=mode.state active=infra infra_active=true")
+            .unwrap();
+
+        let decoded = FirmwareSchema::load().decode_packet(&packet).unwrap();
+        assert_eq!(decoded["method"], "event");
+        assert_eq!(
+            decoded["payload"]["message"],
+            "event type=mode.state active=infra infra_active=true"
+        );
+        assert_eq!(decoded["payload"]["data"]["infra_active"], true);
+    }
+
+    #[test]
+    fn unknown_method_and_tags_remain_structured() {
+        let decoded = FirmwareSchema::load().rename_decoded(json!({
+            "method": 65535,
+            "payload": {"999": true}
+        }));
+        assert_eq!(decoded["method"], 65535);
+        assert_eq!(decoded["payload"]["999"], true);
     }
 }
