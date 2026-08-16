@@ -1,0 +1,45 @@
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Rust/ESP-IDF startup and the bounded object worker share the app task. The
+# default 8192-byte stack can underflow during the Recovery handoff on C6.
+# Recovery's synchronous UDP worker owns several MTU-sized datagram buffers,
+# callback state, and bounded flash-transfer bookkeeping.  Keep this task at
+# 64 KiB: 16 KiB produced an ESP32-C6 stack-protection fault shortly after a
+# full object-transfer window arrived, even with the 48 KiB manifest decoder
+# allocated directly on the heap.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+# esp-idf-sys's std/libc ABI checks require the complete socket type surface;
+# Recovery does not open a socket and the QUIC bearer remains above this SDK
+# boundary.
+CONFIG_LWIP_MAX_SOCKETS=4
+CONFIG_LWIP_IPV6=y
+# The Wi-Fi object sender legitimately emits a 32-packet transport window.
+# lwIP's default UDP mailbox of six packets drops most of that burst before
+# Recovery can apply transport ACK/reorder logic. Keep bounded headroom above
+# the advertised sender window; this is per-socket pbuf storage, not NV state.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=40
+# Enable the socket-level bound requested by wifi.rs; otherwise lwIP rejects
+# SO_RCVBUF and only the global UDP mailbox limit applies.
+CONFIG_LWIP_SO_RCVBUF=y
+# The reliable UDP sender has a 32-packet Recovery flight budget. ESP-IDF's
+# default Block-ACK windows of six discard a valid AMPDU burst before lwIP can
+# queue it, even though the socket and transport are provisioned for it.
+# This ESP32 target caps static RX buffers at 25. It cannot equal the
+# 32-packet BA window, but 25 is valid and meets ESP-IDF's requirement that
+# the BA window not exceed twice the static buffer count. Dynamic buffers
+# supply the remaining bounded headroom; do not use 32 here because Kconfig
+# silently discards it and leaves the old value active.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=25
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_RX_BA_WIN=32
+CONFIG_ESP_WIFI_TX_BA_WIN=32

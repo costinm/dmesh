@@ -1,0 +1,32 @@
+[package]
+name = "dmesh-recovery-rs"
+version = "0.2.0"
+edition = "2021"
+resolver = "2"
+
+[workspace]
+
+[dependencies]
+dmesh-transport = { path = "../../crates/dmesh-transport" }
+dmesh-object-store = { path = "../../crates/dmesh-object-store", default-features = false }
+uart-codec = { path = "../../crates/uart-codec" }
+# `no_std` here means no Rust std runtime. ESP-IDF, Wi-Fi, UART, and FreeRTOS
+# are still linked and called through the generated C bindings.
+esp-idf-sys = { version = "0.37", default-features = false, features = ["alloc_handler"] }
+
+[build-dependencies]
+embuild = "0.33.3"
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = true
+
+# ESP-IDF 6 removed legacy MbedTLS headers while the released sys crate still
+# includes them unconditionally. Keep the same narrow upstream binding fix as
+# the Main firmware until the next esp-idf-sys release.
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git", rev = "8369f610a31e9c90a5479ed7f366f983589dfa0a" }
