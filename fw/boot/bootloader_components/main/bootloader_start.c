@@ -37,7 +37,7 @@
  * pulse.  CP210x reset/forward scheduling can consume several hundred ms;
  * keep a bounded but generous window so the packet is not lost while still
  * returning to normal partition selection promptly on an idle boot. */
-#define UART_BOOT_WINDOW_MS 3000
+#define UART_BOOT_WINDOW_MS 1000
 #define BOOT_LOOP_WINDOW_TICKS 1000000u /* about 5 s at the ESP32 slow clock */
 #define FAILURE_LIMIT 6
 #define RAPID_RESET_COUNT 3
@@ -138,6 +138,19 @@ static bool uart_boot_enabled(void)
     return !configured || value != 0;
 }
 
+/* A managed USB-UART reset is the explicit host handoff path.  Keep the
+ * bounded selector window there even when NVS defaults to Main; normal
+ * software/RTC boots must not pay that delay.  ESP32-C6 reports this as
+ * RESET_REASON_USB_UART_HPSYS (0x15). */
+static bool uart_selector_reset(void)
+{
+#if CONFIG_IDF_TARGET_ESP32C6
+    return esp_rom_get_reset_reason(0) == 0x15;
+#else
+    return false;
+#endif
+}
+
 static void boot_identity_rtc_values(uint8_t *handoff, uint8_t *main_failures,
                                      uint8_t *recovery_failures,
                                      uint8_t *recent_resets)
@@ -195,7 +208,10 @@ static int boot_cbor_selector(const uint8_t *data, size_t length)
            partition == DMESH_BOOT_PARTITION_MAIN ? 2 : 0;
 }
 
-static int uart_boot_requested(void)
+/* Emit this before partition selection, including a persisted Recovery
+ * target, so a failed NVS read cannot be inferred only from a later Main
+ * boot. The values after stage2_version are configured and target. */
+static void emit_boot_identity(bool boot_target_configured, uint32_t boot_target)
 {
     uint8_t mac[6] = {0};
     (void)esp_efuse_read_field_blob(ESP_EFUSE_MAC_FACTORY, mac, 48);
@@ -208,13 +224,18 @@ static int uart_boot_requested(void)
         payload, sizeof(payload), DMESH_BOOT_ROLE_STAGE2,
         DMESH_BOOT_PARTITION_BOOTLOADER,
         (uint8_t)esp_rom_get_reset_reason(0), handoff,
-        main_failures, recovery_failures, recent_resets, rtc_boot_ticks(), mac);
+        main_failures, recovery_failures, recent_resets, rtc_boot_ticks(),
+        boot_target_configured, boot_target, mac);
     uint8_t wire[256];
     size_t wire_len = dmesh_boot_frame_encode(payload, payload_len, wire,
                                               sizeof(wire));
     for (size_t i = 0; i < wire_len; ++i) {
         esp_rom_output_tx_one_char(wire[i]);
     }
+}
+
+static int uart_boot_requested(void)
+{
 
     const uint32_t polls = UART_BOOT_WINDOW_MS * 1000;
 
@@ -297,17 +318,42 @@ static void halt_for_uart(const char *reason)
 
 static int select_partition(void)
 {
+    /* A verified Recovery image explicitly hands off to Main through this
+     * volatile RTC byte. It must outrank the persistent lab command-mode
+     * Recovery override: otherwise a successful Wi-Fi update loops straight
+     * back into Recovery and can never satisfy its post-update Main proof.
+     * Recovery writes this only after all manifest block digests and flash
+     * worker completions succeed. */
+    if (DMESH_RTC_HANDOFF == DMESH_BOOT_HEALTH_HANDOFF_MAIN) {
+        ESP_LOGW(TAG, "RTC handoff overrides NVS target with Main");
+        /* The handoff is explicitly one-shot.  Leaving it set would make a
+         * completed update permanently veto the operator's later Recovery
+         * setting, including normal command-mode performance testing. */
+        DMESH_RTC_HANDOFF = DMESH_BOOT_HEALTH_HANDOFF_NORMAL;
+        return MAIN_INDEX;
+    }
     /* Explicit lab/operator override. Unlike the UART selector, this is read
      * before the boot window, so repeated Recovery diagnostics neither wait
      * for UART nor accidentally fall through to Main. Values are partition
      * IDs: 1=Main, 2=Recovery; missing or invalid values preserve policy. */
     uint32_t boot_target = 0;
-    if (read_u32("boot_target", &boot_target)) {
+    bool boot_target_configured = read_u32("boot_target", &boot_target);
+    emit_boot_identity(boot_target_configured, boot_target);
+    if (boot_target_configured) {
         if (boot_target == DMESH_BOOT_PARTITION_RECOVERY) {
             ESP_LOGW(TAG, "NVS boot_target selects Recovery");
             return RECOVERY_INDEX;
         }
         if (boot_target == DMESH_BOOT_PARTITION_MAIN) {
+            /* Main is the persistent default, not a veto on an explicit
+             * managed UART Recovery selection made immediately after reset. */
+            if (uart_boot_enabled() && uart_selector_reset()) {
+                int uart = uart_boot_requested();
+                if (uart == 1) {
+                    ESP_LOGW(TAG, "UART selector overrides NVS Main with Recovery");
+                    return RECOVERY_INDEX;
+                }
+            }
             ESP_LOGW(TAG, "NVS boot_target selects Main");
             return MAIN_INDEX;
         }
@@ -323,8 +369,9 @@ static int select_partition(void)
 
     bool uart_enabled = uart_boot_enabled();
     int uart = uart_enabled ? uart_boot_requested() : 0;
-    /* Partition handoff is volatile RTC state.  Main is the only supported
-     * writer; a stale value is cleared by the next successful transition. */
+    /* Partition handoff is volatile RTC state. A verified Recovery transfer
+     * may request Main above; this remaining path handles Recovery requests.
+     * A stale value is cleared by the next successful transition. */
     bool request = false;
     boot_health_state_t *health = boot_health_state();
     uint8_t handoff = DMESH_RTC_HANDOFF;

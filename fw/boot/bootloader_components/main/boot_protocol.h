@@ -4,6 +4,7 @@
  * changes synchronized with the Recovery copy and the human-readable API. */
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #define DMESH_BOOT_WIRE_FLAG 0x7e
@@ -66,6 +67,7 @@ static inline size_t dmesh_boot_identity_event(uint8_t *payload, size_t capacity
                                                uint8_t reset_reason, uint8_t handoff,
                                                uint8_t main_failures, uint8_t recovery_failures,
                                                uint8_t recent_resets, uint64_t rtc_tick,
+                                               bool boot_target_configured, uint32_t boot_target,
                                                const uint8_t mac[6])
 {
     size_t cursor = 0, n;
@@ -78,7 +80,8 @@ static inline size_t dmesh_boot_identity_event(uint8_t *payload, size_t capacity
     payload[cursor++] = 0x9f;
     uint64_t values[] = {role, partition, reset_reason, handoff, main_failures,
                          recovery_failures, recent_resets, rtc_tick,
-                         DMESH_STAGE2_VERSION};
+                         DMESH_STAGE2_VERSION, boot_target_configured,
+                         boot_target};
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
         n = dmesh_cbor_put_uint(payload + cursor, capacity - cursor, values[i]);
         if (!n) return 0;

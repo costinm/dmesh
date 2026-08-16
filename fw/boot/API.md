@@ -27,12 +27,17 @@ its tuple is:
 
 ```text
 [role, partition, reset_reason, rtc_handoff, main_failures,
- recovery_failures, recent_resets, rtc_tick, stage2_version, mac_bytes]
+ recovery_failures, recent_resets, rtc_tick, stage2_version,
+ boot_target_configured, boot_target, mac_bytes]
 
 `stage2_version` is a numeric build identifier in `YYYYMMDDNNN` form. The
 fleet build accepts `DMESH_STAGE2_VERSION`; when unset it defaults to the UTC
 build date with sequence `000`. Main and Recovery versions are separate and
 are not represented by this field.
+
+`boot_target_configured` and `boot_target` report Stage2's own NVS read at
+boot. A configured value of `2` must be followed by Recovery. When the flag is
+`0`, the value is zero and normal selection applies.
 ```
 
 Stage2 has role `3`, partition `0`. The event is diagnostic and must not select

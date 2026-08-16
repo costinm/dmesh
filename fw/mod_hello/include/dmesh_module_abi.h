@@ -5,7 +5,6 @@
 
 #include "dmesh_lora_abi.h"
 #include "../../modules/include/dmesh_hw_abi.h"
-#include "../../mod_flash/include/dmesh_flash_abi.h"
 
 #define DMESH_MODULE_ABI_VERSION 4u
 #define DMESH_MODULE_MAGIC 0x444f4d44u
@@ -54,8 +53,6 @@ typedef struct {
     const dmesh_lora_host_v1 *lora_host;
     const dmesh_lora_config_v1 *lora_config;
     const dmesh_module_host_v1 *host;
-    /* Additive; older modules validate only the prefix above. */
-    const dmesh_flash_host_v1 *flash_host;
 } dmesh_module_context_t;
 
 typedef int (*dmesh_module_entry_fn)(const dmesh_module_context_t *context,

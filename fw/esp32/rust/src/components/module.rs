@@ -728,29 +728,6 @@ pub fn invoke_module(
             "module name must be 1..15 ASCII alphanumeric or underscore bytes"
         ));
     }
-    if name == "flash" {
-        if !unsafe { dmesh_module_flash_supported() } {
-            return Err(anyhow!("flash module host is unavailable"));
-        }
-        let transport = request.arg("transport").unwrap_or("tcp");
-        if transport == "tcp" {
-            // If the caller already prepared the IP STA, do not run another
-            // radio/power transition immediately before the module opens its
-            // socket. This is the normal scripted path: Main first stops NAN,
-            // then configures the static STA, then starts mod_flash. A second
-            // transition here can invalidate the lwIP/Wi-Fi data plane even
-            // though the STA still reports an address.
-            if !crate::components::wifi::ip_sta_ready() {
-                crate::components::mode::stop_for_ip_transport();
-            }
-        }
-        if !unsafe { dmesh_module_loader_prepare_flash(1500) } {
-            if transport == "tcp" {
-                let _ = crate::components::mode::resume_from_ip_transport(settings);
-            }
-            return Err(anyhow!("module did not quiesce before flash module start"));
-        }
-    }
     if name == "lora" && unsafe { dmesh_module_loader_is_lora() } {
         configure_lora(settings)?;
         let args = request.arg("args").unwrap_or("status").as_bytes();
