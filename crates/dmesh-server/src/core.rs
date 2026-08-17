@@ -24,6 +24,29 @@ pub const RECORD_DONE: u8 = 3;
 pub const MAX_RECORD: usize = 16 * 1024 * 1024;
 pub const REQUEST_MAX: usize = 1024;
 
+/// Credit return after one verified object record. This policy is independent
+/// of UDP/UART/radio: a persistent sink returns blob credit only when it has
+/// reclaimed storage, while a benchmark/fake sink can reuse it immediately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectRecordCredit {
+    Immediate(usize),
+    Deferred,
+}
+
+pub const fn verified_object_record_credit(
+    kind: u8,
+    payload_len: usize,
+    immediately_reusable: bool,
+) -> Option<ObjectRecordCredit> {
+    let record_len = payload_len.saturating_add(5);
+    match kind {
+        RECORD_MANIFEST | RECORD_DONE => Some(ObjectRecordCredit::Immediate(record_len)),
+        RECORD_BLOB if immediately_reusable => Some(ObjectRecordCredit::Immediate(record_len)),
+        RECORD_BLOB => Some(ObjectRecordCredit::Deferred),
+        _ => None,
+    }
+}
+
 /// Encode the object-store GET map. Transport wraps the returned bytes in its
 /// own stream packet; this function has no bearer or packet dependency.
 pub fn encode_get(out: &mut [u8], name: Option<&[u8]>, cpu: u8, target: u8) -> Option<usize> {
@@ -38,6 +61,138 @@ pub fn encode_get(out: &mut [u8], name: Option<&[u8]>, cpu: u8, target: u8) -> O
     encoder.uint(2)?;
     encoder.uint(target as u64)?;
     Some(encoder.len())
+}
+
+/// One contiguous chunk in the ordered object-response stream.
+///
+/// The five-byte record header is part of the stream.  This is deliberately
+/// below UDP, UART, ESP-NOW/action, and any future bearer: the transport owns
+/// packetisation, ACKs, loss recovery, and flow control, while this type owns
+/// only the canonical record order and stream offsets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectStreamChunk {
+    pub offset: u64,
+    pub len: usize,
+    pub fin: bool,
+    pub record_index: usize,
+}
+
+/// Turn materialised object records into bounded chunks of one ordered stream.
+///
+/// A packet never crosses a record boundary. This preserves the existing
+/// manifest-before-blob admission barrier while allowing the transport to fill
+/// its congestion/credit window with consecutive blob chunks. `out` is owned
+/// by the bearer adapter, so this core helper neither allocates per packet nor
+/// knows which bearer will transmit the result.
+pub struct ObjectRecordStream {
+    records: Vec<(u8, Vec<u8>)>,
+    record_index: usize,
+    record_offset: usize,
+    stream_offset: u64,
+    sent_bytes: usize,
+}
+
+impl ObjectRecordStream {
+    pub fn new(records: Vec<(u8, Vec<u8>)>) -> Self {
+        Self {
+            records,
+            record_index: 0,
+            record_offset: 0,
+            stream_offset: 0,
+            sent_bytes: 0,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.record_index == self.records.len()
+    }
+
+    pub fn sent_bytes(&self) -> usize {
+        self.sent_bytes
+    }
+
+    pub fn record_index(&self) -> usize {
+        self.record_index
+    }
+
+    /// Copy the next bounded ordered chunk into `out` without advancing.
+    ///
+    /// A bearer must call [`Self::advance`] only after quic-lite accepted the
+    /// resulting packet. That distinction prevents a congestion/credit
+    /// rejection from skipping object bytes. A zero-sized output is never a
+    /// valid transport packet and returns `None` without changing state.
+    pub fn copy_next(&self, out: &mut [u8]) -> Option<ObjectStreamChunk> {
+        if out.is_empty() || self.is_complete() {
+            return None;
+        }
+        let (kind, body) = self.records.get(self.record_index)?;
+        let record_len = body.len().checked_add(5)?;
+        if self.record_offset >= record_len {
+            return None;
+        }
+        let len = out.len().min(record_len - self.record_offset);
+        for (index, destination) in out[..len].iter_mut().enumerate() {
+            let position = self.record_offset + index;
+            *destination = match position {
+                0 => *kind,
+                1..=4 => (body.len() as u32).to_be_bytes()[position - 1],
+                _ => body[position - 5],
+            };
+        }
+        let offset = self.stream_offset;
+        let completed_record = self.record_offset + len == record_len;
+        let fin = completed_record && *kind == RECORD_DONE;
+        Some(ObjectStreamChunk {
+            offset,
+            len,
+            fin,
+            record_index: self.record_index,
+        })
+    }
+
+    /// Commit exactly the preceding [`Self::copy_next`] result after the
+    /// transport has accepted it for transmission.
+    pub fn advance(&mut self, chunk: ObjectStreamChunk) -> bool {
+        let Some(expected) = self.copy_next(&mut [0u8; 1]) else {
+            return false;
+        };
+        // The one-byte probe above deliberately verifies only the current
+        // record/offset. Its length differs for larger caller buffers, so
+        // validate the stable fields and calculate the remaining bound here.
+        if chunk.offset != expected.offset || chunk.record_index != expected.record_index {
+            return false;
+        }
+        let Some((kind, body)) = self.records.get(self.record_index) else {
+            return false;
+        };
+        let remaining = body
+            .len()
+            .saturating_add(5)
+            .saturating_sub(self.record_offset);
+        if chunk.len == 0 || chunk.len > remaining {
+            return false;
+        }
+        let completes = chunk.len == remaining;
+        if chunk.fin != (completes && *kind == RECORD_DONE) {
+            return false;
+        }
+        self.record_offset += chunk.len;
+        self.stream_offset = self.stream_offset.saturating_add(chunk.len as u64);
+        self.sent_bytes = self.sent_bytes.saturating_add(chunk.len);
+        if completes {
+            self.record_index += 1;
+            self.record_offset = 0;
+        }
+        true
+    }
+
+    /// Copy and advance the next bounded ordered chunk. This convenience is
+    /// suitable for deterministic in-process links; real bearer adapters use
+    /// `copy_next`/`advance` around their transport admission call.
+    pub fn next_chunk(&mut self, out: &mut [u8]) -> Option<ObjectStreamChunk> {
+        let chunk = self.copy_next(out)?;
+        self.advance(chunk).then_some(chunk)
+    }
 }
 
 /// Byte-record extraction over an already ordered transport stream. The
@@ -74,9 +229,7 @@ pub struct FixedRecordDecoder<const MAX_MANIFEST: usize, const MAX_BLOB: usize> 
     blob: [u8; MAX_BLOB],
 }
 
-impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize>
-    FixedRecordDecoder<MAX_MANIFEST, MAX_BLOB>
-{
+impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MANIFEST, MAX_BLOB> {
     pub const fn new() -> Self {
         Self {
             header: [0; 5],
@@ -763,6 +916,22 @@ impl<S> Receiver<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_object_credit_is_storage_not_bearer_policy() {
+        assert_eq!(
+            verified_object_record_credit(RECORD_MANIFEST, 10, false),
+            Some(ObjectRecordCredit::Immediate(15))
+        );
+        assert_eq!(
+            verified_object_record_credit(RECORD_BLOB, 4096, false),
+            Some(ObjectRecordCredit::Deferred)
+        );
+        assert_eq!(
+            verified_object_record_credit(RECORD_BLOB, 4096, true),
+            Some(ObjectRecordCredit::Immediate(4101))
+        );
+    }
     struct Sink {
         blocks: u32,
         bytes: usize,
@@ -886,11 +1055,19 @@ mod tests {
         }
         let mut decoder = FixedRecordDecoder::<8, 16>::new();
         let mut sink = Sink::default();
-        decoder.push(&[RECORD_MANIFEST, 0, 0, 0], &mut sink).unwrap();
+        decoder
+            .push(&[RECORD_MANIFEST, 0, 0, 0], &mut sink)
+            .unwrap();
         decoder
             .push(&[3, b'a', b'b', b'c', RECORD_DONE, 0, 0, 0, 0], &mut sink)
             .unwrap();
-        assert_eq!(sink.0, vec![(RECORD_MANIFEST, b"abc".to_vec()), (RECORD_DONE, Vec::new())]);
+        assert_eq!(
+            sink.0,
+            vec![
+                (RECORD_MANIFEST, b"abc".to_vec()),
+                (RECORD_DONE, Vec::new())
+            ]
+        );
         assert_eq!(
             decoder.push(&[RECORD_BLOB, 0, 0, 0, 17], &mut sink),
             Err(FixedRecordError::Invalid)
@@ -1025,5 +1202,58 @@ mod tests {
         let mut bytes = [0u8; 64];
         let len = encode_get(&mut bytes, None, 13, 6).unwrap();
         assert_eq!(&bytes[..len], &[0xa2, 0x01, 0x0d, 0x02, 0x06]);
+    }
+
+    #[test]
+    fn object_record_stream_keeps_records_ordered_and_finishes_only_on_done() {
+        let mut stream = ObjectRecordStream::new(vec![
+            (RECORD_MANIFEST, b"meta".to_vec()),
+            (RECORD_BLOB, b"abcdef".to_vec()),
+            (RECORD_DONE, Vec::new()),
+        ]);
+        let mut output = [0u8; 4];
+        let mut bytes = Vec::new();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next_chunk(&mut output) {
+            bytes.extend_from_slice(&output[..chunk.len]);
+            chunks.push(chunk);
+        }
+        assert_eq!(
+            bytes,
+            [
+                RECORD_MANIFEST,
+                0,
+                0,
+                0,
+                4,
+                b'm',
+                b'e',
+                b't',
+                b'a',
+                RECORD_BLOB,
+                0,
+                0,
+                0,
+                6,
+                b'a',
+                b'b',
+                b'c',
+                b'd',
+                b'e',
+                b'f',
+                RECORD_DONE,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+        assert_eq!(chunks[0].offset, 0);
+        assert_eq!(chunks[1].offset, 4);
+        assert_eq!(chunks.last().unwrap().offset, 24);
+        assert!(!chunks.iter().take(chunks.len() - 1).any(|chunk| chunk.fin));
+        assert!(chunks.last().unwrap().fin);
+        assert_eq!(stream.sent_bytes(), bytes.len());
+        assert!(stream.is_complete());
     }
 }

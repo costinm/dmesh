@@ -2,10 +2,12 @@
 name = "lmesh"
 version = "0.0.1"
 edition = "2024"
+autoexamples = false
 
 [dependencies]
 dmesh-rawnan = { path = "../rawnan" }
-dmesh-transport = { path = "../dmesh-transport" }
+dmesh-server = { path = "../dmesh-server", features = ["udp"] }
+quic-lite = { path = "../quic-lite" }
 lmesh-wifi = { path = "../lmesh-wifi" }
 lmesh-uart = { path = "../lmesh-uart" }
 lmesh-ble-hci = { path = "../lmesh-ble-hci" }
@@ -21,6 +23,11 @@ anyhow = "1.0"
 libc = "0.2"
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 minicbor = "2.2"
+uart-codec = { path = "../uart-codec" }
 
 [lib]
 name = "lmesh"
+
+[[bin]]
+name = "dmesh-iperf"
+path = "examples/dmesh_iperf.rs"

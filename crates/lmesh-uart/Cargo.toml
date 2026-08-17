@@ -7,7 +7,8 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 dmesh-rawnan = { path = "../rawnan" }
-dmesh-transport = { path = "../dmesh-transport" }
+dmesh-server = { path = "../dmesh-server", features = ["udp"] }
+quic-lite = { path = "../quic-lite" }
 libc = "0.2"
 minicbor = "2.2"
 sha2 = "0.11"

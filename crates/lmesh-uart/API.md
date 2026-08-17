@@ -1,10 +1,11 @@
 # lmesh-uart service API
 
-`lmesh-uart` builds the host service binary and library. It provides
-stable USB/UART forwarding, ESP32 serial command access, modem-line controls,
-and serial-forwarding diagnostics. The low-level PPP/HDLC codec is documented
-in [`uart-codec/API.md`](../uart-codec/API.md) and is also used by the ESP32
-firmware.
+`lmesh-uart` builds the host UART L2 service and library. Legacy byte forwards
+are disabled for every board. The service is being converted to a QUIC-lite
+UART proxy: PPP/HDLC carries bearer packets, while commands, logs, and object
+transfer are `dmesh-server` services on QUIC-lite streams. The low-level
+PPP/HDLC codec is documented in [`uart-codec/API.md`](../uart-codec/API.md)
+and is also used by the ESP32 firmware.
 
 The service owns the host UART backend directly and does not depend on the
 Wi-Fi service crate. Firmware framing is shared through `uart-codec`.
@@ -40,11 +41,18 @@ endpoint accepts one JSON object per line and returns one JSON object per line.
 Every response has either `{"success":true,"data":...}` or
 `{"success":false,"error":"..."}`.
 
-Configured forwards are on-demand endpoint registrations. `forward.list`
-reports the configured socket even when its physical USB path is absent;
-`available` indicates whether that path currently exists. A client operation
-may therefore fail for a disconnected device without preventing the service
-from starting.
+The configured board inventory is retained for explicit provisioning and the
+proxy migration, but every legacy `serial_forwards` entry is `enabled = false`.
+`forward.list` must remain empty. The replacement client surface starts with a
+reusable QUIC-lite IPERF session library (also used by `dmesh-iperf`): it
+opens a direct serial L2 together with its IP backend and never revives
+byte-forward sockets. Generic command dispatch, IP-only targets, and
+long-lived `log watch` streams are the next additions to that same client API;
+they are not implemented by the current IPERF wrapper.
+
+`lmesh-wifi` will use this same session/client API as its fleet egress-gateway
+handler. ESP-NOW, STA/UDP, and future LoRa/FSK are path choices owned by the
+connection runtime, not distinct command or IPERF protocols.
 
 Per-forward sockets use `/run/mesh/lmesh-uart` by default, so the service does
 not collide with the main `lmesh` service's per-device sockets. The
@@ -62,12 +70,6 @@ capture file.
 | `usb.serial.list` | List discovered USB serial adapters | `handshake` |
 | `usb.serial.handshake` | Probe an adapter and identify its profile | `port`, `profile`, `baud`, `timeout_sec` |
 | `usb.serial.boot` | Send a boot/reset command through an adapter | `port`, `command`, `reset`, `timeout_sec` |
-| `usb.serial.forward.start` | Start a managed serial forward | `port`, `baud`, `tcp_port`, `tcp_mode`, `handshake`, `multi`, `direct` |
-| `usb.serial.connect` | Alias for `usb.serial.forward.start` | Same as above |
-| `usb.serial.forward.stop` | Stop a serial forward | `port` |
-| `usb.serial.disconnect` | Alias for `usb.serial.forward.stop` | `port` |
-| `usb.serial.forward.list` | List active forwards | — |
-| `usb.serial.forward.flush` | Flush a forward's pending data | `port` |
 | `usb.serial.rst` | Pulse the adapter reset/modem line | `port` |
 | `usb.serial.reset` | Alias for `usb.serial.rst` | `port` |
 | `usb.serial.dtr` | Set or pulse DTR | `port`, `asserted`, `pulse_ms` |

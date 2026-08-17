@@ -1,5 +1,5 @@
 [package]
-name = "dmesh-object-store"
+name = "dmesh-server"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,7 +14,7 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 
 [features]
-default = ["std"]
+default = ["std", "udp"]
 std = [
     "dep:anyhow",
     "dep:hex",
@@ -24,9 +24,27 @@ std = [
     "dep:tracing",
     "dep:tracing-subscriber",
 ]
+udp = ["std", "dep:libc", "quic-lite/std"]
 
 [dev-dependencies]
 tempfile = "3"
 
 [lib]
-name = "dmesh_object_store"
+name = "dmesh_server"
+
+[[example]]
+name = "recovery-iperf-server"
+required-features = ["udp"]
+test = true
+
+[[test]]
+name = "running_lmesh_wifi"
+required-features = ["udp"]
+
+[dependencies.quic-lite]
+path = "../quic-lite"
+default-features = false
+
+[dependencies.libc]
+version = "0.2"
+optional = true

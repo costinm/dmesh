@@ -4,6 +4,8 @@
 //! transport around it may be JSONL over a mesh socket or the main service's
 //! framed mesh protocol.
 
+pub mod client;
+pub mod l2;
 mod schema;
 mod service;
 
@@ -36,26 +38,12 @@ pub fn handle_request(uart: &UartService, request: Value) -> Value {
             request.get("timeout_sec").and_then(Value::as_f64),
             request.get("reset").and_then(Value::as_bool),
         )),
-        "usb.serial.forward.start" | "usb.serial.connect" => Ok(uart.serial_forward_start(
-            string_arg(&request, "port"),
-            request
-                .get("baud")
-                .and_then(Value::as_u64)
-                .map(|value| value as u32),
-            request
-                .get("tcp_port")
-                .and_then(Value::as_u64)
-                .map(|value| value as u16),
-            string_arg(&request, "tcp_mode"),
-            request.get("handshake").and_then(Value::as_bool),
-            request.get("multi").and_then(Value::as_bool),
-            request.get("direct").and_then(Value::as_bool),
-        )),
-        "usb.serial.forward.stop" | "usb.serial.disconnect" => {
-            Ok(uart.serial_forward_stop(string_arg(&request, "port")))
-        }
-        "usb.serial.forward.list" => Ok(uart.serial_forward_list()),
-        "usb.serial.forward.flush" => Ok(uart.serial_forward_flush(string_arg(&request, "port"))),
+        "usb.serial.forward.start"
+        | "usb.serial.connect"
+        | "usb.serial.forward.stop"
+        | "usb.serial.disconnect"
+        | "usb.serial.forward.list"
+        | "usb.serial.forward.flush" => Err("legacy UART byte forwarding is retired; use the QUIC-lite client".into()),
         "usb.serial.rst" | "usb.serial.reset" => {
             Ok(uart.serial_modem_reset(string_arg(&request, "port")))
         }

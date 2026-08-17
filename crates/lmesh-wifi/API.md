@@ -30,8 +30,12 @@ The shared DM v1 NAN/BLE wire format and raw frame state machine live in
 [`dmesh-rawnan/API.md`](../rawnan/API.md). This crate owns only the Linux
 interface operations and their AP/STA/raw-NAN orchestration.
 
-UART forwarding is implemented by the independent `lmesh-uart` service. This
-crate owns no UART service lifecycle or control socket.
+Legacy UART forwarding is retired. `lmesh-uart` remains a reusable serial L2
+library, but has no device command, log, or flash socket. A future
+`lmesh-wifi` device manager may own a board's direct serial and STA adapters
+together; it contributes both to the same peer/path record, whose DCID maps to
+one QUIC-lite connection. It may therefore probe, select, or use serial and
+UDP concurrently without making an application command bearer-specific.
 
 Experimental BLE HCI operations are owned by `lmesh` and are intentionally
 outside this stable library.
@@ -58,8 +62,8 @@ The host experiment commands are available on the service socket:
 
 ## Object-store UDP bearer
 
-The Wi-Fi service starts the feature-gated host QUIC/UDP server from
-`dmesh-transport`. It can also be started on the existing service socket
+The Wi-Fi service starts the feature-gated host QUIC/UDP adapter from
+`dmesh-server`. It can also be started on the existing service socket
 without restarting `lmesh-wifi`:
 
 ```text
@@ -71,17 +75,50 @@ explicit command is idempotent and remains useful for selecting another
 artifact root.
 
 The server routes datagrams by opaque DCID to a transport connection, then
-passes stream data to the installed object-store service. It accepts a binary
-CBOR GET and returns manifest/blob records on transport streams. UDP is only
-the datagram bearer; `dmesh-object-store` itself has no socket or UDP code. The
-The stable `lmesh-wifi` launcher also starts the object-store TCP compatibility
-listener on port 3337 when configured. The embedded `lmesh` superset delegates
-to this same library startup path and does not create a second listener.
+dispatches its registered `dmesh-server` stream services. This includes binary
+CBOR GET/manifest/blob transfer and the deterministic `iperf` stream handler;
+clients can therefore request IPERF over the same managed UDP bearer that owns
+the WLAN interface and its capabilities. UDP is only the datagram bearer;
+`quic-lite` itself has no socket, CBOR, or UDP code. No TCP object-store
+compatibility listener remains.
 
-Raw NAN currently uses the same `dmesh-transport` envelope for packet and
-filter validation, but the ESP receiver is still a bounded envelope/object
-receiver rather than a complete host-served object stream. Do not treat NAN
-envelope counters as flashing completion evidence.
+## Gateway IPERF client
+
+`transport.client.iperf` starts the same `lmesh-uart` client implementation
+used by the standalone `dmesh-iperf` binary. It is a gateway operation, not a
+second raw-radio benchmark:
+
+```text
+mesh lmesh-wifi transport.client.iperf iface=wlan0 \
+  serial=/dev/serial/by-id/<device> bootstrap=10.78.0.1:0 \
+  backend=10.78.0.1:3339 bytes=2097152 bearer=spill
+```
+
+The current host gateway slice requires a direct serial L2 plus an IP backend.
+`bearer` accepts `uart`, `udp`, `aggregate`/`fastest`, or `spill`; the same
+policy values will select ESP-NOW and LoRa/FSK paths once those adapters enter
+the shared connection owner. The request returns once the bounded client task
+starts; its terminal report is emitted by the shared client, not inferred from
+that start acknowledgement.
+
+`transport.client.service` uses the same client implementation for direct
+UDP/IP service requests, including a bounded `log-watch` poll:
+
+```text
+mesh lmesh-wifi transport.client.service iface=wlan0 \
+  target=udp://10.78.0.42:3339 service=log-watch log_records=16
+```
+
+It records completion in service history. `log-watch` is presently a bounded
+poll; a persistent framed subscription is planned and will use this same
+connection/path owner.
+
+NAN remains discovery/bootstrap only. The extended ESP-NOW/DMesh vendor-action
+frame is the planned QUIC-lite data bearer and will carry the same
+`dmesh-server` object/control/log services as UDP and UART. Raw-action
+injection/history commands below are diagnostics, not object or flashing
+completion evidence; the production action flash operation is added only with
+the host action adapter and the shared Main/Recovery receiver.
 
 ```text
 wifi.interface.status iface=wlan1
@@ -96,26 +133,20 @@ wifi.raw.send iface=wlan1 channel=6 tx_variant=af_packet frame_hex=<ethernet-fra
 messages.history keys=wifi.raw.tx,wifi.raw.rx limit=40
 ```
 
-### Minimal AP+NAN test
+### Historical AP+NAN setup reference
 
 ```sh
 source ./env.sh
 mesh lmesh wifi.ap.start_open iface=wlan1 ssid=dmesh-lmesh6
 mesh lmesh-wifi wifi.ap.status iface=wlan0
 mesh lmesh-wifi wifi.rawnan.status iface=wlan0
-mesh lmesh-uart esp.serial.command port=e6 \
-  command='wifi mode=sta ssid=Direct-CAB879CC-Dmesh-local psk= channel=6 timeout=10000' \
-  timeout_sec=20
-mesh lmesh-uart esp.serial.command port=e6 \
-  command='nan sync_beacon=count=1 interval_ms=100' timeout_sec=15
-mesh lmesh-uart esp.serial.command port=e6 \
-  command='nan publish=count=1 sync=true' timeout_sec=15
 ```
 
 The AP command owns only `wlan1`; `lmesh-wifi` continues to own `wlan0`.
-`sync_beacon` is an explicit debugging transmission. It is not enabled as a
-production NAN master-election behavior. See
-[`debugging.md`](debugging.md) for the complete command set and captures.
+The former UART command steps are intentionally omitted: transport tests use
+the registered QUIC-lite services over a discovered L2 path. `sync_beacon` is
+an explicit debugging transmission, not production NAN master-election
+behavior. See [`debugging.md`](debugging.md) for captures.
 
 ### Persistent socket and event polling
 

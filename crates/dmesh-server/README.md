@@ -1,4 +1,4 @@
-# dmesh-object-store
+# dmesh-server
 
 This crate is a transport-neutral object store. A client sends a compact CBOR
 `GET` map containing binary parameters such as object name, CPU, and target.

@@ -9,7 +9,7 @@ Other component contracts remain authoritative in:
 - [`lmesh-uart/API.md`](../lmesh-uart/API.md)
 - [`uart-codec/API.md`](../uart-codec/API.md)
 - [`rawnan/API.md`](../rawnan/API.md)
-- [`dmesh-transport`](../dmesh-transport/)
+- [`quic-lite`](../quic-lite/) and [`dmesh-server`](../dmesh-server/)
 
 BLE HCI is experimental and is implemented only by `lmesh`; it is not part of
 the stable `lmesh-wifi` API. This file intentionally contains pointers only;

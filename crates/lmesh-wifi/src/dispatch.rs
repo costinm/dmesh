@@ -253,35 +253,6 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                         .map(|v| v.min(54) as u8),
                 ))
             }
-            "wifi.raw.bench_send" | "transport.bench.start" => {
-                let iface = authorize(netd, &request, Operation::Nan)?;
-                let destination = string_arg(&request, "destination")
-                    .ok_or_else(|| anyhow::anyhow!("destination is required"))?;
-                let bytes = request
-                    .get("bytes")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("bytes is required"))?;
-                Ok(radio.wifi_raw_bench_send(
-                    Some(iface),
-                    request
-                        .get("channel")
-                        .and_then(Value::as_u64)
-                        .map(|v| v.min(13) as u8),
-                    destination,
-                    string_arg(&request, "bssid"),
-                    bytes as usize,
-                    request
-                        .get("chunk_bytes")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as usize),
-                    string_arg(&request, "tx_variant"),
-                    string_arg(&request, "llc"),
-                    request
-                        .get("multicast")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                ))
-            }
             "wifi.object.udp.start" => {
                 let _iface = authorize(netd, &request, Operation::Sta)?;
                 Ok(radio.object_udp_start(
@@ -294,6 +265,41 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                 ))
             }
             "wifi.object.udp.status" => Ok(radio.object_udp_status()),
+            "transport.client.iperf" => {
+                let _iface = authorize(netd, &request, Operation::Sta)?;
+                let serial = string_arg(&request, "serial")
+                    .ok_or_else(|| anyhow::anyhow!("serial is required"))?;
+                let bootstrap = string_arg(&request, "bootstrap")
+                    .ok_or_else(|| anyhow::anyhow!("bootstrap is required"))?;
+                let backend = string_arg(&request, "backend")
+                    .ok_or_else(|| anyhow::anyhow!("backend is required"))?;
+                let bytes = request
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("bytes is required"))?
+                    .min(u32::MAX as u64) as u32;
+                Ok(radio.transport_client_iperf(
+                    serial,
+                    bootstrap,
+                    backend,
+                    bytes,
+                    string_arg(&request, "bearer"),
+                ))
+            }
+            "transport.client.service" => {
+                let _iface = authorize(netd, &request, Operation::Sta)?;
+                let target = string_arg(&request, "target")
+                    .ok_or_else(|| anyhow::anyhow!("target is required (udp://HOST:PORT)"))?;
+                Ok(radio.transport_client_service(
+                    target,
+                    string_arg(&request, "service").unwrap_or_else(|| "status".to_owned()),
+                    string_arg(&request, "body_hex"),
+                    request
+                        .get("log_records")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.min(u8::MAX as u64) as u8),
+                ))
+            }
             "messages.history" => Ok(radio.history(
                 string_arg(&request, "keys"),
                 request

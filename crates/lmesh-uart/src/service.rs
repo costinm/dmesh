@@ -72,9 +72,18 @@ const FIRMWARE_UART_ESCAPE: u8 = UART_ESCAPE;
 
 /// Host-side adapter from the no-std UART codec's raw payloads to the shared
 /// mesh CBOR stream-frame representation used by the Linux service.
-#[derive(Default)]
 struct FirmwareUartDecoder {
     codec: uart_codec::codec::Decoder,
+}
+
+impl Default for FirmwareUartDecoder {
+    fn default() -> Self {
+        // One marker byte precedes a full-MTU QUIC-lite packet in a PPP
+        // information field. Direct CBOR records remain limited to the MTU.
+        Self {
+            codec: uart_codec::codec::Decoder::with_max(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1),
+        }
+    }
 }
 
 impl FirmwareUartDecoder {
@@ -1384,6 +1393,25 @@ impl SerialForwardLog {
                 logged += 1;
                 continue;
             };
+            if payload.first() == Some(&0xf7) {
+                // UART L2 transport packets are not CBOR notifications. Keep
+                // their PPP framing decoded, but never hand their opaque
+                // QUIC-lite bytes to the schema/text decoder.
+                let packet = &payload[1..];
+                let header = quic_lite::ShortHeader::decode(packet)
+                    .map(|(header, _)| header.dcid.value().to_string())
+                    .unwrap_or_else(|_| "invalid".to_owned());
+                writeln!(
+                    self.file,
+                    "ts_ms={} host={} dir=rx kind=quic_lite bytes={} dcid={}",
+                    now_millis_u64(),
+                    host,
+                    packet.len(),
+                    header,
+                )?;
+                logged += 1;
+                continue;
+            }
             if let Some(event) = nan_sleepy_start_event(payload) {
                 writeln!(
                     self.file,
@@ -3780,8 +3808,13 @@ impl UartService {
             esp_targets: Arc::new(configured_esp_targets()),
         };
         if enable_uart {
-            service.start_configured_serial_forwards();
-            service.start_configured_esp_reverse_sessions();
+            // UART is an L2 bearer only.  Do not recreate serial UDS/TCP
+            // forwards or reverse-Main TCP listeners from configuration;
+            // commands and logs use the shared QUIC-lite client/services.
+            service.record(
+                "uart.legacy_forwarding",
+                json!({"enabled": false, "reason": "retired"}),
+            );
         }
         service
     }
@@ -4901,9 +4934,9 @@ mod log_fields_tests {
         // recovery_failures, recent_resets, rtc_tick, stage2_version,
         // boot_target_configured, boot_target, mac]}
         let payload = [
-            0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x1a, 0x12, 0x34, 0x56, 0x78, 0x18, 0x2a, 0x01, 0x02, 0x46,
-            0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00, 0xff, 0xff,
+            0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x1a, 0x12, 0x34, 0x56, 0x78, 0x18, 0x2a, 0x01, 0x02, 0x46, 0x14, 0xc1, 0x9f, 0xe5,
+            0x98, 0x00, 0xff, 0xff,
         ];
 
         assert_eq!(

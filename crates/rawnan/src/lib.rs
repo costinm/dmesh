@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Result};
 pub mod espnow;
 pub use espnow::{
     action_header as espnow_action_header, build_action_frame as build_espnow_action_frame,
+    parse_action_frame as parse_espnow_action_frame,
 };
 
 pub mod service;

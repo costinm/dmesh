@@ -6,7 +6,6 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 pub mod dispatch;
 mod radio;
@@ -97,51 +96,6 @@ impl WifiService {
             Some("monitor".to_owned()),
         )
     }
-
-    /// Start the stable object-store TCP server used by device flashing.
-    ///
-    /// The UDP bearer is started by `RadioService::object_udp_start`; this
-    /// companion server owns artifact lookup/archive handling and belongs to
-    /// the long-running Wi-Fi service rather than the experimental superset.
-    pub fn start_object_store(&self) -> bool {
-        let Some(config) = object_server_config() else {
-            return false;
-        };
-        tokio::spawn(async move {
-            if let Err(error) = dmesh_object_store::ObjectServer::new(config).run().await {
-                tracing::error!(%error, "object_store_server_failed");
-            }
-        });
-        true
-    }
-}
-
-/// Build the optional stable object-store server configuration from the
-/// deployment environment. A configured artifact root enables the service;
-/// otherwise only the UDP transport remains active.
-pub fn object_server_config() -> Option<dmesh_object_store::ServerConfig> {
-    let enabled = std::env::var("LMESH_OBJECT_SERVER_TCP")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-        .unwrap_or(false);
-    let root = std::env::var_os("LMESH_OBJECT_STORE_ROOT");
-    if !enabled && root.is_none() {
-        return None;
-    }
-    Some(dmesh_object_store::ServerConfig {
-        bind: std::env::var("LMESH_OBJECT_SERVER_BIND").unwrap_or_else(|_| "0.0.0.0".to_string()),
-        port: std::env::var("LMESH_OBJECT_SERVER_PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3337),
-        artifact_root: root.map(PathBuf::from).unwrap_or_else(|| {
-            std::env::var_os("DMESH_REPO")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/ws/dmesh"))
-                .join("target/flash")
-        }),
-        archive_root: std::env::var_os("DMESH_FLASH_ARCHIVE_DIR").map(PathBuf::from),
-        ..dmesh_object_store::ServerConfig::default()
-    })
 }
 
 pub(crate) fn public_key_sha(public_key: &str) -> String {

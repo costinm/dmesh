@@ -52,6 +52,10 @@ impl<'a> Encoder<'a> {
         self.head(2, value.len() as u64)?;
         self.bytes(value)
     }
+    pub fn text_value(&mut self, value: &[u8]) -> Option<()> {
+        self.head(3, value.len() as u64)?;
+        self.bytes(value)
+    }
     pub fn boolean(&mut self, value: bool) -> Option<()> {
         self.put(if value { 0xf5 } else { 0xf4 })
     }
@@ -115,6 +119,10 @@ impl<'a> Decoder<'a> {
         let bytes = self.take(len as usize)?;
         dst[..bytes.len()].copy_from_slice(bytes);
         Some(bytes.len())
+    }
+    pub fn text_ref(&mut self) -> Option<&'a [u8]> {
+        let (major, len) = self.head()?;
+        (major == 3).then(|| self.take(len as usize)).flatten()
     }
     pub fn boolean(&mut self) -> Option<bool> {
         match *self.take(1)?.first()? {

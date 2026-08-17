@@ -24,7 +24,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
-use dmesh_transport::{ConnectionId, Frame, PeerKey, ShortHeader, StreamFrame, encode_envelope};
 use tracing::{debug, error, info, instrument, warn};
 
 // The Wi-Fi crate owns the radio implementation. Re-export the wire protocol
@@ -41,61 +40,13 @@ const NAN_UDP_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
 const NAN_UDP_HEADER_LEN: usize = 12;
 const NAN_UDP_FRAME_MAX: usize = 512;
 
-/// Build a bearer-independent NAN transfer trace. This is deliberately a
-/// dry-run: it exercises packet sizing and envelope overhead without opening
-/// TCP/UDP or touching a device.
-pub fn nan_object_dry_run(image_size: usize, mtu: usize) -> serde_json::Value {
-    let mtu = mtu.clamp(256, 2_304);
-    let block_size = mtu.saturating_sub(96).max(64);
-    let cid = ConnectionId::new(1).expect("constant CID");
-    let key = PeerKey {
-        wifi_mac: [0x50, 0x6f, 0x9a, 0, 0, 1],
-        dcid: cid,
-    };
-    let mut packet = vec![0u8; mtu];
-    let mut envelope = vec![0u8; mtu];
-    let mut offset = 0usize;
-    let mut packets = 0usize;
-    let mut payload_bytes = 0usize;
-    let mut wire_bytes = 0usize;
-    while offset < image_size {
-        let len = block_size.min(image_size - offset);
-        let header = ShortHeader {
-            flags: 0,
-            dcid: cid,
-            packet_number: packets as u32,
-            packet_number_len: 2,
-        };
-        let header_len = header.encode(&mut packet).unwrap_or(0);
-        let frame = Frame::Stream(StreamFrame {
-            id: 0,
-            offset: offset as u64,
-            fin: offset + len == image_size,
-            data: &vec![0u8; len],
-        });
-        let frame_len = frame.encode(&mut packet[header_len..]).unwrap_or(0);
-        let wire_len =
-            encode_envelope(key, 1, &packet[..header_len + frame_len], &mut envelope).unwrap_or(0);
-        if wire_len == 0 {
-            break;
-        }
-        packets += 1;
-        payload_bytes += len;
-        wire_bytes += wire_len;
-        offset += len;
-    }
+/// NAN supplies discovery/bootstrap only. It is deliberately not a
+/// QUIC-lite data bearer and must not be used to model object transfer.
+pub fn nan_object_dry_run(_image_size: usize, _mtu: usize) -> serde_json::Value {
     serde_json::json!({
-        "ok": offset == image_size,
-        "bearer": "nan-data",
-        "fallback": "nan-action-compatible",
-        "image_bytes": image_size,
-        "mtu": mtu,
-        "block_bytes": block_size,
-        "packets": packets,
-        "payload_bytes": payload_bytes,
-        "wire_bytes": wire_bytes,
-        "connection_key": "wifi_mac+dcid",
-        "ip_dependency": false,
+        "ok": false,
+        "bearer": "nan-discovery",
+        "error": "NAN is discovery/bootstrap only; select UDP, UART, or ESP-NOW/action",
     })
 }
 
@@ -745,39 +696,6 @@ pub enum Request {
         #[serde(default)]
         reset: Option<bool>,
     },
-    /// Start a managed USB serial byte forward on a UDS.
-    #[serde(rename = "usb.serial.forward.start", alias = "usb.serial.connect")]
-    UsbSerialForwardStart {
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        baud: Option<u32>,
-        #[serde(default)]
-        tcp_port: Option<u16>,
-        #[serde(default)]
-        tcp_mode: Option<String>,
-        #[serde(default)]
-        handshake: Option<bool>,
-        #[serde(default)]
-        multi: Option<bool>,
-        #[serde(default)]
-        direct: Option<bool>,
-    },
-    /// Stop a managed USB serial byte forward.
-    #[serde(rename = "usb.serial.forward.stop", alias = "usb.serial.disconnect")]
-    UsbSerialForwardStop {
-        #[serde(default)]
-        port: Option<String>,
-    },
-    /// List managed USB serial byte forwards.
-    #[serde(rename = "usb.serial.forward.list")]
-    UsbSerialForwardList,
-    /// Flush bytes queued for a sleepy/unknown firmware forward to UART.
-    #[serde(rename = "usb.serial.forward.flush")]
-    UsbSerialForwardFlush {
-        #[serde(default)]
-        port: Option<String>,
-    },
     /// Pulse RTS to reset a board through a USB-UART bridge (explicit recovery tool).
     #[serde(rename = "usb.serial.rst", alias = "usb.serial.reset")]
     UsbSerialReset {
@@ -814,11 +732,6 @@ pub enum Request {
         /// omitted, the command is sent as one DW-gated message.
         #[serde(default)]
         active_ms: Option<u32>,
-        /// Optional TCP endpoint for an already active Main STA maintenance
-        /// session.  The NAN wake/control command remains the session setup;
-        /// normal commands then avoid the gateway UART path.
-        #[serde(default)]
-        tcp: Option<String>,
         /// Force one managed-forward request through immediately. This is a
         /// diagnostic escape for a board already known to be awake; normal
         /// callers must leave it unset so sleepy-node queueing is preserved.
@@ -1022,28 +935,6 @@ pub enum Request {
         /// `monitor`/`monitor_active` (802.11) or `af_packet` (Ethernet).
         #[serde(default)]
         frame_hex: Option<String>,
-    },
-    /// Send a burst of QUIC-shaped DMTB stream frames through one persistent
-    /// monitor interface. This is a host-to-device NAN action-frame benchmark;
-    /// it deliberately does not add retries or acknowledgements.
-    #[serde(rename = "wifi.raw.bench_send", alias = "transport.bench.start")]
-    WifiRawBenchSend {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        channel: Option<u8>,
-        destination: String,
-        #[serde(default)]
-        bssid: Option<String>,
-        bytes: usize,
-        #[serde(default)]
-        chunk_bytes: Option<usize>,
-        #[serde(default)]
-        tx_variant: Option<String>,
-        #[serde(default)]
-        llc: Option<String>,
-        #[serde(default)]
-        multicast: bool,
     },
     /// Send a raw Wi-Fi DMesh status ping and collect replies.
     #[serde(rename = "wifi.raw.ping")]
@@ -1298,12 +1189,6 @@ impl LmeshService {
         self.wifi_service.start_canary_rawnan(None)
     }
 
-    /// Start device-flashing object-store services through the shared Wi-Fi
-    /// library. The stable lmesh-wifi process uses the same path.
-    pub fn start_object_store(&self) -> bool {
-        self.wifi_service.start_object_store()
-    }
-
     fn owned_wifi_iface(
         &self,
         iface: Option<String>,
@@ -1404,43 +1289,6 @@ impl LmeshService {
                     "reset": reset,
                 }),
             )),
-            Request::UsbSerialForwardStart {
-                port,
-                baud,
-                tcp_port,
-                tcp_mode,
-                handshake,
-                multi,
-                direct,
-            } => uart_dispatch_response(lmesh_uart::handle_request(
-                &self.uart,
-                serde_json::json!({
-                    "method": "usb.serial.forward.start",
-                    "port": port,
-                    "baud": baud,
-                    "tcp_port": tcp_port,
-                    "tcp_mode": tcp_mode,
-                    "handshake": handshake,
-                    "multi": multi,
-                    "direct": direct,
-                }),
-            )),
-            Request::UsbSerialForwardStop { port } => {
-                uart_dispatch_response(lmesh_uart::handle_request(
-                    &self.uart,
-                    serde_json::json!({"method": "usb.serial.forward.stop", "port": port}),
-                ))
-            }
-            Request::UsbSerialForwardList => uart_dispatch_response(lmesh_uart::handle_request(
-                &self.uart,
-                serde_json::json!({"method": "usb.serial.forward.list"}),
-            )),
-            Request::UsbSerialForwardFlush { port } => {
-                uart_dispatch_response(lmesh_uart::handle_request(
-                    &self.uart,
-                    serde_json::json!({"method": "usb.serial.forward.flush", "port": port}),
-                ))
-            }
             Request::UsbSerialReset { port } => uart_dispatch_response(lmesh_uart::handle_request(
                 &self.uart,
                 serde_json::json!({"method": "usb.serial.reset", "port": port}),
@@ -1466,7 +1314,6 @@ impl LmeshService {
                 gateway,
                 target,
                 active_ms,
-                tcp,
                 force_direct,
             } => {
                 let default_route = gateway
@@ -1479,9 +1326,7 @@ impl LmeshService {
                 let route = gateway
                     .map(|gateway| (gateway, target))
                     .or(default_route.map(|(gateway, target)| (gateway, Some(target))));
-                mesh::protocol::Response::ok_with_data(if let Some(tcp) = tcp {
-                    self.radio.esp_tcp_command(tcp, command, timeout_sec)
-                } else if let Some((gateway, target)) = route {
+                mesh::protocol::Response::ok_with_data(if let Some((gateway, target)) = route {
                     self.radio
                         .esp_remote_command(gateway, target, command, timeout_sec, active_ms)
                 } else {
@@ -1676,27 +1521,6 @@ impl LmeshService {
                 };
                 mesh::protocol::Response::ok_with_data(result)
             }
-            Request::WifiRawBenchSend {
-                iface,
-                channel,
-                destination,
-                bssid,
-                bytes,
-                chunk_bytes,
-                tx_variant,
-                llc,
-                multicast,
-            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_bench_send(
-                iface,
-                channel,
-                destination,
-                bssid,
-                bytes,
-                chunk_bytes,
-                tx_variant,
-                llc,
-                multicast,
-            )),
             Request::WifiRawPing {
                 iface,
                 channel,
@@ -1877,31 +1701,16 @@ fn base64_url_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn nan_object_dry_run_is_ip_free_and_sizes_frames() {
+    fn nan_object_dry_run_rejects_a_data_bearer() {
         let result = super::nan_object_dry_run(10_000, 1_200);
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["bearer"], "nan-data");
-        assert_eq!(result["ip_dependency"], false);
-        assert!(result["packets"].as_u64().unwrap() > 1);
-        assert!(result["wire_bytes"].as_u64().unwrap() >= 10_000);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["bearer"], "nan-discovery");
     }
 
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn benchmark_transport_alias_deserializes() {
-        let request: Request = serde_json::from_value(serde_json::json!({
-            "method": "transport.bench.start",
-            "iface": "wlan1",
-            "destination": "ff:ff:ff:ff:ff:ff",
-            "bytes": 64
-        }))
-        .expect("transport benchmark alias should remain script-compatible");
-        assert!(matches!(request, Request::WifiRawBenchSend { .. }));
-    }
 
     #[test]
     fn test_base64_url_encode() {

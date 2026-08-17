@@ -1,5 +1,5 @@
-use dmesh_object_store::protocol::{decode_get, encode_get};
-use dmesh_transport::{
+use dmesh_server::protocol::{decode_get, encode_get};
+use quic_lite::{
     ConnectionId, ConnectionIds, ConnectionLimits, EndpointState, FIRST_CLIENT_BIDI_STREAM_ID,
     INITIAL_MAX_STREAM_DATA, Role,
 };
@@ -37,7 +37,7 @@ fn object_get_crosses_transport_stream_boundary() {
         1200,
         ConnectionIds::new(dcid, ConnectionId::new(2).unwrap()).unwrap(),
     );
-    let dmesh_transport::TransportPacket::Stream { frame: stream, .. } =
+    let quic_lite::TransportPacket::Stream { frame: stream, .. } =
         receiver.receive_datagram(&packet[..packet_len]).unwrap()
     else {
         panic!("expected stream");

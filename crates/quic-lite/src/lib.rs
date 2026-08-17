@@ -13,23 +13,28 @@ extern crate alloc;
 use alloc::vec::Vec;
 #[cfg(not(any(feature = "std", test)))]
 use alloc::{
-    alloc::{alloc, dealloc, Layout},
+    alloc::{Layout, alloc, dealloc},
     boxed::Box,
 };
 
-#[cfg(all(any(feature = "udp", feature = "std"), not(test)))]
+#[cfg(all(feature = "std", not(test)))]
 extern crate std;
 
 pub mod callback;
-pub mod handlers;
+pub mod iperf;
 pub mod ledger;
 
 pub mod mux;
 
-pub mod nan_fragment;
+pub mod framed_stream;
+pub mod path_bridge;
+pub mod path_router;
+pub mod uart;
 
-#[cfg(feature = "udp")]
-pub mod udp;
+pub use path_router::{
+    ConnectionTable, ConnectionTableError, DcidRouter, DcidRouterError, PathCapacity, PathPolicy,
+    PathState,
+};
 
 #[cfg(any(feature = "std", test))]
 pub mod fake;
@@ -62,13 +67,146 @@ pub const SERVICE_EVENTS: u8 = 7;
 /// Recovery command/log exchange. Payloads are compact CBOR records owned by
 /// Recovery; transport only carries the stream and never interprets them.
 pub const SERVICE_CONTROL: u8 = 8;
+/// Subscribe to bounded diagnostic log records exposed by a server.  The
+/// transport only carries this tag; log schemas and retention are server
+/// policy.
+pub const SERVICE_LOG_WATCH: u8 = 9;
+
+/// A small CBOR selector used at the beginning of a stream command.  This is
+/// intentionally not a CBOR dependency or a general decoder: transport only
+/// recognizes one definite integer or text item and leaves the body opaque.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CborSelector<'a> {
+    Tag(u64),
+    Name(&'a [u8]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CborSelectorError {
+    Truncated,
+    Unsupported,
+}
+
+/// Decode a definite CBOR unsigned-integer or text selector at `input[0]`.
+/// The returned offset begins the handler-owned payload.
+pub fn decode_cbor_selector(input: &[u8]) -> Result<(CborSelector<'_>, usize), CborSelectorError> {
+    let Some(&head) = input.first() else {
+        return Err(CborSelectorError::Truncated);
+    };
+    let major = head >> 5;
+    let additional = head & 0x1f;
+    let (value, header_len) = match additional {
+        value @ 0..=23 => (u64::from(value), 1),
+        24 => (*input.get(1).ok_or(CborSelectorError::Truncated)? as u64, 2),
+        25 => {
+            let bytes: [u8; 2] = input
+                .get(1..3)
+                .ok_or(CborSelectorError::Truncated)?
+                .try_into()
+                .map_err(|_| CborSelectorError::Truncated)?;
+            (u64::from(u16::from_be_bytes(bytes)), 3)
+        }
+        26 => {
+            let bytes: [u8; 4] = input
+                .get(1..5)
+                .ok_or(CborSelectorError::Truncated)?
+                .try_into()
+                .map_err(|_| CborSelectorError::Truncated)?;
+            (u64::from(u32::from_be_bytes(bytes)), 5)
+        }
+        27 => {
+            let bytes: [u8; 8] = input
+                .get(1..9)
+                .ok_or(CborSelectorError::Truncated)?
+                .try_into()
+                .map_err(|_| CborSelectorError::Truncated)?;
+            (u64::from_be_bytes(bytes), 9)
+        }
+        _ => return Err(CborSelectorError::Unsupported),
+    };
+    match major {
+        0 => Ok((CborSelector::Tag(value), header_len)),
+        3 => {
+            let end = header_len
+                .checked_add(value as usize)
+                .ok_or(CborSelectorError::Unsupported)?;
+            Ok((
+                CborSelector::Name(
+                    input
+                        .get(header_len..end)
+                        .ok_or(CborSelectorError::Truncated)?,
+                ),
+                end,
+            ))
+        }
+        _ => Err(CborSelectorError::Unsupported),
+    }
+}
 pub const CONTROL_STREAM_ID: u64 = 0;
 pub const FIRST_CLIENT_BIDI_STREAM_ID: u64 = 4;
 pub const FIRST_SERVER_BIDI_STREAM_ID: u64 = 1;
 pub const FIRST_CLIENT_UNI_STREAM_ID: u64 = 2;
 pub const FIRST_SERVER_UNI_STREAM_ID: u64 = 3;
-/// Default bearer payload bound used by the host profile and radio adapters.
-pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1400;
+/// Default bearer payload bound shared by UART, UDP, and the current extended
+/// ESP-NOW/vendor-action frame. The action-frame adapter is presently capped
+/// at 1200 bytes, so no bearer may silently use a larger transport packet.
+pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
+/// Conservative one-datagram application payload after short-header and
+/// stream-frame overhead. Commands using this bound never rely on L2
+/// fragmentation, even when CID/varint widths grow.
+pub const DEFAULT_MAX_STREAM_PAYLOAD: usize = DEFAULT_MAX_DATAGRAM_SIZE - 64;
+/// Fixed histogram shape for bearer inter-packet gaps.  Keeping this in the
+/// transport lets every bearer report comparable pacing evidence without
+/// coupling the measurements to sockets, Wi-Fi, or a server schema.
+pub const INTERPACKET_GAP_BUCKETS: usize = 6;
+
+/// Classify an elapsed bearer gap in microseconds.
+pub const fn interpacket_gap_bucket(delta_us: u64) -> usize {
+    match delta_us {
+        0..=999 => 0,
+        1_000..=4_999 => 1,
+        5_000..=9_999 => 2,
+        10_000..=24_999 => 3,
+        25_000..=49_999 => 4,
+        _ => 5,
+    }
+}
+
+/// Return whether a wrapping millisecond clock is strictly before `deadline`.
+///
+/// Callers must keep individual intervals below half the `u32` range.  This
+/// is suitable for short bearer retries and active-session leases and remains
+/// host-testable independently of a firmware clock implementation.
+pub const fn before_deadline_u32(now: u32, deadline: u32) -> bool {
+    (now.wrapping_sub(deadline) as i32) < 0
+}
+
+/// Opaque egress timing for a datagram bearer.  The caller supplies a
+/// monotonic microsecond clock; transport payload contents are not retained.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatagramTiming {
+    pub datagrams: u64,
+    pub gaps: u64,
+    pub total_gap_us: u64,
+    pub max_gap_us: u64,
+    pub gap_buckets: [u64; INTERPACKET_GAP_BUCKETS],
+    last_sent_us: Option<u64>,
+}
+
+impl DatagramTiming {
+    pub fn record_at(&mut self, now_us: u64) {
+        if let Some(previous) = self.last_sent_us {
+            let gap = now_us.saturating_sub(previous);
+            self.gaps = self.gaps.saturating_add(1);
+            self.total_gap_us = self.total_gap_us.saturating_add(gap);
+            self.max_gap_us = self.max_gap_us.max(gap);
+            let bucket = interpacket_gap_bucket(gap);
+            self.gap_buckets[bucket] = self.gap_buckets[bucket].saturating_add(1);
+        }
+        self.last_sent_us = Some(now_us);
+        self.datagrams = self.datagrams.saturating_add(1);
+    }
+}
 /// Production Recovery's explicit maximum sender ledger. The host Wi-Fi
 /// profile must retain at least the receiver-advertised packet budget.
 pub const RECOVERY_MAX_HISTORY_PACKETS: usize = 64;
@@ -94,6 +232,104 @@ pub const RECOVERY_REORDER_CAPACITY_BYTES: usize = 64 * DEFAULT_MAX_DATAGRAM_SIZ
 /// header).  Packet history remains independently capped at 64; byte credit
 /// is intentionally the tighter startup backpressure.
 pub const RECOVERY_INITIAL_MAX_DATA: u64 = 8 * (4 * 1024 + 17);
+
+/// Recovery's connection credit profile. Object transfer is constrained by
+/// its flash-slot budget; a host/device transport benchmark instead uses the
+/// requested packet window so it measures transport rather than storage.
+pub fn recovery_connection_limits(
+    transport_diagnostic: bool,
+    requested_packets: u8,
+) -> ConnectionLimits {
+    let max_data = if transport_diagnostic {
+        let packets = if requested_packets == 0 {
+            RECOVERY_MAX_IN_FLIGHT_PACKETS
+        } else {
+            u16::from(requested_packets).min(RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS)
+        };
+        u64::from(packets) * 1200
+    } else {
+        RECOVERY_INITIAL_MAX_DATA
+    };
+    ConnectionLimits {
+        max_data,
+        max_stream_data: max_data,
+        ..ConnectionLimits::default()
+    }
+}
+
+/// Decide whether a bearer task should yield after an empty nonblocking poll.
+/// The transport owns control emission; this only bounds CPU monopolization.
+pub const fn bearer_poll_should_yield(
+    emitted_control: bool,
+    receive_wait_us: u64,
+    consecutive_empty_spins: u64,
+    since_full_yield_us: u64,
+    spin_limit: u64,
+    max_unyielded_us: u64,
+) -> bool {
+    !emitted_control
+        && receive_wait_us < 1_000
+        && consecutive_empty_spins >= spin_limit
+        && since_full_yield_us >= max_unyielded_us
+}
+
+#[cfg(test)]
+mod recovery_profile_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_profile_keeps_flash_and_diagnostic_credit_distinct() {
+        let flash = recovery_connection_limits(false, 64);
+        let default_diagnostic = recovery_connection_limits(true, 0);
+        let diagnostic = recovery_connection_limits(true, 24);
+        assert_eq!(flash.max_data, RECOVERY_INITIAL_MAX_DATA);
+        assert_eq!(
+            default_diagnostic.max_data,
+            u64::from(RECOVERY_MAX_IN_FLIGHT_PACKETS) * 1200
+        );
+        assert_eq!(diagnostic.max_data, 24 * 1200);
+    }
+
+    #[test]
+    fn bearer_poll_yield_is_bounded_and_control_aware() {
+        assert!(!bearer_poll_should_yield(true, 0, 8, 100_000, 8, 100_000));
+        assert!(!bearer_poll_should_yield(false, 0, 7, 100_000, 8, 100_000));
+        assert!(bearer_poll_should_yield(false, 0, 8, 100_000, 8, 100_000));
+    }
+
+    #[test]
+    fn bearer_timing_is_clock_supplied_and_bounded() {
+        let mut timing = DatagramTiming::default();
+        timing.record_at(1_000);
+        timing.record_at(1_500);
+        timing.record_at(11_500);
+        assert_eq!(timing.datagrams, 3);
+        assert_eq!(timing.gaps, 2);
+        assert_eq!(timing.total_gap_us, 10_500);
+        assert_eq!(timing.max_gap_us, 10_000);
+        assert_eq!(timing.gap_buckets, [1, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn stream_selector_accepts_compact_tag_or_name_only() {
+        assert_eq!(
+            decode_cbor_selector(&[8, 0xa0]),
+            Ok((CborSelector::Tag(8), 1))
+        );
+        assert_eq!(
+            decode_cbor_selector(&[0x69, b'l', b'o', b'g', b'-', b'w', b'a', b't', b'c', b'h']),
+            Ok((CborSelector::Name(b"log-watch"), 10))
+        );
+        assert_eq!(
+            decode_cbor_selector(&[0xa1]),
+            Err(CborSelectorError::Unsupported)
+        );
+        assert_eq!(
+            decode_cbor_selector(&[0x78]),
+            Err(CborSelectorError::Truncated)
+        );
+    }
+}
 
 /// Minimal synchronous bearer contract used by deterministic conformance
 /// drivers. UDP, NAN, BLE, and device adapters own the actual I/O and peer
@@ -703,12 +939,25 @@ pub fn encode_bootstrap_open_packet_with_limits(
     limits: ConnectionLimits,
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    encode_bootstrap_open_packet_with_profile(client_cid, packet_number, limits, 0, out)
+}
+
+/// Encode OPEN with the complete initial receiver profile.  `0` means the
+/// peer should use its normal packet budget; a non-zero value is useful for a
+/// bounded diagnostic path and remains bearer-neutral.
+pub fn encode_bootstrap_open_packet_with_profile(
+    client_cid: ConnectionId,
+    packet_number: u32,
+    limits: ConnectionLimits,
+    max_in_flight_packets: u16,
+    out: &mut [u8],
+) -> Result<usize, Error> {
     let mut body = [0u8; 32];
     let body_len = BootstrapOpen {
         client_receive_cid: client_cid,
         max_data: limits.max_data,
         max_stream_data: limits.max_stream_data,
-        max_in_flight_packets: 0,
+        max_in_flight_packets,
     }
     .encode(&mut body)?;
     let header_len = ShortHeader {
@@ -2020,7 +2269,11 @@ impl<const N: usize> ConnectionState<N> {
 /// acknowledgement ranges, receive credit, peer-advertised send credit, and
 /// congestion control.
 #[derive(Clone)]
-pub struct EndpointState<const N: usize, const H: usize = 16, const P: usize = 1400> {
+pub struct EndpointState<
+    const N: usize,
+    const H: usize = 16,
+    const P: usize = DEFAULT_MAX_DATAGRAM_SIZE,
+> {
     pub send: SendFlowControl<N>,
     pub receive: ConnectionState<N>,
     pub congestion: CongestionController,
@@ -2045,7 +2298,10 @@ pub struct EndpointState<const N: usize, const H: usize = 16, const P: usize = 1
     max_ack_delay_ms: u64,
     peer_max_ack_delay_ms: u64,
     peer_max_in_flight_packets: usize,
-    pending_stream_id: Option<u64>,
+    // Several streams may be consumed before delayed ACK emission. Keep a
+    // bounded deduplicated set so one stream's MAX_STREAM_DATA cannot erase
+    // another's credit update. The bound matches active stream state `N`.
+    pending_stream_ids: [Option<u64>; N],
     send_clock: u64,
     rtt: RttEstimator,
     /// Endpoint-owned PTO scheduling. A bearer may poll in a tight loop when
@@ -2070,7 +2326,7 @@ pub type RecoveryEndpoint<const N: usize = 2> = EndpointState<N, 4, 256>;
 pub type Esp32Endpoint<const N: usize = 8> = EndpointState<N, 4, 512>;
 /// Host endpoints may use a larger heap-backed ledger; the active capacity is
 /// selected per connection, so this ceiling is not allocated unless chosen.
-pub type HostEndpoint<const N: usize = 8> = EndpointState<N, 512, 1400>;
+pub type HostEndpoint<const N: usize = 8> = EndpointState<N, 512, DEFAULT_MAX_DATAGRAM_SIZE>;
 
 /// Directional connection identifiers. `local_receive` is the CID this
 /// endpoint accepts on inbound packets; `peer_receive` is the CID placed in
@@ -2201,7 +2457,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             max_ack_delay_ms: 25,
             peer_max_ack_delay_ms: 25,
             peer_max_in_flight_packets: usize::MAX,
-            pending_stream_id: None,
+            pending_stream_ids: [None; N],
             send_clock: 0,
             rtt: RttEstimator::default(),
             last_pto_probe_at: None,
@@ -2632,6 +2888,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         let mut streams = [None; 8];
         let mut stream_count = 0usize;
         let mut has_ack = false;
+        let mut ack_eliciting = false;
         let mut ack_frequency = None;
         let mut close_code = None;
         while offset < input.len() {
@@ -2641,12 +2898,14 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             }
             match frame {
                 Frame::Ack { .. } | Frame::AckRanges { .. } => has_ack = true,
+                Frame::Ping => ack_eliciting = true,
                 Frame::AckFrequency {
                     sequence,
                     packet_threshold,
                     max_ack_delay_us,
                     reordering_threshold,
                 } => {
+                    ack_eliciting = true;
                     if ack_frequency.is_some() {
                         return Err(Error::Invalid);
                     }
@@ -2658,6 +2917,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                     ));
                 }
                 Frame::Stream(value) => {
+                    ack_eliciting = true;
                     if stream_count >= streams.len() {
                         return Err(Error::Invalid);
                     }
@@ -2697,6 +2957,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             self.close_code = Some(code);
             self.control_pending = true;
             self.ack_pending = true;
+            ack_eliciting = true;
         }
         self.stats.received_datagrams += 1;
         if duplicate {
@@ -2710,11 +2971,11 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         }
         let Some(stream) = streams[0] else {
             // ACK/control packets still consume receive packet numbers.
-            // ACK_FREQUENCY is itself ack-eliciting; other control packets
-            // are only acknowledged when an ACK is otherwise due.
+            // PING, ACK_FREQUENCY, and CLOSE are ack-eliciting. Pure ACK and
+            // flow-control packets are only acknowledged when otherwise due.
             self.observe_packet(header.packet_number);
             self.stats.control_datagrams += 1;
-            if ack_frequency.is_some() {
+            if ack_eliciting {
                 self.ack_pending = true;
                 self.ack_packets = self.ack_packets.saturating_add(1);
             }
@@ -2729,9 +2990,13 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         if self.ack_reordering_threshold != 0 {
             if let Some(highest) = self.highest_received_packet {
                 let reordering = if header.packet_number > highest {
-                    header.packet_number.saturating_sub(highest.saturating_add(1))
+                    header
+                        .packet_number
+                        .saturating_sub(highest.saturating_add(1))
                 } else {
-                    highest.saturating_sub(header.packet_number).saturating_add(1)
+                    highest
+                        .saturating_sub(header.packet_number)
+                        .saturating_add(1)
                 };
                 if reordering >= self.ack_reordering_threshold {
                     self.control_pending = true;
@@ -2741,7 +3006,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.observe_packet(header.packet_number);
         self.ack_pending = true;
         self.ack_packets = self.ack_packets.saturating_add(1);
-        self.pending_stream_id = Some(stream.id);
+        self.queue_stream_credit(stream.id);
         self.stats.stream_datagrams += 1;
         Ok(TransportPacket::Stream {
             header,
@@ -2962,6 +3227,27 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.stream_consumed_inner(stream_id, bytes, false)
     }
 
+    fn queue_stream_credit(&mut self, stream_id: u64) {
+        if self
+            .pending_stream_ids
+            .iter()
+            .any(|pending| *pending == Some(stream_id))
+        {
+            return;
+        }
+        // A pending credit belongs only to an accepted stream, and accepted
+        // streams are bounded by this endpoint's `N` slots. Therefore a free
+        // pending slot must exist unless a caller has violated endpoint
+        // ownership; retaining existing credits is safer than overwriting one.
+        if let Some(slot) = self
+            .pending_stream_ids
+            .iter_mut()
+            .find(|pending| pending.is_none())
+        {
+            *slot = Some(stream_id);
+        }
+    }
+
     fn stream_consumed_inner(
         &mut self,
         stream_id: u64,
@@ -2981,7 +3267,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             self.control_pending = true;
         }
         self.ack_pending = true;
-        self.pending_stream_id = Some(stream_id);
+        self.queue_stream_credit(stream_id);
         Ok(())
     }
 
@@ -3018,7 +3304,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             }
             .encode(&mut out[p..])?;
             p += Frame::MaxData(self.receive.connection.max_data).encode(&mut out[p..])?;
-            if let Some(stream_id) = self.pending_stream_id.take() {
+            for stream_id in self.pending_stream_ids.iter_mut().filter_map(Option::take) {
                 let max = self
                     .receive
                     .stream_max_data(stream_id)
@@ -3244,6 +3530,34 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         Ok((p, packet_number))
     }
 
+    /// Encode a small ack-eliciting probe on an established connection.
+    /// Probes carry no application bytes or stream credit; multipath adapters
+    /// use them to refresh a bearer measurement after temporary loss. Their
+    /// packet number still belongs to the one shared connection sequence.
+    pub fn encode_probe_packet(
+        &mut self,
+        dcid: ConnectionId,
+        out: &mut [u8],
+    ) -> Result<(usize, u32), Error> {
+        if self.peer_cid.is_some_and(|peer| peer != dcid) {
+            return Err(Error::WrongConnectionId);
+        }
+        let packet_number = self.next_packet_number;
+        let header = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid,
+            packet_number,
+            packet_number_len: packet_number_len(packet_number, self.largest_received()),
+        };
+        let header_len = header.encode(out)?;
+        let frame_len = Frame::Ping.encode(&mut out[header_len..])?;
+        self.next_packet_number = self
+            .next_packet_number
+            .checked_add(1)
+            .ok_or(Error::PacketNumberExhausted)?;
+        Ok((header_len + frame_len, packet_number))
+    }
+
     /// Re-encode one outstanding stream frame with a fresh packet number.
     ///
     /// Packet numbers are never reused within a connection. A retransmission
@@ -3353,10 +3667,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             Some(packet_number) => {
                 let retransmission = self.retransmit_stream_packet(packet_number, out)?;
                 if retransmission.is_some() {
-                    self.stats.loss_retransmitted_datagrams = self
-                        .stats
-                        .loss_retransmitted_datagrams
-                        .saturating_add(1);
+                    self.stats.loss_retransmitted_datagrams =
+                        self.stats.loss_retransmitted_datagrams.saturating_add(1);
                 }
                 Ok(retransmission)
             }
@@ -3392,10 +3704,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             Some(packet_number) => {
                 let retransmission = self.retransmit_stream_packet(packet_number, out)?;
                 if retransmission.is_some() {
-                    self.stats.pto_retransmitted_datagrams = self
-                        .stats
-                        .pto_retransmitted_datagrams
-                        .saturating_add(1);
+                    self.stats.pto_retransmitted_datagrams =
+                        self.stats.pto_retransmitted_datagrams.saturating_add(1);
                     self.last_pto_probe_at = Some(now);
                     self.pto_backoff = self.pto_backoff.saturating_add(1).min(5);
                 }
@@ -3442,15 +3752,11 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                 self.send_clock.saturating_sub(packet.sent_at) >= time_threshold;
             if packet_threshold_lost || time_threshold_lost {
                 if packet_threshold_lost {
-                    self.stats.loss_packet_threshold_datagrams = self
-                        .stats
-                        .loss_packet_threshold_datagrams
-                        .saturating_add(1);
+                    self.stats.loss_packet_threshold_datagrams =
+                        self.stats.loss_packet_threshold_datagrams.saturating_add(1);
                 } else {
-                    self.stats.loss_time_threshold_datagrams = self
-                        .stats
-                        .loss_time_threshold_datagrams
-                        .saturating_add(1);
+                    self.stats.loss_time_threshold_datagrams =
+                        self.stats.loss_time_threshold_datagrams.saturating_add(1);
                 }
                 packet.lost = true;
                 lost_bytes = lost_bytes.saturating_add(packet.bytes);
@@ -3502,6 +3808,15 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn before_deadline_handles_normal_and_wrapping_u32_clocks() {
+        assert!(before_deadline_u32(100, 101));
+        assert!(!before_deadline_u32(101, 101));
+        assert!(!before_deadline_u32(102, 101));
+        assert!(before_deadline_u32(u32::MAX - 2, 3));
+        assert!(!before_deadline_u32(3, u32::MAX - 2));
+    }
     use std::collections::VecDeque;
     use std::vec;
     use std::vec::Vec;
@@ -3798,14 +4113,9 @@ mod tests {
             ..ConnectionLimits::default()
         };
         let mut open_ack = [0u8; 128];
-        let open_ack_len = encode_bootstrap_open_ack_packet_with_limits(
-            client,
-            server,
-            98,
-            limits,
-            &mut open_ack,
-        )
-        .unwrap();
+        let open_ack_len =
+            encode_bootstrap_open_ack_packet_with_limits(client, server, 98, limits, &mut open_ack)
+                .unwrap();
         let (header, acknowledged) =
             decode_bootstrap_open_ack_packet_with_limits(&open_ack[..open_ack_len], client)
                 .unwrap();
@@ -3845,6 +4155,25 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_profile_preserves_explicit_packet_budget() {
+        let client = ConnectionId::new(0x713).unwrap();
+        let limits = ConnectionLimits {
+            max_data: 48_000,
+            max_stream_data: 24_000,
+            ..ConnectionLimits::default()
+        };
+        let mut packet = [0u8; 128];
+        let used =
+            encode_bootstrap_open_packet_with_profile(client, 7, limits, 24, &mut packet).unwrap();
+        let (header, open) = decode_bootstrap_open_packet_with_limits(&packet[..used]).unwrap();
+        assert_eq!(header.packet_number, 7);
+        assert_eq!(open.client_receive_cid, client);
+        assert_eq!(open.max_data, 48_000);
+        assert_eq!(open.max_stream_data, 24_000);
+        assert_eq!(open.max_in_flight_packets, 24);
+    }
+
+    #[test]
     fn bootstrap_packet_budget_limits_small_datagram_burst() {
         let local = ConnectionId::new(0x701).unwrap();
         let peer = ConnectionId::new(0x702).unwrap();
@@ -3861,8 +4190,7 @@ mod tests {
         sender
             .open_send_stream(FIRST_SERVER_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA)
             .unwrap();
-        sender.congestion.congestion_window =
-            u64::from(RECOVERY_MAX_IN_FLIGHT_PACKETS) * 1400;
+        sender.congestion.congestion_window = u64::from(RECOVERY_MAX_IN_FLIGHT_PACKETS) * 1400;
         let mut packet = [0u8; 128];
         for offset in 0..u64::from(RECOVERY_MAX_IN_FLIGHT_PACKETS) {
             sender
@@ -4157,7 +4485,10 @@ mod tests {
         assert_eq!(client.history_capacity(), 2);
         client.set_history_capacity(1).unwrap();
         assert_eq!(client.history_capacity(), 1);
-        assert_eq!(client.retransmission_capacity_bytes(), 1400);
+        assert_eq!(
+            client.retransmission_capacity_bytes(),
+            DEFAULT_MAX_DATAGRAM_SIZE
+        );
         assert_eq!(client.set_history_capacity(0), Err(Error::HistoryFull));
         client.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
         let mut packet = [0u8; 256];
@@ -4268,9 +4599,11 @@ mod tests {
         let mut malformed = [0u8; 64];
         let header_len = header.encode(&mut malformed).unwrap();
         malformed[header_len] = FRAME_STREAM_BASE as u8 | 0x04 | 0x02 | 1;
-        assert!(endpoint
-            .receive_datagram(&malformed[..header_len + 1])
-            .is_err());
+        assert!(
+            endpoint
+                .receive_datagram(&malformed[..header_len + 1])
+                .is_err()
+        );
         assert_eq!(endpoint.peer_connection_id(), None);
 
         let frame_len = Frame::Ping.encode(&mut malformed[header_len..]).unwrap();
@@ -4636,11 +4969,13 @@ mod tests {
         sender.set_time(85);
         sender.receive_datagram(&ack[..used]).unwrap();
 
-        assert!(sender
-            .sent_packets
-            .iter()
-            .flatten()
-            .any(|packet| packet.packet_number == first && !packet.lost));
+        assert!(
+            sender
+                .sent_packets
+                .iter()
+                .flatten()
+                .any(|packet| packet.packet_number == first && !packet.lost)
+        );
     }
 
     #[test]
@@ -4769,7 +5104,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(deliveries, 2);
-        assert_eq!(emitted, 1, "fresh-number retransmission must be re-ACKed promptly");
+        assert_eq!(
+            emitted, 1,
+            "fresh-number retransmission must be re-ACKed promptly"
+        );
         assert_eq!(receiver.stats().ack_immediate_datagrams, 1);
     }
 
@@ -4872,7 +5210,10 @@ mod tests {
                 reordering_threshold: 1,
             }
         );
-        assert_eq!(receiver.receive_datagram(&packet[..used]).unwrap(), TransportPacket::Control);
+        assert_eq!(
+            receiver.receive_datagram(&packet[..used]).unwrap(),
+            TransportPacket::Control
+        );
         assert_eq!(sender.stats().sent_control_datagrams, 1);
         assert_eq!(sender.stats().sent_stream_datagrams, 0);
         assert_eq!(receiver.ack_frequency, 2);
@@ -4919,11 +5260,20 @@ mod tests {
             packet.lost = true;
         }
         let mut repairs = 0;
-        while sender.retransmit_marked_loss(&mut packet).unwrap().is_some() {
+        while sender
+            .retransmit_marked_loss(&mut packet)
+            .unwrap()
+            .is_some()
+        {
             repairs += 1;
         }
         assert_eq!(repairs, 3);
-        assert!(sender.retransmit_pto_probe(0, 250, &mut packet).unwrap().is_none());
+        assert!(
+            sender
+                .retransmit_pto_probe(0, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         let stats = sender.stats();
         assert_eq!(stats.loss_retransmitted_datagrams, 3);
         assert_eq!(stats.pto_retransmitted_datagrams, 0);
@@ -4947,11 +5297,31 @@ mod tests {
 
         // All four packets are overdue together. This must still emit just
         // one PTO probe, rather than a tight-loop burst of four retries.
-        assert!(sender.retransmit_pto_probe(250, 250, &mut packet).unwrap().is_some());
-        assert!(sender.retransmit_pto_probe(250, 250, &mut packet).unwrap().is_none());
-        assert!(sender.retransmit_pto_probe(499, 250, &mut packet).unwrap().is_none());
+        assert!(
+            sender
+                .retransmit_pto_probe(250, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(250, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(499, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         // PTO backoff doubles the next wait.
-        assert!(sender.retransmit_pto_probe(750, 250, &mut packet).unwrap().is_some());
+        assert!(
+            sender
+                .retransmit_pto_probe(750, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(sender.stats().pto_retransmitted_datagrams, 2);
     }
 
@@ -5165,10 +5535,12 @@ mod tests {
             .encode_stream_packet(peer, 4, 0, true, b"clock", &mut packet)
             .unwrap();
         sender.set_time(109);
-        assert!(sender
-            .retransmit_due(109, 10, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_due(109, 10, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         let (_, retransmitted) = sender
             .retransmit_due(110, 10, &mut packet)
             .unwrap()
@@ -5200,10 +5572,12 @@ mod tests {
             .find(|sent| sent.packet_number == packet_number)
             .unwrap()
             .lost = true;
-        assert!(sender
-            .retransmit_stream_packet(packet_number, &mut packet)
-            .unwrap()
-            .is_some());
+        assert!(
+            sender
+                .retransmit_stream_packet(packet_number, &mut packet)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -5473,7 +5847,7 @@ mod tests {
         assert_eq!(
             HostEndpoint::<8>::new(Role::Client, ConnectionLimits::default(), 1200)
                 .retransmission_capacity_bytes(),
-            512 * 1400
+            512 * DEFAULT_MAX_DATAGRAM_SIZE
         );
 
         fn stress<const H: usize, const P: usize>() {
@@ -5588,6 +5962,40 @@ mod tests {
                 .packet_number,
             0
         );
+    }
+
+    #[test]
+    fn established_probe_is_ack_eliciting_and_uses_shared_packet_numbers() {
+        let client = ConnectionId::new(811).unwrap();
+        let server = ConnectionId::new(812).unwrap();
+        let mut sender = EndpointState::<4, 4>::new_established(
+            Role::Client,
+            ConnectionLimits::default(),
+            1200,
+            ConnectionIds::new(client, server).unwrap(),
+        );
+        let mut receiver = EndpointState::<4, 4>::new_established(
+            Role::Server,
+            ConnectionLimits::default(),
+            1200,
+            ConnectionIds::new(server, client).unwrap(),
+        );
+        receiver.set_ack_policy(1, 0);
+        let mut probe = [0u8; 64];
+        let (used, number) = sender.encode_probe_packet(server, &mut probe).unwrap();
+        assert_eq!(number, 0);
+        assert!(matches!(
+            receiver.receive_datagram(&probe[..used]),
+            Ok(TransportPacket::Control)
+        ));
+        let mut ack = [0u8; 64];
+        let ack_len = receiver.poll_transmit(&mut ack).unwrap().unwrap();
+        assert!(sender.receive_datagram(&ack[..ack_len]).is_ok());
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        let (_, next) = sender
+            .encode_stream_packet(server, 4, 0, true, b"x", &mut probe)
+            .unwrap();
+        assert_eq!(next, 1);
     }
 
     #[test]
@@ -5968,57 +6376,6 @@ mod tests {
         assert!(retransmits > 0);
     }
 
-    /// Apple-to-apple synthetic baseline for the same byte volume and
-    /// application chunk size, using a real localhost TCP socket. No files,
-    /// manifests, or object-store framing are involved.
-    #[tokio::test]
-    #[ignore = "64 MiB synthetic localhost TCP benchmark; run scripts/build.sh transport-compare"]
-    async fn tcp_memory_stream_64m_baseline() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-
-        let total = std::env::var("DMESH_STREAM_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(64 * 1024 * 1024);
-        let chunk_size = 1200 - 32;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut received = 0usize;
-            while received < total {
-                let n = stream.read(&mut buffer).await.unwrap();
-                assert!(n != 0, "TCP peer closed before synthetic stream completed");
-                received += n;
-            }
-            received
-        });
-
-        let mut stream = TcpStream::connect(address).await.unwrap();
-        stream.set_nodelay(true).unwrap();
-        let chunk = vec![0xa5u8; chunk_size];
-        let started = std::time::Instant::now();
-        let mut sent = 0usize;
-        while sent < total {
-            let len = (total - sent).min(chunk.len());
-            stream.write_all(&chunk[..len]).await.unwrap();
-            sent += len;
-        }
-        stream.shutdown().await.unwrap();
-        assert_eq!(server.await.unwrap(), total);
-        let elapsed_ms = started.elapsed().as_millis().max(1);
-        let bitrate_kbps = (total as u128 * 8_000 / elapsed_ms) as u64 / 1000;
-        std::println!(
-            "tcp_memory_stream bytes={} chunk_bytes={} elapsed_ms={} bitrate_kbps={} tcp_nodelay=true",
-            total,
-            chunk_size,
-            elapsed_ms,
-            bitrate_kbps,
-        );
-    }
-
     #[test]
     fn packet_number_length_uses_strict_half_window() {
         assert_eq!(packet_number_len(0, None), 1);
@@ -6026,6 +6383,42 @@ mod tests {
         assert_eq!(packet_number_len(128, Some(0)), 2);
         assert_eq!(packet_number_len(32_767, Some(0)), 2);
         assert_eq!(packet_number_len(32_768, Some(0)), 3);
+    }
+
+    #[test]
+    fn one_control_packet_returns_credit_for_each_consumed_stream() {
+        let limits = ConnectionLimits {
+            max_data: 32,
+            max_stream_data: 16,
+            max_streams_bidi: 2,
+            max_streams_uni: 0,
+        };
+        let mut endpoint = EndpointState::<2, 4, 256>::new(Role::Client, limits, 256);
+        endpoint
+            .install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap())
+            .unwrap();
+        endpoint.receive.accept(1, 0, 4, false).unwrap();
+        endpoint.receive.accept(5, 0, 4, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.stream_consumed(1, 4).unwrap();
+        endpoint.stream_consumed(5, 4).unwrap();
+
+        let mut packet = [0u8; 256];
+        let used = endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let (_, mut offset) = ShortHeader::decode(&packet[..used]).unwrap();
+        let mut credit_ids = [0u64; 2];
+        let mut credits = 0usize;
+        while offset < used {
+            let (frame, frame_len) = decode_frame(&packet[offset..used]).unwrap();
+            if let Frame::MaxStreamData { id, .. } = frame {
+                credit_ids[credits] = id;
+                credits += 1;
+            }
+            offset += frame_len;
+        }
+        assert_eq!(credits, 2);
+        assert!(credit_ids.contains(&1));
+        assert!(credit_ids.contains(&5));
     }
 
     #[test]

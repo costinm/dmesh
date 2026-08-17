@@ -399,7 +399,6 @@ impl crate::DatagramBearer for FakeDatagramLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::string::String;
     use std::vec;
 
     #[test]
@@ -420,20 +419,14 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("operation failed: {error:?}"));
         assert_eq!(results.len(), 5);
-        assert!(String::from_utf8_lossy(&results[0].response).contains("service=2"));
-        assert_eq!(results[1].response.len(), 49);
-        assert_eq!(results[1].response[0], 1);
+        assert_eq!(results[0].response, vec![SERVICE_ECHO]);
+        assert_eq!(results[1].response[0], SERVICE_IPERF);
+        assert_eq!(results[2].response, vec![SERVICE_METRICS]);
         assert_eq!(
-            u64::from_be_bytes(results[1].response[1..9].try_into().unwrap()),
-            32
+            results[3].response,
+            vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
         );
-        assert_eq!(
-            u64::from_be_bytes(results[1].response[9..17].try_into().unwrap()),
-            7
-        );
-        assert!(String::from_utf8_lossy(&results[2].response).contains("metrics_version=1"));
-        assert!(String::from_utf8_lossy(&results[3].response).contains("events_version="));
-        assert!(String::from_utf8_lossy(&results[4].response).contains("echo"));
+        assert_eq!(results[4].response, vec![SERVICE_STREAM]);
     }
 
     #[test]
@@ -450,8 +443,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(results.len(), 2);
-        assert!(String::from_utf8_lossy(&results[0].response).contains("metrics_version=1"));
-        assert!(String::from_utf8_lossy(&results[1].response).contains("events_version="));
+        assert_eq!(results[0].response, vec![SERVICE_METRICS]);
+        assert_eq!(
+            results[1].response,
+            vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
+        );
     }
 
     #[test]
@@ -559,8 +555,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 2);
-        assert!(String::from_utf8_lossy(&result[0].response).contains("metrics_version=1"));
-        assert!(String::from_utf8_lossy(&result[1].response).contains("events_version="));
+        assert_eq!(result[0].response, vec![SERVICE_METRICS]);
+        assert_eq!(
+            result[1].response,
+            vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
+        );
     }
 
     #[test]
@@ -603,18 +602,18 @@ mod tests {
         .unwrap();
         assert_eq!(first.len(), operations.len());
         assert_eq!(second.len(), operations.len());
-        for result in first {
-            let text = String::from_utf8_lossy(&result.response);
-            if result.operation == StreamOperation::Metrics {
-                assert!(text.contains("connection_dcid=1538"));
-            }
-        }
-        for result in second {
-            let text = String::from_utf8_lossy(&result.response);
-            if result.operation == StreamOperation::Metrics {
-                assert!(text.contains("connection_dcid=1794"));
-            }
-        }
+        assert!(
+            first
+                .iter()
+                .any(|result| result.operation == StreamOperation::Metrics
+                    && result.response == vec![SERVICE_METRICS])
+        );
+        assert!(
+            second
+                .iter()
+                .any(|result| result.operation == StreamOperation::Metrics
+                    && result.response == vec![SERVICE_METRICS])
+        );
     }
 
     #[test]

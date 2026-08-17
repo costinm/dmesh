@@ -14,9 +14,6 @@ async fn main() -> Result<()> {
     let radio = Arc::new(service.radio().clone());
     let (trace, _guard) = mesh::local_trace::init("lmesh-wifi");
     mesh::local_trace::serve("lmesh-wifi", trace.clone());
-    if service.start_object_store() {
-        tracing::info!("object_store_startup");
-    }
     for result in service.start_stable() {
         tracing::info!(
             ok = result

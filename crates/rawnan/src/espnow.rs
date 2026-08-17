@@ -19,6 +19,11 @@ pub const KIND_RADIO: u8 = 1;
 pub const HEADER_LEN: usize = 11;
 pub const ACTION_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
 pub const ACTION_TYPE: u8 = 0x04;
+pub const IEEE80211_HEADER_LEN: usize = 24;
+/// One QUIC-lite datagram must fit in a single raw action frame.  There is no
+/// radio-layer fragmentation: bearers with a smaller real limit must lower
+/// the common transport MTU before they are admitted as a path.
+pub const MAX_ACTION_PAYLOAD: usize = 1400;
 
 pub fn build_radio_packet(data: &[u8], rssi: i32, snr: f32) -> Result<Vec<u8>> {
     if data.len() > u16::MAX as usize {
@@ -50,15 +55,59 @@ pub fn build_action_frame(
     source: [u8; 6],
     bssid: [u8; 6],
     payload: &[u8],
-) -> Vec<u8> {
-    let body_len = payload.len().min(1400);
-    let mut frame = Vec::with_capacity(crate::IEEE80211_HEADER_LEN + 9 + body_len);
+) -> Result<Vec<u8>> {
+    if payload.len() > MAX_ACTION_PAYLOAD {
+        anyhow::bail!(
+            "ESP-NOW action payload exceeds single-frame limit {}: {}",
+            MAX_ACTION_PAYLOAD,
+            payload.len()
+        );
+    }
+    let mut frame = Vec::with_capacity(IEEE80211_HEADER_LEN + 9 + payload.len());
     frame.extend_from_slice(&[0xd0, 0, 0, 0]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
     frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&action_header());
-    frame.extend_from_slice(&payload[..body_len]);
-    frame
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Parse a raw-injected ESP-NOW-compatible action frame. The adapter owns
+/// monitor metadata and optional FCS removal; this function only validates
+/// the portable 802.11/action envelope and returns the complete L2 payload.
+pub fn parse_action_frame(frame: &[u8]) -> Option<([u8; 6], &[u8])> {
+    if frame.len() < IEEE80211_HEADER_LEN + 9 || frame[0] != 0xd0 {
+        return None;
+    }
+    let source = frame.get(10..16)?.try_into().ok()?;
+    let action = frame.get(IEEE80211_HEADER_LEN..)?;
+    if action.get(..4) != Some(&ACTION_PREFIX)
+        || action.get(8).copied() != Some(ACTION_TYPE)
+    {
+        return None;
+    }
+    Some((source, action.get(9..)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_frame_round_trip_preserves_addresses_and_payload() {
+        let destination = [1, 2, 3, 4, 5, 6];
+        let source = [6, 5, 4, 3, 2, 1];
+        let payload = [0x40, 0x01, 0x02, 0x03];
+        let frame = build_action_frame(destination, source, destination, &payload).unwrap();
+
+        assert_eq!(parse_action_frame(&frame), Some((source, payload.as_slice())));
+    }
+
+    #[test]
+    fn action_frame_rejects_foreign_and_oversize_data() {
+        assert!(build_action_frame([0; 6], [1; 6], [0; 6], &[0; MAX_ACTION_PAYLOAD + 1]).is_err());
+        assert!(parse_action_frame(&[0xd0; IEEE80211_HEADER_LEN + 9]).is_none());
+    }
 }

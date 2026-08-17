@@ -1,11 +1,11 @@
 //! Host-side probe for the managed lmesh-wifi UDP object service.
 //!
 //! Run explicitly with the service already running:
-//! `cargo test -p dmesh-transport --features udp --test running_lmesh_wifi -- --ignored --nocapture`
+//! `cargo test -p quic-lite --features udp --test running_lmesh_wifi -- --ignored --nocapture`
 
-use dmesh_object_store::protocol::{RECORD_MANIFEST, encode_get};
-use dmesh_transport::udp::UdpClient;
-use dmesh_transport::{FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_OBJECT};
+use dmesh_server::protocol::{RECORD_MANIFEST, encode_get};
+use dmesh_server::udp::UdpClient;
+use quic_lite::{FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_OBJECT};
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
 
@@ -18,7 +18,7 @@ async fn running_lmesh_wifi_returns_a_main_manifest() {
     let mut client = UdpClient::connect(
         "0.0.0.0:0".parse().unwrap(),
         "127.0.0.1:3336".parse().unwrap(),
-        dmesh_transport::ConnectionId::new(1).unwrap(),
+        quic_lite::ConnectionId::new(1).unwrap(),
     )
     .await
     .expect("connect to managed lmesh-wifi UDP service");
@@ -41,7 +41,7 @@ async fn running_lmesh_wifi_transfers_complete_object_over_loopback() {
     let mut client = UdpClient::connect(
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:3336".parse().unwrap(),
-        dmesh_transport::ConnectionId::new(2).unwrap(),
+        quic_lite::ConnectionId::new(2).unwrap(),
     )
     .await
     .expect("connect to managed lmesh-wifi UDP service");
@@ -69,7 +69,7 @@ async fn running_lmesh_wifi_transfers_complete_object_over_loopback() {
 /// port 3336; this test itself owns the diagnostic telemetry port 3338 and
 /// exercises the ESP's separate raw command port 3337. Run after flashing a
 /// Recovery image with `stg2:boot_target=2`:
-/// `DMESH_RECOVERY_IP=10.78.0.200 cargo test -p dmesh-transport --features udp --test running_lmesh_wifi recovery_udp_boot_beacon -- --ignored --nocapture`
+/// `DMESH_RECOVERY_IP=10.78.0.200 cargo test -p quic-lite --features udp --test running_lmesh_wifi recovery_udp_boot_beacon -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "requires Recovery command mode on the stable lmesh-wifi AP"]
 async fn recovery_udp_boot_beacon_reaches_host_test_scaffold() {
@@ -81,7 +81,9 @@ async fn recovery_udp_boot_beacon_reaches_host_test_scaffold() {
     let command = tokio::net::UdpSocket::bind("10.78.0.1:0")
         .await
         .expect("bind host Recovery command socket");
-    command.send_to(&[1], format!("{recovery}:3337")).await
+    command
+        .send_to(&[1], format!("{recovery}:3337"))
+        .await
         .expect("trigger Recovery status log");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut saw_log = false;
@@ -98,7 +100,9 @@ async fn recovery_udp_boot_beacon_reaches_host_test_scaffold() {
             [0x71, ..] => {
                 saw_log = true;
                 if !beacon_requested {
-                    command.send_to(&[4], format!("{recovery}:3337")).await
+                    command
+                        .send_to(&[4], format!("{recovery}:3337"))
+                        .await
                         .expect("trigger Recovery telemetry beacon");
                     beacon_requested = true;
                 }

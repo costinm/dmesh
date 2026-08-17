@@ -27,9 +27,6 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
 
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
-    if service.start_object_store() {
-        debug!("object_store_started_by_wifi_service");
-    }
     let rawnan_started = if rawnan_autostart_enabled() {
         let result = service.start_default_rawnan();
         debug!(?result, "rawnan_default_started");

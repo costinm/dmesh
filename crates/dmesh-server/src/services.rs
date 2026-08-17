@@ -4,14 +4,78 @@
 //! stream packet, passes the service tag/body to [`handle_stream`], and sends
 //! the returned response on its own transport.
 
-use crate::{
-    ConnectionId, EndpointState, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF,
-    SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS, SERVICE_STREAM,
-};
 use alloc::format;
 use alloc::vec::Vec;
+use quic_lite::{
+    CborSelector, ConnectionId, EndpointState, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS,
+    SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS,
+    SERVICE_STREAM, decode_cbor_selector,
+};
 
 const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
+pub const LOG_WATCH_MAX_RECORDS: usize = 64;
+
+/// Bounded subscription request shared by every server adapter. The request
+/// is deliberately small and opaque to QUIC-lite: adapters decide only how
+/// to schedule the resulting stream records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogWatchRequest {
+    pub records: usize,
+}
+
+pub fn decode_log_watch_request(data: &[u8]) -> Result<LogWatchRequest, &'static str> {
+    let records = match data {
+        [] => 1,
+        [records] => usize::from(*records),
+        _ => return Err("log-watch request must contain at most one record count"),
+    };
+    if !(1..=LOG_WATCH_MAX_RECORDS).contains(&records) {
+        return Err("log-watch record count out of range");
+    }
+    Ok(LogWatchRequest { records })
+}
+
+/// Encode a compact `recovery` success response whose payload is a numeric
+/// counter map. UART, UDP logging, and host tests share this schema; bearer
+/// framing is deliberately outside this function.
+pub fn encode_numeric_result(values: &[(u64, u64)]) -> Option<Vec<u8>> {
+    if values.len() > u8::MAX as usize {
+        return None;
+    }
+    let mut inner = [0u8; 1024];
+    let mut encoder = crate::cbor::Encoder::new(&mut inner);
+    encoder.map(values.len() as u64)?;
+    for (key, value) in values {
+        encoder.uint(*key)?;
+        encoder.uint(*value)?;
+    }
+    let encoded_len = encoder.len();
+    drop(encoder);
+    let mut response = Vec::with_capacity(16 + encoded_len);
+    response.extend_from_slice(&[0xa3, 0x00, 0x18, 0x44, 0x04, 0x62, b'o', b'k', 0x06]);
+    response.extend_from_slice(&inner[..encoded_len]);
+    Some(response)
+}
+
+/// Encode the bounded diagnostic/status envelope used by the direct-CBOR
+/// exception plane. Firmware adapters share this rather than growing a
+/// second CBOR schema for bootstrap failures.
+pub fn encode_status_text(message: &[u8]) -> Option<Vec<u8>> {
+    if message.len() >= 256 {
+        return None;
+    }
+    let mut response = Vec::with_capacity(16 + message.len());
+    response.extend_from_slice(&[
+        0xa3, 0x00, 0x18, 0x44, 0x04, 0x62, b'o', b'k', 0x06, 0xa1, 0x18, 0x20,
+    ]);
+    if message.len() < 24 {
+        response.push(0x60 + message.len() as u8);
+    } else {
+        response.extend_from_slice(&[0x78, message.len() as u8]);
+    }
+    response.extend_from_slice(message);
+    Some(response)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventRecord {
@@ -98,6 +162,7 @@ impl Default for StreamRegistry {
         registry.register(SERVICE_METRICS, b"metrics");
         registry.register(SERVICE_EVENTS, b"events");
         registry.register(SERVICE_CONTROL, b"control");
+        registry.register(SERVICE_LOG_WATCH, b"log-watch");
         registry
     }
 }
@@ -115,6 +180,21 @@ impl StreamRegistry {
 
     pub fn contains(&self, tag: u8) -> bool {
         self.handlers.iter().any(|handler| handler.tag == tag)
+    }
+
+    /// Resolve the compact CBOR selector at the beginning of a stream body.
+    /// Both stable numeric tags and human-readable names select the same
+    /// registered handler; the remaining bytes are handler-owned.
+    pub fn resolve_cbor<'a>(&self, input: &'a [u8]) -> Option<(u8, &'a [u8])> {
+        let (selector, used) = decode_cbor_selector(input).ok()?;
+        let handler = match selector {
+            CborSelector::Tag(tag) => self
+                .handlers
+                .iter()
+                .find(|handler| u64::from(handler.tag) == tag),
+            CborSelector::Name(name) => self.handlers.iter().find(|handler| handler.name == name),
+        }?;
+        Some((handler.tag, &input[used..]))
     }
 }
 
@@ -181,9 +261,25 @@ pub fn handle_stream_with_events<const N: usize, const H: usize, const P: usize>
         // The UDP adapter supplies the command mailbox. Keep a harmless
         // registered fallback for bearer tests which use handlers directly.
         SERVICE_CONTROL => Ok(Vec::new()),
+        // Log retention and authentication are server policy.  This compact
+        // baseline acknowledges the stream without making command or object
+        // streams wait for an unavailable log consumer.
+        SERVICE_LOG_WATCH => Ok(log_watch_status(events, data)),
         SERVICE_OBJECT => Err("object service belongs to object-store adapter"),
         _ => Err("unknown stream service"),
     }
+}
+
+fn log_watch_status(events: Option<&EventRing>, data: &[u8]) -> Vec<u8> {
+    let requested = decode_log_watch_request(data)
+        .map(|request| request.records)
+        .unwrap_or(0);
+    let since = core::str::from_utf8(data)
+        .ok()
+        .and_then(|value| value.strip_prefix("since=")?.parse::<u64>().ok())
+        .unwrap_or(0);
+    let next_sequence = events.map_or(0, EventRing::next_sequence);
+    format!("log_watch_version=1;next_sequence={next_sequence};since={since};requested={requested};logs=0").into_bytes()
 }
 
 fn connection_status<const N: usize, const H: usize, const P: usize>(
@@ -312,8 +408,27 @@ fn events_status<const N: usize, const H: usize, const P: usize>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_status_envelope_is_bounded_and_shared() {
+        let response = encode_status_text(b"bootstrap failed").unwrap();
+        assert_eq!(
+            &response[..9],
+            &[0xa3, 0x00, 0x18, 0x44, 0x04, 0x62, b'o', b'k', 0x06]
+        );
+        assert!(encode_status_text(&[b'x'; 256]).is_none());
+    }
+
+    #[test]
+    fn log_watch_request_is_bounded_and_bearer_neutral() {
+        assert_eq!(decode_log_watch_request(&[]).unwrap().records, 1);
+        assert_eq!(decode_log_watch_request(&[64]).unwrap().records, 64);
+        assert!(decode_log_watch_request(&[0]).is_err());
+        assert!(decode_log_watch_request(&[65]).is_err());
+        assert!(decode_log_watch_request(&[1, 2]).is_err());
+    }
+
     use super::*;
-    use crate::{ConnectionLimits, EndpointState, Role};
+    use quic_lite::{ConnectionLimits, EndpointState, Role};
 
     #[test]
     fn event_ring_is_bounded_and_pollable() {
@@ -327,6 +442,31 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].kind, 2);
         assert_eq!(records[1].stream_id, 12);
+    }
+
+    #[test]
+    fn numeric_result_is_a_bounded_recovery_response() {
+        let response = encode_numeric_result(&[(1, 2), (90, u64::MAX)]).unwrap();
+        assert_eq!(
+            &response[..9],
+            &[0xa3, 0x00, 0x18, 0x44, 0x04, 0x62, b'o', b'k', 0x06]
+        );
+        assert!(response.len() < 1400);
+        assert!(encode_numeric_result(&vec![(0, 0); 256]).is_none());
+    }
+
+    #[test]
+    fn registry_resolves_cbor_tag_and_name_without_bearer_state() {
+        let registry = StreamRegistry::default();
+        assert_eq!(
+            registry.resolve_cbor(&[SERVICE_LOG_WATCH, 0xa0]),
+            Some((SERVICE_LOG_WATCH, &[0xa0][..]))
+        );
+        assert_eq!(
+            registry.resolve_cbor(&[0x64, b'e', b'c', b'h', b'o', 1, 2]),
+            Some((SERVICE_ECHO, &[1, 2][..]))
+        );
+        assert_eq!(registry.resolve_cbor(&[0x0a]), None);
     }
 
     #[test]
@@ -420,7 +560,7 @@ mod tests {
                 continue;
             } // deterministic loss
             assert!(now >= 10); // deterministic latency injection point
-            let crate::TransportPacket::Stream { frame, .. } =
+            let quic_lite::TransportPacket::Stream { frame, .. } =
                 server.receive_datagram(&packet[..used]).unwrap()
             else {
                 panic!("expected stream");
@@ -455,7 +595,7 @@ mod tests {
         server
             .install_connection_ids(server_cid, client_cid)
             .unwrap();
-        let mut link = crate::fake::FakeDatagramLink::new(crate::fake::FaultConfig {
+        let mut link = quic_lite::fake::FakeDatagramLink::new(quic_lite::fake::FaultConfig {
             latency_ticks: 3,
             drop_every: Some(4),
             duplicate: true,
@@ -481,7 +621,7 @@ mod tests {
         }
         let mut delivered = 0;
         for packet in link.poll(3) {
-            if let Ok(crate::TransportPacket::Stream { frame, .. }) =
+            if let Ok(quic_lite::TransportPacket::Stream { frame, .. }) =
                 server.receive_datagram(&packet)
             {
                 let service = frame.data[0];

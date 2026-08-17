@@ -5,24 +5,42 @@
 //! The crate resolves a binary CBOR GET request and produces a manifest plus
 //! blob records on a caller-provided stream. It contains no sockets, UDP,
 //! QUIC packet handling, retransmission, or radio code. A host may put those
-//! records on TCP, SSH, or any other stream; firmware may put them on a
-//! `dmesh-transport` stream.
+//! records on a `quic-lite` stream; bearer adapters own socket or radio I/O.
+
+extern crate alloc;
 
 pub mod cbor;
+/// Small no-std network-address helpers used by bearer adapters. This module
+/// has no socket runtime or ESP-IDF dependency.
+pub mod net;
+pub mod recovery;
+/// Predefined common stream services and schemas.  This is deliberately
+/// above `quic-lite`: transport provides ordered streams, while this module
+/// owns service tags, CBOR/object operations, diagnostics, and log watching.
+pub mod services;
+
+/// Socket-free ESP-NOW/vendor-action object bearer. `lmesh-wifi` supplies raw
+/// 802.11 send/receive; this module owns only the same QUIC-lite bootstrap,
+/// DCID routing, object GET, and stream scheduling used by the UDP adapter.
+#[cfg(feature = "std")]
+pub mod action;
+
+/// Host UDP adapter and standalone test server. This is intentionally kept
+/// out of `quic-lite`: it owns sockets, Tokio scheduling, object-server
+/// wiring, and test-only service handlers.
+#[cfg(feature = "udp")]
+pub mod udp;
 
 #[cfg(feature = "std")]
 mod host {
     use crate::cbor;
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::time::{timeout, Duration};
 
     pub use crate::protocol::{
         GetRequest, MAX_RECORD, RECORD_BLOB, RECORD_DONE, RECORD_MANIFEST, REQUEST_MAX,
@@ -32,21 +50,15 @@ mod host {
 
     #[derive(Debug, Clone)]
     pub struct ServerConfig {
-        pub bind: String,
-        pub port: u16,
         pub artifact_root: PathBuf,
         pub archive_root: Option<PathBuf>,
-        pub idle_timeout: Duration,
     }
 
     impl Default for ServerConfig {
         fn default() -> Self {
             Self {
-                bind: "0.0.0.0".into(),
-                port: 3337,
                 artifact_root: PathBuf::from("target/flash"),
                 archive_root: None,
-                idle_timeout: Duration::from_secs(900),
             }
         }
     }
@@ -239,35 +251,6 @@ mod host {
         Ok(out)
     }
 
-    async fn read_record<R: AsyncRead + Unpin>(
-        reader: &mut R,
-        idle: Duration,
-    ) -> Result<(u8, Vec<u8>)> {
-        let mut header = [0u8; 5];
-        timeout(idle, reader.read_exact(&mut header)).await??;
-        let len = u32::from_be_bytes(header[1..5].try_into()?) as usize;
-        if len > REQUEST_MAX {
-            bail!("request record too large");
-        }
-        let mut body = vec![0u8; len];
-        timeout(idle, reader.read_exact(&mut body)).await??;
-        Ok((header[0], body))
-    }
-
-    async fn write_record<W: AsyncWrite + Unpin>(
-        writer: &mut W,
-        kind: u8,
-        body: &[u8],
-    ) -> Result<()> {
-        if body.len() > MAX_RECORD {
-            bail!("response record too large");
-        }
-        writer.write_all(&[kind]).await?;
-        writer.write_all(&(body.len() as u32).to_be_bytes()).await?;
-        writer.write_all(body).await?;
-        Ok(())
-    }
-
     #[derive(Clone)]
     pub struct ObjectServer {
         pub config: ServerConfig,
@@ -282,10 +265,9 @@ mod host {
             }
         }
 
-        /// Resolve a GET and materialize the transport-neutral response
-        /// records. Bearer adapters may stream these records over TCP, UDP,
-        /// QUIC, or a radio without making the object store aware of that
-        /// bearer.
+        /// Resolve a GET and materialize transport-neutral response records.
+        /// Bearer adapters stream them through QUIC-lite without making the
+        /// object service aware of a socket or radio implementation.
         pub fn response_records(&self, request: GetRequest<'_>) -> Result<Vec<(u8, Vec<u8>)>> {
             let source = target_file(&self.config.artifact_root, request)?;
             let manifest = self.manifests.get(&source)?;
@@ -308,37 +290,6 @@ mod host {
             }
             records.push((RECORD_DONE, Vec::new()));
             Ok(records)
-        }
-
-        pub async fn run(self) -> Result<()> {
-            std::fs::create_dir_all(&self.config.artifact_root)?;
-            let _ = self.manifests.prepare_tree(&self.config.artifact_root);
-            let listener = TcpListener::bind((&*self.config.bind, self.config.port)).await?;
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let server = self.clone();
-                tokio::spawn(async move {
-                    let _ = server.handle_stream(stream).await;
-                });
-            }
-        }
-
-        pub async fn handle_stream<S>(&self, stream: S) -> Result<()>
-        where
-            S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        {
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            let (kind, request_bytes) = read_record(&mut reader, self.config.idle_timeout).await?;
-            if kind != crate::protocol::FRAME_GET {
-                bail!("expected GET record");
-            }
-            let request = crate::protocol::decode_get(&request_bytes)
-                .ok_or_else(|| anyhow::anyhow!("invalid GET"))?;
-            for (kind, body) in self.response_records(request)? {
-                write_record(&mut writer, kind, &body).await?;
-            }
-            writer.flush().await?;
-            Ok(())
         }
     }
 
@@ -373,15 +324,19 @@ mod host {
             assert_eq!(records[3], (RECORD_DONE, Vec::new()));
 
             let full_digest = Sha256::digest(&bytes).to_vec();
-            assert!(records[0]
-                .1
-                .windows(full_digest.len())
-                .any(|window| window == &full_digest[..]));
+            assert!(
+                records[0]
+                    .1
+                    .windows(full_digest.len())
+                    .any(|window| window == &full_digest[..])
+            );
             let first_digest = Sha256::digest(&bytes[..BLOCK_SIZE]).to_vec();
-            assert!(records[0]
-                .1
-                .windows(4)
-                .any(|window| window == &first_digest[..4]));
+            assert!(
+                records[0]
+                    .1
+                    .windows(4)
+                    .any(|window| window == &first_digest[..4])
+            );
             assert_eq!(&records[1].1[..4], &[0, 0, 0, 0]);
             assert_eq!(
                 u32::from_be_bytes(records[1].1[4..8].try_into().unwrap()),

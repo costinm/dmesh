@@ -9,6 +9,6 @@ services such as `lora1.lmesh`. `mesh FQDN help` reads it locally; firmware
 does not carry or serve command help, so help remains available while a device
 is sleeping or unreachable.
 
-`../API.md` and `../ESP_FIRMWARE_API.md` are the canonical specification,
-including private firmware methods and `mesh-api` TOML blocks. Generate this
-catalogs from their public blocks; do not edit them by hand.
+`../API.md` is the canonical specification for the managed host services.
+Firmware operations are now dmesh-server stream handlers, not a generated
+direct-command catalog. Do not add retired firmware command methods here.

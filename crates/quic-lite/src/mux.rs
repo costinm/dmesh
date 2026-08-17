@@ -5,7 +5,6 @@
 //! radio, timer, and peer-address policy stays outside this module.
 
 use crate::callback::{CallbackStreams, CopyingError, CopyingStreamEvents};
-use crate::handlers::{handle_stream_with_events, EventRing, StreamRegistry};
 use crate::{ConnectionId, EndpointState, Error, Role, TransportPacket};
 use alloc::{sync::Arc, vec::Vec};
 
@@ -53,22 +52,18 @@ impl CopyingStreamEvents for RequestCollector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MuxResponse {
-    pub stream_id: u64,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxRequest {
     pub stream_id: u64,
     pub data: Vec<u8>,
 }
 
 /// Persistent connection state plus bounded stream lifecycle management.
-pub struct StreamMux<const N: usize, const H: usize = 16, const P: usize = 1400> {
+pub struct StreamMux<
+    const N: usize,
+    const H: usize = 16,
+    const P: usize = { crate::DEFAULT_MAX_DATAGRAM_SIZE },
+> {
     pub endpoint: EndpointState<N, H, P>,
-    pub registry: StreamRegistry,
-    pub events: EventRing,
     completed: Vec<u64>,
     max_pending_streams: usize,
     ordered: CallbackStreams<Arc<Vec<u8>>>,
@@ -81,7 +76,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         role: Role,
         limits: crate::ConnectionLimits,
         max_datagram_size: u64,
-        event_capacity: usize,
+        _event_capacity: usize,
         max_pending_streams: usize,
         max_stream_bytes: usize,
     ) -> Self {
@@ -89,7 +84,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             role,
             limits,
             max_datagram_size,
-            event_capacity,
+            _event_capacity,
             max_pending_streams,
             max_stream_bytes,
             H,
@@ -100,7 +95,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         role: Role,
         limits: crate::ConnectionLimits,
         max_datagram_size: u64,
-        event_capacity: usize,
+        _event_capacity: usize,
         max_pending_streams: usize,
         max_stream_bytes: usize,
         history_capacity: usize,
@@ -112,8 +107,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 max_datagram_size,
                 history_capacity,
             ),
-            registry: StreamRegistry::default(),
-            events: EventRing::new(event_capacity),
             completed: Vec::new(),
             max_pending_streams,
             ordered: CallbackStreams::new(max_pending_streams, max_stream_bytes),
@@ -150,7 +143,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         if !self.ready.is_empty() {
             return Ok(Some(self.ready.remove(0)));
         }
-        let (header, header_len) = crate::ShortHeader::decode_with_expected(
+        let (_header, header_len) = crate::ShortHeader::decode_with_expected(
             input,
             self.endpoint.expected_packet_number(),
         )?;
@@ -169,8 +162,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         }
         if parsed_streams.is_empty() {
             let _ = self.endpoint.receive_datagram(input)?;
-            self.events
-                .push(1, 0, header.packet_number as u64, input.len() as u64);
             return Ok(None);
         };
         let lease = Arc::new(input.to_vec());
@@ -200,9 +191,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         for frame in parsed_streams {
             let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
             let range = start..start + frame.data.len();
-            if let Some(request) =
-                self.deliver_stream_frame(frame, lease.clone(), range, header.packet_number)?
-            {
+            if let Some(request) = self.deliver_stream_frame(frame, lease.clone(), range)? {
                 if first.is_none() {
                     first = Some(request);
                 } else {
@@ -218,13 +207,10 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         frame: crate::StreamFrame<'_>,
         packet: Arc<Vec<u8>>,
         range: core::ops::Range<usize>,
-        packet_number: u32,
     ) -> Result<Option<MuxRequest>, Error> {
         if self.completed.contains(&frame.id) {
             return Ok(None);
         }
-        self.events
-            .push(2, frame.id, packet_number as u64, frame.data.len() as u64);
         let mut collector = RequestCollector::default();
         match self.ordered.receive_copying(
             frame.id,
@@ -266,38 +252,12 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         self.endpoint.stream_consumed(stream_id, bytes)
     }
 
-    /// Receive one datagram, reassemble stream fragments, and return a
-    /// completed handler response when a stream reaches FIN.
-    pub fn receive_datagram<'a>(&mut self, input: &'a [u8]) -> Result<Option<MuxResponse>, Error> {
-        let packet_number = crate::ShortHeader::decode(input).map(|(h, _)| h.packet_number)?;
-        let Some(request) = self.receive_request(input)? else {
-            return Ok(None);
-        };
-        let stream_id = request.stream_id;
-        let data = request.data;
-        let service = *data.first().ok_or(Error::Invalid)?;
-        let body = &data[1..];
-        let connection = self
-            .endpoint
-            .local_connection_id()
-            .or_else(|| self.endpoint.peer_connection_id())
-            .ok_or(Error::WrongConnectionId)?;
-        let response = handle_stream_with_events(
-            &self.endpoint,
-            Some(&self.events),
-            connection,
-            stream_id,
-            &self.registry,
-            service,
-            body,
-        )
-        .map_err(|_| Error::Invalid)?;
-        self.events
-            .push(3, stream_id, packet_number as u64, response.len() as u64);
-        Ok(Some(MuxResponse {
-            stream_id,
-            data: response,
-        }))
+    /// Compatibility spelling for callers that treat the mux as a datagram
+    /// consumer. The returned value is the completed *request*, not an
+    /// application response; dispatch belongs to `dmesh-server` or another
+    /// application layer.
+    pub fn receive_datagram(&mut self, input: &[u8]) -> Result<Option<MuxRequest>, Error> {
+        self.receive_request(input)
     }
 
     pub fn encode_response(
@@ -327,9 +287,8 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
 mod tests {
     use super::*;
     use crate::{
-        ConnectionId, ConnectionLimits, Role, FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_METRICS,
+        ConnectionId, ConnectionLimits, FIRST_CLIENT_BIDI_STREAM_ID, Role, SERVICE_METRICS,
     };
-    use alloc::format;
 
     #[test]
     fn persistent_mux_reassembles_multiple_streams_and_exposes_metrics() {
@@ -355,19 +314,10 @@ mod tests {
                 .unwrap();
             let response = server.receive_datagram(&packet[..used]).unwrap().unwrap();
             assert_eq!(response.stream_id, next_stream);
-            assert!(core::str::from_utf8(&response.data)
-                .unwrap()
-                .contains("metrics_version=1"));
-            assert!(core::str::from_utf8(&response.data)
-                .unwrap()
-                .contains("retained_payload_bytes="));
-            assert!(core::str::from_utf8(&response.data)
-                .unwrap()
-                .contains("history_storage_slots="));
+            assert_eq!(response.data, request);
             next_stream += 4;
         }
         assert_eq!(server.pending_streams(), 0);
-        assert_eq!(server.events.len(), 6);
     }
 
     #[test]
@@ -389,10 +339,12 @@ mod tests {
             .endpoint
             .encode_stream_packet(s, 4, 4, true, b"ics", &mut packet)
             .unwrap();
-        assert!(server
-            .receive_datagram(&packet[..second_len])
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .receive_datagram(&packet[..second_len])
+                .unwrap()
+                .is_none()
+        );
         let (first_len, _) = client
             .endpoint
             .encode_stream_packet(
@@ -410,9 +362,10 @@ mod tests {
             .receive_datagram(&packet[..first_len])
             .unwrap()
             .unwrap();
-        assert!(core::str::from_utf8(&response.data)
-            .unwrap()
-            .contains("service=2"));
+        assert_eq!(
+            response.data,
+            [crate::SERVICE_ECHO, b'b', b'a', b'd', b'i', b'c', b's']
+        );
     }
 
     #[test]
@@ -461,9 +414,17 @@ mod tests {
                 .unwrap();
             let response = server.receive_datagram(&packet[..used]).unwrap().unwrap();
             assert_eq!(response.stream_id, stream);
-            let text = core::str::from_utf8(&response.data).unwrap();
-            assert!(text.contains("service=2"));
-            assert!(text.contains(&format!("stream_id={stream}")));
+            assert_eq!(
+                response.data,
+                [
+                    crate::SERVICE_ECHO,
+                    b'\x10' + stream as u8,
+                    b'd',
+                    b'o',
+                    b'n',
+                    b'e'
+                ]
+            );
         }
         assert_eq!(server.pending_streams(), 0);
     }
@@ -494,19 +455,23 @@ mod tests {
                 &mut packet,
             )
             .unwrap();
-        assert!(server
-            .receive_request(&packet[..first_len])
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .receive_request(&packet[..first_len])
+                .unwrap()
+                .is_none()
+        );
         let received_before_conflict = server.endpoint.receive.received_data;
         let (conflict_len, _) = client
             .endpoint
             .encode_stream_packet(s, 4, 1, true, b"Z", &mut packet)
             .unwrap();
-        assert!(server
-            .receive_request(&packet[..conflict_len])
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .receive_request(&packet[..conflict_len])
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(server.pending_streams(), 1);
         assert_eq!(
             server.endpoint.receive.received_data,

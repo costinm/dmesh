@@ -26,7 +26,6 @@ use crate::radio_protocol;
 use crate::schema::FirmwareSchema;
 use dmesh_rawnan::service::FollowupDedup;
 use dmesh_rawnan::{Action as RawNanAction, NanState, RxFrame as RawNanRxFrame};
-use dmesh_transport::encode_bench_stream;
 use uart_codec::codec::{UART_ESCAPE, UART_FLAG};
 
 const DEFAULT_WIFI_IFACE: &str = "wlan1";
@@ -41,9 +40,6 @@ const DEFAULT_RAW_WIFI_CHANNEL: u8 = 6;
 const DEFAULT_RAW_WIFI_LISTEN_SECS: u64 = 60;
 const DEFAULT_LMESH_CONFIG_FILE: &str = "/home/system/etc/lmesh/lmesh.toml";
 const REMOTE_REQUEST_ID_KEY: u16 = 333;
-const RAW_UDP_DIAGNOSTIC_PORT: u16 = 3337;
-const RAW_UDP_FLOOD_BYTES: usize = 2 * 1024 * 1024;
-const RAW_UDP_FLOOD_PAYLOAD: usize = 1200;
 static REMOTE_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // Raw monitor traffic is high volume (especially with an APSTA ESP peer), so
 // a short global ring could evict the semantic NAN event before a diagnostic
@@ -94,47 +90,6 @@ const SERIAL_RESET_NONE: u8 = 0;
 const FIRMWARE_UART_FLAG: u8 = UART_FLAG;
 const FIRMWARE_UART_ESCAPE: u8 = UART_ESCAPE;
 
-/// Serve one raw diagnostic command. Wire values are numeric only:
-/// 1 -> `[0x81, 1]`; `[2, packet_size_be_u16]` -> a fixed flood followed by
-/// `[0x83, packets, bytes]`. Every data packet starts with a u32 packet ID.
-async fn raw_udp_handle(socket: &tokio::net::UdpSocket, peer: SocketAddr, request: &[u8]) {
-    raw_udp_handle_with_size(socket, peer, request, RAW_UDP_FLOOD_BYTES).await;
-}
-
-async fn raw_udp_handle_with_size(
-    socket: &tokio::net::UdpSocket,
-    peer: SocketAddr,
-    request: &[u8],
-    flood_bytes: usize,
-) {
-    match request {
-        [1] => { let _ = socket.send_to(&[0x81, 1], peer).await; }
-        [2] | [2, _, _] => {
-            let payload_size = match request {
-                [2, high, low] => u16::from_be_bytes([*high, *low]) as usize,
-                _ => RAW_UDP_FLOOD_PAYLOAD,
-            }.clamp(8, RAW_UDP_FLOOD_PAYLOAD);
-            let mut packet = [0u8; RAW_UDP_FLOOD_PAYLOAD + 5];
-            packet[0] = 0x82;
-            let mut sent = 0usize;
-            let mut sequence = 0u32;
-            while sent < flood_bytes {
-                packet[1..5].copy_from_slice(&sequence.to_be_bytes());
-                let body = (flood_bytes - sent).min(payload_size);
-                packet[5..5 + body].fill(sequence as u8);
-                if socket.send_to(&packet[..5 + body], peer).await.is_err() { break; }
-                sent += body;
-                sequence = sequence.wrapping_add(1);
-            }
-            let mut done = [0u8; 13];
-            done[0] = 0x83;
-            done[1..5].copy_from_slice(&sequence.to_be_bytes());
-            done[5..13].copy_from_slice(&(sent as u64).to_be_bytes());
-            let _ = socket.send_to(&done, peer).await;
-        }
-        _ => { let _ = socket.send_to(&[0xff], peer).await; }
-    }
-}
 
 /// Host-side adapter from the no-std UART codec's raw payloads to the shared
 /// mesh CBOR stream-frame representation used by the Linux service.
@@ -331,7 +286,7 @@ const IEEE80211_LLC_SNAP_DMESH: [u8; IEEE80211_LLC_SNAP_LEN] = [
 const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x86, 0xdd];
 // Private experimental marker for raw NAN data tests.  The payload after
-// this eight-byte LLC value is dmesh-transport directly, not IPv6/UDP.
+// this eight-byte LLC value is quic-lite directly, not IPv6/UDP.
 const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
 const NLMSG_ERROR: u16 = 2;
@@ -364,8 +319,7 @@ pub struct RadioService {
     serial_log: Option<Arc<Mutex<SerialForwardLog>>>,
     stability: Arc<Mutex<Option<StabilityRuntime>>>,
     object_udp_started: Arc<AtomicBool>,
-    transport_control: Arc<dmesh_transport::udp::TransportControl>,
-    raw_udp_started: Arc<AtomicBool>,
+    transport_control: Arc<dmesh_server::udp::TransportControl>,
     uart_enabled: bool,
 }
 
@@ -515,13 +469,17 @@ impl RadioService {
             serial_log,
             stability: Arc::new(Mutex::new(None)),
             object_udp_started: Arc::new(AtomicBool::new(false)),
-            transport_control: Arc::new(dmesh_transport::udp::TransportControl::default()),
-            raw_udp_started: Arc::new(AtomicBool::new(false)),
+            transport_control: Arc::new(dmesh_server::udp::TransportControl::default()),
             uart_enabled: enable_uart,
         };
         if enable_uart {
-            service.start_configured_serial_forwards();
-            service.start_configured_esp_reverse_sessions();
+            // lmesh-wifi owns Wi-Fi/NAN and may invoke the shared L2 client,
+            // but it must not start the retired serial-forward or reverse TCP
+            // listeners from an inherited board configuration.
+            service.record(
+                "uart.legacy_forwarding",
+                json!({"enabled": false, "reason": "retired"}),
+            );
         }
         service
     }
@@ -532,7 +490,7 @@ impl RadioService {
     }
 
     /// Start the object-store UDP bearer without restarting lmesh-wifi. UDP
-    /// terminates here, while dmesh-transport and dmesh-object-store remain
+    /// terminates here, while quic-lite and dmesh-server remain
     /// separate layers inside the adapter.
     pub fn object_udp_start(
         &self,
@@ -570,7 +528,7 @@ impl RadioService {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/flash")
             });
         let started = self.object_udp_started.clone();
-        let mut udp_config = dmesh_transport::udp::UdpConfig {
+        let mut udp_config = dmesh_server::udp::UdpConfig {
             bind: address,
             artifact_root: root,
             // The host retains the sender window. Recovery processes receive
@@ -580,8 +538,8 @@ impl RadioService {
             history_capacity: std::env::var("DMESH_UDP_HISTORY_CAPACITY")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| (1..=dmesh_transport::RECOVERY_MAX_HISTORY_PACKETS).contains(value))
-                .unwrap_or(dmesh_transport::RECOVERY_MAX_HISTORY_PACKETS),
+                .filter(|value| (1..=quic_lite::RECOVERY_MAX_HISTORY_PACKETS).contains(value))
+                .unwrap_or(quic_lite::RECOVERY_MAX_HISTORY_PACKETS),
             // 512 bytes remains in the host fault matrix, but production
             // Recovery uses a near-MTU application chunk. This reduces the
             // number of transport/ACK cycles while staying below the 1400
@@ -589,9 +547,9 @@ impl RadioService {
             object_chunk: std::env::var("DMESH_UDP_OBJECT_CHUNK")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1200),
+                .unwrap_or(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE - 64),
             control: Some(self.transport_control.clone()),
-            ..dmesh_transport::udp::UdpConfig::default()
+            ..dmesh_server::udp::UdpConfig::default()
         };
         // Keep deployment tuning outside the transport implementation while
         // allowing operators to select an explicit host ledger or leave it at
@@ -602,13 +560,13 @@ impl RadioService {
             }
         }
         tokio::spawn(async move {
-            let result = dmesh_transport::udp::run(udp_config).await;
+            let result = dmesh_server::udp::run(udp_config).await;
             started.store(false, Ordering::Release);
             if let Err(error) = result {
                 tracing::warn!(%error, "object_udp_stopped");
             }
         });
-        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "dmesh-transport", "object_store": "dmesh-object-store"})
+        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "quic-lite", "object_store": "dmesh-server", "services": ["object", "iperf", "control", "status", "metrics", "events", "echo"]})
     }
 
     /// Transport-owned aggregates for the stable object listener.  This is
@@ -643,27 +601,131 @@ impl RadioService {
         })
     }
 
-    /// Raw radio/lwIP benchmark on a separate UDP port. This is intentionally
-    /// not a transport service: its one-byte commands and fixed binary replies
-    /// isolate AP/STA and socket throughput from stream/object processing.
-    pub fn raw_udp_start(&self) -> Value {
-        if self.raw_udp_started.swap(true, Ordering::AcqRel) {
-            return json!({"ok": true, "already_running": true, "port": RAW_UDP_DIAGNOSTIC_PORT});
+    /// Start the shared host transport client as a gateway operation. This is
+    /// deliberately a thin adapter: serial framing, path policy, IPERF
+    /// request encoding, and result validation remain in `lmesh-uart` so the
+    /// direct CLI and managed service exercise the same L2 code.
+    pub fn transport_client_iperf(
+        &self,
+        serial: String,
+        bootstrap: String,
+        backend: String,
+        bytes: u32,
+        bearer: Option<String>,
+    ) -> Value {
+        let policy = bearer.unwrap_or_else(|| "aggregate".to_owned());
+        if lmesh_uart::client::ClientPathPolicy::parse(&policy).is_none() {
+            return json!({"ok": false, "error": "bearer must be uart, udp, aggregate, fastest, or spill"});
         }
-        let started = self.raw_udp_started.clone();
-        tokio::spawn(async move {
-            let socket = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, RAW_UDP_DIAGNOSTIC_PORT)).await {
-                Ok(socket) => socket,
-                Err(error) => { tracing::warn!(%error, "raw_udp_bind_failed"); started.store(false, Ordering::Release); return; }
+        let arguments = vec![
+            serial.clone(),
+            bootstrap.clone(),
+            backend.clone(),
+            "--iperf-bytes".to_owned(),
+            bytes.max(8).to_string(),
+            "--bearer".to_owned(),
+            policy.clone(),
+        ];
+        let run_id = REMOTE_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.record(
+            "transport.client.iperf",
+            json!({
+                "ok": true,
+                "state": "started",
+                "run_id": run_id,
+                "serial": serial,
+                "bootstrap": bootstrap,
+                "backend": backend,
+                "bearer": policy,
+                "bytes": bytes.max(8),
+            }),
+        );
+        let history = self.history.clone();
+        let name = format!("dmesh-iperf-{serial}");
+        match std::thread::Builder::new().name(name).spawn(move || {
+            let result = lmesh_uart::client::run_dmesh_iperf_args(arguments);
+            let value = match result {
+                Ok(()) => json!({"ok": true, "state": "completed", "run_id": run_id}),
+                Err(error) => {
+                    tracing::warn!(%error, run_id, "gateway_iperf_finished");
+                    json!({"ok": false, "state": "failed", "run_id": run_id, "error": error})
+                }
             };
-            let mut request = [0u8; 64];
-            loop {
-                let Ok((length, peer)) = socket.recv_from(&mut request).await else { break; };
-                raw_udp_handle(&socket, peer, &request[..length]).await;
-            }
-            started.store(false, Ordering::Release);
-        });
-        json!({"ok": true, "port": RAW_UDP_DIAGNOSTIC_PORT, "bytes": RAW_UDP_FLOOD_BYTES, "payload": RAW_UDP_FLOOD_PAYLOAD})
+            push_history_event(&history, "transport.client.iperf", value);
+        }) {
+            Ok(_) => json!({
+                "ok": true,
+                "client": "lmesh-uart",
+                "service": "iperf",
+                "run_id": run_id,
+                "serial": serial,
+                "bootstrap": bootstrap,
+                "backend": backend,
+                "bearer": policy,
+                "bytes": bytes.max(8),
+            }),
+            Err(error) => json!({"ok": false, "error": format!("start gateway iperf: {error}")}),
+        }
+    }
+
+    /// Run one registered QUIC-lite service through the shared host client.
+    /// The gateway deliberately retains no command schema: service selection
+    /// and optional CBOR body stay in `lmesh-uart`, so a direct CLI invocation
+    /// and an egress-gateway invocation have identical wire behavior.
+    pub fn transport_client_service(
+        &self,
+        target: String,
+        service: String,
+        body_hex: Option<String>,
+        log_records: Option<u8>,
+    ) -> Value {
+        if !matches!(
+            service.as_str(),
+            "status" | "metrics" | "streams" | "log-watch" | "control"
+        ) {
+            return json!({"ok": false, "error": "unknown registered service"});
+        }
+        if log_records.is_some() && service != "log-watch" {
+            return json!({"ok": false, "error": "log_records requires service=log-watch"});
+        }
+        let mut arguments = vec![target.clone(), "--service".to_owned(), service.clone()];
+        if let Some(body_hex) = body_hex.clone() {
+            arguments.push("--body-hex".to_owned());
+            arguments.push(body_hex);
+        }
+        if let Some(log_records) = log_records {
+            arguments.push("--log-records".to_owned());
+            arguments.push(log_records.to_string());
+        }
+        let run_id = REMOTE_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.record(
+            "transport.client.service",
+            json!({"ok": true, "state": "started", "run_id": run_id, "target": target, "service": service}),
+        );
+        let history = self.history.clone();
+        match std::thread::Builder::new()
+            .name(format!("dmesh-client-{run_id}"))
+            .spawn(move || {
+                let result = lmesh_uart::client::run_dmesh_iperf_args(arguments);
+                let value = match result {
+                    Ok(()) => json!({"ok": true, "state": "completed", "run_id": run_id}),
+                    Err(error) => {
+                        tracing::warn!(%error, run_id, "gateway_service_finished");
+                        json!({"ok": false, "state": "failed", "run_id": run_id, "error": error})
+                    }
+                };
+                push_history_event(&history, "transport.client.service", value);
+            }) {
+            Ok(_) => json!({
+                "ok": true,
+                "client": "lmesh-uart",
+                "run_id": run_id,
+                "target": target,
+                "service": service,
+                "log_records": log_records,
+            }),
+            Err(error) => json!({"ok": false, "error": format!("start gateway service: {error}")}),
+        }
     }
 
     pub fn default_esp_route(
@@ -3325,12 +3387,15 @@ impl RadioService {
             // in address3. Using the peer MAC here works only before the
             // device arms its hardware cluster filter, and silently drops
             // host-originated transport packets afterwards.
-            build_dmesh_vendor_action_frame_with_bssid(
+            match build_dmesh_vendor_action_frame_with_bssid(
                 destination,
                 source,
                 nan_bssid,
                 &payload_bytes,
-            )
+            ) {
+                Ok(frame) => frame,
+                Err(error) => return json!({"ok": false, "error": format!("raw ESP-NOW frame: {error}")}),
+            }
         };
         if is_nan_control_frame(&frame)
             && tx_rate_mbps.is_some_and(|rate| !matches!(rate, 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54))
@@ -3578,146 +3643,6 @@ impl RadioService {
         result
     }
 
-    /// Send a QUIC-shaped DMTB stream burst while preparing the monitor VIF
-    /// only once. The ordinary `wifi.raw.send` method is intentionally a
-    /// single-frame diagnostic and re-runs interface setup for each call;
-    /// using it in a tight loop distorted the transport benchmark and could
-    /// wedge some drivers while toggling the parent interface.
-    pub fn wifi_raw_bench_send(
-        &self,
-        iface: Option<String>,
-        channel: Option<u8>,
-        destination: String,
-        bssid: Option<String>,
-        total_bytes: usize,
-        chunk_bytes: Option<usize>,
-        tx_variant: Option<String>,
-        llc: Option<String>,
-        multicast: bool,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let channel = raw_wifi_channel(channel);
-        let destination = match parse_mac(Some(&destination)) {
-            Some(mac) => mac,
-            None => return json!({"ok": false, "error": "destination must be a MAC address"}),
-        };
-        let bssid = bssid
-            .as_deref()
-            .and_then(|value| parse_mac(Some(value)))
-            .unwrap_or(destination);
-        let tx_variant = tx_variant.unwrap_or_else(|| "monitor_active".to_string());
-        let llc = parse_experimental_llc(llc.as_deref()).unwrap_or(RAWNAN_LLC_DEFAULT);
-        let chunk_bytes = chunk_bytes.unwrap_or(512).clamp(64, 900);
-        if total_bytes == 0 || total_bytes > 16 * 1024 * 1024 {
-            return json!({"ok": false, "error": "bytes must be in 1..=16777216"});
-        }
-        let monitor_iface = monitor_iface_name(&iface);
-        let setup = match ensure_monitor_iface(&iface, &monitor_iface, channel, true, false) {
-            Ok(value) => value,
-            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
-        };
-        let socket = match MonitorTxSocket::open(&monitor_iface) {
-            Ok(socket) => socket,
-            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
-        };
-        let source = match iface_mac(&iface) {
-            Ok(mac) => mac,
-            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
-        };
-        let frame_count = total_bytes.div_ceil(chunk_bytes);
-        let started = Instant::now();
-        let mut stream_bytes = 0usize;
-        let mut wire_bytes = 0usize;
-        for sequence in 0..frame_count {
-            let offset = sequence * chunk_bytes;
-            let data_len = (total_bytes - offset).min(chunk_bytes);
-            let mut data = vec![0u8; data_len];
-            for (index, byte) in data.iter_mut().enumerate() {
-                *byte = ((offset + index) & 0xff) as u8;
-            }
-            let mut payload = vec![0u8; 1200];
-            let body_len = match encode_bench_stream(
-                sequence as u32,
-                offset as u64,
-                sequence + 1 == frame_count,
-                &data,
-                &mut payload,
-            ) {
-                Ok(length) => length,
-                Err(error) => {
-                    return json!({"ok": false, "error": format!("stream encode: {error:?}")});
-                }
-            };
-            let frame = if tx_variant == "nan_data_raw" || tx_variant == "nan_data_raw_active" {
-                let data_destination = if multicast {
-                    RAW_WIFI_MULTICAST
-                } else {
-                    destination
-                };
-                build_dmesh_nan_raw_data_frame(
-                    bssid,
-                    data_destination,
-                    source,
-                    &llc,
-                    &payload[..body_len],
-                )
-            } else {
-                build_dmesh_vendor_action_frame_with_bssid(
-                    if multicast {
-                        RAW_WIFI_MULTICAST
-                    } else {
-                        destination
-                    },
-                    source,
-                    bssid,
-                    &payload[..body_len],
-                )
-            };
-            let packet = build_radiotap_packet(&frame);
-            if let Err(error) = socket.send(&packet).and_then(|written| {
-                if written == packet.len() {
-                    Ok(())
-                } else {
-                    bail!(
-                        "short monitor frame write: wrote {written}, expected {}",
-                        packet.len()
-                    )
-                }
-            }) {
-                return json!({
-                    "ok": false,
-                    "error": format!("frame {sequence}: {error:#}"),
-                    "frames_sent": sequence,
-                    "stream_bytes": stream_bytes,
-                    "wire_bytes": wire_bytes,
-                });
-            }
-            stream_bytes += data_len;
-            wire_bytes += packet.len();
-        }
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        json!({
-            "ok": true,
-            "backend": "linux_af_packet_monitor",
-            "iface": iface,
-            "monitor_iface": monitor_iface,
-            "channel": channel,
-            "destination": colon_mac(&destination),
-            "source": colon_mac(&source),
-            "bssid": colon_mac(&bssid),
-            "tx_variant": tx_variant,
-            "llc": hex_bytes(&llc),
-            "multicast": multicast,
-            "frames_sent": frame_count,
-            "stream_bytes": stream_bytes,
-            "wire_bytes": wire_bytes,
-            "elapsed_ms": elapsed_ms,
-            "stream_kbps": if elapsed_ms > 0.0 { stream_bytes as f64 * 8.0 / elapsed_ms } else { 0.0 },
-            "wire_kbps": if elapsed_ms > 0.0 { wire_bytes as f64 * 8.0 / elapsed_ms } else { 0.0 },
-            "setup": setup,
-        })
-    }
-
     /// Send a DMesh raw Wi-Fi ping and return replies observed by the nl80211 listener.
     pub fn wifi_raw_ping(
         &self,
@@ -3824,7 +3749,7 @@ impl RadioService {
             })
             .unwrap_or(destination_bytes);
         let tx = match raw_wifi_source(None, &iface_value)
-            .map(|source| {
+            .and_then(|source| {
                 build_dmesh_vendor_action_frame_with_bssid(
                     destination_bytes,
                     source,
@@ -4732,6 +4657,20 @@ impl RadioService {
         while history.len() > MAX_HISTORY {
             history.pop_front();
         }
+    }
+}
+
+fn push_history_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, key: &str, value: Value) {
+    let mut history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    history.push_back(RadioEvent {
+        ts_millis: now_millis(),
+        key: key.to_owned(),
+        source: "local".to_owned(),
+        value,
+        message: None,
+    });
+    while history.len() > MAX_HISTORY {
+        history.pop_front();
     }
 }
 
@@ -12481,7 +12420,7 @@ fn build_dmesh_vendor_action_frame(
     destination: [u8; 6],
     source: [u8; 6],
     payload: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     build_dmesh_vendor_action_frame_with_bssid(destination, source, destination, payload)
 }
 
@@ -12490,7 +12429,7 @@ fn build_dmesh_vendor_action_frame_with_bssid(
     source: [u8; 6],
     bssid: [u8; 6],
     payload: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     dmesh_rawnan::build_espnow_action_frame(destination, source, bssid, payload)
 }
 
@@ -13495,47 +13434,6 @@ mod tests {
         assert!(wire.windows(10).any(|window| window == b"benchmark\xF5"));
     }
 
-    #[tokio::test]
-    async fn raw_udp_handlers_are_binary_and_host_executable() {
-        let server = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let client = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        client.send_to(&[1], server.local_addr().unwrap()).await.unwrap();
-        let mut request = [0u8; 8];
-        let (length, peer) = server.recv_from(&mut request).await.unwrap();
-        raw_udp_handle(&server, peer, &request[..length]).await;
-        let mut reply = [0u8; RAW_UDP_FLOOD_PAYLOAD + 5];
-        let (length, _) = client.recv_from(&mut reply).await.unwrap();
-        assert_eq!(&reply[..length], &[0x81, 1]);
-
-        client.send_to(&[0], server.local_addr().unwrap()).await.unwrap();
-        let (length, peer) = server.recv_from(&mut request).await.unwrap();
-        raw_udp_handle(&server, peer, &request[..length]).await;
-        let (length, _) = client.recv_from(&mut reply).await.unwrap();
-        assert_eq!(&reply[..length], &[0xff]);
-
-        client.send_to(&[2, 0x02, 0x00], server.local_addr().unwrap()).await.unwrap();
-        let (length, peer) = server.recv_from(&mut request).await.unwrap();
-        raw_udp_handle_with_size(&server, peer, &request[..length], 1300).await;
-        let mut data_packets = 0;
-        let mut bytes = 0usize;
-        let mut expected_id = 0u32;
-        loop {
-            let (length, _) = client.recv_from(&mut reply).await.unwrap();
-            match reply[0] {
-                0x82 => {
-                    assert_eq!(u32::from_be_bytes(reply[1..5].try_into().unwrap()), expected_id);
-                    expected_id = expected_id.wrapping_add(1);
-                    data_packets += 1;
-                    bytes += length - 5;
-                }
-                0x83 => break,
-                value => panic!("unexpected raw opcode {value}"),
-            }
-        }
-        assert_eq!(data_packets, 3);
-        assert_eq!(bytes, 1300);
-    }
-
     #[test]
     fn stage2_identity_reassembles_across_forward_records() {
         let identity = [
@@ -14149,7 +14047,7 @@ mod tests {
     fn raw_wifi_vendor_action_round_trips() {
         let dst = [0xff; 6];
         let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
-        let frame = build_dmesh_vendor_action_frame(dst, src, b"stats");
+        let frame = build_dmesh_vendor_action_frame(dst, src, b"stats").unwrap();
 
         assert_eq!(&frame[..4], &[0xd0, 0x00, 0x00, 0x00]);
         assert_eq!(
@@ -14177,7 +14075,7 @@ mod tests {
         let dst = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00];
         let src = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
         let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x54, 0x6c];
-        let frame = build_dmesh_vendor_action_frame_with_bssid(dst, src, bssid, b"DMTB");
+        let frame = build_dmesh_vendor_action_frame_with_bssid(dst, src, bssid, b"DMTB").unwrap();
 
         assert_eq!(&frame[4..10], &dst); // A1: addressed device
         assert_eq!(&frame[10..16], &src); // A2: host Wi-Fi adapter
@@ -14188,7 +14086,7 @@ mod tests {
 
     #[test]
     fn monitor_fcs_is_removed_only_when_crc_matches() {
-        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping");
+        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
         let crc = crc32_ieee(&frame);
         let mut captured = frame.clone();
         captured.extend_from_slice(&crc.to_le_bytes());
@@ -14219,7 +14117,7 @@ mod tests {
 
     #[test]
     fn raw_wifi_accepts_radiotap_prefix() {
-        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping");
+        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
         let mut packet = vec![0, 0, 8, 0, 0, 0, 0, 0];
         packet.extend_from_slice(&frame);
 
@@ -14245,11 +14143,11 @@ mod tests {
             [2, 0, 0, 0xaa, 0xbb, 0xcc],
             [0x50, 0x6f, 0x9a, 1, 2, 3],
             b"probe",
-        );
+        ).unwrap();
         assert!(is_nan_control_frame(&action));
 
         let ordinary =
-            build_dmesh_vendor_action_frame([0xff; 6], [2, 0, 0, 0xaa, 0xbb, 0xcc], b"probe");
+            build_dmesh_vendor_action_frame([0xff; 6], [2, 0, 0, 0xaa, 0xbb, 0xcc], b"probe").unwrap();
         assert!(!is_nan_control_frame(&ordinary));
     }
 
