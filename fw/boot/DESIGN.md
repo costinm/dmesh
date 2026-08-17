@@ -22,8 +22,8 @@ NVS and PHY offsets and fits a 4 MiB flash:
 | partition table | `0x8000` | `0x1000` |
 | NVS | `0x9000` | `0x6000` |
 | PHY init | `0xf000` | `0x1000` |
-| Recovery | `0x10000` | `0xd0000` |
-| Main | `0xe0000` | `0x2e0000` |
+| Recovery | `0x10000` | `0x100000` |
+| Main | `0x110000` | `0x2b0000` |
 | data | `0x3c0000` | `0x40000` |
 
 Recovery and main are compiled with a 4M partition.csv - main can use 

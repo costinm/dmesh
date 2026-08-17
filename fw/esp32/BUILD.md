@@ -1,9 +1,11 @@
 # ESP32 Build
 
-The active fleet firmware is the Rust ESP-IDF application under
-`fw/esp32/rust`. The older C application and Rust translation scaffold below
-remain development material; the canonical current provisioning and remote
-flashing procedure is [rust/docs/flashing.md](rust/docs/flashing.md).
+The active Main firmware is the Rust ESP-IDF application under
+`fw/esp32/rust`. Stage2 is under `fw/boot`; Rust Recovery is under
+`fw/recovery-rust`. The retired C Recovery must not be restored. The canonical
+build/provisioning procedure is [../../BUILD.md](../../BUILD.md), and the
+active shared-transport cleanup is
+[../../docs/plans/main-recovery-transport-reuse.md](../../docs/plans/main-recovery-transport-reuse.md).
 
 Install dependencies:
 
@@ -11,35 +13,26 @@ Install dependencies:
 scripts/esp32-deps.sh
 ```
 
-Build the legacy C application:
-
-```bash
-. env.sh
-(cd fw/esp32 && idf.py build)
-```
-
 The build uses the flake package in `fw/esp32` for host tools and keeps SDKs
-under `target/esp32-6.0`, not `$HOME`.
-
-Successful build outputs:
-
-- `fw/esp32/build/dmesh.bin`
-- `fw/esp32/build/bootloader/bootloader.bin`
-- `fw/esp32/build/partition_table/partition-table.bin`
-
-The legacy C build is retained for reference and does not own a flashing
-workflow. Do not use `idf.py flash`, Cargo flash subcommands, or `espflash`.
-Use the repository scripts below. Main images are never written over USB.
+under `target/esp32-6.0`, not `$HOME`. Do not use `idf.py flash`, Cargo flash
+subcommands, or `espflash`; use the repository scripts below. Main images are
+never written over USB.
 
 Build the current Rust fleet images from the repository root:
 
 ```bash
-. env.sh
+scripts/build-fw.sh --help
+scripts/build-stage2.sh --help
+scripts/build-recovery-rust.sh --help
 scripts/build-fw.sh e5          # classic ESP32 Main
 scripts/build-fw.sh recovery-s3 # ESP32-S3 Main, common 4 MiB image
 scripts/build-stage2.sh all
 scripts/build-recovery-rust.sh esp32c6
 ```
+
+The scripts source `env.sh` themselves. Main and Stage2 default to `all` when
+no target is supplied; Recovery defaults to classic ESP32. Prefer an explicit
+CPU target during iteration.
 
 Artifacts are kept under `target/flash/`, `target/stage2/`, and
 `target/recovery-rust/`.
@@ -50,9 +43,15 @@ provisioned board. Once stage-2/Recovery are installed, the supported Main updat
 ```bash
 # lmesh-wifi owns the persistent UDP object bearer under mesh-init.
 # Use the common local development flasher.
-python3 scripts/flash-device.py e5 main
+python3 scripts/flash-device.py e5
 # server, port, saved SSID, and MAC-derived IP use defaults
 ```
+
+The omitted target means `main`, and Main resolves to the Wi-Fi Recovery path.
+`--transport usb` is rejected for Main. Routine Main flashing assumes Stage2
+and Rust Recovery are already provisioned; it does not rewrite Recovery before
+each update. Use explicit `stage` or `recovery` targets only for initial
+provisioning or emergency repair.
 
 Optional network values are saved in
 `target/flash-devices/network.json`; pass `--ssid` or `--board-ip` once and
@@ -63,6 +62,11 @@ The helper sends only the recovery-start command through managed lmesh; the
 Main image is transferred over Wi-Fi by Recovery. It reuses port 3336 for
 successive boards. Do not invoke `idf.py flash`, `flash-fw.sh`, or an esptool
 Main-image command for routine updates.
+
+Main no longer links the retired C flash ABI or TCP flash worker. Flash policy
+is target-specific: Main never writes its active Main partition and Recovery
+never writes its active Recovery partition. Both use the shared Rust transport
+and protocol path as it is extracted.
 
 Main-update logs are available in:
 

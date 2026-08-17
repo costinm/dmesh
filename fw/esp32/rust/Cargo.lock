@@ -393,6 +393,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesh-fw-transport"
+version = "0.1.0"
+dependencies = [
+ "dmesh-server",
+ "esp-idf-sys",
+ "quic-lite",
+ "uart-codec",
+]
+
+[[package]]
 name = "dmesh-rawnan"
 version = "0.1.0"
 dependencies = [
@@ -404,8 +414,9 @@ name = "dmesh-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dmesh-fw-transport",
  "dmesh-rawnan",
- "dmesh-transport",
+ "dmesh-server",
  "embedded-svc",
  "embuild",
  "esp-idf-svc",
@@ -413,13 +424,18 @@ dependencies = [
  "libc",
  "log",
  "minicbor",
+ "quic-lite",
  "sha2",
  "uart-codec",
 ]
 
 [[package]]
-name = "dmesh-transport"
+name = "dmesh-server"
 version = "0.1.0"
+dependencies = [
+ "quic-lite",
+ "sha2",
+]
 
 [[package]]
 name = "either"
@@ -1122,6 +1138,10 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "quic-lite"
+version = "0.1.0"
 
 [[package]]
 name = "quote"

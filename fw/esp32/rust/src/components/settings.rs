@@ -144,13 +144,15 @@ impl Settings {
                 // UDP object-store receive window in packets.  Keep this
                 // short because ESP-IDF NVS keys are limited to 15 bytes.
                 "udp.win",
-                "recovery.ssid",
-                "recovery.server",
-                "recovery.ip",
-                "recovery.gw",
-                "recovery.mask",
-                "recovery.port",
-                "recovery.dry",
+                // Shared Recovery/Main STA and transport profile. The keys
+                // are defined by dmesh-fw-transport and deliberately do not
+                // have Recovery-specific compatibility aliases.
+                "ssid",
+                "server",
+                "ip",
+                "gw",
+                "mask",
+                "port",
             ],
         }
     }
@@ -225,6 +227,31 @@ impl Settings {
 
     pub fn set_bool(&mut self, key: &str, value: bool) -> Result<()> {
         self.set_str(key, if value { "true" } else { "false" })
+    }
+}
+
+// Main uses the same bounded transport-profile contract as no-std Recovery.
+// EspDefaultNvs commits each set operation; `commit` is therefore a no-op at
+// this adapter boundary rather than a second, divergent persistence path.
+impl dmesh_fw_transport::TransportSettings for Settings {
+    fn get_text(&mut self, key: &str, output: &mut [u8]) -> Option<usize> {
+        let value = self.get_str(key).ok().flatten()?;
+        let bytes = value.as_bytes();
+        if bytes.len() > output.len() {
+            return None;
+        }
+        output[..bytes.len()].copy_from_slice(bytes);
+        Some(bytes.len())
+    }
+
+    fn set_text(&mut self, key: &str, value: &[u8]) -> bool {
+        core::str::from_utf8(value)
+            .ok()
+            .is_some_and(|value| self.set_str(key, value).is_ok())
+    }
+
+    fn commit(&mut self) -> bool {
+        true
     }
 }
 

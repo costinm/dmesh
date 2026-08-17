@@ -444,35 +444,19 @@ pub fn take_companion_active_changed() -> bool {
 }
 
 pub fn poll_text_commands(registry: &mut CommandRegistry) {
+    let _ = registry;
     poll_raw_nan_rendezvous();
     poll_companion_advertising();
     if BLE_COMPANION_SAVE_PENDING.swap(false, Ordering::Relaxed) {
-        let peer = paired_addr_string();
-        let mut command = CommandRequest::new_binary(42);
-        command.args.insert(97, "true".to_string());
-        command.args.insert(78, "true".to_string());
-        command.args.insert(98, peer);
-        let response = registry.dispatch(&command);
-        let line = format!(
-            "event type=ble.companion save=true response={}",
-            crate::commands::protocol::escape_value(&response.message)
-        );
-        telemetry::record_log(line.clone());
-        telemetry::emit_console(&line);
-        let mut command = CommandRequest::new_binary(49);
-        command.args.insert(97, "true".to_string());
-        command.args.insert(78, "true".to_string());
-        let response = registry.dispatch(&command);
-        let line = format!(
-            "event type=ble.companion mode=companion response={}",
-            crate::commands::protocol::escape_value(&response.message)
-        );
-        telemetry::record_log(line.clone());
-        telemetry::emit_console(&line);
+        telemetry::record_log("event type=ble.companion save_deferred=true");
     }
     if BLE_PENDING_NOTIFY.load(Ordering::Relaxed) && companion_link_ready() {
         notify_companion_pending();
     }
+    // GATT and CoC payloads are bearer traffic, not direct commands.  Their
+    // QUIC-lite attachment is added with the shared transport runtime; drop
+    // queued legacy records until then rather than dispatching them through a
+    // separate registry or response encoder.
     for _ in 0..4 {
         let command = {
             let mut queue = ble_command_queue().lock().unwrap();
@@ -484,16 +468,13 @@ pub fn poll_text_commands(registry: &mut CommandRegistry) {
         if command.data.is_empty() {
             continue;
         }
-        let response = match command.transport {
-            BleTransport::Gatt => {
-                crate::transports::dispatch_binary_packet(registry, &command.data)
+        telemetry::record_log(format!(
+            "event type=ble.legacy_record dropped=true bearer={}",
+            match command.transport {
+                BleTransport::Gatt => "gatt",
+                BleTransport::Coc => "coc",
             }
-            BleTransport::Coc => crate::transports::dispatch_coc_packet(registry, &command.data),
-        };
-        match command.transport {
-            BleTransport::Gatt => send_gatt(&response),
-            BleTransport::Coc => send_coc(&response),
-        }
+        ));
     }
 }
 

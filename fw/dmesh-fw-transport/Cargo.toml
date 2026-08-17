@@ -1,0 +1,24 @@
+[package]
+name = "dmesh-fw-transport"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Firmware crates are built with their ESP-IDF SDK workspaces. Keeping this
+# crate standalone prevents host-only dependencies from entering the root
+# workspace while allowing Recovery and Main to share it directly.
+[workspace]
+
+[lib]
+name = "dmesh_fw_transport"
+path = "src/lib.rs"
+
+[features]
+default = []
+esp-idf = ["dep:esp-idf-sys", "dep:uart-codec"]
+
+[dependencies]
+quic-lite = { path = "../../crates/quic-lite" }
+dmesh-server = { path = "../../crates/dmesh-server", default-features = false }
+uart-codec = { path = "../../crates/uart-codec", optional = true }
+esp-idf-sys = { version = "0.37", default-features = false, features = ["alloc_handler"], optional = true }

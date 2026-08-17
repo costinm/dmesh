@@ -2,8 +2,8 @@ use std::ffi::{c_char, c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use esp_idf_sys as sys;
+use minicbor::{data::Tag, Encoder};
 use uart_codec::codec::{encode_payload, Decoder as UartParser};
-use minicbor::{Encoder, data::Tag};
 
 use super::settings::SharedSettings;
 
@@ -84,9 +84,9 @@ static UART0_HEARTBEAT_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
 
 const UART_FRAME_QUEUE_LEN: u32 = 8;
-// UART carries compact CBOR directly. The generic mesh stream envelope belongs
-// to lmesh UDS clients, not to the byte-oriented physical serial link.
-const UART_MAX_BODY: usize = crate::commands::protocol::CBOR_MAX_RECORD;
+// UART is a bearer with the same packet MTU as UDP. Larger application values
+// are stream data and must be segmented by quic-lite, never by this PPP layer.
+const UART_MAX_BODY: usize = dmesh_fw_transport::TRANSPORT_MTU + 1;
 const UART_TX_QUEUE_LEN: u32 = 16;
 // Keep every driver write below the hardware FIFO capacity. The task waits
 // for idle before each chunk, so ESP-IDF never enables its TX-empty ISR.
@@ -231,9 +231,8 @@ fn nan_sleepy_start_payload() -> Vec<u8> {
     let nan_beacons = super::nan::nan_beacon_snapshot().count;
     let cluster_reselects = super::nan::nan_cluster_reselects();
     let lora_delta = lora_rx.saturating_sub(LAST_WAKE_LORA_RX.swap(lora_rx, Ordering::AcqRel));
-    let nan_delta = nan_beacons.saturating_sub(
-        LAST_WAKE_NAN_BEACON_RX.swap(nan_beacons, Ordering::AcqRel),
-    );
+    let nan_delta =
+        nan_beacons.saturating_sub(LAST_WAKE_NAN_BEACON_RX.swap(nan_beacons, Ordering::AcqRel));
     let cluster_changed = cluster_reselects
         != LAST_WAKE_NAN_CLUSTER_RESELECTS.swap(cluster_reselects, Ordering::AcqRel);
     let mut flags = NAN_SLEEPY_START_FLAGS;
@@ -251,15 +250,29 @@ fn nan_sleepy_start_payload() -> Vec<u8> {
     let field_count = usize::from(flags != 0) + optional_count;
     let mut payload = Vec::with_capacity(3 + field_count * 3);
     let mut encoder = Encoder::new(&mut payload);
-    encoder.tag(Tag::new(NAN_SLEEPY_START_TAG)).expect("CBOR tag");
+    encoder
+        .tag(Tag::new(NAN_SLEEPY_START_TAG))
+        .expect("CBOR tag");
     encoder.map(field_count as u64).expect("CBOR map");
     if flags != 0 {
-        encoder.u8(0).expect("CBOR flags").u16(flags).expect("CBOR flags value");
+        encoder
+            .u8(0)
+            .expect("CBOR flags")
+            .u16(flags)
+            .expect("CBOR flags value");
         if lora_delta != 0 {
-            encoder.u8(1).expect("CBOR lora key").u32(lora_delta).expect("CBOR lora delta");
+            encoder
+                .u8(1)
+                .expect("CBOR lora key")
+                .u32(lora_delta)
+                .expect("CBOR lora delta");
         }
         if nan_delta != 0 {
-            encoder.u8(2).expect("CBOR NAN key").u32(nan_delta).expect("CBOR NAN delta");
+            encoder
+                .u8(2)
+                .expect("CBOR NAN key")
+                .u32(nan_delta)
+                .expect("CBOR NAN delta");
         }
     }
     payload
@@ -472,19 +485,19 @@ pub fn poll_output_probe() {
     let attempt = UART0_OUTPUT_PROBE_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
     if is_active() {
         UART0_OUTPUT_PROBE_SENT.fetch_add(1, Ordering::Relaxed);
-        write_packet(&crate::transports::encode_log_notification(&format!(
+        super::telemetry::record_log(format!(
             "event type=uart.output_probe n={} sent=true",
             attempt
-        )));
+        ));
     } else {
         UART0_OUTPUT_PROBE_DROPPED.fetch_add(1, Ordering::Relaxed);
         // Keep this on the normal write path so uart_tx_drop_idle confirms the
         // output gate, while the dedicated counter distinguishes this test
         // from expected background notification drops.
-        write_packet(&crate::transports::encode_log_notification(&format!(
+        super::telemetry::record_log(format!(
             "event type=uart.output_probe n={} sent=false",
             attempt
-        )));
+        ));
     }
 }
 
@@ -641,6 +654,34 @@ pub fn write_packet(stream_frame: &[u8]) -> bool {
         return false;
     }
     write_wire_bytes(&encode_payload(&body[4..], UART_MAX_BODY).expect("valid UART payload"))
+}
+
+/// Emit one opaque QUIC-lite datagram over the UART PPP L2 bearer. Command
+/// encoding is deliberately above this adapter.
+pub fn write_transport_packet(packet: &[u8]) -> bool {
+    let mut payload = [0u8; UART_MAX_BODY];
+    let Some(used) = dmesh_fw_transport::encode_uart_transport_payload(packet, &mut payload) else {
+        return false;
+    };
+    let Ok(wire) = encode_payload(&payload[..used], UART_MAX_BODY) else {
+        return false;
+    };
+    write_wire_bytes(&wire)
+}
+
+/// Emit a bounded direct-CBOR exception record through Main's sole UART
+/// writer.  This is intentionally limited to bootstrap/boot identity paths;
+/// normal operations must use QUIC-lite streams.
+pub fn write_direct_record(record: &[u8]) -> bool {
+    if record.is_empty() || record.len() > UART_MAX_BODY {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let Ok(wire) = encode_payload(record, UART_MAX_BODY) else {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    write_wire_bytes(&wire)
 }
 
 fn ensure_power_locks() -> bool {
@@ -915,10 +956,7 @@ unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
         let len = queued.len as usize;
         #[cfg(target_arch = "riscv32")]
         {
-            let written = dmesh_usb_serial_write(
-                queued.data.as_ptr().cast::<c_void>(),
-                len as u32,
-            );
+            let written = dmesh_usb_serial_write(queued.data.as_ptr().cast::<c_void>(), len as u32);
             if written != len as i32 {
                 UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
             }
@@ -992,13 +1030,10 @@ mod tests {
     }
 
     #[test]
-    fn binary_uart_accepts_maximum_cbor_record() {
+    fn binary_uart_accepts_transport_mtu_record() {
         let mut parser = new_uart_parser();
-        let input = framed(&vec![0_u8; crate::commands::protocol::CBOR_MAX_RECORD]);
-        assert_eq!(
-            parser.push(&input).unwrap()[0].len(),
-            crate::commands::protocol::CBOR_MAX_RECORD
-        );
+        let input = framed(&vec![0_u8; UART_MAX_BODY]);
+        assert_eq!(parser.push(&input).unwrap()[0].len(), UART_MAX_BODY);
     }
 
     #[test]

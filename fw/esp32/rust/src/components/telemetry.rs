@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
+use quic_lite::framed_stream::{FramedStream, FramedStreamEnqueue, FramedStreamStats};
 
 use crate::commands::protocol::quote_text_value;
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -18,6 +19,10 @@ const MAX_DEPTH: usize = 64;
 const MAX_COMPANION_DEPTH: usize = 64;
 const PREVIEW_BYTES: usize = 96;
 const LORA_WAKE_EVENT_INTERVAL_MS: u32 = 1_000;
+/// Producer-side log buffering is intentionally small.  It is a lossy
+/// diagnostic stream, never a work queue for a FreeRTOS task.
+const LOG_STREAM_RECORDS: usize = 8;
+const LOG_STREAM_RECORD_BYTES: usize = 512;
 
 static LAST_LORA_WAKE_EVENT_MS: AtomicU32 = AtomicU32::new(0);
 
@@ -144,6 +149,30 @@ static UART_INGRESS_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART_INGRESS_OVERSIZE: AtomicU32 = AtomicU32::new(0);
 static MAIN_RAW_POLL_COUNTER: AtomicU32 = AtomicU32::new(0);
 static MAIN_RAW_COMMAND_COUNTER: AtomicU32 = AtomicU32::new(0);
+static LOG_STREAM_DROPPED_UNAVAILABLE: AtomicU32 = AtomicU32::new(0);
+static LOG_STREAM_DROPPED_BUSY: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogStreamWriteResult {
+    Queued(FramedStreamStats),
+    DroppedFull(FramedStreamStats),
+    DroppedOversized(FramedStreamStats),
+    /// Startup has not installed the fixed log queue yet.
+    DroppedUnavailable,
+    /// A transport drain holds the queue. Producers must drop rather than
+    /// wait for it, including from timing-sensitive firmware tasks.
+    DroppedBusy,
+}
+
+/// Aggregate producer-side state.  This is available independently of a
+/// watcher or bearer so status can report that logging was intentionally
+/// lossy under backpressure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogStreamProducerStats {
+    pub queue: Option<FramedStreamStats>,
+    pub dropped_unavailable: u32,
+    pub dropped_busy: u32,
+}
 
 struct TelemetryCommand {
     name: &'static str,
@@ -289,14 +318,82 @@ impl TelemetryCommand {
     }
 }
 
-pub fn record_log(line: impl Into<String>) {
+/// Install the fixed record queue before enabling normal firmware logging.
+/// This performs no connection or bearer work, and is safe to call repeatedly.
+pub fn initialize_log_stream() {
+    let _ = log_stream_slot().set(Mutex::new(FramedStream::new()));
+}
+
+/// Queue one trace/log/event record without waiting for QUIC credit, a
+/// connected watcher, or a contended transport lock. The caller gets an
+/// immediate result; normal logging deliberately drops on every failure mode.
+pub fn record_log(line: impl AsRef<str>) -> LogStreamWriteResult {
+    let line = bounded_log_line(line.as_ref());
+    let record = format!("log ts={} {line}", format_ts(now_ms()));
+    let stream_result = enqueue_log_stream(record.as_bytes(), now_us());
     if let Ok(mut state) = telemetry().try_lock() {
-        push_bounded(
-            &mut state.logs,
-            format!("log ts={} {}", format_ts(now_ms()), line.into()),
-            MAX_DEPTH,
-        );
+        push_bounded(&mut state.logs, record, MAX_DEPTH);
     }
+    stream_result
+}
+
+/// Consume one complete queued record from the log stream. The transport
+/// owner calls this from its normal poll loop; it must not be called by a log
+/// producer. A future watcher maps each returned record to one STREAM frame.
+pub fn take_log_stream_record(
+) -> Option<quic_lite::framed_stream::FramedStreamRecord<LOG_STREAM_RECORD_BYTES>> {
+    log_stream_slot().get()?.try_lock().ok()?.pop()
+}
+
+pub fn log_stream_producer_stats() -> LogStreamProducerStats {
+    let queue = log_stream_slot()
+        .get()
+        .and_then(|stream| stream.try_lock().ok().map(|stream| stream.stats()));
+    LogStreamProducerStats {
+        queue,
+        dropped_unavailable: LOG_STREAM_DROPPED_UNAVAILABLE.load(Ordering::Relaxed),
+        dropped_busy: LOG_STREAM_DROPPED_BUSY.load(Ordering::Relaxed),
+    }
+}
+
+fn log_stream_slot(
+) -> &'static OnceLock<Mutex<FramedStream<LOG_STREAM_RECORDS, LOG_STREAM_RECORD_BYTES>>> {
+    static LOG_STREAM: OnceLock<Mutex<FramedStream<LOG_STREAM_RECORDS, LOG_STREAM_RECORD_BYTES>>> =
+        OnceLock::new();
+    &LOG_STREAM
+}
+
+fn enqueue_log_stream(bytes: &[u8], now_us: u64) -> LogStreamWriteResult {
+    let Some(stream) = log_stream_slot().get() else {
+        LOG_STREAM_DROPPED_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+        return LogStreamWriteResult::DroppedUnavailable;
+    };
+    let Ok(mut stream) = stream.try_lock() else {
+        LOG_STREAM_DROPPED_BUSY.fetch_add(1, Ordering::Relaxed);
+        return LogStreamWriteResult::DroppedBusy;
+    };
+    let outcome = stream.try_enqueue(bytes, now_us);
+    let stats = stream.stats();
+    match outcome {
+        FramedStreamEnqueue::Queued => LogStreamWriteResult::Queued(stats),
+        FramedStreamEnqueue::DroppedFull => LogStreamWriteResult::DroppedFull(stats),
+        FramedStreamEnqueue::DroppedOversized => LogStreamWriteResult::DroppedOversized(stats),
+    }
+}
+
+fn bounded_log_line(line: &str) -> &str {
+    // Timestamp and prefix consume a small, bounded portion of the 512-byte
+    // stream record. Trim only at a UTF-8 boundary so a malformed trace never
+    // causes another allocation while being dropped/recorded.
+    const MAX_LINE_BYTES: usize = LOG_STREAM_RECORD_BYTES - 64;
+    if line.len() <= MAX_LINE_BYTES {
+        return line;
+    }
+    let mut end = MAX_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 pub fn record_packet(
@@ -906,8 +1003,10 @@ fn companion_ack_text(seq: u64, hash: u32) -> String {
 }
 
 pub fn emit_console(line: &str) {
-    super::serial::write_packet(&crate::transports::encode_log_notification(line));
-    super::wifi::forward_console_notification(line);
+    // Log delivery is a stream service.  Do not recreate the retired UART or
+    // raw-Wi-Fi command packet encoders here; the shared transport attachment
+    // will drain this bounded telemetry history for log-watch subscribers.
+    record_log(line.to_owned());
 }
 
 fn reset() {
@@ -1062,6 +1161,10 @@ fn hex_char(nibble: u8) -> char {
 
 fn now_ms() -> i64 {
     unsafe { esp_idf_sys::esp_timer_get_time() / 1000 }
+}
+
+fn now_us() -> u64 {
+    unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 }
 }
 
 fn format_ts(ms: i64) -> String {

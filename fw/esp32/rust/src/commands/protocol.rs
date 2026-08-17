@@ -67,15 +67,18 @@ fn network_address_text(tag: u16, bytes: &[u8]) -> Option<String> {
         return None;
     }
     let address = match bytes.len() {
-        4 => IpAddr::V4(std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+        4 => IpAddr::V4(std::net::Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        )),
         16 => IpAddr::V6(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?)),
         _ => return None,
     };
     Some(address.to_string())
 }
 
-/// Firmware-local command identifiers. These are two-byte CBOR values and are
-/// documented in `crates/lmesh/ESP_FIRMWARE_API.md`.
+/// Retired firmware-local command identifiers.  New operations are registered
+/// as stream handlers; this mapping remains only while component-local CBOR
+/// utilities are split from the old registry.
 pub fn command_id(name: &str) -> Option<u16> {
     Some(match name {
         "status" => 33,
@@ -493,20 +496,8 @@ pub fn arg_tag(name: &str) -> Option<u16> {
         "bench_send" => 260,
         "bench_reset" => 261,
         "delay_us" => 262,
-        "udp_hello" => 263,
-        "udp_hello_status" => 264,
-        "udp_dry_run" => 265,
-        "udp_dry_run_status" => 266,
-        "udp_status_probe" => 267,
-        "udp_status_probe_status" => 268,
-        "udp_status_server" => 269,
-        "udp_status_server_status" => 270,
-        "verify_sha" => 271,
-        // UDP object-transfer mode: receive/verify only when false, or
-        // commit the received image when true.  This is deliberately a
-        // typed command field so the managed flash helper and the text
-        // command path use the same wire representation.
-        "write_flash" => 273,
+        // 263..273 were the retired raw-UDP/DRS2 command fields. Object
+        // transfers now use dmesh-server records on QUIC-lite streams.
         // Stream-transport session selector. Keep this typed field stable so
         // remote two-connection diagnostics can select a local CID without
         // falling back to positional text arguments.
@@ -531,9 +522,7 @@ pub fn encode_binary(request: &CommandRequest) -> Vec<u8> {
         + request
             .binary_args
             .keys()
-            .filter(|&&k| {
-                k != CBOR_STATUS && k != CBOR_ERROR && !request.args.contains_key(&k)
-            })
+            .filter(|&&k| k != CBOR_STATUS && k != CBOR_ERROR && !request.args.contains_key(&k))
             .count()
         + usize::from(!request.payload.is_empty());
 
@@ -798,51 +787,24 @@ mod tests {
     }
 
     #[test]
-    fn nan_transport_request_decodes_cid_selector() {
+    fn dry_run_is_a_typed_boolean_payload_field() {
+        assert_eq!(arg_tag("dry_run"), Some(257));
         let mut bytes = Vec::new();
         Encoder::new(&mut bytes)
             .map(2)
             .unwrap()
             .u16(0)
             .unwrap()
-            .str("nan")
+            .str("recovery")
             .unwrap()
             .u16(6)
             .unwrap()
-            .map(4)
+            .map(1)
             .unwrap()
-            .str("transport")
+            .str("dry_run")
             .unwrap()
-            .str("request")
-            .unwrap()
-            .str("peer")
-            .unwrap()
-            .str("840d8e074170")
-            .unwrap()
-            .str("cid")
-            .unwrap()
-            .str("1281")
-            .unwrap()
-            .str("service")
-            .unwrap()
-            .str("metrics")
+            .bool(true)
             .unwrap();
-        let request = decode_binary(&bytes).unwrap();
-        assert_eq!(request.arg("transport"), Some("request"));
-        assert_eq!(request.arg("peer"), Some("840d8e074170"));
-        assert_eq!(request.arg("cid"), Some("1281"));
-        assert_eq!(request.arg("service"), Some("metrics"));
-    }
-
-    #[test]
-    fn dry_run_is_a_typed_boolean_payload_field() {
-        assert_eq!(arg_tag("dry_run"), Some(257));
-        let mut bytes = Vec::new();
-        Encoder::new(&mut bytes)
-            .map(2).unwrap()
-            .u16(0).unwrap().str("recovery").unwrap()
-            .u16(6).unwrap()
-            .map(1).unwrap().str("dry_run").unwrap().bool(true).unwrap();
         let request = decode_binary(&bytes).unwrap();
         assert_eq!(request.arg("dry_run"), Some("true"));
     }
@@ -851,10 +813,20 @@ mod tests {
     fn text_payload_data_is_decoded_as_hex_bytes() {
         let mut bytes = Vec::new();
         Encoder::new(&mut bytes)
-            .map(2).unwrap()
-            .u16(0).unwrap().str("lorasend").unwrap()
-            .u16(6).unwrap()
-            .map(1).unwrap().str("data").unwrap().str("hex:00ff10").unwrap();
+            .map(2)
+            .unwrap()
+            .u16(0)
+            .unwrap()
+            .str("lorasend")
+            .unwrap()
+            .u16(6)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("data")
+            .unwrap()
+            .str("hex:00ff10")
+            .unwrap();
         let request = decode_binary(&bytes).unwrap();
         assert_eq!(request.payload, vec![0x00, 0xff, 0x10]);
     }
@@ -863,8 +835,8 @@ mod tests {
     fn indefinite_command_and_payload_maps_are_stream_decoded() {
         // {0: "mode", 6: {80: "1000"}} using indefinite maps.
         let bytes = vec![
-            0xbf, 0x00, 0x64, b'm', b'o', b'd', b'e', 0x06, 0xbf, 0x18, 0x50, 0x64, b'1',
-            b'0', b'0', b'0', 0xff, 0xff,
+            0xbf, 0x00, 0x64, b'm', b'o', b'd', b'e', 0x06, 0xbf, 0x18, 0x50, 0x64, b'1', b'0',
+            b'0', b'0', 0xff, 0xff,
         ];
         let request = decode_binary(&bytes).unwrap();
         assert_eq!(request.name, "mode");
@@ -896,7 +868,10 @@ mod tests {
         let request = decode_binary(&bytes).unwrap();
         assert_eq!(request.arg("ip"), Some("10.78.0.200"));
         assert_eq!(request.arg_bytes("ip"), Some(&[10, 78, 0, 200][..]));
-        assert_eq!(request.arg_bytes("gw"), Some(&[0x20, 0x01, 0xdb, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..]));
+        assert_eq!(
+            request.arg_bytes("gw"),
+            Some(&[0x20, 0x01, 0xdb, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..])
+        );
         let encoded = encode_binary(&request);
         assert!(encoded
             .windows(7)

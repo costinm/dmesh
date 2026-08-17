@@ -1,3 +1,6 @@
+// IMPORTANT: This is shared no-std ESP firmware code. Record framing and
+// object validation belong in dmesh-server; this file owns ESP partition I/O,
+// flash-worker scheduling, and real firmware receive-credit release.
 //! Application stream handler for Main flashing.
 //!
 //! `wifi.rs` owns the socket/bearer adapter and passes opaque transport output
@@ -11,18 +14,17 @@ use alloc::{
     vec::Vec,
 };
 use core::ffi::c_void;
-use dmesh_object_store::protocol::{
+use dmesh_server::protocol::{verified_object_record_credit, ObjectRecordCredit};
+use dmesh_server::protocol::{
     FixedRecordDecoder, ImageEvent, ImageReceiver, ImageSink, RecordEvents, BLOCK_SIZE,
     RECORD_BLOB, RECORD_DONE, RECORD_MANIFEST,
 };
-use dmesh_transport::{
+use quic_lite::{
     callback::{CallbackStreams, CopyingError, CopyingStreamEvents},
     StreamFrame,
 };
 
 pub(crate) const OBJECT_STREAM: u64 = 3;
-const RTC_HANDOFF_MAIN: u8 = 2;
-const RTC_HANDOFF_OFFSET: usize = 12 + 5;
 // A 4 MiB image has at most 1024 blocks; its canonical CBOR digest table is
 // below 48 KiB. This allocation is bounded and made once per transfer.
 const MAX_MANIFEST_BYTES: usize = 48 * 1024;
@@ -43,38 +45,8 @@ const BLOCK_RECORD_OVERHEAD: usize = 5 + 12;
 // The peer can therefore be flow-credit blocked just below the byte limit
 // when the remaining credit cannot fit another complete blob record.
 const BOOTSTRAP_ERASE_READY_BYTES: usize =
-    dmesh_transport::RECOVERY_INITIAL_MAX_DATA as usize - (BLOCK_RECORD_OVERHEAD + BLOCK_SIZE);
+    quic_lite::RECOVERY_INITIAL_MAX_DATA as usize - (BLOCK_RECORD_OVERHEAD + BLOCK_SIZE);
 type RecoveryRecordDecoder = FixedRecordDecoder<MAX_MANIFEST_BYTES, MAX_BLOB_RECORD_BYTES>;
-
-/// ESP-IDF's mbedTLS SHA-256 alternate implementation uses the ESP SHA
-/// hardware on this target. Keeping it here, rather than in object-store,
-/// leaves the record protocol portable and makes hardware use explicit.
-fn sha256_native(bytes: &[u8]) -> Option<[u8; 32]> {
-    let mut digest = [0u8; 32];
-    let result =
-        unsafe { esp_idf_sys::mbedtls_sha256(bytes.as_ptr(), bytes.len(), digest.as_mut_ptr(), 0) };
-    (result == 0).then_some(digest)
-}
-
-// boot_health_rtc.h uses SOC_RTC_DRAM_HIGH - DMESH_RTC_RETAIN_RAW_SIZE
-// for this target because ESP_ROM_HAS_LP_ROM is not defined for the C6 SDK.
-#[cfg(target_arch = "riscv32")]
-const RTC_RETAIN_BASE: usize = 0x5000_4000 - 56;
-#[cfg(not(target_arch = "riscv32"))]
-const RTC_RETAIN_BASE: usize = 0x3ff8_0000;
-
-/// Store the one-shot Stage2 Main-selection marker and return the value read
-/// back from the same retained byte.  Callers log that aggregate value before
-/// reset so a failed boot handoff is distinguishable from a failed transfer.
-pub(crate) fn set_main_handoff() -> u8 {
-    unsafe {
-        core::ptr::write_volatile(
-            (RTC_RETAIN_BASE + RTC_HANDOFF_OFFSET) as *mut u8,
-            RTC_HANDOFF_MAIN,
-        );
-        core::ptr::read_volatile((RTC_RETAIN_BASE + RTC_HANDOFF_OFFSET) as *const u8)
-    }
-}
 
 struct RecoveryRecordSink<'a> {
     receiver: &'a mut ImageReceiver<MainSink>,
@@ -90,18 +62,20 @@ impl RecordEvents for RecoveryRecordSink<'_> {
     fn record(&mut self, kind: u8, payload: &[u8]) -> Result<(), Self::Error> {
         if kind == RECORD_MANIFEST {
             if *self.manifest_ok || self.receiver.on_manifest(payload).is_err() {
-                crate::uart::send_response(b"udp manifest rejected");
+                crate::commands::send_response(b"udp manifest rejected");
                 return Err(());
             }
             // The verified manifest remains in ImageReceiver's one bounded
             // allocation for the rest of this transfer.  It does not consume
             // one of the reusable flash slots, so returning its stream
             // credit cannot make the sender outrun a dynamic buffer.
-            self.receiver
-                .sink_mut()
-                .release_record_credit(payload.len().saturating_add(5));
+            if let Some(ObjectRecordCredit::Immediate(credit)) =
+                verified_object_record_credit(kind, payload.len(), self.benchmark)
+            {
+                self.receiver.sink_mut().release_record_credit(credit);
+            }
             if !self.benchmark {
-                crate::uart::send_response(b"udp manifest accepted");
+                crate::commands::send_response(b"udp manifest accepted");
             }
             *self.manifest_ok = true;
             return Ok(());
@@ -115,17 +89,20 @@ impl RecordEvents for RecoveryRecordSink<'_> {
             // scheduler tick; even one record per sixteen blocks repeatedly
             // stalls the receive/ACK path. Completion counters are reported
             // in the final compact numeric record instead.
-            if let Err(error) = self.receiver.on_block_with_hasher(payload, sha256_native) {
-                crate::uart::send_response(match error {
-                    dmesh_object_store::protocol::ImageError::Truncated => b"udp block truncated",
-                    dmesh_object_store::protocol::ImageError::InvalidManifest => {
+            if let Err(error) = self
+                .receiver
+                .on_block_with_hasher(payload, crate::crypto_esp::sha256_native)
+            {
+                crate::commands::send_response(match error {
+                    dmesh_server::protocol::ImageError::Truncated => b"udp block truncated",
+                    dmesh_server::protocol::ImageError::InvalidManifest => {
                         b"udp block before manifest"
                     }
-                    dmesh_object_store::protocol::ImageError::InvalidBlock => b"udp block invalid",
-                    dmesh_object_store::protocol::ImageError::InvalidSignature => {
+                    dmesh_server::protocol::ImageError::InvalidBlock => b"udp block invalid",
+                    dmesh_server::protocol::ImageError::InvalidSignature => {
                         b"udp block signature invalid"
                     }
-                    dmesh_object_store::protocol::ImageError::Sink => b"udp flash sink failed",
+                    dmesh_server::protocol::ImageError::Sink => b"udp flash sink failed",
                 });
                 return Err(());
             }
@@ -134,10 +111,10 @@ impl RecordEvents for RecoveryRecordSink<'_> {
             // slot, so its verified record is reusable immediately. Without
             // this, a dry run advances only through the bootstrap window and
             // then correctly—but permanently—hits flow control.
-            if self.benchmark {
-                self.receiver
-                    .sink_mut()
-                    .release_record_credit(payload.len().saturating_add(5));
+            if let Some(ObjectRecordCredit::Immediate(credit)) =
+                verified_object_record_credit(kind, payload.len(), self.benchmark)
+            {
+                self.receiver.sink_mut().release_record_credit(credit);
             }
             return Ok(());
         }
@@ -145,14 +122,18 @@ impl RecordEvents for RecoveryRecordSink<'_> {
             match self.receiver.on_done() {
                 Ok(ImageEvent::Complete) => {
                     if !self.benchmark {
-                        crate::uart::send_response(b"udp done record");
+                        crate::commands::send_response(b"udp done record");
                     }
                     *self.complete = true;
-                    self.receiver.sink_mut().release_record_credit(5);
+                    if let Some(ObjectRecordCredit::Immediate(credit)) =
+                        verified_object_record_credit(kind, payload.len(), self.benchmark)
+                    {
+                        self.receiver.sink_mut().release_record_credit(credit);
+                    }
                     return Ok(());
                 }
                 Err(_) => {
-                    crate::uart::send_response(b"udp image rejected");
+                    crate::commands::send_response(b"udp image rejected");
                     return Err(());
                 }
                 Ok(_) => return Err(()),
@@ -175,7 +156,7 @@ struct RecoveryStreamSink<'a> {
 // ARCHITECTURAL BOUNDARY -- this adapter receives ordered application bytes
 // only. It must never parse or generate datagrams, ACKs, packet numbers,
 // retransmission, flow-control, or duplicate-suppression state. The
-// dmesh-transport callback driver owns all of those transport concerns; this
+// quic-lite callback driver owns all of those transport concerns; this
 // file only consumes its stream callback and reports application bytes used.
 impl CopyingStreamEvents for RecoveryStreamSink<'_> {
     type Error = ();
@@ -378,11 +359,7 @@ unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
         let started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
         let result = match job.kind {
             FLASH_JOB_ERASE => unsafe {
-                esp_idf_sys::esp_partition_erase_range(
-                    job.partition,
-                    0,
-                    job.len,
-                )
+                esp_idf_sys::esp_partition_erase_range(job.partition, 0, job.len)
             },
             FLASH_JOB_WRITE => unsafe {
                 esp_idf_sys::esp_partition_write(
@@ -394,7 +371,8 @@ unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
             },
             _ => esp_idf_sys::ESP_FAIL,
         };
-        let elapsed_us = (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started);
+        let elapsed_us =
+            (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started);
         let completion = FlashCompletion {
             kind: job.kind,
             index: job.index,
@@ -446,7 +424,11 @@ impl MainSink {
                 free_blocks.push(allocate_block()?);
             }
         }
-        let worker = if benchmark { None } else { Some(FlashWorker::new()?) };
+        let worker = if benchmark {
+            None
+        } else {
+            Some(FlashWorker::new()?)
+        };
         Some(Self {
             partition,
             benchmark,
@@ -497,7 +479,11 @@ impl MainSink {
     /// peer cannot inject further stream bytes until this sink returns flow
     /// credit. ESP-IDF yields internally while erasing; Recovery sees only
     /// this single application job.
-    fn start_erase_after_bootstrap(&mut self, stream_bytes: usize, complete: bool) -> Result<(), ()> {
+    fn start_erase_after_bootstrap(
+        &mut self,
+        stream_bytes: usize,
+        complete: bool,
+    ) -> Result<(), ()> {
         if self.benchmark
             || self.erase_started
             || (!complete && stream_bytes < BOOTSTRAP_ERASE_READY_BYTES)
@@ -608,7 +594,8 @@ impl MainSink {
                     }
                     self.write_us = self.write_us.saturating_add(completion.elapsed_us);
                     self.writes = self.writes.saturating_add(1);
-                    self.free_blocks.push(unsafe { Box::from_raw(completion.data) });
+                    self.free_blocks
+                        .push(unsafe { Box::from_raw(completion.data) });
                     self.release_record_credit(completion.credit);
                 }
                 _ => return Err(()),
@@ -629,14 +616,13 @@ impl MainSink {
     fn pending_jobs(&self) -> u64 {
         self.pending_jobs as u64
     }
-
 }
 
 impl ImageSink for MainSink {
     type Error = ();
     fn begin(
         &mut self,
-        manifest: &dmesh_object_store::protocol::ImageManifest,
+        manifest: &dmesh_server::protocol::ImageManifest,
     ) -> Result<(), Self::Error> {
         if manifest.target != 6 || manifest.block_size as usize != BLOCK_SIZE {
             return Err(());
@@ -646,10 +632,7 @@ impl ImageSink for MainSink {
     fn write_block(&mut self, index: u32, data: &[u8]) -> Result<(), Self::Error> {
         self.write_image_block(index, data)
     }
-    fn finish(
-        &mut self,
-        _: &dmesh_object_store::protocol::ImageManifest,
-    ) -> Result<(), Self::Error> {
+    fn finish(&mut self, _: &dmesh_server::protocol::ImageManifest) -> Result<(), Self::Error> {
         // ImageReceiver has checked each block against the authenticated
         // manifest digest before calling this hook. Recovery deliberately does
         // not re-hash the whole image: per-block proofs are its acceptance
@@ -702,7 +685,7 @@ impl FlashHandler {
             // Keep the receiver's retained out-of-order bytes above the
             // advertised host sender window. A loss of the first packet in a
             // full burst must not turn into a callback-capacity failure.
-            ordered: CallbackStreams::new(2, dmesh_transport::RECOVERY_REORDER_CAPACITY_BYTES),
+            ordered: CallbackStreams::new(2, quic_lite::RECOVERY_REORDER_CAPACITY_BYTES),
             // Recovery currently has no configured image-signing public key.
             // ImageReceiver therefore fails closed on a signed manifest;
             // provisioning a key must provide a SignatureVerifier here rather
@@ -749,7 +732,7 @@ impl FlashHandler {
     }
 
     /// Consume one already accepted stream callback. Datagram scheduling,
-    /// transport control, and flow credit remain entirely in dmesh-transport.
+    /// transport control, and flow credit remain entirely in quic-lite.
     pub(crate) fn handle_stream(&mut self, stream: StreamFrame<'_>) -> Result<(bool, usize), ()> {
         if stream.id != OBJECT_STREAM {
             return Ok((false, 0));
@@ -774,21 +757,19 @@ impl FlashHandler {
                 &mut sink,
             );
             if let Err(error) = callback_result {
-                crate::uart::send_response(match error {
+                crate::commands::send_response(match error {
                     CopyingError::Transport(error) => match error {
-                        dmesh_transport::callback::CallbackError::InvalidOverlap => {
+                        quic_lite::callback::CallbackError::InvalidOverlap => {
                             b"udp callback invalid overlap"
                         }
-                        dmesh_transport::callback::CallbackError::InvalidFin => {
+                        quic_lite::callback::CallbackError::InvalidFin => {
                             b"udp callback invalid fin"
                         }
-                        dmesh_transport::callback::CallbackError::InvalidCompletion => {
+                        quic_lite::callback::CallbackError::InvalidCompletion => {
                             b"udp callback invalid completion"
                         }
-                        dmesh_transport::callback::CallbackError::Capacity => {
-                            b"udp callback capacity"
-                        }
-                        dmesh_transport::callback::CallbackError::Reset => b"udp callback reset",
+                        quic_lite::callback::CallbackError::Capacity => b"udp callback capacity",
+                        quic_lite::callback::CallbackError::Reset => b"udp callback reset",
                     },
                     CopyingError::Callback(_) => b"udp callback application failed",
                 });

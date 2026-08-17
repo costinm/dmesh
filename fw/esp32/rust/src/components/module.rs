@@ -18,9 +18,6 @@ const MAX_SERVICE_BYTES: usize = 4096;
 
 static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MODULE_INIT_ONCE: OnceLock<()> = OnceLock::new();
-// TCP flash temporarily owns the IP STA and must quiesce NAN. Other
-// transports (FSK/NAN/future QUIC-like links) retain their radio owner.
-static FLASH_TCP_TRANSPORT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn setting_snapshot() -> &'static Mutex<BTreeMap<String, String>> {
     static SNAPSHOT: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
@@ -79,8 +76,12 @@ extern "C" {
     fn dmesh_module_loader_required_stack_words() -> u32;
     fn dmesh_module_lora_configure(config: *const ModuleLoraConfig) -> i32;
     fn dmesh_module_lora_update_config(config: *const ModuleLoraConfig) -> i32;
-    fn dmesh_module_lora_command(args: *const u8, args_len: usize,
-                                 payload: *const u8, payload_len: usize) -> i32;
+    fn dmesh_module_lora_command(
+        args: *const u8,
+        args_len: usize,
+        payload: *const u8,
+        payload_len: usize,
+    ) -> i32;
     fn dmesh_module_loader_task_done() -> bool;
     fn dmesh_module_loader_last_result() -> i32;
     fn dmesh_module_loader_runtime_ms() -> u32;
@@ -100,10 +101,6 @@ extern "C" {
     fn dmesh_module_loader_entry_args_len() -> u32;
     fn dmesh_module_loader_entry_args() -> *const u8;
     fn dmesh_module_loader_last_lora_command() -> *const u8;
-    fn dmesh_module_loader_flash_connect_attempts() -> u32;
-    fn dmesh_module_loader_flash_connect_errno() -> i32;
-    fn dmesh_module_loader_flash_connect_port() -> u16;
-    fn dmesh_module_loader_flash_connect_host() -> *const u8;
     fn dmesh_module_start_service(
         service_tag: u16,
         offset: u32,
@@ -156,9 +153,7 @@ fn configure_lora(settings: &crate::components::settings::SharedSettings) -> Res
     let config = lora_config_from_settings(settings);
     let rc = unsafe { dmesh_module_lora_configure(&config) };
     if rc != 0 {
-        telemetry::record_log(format!(
-            "event type=lora.module_host ok=false result={rc}"
-        ));
+        telemetry::record_log(format!("event type=lora.module_host ok=false result={rc}"));
         return Err(anyhow!("module LoRa host configuration failed result={rc}"));
     }
     Ok(())
@@ -172,7 +167,13 @@ pub fn refresh_settings_snapshot(settings: &crate::components::settings::SharedS
         settings
             .known_keys()
             .iter()
-            .filter_map(|key| settings.get_str(key).ok().flatten().map(|value| ((*key).to_owned(), value)))
+            .filter_map(|key| {
+                settings
+                    .get_str(key)
+                    .ok()
+                    .flatten()
+                    .map(|value| ((*key).to_owned(), value))
+            })
             .collect::<BTreeMap<_, _>>()
     };
     if let Ok(mut snapshot) = setting_snapshot().lock() {
@@ -211,7 +212,8 @@ fn setting_writes() -> &'static Mutex<VecDeque<SettingWrite>> {
 fn encode_event_cbor(event: &ModuleEvent) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(event.payload.len().saturating_add(16));
     let mut encoder = Encoder::new(&mut encoded);
-    let _ = encoder.array(4)
+    let _ = encoder
+        .array(4)
         .and_then(|encoder| encoder.u16(event.event_id))
         .and_then(|encoder| encoder.u8(event.value_type))
         .and_then(|encoder| encoder.u8(event.flags))
@@ -249,16 +251,28 @@ pub unsafe extern "C" fn dmesh_module_get_setting(
     value_capacity: usize,
     value_len: *mut usize,
 ) -> i32 {
-    let Some(key) = valid_callback_key(key, key_len) else { return -1 };
+    let Some(key) = valid_callback_key(key, key_len) else {
+        return -1;
+    };
     if value_len.is_null() || (value_capacity != 0 && value.is_null()) {
         return -1;
     }
-    let Ok(key) = core::str::from_utf8(key) else { return -1 };
-    let Ok(snapshot) = setting_snapshot().try_lock() else { return -1 };
-    let Some(setting) = snapshot.get(key) else { return -2 };
+    let Ok(key) = core::str::from_utf8(key) else {
+        return -1;
+    };
+    let Ok(snapshot) = setting_snapshot().try_lock() else {
+        return -1;
+    };
+    let Some(setting) = snapshot.get(key) else {
+        return -2;
+    };
     let bytes = setting.as_bytes();
-    if bytes.len() > value_capacity { return -3; }
-    if !bytes.is_empty() { core::ptr::copy_nonoverlapping(bytes.as_ptr(), value, bytes.len()); }
+    if bytes.len() > value_capacity {
+        return -3;
+    }
+    if !bytes.is_empty() {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), value, bytes.len());
+    }
     *value_len = bytes.len();
     0
 }
@@ -270,14 +284,29 @@ pub unsafe extern "C" fn dmesh_module_set_setting(
     value: *const u8,
     value_len: usize,
 ) -> i32 {
-    let Some(key) = valid_callback_key(key, key_len) else { return -1 };
-    if value.is_null() || value_len > 128 { return -1; }
-    let Ok(key) = core::str::from_utf8(key) else { return -1 };
+    let Some(key) = valid_callback_key(key, key_len) else {
+        return -1;
+    };
+    if value.is_null() || value_len > 128 {
+        return -1;
+    }
+    let Ok(key) = core::str::from_utf8(key) else {
+        return -1;
+    };
     let value = core::slice::from_raw_parts(value, value_len);
-    let Ok(value) = core::str::from_utf8(value) else { return -1 };
-    let Ok(mut writes) = setting_writes().try_lock() else { return -1 };
-    if writes.len() >= 16 { return -2; }
-    writes.push_back(SettingWrite { key: key.to_owned(), value: value.to_owned() });
+    let Ok(value) = core::str::from_utf8(value) else {
+        return -1;
+    };
+    let Ok(mut writes) = setting_writes().try_lock() else {
+        return -1;
+    };
+    if writes.len() >= 16 {
+        return -2;
+    }
+    writes.push_back(SettingWrite {
+        key: key.to_owned(),
+        value: value.to_owned(),
+    });
     0
 }
 
@@ -297,18 +326,31 @@ pub unsafe extern "C" fn dmesh_module_emit_event(
     } else {
         core::slice::from_raw_parts(payload, payload_len).to_vec()
     };
-    let Ok(mut events) = module_events().try_lock() else { return -1 };
-    if events.len() >= MAX_SERVICE_CALLS { return -2; }
+    let Ok(mut events) = module_events().try_lock() else {
+        return -1;
+    };
+    if events.len() >= MAX_SERVICE_CALLS {
+        return -2;
+    }
     if value_type == 1 || value_type == 2 {
-        if payload_len != 8 { return -1; }
+        if payload_len != 8 {
+            return -1;
+        }
     } else if value_type > 5 {
         return -1;
     }
-    events.push_back(ModuleEvent { event_id, value_type, flags, payload });
+    events.push_back(ModuleEvent {
+        event_id,
+        value_type,
+        flags,
+        payload,
+    });
     0
 }
 
-fn lora_config_from_settings(settings: &crate::components::settings::SharedSettings) -> ModuleLoraConfig {
+fn lora_config_from_settings(
+    settings: &crate::components::settings::SharedSettings,
+) -> ModuleLoraConfig {
     let s = settings.borrow();
     let chip = s.get_str("lora.chip").ok().flatten();
     let sx126 = chip.as_deref().map(|v| v.contains("126")).unwrap_or(false);
@@ -316,24 +358,42 @@ fn lora_config_from_settings(settings: &crate::components::settings::SharedSetti
         abi_version: 2,
         size: std::mem::size_of::<ModuleLoraConfig>() as u32,
         chip: if sx126 { 2 } else { 1 },
-        frequency_hz: s.get_i32("lora.freq", 913_125_000i32).unwrap_or(913_125_000) as u32,
+        frequency_hz: s
+            .get_i32("lora.freq", 913_125_000i32)
+            .unwrap_or(913_125_000) as u32,
         bandwidth_hz: s.get_i32("lora.bw", 250_000).unwrap_or(250_000) as u32,
         spreading_factor: s.get_i32("lora.sf", 10).unwrap_or(10) as u32,
         spi_host: s.get_i32("lora.spi_host", 2).unwrap_or(2),
         sync_word: s.get_i32("lora.sync_word", 0x2b).unwrap_or(0x2b) as u8,
         tx_power: s.get_i32("lora.tx_power", 17).unwrap_or(17) as u8,
-        reset_pin: s.get_i32("lora.rst", if sx126 { 12 } else { 14 })
+        reset_pin: s
+            .get_i32("lora.rst", if sx126 { 12 } else { 14 })
             .unwrap_or(if sx126 { 12 } else { 14 }) as i8,
-        cs_pin: s.get_i32("lora.cs", if sx126 { 8 } else { 18 }).unwrap_or(if sx126 { 8 } else { 18 }) as i8,
-        irq_pin: s.get_i32("lora.dio0", if sx126 { 14 } else { 26 }).unwrap_or(if sx126 { 14 } else { 26 }) as i8,
-        busy_pin: s.get_i32("lora.busy", if sx126 { 13 } else { -1 })
+        cs_pin: s
+            .get_i32("lora.cs", if sx126 { 8 } else { 18 })
+            .unwrap_or(if sx126 { 8 } else { 18 }) as i8,
+        irq_pin: s
+            .get_i32("lora.dio0", if sx126 { 14 } else { 26 })
+            .unwrap_or(if sx126 { 14 } else { 26 }) as i8,
+        busy_pin: s
+            .get_i32("lora.busy", if sx126 { 13 } else { -1 })
             .unwrap_or(if sx126 { 13 } else { -1 }) as i8,
-        sck_pin: s.get_i32("lora.sck", if sx126 { 9 } else { 5 }).unwrap_or(if sx126 { 9 } else { 5 }) as i8,
-        miso_pin: s.get_i32("lora.miso", if sx126 { 11 } else { 19 }).unwrap_or(if sx126 { 11 } else { 19 }) as i8,
-        mosi_pin: s.get_i32("lora.mosi", if sx126 { 10 } else { 27 }).unwrap_or(if sx126 { 10 } else { 27 }) as i8,
+        sck_pin: s
+            .get_i32("lora.sck", if sx126 { 9 } else { 5 })
+            .unwrap_or(if sx126 { 9 } else { 5 }) as i8,
+        miso_pin: s
+            .get_i32("lora.miso", if sx126 { 11 } else { 19 })
+            .unwrap_or(if sx126 { 11 } else { 19 }) as i8,
+        mosi_pin: s
+            .get_i32("lora.mosi", if sx126 { 10 } else { 27 })
+            .unwrap_or(if sx126 { 10 } else { 27 }) as i8,
         board_power_pin: s.get_i32("lora.pwrpin", -1).unwrap_or(-1),
         board_power_level: s.get_i32("lora.pwrlvl", 1).unwrap_or(1),
-        sx1262_dio2_rf_switch: if s.get_bool("lora.dio2rf", false).unwrap_or(false) { 1 } else { 0 },
+        sx1262_dio2_rf_switch: if s.get_bool("lora.dio2rf", false).unwrap_or(false) {
+            1
+        } else {
+            0
+        },
         sx1262_tcxo_mv: s.get_i32("lora.tcxo_mv", 0).unwrap_or(0),
         sx1262_pa_duty: s.get_i32("lora.pa_duty", 4).unwrap_or(4),
         sx1262_pa_hp: s.get_i32("lora.pa_hp", 7).unwrap_or(7),
@@ -343,8 +403,16 @@ fn lora_config_from_settings(settings: &crate::components::settings::SharedSetti
         sx1262_rx_timeout_ms: s.get_i32("lora.rx_timeout", 0).unwrap_or(0),
         coding_rate: s.get_i32("lora.cr", 5).unwrap_or(5),
         preamble: s.get_i32("lora.preamble", 16).unwrap_or(16),
-        crc: if s.get_bool("lora.crc", true).unwrap_or(true) { 1 } else { 0 },
-        cad_rx: if s.get_bool("lora.cad_rx", false).unwrap_or(false) { 1 } else { 0 },
+        crc: if s.get_bool("lora.crc", true).unwrap_or(true) {
+            1
+        } else {
+            0
+        },
+        cad_rx: if s.get_bool("lora.cad_rx", false).unwrap_or(false) {
+            1
+        } else {
+            0
+        },
         cad_interval_ms: s.get_i32("lora.cad_int", 2000).unwrap_or(2000).max(1) as u32,
         cad_rx_ms: s.get_i32("lora.cad_rxms", 1000).unwrap_or(1000).max(1) as u32,
     }
@@ -354,14 +422,14 @@ fn lora_config_from_settings(settings: &crate::components::settings::SharedSetti
 /// apply them. This deliberately leaves SPI ownership in the loader.
 pub fn refresh_lora_config(settings: &crate::components::settings::SharedSettings) -> Result<()> {
     ensure_initialized(settings);
-    if !unsafe { dmesh_module_loader_is_lora() }
-        || unsafe { dmesh_module_loader_task_done() }
-    {
+    if !unsafe { dmesh_module_loader_is_lora() } || unsafe { dmesh_module_loader_task_done() } {
         return Ok(());
     }
     let config = lora_config_from_settings(settings);
     let rc = unsafe { dmesh_module_lora_update_config(&config) };
-    if rc != 0 { return Err(anyhow!("module lora config update failed result={rc}")); }
+    if rc != 0 {
+        return Err(anyhow!("module lora config update failed result={rc}"));
+    }
     Ok(())
 }
 
@@ -379,28 +447,6 @@ pub fn module_task_done() -> bool {
 
 pub fn module_last_result() -> i32 {
     unsafe { dmesh_module_loader_last_result() }
-}
-
-pub fn poll_flash_transport(settings: &crate::components::settings::SharedSettings) {
-    if !FLASH_TCP_TRANSPORT_ACTIVE.load(Ordering::Acquire)
-        || !unsafe { dmesh_module_loader_task_done() }
-    {
-        return;
-    }
-    if !FLASH_TCP_TRANSPORT_ACTIVE.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    let result = unsafe { dmesh_module_loader_last_result() };
-    telemetry::record_log(format!(
-        "event type=module.flash.transport_complete transport=tcp result={} resume=true",
-        result
-    ));
-    if let Err(error) = crate::components::mode::resume_from_ip_transport(settings) {
-        telemetry::record_log(format!(
-            "event type=module.flash.transport_resume ok=false message={}",
-            crate::commands::protocol::escape_value(&error.to_string())
-        ));
-    }
 }
 
 #[derive(Debug)]
@@ -426,12 +472,17 @@ pub unsafe extern "C" fn dmesh_module_call_service(
     response_len: *mut usize,
     timeout_ms: u32,
 ) -> i32 {
-    if service_tag == 0 || payload_len > MAX_SERVICE_BYTES ||
-        (payload_len != 0 && payload.is_null()) ||
-        (response_capacity != 0 && response.is_null()) || timeout_ms == 0 {
+    if service_tag == 0
+        || payload_len > MAX_SERVICE_BYTES
+        || (payload_len != 0 && payload.is_null())
+        || (response_capacity != 0 && response.is_null())
+        || timeout_ms == 0
+    {
         return -1;
     }
-    if response_len.is_null() { return -1; }
+    if response_len.is_null() {
+        return -1;
+    }
     let payload = if payload_len == 0 {
         Vec::new()
     } else {
@@ -444,7 +495,10 @@ pub unsafe extern "C" fn dmesh_module_call_service(
     if calls.len() >= MAX_SERVICE_CALLS {
         return -2;
     }
-    calls.push_back(ServiceCall { service_tag, payload });
+    calls.push_back(ServiceCall {
+        service_tag,
+        payload,
+    });
     core::ptr::write(response_len, 0);
     0
 }
@@ -455,7 +509,10 @@ pub fn poll_main(
     settings: &crate::components::settings::SharedSettings,
 ) {
     for _ in 0..2 {
-        let write = setting_writes().lock().ok().and_then(|mut queue| queue.pop_front());
+        let write = setting_writes()
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front());
         let Some(write) = write else { break };
         let result = settings.borrow_mut().set_str(&write.key, &write.value);
         let ok = result.is_ok();
@@ -466,16 +523,17 @@ pub fn poll_main(
             .unwrap_or_default();
         telemetry::record_log(format!(
             "event type=module.setting_write key={} ok={}{}",
-            write.key,
-            ok,
-            error
+            write.key, ok, error
         ));
         if ok {
             refresh_settings_snapshot(settings);
         }
     }
     for _ in 0..2 {
-        let event = module_events().lock().ok().and_then(|mut queue| queue.pop_front());
+        let event = module_events()
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front());
         let Some(event) = event else { break };
         let mut request = CommandRequest::new("module")
             .arg_pair("op", "event")
@@ -506,7 +564,8 @@ pub fn poll_main(
             46 => "hello",
             _ => {
                 telemetry::record_log(format!(
-                    "event type=module.service rejected=true tag={}", call.service_tag
+                    "event type=module.service rejected=true tag={}",
+                    call.service_tag
                 ));
                 continue;
             }
@@ -583,7 +642,9 @@ impl CommandHandler for ModuleCommand {
                 // the module. Make status reflect the actual flash slot
                 // instead of exposing the deferred-init sentinel values.
                 ensure_initialized(&self.settings);
-                unsafe { dmesh_module_loader_refresh_header(); }
+                unsafe {
+                    dmesh_module_loader_refresh_header();
+                }
                 Ok(CommandResponse::ok(status_text()))
             }
             "psram" => Ok(CommandResponse::ok(psram_text())),
@@ -594,7 +655,11 @@ impl CommandHandler for ModuleCommand {
             }
             "run" => {
                 ensure_initialized(&self.settings);
-                invoke(&self.settings, request.arg("name").unwrap_or("hello"), request)
+                invoke(
+                    &self.settings,
+                    request.arg("name").unwrap_or("hello"),
+                    request,
+                )
             }
             "lora_rx" => crate::components::lora::handle_module_packet(
                 &request.payload,
@@ -635,16 +700,16 @@ fn status_text() -> String {
     };
     let entry_args = unsafe {
         let ptr = dmesh_module_loader_entry_args();
-        if ptr.is_null() { "".to_string() }
-        else { std::ffi::CStr::from_ptr(ptr.cast()).to_string_lossy().into_owned() }
-    };
-    let flash_connect_host = unsafe {
-        let ptr = dmesh_module_loader_flash_connect_host();
-        if ptr.is_null() { "".to_string() }
-        else { std::ffi::CStr::from_ptr(ptr.cast()).to_string_lossy().into_owned() }
+        if ptr.is_null() {
+            "".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(ptr.cast())
+                .to_string_lossy()
+                .into_owned()
+        }
     };
     format!(
-        "module initialized={} flash_exec={} align=0x{MODULE_ALIGN:x} offset=0x{:x} hw_slot=0x{:x} target=module header_valid={} required_stack_words={} task_done={} last_result={} runtime_ms={} max_runtime_ms={} task_runs={} stack_high_water_words={} stage={} spi_calls={} spi_errors={} lora_polls={} lora_irq_wakes={} lora_irq_timeouts={} lora_last_command={} lora_last_command_len={} lora_last_payload_len={} module_events={} module_last_event_id={} entry_args_len={} entry_args={} flash_connect_attempts={} flash_connect_host={} flash_connect_port={} flash_connect_errno={} psram_exec={} psram_reason={}",
+        "module initialized={} flash_exec={} align=0x{MODULE_ALIGN:x} offset=0x{:x} hw_slot=0x{:x} target=module header_valid={} required_stack_words={} task_done={} last_result={} runtime_ms={} max_runtime_ms={} task_runs={} stack_high_water_words={} stage={} spi_calls={} spi_errors={} lora_polls={} lora_irq_wakes={} lora_irq_timeouts={} lora_last_command={} lora_last_command_len={} lora_last_payload_len={} module_events={} module_last_event_id={} entry_args_len={} entry_args={} psram_exec={} psram_reason={}",
         MODULE_INITIALIZED.load(Ordering::Acquire),
         unsafe { dmesh_module_flash_supported() },
         unsafe { dmesh_module_loader_offset() },
@@ -670,10 +735,6 @@ fn status_text() -> String {
         unsafe { dmesh_module_loader_last_module_event_id() },
         unsafe { dmesh_module_loader_entry_args_len() },
         entry_args,
-        unsafe { dmesh_module_loader_flash_connect_attempts() },
-        flash_connect_host,
-        unsafe { dmesh_module_loader_flash_connect_port() },
-        unsafe { dmesh_module_loader_flash_connect_errno() },
         unsafe { dmesh_module_psram_exec_supported() },
         psram_reason()
     )
@@ -707,7 +768,9 @@ pub fn invoke_module(
     // but Main itself keeps running. Refresh the DMOD header before deciding
     // which ABI/service to invoke so a new image can be loaded immediately
     // without rebooting Main.
-    unsafe { dmesh_module_loader_refresh_header(); }
+    unsafe {
+        dmesh_module_loader_refresh_header();
+    }
     let service_tag = match name {
         "lora" => 43u16,
         /* Development-only flash protocol slot.  It is deliberately not in
@@ -718,7 +781,8 @@ pub fn invoke_module(
         "hello" => 46u16,
         _ => 0u16,
     };
-    if service_tag == 0 || name.is_empty()
+    if service_tag == 0
+        || name.is_empty()
         || name.len() > 15
         || !name
             .bytes()
@@ -733,14 +797,22 @@ pub fn invoke_module(
         let args = request.arg("args").unwrap_or("status").as_bytes();
         let result = unsafe {
             dmesh_module_lora_command(
-                args.as_ptr(), args.len(), request.payload.as_ptr(), request.payload.len(),
+                args.as_ptr(),
+                args.len(),
+                request.payload.as_ptr(),
+                request.payload.len(),
             )
         };
         if result == 0 {
-            return Ok(CommandResponse::ok(format!("module lora command queued args={}", String::from_utf8_lossy(args))));
+            return Ok(CommandResponse::ok(format!(
+                "module lora command queued args={}",
+                String::from_utf8_lossy(args)
+            )));
         }
         if result != -21 {
-            return Err(anyhow!("module lora command could not queue result={result}"));
+            return Err(anyhow!(
+                "module lora command could not queue result={result}"
+            ));
         }
         /* -21 means the previous task has exited (normally after `stop`).
          * Starting a new module task is still the module path, not a Main
@@ -776,22 +848,29 @@ pub fn invoke_module(
         let mut value = request.arg("args").unwrap_or("").to_owned();
         for key in ["server", "port", "dry_run", "target"] {
             if let Some(item) = request.arg(key) {
-                if !value.is_empty() { value.push(' '); }
-                value.push_str(key); value.push('='); value.push_str(item);
+                if !value.is_empty() {
+                    value.push(' ');
+                }
+                value.push_str(key);
+                value.push('=');
+                value.push_str(item);
             }
         }
-        // TCP is the module's default and omitting it avoids duplicating the
-        // common case in the tiny ASCII ABI. Preserve an explicit alternate
-        // transport for future FSK/NAN/QUIC modules.
         if let Some(item) = request.arg("transport") {
-            if item != "tcp" {
-                if !value.is_empty() { value.push(' '); }
-                value.push_str("transport="); value.push_str(item);
+            if !value.is_empty() {
+                value.push(' ');
             }
+            value.push_str("transport=");
+            value.push_str(item);
         }
         Some(value)
-    } else { None };
-    let args = flash_args.as_deref().unwrap_or_else(|| request.arg("args").unwrap_or("")).as_bytes();
+    } else {
+        None
+    };
+    let args = flash_args
+        .as_deref()
+        .unwrap_or_else(|| request.arg("args").unwrap_or(""))
+        .as_bytes();
     let result = unsafe {
         dmesh_module_start_service(
             service_tag,
@@ -804,13 +883,7 @@ pub fn invoke_module(
         )
     };
     if result != 0 {
-        if name == "flash" && request.arg("transport").unwrap_or("tcp") == "tcp" {
-            let _ = crate::components::mode::resume_from_ip_transport(settings);
-        }
         return Err(anyhow!("module task could not start result={result}"));
-    }
-    if name == "flash" && request.arg("transport").unwrap_or("tcp") == "tcp" {
-        FLASH_TCP_TRANSPORT_ACTIVE.store(true, Ordering::Release);
     }
     Ok(CommandResponse::ok(format!(
         "module {name} task started offset=0x{offset:x} size=0x{size:x}; see serial log"

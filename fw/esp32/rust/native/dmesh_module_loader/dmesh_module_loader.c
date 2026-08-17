@@ -3,10 +3,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/select.h>
 
 #include "esp_err.h"
 #include "esp_flash.h"
@@ -28,15 +24,10 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_sleep.h"
-#include "lwip/inet.h"
-#include "lwip/ip4.h"
-#include "lwip/sockets.h"
-#include "lwip/tcp.h"
 #include "lwip/netif.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "dmesh_module_abi.h"
-#include "dmesh_flash_abi.h"
 #include "dmesh_hw_host.h"
 
 #define MODULE_ALIGN 0x10000u
@@ -183,10 +174,6 @@ static volatile uint32_t cached_last_lora_command_len;
 static volatile uint32_t cached_module_event_calls;
 static volatile uint32_t cached_last_module_event_id;
 static volatile uint32_t cached_entry_args_len;
-static volatile uint32_t cached_flash_connect_attempts;
-static volatile int32_t cached_flash_connect_errno;
-static volatile uint16_t cached_flash_connect_port;
-static char cached_flash_connect_host[16];
 static char cached_entry_args[16];
 static char cached_last_lora_command[16];
 static TaskHandle_t cached_task_handle;
@@ -1003,10 +990,6 @@ uint32_t dmesh_module_loader_last_module_event_id(void) { return cached_last_mod
 uint32_t dmesh_module_loader_entry_args_len(void) { return cached_entry_args_len; }
 const char *dmesh_module_loader_entry_args(void) { return cached_entry_args; }
 const char *dmesh_module_loader_last_lora_command(void) { return cached_last_lora_command; }
-uint32_t dmesh_module_loader_flash_connect_attempts(void) { return cached_flash_connect_attempts; }
-int32_t dmesh_module_loader_flash_connect_errno(void) { return cached_flash_connect_errno; }
-uint16_t dmesh_module_loader_flash_connect_port(void) { return cached_flash_connect_port; }
-const char *dmesh_module_loader_flash_connect_host(void) { return cached_flash_connect_host; }
 
 typedef struct {
     uint16_t service_tag;
@@ -1095,158 +1078,6 @@ static dmesh_module_host_v1 common_host = {
     .alloc = module_alloc,
 };
 
-static int32_t flash_tcp_connect(void *user, const uint8_t *host,
-                                  size_t host_len, uint16_t port)
-{
-    (void)user;
-    if (host == NULL || host_len == 0 || host_len >= 16) {
-        ESP_LOGE(TAG, "flash tcp connect invalid host len=%u port=%u",
-                 (unsigned)host_len, (unsigned)port);
-        return -1;
-    }
-    char address[16];
-    memcpy(address, host, host_len);
-    address[host_len] = '\0';
-    cached_flash_connect_attempts++;
-    cached_flash_connect_port = port;
-    memset(cached_flash_connect_host, 0, sizeof(cached_flash_connect_host));
-    memcpy(cached_flash_connect_host, address, host_len);
-    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (fd < 0) {
-        cached_flash_connect_errno = errno;
-        ESP_LOGE(TAG, "flash tcp socket failed host=%s port=%u errno=%d",
-                 address, (unsigned)port, errno);
-        return -errno;
-    }
-    struct sockaddr_in peer = {0};
-    peer.sin_family = AF_INET;
-    peer.sin_port = htons(port);
-    int address_result = inet_pton(AF_INET, address, &peer.sin_addr);
-    if (address_result != 1) {
-        /* The local Rust object server is the only supported development
-         * endpoint.  Never turn malformed input into fd=0; use the fixed AP
-         * endpoint explicitly and keep the diagnostic visible. */
-        ESP_LOGE(TAG, "flash tcp invalid IPv4 host host=%s len=%u port=%u; using Rust AP",
-                 address, (unsigned)host_len, (unsigned)port);
-        peer.sin_addr.s_addr = htonl((10u << 24) | (78u << 16) | (0u << 8) | 1u);
-    }
-    ip4_addr_t route_dest = { .addr = peer.sin_addr.s_addr };
-    struct netif *route = ip4_route(&route_dest);
-    ESP_LOGW(TAG, "flash tcp route host=%s route=%p default=%p netif=%p flags=0x%02x ip=%08lx mask=%08lx gw=%08lx",
-             address, (void *)route, (void *)netif_default,
-             route != NULL ? (void *)route : NULL,
-             route != NULL ? (unsigned)route->flags : 0u,
-             route != NULL ? (unsigned long)route->ip_addr.u_addr.ip4.addr : 0ul,
-             route != NULL ? (unsigned long)route->netmask.u_addr.ip4.addr : 0ul,
-             route != NULL ? (unsigned long)route->gw.u_addr.ip4.addr : 0ul);
-    /* A blocking connect can wait through several lwIP retransmission rounds
-     * while the STA has an association but no usable ARP route.  The module
-     * task must not become permanently stuck in that state: Main still needs
-     * to service UART and report the failure. */
-    int original_flags = fcntl(fd, F_GETFL, 0);
-    if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
-        int error = errno;
-        cached_flash_connect_errno = error;
-        ESP_LOGE(TAG, "flash tcp nonblocking setup failed host=%s port=%u errno=%d",
-                 address, (unsigned)port, error);
-        close(fd);
-        return -error;
-    }
-    int connect_result = connect(fd, (struct sockaddr *)&peer, sizeof(peer));
-    if (connect_result != 0 && errno != EINPROGRESS && errno != EWOULDBLOCK) {
-        int error = errno;
-        cached_flash_connect_errno = error;
-        ESP_LOGE(TAG, "flash tcp connect failed host=%s port=%u errno=%d",
-                 address, (unsigned)port, error);
-        close(fd);
-        return -error;
-    }
-    if (connect_result != 0) {
-        fd_set writable;
-        fd_set errors;
-        FD_ZERO(&writable);
-        FD_ZERO(&errors);
-        FD_SET(fd, &writable);
-        FD_SET(fd, &errors);
-        struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
-        int selected = select(fd + 1, NULL, &writable, &errors, &timeout);
-        int socket_error = 0;
-        socklen_t socket_error_len = sizeof(socket_error);
-        if (selected <= 0 ||
-            getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len) != 0 ||
-            socket_error != 0 || FD_ISSET(fd, &errors)) {
-            int error = selected == 0 ? ETIMEDOUT :
-                (socket_error != 0 ? socket_error : errno);
-            cached_flash_connect_errno = error;
-            ESP_LOGE(TAG, "flash tcp connect timeout/failure host=%s port=%u errno=%d",
-                     address, (unsigned)port, error);
-            close(fd);
-            return -error;
-        }
-    }
-    if (fcntl(fd, F_SETFL, original_flags) != 0) {
-        int error = errno;
-        cached_flash_connect_errno = error;
-        ESP_LOGE(TAG, "flash tcp restore blocking mode failed host=%s port=%u errno=%d",
-                 address, (unsigned)port, error);
-        close(fd);
-        return -error;
-    }
-    cached_flash_connect_errno = 0;
-    ESP_LOGI(TAG, "flash tcp connected host=%s port=%u fd=%d", address,
-             (unsigned)port, fd);
-    return fd;
-}
-
-static int32_t flash_tcp_set_options(void *user, int32_t fd,
-                                     uint32_t recv_buf, uint32_t send_buf,
-                                     uint32_t timeout_ms, uint8_t nodelay)
-{
-    (void)user;
-    int value = (int)recv_buf;
-    if (recv_buf != 0 && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) != 0) return -errno;
-    value = (int)send_buf;
-    if (send_buf != 0 && setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) != 0) return -errno;
-    if (nodelay) {
-        value = 1;
-        if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) != 0) return -errno;
-    }
-    if (timeout_ms != 0) {
-        struct timeval timeout = {.tv_sec = (time_t)(timeout_ms / 1000u),
-                                   .tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u)};
-        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) return -errno;
-        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) return -errno;
-    }
-    return 0;
-}
-
-static int32_t flash_tcp_recv(void *user, int32_t fd, uint8_t *data, size_t len,
-                              uint32_t timeout_ms)
-{
-    (void)user;
-    /* tcp_set_options() is called once immediately after connect.  Repeating
-     * setsockopt(SO_RCVTIMEO) for every header and payload read adds two
-     * control calls per DRS2 frame and was measurable on the ESP socket path.
-     * Keep the ABI timeout argument for older hosts, but let the socket's
-     * already-installed timeout do the work. */
-    (void)timeout_ms;
-    int result = recv(fd, data, len, 0);
-    return result < 0 ? -errno : result;
-}
-
-static int32_t flash_tcp_send(void *user, int32_t fd, const uint8_t *data, size_t len)
-{
-    (void)user;
-    int result = send(fd, data, len, 0);
-    return result < 0 ? -errno : result;
-}
-
-static int32_t flash_tcp_close(void *user, int32_t fd)
-{
-    (void)user;
-    return close(fd) == 0 ? 0 : -errno;
-}
-
 static int32_t flash_erase(void *user, uint32_t address, uint32_t length)
 {
     (void)user;
@@ -1303,28 +1134,6 @@ int dmesh_main_flash_write(uint32_t offset, const uint8_t *data, size_t length)
         length > partition->size - offset) return -1;
     return esp_partition_write(partition, offset, data, length);
 }
-
-static uint64_t flash_now_ms(void *user)
-{
-    (void)user;
-    return (uint64_t)(esp_timer_get_time() / 1000);
-}
-
-static const dmesh_flash_host_v1 flash_host = {
-    .abi_version = DMESH_FLASH_HOST_ABI_VERSION,
-    .size = sizeof(dmesh_flash_host_v1),
-    .features = DMESH_FLASH_HOST_FEATURE_TCP | DMESH_FLASH_HOST_FEATURE_FLASH_WRITE |
-                DMESH_FLASH_HOST_FEATURE_DRY_RUN,
-    .user = NULL,
-    .tcp_connect = flash_tcp_connect,
-    .tcp_set_options = flash_tcp_set_options,
-    .tcp_recv = flash_tcp_recv,
-    .tcp_send = flash_tcp_send,
-    .tcp_close = flash_tcp_close,
-    .flash_erase = flash_erase,
-    .flash_write = flash_write,
-    .now_ms = flash_now_ms,
-};
 
 bool dmesh_module_flash_supported(void)
 {
@@ -1427,7 +1236,6 @@ static int invoke_now(uint16_t expected_service_tag, uint32_t offset, uint32_t s
             .lora_host = &lora_host,
             .lora_config = &lora_config,
             .host = &common_host,
-            .flash_host = &flash_host,
         };
         result = entry(&context, payload, payload_len, args, args_len);
     } else {

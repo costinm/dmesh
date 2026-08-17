@@ -1,21 +1,18 @@
+pub mod action_stream;
 pub mod battery;
 pub mod ble_bt;
-pub mod bytes;
 pub mod button;
+pub mod bytes;
 pub mod gpio;
 pub mod i2c;
-pub mod ip_command;
-pub mod l3dmesh;
 pub mod lora;
 pub mod mode;
 pub mod module;
 pub mod nan;
-pub mod nan_stream;
-pub mod object_store;
-pub mod object_transfer;
 pub mod nvs;
-pub mod power;
+pub mod object_store;
 pub mod peripherals;
+pub mod power;
 pub mod recovery;
 pub mod reset;
 pub mod rgbled;
@@ -24,28 +21,7 @@ pub mod settings;
 pub mod sleep;
 pub mod telemetry;
 pub mod test;
+pub mod transport_runtime;
 pub mod udp;
 pub mod wake;
 pub mod wifi;
-
-use crate::commands::CommandRegistry;
-
-use settings::SharedSettings;
-
-pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
-    peripherals::register_commands(registry, settings.clone());
-    lora::register_commands(registry, settings.clone());
-    mode::register_commands(registry, settings.clone());
-    module::register_commands(registry, settings.clone());
-    ble_bt::register_commands(registry, settings.clone());
-    nan::register_commands(registry, settings.clone());
-    power::register_commands(registry, settings.clone());
-    recovery::register_commands(registry, settings.clone());
-    reset::register_commands(registry);
-    rgbled::register_commands(registry);
-    sleep::register_commands(registry, settings.clone());
-    test::register_commands(registry);
-    telemetry::register_commands(registry, settings.clone());
-    nvs::register_commands(registry, settings.clone());
-    wifi::register_commands(registry, settings);
-}

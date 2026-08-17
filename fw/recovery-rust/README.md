@@ -1,28 +1,53 @@
 # Rust Recovery
 
-This target is the Rust Recovery target for the classic ESP32 and ESP32-C6
-(RISC-V) boards. It owns the packetized USB/UART control loop and the RTC-only
-Main handoff. The C6 build is selected with `scripts/build-recovery-rust.sh
-esp32c6`.
-It uses the same bearer-neutral `dmesh-transport` framing and embedded
-`dmesh-object-store::protocol` receiver that Main is adopting. Its UDP object
-worker performs the version-0 short-header bootstrap (`DCID=0`, stream 0),
-installs independent client/server receive CIDs, then sends the object GET.
-The build probe is still dry-run only: it exercises construction and framing
-without claiming a live NAN/BLE bearer or a successful device exchange.
+Rust Recovery is the standalone Recovery application for classic ESP32 and
+ESP32-C6. Stage2 selects it for a one-shot Main update or explicit command
+mode. The retired C Recovery is not a fallback.
 
-Build it with:
+Recovery currently owns:
+
+- compact CBOR command/log records over PPP-like UART framing;
+- persisted STA identity/network defaults plus temporary per-command benchmark
+  settings;
+- IPv4 object transfer and IPv6 link-local diagnostics;
+- the ESP datagram adapter for `quic-lite`;
+- ordered object-stream consumption through
+  `dmesh-server::ImageReceiver`;
+- manifest/signature policy, per-block integrity checks, bounded flash
+  buffering, Main partition erase/write, commit, and Stage2 handoff.
+
+`wifi.rs` is a bearer adapter and scheduler. `udp_flash.rs` consumes ordered
+stream bytes and owns flash semantics; it must not contain ACK or
+retransmission logic. `uart.rs` currently shares command records with the
+temporary UDP control endpoint, but UART is not yet a full `quic-lite`
+bearer. That migration is tracked in
+[`docs/plans/main-recovery-transport-reuse.md`](../../docs/plans/main-recovery-transport-reuse.md).
+
+Build an explicit CPU family:
 
 ```sh
+scripts/build-recovery-rust.sh --help
+scripts/build-recovery-rust.sh esp32
 scripts/build-recovery-rust.sh esp32c6
 ```
 
-The result is written below `target/recovery-rust/`; this script never flashes
-a board. The checked-in `scripts/flash-device.py e7 stage` wrapper performs
-the actual verified provisioning.
+The no-argument default is classic ESP32. Artifacts are CPU-specific under
+`target/recovery-rust/flash/<family>/`; the build script never flashes a
+board.
 
-Recovery accepts PPP/CBOR method 68 packets on USB. `op=main` or
-`op=reboot_main` sets the RTC handoff to Main and reboots immediately. A
-transport packet may carry `ssid`, `server`, `ip`, `gateway`/`gw`, `mask`,
-`port`, `dry_run`, and `log_level`; these are retained as runtime parameters
-for the network worker and are never written to NVS.
+All provisioning and updates use the common tool:
+
+```sh
+scripts/flash-device.py e7 recovery  # explicit USB provisioning/emergency
+scripts/flash-device.py e7           # Main update; defaults to Wi-Fi Recovery
+```
+
+A routine Main update assumes Stage2 and Recovery are already provisioned and
+does not rewrite Recovery over USB. Main is transferred over UDP 3336, while
+the temporary command endpoint is UDP 3337 and compact telemetry/logs use UDP
+3338. Successful completion requires durable image completion, reboot, and a
+fresh direct Main status; command acknowledgement alone is insufficient.
+
+The paused Wi-Fi measurements, transport counters, and exact restart commands
+are in
+[`docs/lab/recovery-wifi-transport-baseline.md`](../../docs/lab/recovery-wifi-transport-baseline.md).

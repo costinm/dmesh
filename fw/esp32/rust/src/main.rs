@@ -1,14 +1,10 @@
 use anyhow::Result;
 use std::ffi::{c_char, c_int};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 mod commands;
 mod components;
-mod transports;
-
-use commands::CommandRegistry;
-use components::l3dmesh::L3Mesh;
 
 const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
 const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
@@ -17,6 +13,10 @@ const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
 // breadcrumbs are useful before that point, but writing them afterwards can
 // split a CBOR/PPP record and make lmesh lose the boot/mode notification.
 static FRAMED_UART_READY: AtomicBool = AtomicBool::new(false);
+// A host can attach just after the initial reset identity. Retransmit it once
+// from the normal cooperative loop so boot proof does not depend on opening
+// the physical UART during the reset edge.
+static BOOT_IDENTITY_RETRY_AT_MS: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
     let _ = run();
@@ -39,18 +39,11 @@ fn run() -> Result<()> {
     components::recovery::mark_main_boot_start();
     components::wake::register_main_task();
     init_console_uart();
+    components::telemetry::initialize_log_stream();
     quiet_runtime_logs();
-    if let Err(err) = components::wifi::init_ip_stack() {
-        components::telemetry::record_log(format!(
-            "event type=wifi.ip_stack_init ok=false message={}",
-            commands::protocol::escape_value(&err.to_string())
-        ));
-    } else if let Err(err) = components::wifi::prepare_ip_sta_netif() {
-        components::telemetry::record_log(format!(
-            "event type=wifi.ip_netif_init ok=false message={}",
-            commands::protocol::escape_value(&err.to_string())
-        ));
-    }
+    // `dmesh-fw-transport::wifi_esp` owns the ESP-IDF network stack and the
+    // default STA netif.  Creating either here races the shared STA adapter
+    // and makes ESP-IDF abort on a duplicate default netif.
 
     let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
     boot_print("dm-rs boot step=settings\n");
@@ -82,9 +75,12 @@ fn run() -> Result<()> {
         ));
     }
 
-    boot_print("dm-rs boot step=registry\n");
-    let mut registry = CommandRegistry::new();
-    components::register_commands(&mut registry, settings.clone());
+    // Main no longer exposes the old command registry. New operations are
+    // registered as dmesh-server stream handlers on the shared QUIC-lite
+    // connection; direct CBOR remains only for the narrow wake/bootstrap
+    // exception handled below. Keep the parser module compiling while shared
+    // component helpers are migrated, but never instantiate or dispatch it.
+    boot_print("dm-rs boot step=legacy_commands_disabled\n");
     // Optional modules are deliberately not touched during boot. A stale or
     // incompatible module must not prevent Main from reaching its console;
     // explicit `module`/`lora` commands initialize the loader instead.
@@ -142,30 +138,24 @@ fn run() -> Result<()> {
         components::mode::init(&settings);
     }
 
-    if boot_window.pairing_recovery {
-        boot_print("dm-rs boot step=mesh_skip_pairing\n");
-        components::telemetry::record_log(
-            "event type=mesh.start skipped=true reason=pairing_recovery",
-        );
-    } else {
-        boot_print("dm-rs boot step=mesh\n");
-        let mut mesh = L3Mesh::new();
-        boot_print("dm-rs boot step=mesh_ble_local_only\n");
-        boot_print("dm-rs boot step=mesh_lora\n");
-        if components::module::lora_enabled() {
-            boot_print("dm-rs lora backend=module");
-        }
-        // Keep the transport registration stable. The module owns the radio
-        // task; this transport remains the Main-side forwarding surface and
-        // legacy fallback path.
-        mesh.add_transport(components::lora::transport(settings.clone()));
-        boot_print("dm-rs boot step=mesh_nan\n");
-        mesh.add_transport(components::nan::transport());
-    }
+    // Both roles load the identical Recovery/Main transport profile and have
+    // the same stream handlers available. Only infra starts the shared STA
+    // bearer here; sleepy waits for an explicit direct UART or NAN wake
+    // request instead of turning every raw-NAN duty wake into IP activity.
+    components::transport_runtime::initialize(&settings, components::mode::infra_mode());
 
     let ready = "event type=system.ready app=dmesh-rs";
     components::telemetry::record_log(ready);
     components::recovery::mark_main_boot_healthy();
+    // Direct boot identity is the bounded pre-stream proof that Stage2 chose
+    // Main and this application reached its healthy point.  It is not a log
+    // or command response; normal diagnostics remain stream services.
+    let identity = dmesh_fw_transport::recovery_runtime::boot_identity_payload(1, 1);
+    let _ = components::serial::write_direct_record(&identity);
+    let identity_retry_at =
+        unsafe { (esp_idf_sys::esp_timer_get_time().max(0) as u64 / 1_000) as u32 }
+            .wrapping_add(1_000);
+    BOOT_IDENTITY_RETRY_AT_MS.store(identity_retry_at, Ordering::Release);
     boot_print("dm-rs boot step=console\n");
     // Stage2 owns boot-time recovery selection. Do not install the GPIO0 ISR
     // during Main startup: on some ESP32 boards the physical PRG line can
@@ -178,6 +168,17 @@ fn run() -> Result<()> {
     boot_print("dm-rs boot step=runtime_interrupts_skipped");
     let mut first_loop_trace = true;
     loop {
+        let identity_retry_at = BOOT_IDENTITY_RETRY_AT_MS.load(Ordering::Acquire);
+        let now_ms = unsafe { (esp_idf_sys::esp_timer_get_time().max(0) as u64 / 1_000) as u32 };
+        if identity_retry_at != 0
+            && !quic_lite::before_deadline_u32(now_ms, identity_retry_at)
+            && BOOT_IDENTITY_RETRY_AT_MS
+                .compare_exchange(identity_retry_at, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let identity = dmesh_fw_transport::recovery_runtime::boot_identity_payload(1, 1);
+            let _ = components::serial::write_direct_record(&identity);
+        }
         components::telemetry::record_main_loop();
         // GPIO0/PRG must be handled before the raw-NAN scheduler. Otherwise
         // the scheduler can try to enter light sleep while the PRG level
@@ -204,26 +205,17 @@ fn run() -> Result<()> {
             boot_print("dm-rs loop before_mode");
         }
         components::mode::poll(&settings);
+        components::transport_runtime::poll();
         if first_loop_trace {
             boot_print("dm-rs loop after_mode");
         }
-        components::ble_bt::poll_text_commands(&mut registry);
-        poll_raw_wifi_commands(&mut registry, &settings);
-        components::wifi::poll_udp_hello();
-        components::wifi::poll_udp_dry_run();
-        components::wifi::poll_udp_status_probe();
-        components::wifi::poll_udp_status_server();
+        // Legacy raw-Wi-Fi commands and their UDP probes are intentionally
+        // not polled.  Bearer packets enter QUIC-lite through the shared
+        // transport runtime instead of owning a second command session.
+        poll_raw_wifi_commands();
         components::wifi::poll_ip_sta();
-        poll_nan_commands(&mut registry, &settings);
-        components::ip_command::poll(&mut registry);
-        components::module::poll_main(&mut registry, &settings);
-        components::module::poll_flash_transport(&settings);
-        components::test::poll_main();
-        drain_uart_console(&mut registry, &settings, companion_active_ms);
-        // The CBOR recovery command only arms the raw TCP session. The worker
-        // owns the outbound socket and flash operations; keep this call as a
-        // compatibility no-op for the stable Main command loop.
-        components::recovery::poll_flash_tcp(&settings);
+        poll_nan_commands();
+        drain_uart_console();
         // A beacon can arrive near the end of a sparse DW. Poll quickly only
         // while the raw-NAN window is already awake so post-beacon shutdown is
         // bounded by the NAN dwell without adding periodic wakeups during
@@ -251,11 +243,7 @@ fn run() -> Result<()> {
     }
 }
 
-fn drain_uart_console(
-    registry: &mut CommandRegistry,
-    settings: &components::settings::SharedSettings,
-    companion_active_ms: u32,
-) {
+fn drain_uart_console() {
     while let Some(frame) = components::serial::take_frame() {
         // A tagged NAN_SLEEPY_START event is a transport wake notification,
         // not a command. It is emitted by the UART wake scheduler and must
@@ -263,15 +251,34 @@ fn drain_uart_console(
         if frame.data.is_empty() {
             continue;
         }
-        components::mode::mark_companion_active(settings, companion_active_ms);
-        let response = transports::dispatch_uart_packet(registry, &frame.data);
-        if !response.is_empty() {
-            components::serial::write_packet(&response);
+        match dmesh_fw_transport::classify_ppp_payload(&frame.data) {
+            Ok(dmesh_fw_transport::PppIngress::Transport(packet)) => {
+                let _ = components::action_stream::receive_uart(packet);
+                continue;
+            }
+            Ok(dmesh_fw_transport::PppIngress::DirectRecord(record)) => {
+                // The sleepy-start notification itself is device-to-host.
+                // A host replies with this bounded Recovery/bootstrap CBOR
+                // request to open its first STA/stream session; ordinary
+                // direct records remain restricted by the exception policy.
+                if dmesh_server::recovery::decode_recovery_command(record).is_some() {
+                    components::transport_runtime::request_active_session("uart_bootstrap");
+                    // This compact map is a transport wake/bootstrap
+                    // exception, not a legacy Main `recovery` command. In
+                    // particular, its numeric transport/IPERF fields do not
+                    // have the old command registry's string value shape;
+                    // falling through would turn an L2 wake into a malformed
+                    // command (or an unintended recovery reboot request).
+                    continue;
+                }
+                components::telemetry::record_log(format!(
+                    "event type=direct_record rejected=true bytes={}",
+                    record.len()
+                ));
+                continue;
+            }
+            Err(_) => continue,
         }
-        // The manager owns driver deletion. It observes this notification only
-        // after the acknowledgement above has been accepted by UART TX.
-        let _ = components::serial::finish_pending_uninstall();
-        let _ = components::serial::finish_pending_suspend();
     }
 }
 
@@ -291,9 +298,7 @@ fn run_boot_active_window(wake_cause: esp_idf_sys::esp_sleep_source_t) -> BootWi
         };
     }
 
-    components::telemetry::record_log(
-        "event type=boot_window barrier=true action=startup_hold",
-    );
+    components::telemetry::record_log("event type=boot_window barrier=true action=startup_hold");
     components::telemetry::record_log(format!(
         "event type=boot_window start=true cause={} window_ms={}",
         wake_cause_name(wake_cause),
@@ -337,10 +342,7 @@ fn wake_cause_name(cause: esp_idf_sys::esp_sleep_source_t) -> &'static str {
     }
 }
 
-fn poll_raw_wifi_commands(
-    registry: &mut CommandRegistry,
-    _settings: &components::settings::SharedSettings,
-) {
+fn poll_raw_wifi_commands() {
     components::telemetry::record_raw_poll();
     while let Some(command) = components::wifi::take_raw_command() {
         components::telemetry::record_raw_command();
@@ -355,63 +357,21 @@ fn poll_raw_wifi_commands(
             command.payload.len(),
             command.rssi
         ));
-        // A few ESP-IDF raw-management paths append the 802.11 FCS to the
-        // action body but report a sig_len that excludes it. The Wi-Fi layer
-        // normally removes it; repeat the bounded validation here so a
-        // command can never reach the dispatcher with trailing non-CBOR
-        // bytes when the driver metadata is inconsistent.
-        let dispatch_payload = if command.payload.len() > 4
-            && commands::protocol::decode_binary(&command.payload).is_err()
-            && commands::protocol::decode_binary(&command.payload[..command.payload.len() - 4])
-                .is_ok()
-        {
-            &command.payload[..command.payload.len() - 4]
-        } else {
-            &command.payload
-        };
-        let response_payload = transports::dispatch_binary_packet(registry, dispatch_payload);
-        if response_payload.is_empty() {
-            continue;
-        }
-        if let Err(err) = components::wifi::send_response_payload_to(
-                command.response,
-                command.source,
-                &response_payload,
-            ) {
-            components::telemetry::record_log(format!(
-                "event type=wifi.raw_response ok=false msg={}",
-                commands::protocol::escape_value(&err.to_string())
-            ));
-        }
+        // The old raw-action CBOR dispatcher is disabled. This bearer will
+        // re-enter through action_stream once it carries QUIC-lite packets.
+        let _ = command.response;
     }
 }
 
-fn poll_nan_commands(
-    registry: &mut CommandRegistry,
-    _settings: &components::settings::SharedSettings,
-) {
+fn poll_nan_commands() {
     components::nan::poll_rx();
-    if let Err(err) = components::nan_stream::poll() {
-        components::telemetry::record_log(format!(
-            "event type=nan.transport_poll ok=false msg={}",
-            commands::protocol::escape_value(&err.to_string())
-        ));
-    }
     while let Some(command) = components::nan::take_command() {
         components::telemetry::record_log(format!(
             "event type=nan.command len={}",
             command.payload.len()
         ));
-        let response_payload = transports::dispatch_binary_packet(registry, &command.payload);
-        if response_payload.is_empty() {
-            continue;
-        }
-        if let Err(err) = components::nan::queue_response_payload_to(&command, &response_payload) {
-            components::telemetry::record_log(format!(
-                "event type=nan.response ok=false msg={}",
-                commands::protocol::escape_value(&err.to_string())
-            ));
-        }
+        // NAN is discovery/bootstrap only; direct CBOR application dispatch
+        // remains disabled until the common stream path owns it.
     }
 }
 

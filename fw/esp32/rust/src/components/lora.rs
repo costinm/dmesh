@@ -12,7 +12,6 @@ use anyhow::{anyhow, bail, Result};
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::parse_bytes;
-use super::l3dmesh::{Frame as MeshFrame, Transport};
 use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
@@ -118,11 +117,26 @@ impl Default for LoraConfig {
 }
 
 pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSettings) {
-    registry.register(LoraCommand { name: "lora", settings: settings.clone() });
-    registry.register(LoraCommand { name: "loraprobe", settings: settings.clone() });
-    registry.register(LoraCommand { name: "lorasend", settings: settings.clone() });
-    registry.register(LoraCommand { name: "loralisten", settings: settings.clone() });
-    registry.register(LoraCommand { name: "loradump", settings: settings.clone() });
+    registry.register(LoraCommand {
+        name: "lora",
+        settings: settings.clone(),
+    });
+    registry.register(LoraCommand {
+        name: "loraprobe",
+        settings: settings.clone(),
+    });
+    registry.register(LoraCommand {
+        name: "lorasend",
+        settings: settings.clone(),
+    });
+    registry.register(LoraCommand {
+        name: "loralisten",
+        settings: settings.clone(),
+    });
+    registry.register(LoraCommand {
+        name: "loradump",
+        settings: settings.clone(),
+    });
     registry.register(RadioCommand { settings });
 }
 
@@ -139,16 +153,26 @@ pub fn load_config(settings: &SharedSettings) -> Result<LoraConfig> {
     config.beacon = s.get_bool("lora.beacon", config.beacon)?;
     config.spi_host = s.get_i32("lora.spi_host", config.spi_host)?;
     for (key, field) in [
-        ("sck", &mut config.sck), ("miso", &mut config.miso),
-        ("mosi", &mut config.mosi), ("cs", &mut config.cs),
-        ("rst", &mut config.rst), ("dio0", &mut config.dio0),
-        ("busy", &mut config.busy), ("pwrpin", &mut config.board_power_pin),
-        ("pwrlvl", &mut config.board_power_level), ("tcxo_mv", &mut config.sx1262_tcxo_mv),
-        ("pa_duty", &mut config.sx1262_pa_duty), ("pa_hp", &mut config.sx1262_pa_hp),
-        ("pa_dev", &mut config.sx1262_pa_device), ("pa_lut", &mut config.sx1262_pa_lut),
-        ("rx_timeout", &mut config.sx1262_rx_timeout_ms), ("sx_sync", &mut config.sx1262_sync_word),
-        ("sf", &mut config.sf), ("cr", &mut config.cr),
-        ("sync_word", &mut config.sync_word), ("preamble", &mut config.preamble),
+        ("sck", &mut config.sck),
+        ("miso", &mut config.miso),
+        ("mosi", &mut config.mosi),
+        ("cs", &mut config.cs),
+        ("rst", &mut config.rst),
+        ("dio0", &mut config.dio0),
+        ("busy", &mut config.busy),
+        ("pwrpin", &mut config.board_power_pin),
+        ("pwrlvl", &mut config.board_power_level),
+        ("tcxo_mv", &mut config.sx1262_tcxo_mv),
+        ("pa_duty", &mut config.sx1262_pa_duty),
+        ("pa_hp", &mut config.sx1262_pa_hp),
+        ("pa_dev", &mut config.sx1262_pa_device),
+        ("pa_lut", &mut config.sx1262_pa_lut),
+        ("rx_timeout", &mut config.sx1262_rx_timeout_ms),
+        ("sx_sync", &mut config.sx1262_sync_word),
+        ("sf", &mut config.sf),
+        ("cr", &mut config.cr),
+        ("sync_word", &mut config.sync_word),
+        ("preamble", &mut config.preamble),
         ("tx_power", &mut config.tx_power),
     ] {
         *field = s.get_i32(&format!("lora.{key}"), *field)?;
@@ -186,7 +210,9 @@ pub fn keep_rx_in_light_sleep(settings: &SharedSettings) -> bool {
     if !background_rx_running() {
         return false;
     }
-    load_config(settings).map(|config| config.cad_rx).unwrap_or(false)
+    load_config(settings)
+        .map(|config| config.cad_rx)
+        .unwrap_or(false)
 }
 
 pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::JoinHandle<()>>> {
@@ -219,33 +245,15 @@ pub fn send_raw(settings: &SharedSettings, payload: &[u8]) -> Result<String> {
     super::module::invoke_module(settings, "lora", &request).map(|response| response.message)
 }
 
-pub fn transport(settings: SharedSettings) -> LoraTransport {
-    LoraTransport { settings, sent_frames: 0 }
-}
-
-pub struct LoraTransport {
+struct LoraCommand {
+    name: &'static str,
     settings: SharedSettings,
-    sent_frames: u32,
 }
-
-impl Transport for LoraTransport {
-    fn name(&self) -> &'static str { "lora" }
-
-    fn send(&mut self, frame: &MeshFrame<'_>, _from_interface: i32) -> Result<()> {
-        super::module::ensure_initialized(&self.settings);
-        self.sent_frames = self.sent_frames.saturating_add(1);
-        let mut request = CommandRequest::new("lora").arg_pair("args", "tx");
-        request.payload = frame.payload().to_vec();
-        super::module::invoke_module(&self.settings, "lora", &request).map(|_| ())?;
-        telemetry::count_packet("lora", Direction::Tx, frame.payload().len());
-        Ok(())
-    }
-}
-
-struct LoraCommand { name: &'static str, settings: SharedSettings }
 
 impl CommandHandler for LoraCommand {
-    fn name(&self) -> &'static str { self.name }
+    fn name(&self) -> &'static str {
+        self.name
+    }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         super::module::ensure_initialized(&self.settings);
@@ -254,7 +262,11 @@ impl CommandHandler for LoraCommand {
          * SPI, start a module task, or hand an unknown `status` command to a
          * stale image. */
         let status_requested = request.arg("op") == Some("status")
-            || request.arg("status").map(parse_bool).transpose()?.unwrap_or(false);
+            || request
+                .arg("status")
+                .map(parse_bool)
+                .transpose()?
+                .unwrap_or(false);
         if self.name == "lora" && status_requested {
             return Ok(CommandResponse::ok(status_text(&self.settings)));
         }
@@ -270,8 +282,15 @@ impl CommandHandler for LoraCommand {
             }
             "loralisten" => "rx",
             "loraprobe" => "probe",
-            _ if request.arg("rx").or_else(|| request.arg("sleep"))
-                .map(parse_bool).transpose()?.is_some_and(|value| !value) => "stop",
+            _ if request
+                .arg("rx")
+                .or_else(|| request.arg("sleep"))
+                .map(parse_bool)
+                .transpose()?
+                .is_some_and(|value| !value) =>
+            {
+                "stop"
+            }
             _ => request.arg("op").unwrap_or("status"),
         };
         module_request = module_request.arg_pair("args", op);
@@ -279,14 +298,23 @@ impl CommandHandler for LoraCommand {
     }
 }
 
-struct RadioCommand { settings: SharedSettings }
+struct RadioCommand {
+    settings: SharedSettings,
+}
 
 impl CommandHandler for RadioCommand {
-    fn name(&self) -> &'static str { "radio" }
+    fn name(&self) -> &'static str {
+        "radio"
+    }
 
     fn handle(&mut self, request: &CommandRequest) -> Result<CommandResponse> {
         super::module::ensure_initialized(&self.settings);
-        if request.arg("status").map(parse_bool).transpose()?.unwrap_or(false) {
+        if request
+            .arg("status")
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or(false)
+        {
             return Ok(CommandResponse::ok("radio backend=module modulation=gfsk"));
         }
         let mut module_request = request.clone().arg_pair("args", "fsk");
@@ -299,22 +327,39 @@ impl CommandHandler for RadioCommand {
 
 fn persist_settings(settings: &SharedSettings, request: &CommandRequest) -> Result<()> {
     if let Some(chip) = request.arg("chip") {
-        settings.borrow_mut().set_str("lora.chip", LoraChip::parse(chip)?.as_str())?;
+        settings
+            .borrow_mut()
+            .set_str("lora.chip", LoraChip::parse(chip)?.as_str())?;
     }
     for (arg, key) in [
-        ("freq", "lora.freq"), ("bw", "lora.bw"), ("sf", "lora.sf"),
-        ("cr", "lora.cr"), ("sync_word", "lora.sync_word"),
-        ("preamble", "lora.preamble"), ("tx_power", "lora.tx_power"),
-        ("spi_host", "lora.spi_host"), ("sck", "lora.sck"),
-        ("miso", "lora.miso"), ("mosi", "lora.mosi"), ("cs", "lora.cs"),
-        ("rst", "lora.rst"), ("dio0", "lora.dio0"), ("busy", "lora.busy"),
-        ("cad_interval_ms", "lora.cad_int"), ("cad_rx_ms", "lora.cad_rxms"),
+        ("freq", "lora.freq"),
+        ("bw", "lora.bw"),
+        ("sf", "lora.sf"),
+        ("cr", "lora.cr"),
+        ("sync_word", "lora.sync_word"),
+        ("preamble", "lora.preamble"),
+        ("tx_power", "lora.tx_power"),
+        ("spi_host", "lora.spi_host"),
+        ("sck", "lora.sck"),
+        ("miso", "lora.miso"),
+        ("mosi", "lora.mosi"),
+        ("cs", "lora.cs"),
+        ("rst", "lora.rst"),
+        ("dio0", "lora.dio0"),
+        ("busy", "lora.busy"),
+        ("cad_interval_ms", "lora.cad_int"),
+        ("cad_rx_ms", "lora.cad_rxms"),
     ] {
         if let Some(value) = request.arg(arg) {
             settings.borrow_mut().set_i32(key, parse_i32(value)?)?;
         }
     }
-    for (arg, key) in [("crc", "lora.crc"), ("beacon", "lora.beacon"), ("dio2rf", "lora.dio2rf"), ("cad_rx", "lora.cad_rx")] {
+    for (arg, key) in [
+        ("crc", "lora.crc"),
+        ("beacon", "lora.beacon"),
+        ("dio2rf", "lora.dio2rf"),
+        ("cad_rx", "lora.cad_rx"),
+    ] {
         if let Some(value) = request.arg(arg) {
             settings.borrow_mut().set_bool(key, parse_bool(value)?)?;
         }
@@ -323,25 +368,54 @@ fn persist_settings(settings: &SharedSettings, request: &CommandRequest) -> Resu
 }
 
 fn parse_payload(request: &CommandRequest) -> Result<Vec<u8>> {
-    if !request.payload.is_empty() { return Ok(request.payload.clone()); }
-    let value = request.arg("data").or_else(|| request.arg("payload")).unwrap_or("");
-    if value.is_empty() { bail!("payload is required") }
+    if !request.payload.is_empty() {
+        return Ok(request.payload.clone());
+    }
+    let value = request
+        .arg("data")
+        .or_else(|| request.arg("payload"))
+        .unwrap_or("");
+    if value.is_empty() {
+        bail!("payload is required")
+    }
     parse_bytes(value)
 }
 
 #[derive(Clone, Debug)]
-pub struct WakePacket { pub data: Vec<u8>, pub rssi: i32, pub snr: f32 }
+pub struct WakePacket {
+    pub data: Vec<u8>,
+    pub rssi: i32,
+    pub snr: f32,
+}
 
-pub fn prepare_deep_sleep_rx(_config: &LoraConfig) -> Result<()> { Ok(()) }
-pub fn read_wake_packet_no_reset(_config: &LoraConfig) -> Result<Option<WakePacket>> { Ok(None) }
+pub fn prepare_deep_sleep_rx(_config: &LoraConfig) -> Result<()> {
+    Ok(())
+}
+pub fn read_wake_packet_no_reset(_config: &LoraConfig) -> Result<Option<WakePacket>> {
+    Ok(None)
+}
 
-struct Packet { data: Vec<u8>, rssi: i32, snr: f32 }
+struct Packet {
+    data: Vec<u8>,
+    rssi: i32,
+    snr: f32,
+}
 
 pub fn handle_module_packet(data: &[u8], rssi: i32, snr: f32) -> Result<CommandResponse> {
-    if data.is_empty() || data.len() > 255 { bail!("module LoRa packet length invalid") }
-    let packet = Packet { data: data.to_vec(), rssi, snr };
-    telemetry::record_packet("lora", Direction::Rx, &packet.data,
-        format!("source=module rssi={} snr={}", packet.rssi, packet.snr));
+    if data.is_empty() || data.len() > 255 {
+        bail!("module LoRa packet length invalid")
+    }
+    let packet = Packet {
+        data: data.to_vec(),
+        rssi,
+        snr,
+    };
+    telemetry::record_packet(
+        "lora",
+        Direction::Rx,
+        &packet.data,
+        format!("source=module rssi={} snr={}", packet.rssi, packet.snr),
+    );
     // A packet is an in-band radio wake trigger. Do not emit a second UART
     // heartbeat here: the scheduled NAN wake owns the single UART rendezvous
     // packet, and LoRa activity is included in its compact counters.
@@ -349,7 +423,9 @@ pub fn handle_module_packet(data: &[u8], rssi: i32, snr: f32) -> Result<CommandR
     if telemetry::take_lora_wake_event_slot() {
         telemetry::record_log(format!(
             "event type=lora.packet_wake len={} rssi={} snr={} active_ms=5000",
-            data.len(), rssi, snr
+            data.len(),
+            rssi,
+            snr
         ));
         let wake_stats = telemetry::lora_wake_stats_text();
         telemetry::record_log(wake_stats.clone());
@@ -360,28 +436,42 @@ pub fn handle_module_packet(data: &[u8], rssi: i32, snr: f32) -> Result<CommandR
         telemetry::emit_console(&wake_stats);
     }
     forward_rx_packet(&packet);
-    Ok(CommandResponse::ok(format!("module lora rx len={} rssi={} snr={}", data.len(), rssi, snr)))
+    Ok(CommandResponse::ok(format!(
+        "module lora rx len={} rssi={} snr={}",
+        data.len(),
+        rssi,
+        snr
+    )))
 }
 
 fn forward_rx_packet(packet: &Packet) {
     super::mode::observe_lora_ping("lora", &packet.data, packet.rssi);
-    let Ok(espnow) = dmesh_rawnan::espnow::build_radio_packet(&packet.data, packet.rssi, packet.snr)
+    let Ok(espnow) =
+        dmesh_rawnan::espnow::build_radio_packet(&packet.data, packet.rssi, packet.snr)
     else {
         telemetry::record_log(format!(
             "event type=lora.espnow_forward ok=false len={} rssi={} snr={} msg=payload-too-large",
-            packet.data.len(), packet.rssi, packet.snr
+            packet.data.len(),
+            packet.rssi,
+            packet.snr
         ));
         return;
     };
     if let Err(err) = super::wifi::send_espnow_broadcast(&espnow) {
         telemetry::record_log(format!(
             "event type=lora.espnow_forward ok=false len={} rssi={} snr={} msg={}",
-            packet.data.len(), packet.rssi, packet.snr, err
+            packet.data.len(),
+            packet.rssi,
+            packet.snr,
+            err
         ));
     } else {
         telemetry::record_log(format!(
             "event type=lora.espnow_forward ok=true len={} rssi={} snr={} envelope_len={}",
-            packet.data.len(), packet.rssi, packet.snr, espnow.len()
+            packet.data.len(),
+            packet.rssi,
+            packet.snr,
+            espnow.len()
         ));
     }
     if super::mode::is_companion_mode() {
