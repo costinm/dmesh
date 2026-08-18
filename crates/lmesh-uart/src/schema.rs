@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -22,6 +22,8 @@ pub(crate) struct FirmwareSchemaFile {
 pub(crate) struct SchemaMethod {
     pub id: u16,
     pub name: String,
+    #[serde(default)]
+    pub direct_control: bool,
     #[serde(default)]
     pub fields: Vec<SchemaField>,
 }
@@ -46,15 +48,19 @@ pub(crate) struct SchemaField {
     pub kind: Option<String>,
 }
 
+/// Host-side vocabulary for compact firmware CBOR. It is independent of a
+/// particular bearer: device sessions use the same schema over UART, UDP, or
+/// any later QUIC-lite path.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FirmwareSchema {
+pub struct FirmwareSchema {
     methods: BTreeMap<u16, SchemaMethod>,
     fields: BTreeMap<u16, BTreeMap<u16, String>>,
     messages: BTreeMap<String, SchemaMessage>,
+    catalog: mesh::cbor::Catalog,
 }
 
 impl FirmwareSchema {
-    pub(crate) fn load() -> Self {
+    pub fn load() -> Self {
         let mut schema = Self::default();
         if let Ok(core) = serde_json::from_str::<FirmwareSchemaFile>(CORE_SCHEMA) {
             schema.merge(core);
@@ -73,7 +79,23 @@ impl FirmwareSchema {
                 }
             }
         }
+        schema.refresh_catalog();
         schema
+    }
+
+    fn refresh_catalog(&mut self) {
+        let tools = self.methods.values().map(|method| {
+            let properties = method.fields.iter().map(|field| {
+                (field.name.clone(), json!({"x-mesh-cbor": {"id": field.id}}))
+            }).collect::<Map<String, Value>>();
+            json!({
+                "name": method.name,
+                "x-mesh-cbor": {"id": method.id},
+                "inputSchema": {"type": "object", "properties": properties},
+            })
+        }).collect::<Vec<_>>();
+        self.catalog = mesh::cbor::Catalog::from_tools_json(&Value::Array(tools))
+            .expect("firmware JSON schema has valid u16 CBOR tags");
     }
 
     fn merge(&mut self, file: FirmwareSchemaFile) {
@@ -93,7 +115,7 @@ impl FirmwareSchema {
         }
     }
 
-    pub(crate) fn rename_decoded(&self, mut value: Value) -> Value {
+    pub fn rename_decoded(&self, mut value: Value) -> Value {
         let Some(object) = value.as_object_mut() else {
             return value;
         };
@@ -142,8 +164,8 @@ impl FirmwareSchema {
     /// Decode a firmware compact-CBOR payload into a schema-labelled value.
     /// Unknown method and field IDs remain numeric, so diagnostics stay
     /// structured and lossless when a host has not yet installed a schema.
-    pub(crate) fn decode_packet(&self, payload: &[u8]) -> Result<Value> {
-        let value = mesh::cbor::decode_json(payload, &mesh::cbor::Catalog::default())?;
+    pub fn decode_packet(&self, payload: &[u8]) -> Result<Value> {
+        let value = mesh::cbor::decode_json(payload, &self.catalog)?;
         Ok(self.rename_decoded(value))
     }
 
@@ -184,6 +206,169 @@ impl FirmwareSchema {
     }
 }
 
+/// Render a direct device record for a human-facing shell/session. Printable
+/// boot and platform output remains text; compact CBOR is decoded and labelled
+/// by the local schema. Unknown data is retained as hex instead of discarded.
+pub fn render_device_record(schema: &FirmwareSchema, payload: &[u8]) -> String {
+    if payload.is_empty() {
+        return "kind=empty".to_owned();
+    }
+    if bytes_are_text(payload) {
+        return format!(
+            "kind=text text={}",
+            serde_json::to_string(&text_preview(payload)).expect("string JSON")
+        );
+    }
+    match schema.decode_packet(payload) {
+        Ok(decoded) if decoded.get("error").is_none() => cbor_log_fields(&decoded),
+        Ok(decoded) => format!("kind=cbor_error value={decoded}"),
+        Err(_) => format!(
+            "kind=raw bytes={} hex={}",
+            payload.len(),
+            hex_encode(payload)
+        ),
+    }
+}
+
+/// Convert a shell-style command to the compact stream frame used only by the
+/// explicitly selected direct-CBOR exception plane. New application operations
+/// should use QUIC-lite service streams, where normal flow control applies.
+fn command_json(command: &str) -> Result<Value> {
+    let mut words = command.split_ascii_whitespace();
+    let method = words.next().context("empty firmware command")?;
+    let mut fields = Map::new();
+    for word in words {
+        let (key, value) = word.split_once('=').unwrap_or((word, "true"));
+        if key == "payload" {
+            let hex = value.strip_prefix("hex:").unwrap_or(value);
+            fields.insert("data".to_owned(), Value::Array(decode_hex(hex)?.into_iter().map(Value::from).collect()));
+        } else {
+            fields.insert(key.to_owned(), Value::String(value.to_owned()));
+        }
+    }
+    fields.insert("method".to_owned(), Value::String(method.to_owned()));
+    Ok(Value::Object(fields))
+}
+
+#[cfg(test)]
+pub fn encode_text_command(command: &str) -> Result<Vec<u8>> {
+    let schema = FirmwareSchema::load();
+    Ok(mesh::cbor::encode_stream_frame(&mesh::cbor::encode_json(&command_json(command)?, &schema.catalog)?)?)
+}
+
+/// Encode the explicit Recovery direct-control exception without a generic
+/// stream-frame wrapper. Recovery accepts the canonical `{0: "recovery",
+/// 6: {...}}` CBOR envelope before a QUIC-lite connection exists; wrapping it
+/// turns the command into unrelated stream data and is correctly rejected.
+pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
+    let schema = FirmwareSchema::load();
+    let value = command_json(command)?;
+    let method = value.get("method").and_then(Value::as_str).context("command method")?;
+    let cbor = mesh::cbor::encode_json(&value, &schema.catalog)?;
+    let direct = schema.methods.values().any(|entry| entry.name == method && entry.direct_control);
+    if direct { Ok(cbor) } else { Ok(mesh::cbor::encode_stream_frame(&cbor)?) }
+}
+
+/// Compact logfmt renderer shared by the session CLI and the remaining
+/// diagnostics code. `status=ok` is omitted because it is not delivery proof.
+pub fn cbor_log_fields(value: &Value) -> String {
+    let mut fields = Vec::new();
+    flatten_cbor_log_value(&mut fields, None, value, true);
+    fields.join(" ")
+}
+
+fn flatten_cbor_log_value(
+    fields: &mut Vec<String>,
+    prefix: Option<&str>,
+    value: &Value,
+    top_level: bool,
+) {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                if top_level && key == "status" && value.as_str() == Some("ok") {
+                    continue;
+                }
+                let key = prefix
+                    .map(|prefix| format!("{prefix}.{key}"))
+                    .unwrap_or_else(|| key.clone());
+                flatten_cbor_log_value(fields, Some(&key), value, false);
+            }
+        }
+        Value::Array(_) => {
+            if let Some(key) = prefix {
+                fields.push(format!("{key}={}", logfmt_json_value(value)));
+            }
+        }
+        _ => {
+            if let Some(key) = prefix {
+                fields.push(format!("{key}={}", logfmt_json_value(value)));
+            }
+        }
+    }
+}
+
+fn logfmt_json_value(value: &Value) -> String {
+    match value {
+        Value::String(value)
+            if !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'=' | b'"')) =>
+        {
+            value.clone()
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn bytes_are_text(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .filter(|byte| matches!(**byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e))
+        .count()
+        * 100
+        >= bytes.len().saturating_mul(90)
+}
+
+fn text_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .filter_map(|byte| match *byte {
+            b'\r' | b'\n' => None,
+            b'\t' | 0x20..=0x7e => Some((*byte as char).to_string()),
+            value => Some(format!("\\x{value:02x}")),
+        })
+        .collect()
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        anyhow::bail!("hex payload must have an even number of characters");
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(Into::into))
+        .collect()
+}
+
+fn hex_encode(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[allow(dead_code)]
+fn firmware_arg_tag(name: &str) -> Option<u16> {
+    Some(match name {
+        "op" => 87,
+        "name" => 409,
+        "server" => 246,
+        "port" => 191,
+        "target" => 346,
+        "object_action_stats" => 272,
+        _ => return None,
+    })
+}
+
 fn configured_schema_files() -> Vec<PathBuf> {
     let Some(dir) = std::env::var_os("SCHEMA_DIR")
         .map(PathBuf::from)
@@ -220,7 +405,7 @@ fn resolve_schema_directory(path: PathBuf) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::FirmwareSchema;
+    use super::{FirmwareSchema, encode_direct_command, encode_text_command, render_device_record};
     use minicbor::Encoder;
     use serde_json::json;
 
@@ -271,5 +456,25 @@ mod tests {
         }));
         assert_eq!(decoded["method"], 65535);
         assert_eq!(decoded["payload"]["999"], true);
+    }
+
+    #[test]
+    fn session_renderer_keeps_text_and_schema_labels() {
+        let schema = FirmwareSchema::load();
+        assert_eq!(
+            render_device_record(&schema, b"boot ready\n"),
+            "kind=text text=\"boot ready\""
+        );
+        let command = encode_text_command("mode active_ms=1000").unwrap();
+        let payload = mesh::cbor::decode_stream_frame(&command).unwrap();
+        assert!(schema.decode_packet(payload).is_ok());
+    }
+
+    #[test]
+    fn recovery_direct_command_is_not_stream_wrapped() {
+        let command = encode_direct_command("recovery raw_tx_rate=24").unwrap();
+        let decoded = dmesh_server::recovery::decode_recovery_command(&command);
+        assert!(decoded.is_some(), "command={command:02x?}");
+        assert_eq!(decoded.unwrap().raw_tx_rate, Some(24));
     }
 }

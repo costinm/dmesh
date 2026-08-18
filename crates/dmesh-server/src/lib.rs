@@ -10,14 +10,21 @@
 extern crate alloc;
 
 pub mod cbor;
+pub mod iperf;
 /// Small no-std network-address helpers used by bearer adapters. This module
 /// has no socket runtime or ESP-IDF dependency.
 pub mod net;
+pub mod raw_iperf;
+/// CBOR-decoded, socket-free raw 802.11 hardware request schema.
+pub mod raw_wifi;
 pub mod recovery;
 /// Predefined common stream services and schemas.  This is deliberately
 /// above `quic-lite`: transport provides ordered streams, while this module
 /// owns service tags, CBOR/object operations, diagnostics, and log watching.
 pub mod services;
+/// Bearer-neutral server connection bootstrap/mux state. This is no-std and
+/// has host tests; ESP and host adapters own their peer and socket/task glue.
+pub mod stream_server;
 
 /// Socket-free ESP-NOW/vendor-action object bearer. `lmesh-wifi` supplies raw
 /// 802.11 send/receive; this module owns only the same QUIC-lite bootstrap,

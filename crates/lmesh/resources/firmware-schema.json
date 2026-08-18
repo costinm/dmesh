@@ -51,7 +51,7 @@
     {"id": 65, "name": "button"},
     {"id": 66, "name": "nvs"},
     {"id": 67, "name": "radio"},
-    {"id": 68, "name": "recovery"},
+    {"id": 68, "name": "recovery", "direct_control": true},
     {"id": 69, "name": "reset"},
     {"id": 70, "name": "module"},
     {"id": 71, "name": "hello"}

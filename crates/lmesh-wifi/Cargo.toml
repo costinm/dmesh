@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0"
 dmesh-server = { path = "../dmesh-server", features = ["udp"] }
-lmesh-uart = { path = "../lmesh-uart" }
+dmesh-cli = { path = "../dmesh-cli" }
 dmesh-rawnan = { path = "../rawnan" }
 quic-lite = { path = "../quic-lite" }
 libc = "0.2"

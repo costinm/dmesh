@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod dispatch;
+mod ndp;
 mod radio;
 /// Host-side JSON/compatibility conversion for raw NAN and legacy BLE commands.
 /// The byte/state core remains in `dmesh-rawnan`.

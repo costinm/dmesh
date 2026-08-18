@@ -1,8 +1,8 @@
 # uart-codec API
 
-`uart-codec` is the low-level crate behind the stable UART-forwarding service
-and the ESP32 firmware UART transport. The std JSONL service binary is built by
-[`lmesh-uart/API.md`](../lmesh-uart/API.md).
+`uart-codec` is the low-level crate behind the UART transport. The retired
+forwarding API is retained only as migration reference; serial ownership is in
+`dmesh-cli`.
 
 ## Physical framing
 
@@ -26,10 +26,9 @@ adapter.
 
 ## Service boundary
 
-USB serial discovery, managed UDS/TCP forwards, RFC2217 compatibility, serial
-logs, and ESP32 command handling are documented in
-[`lmesh-uart/API.md`](../lmesh-uart/API.md). Its normal
-mesh-init socket is `/run/mesh/lmesh-uart/mesh.sock`.
+USB serial discovery, direct session ownership, serial logs, and ESP32 command
+handling are documented in [`dmesh-cli/README.md`](../dmesh-cli/README.md).
+There is no managed UART control socket.
 
 Generic text, JSON, JSON-RPC, CBOR, JSONL, and schema loading are supplied by
 `ssh-mesh/crates/mesh` and are shared by all services.

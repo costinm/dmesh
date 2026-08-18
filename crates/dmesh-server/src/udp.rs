@@ -6,10 +6,15 @@
 //! currently installed here, while the same connection table is intended for
 //! additional host-test services on other stream IDs.
 
-use crate::protocol::ObjectRecordStream;
-use crate::services::handle_stream_with_events;
+use crate::services::{
+    CONTROL_PATH_POLICY, CONTROL_RESPONSE, decode_path_policy, handle_stream_with_events,
+};
 pub use crate::services::{EventRing, StreamHandler, StreamRegistry};
 use crate::{ObjectServer, ServerConfig};
+use crate::{
+    iperf::{IperfServicePlan, IperfServiceRequest, decode_iperf_service_request},
+    protocol::ObjectRecordStream,
+};
 use anyhow::{Context, Result, bail};
 use quic_lite::ledger::{
     LedgerCapacityController, LedgerMemoryPolicy, LedgerMemorySnapshot, select_capacity,
@@ -32,6 +37,14 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, timeout};
 
 const MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
+/// Stable `lmesh-wifi`/wlan0 object and IPERF listener.
+pub const STABLE_WIFI_UDP_PORT: u16 = 3336;
+/// Development `lmesh`/wlan1 listener.  It must not collide with wlan0.
+pub const DEVELOPMENT_WIFI_UDP_PORT: u16 = 3337;
+/// Reserved local port for `dmesh-cli` session/driver endpoints.
+pub const DMESH_CLI_UDP_PORT: u16 = 3338;
+/// Raw IPv6 firmware bearer port (outside host UDP listener ownership).
+pub const RAW_UDP6_PORT: u16 = 3339;
 // Object records leave frame/control headroom inside the single shared bearer
 // MTU. No UDP-only payload expansion is permitted while action frames remain
 // capped at this bound.
@@ -74,12 +87,6 @@ const CONTROL_POLL: u8 = 1;
 /// cap repairs a short/cwnd-limited burst promptly.
 const RECOVERY_OBJECT_ACK_FREQUENCY: u8 = 8;
 const RECOVERY_MAX_ACK_DELAY_US: u64 = 5_000;
-const CONTROL_RESPONSE: u8 = 2;
-/// Set a connection's bearer-neutral egress policy. Payload is one of
-/// `[0]` highest measured speed, `[1, path]` explicit comparison path, or
-/// `[2, primary]` airtime-first with spillover when that path is full.
-/// More cost/relay policies will be added here without changing QUIC-lite.
-const CONTROL_PATH_POLICY: u8 = 3;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 
 /// Decode the transport-service envelope for an object GET.  The CBOR bytes
@@ -286,17 +293,6 @@ impl Default for TransportControl {
     }
 }
 
-fn decode_path_policy(record: &[u8]) -> Option<PathPolicy> {
-    match record {
-        [0] => Some(PathPolicy::HighestMeasuredSpeed),
-        [1, path] => Some(PathPolicy::Explicit(*path as usize)),
-        [2, primary] => Some(PathPolicy::AirtimeFirst {
-            primary: *primary as usize,
-        }),
-        _ => None,
-    }
-}
-
 struct ConnectionDatagram {
     peer: SocketAddr,
     bytes: Vec<u8>,
@@ -451,23 +447,22 @@ fn interpacket_gap_bucket(gap: Duration) -> usize {
 /// 11 bytes remain the compatibility schema (`service`, byte count, packet
 /// size); absent trailing fields deliberately inherit the listener defaults.
 fn iperf_schedule(
-    request: &[u8],
+    request: IperfServiceRequest,
     default_pace: Duration,
     default_burst_packets: usize,
     default_burst_delay: Duration,
 ) -> (Duration, usize, Duration, u8, u64) {
     let pace = request
-        .get(11..15)
-        .map(|bytes| Duration::from_micros(u32::from_be_bytes(bytes.try_into().unwrap()) as u64))
+        .pace_us
+        .map(|pace| Duration::from_micros(u64::from(pace)))
         .unwrap_or(default_pace);
     let burst_packets = request
-        .get(15)
-        .copied()
+        .burst_packets
         .map(usize::from)
         .unwrap_or(default_burst_packets);
     let burst_delay = request
-        .get(16..20)
-        .map(|bytes| Duration::from_micros(u32::from_be_bytes(bytes.try_into().unwrap()) as u64))
+        .burst_delay_us
+        .map(|delay| Duration::from_micros(u64::from(delay)))
         .unwrap_or(default_burst_delay);
     // ACK_FREQUENCY's wire threshold is one below the human-facing packet
     // ratio. Keep it request-scoped so a benchmark does not depend on a
@@ -477,13 +472,11 @@ fn iperf_schedule(
     // as Recovery's command parser so a malformed request cannot start an
     // IPERF transfer while silently failing to install its advertised policy.
     let ack_frequency = request
-        .get(20)
-        .copied()
+        .ack_frequency
         .unwrap_or(2)
         .clamp(1, quic_lite::ACK_RANGE_CAPACITY as u8);
     let ack_delay_us = request
-        .get(21)
-        .copied()
+        .ack_delay_ms
         .map(|milliseconds| u64::from(milliseconds.clamp(1, 25)) * 1_000)
         .unwrap_or(RECOVERY_MAX_ACK_DELAY_US);
     (
@@ -639,7 +632,7 @@ pub struct UdpConfig {
 impl Default for UdpConfig {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:3336".parse().unwrap(),
+            bind: SocketAddr::from(([0, 0, 0, 0], STABLE_WIFI_UDP_PORT)),
             artifact_root: PathBuf::from("."),
             history_capacity: 0,
             ledger_memory_policy: LedgerMemoryPolicy::default(),
@@ -717,6 +710,17 @@ pub struct UdpClient {
     local_cid: quic_lite::ConnectionId,
 }
 
+/// One committed server-initiated stream frame. This keeps offset and FIN
+/// visible to diagnostic clients such as IPERF without exposing any socket or
+/// bearer-specific framing above `UdpClient`.
+#[derive(Debug)]
+pub struct ReceivedStream {
+    pub id: u64,
+    pub offset: u64,
+    pub fin: bool,
+    pub data: Vec<u8>,
+}
+
 impl UdpClient {
     /// Set the local delayed-ACK packet threshold for a diagnostic client.
     /// The wire ACK logic remains in `EndpointState`.
@@ -786,6 +790,11 @@ impl UdpClient {
             local_cid: local_cid,
         };
         let mut response = [0u8; MTU];
+        // A bootstrap timeout used to discard the only evidence of an L2
+        // response.  Keep the client bearer-neutral but preserve a compact
+        // diagnostic so an AP-relayed UDP test can distinguish no return
+        // packet from a malformed or misrouted one.
+        let mut last_observation = None;
         for packet_number in 0..BOOTSTRAP_ATTEMPTS {
             let mut open = [0u8; MTU];
             let used = quic_lite::encode_bootstrap_open_packet_with_limits(
@@ -801,16 +810,30 @@ impl UdpClient {
                 continue;
             };
             if response_peer != client.peer {
+                last_observation = Some(format!(
+                    "reply_peer={} expected_peer={} bytes={len}",
+                    response_peer, client.peer
+                ));
                 continue;
             }
-            let Ok((header, ack)) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            let (header, ack) = match quic_lite::decode_bootstrap_open_ack_packet_with_limits(
                 &response[..len],
                 local_cid,
-            ) else {
-                continue;
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    last_observation = Some(format!("invalid_ack bytes={len} error={error:?}"));
+                    continue;
+                }
             };
             let server_cid = ack.server_receive_cid;
             if header.dcid != local_cid || server_cid.value() == 0 {
+                last_observation = Some(format!(
+                    "invalid_ack_route dcid={} server_cid={} expected_dcid={}",
+                    header.dcid.value(),
+                    server_cid.value(),
+                    local_cid.value()
+                ));
                 continue;
             }
             client
@@ -827,7 +850,10 @@ impl UdpClient {
                 .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
             return Ok(client);
         }
-        bail!("UDP bootstrap timeout after {BOOTSTRAP_ATTEMPTS} attempts")
+        if let Some(observation) = last_observation {
+            bail!("UDP bootstrap timeout after {BOOTSTRAP_ATTEMPTS} attempts ({observation})")
+        }
+        bail!("UDP bootstrap timeout after {BOOTSTRAP_ATTEMPTS} attempts (no response)")
     }
 
     /// Send one complete application request stream and wait for its
@@ -876,6 +902,18 @@ impl UdpClient {
         data: &[u8],
         fin: bool,
     ) -> Result<(u64, Vec<u8>, bool)> {
+        let frame = self.request_stream_frame(stream_id, data, fin).await?;
+        Ok((frame.id, frame.data, frame.fin))
+    }
+
+    /// Send one request and wait for its first application response while
+    /// retaining the stream offset for a multi-frame consumer.
+    pub async fn request_stream_frame(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<ReceivedStream> {
         self.endpoint
             .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
             .map_err(|error| anyhow::anyhow!("client stream: {error:?}"))?;
@@ -915,9 +953,14 @@ impl UdpClient {
                 {
                     quic_lite::TransportPacket::Control => continue,
                     quic_lite::TransportPacket::Stream { frame, .. } => {
-                        let response = frame.data.to_vec();
+                        let response = ReceivedStream {
+                            id: frame.id,
+                            offset: frame.offset,
+                            fin: frame.fin,
+                            data: frame.data.to_vec(),
+                        };
                         self.endpoint
-                            .stream_consumed(frame.id, frame.data.len())
+                            .stream_consumed(response.id, response.data.len())
                             .map_err(|error| {
                                 anyhow::anyhow!("client response accounting: {error:?}")
                             })?;
@@ -929,7 +972,7 @@ impl UdpClient {
                         {
                             self.socket.send_to(&ack[..ack_len], self.peer).await?;
                         }
-                        return Ok((frame.id, response, frame.fin));
+                        return Ok(response);
                     }
                 }
             }
@@ -955,6 +998,13 @@ impl UdpClient {
     /// Receive one application stream packet and return its bytes. ACK and
     /// window generation remain inside the transport client.
     pub async fn recv_stream(&mut self) -> Result<(u64, Vec<u8>, bool)> {
+        let frame = self.recv_stream_frame().await?;
+        Ok((frame.id, frame.data, frame.fin))
+    }
+
+    /// Receive one application stream packet and retain its offset for a
+    /// multi-frame consumer. ACK/window generation remains in this client.
+    pub async fn recv_stream_frame(&mut self) -> Result<ReceivedStream> {
         loop {
             let mut packet = [0u8; MTU];
             let (len, peer) = self.socket.recv_from(&mut packet).await?;
@@ -980,7 +1030,12 @@ impl UdpClient {
             {
                 self.socket.send_to(&control[..used], self.peer).await?;
             }
-            return Ok((stream.id, stream.data.to_vec(), stream.fin));
+            return Ok(ReceivedStream {
+                id: stream.id,
+                offset: stream.offset,
+                fin: stream.fin,
+                data: stream.data.to_vec(),
+            });
         }
     }
 }
@@ -1703,30 +1758,18 @@ async fn process_persistent_packet<const H: usize>(
             {
                 bail!("iperf transfer already active");
             }
-            let requested = request
-                .data
-                .get(1..9)
-                .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
-                .unwrap_or(0)
-                .clamp(1, 64 * 1024 * 1024) as usize;
-            let packet_size = request
-                .data
-                .get(9..11)
-                .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()) as usize)
-                .unwrap_or(object_chunk)
-                .clamp(8, MAX_OBJECT_CHUNK);
+            let iperf_request = decode_iperf_service_request(&request.data)
+                .ok_or_else(|| anyhow::anyhow!("invalid IPERF request"))?;
+            // The no-std handler plan is also consumed by firmware. Keep
+            // request clamping, stream expansion, and ACK policy identical
+            // before this socket adapter adds host-only pacing.
+            let iperf_plan = IperfServicePlan::from_request(iperf_request, MAX_OBJECT_CHUNK);
             // The optional fields are diagnostic-only, scoped to this
             // IPERF request. Normal object transfers keep UdpConfig's
             // default unpaced scheduling, and an older Recovery request
             // (11 bytes) still uses the listener defaults.
-            let (
-                request_pace,
-                request_burst,
-                request_burst_delay,
-                request_ack_frequency,
-                request_ack_delay_us,
-            ) = iperf_schedule(
-                &request.data,
+            let (request_pace, request_burst, request_burst_delay, _, _) = iperf_schedule(
+                iperf_request,
                 iperf_pace,
                 iperf_burst_packets,
                 iperf_burst_delay,
@@ -1739,8 +1782,8 @@ async fn process_persistent_packet<const H: usize>(
             mux.endpoint
                 .request_ack_frequency(
                     0,
-                    u64::from(request_ack_frequency.saturating_sub(1)),
-                    request_ack_delay_us,
+                    u64::from(iperf_plan.ack_frequency.saturating_sub(1)),
+                    u64::from(iperf_plan.ack_delay_ms) * 1_000,
                     1,
                 )
                 .map_err(|error| anyhow::anyhow!("iperf ACK_FREQUENCY: {error:?}"))?;
@@ -1751,49 +1794,38 @@ async fn process_persistent_packet<const H: usize>(
             {
                 socket.send_to(&packet[..used], peer).await?;
             }
-            let parallel = request.data.get(30).copied().unwrap_or(1).clamp(1, 4) as usize;
-            let each = requested / parallel;
-            let remainder = requested % parallel;
-            for (index, transfer) in byte_transfers.iter_mut().take(parallel).enumerate() {
-                let bytes = each + usize::from(index < remainder);
+            for (index, transfer) in byte_transfers
+                .iter_mut()
+                .take(iperf_plan.normal_streams)
+                .enumerate()
+            {
+                let bytes = iperf_plan.normal_bytes[index];
                 *transfer = Some(PendingByteTransfer::new(
                     *response_stream,
                     bytes,
-                    packet_size,
+                    iperf_plan.packet_size,
                     request_pace,
                     request_burst,
                     request_burst_delay,
                 ));
                 *response_stream = response_stream.saturating_add(4);
             }
-            let low_requested = request
-                .data
-                .get(22..26)
-                .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
-                .unwrap_or(0)
-                .min(64 * 1024 * 1024);
-            let high_requested = request
-                .data
-                .get(26..30)
-                .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
-                .unwrap_or(0)
-                .min(64 * 1024 * 1024);
-            if high_requested != 0 {
+            if iperf_plan.high_priority_bytes != 0 {
                 *high_byte_transfer = Some(PendingByteTransfer::new(
                     *response_stream,
-                    high_requested,
-                    packet_size,
+                    iperf_plan.high_priority_bytes,
+                    iperf_plan.packet_size,
                     request_pace,
                     request_burst,
                     request_burst_delay,
                 ));
                 *response_stream = response_stream.saturating_add(4);
             }
-            if low_requested != 0 {
+            if iperf_plan.low_priority_bytes != 0 {
                 *low_byte_transfer = Some(PendingByteTransfer::new(
                     *response_stream,
-                    low_requested,
-                    packet_size,
+                    iperf_plan.low_priority_bytes,
+                    iperf_plan.packet_size,
                     request_pace,
                     request_burst,
                     request_burst_delay,
@@ -2268,7 +2300,12 @@ mod tests {
         let defaults = (Duration::from_micros(17), 3, Duration::from_micros(29));
         let legacy = [SERVICE_IPERF; 11];
         assert_eq!(
-            iperf_schedule(&legacy, defaults.0, defaults.1, defaults.2),
+            iperf_schedule(
+                decode_iperf_service_request(&legacy).unwrap(),
+                defaults.0,
+                defaults.1,
+                defaults.2,
+            ),
             (
                 defaults.0,
                 defaults.1,
@@ -2286,7 +2323,12 @@ mod tests {
         request[20] = 8;
         request[21] = 1;
         assert_eq!(
-            iperf_schedule(&request, defaults.0, defaults.1, defaults.2),
+            iperf_schedule(
+                decode_iperf_service_request(&request).unwrap(),
+                defaults.0,
+                defaults.1,
+                defaults.2,
+            ),
             (
                 Duration::from_micros(250),
                 4,
@@ -2297,7 +2339,13 @@ mod tests {
         );
         request[20] = u8::MAX;
         assert_eq!(
-            iperf_schedule(&request, defaults.0, defaults.1, defaults.2).3,
+            iperf_schedule(
+                decode_iperf_service_request(&request).unwrap(),
+                defaults.0,
+                defaults.1,
+                defaults.2,
+            )
+            .3,
             quic_lite::ACK_RANGE_CAPACITY as u8
         );
     }
@@ -3741,9 +3789,19 @@ mod tests {
                 .request_stream(registry_stream, &[SERVICE_STREAM], true)
                 .await
                 .unwrap();
-            let registry_text = core::str::from_utf8(&registry).unwrap();
-            assert!(registry_text.contains("metrics"));
-            assert!(registry_text.contains("events"));
+            // `handlers` is compact CBOR `[[tag, name], ...]`, not a text
+            // command surface. The names remain discovery metadata only.
+            assert_eq!(registry.first(), Some(&0x89));
+            assert!(
+                registry
+                    .windows(b"metrics".len())
+                    .any(|item| item == b"metrics")
+            );
+            assert!(
+                registry
+                    .windows(b"events".len())
+                    .any(|item| item == b"events")
+            );
         }
         assert_ne!(server_cids[0], server_cids[1]);
         server_task.abort();

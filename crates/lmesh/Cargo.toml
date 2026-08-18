@@ -27,7 +27,3 @@ uart-codec = { path = "../uart-codec" }
 
 [lib]
 name = "lmesh"
-
-[[bin]]
-name = "dmesh-iperf"
-path = "examples/dmesh_iperf.rs"

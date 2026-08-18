@@ -1,3 +1,4 @@
+#![no_std]
 //! Shared wire-level NAN definitions for Linux, ESP32, and Android adapters.
 //!
 //! The important boundary is intentional: this crate owns bytes on the air
@@ -7,6 +8,9 @@
 //! concerns separate prevents a timing workaround in one adapter from
 //! silently changing the Android/ESP interoperability format.
 
+extern crate alloc;
+
+use alloc::{vec, vec::Vec};
 use anyhow::{anyhow, bail, Result};
 pub mod espnow;
 pub use espnow::{
@@ -107,6 +111,7 @@ pub fn select_soft_nan_sync(
 /// expose the same names and meanings; adapters only decide how a sample is
 /// collected and how it is rendered on their debug socket.
 pub mod metrics {
+    use alloc::{format, string::String};
     /// Cross-adapter NAN counters. Values are deliberately plain integers so
     /// ESP32, Linux, recovery, and embedded users can populate the same
     /// snapshot without sharing an allocator, logger, or atomic type.
@@ -178,7 +183,7 @@ pub mod metrics {
         )
     }
 
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
     pub static NAN_RX_MGMT: AtomicU32 = AtomicU32::new(0);
     pub static NAN_RX_ACTION: AtomicU32 = AtomicU32::new(0);
@@ -679,6 +684,7 @@ fn checksum_finalize(mut sum: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn nan_beacon(bssid: [u8; 6], tsf_us: u64, interval_tu: u16) -> Vec<u8> {
         let mut frame = vec![0_u8; 34];
@@ -699,6 +705,8 @@ mod tests {
             0,
             b"ssi",
         );
+        assert!(is_action_frame(&frame));
+        assert!(!is_action_frame(&[0x80]));
         assert_eq!(
             &frame[..24],
             &[
@@ -944,6 +952,12 @@ pub fn is_nan_bssid(frame: &[u8]) -> bool {
 }
 pub fn is_beacon(frame: &[u8]) -> bool {
     frame.first() == Some(&0x80)
+}
+/// Whether an 802.11 management frame is an action frame. This accepts every
+/// action category; a bearer-specific parser decides whether its body is NAN,
+/// ESP-NOW-compatible, or another vendor protocol.
+pub fn is_action_frame(frame: &[u8]) -> bool {
+    frame.first() == Some(&0xd0)
 }
 pub fn is_nan_beacon(frame: &[u8]) -> bool {
     is_beacon(frame) && is_nan_bssid(frame)

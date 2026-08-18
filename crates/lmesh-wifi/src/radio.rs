@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -89,7 +89,6 @@ const SERIAL_RESET_NONE: u8 = 0;
 // generic mesh stream envelope remains at the lmesh UDS boundary.
 const FIRMWARE_UART_FLAG: u8 = UART_FLAG;
 const FIRMWARE_UART_ESCAPE: u8 = UART_ESCAPE;
-
 
 /// Host-side adapter from the no-std UART codec's raw payloads to the shared
 /// mesh CBOR stream-frame representation used by the Linux service.
@@ -248,8 +247,8 @@ const NL80211_STA_FLAG_ASSOCIATED: u32 = 1 << 7;
 const OPEN_AP_OFDM_BASIC_RATES: [u8; 1] = [0x8c];
 const OPEN_AP_OFDM_EXTENDED_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6c];
 const HOSTAPD_HT20_CAPABILITY: [u8; 28] = [
-    0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 fn open_ap_basic_rates() -> &'static [u8] {
@@ -305,10 +304,6 @@ pub struct RadioService {
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
     serial_forwards: Arc<Mutex<BTreeMap<String, SerialForwardRuntime>>>,
-    /// Persistent TCP sessions initiated by Main after it joins STA.  These
-    /// deliberately reverse the usual host->board direction: AP isolation
-    /// commonly prevents the host from opening a connection to a station.
-    esp_reverse_sessions: Arc<BTreeMap<String, ReverseMainRuntime>>,
     /// Default infrastructure gateway for configured ESP targets. A missing
     /// explicit `gateway` on `esp.serial.command` is resolved here; all ESP
     /// UART commands still require a managed forward.
@@ -419,8 +414,15 @@ impl RadioService {
         let Some(mac) = parse_mac(Some(mac.trim())) else {
             return json!({"ok": false, "error": "invalid station MAC"});
         };
-        let mut stations = self.ap_no_ht_stations.lock().unwrap_or_else(|p| p.into_inner());
-        if ht { stations.remove(&mac); } else { stations.insert(mac); }
+        let mut stations = self
+            .ap_no_ht_stations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if ht {
+            stations.remove(&mac);
+        } else {
+            stations.insert(mac);
+        }
         let value = json!({"ok": true, "station": colon_mac(&mac), "ht": ht,
             "reassociate_required": true});
         self.record("wifi.ap.station.profile", value.clone());
@@ -452,7 +454,6 @@ impl RadioService {
                     None
                 }
             });
-        let reverse_sessions = configured_esp_reverse_sessions();
         let service = Self {
             history: Arc::new(Mutex::new(VecDeque::new())),
             radios: Arc::new(load_radio_adapters()),
@@ -462,7 +463,6 @@ impl RadioService {
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             ap_no_ht_stations: Arc::new(Mutex::new(ap_no_ht_stations())),
             serial_forwards: Arc::new(Mutex::new(BTreeMap::new())),
-            esp_reverse_sessions: Arc::new(reverse_sessions),
             esp_gateway: configured_esp_gateway(),
             esp_targets: Arc::new(configured_esp_targets()),
             esp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -474,8 +474,8 @@ impl RadioService {
         };
         if enable_uart {
             // lmesh-wifi owns Wi-Fi/NAN and may invoke the shared L2 client,
-            // but it must not start the retired serial-forward or reverse TCP
-            // listeners from an inherited board configuration.
+            // but it must not start a legacy serial-forward listener from an
+            // inherited board configuration.
             service.record(
                 "uart.legacy_forwarding",
                 json!({"enabled": false, "reason": "retired"}),
@@ -502,7 +502,15 @@ impl RadioService {
             return json!({"ok": true, "already_running": true, "bearer": "udp"});
         }
         let bind = bind.unwrap_or_else(|| "0.0.0.0".to_owned());
-        let port = port.unwrap_or(3336);
+        // lmesh-wifi owns the stable wlan0 AP by default.  The development
+        // lmesh/wlan1 service selects its separate listener through
+        // LMESH_OBJECT_SERVER_PORT, so both can run on the same host.
+        let port = port.unwrap_or_else(|| {
+            std::env::var("LMESH_OBJECT_SERVER_PORT")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(dmesh_server::udp::STABLE_WIFI_UDP_PORT)
+        });
         let address = match format!("{bind}:{port}").parse::<SocketAddr>() {
             Ok(address) => address,
             Err(error) => {
@@ -566,7 +574,7 @@ impl RadioService {
                 tracing::warn!(%error, "object_udp_stopped");
             }
         });
-        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "quic-lite", "object_store": "dmesh-server", "services": ["object", "iperf", "control", "status", "metrics", "events", "echo"]})
+        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "quic-lite", "object_store": "dmesh-server", "services": ["object", "echo", "status", "handlers", "iperf", "metrics", "events", "control", "log-watch"]})
     }
 
     /// Transport-owned aggregates for the stable object listener.  This is
@@ -603,7 +611,7 @@ impl RadioService {
 
     /// Start the shared host transport client as a gateway operation. This is
     /// deliberately a thin adapter: serial framing, path policy, IPERF
-    /// request encoding, and result validation remain in `lmesh-uart` so the
+    /// request encoding, and result validation remain in `dmesh-cli` so the
     /// direct CLI and managed service exercise the same L2 code.
     pub fn transport_client_iperf(
         &self,
@@ -614,7 +622,7 @@ impl RadioService {
         bearer: Option<String>,
     ) -> Value {
         let policy = bearer.unwrap_or_else(|| "aggregate".to_owned());
-        if lmesh_uart::client::ClientPathPolicy::parse(&policy).is_none() {
+        if dmesh_cli::client::ClientPathPolicy::parse(&policy).is_none() {
             return json!({"ok": false, "error": "bearer must be uart, udp, aggregate, fastest, or spill"});
         }
         let arguments = vec![
@@ -641,9 +649,9 @@ impl RadioService {
             }),
         );
         let history = self.history.clone();
-        let name = format!("dmesh-iperf-{serial}");
+        let name = format!("dmesh-cli-iperf-{serial}");
         match std::thread::Builder::new().name(name).spawn(move || {
-            let result = lmesh_uart::client::run_dmesh_iperf_args(arguments);
+            let result = dmesh_cli::client::run_dmesh_cli_args(arguments);
             let value = match result {
                 Ok(()) => json!({"ok": true, "state": "completed", "run_id": run_id}),
                 Err(error) => {
@@ -655,7 +663,7 @@ impl RadioService {
         }) {
             Ok(_) => json!({
                 "ok": true,
-                "client": "lmesh-uart",
+                "client": "dmesh-cli",
                 "service": "iperf",
                 "run_id": run_id,
                 "serial": serial,
@@ -670,7 +678,7 @@ impl RadioService {
 
     /// Run one registered QUIC-lite service through the shared host client.
     /// The gateway deliberately retains no command schema: service selection
-    /// and optional CBOR body stay in `lmesh-uart`, so a direct CLI invocation
+    /// and optional CBOR body stay in `dmesh-cli`, so a direct CLI invocation
     /// and an egress-gateway invocation have identical wire behavior.
     pub fn transport_client_service(
         &self,
@@ -681,7 +689,7 @@ impl RadioService {
     ) -> Value {
         if !matches!(
             service.as_str(),
-            "status" | "metrics" | "streams" | "log-watch" | "control"
+            "status" | "metrics" | "services" | "streams" | "log-watch" | "control"
         ) {
             return json!({"ok": false, "error": "unknown registered service"});
         }
@@ -706,7 +714,7 @@ impl RadioService {
         match std::thread::Builder::new()
             .name(format!("dmesh-client-{run_id}"))
             .spawn(move || {
-                let result = lmesh_uart::client::run_dmesh_iperf_args(arguments);
+                let result = dmesh_cli::client::run_dmesh_cli_args(arguments);
                 let value = match result {
                     Ok(()) => json!({"ok": true, "state": "completed", "run_id": run_id}),
                     Err(error) => {
@@ -718,7 +726,7 @@ impl RadioService {
             }) {
             Ok(_) => json!({
                 "ok": true,
-                "client": "lmesh-uart",
+                "client": "dmesh-cli",
                 "run_id": run_id,
                 "target": target,
                 "service": service,
@@ -864,36 +872,6 @@ impl RadioService {
             .map(|forward| forward.socket_path.clone())
     }
 
-    fn start_configured_esp_reverse_sessions(&self) {
-        if self.esp_reverse_sessions.is_empty() {
-            return;
-        }
-        let sessions = self.esp_reverse_sessions.clone();
-        for session in sessions.values() {
-            let session = session.clone();
-            let uds_session = session.clone();
-            let sessions = sessions.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = reverse_main_uds_loop(uds_session.clone()) {
-                    tracing::warn!(id = %uds_session.id, error = %error, "reverse_main_uds_exited");
-                }
-            });
-            // One listener is enough for all configured boards on a port.
-            // The first matching session owns it; all peers are checked
-            // against the configured STA address before being accepted.
-            if !sessions
-                .values()
-                .any(|other| other.id < session.id && other.port == session.port)
-            {
-                std::thread::spawn(move || {
-                    if let Err(error) = reverse_main_accept_loop(session.port, sessions) {
-                        tracing::warn!(port = session.port, error = %error, "reverse_main_listener_exited");
-                    }
-                });
-            }
-        }
-    }
-
     fn run_stability_cycle(
         &self,
         source: &str,
@@ -968,6 +946,7 @@ impl RadioService {
         })
     }
 
+    #[cfg(any())]
     fn start_configured_serial_forwards(&self) {
         let config_path = lmesh_config_path();
         let Some(config) = read_lmesh_config() else {
@@ -993,16 +972,9 @@ impl RadioService {
             if forward.enabled == Some(false) {
                 continue;
             }
-            let tcp_mode = forward
-                .tcp_mode
-                .clone()
-                .or_else(|| forward.tcp_port.map(|_| "rfc2217".to_string()))
-                .unwrap_or_else(|| "framed".to_string());
             let result = self.serial_forward_start(
                 Some(forward.port.clone()),
                 forward.baud,
-                forward.tcp_port,
-                Some(tcp_mode),
                 Some(false),
                 forward.multi,
                 forward.direct,
@@ -1306,7 +1278,6 @@ impl RadioService {
                         json!({
                             "id": forward.id,
                             "socket": forward.socket_path,
-                            "tcp_listen": forward.tcp_listen,
                             "baud": forward.baud,
                             "firmware": forward
                                 .firmware_state
@@ -1596,17 +1567,30 @@ impl RadioService {
         }
     }
 
-    /// Start a generic byte-forwarding UDS for one USB serial device.
+    /// Legacy byte-forwarding start operation.
+    ///
+    /// Device UARTs are now QUIC-lite L2 bearers owned directly by the client
+    /// (or a future QUIC-lite proxy), not a managed UDS byte forward. Keep
+    /// this explicit rejection while the log/serial translation helpers are
+    /// migrated into the client library; it must never open a device port,
+    /// create a socket, or reintroduce a command side channel.
+    #[allow(unreachable_code, unused_mut, unused_variables)]
     pub fn serial_forward_start(
         &self,
         port: Option<String>,
         mut baud: Option<u32>,
-        mut tcp_port: Option<u16>,
-        mut tcp_mode: Option<String>,
         handshake: Option<bool>,
         mut multi: Option<bool>,
         direct: Option<bool>,
     ) -> Value {
+        // Keep the rest of this function compiled only while its serial
+        // decoder/log conversion is being extracted to lmesh-uart. This
+        // return is deliberately before target resolution and socket setup.
+        return json!({
+            "ok": false,
+            "retired": true,
+            "error": "legacy UART byte forwarding is retired; use the QUIC-lite device client",
+        });
         let configured = port
             .as_deref()
             .and_then(canonical_usb_port_id)
@@ -1617,8 +1601,6 @@ impl RadioService {
             .unwrap_or(false);
         if let Some(configured) = configured.as_ref() {
             baud = baud.or(configured.baud);
-            tcp_port = tcp_port.or(configured.tcp_port);
-            tcp_mode = tcp_mode.or_else(|| configured.tcp_mode.clone());
             multi = multi.or(configured.multi);
         }
         // Probe firmware forwards immediately.  Once the device reports
@@ -1627,15 +1609,6 @@ impl RadioService {
         // byte forwards may still opt into immediate delivery explicitly.
         let direct_write = raw_output || direct.unwrap_or(false);
         let multi = multi.unwrap_or(false);
-        let tcp_mode = match SerialForwardTcpMode::parse(tcp_mode.as_deref().unwrap_or("auto")) {
-            Ok(mode) => mode,
-            Err(error) => {
-                return json!({
-                    "ok": false,
-                    "error": error.to_string(),
-                });
-            }
-        };
         let Some(target) = resolve_usb_serial_target(port, baud) else {
             return json!({
                 "ok": false,
@@ -1701,39 +1674,9 @@ impl RadioService {
                 "error": format!("failed to set serial forward listener nonblocking: {error}"),
             });
         }
-        let (tcp_listener, tcp_listen) = match tcp_port {
-            Some(port) => {
-                let bind_addr = format!("127.0.0.1:{port}");
-                match TcpListener::bind(&bind_addr) {
-                    Ok(listener) => {
-                        if let Err(error) = listener.set_nonblocking(true) {
-                            let _ = fs::remove_file(&socket_path);
-                            return json!({
-                                "ok": false,
-                                "id": id,
-                                "tcp_listen": bind_addr,
-                                "error": format!("failed to set TCP serial forward listener nonblocking: {error}"),
-                            });
-                        }
-                        let listen = listener
-                            .local_addr()
-                            .map(|addr| addr.to_string())
-                            .unwrap_or(bind_addr);
-                        (Some(listener), Some(listen))
-                    }
-                    Err(error) => {
-                        let _ = fs::remove_file(&socket_path);
-                        return json!({
-                            "ok": false,
-                            "id": id,
-                            "tcp_listen": bind_addr,
-                            "error": format!("failed to bind TCP serial forward: {error}"),
-                        });
-                    }
-                }
-            }
-            None => (None, None),
-        };
+        // Network serial forwarding is retired. The legacy serial path, while
+        // it still exists for local modem utilities, may only bind its Unix
+        // socket.
         let stop = Arc::new(AtomicBool::new(false));
         let reset_request = Arc::new(AtomicU8::new(SERIAL_RESET_NONE));
         let flush_request = Arc::new(AtomicBool::new(false));
@@ -1750,7 +1693,6 @@ impl RadioService {
         let thread_id = id.clone();
         let thread_path = path.clone();
         let thread_socket_path = socket_path.clone();
-        let thread_tcp_listen = tcp_listen.clone();
         let thread_log_path = log_path.clone();
         let thread_log = log_path.as_ref().and_then(|_| self.serial_log.clone());
         let thread_baud = baud;
@@ -1760,8 +1702,6 @@ impl RadioService {
                 &thread_path,
                 thread_baud,
                 listener,
-                tcp_listener,
-                tcp_mode,
                 multi,
                 raw_output,
                 thread_reset_request,
@@ -1778,7 +1718,6 @@ impl RadioService {
                     forward_id = %thread_id,
                     port = %thread_path,
                     socket = %thread_socket_path,
-                    tcp = ?thread_tcp_listen,
                     error = %error,
                     "serial_forward_exited"
                 );
@@ -1789,7 +1728,6 @@ impl RadioService {
             radio_id: id.clone(),
             port: path.clone(),
             socket_path: socket_path.clone(),
-            tcp_listen: tcp_listen.clone(),
             log_path: log_path.clone(),
             baud,
             multi,
@@ -1815,9 +1753,7 @@ impl RadioService {
             "baud": baud,
             "multi": multi,
             "raw": raw_output,
-            "tcp_mode": tcp_mode.name(),
             "socket": socket_path,
-            "tcp_listen": tcp_listen,
             "log_path": log_path,
             "handshake": handshake_result,
         });
@@ -1844,9 +1780,6 @@ impl RadioService {
         };
         runtime.stop.store(true, Ordering::Release);
         let _ = std::os::unix::net::UnixStream::connect(&runtime.socket_path);
-        if let Some(tcp_listen) = &runtime.tcp_listen {
-            let _ = TcpStream::connect(tcp_listen);
-        }
         if let Some(handle) = runtime.handle.take() {
             let _ = handle.join();
         }
@@ -1857,7 +1790,6 @@ impl RadioService {
             "port": runtime.port,
             "multi": runtime.multi,
             "socket": runtime.socket_path,
-            "tcp_listen": runtime.tcp_listen,
         });
         self.record("usb.serial.forward.stop", result.clone());
         result
@@ -1878,7 +1810,6 @@ impl RadioService {
                     "socket": forward.socket_path,
                     "baud": forward.baud,
                     "multi": forward.multi,
-                    "tcp_listen": forward.tcp_listen,
                     "log_path": forward.log_path,
                     "started_ms": forward.started_ms,
                     "running": !forward.stop.load(Ordering::Acquire),
@@ -3232,9 +3163,10 @@ impl RadioService {
         &self,
         config: &mesh::local_trace::TraceConfig,
     ) -> Option<String> {
-        let target = config.targets.iter().find(|target| {
-            target.starts_with("dmesh.event.wifi.rawnan")
-        })?;
+        let target = config
+            .targets
+            .iter()
+            .find(|target| target.starts_with("dmesh.event.wifi.rawnan"))?;
         let _ = target;
         let iface = wifi_iface(None);
         let mut subscribers = self
@@ -3394,7 +3326,9 @@ impl RadioService {
                 &payload_bytes,
             ) {
                 Ok(frame) => frame,
-                Err(error) => return json!({"ok": false, "error": format!("raw ESP-NOW frame: {error}")}),
+                Err(error) => {
+                    return json!({"ok": false, "error": format!("raw ESP-NOW frame: {error}")});
+                }
             }
         };
         if is_nan_control_frame(&frame)
@@ -3816,6 +3750,164 @@ impl RadioService {
         result
     }
 
+    /// Run the standard QUIC-lite IPERF service through raw ESP-NOW-compatible
+    /// vendor action frames. The host owns monitor injection/capture only;
+    /// bootstrap, stream request, ACKs, and IPERF validation live in the
+    /// bearer-neutral `dmesh_server::raw_iperf::RawIperfClient`.
+    pub fn raw_espnow_iperf(
+        &self,
+        iface: Option<String>,
+        channel: Option<u8>,
+        destination: String,
+        bytes: u64,
+        timeout_ms: Option<u64>,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let channel = raw_wifi_channel(channel);
+        let timeout_ms = timeout_ms.unwrap_or(20_000).clamp(1_000, 60_000);
+        let destination_mac = match parse_mac(Some(&destination)) {
+            Some(mac) => mac,
+            None => return json!({"ok": false, "error": "destination must be a MAC address"}),
+        };
+        let source = match raw_wifi_source(None, &iface) {
+            Ok(mac) => mac,
+            Err(error) => {
+                return json!({"ok": false, "iface": iface, "error": format!("source MAC: {error:#}")});
+            }
+        };
+        // `nl80211` frame events keep the AP's managed station association
+        // intact. Monitor-VIF creation is useful for passive NAN inspection
+        // but can sever an active Recovery STA on this chipset.
+        let listen = self.wifi_raw_listen(
+            Some(iface.clone()),
+            Some(channel),
+            Some((timeout_ms / 1_000 + 3).max(3)),
+            Some("nl80211".to_owned()),
+        );
+        if !listen.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return json!({"ok": false, "iface": iface, "channel": channel, "listen": listen, "error": "raw monitor did not start"});
+        }
+        let cid_value = now_millis_u64().max(1);
+        let client_cid = match quic_lite::ConnectionId::new(cid_value) {
+            Some(cid) => cid,
+            None => return json!({"ok": false, "error": "could not allocate client CID"}),
+        };
+        let mut client = match dmesh_server::raw_iperf::RawIperfClient::<
+            4,
+            { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+        >::new(client_cid, bytes)
+        {
+            Ok(client) => client,
+            Err(error) => return json!({"ok": false, "error": format!("IPERF client: {error:?}")}),
+        };
+        let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let mut pending = match client.start(&mut packet) {
+            Ok(used) => Some(used),
+            Err(error) => return json!({"ok": false, "error": format!("IPERF OPEN: {error:?}")}),
+        };
+        let started = Instant::now();
+        let start_ms = now_millis_u64();
+        let mut seen = HashSet::new();
+        let mut tx_count = 0u64;
+        let mut rx_count = 0u64;
+        let mut last_error = None;
+        while started.elapsed() < Duration::from_millis(timeout_ms) {
+            if let Some(used) = pending.take() {
+                // Use the AP-owning interface's nl80211 management-frame
+                // path, not monitor injection. A monitor VIF can transmit a
+                // locally captured frame without the AP delivering it to its
+                // associated STA; `action` reaches the same station path as
+                // the existing raw ESP-NOW command bearer.
+                let sent = self.wifi_raw_send(
+                    Some(iface.clone()),
+                    Some(channel),
+                    Some(1),
+                    Some(colon_mac(&destination_mac)),
+                    Some(colon_mac(&source)),
+                    Some("action".to_owned()),
+                    None,
+                    Some(colon_mac(&source)),
+                    None,
+                    format!("hex:{}", hex_lower(&packet[..used])),
+                    Some(6),
+                );
+                if !sent.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    last_error = Some(format!(
+                        "raw action TX: {}",
+                        sent.get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                    ));
+                    break;
+                }
+                tx_count = tx_count.saturating_add(1);
+            }
+            let events = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|event| {
+                    event.key == "wifi.raw.rx" && event.ts_millis >= u128::from(start_ms)
+                })
+                .map(|event| (event.ts_millis, event.value.clone()))
+                .collect::<Vec<_>>();
+            for (timestamp, event) in events {
+                let Some(payload_hex) = event.get("payload").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !seen.insert((timestamp, payload_hex.to_owned())) {
+                    continue;
+                }
+                let Ok(payload) = decode_firmware_hex(payload_hex) else {
+                    continue;
+                };
+                rx_count = rx_count.saturating_add(1);
+                match client.receive(&payload, &mut packet) {
+                    Ok(next) => pending = next,
+                    Err(error) => last_error = Some(format!("QUIC-lite RX: {error:?}")),
+                }
+                if client.is_complete() {
+                    break;
+                }
+            }
+            if client.is_complete() {
+                break;
+            }
+            if last_error.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let elapsed_us = started.elapsed().as_micros();
+        let complete = client.is_complete();
+        let transferred = client.bytes();
+        let bps = if elapsed_us == 0 {
+            0
+        } else {
+            transferred.saturating_mul(8).saturating_mul(1_000_000) / elapsed_us as u64
+        };
+        let result = json!({
+            "ok": complete,
+            "bearer": "espnow_raw_action",
+            "iface": iface,
+            "channel": channel,
+            "destination": destination,
+            "requested_bytes": bytes,
+            "bytes": transferred,
+            "elapsed_us": elapsed_us,
+            "bps": bps,
+            "tx_packets": tx_count,
+            "rx_packets": rx_count,
+            "callback_errors": client.callback_errors(),
+            "server_cid": client.server_cid().map(|cid| cid.value()),
+            "listen": listen,
+            "error": last_error,
+        });
+        self.record("wifi.raw.iperf", result.clone());
+        result
+    }
+
     /// Capture beacon and probe-response management frames through an AF_PACKET monitor socket.
     pub fn wifi_mgmt_capture(
         &self,
@@ -4028,45 +4120,6 @@ impl RadioService {
             "command": command,
             "error": "physical UART access is disabled; use an active managed serial forward",
         })
-    }
-
-    /// Send an existing compact-CBOR firmware command over Main's temporary
-    /// STA maintenance listener.  This deliberately has no UART fallback:
-    /// callers use NAN to activate the session, then specify the board's
-    /// numeric `ip:port` endpoint for reliable command and block-image work.
-    pub fn esp_tcp_command(
-        &self,
-        endpoint: String,
-        command: String,
-        timeout_sec: Option<f64>,
-    ) -> Value {
-        let timeout_ms = timeout_sec
-            .map(|secs| (secs.max(0.05) * 1000.0).round() as u64)
-            .unwrap_or(3_000)
-            .clamp(50, 300_000);
-        let result = match self
-            .esp_reverse_sessions
-            .get(&endpoint)
-            .map(|session| reverse_main_exchange(session, &command, timeout_ms))
-            .unwrap_or_else(|| tcp_firmware_exchange(&endpoint, &command, timeout_ms))
-        {
-            Ok(response) => json!({
-                "ok": true,
-                "endpoint": endpoint,
-                "command": command,
-                "via": "main_tcp_session",
-                "response": response,
-            }),
-            Err(error) => json!({
-                "ok": false,
-                "endpoint": endpoint,
-                "command": command,
-                "via": "main_tcp_session",
-                "error": error.to_string(),
-            }),
-        };
-        self.record("esp.serial.command", result.clone());
-        result
     }
 
     /// Route a compact-CBOR firmware command through an always-on NAN
@@ -4661,7 +4714,9 @@ impl RadioService {
 }
 
 fn push_history_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, key: &str, value: Value) {
-    let mut history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut history = history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     history.push_back(RadioEvent {
         ts_millis: now_millis(),
         key: key.to_owned(),
@@ -4704,7 +4759,6 @@ struct SerialForwardRuntime {
     radio_id: String,
     port: String,
     socket_path: String,
-    tcp_listen: Option<String>,
     log_path: Option<String>,
     baud: u32,
     multi: bool,
@@ -4747,15 +4801,6 @@ impl FirmwareState {
             "last_event_ms": self.last_event_ms,
         })
     }
-}
-
-#[derive(Clone, Debug)]
-struct ReverseMainRuntime {
-    id: String,
-    ip: Ipv4Addr,
-    port: u16,
-    socket_path: String,
-    stream: Arc<Mutex<Option<TcpStream>>>,
 }
 
 struct StabilityRuntime {
@@ -4899,31 +4944,10 @@ impl SerialForwardStats {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SerialForwardTcpMode {
+enum SerialForwardWireMode {
     Framed,
     Rfc2217,
     Auto,
-}
-
-impl SerialForwardTcpMode {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "framed" | "frame" | "text" | "plain" => Ok(Self::Framed),
-            "rfc2217" | "telnet" | "flash" => Ok(Self::Rfc2217),
-            "auto" | "" => Ok(Self::Auto),
-            other => {
-                bail!("unsupported serial TCP mode {other:?}; expected framed, rfc2217, or auto")
-            }
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Framed => "framed",
-            Self::Rfc2217 => "rfc2217",
-            Self::Auto => "auto",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5222,8 +5246,6 @@ fn serial_forward_loop(
     port: &str,
     baud: u32,
     listener: UnixListener,
-    tcp_listener: Option<TcpListener>,
-    tcp_mode: SerialForwardTcpMode,
     multi: bool,
     raw_output: bool,
     reset_request: Arc<AtomicU8>,
@@ -5358,39 +5380,6 @@ fn serial_forward_loop(
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error).context("failed to accept serial forward client"),
-        }
-        if let Some(tcp_listener) = &tcp_listener {
-            loop {
-                match tcp_listener.accept() {
-                    Ok((stream, addr)) => {
-                        stats.client_accepts.fetch_add(1, Ordering::Relaxed);
-                        tracing::info!(
-                            forward_id = %id,
-                            port = %port,
-                            transport = "tcp",
-                            client = %addr,
-                            "serial_forward_client"
-                        );
-                        match add_serial_forward_tcp_client(&mut clients, stream, tcp_mode) {
-                            Ok(()) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    forward_id = %id,
-                                    port = %port,
-                                    client = %addr,
-                                    error = %error,
-                                    "serial_forward_client_error"
-                                );
-                            }
-                        }
-                        progressed = true;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        return Err(error).context("failed to accept TCP serial forward client");
-                    }
-                }
-            }
         }
         let flash_log_quiet = log_flash_quiet_until_ms.load(Ordering::Acquire) > now_millis_u64();
         match serial.read(&mut serial_buf) {
@@ -5590,7 +5579,6 @@ fn serial_forward_loop(
             wait_for_serial_forward_io(
                 &serial,
                 &listener,
-                tcp_listener.as_ref(),
                 &clients,
                 !serial_tx.is_empty(),
                 &stats,
@@ -5606,12 +5594,11 @@ fn serial_forward_loop(
 fn wait_for_serial_forward_io(
     serial: &fs::File,
     listener: &UnixListener,
-    tcp_listener: Option<&TcpListener>,
     clients: &[SerialForwardClient],
     serial_writable: bool,
     stats: &SerialForwardStats,
 ) -> Result<()> {
-    let mut fds = Vec::with_capacity(3 + clients.len());
+    let mut fds = Vec::with_capacity(2 + clients.len());
     let mut serial_events = libc::POLLIN;
     if serial_writable {
         serial_events |= libc::POLLOUT;
@@ -5626,13 +5613,6 @@ fn wait_for_serial_forward_io(
         events: libc::POLLIN,
         revents: 0,
     });
-    if let Some(tcp_listener) = tcp_listener {
-        fds.push(libc::pollfd {
-            fd: tcp_listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-    }
     for client in clients {
         if let Some(fd) = client.stream.raw_fd() {
             let mut events = libc::POLLIN;
@@ -5697,22 +5677,7 @@ fn add_serial_forward_unix_client(
     stream
         .set_nonblocking(true)
         .context("failed to set UDS client nonblocking")?;
-    add_serial_forward_client(clients, Box::new(stream), SerialForwardTcpMode::Framed);
-    Ok(())
-}
-
-fn add_serial_forward_tcp_client(
-    clients: &mut Vec<SerialForwardClient>,
-    stream: TcpStream,
-    tcp_mode: SerialForwardTcpMode,
-) -> Result<()> {
-    stream
-        .set_nonblocking(true)
-        .context("failed to set TCP client nonblocking")?;
-    stream
-        .set_nodelay(true)
-        .context("failed to disable Nagle buffering for TCP serial forward")?;
-    add_serial_forward_client(clients, Box::new(stream), tcp_mode);
+    add_serial_forward_client(clients, Box::new(stream), SerialForwardWireMode::Framed);
     Ok(())
 }
 
@@ -5728,22 +5693,16 @@ impl SerialForwardStream for UnixStream {
     }
 }
 
-impl SerialForwardStream for TcpStream {
-    fn raw_fd(&self) -> Option<RawFd> {
-        Some(self.as_raw_fd())
-    }
-}
-
 fn add_serial_forward_client(
     clients: &mut Vec<SerialForwardClient>,
     stream: Box<dyn SerialForwardStream>,
-    tcp_mode: SerialForwardTcpMode,
+    wire_mode: SerialForwardWireMode,
 ) {
     let id = clients
         .last()
         .map(|client| client.id.saturating_add(1))
         .unwrap_or(1);
-    clients.push(SerialForwardClient::new(id, stream, tcp_mode));
+    clients.push(SerialForwardClient::new(id, stream, wire_mode));
 }
 
 fn broadcast_serial_output(
@@ -5784,9 +5743,9 @@ struct SerialForwardClient {
     stream: Box<dyn SerialForwardStream>,
     input: Vec<u8>,
     output: VecDeque<u8>,
-    tcp_mode: SerialForwardTcpMode,
+    wire_mode: SerialForwardWireMode,
     rfc2217_mode: bool,
-    // UDS/TCP input is auto-detected per client. Text clients receive the
+    // Unix-socket input is auto-detected per client. Text clients receive the
     // matching human-readable response representation; framed clients keep
     // the length-prefixed CBOR stream.
     text_mode: bool,
@@ -5794,14 +5753,18 @@ struct SerialForwardClient {
 }
 
 impl SerialForwardClient {
-    fn new(id: u64, stream: Box<dyn SerialForwardStream>, tcp_mode: SerialForwardTcpMode) -> Self {
+    fn new(
+        id: u64,
+        stream: Box<dyn SerialForwardStream>,
+        wire_mode: SerialForwardWireMode,
+    ) -> Self {
         Self {
             id,
             stream,
             input: Vec::new(),
             output: VecDeque::new(),
-            tcp_mode,
-            rfc2217_mode: tcp_mode == SerialForwardTcpMode::Rfc2217,
+            wire_mode,
+            rfc2217_mode: wire_mode == SerialForwardWireMode::Rfc2217,
             text_mode: false,
             force_direct: false,
         }
@@ -5841,7 +5804,7 @@ impl SerialForwardClient {
     }
 
     fn is_rfc2217(&self) -> bool {
-        self.rfc2217_mode || self.tcp_mode == SerialForwardTcpMode::Rfc2217
+        self.rfc2217_mode || self.wire_mode == SerialForwardWireMode::Rfc2217
     }
 
     fn flush_output(&mut self) -> Result<bool> {
@@ -5935,8 +5898,8 @@ impl SerialForwardClient {
             // this client; merely recording `self.force_direct` is
             // insufficient because the packet would otherwise remain queued.
             let direct_for_client = serial_direct || self.force_direct;
-            if (self.tcp_mode == SerialForwardTcpMode::Rfc2217
-                || self.tcp_mode == SerialForwardTcpMode::Auto)
+            if (self.wire_mode == SerialForwardWireMode::Rfc2217
+                || self.wire_mode == SerialForwardWireMode::Auto)
                 && self.input[0] == RFC2217_IAC
             {
                 self.rfc2217_mode = true;
@@ -6609,7 +6572,11 @@ fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
         bail!("Recovery STA packet field is too long or empty");
     }
     let mut packet = Vec::with_capacity(
-        96 + endpoint.len() + local_ip.len() + ssid.len() + gateway.len() + mask.len()
+        96 + endpoint.len()
+            + local_ip.len()
+            + ssid.len()
+            + gateway.len()
+            + mask.len()
             + password.len(),
     );
     packet.extend_from_slice(&[
@@ -7183,163 +7150,6 @@ fn firmware_arg_tag(name: &str) -> Option<u16> {
         "object_action_stats" => 272,
         _ => return None,
     })
-}
-
-/// Accept one persistent reverse Main connection for every configured STA
-/// address. Unknown peers are discarded rather than becoming an implicit
-/// maintenance endpoint.
-fn reverse_main_accept_loop(
-    port: u16,
-    sessions: Arc<BTreeMap<String, ReverseMainRuntime>>,
-) -> Result<()> {
-    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
-        .with_context(|| format!("failed to bind reverse Main listener on 0.0.0.0:{port}"))?;
-    tracing::info!(port, "reverse_main_listener_started");
-    for accepted in listener.incoming() {
-        let stream = accepted.context("failed to accept reverse Main connection")?;
-        let peer = stream
-            .peer_addr()
-            .context("failed to identify reverse Main peer")?;
-        let Some((id, session)) = sessions
-            .iter()
-            .find(|(_, session)| peer.ip() == std::net::IpAddr::V4(session.ip))
-        else {
-            tracing::warn!(peer = %peer, port, "reverse_main_unknown_peer");
-            continue;
-        };
-        stream.set_nodelay(true).ok();
-        let mut current = session
-            .stream
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *current = Some(stream);
-        tracing::info!(id = %id, peer = %peer, socket = %session.socket_path, "reverse_main_connected");
-    }
-    Ok(())
-}
-
-/// Expose the accepted connection as the familiar per-device managed socket.
-/// Each UDS client sends one `u32 length + CBOR` request and receives the
-/// matching framed response. The shared reverse stream is serialized so one
-/// device cannot have replies assigned to the wrong local caller.
-fn reverse_main_uds_loop(session: ReverseMainRuntime) -> Result<()> {
-    if let Some(parent) = PathBuf::from(&session.socket_path).parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _ = fs::remove_file(&session.socket_path);
-    let listener = UnixListener::bind(&session.socket_path)
-        .with_context(|| format!("failed to bind reverse Main socket {}", session.socket_path))?;
-    configure_serial_forward_socket(&session.socket_path)?;
-    for accepted in listener.incoming() {
-        let mut client = accepted.context("failed to accept reverse Main socket client")?;
-        let session = session.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let mut length = [0_u8; 4];
-                client.read_exact(&mut length)?;
-                let length = u32::from_be_bytes(length) as usize;
-                if length == 0 || length > 4096 {
-                    bail!("invalid reverse Main request length {length}");
-                }
-                let mut payload = vec![0_u8; length];
-                client.read_exact(&mut payload)?;
-                let response = reverse_main_exchange_payload(&session, &payload, 30_000)?;
-                client.write_all(&(response.len() as u32).to_be_bytes())?;
-                client.write_all(&response)?;
-                client.flush()?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                tracing::debug!(id = %session.id, error = %error, "reverse_main_socket_exchange_failed");
-            }
-        });
-    }
-    Ok(())
-}
-
-fn reverse_main_exchange(
-    session: &ReverseMainRuntime,
-    command: &str,
-    timeout_ms: u64,
-) -> Result<Value> {
-    let stream_frame = firmware_command_cbor(command)?;
-    let payload = mesh::cbor::decode_stream_frame(&stream_frame)?;
-    let response = reverse_main_exchange_payload(session, &payload, timeout_ms)?;
-    mesh::cbor::decode_json(&response, &mesh::cbor::Catalog::default())
-        .context("Main reverse TCP response is not compact CBOR")
-}
-
-fn reverse_main_exchange_payload(
-    session: &ReverseMainRuntime,
-    payload: &[u8],
-    timeout_ms: u64,
-) -> Result<Vec<u8>> {
-    let timeout = Duration::from_millis(timeout_ms);
-    let mut guard = session
-        .stream
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let stream = guard
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("Main reverse session {} is not connected", session.id))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let length = u32::try_from(payload.len()).context("firmware command is too large for TCP")?;
-    if let Err(error) = stream
-        .write_all(&length.to_be_bytes())
-        .and_then(|_| stream.write_all(payload))
-        .and_then(|_| stream.flush())
-    {
-        *guard = None;
-        return Err(error).context("failed to write Main reverse command");
-    }
-    let mut length = [0_u8; 4];
-    if let Err(error) = stream.read_exact(&mut length) {
-        *guard = None;
-        return Err(error).context("failed to read Main reverse response length");
-    }
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > 4096 {
-        bail!("invalid Main reverse response length {length}");
-    }
-    let mut response = vec![0_u8; length];
-    if let Err(error) = stream.read_exact(&mut response) {
-        *guard = None;
-        return Err(error).context("failed to read Main reverse response");
-    }
-    Ok(response)
-}
-
-/// One request/response exchange with Main's STA maintenance command port.
-/// The outer u32 is TCP framing only; its payload is the same compact CBOR
-/// accepted by radio and UART command dispatch.
-fn tcp_firmware_exchange(endpoint: &str, command: &str, timeout_ms: u64) -> Result<Value> {
-    let address: SocketAddr = endpoint
-        .parse()
-        .with_context(|| format!("TCP endpoint must be numeric ip:port, got {endpoint:?}"))?;
-    let timeout = Duration::from_millis(timeout_ms);
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .with_context(|| format!("failed to connect Main maintenance endpoint {endpoint}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    let stream_frame = firmware_command_cbor(command)?;
-    let payload = mesh::cbor::decode_stream_frame(&stream_frame)?;
-    let length = u32::try_from(payload.len()).context("firmware command is too large for TCP")?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()?;
-
-    let mut length = [0_u8; 4];
-    stream.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > 4096 {
-        bail!("invalid Main TCP response length {length}");
-    }
-    let mut payload = vec![0_u8; length];
-    stream.read_exact(&mut payload)?;
-    mesh::cbor::decode_json(&payload, &mesh::cbor::Catalog::default())
-        .context("Main TCP response is not compact CBOR")
 }
 
 fn decode_firmware_hex(value: &str) -> Result<Vec<u8>> {
@@ -8387,24 +8197,8 @@ struct LmeshToml {
     esp_gateway: Option<String>,
     #[serde(default)]
     esp_targets: BTreeMap<String, String>,
-    /// Main STA sessions originate at the ESP and are accepted by lmesh.
-    #[serde(default)]
-    esp_reverse_sessions: Vec<EspReverseSessionConfig>,
     /// One append-only, host-timestamped capture for all managed serial forwards.
     serial_log_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EspReverseSessionConfig {
-    id: String,
-    ip: Ipv4Addr,
-    #[serde(default = "default_reverse_main_port")]
-    port: u16,
-    socket: Option<String>,
-}
-
-fn default_reverse_main_port() -> u16 {
-    3343
 }
 
 fn configured_esp_gateway() -> String {
@@ -8437,27 +8231,6 @@ fn configured_esp_targets() -> BTreeMap<String, String> {
         }
     }
     targets
-}
-
-fn configured_esp_reverse_sessions() -> BTreeMap<String, ReverseMainRuntime> {
-    read_lmesh_config()
-        .map(|config| config.esp_reverse_sessions)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|config| {
-            let socket_path = config
-                .socket
-                .unwrap_or_else(|| format!("/run/mesh/lmesh/{}-ip.sock", config.id));
-            let runtime = ReverseMainRuntime {
-                id: config.id.clone(),
-                ip: config.ip,
-                port: config.port,
-                socket_path,
-                stream: Arc::new(Mutex::new(None)),
-            };
-            (config.id, runtime)
-        })
-        .collect()
 }
 
 fn resolve_esp_route(
@@ -8493,8 +8266,6 @@ struct SerialForwardConfig {
     port: String,
     path: Option<String>,
     baud: Option<u32>,
-    tcp_port: Option<u16>,
-    tcp_mode: Option<String>,
     multi: Option<bool>,
     log: Option<bool>,
     /// Forward unframed serial output verbatim. This is for external sources
@@ -9305,14 +9076,9 @@ impl Nl80211Socket {
             build_open_probe_resp(mac, ssid, channel).map_err(|error| (error, Vec::new()))?;
         let hostapd_probe_ies =
             hostapd_open_ap_probe_ies(ssid, channel).map_err(|error| (error, Vec::new()))?;
-        let hostapd_probe_resp = build_open_probe_resp_with_ies(
-            mac,
-            ssid,
-            channel,
-            0x0401,
-            &hostapd_probe_ies,
-        )
-        .map_err(|error| (error, Vec::new()))?;
+        let hostapd_probe_resp =
+            build_open_probe_resp_with_ies(mac, ssid, channel, 0x0401, &hostapd_probe_ies)
+                .map_err(|error| (error, Vec::new()))?;
         let profiles = [
             ApStartProfile {
                 name: "hostapd_exact_ht20",
@@ -10747,7 +10513,11 @@ fn insert_station_rate_info(
         out.insert(format!("{direction}_mcs"), json!(*mcs));
         out.insert(
             format!("{direction}_width_mhz"),
-            json!(if attr(NL80211_RATE_INFO_40_MHZ_WIDTH).is_some() { 40 } else { 20 }),
+            json!(if attr(NL80211_RATE_INFO_40_MHZ_WIDTH).is_some() {
+                40
+            } else {
+                20
+            }),
         );
         out.insert(
             format!("{direction}_short_gi"),
@@ -11007,17 +10777,15 @@ fn ap_mgmt_receive_loop(
                         .is_ok();
                     object.insert("station_removed".to_string(), json!(removed));
                 }
-                if let Some(response) =
-                    handle_open_ap_sme_frame(
-                        &socket,
-                        iface,
-                        ifindex,
-                        ap_mac,
-                        &frame,
-                        &ap_no_ht_stations,
-                        channel,
-                    )
-                    && let Some(object) = value.as_object_mut()
+                if let Some(response) = handle_open_ap_sme_frame(
+                    &socket,
+                    iface,
+                    ifindex,
+                    ap_mac,
+                    &frame,
+                    &ap_no_ht_stations,
+                    channel,
+                ) && let Some(object) = value.as_object_mut()
                 {
                     object.insert("sme_response".to_string(), response);
                 }
@@ -11196,7 +10964,10 @@ fn handle_open_ap_sme_frame(
         }
         0 | 2 => {
             let aid = 1_u16;
-            let allow_ht = !ap_no_ht_stations.lock().unwrap_or_else(|p| p.into_inner()).contains(&sta_mac);
+            let allow_ht = !ap_no_ht_stations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&sta_mac);
             let add_station = Nl80211Socket::open()
                 .and_then(|socket| {
                     // A station entry can survive an ESP reset or a prior
@@ -11265,13 +11036,7 @@ fn send_open_ap_mgmt_response(
                 }),
                 Err(monitor_error) => {
                     if socket
-                        .send_frame(
-                            ifindex,
-                            channel_to_freq(channel),
-                            &options,
-                            frame,
-                            None,
-                        )
+                        .send_frame(ifindex, channel_to_freq(channel), &options, frame, None)
                         .is_ok()
                     {
                         json!({
@@ -12249,7 +12014,7 @@ fn build_open_assoc_response(
     // association response must carry the matching WMM Parameter element too.
     // Without it, Linux reports WMM/WME=no for the station even though the AP
     // beacon contains the element; that disables the normal Wi-Fi QoS/Block
-    // ACK path and is especially costly for the direct TCP flash link.
+    // ACK path and is especially costly for a direct Wi-Fi transfer.
     frame.extend_from_slice(&wmm_parameter_ie());
     frame
 }
@@ -12311,28 +12076,8 @@ fn esp_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     ies.push(0x3d);
     ies.push(22);
     ies.extend_from_slice(&[
-        channel,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
+        channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ]);
     ies.push(0x7f);
     ies.push(9);
@@ -13235,9 +12980,18 @@ mod tests {
         assert_eq!(read_u16_at(&probe, IEEE80211_BODY + 10), Some(0x0401));
         assert_eq!(probe_ies, beacon_ies);
         assert_eq!(management_ie_bytes(probe_ies, 1), Some(&[0x8c][..]));
-        assert_eq!(management_ie_bytes(probe_ies, 50), Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice()));
-        assert_eq!(management_ie_bytes(probe_ies, 45), management_ie_bytes(assoc_ies, 45));
-        assert_eq!(management_ie_bytes(probe_ies, 61), management_ie_bytes(assoc_ies, 61));
+        assert_eq!(
+            management_ie_bytes(probe_ies, 50),
+            Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice())
+        );
+        assert_eq!(
+            management_ie_bytes(probe_ies, 45),
+            management_ie_bytes(assoc_ies, 45)
+        );
+        assert_eq!(
+            management_ie_bytes(probe_ies, 61),
+            management_ie_bytes(assoc_ies, 61)
+        );
         assert!(management_ie_bytes(probe_ies, 221).is_some());
     }
 
@@ -13368,7 +13122,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Framed);
         let mut serial_tx = VecDeque::new();
         let mut serial_pending = VecDeque::new();
         client
@@ -13634,7 +13388,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Framed);
         let mut serial_tx = VecDeque::new();
         let mut serial_pending = VecDeque::new();
         let frame = firmware_command_cbor("status").unwrap();
@@ -13673,7 +13427,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Framed);
         let mut serial_tx = VecDeque::new();
         let mut serial_pending = VecDeque::new();
         let frame = firmware_command_cbor("status").unwrap();
@@ -13703,7 +13457,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Framed);
         let mut serial_tx = VecDeque::new();
         let mut serial_pending = VecDeque::new();
         let frame = firmware_command_cbor("status").unwrap();
@@ -13737,7 +13491,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Framed);
         let mut serial_tx = VecDeque::new();
         let mut serial_pending = VecDeque::new();
         client.input.extend_from_slice(b"status\r\n");
@@ -13768,7 +13522,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Framed);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Framed);
         client.text_mode = true;
         let mut clients = vec![client];
         let stats = SerialForwardStats::default();
@@ -14000,7 +13754,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Rfc2217);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Rfc2217);
         let mut serial_tx = VecDeque::new();
         let mut serial_pending = VecDeque::new();
 
@@ -14034,7 +13788,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let mut client =
-            SerialForwardClient::new(1, Box::new(stream), SerialForwardTcpMode::Rfc2217);
+            SerialForwardClient::new(1, Box::new(stream), SerialForwardWireMode::Rfc2217);
 
         assert!(client.queue_output(&[0x41, RFC2217_IAC, 0x42]));
         assert_eq!(
@@ -14086,7 +13840,8 @@ mod tests {
 
     #[test]
     fn monitor_fcs_is_removed_only_when_crc_matches() {
-        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
+        let frame =
+            build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
         let crc = crc32_ieee(&frame);
         let mut captured = frame.clone();
         captured.extend_from_slice(&crc.to_le_bytes());
@@ -14117,7 +13872,8 @@ mod tests {
 
     #[test]
     fn raw_wifi_accepts_radiotap_prefix() {
-        let frame = build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
+        let frame =
+            build_dmesh_vendor_action_frame([0xff; 6], [1, 2, 3, 4, 5, 6], b"ping").unwrap();
         let mut packet = vec![0, 0, 8, 0, 0, 0, 0, 0];
         packet.extend_from_slice(&frame);
 
@@ -14143,11 +13899,13 @@ mod tests {
             [2, 0, 0, 0xaa, 0xbb, 0xcc],
             [0x50, 0x6f, 0x9a, 1, 2, 3],
             b"probe",
-        ).unwrap();
+        )
+        .unwrap();
         assert!(is_nan_control_frame(&action));
 
         let ordinary =
-            build_dmesh_vendor_action_frame([0xff; 6], [2, 0, 0, 0xaa, 0xbb, 0xcc], b"probe").unwrap();
+            build_dmesh_vendor_action_frame([0xff; 6], [2, 0, 0, 0xaa, 0xbb, 0xcc], b"probe")
+                .unwrap();
         assert!(!is_nan_control_frame(&ordinary));
     }
 

@@ -1,0 +1,9 @@
+[package]
+name = "dmesh-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+lmesh-uart = { path = "../lmesh-uart" }
+

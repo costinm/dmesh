@@ -8,6 +8,15 @@ use crate::cbor::{Decoder, Encoder};
 /// Numeric method identifier for the Recovery command schema.
 pub const RECOVERY_METHOD: u64 = 68;
 
+/// Bounded direct boot identity used before a QUIC-lite connection exists.
+/// This compact-CBOR exception is shared by Stage2-adjacent firmware, Main,
+/// Recovery, and host decoders; it is not a Recovery command or UART schema.
+pub const fn boot_identity_payload(role: u8, partition: u8) -> [u8; 11] {
+    [
+        0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, role, partition, 0xff, 0xff,
+    ]
+}
+
 /// Bearer-neutral request for Recovery's deterministic QUIC-lite IPERF
 /// stream. Host CLI adapters may transport the encoded record over UART,
 /// UDP, or a future privileged action-frame bearer without reimplementing the
@@ -87,7 +96,7 @@ pub fn encode_iperf_request(request: IperfRequest, out: &mut [u8]) -> Option<usi
         || request.ack_frequency as usize > quic_lite::ACK_RANGE_CAPACITY
         || request.ack_delay_ms == 0
         || request.ack_delay_ms > 25
-        || request.path_policy > 3
+        || request.path_policy > 4
     {
         return None;
     }
@@ -134,7 +143,9 @@ pub fn decode_iperf_result(packet: &[u8]) -> Option<IperfResult> {
     if major != 5 {
         return None;
     }
-    for _ in 0..fields {
+    let mut entry = 0;
+    while (fields == u64::MAX && !root.consume_break()) || (fields != u64::MAX && entry < fields) {
+        entry += 1;
         let key = root.uint()?;
         if key != 6 {
             root.skip()?;
@@ -208,6 +219,9 @@ pub struct RecoveryCommand<'a> {
     pub benchmark_run_id: Option<u32>,
     pub ack_frequency: Option<u8>,
     pub ack_delay_ms: Option<u8>,
+    /// Raw injected Wi-Fi PHY rate in Mbit/s; zero leaves the driver rate
+    /// control enabled. This is association-scoped, never persistent.
+    pub raw_tx_rate: Option<u8>,
     pub timeout_ms: Option<u32>,
     pub path_policy: Option<u8>,
 }
@@ -223,7 +237,9 @@ pub fn recovery_command_payload(packet: &[u8]) -> Option<&[u8]> {
     }
     let mut recovery_method = false;
     let mut payload = None;
-    for _ in 0..fields {
+    let mut entry = 0;
+    while (fields == u64::MAX && !root.consume_break()) || (fields != u64::MAX && entry < fields) {
+        entry += 1;
         let key = root.uint()?;
         if key == 0 {
             let (kind, value) = root.head()?;
@@ -267,7 +283,9 @@ pub fn decode_recovery_command(packet: &[u8]) -> Option<RecoveryCommand<'_>> {
         return None;
     }
     let mut command = RecoveryCommand::default();
-    for _ in 0..fields {
+    let mut entry = 0;
+    while (fields == u64::MAX && !body.consume_break()) || (fields != u64::MAX && entry < fields) {
+        entry += 1;
         let (kind, numeric_key) = body.head()?;
         let text_key = if kind == 3 && numeric_key != u64::MAX {
             body.take(numeric_key as usize)?
@@ -339,10 +357,20 @@ pub fn decode_recovery_command(packet: &[u8]) -> Option<RecoveryCommand<'_>> {
             );
         } else if named(b"ack_ms") || named(b"ack_delay") || (kind == 0 && numeric_key == 241) {
             command.ack_delay_ms = Some(body.uint_or_text()?.clamp(1, 25) as u8);
+        } else if named(b"raw_tx_rate") || named(b"raw_rate") {
+            let rate = u8::try_from(body.uint_or_text()?).ok()?;
+            // `0` means driver-controlled. Fixed rates mirror the ESP-IDF
+            // PHY enum and deliberately reject arbitrary values at the
+            // host-testable command boundary.
+            if matches!(rate, 0 | 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
+                command.raw_tx_rate = Some(rate);
+            } else {
+                return None;
+            }
         } else if named(b"timeout_ms") || (kind == 0 && numeric_key == 250) {
             command.timeout_ms = Some(body.uint_or_text()?.clamp(1_000, 300_000) as u32);
         } else if named(b"path_policy") || named(b"path") {
-            command.path_policy = Some(body.uint_or_text()?.min(3) as u8);
+            command.path_policy = Some(body.uint_or_text()?.min(4) as u8);
         } else {
             body.skip()?;
         }
@@ -396,8 +424,19 @@ mod tests {
     }
 
     #[test]
+    fn decodes_raw_rate_as_an_association_setting() {
+        // {0: 68, 6: {"raw_tx_rate": 54}}
+        let packet = [
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x6b, b'r', b'a', b'w', b'_', b't', b'x',
+            b'_', b'r', b'a', b't', b'e', 0x18, 0x36,
+        ];
+        assert_eq!(decode_recovery_command(&packet).unwrap().raw_tx_rate, Some(54));
+    }
+
+    #[test]
     fn iperf_request_round_trips_through_the_recovery_schema() {
-        let request = IperfRequest::uart(3350, 131_072, 0x4455_6688);
+        let mut request = IperfRequest::uart(3350, 131_072, 0x4455_6688);
+        request.path_policy = 4;
         let mut packet = [0u8; 128];
         let used = encode_iperf_request(request, &mut packet).unwrap();
         let decoded = decode_recovery_command(&packet[..used]).unwrap();
@@ -405,7 +444,7 @@ mod tests {
         assert_eq!(decoded.iperf_bytes, Some(131_072));
         assert_eq!(decoded.iperf_packet_size, Some(request.packet_size));
         assert_eq!(decoded.benchmark_run_id, Some(request.run_id));
-        assert_eq!(decoded.path_policy, Some(2));
+        assert_eq!(decoded.path_policy, Some(4));
     }
 
     #[test]
@@ -434,5 +473,13 @@ mod tests {
         assert_eq!(command.ssid, Some(&[b'a', 0, b'b'][..]));
         assert_eq!(command.server, Some(b"10.0.0.1".as_slice()));
         assert!(command.profile_updated);
+    }
+
+    #[test]
+    fn boot_identity_is_a_small_bearer_neutral_exception() {
+        assert_eq!(
+            boot_identity_payload(1, 1),
+            [0xbf, 0x07, 0x19, 0xea, 0x60, 0x06, 0x9f, 1, 1, 0xff, 0xff]
+        );
     }
 }

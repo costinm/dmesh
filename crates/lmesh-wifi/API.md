@@ -82,11 +82,15 @@ the WLAN interface and its capabilities. UDP is only the datagram bearer;
 `quic-lite` itself has no socket, CBOR, or UDP code. No TCP object-store
 compatibility listener remains.
 
-## Gateway IPERF client
+## ESP-NOW/action validation
 
-`transport.client.iperf` starts the same `lmesh-uart` client implementation
-used by the standalone `dmesh-iperf` binary. It is a gateway operation, not a
-second raw-radio benchmark:
+`dmesh-cli` is the standalone UART/STA test client and UDP server. Do not
+use `lmesh-wifi` as a gateway IPERF client for those bearers. This service is
+needed only when validating raw ESP-NOW/vendor-action frames, because it owns
+the required WLAN capabilities and raw injection/receive path.
+
+The following gateway operations are experimental compatibility helpers, not
+the normal UART/STA test path:
 
 ```text
 mesh lmesh-wifi transport.client.iperf iface=wlan0 \
@@ -101,8 +105,9 @@ the shared connection owner. The request returns once the bounded client task
 starts; its terminal report is emitted by the shared client, not inferred from
 that start acknowledgement.
 
-`transport.client.service` uses the same client implementation for direct
-UDP/IP service requests, including a bounded `log-watch` poll:
+`transport.client.service` remains an experimental helper for raw-action work;
+use `dmesh-cli` directly for UART/STA service requests and bounded log
+watching.
 
 ```text
 mesh lmesh-wifi transport.client.service iface=wlan0 \

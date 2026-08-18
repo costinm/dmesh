@@ -18,6 +18,14 @@ fn u8_arg(request: &Value, name: &str) -> Option<u8> {
     })
 }
 
+fn u64_arg(request: &Value, name: &str) -> Option<u64> {
+    request.get(name).and_then(|value| match value {
+        Value::Number(value) => value.as_u64(),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
 /// The mesh CLI deliberately parses bare numeric values as JSON numbers.
 /// Rate profiles use human-readable values ("12", "24", "auto"), so accept
 /// those numeric CLI forms instead of silently falling back to `auto`.
@@ -120,6 +128,34 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                 let iface = authorize(netd, &request, Operation::Ap)?;
                 Ok(radio.wifi_ap_stations(Some(iface)))
             }
+            "wifi.udp6.ndp.capture" => {
+                let iface = authorize(netd, &request, Operation::Ap)?;
+                Ok(crate::ndp::capture_neighbor_advertisements(
+                    &iface,
+                    u64_arg(&request, "wait_ms").unwrap_or(2_000),
+                ))
+            }
+            "wifi.udp6.ndp.monitor" => {
+                let iface = authorize(netd, &request, Operation::Ap)?;
+                Ok(crate::ndp::capture_monitor_neighbor_advertisements(
+                    &iface,
+                    u64_arg(&request, "wait_ms").unwrap_or(2_000),
+                ))
+            }
+            "wifi.udp6.ndp.reset" => {
+                let iface = authorize(netd, &request, Operation::Ap)?;
+                let address = string_arg(&request, "address")
+                    .ok_or_else(|| anyhow::anyhow!("address is required"))?;
+                Ok(crate::ndp::clear_neighbor(&iface, &address))
+            }
+            "wifi.udp6.neigh.set" => {
+                let iface = authorize(netd, &request, Operation::Ap)?;
+                let address = string_arg(&request, "address")
+                    .ok_or_else(|| anyhow::anyhow!("address is required"))?;
+                let mac = string_arg(&request, "mac")
+                    .ok_or_else(|| anyhow::anyhow!("mac is required"))?;
+                Ok(crate::ndp::set_static_neighbor(&iface, &address, &mac))
+            }
             "wifi.ap.station.remove" => {
                 let iface = authorize(netd, &request, Operation::Ap)?;
                 let mac = string_arg(&request, "mac")
@@ -196,6 +232,21 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                     string_arg(&request, "bssid"),
                     string_arg(&request, "payload").unwrap_or_else(|| "ping".to_owned()),
                     request.get("wait_ms").and_then(Value::as_u64),
+                ))
+            }
+            "wifi.raw.iperf" => {
+                let iface = authorize(netd, &request, Operation::Nan)?;
+                let destination = string_arg(&request, "destination")
+                    .ok_or_else(|| anyhow::anyhow!("destination is required"))?;
+                Ok(radio.raw_espnow_iperf(
+                    Some(iface),
+                    request
+                        .get("channel")
+                        .and_then(Value::as_u64)
+                        .map(|v| v.min(13) as u8),
+                    destination,
+                    u64_arg(&request, "bytes").unwrap_or(8 * 1024),
+                    u64_arg(&request, "timeout_ms"),
                 ))
             }
             "wifi.rate.profile" => {
@@ -337,8 +388,14 @@ mod tests {
 
     #[test]
     fn rate_profile_accepts_cli_numeric_values() {
-        assert_eq!(rate_profile_arg(&json!({"profile": 24})).as_deref(), Some("24"));
-        assert_eq!(rate_profile_arg(&json!({"profile": "auto"})).as_deref(), Some("auto"));
+        assert_eq!(
+            rate_profile_arg(&json!({"profile": 24})).as_deref(),
+            Some("24")
+        );
+        assert_eq!(
+            rate_profile_arg(&json!({"profile": "auto"})).as_deref(),
+            Some("auto")
+        );
         assert_eq!(rate_profile_arg(&json!({"profile": true})), None);
     }
 

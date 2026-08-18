@@ -5,6 +5,7 @@
 //! framed mesh protocol.
 
 pub mod client;
+pub mod device;
 pub mod l2;
 mod schema;
 mod service;
@@ -43,7 +44,9 @@ pub fn handle_request(uart: &UartService, request: Value) -> Value {
         | "usb.serial.forward.stop"
         | "usb.serial.disconnect"
         | "usb.serial.forward.list"
-        | "usb.serial.forward.flush" => Err("legacy UART byte forwarding is retired; use the QUIC-lite client".into()),
+        | "usb.serial.forward.flush" => {
+            Err("legacy UART byte forwarding is retired; use the QUIC-lite client".into())
+        }
         "usb.serial.rst" | "usb.serial.reset" => {
             Ok(uart.serial_modem_reset(string_arg(&request, "port")))
         }

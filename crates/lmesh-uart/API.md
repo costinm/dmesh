@@ -1,89 +1,97 @@
-# lmesh-uart service API
+# UART L2 library API
 
-`lmesh-uart` builds the host UART L2 service and library. Legacy byte forwards
-are disabled for every board. The service is being converted to a QUIC-lite
-UART proxy: PPP/HDLC carries bearer packets, while commands, logs, and object
-transfer are `dmesh-server` services on QUIC-lite streams. The low-level
+`lmesh-uart` is the reusable host UART L2 library. New serial ownership belongs
+to `dmesh-cli`; do not deploy or start the old forwarding service. Legacy byte
+forwards are retired. PPP/HDLC carries
+QUIC-lite bearer packets, while
+commands, logs, and object transfer are `dmesh-server` stream services. The low-level
 PPP/HDLC codec is documented in [`uart-codec/API.md`](../uart-codec/API.md)
 and is also used by the ESP32 firmware.
 
-The service owns the host UART backend directly and does not depend on the
-Wi-Fi service crate. Firmware framing is shared through `uart-codec`.
-It does not own a Wi-Fi interface or start AP/NAN itself.
+The client owns an explicitly selected device interface; it is not a UART
+custom-protocol daemon and does not own Wi-Fi/AP/NAN. Firmware framing is
+shared through `uart-codec`. Direct boot/platform text and compact CBOR are
+rendered through the same schema used by diagnostics.
 
-Configured forwards are loaded in this order:
+## Device inventory
 
-1. `LMESH_UART_CONFIG_FILE`, when set;
-2. `$HOME/etc/lmesh-uart/lmesh.toml`, when it exists;
-3. `LMESH_CONFIG_FILE`, then the legacy `/home/system/etc/lmesh/lmesh.toml`.
+The shared inventory root is `/home/lmesh/etc/lmesh/devices`. Each device has
+one directory and a `device.toml` file, for example
+[`examples/devices/e6/device.toml`](examples/devices/e6/device.toml). The
+library accepts an explicit `/dev/...` serial path, `udp://IP:PORT` / IP
+literal, or a directory name such as `e6`. `LMESH_DEVICE_DIR` overrides the
+root for tests and isolated deployments.
 
-The default service home is `/home/lmesh-uart`; deployments and local tests
-set `HOME` to an independent `target/...` home. The binary can run directly;
-mesh-init is only needed when supervision and socket setup are desired. UART access still requires filesystem access to
-the selected `/dev/serial/by-id` devices and membership in the relevant device
-groups.
+`static_ipv4`, `ipv6_link_local`, `serial_id`, and `auth_secret_ref` are
+inventory fields. The secret field is a reference only: authentication and
+encryption are a future end-to-end layer across every untrusted bearer.
+Current UDP sessions prefer `static_ipv4`; a serial-only profile resolves to
+its `/dev/serial/by-id/<serial_id>` path. IPv6 link-local is recorded now but
+needs a caller-selected interface scope before it becomes a UDP path.
 
-For an absolute control socket such as /run/mesh/lmesh-uart/mesh.sock, the
-parent runtime directory must already be created and owned by the service
-user. mesh-init does this as root; a direct unprivileged launch should use a
-target-local socket path or pre-create the runtime directory.
+The binary is a foreground shell, not a managed UART protocol daemon. It takes
+the session target directly and has no default control socket or forwarding
+configuration. UART access still requires filesystem access to the selected
+`/dev/serial/by-id` device and membership in the relevant device groups.
 
-## Endpoint and protocol
+## Session socket
 
-The default mesh-init endpoint is:
+The replacement client surface is a reusable QUIC-lite device session (also
+used by `dmesh-cli`). It opens a direct serial L2 together with its IP
+backend when explicitly requested, or a direct UDP session for an IP/device
+profile. It never revives byte-forward sockets. Direct records are rendered as
+text or schema-labelled compact CBOR. `--command TEXT` encodes the explicitly
+selected direct-CBOR diagnostic/boot record; normal operations remain service
+streams. `log-watch` currently performs the bounded server poll; framed
+long-lived log delivery is pending its server handler.
 
-```text
-/run/mesh/lmesh-uart/mesh.sock
-```
+`dmesh-cli <serial-or-device> --watch` is a passive UART diagnostic for
+raw boot/platform text and direct-CBOR exception records. It labels marked
+QUIC-lite frames as transport observations and does not attempt to render
+them as logs. Firmware-generated logs use the `log-watch` service stream.
 
-Set `LMESH_CONTROL_SOCKET` to use another path during development. The
-endpoint accepts one JSON object per line and returns one JSON object per line.
-Every response has either `{"success":true,"data":...}` or
-`{"success":false,"error":"..."}`.
+`dmesh-cli <device-or-ip> --services` opens the registered `handlers`
+stream and prints the stable service list. Its response schema is CBOR
+`[[tag, name], ...]`; names are discovery/debug metadata only and never
+dispatch a command. Each handler owns the compact payload fields after its
+numeric tag. The CLI continues to use its local firmware schema for direct
+CBOR records and handler-specific CBOR responses.
 
-The configured board inventory is retained for explicit provisioning and the
-proxy migration, but every legacy `serial_forwards` entry is `enabled = false`.
-`forward.list` must remain empty. The replacement client surface starts with a
-reusable QUIC-lite IPERF session library (also used by `dmesh-iperf`): it
-opens a direct serial L2 together with its IP backend and never revives
-byte-forward sockets. Generic command dispatch, IP-only targets, and
-long-lived `log watch` streams are the next additions to that same client API;
-they are not implemented by the current IPERF wrapper.
+`dmesh-cli udp://IP:PORT --socket PATH` owns one UDP QUIC-lite connection
+and creates a mode-0600 JSONL Unix socket. Each line such as
+`{"service":"status"}`, `{"service":"services"}`, or
+`{"service":"log-watch","body_hex":"04"}`
+opens the next stream on that owned connection and receives one JSON result.
+It is intentionally a session socket, not TCP/serial byte forwarding.
 
-`lmesh-wifi` will use this same session/client API as its fleet egress-gateway
-handler. ESP-NOW, STA/UDP, and future LoRa/FSK are path choices owned by the
-connection runtime, not distinct command or IPERF protocols.
+`dmesh-cli` is the authoritative host test and shell tool. It owns direct
+UART L2 sessions, UDP sessions, handler discovery, bounded `log-watch` polls,
+and the optional local session socket used to expose a selected device
+connection to other tools. For UART/multipath IPERF it starts the matching
+temporary UDP server itself; a standalone UDP-server subcommand is a planned
+extension. It does not depend on `lmesh-wifi`; that service is reserved for
+raw ESP-NOW/action-frame validation because it owns the required WLAN
+capabilities.
 
-Per-forward sockets use `/run/mesh/lmesh-uart` by default, so the service does
-not collide with the main `lmesh` service's per-device sockets. The
-`LMESH_SERIAL_SOCKET_DIR` override is available for isolated local tests.
+## Reproducible transport tests
 
-UART capture is per device and is written to HOME/logs/<device>.log. Each file
-is rotated to <device>.log.1 at 16 MiB. A forward with log = false has no
-capture file.
+Integration tests import the same `dmesh_cli::client` library entry points
+rather than shelling out to `dmesh-cli`. Infra devices with recorded STA
+addresses are the normal test targets: a host test can issue a QUIC-lite
+IPERF handler request to one device, or request that one device's IPERF client
+target another device. This exercises handler dispatch and device-to-device
+paths without opening UART.
 
-## Methods
+Use UART only for explicit bearer coverage: direct serial ownership at test
+startup, PPP framing/MTU, queue saturation, and UART/STA spill/failover. The
+CLI remains useful for ad-hoc diagnosis because it calls the same library; it
+is not the test framework or a separate protocol implementation.
 
-| Method | Purpose | Common arguments |
-| --- | --- | --- |
-| `status` | Service and UART status | — |
-| `usb.serial.list` | List discovered USB serial adapters | `handshake` |
-| `usb.serial.handshake` | Probe an adapter and identify its profile | `port`, `profile`, `baud`, `timeout_sec` |
-| `usb.serial.boot` | Send a boot/reset command through an adapter | `port`, `command`, `reset`, `timeout_sec` |
-| `usb.serial.rst` | Pulse the adapter reset/modem line | `port` |
-| `usb.serial.reset` | Alias for `usb.serial.rst` | `port` |
-| `usb.serial.dtr` | Set or pulse DTR | `port`, `asserted`, `pulse_ms` |
-| `esp.serial.command` | Send a framed command to an ESP32 | `adapter`, `port`, `command`, `timeout_sec`, `force_direct` |
+The optional `--socket PATH` is created only by an explicitly requested device
+session. It exposes service streams on that one connection and is removed only
+when the session owner exits; there are no per-forward sockets or TCP ports.
 
-Boolean arguments are JSON booleans, ports are adapter paths, and timeouts are
-in seconds unless the argument name ends in `_ms`. The service keeps the
-framing and transport details below this JSONL boundary; callers should use
-these methods rather than constructing PPP frames themselves.
-
-## Ownership and lifecycle
-
-The reusable JSON dispatcher is exported from the crate library for the main
-`lmesh` service. `mesh-init` starts and supervises this service. It should provide a separate
-service home and environment from the main `lmesh` process. The service does
-not create its socket parent directory; service setup is responsible for
-creating the configured runtime directory with suitable ownership.
+The small `UartService` library type remains for explicit local USB inventory
+and safe modem-line operations used by provisioning tools. Its old
+`esp.serial.command`, boot, forwarding, and TCP methods are intentionally
+retired; command/log traffic belongs to the session client.

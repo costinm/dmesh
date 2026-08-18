@@ -191,8 +191,14 @@ mod tests {
     fn non_blocking_enqueue_reports_immediate_queue_state() {
         let mut queue = FramedStream::<1, 3>::new();
         assert_eq!(queue.try_enqueue(b"ok", 1), FramedStreamEnqueue::Queued);
-        assert_eq!(queue.try_enqueue(b"new", 2), FramedStreamEnqueue::DroppedFull);
-        assert_eq!(queue.try_enqueue(b"long", 3), FramedStreamEnqueue::DroppedOversized);
+        assert_eq!(
+            queue.try_enqueue(b"new", 2),
+            FramedStreamEnqueue::DroppedFull
+        );
+        assert_eq!(
+            queue.try_enqueue(b"long", 3),
+            FramedStreamEnqueue::DroppedOversized
+        );
         assert_eq!(
             queue.stats(),
             FramedStreamStats {

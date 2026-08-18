@@ -15,8 +15,9 @@ LMesh runs as regular user but with CAP_NET_ADMIN. It may register a monitor
 interface on wifi or take over a wifi interface, based on configuration, and use
 it for NAN discovery, follow-ups and as a non-DS communication medium.
 
-UART forwarding is owned by the separate `lmesh-uart` service. The full lmesh
-process retains the shared dispatcher API but does not open or start USB/UART
+The legacy UART forwarding service is retired. The full lmesh process retains
+the shared dispatcher API but does not open or start USB/UART; `dmesh-cli`
+owns a physical serial interface while it is in use.
 forwards; it can still use the shared raw-NAN code for mesh operations.
 
 Lmesh is only concerned with accepting and sending packets locally, based on 

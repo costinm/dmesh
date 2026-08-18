@@ -6,7 +6,8 @@ their JSONL contract are defined by [`lmesh-wifi/API.md`](../lmesh-wifi/API.md).
 
 Other component contracts remain authoritative in:
 
-- [`lmesh-uart/API.md`](../lmesh-uart/API.md)
+- [`dmesh-cli/README.md`](../dmesh-cli/README.md) for direct device sessions
+- [`lmesh-uart/API.md`](../lmesh-uart/API.md) for the UART L2 library
 - [`uart-codec/API.md`](../uart-codec/API.md)
 - [`rawnan/API.md`](../rawnan/API.md)
 - [`quic-lite`](../quic-lite/) and [`dmesh-server`](../dmesh-server/)

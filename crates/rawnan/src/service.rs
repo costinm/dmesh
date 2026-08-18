@@ -12,6 +12,7 @@ use crate::{
     NAN_SDEA_SERVICE_UPDATE_CONTROL, NAN_SERVICE_FLAG_ACTIVE_ACK, NAN_SERVICE_FLAG_BLE_WAKE,
     NAN_SERVICE_FLAG_UART_WAKE, NAN_SERVICE_INFO_LEN,
 };
+use alloc::{collections::VecDeque, vec::Vec};
 use anyhow::{bail, Result};
 
 /// Build the USD active-subscribe/publish service-discovery frame. Service
@@ -291,14 +292,14 @@ pub fn parse_dmesh_service_info(data: &[u8]) -> Option<DmeshServiceInfo> {
 #[derive(Debug)]
 pub struct FollowupDedup {
     capacity: usize,
-    order: std::collections::VecDeque<([u8; 6], u16, u8, u32)>,
+    order: VecDeque<([u8; 6], u16, u8, u32)>,
 }
 
 impl FollowupDedup {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            order: std::collections::VecDeque::new(),
+            order: VecDeque::new(),
         }
     }
 

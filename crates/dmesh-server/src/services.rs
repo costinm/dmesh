@@ -7,13 +7,88 @@
 use alloc::format;
 use alloc::vec::Vec;
 use quic_lite::{
-    CborSelector, ConnectionId, EndpointState, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS,
+    ConnectionId, EndpointState, PathPolicy, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS,
     SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS,
-    SERVICE_STREAM, decode_cbor_selector,
+    SERVICE_STREAM,
 };
+
+pub use quic_lite::{StreamHandler, StreamRegistry};
 
 const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
 pub const LOG_WATCH_MAX_RECORDS: usize = 64;
+/// Control-stream subtype for selecting a bearer-neutral egress policy.
+pub const CONTROL_PATH_POLICY: u8 = 3;
+/// First byte in a compact control-handler response.
+pub const CONTROL_RESPONSE: u8 = 2;
+
+/// Common diagnostic/control handler set that does not require an object
+/// receiver. ESP-NOW, UART, and UDP endpoints use it until their object sink
+/// is explicitly attached, so discovery never advertises `object` early.
+pub fn diagnostic_stream_registry() -> StreamRegistry {
+    let mut registry = StreamRegistry::empty();
+    for (tag, name) in [
+        (SERVICE_ECHO, b"echo".as_slice()),
+        (SERVICE_STATUS, b"status".as_slice()),
+        (SERVICE_STREAM, b"handlers".as_slice()),
+        (SERVICE_IPERF, b"iperf".as_slice()),
+        (SERVICE_METRICS, b"metrics".as_slice()),
+        (SERVICE_EVENTS, b"events".as_slice()),
+        (SERVICE_CONTROL, b"control".as_slice()),
+        (SERVICE_LOG_WATCH, b"log-watch".as_slice()),
+    ] {
+        // This is a required mutation, not merely a debug-time invariant.
+        // The same registry is used by release firmware and host adapters.
+        // A static duplicate is a debug-time source error, never a runtime
+        // reason to panic an embedded server.
+        let _registered = registry.register(tag, name);
+        debug_assert!(_registered);
+    }
+    registry
+}
+
+/// Standard server surface when an object receiver/sender has been attached.
+/// Bearer adapters use this rather than copying a service-name list: the
+/// numeric registry is the dispatch authority and names remain diagnostics.
+pub fn object_stream_registry() -> StreamRegistry {
+    StreamRegistry::default()
+}
+
+/// Decode the compact policy body used after `CONTROL_PATH_POLICY`.
+/// `[0]` selects the highest measured available path, `[1, path]` compares on
+/// one explicit path, `[2, primary]` prefers the low-airtime path until its
+/// adapter reports full, and `[3]` aggregates all available paths. Physical
+/// bearer names never appear on the wire.
+pub fn decode_path_policy(data: &[u8]) -> Option<PathPolicy> {
+    match data {
+        [0] => Some(PathPolicy::HighestMeasuredSpeed),
+        [1, path] => Some(PathPolicy::Explicit(*path as usize)),
+        [2, primary] => Some(PathPolicy::AirtimeFirst {
+            primary: *primary as usize,
+        }),
+        [3] => Some(PathPolicy::Aggregate),
+        _ => None,
+    }
+}
+
+/// Acknowledge a policy change using the same compact body on every bearer.
+pub fn encode_path_policy_response(policy: PathPolicy) -> Vec<u8> {
+    let mut response = Vec::with_capacity(3);
+    response.push(CONTROL_RESPONSE);
+    match policy {
+        PathPolicy::HighestMeasuredSpeed => response.push(0),
+        PathPolicy::Explicit(path) if path <= u8::MAX as usize => {
+            response.extend_from_slice(&[1, path as u8])
+        }
+        PathPolicy::AirtimeFirst { primary } if primary <= u8::MAX as usize => {
+            response.extend_from_slice(&[2, primary as u8])
+        }
+        PathPolicy::Aggregate => response.push(3),
+        // `PathPolicy` is internally unconstrained; no ESP adapter has more
+        // than 255 paths. Preserve a valid response rather than panicking.
+        _ => response.push(0),
+    }
+    response
+}
 
 /// Bounded subscription request shared by every server adapter. The request
 /// is deliberately small and opaque to QUIC-lite: adapters decide only how
@@ -86,6 +161,86 @@ pub struct EventRecord {
     pub value: u64,
 }
 
+/// One application-owned binary event retained outside the transport core.
+/// The numeric envelope is shared by firmware and host clients; payload bytes
+/// remain opaque to dmesh-server and QUIC-lite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BinaryEventRecord<'a> {
+    pub sequence: u64,
+    pub event_id: u16,
+    pub value_type: u8,
+    pub flags: u8,
+    pub payload: &'a [u8],
+}
+
+fn cbor_head_len(value: u64) -> usize {
+    if value < 24 {
+        1
+    } else if value <= u8::MAX as u64 {
+        2
+    } else if value <= u32::MAX as u64 {
+        5
+    } else {
+        9
+    }
+}
+
+fn binary_event_len(event: BinaryEventRecord<'_>) -> usize {
+    // [sequence, event_id, value_type, flags, payload]
+    cbor_head_len(5)
+        .saturating_add(cbor_head_len(event.sequence))
+        .saturating_add(cbor_head_len(u64::from(event.event_id)))
+        .saturating_add(cbor_head_len(u64::from(event.value_type)))
+        .saturating_add(cbor_head_len(u64::from(event.flags)))
+        .saturating_add(cbor_head_len(event.payload.len() as u64))
+        .saturating_add(event.payload.len())
+}
+
+/// Encode canonical CBOR `[next_sequence, [[seq,id,type,flags,payload],...]]`
+/// without splitting an event. `max_bytes` bounds one bearer response; callers
+/// continue with `since=<sequence>` when the retained history is longer.
+pub fn encode_binary_events(
+    next_sequence: u64,
+    records: &[BinaryEventRecord<'_>],
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let header = cbor_head_len(2).saturating_add(cbor_head_len(next_sequence));
+    let mut count = 0usize;
+    let mut events_len = 0usize;
+    for record in records {
+        let event_len = binary_event_len(*record);
+        let next = header
+            .saturating_add(cbor_head_len((count + 1) as u64))
+            .saturating_add(events_len)
+            .saturating_add(event_len);
+        if next > max_bytes {
+            break;
+        }
+        events_len = events_len.saturating_add(event_len);
+        count += 1;
+    }
+    if header.saturating_add(cbor_head_len(count as u64)) > max_bytes {
+        return None;
+    }
+    let mut output = Vec::with_capacity(max_bytes);
+    output.resize(max_bytes, 0);
+    let mut encoder = crate::cbor::Encoder::new(&mut output);
+    encoder.array(2)?;
+    encoder.uint(next_sequence)?;
+    encoder.array(count as u64)?;
+    for record in records.iter().take(count) {
+        encoder.array(5)?;
+        encoder.uint(record.sequence)?;
+        encoder.uint(u64::from(record.event_id))?;
+        encoder.uint(u64::from(record.value_type))?;
+        encoder.uint(u64::from(record.flags))?;
+        encoder.bytes_value(record.payload)?;
+    }
+    let len = encoder.len();
+    output.truncate(len);
+    Some(output)
+}
+
 /// Bounded, bearer-neutral event history for diagnostics and test control.
 #[derive(Clone, Debug)]
 pub struct EventRing {
@@ -135,66 +290,6 @@ impl EventRing {
         self.entries
             .iter()
             .filter(move |record| record.sequence >= sequence)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StreamHandler {
-    pub tag: u8,
-    pub name: &'static [u8],
-}
-
-#[derive(Clone, Debug)]
-pub struct StreamRegistry {
-    handlers: Vec<StreamHandler>,
-}
-
-impl Default for StreamRegistry {
-    fn default() -> Self {
-        let mut registry = Self {
-            handlers: Vec::new(),
-        };
-        registry.register(SERVICE_OBJECT, b"object");
-        registry.register(SERVICE_ECHO, b"echo");
-        registry.register(SERVICE_STATUS, b"status");
-        registry.register(SERVICE_STREAM, b"stream");
-        registry.register(SERVICE_IPERF, b"iperf");
-        registry.register(SERVICE_METRICS, b"metrics");
-        registry.register(SERVICE_EVENTS, b"events");
-        registry.register(SERVICE_CONTROL, b"control");
-        registry.register(SERVICE_LOG_WATCH, b"log-watch");
-        registry
-    }
-}
-
-impl StreamRegistry {
-    pub fn register(&mut self, tag: u8, name: &'static [u8]) {
-        if !self.handlers.iter().any(|handler| handler.tag == tag) {
-            self.handlers.push(StreamHandler { tag, name });
-        }
-    }
-
-    pub fn handlers(&self) -> &[StreamHandler] {
-        &self.handlers
-    }
-
-    pub fn contains(&self, tag: u8) -> bool {
-        self.handlers.iter().any(|handler| handler.tag == tag)
-    }
-
-    /// Resolve the compact CBOR selector at the beginning of a stream body.
-    /// Both stable numeric tags and human-readable names select the same
-    /// registered handler; the remaining bytes are handler-owned.
-    pub fn resolve_cbor<'a>(&self, input: &'a [u8]) -> Option<(u8, &'a [u8])> {
-        let (selector, used) = decode_cbor_selector(input).ok()?;
-        let handler = match selector {
-            CborSelector::Tag(tag) => self
-                .handlers
-                .iter()
-                .find(|handler| u64::from(handler.tag) == tag),
-            CborSelector::Name(name) => self.handlers.iter().find(|handler| handler.name == name),
-        }?;
-        Some((handler.tag, &input[used..]))
     }
 }
 
@@ -249,15 +344,7 @@ pub fn handle_stream_with_events<const N: usize, const H: usize, const P: usize>
             stream_id,
             data,
         )),
-        SERVICE_STREAM => {
-            let mut list = Vec::new();
-            for handler in registry.handlers() {
-                list.push(handler.tag);
-                list.push(handler.name.len() as u8);
-                list.extend_from_slice(handler.name);
-            }
-            Ok(list)
-        }
+        SERVICE_STREAM => Ok(registry.encode_handler_list()),
         // The UDP adapter supplies the command mailbox. Keep a harmless
         // registered fallback for bearer tests which use handlers directly.
         SERVICE_CONTROL => Ok(Vec::new()),
@@ -445,6 +532,29 @@ mod tests {
     }
 
     #[test]
+    fn binary_event_response_is_canonical_bounded_and_payload_preserving() {
+        let events = [BinaryEventRecord {
+            sequence: 3,
+            event_id: 45,
+            value_type: 5,
+            flags: 0,
+            payload: b"abc",
+        }];
+        assert_eq!(
+            encode_binary_events(7, &events, 64).unwrap(),
+            vec![
+                0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c'
+            ]
+        );
+        // A too-small response preserves a valid continuation envelope and
+        // never emits a partial payload/event.
+        assert_eq!(
+            encode_binary_events(7, &events, 4).unwrap(),
+            vec![0x82, 7, 0x80]
+        );
+    }
+
+    #[test]
     fn numeric_result_is_a_bounded_recovery_response() {
         let response = encode_numeric_result(&[(1, 2), (90, u64::MAX)]).unwrap();
         assert_eq!(
@@ -456,17 +566,28 @@ mod tests {
     }
 
     #[test]
-    fn registry_resolves_cbor_tag_and_name_without_bearer_state() {
+    fn registry_resolves_only_numeric_tag_without_bearer_state() {
         let registry = StreamRegistry::default();
         assert_eq!(
-            registry.resolve_cbor(&[SERVICE_LOG_WATCH, 0xa0]),
+            registry.resolve_tag(&[SERVICE_LOG_WATCH, 0xa0]),
             Some((SERVICE_LOG_WATCH, &[0xa0][..]))
         );
         assert_eq!(
-            registry.resolve_cbor(&[0x64, b'e', b'c', b'h', b'o', 1, 2]),
-            Some((SERVICE_ECHO, &[1, 2][..]))
+            registry.resolve_tag(&[0x64, b'e', b'c', b'h', b'o', 1, 2]),
+            None
         );
-        assert_eq!(registry.resolve_cbor(&[0x0a]), None);
+        assert_eq!(registry.resolve_tag(&[0x0a]), None);
+    }
+
+    #[test]
+    fn diagnostic_registry_never_advertises_an_unattached_object_sink() {
+        let registry = diagnostic_stream_registry();
+        assert!(!registry.contains(SERVICE_OBJECT));
+        assert!(registry.contains(SERVICE_LOG_WATCH));
+        assert_eq!(
+            registry.resolve_tag(&[SERVICE_STREAM]),
+            Some((SERVICE_STREAM, &[][..]))
+        );
     }
 
     #[test]
@@ -641,5 +762,29 @@ mod tests {
         assert!(link.dropped() >= 1);
         assert!(delivered >= 2);
         assert!(link.sent() >= 5);
+    }
+
+    #[test]
+    fn path_policy_control_is_compact_and_bearer_neutral() {
+        assert_eq!(
+            decode_path_policy(&[0]),
+            Some(quic_lite::PathPolicy::HighestMeasuredSpeed)
+        );
+        assert_eq!(
+            decode_path_policy(&[1, 2]),
+            Some(quic_lite::PathPolicy::Explicit(2))
+        );
+        assert_eq!(
+            decode_path_policy(&[2, 1]),
+            Some(quic_lite::PathPolicy::AirtimeFirst { primary: 1 })
+        );
+        assert_eq!(
+            decode_path_policy(&[3]),
+            Some(quic_lite::PathPolicy::Aggregate)
+        );
+        assert_eq!(
+            encode_path_policy_response(quic_lite::PathPolicy::Explicit(2)),
+            vec![CONTROL_RESPONSE, 1, 2]
+        );
     }
 }

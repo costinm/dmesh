@@ -45,6 +45,9 @@ impl<'a> Encoder<'a> {
     pub fn map(&mut self, count: u64) -> Option<()> {
         self.head(5, count)
     }
+    pub fn array(&mut self, count: u64) -> Option<()> {
+        self.head(4, count)
+    }
     pub fn uint(&mut self, value: u64) -> Option<()> {
         self.head(0, value)
     }
@@ -85,9 +88,18 @@ impl<'a> Decoder<'a> {
             25 => u16::from_be_bytes(self.take(2)?.try_into().ok()?) as u64,
             26 => u32::from_be_bytes(self.take(4)?.try_into().ok()?) as u64,
             27 => u64::from_be_bytes(self.take(8)?.try_into().ok()?),
+            31 => u64::MAX,
             _ => return None,
         };
         Some((major, value))
+    }
+    pub fn consume_break(&mut self) -> bool {
+        if self.data.get(self.pos) == Some(&0xff) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
     pub fn take(&mut self, len: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(len)?;
@@ -171,13 +183,17 @@ impl<'a> Decoder<'a> {
                 Some(())
             }
             4 => {
-                for _ in 0..len {
+                let mut index = 0;
+                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len) {
+                    index += 1;
                     self.skip()?;
                 }
                 Some(())
             }
             5 => {
-                for _ in 0..len {
+                let mut index = 0;
+                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len) {
+                    index += 1;
                     self.skip()?;
                     self.skip()?;
                 }

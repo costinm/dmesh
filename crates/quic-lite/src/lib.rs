@@ -9,7 +9,6 @@
 //! bearer/security layer.
 
 extern crate alloc;
-#[cfg(any(feature = "std", test))]
 use alloc::vec::Vec;
 #[cfg(not(any(feature = "std", test)))]
 use alloc::{
@@ -20,6 +19,7 @@ use alloc::{
 #[cfg(all(feature = "std", not(test)))]
 extern crate std;
 
+pub mod bearer_probe;
 pub mod callback;
 pub mod iperf;
 pub mod ledger;
@@ -27,8 +27,11 @@ pub mod ledger;
 pub mod mux;
 
 pub mod framed_stream;
+pub mod packet_pool;
 pub mod path_bridge;
 pub mod path_router;
+pub mod ram_budget;
+pub mod raw_udp6;
 pub mod uart;
 
 pub use path_router::{
@@ -61,6 +64,11 @@ pub const SERVICE_OBJECT: u8 = 1;
 pub const SERVICE_ECHO: u8 = 2;
 pub const SERVICE_STATUS: u8 = 3;
 pub const SERVICE_STREAM: u8 = 4;
+/// Enumerate every registered application stream handler.  The response is a
+/// compact CBOR array of `[tag, name]` pairs. `STREAM` is retained as the
+/// numeric wire tag while the handler name makes its purpose explicit to
+/// interactive clients.
+pub const SERVICE_HANDLERS: u8 = SERVICE_STREAM;
 pub const SERVICE_IPERF: u8 = 5;
 pub const SERVICE_METRICS: u8 = 6;
 pub const SERVICE_EVENTS: u8 = 7;
@@ -74,11 +82,10 @@ pub const SERVICE_LOG_WATCH: u8 = 9;
 
 /// A small CBOR selector used at the beginning of a stream command.  This is
 /// intentionally not a CBOR dependency or a general decoder: transport only
-/// recognizes one definite integer or text item and leaves the body opaque.
+/// recognizes one definite integer service tag and leaves the body opaque.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CborSelector<'a> {
+pub enum CborSelector {
     Tag(u64),
-    Name(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,9 +94,170 @@ pub enum CborSelectorError {
     Unsupported,
 }
 
-/// Decode a definite CBOR unsigned-integer or text selector at `input[0]`.
-/// The returned offset begins the handler-owned payload.
-pub fn decode_cbor_selector(input: &[u8]) -> Result<(CborSelector<'_>, usize), CborSelectorError> {
+/// One application handler advertised by a QUIC-lite endpoint.
+///
+/// This deliberately describes dispatch only.  It contains neither a CBOR
+/// schema nor a function pointer: the application owning a stream reads its
+/// own payload after QUIC-lite has selected it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamHandler {
+    pub tag: u8,
+    pub name: &'static [u8],
+}
+
+/// Shared stream-handler registry for every QUIC-lite bearer.
+///
+/// The registry is in the transport crate so UART, UDP, ESP-NOW, and host
+/// tests advertise the exact same tag/name surface.  It remains no_std and
+/// only uses `alloc`; CBOR is limited to the small selector helper below.
+#[derive(Clone, Debug)]
+pub struct StreamRegistry {
+    handlers: Vec<StreamHandler>,
+}
+
+impl Default for StreamRegistry {
+    fn default() -> Self {
+        let mut registry = Self {
+            handlers: Vec::new(),
+        };
+        for handler in [
+            StreamHandler {
+                tag: SERVICE_OBJECT,
+                name: b"object",
+            },
+            StreamHandler {
+                tag: SERVICE_ECHO,
+                name: b"echo",
+            },
+            StreamHandler {
+                tag: SERVICE_STATUS,
+                name: b"status",
+            },
+            StreamHandler {
+                tag: SERVICE_HANDLERS,
+                name: b"handlers",
+            },
+            StreamHandler {
+                tag: SERVICE_IPERF,
+                name: b"iperf",
+            },
+            StreamHandler {
+                tag: SERVICE_METRICS,
+                name: b"metrics",
+            },
+            StreamHandler {
+                tag: SERVICE_EVENTS,
+                name: b"events",
+            },
+            StreamHandler {
+                tag: SERVICE_CONTROL,
+                name: b"control",
+            },
+            StreamHandler {
+                tag: SERVICE_LOG_WATCH,
+                name: b"log-watch",
+            },
+        ] {
+            // Registration mutates the advertised surface.  Do not place it
+            // inside `debug_assert!`: release firmware would otherwise build
+            // an empty registry and reject every valid stream service.  The
+            // canonical static list is trusted in production; debug builds
+            // still check it contains no duplicate tag or name.
+            let _registered = registry.register(handler.tag, handler.name);
+            debug_assert!(_registered);
+        }
+        registry
+    }
+}
+
+impl StreamRegistry {
+    /// Start with no advertised handlers. Bearer adapters use this when their
+    /// available service surface is intentionally narrower than the common
+    /// host/server baseline.
+    pub fn empty() -> Self {
+        Self {
+            handlers: Vec::new(),
+        }
+    }
+
+    /// Register one stable service tag and human-readable name.  A duplicate
+    /// tag or name is rejected so discovery cannot advertise an ambiguous
+    /// handler.
+    pub fn register(&mut self, tag: u8, name: &'static [u8]) -> bool {
+        if name.is_empty()
+            || self
+                .handlers
+                .iter()
+                .any(|handler| handler.tag == tag || handler.name == name)
+        {
+            return false;
+        }
+        self.handlers.push(StreamHandler { tag, name });
+        true
+    }
+
+    pub fn handlers(&self) -> &[StreamHandler] {
+        &self.handlers
+    }
+
+    pub fn contains(&self, tag: u8) -> bool {
+        self.handlers.iter().any(|handler| handler.tag == tag)
+    }
+
+    /// Encode handler discovery as canonical compact CBOR:
+    /// `[[tag, "name"], ...]`. This small self-contained encoder keeps
+    /// QUIC-lite free of a CBOR crate and is not a handler payload schema.
+    pub fn encode_handler_list(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(1 + self.handlers.len() * 12);
+        encode_cbor_head(&mut output, 4, self.handlers.len() as u64);
+        for handler in &self.handlers {
+            encode_cbor_head(&mut output, 4, 2);
+            encode_cbor_head(&mut output, 0, u64::from(handler.tag));
+            encode_cbor_head(&mut output, 3, handler.name.len() as u64);
+            output.extend_from_slice(handler.name);
+        }
+        output
+    }
+
+    /// Resolve a compact numeric service tag at the beginning of a stream
+    /// body. Names are deliberately discovery-only metadata and never select
+    /// a handler or command.
+    pub fn resolve_tag<'a>(&self, input: &'a [u8]) -> Option<(u8, &'a [u8])> {
+        let (selector, used) = decode_cbor_selector(input).ok()?;
+        let CborSelector::Tag(tag) = selector;
+        let handler = self
+            .handlers
+            .iter()
+            .find(|handler| u64::from(handler.tag) == tag)?;
+        Some((handler.tag, &input[used..]))
+    }
+}
+
+fn encode_cbor_head(output: &mut Vec<u8>, major: u8, value: u64) {
+    debug_assert!(major < 8);
+    let prefix = major << 5;
+    match value {
+        0..=23 => output.push(prefix | value as u8),
+        24..=255 => output.extend_from_slice(&[prefix | 24, value as u8]),
+        256..=65_535 => {
+            output.push(prefix | 25);
+            output.extend_from_slice(&(value as u16).to_be_bytes());
+        }
+        65_536..=4_294_967_295 => {
+            output.push(prefix | 26);
+            output.extend_from_slice(&(value as u32).to_be_bytes());
+        }
+        _ => {
+            output.push(prefix | 27);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+/// Decode a definite CBOR unsigned-integer service tag at `input[0]`.
+/// Names are discovery metadata only and are rejected here. The returned
+/// offset begins the handler-owned payload.
+pub fn decode_cbor_selector(input: &[u8]) -> Result<(CborSelector, usize), CborSelectorError> {
     let Some(&head) = input.first() else {
         return Err(CborSelectorError::Truncated);
     };
@@ -124,22 +292,10 @@ pub fn decode_cbor_selector(input: &[u8]) -> Result<(CborSelector<'_>, usize), C
         }
         _ => return Err(CborSelectorError::Unsupported),
     };
-    match major {
-        0 => Ok((CborSelector::Tag(value), header_len)),
-        3 => {
-            let end = header_len
-                .checked_add(value as usize)
-                .ok_or(CborSelectorError::Unsupported)?;
-            Ok((
-                CborSelector::Name(
-                    input
-                        .get(header_len..end)
-                        .ok_or(CborSelectorError::Truncated)?,
-                ),
-                end,
-            ))
-        }
-        _ => Err(CborSelectorError::Unsupported),
+    if major == 0 {
+        Ok((CborSelector::Tag(value), header_len))
+    } else {
+        Err(CborSelectorError::Unsupported)
     }
 }
 pub const CONTROL_STREAM_ID: u64 = 0;
@@ -311,14 +467,14 @@ mod recovery_profile_tests {
     }
 
     #[test]
-    fn stream_selector_accepts_compact_tag_or_name_only() {
+    fn stream_selector_accepts_compact_tag_only() {
         assert_eq!(
             decode_cbor_selector(&[8, 0xa0]),
             Ok((CborSelector::Tag(8), 1))
         );
         assert_eq!(
             decode_cbor_selector(&[0x69, b'l', b'o', b'g', b'-', b'w', b'a', b't', b'c', b'h']),
-            Ok((CborSelector::Name(b"log-watch"), 10))
+            Err(CborSelectorError::Unsupported)
         );
         assert_eq!(
             decode_cbor_selector(&[0xa1]),
@@ -328,6 +484,31 @@ mod recovery_profile_tests {
             decode_cbor_selector(&[0x78]),
             Err(CborSelectorError::Truncated)
         );
+    }
+
+    #[test]
+    fn shared_handler_registry_advertises_tag_and_name_once() {
+        let mut registry = StreamRegistry::default();
+        assert!(registry.contains(SERVICE_HANDLERS));
+        assert_eq!(
+            registry.resolve_tag(&[SERVICE_HANDLERS, 1]),
+            Some((SERVICE_HANDLERS, &[1][..]))
+        );
+        assert_eq!(
+            registry.resolve_tag(&[0x68, b'h', b'a', b'n', b'd', b'l', b'e', b'r', b's']),
+            None
+        );
+        assert_eq!(
+            registry.encode_handler_list().get(..11),
+            Some(
+                &[
+                    0x89, 0x82, 1, 0x66, b'o', b'b', b'j', b'e', b'c', b't', 0x82
+                ][..]
+            )
+        );
+        assert!(!registry.register(SERVICE_HANDLERS, b"different-name"));
+        assert!(!registry.register(42, b"handlers"));
+        assert!(registry.register(42, b"custom"));
     }
 }
 
@@ -3225,6 +3406,34 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     /// constructs or interprets an ACK.
     pub fn stream_consumed_deferred(&mut self, stream_id: u64, bytes: usize) -> Result<(), Error> {
         self.stream_consumed_inner(stream_id, bytes, false)
+    }
+
+    /// Record durable consumption but deliberately withhold any MAX_* credit
+    /// extension. A device-wide RAM admission controller calls
+    /// [`Self::grant_receive_window`] later, once shared packet/relay memory
+    /// is available. ACK state remains live so a sender can distinguish
+    /// delivery from additional receive capacity.
+    pub fn stream_consumed_without_credit(
+        &mut self,
+        stream_id: u64,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        self.receive.consume(stream_id, bytes as u64)?;
+        self.ack_pending = true;
+        Ok(())
+    }
+
+    /// Advertise an admitted effective receive window. `window_bytes` is a
+    /// sliding-window size, not an unconditional increment; FlowControl only
+    /// advances the absolute MAX_* values as consumed bytes make room. A
+    /// smaller value therefore withholds replenishment and never revokes an
+    /// already advertised peer credit.
+    pub fn grant_receive_window(&mut self, stream_id: u64, window_bytes: u64) -> Result<(), Error> {
+        self.receive.extend_connection_credit(window_bytes);
+        self.receive.extend_stream_credit(stream_id, window_bytes)?;
+        self.control_pending = true;
+        self.queue_stream_credit(stream_id);
+        Ok(())
     }
 
     fn queue_stream_credit(&mut self, stream_id: u64) {

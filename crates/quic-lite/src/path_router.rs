@@ -61,6 +61,12 @@ pub enum PathPolicy {
     /// Use the best measured bearer and periodically probe all paths so a
     /// recovered faster bearer is selected again.
     HighestMeasuredSpeed,
+    /// Use every available bearer concurrently. An adapter supplies bounded
+    /// egress capacity for slow paths; full paths are skipped until they make
+    /// room, while unbounded paths continue carrying the remainder. This is
+    /// intentionally distinct from `HighestMeasuredSpeed`: it is the policy
+    /// used to measure whether two L2 bearers add capacity.
+    Aggregate,
     /// Prefer a low-airtime bearer until its local queue/credit is full, then
     /// spill to the best available alternate.
     AirtimeFirst { primary: usize },
@@ -152,6 +158,15 @@ impl<T, const CONNECTIONS: usize, const PATHS: usize> ConnectionTable<T, CONNECT
             .iter()
             .enumerate()
             .filter_map(|(slot, entry)| entry.as_ref().map(|value| (slot, value)))
+    }
+
+    /// Mutably visit active DCID bindings without exposing the fixed backing
+    /// array. Bearer schedulers use this for bounded timer/egress progress.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+        self.entries
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(slot, entry)| entry.as_mut().map(|value| (slot, value)))
     }
 
     pub fn route_mut(
@@ -348,6 +363,18 @@ impl<const CONNECTIONS: usize, const PATHS: usize> DcidRouter<CONNECTIONS, PATHS
             {
                 Some(primary)
             }
+            PathPolicy::Aggregate => self
+                .paths
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| state.available && state.capacity.has_capacity())
+                // `sent_packets` provides deterministic fair selection while
+                // an adapter's bounded queue is below its limit. Once UART,
+                // FSK, or another slow path is full it is not eligible, so
+                // the faster bearer continues instead of stalling a stream.
+                .min_by_key(|(_, state)| state.sent_packets)
+                .map(|(path, _)| path)
+                .or_else(|| self.paths.iter().position(|state| state.available)),
             PathPolicy::AirtimeFirst { .. } | PathPolicy::HighestMeasuredSpeed => self
                 .paths
                 .iter()
@@ -485,6 +512,23 @@ mod tests {
         assert_eq!(
             router.select_with_policy(PathPolicy::AirtimeFirst { primary: 0 }, false),
             Ok(0)
+        );
+        // Aggregate is fair while both paths can accept a packet.
+        assert_eq!(
+            router.select_with_policy(PathPolicy::Aggregate, false),
+            Ok(0)
+        );
+        assert_eq!(
+            router.select_with_policy(PathPolicy::Aggregate, false),
+            Ok(1)
+        );
+        // A full bounded path is skipped instead of stalling the connection.
+        router
+            .set_path_capacity(0, PathCapacity::new(8, 8))
+            .unwrap();
+        assert_eq!(
+            router.select_with_policy(PathPolicy::Aggregate, false),
+            Ok(1)
         );
     }
 }
