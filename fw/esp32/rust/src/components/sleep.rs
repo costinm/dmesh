@@ -1438,7 +1438,7 @@ fn active_window(state: &RtcSleepState) -> Result<bool> {
                 "event type=sleep.active transport=nan_raw status=error message={}",
                 crate::commands::protocol::escape_value(&err.to_string())
             )),
-        }
+        };
         let sync_us = super::nan::sync_to_next_discovery_window(350, 512, 0);
         telemetry::record_log(format!(
             "event type=sleep.active transport=nan_raw sync_us={}",
@@ -1458,7 +1458,7 @@ fn active_window(state: &RtcSleepState) -> Result<bool> {
         }
     }
     while Instant::now() < deadline {
-        if state.flags & FLAG_SERIAL != 0 && super::serial::has_pending_frame() {
+        if state.flags & FLAG_SERIAL != 0 && super::serial::has_pending_ingress() {
             telemetry::record_log("event type=sleep.active source=serial action=promote");
             if state.flags & FLAG_NAN_RAW != 0 {
                 let _ = super::nan::stop_nan();

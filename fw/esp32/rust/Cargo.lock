@@ -396,6 +396,7 @@ dependencies = [
 name = "dmesh-fw-transport"
 version = "0.1.0"
 dependencies = [
+ "dmesh-rawnan",
  "dmesh-server",
  "esp-idf-sys",
  "quic-lite",

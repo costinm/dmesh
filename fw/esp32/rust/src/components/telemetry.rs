@@ -21,7 +21,21 @@ const PREVIEW_BYTES: usize = 96;
 const LORA_WAKE_EVENT_INTERVAL_MS: u32 = 1_000;
 /// Producer-side log buffering is intentionally small.  It is a lossy
 /// diagnostic stream, never a work queue for a FreeRTOS task.
-const LOG_STREAM_RECORDS: usize = 8;
+// Keep enough boot history to include the asynchronously started STA/UDP
+// bearers, while remaining a small fixed lossy diagnostic queue. Producers
+// never wait for this storage or for a transport consumer.
+// `FramedStream::new()` constructs the fixed record array at its call site.
+// Classic ESP32's early Main task cannot safely materialize an 8 KiB log
+// queue on its stack before the rest of the runtime is established. Keep the
+// same nonblocking/drop contract with a small classic profile; larger boards
+// retain the diagnostic history needed for STA/UDP bring-up.
+#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+const LOG_STREAM_RECORDS: usize = 2;
+#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+const LOG_STREAM_RECORD_BYTES: usize = 256;
+#[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+const LOG_STREAM_RECORDS: usize = 16;
+#[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
 const LOG_STREAM_RECORD_BYTES: usize = 512;
 
 static LAST_LORA_WAKE_EVENT_MS: AtomicU32 = AtomicU32::new(0);

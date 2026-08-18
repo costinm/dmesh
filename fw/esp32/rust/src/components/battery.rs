@@ -386,7 +386,7 @@ fn parse_pins(value: &str) -> Result<Vec<i32>> {
 fn wait_for_key_or_timeout(interval_ms: u64) -> bool {
     let mut waited = 0_u64;
     while waited < interval_ms {
-        if super::serial::has_pending_frame() {
+        if super::serial::has_pending_ingress() {
             return true;
         }
         let step = (interval_ms - waited).min(50);

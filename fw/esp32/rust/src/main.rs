@@ -8,11 +8,20 @@ mod components;
 
 const BOOT_ACTIVE_WINDOW_MS: u32 = 10_000;
 const MAIN_HOUSEKEEPING_POLL_MS: u64 = 1_000;
+// A console wake keeps Main's non-BLE companion policy active, but it must
+// not initialize the BLE controller or read BLE settings at boot.
+const COMPANION_ACTIVE_MS: u32 = 5_000;
 
-// UART0 has exactly one framed owner after init_console_uart().  Raw ROM
-// breadcrumbs are useful before that point, but writing them afterwards can
-// split a CBOR/PPP record and make lmesh lose the boot/mode notification.
+// UART0 has exactly one owner after init_console_uart(). Raw ROM breadcrumbs
+// are useful before that point; afterwards raw ASCII diagnostics are injected
+// as complete records into the shared UART writer, never emitted directly by
+// a Main, Wi-Fi, or transport task.
 static FRAMED_UART_READY: AtomicBool = AtomicBool::new(false);
+// Heap APIs do not allocate. Capture the true entry state before flash, NVS,
+// or console initialization; emit it only after the console writer is ready.
+static HEAP_ENTRY_FREE: AtomicU32 = AtomicU32::new(0);
+static HEAP_ENTRY_LARGEST: AtomicU32 = AtomicU32::new(0);
+static HEAP_ENTRY_MINIMUM: AtomicU32 = AtomicU32::new(0);
 // A host can attach just after the initial reset identity. Retransmit it once
 // from the normal cooperative loop so boot proof does not depend on opening
 // the physical UART during the reset edge.
@@ -28,26 +37,80 @@ pub extern "C" fn app_main() {
 }
 
 fn run() -> Result<()> {
-    boot_print("dm-rs boot step=link_patches");
+    capture_entry_heap();
+    rom_breadcrumb(b"dm-rs boot step=link_patches\0");
     esp_idf_sys::link_patches();
-    boot_print("dm-rs boot step=link_patches_done");
+    rom_breadcrumb(b"dm-rs boot step=link_patches_done\0");
+    rom_breadcrumb(b"dm-rs boot step=flash_size_begin\0");
     if let Err(err) = components::recovery::configure_flash_size_from_hardware() {
-        boot_print("dm-rs flash size override failed");
+        rom_breadcrumb(b"dm-rs flash size override failed\0");
         eprintln!("flash size override failed: {err}");
     }
-    boot_print("dm-rs boot step=flash_size_done");
+    rom_breadcrumb(b"dm-rs boot step=flash_size_done\0");
     components::recovery::mark_main_boot_start();
     components::wake::register_main_task();
+    dmesh_fw_transport::uart_esp::set_ingress_notify(Some(components::wake::notify));
+    let before_console = heap_snapshot();
+    rom_breadcrumb(b"dm-rs uart setup begin\0");
     init_console_uart();
-    components::telemetry::initialize_log_stream();
+    rom_breadcrumb(b"dm-rs uart setup done\0");
+    report_entry_and_console_heap(before_console);
+    // `std::sync::Mutex` is backed by an ESP-IDF queue.  On classic ESP32,
+    // defer its first construction until NVS/settings has initialized its own
+    // allocator and lock state; the UART driver itself remains available for
+    // raw boot diagnostics in the meantime.
+    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+    {
+        components::telemetry::initialize_log_stream();
+        rom_breadcrumb(b"dm-rs log queue done\0");
+    }
+    // ESP-IDF 6's classic-ESP32 log-level path lazily creates a global log
+    // mutex without inter-core initialization. Boot logging may already have
+    // raced that setup, and `esp_log_level_set` then asserts on a non-mutex
+    // queue handle. Suppressing optional log levels is not required for the
+    // UART L2; retain raw diagnostic text and leave C6/S3 unchanged.
+    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
     quiet_runtime_logs();
     // `dmesh-fw-transport::wifi_esp` owns the ESP-IDF network stack and the
     // default STA netif.  Creating either here races the shared STA adapter
     // and makes ESP-IDF abort on a duplicate default netif.
 
+    rom_breadcrumb(b"dm-rs wake cause begin\0");
     let wake_cause = unsafe { esp_idf_sys::esp_sleep_get_wakeup_cause() };
-    boot_print("dm-rs boot step=settings\n");
+    rom_breadcrumb(b"dm-rs wake cause done\0");
+    // This isolates NVS/settings-store cost from the entry and console
+    // baselines reported immediately after the console writer became ready.
+    report_heap_phase(
+        b"heap pre_settings free=",
+        b"heap pre_settings largest=",
+        b"heap pre_settings min=",
+    );
+    rom_breadcrumb(b"dm-rs settings begin\0");
     let settings = components::settings::open_shared();
+    rom_breadcrumb(b"dm-rs settings done\0");
+    report_heap_phase(
+        b"heap settings free=",
+        b"heap settings largest=",
+        b"heap settings min=",
+    );
+    // Reserve the shared raw STA driver's allocations before optional power,
+    // BLE, and boot-window work. Recovery reaches Wi-Fi at this point; doing
+    // it later in Main can leave ESP-IDF without the contiguous heap it needs
+    // even though total free memory appears sufficient.
+    let infra_at_boot = components::mode::configured_infra_mode(&settings);
+    components::transport_runtime::initialize(&settings, infra_at_boot);
+    report_heap_phase(
+        b"heap transport free=",
+        b"heap transport largest=",
+        b"heap transport min=",
+    );
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    {
+        components::telemetry::initialize_log_stream();
+        rom_breadcrumb(b"dm-rs log queue done\0");
+    }
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    start_deferred_classic_uart_l2();
     boot_print("dm-rs boot step=power\n");
     if let Err(err) = components::power::apply_default(&settings) {
         components::telemetry::record_log(format!(
@@ -87,21 +150,15 @@ fn run() -> Result<()> {
     boot_print("dm-rs boot step=module_deferred\n");
 
     boot_print("dm-rs boot step=ble_config\n");
-    let companion_setting = settings.borrow().get_bool("ble.comp", true);
-    if let Err(err) = &companion_setting {
-        let line = format!(
-            "event type=ble.companion_error source=startup message={}",
-            commands::protocol::escape_value(&err.to_string())
-        );
-        components::telemetry::record_log(line);
-    }
-    let companion_active_ms = settings
-        .borrow()
-        .get_i32("cm.active_ms", 5_000)
-        .unwrap_or(5_000)
-        .max(0) as u32;
-    components::ble_bt::configure_companion_advertising(30_000, 5_000);
-    components::ble_bt::configure_companion_active_window(companion_active_ms);
+    // BLE has no boot-time role in the Wi-Fi transport profile.  In
+    // particular, do not construct its command queue/controller allocations
+    // merely to read companion defaults: a hardware or pairing stream request
+    // owns `ensure_ble()` and pays that memory cost on demand.
+    report_heap_phase(
+        b"heap ble_deferred free=",
+        b"heap ble_deferred largest=",
+        b"heap ble_deferred min=",
+    );
     boot_print("dm-rs boot step=boot_window\n");
     let boot_window = run_boot_active_window(wake_cause);
     // UART remains available through its dedicated manager task, but it is
@@ -110,20 +167,9 @@ fn run() -> Result<()> {
     components::serial::configure_active_window(&settings);
     boot_print("dm-rs boot step=mode\n");
     if boot_window.pairing_recovery {
-        match components::ble_bt::start_pairing_recovery(&settings) {
-            Ok(removed) => {
-                components::telemetry::record_log(format!(
-                    "event type=boot_window pairing_recovery=true bonds_removed={}",
-                    removed
-                ));
-            }
-            Err(err) => {
-                components::telemetry::record_log(format!(
-                    "event type=boot_window pairing_recovery=false msg={}",
-                    commands::protocol::escape_value(&err.to_string())
-                ));
-            }
-        }
+        components::telemetry::record_log(
+            "event type=boot_window pairing_recovery=true ble=deferred",
+        );
         components::mode::enter_pairing_recovery(
             &settings,
             components::ble_bt::PAIRING_RECOVERY_WINDOW_MS,
@@ -138,19 +184,13 @@ fn run() -> Result<()> {
         components::mode::init(&settings);
     }
 
-    // Both roles load the identical Recovery/Main transport profile and have
-    // the same stream handlers available. Only infra starts the shared STA
-    // bearer here; sleepy waits for an explicit direct UART or NAN wake
-    // request instead of turning every raw-NAN duty wake into IP activity.
-    components::transport_runtime::initialize(&settings, components::mode::infra_mode());
-
     let ready = "event type=system.ready app=dmesh-rs";
     components::telemetry::record_log(ready);
     components::recovery::mark_main_boot_healthy();
     // Direct boot identity is the bounded pre-stream proof that Stage2 chose
     // Main and this application reached its healthy point.  It is not a log
     // or command response; normal diagnostics remain stream services.
-    let identity = dmesh_fw_transport::recovery_runtime::boot_identity_payload(1, 1);
+    let identity = dmesh_server::recovery::boot_identity_payload(1, 1);
     let _ = components::serial::write_direct_record(&identity);
     let identity_retry_at =
         unsafe { (esp_idf_sys::esp_timer_get_time().max(0) as u64 / 1_000) as u32 }
@@ -176,7 +216,7 @@ fn run() -> Result<()> {
                 .compare_exchange(identity_retry_at, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            let identity = dmesh_fw_transport::recovery_runtime::boot_identity_payload(1, 1);
+            let identity = dmesh_server::recovery::boot_identity_payload(1, 1);
             let _ = components::serial::write_direct_record(&identity);
         }
         components::telemetry::record_main_loop();
@@ -189,14 +229,14 @@ fn run() -> Result<()> {
             // its own is insufficient: command responses remain TX-gated
             // unless this also restores the bounded UART active window.
             components::serial::activate_window();
-            components::mode::mark_companion_active(&settings, companion_active_ms);
+            components::mode::mark_companion_active(&settings, COMPANION_ACTIVE_MS);
             components::telemetry::record_log("event type=uart.wake source=button");
             components::telemetry::emit_console("event type=uart.wake source=button");
         }
         if components::peripherals::take_long_presses() > 0 {
             components::serial::set_debug_enabled(true);
             components::serial::activate_window();
-            components::mode::mark_companion_active(&settings, companion_active_ms);
+            components::mode::mark_companion_active(&settings, COMPANION_ACTIVE_MS);
         }
         for _ in 0..components::peripherals::take_sync_requests() {
             components::mode::send_button_sync(&settings);
@@ -209,13 +249,10 @@ fn run() -> Result<()> {
         if first_loop_trace {
             boot_print("dm-rs loop after_mode");
         }
-        // Legacy raw-Wi-Fi commands and their UDP probes are intentionally
-        // not polled.  Bearer packets enter QUIC-lite through the shared
-        // transport runtime instead of owning a second command session.
-        poll_raw_wifi_commands();
         components::wifi::poll_ip_sta();
         poll_nan_commands();
-        drain_uart_console();
+        components::module::poll_callbacks(&settings);
+        components::module::poll_stream_services(&settings);
         // A beacon can arrive near the end of a sparse DW. Poll quickly only
         // while the raw-NAN window is already awake so post-beacon shutdown is
         // bounded by the NAN dwell without adding periodic wakeups during
@@ -243,42 +280,60 @@ fn run() -> Result<()> {
     }
 }
 
-fn drain_uart_console() {
-    while let Some(frame) = components::serial::take_frame() {
-        // A tagged NAN_SLEEPY_START event is a transport wake notification,
-        // not a command. It is emitted by the UART wake scheduler and must
-        // never be dispatched through the command registry.
-        if frame.data.is_empty() {
-            continue;
-        }
-        match dmesh_fw_transport::classify_ppp_payload(&frame.data) {
-            Ok(dmesh_fw_transport::PppIngress::Transport(packet)) => {
-                let _ = components::action_stream::receive_uart(packet);
-                continue;
-            }
-            Ok(dmesh_fw_transport::PppIngress::DirectRecord(record)) => {
-                // The sleepy-start notification itself is device-to-host.
-                // A host replies with this bounded Recovery/bootstrap CBOR
-                // request to open its first STA/stream session; ordinary
-                // direct records remain restricted by the exception policy.
-                if dmesh_server::recovery::decode_recovery_command(record).is_some() {
-                    components::transport_runtime::request_active_session("uart_bootstrap");
-                    // This compact map is a transport wake/bootstrap
-                    // exception, not a legacy Main `recovery` command. In
-                    // particular, its numeric transport/IPERF fields do not
-                    // have the old command registry's string value shape;
-                    // falling through would turn an L2 wake into a malformed
-                    // command (or an unintended recovery reboot request).
-                    continue;
-                }
-                components::telemetry::record_log(format!(
-                    "event type=direct_record rejected=true bytes={}",
-                    record.len()
-                ));
-                continue;
-            }
-            Err(_) => continue,
-        }
+/// Fixed-cost boot diagnostics: free heap alone hides fragmentation, whereas
+/// the largest 8-bit-capable block directly explains a failed Rust allocation.
+/// This does not enable heap tracing or allocate memory.
+fn capture_entry_heap() {
+    let (free, largest, minimum) = heap_snapshot();
+    HEAP_ENTRY_FREE.store(free, Ordering::Relaxed);
+    HEAP_ENTRY_LARGEST.store(largest, Ordering::Relaxed);
+    HEAP_ENTRY_MINIMUM.store(minimum, Ordering::Relaxed);
+}
+
+fn heap_snapshot() -> (u32, u32, u32) {
+    unsafe {
+        (
+            esp_idf_sys::esp_get_free_heap_size(),
+            esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT as _) as u32,
+            esp_idf_sys::esp_get_minimum_free_heap_size(),
+        )
+    }
+}
+
+fn report_entry_and_console_heap(before_console: (u32, u32, u32)) {
+    dmesh_fw_transport::commands::send_stat(
+        b"heap entry free=",
+        HEAP_ENTRY_FREE.load(Ordering::Relaxed) as u64,
+    );
+    dmesh_fw_transport::commands::send_stat(
+        b"heap entry largest=",
+        HEAP_ENTRY_LARGEST.load(Ordering::Relaxed) as u64,
+    );
+    dmesh_fw_transport::commands::send_stat(
+        b"heap entry min=",
+        HEAP_ENTRY_MINIMUM.load(Ordering::Relaxed) as u64,
+    );
+    dmesh_fw_transport::commands::send_stat(b"heap pre_console free=", before_console.0 as u64);
+    dmesh_fw_transport::commands::send_stat(b"heap pre_console largest=", before_console.1 as u64);
+    dmesh_fw_transport::commands::send_stat(b"heap pre_console min=", before_console.2 as u64);
+    report_heap_phase(
+        b"heap console free=",
+        b"heap console largest=",
+        b"heap console min=",
+    );
+}
+
+fn report_heap_phase(free: &[u8], largest: &[u8], minimum: &[u8]) {
+    unsafe {
+        dmesh_fw_transport::commands::send_stat(free, esp_idf_sys::esp_get_free_heap_size() as u64);
+        dmesh_fw_transport::commands::send_stat(
+            largest,
+            esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT as _) as u64,
+        );
+        dmesh_fw_transport::commands::send_stat(
+            minimum,
+            esp_idf_sys::esp_get_minimum_free_heap_size() as u64,
+        );
     }
 }
 
@@ -342,53 +397,26 @@ fn wake_cause_name(cause: esp_idf_sys::esp_sleep_source_t) -> &'static str {
     }
 }
 
-fn poll_raw_wifi_commands() {
-    components::telemetry::record_raw_poll();
-    while let Some(command) = components::wifi::take_raw_command() {
-        components::telemetry::record_raw_command();
-        components::telemetry::record_log(format!(
-            "event type=wifi.raw_command source={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} len={} rssi={}",
-            command.source[0],
-            command.source[1],
-            command.source[2],
-            command.source[3],
-            command.source[4],
-            command.source[5],
-            command.payload.len(),
-            command.rssi
-        ));
-        // The old raw-action CBOR dispatcher is disabled. This bearer will
-        // re-enter through action_stream once it carries QUIC-lite packets.
-        let _ = command.response;
-    }
-}
-
 fn poll_nan_commands() {
     components::nan::poll_rx();
-    while let Some(command) = components::nan::take_command() {
-        components::telemetry::record_log(format!(
-            "event type=nan.command len={}",
-            command.payload.len()
-        ));
-        // NAN is discovery/bootstrap only; direct CBOR application dispatch
-        // remains disabled until the common stream path owns it.
-    }
 }
 
 /// Boot progress is retained in telemetry only. UART output is demand-driven:
 /// emitting boot logs before a console client wakes it can leave UART0's IDF
 /// ISR active through the radio startup transition.
 fn boot_print(message: &str) {
-    components::telemetry::record_log(message.trim());
-    // Keep raw output strictly before the framed UART owner starts. Once the
-    // driver is ready, telemetry is the only output path; otherwise a ROM
-    // breadcrumb can be inserted in the middle of a framed response/event.
-    if !FRAMED_UART_READY.load(Ordering::Acquire) {
-        if let Ok(message) = std::ffi::CString::new(message.trim()) {
-            unsafe {
-                esp_rom_printf(b"%s\r\n\0".as_ptr() as *const c_char, message.as_ptr());
-            }
-        }
+    if FRAMED_UART_READY.load(Ordering::Acquire) {
+        // Raw text is solely a UART/QUIC-lite troubleshooting breadcrumb. The
+        // shared writer serializes this complete line with PPP records, while
+        // normal firmware logs remain available through `log-watch`.
+        #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+        components::telemetry::record_log(message.trim());
+        let _ = dmesh_fw_transport::uart_esp::send_debug_text(message.trim().as_bytes());
+    } else {
+        // Keep the pre-L2 path allocation-free. `boot_print` accepts dynamic
+        // text, so it cannot safely pass an arbitrary Rust `&str` to ROM
+        // printf without building a NUL-terminated buffer. Boot-critical
+        // progress uses the static `rom_breadcrumb` calls above instead.
     }
 }
 
@@ -396,131 +424,67 @@ unsafe extern "C" {
     fn esp_rom_printf(format: *const c_char, ...);
 }
 
+/// Heap-free static boot breadcrumb for diagnosing the narrow period before
+/// Main's UART L2 can own the console. Unlike `boot_print`, this may be used
+/// around driver/queue setup without allocating or taking a logger mutex.
+fn rom_breadcrumb(message: &'static [u8]) {
+    unsafe {
+        esp_rom_printf(
+            b"%s\r\n\0".as_ptr() as *const c_char,
+            message.as_ptr() as *const c_char,
+        );
+    }
+}
+
 fn init_console_uart() {
-    const UART0: esp_idf_sys::uart_port_t = esp_idf_sys::uart_port_t_UART_NUM_0;
     unsafe {
-        #[cfg(target_arch = "riscv32")]
-        {
-            let install = components::serial::install_usb_console();
-            if install != 0 {
-                components::telemetry::record_log(format!(
-                    "event type=usb_serial.state=failed err={install}"
-                ));
-                return;
-            }
-            match components::serial::start_ingress_task(core::ptr::null_mut()) {
-                Ok(()) => {
-                    components::serial::activate_window();
-                    FRAMED_UART_READY.store(true, Ordering::Release);
-                    components::telemetry::record_log(
-                        "event type=usb_serial state=ready rx=true tx=true",
-                    );
-                }
-                Err(err) => components::telemetry::record_log(format!(
-                    "event type=usb_serial state=failed err={err}"
-                )),
-            }
+        if !dmesh_fw_transport::uart_esp::install_l2_driver() {
+            components::telemetry::record_log(format!("event type=uart.driver state=failed"));
             return;
         }
+        // On classic ESP32, defer shared queue/task creation until after NVS
+        // settings has performed the application's first heap allocations.
+        // Its console driver is ready now; only L2 ownership is delayed.
+        #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+        return;
 
-        // RX uses ESP-IDF's proven interrupt/event queue. TX has no driver
-        // buffer or TX-empty interrupt; serial.rs owns it with direct FIFO
-        // writes, avoiding the classic ESP32 UART TX ISR watchdog failure.
-        let mut config = esp_idf_sys::uart_config_t::default();
-        config.baud_rate = 115_200;
-        config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
-        config.parity = esp_idf_sys::uart_parity_t_UART_PARITY_DISABLE;
-        config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;
-        config.flow_ctrl = esp_idf_sys::uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE;
-        config.__bindgen_anon_1.source_clk = uart_source_clk();
-        let _ = esp_idf_sys::uart_param_config(UART0, &config);
-        preserve_uart0_pins_in_light_sleep();
-
-        // Use ESP-IDF's RX event queue. The driver owns RX interrupts and
-        // reports complete data/overflow events to serial.rs; no application
-        // task blocks directly on UART0. TX has no driver buffer and remains
-        // direct FIFO writes from serial.rs, avoiding TX-empty ISR loops.
-        let mut queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
-        let mut install = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut queue, 0);
-        if install == esp_idf_sys::ESP_ERR_INVALID_STATE {
-            let _ = esp_idf_sys::uart_driver_delete(UART0);
-            install = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut queue, 0);
-        }
-        if install != esp_idf_sys::ESP_OK || queue.is_null() {
-            components::telemetry::record_log(format!(
-                "event type=uart.rx_queue state=failed err={install}"
-            ));
-            return;
-        }
-        let (tx_pin, rx_pin) = uart0_pins();
-        // A replaced early-console driver does not retain a portable pin
-        // attachment. UART0 is GPIO1/3 on classic ESP32 and GPIO43/44 on the
-        // S3 external bridge used by the Heltec V3 test board.
-        // ESP-IDF 6 exposes the variadic C macro as its concrete 7-argument
-        // implementation in bindgen. Older SDKs expose the 5-argument symbol.
-        #[cfg(esp_idf_version_at_least_6_0_0)]
-        let _ = esp_idf_sys::_uart_set_pin6(UART0, tx_pin, rx_pin, -1, -1, -1, -1);
-        #[cfg(not(esp_idf_version_at_least_6_0_0))]
-        let _ = esp_idf_sys::uart_set_pin(UART0, tx_pin, rx_pin, -1, -1);
-        let _ = esp_idf_sys::uart_disable_tx_intr(UART0);
-        // Let the hardware report a complete short command or the RX timeout.
-        // On ESP32-S3, a one-byte threshold can leave the IDF event path
-        // disabled after the driver is installed; the timeout still handles
-        // the short framed commands without requiring a second UART reader.
-        let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 64);
-        let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
-        esp_idf_sys::uart_set_always_rx_timeout(UART0, true);
-        let _ = esp_idf_sys::uart_enable_rx_intr(UART0);
-        let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
-        let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
-        match components::serial::start_ingress_task(queue) {
-            Ok(()) => {
-                components::serial::activate_window();
-                FRAMED_UART_READY.store(true, Ordering::Release);
-                components::telemetry::record_log(
-                    "event type=uart.rx_queue state=ready baud=115200 tx_isr=false",
-                );
-            }
-            Err(err) => {
-                components::telemetry::record_log(&format!("event type=uart.rx_queue err={err}"));
-            }
+        #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+        if dmesh_fw_transport::uart_esp::start_shared_l2(
+            components::action_stream::dispatch_uart_ingress,
+            components::action_stream::dispatch_uart_raw_ingress,
+        ) {
+            components::serial::activate_window();
+            FRAMED_UART_READY.store(true, Ordering::Release);
+            components::telemetry::record_log(
+                "event type=uart state=ready baud=115200 tx_isr=false shared_l2=true pool=shared",
+            );
+        } else {
+            components::telemetry::record_log("event type=uart state=failed reason=shared_l2");
         }
     }
 }
 
-#[cfg(target_feature = "esp32s3ops")]
-fn uart0_pins() -> (i32, i32) {
-    (43, 44)
-}
-
-#[cfg(not(target_feature = "esp32s3ops"))]
-fn uart0_pins() -> (i32, i32) {
-    (1, 3)
-}
-
-#[cfg(target_feature = "esp32s3ops")]
-fn preserve_uart0_pins_in_light_sleep() {
-    unsafe {
-        // ESP32-S3 UART0 is fixed to TX=GPIO43/RX=GPIO44. IDF otherwise
-        // switches those pins to its automatic GPIO sleep configuration,
-        // preventing a stale PRG/UART wake from reopening the console while raw-NAN is
-        // between Wi-Fi windows.
-        let _ = esp_idf_sys::gpio_sleep_sel_dis(43);
-        let _ = esp_idf_sys::gpio_sleep_sel_dis(44);
+#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+fn start_deferred_classic_uart_l2() {
+    rom_breadcrumb(b"dm-rs uart l2 start begin\0");
+    let task = unsafe {
+        dmesh_fw_transport::uart_esp::start_shared_l2(
+            components::action_stream::dispatch_uart_ingress,
+            components::action_stream::dispatch_uart_raw_ingress,
+        )
+    };
+    rom_breadcrumb(b"dm-rs uart l2 start done\0");
+    if task {
+        components::serial::activate_window();
+        FRAMED_UART_READY.store(true, Ordering::Release);
+        components::telemetry::record_log(
+            "event type=uart state=ready baud=115200 tx_isr=false shared_l2=true pool=shared",
+        );
+    } else {
+        // Keep the raw ROM/console diagnostic path alive; do not crash Main
+        // merely because the optional framed L2 could not obtain its bounds.
+        rom_breadcrumb(b"dm-rs uart l2 deferred start failed\0");
     }
-}
-
-#[cfg(not(target_feature = "esp32s3ops"))]
-fn preserve_uart0_pins_in_light_sleep() {}
-
-#[cfg(any(target_feature = "esp32s3ops", target_arch = "riscv32"))]
-fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
-    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
-}
-
-#[cfg(all(not(target_feature = "esp32s3ops"), not(target_arch = "riscv32")))]
-fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
-    esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_APB
 }
 
 fn wait_for_firmware_activity(timeout: Duration) -> UartWait {

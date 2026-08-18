@@ -12,3 +12,7 @@ errors are events, not blocking command responses.
 LoRa and FSK wire payloads are opaque to Main. Chip-specific IRQ, FIFO, BUSY,
 reset, and continuous-RX behavior remain module-owned.
 
+The QUIC-lite service tag is `43`. Main acknowledges a bounded accepted stream
+request with CBOR `[0]`, then invokes the module from its serialized owner
+loop. RX/TX completion remains an asynchronous module event; bearer tasks do
+not wait for radio work.

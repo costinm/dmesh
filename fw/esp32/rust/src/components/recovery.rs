@@ -1,6 +1,3 @@
-use std::thread;
-use std::time::Duration;
-
 use anyhow::{anyhow, Result};
 use esp_idf_svc::partition::EspPartition;
 use esp_idf_sys as sys;
@@ -162,10 +159,9 @@ impl CommandHandler for RecoveryCommand {
         request_recovery_boot(dry_run);
         let reboot = parse_bool(request.arg("reboot").unwrap_or("true"))?;
         if reboot {
-            thread::spawn(|| {
-                thread::sleep(Duration::from_millis(250));
-                unsafe { sys::esp_restart() };
-            });
+            if !dmesh_fw_transport::task_esp::schedule_restart_ms(250) {
+                return Err(anyhow!("recovery restart scheduler unavailable"));
+            }
         }
         Ok(CommandResponse::ok(format!(
             "recovery RTC handoff armed; Recovery will scan Direct-* with device dry_run={dry_run} reboot={reboot}"
@@ -231,10 +227,9 @@ fn handle_flash_operation(request: &CommandRequest, op: &str) -> Result<CommandR
             )))
         }
         "reboot" => {
-            thread::spawn(|| {
-                thread::sleep(Duration::from_millis(250));
-                unsafe { sys::esp_restart() };
-            });
+            if !dmesh_fw_transport::task_esp::schedule_restart_ms(250) {
+                return Err(anyhow!("recovery restart scheduler unavailable"));
+            }
             Ok(CommandResponse::ok("recovery flash reboot scheduled"))
         }
         other => Err(anyhow!("unknown recovery operation {other}")),

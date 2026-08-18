@@ -15,6 +15,15 @@ const MODULE_ALIGN: u32 = 0x10000;
 const MODULE_HW_SLOT: u32 = 1;
 const MAX_SERVICE_CALLS: usize = 8;
 const MAX_SERVICE_BYTES: usize = 4096;
+/// Module events use a single bearer MTU today: no UART/UDP/action
+/// fragmentation is added below the stream layer. Leave room for the common
+/// `events` response tuple and reject an oversized callback at the ABI edge.
+const MAX_STREAM_EVENT_BYTES: usize = 1024;
+/// QUIC-lite handlers run on bearer tasks, while module loading and the ESP
+/// host ABI belong to Main's serialized context. Keep the handoff short and
+/// bounded: callers receive an immediate queued/not-queued response and
+/// completion is reported through the normal module event/log surface.
+const MAX_STREAM_SERVICE_CALLS: usize = 8;
 
 static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MODULE_INIT_ONCE: OnceLock<()> = OnceLock::new();
@@ -318,7 +327,7 @@ pub unsafe extern "C" fn dmesh_module_emit_event(
     payload: *const u8,
     payload_len: usize,
 ) -> i32 {
-    if payload_len > MAX_SERVICE_BYTES || (payload_len != 0 && payload.is_null()) {
+    if payload_len > MAX_STREAM_EVENT_BYTES || (payload_len != 0 && payload.is_null()) {
         return -1;
     }
     let payload = if payload_len == 0 {
@@ -458,6 +467,116 @@ struct ServiceCall {
 fn service_calls() -> &'static Mutex<VecDeque<ServiceCall>> {
     static CALLS: OnceLock<Mutex<VecDeque<ServiceCall>>> = OnceLock::new();
     CALLS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+#[derive(Debug)]
+struct StreamServiceCall {
+    service_tag: u8,
+    payload: Vec<u8>,
+}
+
+fn stream_service_calls() -> &'static Mutex<VecDeque<StreamServiceCall>> {
+    static CALLS: OnceLock<Mutex<VecDeque<StreamServiceCall>>> = OnceLock::new();
+    CALLS.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Queue a numeric module service from a QUIC-lite stream. This has no
+/// command-name parsing and never waits for module code or NVS. Tags remain
+/// the dispatch identity; names only appear in handler discovery.
+pub fn enqueue_stream_service(service_tag: u8, payload: &[u8]) -> bool {
+    if !matches!(service_tag, 43 | 45) || payload.len() > MAX_SERVICE_BYTES {
+        return false;
+    }
+    let Ok(mut calls) = stream_service_calls().try_lock() else {
+        return false;
+    };
+    if calls.len() >= MAX_STREAM_SERVICE_CALLS {
+        return false;
+    }
+    calls.push_back(StreamServiceCall {
+        service_tag,
+        payload: payload.to_vec(),
+    });
+    true
+}
+
+/// Execute a small number of accepted stream calls from Main's single owner
+/// loop. Module operations can start asynchronous module tasks, but no
+/// transport worker waits for those tasks or for their event callbacks.
+pub fn poll_stream_services(settings: &crate::components::settings::SharedSettings) {
+    for _ in 0..2 {
+        let call = stream_service_calls()
+            .lock()
+            .ok()
+            .and_then(|mut calls| calls.pop_front());
+        let Some(call) = call else { break };
+        let name = match call.service_tag {
+            43 => "lora",
+            45 => "hw",
+            _ => continue,
+        };
+        ensure_initialized(settings);
+        let mut request = CommandRequest::new(name).arg_pair("args", "stream");
+        request.payload = call.payload;
+        match invoke_module(settings, name, &request) {
+            Ok(response) => telemetry::record_log(format!(
+                "event type=module.stream tag={} queued=true status={:?} message={}",
+                call.service_tag, response.status, response.message
+            )),
+            Err(error) => telemetry::record_log(format!(
+                "event type=module.stream tag={} queued=true ok=false message={error}",
+                call.service_tag
+            )),
+        };
+    }
+}
+
+/// Drain callbacks emitted by a loaded module without reviving Main's retired
+/// string command registry. Settings remain Main-owned; event payloads are
+/// published unchanged to the existing numeric QUIC-lite `events` service.
+pub fn poll_callbacks(settings: &crate::components::settings::SharedSettings) {
+    for _ in 0..2 {
+        let write = setting_writes()
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front());
+        let Some(write) = write else { break };
+        let result = settings.borrow_mut().set_str(&write.key, &write.value);
+        let ok = result.is_ok();
+        let error = result
+            .as_ref()
+            .err()
+            .map(|err| format!(" msg={err}"))
+            .unwrap_or_default();
+        telemetry::record_log(format!(
+            "event type=module.setting_write key={} ok={}{}",
+            write.key, ok, error
+        ));
+        if ok {
+            refresh_settings_snapshot(settings);
+        }
+    }
+    for _ in 0..2 {
+        let event = module_events()
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.pop_front());
+        let Some(event) = event else { break };
+        let published = super::action_stream::publish_module_event(
+            event.event_id,
+            event.value_type,
+            event.flags,
+            &event.payload,
+        );
+        telemetry::record_log(format!(
+            "event type=module.structured_event id={} value_type={} flags={} payload_len={} published={}",
+            event.event_id,
+            event.value_type,
+            event.flags,
+            event.payload.len(),
+            published
+        ));
+    }
 }
 
 /// C ABI used by module task contexts. It only copies a bounded request into a

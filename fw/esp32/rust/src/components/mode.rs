@@ -195,7 +195,9 @@ pub fn register_commands(registry: &mut CommandRegistry, settings: SharedSetting
 pub fn init(settings: &SharedSettings) {
     let mode = configured_mode(settings);
     PRODUCT_MODE.store(mode, Ordering::Relaxed);
-    let result = if mode == MODE_SLEEPY {
+    let result = if super::transport_runtime::sta_bearer_owns_wifi() {
+        Ok(())
+    } else if mode == MODE_SLEEPY {
         start_raw_nan_duty(settings, "boot", get_u32(settings, "nan.channel", 6) as u8)
     } else {
         start_infra_radios(settings, "boot")
@@ -228,7 +230,9 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool, rebo
     };
     let mode = configured_mode(settings);
     PRODUCT_MODE.store(mode, Ordering::Relaxed);
-    let result = if mode == MODE_SLEEPY {
+    let result = if super::transport_runtime::sta_bearer_owns_wifi() {
+        Ok(())
+    } else if mode == MODE_SLEEPY {
         start_raw_nan_duty(settings, reason, get_u32(settings, "nan.channel", 6) as u8)
     } else {
         start_infra_radios(settings, reason)
@@ -252,6 +256,27 @@ pub fn init_after_boot_window(settings: &SharedSettings, button_wake: bool, rebo
         infra_active_session_enabled()
     ));
     emit_mode_state();
+}
+
+/// Read the persisted product role before mode initialization. The transport
+/// startup uses this only to decide whether an infrastructure device should
+/// acquire STA at boot; `init` remains the sole owner of the runtime mode
+/// state.
+pub fn configured_infra_mode(settings: &SharedSettings) -> bool {
+    configured_mode(settings) == MODE_INFRA
+}
+
+/// Hand radio ownership to the shared STA transport before it configures its
+/// netif. Raw NAN/AP setup and a socket-bearing STA are separate ESP-IDF
+/// driver modes today; leaving the former armed can disconnect a just
+/// associated STA. This is deliberately invoked by the transport owner, not
+/// by a UART/command path. AP+STA/NAN coexistence will replace this boundary
+/// only when it has an explicit, tested driver implementation.
+pub fn suspend_raw_radio_for_sta() {
+    stop_raw_nan_duty();
+    let _ = stop_ap_owner();
+    super::nan::stop_nan().ok();
+    super::wifi::stop_raw_monitor_for_lwip_sta().ok();
 }
 
 /// Host-visible state transition used by managed UART forwards.  This is an
@@ -334,10 +359,16 @@ pub fn poll(settings: &SharedSettings) {
     }
     // Raw AP/APSTA infrastructure profiles may not use the normal AP-owner
     // state machine, but they still need the periodic NAN advertisement.
-    if infra_mode() {
+    // UART/STA validation uses the Recovery-derived shared IP bearer. Raw
+    // NAN/AP setup mutates the same ESP-IDF Wi-Fi driver, so defer it while
+    // that bearer owns or is acquiring the radio. This is a policy boundary,
+    // not an ESP-NOW removal: proper AP+STA/NAN coexistence is restored only
+    // once it has explicit driver hooks and path tests.
+    let sta_bearer_owns_wifi = super::transport_runtime::sta_bearer_owns_wifi();
+    if infra_mode() && !sta_bearer_owns_wifi {
         super::nan::ensure_infra_publish(settings);
     }
-    if AP_OWNER_RUNNING.load(Ordering::Relaxed) {
+    if AP_OWNER_RUNNING.load(Ordering::Relaxed) && !sta_bearer_owns_wifi {
         poll_ap_owner(settings);
         // Keep an infrastructure ESP discoverable without requiring a
         // one-shot UART `nan publish` command. The helper sends immediately
@@ -803,12 +834,9 @@ fn start_infra_lora(settings: &SharedSettings, reason: &'static str) -> Result<(
     }
     boot_print("dm-rs mode step=lora_rx");
     match super::lora::start_background_rx(settings.clone()) {
-        Ok(Some(_)) => telemetry::record_log(format!(
-            "event type=mode.infra_radio medium=lora rx=true reason={}",
-            reason
-        )),
-        Ok(None) => telemetry::record_log(format!(
-            "event type=mode.infra_radio medium=lora rx=false reason={} status=unavailable_or_running",
+        Ok(()) => telemetry::record_log(format!(
+            "event type=mode.infra_radio medium=lora rx={} reason={}",
+            super::lora::background_rx_running(),
             reason
         )),
         Err(err) => telemetry::record_log(format!(
@@ -816,7 +844,7 @@ fn start_infra_lora(settings: &SharedSettings, reason: &'static str) -> Result<(
             reason,
             crate::commands::protocol::escape_value(&err.to_string())
         )),
-    }
+    };
     boot_print("dm-rs mode step=lora_done");
     Ok(())
 }

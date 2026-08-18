@@ -42,6 +42,7 @@ pub fn apply_recovery_command(
     profile.benchmark_run_id = command.benchmark_run_id.unwrap_or(0);
     profile.ack_frequency = command.ack_frequency.unwrap_or(0);
     profile.ack_delay_ms = command.ack_delay_ms.unwrap_or(0);
+    profile.raw_tx_rate = command.raw_tx_rate.unwrap_or(0);
     profile.path_policy = command.path_policy.unwrap_or(0);
     profile.timeout_ms = command.timeout_ms.unwrap_or(300_000);
     profile.run_requested = false;

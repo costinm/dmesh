@@ -13,7 +13,11 @@ CONFIG_ESP32_XTAL_FREQ_AUTO=y
 # CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
+# Main performs NVS/settings, bounded stream setup, and ESP-PM configuration
+# before handing off to its cooperative loop. The prior 7 KiB stack overflows
+# on classic ESP32 during PM setup; use an explicit 12 KiB bound rather than
+# permitting silent stack corruption.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set

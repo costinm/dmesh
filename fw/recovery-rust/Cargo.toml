@@ -6,6 +6,14 @@ resolver = "2"
 
 [workspace]
 
+[features]
+# Recovery's production transport composition is raw IPv6/UDP plus the
+# raw ESP-NOW action bearer. The feature names remain only as crate-internal
+# dependency wiring; operators do not select a socket fallback.
+default = ["wifi-raw-udp6", "wifi-espnow"]
+wifi-raw-udp6 = ["dmesh-fw-transport/wifi-raw-udp6"]
+wifi-espnow = ["dmesh-fw-transport/wifi-espnow"]
+
 [dependencies]
 dmesh-fw-transport = { path = "../dmesh-fw-transport", features = ["esp-idf"] }
 # `no_std` here means no Rust std runtime. ESP-IDF, Wi-Fi, UART, and FreeRTOS

@@ -4,6 +4,9 @@ target = "xtensa-esp32-espidf"
 [target.xtensa-esp32-espidf]
 linker = "ldproxy"
 
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+
 [target.riscv32imac-esp-espidf]
 linker = "ldproxy"
 

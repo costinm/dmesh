@@ -36,6 +36,7 @@ impl Drop for NvsStore {
 
 impl crate::TransportSettings for NvsStore {
     fn get_text(&mut self, key: &str, output: &mut [u8]) -> Option<usize> {
+        let key = nvs_key(key)?;
         let mut capacity = output.len();
         let result = unsafe {
             nvs_get_str(
@@ -49,6 +50,9 @@ impl crate::TransportSettings for NvsStore {
     }
 
     fn set_text(&mut self, key: &str, value: &[u8]) -> bool {
+        let Some(key) = nvs_key(key) else {
+            return false;
+        };
         let mut terminated = [0u8; 65];
         if value.len() >= terminated.len() {
             return false;
@@ -59,6 +63,24 @@ impl crate::TransportSettings for NvsStore {
 
     fn commit(&mut self) -> bool {
         unsafe { nvs_commit(self.handle) == 0 }
+    }
+}
+
+/// `nvs_get_str`/`nvs_set_str` take C strings.  Never pass a Rust `&str`
+/// pointer directly: literals are not required to carry a trailing NUL and a
+/// profile read can otherwise depend on adjacent linker data.  Keeping this
+/// finite mapping also ensures that shared-profile persistence cannot write
+/// arbitrary NVS keys from a transport request.
+fn nvs_key(key: &str) -> Option<&'static [u8]> {
+    match key {
+        "ssid" => Some(b"ssid\0"),
+        "server" => Some(b"server\0"),
+        "ip" => Some(b"ip\0"),
+        "gw" => Some(b"gw\0"),
+        "mask" => Some(b"mask\0"),
+        "port" => Some(b"port\0"),
+        "udp.win" => Some(b"udp.win\0"),
+        _ => None,
     }
 }
 

@@ -1,8 +1,4 @@
-use std::thread;
-use std::time::Duration;
-
 use anyhow::Result;
-use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
@@ -20,10 +16,10 @@ impl CommandHandler for ResetCommand {
     }
 
     fn handle(&mut self, _request: &CommandRequest) -> Result<CommandResponse> {
-        thread::spawn(|| {
-            thread::sleep(Duration::from_millis(100));
-            unsafe { sys::esp_restart() };
-        });
-        Ok(CommandResponse::ok("reset scheduled"))
+        if dmesh_fw_transport::task_esp::schedule_restart_ms(100) {
+            Ok(CommandResponse::ok("reset scheduled"))
+        } else {
+            Ok(CommandResponse::error("reset scheduler unavailable"))
+        }
     }
 }

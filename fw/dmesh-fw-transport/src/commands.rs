@@ -91,19 +91,19 @@ pub fn apply_packet(packet: &[u8], params: &mut TransportProfile) -> Option<bool
 /// only enqueue opaque records; this handler owns the schema and worker wake.
 pub fn accept_packet(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
     let reboot_main = apply_packet(packet, params)?;
-    crate::state::command_accepted();
+    crate::state::direct_record_accepted();
     Some(reboot_main)
 }
 
 #[cfg(test)]
 mod command_tests {
     use super::apply_packet;
-    use crate::{state::command_generation_changed_from, TransportProfile};
+    use crate::{state::direct_record_generation_changed_from, TransportProfile};
 
     #[test]
-    fn command_arrival_during_worker_is_not_missed() {
-        assert!(command_generation_changed_from(41, 42));
-        assert!(!command_generation_changed_from(42, 42));
+    fn direct_record_arrival_during_worker_is_not_missed() {
+        assert!(direct_record_generation_changed_from(41, 42));
+        assert!(!direct_record_generation_changed_from(42, 42));
     }
 
     #[test]

@@ -344,12 +344,14 @@ pub fn raw_nan_wake_window() {
         match start_connectable_event(DmeshBleEvent::PayloadPending, &[]) {
             Ok(()) => {
                 open_companion_active_window(companion_adv_ms());
-                telemetry::record_log("event type=ble.raw_nan state=payload_advertising")
+                telemetry::record_log("event type=ble.raw_nan state=payload_advertising");
             }
-            Err(err) => telemetry::record_log(format!(
-                "event type=ble.raw_nan state=advertise_failed msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            )),
+            Err(err) => {
+                telemetry::record_log(format!(
+                    "event type=ble.raw_nan state=advertise_failed msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+            }
         }
     } else if scan_ms == 0 {
         return;
@@ -363,10 +365,12 @@ pub fn raw_nan_wake_window() {
                     "event type=ble.raw_nan state=wake_scan scan_ms={scan_ms}"
                 ));
             }
-            Err(err) => telemetry::record_log(format!(
-                "event type=ble.raw_nan state=scan_failed msg={}",
-                crate::commands::protocol::escape_value(&err.to_string())
-            )),
+            Err(err) => {
+                telemetry::record_log(format!(
+                    "event type=ble.raw_nan state=scan_failed msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+            }
         }
     }
 }
@@ -1340,10 +1344,12 @@ pub fn poll_raw_nan_rendezvous() {
                         "event type=ble.rendezvous state=connectable wake=true adv_ms={adv_ms}"
                     ));
                 }
-                Err(err) => telemetry::record_log(format!(
-                    "event type=ble.rendezvous state=advertise_failed msg={}",
-                    crate::commands::protocol::escape_value(&err.to_string())
-                )),
+                Err(err) => {
+                    telemetry::record_log(format!(
+                        "event type=ble.rendezvous state=advertise_failed msg={}",
+                        crate::commands::protocol::escape_value(&err.to_string())
+                    ));
+                }
             }
         } else {
             telemetry::record_log("event type=ble.rendezvous state=no_wake");

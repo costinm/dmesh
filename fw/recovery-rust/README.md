@@ -38,15 +38,16 @@ board.
 All provisioning and updates use the common tool:
 
 ```sh
-scripts/flash-device.py e7 recovery  # explicit USB provisioning/emergency
-scripts/flash-device.py e7           # Main update; defaults to Wi-Fi Recovery
+scripts/flash-device.py e7 recovery
+scripts/flash-device.py e7 main
+scripts/flash-device.py e7 nvs --boot-target recovery
 ```
 
-A routine Main update assumes Stage2 and Recovery are already provisioned and
-does not rewrite Recovery over USB. Main is transferred over UDP 3336, while
-the temporary command endpoint is UDP 3337 and compact telemetry/logs use UDP
-3338. Successful completion requires durable image completion, reboot, and a
-fresh direct Main status; command acknowledgement alone is insufficient.
+`flash-device.py` is the only supported flashing interface. It currently uses
+esptool for all targets; do not invoke esptool directly. Production Recovery
+will instead be served by `lmesh-wifi`, with UDP server ports selected per
+session. Successful completion requires durable image completion, reboot, and
+a fresh direct Main status; command acknowledgement alone is insufficient.
 
 The paused Wi-Fi measurements, transport counters, and exact restart commands
 are in

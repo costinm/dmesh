@@ -5,7 +5,7 @@ The active Main firmware is the Rust ESP-IDF application under
 `fw/recovery-rust`. The retired C Recovery must not be restored. The canonical
 build/provisioning procedure is [../../BUILD.md](../../BUILD.md), and the
 active shared-transport cleanup is
-[../../docs/plans/main-recovery-transport-reuse.md](../../docs/plans/main-recovery-transport-reuse.md).
+[../../notes/plans/main-recovery-transport-reuse.md](../../notes/plans/main-recovery-transport-reuse.md).
 
 Install dependencies:
 
@@ -15,8 +15,9 @@ scripts/esp32-deps.sh
 
 The build uses the flake package in `fw/esp32` for host tools and keeps SDKs
 under `target/esp32-6.0`, not `$HOME`. Do not use `idf.py flash`, Cargo flash
-subcommands, or `espflash`; use the repository scripts below. Main images are
-never written over USB.
+subcommands, or `espflash`; use the repository scripts below. The obsolete
+"no USB Main" rule no longer applies: every write, including Main, must go
+through `scripts/flash-device.py`.
 
 Build the current Rust fleet images from the repository root:
 
@@ -36,37 +37,54 @@ CPU target during iteration.
 
 Artifacts are kept under `target/flash/`, `target/stage2/`, and
 `target/recovery-rust/`.
-USB flashing is limited to initial provisioning or emergency repair of the
-stage-2 and Recovery partitions. Never use USB or esptool to replace Main on a
-provisioned board. Once stage-2/Recovery are installed, the supported Main update is:
+Use `scripts/flash-device.py` for every firmware target, including Main. It is
+the sole supported flashing entry point and currently provisions images through
+its direct USB/esptool implementation. Do not call `esptool`, `idf.py flash`,
+or `flash-fw.sh` directly. Wi-Fi Recovery remains the intended production
+Main-update path and will be owned by `lmesh-wifi` when it is complete; it is
+not the current default in this checkout.
 
 ```bash
-# lmesh-wifi owns the persistent UDP object bearer under mesh-init.
-# Use the common local development flasher.
+# Use the common local development flasher. Production Recovery will be
+# served by lmesh-wifi once that path is complete.
 python3 scripts/flash-device.py e5
 # server, port, saved SSID, and MAC-derived IP use defaults
 ```
 
-The omitted target means `main`, and Main resolves to the Wi-Fi Recovery path.
-`--transport usb` is rejected for Main. Routine Main flashing assumes Stage2
-and Rust Recovery are already provisioned; it does not rewrite Recovery before
-each update. Use explicit `stage` or `recovery` targets only for initial
-provisioning or emergency repair.
+The omitted target means `main`. Select `stage`, `recovery`, `main`, or `nvs`
+explicitly when needed. Use the `nvs` target and its Stage2-selector option for
+reliable boot selection; do not use modem-line scripts for that purpose.
 
 Optional network values are saved in
 `target/flash-devices/network.json`; pass `--ssid` or `--board-ip` once and
 subsequent commands reuse them. An example is in
-`docs/lab/flash-network.json.example`.
+`notes/lab/flash-network.json.example`.
 
-The helper sends only the recovery-start command through managed lmesh; the
-Main image is transferred over Wi-Fi by Recovery. It reuses port 3336 for
-successive boards. Do not invoke `idf.py flash`, `flash-fw.sh`, or an esptool
-Main-image command for routine updates.
+Today the helper writes through esptool and verifies the result. Future
+production updates will have `lmesh-wifi` own the Recovery UDP server; separate
+UDP Recovery servers may use different ports. Do not invoke `idf.py flash`,
+`flash-fw.sh`, or an esptool command outside this helper.
 
 Main no longer links the retired C flash ABI or TCP flash worker. Flash policy
 is target-specific: Main never writes its active Main partition and Recovery
 never writes its active Recovery partition. Both use the shared Rust transport
 and protocol path as it is extracted.
+
+Main and Recovery default to `wifi-raw-udp6` and `wifi-espnow`, using the same
+common transport code. There is no DMesh lwIP socket-transport feature;
+residual SDK linkage is acceptable. Diagnostic device-to-device clients remain
+lab-only so normal Main does not reserve their state:
+
+```bash
+DMESH_FW_FEATURES=e6-raw-udp6-iperf-lab scripts/build-fw.sh e6
+DMESH_FW_FEATURES=e6-espnow-iperf-lab scripts/build-fw.sh e6
+```
+
+Build the selected lab immediately before `scripts/flash-device.py e7 main`.
+The build wrapper tracks feature composition and invalidates incompatible
+stale Cargo output. Exact identities, commands, rates, size deltas, and the
+remaining receive-filter limitation are in
+[../../notes/2026-08-18-c6-raw-udp6-espnow-results.md](../../notes/2026-08-18-c6-raw-udp6-espnow-results.md).
 
 Main-update logs are available in:
 

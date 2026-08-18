@@ -5,8 +5,6 @@
 //! names, packet forwarding, and the mesh transport bridge.  It has no SPI,
 //! GPIO, interrupt, or chip-driver implementation.
 
-use std::thread;
-
 use anyhow::{anyhow, bail, Result};
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -215,7 +213,7 @@ pub fn keep_rx_in_light_sleep(settings: &SharedSettings) -> bool {
         .unwrap_or(false)
 }
 
-pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::JoinHandle<()>>> {
+pub fn start_background_rx(settings: SharedSettings) -> Result<()> {
     if !super::module::lora_enabled() {
         return Err(anyhow!("LoRa requires a deployed lora module"));
     }
@@ -225,7 +223,7 @@ pub fn start_background_rx(settings: SharedSettings) -> Result<Option<thread::Jo
         let request = CommandRequest::new("lora").arg_pair("args", "rx");
         super::module::invoke_module(&settings, "lora", &request)?;
     }
-    Ok(None)
+    Ok(())
 }
 
 pub fn sleep_radio(settings: &SharedSettings) -> Result<()> {

@@ -6,6 +6,21 @@ resolver = "2"
 
 [workspace]
 
+[features]
+# Main has the same normal bearer composition as Recovery.  Main adds only
+# application handlers and sleepy-device policy around these shared adapters.
+default = ["wifi-raw-udp6", "wifi-espnow"]
+wifi-raw-udp6 = ["dmesh-fw-transport/wifi-raw-udp6"]
+wifi-raw-udp6-client = ["wifi-raw-udp6", "dmesh-fw-transport/wifi-raw-udp6-client"]
+# The raw action bearer uses rawnan, not ESP-IDF ESP-NOW. NAN beacon sync and
+# radio power policy remain Main-local hooks.
+wifi-espnow = ["dmesh-fw-transport/wifi-espnow"]
+wifi-espnow-client = ["wifi-espnow", "dmesh-fw-transport/wifi-espnow-client"]
+# Lab-only one-shot E7 -> E6 shared ESP-NOW validation. It is never enabled
+# by normal Main builds and contains no discovery, beacon, or power policy.
+e6-espnow-iperf-lab = ["wifi-espnow-client"]
+e6-raw-udp6-iperf-lab = ["wifi-raw-udp6-client"]
+
 [dependencies]
 dmesh-rawnan = { path = "../../../crates/rawnan", default-features = false }
 quic-lite = { path = "../../../crates/quic-lite" }

@@ -10,7 +10,6 @@ pub mod mode;
 pub mod module;
 pub mod nan;
 pub mod nvs;
-pub mod object_store;
 pub mod peripherals;
 pub mod power;
 pub mod recovery;

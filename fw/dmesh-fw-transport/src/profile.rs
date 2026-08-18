@@ -42,7 +42,10 @@ pub struct TransportProfile {
     pub command_mode: bool,
     pub ack_frequency: u8,
     pub ack_delay_ms: u8,
-    /// 0 dynamic, 1 UDP, 2 UART, 3 UART-first airtime spillover.
+    /// `0` leaves the raw injected STA frame rate driver-controlled; otherwise
+    /// one of 6, 9, 12, 18, 24, 36, 48, or 54 Mbit/s. Command-scoped only.
+    pub raw_tx_rate: u8,
+    /// 0 fastest, 1 UDP, 2 UART, 3 UART-first spillover, 4 aggregate.
     pub path_policy: u8,
     pub timeout_ms: u32,
 }
@@ -79,6 +82,7 @@ impl TransportProfile {
             command_mode: false,
             ack_frequency: 0,
             ack_delay_ms: 0,
+            raw_tx_rate: 0,
             path_policy: 0,
             timeout_ms: 300_000,
         }

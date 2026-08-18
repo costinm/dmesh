@@ -16,6 +16,11 @@ The module entry payload is a definite-length CBOR array of unsigned integers.
 The first item is `operation`; the remaining items depend on that operation.
 No text keys or text values are required.
 
+The array is the body of QUIC-lite stream service tag `45`. The immediate
+stream response is CBOR `[0]` when the bounded Main-owned module queue accepts
+the request; execution and samples are asynchronous module events. `[0]` is
+not a completed-operation result.
+
 ### Operation IDs
 
 | ID | Name | Purpose |
@@ -80,6 +85,10 @@ ModuleEvent(event_id, value_type=5, flags, cbor_tuple)
 
 The payload is a CBOR tuple of unsigned integers. `value_type=5` means Main
 must forward the bytes unchanged; it must not format or reinterpret fields.
+Module callback payloads are limited to 1024 bytes until stream-response
+segmentation is implemented. Main exposes them unchanged through service tag
+`events` as CBOR `[next_sequence, [[sequence, event_id, value_type, flags,
+payload], ...]]`; clients poll with the ASCII request `since=<sequence>`.
 
 ### Event IDs and tuples
 

@@ -1,5 +1,12 @@
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(esp_idf_version_at_least_6_0_0)");
+    // The build wrapper supplies an RFC 3339 UTC timestamp.  Keep this
+    // optional for direct Cargo builds, but always expose a stable status
+    // field so a live device identifies the exact build being exercised.
+    println!("cargo:rerun-if-env-changed=DMESH_BUILD_TIMESTAMP");
+    let build_timestamp = std::env::var("DMESH_BUILD_TIMESTAMP")
+        .unwrap_or_else(|_| "unknown".to_owned());
+    println!("cargo:rustc-env=DMESH_BUILD_TIMESTAMP={build_timestamp}");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let partition_file = std::path::Path::new("../../boot/partitions.csv");
     std::fs::copy(partition_file, format!("{out_dir}/partitions.csv"))

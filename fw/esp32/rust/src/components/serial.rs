@@ -1,23 +1,9 @@
-use std::ffi::{c_char, c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use esp_idf_sys as sys;
 use minicbor::{data::Tag, Encoder};
-use uart_codec::codec::{encode_payload, Decoder as UartParser};
 
 use super::settings::SharedSettings;
-
-#[cfg(target_arch = "riscv32")]
-unsafe extern "C" {
-    fn dmesh_usb_serial_install() -> i32;
-    fn dmesh_usb_serial_read(buffer: *mut c_void, length: u32, ticks: u32) -> i32;
-    fn dmesh_usb_serial_write(buffer: *const c_void, length: u32) -> i32;
-}
-
-#[cfg(target_arch = "riscv32")]
-pub fn install_usb_console() -> i32 {
-    unsafe { dmesh_usb_serial_install() }
-}
 
 /// Keep the debug transport usable long enough to issue a command after it wakes.
 ///
@@ -33,11 +19,6 @@ pub const DEFAULT_ACTIVE_MS: u32 = 4_000;
 /// mode overrides this with its continuously active UART policy.
 pub const DEFAULT_RAW_NAN_HEARTBEAT_EVERY: i32 = 8;
 const MIN_ACTIVE_MS: u32 = 4_000;
-#[cfg(target_feature = "esp32s3ops")]
-const UART_REQUIRES_APB_LOCK: bool = false;
-#[cfg(not(target_feature = "esp32s3ops"))]
-const UART_REQUIRES_APB_LOCK: bool = true;
-
 /// Classic ESP32 retains UART/GPIO wake for its explicit raw-NAN sleep path.
 /// ESP32-S3 uses the same explicit sleep path and its console wakes through
 /// the normal UART/GPIO interrupt path.
@@ -46,94 +27,33 @@ pub const RAW_NAN_UART_WAKE: bool = true;
 #[cfg(not(target_feature = "esp32s3ops"))]
 pub const RAW_NAN_BUTTON_WAKE: bool = true;
 
-static UART0_APB_LOCK: AtomicPtr<sys::esp_pm_lock> = AtomicPtr::new(core::ptr::null_mut());
-static UART0_APB_LOCK_HELD: AtomicBool = AtomicBool::new(false);
-static UART0_NO_LIGHT_SLEEP_LOCK: AtomicPtr<sys::esp_pm_lock> =
-    AtomicPtr::new(core::ptr::null_mut());
-static UART0_NO_LIGHT_SLEEP_LOCK_HELD: AtomicBool = AtomicBool::new(false);
-static UART0_ACTIVE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
-static UART0_ALWAYS_ON: AtomicBool = AtomicBool::new(false);
-static UART0_ACTIVE_WINDOW_MS: AtomicU32 = AtomicU32::new(DEFAULT_ACTIVE_MS);
-static UART0_DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
-static UART0_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static UART0_SUSPEND_AFTER_RESPONSE: AtomicBool = AtomicBool::new(false);
-static UART0_UNINSTALL_AFTER_RESPONSE: AtomicBool = AtomicBool::new(false);
-static UART0_DRIVER_INSTALLED: AtomicBool = AtomicBool::new(true);
-static UART0_EVENT_TASK: AtomicPtr<sys::tskTaskControlBlock> =
-    AtomicPtr::new(core::ptr::null_mut());
-static UART0_TX_TASK: AtomicPtr<sys::tskTaskControlBlock> = AtomicPtr::new(core::ptr::null_mut());
-static UART0_FRAME_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
-static UART0_TX_QUEUE: AtomicPtr<sys::QueueDefinition> = AtomicPtr::new(core::ptr::null_mut());
-static UART0_RX_EVENTS: AtomicU32 = AtomicU32::new(0);
-static UART0_RX_BREADCRUMB: AtomicBool = AtomicBool::new(false);
-static UART0_RX_DROPS: AtomicU32 = AtomicU32::new(0);
-static UART0_RX_ERRORS: AtomicU32 = AtomicU32::new(0);
 static UART0_TX_DROPS_IDLE: AtomicU32 = AtomicU32::new(0);
 static UART0_TX_DROPS_QUEUE: AtomicU32 = AtomicU32::new(0);
-static UART0_QUEUED_FRAMES: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_OUTPUT_PROBE_DROPPED: AtomicU32 = AtomicU32::new(0);
-static UART0_FRAME_DROPS: AtomicU32 = AtomicU32::new(0);
-static UART0_ESCAPE_ERRORS: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_EVERY: AtomicU32 = AtomicU32::new(DEFAULT_RAW_NAN_HEARTBEAT_EVERY as u32);
 static UART0_HEARTBEAT_WAKES: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_SENT: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_DROPPED: AtomicU32 = AtomicU32::new(0);
 static UART0_HEARTBEAT_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
 
-const UART_FRAME_QUEUE_LEN: u32 = 8;
-// UART is a bearer with the same packet MTU as UDP. Larger application values
-// are stream data and must be segmented by quic-lite, never by this PPP layer.
-const UART_MAX_BODY: usize = dmesh_fw_transport::TRANSPORT_MTU + 1;
-const UART_TX_QUEUE_LEN: u32 = 16;
-// Keep every driver write below the hardware FIFO capacity. The task waits
-// for idle before each chunk, so ESP-IDF never enables its TX-empty ISR.
-const UART_TX_FRAME_MAX: usize = 512;
-// At 115200 baud a 32-byte chunk drains in less than three milliseconds. Leave a
-// full FreeRTOS tick before the next one instead of using the driver's
-// TX-done/TX-empty ISR path.
-const UART_TX_FIFO_CHUNK: usize = 32;
-const UART_TX_FIFO_DRAIN_MS: u32 = 2;
-
-/// An owned complete UART record. The ingress task is the only code that
-/// reads the IDF UART driver; consumers only receive parsed records.
-pub struct UartFrame {
-    pub data: Vec<u8>,
-}
-
-#[repr(C)]
-struct QueuedFrame {
-    data: *mut Vec<u8>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct QueuedTx {
-    len: u16,
-    data: [u8; UART_TX_FRAME_MAX],
-}
-
-/// Remove the UART0 driver for a one-boot power measurement.
+/// Retired UART-driver removal power measurement.
 ///
-/// This is intentionally one-way: reset reinstates the normal boot console.
-/// The deletion is deferred so the command acknowledgement can leave UART0.
+/// The shared L2 task owns the driver for the full process lifetime; a Main
+/// component must not remove it beneath a live bearer.
 pub fn request_uninstall_for_measurement() {
-    UART0_UNINSTALL_AFTER_RESPONSE.store(true, Ordering::Release);
+    // The common UART L2 task owns the driver and its queues.  A component
+    // command cannot safely tear it down; keep the measurement request
+    // explicitly unsupported rather than retaining a second lifecycle path.
 }
 
 pub fn measurement_status_fields() -> String {
     format!(
-        "uart_driver={} uart_active={} uart_rx_wake={} uart_rx_events={} uart_rx_drop={} uart_rx_err={} uart_frame_drop={} uart_escape_err={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_hb_every={} uart_hb_wakes={} uart_hb_sent={} uart_hb_dropped={} uart_hb_window_ms={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
-        UART0_DRIVER_INSTALLED.load(Ordering::Relaxed),
+        "uart_active={} uart_tx_drop_idle={} uart_tx_drop_queue={} uart_hb_every={} uart_hb_wakes={} uart_hb_sent={} uart_hb_dropped={} uart_hb_window_ms={} uart_probe_attempts={} uart_probe_sent={} uart_probe_dropped={}",
         is_active(),
-        !UART0_SUSPENDED.load(Ordering::Relaxed),
-        UART0_RX_EVENTS.load(Ordering::Relaxed),
-        UART0_RX_DROPS.load(Ordering::Relaxed),
-        UART0_RX_ERRORS.load(Ordering::Relaxed),
-        UART0_FRAME_DROPS.load(Ordering::Relaxed),
-        UART0_ESCAPE_ERRORS.load(Ordering::Relaxed),
         UART0_TX_DROPS_IDLE.load(Ordering::Relaxed),
         UART0_TX_DROPS_QUEUE.load(Ordering::Relaxed),
         UART0_HEARTBEAT_EVERY.load(Ordering::Relaxed),
@@ -174,7 +94,7 @@ pub fn configure_active_window(settings: &SharedSettings) {
     // Delimiter framing makes the first complete CBOR command self-synchronizing,
     // so a short window is sufficient and avoids holding PM locks for 20 seconds.
     let active_ms = configured_ms.max(MIN_ACTIVE_MS);
-    UART0_ACTIVE_WINDOW_MS.store(active_ms, Ordering::Relaxed);
+    dmesh_fw_transport::uart_esp::configure_active_window(active_ms);
     set_heartbeat_every(
         settings
             .borrow()
@@ -199,16 +119,7 @@ pub fn set_heartbeat_every(every: u32) {
 /// Open the bounded UART console window from an authenticated/in-band wake
 /// trigger such as a targeted NAN service advertisement.
 pub fn activate_window_for(window_ms: u32) {
-    if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    UART0_DEBUG_ENABLED.store(true, Ordering::Release);
-    let until = now_ms().wrapping_add(window_ms.max(1));
-    let current = UART0_ACTIVE_UNTIL_MS.load(Ordering::Acquire);
-    if current == 0 || time_after_or_equal(until, current) {
-        UART0_ACTIVE_UNTIL_MS.store(until, Ordering::Release);
-    }
-    let _ = ensure_power_locks();
+    dmesh_fw_transport::uart_esp::activate_window_for(window_ms);
 }
 
 const NAN_SLEEPY_START_TAG: u64 = 6;
@@ -282,7 +193,7 @@ fn emit_nan_sleepy_start(window_ms: u32) -> bool {
     UART0_HEARTBEAT_WINDOW_MS.store(window_ms, Ordering::Relaxed);
     activate_window_for(window_ms);
     let payload = nan_sleepy_start_payload();
-    if write_wire_bytes(&encode_payload(&payload, UART_MAX_BODY).expect("valid UART payload")) {
+    if write_direct_record(&payload) {
         UART0_HEARTBEAT_SENT.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -310,164 +221,32 @@ pub fn on_uart_recovery_wake(window_ms: u32) -> bool {
     emit_nan_sleepy_start(window_ms)
 }
 
-/// Start the single UART ingress task after UART0 has installed an IDF RX
-/// event queue. No other firmware task may call `uart_read_bytes`.
-pub fn start_ingress_task(event_queue: sys::QueueHandle_t) -> Result<(), sys::esp_err_t> {
-    if !UART0_EVENT_TASK.load(Ordering::Acquire).is_null() {
-        return Ok(());
-    }
-    let frame_queue = unsafe {
-        sys::xQueueGenericCreate(
-            UART_FRAME_QUEUE_LEN,
-            core::mem::size_of::<QueuedFrame>() as u32,
-            0,
-        )
-    };
-    if frame_queue.is_null() {
-        return Err(sys::ESP_ERR_NO_MEM);
-    }
-    UART0_FRAME_QUEUE.store(frame_queue, Ordering::Release);
-    let tx_queue = unsafe {
-        sys::xQueueGenericCreate(
-            UART_TX_QUEUE_LEN,
-            core::mem::size_of::<QueuedTx>() as u32,
-            0,
-        )
-    };
-    if tx_queue.is_null() {
-        unsafe { sys::vQueueDelete(frame_queue) };
-        UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-        return Err(sys::ESP_ERR_NO_MEM);
-    }
-    UART0_TX_QUEUE.store(tx_queue, Ordering::Release);
-    let name = CString::new("uart_mgr").map_err(|_| sys::ESP_FAIL)?;
-    let mut task = core::ptr::null_mut();
-    let ret = unsafe {
-        sys::xTaskCreatePinnedToCore(
-            Some(uart_manager_task),
-            name.as_ptr(),
-            4096,
-            event_queue.cast::<c_void>(),
-            6,
-            &mut task,
-            0,
-        )
-    };
-    if ret != 1 || task.is_null() {
-        unsafe { sys::vQueueDelete(frame_queue) };
-        unsafe { sys::vQueueDelete(tx_queue) };
-        UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-        UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-        return Err(sys::ESP_FAIL);
-    }
-    UART0_EVENT_TASK.store(task, Ordering::Release);
-    let tx_name = CString::new("uart_tx").map_err(|_| sys::ESP_FAIL)?;
-    let mut tx_task = core::ptr::null_mut();
-    let tx_ret = unsafe {
-        sys::xTaskCreatePinnedToCore(
-            Some(uart_tx_task),
-            tx_name.as_ptr(),
-            4096,
-            tx_queue.cast::<c_void>(),
-            5,
-            &mut tx_task,
-            0,
-        )
-    };
-    if tx_ret != 1 || tx_task.is_null() {
-        unsafe { sys::vTaskDelete(task) };
-        unsafe { sys::vQueueDelete(frame_queue) };
-        unsafe { sys::vQueueDelete(tx_queue) };
-        UART0_EVENT_TASK.store(core::ptr::null_mut(), Ordering::Release);
-        UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-        UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-        return Err(sys::ESP_FAIL);
-    }
-    UART0_TX_TASK.store(tx_task, Ordering::Release);
-    Ok(())
+/// Return whether the shared UART L2 task has a complete direct exception
+/// record or QUIC-lite datagram ready. This deliberately does not touch the
+/// UART driver; sleep policy only needs a bounded dispatcher-work hint.
+pub fn has_pending_ingress() -> bool {
+    dmesh_fw_transport::uart_esp::has_pending_ingress()
 }
 
-pub fn take_frame() -> Option<UartFrame> {
-    let queue = UART0_FRAME_QUEUE.load(Ordering::Acquire);
-    if queue.is_null() {
-        return None;
-    }
-    let mut queued = QueuedFrame {
-        data: core::ptr::null_mut(),
-    };
-    let received =
-        unsafe { sys::xQueueReceive(queue, (&mut queued as *mut QueuedFrame).cast::<c_void>(), 0) };
-    if received != 1 || queued.data.is_null() {
-        return None;
-    }
-    UART0_QUEUED_FRAMES.fetch_sub(1, Ordering::Relaxed);
-    Some(UartFrame {
-        data: *unsafe { Box::from_raw(queued.data) },
-    })
-}
-
-/// Return whether the event-driven UART ingress task has a complete record
-/// ready for the command owner. This deliberately does not touch the UART
-/// driver; `uart_manager_task` is its sole reader.
-pub fn has_pending_frame() -> bool {
-    UART0_QUEUED_FRAMES.load(Ordering::Acquire) != 0
-}
-
-/// Let the ingress task process a deferred driver deletion after the command
-/// acknowledgement has been transmitted. This operation is reset-only.
+/// Retired measurement hook retained only until the old power-command source
+/// is deleted. The shared UART L2 owner cannot safely be torn down from a
+/// component-level deferred response.
 pub fn finish_pending_uninstall() -> std::result::Result<bool, sys::esp_err_t> {
-    if !UART0_UNINSTALL_AFTER_RESPONSE.swap(false, Ordering::AcqRel) {
-        return Ok(!UART0_DRIVER_INSTALLED.load(Ordering::Acquire));
-    }
-
-    UART0_DEBUG_ENABLED.store(false, Ordering::Release);
-    UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Release);
-    release_apb_lock();
-    let task = UART0_EVENT_TASK.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !task.is_null() {
-        unsafe { sys::vTaskDelete(task) };
-    }
-    let tx_task = UART0_TX_TASK.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !tx_task.is_null() {
-        unsafe { sys::vTaskDelete(tx_task) };
-    }
-    unsafe {
-        let _ = sys::uart_driver_delete(sys::uart_port_t_UART_NUM_0);
-    };
-    UART0_DRIVER_INSTALLED.store(false, Ordering::Release);
-    UART0_FRAME_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-    UART0_TX_QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-    Ok(true)
+    // The old task pair could be deleted with its UART driver. The shared
+    // `dmesh_fw_transport::uart_esp` task now owns that driver and the
+    // bounded queues used by sleepy wake. Deleting it here would leave a live
+    // L2 task with invalid driver state, so fail closed until a coordinated
+    // common-adapter stop/restart lifecycle is intentionally designed.
+    Err(sys::ESP_ERR_NOT_SUPPORTED)
 }
 
 pub fn activate_window() {
     poll_output_probe();
-    if !UART0_DEBUG_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-    let active_ms = UART0_ACTIVE_WINDOW_MS.load(Ordering::Relaxed);
-    if active_ms == 0 {
-        release_apb_lock();
-        UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Relaxed);
-        return;
-    }
-    let until = now_ms().wrapping_add(active_ms);
-    UART0_ACTIVE_UNTIL_MS.store(until, Ordering::Relaxed);
-    let _ = ensure_power_locks();
+    dmesh_fw_transport::uart_esp::activate_window();
 }
 
 pub fn poll_active_window() {
-    if UART0_ALWAYS_ON.load(Ordering::Acquire) {
-        return;
-    }
-    if !UART0_APB_LOCK_HELD.load(Ordering::Relaxed) {
-        return;
-    }
-    let until = UART0_ACTIVE_UNTIL_MS.load(Ordering::Relaxed);
-    if until == 0 || !time_after_or_equal(now_ms(), until) {
-        return;
-    }
-    release_apb_lock();
+    dmesh_fw_transport::uart_esp::poll_active_window();
 }
 
 /// Run a due output-gate probe from the control task.
@@ -502,8 +281,7 @@ pub fn poll_output_probe() {
 }
 
 pub fn is_active() -> bool {
-    UART0_DEBUG_ENABLED.load(Ordering::Relaxed)
-        && (UART0_ALWAYS_ON.load(Ordering::Relaxed) || UART0_APB_LOCK_HELD.load(Ordering::Relaxed))
+    dmesh_fw_transport::uart_esp::is_active()
 }
 
 /// Whether UART was explicitly opened as a bounded interactive window.
@@ -513,61 +291,24 @@ pub fn is_active() -> bool {
 /// turn a queued NAN packet into an arbitrary-time transmission to a sleepy
 /// peer; callers that need to bypass DW gating must use this predicate.
 pub fn interactive_active() -> bool {
-    UART0_DEBUG_ENABLED.load(Ordering::Relaxed)
-        && !UART0_ALWAYS_ON.load(Ordering::Relaxed)
-        && UART0_APB_LOCK_HELD.load(Ordering::Relaxed)
+    dmesh_fw_transport::uart_esp::interactive_active()
 }
 
 /// Keep the infrastructure UART and its power lock active continuously.
 pub fn set_always_on(enabled: bool) {
-    UART0_ALWAYS_ON.store(enabled, Ordering::Release);
-    if enabled {
-        UART0_DEBUG_ENABLED.store(true, Ordering::Release);
-        let _ = ensure_power_locks();
-    } else {
-        release_apb_lock();
-        UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Release);
-    }
+    dmesh_fw_transport::uart_esp::set_always_on(enabled);
 }
 
 pub fn set_debug_enabled(enabled: bool) {
-    UART0_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
-    if enabled {
-        activate_window();
-    } else {
-        release_apb_lock();
-        UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Relaxed);
-    }
-}
-
-/// Called from the UART event task as soon as RX data arrives.
-///
-/// This runs before the main task parses the line. RX extends an open debug
-/// window. A quiet console is reopened by the next framed UART/radio
-/// rendezvous, never by modem-control lines.
-pub fn note_rx_activity() {
-    if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    UART0_SUSPENDED.store(false, Ordering::Release);
-    set_debug_enabled(true);
+    dmesh_fw_transport::uart_esp::set_debug_enabled(enabled);
 }
 
 /// Restore UART RX after a light-sleep wake.
 ///
-/// ESP-IDF can leave the UART RX interrupt disabled after a GPIO wake even
-/// though the UART peripheral and its driver queue remain installed. Re-arm
-/// the interrupt and wake threshold before the host sends the first command.
+/// The common L2 owner re-arms the interrupt and wake threshold before the
+/// host sends the first command.
 pub fn rearm_after_wake() {
-    if !UART0_DRIVER_INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    UART0_SUSPENDED.store(false, Ordering::Relaxed);
-    unsafe {
-        let _ = sys::uart_set_wakeup_threshold(sys::uart_port_t_UART_NUM_0, 3);
-        let _ = sys::uart_enable_rx_intr(sys::uart_port_t_UART_NUM_0);
-    }
-    note_rx_activity();
+    dmesh_fw_transport::uart_esp::rearm_after_wake();
 }
 
 /// Close the console immediately after the current command response is sent.
@@ -584,248 +325,45 @@ pub fn finish_pending_suspend() -> bool {
     }
     // "quiet" suppresses TX and permits light sleep. RX remains armed so a
     // line (or its wake preamble) is sufficient to reopen the console.
-    UART0_SUSPENDED.store(false, Ordering::Relaxed);
-    UART0_DEBUG_ENABLED.store(false, Ordering::Relaxed);
-    UART0_ACTIVE_UNTIL_MS.store(0, Ordering::Relaxed);
-    release_apb_lock();
+    dmesh_fw_transport::uart_esp::set_debug_enabled(false);
     true
 }
 
 /// Release UART power locks while retaining the normal framed RX wake.
 pub fn suspend_for_light_sleep() {
-    if UART0_ALWAYS_ON.load(Ordering::Acquire) {
-        return;
-    }
-    // Keep RX interrupt and UART wake armed. The ingress task turns received
-    // bytes into a console-active window; disabling RX here made sleeping
-    // boards otherwise stranded remote diagnostic consoles.
-    release_apb_lock();
-}
-
-fn write_wire_bytes(bytes: &[u8]) -> bool {
-    if !is_active() {
-        UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let queue = UART0_TX_QUEUE.load(Ordering::Acquire);
-    if queue.is_null() {
-        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let mut accepted = true;
-    for chunk in bytes.chunks(UART_TX_FRAME_MAX) {
-        let mut queued = QueuedTx {
-            len: chunk.len() as u16,
-            data: [0; UART_TX_FRAME_MAX],
-        };
-        queued.data[..chunk.len()].copy_from_slice(chunk);
-        let sent = unsafe {
-            sys::xQueueGenericSend(queue, (&queued as *const QueuedTx).cast::<c_void>(), 0, 0)
-        };
-        if sent != 1 {
-            UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-            accepted = false;
-        }
-    }
-    accepted
-}
-
-/// Queue one complete mesh stream record on the physical UART.
-///
-/// The UDS/mesh boundary remains a generic mesh stream record; UART carries
-/// compact CBOR directly inside an HDLC/PPP frame. This keeps
-/// corrupted serial bytes from being interpreted as a record length.
-pub fn write_packet(stream_frame: &[u8]) -> bool {
-    let Some(body) = stream_frame.get(4..) else {
-        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    let Ok(body_len_bytes) = <[u8; 4]>::try_from(&stream_frame[..4]) else {
-        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    let body_len = u32::from_be_bytes(body_len_bytes) as usize;
-    if body_len != body.len()
-        || body.len() < 4
-        || body[..4] != [0, 0xcb, 0, 0]
-        || !(1..=UART_MAX_BODY).contains(&(body.len() - 4))
-    {
-        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    write_wire_bytes(&encode_payload(&body[4..], UART_MAX_BODY).expect("valid UART payload"))
+    // Keep RX interrupt and UART wake armed. The shared ingress task turns
+    // received bytes into a console-active window; disabling RX here would
+    // strand sleeping boards from their next rendezvous.
+    dmesh_fw_transport::uart_esp::suspend_for_light_sleep();
 }
 
 /// Emit one opaque QUIC-lite datagram over the UART PPP L2 bearer. Command
 /// encoding is deliberately above this adapter.
 pub fn write_transport_packet(packet: &[u8]) -> bool {
-    let mut payload = [0u8; UART_MAX_BODY];
-    let Some(used) = dmesh_fw_transport::encode_uart_transport_payload(packet, &mut payload) else {
+    // QUIC-lite replies are bearer protocol traffic, not console output. An
+    // inbound framed packet already proves that this bearer is in use; gating
+    // its bootstrap ACK on the human-console window deadlocks a sleeping
+    // device before connection flow control can provide backpressure.
+    if !dmesh_fw_transport::uart_esp::send_transport_packet(packet) {
+        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
         return false;
-    };
-    let Ok(wire) = encode_payload(&payload[..used], UART_MAX_BODY) else {
-        return false;
-    };
-    write_wire_bytes(&wire)
+    }
+    true
 }
 
 /// Emit a bounded direct-CBOR exception record through Main's sole UART
 /// writer.  This is intentionally limited to bootstrap/boot identity paths;
 /// normal operations must use QUIC-lite streams.
 pub fn write_direct_record(record: &[u8]) -> bool {
-    if record.is_empty() || record.len() > UART_MAX_BODY {
+    if !is_active() {
+        UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if !dmesh_fw_transport::uart_esp::send_direct_record(record) {
         UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    let Ok(wire) = encode_payload(record, UART_MAX_BODY) else {
-        UART0_TX_DROPS_QUEUE.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    write_wire_bytes(&wire)
-}
-
-fn ensure_power_locks() -> bool {
-    let apb_ok = ensure_apb_lock();
-    let no_light_sleep_ok = ensure_no_light_sleep_lock();
-    apb_ok && no_light_sleep_ok
-}
-
-fn ensure_apb_lock() -> bool {
-    if !UART_REQUIRES_APB_LOCK {
-        if !UART0_APB_LOCK_HELD.swap(true, Ordering::SeqCst) {
-            rom_print(b"event type=uart.active ok=true state=held lock=none\n\0");
-        }
-        return true;
-    }
-
-    unsafe {
-        let mut lock = UART0_APB_LOCK.load(Ordering::SeqCst);
-        if lock.is_null() {
-            let mut created: sys::esp_pm_lock_handle_t = core::ptr::null_mut();
-            let create = sys::esp_pm_lock_create(
-                sys::esp_pm_lock_type_t_ESP_PM_APB_FREQ_MAX,
-                0,
-                b"uart0_apb\0".as_ptr() as *const c_char,
-                &mut created,
-            );
-            if create != sys::ESP_OK || created.is_null() {
-                rom_print(b"event type=uart.pm_lock ok=false phase=create\n\0");
-                return false;
-            }
-            match UART0_APB_LOCK.compare_exchange(
-                core::ptr::null_mut(),
-                created,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => lock = created,
-                Err(existing) => {
-                    let _ = sys::esp_pm_lock_delete(created);
-                    lock = existing;
-                }
-            }
-        }
-        if !UART0_APB_LOCK_HELD.swap(true, Ordering::SeqCst) {
-            let acquire = sys::esp_pm_lock_acquire(lock);
-            if acquire != sys::ESP_OK {
-                UART0_APB_LOCK_HELD.store(false, Ordering::SeqCst);
-                rom_print(b"event type=uart.pm_lock ok=false phase=acquire\n\0");
-                return false;
-            }
-            rom_print(b"event type=uart.pm_lock ok=true type=apb_max state=held\n\0");
-        }
-        true
-    }
-}
-
-fn ensure_no_light_sleep_lock() -> bool {
-    unsafe {
-        let mut lock = UART0_NO_LIGHT_SLEEP_LOCK.load(Ordering::SeqCst);
-        if lock.is_null() {
-            let mut created: sys::esp_pm_lock_handle_t = core::ptr::null_mut();
-            let create = sys::esp_pm_lock_create(
-                sys::esp_pm_lock_type_t_ESP_PM_NO_LIGHT_SLEEP,
-                0,
-                b"uart0_no_ls\0".as_ptr() as *const c_char,
-                &mut created,
-            );
-            if create != sys::ESP_OK || created.is_null() {
-                rom_print(b"event type=uart.pm_lock ok=false phase=create_no_light_sleep\n\0");
-                return false;
-            }
-            match UART0_NO_LIGHT_SLEEP_LOCK.compare_exchange(
-                core::ptr::null_mut(),
-                created,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => lock = created,
-                Err(existing) => {
-                    let _ = sys::esp_pm_lock_delete(created);
-                    lock = existing;
-                }
-            }
-        }
-        if !UART0_NO_LIGHT_SLEEP_LOCK_HELD.swap(true, Ordering::SeqCst) {
-            let acquire = sys::esp_pm_lock_acquire(lock);
-            if acquire != sys::ESP_OK {
-                UART0_NO_LIGHT_SLEEP_LOCK_HELD.store(false, Ordering::SeqCst);
-                rom_print(b"event type=uart.pm_lock ok=false phase=acquire_no_light_sleep\n\0");
-                return false;
-            }
-            rom_print(b"event type=uart.pm_lock ok=true type=no_light_sleep state=held\n\0");
-        }
-        true
-    }
-}
-
-fn release_apb_lock() {
-    release_no_light_sleep_lock();
-    if !UART0_APB_LOCK_HELD.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    if !UART_REQUIRES_APB_LOCK {
-        rom_print(b"event type=uart.active ok=true state=released lock=none\n\0");
-        return;
-    }
-    let lock = UART0_APB_LOCK.load(Ordering::SeqCst);
-    if lock.is_null() {
-        return;
-    }
-    unsafe {
-        let ret = sys::esp_pm_lock_release(lock);
-        if ret == sys::ESP_OK {
-            if UART0_DEBUG_ENABLED.load(Ordering::Relaxed) {
-                rom_print(b"event type=uart.pm_lock ok=true state=released\n\0");
-            }
-        } else {
-            rom_print(b"event type=uart.pm_lock ok=false phase=release\n\0");
-            UART0_APB_LOCK_HELD.store(true, Ordering::SeqCst);
-        }
-    }
-}
-
-fn release_no_light_sleep_lock() {
-    if !UART0_NO_LIGHT_SLEEP_LOCK_HELD.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    let lock = UART0_NO_LIGHT_SLEEP_LOCK.load(Ordering::SeqCst);
-    if lock.is_null() {
-        return;
-    }
-    unsafe {
-        let ret = sys::esp_pm_lock_release(lock);
-        if ret == sys::ESP_OK {
-            if UART0_DEBUG_ENABLED.load(Ordering::Relaxed) {
-                rom_print(
-                    b"event type=uart.pm_lock ok=true type=no_light_sleep state=released\n\0",
-                );
-            }
-        } else {
-            rom_print(b"event type=uart.pm_lock ok=false phase=release_no_light_sleep\n\0");
-            UART0_NO_LIGHT_SLEEP_LOCK_HELD.store(true, Ordering::SeqCst);
-        }
-    }
+    true
 }
 
 fn now_ms() -> u32 {
@@ -836,187 +374,16 @@ fn time_after_or_equal(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) < i32::MAX as u32
 }
 
-unsafe extern "C" fn uart_manager_task(arg: *mut c_void) {
-    #[cfg(target_arch = "riscv32")]
-    if arg.is_null() {
-        let mut parser = new_uart_parser();
-        let mut bytes = [0_u8; 128];
-        loop {
-            let received = dmesh_usb_serial_read(
-                bytes.as_mut_ptr().cast::<c_void>(),
-                bytes.len() as u32,
-                sys::configTICK_RATE_HZ / 10,
-            );
-            if received <= 0 {
-                continue;
-            }
-            UART0_RX_EVENTS.fetch_add(1, Ordering::Relaxed);
-            note_rx_activity();
-            consume_uart_bytes(&mut parser, &bytes[..received as usize]);
-        }
-    }
-
-    let event_queue = arg.cast::<sys::QueueDefinition>();
-    let mut parser = new_uart_parser();
-    loop {
-        let mut event = sys::uart_event_t::default();
-        let received = unsafe {
-            sys::xQueueReceive(
-                event_queue,
-                (&mut event as *mut sys::uart_event_t).cast::<c_void>(),
-                sys::TickType_t::MAX,
-            )
-        };
-        if received != 1 {
-            continue;
-        }
-        match event.type_ {
-            x if x == sys::uart_event_type_t_UART_DATA => {
-                UART0_RX_EVENTS.fetch_add(1, Ordering::Relaxed);
-                if !UART0_RX_BREADCRUMB.swap(true, Ordering::AcqRel) {
-                    // One ROM breadcrumb distinguishes a working UART RX
-                    // event path from a board/bridge that only transmits
-                    // boot text. It is deliberately once-per-boot.
-                    rom_print(b"dm-rs uart rx_event=first\r\n\0");
-                }
-                note_rx_activity();
-                drain_driver_rx(&mut parser);
-            }
-            x if x == sys::uart_event_type_t_UART_FIFO_OVF
-                || x == sys::uart_event_type_t_UART_BUFFER_FULL =>
-            unsafe {
-                UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-                let _ = sys::uart_flush_input(sys::uart_port_t_UART_NUM_0);
-                let _ = sys::xQueueGenericReset(event_queue, 0);
-                parser.reset();
-            },
-            _ => {
-                UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-fn drain_driver_rx(parser: &mut UartParser) {
-    let mut bytes = [0_u8; 128];
-    loop {
-        let received = unsafe {
-            sys::uart_read_bytes(
-                sys::uart_port_t_UART_NUM_0,
-                bytes.as_mut_ptr().cast::<c_void>(),
-                bytes.len() as u32,
-                0,
-            )
-        };
-        if received <= 0 {
-            break;
-        }
-        crate::components::telemetry::record_uart_read(received as usize);
-        consume_uart_bytes(parser, &bytes[..received as usize]);
-    }
-}
-
-fn new_uart_parser() -> UartParser {
-    UartParser::with_max(UART_MAX_BODY)
-}
-
-/// Feed bytes through the shared no-std codec and preserve firmware telemetry
-/// for malformed or oversized physical frames.
-fn consume_uart_bytes(parser: &mut UartParser, bytes: &[u8]) {
-    let frames = parser.push(bytes).expect("UART codec cannot fail");
-    for frame in frames {
-        enqueue_frame(frame);
-    }
-    if parser.take_frame_error() {
-        UART0_FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
-        UART0_ESCAPE_ERRORS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// The only task that writes UART0 after the driver is installed. Radio and
-/// BLE callbacks enqueue records; `uart_tx_chars` copies directly into the
-/// hardware FIFO and never arms the driver's TX-empty refill ISR.
-unsafe extern "C" fn uart_tx_task(arg: *mut c_void) {
-    let queue = arg.cast::<sys::QueueDefinition>();
-    loop {
-        let mut queued = QueuedTx {
-            len: 0,
-            data: [0; UART_TX_FRAME_MAX],
-        };
-        let received = unsafe {
-            sys::xQueueReceive(
-                queue,
-                (&mut queued as *mut QueuedTx).cast::<c_void>(),
-                sys::TickType_t::MAX,
-            )
-        };
-        if received != 1 || queued.len == 0 || queued.len as usize > UART_TX_FRAME_MAX {
-            continue;
-        }
-        let len = queued.len as usize;
-        #[cfg(target_arch = "riscv32")]
-        {
-            let written = dmesh_usb_serial_write(queued.data.as_ptr().cast::<c_void>(), len as u32);
-            if written != len as i32 {
-                UART0_TX_DROPS_IDLE.fetch_add(1, Ordering::Relaxed);
-            }
-            continue;
-        }
-
-        #[cfg(not(target_arch = "riscv32"))]
-        for chunk in queued.data[..len].chunks(UART_TX_FIFO_CHUNK) {
-            // `uart_write_bytes` enables TXFIFO_EMPTY when it needs a refill.
-            // `uart_wait_tx_done` enables another driver TX interrupt. Both
-            // have produced a CPU0 interrupt-WDT loop on classic ESP32. A
-            // FIFO-bounded direct write plus a task delay needs neither.
-            let written = unsafe {
-                sys::uart_tx_chars(
-                    sys::uart_port_t_UART_NUM_0,
-                    chunk.as_ptr().cast::<c_char>(),
-                    chunk.len() as u32,
-                )
-            };
-            if written != chunk.len() as i32 {
-                UART0_RX_ERRORS.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
-            unsafe {
-                sys::vTaskDelay((UART_TX_FIFO_DRAIN_MS * sys::configTICK_RATE_HZ / 1_000).max(1));
-            }
-        }
-    }
-}
-
-fn enqueue_frame(data: Vec<u8>) {
-    let queue = UART0_FRAME_QUEUE.load(Ordering::Acquire);
-    if queue.is_null() {
-        UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let queued = QueuedFrame {
-        data: Box::into_raw(Box::new(data)),
-    };
-    let sent = unsafe {
-        sys::xQueueGenericSend(
-            queue,
-            (&queued as *const QueuedFrame).cast::<c_void>(),
-            0,
-            0,
-        )
-    };
-    if sent != 1 {
-        unsafe { drop(Box::from_raw(queued.data)) };
-        UART0_RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    UART0_QUEUED_FRAMES.fetch_add(1, Ordering::Release);
-    crate::components::wake::notify();
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{nan_sleepy_start_payload, new_uart_parser, UART_MAX_BODY};
+    use super::nan_sleepy_start_payload;
     use uart_codec::codec::{encode_payload, UART_ESCAPE, UART_FLAG};
+
+    const UART_MAX_BODY: usize = dmesh_fw_transport::TRANSPORT_MTU + 1;
+
+    fn new_uart_parser() -> uart_codec::codec::Decoder {
+        uart_codec::codec::Decoder::with_max(UART_MAX_BODY)
+    }
 
     fn framed(payload: &[u8]) -> Vec<u8> {
         encode_payload(payload, UART_MAX_BODY).unwrap()
@@ -1059,12 +426,4 @@ mod tests {
         assert_eq!(payload, vec![0xc6, 0xa0]);
         assert_eq!(framed(&payload), vec![UART_FLAG, 0xc6, 0xa0, UART_FLAG]);
     }
-}
-
-fn rom_print(message: &'static [u8]) {
-    // PM transitions can happen while the IDF UART driver is manipulating its
-    // TX interrupt state. Diagnostics here used to bypass the driver via ROM
-    // printf and caused an interrupt watchdog on CP2104-connected boards.
-    // Normal command/telemetry output remains available after boot.
-    let _ = message;
 }

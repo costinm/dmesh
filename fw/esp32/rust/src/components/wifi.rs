@@ -3,7 +3,6 @@ use std::ffi::c_char;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::Duration;
 
 unsafe extern "C" {
@@ -58,8 +57,6 @@ const RAW_FILTER_PROBE_RESP: u32 = 5;
 const RAW_FILTER_DATA: u32 = 6;
 const RAW_FILTER_DMESH: u32 = 7;
 const RAW_FILTER_DMESH_DATA: u32 = 8;
-const RAW_COMMAND_QUEUE_MAX: usize = 8;
-const RAW_COMMAND_MAX_LEN: usize = 512;
 const RAW_BROADCAST: [u8; 6] = [0xff; 6];
 // ESP-IDF does not expose esp-netif error constants through every generated
 // esp-idf-sys binding set.  This is ESP_ERR_ESP_NETIF_BASE + 0x05 from
@@ -132,10 +129,6 @@ static mut RAW_RX_LAST: [u8; 256] = [0; 256];
 static RAW_TX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_RX_TOTAL: AtomicU32 = AtomicU32::new(0);
 static RAW_CMD_DROPPED: AtomicU32 = AtomicU32::new(0);
-static RAW_OBJECT_ACTION_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
-static RAW_OBJECT_ACTION_ACCEPTED: AtomicU32 = AtomicU32::new(0);
-static RAW_OBJECT_ACTION_LAST_LEN: AtomicU32 = AtomicU32::new(0);
-static RAW_OBJECT_ACTION_LAST_PREFIX: AtomicU32 = AtomicU32::new(0);
 // Receive-path diagnostics for custom DMesh action frames. These distinguish
 // an action frame reaching Main from one carrying the expected marker and
 // from one actually being accepted for command dispatch.
@@ -308,14 +301,6 @@ pub fn beacon_wake_plan_for_dw_stride(
     })
 }
 
-#[derive(Clone, Debug)]
-pub struct RawWifiCommand {
-    pub source: [u8; 6],
-    pub payload: Vec<u8>,
-    pub rssi: i32,
-    pub response: WifiResponsePath,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum WifiResponsePath {
     Action,
@@ -345,7 +330,6 @@ impl WifiResponsePath {
     }
 }
 
-static RAW_COMMAND_QUEUE: OnceLock<Mutex<VecDeque<RawWifiCommand>>> = OnceLock::new();
 const RAW_RESPONSE_HISTORY_MAX: usize = 4;
 
 #[derive(Clone, Debug)]
@@ -385,8 +369,9 @@ pub fn send_espnow_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()
         ensure_raw_wifi_started(6)?;
     }
     let source = raw_tx_source_mac()?;
-    let bssid = super::nan::selected_cluster_bssid().unwrap_or(destination);
-    let frame = dmesh_rawnan::build_espnow_action_frame(destination, source, bssid, payload)
+    // ESP-NOW is connectionless: address 3 is broadcast, not the NAN cluster
+    // or AP BSSID. The portable raw codec rejects any other value.
+    let frame = dmesh_rawnan::build_espnow_action_frame(destination, source, [0xff; 6], payload)
         .map_err(|error| anyhow!("ESP-NOW action frame: {error}"))?;
     raw_tx_frame(&frame, true)?;
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -402,6 +387,41 @@ pub fn send_espnow_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()
 /// Broadcast a raw-injected ESP-NOW-compatible payload.
 pub fn send_espnow_broadcast(payload: &[u8]) -> Result<()> {
     send_espnow_payload_to(RAW_BROADCAST, payload)
+}
+
+/// Inject one complete management/action frame for a controlled raw-radio
+/// experiment. This is reached only through Main's flow-controlled hardware
+/// stream service; the retired text `wifi raw=` registry is not revived.
+pub fn apply_raw_wifi_tx_for_lab(
+    request: dmesh_server::raw_wifi::RawWifiTxRequest<'_>,
+) -> Result<()> {
+    use dmesh_server::raw_wifi::{RawWifiInterface, RawWifiRate};
+    prepare_raw_tx(request.channel)?;
+    let interface = match request.interface {
+        RawWifiInterface::Auto => None,
+        RawWifiInterface::Sta => Some(sys::wifi_interface_t_WIFI_IF_STA),
+        RawWifiInterface::Ap => Some(sys::wifi_interface_t_WIFI_IF_AP),
+    };
+    let rate = match request.rate {
+        RawWifiRate::Auto => "auto",
+        RawWifiRate::Mbps6 => "6",
+        RawWifiRate::Mbps9 => "9",
+        RawWifiRate::Mbps12 => "12",
+        RawWifiRate::Mbps18 => "18",
+        RawWifiRate::Mbps24 => "24",
+        RawWifiRate::Mbps36 => "36",
+        RawWifiRate::Mbps48 => "48",
+        RawWifiRate::Mbps54 => "54",
+    };
+    configure_fixed_tx_rate(
+        rate,
+        interface.unwrap_or_else(raw_tx_interface),
+        request.disable_11b,
+    )?;
+    raw_tx_frame_on(request.frame, request.system_sequence, interface)?;
+    RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+    telemetry::record_packet("wifi", Direction::Tx, request.frame, "raw_lab=true");
+    Ok(())
 }
 
 pub fn send_raw_action_payload_to(destination: [u8; 6], payload: &[u8]) -> Result<()> {
@@ -482,10 +502,6 @@ pub fn send_to_last_command_peer(payload: &[u8]) -> Result<()> {
     send_raw_action_payload_to(peer, payload)
 }
 
-pub fn take_raw_command() -> Option<RawWifiCommand> {
-    raw_command_queue().lock().ok()?.pop_front()
-}
-
 /// Legacy raw-action observer retained only while the old command code is
 /// being removed. New ingress is classified in `nan.rs` with the shared
 /// ESP-NOW action parser before it reaches QUIC-lite.
@@ -499,24 +515,10 @@ pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
     if super::action_stream::receive_espnow(source, payload) {
         return;
     }
-    // Only complete QUIC-lite action datagrams are accepted here. Object
-    // records are stream service data, never a raw action-frame protocol.
-    RAW_OBJECT_ACTION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    let mut prefix = 0u32;
-    for byte in payload.iter().take(4) {
-        prefix = (prefix << 8) | u32::from(*byte);
-    }
-    RAW_OBJECT_ACTION_LAST_LEN.store(payload.len() as u32, Ordering::Relaxed);
-    RAW_OBJECT_ACTION_LAST_PREFIX.store(prefix, Ordering::Relaxed);
-    if super::nan::object_service_observe_action(payload) {
-        RAW_OBJECT_ACTION_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-        telemetry::record_log(format!(
-            "event type=wifi.object_action_rx peer={} len={}",
-            format_mac(source),
-            payload.len()
-        ));
-        return;
-    }
+    // Only complete QUIC-lite action datagrams are accepted here. In
+    // particular, do not hand an unrecognised action payload to the old NAN
+    // object observer: object records belong on the `object` stream once a
+    // firmware object sink is attached to this connection.
     if is_wifi_terminal_payload(payload) {
         let response = RawWifiResponse {
             local_us: unsafe { sys::esp_timer_get_time().max(0) as u64 },
@@ -531,11 +533,10 @@ pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
         }
         return;
     }
-    // The NAN exchange only creates this serverless session. Each subsequent
-    // ESP-NOW-style command refreshes a short idle lease, so a burst of work
-    // stays awake but an idle target naturally returns to its duty schedule.
-    super::mode::request_targeted_wake(5_000);
-    enqueue_command(source, payload, rssi, WifiResponsePath::Action);
+    // No raw action-CBOR fallback remains.  Discovery may open a bounded
+    // session, but application payloads must then enter QUIC-lite streams.
+    let _ = rssi;
+    RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Consume the bounded diagnostic stream used for transport throughput tests.
@@ -835,11 +836,7 @@ impl CommandHandler for WifiCommand {
         }
         if request.arg("object_action_stats").is_some() {
             return Ok(CommandResponse::ok(format!(
-                "wifi object_action attempts={} accepted={} last_len={} last_prefix={:08x}",
-                RAW_OBJECT_ACTION_ATTEMPTS.load(Ordering::Relaxed),
-                RAW_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
-                RAW_OBJECT_ACTION_LAST_LEN.load(Ordering::Relaxed),
-                RAW_OBJECT_ACTION_LAST_PREFIX.load(Ordering::Relaxed),
+                "wifi object_action retired=true transport=quic-lite",
             )));
         }
         if request.arg("netif_stats").is_some() {
@@ -1672,6 +1669,14 @@ fn ensure_low_level_wifi() -> Result<()> {
     Ok(())
 }
 
+/// Establish Main's single ESP-IDF Wi-Fi driver instance for a shared raw
+/// bearer. This does not start an AP/STA session or open an IP socket; it only
+/// reserves Main's known-good driver buffers before `dmesh-fw-transport`
+/// attaches its raw STA RX callback.
+pub(crate) fn prepare_shared_raw_sta_driver() -> Result<()> {
+    ensure_low_level_wifi()
+}
+
 /// Initialize the IDF IP stack even when Main normally runs raw NAN only.
 ///
 /// This is deliberately separate from creating a Wi-Fi netif: it makes the
@@ -1754,49 +1759,83 @@ fn start_ip_sta_async(
     if IP_STA_STARTING.swap(true, Ordering::AcqRel) {
         bail!("IP STA start already in progress");
     }
-    thread::Builder::new()
-        .name("wifi-sta-start".to_owned())
-        .spawn(move || {
-            let result = start_ip_sta_sync(&request, &ssid, &psk, channel);
-            IP_STA_STARTING.store(false, Ordering::Release);
-            match result {
-                Ok(()) => {
-                    let mut ap = sys::wifi_ap_record_t::default();
-                    let mut info = sys::esp_netif_ip_info_t::default();
-                    let (associated, ip_up) = IP_STA_NETIF
-                        .get()
-                        .copied()
-                        .map(|value| unsafe {
-                            let netif = value as *mut sys::esp_netif_t;
-                            (
-                                sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK,
-                                sys::esp_netif_get_ip_info(netif, &mut info) == sys::ESP_OK
-                                    && sys::esp_netif_is_netif_up(netif),
-                            )
-                        })
-                        .unwrap_or((false, false));
-                    telemetry::record_log(format!(
-                        "event type=wifi.sta state=connected associated={} ip_up={} ip={} gw={} mask={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}",
-                        associated,
-                        ip_up,
-                        format_ipv4_u32(info.ip.addr),
-                        format_ipv4_u32(info.gw.addr),
-                        format_ipv4_u32(info.netmask.addr),
-                        ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
-                        ap.rssi,
-                    ));
-                }
-                Err(error) => telemetry::record_log(format!(
-                    "event type=wifi.sta state=failed associated=false ip_up=false message={}",
-                    crate::commands::protocol::escape_value(&error.to_string())
-                )),
-            }
-        })
-        .map(|_| ())
-        .map_err(|error| {
-            IP_STA_STARTING.store(false, Ordering::Release);
-            anyhow!("spawn STA worker: {error}")
-        })
+    let task_state = Box::into_raw(Box::new(IpStaStartTask {
+        request,
+        ssid,
+        psk,
+        channel,
+    }));
+    let mut task = core::ptr::null_mut();
+    let started = unsafe {
+        sys::xTaskCreatePinnedToCore(
+            Some(ip_sta_start_task),
+            b"wifi_sta\0".as_ptr().cast(),
+            12 * 1024,
+            task_state.cast(),
+            4,
+            &mut task,
+            0,
+        ) == 1
+            && !task.is_null()
+    };
+    if started {
+        Ok(())
+    } else {
+        unsafe { drop(Box::from_raw(task_state)) };
+        IP_STA_STARTING.store(false, Ordering::Release);
+        Err(anyhow!("create FreeRTOS STA task failed"))
+    }
+}
+
+/// ESP-specific command adapter. The task yields while association progresses;
+/// it must never perform UART or stream writes directly.
+struct IpStaStartTask {
+    request: CommandRequest,
+    ssid: String,
+    psk: String,
+    channel: u8,
+}
+
+unsafe extern "C" fn ip_sta_start_task(argument: *mut core::ffi::c_void) {
+    let task = unsafe { Box::from_raw(argument.cast::<IpStaStartTask>()) };
+    let result = start_ip_sta_sync(&task.request, &task.ssid, &task.psk, task.channel);
+    IP_STA_STARTING.store(false, Ordering::Release);
+    match result {
+        Ok(()) => {
+            let mut ap = sys::wifi_ap_record_t::default();
+            let mut info = sys::esp_netif_ip_info_t::default();
+            let (associated, ip_up) = IP_STA_NETIF
+                .get()
+                .copied()
+                .map(|value| unsafe {
+                    let netif = value as *mut sys::esp_netif_t;
+                    (
+                        sys::esp_wifi_sta_get_ap_info(&mut ap) == sys::ESP_OK,
+                        sys::esp_netif_get_ip_info(netif, &mut info) == sys::ESP_OK
+                            && sys::esp_netif_is_netif_up(netif),
+                    )
+                })
+                .unwrap_or((false, false));
+            telemetry::record_log(format!(
+                "event type=wifi.sta state=connected associated={} ip_up={} ip={} gw={} mask={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}",
+                associated,
+                ip_up,
+                format_ipv4_u32(info.ip.addr),
+                format_ipv4_u32(info.gw.addr),
+                format_ipv4_u32(info.netmask.addr),
+                ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                ap.rssi,
+            ));
+        }
+        Err(error) => {
+            telemetry::record_log(format!(
+                "event type=wifi.sta state=failed associated=false ip_up=false message={}",
+                crate::commands::protocol::escape_value(&error.to_string())
+            ));
+        }
+    }
+    drop(task);
+    unsafe { sys::vTaskDelete(core::ptr::null_mut()) };
 }
 
 fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, channel: u8) -> Result<()> {
@@ -1889,7 +1928,7 @@ fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, channel: u
             // EHOSTUNREACH even though the STA is associated.
             esp_ok(unsafe { sys::esp_netif_set_default_netif(netif) })?;
             esp_ok(unsafe { sys::esp_netif_set_ip_info(netif, &info) })?;
-            std::thread::sleep(Duration::from_millis(20));
+            task_delay(Duration::from_millis(20));
             let stable = unsafe {
                 sys::esp_netif_get_ip_info(netif, &mut current) == sys::ESP_OK
                     && current.ip.addr == info.ip.addr
@@ -1918,7 +1957,7 @@ fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, channel: u
         if std::time::Instant::now() >= deadline {
             bail!("STA association/IP timeout for ssid={ssid}");
         }
-        std::thread::sleep(Duration::from_millis(100));
+        task_delay(Duration::from_millis(100));
     }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
@@ -2048,7 +2087,7 @@ fn low_level_start_sta(ssid: &str, psk: &str, channel: u8) -> Result<()> {
         if associated || std::time::Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        task_delay(Duration::from_millis(50));
     }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
     WIFI_NETIF_PROBE_RUNNING.store(false, Ordering::Relaxed);
@@ -2264,10 +2303,14 @@ fn wifi_init_config_default() -> sys::wifi_init_config_t {
 }
 
 pub fn stop_raw_monitor() -> Result<()> {
-    // Clear the comparator while the driver is still initialized.
+    // This is the raw STA/AP/NAN teardown path. It deliberately clears the
+    // internal RX callback so a raw IPv6/UDP adapter can take ownership of
+    // received data frames without lwIP consuming them. Do not use it for the
+    // current shared lwIP STA bearer; see `stop_raw_monitor_for_lwip_sta`.
     let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
+        let _ = sys::esp_wifi_internal_reg_rxcb(sys::wifi_interface_t_WIFI_IF_STA, None);
         let stopped = sys::esp_wifi_stop();
         if stopped != sys::ESP_OK
             && stopped != sys::ESP_ERR_INVALID_STATE
@@ -2275,6 +2318,42 @@ pub fn stop_raw_monitor() -> Result<()> {
             && stopped != sys::ESP_ERR_WIFI_NOT_STARTED
         {
             bail!("esp_wifi_stop failed err=0x{stopped:x}");
+        }
+    }
+    RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Stop raw-NAN/promiscuous capture before handing the radio to the shared
+/// `dmesh-fw-transport` STA/lwIP bearer. Preserve ESP-netif's STA RX callback:
+/// it is the only receive callback and owns IPv4/UDP delivery. Raw adapter
+/// mode has a separate lifecycle and must not overwrite that callback while
+/// the lwIP bearer is active.
+///
+/// This is intentionally separate from [`stop_raw_monitor`]. The raw adapter
+/// path remains available for the future no-lwIP IPv6/UDP experiment, where
+/// Main owns RX filtering, action frames, and frame parsing directly.
+pub fn stop_raw_monitor_for_lwip_sta() -> Result<()> {
+    let _ = set_hardware_bssid_filter([0; 6], false);
+    unsafe {
+        let _ = sys::esp_wifi_set_promiscuous(false);
+        let stopped = sys::esp_wifi_stop();
+        if stopped != sys::ESP_OK
+            && stopped != sys::ESP_ERR_INVALID_STATE
+            && stopped != sys::ESP_ERR_WIFI_NOT_INIT
+        {
+            bail!("esp_wifi_stop failed err=0x{stopped:x}");
+        }
+        // Recovery reaches the shared lwIP adapter from a fresh Wi-Fi driver.
+        // Main must do the same when leaving raw/NAN mode; otherwise
+        // `esp_wifi_init` reports INVALID_STATE and retains raw netif/RX
+        // ownership even though the new default STA netif reports association.
+        let deinitialized = sys::esp_wifi_deinit();
+        if deinitialized != sys::ESP_OK
+            && deinitialized != sys::ESP_ERR_WIFI_NOT_INIT
+            && deinitialized != sys::ESP_ERR_INVALID_STATE
+        {
+            bail!("esp_wifi_deinit failed err=0x{deinitialized:x}");
         }
     }
     RAW_MONITOR_RUNNING.store(false, Ordering::Relaxed);
@@ -2885,12 +2964,17 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
             telemetry::record_log(line);
             return;
         }
-        let response = if frame_type(frame) == 2 {
-            WifiResponsePath::Data
-        } else {
-            WifiResponsePath::Action
+        // Raw data/action payloads are now a QUIC-lite bearer only.  Do not
+        // retain a second CBOR command queue beside the common DCID owner:
+        // malformed or legacy payloads are simply not an application input.
+        let Some(source) = frame_address(frame, FRAME_ADDR2) else {
+            RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
         };
-        enqueue_raw_command(frame, payload, rssi, response);
+        if !super::action_stream::receive_espnow(source, payload) {
+            RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let dst = frame_address(frame, FRAME_ADDR1)
             .map(format_mac)
             .unwrap_or_else(|| "none".to_string());
@@ -3187,46 +3271,10 @@ fn base64_standard(data: &[u8]) -> String {
     out
 }
 
-fn enqueue_raw_command(frame: &[u8], payload: &[u8], rssi: i32, response: WifiResponsePath) {
-    let Some(source) = frame_address(frame, FRAME_ADDR2) else {
-        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    enqueue_command(source, payload, rssi, response);
-}
-
-fn enqueue_command(source: [u8; 6], payload: &[u8], rssi: i32, response: WifiResponsePath) {
-    if payload.len() > RAW_COMMAND_MAX_LEN {
-        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    set_last_command_peer(source, response);
-    let Ok(mut queue) = raw_command_queue().lock() else {
-        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    if queue.len() >= RAW_COMMAND_QUEUE_MAX {
-        queue.pop_front();
-        RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
-    queue.push_back(RawWifiCommand {
-        source,
-        payload: payload.to_vec(),
-        rssi,
-        response,
-    });
-    RAW_CMD_RX_TOTAL.fetch_add(1, Ordering::Relaxed);
-    super::wake::notify();
-}
-
 fn is_wifi_terminal_payload(payload: &[u8]) -> bool {
     crate::commands::protocol::decode_binary(payload)
         .map(|req| req.args.contains_key(&4) || req.args.contains_key(&5))
         .unwrap_or(false)
-}
-
-fn raw_command_queue() -> &'static Mutex<VecDeque<RawWifiCommand>> {
-    RAW_COMMAND_QUEUE.get_or_init(|| Mutex::new(VecDeque::with_capacity(RAW_COMMAND_QUEUE_MAX)))
 }
 
 fn raw_response_history() -> &'static Mutex<VecDeque<RawWifiResponse>> {
@@ -3299,7 +3347,7 @@ fn raw_stats() -> String {
         .unwrap_or_else(|| "none".to_string());
     let (channel, second) = wifi_channel_status();
     format!(
-        "raw_monitor={} filter={} bssid_filter={} ch={} second={} conn_wake_ms={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} action_candidates={} action_marker_misses={} action_accepted={} object_attempts={} object_accepted={} last_peer={} last_response={} last_len={} last_rssi={} last={}",
+        "raw_monitor={} filter={} bssid_filter={} ch={} second={} conn_wake_ms={} rx={} matched={} dropped={} tx={} cmd_rx={} cmd_dropped={} action_candidates={} action_marker_misses={} action_accepted={} last_peer={} last_response={} last_len={} last_rssi={} last={}",
         RAW_MONITOR_RUNNING.load(Ordering::Relaxed),
         raw_filter_name(),
         RAW_FILTER_BSSID_ENABLED.load(Ordering::Relaxed),
@@ -3315,8 +3363,6 @@ fn raw_stats() -> String {
         RAW_ACTION_CANDIDATES.load(Ordering::Relaxed),
         RAW_ACTION_MARKER_MISSES.load(Ordering::Relaxed),
         RAW_ACTION_ACCEPTED.load(Ordering::Relaxed),
-        RAW_OBJECT_ACTION_ATTEMPTS.load(Ordering::Relaxed),
-        RAW_OBJECT_ACTION_ACCEPTED.load(Ordering::Relaxed),
         peer,
         last_response_path().name(),
         last_len,
