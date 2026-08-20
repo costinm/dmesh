@@ -130,6 +130,8 @@
               pkgs.ripgrep
               pkgs.rustc
               pkgs.socat
+              # Packet-level NAN diagnostics and Android PHY-rate capture.
+              pkgs.tshark
               pkgs.rustup
               pkgs.unzip
               pkgs.which

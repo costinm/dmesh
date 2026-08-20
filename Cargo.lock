@@ -1564,19 +1564,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "dmesh-object-store"
+name = "dmesh-cli"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "dmesh-transport",
- "hex",
- "serde",
+ "dmesh-rawnan",
+ "dmesh-server",
+ "lmesh-uart",
+ "quic-lite",
  "serde_json",
- "sha2 0.11.0",
- "tempfile",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1584,7 +1580,23 @@ name = "dmesh-rawnan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+]
+
+[[package]]
+name = "dmesh-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "quic-lite",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1598,13 +1610,6 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "dmesh-transport"
-version = "0.1.0"
-dependencies = [
- "tokio",
 ]
 
 [[package]]
@@ -3326,15 +3331,16 @@ name = "lmesh"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "dmesh-object-store",
  "dmesh-rawnan",
- "dmesh-transport",
+ "dmesh-server",
  "libc",
+ "lmesh-ble-hci",
  "lmesh-uart",
  "lmesh-wifi",
  "mesh",
  "minicbor",
  "p256",
+ "quic-lite",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -3342,6 +3348,15 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uart-codec",
+]
+
+[[package]]
+name = "lmesh-ble-hci"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
 ]
 
 [[package]]
@@ -3350,10 +3365,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dmesh-rawnan",
- "dmesh-transport",
+ "dmesh-server",
  "libc",
  "mesh",
  "minicbor",
+ "quic-lite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3368,18 +3384,28 @@ name = "lmesh-wifi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dmesh-cli",
  "dmesh-rawnan",
- "dmesh-transport",
+ "dmesh-server",
  "libc",
  "mesh",
  "minicbor",
+ "quic-lite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
  "uart-codec",
+]
+
+[[package]]
+name = "lmesh-wpa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -4738,6 +4764,10 @@ name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+
+[[package]]
+name = "quic-lite"
+version = "0.1.0"
 
 [[package]]
 name = "quick-error"

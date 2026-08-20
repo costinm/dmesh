@@ -35,7 +35,6 @@ export MESH_TOOLS="${MESH_TOOLS:-${DMESH_REPO}/crates/lmesh/resources/tools.json
 export MESH_SERVICE_DIR="${MESH_SERVICE_DIR:-/home/system/etc/mesh-init}"
 export LMESH_CONTROL_SOCKET="${LMESH_CONTROL_SOCKET:-/run/mesh/lmesh/mesh.sock}"
 export DMESH_LMESH_CONTROL_ENDPOINT="${DMESH_LMESH_CONTROL_ENDPOINT:-unix://${LMESH_CONTROL_SOCKET}}"
-export LMESH_SERIAL_LOG="${LMESH_SERIAL_LOG:-${DMESH_REPO}/target/lmesh-radio-build/log/serial.log}"
 # NAN gateway routing is experimental/WIP and disabled by default. The
 # role-to-device map is retained only for isolated gateway experiments.
 # NAN gateway routing is experimental/WIP and disabled by default.
@@ -77,9 +76,32 @@ mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" \
     "$(dirname "$NIX_PROFILE")"
 
 if [ -d "$NIX_PROFILE/bin" ]; then
-    export PATH="$NIX_PROFILE/bin:$PATH"
+    # The repo profile contains a BusyBox compatibility `timeout`.  Keep the
+    # profile tools available, but let GNU coreutils provide the normal shell
+    # utilities (notably `timeout`, whose `--foreground` behaviour is needed
+    # by the test harness).
+    export PATH="/usr/bin:/bin:$NIX_PROFILE/bin:$PATH"
 fi
 export PATH="$CARGO_HOME/bin:$PATH"
+
+# Some ssh-mesh service environments prepend their BusyBox runtime bundle.
+# It is not a DMesh build toolchain and causes ordinary commands such as
+# `find`, `ps`, and `sed` to silently use the reduced BusyBox implementations.
+# Keep the actual ssh-mesh release directory below; remove only this runtime
+# bundle from the inherited PATH.
+_dmesh_path_clean=""
+_dmesh_old_ifs="$IFS"
+IFS=:
+for _dmesh_path_entry in $PATH; do
+    [ "$_dmesh_path_entry" = "/opt/ssh-mesh/bin" ] && continue
+    if [ -n "$_dmesh_path_clean" ]; then
+        _dmesh_path_clean="$_dmesh_path_clean:$_dmesh_path_entry"
+    else
+        _dmesh_path_clean="$_dmesh_path_entry"
+    fi
+done
+IFS="$_dmesh_old_ifs"
+export PATH="$_dmesh_path_clean"
 
 # Firmware dependencies and toolchains are repo-local too. Source the
 # generated ESP-IDF environment once here so normal shells do not need a
@@ -147,4 +169,7 @@ unset _dmesh_ssh_candidate
 unset _dmesh_ssh_mesh_release
 unset _dmesh_cargo_home
 unset _dmesh_rustup_home
+unset _dmesh_path_clean
+unset _dmesh_old_ifs
+unset _dmesh_path_entry
 export DMESH_ENV_LOADED=1

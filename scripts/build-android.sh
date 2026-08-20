@@ -569,9 +569,9 @@ install_apps_on_device() {
     # ADB installs may block forever after a USB transport reset.  Bound the
     # operation so install-all can continue with other USB or Wi-Fi devices.
     local install_timeout="${DMESH_ADB_INSTALL_TIMEOUT:-120}"
-    timeout --foreground "$install_timeout" adb -s "$serial" install -r "$dmesh_apk"
-    timeout --foreground "$install_timeout" adb -s "$serial" install -r "$web_apk"
-    timeout --foreground "$install_timeout" adb -s "$serial" install -r "$chat_apk"
+    timeout "$install_timeout" adb -s "$serial" install -r "$dmesh_apk"
+    timeout "$install_timeout" adb -s "$serial" install -r "$web_apk"
+    timeout "$install_timeout" adb -s "$serial" install -r "$chat_apk"
 }
 
 uninstall_apps_on_device() {
@@ -613,7 +613,7 @@ android_shell_command() {
     # content arguments and is silently rejected by the provider CLI.
     local escaped_command
     escaped_command="${command//\'/\'\\\'\'}"
-    timeout --foreground "${DMESH_ADB_COMMAND_TIMEOUT:-30}" adb -s "$serial" shell \
+    timeout "${DMESH_ADB_COMMAND_TIMEOUT:-30}" adb -s "$serial" shell \
         "content call --uri content://$APP_DMESH_PKG.shell --method command --arg '$escaped_command'"
 }
 

@@ -105,8 +105,31 @@ musl() {
     # are not pulled into the static Linux artifact set.
     "$DMESH_CARGO_BIN" build --release --target x86_64-unknown-linux-musl \
         -p lmesh \
+        -p lmesh-wifi \
+        -p dmesh-cli \
+        -p lmesh-uart \
         -p mesh-tun \
         -p dmeshtui
+
+    # Keep mesh-init service homes uniform: /home/<service> is provisioned as
+    # a symlink to target/home/<service> during development.
+    for service in lmesh lmesh-wifi; do
+        mkdir -p "$DMESH_REPO/target/home/$service/bin"
+        ln -sfn \
+            "$DMESH_REPO/target/x86_64-unknown-linux-musl/release/$service" \
+            "$DMESH_REPO/target/home/$service/bin/$service"
+    done
+
+    # Keep the standalone UART service self-contained under its controlled
+    # service home. The example records the board inventory but explicitly
+    # disables legacy byte forwards; the replacement is the QUIC-lite UART L2
+    # proxy owned by lmesh-uart.
+    mkdir -p "$DMESH_REPO/target/home/lmesh-uart/bin" \
+        "$DMESH_REPO/target/home/lmesh-uart/etc/lmesh-uart"
+    ln -sfn "$DMESH_REPO/target/x86_64-unknown-linux-musl/release/lmesh-uart" \
+        "$DMESH_REPO/target/home/lmesh-uart/bin/lmesh-uart"
+    ln -sfn "$DMESH_REPO/crates/lmesh-uart/examples/lmesh.toml" \
+        "$DMESH_REPO/target/home/lmesh-uart/etc/lmesh-uart/lmesh.toml"
 
     # `mesh` is the generic client from ssh-mesh, not an lmesh-specific
     # wrapper. Let Cargo retain the artifact under ssh-mesh/target, beside its
@@ -163,54 +186,106 @@ lmesh_test() {
 object_store_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" test -p dmesh-object-store
+    "$DMESH_CARGO_BIN" test -p dmesh-server
 }
 
-recovery_test() {
-    PYTHONPATH="$DMESH_REPO/fw/recovery/tools" "$DMESH_PYTHON" \
-        "$DMESH_REPO/scripts/test_recovery_protocol.py"
+transport_test() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" test -p quic-lite
+    "$DMESH_CARGO_BIN" test -p dmesh-server --features udp --lib
+    "$DMESH_CARGO_BIN" test -p dmesh-server --features udp --test object_store_stream
 }
 
-object_store_udp() {
+transport_coverage() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    local llvm_cov_version
+    llvm_cov_version="$($DMESH_CARGO_BIN llvm-cov --version 2>/dev/null || true)"
+    if [ "$llvm_cov_version" != "cargo-llvm-cov 0.8.7" ]; then
+        echo "Requires cargo-llvm-cov 0.8.7 in the development environment" >&2
+        return 2
+    fi
+    mkdir -p "$DMESH_REPO/target/coverage"
+    "$DMESH_CARGO_BIN" llvm-cov test -p quic-lite --no-default-features \
+        --lcov --output-path "$DMESH_REPO/target/coverage/quic-lite-core.lcov"
+    "$DMESH_CARGO_BIN" llvm-cov test -p dmesh-server --features udp \
+        --lcov --output-path "$DMESH_REPO/target/coverage/dmesh-server-udp.lcov"
+    # Keep the crate-wide gates executable in CI. Module/scenario coverage is
+    # reviewed from the emitted LCOV and the protocol matrix; these totals are
+    # the non-negotiable backstop against silently losing broad coverage.
+    "$DMESH_CARGO_BIN" llvm-cov report -p quic-lite \
+        --fail-under-lines 80 \
+        --fail-under-regions 85
+}
+
+transport_fuzz_smoke() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" test -p quic-lite --features std
+}
+
+transport_loopback() {
     shift || true
     require_dmesh_cargo
     configure_ssh_mesh_override
-    DMESH_UDP_SERVER_PORT="${DMESH_UDP_SERVER_PORT:-3336}" \
-    DMESH_UDP_SERVER_BIND="${DMESH_UDP_SERVER_BIND:-0.0.0.0}" \
-    DMESH_OBJECT_STORE_ROOT="${DMESH_OBJECT_STORE_ROOT:-$DMESH_REPO/target/flash}" \
-        "$DMESH_CARGO_BIN" run -p dmesh-object-store --bin udp-server -- "$@"
+    "$DMESH_CARGO_BIN" test -p quic-lite memory_stream_stress \
+        -- --ignored --nocapture --test-threads=1 "$@"
 }
 
-object_store_udp_status() {
+transport_tcp_loopback() {
     shift || true
     require_dmesh_cargo
     configure_ssh_mesh_override
-    DMESH_UDP_STATUS_PORT="${DMESH_UDP_STATUS_PORT:-3338}" \
-    DMESH_UDP_STATUS_BIND="${DMESH_UDP_STATUS_BIND:-0.0.0.0}" \
-        "$DMESH_CARGO_BIN" run -p dmesh-object-store --bin udp-status-server -- "$@"
+    "$DMESH_CARGO_BIN" test -p dmesh-server tcp_memory_stream_64m_baseline \
+        -- --ignored --nocapture --test-threads=1 "$@"
+}
+
+transport_compare() {
+    shift || true
+    local bytes="${DMESH_STREAM_BYTES:-67108864}"
+    DMESH_STREAM_BYTES="$bytes" transport_loopback
+    DMESH_STREAM_BYTES="$bytes" transport_tcp_loopback
+}
+
+object_store_tcp_loopback() {
+    shift || true
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" test -p dmesh-server tcp_16m_baseline \
+        -- --ignored --nocapture --test-threads=1 "$@"
 }
 
 lmesh_restart() {
-    local binary="$DMESH_REPO/target/x86_64-unknown-linux-musl/release/lmesh"
+    restart_managed_service lmesh
+}
+
+lmesh_wifi_restart() {
+    restart_managed_service lmesh-wifi
+}
+
+restart_managed_service() {
+    local service="$1"
+    local binary="$DMESH_REPO/target/x86_64-unknown-linux-musl/release/$service"
     local old=""
     local new=""
     if [ ! -x "$binary" ]; then
-        echo "Missing lmesh binary; run scripts/build.sh musl" >&2
+        echo "Missing $service binary; run scripts/build.sh musl" >&2
         return 1
     fi
-    old="$(pgrep -n -f "^$binary$" || true)"
+    old="$(pgrep -n -x "$service" || true)"
     if [ -n "$old" ]; then
         kill -TERM "$old"
     fi
     for _ in $(seq 1 30); do
-        new="$(pgrep -n -f "^$binary$" || true)"
+        new="$(pgrep -n -x "$service" || true)"
         if [ -n "$new" ] && [ "$new" != "$old" ]; then
-            echo "lmesh restarted pid=$new"
+            echo "$service restarted pid=$new"
             return 0
         fi
         sleep 1
     done
-    echo "lmesh did not restart after pid=${old:-none}" >&2
+    echo "$service did not restart after pid=${old:-none}" >&2
     return 1
 }
 
@@ -221,9 +296,14 @@ case "${1:-musl}" in
     lmesh-check) lmesh_check ;;
     lmesh-test) lmesh_test ;;
     object-store-test) object_store_test ;;
-    object-store-udp) object_store_udp "$@" ;;
-    object-store-udp-status) object_store_udp_status "$@" ;;
+    transport-test) transport_test ;;
+    transport-coverage) transport_coverage ;;
+    transport-fuzz-smoke) transport_fuzz_smoke ;;
+    transport-loopback) transport_loopback "$@" ;;
+    transport-tcp-loopback) transport_tcp_loopback "$@" ;;
+    transport-compare) transport_compare "$@" ;;
+    object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
-    recovery-test) recovery_test ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|object-store-test|object-store-udp|object-store-udp-status|lmesh-restart|recovery-test}" >&2; exit 2 ;;
+    lmesh-wifi-restart) lmesh_wifi_restart ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|object-store-test|transport-test|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
 esac
