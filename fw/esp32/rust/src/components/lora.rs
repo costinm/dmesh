@@ -5,12 +5,12 @@
 //! names, packet forwarding, and the mesh transport bridge.  It has no SPI,
 //! GPIO, interrupt, or chip-driver implementation.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::parse_bytes;
-use super::settings::{parse_bool, parse_i32, SharedSettings};
+use super::settings::{SharedSettings, parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
 
 const DEFAULT_FREQUENCY_HZ: u32 = 913_125_000;
@@ -187,9 +187,16 @@ pub fn status_text(settings: &SharedSettings) -> String {
     match load_config(settings) {
         Ok(config) => format!(
             "lora backend=module chip={} freq={} bw={} sf={} cr={} sync_word=0x{:02x} tx_power={} cad_rx={} cad_interval_ms={} cad_rx_ms={} module_authoritative=true",
-            config.chip.as_str(), config.frequency_hz, config.bandwidth_hz,
-            config.sf, config.cr, config.sync_word, config.tx_power,
-            config.cad_rx, config.cad_interval_ms, config.cad_rx_ms
+            config.chip.as_str(),
+            config.frequency_hz,
+            config.bandwidth_hz,
+            config.sf,
+            config.cr,
+            config.sync_word,
+            config.tx_power,
+            config.cad_rx,
+            config.cad_interval_ms,
+            config.cad_rx_ms
         ),
         Err(err) => format!("lora backend=module configured=false error={err}"),
     }

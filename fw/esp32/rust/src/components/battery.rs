@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{parse_bool, SharedSettings};
+use super::settings::{SharedSettings, parse_bool};
 
 const DEFAULT_BATTERY_PIN: i32 = 35;
 const DEFAULT_DIVIDER: f32 = 2.2;

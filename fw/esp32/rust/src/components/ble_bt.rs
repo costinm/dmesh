@@ -1,16 +1,16 @@
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uchar, c_ushort};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{parse_bool, parse_i32, SharedSettings};
+use super::settings::{SharedSettings, parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
 
 extern "C" {
@@ -214,8 +214,22 @@ pub fn advertised_identity() -> String {
 pub fn uuid128_string(uuid: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        uuid[15], uuid[14], uuid[13], uuid[12], uuid[11], uuid[10], uuid[9], uuid[8],
-        uuid[7], uuid[6], uuid[5], uuid[4], uuid[3], uuid[2], uuid[1], uuid[0]
+        uuid[15],
+        uuid[14],
+        uuid[13],
+        uuid[12],
+        uuid[11],
+        uuid[10],
+        uuid[9],
+        uuid[8],
+        uuid[7],
+        uuid[6],
+        uuid[5],
+        uuid[4],
+        uuid[3],
+        uuid[2],
+        uuid[1],
+        uuid[0]
     )
 }
 
@@ -1528,7 +1542,11 @@ fn ble_stats() -> String {
         BLE_SCAN_STARTED.load(Ordering::Relaxed),
         BLE_RAW_NAN_KEEP_ACTIVE.load(Ordering::Relaxed),
         BLE_BONDING_ENABLED.load(Ordering::Relaxed),
-        if BLE_RAW_NAN_LINK_PROFILE.load(Ordering::Relaxed) { "raw_nan" } else { "default" },
+        if BLE_RAW_NAN_LINK_PROFILE.load(Ordering::Relaxed) {
+            "raw_nan"
+        } else {
+            "default"
+        },
         BLE_SCAN_REPORTS.load(Ordering::Relaxed),
         BLE_SCAN_MATCHED.load(Ordering::Relaxed),
         BLE_SCAN_LAST_RSSI.load(Ordering::Relaxed),

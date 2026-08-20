@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use esp_idf_sys as sys;
 
 use crate::commands::protocol::quote_text_value;
@@ -66,10 +66,11 @@ impl NvsCommand {
     }
 
     fn namespace(&self) -> Result<CommandResponse> {
-        let settings = self.settings.borrow();
+        let mut settings = self.settings.borrow_mut();
+        let handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
         Ok(CommandResponse::ok(format!(
             "namespace {}",
-            settings.namespace()
+            handler.namespace()
         )))
     }
 
@@ -97,9 +98,11 @@ impl NvsCommand {
         }
 
         let mut settings = self.settings.borrow_mut();
+        let mut handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
         let mut changed = Vec::new();
         for (key, value) in pairs {
-            settings.set_str(key, value)?;
+            handler.set(key, value)
+                .map_err(anyhow::Error::msg)?;
             log::info!("setting set: key={} value={}", key, value);
             changed.push(key.to_string());
         }
@@ -115,7 +118,10 @@ impl NvsCommand {
             .positional(positional_skip)
             .or_else(|| request.arg("key"))
             .ok_or_else(|| anyhow!("get requires KEY"))?;
-        let value = self.settings.borrow().get_str(key)?.unwrap_or_default();
+        let mut settings = self.settings.borrow_mut();
+        let handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
+        let value = handler.get(key)
+            .map_err(anyhow::Error::msg)?;
         Ok(CommandResponse::ok(format!(
             "{key}={}",
             quote_text_value(&value)
@@ -123,13 +129,13 @@ impl NvsCommand {
     }
 
     fn list_values(&self) -> Result<CommandResponse> {
-        let settings = self.settings.borrow();
-        let mut values = Vec::new();
-        for key in settings.known_keys() {
-            if let Some(value) = settings.get_str(key)? {
-                values.push(format!("{key}={}", quote_text_value(&value)));
-            }
-        }
+        let mut settings = self.settings.borrow_mut();
+        let handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
+        let values = handler.list()
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", quote_text_value(&value)))
+            .collect::<Vec<_>>();
         Ok(CommandResponse::ok(values.join(" ")))
     }
 }

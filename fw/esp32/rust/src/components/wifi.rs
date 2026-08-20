@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_char;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -13,6 +13,11 @@ unsafe extern "C" {
     ) -> sys::esp_err_t;
 }
 
+// A normal SoftAP beacon carrying the WFA NAN vendor IE. This is deliberately
+// a test source for the shared non-promiscuous receiver, not a substitute for
+// a real NAN synchronization beacon: an AP BSSID and its TSF remain AP-owned.
+const NAN_VENDOR_IE_BEACON_PROBE: [u8; 8] = [0xdd, 6, 0x50, 0x6f, 0x9a, 0x13, 0x44, 0x4d];
+
 // Main creates the default STA netif before initializing the Wi-Fi driver,
 // matching Recovery's C startup sequence. The normal ESP-IDF event handlers
 // own link-up and route transitions after association.
@@ -23,19 +28,17 @@ extern "C" {
     fn dmesh_module_loader_ip_netif_addr(esp_netif: *mut sys::esp_netif_t, which: u8) -> u32;
 }
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::{hex_bytes, parse_bytes};
-use super::settings::{parse_bool, parse_i32, SharedSettings};
+use super::settings::{SharedSettings, parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
 
 unsafe extern "C" {
     fn esp_wifi_connectionless_module_set_wake_interval(wake_interval: u16) -> sys::esp_err_t;
-    fn dmesh_wifi_filter_set_bssid(interface_id: u8, bssid: *const u8, enabled: bool) -> i32;
-    fn dmesh_wifi_filter_supported() -> bool;
 }
 
 const FRAME_ADDR1: usize = 4;
@@ -399,8 +402,13 @@ pub fn apply_raw_wifi_tx_for_lab(
     prepare_raw_tx(request.channel)?;
     let interface = match request.interface {
         RawWifiInterface::Auto => None,
-        RawWifiInterface::Sta => Some(sys::wifi_interface_t_WIFI_IF_STA),
-        RawWifiInterface::Ap => Some(sys::wifi_interface_t_WIFI_IF_AP),
+        RawWifiInterface::Sta => Some(dmesh_fw_transport::wifi_esp::RadioInterface::Sta),
+        RawWifiInterface::Ap => Some(dmesh_fw_transport::wifi_esp::RadioInterface::Ap),
+        // The request remains explicit even though ESP-IDF documents raw
+        // 802.11 injection only for STA/AP.  Do not substitute STA here: a
+        // lab result must distinguish an unsupported NAN TX lane from a
+        // successful STA transmission.
+        RawWifiInterface::Nan => Some(dmesh_fw_transport::wifi_esp::RadioInterface::Nan),
     };
     let rate = match request.rate {
         RawWifiRate::Auto => "auto",
@@ -413,12 +421,63 @@ pub fn apply_raw_wifi_tx_for_lab(
         RawWifiRate::Mbps48 => "48",
         RawWifiRate::Mbps54 => "54",
     };
-    configure_fixed_tx_rate(
-        rate,
-        interface.unwrap_or_else(raw_tx_interface),
-        request.disable_11b,
-    )?;
-    raw_tx_frame_on(request.frame, request.system_sequence, interface)?;
+    let is_action = request.frame.len() >= 24 && request.frame[0] == 0xd0 && request.frame[1] == 0;
+    // APSTA's raw-data default is AP (the AP owner supplies its source MAC),
+    // but the proven connectionless action lane is STA.  Keep an explicitly
+    // requested AP/NAN lane exact; only `auto` picks the viable STA action
+    // interface.
+    let selected_interface = if is_action {
+        interface.unwrap_or(dmesh_fw_transport::wifi_esp::RadioInterface::Sta)
+    } else {
+        interface.unwrap_or_else(|| {
+            if raw_tx_interface() == sys::wifi_interface_t_WIFI_IF_AP {
+                dmesh_fw_transport::wifi_esp::RadioInterface::Ap
+            } else {
+                dmesh_fw_transport::wifi_esp::RadioInterface::Sta
+            }
+        })
+    };
+    // `auto` means leave the driver's existing policy alone.  In particular
+    // do not reset the action-TX lane just before submitting a complete
+    // action frame; callers that want a probe rate supply it explicitly.
+    if request.rate != RawWifiRate::Auto {
+        configure_fixed_tx_rate(
+            rate,
+            dmesh_fw_transport::wifi_esp::radio_interface_id(selected_interface),
+            request.disable_11b,
+        )?;
+    }
+    // ESP-IDF documents `esp_wifi_80211_tx` for STA/AP and rejects some
+    // associated-station action injections.  A complete action frame still
+    // belongs on the raw control surface: retain the caller's A1/A3/body but
+    // use the driver's action-TX lane, which accepts an explicit interface.
+    // This lets the same CBOR request exercise STA, APSTA's AP lane, or the
+    // experimental NAN interface without a convenience-only frame format.
+    if is_action {
+        let destination: [u8; 6] = request.frame[4..10]
+            .try_into()
+            .map_err(|_| anyhow!("raw action destination"))?;
+        let bssid: [u8; 6] = request.frame[16..22]
+            .try_into()
+            .map_err(|_| anyhow!("raw action BSSID"))?;
+        if !dmesh_fw_transport::wifi_espnow_esp::transmit_public_action_on_interface(
+            selected_interface,
+            destination,
+            bssid,
+            &request.frame[24..],
+        ) {
+            bail!(
+                "raw action transmission failed err=0x{:x}",
+                dmesh_fw_transport::wifi_espnow_esp::last_tx_error()
+            )
+        }
+    } else {
+        raw_tx_frame_on(
+            request.frame,
+            request.system_sequence,
+            interface.map(dmesh_fw_transport::wifi_esp::radio_interface_id),
+        )?;
+    }
     RAW_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
     telemetry::record_packet("wifi", Direction::Tx, request.frame, "raw_lab=true");
     Ok(())
@@ -647,24 +706,6 @@ pub fn start_raw_monitor_mode(channel: u8, filter: &str) -> Result<()> {
     start_raw_only(channel, filter)
 }
 
-/// Apply the Wi-Fi MAC's internal BSSID comparator. This is a hardware
-/// prefilter, unlike `RAW_FILTER_BSSID`, which discards a frame in software
-/// after the promiscuous callback has already run.
-pub(crate) fn set_hardware_bssid_filter(bssid: [u8; 6], enabled: bool) -> Result<()> {
-    if !unsafe { dmesh_wifi_filter_supported() } {
-        bail!("hardware Wi-Fi BSSID filter is unavailable")
-    }
-    // Raw-NAN owns the NAN receive policy, not the public STA/AP profiles.
-    // Using the STA comparator here can leave NAN action frames outside the
-    // intended hardware-filter path on targets that expose a separate NAN
-    // interface slot (notably ESP32-C6).
-    let rc = unsafe { dmesh_wifi_filter_set_bssid(2, bssid.as_ptr(), enabled) };
-    if rc != 0 {
-        bail!("hardware Wi-Fi BSSID filter failed result={rc}")
-    }
-    Ok(())
-}
-
 pub fn start_light_sleep_test_mode(mode: &str, channel: u8) -> Result<()> {
     let channel = channel.clamp(1, 13);
     match mode {
@@ -686,6 +727,24 @@ pub fn start_light_sleep_test_ap(channel: u8, beacon_ms: u32) -> Result<()> {
     let ssid = default_direct_ssid()?;
     let beacon_tu = beacon_ms_to_tu(beacon_ms);
     low_level_start_ap_with_beacon_tu(&ssid, "", channel, beacon_tu)
+}
+
+/// Start a channel-6 SoftAP beacon with a WFA NAN vendor IE for an RX-filter
+/// experiment. The basic open-AP/APSTA transition is shared in
+/// `dmesh-fw-transport` for Recovery and Main. This remains Main-specific
+/// only because it adds a Main-owned beacon vendor IE for its local
+/// NAN/power experiment.
+pub fn start_nan_vendor_ie_beacon_probe(channel: u8) -> Result<()> {
+    start_light_sleep_test_ap(channel, 102)?;
+    let result = unsafe {
+        sys::esp_wifi_set_vendor_ie(
+            true,
+            sys::wifi_vendor_ie_type_t_WIFI_VND_IE_TYPE_BEACON,
+            sys::wifi_vendor_ie_id_t_WIFI_VND_IE_ID_0,
+            NAN_VENDOR_IE_BEACON_PROBE.as_ptr().cast(),
+        )
+    };
+    esp_ok(result)
 }
 
 fn start_raw_only(channel: u8, filter: &str) -> Result<()> {
@@ -1823,7 +1882,12 @@ unsafe extern "C" fn ip_sta_start_task(argument: *mut core::ffi::c_void) {
                 format_ipv4_u32(info.ip.addr),
                 format_ipv4_u32(info.gw.addr),
                 format_ipv4_u32(info.netmask.addr),
-                ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                ap.bssid[0],
+                ap.bssid[1],
+                ap.bssid[2],
+                ap.bssid[3],
+                ap.bssid[4],
+                ap.bssid[5],
                 ap.rssi,
             ));
         }
@@ -1915,7 +1979,13 @@ fn start_ip_sta_sync(request: &CommandRequest, ssid: &str, psk: &str, channel: u
         if associated {
             telemetry::record_log(format!(
                 "event type=wifi.sta associated=true bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}",
-                ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5], ap.rssi
+                ap.bssid[0],
+                ap.bssid[1],
+                ap.bssid[2],
+                ap.bssid[3],
+                ap.bssid[4],
+                ap.bssid[5],
+                ap.rssi
             ));
         }
         if associated {
@@ -2238,7 +2308,6 @@ fn low_level_scan() -> Result<Vec<ScanAp>> {
 }
 
 fn low_level_stop_wifi() -> Result<()> {
-    let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         let _ = sys::esp_wifi_disconnect();
         let _ = sys::esp_wifi_set_promiscuous(false);
@@ -2307,7 +2376,6 @@ pub fn stop_raw_monitor() -> Result<()> {
     // internal RX callback so a raw IPv6/UDP adapter can take ownership of
     // received data frames without lwIP consuming them. Do not use it for the
     // current shared lwIP STA bearer; see `stop_raw_monitor_for_lwip_sta`.
-    let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
         let _ = sys::esp_wifi_internal_reg_rxcb(sys::wifi_interface_t_WIFI_IF_STA, None);
@@ -2334,7 +2402,6 @@ pub fn stop_raw_monitor() -> Result<()> {
 /// path remains available for the future no-lwIP IPv6/UDP experiment, where
 /// Main owns RX filtering, action frames, and frame parsing directly.
 pub fn stop_raw_monitor_for_lwip_sta() -> Result<()> {
-    let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         let _ = sys::esp_wifi_set_promiscuous(false);
         let stopped = sys::esp_wifi_stop();
@@ -2364,7 +2431,6 @@ pub fn stop_raw_monitor_for_lwip_sta() -> Result<()> {
 /// The esp-netif Wi-Fi attachment is stateful on ESP-IDF; preserving it is
 /// required when switching an active raw-NAN STA into the IP data plane.
 pub fn stop_raw_capture() -> Result<()> {
-    let _ = set_hardware_bssid_filter([0; 6], false);
     unsafe {
         esp_ok(sys::esp_wifi_set_promiscuous(false))?;
     }
@@ -2387,7 +2453,6 @@ pub fn stop_raw_wifi_for_sleep() -> Result<()> {
         .map_err(|_| anyhow!("Wi-Fi driver transition lock poisoned"))?;
     #[cfg(target_feature = "esp32s3ops")]
     {
-        let _ = set_hardware_bssid_filter([0; 6], false);
         unsafe {
             let _ = sys::esp_wifi_disconnect();
             let _ = sys::esp_wifi_set_promiscuous(false);
@@ -3592,11 +3657,7 @@ fn wifi_channel_status() -> (i32, &'static str) {
 fn ap_station_count() -> i32 {
     let mut list = sys::wifi_sta_list_t::default();
     let ret = unsafe { sys::esp_wifi_ap_get_sta_list(&mut list) };
-    if ret == sys::ESP_OK {
-        list.num
-    } else {
-        -1
-    }
+    if ret == sys::ESP_OK { list.num } else { -1 }
 }
 
 fn validate_wifi_string(name: &str, value: &str, max: usize) -> Result<()> {

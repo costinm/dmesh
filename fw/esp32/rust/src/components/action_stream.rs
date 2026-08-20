@@ -3,21 +3,21 @@
 //! NAN discovers peers; this module owns only complete action-frame datagrams
 //! and routes them by DCID. It is intentionally independent of NAN state.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dmesh_server::stream_server::{
     BinaryEventHistory, PassiveAssociations, StreamClientConnection, StreamServerConnection,
 };
 use dmesh_server::{
-    iperf::{decode_iperf_service_request, IperfServicePlan},
+    iperf::{IperfServicePlan, decode_iperf_service_request},
     services::{
-        decode_path_policy, diagnostic_stream_registry, encode_binary_events,
-        encode_path_policy_response, handle_stream_with_events, BinaryEventRecord,
-        CONTROL_PATH_POLICY,
+        BinaryEventRecord, CONTROL_PATH_POLICY, decode_path_policy, diagnostic_stream_registry,
+        encode_binary_events, encode_path_policy_response, handle_stream_with_events,
     },
 };
 use quic_lite::{
-    iperf::IperfSender, ConnectionId, ConnectionTable, PathState, ShortHeader, StreamRegistry,
-    FLAG_FIXED, SERVICE_CONTROL, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_STATUS,
+    ConnectionId, ConnectionTable, FLAG_FIXED, PathState, SERVICE_CONTROL, SERVICE_EVENTS,
+    SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_STATUS, ShortHeader, StreamRegistry,
+    iperf::IperfSender,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -49,8 +49,6 @@ const MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
 // that call chain: the task can idle successfully, then reset the board on
 // its first datagram.  Keep this explicit, just as the shared UART L2 task
 // does, rather than making packet processing depend on a toolchain default.
-const UDP_BEARER_TASK_STACK_BYTES: usize = 20 * 1024;
-const UDP_BEARER_TASK_PRIORITY: u32 = 5;
 // UART enters the same DCID/server path as UDP.  Do not dispatch it from
 // Main's application task: creating a server connection and encoding its
 // bootstrap ACK has the same stack depth as the UDP path, and classic ESP32
@@ -69,11 +67,14 @@ const UART_PATH: usize = 1;
 const UDP_PATH: usize = 2;
 const SERVICE_LORA: u8 = 43;
 const SERVICE_HARDWARE: u8 = 45;
-/// Main-local lab command carried on the already flow-controlled hardware
-/// service. It starts an existing raw ESP-NOW IPERF client; it is not part of
-/// the air-frame protocol or a Recovery command schema.
-const HARDWARE_ESPNOW_IPERF_PREFIX: &[u8] = b"espnow-iperf:";
-const HARDWARE_RAW_UDP6_IPERF_PREFIX: &[u8] = b"raw-udp6-iperf:";
+/// Send one complete raw NOW-like action through the shared transport lane.
+/// The body is destination MAC followed by the portable `rawnan` payload;
+/// this is a radio/filter diagnostic, not an ESP-IDF ESP-NOW operation.
+const HARDWARE_ESPNOW_ACTION_PREFIX: &[u8] = b"espnow-action:";
+const HARDWARE_NAN_PUBLIC_ACTION_PREFIX: &[u8] = b"nan-public-action:";
+/// Main-only source for the shared Recovery/Main non-promiscuous beacon-IE
+/// receive experiment. This is not an ESP-NOW or NAN data-path command.
+const HARDWARE_NAN_VENDOR_IE_PROBE_PREFIX: &[u8] = b"nan-vendor-ie-probe:";
 const MODULE_EVENT_HISTORY: usize = 16;
 const MODULE_EVENT_RESPONSE_MAX: usize = MTU - 64;
 /// All IP bearers use the same QUIC-lite port. This is an L2 adapter socket,
@@ -260,8 +261,12 @@ pub fn open_espnow_client_request(peer: [u8; 6], request: Option<Vec<u8>>) -> Re
         remember_association(peer, client);
         (client, open[..used].to_vec())
     };
-    wifi::send_espnow_payload_to(peer, &open)
-        .map_err(|error| anyhow!("ESP-NOW client OPEN send: {error}"))?;
+    if !dmesh_fw_transport::wifi_espnow_esp::transmit(
+        dmesh_fw_transport::wifi_espnow_esp::EspNowPeer { mac: peer },
+        &open,
+    ) {
+        return Err(anyhow!("ESP-NOW client OPEN send failed"));
+    }
     Ok(client)
 }
 
@@ -313,8 +318,6 @@ static PASSIVE_ASSOCIATIONS: OnceLock<
 > = OnceLock::new();
 static ASSOCIATION_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static NEXT_CID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x2000);
-static UDP_BEARER_ENABLED: AtomicBool = AtomicBool::new(false);
-static UDP_BEARER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Main owns only the lock and producer wiring. The bounded event record and
 /// replacement policy are bearer-neutral dmesh-server state.
@@ -330,8 +333,7 @@ pub fn publish_module_event(event_id: u16, value_type: u8, flags: u8, payload: &
     let Ok(mut history) = event_history().try_lock() else {
         return false;
     };
-    history.push(event_id, value_type, flags, payload);
-    true
+    history.push(event_id, value_type, flags, payload)
 }
 
 /// Main's `events` response is canonical CBOR `[next, [[seq,id,type,flags,
@@ -422,7 +424,6 @@ pub fn receive_udp(packet: &[u8]) -> Option<Vec<u8>> {
 /// Allocation-free bridge used by Main's optional raw UDP6 bearer. Connection
 /// ownership remains in this Main-specific multipath table; the shared ESP
 /// adapter only supplies the received Ethernet peer and caller-owned output.
-#[cfg(feature = "wifi-raw-udp6")]
 pub fn receive_raw_udp6(packet: &[u8], output: &mut [u8; MTU]) -> Option<usize> {
     let response = receive_udp(packet)?;
     if response.len() > output.len() {
@@ -465,7 +466,10 @@ fn receive(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> bool {
         if uart {
             let _ = super::serial::write_transport_packet(&response);
         } else {
-            let _ = wifi::send_espnow_payload_to(peer, &response);
+            let _ = dmesh_fw_transport::wifi_espnow_esp::transmit(
+                dmesh_fw_transport::wifi_espnow_esp::EspNowPeer { mac: peer },
+                &response,
+            );
         }
     }
     true
@@ -671,32 +675,41 @@ fn receive_response(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> Op
                     .unwrap_or_default())
             } else if service == SERVICE_EVENTS {
                 events_response(body)
-            } else if service == SERVICE_HARDWARE && body.starts_with(HARDWARE_ESPNOW_IPERF_PREFIX)
+            } else if service == SERVICE_HARDWARE && body.starts_with(HARDWARE_ESPNOW_ACTION_PREFIX)
             {
-                match start_hardware_espnow_iperf(body) {
-                    Ok(cid) => Ok(format!("espnow_iperf_started cid={}", cid.value()).into_bytes()),
-                    Err(error) => Err(error),
-                }
+                let bytes = send_hardware_espnow_action(body).map_err(anyhow::Error::msg)?;
+                Ok(format!("espnow_action_sent bytes={bytes}").into_bytes())
             } else if service == SERVICE_HARDWARE
-                && body.starts_with(HARDWARE_RAW_UDP6_IPERF_PREFIX)
+                && body.starts_with(HARDWARE_NAN_VENDOR_IE_PROBE_PREFIX)
             {
-                match start_hardware_raw_udp6_iperf(body) {
-                    Ok(cid) => {
-                        Ok(format!("raw_udp6_iperf_started cid={}", cid.value()).into_bytes())
-                    }
-                    Err(error) => Err(error),
-                }
+                start_hardware_nan_vendor_ie_probe(body).map_err(anyhow::Error::msg)?;
+                Ok(b"nan_vendor_ie_beacon_probe_started".to_vec())
+            } else if service == SERVICE_HARDWARE
+                && body.starts_with(HARDWARE_NAN_PUBLIC_ACTION_PREFIX)
+            {
+                send_hardware_nan_public_action(body).map_err(anyhow::Error::msg)?;
+                Ok(b"nan_public_action_sent".to_vec())
             } else if service == SERVICE_HARDWARE {
-                match inject_hardware_raw_80211(body) {
-                    Ok(bytes) => Ok(format!("raw80211_sent bytes={bytes}").into_bytes()),
-                    Err("hardware raw CBOR") => {
-                        if super::module::enqueue_stream_service(service, body) {
-                            Ok(vec![0x81, 0x00])
-                        } else {
-                            Err("module stream queue full or invalid request")
+                if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(body) {
+                    let mut response = [0u8; 192];
+                    let used = dmesh_fw_transport::wifi_radio_lab_esp::handle_encoded(
+                        request,
+                        &mut response,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    Ok(response[..used].to_vec())
+                } else {
+                    match inject_hardware_raw_80211(body) {
+                        Ok(bytes) => Ok(format!("raw80211_sent bytes={bytes}").into_bytes()),
+                        Err("hardware raw CBOR") => {
+                            if super::module::enqueue_stream_service(service, body) {
+                                Ok(vec![0x81, 0x00])
+                            } else {
+                                Err("module stream queue full or invalid request")
+                            }
                         }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
             } else if service == SERVICE_LORA {
                 // Module tasks must never run on a UART/UDP/ESP-NOW bearer
@@ -721,21 +734,26 @@ fn receive_response(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> Op
                 )
                 .map_err(|error| anyhow!(error))?;
                 let uart = dmesh_fw_transport::uart_esp::uart_l2_stats();
-                #[cfg(feature = "wifi-raw-udp6")]
                 let raw = dmesh_fw_transport::wifi_raw_udp6_esp::stats();
-                #[cfg(feature = "wifi-raw-udp6")]
                 let raw_start_status = dmesh_fw_transport::wifi_raw_udp6_esp::start_status();
-                #[cfg(not(feature = "wifi-raw-udp6"))]
-                let raw = (0, 0, 0, 0, 0, 0);
-                #[cfg(not(feature = "wifi-raw-udp6"))]
-                let raw_start_status = 0;
-                #[cfg(feature = "wifi-espnow-client")]
-                let espnow_client = dmesh_fw_transport::wifi_espnow_esp::iperf_client_result();
-                #[cfg(not(feature = "wifi-espnow-client"))]
+                let espnow_client = dmesh_fw_transport::wifi_espnow_esp::raw_client_result();
                 let espnow_client = (0, 0, 0);
+                let espnow = dmesh_fw_transport::wifi_espnow_esp::stats();
+                let espnow_rx_diagnostics =
+                    dmesh_fw_transport::wifi_espnow_esp::receive_diagnostics();
+                let espnow_client_diagnostics =
+                    dmesh_fw_transport::wifi_espnow_esp::client_diagnostics();
+                let espnow = (0, 0, 0, 0);
+                let espnow_rx_diagnostics = (0, 0, 0, 0);
+                let espnow_client_diagnostics = (0, 0, 0, 0, 0, 0, 0);
+                let wifi_promiscuous = dmesh_fw_transport::wifi_esp::promiscuous_enabled()
+                    .map(u8::from)
+                    .unwrap_or(u8::MAX);
+                let nan_dw_sync = dmesh_fw_transport::wifi_nan_dw_capture_esp::sync_diagnostics();
+                let nan_dw_sync = ([0; 6], 0, false);
                 status.extend_from_slice(
                     format!(
-                        ";build_timestamp={};active_connections={};uart_l2_baud={};uart_l2_rx_events={};uart_l2_rx_bytes={};raw_start_status={raw_start_status};raw_rx={};raw_drops={};raw_invalid={};raw_delivered={};raw_tx={};raw_tx_failures={};espnow_client_bytes={};espnow_client_errors={};espnow_client_elapsed_us={}",
+                        ";build_timestamp={};active_connections={};uart_l2_baud={};uart_l2_rx_events={};uart_l2_rx_bytes={};raw_start_status={raw_start_status};raw_rx={};raw_drops={};raw_invalid={};raw_delivered={};raw_tx={};raw_tx_failures={};espnow_rx={};espnow_drops={};espnow_tx={};espnow_tx_failures={};espnow_dispatcher_rx={};espnow_tx_hook_rx={};espnow_parse_drops={};espnow_self_echoes={};espnow_client_peer_mismatches={};espnow_client_receive_ok={};espnow_client_receive_errors={};espnow_client_last_error={};espnow_client_bootstrap_acks={};espnow_client_stream_packets={};espnow_client_other_packets={};espnow_client_bytes={};espnow_client_errors={};espnow_client_elapsed_us={};nan_dw_bssid={:02x}{:02x}{:02x}{:02x}{:02x}{:02x};nan_dw_anchor_us={};nan_dw_capturing={};wifi_promiscuous={wifi_promiscuous}",
                         env!("DMESH_BUILD_TIMESTAMP"),
                         active_connections,
                         uart.physical_baud,
@@ -747,9 +765,28 @@ fn receive_response(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> Op
                         raw.3,
                         raw.4,
                         raw.5,
+                        espnow.0,
+                        espnow.1,
+                        espnow.2,
+                        espnow.3,
+                        espnow_rx_diagnostics.0,
+                        espnow_rx_diagnostics.1,
+                        espnow_rx_diagnostics.2,
+                        espnow_rx_diagnostics.3,
+                        espnow_client_diagnostics.0,
+                        espnow_client_diagnostics.1,
+                        espnow_client_diagnostics.2,
+                        espnow_client_diagnostics.3,
+                        espnow_client_diagnostics.4,
+                        espnow_client_diagnostics.5,
+                        espnow_client_diagnostics.6,
                         espnow_client.0,
                         espnow_client.1,
                         espnow_client.2,
+                        nan_dw_sync.0[0], nan_dw_sync.0[1], nan_dw_sync.0[2],
+                        nan_dw_sync.0[3], nan_dw_sync.0[4], nan_dw_sync.0[5],
+                        nan_dw_sync.1,
+                        u8::from(nan_dw_sync.2),
                     )
                     .as_bytes(),
                 );
@@ -766,7 +803,12 @@ fn receive_response(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> Op
                 )
             };
             super::transport_runtime::stream_completed();
-            let body = response.map_err(|_| anyhow!("action service"))?;
+            // Preserve the adapter error on the direct UART diagnostic path.
+            // In particular, raw 802.11 lab injection needs to distinguish a
+            // frame-format rejection from an interface/rate-policy error;
+            // collapsing either to "action service" makes a non-promiscuous
+            // RX experiment impossible to interpret.
+            let body = response.map_err(|error| anyhow!("action service: {error}"))?;
             let (used, _) = server_connection
                 .encode_response(&body, &mut out)
                 .map_err(|_| anyhow!("action response"))?;
@@ -846,112 +888,83 @@ fn receive_response(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> Op
     }
 }
 
-/// Decode one exact Main hardware-service request. Keeping this parser small
-/// and local prevents a test control message from becoming a second wire
-/// protocol beside `rawnan`'s portable action-frame layout.
-fn start_hardware_espnow_iperf(body: &[u8]) -> Result<ConnectionId, &'static str> {
+/// Send a portable raw NOW-like payload without creating a QUIC-lite client.
+/// This keeps the receive-filter test distinct from connection admission,
+/// loss recovery, or IPERF scheduling.
+fn send_hardware_espnow_action(body: &[u8]) -> Result<usize, &'static str> {
     let value = body
-        .strip_prefix(HARDWARE_ESPNOW_IPERF_PREFIX)
+        .strip_prefix(HARDWARE_ESPNOW_ACTION_PREFIX)
         .ok_or("hardware request prefix")?;
-    if value.len() != 14 {
-        return Err("hardware espnow request must contain MAC plus u64 bytes");
+    if value.len() < 7 {
+        return Err("hardware espnow action must contain destination plus payload");
     }
-    let mut peer = [0u8; 6];
-    peer.copy_from_slice(&value[..6]);
-    let bytes = u64::from_be_bytes(value[6..14].try_into().map_err(|_| "hardware byte count")?);
-    if bytes == 0 {
-        return Err("hardware espnow byte count must be nonzero");
+    let destination: [u8; 6] = value[..6]
+        .try_into()
+        .map_err(|_| "hardware espnow destination")?;
+    let payload = &value[6..];
+    if payload.len() > dmesh_rawnan::espnow::MAX_ACTION_PAYLOAD {
+        return Err("hardware espnow action payload too large");
     }
-    #[cfg(feature = "wifi-espnow-client")]
-    {
-        if super::transport_runtime::start_shared_espnow_iperf(peer, bytes) {
-            return Ok(ConnectionId::new(1).expect("nonzero lab request CID"));
-        }
-        return Err("could not start shared ESP-NOW IPERF");
+    if dmesh_fw_transport::wifi_espnow_esp::transmit(
+        dmesh_fw_transport::wifi_espnow_esp::EspNowPeer { mac: destination },
+        payload,
+    ) {
+        Ok(payload.len())
+    } else {
+        Err("hardware espnow action transmission failed")
     }
-    #[cfg(not(feature = "wifi-espnow-client"))]
-    Err("ESP-NOW IPERF client is not enabled")
 }
 
-/// Runtime device-to-device raw IPv6/UDP diagnostic request. The peer MAC,
-/// RFC4291 address, and byte count are handler data, never a build feature.
-fn start_hardware_raw_udp6_iperf(body: &[u8]) -> Result<ConnectionId, &'static str> {
-    let value = body
-        .strip_prefix(HARDWARE_RAW_UDP6_IPERF_PREFIX)
+fn start_hardware_nan_vendor_ie_probe(body: &[u8]) -> Result<(), &'static str> {
+    let channel = body
+        .strip_prefix(HARDWARE_NAN_VENDOR_IE_PROBE_PREFIX)
         .ok_or("hardware request prefix")?;
-    if value.len() != 30 {
-        return Err("hardware raw UDP6 request must contain MAC, IPv6, and u64 bytes");
+    let channel = match channel {
+        [] => 6,
+        [channel] if (1..=13).contains(channel) => *channel,
+        _ => return Err("hardware NAN vendor-IE probe channel must be one byte 1..13"),
+    };
+    super::wifi::start_nan_vendor_ie_beacon_probe(channel)
+        .map_err(|_| "could not start NAN vendor-IE beacon probe")
+}
+
+/// Hardware request: `nan-public-action:` followed by destination MAC,
+/// BSSID, and complete public-action body. The host uses the portable rawnan
+/// SDF/follow-up builders; this adapter only selects the ESP action-TX lane.
+fn send_hardware_nan_public_action(body: &[u8]) -> Result<(), &'static str> {
+    let value = body
+        .strip_prefix(HARDWARE_NAN_PUBLIC_ACTION_PREFIX)
+        .ok_or("hardware NAN action prefix")?;
+    if value.len() < 18 || !value[12..].starts_with(&[0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13]) {
+        return Err("hardware NAN action requires destination, BSSID, and public NAN body");
     }
-    let mut peer = [0u8; 6];
-    peer.copy_from_slice(&value[..6]);
-    let mut ip = [0u8; 16];
-    ip.copy_from_slice(&value[6..22]);
-    let bytes = u64::from_be_bytes(
-        value[22..30]
-            .try_into()
-            .map_err(|_| "hardware byte count")?,
-    );
-    if bytes == 0 {
-        return Err("hardware raw UDP6 byte count must be nonzero");
-    }
-    #[cfg(feature = "wifi-raw-udp6-client")]
+    let destination: [u8; 6] = value[..6]
+        .try_into()
+        .map_err(|_| "hardware NAN destination")?;
+    let bssid: [u8; 6] = value[6..12].try_into().map_err(|_| "hardware NAN BSSID")?;
+    if dmesh_fw_transport::wifi_espnow_esp::transmit_public_action(destination, bssid, &value[12..])
     {
-        if super::transport_runtime::start_shared_raw_udp6_iperf(peer, ip, bytes) {
-            return Ok(ConnectionId::new(1).expect("nonzero lab request CID"));
-        }
-        return Err("could not start shared raw UDP6 IPERF");
+        Ok(())
+    } else {
+        Err("hardware NAN action transmission failed")
     }
-    #[cfg(not(feature = "wifi-raw-udp6-client"))]
-    Err("raw UDP6 IPERF client is not enabled")
 }
 
 fn inject_hardware_raw_80211(body: &[u8]) -> Result<usize, &'static str> {
     let request =
         dmesh_server::raw_wifi::decode_raw_wifi_tx(body).map_err(|_| "hardware raw CBOR")?;
     let bytes = request.frame.len();
-    super::wifi::apply_raw_wifi_tx_for_lab(request).map_err(|_| "hardware raw injection failed")?;
-    Ok(bytes)
-}
-
-/// Enable or suspend Main's UDP bearer without creating another transport
-/// endpoint. The task performs only nonblocking receives and yields to
-/// FreeRTOS between polls; STA association stays owned by `transport_runtime`.
-pub fn set_udp_bearer_enabled(enabled: bool) {
-    UDP_BEARER_ENABLED.store(enabled, Ordering::Release);
-    if !enabled || UDP_BEARER_STARTED.load(Ordering::Acquire) {
-        return;
+    if let Err(error) = super::wifi::apply_raw_wifi_tx_for_lab(request) {
+        // The client receives a stable compact error, while the detailed
+        // driver return stays in the bounded firmware log for the paired
+        // e7->e6 raw-action experiment.
+        super::telemetry::record_log(format!(
+            "event type=wifi.raw_lab_tx ok=false error={}",
+            crate::commands::protocol::escape_value(&error.to_string())
+        ));
+        return Err("hardware raw injection failed");
     }
-    let mut task = core::ptr::null_mut();
-    let started = unsafe {
-        esp_idf_sys::xTaskCreatePinnedToCore(
-            Some(udp_bearer_task_entry),
-            b"dmesh_udp_l2\0".as_ptr().cast(),
-            UDP_BEARER_TASK_STACK_BYTES as _,
-            core::ptr::null_mut(),
-            UDP_BEARER_TASK_PRIORITY,
-            &mut task,
-            0,
-        ) == 1
-            && !task.is_null()
-    };
-    // Do not latch a failed task creation forever. `transport_runtime::poll`
-    // calls this again while an infrastructure STA is associated, so a short
-    // memory/order pressure during boot becomes a bounded retry rather than a
-    // silent loss of the UDP bearer.
-    UDP_BEARER_STARTED.store(started, Ordering::Release);
-}
-
-unsafe extern "C" fn udp_bearer_task_entry(_argument: *mut core::ffi::c_void) {
-    udp_bearer_task();
-}
-
-fn udp_bearer_task() {
-    dmesh_fw_transport::wifi_esp::run_udp_server_bearer(
-        &UDP_BEARER_ENABLED,
-        UDP_TRANSPORT_PORT,
-        receive_udp,
-        poll_udp,
-    );
+    Ok(bytes)
 }
 
 /// Main's only UART-specific policy callback. Framing, admission and egress
@@ -973,6 +986,39 @@ pub fn dispatch_uart_raw_ingress(
     _item: dmesh_fw_transport::shared_ingress_esp::IngressPacket,
     record: &[u8],
 ) {
+    if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(record) {
+        let mut response = [0u8; 192];
+        match dmesh_fw_transport::wifi_radio_lab_esp::handle_encoded(request, &mut response) {
+            Ok(used) => {
+                let _ = super::serial::write_direct_record(&response[..used]);
+            }
+            Err(error) => {
+                // Raw PPP is an operational diagnostic path.  Return an
+                // explicit bounded record on the same bearer so host tests
+                // can distinguish an unavailable radio client from a UART
+                // timeout; the identical CBOR request is usable on streams.
+                let _ = super::serial::write_direct_record(error.as_bytes());
+                let _ = super::telemetry::record_log(format!(
+                    "event type=radio.lab error={}",
+                    crate::commands::protocol::escape_value(error)
+                ));
+            }
+        }
+        return;
+    }
+    if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_tx(record) {
+        match dmesh_fw_transport::wifi_radio_lab_esp::transmit_raw_action(request) {
+            Ok(bytes) => {
+                let _ = super::serial::write_direct_record(
+                    format!("radio raw action sent bytes={bytes}").as_bytes(),
+                );
+            }
+            Err(error) => {
+                let _ = super::serial::write_direct_record(error.as_bytes());
+            }
+        }
+        return;
+    }
     if !super::transport_runtime::apply_direct_record(record) {
         super::telemetry::record_log(format!(
             "event type=direct_record rejected=true bytes={}",

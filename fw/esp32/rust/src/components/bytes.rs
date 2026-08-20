@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 pub fn parse_bytes(value: &str) -> Result<Vec<u8>> {
     let value = value.strip_prefix("hex:").unwrap_or(value);

@@ -258,9 +258,9 @@ fn run() -> Result<()> {
         // bounded by the NAN dwell without adding periodic wakeups during
         // light sleep.
         let housekeeping_ms = if components::mode::raw_nan_duty_active() {
-            // The NAN-required post-beacon dwell is only 32 ms. Polling at
-            // 10 ms keeps shutdown close to that dwell without adding any
-            // periodic wakeups while the radio is light-sleeping.
+            // A NAN discovery window can receive a beacon near its end. Keep
+            // the bounded post-beacon shutdown responsive without adding an
+            // idle periodic wake.
             10
         } else {
             MAIN_HOUSEKEEPING_POLL_MS

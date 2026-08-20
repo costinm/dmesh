@@ -16,23 +16,26 @@ object records). Every Rust source file in this crate repeats that boundary.
 
 ## Transport profile and NVS
 
-`TransportProfile` is the fixed-capacity, allocation-free STA and transport
-profile. Both binaries persist it under NVS namespace `dmesh` with these keys:
+`TransportProfile` is the fixed-capacity, allocation-free runtime STA
+preference. The registered firmware `nvs` handler owns persistent settings;
+the only value read directly before that handler can run is `dmesh:ssid`.
 
 | Field | NVS key |
 | --- | --- |
 | STA SSID | `ssid` |
-| transport peer | `server` |
-| static IPv4 address | `ip` |
-| gateway | `gw` |
-| mask | `mask` |
-| UDP transport port | `port` |
 
-`TransportSettings` adapts these operations to a platform NVS handle.
-`load_profile` and `persist_profile` own bounded parsing and serialization;
-they never initialize flash/NVS, start STA, or commit an RTC boot target.
-Main's settings service must expose these same keys directly. Historical
-`recovery.*` aliases are not a transport configuration surface.
+Raw UDP6 derives its link-local source address from the STA MAC and its peer
+from received packets/the associated AP BSSID. It does not use an NVS IPv4
+address, gateway, mask, server, or UDP port.
+
+Unsolicited events default to the stable `lmesh-wifi` UDP destination port
+3336. This runtime default is not persisted and is distinct from the fixed
+raw UDP6 bearer port (3339); a registered event handler may select a different
+destination. Service requests, including iperf, carry their own port.
+
+Use `nvs get ssid` and `nvs set ssid <value>` for this preference. The same
+handler owns other validated DMesh NVS values. Historical `recovery.*` aliases
+are not a transport configuration surface.
 
 ## Command schema
 
@@ -55,12 +58,12 @@ command API.
 | Direct record | Why it may bypass QUIC-lite | Direction/limits |
 | --- | --- | --- |
 | Stage2 boot selection/status | Stage2 runs before the transport runtime exists | UART only; small CBOR request/response |
-| Initial STA profile/bootstrap request | Needed only to create the first usable IP/QUIC-lite path | UART only; bounded profile; no bulk data |
+| Initial STA profile/bootstrap request | Needed only to select the first raw UDP6 association | UART only; bounded SSID preference; no bulk data |
 | Boot identity and fatal bootstrap failure | Lets an attached operator diagnose failure before a connection exists | device-to-host only; one bounded record per event |
 | Explicit recovery escape/reboot request | Last-resort repair when no usable transport can be established | UART only; authenticated in the future security layer |
 
 Ordinary configuration, command responses, object/flash requests, status,
-metrics, iperf, and all ordinary logs are prohibited from direct CBOR. They
+metrics, and all ordinary logs are prohibited from direct CBOR. They
 use registered QUIC-lite streams. A high-priority stream is the answer for a
 latency-sensitive command or response; it must not open a bypass.
 
@@ -69,6 +72,38 @@ Before removing Main's legacy dispatcher, enforce this allow-list at direct
 ingress and count/reject every other direct record. Normal log streaming is
 also deferred; until then boot/fatal records above are the only direct log
 exceptions.
+
+### Live STA egress and raw-rate controls
+
+The direct Recovery command `recovery sta_driver_tx=true|false` changes the
+next raw-UDP6 STA response without a reboot or a Wi-Fi re-association.
+`false` selects explicit raw 802.11 injection; `true` selects the ESP-IDF
+associated Ethernet handoff (`esp_wifi_internal_tx`). The control is volatile
+and is reset to `false` at boot. It exists to compare driver queue/rate
+behavior while preserving the same NDP, UDP6 parser, QUIC-lite connection,
+and packet-pool path; it is not a production network preference.
+
+`recovery raw_tx_rate=<0|6|9|12|18|24|36|48|54>` is a raw-injection
+diagnostic, not evidence that a PHY change took effect. It invokes ESP-IDF's
+fixed-rate API without a reboot or reassociation, but on the current C6 test a
+post-association request for 6 Mbit/s was accepted while both host evidence
+and raw-TX completion status still showed the 1-Mbit/s default. Inspect the
+completion rate and host capture; never treat command acceptance as an applied
+rate. `0` leaves ESP-IDF's documented 1-Mbit/s raw-frame default in effect;
+it is not driver rate control.
+
+Every direct Recovery command patches only the named live fields. For example,
+changing `sta_driver_tx` preserves the configured NAN/NOW opt-in, ACK cadence,
+rate, and path policy. `radio.snapshot` reports the active `sta_driver_tx`
+selection alongside the existing raw TX rate and counters.
+
+`recovery bssid_check_disabled=true|false` selects the private STA receive
+filter used by raw UDP6 and action experiments. `true` is the historical
+default/bypass. Changing it performs one logged STA stop/start and
+re-association (about one second on e6), rather than claiming that the private
+filter can be safely reversed while frames are live. It does not reboot the
+device or rebuild firmware. `radio.snapshot` key `78` reports the applied
+setting; validate each choice with NDP plus a completed UDP6 request.
 
 ## Main command migration
 
@@ -80,7 +115,7 @@ path.
 
 | Existing Main area | Shared handler destination |
 | --- | --- |
-| Recovery/flash profile, GET/object, iperf | existing `recovery` and `object` services |
+| Recovery/flash profile and GET/object | existing `recovery` and `object` services |
 | status, metrics, events, logs | existing `status`, `metrics`, `events`, `log-watch` services |
 | Wi-Fi STA/session control | `control` handler plus firmware STA adapter |
 | NAN, LoRa/FSK, ESP-NOW, battery, hardware/modules | Main-contributed handlers with stable numeric tags and names |

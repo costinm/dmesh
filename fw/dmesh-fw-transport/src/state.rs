@@ -15,7 +15,10 @@ pub(crate) fn direct_record_queued() {
 /// A direct record was accepted by the narrow exception dispatcher. This is
 /// deliberately separate from transport ingress and wakes a worker waiting
 /// for a subsequent run.
-pub(crate) fn direct_record_accepted() {
+/// Account for a common direct control record accepted by either Recovery or
+/// Main.  The wake/generation primitive is firmware-only, but it cannot be
+/// Recovery-private because both images dispatch the identical CBOR records.
+pub fn direct_record_accepted() {
     direct_record_queued();
 }
 

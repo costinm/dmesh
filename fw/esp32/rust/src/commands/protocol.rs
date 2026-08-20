@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, Result};
-use minicbor::{data::Type, Decoder, Encoder};
+use anyhow::{Result, anyhow, bail};
+use minicbor::{Decoder, Encoder, data::Type};
 use std::net::IpAddr;
 
 use super::CommandRequest;
@@ -657,7 +657,9 @@ pub fn decode_binary(input: &[u8]) -> Result<CommandRequest> {
                             // inside the payload map. Accept the documented
                             // hex form as well as native CBOR byte strings.
                             Type::String => payload.extend(decode_text_bytes(decoder.str()?)?),
-                            kind => bail!("unexpected payload data type {kind:?}; expected bytes or hex string"),
+                            kind => bail!(
+                                "unexpected payload data type {kind:?}; expected bytes or hex string"
+                            ),
                         }
                     } else {
                         let value = match decoder.datatype()? {
@@ -873,8 +875,10 @@ mod tests {
             Some(&[0x20, 0x01, 0xdb, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..])
         );
         let encoded = encode_binary(&request);
-        assert!(encoded
-            .windows(7)
-            .any(|window| window == [0x18, 0xf7, 0x44, 10, 78, 0, 200]));
+        assert!(
+            encoded
+                .windows(7)
+                .any(|window| window == [0x18, 0xf7, 0x44, 10, 78, 0, 200])
+        );
     }
 }

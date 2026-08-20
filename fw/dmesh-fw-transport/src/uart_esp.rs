@@ -1,11 +1,11 @@
-// IMPORTANT: This is shared no-std ESP firmware code. PPP marker semantics
-// and classification are in quic-lite; this file owns ESP USB/UART queues and
-// the nonblocking FreeRTOS L2 task shared by Recovery and Main.
+// IMPORTANT: This is shared no-std ESP firmware code. It owns ESP USB/UART
+// queues and the nonblocking FreeRTOS L2 task shared by Recovery and Main.
+// PPP marker semantics and classification remain in quic-lite.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{classify_ppp_payload, PppIngress};
+use quic_lite::uart::{classify_uart_payload, UartIngress, UART_TRANSPORT_MARKER};
 use uart_codec::codec::{Decoder as UartDecoder, Encoder as UartEncoder};
 
 /// UART is an L2 bearer and therefore uses the transport MTU rather than a
@@ -617,7 +617,7 @@ pub(crate) fn enqueue_transport_packet(packet: &[u8]) -> bool {
 pub fn dequeue_transport_packet(out: &mut [u8; UART_MAX_PACKET]) -> Option<usize> {
     let _ = out;
     // Connection owners are called by the shared pool worker. Retaining this
-    // source-compatible stub prevents old optional lwIP lab code from
+    // source-compatible stub prevents old optional lab code from
     // accidentally reviving a second UART packet queue.
     None
 }
@@ -673,7 +673,7 @@ pub fn send_transport_packet(packet: &[u8]) -> bool {
         len: (packet.len() + 1) as u16,
         bytes: [0; UART_MAX_PACKET],
     };
-    queued.bytes[0] = crate::UART_TRANSPORT_MARKER;
+    queued.bytes[0] = UART_TRANSPORT_MARKER;
     queued.bytes[1..packet.len() + 1].copy_from_slice(packet);
     UART_EGRESS_QUEUED.fetch_add(1, Ordering::AcqRel);
     let accepted = unsafe {
@@ -1062,8 +1062,8 @@ fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
         // CBOR-over-PPP. Transport-marked packets are deliberately not fed
         // into that parser: their stream dispatch belongs to the shared
         // transport runtime above this physical bearer.
-        match classify_ppp_payload(&record) {
-            Ok(PppIngress::DirectRecord(record)) => {
+        match classify_uart_payload(&record) {
+            Ok(UartIngress::DirectRecord(record)) => {
                 if crate::shared_ingress_esp::enqueue(
                     crate::shared_ingress_esp::IngressKind::UartRaw,
                     [0; 6],
@@ -1073,7 +1073,7 @@ fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
                     notify_ingress();
                 }
             }
-            Ok(PppIngress::Transport(packet)) => {
+            Ok(UartIngress::Transport(packet)) => {
                 if enqueue_transport_packet(packet) {
                     activate_window();
                     notify_ingress();

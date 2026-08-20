@@ -1,10 +1,10 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::{hex_bytes, parse_bytes};
-use super::settings::{parse_i32, SharedSettings};
+use super::settings::{SharedSettings, parse_i32};
 
 #[derive(Clone, Debug)]
 struct I2cState {

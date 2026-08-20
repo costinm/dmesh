@@ -7,97 +7,46 @@
 //! request to the Recovery-owned parameter image. UART, UDP, and future L2
 //! bearers call this handler without inheriting USB, PPP, or FreeRTOS code.
 
-use alloc::vec::Vec;
-use dmesh_server::services::{encode_numeric_result, encode_status_text};
+use dmesh_server::services::{encode_status_numeric, encode_status_text};
 
 use crate::TransportProfile;
 
-/// Emit the shared Recovery diagnostic envelope over the configured direct
-/// record egress.  This stays with the schema/command boundary; UART merely
-/// transports the resulting opaque record.
+/// Emit a pre-encoded schema record through the selected direct bearer.
+/// This is the bounded UART bootstrap fallback only: it is used before a
+/// stream client can request status/events. Normal on-demand replies belong
+/// on their requesting stream, and state transitions belong in event history.
+pub fn send_record(record: &[u8]) -> bool {
+    crate::uart_esp::send_direct_record(record)
+}
+
+/// Emit the shared diagnostic envelope over the registered direct-record
+/// bearer. The selected bearer is a runtime policy, not a command concern.
 pub fn send_response(message: &[u8]) {
     let Some(cbor) = encode_status_text(message) else {
         return;
     };
-    let _ = crate::uart_esp::send_direct_record(&cbor);
+    let _ = send_record(&cbor);
 }
 
 pub fn send_stat(prefix: &[u8], value: u64) {
-    let mut message = [0u8; 96];
-    if prefix.len() >= message.len() {
-        return;
-    }
-    message[..prefix.len()].copy_from_slice(prefix);
-    let mut digits = [0u8; 20];
-    let mut number = value;
-    let mut count = 0;
-    loop {
-        digits[count] = b'0' + (number % 10) as u8;
-        count += 1;
-        number /= 10;
-        if number == 0 {
-            break;
-        }
-    }
-    for index in 0..count {
-        message[prefix.len() + index] = digits[count - index - 1];
-    }
-    send_response(&message[..prefix.len() + count]);
-}
-
-/// Emit compact numeric benchmark telemetry. Numeric keys are part of the
-/// dmesh-server schema and deliberately never leak into UART transport code.
-pub fn send_benchmark_stats(values: &[(u64, u64)]) {
-    let Some(cbor) = encode_benchmark_stats(values) else {
+    let Some(cbor) = encode_status_numeric(prefix, value) else {
         return;
     };
-    let _ = crate::uart_esp::send_direct_record(&cbor);
+    let _ = send_record(&cbor);
 }
 
-/// Encode completion telemetry once for every direct-record path. An
-/// oversized diagnostic is omitted rather than fragmented at the L2 layer.
-fn encode_benchmark_stats(values: &[(u64, u64)]) -> Option<Vec<u8>> {
-    encode_numeric_result(values)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::encode_benchmark_stats;
-    use alloc::vec::Vec;
-
-    #[test]
-    fn full_transport_benchmark_map_fits_shared_mtu() {
-        let values: Vec<(u64, u64)> = (0..84)
-            .map(|key| (key, u64::MAX.saturating_sub(key)))
-            .collect();
-        let encoded = encode_benchmark_stats(&values).expect("full benchmark map encodes");
-        assert!(encoded.len() <= dmesh_fw_transport::TRANSPORT_MTU);
-    }
-}
-
-/// Apply a transport-neutral Recovery request. Device persistence remains an
-/// explicit callback on the parameter image; the handler owns no bearer I/O.
-pub fn apply_packet(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
+/// Apply an already-dispatched raw command to the device's transient profile.
+/// Persisting settings is the registered NVS handler's responsibility; packet
+/// decoding and reply routing belong to `dmesh-server` and the shared
+/// dispatcher respectively.
+pub fn apply_profile_command(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
     let result = crate::apply_recovery_packet(packet, params)?;
-    if result.profile_updated {
-        unsafe {
-            let _ = crate::esp_nvs::persist_profile(params);
-        }
-    }
     Some(result.request_main_handoff)
-}
-
-/// Dispatch one direct Recovery CBOR record from any bearer.  UART and UDP
-/// only enqueue opaque records; this handler owns the schema and worker wake.
-pub fn accept_packet(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
-    let reboot_main = apply_packet(packet, params)?;
-    crate::state::direct_record_accepted();
-    Some(reboot_main)
 }
 
 #[cfg(test)]
 mod command_tests {
-    use super::apply_packet;
+    use super::apply_profile_command;
     use crate::{state::direct_record_generation_changed_from, TransportProfile};
 
     #[test]
@@ -107,14 +56,11 @@ mod command_tests {
     }
 
     #[test]
-    fn explicit_transport_window_accepts_the_declared_64_packet_ceiling() {
+    fn profile_command_keeps_runtime_values_out_of_device_state() {
         let packet = [0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x18, 0xf2, 0x18, 0x40];
         let mut params = TransportProfile::new();
-        assert_eq!(apply_packet(&packet, &mut params), Some(true));
-        assert_eq!(
-            params.iperf_window_packets,
-            quic_lite::RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS as u8
-        );
+        assert_eq!(apply_profile_command(&packet, &mut params), Some(true));
+        assert_eq!(params.ack_frequency, 0);
     }
 
     #[test]
@@ -124,9 +70,9 @@ mod command_tests {
             0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x64, b'p', b'a', b't', b'h', 0x03,
         ];
         let mut params = TransportProfile::new();
-        assert_eq!(apply_packet(&delay, &mut params), Some(true));
+        assert_eq!(apply_profile_command(&delay, &mut params), Some(true));
         assert_eq!(params.ack_delay_ms, 1);
-        assert_eq!(apply_packet(&path, &mut params), Some(true));
+        assert_eq!(apply_profile_command(&path, &mut params), Some(true));
         assert_eq!(params.path_policy, 3);
     }
 
@@ -139,16 +85,8 @@ mod command_tests {
             0x18, 0xf2, 0x00, 0x18, 0xf3, 0x00, 0x18, 0xf4, 0x00, 0x18, 0xf5, 0x00,
         ];
         let mut params = TransportProfile::new();
-        assert_eq!(apply_packet(&packet, &mut params), Some(true));
-        assert!(params.benchmark && params.transport_test);
-        assert_eq!(params.port, 3339);
-        assert_eq!(params.iperf_bytes, 28_800);
-        assert_eq!(
-            params.iperf_packet_size,
-            quic_lite::DEFAULT_MAX_STREAM_PAYLOAD as u16
-        );
+        assert_eq!(apply_profile_command(&packet, &mut params), Some(true));
         assert_eq!(params.ack_frequency, 8);
         assert_eq!(params.timeout_ms, 10_000);
-        assert_eq!(params.benchmark_run_id, 123);
     }
 }

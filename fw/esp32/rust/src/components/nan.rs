@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -16,7 +16,7 @@ use shared_nan::{
     NAN_DW_UNITS_SHIFT, NAN_REQUEST_ID_KEY, NAN_RX_FRAME_MAX,
 };
 
-use super::settings::{parse_bool, parse_i32, SharedSettings};
+use super::settings::{SharedSettings, parse_bool, parse_i32};
 use super::telemetry::{self, Direction};
 
 const NAN_ID: u8 = 1;
@@ -703,6 +703,23 @@ pub fn start_raw_window(channel: u8, filter: &str) -> Result<()> {
     // the retained frames even if the immediate TX is missed.
     if super::mode::infra_mode() {
         prime_infra_publish();
+    }
+    Ok(())
+}
+
+/// Gate raw NAN capture without unregistering the parser or changing radio
+/// ownership.  The Main mode scheduler uses this for short discovery windows:
+/// an infrastructure owner may keep Wi-Fi awake for AP/STA traffic, but must
+/// not leave the promiscuous management receiver active between NAN DWs.
+///
+/// This is intentionally a Main radio-policy primitive. The portable NAN
+/// codec and the raw UDP6/NOW-like bearers do not depend on it.
+pub fn set_raw_capture_enabled(enabled: bool) -> Result<()> {
+    if !NAN_RUNNING.load(Ordering::Acquire) {
+        bail!("NAN raw capture is not running");
+    }
+    unsafe {
+        esp_ok(sys::esp_wifi_set_promiscuous(enabled)).context("nan promiscuous state")?;
     }
     Ok(())
 }
@@ -2149,7 +2166,18 @@ impl NanCommand {
 
         telemetry::record_log(format!(
             "event type=nan.cycle start=true channel={} period_ms={} active_ms={} idle_ms={} count={} filter={} sync={} dw_tu={} offset_tu={} sync_ms={} extend_on_rx={} extend_ms={}",
-            channel, period_ms, active_ms, idle_ms, count, filter, sync, dw_tu, offset_tu, sync_timeout_ms, extend_on_rx, extend_ms
+            channel,
+            period_ms,
+            active_ms,
+            idle_ms,
+            count,
+            filter,
+            sync,
+            dw_tu,
+            offset_tu,
+            sync_timeout_ms,
+            extend_on_rx,
+            extend_ms
         ));
         for idx in 0..count {
             stop_nan()?;
@@ -2183,7 +2211,9 @@ impl NanCommand {
                     wait_us,
                     last_beacon_local_us(),
                     last_beacon_tsf_us(),
-                    NAN_RX_BEACON.load(Ordering::Relaxed).saturating_sub(before_beacon)
+                    NAN_RX_BEACON
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(before_beacon)
                 ));
                 if wait_us > 0 {
                     task_delay(Duration::from_micros(wait_us));
@@ -2246,9 +2276,13 @@ impl NanCommand {
                 extended,
                 estimated_tsf_us(end_local_us),
                 estimated_tsf_us(end_local_us) % (dw_tu * 1024),
-                NAN_RX_BEACON.load(Ordering::Relaxed).saturating_sub(start_beacons),
+                NAN_RX_BEACON
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(start_beacons),
                 NAN_RX_SDF.load(Ordering::Relaxed).saturating_sub(start_sdf),
-                NAN_RX_ACTION.load(Ordering::Relaxed).saturating_sub(start_action),
+                NAN_RX_ACTION
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(start_action),
                 last_beacon_local_us(),
                 last_beacon_tsf_us()
             ));
@@ -2436,80 +2470,10 @@ fn configured_hardware_filter_bssid() -> Option<[u8; 6]> {
 /// This runs from the normal Main task (never the Wi-Fi callback), so changing
 /// the internal driver comparator cannot block the RX interrupt path.
 fn reconcile_hardware_bssid_filter() {
-    if !NAN_RUNNING.load(Ordering::Relaxed) {
-        return;
-    }
-    let manual = configured_hardware_filter_bssid();
-    let desired = if let Some(bssid) = manual {
-        Some(bssid)
-    } else if !NAN_HW_FILTER_ENABLED.load(Ordering::Relaxed) {
-        None
-    } else {
-        let last = last_beacon_local_us();
-        let fresh = last != 0 && now_us().saturating_sub(last) < NAN_CLUSTER_RESELECT_AFTER_US;
-        if fresh && NAN_CLUSTER_LOCKED.load(Ordering::Acquire) {
-            Some(nan_cluster_bssid())
-        } else {
-            None
-        }
-    };
-    let currently_armed = NAN_HW_FILTER_STATE.load(Ordering::Acquire) == NAN_HW_FILTER_ARMED;
-    let current_bssid = nan_cluster_bssid();
-    let needs_change = match desired {
-        Some(bssid) => !currently_armed || current_bssid != bssid,
-        None => currently_armed,
-    };
-    if !needs_change {
-        return;
-    }
-    let result = match desired {
-        Some(bssid) => {
-            let result = super::wifi::set_hardware_bssid_filter(bssid, true);
-            if result.is_ok() {
-                NAN_HW_FILTER_STATE.store(NAN_HW_FILTER_ARMED, Ordering::Release);
-                NAN_HW_FILTER_ARMS.fetch_add(1, Ordering::Relaxed);
-            }
-            result
-        }
-        None => {
-            let result = super::wifi::set_hardware_bssid_filter([0; 6], false);
-            if result.is_ok() {
-                NAN_HW_FILTER_STATE.store(NAN_HW_FILTER_DISCOVERY, Ordering::Release);
-                NAN_HW_FILTER_REPROBES.fetch_add(1, Ordering::Relaxed);
-                if last_beacon_local_us() != 0
-                    && now_us().saturating_sub(last_beacon_local_us())
-                        >= NAN_CLUSTER_RESELECT_AFTER_US
-                {
-                    NAN_CLUSTER_LOCKED.store(false, Ordering::Release);
-                }
-            }
-            result
-        }
-    };
-    if let Err(err) = result {
-        NAN_HW_FILTER_ERRORS.fetch_add(1, Ordering::Relaxed);
-        telemetry::record_log(format!(
-            "event type=nan.hw_bssid_filter ok=false state={} error={}",
-            if desired.is_some() {
-                "armed"
-            } else {
-                "discovery"
-            },
-            crate::commands::protocol::escape_value(&err.to_string())
-        ));
-    } else {
-        telemetry::record_log(format!(
-            "event type=nan.hw_bssid_filter ok=true state={} bssid={}",
-            if desired.is_some() {
-                "armed"
-            } else {
-                "discovery"
-            },
-            desired
-                .map(|bssid| format_mac(&bssid))
-                .unwrap_or_else(|| "none".to_string())
-        ));
-    }
+    // C6 exposes only STA/AP RX lanes and both stay BSSID-check-disabled.
+    // Retain the observable state field for existing status schemas, but do
+    // not arm a private comparator from NAN cluster observations.
+    NAN_HW_FILTER_STATE.store(NAN_HW_FILTER_DISCOVERY, Ordering::Release);
 }
 
 fn ensure_rx_queue() -> Result<()> {
@@ -2930,29 +2894,7 @@ fn nan_sync_beacon_frame() -> Result<Vec<u8>> {
         bail!("no captured NAN synchronization beacon yet");
     }
     let tsf_us = observed_tsf_us.saturating_add(now_us().saturating_sub(local_us));
-    nan_sync_beacon_frame_for(&template, &station_mac()?, &nan_cluster_bssid(), tsf_us)
-}
-
-fn nan_sync_beacon_frame_for(
-    template: &[u8],
-    mac: &[u8; 6],
-    cluster_bssid: &[u8; 6],
-    tsf_us: u64,
-) -> Result<Vec<u8>> {
-    if template.len() < FRAME_DATA + 12 || template.len() > NAN_RX_FRAME_MAX {
-        bail!(
-            "invalid NAN synchronization beacon template length={}",
-            template.len()
-        );
-    }
-    if template[0] != 0x80 || !is_nan_bssid(template) {
-        bail!("captured frame is not a NAN synchronization beacon");
-    }
-    let mut frame = template.to_vec();
-    frame[FRAME_SRC..FRAME_SRC + 6].copy_from_slice(mac);
-    frame[FRAME_BSSID..FRAME_BSSID + 6].copy_from_slice(cluster_bssid);
-    frame[FRAME_DATA..FRAME_DATA + 8].copy_from_slice(&tsf_us.to_le_bytes());
-    Ok(frame)
+    dmesh_rawnan::rewrite_nan_sync_beacon(&template, &station_mac()?, &nan_cluster_bssid(), tsf_us)
 }
 
 /// Encode one committed 2.4-GHz availability entry from the raw-NAN duty
@@ -3523,12 +3465,17 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                                     match queue_solicited_publish(info.instance) {
                                         Ok(queued) => telemetry::record_log(format!(
                                             "event type=nan.solicited_publish_queued peer={} requestor_instance={} queue_len={}",
-                                            format_mac(&info.source), info.instance, queued
+                                            format_mac(&info.source),
+                                            info.instance,
+                                            queued
                                         )),
                                         Err(error) => telemetry::record_log(format!(
                                             "event type=nan.solicited_publish_queued ok=false peer={} requestor_instance={} message={}",
-                                            format_mac(&info.source), info.instance,
-                                            crate::commands::protocol::escape_value(&error.to_string())
+                                            format_mac(&info.source),
+                                            info.instance,
+                                            crate::commands::protocol::escape_value(
+                                                &error.to_string()
+                                            )
                                         )),
                                     };
                                 }
@@ -3620,10 +3567,10 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                                 }
                                 Err(error) => {
                                     telemetry::record_log(format!(
-                                    "event type=nan.dmesh_followup_ack_error peer={} seq={} message={}",
-                                    format_mac(&info.source),
-                                    dmesh.seq,
-                                    crate::commands::protocol::escape_value(&error.to_string())
+                                        "event type=nan.dmesh_followup_ack_error peer={} seq={} message={}",
+                                        format_mac(&info.source),
+                                        dmesh.seq,
+                                        crate::commands::protocol::escape_value(&error.to_string())
                                     ));
                                 }
                             }
@@ -4328,7 +4275,7 @@ mod tests {
             .copy_from_slice(&[0x50, 0x6f, 0x9a, 0x01, 0x01, 0x02]);
         template[FRAME_DATA + 12..].copy_from_slice(b"nan-ie");
 
-        let frame = nan_sync_beacon_frame_for(&template, &mac, &bssid, 42).unwrap();
+        let frame = dmesh_rawnan::rewrite_nan_sync_beacon(&template, &mac, &bssid, 42).unwrap();
         assert_eq!(&frame[FRAME_SRC..FRAME_SRC + 6], mac);
         assert_eq!(&frame[FRAME_BSSID..FRAME_BSSID + 6], bssid);
         assert_eq!(beacon_tsf_us(&frame), Some(42));

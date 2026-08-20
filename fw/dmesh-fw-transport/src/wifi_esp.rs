@@ -1,92 +1,57 @@
 // IMPORTANT: This is shared no-std ESP firmware code. QUIC-lite and CBOR
 // service mechanics remain in quic-lite/dmesh-server; this file owns ESP-IDF
-// STA, UDP sockets, and FreeRTOS bearer scheduling for Recovery and Main.
-//! Wi-Fi STA setup and UDP transport adapter.
+// STA and FreeRTOS bearer scheduling for Recovery and Main.
+//! Wi-Fi STA setup and raw Ethernet transport adapter.
 //!
-//! This module owns all bearer concerns: static STA configuration, sockets,
-//! bootstrap, datagram receive/send, and quic-lite scheduling. The
+//! This module owns all bearer concerns: static STA configuration, raw frame
+//! bootstrap, datagram receive/send, and QUIC-lite scheduling. The
 //! flashing module sees only ordered application stream callbacks.
 
-use crate::{
-    commands as uart,
-    flash::{FlashHandler, OBJECT_STREAM},
-    uart_esp as l2, TransportProfile,
-};
-use alloc::vec::Vec;
-#[cfg(not(feature = "wifi-raw-udp6"))]
-use core::sync::atomic::AtomicPtr;
+use crate::{commands as uart, TransportProfile};
+use alloc::{boxed::Box, vec::Vec};
 use core::{
-    ffi::{c_int, c_void},
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
-};
-use dmesh_server::{
-    iperf::{encode_iperf_service_request, IperfServiceRequest},
-    protocol::encode_get,
-};
-use quic_lite::iperf::IperfRun;
-use quic_lite::{
-    interpacket_gap_bucket, CommittedStreamDisposition, ConnectionId, DatagramTiming,
-    RecoveryEndpoint, Role, INTERPACKET_GAP_BUCKETS,
+    ffi::c_void,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering},
 };
 
-const UDP_MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
-// The socket queue is part of the receiver budget, not merely an incidental
-// lwIP tuning knob. A command may advertise the 64-packet diagnostic window;
-// accepting that flight with only the former 40-datagram queue lets ordinary
-// burst delivery drop packets before quic-lite can ACK or reorder them.
-// The raw command endpoint remains registered while a transport transfer is
-// active.  Two 64-packet lwIP queues plus the manifest and flash-slot pool
-// exhaust C6 internal RAM, so retain one 32-packet radio burst here. Transport
-// still supports a 64-packet peer-history budget; byte credit is the actual
-// startup backpressure.
-const UDP_RECEIVE_PACKETS: usize = 32;
-const UDP_RECEIVE_BUFFER_BYTES: usize = UDP_RECEIVE_PACKETS * UDP_MTU;
-// This is also the delayed-ACK timer tick. It must be shorter than the
-// transport delayed-ACK deadline so a short final burst is acknowledged even
-// when no more datagrams arrive.
-const SOCKET_TIMEOUT_MS: u32 = 5;
-// Bound one nonblocking lwIP drain so control/timer work cannot starve when
-// the peer continuously refills the UDP receive queue.
-const UDP_RECEIVE_DRAIN_LIMIT: usize = 32;
-// Recovery's UDP worker runs above Idle on the single-core C6. A yield is a
-// whole FreeRTOS tick on this board, so doing it after each burst turns the
-// receive loop into an accidental sender pacer. Drain eight bounded bursts
-// (at most 256 datagrams) before yielding: Idle and the flash worker still
-// run regularly, while ACK/window progress remains genuinely batched.
-const UDP_RECEIVE_YIELD_BURSTS: u64 = 8;
-// A few immediate returns establish that this is a real spin rather than the
-// normal tail after an ACK. The subsequent wall-clock budget, rather than a
-// packet/poll count, determines when we must let Idle run for a whole tick.
-const EMPTY_SOCKET_TICK_YIELD_SPINS: u64 = 8;
-// FreeRTOS runs at 100 Hz here, so vTaskDelay(1) costs roughly 10 ms. Do not
-// pay that cost once per handful of EWOULDBLOCK returns: it became most of a
-// benchmark's wall time. A 100 ms bound still gives Idle and the flash worker
-// a deterministic opportunity during a sustained empty spin.
-const EMPTY_SOCKET_MAX_UNYIELDED_US: u64 = 100_000;
-// LAN Recovery should not defer the tail of a burst for WAN-scale delays.
-// Reordering still triggers an immediate ACK inside quic-lite.
-// Recovery and the host object service use this LAN profile from bootstrap.
-// ACK_FREQUENCY may refine it later, but a lost one-shot control frame must
-// not silently fall back to ACK-every-two and collapse a 32-packet flight.
-const DEFAULT_ACK_FREQUENCY: u8 = 8;
-const RECOVERY_MAX_ACK_DELAY_MS: u64 = 5;
-const BOOTSTRAP_RETRY_MS: u64 = 500;
-/// Normal QUIC-lite PING interval used to refresh measurements on every live
-/// bearer. This is not an empty PPP heartbeat.
-const PATH_PROBE_INTERVAL_US: u64 = 1_000_000;
-const RECOVERY_CONNECTION_CID_PREFIX: u64 = 1 << 32;
-const SERVICE_OBJECT: u8 = quic_lite::SERVICE_OBJECT;
-const REQUEST_STREAM: u64 = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID;
-const IPERF_STREAM: u64 = quic_lite::FIRST_SERVER_BIDI_STREAM_ID;
-const IPERF_MAX_NORMAL_STREAMS: usize = 4;
-/// Three normal IPERF streams plus high/low service streams fit in this
-/// bounded Recovery endpoint.  This is transport stream-state capacity, not
-/// a UART queue size; keep it independent of the selected bearer.
-const RECOVERY_TRANSPORT_STREAMS: usize = IPERF_MAX_NORMAL_STREAMS + 2;
-/// Second server-initiated stream used only by the priority-flow test. It is
-/// a log-like low-priority service payload, not a UART/control record.
-const INITIAL_MAX_STREAM_DATA: u64 = quic_lite::INITIAL_MAX_STREAM_DATA;
-const TRANSPORT_UDP_PORT: u16 = 3339;
+// TODO: duplicated in nvs.rs, don't belong here.
+extern "C" {
+    fn nvs_flash_init() -> i32;
+    fn nvs_open(namespace: *const i8, mode: i32, handle: *mut u32) -> i32;
+    fn nvs_get_str(handle: u32, key: *const i8, value: *mut i8, length: *mut usize) -> i32;
+    fn nvs_close(handle: u32);
+}
+
+/// Load the one Wi-Fi setting needed before a stream handler exists. All
+/// ordinary NVS reads/writes use Main's registered `nvs` handler instead.
+pub unsafe fn initialize_nvs() -> bool {
+    let initialized = unsafe { nvs_flash_init() };
+    initialized == esp_idf_sys::ESP_OK || initialized == esp_idf_sys::ESP_ERR_INVALID_STATE
+}
+
+pub unsafe fn load_preferred_ssid(profile: &mut TransportProfile) {
+    if !unsafe { initialize_nvs() } {
+        return;
+    }
+    let mut handle = 0_u32;
+    if unsafe { nvs_open(b"dmesh\0".as_ptr().cast(), 0, &mut handle) } != esp_idf_sys::ESP_OK {
+        return;
+    }
+    let mut capacity = profile.ssid.len();
+    let result = unsafe {
+        nvs_get_str(
+            handle,
+            b"ssid\0".as_ptr().cast(),
+            profile.ssid.as_mut_ptr().cast(),
+            &mut capacity,
+        )
+    };
+    unsafe { nvs_close(handle) };
+    if result == esp_idf_sys::ESP_OK && capacity != 0 {
+        profile.ssid_len = capacity.saturating_sub(1).min(profile.ssid.len());
+    }
+}
+
 // Recovery-only PHY policy. It is deliberately not an NVS setting: normal
 // images retain their default protocol set.  ESP-IDF does not support an
 // 802.11n-only 2.4 GHz STA bitmap; the supported set is b/g/n.  Including n
@@ -94,35 +59,224 @@ const TRANSPORT_UDP_PORT: u16 = 3339;
 const RECOVERY_STA_PROTOCOL: u8 = (esp_idf_sys::WIFI_PROTOCOL_11B
     | esp_idf_sys::WIFI_PROTOCOL_11G
     | esp_idf_sys::WIFI_PROTOCOL_11N) as u8;
+// Keep the normal STA lane at HT20.  The data bearer must coexist with NAN
+// and NOW on 2.4 GHz, where an HT40 secondary channel is both less robust and
+// needlessly complicates retry/performance diagnosis.  A future dedicated
+// lab mode may opt into HT40, but it must not change the normal association.
+const RECOVERY_STA_HT40: bool = false;
 
-unsafe extern "C" {
-    fn __errno() -> *mut c_int;
-    fn esp_wifi_internal_set_fix_rate(
-        interface: esp_idf_sys::wifi_interface_t,
-        enabled: bool,
-        rate: esp_idf_sys::wifi_phy_rate_t,
-    ) -> i32;
-    fn esp_wifi_config_11b_rate(interface: esp_idf_sys::wifi_interface_t, disable: bool) -> i32;
+/// The one hardware radio personality currently allowed to own ESP-IDF.
+/// Bearers can share packet/QUIC code, but they must not independently alter
+/// Wi-Fi callbacks, promiscuous state, or channel while another personality
+/// is live.  All transitions are serialized and logged here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RadioMode {
+    Idle = 0,
+    // Test only modes
+    StaRawUdp6 = 1,
+    EspNowAction = 2,
+    NanPromiscuous = 3,
+    RadioLab = 4,
+
+    // Prod modes
+    // - Nan means promiscuous in DW (512ms or 4 sec for sleepy)
+    // - Now means action frames callback/tx
+    // Both must work along with AP (with other devices connected), APSta ()
+    ApRawUdp6 = 5, // Plus NanNow
+    /// Associated raw-UDP6, plus the bounded NAN discovery-window receiver
+    /// and the connectionless NOW action dispatcher.  This is one hardware
+    /// personality, not three independent owners of global Wi-Fi state.
+    StaRawUdp6NanNow = 6,
+    // Also UnasocStaRawUdp6NanNow.
+    // Also ApStaUdp6NanNow
 }
 
-/// Select the data rate used by raw-injected STA frames for one association.
-/// `0` restores ESP-IDF rate control. The STA initializer excludes legacy
-/// 11b/CCK rates *before* `esp_wifi_start`; ESP-IDF rejects that policy call
-/// afterward, so this post-association helper changes only the fixed-rate
-/// switch.
+impl RadioMode {
+    const fn label(self) -> &'static [u8] {
+        match self {
+            Self::Idle => b"idle",
+            Self::StaRawUdp6 => b"sta_raw_udp6",
+            Self::EspNowAction => b"espnow_action",
+            Self::NanPromiscuous => b"nan_promiscuous",
+            Self::RadioLab => b"radio_lab",
+            Self::ApRawUdp6 => b"ap_raw_udp6",
+            Self::StaRawUdp6NanNow => b"sta_raw_udp6_nan_now",
+        }
+    }
+}
+
+static RADIO_MODE: AtomicU8 = AtomicU8::new(RadioMode::Idle as u8);
+
+/// Claim the radio for exactly one named mode.  Returning false is an
+/// explicit mode conflict, never a best-effort change to global ESP-IDF
+/// settings.  The caller must stop the existing owner first.
+pub fn enter_radio_mode(mode: RadioMode) -> bool {
+    let previous = RADIO_MODE.load(Ordering::Acquire);
+    if previous == mode as u8 {
+        return true;
+    }
+    if previous != RadioMode::Idle as u8 {
+        uart::send_stat(b"wifi mode conflict active=", previous as u64);
+        uart::send_stat(b"wifi mode requested=", mode as u8 as u64);
+        return false;
+    }
+    if RADIO_MODE
+        .compare_exchange(previous, mode as u8, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    // TODO: one response (packet) with both
+    uart::send_response(b"wifi mode start");
+    uart::send_response(mode.label());
+    true
+}
+
+/// Release one named owner after it has disabled callbacks and radio state.
+/// A mismatched stop is retained as a diagnostic rather than tearing down
+/// the active owner.
+pub fn leave_radio_mode(mode: RadioMode) {
+    if RADIO_MODE
+        .compare_exchange(mode as u8, RadioMode::Idle as u8, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        uart::send_response(b"wifi mode stop");
+        uart::send_response(mode.label());
+    }
+}
+
+pub fn radio_mode() -> RadioMode {
+    match RADIO_MODE.load(Ordering::Acquire) {
+        1 => RadioMode::StaRawUdp6,
+        2 => RadioMode::EspNowAction,
+        3 => RadioMode::NanPromiscuous,
+        4 => RadioMode::RadioLab,
+        5 => RadioMode::ApRawUdp6,
+        6 => RadioMode::StaRawUdp6NanNow,
+        _ => RadioMode::Idle,
+    }
+}
+
+// Lab-only switch: retain the initialized STA radio and channel but prevent
+// the normal recovery task from re-associating after an explicit disconnect.
+// It is intentionally volatile and never touches the persisted profile/NVS.
+static LAB_FORCE_UNASSOCIATED: AtomicBool = AtomicBool::new(false);
+// The continuous `(127,0)` NOW callback is global driver state. Preserve the
+// requested state across a lab STA/AP restart: ROC-only rows must not have
+// `ensure_lab_main_style_raw_sta` silently re-enable it before ROC is armed.
+static NOW_DISPATCHER_ENABLED: AtomicBool = AtomicBool::new(true);
+// Volatile APSTA owner used only by the common raw-radio laboratory handler.
+// It intentionally creates no esp-netif or network-stack endpoint: AP beacons and the
+// radio driver's management/action receive path are the subject of the test.
+static LAB_OPEN_AP: AtomicBool = AtomicBool::new(false);
+static STA_BSSID_CHECK_DISABLED: AtomicBool = AtomicBool::new(true);
+
+unsafe extern "C" {
+    fn esp_wifi_config_11b_rate(interface: esp_idf_sys::wifi_interface_t, disable: bool) -> i32;
+    // Private libpp receive-filter hooks. C6 exposes only the STA/AP lanes;
+    // there is no RISC-V NAN interface to program. Keep these declarations
+    // beside the Wi-Fi lifecycle so the raw receive baseline is visible with
+    // the driver setup rather than hidden in an extra C component.
+    fn ic_rx_disable_bssid_check(interface_id: u8);
+    fn ic_rx_enable_bssid_check(interface_id: u8);
+    fn ic_set_rx_policy_ubssid_check(interface_id: u8, enabled: bool) -> bool;
+    // Private libnet80211 receive registration. It is lifecycle state, not
+    // ESP-NOW framing: all firmware images use the same Wi-Fi owner and may
+    // select it at runtime alongside bounded ROC observation.
+    fn ieee80211_recv_action_register(
+        category: u8,
+        action: u8,
+        callback: Option<unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8, *mut u8) -> i32>,
+    ) -> i32;
+}
+
+/// Configure the private BSSID policy on one real Wi-Fi receive lane.
 ///
-/// This deliberately lives beside the ESP-IDF raw adapter: the command
-/// schema/profile is host-testable, but PHY programming is not.
-pub fn configure_raw_tx_rate(mbps: u8) -> bool {
-    let interface = esp_idf_sys::wifi_interface_t_WIFI_IF_STA;
-    let rate = match mbps {
-        0 => unsafe {
-            return esp_wifi_internal_set_fix_rate(
-                interface,
-                false,
-                esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_12M,
-            ) == esp_idf_sys::ESP_OK;
-        },
+/// This is intentionally an explicit per-lane operation: the paired NOW
+/// matrix needs to distinguish the STA policy from the AP/APSTA policy. NAN
+/// has no continuous private action dispatcher; it is received only in DW.
+pub fn set_bssid_check_disabled(interface_id: u8, disabled: bool) -> bool {
+    let applied = unsafe {
+        if disabled {
+            let policy_updated = ic_set_rx_policy_ubssid_check(interface_id, false);
+            ic_rx_disable_bssid_check(interface_id);
+            policy_updated
+        } else {
+            ic_rx_enable_bssid_check(interface_id);
+            ic_set_rx_policy_ubssid_check(interface_id, true)
+        }
+    };
+    if applied && interface_id == 0 {
+        STA_BSSID_CHECK_DISABLED.store(disabled, Ordering::Release);
+    }
+    applied
+}
+
+pub fn sta_bssid_check_disabled() -> bool {
+    STA_BSSID_CHECK_DISABLED.load(Ordering::Acquire)
+}
+
+/// Compatibility wrapper for action/NAN callers that intentionally need the
+/// bypass. Associated raw UDP6 selects its policy from its runtime profile.
+pub fn disable_bssid_check(interface_id: u8) {
+    let _ = set_bssid_check_disabled(interface_id, true);
+}
+
+/// Install the connectionless NOW management-action callback after Wi-Fi is
+/// live. NAN public actions deliberately have no continuous dispatcher: NAN
+/// receive is bounded to its scheduled promiscuous discovery windows.
+pub fn register_now_dispatcher() -> bool {
+    // Vendor-public action `(127, 0)` is the continuous, non-promiscuous
+    // NOW-like receive style. ROC remains an explicit bounded alternative in
+    // `wifi_nonpromisc_probe_esp`; NAN production receive is DW capture.
+    // Registration is global (not STA/AP scoped) and must be repeated after
+    // an ESP-IDF Wi-Fi stop/start transition.
+    if !NOW_DISPATCHER_ENABLED.load(Ordering::Acquire) {
+        // ESP-IDF's private registration path does not document a null
+        // callback as an unregister operation. Keep the already-installed
+        // driver hook and make the Rust callback inert instead; ROC owns its
+        // separate receive lease without a null function pointer transition.
+        return true;
+    }
+    unsafe {
+        ieee80211_recv_action_register(127, 0, Some(crate::wifi_espnow_esp::action_rx_callback))
+            == 0
+    }
+}
+
+/// Select the continuous private NOW dispatcher. ROC-only tests turn this off
+/// so an action classification can be attributed solely to ROC.
+pub fn set_now_dispatcher(enabled: bool) -> bool {
+    NOW_DISPATCHER_ENABLED.store(enabled, Ordering::Release);
+    if !enabled {
+        return true;
+    }
+    // `ieee80211_recv_action_register` is a private Wi-Fi-driver entry
+    // point.  On C6 it may block indefinitely when invoked after an
+    // operator has deliberately disconnected an otherwise live STA for a
+    // ROC-only experiment.  The hook is global and was installed while the
+    // radio was live; disabling the dispatcher only makes its Rust callback
+    // inert, it does not unregister that hook.  Therefore a re-enable during
+    // the unassociated hold must restore only the admission policy.  The
+    // existing association and Wi-Fi stop/start paths re-register after the
+    // driver has a valid STA context.
+    if lab_force_unassociated() && !sta_associated() {
+        return true;
+    }
+    register_now_dispatcher()
+}
+
+/// Whether the continuous driver callback should admit a NOW frame. ROC-only
+/// tests retain the driver hook but turn this off before their lease begins.
+pub(crate) fn now_dispatcher_enabled() -> bool {
+    NOW_DISPATCHER_ENABLED.load(Ordering::Acquire)
+}
+
+/// Convert a raw-injection rate to ESP-IDF's PHY enum.
+fn raw_tx_rate(mbps: u8) -> Option<esp_idf_sys::wifi_phy_rate_t> {
+    Some(match mbps {
+        0 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_1M_L,
         6 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_6M,
         9 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_9M,
         12 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_12M,
@@ -131,232 +285,140 @@ pub fn configure_raw_tx_rate(mbps: u8) -> bool {
         36 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_36M,
         48 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_48M,
         54 => esp_idf_sys::wifi_phy_rate_t_WIFI_PHY_RATE_54M,
-        _ => return false,
-    };
-    unsafe { esp_wifi_internal_set_fix_rate(interface, true, rate) == esp_idf_sys::ESP_OK }
+        _ => return None,
+    })
+}
+
+/// Select a non-default data rate used by raw-injected STA frames.
+///
+/// `esp_wifi_80211_tx` has its own documented rate setting and otherwise
+/// emits at 1 Mbit/s. Use the public raw-802.11 API here so UDP6 and
+/// action/NOW share the same setting.
+/// `0` must leave ESP-IDF untouched: it is the documented raw-frame default
+/// of 1 Mbit/s, and programming the 1M enum after we reject 11b basic rates
+/// is invalid on the C6 driver.
+///
+/// This deliberately lives beside the ESP-IDF raw adapter: the command
+/// schema/profile is host-testable, but PHY programming is not.
+pub fn configure_raw_tx_rate(mbps: u8) -> bool {
+    if mbps == 0 {
+        return true;
+    }
+    let interface = esp_idf_sys::wifi_interface_t_WIFI_IF_STA;
+    let Some(rate) = raw_tx_rate(mbps) else { return false; };
+    unsafe { esp_idf_sys::esp_wifi_config_80211_tx_rate(interface, rate) == esp_idf_sys::ESP_OK }
 }
 
 static STA_RECONNECT_TASK_STARTED: AtomicBool = AtomicBool::new(false);
+// `esp_wifi_sta_get_ap_info` can retain a record after the AP has discarded
+// the station.  Keep the driver transition as the association authority and
+// use the AP record only to refresh diagnostic addressing while connected.
+// These are deliberately static atomics: the ESP-IDF default event loop owns
+// the callback for the process lifetime and must never retain a Rust object.
+static STA_EVENT_HANDLER_REGISTERED: AtomicBool = AtomicBool::new(false);
+static STA_ASSOCIATED_EVENT: AtomicBool = AtomicBool::new(false);
+static STA_LAST_DISCONNECT_REASON: AtomicU8 = AtomicU8::new(0);
+/// Observe loss frequently enough to notice an AP restart promptly, but do
+/// not blindly call `esp_wifi_connect` on every observation.  Candidate scans
+/// and association requests happen only after a sustained loss.
+const STA_ASSOCIATION_OBSERVE_TICKS: u32 = 10;
+const STA_ASSOCIATION_LOSS_OBSERVATIONS: u8 = 20;
+const STA_RECONNECT_SCAN_COOLDOWN_OBSERVATIONS: u8 = 20;
+const STA_MINIMUM_RSSI_DBM: i8 = -70;
+const STA_SCAN_MAX_RECORDS: usize = 16;
+
+/// Task-owned copy of the preference loaded from NVS.  It is a hint only:
+/// scan observations choose a stronger eligible `DIRECT-*-dmesh` AP when the
+/// preferred AP is absent or below the RSSI floor.
+struct StaReconnectConfig {
+    preferred_ssid: [u8; 33],
+    preferred_ssid_len: usize,
+}
+
+/// Owned scan result retained only until the immediately following
+/// `esp_wifi_set_config` call.  It prevents a reconnect scan from reserving
+/// packet memory or retaining heap allocations between association epochs.
+struct ScannedStaCandidate {
+    ssid: [u8; 33],
+    ssid_len: usize,
+    bssid: [u8; 6],
+    channel: u8,
+    preferred: bool,
+}
 // Main may keep NAN/raw Wi-Fi initialized while the STA association retries.
 // The default STA netif is an ESP-IDF singleton: recreating it on a retry
 // asserts in `esp_netif_create_default_wifi_sta`.  Retain this adapter-owned
 // handle for the lifetime of the firmware and reuse it after `stop_sta()`.
-#[cfg(not(feature = "wifi-raw-udp6"))]
 static STA_NETIF: AtomicPtr<esp_idf_sys::esp_netif_t> = AtomicPtr::new(core::ptr::null_mut());
 static STA_DRIVER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static STA_AMPDU_ENABLED: AtomicBool = AtomicBool::new(true);
+static STA_11B_RATES_DISABLED: AtomicBool = AtomicBool::new(true);
 // `esp_wifi_init` may allocate part of its driver state before returning
 // ESP_ERR_NO_MEM. Retrying that exact initialization leaks/fragmentates the
 // remaining heap, so a reboot or a changed image/profile is required.
 static STA_DRIVER_INIT_FAILED: AtomicBool = AtomicBool::new(false);
-static UDP_SERVER_SOCKET_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
-static UDP_SERVER_BIND_SUCCESSES: AtomicU32 = AtomicU32::new(0);
-static UDP_SERVER_BIND_FAILURES: AtomicU32 = AtomicU32::new(0);
-static UDP_SERVER_RECEIVED: AtomicU32 = AtomicU32::new(0);
-static UDP_SERVER_SENT: AtomicU32 = AtomicU32::new(0);
-static UDP_SERVER_PROBE_RECEIVED: AtomicU32 = AtomicU32::new(0);
-static UDP_SERVER_PROBE_SENT: AtomicU32 = AtomicU32::new(0);
 
-/// Nonblocking shared-bearer counters. They are deliberately separate from
-/// UART diagnostics: a full UART queue must never affect a UDP socket task.
-pub fn udp_server_stats() -> (u32, u32, u32, u32, u32) {
-    (
-        UDP_SERVER_SOCKET_ATTEMPTS.load(Ordering::Relaxed),
-        UDP_SERVER_BIND_SUCCESSES.load(Ordering::Relaxed),
-        UDP_SERVER_BIND_FAILURES.load(Ordering::Relaxed),
-        UDP_SERVER_RECEIVED.load(Ordering::Relaxed),
-        UDP_SERVER_SENT.load(Ordering::Relaxed),
-    )
-}
-
-/// Socket-level probe counters, intentionally separate from QUIC-lite packet
-/// counters. They localize AP/lwIP delivery without adding a raw command path.
-pub fn udp_server_probe_stats() -> (u32, u32) {
-    (
-        UDP_SERVER_PROBE_RECEIVED.load(Ordering::Relaxed),
-        UDP_SERVER_PROBE_SENT.load(Ordering::Relaxed),
-    )
-}
-
-/// Shared lwIP UDP server bearer.  It owns only socket lifecycle and bounded
-/// FreeRTOS yielding; packet routing and services remain in the caller's
-/// QUIC-lite dispatcher. Recovery's outbound object client is deliberately a
-/// separate operation below, not a replacement for this server bearer.
-pub fn run_udp_server_bearer(
-    enabled: &AtomicBool,
-    port: u16,
-    handler: fn(&[u8]) -> Option<Vec<u8>>,
-    poll_egress: fn() -> Option<Vec<u8>>,
+unsafe extern "C" fn sta_event_handler(
+    _argument: *mut c_void,
+    _event_base: esp_idf_sys::esp_event_base_t,
+    event_id: i32,
+    event_data: *mut c_void,
 ) {
-    loop {
-        if !enabled.load(Ordering::Acquire) {
-            unsafe { esp_idf_sys::vTaskDelay(10) };
-            continue;
-        }
-        UDP_SERVER_SOCKET_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        let fd = unsafe {
-            esp_idf_sys::lwip_socket(
-                esp_idf_sys::AF_INET as c_int,
-                esp_idf_sys::SOCK_DGRAM as c_int,
-                esp_idf_sys::IPPROTO_UDP as c_int,
-            )
+    if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_CONNECTED as i32 {
+        STA_ASSOCIATED_EVENT.store(true, Ordering::Release);
+    } else if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_DISCONNECTED as i32 {
+        let reason = if event_data.is_null() {
+            0
+        } else {
+            unsafe {
+                (*(event_data.cast::<esp_idf_sys::wifi_event_sta_disconnected_t>())).reason
+            }
         };
-        if fd < 0 {
-            unsafe { esp_idf_sys::vTaskDelay(10) };
-            continue;
-        }
-        let local = esp_idf_sys::sockaddr_in {
-            sin_len: core::mem::size_of::<esp_idf_sys::sockaddr_in>() as u8,
-            sin_family: esp_idf_sys::AF_INET as u8,
-            sin_port: port.to_be(),
-            sin_addr: esp_idf_sys::in_addr { s_addr: 0 },
-            sin_zero: [0; 8],
-        };
-        if unsafe {
-            esp_idf_sys::lwip_bind(
-                fd,
-                (&local as *const esp_idf_sys::sockaddr_in).cast(),
-                core::mem::size_of::<esp_idf_sys::sockaddr_in>() as _,
-            )
-        } != 0
-        {
-            UDP_SERVER_BIND_FAILURES.fetch_add(1, Ordering::Relaxed);
-            unsafe { esp_idf_sys::lwip_close(fd) };
-            unsafe { esp_idf_sys::vTaskDelay(10) };
-            continue;
-        }
-        UDP_SERVER_BIND_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-        // Match the exercised Recovery worker's bounded lwIP allowance. This
-        // is bearer buffering only; QUIC-lite flow control remains per DCID.
-        let receive_buffer_bytes = UDP_RECEIVE_BUFFER_BYTES as c_int;
-        unsafe {
-            let _ = esp_idf_sys::lwip_setsockopt(
-                fd,
-                esp_idf_sys::SOL_SOCKET as c_int,
-                esp_idf_sys::SO_RCVBUF as c_int,
-                (&receive_buffer_bytes as *const c_int).cast(),
-                core::mem::size_of_val(&receive_buffer_bytes) as _,
-            );
-        }
-        unsafe {
-            let flags = esp_idf_sys::fcntl(fd, esp_idf_sys::F_GETFL as c_int);
-            if flags >= 0 {
-                let _ = esp_idf_sys::fcntl(
-                    fd,
-                    esp_idf_sys::F_SETFL as c_int,
-                    flags | esp_idf_sys::O_NONBLOCK as c_int,
-                );
-            }
-        }
-        let mut packet = [0u8; UDP_MTU];
-        while enabled.load(Ordering::Acquire) {
-            let mut peer = esp_idf_sys::sockaddr_in::default();
-            let mut peer_len = core::mem::size_of::<esp_idf_sys::sockaddr_in>() as _;
-            let received = unsafe {
-                esp_idf_sys::lwip_recvfrom(
-                    fd,
-                    packet.as_mut_ptr().cast(),
-                    packet.len(),
-                    0,
-                    (&mut peer as *mut esp_idf_sys::sockaddr_in).cast(),
-                    &mut peer_len,
-                )
-            };
-            if received <= 0 {
-                unsafe { esp_idf_sys::vTaskDelay(1) };
-                continue;
-            }
-            let mut received = received;
-            let mut burst = 0usize;
-            loop {
-                burst = burst.saturating_add(1);
-                UDP_SERVER_RECEIVED.fetch_add(1, Ordering::Relaxed);
-                let probe = quic_lite::bearer_probe::udp_bearer_probe_response(
-                    &packet[..received as usize],
-                );
-                let is_probe = probe.is_some();
-                if is_probe {
-                    UDP_SERVER_PROBE_RECEIVED.fetch_add(1, Ordering::Relaxed);
-                }
-                let response = probe
-                    .map(|response| Vec::from(response.as_slice()))
-                    .or_else(|| handler(&packet[..received as usize]));
-                if let Some(response) = response.filter(|response| !response.is_empty()) {
-                    peer.sin_len = core::mem::size_of::<esp_idf_sys::sockaddr_in>() as u8;
-                    peer.sin_family = esp_idf_sys::AF_INET as u8;
-                    let sent = unsafe {
-                        esp_idf_sys::lwip_sendto(
-                            fd,
-                            response.as_ptr().cast(),
-                            response.len(),
-                            0,
-                            (&peer as *const esp_idf_sys::sockaddr_in).cast(),
-                            core::mem::size_of::<esp_idf_sys::sockaddr_in>() as _,
-                        )
-                    };
-                    if sent >= 0 {
-                        UDP_SERVER_SENT.fetch_add(1, Ordering::Relaxed);
-                        if is_probe {
-                            UDP_SERVER_PROBE_SENT.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                if burst >= UDP_RECEIVE_DRAIN_LIMIT {
-                    break;
-                }
-                peer_len = core::mem::size_of::<esp_idf_sys::sockaddr_in>() as _;
-                let next = unsafe {
-                    esp_idf_sys::lwip_recvfrom(
-                        fd,
-                        packet.as_mut_ptr().cast(),
-                        packet.len(),
-                        esp_idf_sys::MSG_DONTWAIT as c_int,
-                        (&mut peer as *mut esp_idf_sys::sockaddr_in).cast(),
-                        &mut peer_len,
-                    )
-                };
-                if next <= 0 {
-                    break;
-                }
-                received = next;
-            }
-            // The old callback model produced one data packet only as an ACK
-            // response. After the same bounded ingress drain as Recovery,
-            // let the dispatcher fill its retained QUIC-lite flight.
-            for _ in 0..UDP_RECEIVE_DRAIN_LIMIT {
-                let Some(response) = poll_egress() else {
-                    break;
-                };
-                peer.sin_len = core::mem::size_of::<esp_idf_sys::sockaddr_in>() as u8;
-                peer.sin_family = esp_idf_sys::AF_INET as u8;
-                let sent = unsafe {
-                    esp_idf_sys::lwip_sendto(
-                        fd,
-                        response.as_ptr().cast(),
-                        response.len(),
-                        0,
-                        (&peer as *const esp_idf_sys::sockaddr_in).cast(),
-                        core::mem::size_of::<esp_idf_sys::sockaddr_in>() as _,
-                    )
-                };
-                if sent < 0 {
-                    break;
-                }
-                UDP_SERVER_SENT.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        unsafe { esp_idf_sys::lwip_close(fd) };
+        STA_LAST_DISCONNECT_REASON.store(reason, Ordering::Release);
+        STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
     }
 }
 
-/// ESP-IDF supplies the monotonic clock; the transport owns the resulting
-/// opaque timing accumulator so every bearer uses the same measurements.
-fn record_control_success(timing: &mut DatagramTiming) {
-    timing.record_at(unsafe { esp_idf_sys::esp_timer_get_time() as u64 });
+/// Subscribe once to ESP-IDF's STA transitions.  A stop/start keeps the
+/// default event loop alive, so re-registering would produce duplicate state
+/// transitions and diagnostic noise.
+unsafe fn register_sta_event_handlers() -> bool {
+    if STA_EVENT_HANDLER_REGISTERED.load(Ordering::Acquire) {
+        return true;
+    }
+    let connected = unsafe {
+        esp_idf_sys::esp_event_handler_register(
+            esp_idf_sys::WIFI_EVENT,
+            esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_CONNECTED as i32,
+            Some(sta_event_handler),
+            core::ptr::null_mut(),
+        )
+    };
+    let disconnected = unsafe {
+        esp_idf_sys::esp_event_handler_register(
+            esp_idf_sys::WIFI_EVENT,
+            esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_DISCONNECTED as i32,
+            Some(sta_event_handler),
+            core::ptr::null_mut(),
+        )
+    };
+    if connected == esp_idf_sys::ESP_OK && disconnected == esp_idf_sys::ESP_OK {
+        STA_EVENT_HANDLER_REGISTERED.store(true, Ordering::Release);
+        true
+    } else {
+        uart::send_stat(
+            b"wifi STA event registration result=",
+            if connected != esp_idf_sys::ESP_OK {
+                connected as u32 as u64
+            } else {
+                disconnected as u32 as u64
+            },
+        );
+        false
+    }
 }
 
-pub(crate) use dmesh_server::net::parse_ipv4;
-
-fn wifi_init_config_default() -> esp_idf_sys::wifi_init_config_t {
+fn wifi_init_config(params: &TransportProfile) -> esp_idf_sys::wifi_init_config_t {
     esp_idf_sys::wifi_init_config_t {
         osi_funcs: core::ptr::addr_of_mut!(esp_idf_sys::g_wifi_osi_funcs),
         wpa_crypto_funcs: unsafe { esp_idf_sys::g_wifi_default_wpa_crypto_funcs },
@@ -369,16 +431,31 @@ fn wifi_init_config_default() -> esp_idf_sys::wifi_init_config_t {
         rx_mgmt_buf_num: esp_idf_sys::WIFI_RX_MGMT_BUF_NUM_DEF as i32,
         cache_tx_buf_num: esp_idf_sys::WIFI_CACHE_TX_BUFFER_NUM as i32,
         csi_enable: esp_idf_sys::WIFI_CSI_ENABLED as i32,
-        ampdu_rx_enable: esp_idf_sys::WIFI_AMPDU_RX_ENABLED as i32,
-        // Raw UDP6/ESP-NOW uses short independently acknowledged frames.
-        // Main's proven raw Wi-Fi configuration disables AMPDU TX; leaving it
-        // on raises esp_wifi_init's allocation requirement beyond the C6 Main
-        // canary heap and returns ESP_ERR_NO_MEM.
-        ampdu_tx_enable: 0,
+        // ESP-IDF consumes both settings only in esp_wifi_init.  The runtime
+        // profile therefore performs a full, logged STA driver reinit rather
+        // than pretending that a stop/start changes aggregation.
+        ampdu_rx_enable: if params.sta_ampdu_enabled {
+            esp_idf_sys::WIFI_AMPDU_RX_ENABLED as i32
+        } else {
+            0
+        },
+        ampdu_tx_enable: if params.sta_ampdu_enabled {
+            esp_idf_sys::WIFI_AMPDU_TX_ENABLED as i32
+        } else {
+            0
+        },
         amsdu_tx_enable: esp_idf_sys::WIFI_AMSDU_TX_ENABLED as i32,
         nvs_enable: esp_idf_sys::WIFI_NVS_ENABLED as i32,
         nano_enable: esp_idf_sys::WIFI_NANO_FORMAT_ENABLED as i32,
-        rx_ba_win: esp_idf_sys::WIFI_DEFAULT_RX_BA_WIN as i32,
+        // The ESP-IDF default itself uses a zero BA window whenever AMPDU RX
+        // is compiled out. Keep that invariant for the runtime diagnostic:
+        // retaining the build-time window while the enable bit is false still
+        // lets the peer negotiate ADDBA on C6.
+        rx_ba_win: if params.sta_ampdu_enabled {
+            esp_idf_sys::WIFI_DEFAULT_RX_BA_WIN as i32
+        } else {
+            0
+        },
         wifi_task_core_id: esp_idf_sys::WIFI_TASK_CORE_ID as i32,
         beacon_max_len: esp_idf_sys::WIFI_SOFTAP_BEACON_MAX_LEN as i32,
         mgmt_sbuf_num: esp_idf_sys::WIFI_MGMT_SBUF_NUM as i32,
@@ -391,228 +468,16 @@ fn wifi_init_config_default() -> esp_idf_sys::wifi_init_config_t {
     }
 }
 
-unsafe fn report_radio_profile() {
-    let mut phymode: esp_idf_sys::wifi_phy_mode_t = core::mem::zeroed();
-    if esp_idf_sys::esp_wifi_sta_get_negotiated_phymode(&mut phymode) == esp_idf_sys::ESP_OK {
-        uart::send_stat(b"radio negotiated_phymode_id=", phymode as u64);
-    }
-    let mut bandwidth: esp_idf_sys::wifi_bandwidth_t = core::mem::zeroed();
-    if esp_idf_sys::esp_wifi_get_bandwidth(
-        esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
-        &mut bandwidth,
-    ) == esp_idf_sys::ESP_OK
-    {
-        uart::send_stat(b"radio bandwidth_id=", bandwidth as u64);
-    }
-    let mut protocol_bitmap = 0u8;
-    if esp_idf_sys::esp_wifi_get_protocol(
-        esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
-        &mut protocol_bitmap,
-    ) == esp_idf_sys::ESP_OK
-    {
-        uart::send_stat(b"radio protocol_bitmap=", protocol_bitmap as u64);
-    }
-}
-
-#[cfg(not(feature = "wifi-raw-udp6"))]
-pub fn init_sta(params: &TransportProfile) {
-    unsafe {
-        if STA_DRIVER_INIT_FAILED.load(Ordering::Acquire) {
-            uart::send_response(b"wifi driver init previously failed");
-            return;
-        }
-        if !params.has_flash_profile() {
-            uart::send_response(b"recovery profile missing");
-            return;
-        }
-        uart::send_response(b"wifi init begin");
-        let _ = esp_idf_sys::esp_netif_init();
-        let _ = esp_idf_sys::esp_event_loop_create_default();
-        let mut netif = STA_NETIF.load(Ordering::Acquire);
-        if netif.is_null() {
-            let created = esp_idf_sys::esp_netif_create_default_wifi_sta();
-            if created.is_null() {
-                uart::send_response(b"wifi netif failed");
-                return;
-            }
-            match STA_NETIF.compare_exchange(
-                core::ptr::null_mut(),
-                created,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => netif = created,
-                Err(existing) => {
-                    // The Main session owner serializes starts today, but
-                    // keep this safe if another FreeRTOS task races startup.
-                    netif = existing;
-                }
-            }
-        }
-        uart::send_response(b"wifi netif ready");
-        if !STA_DRIVER_INITIALIZED.swap(true, Ordering::AcqRel) {
-            let mut init = wifi_init_config_default();
-            let result = esp_idf_sys::esp_wifi_init(&mut init);
-            if result != esp_idf_sys::ESP_OK && result != esp_idf_sys::ESP_ERR_INVALID_STATE {
-                STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
-                STA_DRIVER_INIT_FAILED.store(true, Ordering::Release);
-                uart::send_response(b"wifi driver init failed");
-                return;
-            }
-        }
-        uart::send_response(b"wifi driver ready");
-        let _ = esp_idf_sys::esp_wifi_set_storage(esp_idf_sys::wifi_storage_t_WIFI_STORAGE_RAM);
-        let mut sta = esp_idf_sys::wifi_sta_config_t::default();
-        let ssid = if params.ssid_len != 0 {
-            &params.ssid[..params.ssid_len]
-        } else {
-            b"Direct-Recovery"
-        };
-        for (dst, src) in sta.ssid.iter_mut().zip(ssid.iter().copied()) {
-            *dst = src;
-        }
-        sta.password = [0; 64];
-        let mut config = esp_idf_sys::wifi_config_t { sta };
-        let _ = esp_idf_sys::esp_wifi_set_mode(esp_idf_sys::wifi_mode_t_WIFI_MODE_STA);
-        let _ = esp_idf_sys::esp_wifi_set_config(
-            esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
-            &mut config,
-        );
-        let mut protocols = esp_idf_sys::wifi_protocols_t {
-            ghz_2g: RECOVERY_STA_PROTOCOL as u16,
-            ghz_5g: 0,
-        };
-        if esp_idf_sys::esp_wifi_set_protocols(
-            esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
-            &mut protocols,
-        ) != esp_idf_sys::ESP_OK
-        {
-            uart::send_response(b"wifi bgn set failed");
-            return;
-        }
-        uart::send_response(b"wifi bgn configured");
-        // ESP-IDF does not offer n-only for a 2.4 GHz STA; keep the required
-        // b/g/n protocol bitmap for HT negotiation but prohibit CCK/11b data
-        // rates before the association begins.
-        if esp_wifi_config_11b_rate(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, true)
-            == esp_idf_sys::ESP_OK
-        {
-            uart::send_response(b"wifi 11b rates disabled");
-        } else {
-            uart::send_response(b"wifi 11b rate policy failed");
-        }
-        let server_host = params
-            .server
-            .get(..params.server_len)
-            .and_then(|server| server.split(|byte| *byte == b':').next())
-            .unwrap_or(&[]);
-        let gateway_bytes = if params.gateway_len != 0 {
-            &params.gateway[..params.gateway_len]
-        } else {
-            server_host
-        };
-        let mask_bytes: &[u8] = if params.mask_len != 0 {
-            &params.mask[..params.mask_len]
-        } else {
-            b"255.255.0.0"
-        };
-        let (Some(ip), Some(mask), Some(gateway)) = (
-            parse_ipv4(&params.local_ip[..params.local_ip_len]),
-            parse_ipv4(mask_bytes),
-            parse_ipv4(gateway_bytes),
-        ) else {
-            uart::send_response(b"wifi static profile invalid");
-            return;
-        };
-        let dhcp = esp_idf_sys::esp_netif_dhcpc_stop(netif);
-        if dhcp != esp_idf_sys::ESP_OK
-            && dhcp != esp_idf_sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED
-        {
-            uart::send_response(b"wifi DHCP stop failed");
-            return;
-        }
-        let info = esp_idf_sys::esp_netif_ip_info_t {
-            ip: esp_idf_sys::esp_ip4_addr { addr: ip },
-            netmask: esp_idf_sys::esp_ip4_addr { addr: mask },
-            gw: esp_idf_sys::esp_ip4_addr { addr: gateway },
-        };
-        if esp_idf_sys::esp_netif_set_ip_info(netif, &info) != esp_idf_sys::ESP_OK {
-            uart::send_response(b"wifi static IP failed");
-            return;
-        }
-        uart::send_response(b"wifi static IP configured");
-        let start_result = esp_idf_sys::esp_wifi_start();
-        if start_result != esp_idf_sys::ESP_OK && start_result != esp_idf_sys::ESP_ERR_INVALID_STATE
-        {
-            uart::send_response(b"wifi STA start failed");
-            return;
-        }
-        uart::send_response(b"wifi start complete");
-        let _ = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-        if esp_idf_sys::esp_wifi_connect() != esp_idf_sys::ESP_OK {
-            uart::send_response(b"wifi STA connect failed");
-            return;
-        }
-        start_sta_reconnect_task();
-        uart::send_response(b"wifi connect issued");
-        uart::send_response(b"wifi STA started");
-        let mut associated = false;
-        let mut ip_ready = false;
-        for attempt in 0..50 {
-            esp_idf_sys::vTaskDelay(100);
-            if attempt != 0 && attempt % 10 == 0 && !associated {
-                let _ = esp_idf_sys::esp_wifi_connect();
-            }
-            let _ = esp_idf_sys::esp_netif_dhcpc_stop(netif);
-            let _ = esp_idf_sys::esp_netif_set_default_netif(netif);
-            let _ = esp_idf_sys::esp_netif_set_ip_info(netif, &info);
-            let mut ap = esp_idf_sys::wifi_ap_record_t::default();
-            if esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == esp_idf_sys::ESP_OK {
-                associated = true;
-            }
-            let mut current = esp_idf_sys::esp_netif_ip_info_t::default();
-            ip_ready = esp_idf_sys::esp_netif_get_ip_info(netif, &mut current)
-                == esp_idf_sys::ESP_OK
-                && current.ip.addr != 0
-                && esp_idf_sys::esp_netif_is_netif_up(netif);
-            if associated && ip_ready {
-                break;
-            }
-        }
-        if !(associated && ip_ready) {
-            uart::send_response(b"wifi readiness timeout");
-        }
-        uart::send_response(if associated {
-            b"wifi STA associated"
-        } else {
-            b"wifi STA association failed"
-        });
-        uart::send_response(if ip_ready {
-            b"wifi IP ready"
-        } else {
-            b"wifi IP not ready"
-        });
-        // esp-netif requires an active STA netif before it can install the
-        // link-local address.  Asking immediately after esp_wifi_start()
-        // returned ESP_ERR_ESP_NETIF_IF_NOT_READY on the C6.
-        if associated && esp_idf_sys::esp_netif_create_ip6_linklocal(netif) == esp_idf_sys::ESP_OK {
-            uart::send_response(b"wifi IPv6 link-local requested");
-        } else {
-            uart::send_response(b"wifi IPv6 link-local failed");
-        }
-        if associated {
-            report_radio_profile();
-        }
-        uart::send_response(b"wifi static STA configured");
-    }
-}
-
 /// Associate a STA for the raw Ethernet bearer without constructing an
-/// esp-netif, DHCP client, IPv4 profile, or lwIP socket.  The raw adapter
+/// DHCP client, IPv4 profile, or transport endpoint. The raw adapter
 /// registers its own single RX callback after this bounded association wait.
-#[cfg(feature = "wifi-raw-udp6")]
 pub fn init_sta(params: &TransportProfile) {
     unsafe {
+        if !enter_radio_mode(RadioMode::StaRawUdp6) {
+            return;
+        }
+        let init_started_us = esp_idf_sys::esp_timer_get_time();
+        uart::send_stat(b"wifi raw sta init_ms=", 0);
         if STA_DRIVER_INIT_FAILED.load(Ordering::Acquire) {
             uart::send_response(b"wifi raw driver init previously failed");
             return;
@@ -626,7 +491,7 @@ pub fn init_sta(params: &TransportProfile) {
         // scheduled. Its ESP-IDF Wi-Fi initialization requires the netif and
         // default event-loop base to exist first; Recovery already has these
         // globals available through its minimal startup. This is only ESP-IDF
-        // driver setup, not a netif/socket UDP transport.
+        // driver setup, not a DMesh transport endpoint.
         let netif = esp_idf_sys::esp_netif_init();
         if netif != esp_idf_sys::ESP_OK && netif != esp_idf_sys::ESP_ERR_INVALID_STATE {
             uart::send_response(b"wifi raw netif init failed");
@@ -637,7 +502,26 @@ pub fn init_sta(params: &TransportProfile) {
             uart::send_response(b"wifi raw event loop init failed");
             return;
         }
+        if !register_sta_event_handlers() {
+            uart::send_response(b"wifi STA event handler failed");
+            return;
+        }
+        // This is the standard ESP-IDF ordering: create the default Wi-Fi
+        // STA glue after esp-netif/event-loop initialization but *before*
+        // esp_wifi_init.  `esp_wifi_internal_tx` is the glue's egress API;
+        // creating it only after the driver was initialized accepted frames
+        // but left the associated Ethernet path undrained on e6.
+        if STA_NETIF.load(Ordering::Acquire).is_null() {
+            let netif = esp_idf_sys::esp_netif_create_default_wifi_sta();
+            if netif.is_null() {
+                uart::send_response(b"wifi raw STA netif create failed");
+                return;
+            }
+            STA_NETIF.store(netif, Ordering::Release);
+        }
         if !STA_DRIVER_INITIALIZED.swap(true, Ordering::AcqRel) {
+            STA_AMPDU_ENABLED.store(params.sta_ampdu_enabled, Ordering::Release);
+            STA_11B_RATES_DISABLED.store(params.sta_11b_rates_disabled, Ordering::Release);
             uart::send_stat(
                 b"wifi raw heap free=",
                 esp_idf_sys::heap_caps_get_free_size(esp_idf_sys::MALLOC_CAP_8BIT) as u64,
@@ -646,7 +530,12 @@ pub fn init_sta(params: &TransportProfile) {
                 b"wifi raw heap largest=",
                 esp_idf_sys::heap_caps_get_largest_free_block(esp_idf_sys::MALLOC_CAP_8BIT) as u64,
             );
-            let mut init = wifi_init_config_default();
+            uart::send_response(if params.sta_ampdu_enabled {
+                b"wifi STA AMPDU enabled"
+            } else {
+                b"wifi STA AMPDU disabled"
+            });
+            let mut init = wifi_init_config(params);
             let result = esp_idf_sys::esp_wifi_init(&mut init);
             if result != esp_idf_sys::ESP_OK && result != esp_idf_sys::ESP_ERR_INVALID_STATE {
                 STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
@@ -684,20 +573,52 @@ pub fn init_sta(params: &TransportProfile) {
             uart::send_response(b"wifi bgn set failed");
             return;
         }
-        let _ = esp_wifi_config_11b_rate(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, true);
+        let bandwidth = if RECOVERY_STA_HT40 {
+            esp_idf_sys::wifi_bandwidth_t_WIFI_BW40
+        } else {
+            esp_idf_sys::wifi_bandwidth_t_WIFI_BW20
+        };
+        if esp_idf_sys::esp_wifi_set_bandwidth(
+            esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+            bandwidth,
+        ) != esp_idf_sys::ESP_OK
+        {
+            uart::send_response(b"wifi STA bandwidth set failed");
+            return;
+        }
+        // This must happen after init and before start. Its effect includes
+        // the negotiated legacy/basic-rate set, so the direct profile applies
+        // it through the full driver reinit used by AMPDU, never live.
+        let legacy_rate = esp_wifi_config_11b_rate(
+            esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+            params.sta_11b_rates_disabled,
+        );
+        if legacy_rate != esp_idf_sys::ESP_OK {
+            uart::send_stat(b"wifi STA 11b policy result=", legacy_rate as u32 as u64);
+            return;
+        }
+        STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
         let started = esp_idf_sys::esp_wifi_start();
         if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
             uart::send_response(b"wifi STA start failed");
             return;
         }
+        if !set_bssid_check_disabled(0, params.sta_bssid_check_disabled) {
+            uart::send_response(b"wifi STA BSSID policy failed");
+            return;
+        }
+        uart::send_stat(b"wifi raw sta started_ms=", elapsed_ms(init_started_us));
         let _ = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-        let _ = esp_idf_sys::esp_wifi_connect();
-        start_sta_reconnect_task();
+        let connect = esp_idf_sys::esp_wifi_connect();
+        uart::send_stat(b"wifi raw sta connect_ms=", elapsed_ms(init_started_us));
+        if connect != esp_idf_sys::ESP_OK && connect != esp_idf_sys::ESP_ERR_WIFI_CONN {
+            uart::send_stat(b"wifi raw sta connect_result=", connect as u32 as u64);
+        }
+        start_sta_reconnect_task(params);
         let mut associated = false;
         for attempt in 0..50 {
             esp_idf_sys::vTaskDelay(100);
-            let mut ap = esp_idf_sys::wifi_ap_record_t::default();
-            associated = esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == esp_idf_sys::ESP_OK;
+            associated = STA_ASSOCIATED_EVENT.load(Ordering::Acquire);
             if associated {
                 break;
             }
@@ -710,16 +631,163 @@ pub fn init_sta(params: &TransportProfile) {
         } else {
             b"wifi raw STA association failed"
         });
-        if associated {
-            report_radio_profile();
-        }
+        uart::send_stat(b"wifi raw sta associated_ms=", elapsed_ms(init_started_us));
+        // Action/NOW registration is a separately requested radio mode.
+        // Do not install it as a side effect of raw UDP6 association: its
+        // driver callback is global and would make Recovery run two modes.
     }
+}
+
+fn elapsed_ms(started_us: i64) -> u64 {
+    (unsafe { esp_idf_sys::esp_timer_get_time() } - started_us).max(0) as u64 / 1_000
+}
+
+/// Radio interface selected by a bearer.  This is deliberately not the
+/// ESP-IDF enum: protocol adapters request a logical lane while this file
+/// remains the only location that maps it onto hardware APIs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RadioInterface {
+    Sta,
+    Ap,
+    Nan,
+}
+
+fn radio_interface_native(interface: RadioInterface) -> esp_idf_sys::wifi_interface_t {
+    match interface {
+        RadioInterface::Sta => esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+        RadioInterface::Ap => esp_idf_sys::wifi_interface_t_WIFI_IF_AP,
+        RadioInterface::Nan => esp_idf_sys::wifi_interface_t_WIFI_IF_NAN,
+    }
+}
+
+/// ABI-only interface value for a request structure owned by a protocol
+/// adapter. It performs no radio operation; all ESP-IDF calls stay here.
+pub fn radio_interface_id(interface: RadioInterface) -> esp_idf_sys::wifi_interface_t {
+    radio_interface_native(interface)
+}
+
+/// ESP-IDF Ethernet callback ABI. The handler is protocol-owned, while its
+/// registration, buffer lifetime, and hardware interface remain centralized.
+pub type EthernetRxCallback =
+    unsafe extern "C" fn(*mut c_void, u16, *mut c_void) -> esp_idf_sys::esp_err_t;
+
+pub fn register_ethernet_rx_callback(
+    interface: RadioInterface,
+    callback: Option<EthernetRxCallback>,
+) -> i32 {
+    unsafe { esp_idf_sys::esp_wifi_internal_reg_rxcb(radio_interface_native(interface), callback) }
+}
+
+pub fn release_ethernet_rx_buffer(buffer: *mut c_void) {
+    unsafe { esp_idf_sys::esp_wifi_internal_free_rx_buffer(buffer) }
+}
+
+pub fn interface_mac(interface: RadioInterface) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    (unsafe { esp_idf_sys::esp_wifi_get_mac(radio_interface_native(interface), mac.as_mut_ptr()) }
+        == esp_idf_sys::ESP_OK)
+        .then_some(mac)
+}
+
+/// Submit an Ethernet-II frame through the driver-owned data path.
+pub fn transmit_ethernet(interface: RadioInterface, frame: &[u8]) -> i32 {
+    unsafe {
+        esp_idf_sys::esp_wifi_internal_tx(
+            radio_interface_native(interface),
+            frame.as_ptr().cast_mut().cast(),
+            frame.len() as u16,
+        )
+    }
+}
+
+/// Submit one complete raw station data frame.  The caller owns only frame
+/// construction; rate/queue semantics and the ESP-IDF call stay here.
+pub fn transmit_raw_station(frame: &[u8]) -> i32 {
+    unsafe {
+        esp_idf_sys::esp_wifi_80211_tx(
+            radio_interface_native(RadioInterface::Sta),
+            frame.as_ptr().cast(),
+            frame.len() as i32,
+            true,
+        )
+    }
+}
+
+/// Register the bounded completion observer for public raw-802.11 TX. The
+/// callback runs on ESP-IDF's Wi-Fi task and must only update atomics.
+pub fn register_raw_tx_done_callback(
+    callback: Option<unsafe extern "C" fn(*const esp_idf_sys::esp_80211_tx_info_t)>,
+) -> i32 {
+    unsafe { esp_idf_sys::esp_wifi_register_80211_tx_cb(callback) }
+}
+
+pub fn current_channel() -> Option<(u8, esp_idf_sys::wifi_second_chan_t)> {
+    let mut channel = 0u8;
+    let mut secondary = esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE;
+    (unsafe { esp_idf_sys::esp_wifi_get_channel(&mut channel, &mut secondary) } == esp_idf_sys::ESP_OK)
+        .then_some((channel, secondary))
+}
+
+/// Pin the radio to a 2.4 GHz primary channel with no secondary channel.
+/// Callers select policy; the hardware mutation remains with the radio owner.
+pub fn set_ht20_channel(channel: u8) -> bool {
+    unsafe {
+        esp_idf_sys::esp_wifi_set_channel(
+            channel.clamp(1, 13),
+            esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+        ) == esp_idf_sys::ESP_OK
+    }
+}
+
+/// Submit one caller-constructed ESP-IDF action TX request.  Framing remains
+/// bearer-specific, but the only actual radio submit operation is here.
+pub fn submit_action_tx(request: *mut esp_idf_sys::wifi_action_tx_req_t) -> i32 {
+    unsafe { esp_idf_sys::esp_wifi_action_tx_req(request) }
+}
+
+pub type PromiscuousRxCallback = unsafe extern "C" fn(
+    *mut c_void,
+    esp_idf_sys::wifi_promiscuous_pkt_type_t,
+);
+
+pub fn configure_promiscuous_rx(
+    callback: Option<PromiscuousRxCallback>,
+    filter: &mut esp_idf_sys::wifi_promiscuous_filter_t,
+) -> bool {
+    unsafe {
+        esp_idf_sys::esp_wifi_set_promiscuous(false) == esp_idf_sys::ESP_OK
+            && esp_idf_sys::esp_wifi_set_promiscuous_rx_cb(callback) == esp_idf_sys::ESP_OK
+            && esp_idf_sys::esp_wifi_set_promiscuous_filter(filter) == esp_idf_sys::ESP_OK
+    }
+}
+
+pub fn set_promiscuous(enabled: bool) -> bool {
+    unsafe { esp_idf_sys::esp_wifi_set_promiscuous(enabled) == esp_idf_sys::ESP_OK }
+}
+
+pub fn set_promiscuous_filter(filter: &mut esp_idf_sys::wifi_promiscuous_filter_t) -> bool {
+    unsafe { esp_idf_sys::esp_wifi_set_promiscuous_filter(filter) == esp_idf_sys::ESP_OK }
+}
+
+pub type VendorIeRxCallback = unsafe extern "C" fn(
+    *mut c_void,
+    u32,
+    *const u8,
+    *const esp_idf_sys::vendor_ie_data_t,
+    i32,
+);
+
+pub fn register_vendor_ie_callback(callback: Option<VendorIeRxCallback>) -> i32 {
+    unsafe { esp_idf_sys::esp_wifi_set_vendor_ie_cb(callback, core::ptr::null_mut()) }
+}
+
+pub fn remain_on_channel(request: *mut esp_idf_sys::wifi_roc_req_t) -> i32 {
+    unsafe { esp_idf_sys::esp_wifi_remain_on_channel(request) }
 }
 
 /// Attach a caller-owned QUIC-lite handler to the generic raw Ethernet
 /// adapter. The caller owns all DCID and application state; this module owns
 /// only STA lifecycle and ESP Wi-Fi registration.
-#[cfg(feature = "wifi-raw-udp6")]
 pub fn start_raw_udp6(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool {
     let mut mac = [0u8; 6];
     let mut ap = esp_idf_sys::wifi_ap_record_t::default();
@@ -737,11 +805,17 @@ pub fn start_raw_udp6(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool
     crate::wifi_raw_udp6_esp::start(mac, ap.bssid, handler)
 }
 
-/// Attach a caller-owned QUIC-lite handler to the raw ESP-NOW-compatible
-/// action bearer. The portable action parser/encoder lives in `rawnan`; this
-/// module only verifies that the STA radio is ready and supplies its MAC.
-#[cfg(feature = "wifi-espnow")]
-pub fn start_espnow(handler: crate::wifi_espnow_esp::EspNowHandler) -> bool {
+/// Bind the caller-owned QUIC-lite action handler to the shared radio ingress.
+///
+/// This does not start an ESP-NOW subsystem or decide radio state. Wi-Fi
+/// startup registers the global NOW action callback; all received frames
+/// then enter the common bounded ingress pool, and this function supplies the
+/// action decoder/QUIC dispatch only. Association is a raw-UDP peer-selection
+/// condition, not an action-dispatch condition.
+pub fn install_action_ingress(handler: crate::wifi_espnow_esp::EspNowHandler) -> bool {
+    if !enter_radio_mode(RadioMode::EspNowAction) {
+        return false;
+    }
     let mut mac = [0u8; 6];
     let read = unsafe {
         esp_idf_sys::esp_read_mac(
@@ -749,1674 +823,547 @@ pub fn start_espnow(handler: crate::wifi_espnow_esp::EspNowHandler) -> bool {
             esp_idf_sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
         )
     };
-    if read != esp_idf_sys::ESP_OK || !sta_associated() {
+    if read != esp_idf_sys::ESP_OK {
+        leave_radio_mode(RadioMode::EspNowAction);
         return false;
     }
-    crate::wifi_espnow_esp::start(mac, handler)
+    let installed = crate::wifi_espnow_esp::install_action_ingress(mac, handler);
+    if !installed {
+        leave_radio_mode(RadioMode::EspNowAction);
+    }
+    installed
+}
+
+/// Upgrade an already-associated STA/UDP6 personality to the production
+/// coexistence configuration.  The baseline remains pure STA until this is
+/// called; NAN's bounded promiscuous DW and NOW's global action callback are
+/// installed together and are removed together by [`stop_nan_now`].
+pub fn start_nan_now(handler: crate::wifi_espnow_esp::EspNowHandler) -> bool {
+    if RADIO_MODE
+        .compare_exchange(
+            RadioMode::StaRawUdp6 as u8,
+            RadioMode::StaRawUdp6NanNow as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        uart::send_stat(b"wifi NAN/NOW requested mode=", radio_mode() as u8 as u64);
+        return false;
+    }
+    uart::send_response(b"wifi mode upgrade sta_raw_udp6_nan_now");
+    let Some(mac) = interface_mac(RadioInterface::Sta) else {
+        RADIO_MODE.store(RadioMode::StaRawUdp6 as u8, Ordering::Release);
+        return false;
+    };
+    if !crate::wifi_espnow_esp::install_action_ingress(mac, handler)
+        || !set_now_dispatcher(true)
+        || !crate::wifi_nan_dw_capture_esp::start()
+    {
+        crate::wifi_nan_dw_capture_esp::stop();
+        crate::wifi_espnow_esp::stop_action_ingress();
+        set_now_dispatcher(false);
+        RADIO_MODE.store(RadioMode::StaRawUdp6 as u8, Ordering::Release);
+        uart::send_response(b"wifi NAN/NOW start failed");
+        return false;
+    }
+    uart::send_response(b"wifi NAN/NOW started");
+    true
+}
+
+/// Return the combined coexistence personality to a pure STA/UDP6 baseline.
+/// Call this before a baseline measurement or before stopping the STA.
+pub fn stop_nan_now() {
+    if radio_mode() != RadioMode::StaRawUdp6NanNow {
+        return;
+    }
+    crate::wifi_nan_dw_capture_esp::stop();
+    crate::wifi_espnow_esp::stop_action_ingress();
+    set_now_dispatcher(false);
+    RADIO_MODE.store(RadioMode::StaRawUdp6 as u8, Ordering::Release);
+    uart::send_response(b"wifi NAN/NOW stopped");
 }
 
 /// End a bounded sleepy-node STA session.  The caller owns the session policy;
 /// this adapter only releases the ESP-IDF STA bearer so the normal light-sleep
 /// scheduler can resume. Infrastructure callers intentionally never use it.
 pub fn stop_sta() {
+    stop_nan_now();
+    crate::wifi_raw_udp6_esp::stop();
+    unsafe {
+        STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
+        let _ = esp_idf_sys::esp_wifi_disconnect();
+        let _ = esp_idf_sys::esp_wifi_stop();
+        let netif = STA_NETIF.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !netif.is_null() {
+            esp_idf_sys::esp_netif_destroy_default_wifi(netif.cast());
+        }
+        leave_radio_mode(RadioMode::StaRawUdp6);
+    }
+}
+
+/// Stop only the ESP-IDF STA runtime so a changed pre-association receive
+/// policy can be applied by the existing `init_sta` path.  The caller owns
+/// bearer shutdown and immediately reinitializes the same radio mode; this is
+/// a controlled Wi-Fi restart, not a device reboot or a second Wi-Fi owner.
+pub fn restart_sta_runtime() {
+    STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
     unsafe {
         let _ = esp_idf_sys::esp_wifi_disconnect();
         let _ = esp_idf_sys::esp_wifi_stop();
     }
+    uart::send_response(b"wifi STA restarting for policy");
+}
+
+/// Recreate the Wi-Fi driver so an updated `wifi_init_config_t` is actually
+/// consumed.  Stop/start alone leaves ESP-IDF's AMPDU settings unchanged.
+/// The default netif is also released, avoiding a second persistent adapter
+/// or a stale binding across the driver epoch.
+pub fn restart_sta_driver_runtime() {
+    STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
+    unsafe {
+        let _ = esp_idf_sys::esp_wifi_disconnect();
+        let _ = esp_idf_sys::esp_wifi_stop();
+        let result = esp_idf_sys::esp_wifi_deinit();
+        if result != esp_idf_sys::ESP_OK
+            && result != esp_idf_sys::ESP_ERR_WIFI_NOT_INIT
+            && result != esp_idf_sys::ESP_ERR_INVALID_STATE
+        {
+            uart::send_stat(b"wifi STA driver deinit result=", result as u32 as u64);
+        }
+        STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
+        let netif = STA_NETIF.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !netif.is_null() {
+            esp_idf_sys::esp_netif_destroy_default_wifi(netif.cast());
+        }
+    }
+    uart::send_response(b"wifi STA driver restarting for policy");
+}
+
+/// The AMPDU configuration of the current Wi-Fi-driver epoch.
+pub fn sta_ampdu_enabled() -> bool {
+    STA_AMPDU_ENABLED.load(Ordering::Acquire)
+}
+
+/// Best-effort receive-side RSSI for the associated AP. The event-driven
+/// association flag remains authoritative: ESP-IDF may retain an AP record
+/// after the host has silently removed a station, so this is telemetry only.
+pub fn sta_ap_rssi_dbm() -> Option<i8> {
+    if !STA_ASSOCIATED_EVENT.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut ap = esp_idf_sys::wifi_ap_record_t::default();
+    (unsafe { esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) } == esp_idf_sys::ESP_OK)
+        .then_some(ap.rssi)
+}
+
+/// Whether the current STA-driver epoch suppresses 802.11b rates.
+pub fn sta_11b_rates_disabled() -> bool {
+    STA_11B_RATES_DISABLED.load(Ordering::Acquire)
+}
+
+/// Disconnect without stopping the radio, for a bounded connectionless-action
+/// experiment. `start_espnow` must already have installed its receiver while
+/// associated.  The caller can later clear this switch and let the normal
+/// beacon-led reconnect task resume; no NVS setting is modified.
+pub fn set_lab_force_unassociated(enabled: bool, channel: u8) {
+    LAB_FORCE_UNASSOCIATED.store(enabled, Ordering::Release);
+    if !enabled {
+        // Resume immediately for an operator-controlled UART test rather
+        // than waiting for the bounded reconnect observer to notice it.
+        unsafe {
+            let _ = esp_idf_sys::esp_wifi_connect();
+        }
+        return;
+    }
+    unsafe {
+        let _ = esp_idf_sys::esp_wifi_disconnect();
+        let _ = esp_idf_sys::esp_wifi_set_channel(
+            channel.clamp(1, 13),
+            esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+        );
+    }
+}
+
+/// Current volatile state of the raw-radio disassociation laboratory switch.
+pub fn lab_force_unassociated() -> bool {
+    LAB_FORCE_UNASSOCIATED.load(Ordering::Acquire)
+}
+
+/// Enable or disable the shared, open APSTA laboratory owner.  This is an
+/// ephemeral radio transition for Recovery and Main alike; it does not touch
+/// the persisted STA profile/NVS and deliberately does not create an IP data
+/// plane.  Its SSID is deterministically derived from the AP MAC so a peer
+/// can identify the test AP without another configuration channel.
+pub fn set_lab_open_ap(enabled: bool, channel: u8, beacon_tu: u16) -> bool {
+    let channel = channel.clamp(1, 13);
+    unsafe {
+        let _ = esp_idf_sys::esp_wifi_stop();
+        let _ = esp_idf_sys::esp_wifi_set_promiscuous(false);
+        let mode = if enabled {
+            esp_idf_sys::wifi_mode_t_WIFI_MODE_APSTA
+        } else {
+            esp_idf_sys::wifi_mode_t_WIFI_MODE_STA
+        };
+        if esp_idf_sys::esp_wifi_set_mode(mode) != esp_idf_sys::ESP_OK {
+            return false;
+        }
+        if enabled {
+            let mut ap = esp_idf_sys::wifi_ap_config_t::default();
+            let mut mac = [0u8; 6];
+            let _ = esp_idf_sys::esp_wifi_get_mac(
+                esp_idf_sys::wifi_interface_t_WIFI_IF_AP,
+                mac.as_mut_ptr(),
+            );
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let mut ssid = *b"DIRECT-000000-dmesh";
+            for (index, byte) in mac[3..].iter().enumerate() {
+                ssid[7 + index * 2] = HEX[(byte >> 4) as usize];
+                ssid[8 + index * 2] = HEX[(byte & 0x0f) as usize];
+            }
+            ap.ssid[..ssid.len()].copy_from_slice(&ssid);
+            ap.ssid_len = ssid.len() as u8;
+            ap.channel = channel;
+            ap.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
+            ap.max_connection = 4;
+            ap.beacon_interval = beacon_tu.clamp(100, 60_000);
+            let mut config = esp_idf_sys::wifi_config_t { ap };
+            if esp_idf_sys::esp_wifi_set_config(
+                esp_idf_sys::wifi_interface_t_WIFI_IF_AP,
+                &mut config,
+            ) != esp_idf_sys::ESP_OK
+            {
+                return false;
+            }
+        }
+        if esp_idf_sys::esp_wifi_start() != esp_idf_sys::ESP_OK {
+            return false;
+        }
+        // `wifi_ap_config_t::channel` is a requested AP configuration.  Read
+        // the live radio back after start: APSTA arbitration (or a future
+        // ESP-IDF change) must not let a channel-6 lab test silently run on
+        // the driver's fallback channel.
+        let mut primary = 0u8;
+        let mut secondary = esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE;
+        // This assertion applies to an enabled AP only.  On disable the radio
+        // becomes STA-owned again and its association controller is free to
+        // select its AP's channel; treating that normal transition as an AP
+        // setup failure leaves the volatile `ap_active` state stale.
+        if enabled
+            && (esp_idf_sys::esp_wifi_get_channel(&mut primary, &mut secondary)
+                != esp_idf_sys::ESP_OK
+                || primary != channel)
+        {
+            return false;
+        }
+        if enabled && !crate::wifi_raw_udp6_esp::ensure_ap_rx_callback() {
+            // AP raw Ethernet is a separate ESP-IDF RX interface.  Do not
+            // claim the AP lab data plane is active if its callback could
+            // not be installed; action-frame hooks are global and unaffected.
+            return false;
+        }
+        // NOW's hook is global rather than STA/AP-specific, but ESP-IDF owns
+        // it inside the Wi-Fi driver. Reinstall it after this
+        // stop/start transition; their `STARTED` state only owns Rust-side
+        // queue allocation and must not stand in for driver registration.
+        if !register_now_dispatcher() {
+            return false;
+        }
+        if enabled {
+            disable_bssid_check(1); // AP
+        }
+        // The AP is a powered infrastructure/timebase owner during this lab
+        // case. Do not let modem power-save hide management/action reception
+        // or inject multi-beacon receive gaps into a non-promiscuous test.
+        if esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE)
+            != esp_idf_sys::ESP_OK
+        {
+            return false;
+        }
+        if LAB_FORCE_UNASSOCIATED.load(Ordering::Acquire) {
+            let _ = esp_idf_sys::esp_wifi_disconnect();
+            let _ = esp_idf_sys::esp_wifi_set_channel(
+                channel,
+                esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+            );
+        }
+    }
+    LAB_OPEN_AP.store(enabled, Ordering::Release);
+    true
+}
+
+/// Reproduce Main's raw idle-STA bring-up tail on an already initialized
+/// shared driver.  The action/data dispatcher is registered separately by
+/// `wifi_espnow_esp::start`; this routine deliberately neither replaces it
+/// nor enables promiscuous capture.  It is a volatile lab mode, not a new
+/// connection/profile owner.
+pub fn ensure_lab_main_style_raw_sta(channel: u8) -> bool {
+    let channel = channel.clamp(1, 13);
+    unsafe {
+        let mut mode = esp_idf_sys::wifi_mode_t_WIFI_MODE_NULL;
+        let _ = esp_idf_sys::esp_wifi_get_mode(&mut mode);
+        if mode == esp_idf_sys::wifi_mode_t_WIFI_MODE_NULL
+            && esp_idf_sys::esp_wifi_set_mode(esp_idf_sys::wifi_mode_t_WIFI_MODE_STA)
+                != esp_idf_sys::ESP_OK
+        {
+            return false;
+        }
+        let started = esp_idf_sys::esp_wifi_start();
+        if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
+            return false;
+        }
+        if esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE)
+            != esp_idf_sys::ESP_OK
+        {
+            return false;
+        }
+        // Wi-Fi start/disconnect transitions can discard the driver's private
+        // vendor-action hook even though the Rust-side callback pointer is
+        // still installed. Re-register after the driver is live and before
+        // entering the unassociated hold: this is the normal, non-promiscuous
+        // `(127,0)` receiver used by both Recovery and Main, not a NAN DW
+        // fallback. Reapply the real STA-lane policy at the same boundary.
+        if !register_now_dispatcher() {
+            return false;
+        }
+        disable_bssid_check(0);
+        let _ = esp_idf_sys::esp_wifi_disconnect();
+        let _ = esp_idf_sys::esp_wifi_set_channel(
+            channel,
+            esp_idf_sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+        );
+        if esp_idf_sys::esp_wifi_set_promiscuous(false) != esp_idf_sys::ESP_OK {
+            return false;
+        }
+    }
+    LAB_FORCE_UNASSOCIATED.store(true, Ordering::Release);
+    LAB_OPEN_AP.store(false, Ordering::Release);
+    true
+}
+
+/// Whether the volatile raw-radio APSTA owner is currently enabled.
+pub fn lab_open_ap_active() -> bool {
+    LAB_OPEN_AP.load(Ordering::Acquire)
 }
 
 /// Cheap association observation for Main's nonblocking session owner.
 pub fn sta_associated() -> bool {
-    unsafe {
-        let mut ap = esp_idf_sys::wifi_ap_record_t::default();
-        esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == esp_idf_sys::ESP_OK
+    STA_ASSOCIATED_EVENT.load(Ordering::Acquire)
+}
+
+/// Read the driver's actual promiscuous-mode state for diagnostics. This is
+/// intentionally observation-only: NAN power policy owns any transition,
+/// while the raw UDP6 and NOW-like bearers must be able to prove that they
+/// operate with promiscuous capture disabled.
+pub fn promiscuous_enabled() -> Result<bool, esp_idf_sys::esp_err_t> {
+    let mut enabled = false;
+    let result = unsafe { esp_idf_sys::esp_wifi_get_promiscuous(&mut enabled) };
+    if result == esp_idf_sys::ESP_OK {
+        Ok(enabled)
+    } else {
+        Err(result)
     }
 }
 
-/// Keep the Recovery STA associated across a controlled AP restart/channel
-/// move.  The transport owns reconnect/ACK state above this bearer; this task
-/// only asks ESP-IDF to restore the existing STA association when its own
-/// association query says it is absent.
-fn start_sta_reconnect_task() {
+/// Keep the shared Recovery/Main STA associated across an AP restart or
+/// channel move.  The task observes association loss, then scans and selects
+/// an eligible DMesh beacon; it never turns a transient missing AP into a
+/// blind `esp_wifi_connect` loop.  The selected BSSID is also the advertised
+/// server MAC: `quic_lite::raw_udp6::link_local_from_mac` derives its IPv6 LL
+/// endpoint without a separate raw-UDP address setting.
+fn start_sta_reconnect_task(params: &TransportProfile) {
     if STA_RECONNECT_TASK_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    let mut config = StaReconnectConfig {
+        preferred_ssid: [0; 33],
+        preferred_ssid_len: params.ssid_len.min(33),
+    };
+    config.preferred_ssid[..config.preferred_ssid_len]
+        .copy_from_slice(&params.ssid[..config.preferred_ssid_len]);
+    let config = Box::into_raw(Box::new(config));
     let mut task = core::ptr::null_mut();
     let result = unsafe {
         esp_idf_sys::xTaskCreatePinnedToCore(
             Some(sta_reconnect_task),
             b"wifi_recon\0".as_ptr().cast(),
             3072,
-            core::ptr::null_mut(),
+            config.cast(),
             3,
             &mut task,
             0,
         )
     };
     if result != 1 || task.is_null() {
+        unsafe { drop(Box::from_raw(config)) };
         STA_RECONNECT_TASK_STARTED.store(false, Ordering::Release);
         uart::send_response(b"wifi reconnect task failed");
+    } else {
+        // One boot-time proof that the long-lived shared STA owner exists.
+        // Subsequent messages are transition-only so an AP outage cannot
+        // turn the diagnostic path into a periodic UART event source.
+        uart::send_response(b"wifi reconnect task started");
     }
 }
 
-unsafe extern "C" fn sta_reconnect_task(_argument: *mut c_void) {
+unsafe extern "C" fn sta_reconnect_task(argument: *mut c_void) {
+    let config = unsafe { Box::from_raw(argument.cast::<StaReconnectConfig>()) };
+    let preferred_ssid = &config.preferred_ssid[..config.preferred_ssid_len];
+    // Do not report the normal interval between `esp_wifi_connect` and the
+    // first CONNECTED event as a loss.  Once an association has been seen,
+    // a DISCONNECTED event is authoritative even if get_ap_info is stale.
+    let mut seen_association = false;
+    let mut missing_observations = 0u8;
+    let mut scan_cooldown = 0u8;
+    uart::send_response(b"wifi reconnect task running");
     loop {
-        esp_idf_sys::vTaskDelay(1000);
-        let mut ap = esp_idf_sys::wifi_ap_record_t::default();
-        if esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) != esp_idf_sys::ESP_OK {
-            let _ = esp_idf_sys::esp_wifi_connect();
+        esp_idf_sys::vTaskDelay(STA_ASSOCIATION_OBSERVE_TICKS);
+        if LAB_FORCE_UNASSOCIATED.load(Ordering::Acquire) {
+            continue;
         }
-    }
-}
-
-fn sockaddr_len() -> esp_idf_sys::socklen_t {
-    core::mem::size_of::<esp_idf_sys::sockaddr_in>() as _
-}
-
-fn send_packet(fd: c_int, peer: &esp_idf_sys::sockaddr_in, bytes: &[u8]) -> bool {
-    unsafe {
-        // lwIP recvfrom does not reliably populate BSD's sin_len field. Make
-        // the outbound address canonical rather than feeding that partial
-        // structure straight back into sendto.
-        let mut destination = *peer;
-        destination.sin_len = core::mem::size_of::<esp_idf_sys::sockaddr_in>() as u8;
-        destination.sin_family = esp_idf_sys::AF_INET as u8;
-        esp_idf_sys::lwip_sendto(
-            fd,
-            bytes.as_ptr().cast(),
-            bytes.len(),
-            0,
-            (&destination as *const esp_idf_sys::sockaddr_in).cast(),
-            sockaddr_len(),
-        ) >= 0
-    }
-}
-
-/// ESP32-specific egress selection for the shared connection. Path 0 is the
-/// Recovery UDP socket and path 1 is PPP UART; `DcidRouter` owns availability
-/// and fallback, not the application/flash callbacks.
-fn send_transport_datagram(
-    router: &mut quic_lite::DcidRouter<1, 2>,
-    policy: quic_lite::PathPolicy,
-    primary_full: bool,
-    fd: c_int,
-    peer: &esp_idf_sys::sockaddr_in,
-    bytes: &[u8],
-) -> bool {
-    // UART egress is owned by its dedicated FreeRTOS task. Publish its
-    // bounded queue before choosing a path so AirtimeFirst can spill rather
-    // than turn a full USB/PPP queue into a transport failure.
-    let (queued_packets, capacity_packets) = l2::transport_egress_capacity();
-    let _ = router.set_path_capacity(
-        1,
-        quic_lite::PathCapacity::new(queued_packets, capacity_packets),
-    );
-    let selected = match router.select_with_policy(policy, primary_full) {
-        Ok(path) => path,
-        Err(_) => return false,
-    };
-    let started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-    let sent = match selected {
-        0 => send_packet(fd, peer, bytes),
-        1 => l2::send_transport_packet(bytes),
-        _ => false,
-    };
-    let elapsed = (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started);
-    if sent {
-        let _ = router.record_path_sample(selected, bytes.len(), elapsed);
-        return true;
-    }
-    let _ = router.record_path_loss(selected);
-    let _ = router.set_path_available(selected, false);
-    // A failure is a bearer observation, not a stream failure. Try another
-    // live path under the dynamic policy without rebuilding endpoint state.
-    let fallback =
-        match router.select_with_policy(quic_lite::PathPolicy::HighestMeasuredSpeed, true) {
-            Ok(path) => path,
-            Err(_) => return false,
-        };
-    let fallback_started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-    let fallback_sent = match fallback {
-        0 => send_packet(fd, peer, bytes),
-        1 => l2::send_transport_packet(bytes),
-        _ => false,
-    };
-    let fallback_elapsed =
-        (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(fallback_started);
-    if fallback_sent {
-        let _ = router.record_path_sample(fallback, bytes.len(), fallback_elapsed);
-    } else {
-        let _ = router.record_path_loss(fallback);
-        let _ = router.set_path_available(fallback, false);
-    }
-    fallback_sent
-}
-
-fn send_errno() -> i32 {
-    unsafe { *__errno() }
-}
-
-/// Run one shared Recovery/Main connection over its registered L2 bearers.
-///
-/// UDP supplies the STA socket adapter and UART supplies the dedicated PPP
-/// queue adapter. Both ingress paths route through the same DCID router and
-/// the same endpoint/stream/flash state below; neither bearer owns an ACK,
-/// retransmission ledger, or service callback. Additional ESP bearers extend
-/// this loop by feeding a complete MTU datagram plus a path ID.
-pub fn run_transport(
-    profile: &TransportProfile,
-    // Recovery supplies its RTC/Stage2/reboot completion action. Main passes
-    // a non-rebooting completion action for its own permitted flash targets.
-    complete_main_flash: fn() -> bool,
-) {
-    // Keep the runtime entry point profile-shaped. Recovery and Main load the
-    // same no-std profile, so adding a transport option cannot create a
-    // second, positional argument contract in one firmware binary.
-    let server = &profile.server[..profile.server_len];
-    let port = profile.port;
-    let benchmark = profile.benchmark;
-    let timeout_ms = profile.timeout_ms;
-    let ack_frequency = profile.ack_frequency;
-    let ack_delay_ms = profile.ack_delay_ms;
-    let path_policy = profile.path_policy;
-    let transport_test = profile.transport_test;
-    let iperf_packet_size = profile.iperf_packet_size;
-    let iperf_bytes = profile.iperf_bytes;
-    let iperf_parallel_streams = profile.iperf_parallel_streams;
-    let iperf_high_priority_bytes = profile.iperf_high_priority_bytes;
-    let iperf_low_priority_bytes = profile.iperf_low_priority_bytes;
-    let iperf_validation = profile.iperf_validation;
-    let iperf_pace_us = profile.iperf_pace_us;
-    let iperf_burst_packets = profile.iperf_burst_packets;
-    let iperf_burst_delay_us = profile.iperf_burst_delay_us;
-    let iperf_window_packets = profile.iperf_window_packets;
-    let benchmark_run_id = profile.benchmark_run_id;
-    let Some(server_ip) = parse_ipv4(server) else {
-        uart::send_response(b"udp server address invalid");
-        return;
-    };
-    let fd = unsafe {
-        esp_idf_sys::lwip_socket(
-            esp_idf_sys::AF_INET as c_int,
-            esp_idf_sys::SOCK_DGRAM as c_int,
-            esp_idf_sys::IPPROTO_UDP as c_int,
-        )
-    };
-    if fd < 0 {
-        uart::send_response(b"udp socket failed");
-        return;
-    }
-    uart::send_response(b"udp socket ready");
-    let receive_buffer_bytes = UDP_RECEIVE_BUFFER_BYTES as c_int;
-    let receive_buffer_result = unsafe {
-        esp_idf_sys::lwip_setsockopt(
-            fd,
-            esp_idf_sys::SOL_SOCKET as c_int,
-            esp_idf_sys::SO_RCVBUF as c_int,
-            (&receive_buffer_bytes as *const c_int).cast(),
-            core::mem::size_of_val(&receive_buffer_bytes) as _,
-        )
-    };
-    if receive_buffer_result != 0 {
-        uart::send_response(b"udp receive buffer failed");
-    } else {
-        uart::send_stat(b"udp receive buffer=", UDP_RECEIVE_BUFFER_BYTES as u64);
-    }
-    let timeout = esp_idf_sys::timeval {
-        tv_sec: 0,
-        tv_usec: SOCKET_TIMEOUT_MS as i32 * 1000,
-    };
-    unsafe {
-        let _ = esp_idf_sys::lwip_setsockopt(
-            fd,
-            esp_idf_sys::SOL_SOCKET as c_int,
-            esp_idf_sys::SO_RCVTIMEO as c_int,
-            (&timeout as *const esp_idf_sys::timeval).cast(),
-            core::mem::size_of_val(&timeout) as _,
-        );
-    }
-    let local = esp_idf_sys::sockaddr_in {
-        sin_len: core::mem::size_of::<esp_idf_sys::sockaddr_in>() as u8,
-        sin_family: esp_idf_sys::AF_INET as u8,
-        sin_port: TRANSPORT_UDP_PORT.to_be(),
-        sin_addr: esp_idf_sys::in_addr { s_addr: 0 },
-        sin_zero: [0; 8],
-    };
-    if unsafe {
-        esp_idf_sys::lwip_bind(
-            fd,
-            (&local as *const esp_idf_sys::sockaddr_in).cast(),
-            sockaddr_len(),
-        )
-    } < 0
-    {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    }
-    let recovery_limits =
-        quic_lite::recovery_connection_limits(transport_test, iperf_window_packets);
-    let mut endpoint = RecoveryEndpoint::<RECOVERY_TRANSPORT_STREAMS>::new(
-        Role::Client,
-        recovery_limits,
-        UDP_MTU as u64,
-    );
-    // ACK coalescing is configured here, while ACK encoding and emission
-    // remain entirely inside quic-lite.
-    let effective_ack_delay_ms = if ack_delay_ms == 0 {
-        RECOVERY_MAX_ACK_DELAY_MS
-    } else {
-        u64::from(ack_delay_ms.clamp(1, 25))
-    };
-    endpoint.set_ack_policy(
-        if ack_frequency == 0 {
-            DEFAULT_ACK_FREQUENCY
-        } else {
-            ack_frequency
-        },
-        effective_ack_delay_ms,
-    );
-    let server_peer = esp_idf_sys::sockaddr_in {
-        sin_len: core::mem::size_of::<esp_idf_sys::sockaddr_in>() as u8,
-        sin_family: esp_idf_sys::AF_INET as u8,
-        sin_port: port.to_be(),
-        sin_addr: esp_idf_sys::in_addr { s_addr: server_ip },
-        sin_zero: [0; 8],
-    };
-    // A server retains a completed connection briefly so delayed packets can
-    // be rejected safely.  Reusing CID=1 on the fixed Recovery UDP source
-    // port therefore makes a later command-mode benchmark look like a stale
-    // bootstrap and it never receives a bootstrap ACK.  A benchmark run ID is
-    // host-generated per command; normal object runs use ESP's hardware RNG.
-    // Packet numbers may restart only because this is a distinct connection.
-    let Some(client_cid) =
-        recovery_connection_id(benchmark_run_id, unsafe { esp_idf_sys::esp_random() })
-    else {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    };
-    let mut open_packet = [0u8; UDP_MTU];
-    let mut bootstrap_packet_number = 0u32;
-    let Some(mut open_len) = quic_lite::encode_bootstrap_open_packet_with_profile(
-        client_cid,
-        bootstrap_packet_number,
-        recovery_limits,
-        if iperf_window_packets == 0 {
-            quic_lite::RECOVERY_MAX_IN_FLIGHT_PACKETS
-        } else {
-            u16::from(iperf_window_packets)
-        },
-        &mut open_packet,
-    )
-    .ok() else {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    };
-    // An explicit UART or UART-first policy must bootstrap on UART too. The
-    // host bridge can forward that OPEN to its UDP server without a device
-    // socket peer, and the returning OPEN_ACK enters the same PPP ingress
-    // queue as every established packet. Sending this first packet only over
-    // UDP made a UART comparison depend on an unrelated UDP bootstrap path.
-    let bootstrap_uart = matches!(path_policy, 2 | 3);
-    let bootstrap_sent = if bootstrap_uart {
-        l2::send_transport_packet(&open_packet[..open_len])
-    } else {
-        send_packet(fd, &server_peer, &open_packet[..open_len])
-    };
-    if !bootstrap_sent {
-        uart::send_response(if bootstrap_uart {
-            b"uart bootstrap send failed"
-        } else {
-            b"udp bootstrap send failed"
-        });
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    }
-    uart::send_response(if bootstrap_uart {
-        b"uart bootstrap open sent"
-    } else {
-        b"udp bootstrap open sent"
-    });
-    let deadline = unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 }
-        .saturating_add(timeout_ms as u64);
-    let mut server_cid = None;
-    let mut last_open = unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 };
-    let mut packet = [0u8; UDP_MTU];
-    let mut uart_bootstrap_packet = [0u8; l2::UART_MAX_PACKET];
-    let mut peer = esp_idf_sys::sockaddr_in::default();
-    let mut peer_len = sockaddr_len();
-    while unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 } < deadline {
-        let received = if bootstrap_uart {
-            if let Some(used) = l2::dequeue_transport_packet(&mut uart_bootstrap_packet) {
-                packet[..used].copy_from_slice(&uart_bootstrap_packet[..used]);
-                used as i32
-            } else {
-                0
-            }
-        } else {
-            unsafe {
-                esp_idf_sys::lwip_recvfrom(
-                    fd,
-                    packet.as_mut_ptr().cast(),
-                    packet.len(),
-                    0,
-                    (&mut peer as *mut esp_idf_sys::sockaddr_in).cast(),
-                    &mut peer_len,
-                ) as i32
-            }
-        };
-        if received > 0 {
-            if let Ok((header, ack)) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
-                &packet[..received as usize],
-                client_cid,
-            ) {
-                if endpoint
-                    .set_initial_peer_budget(
-                        ack.max_data,
-                        ack.max_stream_data,
-                        ack.max_in_flight_packets,
-                    )
-                    .is_err()
-                {
-                    break;
-                }
-                // Bootstrap retries can make the host emit several OPEN_ACKs
-                // before this one arrives. Its sender packet number belongs
-                // to the host's independent packet-number space; observing it
-                // here makes the first established packet contiguous instead
-                // of reporting those valid bootstrap ACKs as stream loss.
-                endpoint.observe_packet(header.packet_number);
-                server_cid = Some(ack.server_receive_cid);
-                break;
-            }
-        }
-        // UDP bootstrap normally blocks in lwIP for one short socket tick.
-        // UART ingress is nonblocking, so provide the equivalent cooperative
-        // tick while waiting for its OPEN_ACK; otherwise this worker can
-        // starve the dedicated PPP task that must enqueue that ACK.
-        if received <= 0 && bootstrap_uart {
-            unsafe { esp_idf_sys::vTaskDelay(1) };
-        }
-        let now = unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 };
-        if now.saturating_sub(last_open) >= BOOTSTRAP_RETRY_MS {
-            bootstrap_packet_number = match bootstrap_packet_number.checked_add(1) {
-                Some(value) => value,
-                None => break,
-            };
-            let Some(next_open_len) = quic_lite::encode_bootstrap_open_packet_with_profile(
-                client_cid,
-                bootstrap_packet_number,
-                recovery_limits,
-                if iperf_window_packets == 0 {
-                    quic_lite::RECOVERY_MAX_IN_FLIGHT_PACKETS
-                } else {
-                    u16::from(iperf_window_packets)
-                },
-                &mut open_packet,
-            )
-            .ok() else {
-                break;
-            };
-            open_len = next_open_len;
-            let _ = if bootstrap_uart {
-                l2::send_transport_packet(&open_packet[..open_len])
-            } else {
-                send_packet(fd, &server_peer, &open_packet[..open_len])
-            };
-            last_open = now;
-        }
-    }
-    let Some(server_cid) = server_cid else {
-        uart::send_response(b"udp bootstrap timeout");
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    };
-    uart::send_response(b"udp bootstrap established");
-    if endpoint
-        .install_connection_ids(client_cid, server_cid)
-        .is_err()
-    {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    }
-    let Some(first_established_packet_number) = bootstrap_packet_number.checked_add(1) else {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    };
-    if endpoint
-        .continue_packet_numbers_from(first_established_packet_number)
-        .is_err()
-    {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    }
-    // Every established bearer packet reaches this shared DCID router before
-    // the connection. UDP and the dedicated PPP UART task both feed this one
-    // client CID; future bearers register additional paths without creating
-    // another endpoint, retransmission ledger, or stream state.
-    let mut ingress = quic_lite::DcidRouter::<1, 2>::new([
-        quic_lite::PathState::new(), // UDP
-        quic_lite::PathState::new(), // UART PPP
-    ]);
-    if ingress.register(client_cid).is_err()
-        || ingress.set_path_available(0, true).is_err()
-        || (bootstrap_uart && ingress.set_path_available(1, true).is_err())
-    {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    }
-    // Normal operation migrates to the best measured bearer. A direct
-    // command/control policy may later pin a benchmark path or request
-    // airtime-first spillover without changing this connection instance.
-    let path_policy = match path_policy {
-        1 => quic_lite::PathPolicy::Explicit(0), // UDP comparison
-        2 => quic_lite::PathPolicy::Explicit(1), // UART comparison
-        3 => quic_lite::PathPolicy::AirtimeFirst { primary: 1 },
-        4 => quic_lite::PathPolicy::Aggregate,
-        _ => quic_lite::PathPolicy::HighestMeasuredSpeed,
-    };
-    let mut request_body = [0u8; 64];
-    let request_body_len = if transport_test {
-        // SERVICE_IPERF is a transport-only deterministic byte stream. This
-        // deliberately isolates radio/lwIP/transport behavior from object
-        // decoding, hashing, erase, and flash writes.
-        // The request layout is shared with the host UDP server. It is a
-        // stream-service payload, not ESP or UART protocol state.
-        encode_iperf_service_request(
-            IperfServiceRequest {
-                bytes: iperf_bytes as u64,
-                packet_size: iperf_packet_size,
-                pace_us: Some(iperf_pace_us),
-                burst_packets: Some(iperf_burst_packets),
-                burst_delay_us: Some(iperf_burst_delay_us),
-                ack_frequency: Some(if ack_frequency == 0 {
-                    DEFAULT_ACK_FREQUENCY
-                } else {
-                    ack_frequency
-                }),
-                ack_delay_ms: Some(effective_ack_delay_ms as u8),
-                low_priority_bytes: Some(iperf_low_priority_bytes),
-                high_priority_bytes: Some(iperf_high_priority_bytes),
-                parallel_streams: Some(
-                    iperf_parallel_streams.clamp(1, IPERF_MAX_NORMAL_STREAMS as u8),
-                ),
-            },
-            &mut request_body,
-        )
-        .expect("fixed IPERF request buffer")
-    } else {
-        request_body[0] = SERVICE_OBJECT;
-        // This one-byte transport-service envelope carries the negotiated
-        // ACK ratio. The object-store payload starts at byte two and remains
-        // its exact canonical CBOR GET map.
-        request_body[1] = if ack_frequency == 0 {
-            DEFAULT_ACK_FREQUENCY
-        } else {
-            ack_frequency
-        };
-        let Some(request_len_body) = encode_get(&mut request_body[2..], None, 13, 6) else {
-            unsafe {
-                esp_idf_sys::lwip_close(fd);
-            }
-            return;
-        };
-        request_len_body + 2
-    };
-    if endpoint
-        .open_send_stream(REQUEST_STREAM, INITIAL_MAX_STREAM_DATA)
-        .is_err()
-    {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    }
-    let mut request_packet = [0u8; UDP_MTU];
-    let Some((mut request_len, mut request_packet_number)) = endpoint
-        .encode_stream_packet(
-            server_cid,
-            REQUEST_STREAM,
-            0,
-            true,
-            &request_body[..request_body_len],
-            &mut request_packet,
-        )
-        .ok()
-    else {
-        unsafe {
-            esp_idf_sys::lwip_close(fd);
-        }
-        return;
-    };
-    // Bootstrap is necessarily sent on the configured UDP peer because this
-    // Recovery client has no serial peer address to open against. From the
-    // first established service packet onward, do not special-case UDP: use
-    // the same policy/capacity path selector as ACKs, probes, and retries.
-    // A UART path becomes eligible as soon as its shared L2 ingress observes
-    // a packet for this DCID, allowing the connection to migrate or spill
-    // without rebuilding stream state.
-    let _ = send_transport_datagram(
-        &mut ingress,
-        path_policy,
-        false,
-        fd,
-        &server_peer,
-        &request_packet[..request_len],
-    );
-    // Measure the object transfer itself, excluding bootstrap and request
-    // setup. The counters come from quic-lite; Recovery only reports
-    // the opaque snapshot and never interprets ACK or loss behavior.
-    endpoint.reset_stats();
-    uart::send_response(b"udp request sent");
-    let mut last_request = unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 };
-    let mut session_started = false;
-    let mut flash = if transport_test {
-        None
-    } else {
-        match FlashHandler::new(benchmark) {
-            Some(value) => Some(value),
-            None => {
-                uart::send_response(b"udp main partition missing");
-                unsafe {
-                    esp_idf_sys::lwip_close(fd);
-                }
-                return;
-            }
-        }
-    };
-    let mut rx_datagrams = 0u64;
-    let mut rejected_datagrams = 0u64;
-    let mut stream_datagrams = 0u64;
-    let mut control_datagrams = 0u64;
-    let mut transport_datagrams = 0u64;
-    let mut request_retries = 0u64;
-    let mut duplicate_datagrams = 0u64;
-    let mut last_rx_us = None;
-    let mut interpacket_count = 0u64;
-    let mut interpacket_total_us = 0u64;
-    let mut interpacket_max_us = 0u64;
-    let mut interpacket_gap_buckets = [0u64; INTERPACKET_GAP_BUCKETS];
-    let iperf_parallel_streams = iperf_parallel_streams.clamp(1, IPERF_MAX_NORMAL_STREAMS as u8);
-    // Stream placement, validation, completion and byte/error accounting are
-    // host-testable QUIC-lite IPERF semantics. The ESP loop supplies only
-    // committed stream frames and uses their consumed byte count for credit.
-    let mut iperf = IperfRun::<IPERF_MAX_NORMAL_STREAMS>::new(
-        iperf_validation,
-        iperf_parallel_streams as usize,
-        iperf_high_priority_bytes != 0,
-        iperf_low_priority_bytes != 0,
-    );
-    let mut transfer_started_us = 0u64;
-    let mut transfer_completed_us = 0u64;
-    let mut transport_errors = [0u64; 11];
-    let mut transport_send_failures = 0u64;
-    let mut transport_last_send_errno = 0i32;
-    let mut outbound_control_timing = DatagramTiming::default();
-    // Separate genuine socket timeouts from immediate EWOULDBLOCK returns.
-    // They have different scheduling meaning: the former already gave Wi-Fi
-    // time to run, while the latter can spin this higher-priority task.
-    let mut empty_socket_returns = 0u64;
-    let mut empty_socket_spins = 0u64;
-    let mut empty_socket_yields = 0u64;
-    // Measured around the full RTOS-tick yield only.  This distinguishes the
-    // intended cooperative handoff from an actual scheduler delay without
-    // putting a clock read in the per-datagram receive path.
-    let mut empty_socket_tick_yield_us = 0u64;
-    let mut empty_socket_cooperative_yields = 0u64;
-    let mut consecutive_empty_spins = 0u64;
-    let mut last_full_tick_yield_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-    let mut receive_bursts = 0u64;
-    let mut receive_burst_max = 0u64;
-    let mut receive_bursts_since_yield = 0u64;
-    let mut uart_packet = [0u8; l2::UART_MAX_PACKET];
-    loop {
-        let now = unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 };
-        if now >= deadline {
-            break;
-        }
-        endpoint.set_time(now);
-        let probe_now_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-        if let Some(path) = ingress.select_probe(probe_now_us, PATH_PROBE_INTERVAL_US) {
-            let mut probe = [0u8; UDP_MTU];
-            if let Ok((used, _)) = endpoint.encode_probe_packet(server_cid, &mut probe) {
-                let _ = send_transport_datagram(
-                    &mut ingress,
-                    quic_lite::PathPolicy::Explicit(path),
-                    false,
-                    fd,
-                    &server_peer,
-                    &probe[..used],
-                );
-            }
-        }
-        let receive_started_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-        let mut received_path = 0usize;
-        let received = if let Some(used) = l2::dequeue_transport_packet(&mut uart_packet) {
-            // The UART task has already stripped the PPP marker. Copy into
-            // the common packet buffer so the same endpoint consumes this
-            // packet exactly as it would a UDP datagram.
-            packet[..used].copy_from_slice(&uart_packet[..used]);
-            let _ = ingress.set_path_available(1, true);
-            received_path = 1;
-            used as i32
-        } else {
-            // Once a packetized serial bearer is live, never let an empty UDP
-            // socket impose its 5 ms (one FreeRTOS tick in practice) timeout
-            // between serial packets. The UART task is independently filling
-            // its bounded ingress queue; use the existing cooperative empty
-            // path below until either bearer has input. UDP-only transfers
-            // retain their short blocking receive for efficient Wi-Fi idle.
-            let socket_flags = if ingress.path(1).is_some_and(|path| path.available)
-                || matches!(
-                    path_policy,
-                    quic_lite::PathPolicy::Explicit(1)
-                        | quic_lite::PathPolicy::AirtimeFirst { primary: 1 }
-                ) {
-                esp_idf_sys::MSG_DONTWAIT as c_int
-            } else {
-                0
-            };
-            peer_len = sockaddr_len();
-            unsafe {
-                esp_idf_sys::lwip_recvfrom(
-                    fd,
-                    packet.as_mut_ptr().cast(),
-                    packet.len(),
-                    socket_flags,
-                    (&mut peer as *mut esp_idf_sys::sockaddr_in).cast(),
-                    &mut peer_len,
-                ) as i32
-            }
-        };
-        if received <= 0 {
-            let receive_wait_us = (unsafe { esp_idf_sys::esp_timer_get_time() as u64 })
-                .saturating_sub(receive_started_us);
-            empty_socket_returns = empty_socket_returns.saturating_add(1);
-            if receive_wait_us < 1_000 {
-                empty_socket_spins = empty_socket_spins.saturating_add(1);
-                consecutive_empty_spins = consecutive_empty_spins.saturating_add(1);
-            } else {
-                consecutive_empty_spins = 0;
-            }
-            // The bearer only reports its timer tick. Transport decides
-            // whether a delayed ACK/window update is pending and encodes it;
-            // Recovery must never manipulate ACKs or credit directly.
-            endpoint.on_bearer_timeout();
-            // A full initial stream window can leave the sender correctly
-            // waiting for MAX_* while the flash worker finishes its queued
-            // blocks.  Do not require a new inbound datagram to observe that
-            // completion: drain the application-owned slots on every bearer
-            // timeout, then give transport an opportunity to publish its own
-            // credit/control frame.  Recovery neither inspects nor encodes
-            // that frame.
-            if let Some(flash) = flash.as_mut() {
-                let released = match flash.flush_pending() {
-                    Ok(value) => value,
-                    Err(()) => {
-                        uart::send_response(b"udp flash sink failed");
-                        unsafe { esp_idf_sys::lwip_close(fd) };
-                        return;
-                    }
-                };
-                if released != 0
-                    && endpoint
-                        .stream_consumed_deferred(OBJECT_STREAM, released)
-                        .is_err()
-                {
-                    uart::send_response(b"udp stream credit failed");
-                    unsafe { esp_idf_sys::lwip_close(fd) };
-                    return;
-                }
-            }
-            let mut delayed_control = [0u8; UDP_MTU];
-            let mut emitted_control = false;
-            if let Ok(Some(used)) = endpoint.poll_transmit(&mut delayed_control) {
-                if send_transport_datagram(
-                    &mut ingress,
-                    path_policy,
-                    false,
-                    fd,
-                    &server_peer,
-                    &delayed_control[..used],
-                ) {
-                    transport_datagrams = transport_datagrams.saturating_add(1);
-                    record_control_success(&mut outbound_control_timing);
-                    emitted_control = true;
-                } else {
-                    transport_send_failures = transport_send_failures.saturating_add(1);
-                    transport_last_send_errno = send_errno();
-                }
-            }
-            if let Some(flash) = flash.as_mut() {
-                if flash.start_erase_after_bootstrap().is_err() {
-                    uart::send_response(b"udp flash erase failed");
-                    unsafe { esp_idf_sys::lwip_close(fd) };
-                    return;
-                }
-            }
-            if !session_started && now.saturating_sub(last_request) >= 500 {
-                let mut retry = [0u8; UDP_MTU];
-                if let Ok(Some((retry_len, replacement_packet_number))) =
-                    endpoint.retransmit_stream_packet(request_packet_number, &mut retry)
-                {
-                    request_packet[..retry_len].copy_from_slice(&retry[..retry_len]);
-                    request_len = retry_len;
-                    request_packet_number = replacement_packet_number;
-                    let _ = send_transport_datagram(
-                        &mut ingress,
-                        path_policy,
-                        false,
-                        fd,
-                        &server_peer,
-                        &request_packet[..request_len],
-                    );
-                    request_retries = request_retries.saturating_add(1);
-                }
-                last_request = now;
-            }
-            // lwIP can return EWOULDBLOCK immediately despite SO_RCVTIMEO.
-            // In a real flash this commonly happens while the asynchronous
-            // erase/write worker owns every record slot. Without a yield,
-            // this higher-priority task spins, starves both Idle (task-WDT)
-            // and the worker, and makes a healthy flow-control pause fatal.
-            // A successfully emitted transport control packet is different:
-            // return to the blocking receive immediately so its peer's
-            // response is not delayed by one scheduler tick.
-            if quic_lite::bearer_poll_should_yield(
-                emitted_control,
-                receive_wait_us,
-                consecutive_empty_spins,
-                (unsafe { esp_idf_sys::esp_timer_get_time() as u64 })
-                    .saturating_sub(last_full_tick_yield_us),
-                EMPTY_SOCKET_TICK_YIELD_SPINS,
-                EMPTY_SOCKET_MAX_UNYIELDED_US,
-            ) {
-                empty_socket_yields = empty_socket_yields.saturating_add(1);
-                consecutive_empty_spins = 0;
-                let yield_started_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-                unsafe { esp_idf_sys::vTaskDelay(1) };
-                empty_socket_tick_yield_us = empty_socket_tick_yield_us.saturating_add(
-                    (unsafe { esp_idf_sys::esp_timer_get_time() as u64 })
-                        .saturating_sub(yield_started_us),
-                );
-                last_full_tick_yield_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-            } else if !emitted_control && receive_wait_us < 1_000 {
-                // Let Wi-Fi/lwIP work run without turning this recovery
-                // turn into a fixed 10 ms sleep. The bounded full-tick path
-                // above still guarantees Idle time during a true empty spin.
-                empty_socket_cooperative_yields = empty_socket_cooperative_yields.saturating_add(1);
-                unsafe { esp_idf_sys::vPortYield() };
+        if STA_ASSOCIATED_EVENT.load(Ordering::Acquire) {
+            seen_association = true;
+            missing_observations = 0;
+            scan_cooldown = 0;
+            let mut ap = esp_idf_sys::wifi_ap_record_t::default();
+            if esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == esp_idf_sys::ESP_OK {
+                crate::wifi_raw_udp6_esp::update_ap_bssid(ap.bssid);
             }
             continue;
         }
-        consecutive_empty_spins = 0;
-        let mut received = received as usize;
-        let mut burst_datagrams = 0usize;
-        let mut image_complete = false;
-        'drain: loop {
-            endpoint.set_time(unsafe { esp_idf_sys::esp_timer_get_time() as u64 / 1000 });
-            rx_datagrams = rx_datagrams.saturating_add(1);
-            burst_datagrams = burst_datagrams.saturating_add(1);
-            let received_at_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-            if let Some(previous) = last_rx_us {
-                let delta = received_at_us.saturating_sub(previous);
-                let _ = ingress.record_path_sample(received_path, received, delta);
-                interpacket_count = interpacket_count.saturating_add(1);
-                interpacket_total_us = interpacket_total_us.saturating_add(delta);
-                interpacket_max_us = interpacket_max_us.max(delta);
-                let bucket = interpacket_gap_bucket(delta);
-                interpacket_gap_buckets[bucket] = interpacket_gap_buckets[bucket].saturating_add(1);
-            }
-            last_rx_us = Some(received_at_us);
-            if received_path == 0 {
-                let _ = ingress.set_path_available(0, true);
-            }
-            if ingress.route(received_path, &packet[..received]).is_err() {
-                rejected_datagrams = rejected_datagrams.saturating_add(1);
-                if !benchmark {
-                    uart::send_response(b"udp packet route rejected");
-                }
-                break 'drain;
-            }
-            let mut stream_error = false;
-            // Recovery treats an image/parser failure as terminal for this
-            // transfer.  Use the committed callback path so an ordinary in-order
-            // packet does not heap-copy the complete transport endpoint and its
-            // retransmission ledger merely to preserve retryable callback
-            // backpressure that Recovery never uses.
-            let receive_result = endpoint.receive_with_committed_callback_dispositions(
-                &packet[..received],
-                |stream| {
-                    stream_datagrams = stream_datagrams.saturating_add(1);
-                    if !session_started {
-                        // Benchmark receives must not synchronously write UART:
-                        // one record here stalled the next recvfrom for ~300 ms
-                        // and manufactured two apparent Wi-Fi losses.
-                        if !benchmark {
-                            uart::send_response(b"udp stream received");
-                        }
-                        session_started = true;
-                        transfer_started_us = received_at_us;
-                    }
-                    if transport_test {
-                        let (complete, consumed) = match iperf.handle(IPERF_STREAM, stream) {
-                            Ok(value) => value,
-                            Err(()) => {
-                                stream_error = true;
-                                return Err(quic_lite::Error::Invalid);
-                            }
-                        };
-                        image_complete = complete;
-                        if image_complete {
-                            transfer_completed_us =
-                                unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-                        }
-                        Ok(CommittedStreamDisposition::Consumed(consumed))
-                    } else {
-                        match flash
-                            .as_mut()
-                            .expect("flash receiver")
-                            .handle_stream(stream)
-                        {
-                            Ok((complete, consumed)) => {
-                                image_complete = complete;
-                                if image_complete {
-                                    transfer_completed_us =
-                                        unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-                                }
-                                Ok(if consumed == 0 {
-                                    // CallbackStreams returns zero only for an
-                                    // already delivered range. That is a real
-                                    // reordering/retransmission exception.
-                                    CommittedStreamDisposition::Reack
-                                } else {
-                                    // The bounded flash pool owns these bytes;
-                                    // its post-ACK flush will return credit.
-                                    CommittedStreamDisposition::Deferred
-                                })
-                            }
-                            Err(()) => {
-                                stream_error = true;
-                                Err(quic_lite::Error::Invalid)
-                            }
-                        }
-                    }
-                },
+        if !seen_association {
+            continue;
+        }
+        missing_observations = missing_observations.saturating_add(1);
+        if missing_observations == 1 {
+            uart::send_response(b"wifi reconnect association lost");
+            uart::send_stat(
+                b"wifi reconnect disconnect_reason=",
+                STA_LAST_DISCONNECT_REASON.load(Ordering::Acquire) as u64,
             );
-            let transport_info = match receive_result {
-                Ok(value) => value,
-                Err(error) => {
-                    rejected_datagrams = rejected_datagrams.saturating_add(1);
-                    let index = match error {
-                        quic_lite::Error::BufferTooSmall => 0,
-                        quic_lite::Error::Truncated => 1,
-                        quic_lite::Error::Invalid => 2,
-                        quic_lite::Error::InvalidVarint => 3,
-                        quic_lite::Error::FlowControl => 4,
-                        quic_lite::Error::StreamLimit => 5,
-                        quic_lite::Error::PacketNumberExhausted => 6,
-                        quic_lite::Error::WrongConnectionId => 7,
-                        quic_lite::Error::BootstrapInvalid => 8,
-                        quic_lite::Error::HistoryFull => 9,
-                        quic_lite::Error::RetransmissionTooLarge => 10,
-                    };
-                    transport_errors[index] = transport_errors[index].saturating_add(1);
-                    // Never log a packet-level error here. UART writes can block
-                    // for roughly one scheduler tick and turn ordinary
-                    // reordering into an artificial hundred-millisecond radio
-                    // gap. The final numeric benchmark record reports this
-                    // counter; non-benchmark transfers retain the concise error.
-                    if !benchmark {
-                        uart::send_response(if stream_error {
-                            b"udp stream reassembly failed"
-                        } else {
-                            b"udp packet rejected"
-                        });
-                    }
-                    break 'drain;
-                }
-            };
-            if transport_info.duplicate {
-                duplicate_datagrams = duplicate_datagrams.saturating_add(1);
-            }
-            if !transport_info.stream {
-                control_datagrams = control_datagrams.saturating_add(1);
-            }
-            if image_complete || burst_datagrams >= UDP_RECEIVE_DRAIN_LIMIT {
-                break 'drain;
-            }
-            peer_len = sockaddr_len();
-            let next = unsafe {
-                esp_idf_sys::lwip_recvfrom(
-                    fd,
-                    packet.as_mut_ptr().cast(),
-                    packet.len(),
-                    esp_idf_sys::MSG_DONTWAIT as i32,
-                    (&mut peer as *mut esp_idf_sys::sockaddr_in).cast(),
-                    &mut peer_len,
-                )
-            };
-            if next <= 0 {
-                break 'drain;
-            }
-            received = next as usize;
-            received_path = 0;
         }
-        receive_bursts = receive_bursts.saturating_add(1);
-        receive_burst_max = receive_burst_max.max(burst_datagrams as u64);
-        let mut transport_out = [0u8; UDP_MTU];
-        if let Ok(Some(used)) = endpoint.poll_transmit(&mut transport_out) {
-            if send_transport_datagram(
-                &mut ingress,
-                path_policy,
-                false,
-                fd,
-                &server_peer,
-                &transport_out[..used],
-            ) {
-                transport_datagrams = transport_datagrams.saturating_add(1);
-                record_control_success(&mut outbound_control_timing);
-            } else {
-                transport_send_failures = transport_send_failures.saturating_add(1);
-                transport_last_send_errno = send_errno();
-            }
+        if missing_observations < STA_ASSOCIATION_LOSS_OBSERVATIONS {
+            continue;
         }
-        if let Some(flash) = flash.as_mut() {
-            // Do not begin erase here.  A byte threshold reached at the end
-            // of this drained burst does not prove the Wi-Fi/lwIP queues are
-            // empty: later frames from the same host flight may already be
-            // queued.  ESP flash erase pauses Wi-Fi, so starting it here
-            // drops precisely those frames and strands the transfer before
-            // it can return any storage credit.  The empty-socket branch
-            // above is the application-safe boundary: transport has emitted
-            // its ACK/control and the sender is flow-credit blocked.
-            let released = match flash.flush_pending() {
-                Ok(value) => value,
-                Err(()) => {
-                    uart::send_response(b"udp flash sink failed");
-                    unsafe { esp_idf_sys::lwip_close(fd) };
-                    return;
-                }
-            };
-            if released != 0
-                && endpoint
-                    .stream_consumed_deferred(OBJECT_STREAM, released)
-                    .is_err()
+        if scan_cooldown != 0 {
+            scan_cooldown -= 1;
+            continue;
+        }
+        scan_cooldown = STA_RECONNECT_SCAN_COOLDOWN_OBSERVATIONS;
+        let reconnect_started_us = esp_idf_sys::esp_timer_get_time();
+        uart::send_stat(b"wifi reconnect scan_ms=", elapsed_ms(reconnect_started_us));
+        if let Some(selection) = scan_dmesh_sta_candidate(preferred_ssid) {
+            let mut sta = esp_idf_sys::wifi_sta_config_t::default();
+            for (dst, src) in sta
+                .ssid
+                .iter_mut()
+                .zip(selection.ssid[..selection.ssid_len].iter())
             {
-                uart::send_response(b"udp stream credit failed");
-                unsafe { esp_idf_sys::lwip_close(fd) };
-                return;
+                *dst = *src;
             }
-            if released != 0 {
-                // The first poll ACKed the receive burst before SPI work.
-                // Storage is now free, so give transport one immediate
-                // scheduling opportunity to advertise its own MAX_* update;
-                // Recovery neither encodes nor interprets that control data.
-                let mut released_control = [0u8; UDP_MTU];
-                if let Ok(Some(used)) = endpoint.poll_transmit(&mut released_control) {
-                    if send_transport_datagram(
-                        &mut ingress,
-                        path_policy,
-                        false,
-                        fd,
-                        &server_peer,
-                        &released_control[..used],
-                    ) {
-                        transport_datagrams = transport_datagrams.saturating_add(1);
-                        record_control_success(&mut outbound_control_timing);
-                    } else {
-                        transport_send_failures = transport_send_failures.saturating_add(1);
-                        transport_last_send_errno = send_errno();
-                    }
-                }
-            }
-        }
-        receive_bursts_since_yield = receive_bursts_since_yield.saturating_add(1);
-        if receive_bursts_since_yield >= UDP_RECEIVE_YIELD_BURSTS {
-            // One tick per drained burst is small compared with a per-packet
-            // delay, while preventing a continuous full-rate stream from
-            // starving the registered Idle task.
-            unsafe { esp_idf_sys::vTaskDelay(1) };
-            receive_bursts_since_yield = 0;
-        }
-        if image_complete {
-            // The DONE record proves that every block has been checked, not
-            // that the asynchronous flash worker has made those checked
-            // bytes durable.  Keep Recovery alive until every retained slot
-            // returns from the worker before handing Main to stage2.
-            if !benchmark && !transport_test {
-                let mut next_durable_log_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-                loop {
-                    if flash
-                        .as_mut()
-                        .expect("flash receiver")
-                        .start_erase_after_bootstrap()
-                        .is_err()
-                    {
-                        uart::send_response(b"udp flash erase failed");
-                        unsafe { esp_idf_sys::lwip_close(fd) };
-                        return;
-                    }
-                    let released = match flash.as_mut().expect("flash receiver").flush_pending() {
-                        Ok(value) => value,
-                        Err(()) => {
-                            uart::send_response(b"udp flash sink failed");
-                            unsafe { esp_idf_sys::lwip_close(fd) };
-                            return;
-                        }
-                    };
-                    if released != 0 {
-                        if endpoint
-                            .stream_consumed_deferred(OBJECT_STREAM, released)
-                            .is_err()
-                        {
-                            uart::send_response(b"udp stream credit failed");
-                            unsafe { esp_idf_sys::lwip_close(fd) };
-                            return;
-                        }
-                        let mut control = [0u8; UDP_MTU];
-                        if let Ok(Some(used)) = endpoint.poll_transmit(&mut control) {
-                            if send_transport_datagram(
-                                &mut ingress,
-                                path_policy,
-                                false,
-                                fd,
-                                &server_peer,
-                                &control[..used],
-                            ) {
-                                transport_datagrams = transport_datagrams.saturating_add(1);
-                                record_control_success(&mut outbound_control_timing);
-                            }
-                        }
-                    }
-                    if flash.as_mut().expect("flash receiver").durable() {
-                        break;
-                    }
-                    let now_us = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-                    if now_us >= next_durable_log_us {
-                        // One compact counter per second is deliberately
-                        // after the final stream frame. It diagnoses a stuck
-                        // erase/write worker without perturbing radio or ACK
-                        // scheduling during the transfer.
-                        uart::send_stat(
-                            b"udp durable jobs=",
-                            flash.as_mut().expect("flash receiver").pending_flash_jobs(),
-                        );
-                        next_durable_log_us = now_us.saturating_add(1_000_000);
-                    }
-                    unsafe { esp_idf_sys::vTaskDelay(1) };
-                }
-            }
-            uart::send_response(b"udp image complete");
-            if benchmark {
-                let (delivered_bytes, block_records) = if transport_test {
-                    (iperf.bytes() as usize, 0)
+            sta.bssid_set = true;
+            sta.bssid.copy_from_slice(&selection.bssid);
+            sta.channel = selection.channel;
+            let mut wifi = esp_idf_sys::wifi_config_t { sta };
+            if esp_idf_sys::esp_wifi_set_config(
+                esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                &mut wifi,
+            ) == esp_idf_sys::ESP_OK
+            {
+                // A reset of the association state is necessary after a host
+                // AP restart; a bare connect can otherwise retain the old
+                // BSSID/channel in ESP-IDF's fast-scan cache.
+                let _ = esp_idf_sys::esp_wifi_disconnect();
+                let connect = esp_idf_sys::esp_wifi_connect();
+                uart::send_response(if selection.preferred {
+                    b"wifi reconnect preferred candidate"
                 } else {
-                    flash.as_ref().expect("flash receiver").benchmark_stats()
-                };
-                let elapsed_us = transfer_completed_us.saturating_sub(transfer_started_us);
-                let bits_per_second = if elapsed_us == 0 {
-                    0
-                } else {
-                    delivered_bytes as u64 * 8_000_000 / elapsed_us
-                };
-                let transport_stats = endpoint.stats();
-                let iperf_errors = iperf.callback_errors();
-                uart::send_benchmark_stats(&[
-                    (0, rx_datagrams),
-                    (1, rejected_datagrams),
-                    (2, stream_datagrams),
-                    (3, control_datagrams),
-                    (4, transport_datagrams),
-                    (5, request_retries),
-                    (6, duplicate_datagrams),
-                    (7, interpacket_count),
-                    (8, interpacket_total_us),
-                    (9, interpacket_max_us),
-                    (10, delivered_bytes as u64),
-                    (11, block_records as u64),
-                    (12, transport_stats.received_datagrams),
-                    (13, transport_stats.stream_datagrams),
-                    (14, transport_stats.control_datagrams),
-                    (15, transport_stats.duplicate_datagrams),
-                    (16, transport_stats.out_of_order_datagrams),
-                    (17, transport_stats.inferred_missing_packets),
-                    (18, transport_stats.sent_datagrams),
-                    (103, transport_stats.sent_stream_datagrams),
-                    (104, transport_stats.sent_control_datagrams),
-                    (19, transport_stats.retransmitted_datagrams),
-                    (20, transport_stats.ack_datagrams),
-                    (21, transport_stats.receive_interpacket_samples),
-                    (22, transport_stats.receive_interpacket_total),
-                    (23, transport_stats.receive_interpacket_min),
-                    (24, transport_stats.ack_immediate_datagrams),
-                    (25, transport_stats.ack_threshold_datagrams),
-                    (26, transport_stats.ack_timer_datagrams),
-                    // Transport-only result: 34 bytes, 35 elapsed us, 36
-                    // bits/s. Host presentation must use kbps/Mbps.
-                    (34, delivered_bytes as u64),
-                    (35, elapsed_us),
-                    (36, bits_per_second),
-                    (39, iperf_validation as u64),
-                    (40, iperf_errors[0]),
-                    (41, iperf_errors[1]),
-                    (42, iperf_errors[2]),
-                    (43, iperf_errors[3]),
-                    (44, iperf_errors[4]),
-                    (45, iperf_errors[5]),
-                    (46, transport_errors[0]),
-                    (47, transport_errors[1]),
-                    (48, transport_errors[2]),
-                    (49, transport_errors[3]),
-                    (50, transport_errors[4]),
-                    (51, transport_errors[5]),
-                    (52, transport_errors[6]),
-                    (53, transport_errors[7]),
-                    (54, transport_errors[8]),
-                    (55, transport_errors[9]),
-                    (56, transport_errors[10]),
-                    (57, transport_send_failures),
-                    (58, transport_last_send_errno as u64),
-                    (59, benchmark_run_id as u64),
-                    (107, iperf.normal_bytes()),
-                    (108, iperf.high_bytes()),
-                    (109, iperf.low_bytes()),
-                    // Receiver credit snapshot: lets the host distinguish a
-                    // sender congestion stall from a MAX_* update that was
-                    // never emitted or accepted, without packet logging.
-                    (60, endpoint.receive.connection.max_data),
-                    (61, endpoint.receive.connection.consumed),
-                    (
-                        62,
-                        endpoint.receive.stream_max_data(IPERF_STREAM).unwrap_or(0),
-                    ),
-                    (63, endpoint.receive.received_data),
-                    (64, interpacket_gap_buckets[0]),
-                    (65, interpacket_gap_buckets[1]),
-                    (66, interpacket_gap_buckets[2]),
-                    (67, interpacket_gap_buckets[3]),
-                    (68, interpacket_gap_buckets[4]),
-                    (69, interpacket_gap_buckets[5]),
-                    (70, transport_stats.loss_packet_threshold_datagrams),
-                    (71, transport_stats.loss_time_threshold_datagrams),
-                    (72, transport_stats.loss_events),
-                    (73, transport_stats.loss_retransmitted_datagrams),
-                    (74, transport_stats.pto_retransmitted_datagrams),
-                    (75, transport_stats.ack_frequency_received),
-                    (76, transport_stats.ack_frequency_sent),
-                    (77, endpoint.ack_frequency() as u64),
-                    (78, endpoint.max_ack_delay_ms()),
-                    (82, receive_bursts),
-                    (83, receive_burst_max),
-                    (88, outbound_control_timing.datagrams),
-                    (89, outbound_control_timing.gaps),
-                    (90, outbound_control_timing.total_gap_us),
-                    (91, outbound_control_timing.max_gap_us),
-                    (92, outbound_control_timing.gap_buckets[0]),
-                    (93, outbound_control_timing.gap_buckets[1]),
-                    (94, outbound_control_timing.gap_buckets[2]),
-                    (95, outbound_control_timing.gap_buckets[3]),
-                    (96, outbound_control_timing.gap_buckets[4]),
-                    (97, outbound_control_timing.gap_buckets[5]),
-                    // Empty-socket scheduling evidence: all empty returns,
-                    // those which were immediate spins, and actual RTOS
-                    // tick yields. These are bearer timing only; no ACK or
-                    // packet detail leaks into Recovery's application path.
-                    (98, empty_socket_returns),
-                    (99, empty_socket_spins),
-                    (100, empty_socket_yields),
-                    (101, empty_socket_cooperative_yields),
-                    // Actual wall time spent in the bounded full-tick path.
-                    // This is deliberately aggregate-only telemetry.
-                    (102, empty_socket_tick_yield_us),
-                ]);
-                uart::send_response(b"udp benchmark complete");
-                // A benchmark worker owns one fresh transport association.
-                // Tell the persistent host listener that this operation is
-                // terminal before releasing the UDP socket; otherwise a
-                // lost final ACK can leave PTO retransmissions running into
-                // the next independent benchmark on the same AP.
-                endpoint.close(0);
-                let mut close = [0u8; UDP_MTU];
-                if let Ok(Some(used)) = endpoint.poll_close(&mut close) {
-                    let _ = send_transport_datagram(
-                        &mut ingress,
-                        path_policy,
-                        false,
-                        fd,
-                        &server_peer,
-                        &close[..used],
-                    );
+                    b"wifi reconnect fallback candidate"
+                });
+                uart::send_stat(
+                    b"wifi reconnect connect_ms=",
+                    elapsed_ms(reconnect_started_us),
+                );
+                if connect != esp_idf_sys::ESP_OK && connect != esp_idf_sys::ESP_ERR_WIFI_CONN {
+                    uart::send_stat(b"wifi reconnect result=", connect as u32 as u64);
                 }
-                unsafe {
-                    esp_idf_sys::lwip_close(fd);
-                }
-                return;
             } else {
-                // Numeric timings let the host distinguish radio/transport
-                // stalls from synchronous SPI flash work without adding a
-                // packet-path UART log. Keys 84..86 are erase us, write us,
-                // and successful write calls.
-                let (erase_us, write_us, writes) =
-                    flash.as_mut().expect("flash receiver").flash_stats();
-                let (delivered_bytes, block_records) =
-                    flash.as_ref().expect("flash receiver").benchmark_stats();
-                // Production elapsed time runs through the final durable
-                // flash completion, unlike dry mode which stops at the DONE
-                // record.  This is the actual Recovery Wi-Fi flashing rate.
-                let elapsed_us = (unsafe { esp_idf_sys::esp_timer_get_time() as u64 })
-                    .saturating_sub(transfer_started_us);
-                let bits_per_second = if elapsed_us == 0 {
-                    0
-                } else {
-                    delivered_bytes as u64 * 8_000_000 / elapsed_us
-                };
-                let transport_stats = endpoint.stats();
-                uart::send_benchmark_stats(&[
-                    (7, interpacket_count),
-                    (8, interpacket_total_us),
-                    (9, interpacket_max_us),
-                    (10, delivered_bytes as u64),
-                    (11, block_records as u64),
-                    (34, delivered_bytes as u64),
-                    (35, elapsed_us),
-                    (36, bits_per_second),
-                    (12, transport_stats.received_datagrams),
-                    (13, transport_stats.stream_datagrams),
-                    (14, transport_stats.control_datagrams),
-                    (15, transport_stats.duplicate_datagrams),
-                    (16, transport_stats.out_of_order_datagrams),
-                    (17, transport_stats.inferred_missing_packets),
-                    (18, transport_stats.sent_datagrams),
-                    (103, transport_stats.sent_stream_datagrams),
-                    (104, transport_stats.sent_control_datagrams),
-                    (19, transport_stats.retransmitted_datagrams),
-                    (20, transport_stats.ack_datagrams),
-                    (21, transport_stats.receive_interpacket_samples),
-                    (22, transport_stats.receive_interpacket_total),
-                    (23, transport_stats.receive_interpacket_min),
-                    (24, transport_stats.ack_immediate_datagrams),
-                    (25, transport_stats.ack_threshold_datagrams),
-                    (26, transport_stats.ack_timer_datagrams),
-                    (70, transport_stats.loss_packet_threshold_datagrams),
-                    (71, transport_stats.loss_time_threshold_datagrams),
-                    (72, transport_stats.loss_events),
-                    (73, transport_stats.loss_retransmitted_datagrams),
-                    (74, transport_stats.pto_retransmitted_datagrams),
-                    (75, transport_stats.ack_frequency_received),
-                    (76, transport_stats.ack_frequency_sent),
-                    (77, endpoint.ack_frequency() as u64),
-                    (78, endpoint.max_ack_delay_ms()),
-                    (64, interpacket_gap_buckets[0]),
-                    (65, interpacket_gap_buckets[1]),
-                    (66, interpacket_gap_buckets[2]),
-                    (67, interpacket_gap_buckets[3]),
-                    (68, interpacket_gap_buckets[4]),
-                    (69, interpacket_gap_buckets[5]),
-                    (82, receive_bursts),
-                    (83, receive_burst_max),
-                    // Opaque outbound control timing, after successful
-                    // sendto only. This is not ACK interpretation.
-                    (88, outbound_control_timing.datagrams),
-                    (89, outbound_control_timing.gaps),
-                    (90, outbound_control_timing.total_gap_us),
-                    (91, outbound_control_timing.max_gap_us),
-                    (92, outbound_control_timing.gap_buckets[0]),
-                    (93, outbound_control_timing.gap_buckets[1]),
-                    (94, outbound_control_timing.gap_buckets[2]),
-                    (95, outbound_control_timing.gap_buckets[3]),
-                    (96, outbound_control_timing.gap_buckets[4]),
-                    (97, outbound_control_timing.gap_buckets[5]),
-                    // Retain the same credit snapshot on a production
-                    // timeout as on a dry run. A partial real-write report
-                    // must say whether the sender stopped on receiver
-                    // credit, rather than forcing a UART packet trace.
-                    (60, endpoint.receive.connection.max_data),
-                    (61, endpoint.receive.connection.consumed),
-                    (
-                        62,
-                        endpoint.receive.stream_max_data(OBJECT_STREAM).unwrap_or(0),
-                    ),
-                    (63, endpoint.receive.received_data),
-                    (84, erase_us),
-                    (85, write_us),
-                    (86, writes),
-                    // Explicitly distinguish this durable, verified image
-                    // completion from the structurally similar timeout
-                    // diagnostic emitted below.
-                    (87, 1),
-                ]);
-                // Only dry/diagnostic runs are reusable. A real image is now
-                // durable and every block has matched the authenticated
-                // manifest, so hand Stage2 back to Main after its concise
-                // completion telemetry has reached the UART/UDP log queues.
-                if !complete_main_flash() {
-                    // Do not reset into forced Recovery and falsely claim a
-                    // Main handoff. The durable image remains available for
-                    // a later retry of this final policy commit.
-                    uart::send_response(b"udp main target failed");
-                    unsafe { esp_idf_sys::lwip_close(fd) };
-                    return;
-                }
-                // Recovery's callback restarts after committing its handoff.
-                // A shared runtime cannot assume that policy for Main.
-                uart::send_response(b"udp main completion requested");
+                uart::send_response(b"wifi reconnect config failed");
             }
+        } else {
+            uart::send_response(b"wifi reconnect no candidate");
         }
-        // recvfrom() is already blocking with a bounded timeout. Sleeping
-        // here adds one RTOS tick after every datagram (about 10 ms on this
-        // target), turning a windowed transfer into an accidental paced
-        // sender. Let the next socket call provide the wait/yield instead.
-    }
-    // A production timeout is exactly when the transport counters matter
-    // most.  It must expose the same compact, aggregate evidence as a dry
-    // run: packet loss/reordering, ACK policy, receive bursts, and durable
-    // flash work.  This runs only after the socket loop has ended, never on
-    // the packet path, so it cannot manufacture the gap it reports.
-    if !benchmark {
-        let transport_stats = endpoint.stats();
-        let (erase_us, write_us, writes) = flash
-            .as_mut()
-            .map(FlashHandler::flash_stats)
-            .unwrap_or((0, 0, 0));
-        uart::send_benchmark_stats(&[
-            (0, rx_datagrams),
-            (1, rejected_datagrams),
-            (2, stream_datagrams),
-            (3, control_datagrams),
-            (4, transport_datagrams),
-            (5, request_retries),
-            (6, duplicate_datagrams),
-            (7, interpacket_count),
-            (8, interpacket_total_us),
-            (9, interpacket_max_us),
-            (12, transport_stats.received_datagrams),
-            (13, transport_stats.stream_datagrams),
-            (14, transport_stats.control_datagrams),
-            (15, transport_stats.duplicate_datagrams),
-            (16, transport_stats.out_of_order_datagrams),
-            (17, transport_stats.inferred_missing_packets),
-            (18, transport_stats.sent_datagrams),
-            (103, transport_stats.sent_stream_datagrams),
-            (104, transport_stats.sent_control_datagrams),
-            (19, transport_stats.retransmitted_datagrams),
-            (20, transport_stats.ack_datagrams),
-            (24, transport_stats.ack_immediate_datagrams),
-            (25, transport_stats.ack_threshold_datagrams),
-            (26, transport_stats.ack_timer_datagrams),
-            (64, interpacket_gap_buckets[0]),
-            (65, interpacket_gap_buckets[1]),
-            (66, interpacket_gap_buckets[2]),
-            (67, interpacket_gap_buckets[3]),
-            (68, interpacket_gap_buckets[4]),
-            (69, interpacket_gap_buckets[5]),
-            (70, transport_stats.loss_packet_threshold_datagrams),
-            (71, transport_stats.loss_time_threshold_datagrams),
-            (72, transport_stats.loss_events),
-            (73, transport_stats.loss_retransmitted_datagrams),
-            (74, transport_stats.pto_retransmitted_datagrams),
-            (75, transport_stats.ack_frequency_received),
-            (76, transport_stats.ack_frequency_sent),
-            (77, endpoint.ack_frequency() as u64),
-            (78, endpoint.max_ack_delay_ms()),
-            (82, receive_bursts),
-            (83, receive_burst_max),
-            (88, outbound_control_timing.datagrams),
-            (89, outbound_control_timing.gaps),
-            (90, outbound_control_timing.total_gap_us),
-            (91, outbound_control_timing.max_gap_us),
-            (92, outbound_control_timing.gap_buckets[0]),
-            (93, outbound_control_timing.gap_buckets[1]),
-            (94, outbound_control_timing.gap_buckets[2]),
-            (95, outbound_control_timing.gap_buckets[3]),
-            (96, outbound_control_timing.gap_buckets[4]),
-            (97, outbound_control_timing.gap_buckets[5]),
-            (84, erase_us),
-            (85, write_us),
-            (86, writes),
-        ]);
-    }
-    if benchmark {
-        let (delivered_bytes, block_records) = if transport_test {
-            (iperf.bytes() as usize, 0)
-        } else {
-            flash.as_ref().expect("flash receiver").benchmark_stats()
-        };
-        let elapsed_us = if transfer_started_us != 0 {
-            (unsafe { esp_idf_sys::esp_timer_get_time() as u64 })
-                .saturating_sub(transfer_started_us)
-        } else {
-            0
-        };
-        let bits_per_second = if elapsed_us == 0 {
-            0
-        } else {
-            delivered_bytes as u64 * 8_000_000 / elapsed_us
-        };
-        let transport_stats = endpoint.stats();
-        uart::send_benchmark_stats(&[
-            (0, rx_datagrams),
-            (1, rejected_datagrams),
-            (2, stream_datagrams),
-            (3, control_datagrams),
-            (4, transport_datagrams),
-            (5, request_retries),
-            (6, duplicate_datagrams),
-            (7, interpacket_count),
-            (8, interpacket_total_us),
-            (9, interpacket_max_us),
-            (10, delivered_bytes as u64),
-            (11, block_records as u64),
-            (12, transport_stats.received_datagrams),
-            (13, transport_stats.stream_datagrams),
-            (14, transport_stats.control_datagrams),
-            (15, transport_stats.duplicate_datagrams),
-            (16, transport_stats.out_of_order_datagrams),
-            (17, transport_stats.inferred_missing_packets),
-            (18, transport_stats.sent_datagrams),
-            (103, transport_stats.sent_stream_datagrams),
-            (104, transport_stats.sent_control_datagrams),
-            (19, transport_stats.retransmitted_datagrams),
-            (20, transport_stats.ack_datagrams),
-            (21, transport_stats.receive_interpacket_samples),
-            (22, transport_stats.receive_interpacket_total),
-            (23, transport_stats.receive_interpacket_min),
-            (24, transport_stats.ack_immediate_datagrams),
-            (25, transport_stats.ack_threshold_datagrams),
-            (26, transport_stats.ack_timer_datagrams),
-            (34, delivered_bytes as u64),
-            (35, elapsed_us),
-            (36, bits_per_second),
-            (57, transport_send_failures),
-            (58, transport_last_send_errno as u64),
-            (59, benchmark_run_id as u64),
-            (107, iperf.normal_bytes()),
-            (108, iperf.high_bytes()),
-            (109, iperf.low_bytes()),
-            (60, endpoint.receive.connection.max_data),
-            (61, endpoint.receive.connection.consumed),
-            (
-                62,
-                endpoint.receive.stream_max_data(IPERF_STREAM).unwrap_or(0),
-            ),
-            (63, endpoint.receive.received_data),
-            (64, interpacket_gap_buckets[0]),
-            (65, interpacket_gap_buckets[1]),
-            (66, interpacket_gap_buckets[2]),
-            (67, interpacket_gap_buckets[3]),
-            (68, interpacket_gap_buckets[4]),
-            (69, interpacket_gap_buckets[5]),
-            (70, transport_stats.loss_packet_threshold_datagrams),
-            (71, transport_stats.loss_time_threshold_datagrams),
-            (72, transport_stats.loss_events),
-            (73, transport_stats.loss_retransmitted_datagrams),
-            (74, transport_stats.pto_retransmitted_datagrams),
-            (75, transport_stats.ack_frequency_received),
-            (76, transport_stats.ack_frequency_sent),
-            (77, endpoint.ack_frequency() as u64),
-            (78, endpoint.max_ack_delay_ms()),
-            (82, receive_bursts),
-            (83, receive_burst_max),
-            (88, outbound_control_timing.datagrams),
-            (89, outbound_control_timing.gaps),
-            (90, outbound_control_timing.total_gap_us),
-            (91, outbound_control_timing.max_gap_us),
-            (92, outbound_control_timing.gap_buckets[0]),
-            (93, outbound_control_timing.gap_buckets[1]),
-            (94, outbound_control_timing.gap_buckets[2]),
-            (95, outbound_control_timing.gap_buckets[3]),
-            (96, outbound_control_timing.gap_buckets[4]),
-            (97, outbound_control_timing.gap_buckets[5]),
-        ]);
-    }
-    uart::send_response(b"udp timeout");
-    unsafe {
-        esp_idf_sys::lwip_close(fd);
     }
 }
 
-fn recovery_connection_id(run_id: u32, random: u32) -> Option<ConnectionId> {
-    let nonce = if run_id == 0 { random } else { run_id };
-    ConnectionId::new(RECOVERY_CONNECTION_CID_PREFIX | u64::from(nonce))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ConnectionId, RecoveryEndpoint, Role, StreamFrame, IPERF_STREAM};
-    use quic_lite::{
-        interpacket_gap_bucket, ConnectionLimits, DatagramTiming, Frame, ShortHeader, FLAG_FIXED,
-    };
-
-    #[test]
-    fn interpacket_gap_buckets_cover_boundaries() {
-        assert_eq!(interpacket_gap_bucket(0), 0);
-        assert_eq!(interpacket_gap_bucket(999), 0);
-        assert_eq!(interpacket_gap_bucket(1_000), 1);
-        assert_eq!(interpacket_gap_bucket(4_999), 1);
-        assert_eq!(interpacket_gap_bucket(5_000), 2);
-        assert_eq!(interpacket_gap_bucket(10_000), 3);
-        assert_eq!(interpacket_gap_bucket(25_000), 4);
-        assert_eq!(interpacket_gap_bucket(50_000), 5);
+/// Convert an ESP-IDF scan into the host-tested selection inputs.  The BSSID
+/// comes from the management-frame beacon itself; it is therefore both the
+/// AP association target and the MAC from which raw UDP6 derives the host LL
+/// endpoint.  No duplicate IPv6 setting or vendor IE is required.
+unsafe fn scan_dmesh_sta_candidate(preferred_ssid: &[u8]) -> Option<ScannedStaCandidate> {
+    let scan = esp_idf_sys::esp_wifi_scan_start(core::ptr::null(), true);
+    if scan != esp_idf_sys::ESP_OK {
+        uart::send_stat(b"wifi reconnect scan_result=", scan as u32 as u64);
+        return None;
     }
-
-    #[test]
-    fn immediate_empty_bearer_returns_only_need_a_bounded_tick_yield() {
-        assert!(!quic_lite::bearer_poll_should_yield(
-            true, 0, 8, 100_000, 8, 100_000
-        ));
-        assert!(!quic_lite::bearer_poll_should_yield(
-            false, 0, 7, 100_000, 8, 100_000
-        ));
-        assert!(!quic_lite::bearer_poll_should_yield(
-            false, 0, 8, 99_999, 8, 100_000
-        ));
-        assert!(quic_lite::bearer_poll_should_yield(
-            false, 0, 8, 100_000, 8, 100_000
-        ));
-        assert!(!quic_lite::bearer_poll_should_yield(
-            false, 1_000, 8, 100_000, 8, 100_000
-        ));
-    }
-
-    #[test]
-    fn outbound_control_timing_is_opaque_and_aggregate() {
-        let mut timing = DatagramTiming::default();
-        timing.record_at(1_000);
-        timing.record_at(1_500);
-        timing.record_at(11_500);
-        assert_eq!(timing.datagrams, 3);
-        assert_eq!(timing.gaps, 2);
-        assert_eq!(timing.total_gap_us, 10_500);
-        assert_eq!(timing.max_gap_us, 10_000);
-        assert_eq!(timing.gap_buckets, [1, 0, 0, 1, 0, 0]);
-    }
-
-    #[test]
-    fn transport_iperf_credit_uses_the_diagnostic_packet_budget_only() {
-        let flash = quic_lite::recovery_connection_limits(false, 64);
-        let iperf_default = quic_lite::recovery_connection_limits(true, 0);
-        let iperf_24 = quic_lite::recovery_connection_limits(true, 24);
-        let iperf_64 = quic_lite::recovery_connection_limits(true, 64);
-        assert_eq!(flash.max_data, quic_lite::RECOVERY_INITIAL_MAX_DATA);
-        assert_eq!(flash.max_stream_data, quic_lite::RECOVERY_INITIAL_MAX_DATA);
-        assert_eq!(
-            iperf_default.max_data,
-            u64::from(quic_lite::RECOVERY_MAX_IN_FLIGHT_PACKETS) * 1200
+    let mut total = 0u16;
+    let count_result = esp_idf_sys::esp_wifi_scan_get_ap_num(&mut total);
+    if count_result != esp_idf_sys::ESP_OK {
+        uart::send_stat(
+            b"wifi reconnect scan_count_result=",
+            count_result as u32 as u64,
         );
-        assert_eq!(iperf_24.max_data, 24 * 1200);
-        assert_eq!(iperf_64.max_stream_data, 64 * 1200);
-        assert!(iperf_64.max_data > flash.max_data);
+        return None;
     }
-
-    #[test]
-    fn delayed_bootstrap_ack_sets_the_host_packet_number_frontier() {
-        let client = ConnectionId::new(0x41).unwrap();
-        let server = ConnectionId::new(0x42).unwrap();
-        let limits = ConnectionLimits {
-            max_data: 64 * 1200,
-            max_stream_data: 64 * 1200,
-            ..ConnectionLimits::default()
-        };
-        let mut bootstrap_ack = [0u8; 128];
-        let ack_len = quic_lite::encode_bootstrap_open_ack_packet_with_limits(
-            client,
-            server,
-            98,
-            limits,
-            &mut bootstrap_ack,
-        )
-        .unwrap();
-        let (header, ack) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
-            &bootstrap_ack[..ack_len],
-            client,
-        )
-        .unwrap();
-        assert_eq!(header.packet_number, 98);
-
-        let mut endpoint = RecoveryEndpoint::<2>::new(Role::Client, limits, 1400);
-        endpoint
-            .set_initial_peer_budget(ack.max_data, ack.max_stream_data, ack.max_in_flight_packets)
-            .unwrap();
-        endpoint.observe_packet(header.packet_number);
-        endpoint.install_connection_ids(client, server).unwrap();
-
-        let mut stream_packet = [0u8; 128];
-        let stream_header = ShortHeader {
-            flags: FLAG_FIXED,
-            dcid: client,
-            packet_number: 99,
-            packet_number_len: 1,
-        }
-        .encode(&mut stream_packet)
-        .unwrap();
-        let stream_len = Frame::Stream(StreamFrame {
-            id: IPERF_STREAM,
-            offset: 0,
-            fin: false,
-            data: b"ok",
-        })
-        .encode(&mut stream_packet[stream_header..])
-        .unwrap();
-        endpoint
-            .receive_datagram(&stream_packet[..stream_header + stream_len])
-            .unwrap();
-        assert_eq!(endpoint.stats().inferred_missing_packets, 0);
+    uart::send_stat(b"wifi reconnect scan_aps=", total as u64);
+    if total == 0 {
+        return None;
     }
+    let count = usize::from(total).min(STA_SCAN_MAX_RECORDS);
+    let mut records = Vec::with_capacity(count);
+    records.resize(count, esp_idf_sys::wifi_ap_record_t::default());
+    let mut returned = count as u16;
+    let records_result =
+        esp_idf_sys::esp_wifi_scan_get_ap_records(&mut returned, records.as_mut_ptr());
+    if records_result != esp_idf_sys::ESP_OK {
+        uart::send_stat(
+            b"wifi reconnect scan_records_result=",
+            records_result as u32 as u64,
+        );
+        return None;
+    }
+    records.truncate(usize::from(returned));
+
+    let mut candidates = Vec::with_capacity(records.len());
+    for record in &records {
+        let len = record
+            .ssid
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(record.ssid.len());
+        candidates.push(quic_lite::sta_selection::StaCandidate {
+            ssid: &record.ssid[..len],
+            bssid: record.bssid,
+            rssi_dbm: record.rssi,
+            channel: record.primary,
+        });
+    }
+    let selection = quic_lite::sta_selection::select_sta_candidate(
+        &candidates,
+        preferred_ssid,
+        STA_MINIMUM_RSSI_DBM,
+    );
+    if selection.is_none() {
+        uart::send_response(b"wifi reconnect scan no eligible AP");
+    }
+    let selection = selection?;
+    let mut ssid = [0; 33];
+    ssid[..selection.candidate.ssid.len()].copy_from_slice(selection.candidate.ssid);
+    Some(ScannedStaCandidate {
+        ssid,
+        ssid_len: selection.candidate.ssid.len(),
+        bssid: selection.candidate.bssid,
+        channel: selection.candidate.channel,
+        preferred: selection.preferred,
+    })
 }

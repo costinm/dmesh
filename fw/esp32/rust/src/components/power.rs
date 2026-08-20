@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{parse_bool, SharedSettings};
+use super::settings::{SharedSettings, parse_bool};
 
 #[repr(C)]
 #[derive(Default)]
@@ -288,7 +288,9 @@ fn configure_pm(max_mhz: u32, min_mhz: u32, light_sleep_enable: bool) -> Result<
     if ret == sys::ESP_OK {
         Ok(())
     } else {
-        bail!("esp_pm_configure failed err=0x{ret:x} min_mhz={min_mhz} max_mhz={max_mhz} light={light_sleep_enable}")
+        bail!(
+            "esp_pm_configure failed err=0x{ret:x} min_mhz={min_mhz} max_mhz={max_mhz} light={light_sleep_enable}"
+        )
     }
 }
 

@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{parse_bool, SharedSettings};
+use super::settings::{SharedSettings, parse_bool};
 use super::telemetry;
 
 const MODE_COMPANION: u8 = 0;
@@ -21,6 +21,10 @@ const DEFAULT_NAN_DUTY_MS: u32 = 4_000;
 // The active interval is the NAN receive/data dwell, not the radio resume
 // margin. The scheduler adds the measured pre-wake margin separately.
 const DEFAULT_NAN_ACTIVE_MS: u32 = 64;
+// Infrastructure starts with an uninterrupted acquisition interval so it can
+// select a NAN cluster before falling back to one bounded capture per DW.
+// Sleepy mode has separate wake/power policy below.
+const DEFAULT_INFRA_NAN_ACQUIRE_MS: u32 = 1_500;
 // Fixed pre-wake guard. Packet loss is intentionally diagnostic only; it must
 // not retune the schedule because a missed 802.11 frame is not evidence that
 // the local clock or radio-start latency changed.
@@ -42,7 +46,7 @@ const DEFAULT_NAN_DW_OFFSET_TU: u32 = 0;
 // another NAN sync source), then repeats a short scan every 16 s.
 const DEFAULT_AP_LOSS_MS: u32 = 12_000;
 const DEFAULT_AP_RECOVERY_MS: u32 = 16_000;
-const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = 600;
+const DEFAULT_AP_RECOVERY_LISTEN_MS: u32 = DEFAULT_INFRA_NAN_ACQUIRE_MS;
 // ESP-IDF requires SoftAP beacon intervals to be multiples of 100 TU. The AP
 // timestamp still samples the same TSF clock used to select the separate
 // 512-TU NAN DW grid below.
@@ -65,6 +69,12 @@ static COMPANION_PENDING_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ENABLED: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_DUTY_NEXT_MS: AtomicU32 = AtomicU32::new(0);
+// An active sleepy session keeps Wi-Fi powered for data traffic, but it must
+// not keep the raw management receiver promiscuous between DW0/DW8. These
+// timers gate only that capture path; they never stop the associated radio.
+static RAW_NAN_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RAW_NAN_CAPTURE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+static RAW_NAN_CAPTURE_NEXT_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_TARGET_WAKE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 static RAW_NAN_TARGET_WAKE_SESSION_END_SENT: AtomicBool = AtomicBool::new(false);
 static RAW_NAN_SYNC_SOURCE: AtomicU8 = AtomicU8::new(SYNC_SOURCE_NONE);
@@ -76,6 +86,13 @@ static AP_OWNER_AP_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AP_OWNER_STARTED_MS: AtomicU32 = AtomicU32::new(0);
 static AP_OWNER_STARTS: AtomicU32 = AtomicU32::new(0);
 static AP_OWNER_STOPS: AtomicU32 = AtomicU32::new(0);
+// AP/STA infrastructure remains awake, but raw NAN beacon capture is only
+// enabled around a bounded discovery interval. Keeping this separate from
+// `AP_OWNER_RUNNING` prevents an always-on gateway from accidentally becoming
+// a continuous promiscuous monitor.
+static AP_OWNER_NAN_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AP_OWNER_NAN_CAPTURE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+static AP_OWNER_NAN_CAPTURE_NEXT_MS: AtomicU32 = AtomicU32::new(0);
 // Infra active mode is a runtime-only override for a powered gateway or a
 // bounded bulk transfer. It deliberately does not persist in NVS: reset must
 // always return a battery node to its configured raw-NAN duty cycle.
@@ -905,6 +922,7 @@ fn start_ap_owner(settings: &SharedSettings, reason: &'static str, channel: u8) 
     };
     RAW_NAN_SYNC_SOURCE.store(initial_source, Ordering::Relaxed);
     super::nan::start_raw_window(channel, "nan")?;
+    start_ap_owner_nan_capture_window(settings)?;
     telemetry::record_log(format!(
         "event type=mode.ap_owner state=watching channel={} reason={} sync_policy={}",
         channel,
@@ -922,10 +940,15 @@ fn stop_ap_owner() -> Result<()> {
         return Ok(());
     }
     if AP_OWNER_AP_ACTIVE.swap(false, Ordering::AcqRel) {
-        super::nan::stop_nan().ok();
         super::wifi::stop_direct_ap_beacon_source()?;
         AP_OWNER_STOPS.fetch_add(1, Ordering::Relaxed);
     }
+    // The watching-only state owns the same capture callback as the fallback
+    // AP state. Always release it when AP ownership ends.
+    super::nan::stop_nan().ok();
+    AP_OWNER_NAN_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    AP_OWNER_NAN_CAPTURE_UNTIL_MS.store(0, Ordering::Relaxed);
+    AP_OWNER_NAN_CAPTURE_NEXT_MS.store(0, Ordering::Relaxed);
     RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
     super::serial::set_always_on(false);
     Ok(())
@@ -941,6 +964,7 @@ fn start_ap_owner_fallback(settings: &SharedSettings, channel: u8) -> Result<()>
     let ssid = super::wifi::start_direct_ap_beacon_source(channel, beacon_tu)?;
     // Re-arm the management callback without changing AP mode.
     super::nan::start_raw_window(channel, "nan")?;
+    start_ap_owner_nan_capture_window(settings)?;
     AP_OWNER_AP_ACTIVE.store(true, Ordering::Relaxed);
     AP_OWNER_STARTS.fetch_add(1, Ordering::Relaxed);
     RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_DIRECT_AP, Ordering::Relaxed);
@@ -957,6 +981,7 @@ fn poll_ap_owner(settings: &SharedSettings) {
     // cadence or battery wake window in infrastructure mode; sleepy-node duty
     // scheduling does not apply while infrastructure mode is selected.
     super::serial::set_always_on(true);
+    poll_ap_owner_nan_capture(settings);
     let channel = get_u32(settings, "nan.channel", 6).clamp(1, 13) as u8;
     let policy = sync_policy(settings);
     let nan_fresh = super::nan::nan_beacon_age_ms()
@@ -1003,7 +1028,129 @@ fn poll_ap_owner(settings: &SharedSettings) {
                 crate::commands::protocol::escape_value(&err.to_string())
             ));
         } else {
+            if let Err(err) = start_ap_owner_nan_capture_window(settings) {
+                telemetry::record_log(format!(
+                    "event type=mode.ap_owner state=nan_capture_failed msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+            }
             telemetry::record_log("event type=mode.ap_owner state=nan_detected ap_stopped=true");
+        }
+    }
+}
+
+/// Begin one AP-owner promiscuous NAN discovery interval.
+///
+/// Infrastructure radios remain associated and carry normal traffic, but the
+/// raw management receiver is enabled only for each NAN DW. NAN beacons carry
+/// the TSF used to place the next window and the same promiscuous interval
+/// receives SDF/service-discovery and follow-up public action frames. Keeping
+/// it disabled between DWs avoids turning an always-on AP/STA relay into a
+/// continuous promiscuous monitor. This is deliberately separate from the
+/// filtered ESP-NOW-compatible action bearer, which never enables
+/// promiscuous mode.
+fn start_ap_owner_nan_capture_window(settings: &SharedSettings) -> Result<()> {
+    let now = now_ms();
+    let active_ms = get_u32(settings, "nan.active_ms", DEFAULT_NAN_ACTIVE_MS).clamp(32, 60_000);
+    // NAN timing is in TUs, not milliseconds. The default 512-TU DW cadence
+    // is about 524 ms. `nan.wake_ms` is the sleepy DW0/DW8 power cadence and
+    // must not slow an infrastructure node's every-DW capture schedule.
+    let dw_tu = get_u32(settings, "nan.dw_tu", DEFAULT_NAN_DW_TU).clamp(1, 65_535);
+    let duty_ms = dw_tu.saturating_mul(1_024).div_ceil(1_000).max(active_ms);
+    super::nan::set_raw_capture_enabled(true)?;
+    AP_OWNER_NAN_CAPTURE_ACTIVE.store(true, Ordering::Release);
+    AP_OWNER_NAN_CAPTURE_UNTIL_MS.store(now.wrapping_add(active_ms), Ordering::Relaxed);
+    AP_OWNER_NAN_CAPTURE_NEXT_MS.store(now.wrapping_add(duty_ms), Ordering::Relaxed);
+    telemetry::record_log(format!(
+        "event type=mode.ap_owner nan_capture=enabled active_ms={} duty_ms={} dw_tu={}",
+        active_ms, duty_ms, dw_tu
+    ));
+    Ok(())
+}
+
+/// Maintain the AP-owner NAN capture duty cycle. No transport queue, radio
+/// mode, or STA/AP association changes here; only promiscuous reception is
+/// toggled around the bounded discovery window.
+fn poll_ap_owner_nan_capture(settings: &SharedSettings) {
+    let now = now_ms();
+    if AP_OWNER_NAN_CAPTURE_ACTIVE.load(Ordering::Acquire) {
+        let until = AP_OWNER_NAN_CAPTURE_UNTIL_MS.load(Ordering::Relaxed);
+        if deadline_due(now, until) {
+            if let Err(err) = super::nan::set_raw_capture_enabled(false) {
+                telemetry::record_log(format!(
+                    "event type=mode.ap_owner nan_capture=disable_failed msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+            } else {
+                telemetry::record_log("event type=mode.ap_owner nan_capture=disabled");
+            }
+            AP_OWNER_NAN_CAPTURE_ACTIVE.store(false, Ordering::Release);
+        }
+        return;
+    }
+    let next = AP_OWNER_NAN_CAPTURE_NEXT_MS.load(Ordering::Relaxed);
+    if !deadline_due(now, next) {
+        return;
+    }
+    if let Err(err) = start_ap_owner_nan_capture_window(settings) {
+        telemetry::record_log(format!(
+            "event type=mode.ap_owner nan_capture=enable_failed msg={}",
+            crate::commands::protocol::escape_value(&err.to_string())
+        ));
+        // Avoid retrying every scheduler pass if the radio transitions away.
+        AP_OWNER_NAN_CAPTURE_NEXT_MS.store(now.wrapping_add(1_000), Ordering::Relaxed);
+    }
+}
+
+/// Record that a newly started sleepy raw-NAN window has promiscuous capture
+/// enabled. When the node is held awake for an active session,
+/// [`poll_raw_nan_capture_gate`] uses this independent schedule to turn that
+/// capture back off between its DW0/DW8 windows while leaving Wi-Fi running.
+fn arm_raw_nan_capture_window(window_ms: u32, cadence_ms: u32) {
+    let now = now_ms();
+    RAW_NAN_CAPTURE_ACTIVE.store(true, Ordering::Release);
+    RAW_NAN_CAPTURE_UNTIL_MS.store(now.wrapping_add(window_ms), Ordering::Relaxed);
+    RAW_NAN_CAPTURE_NEXT_MS.store(now.wrapping_add(cadence_ms), Ordering::Relaxed);
+}
+
+/// Gate a sleepy node's raw management capture when an active session keeps
+/// its Wi-Fi radio powered. Beacons, SDFs, and NAN follow-ups are captured in
+/// the DW0/DW8 interval; ordinary associated traffic continues outside it.
+/// This makes active-session power policy explicit without conflating it with
+/// the non-promiscuous ESP-NOW-compatible action bearer.
+fn poll_raw_nan_capture_gate(window_ms: u32, cadence_ms: u32) {
+    let now = now_ms();
+    if RAW_NAN_CAPTURE_ACTIVE.load(Ordering::Acquire) {
+        if deadline_due(now, RAW_NAN_CAPTURE_UNTIL_MS.load(Ordering::Relaxed)) {
+            if let Err(err) = super::nan::set_raw_capture_enabled(false) {
+                telemetry::record_log(format!(
+                    "event type=nan.capture enabled=false ok=false msg={}",
+                    crate::commands::protocol::escape_value(&err.to_string())
+                ));
+            }
+            RAW_NAN_CAPTURE_ACTIVE.store(false, Ordering::Release);
+        }
+        return;
+    }
+    if !deadline_due(now, RAW_NAN_CAPTURE_NEXT_MS.load(Ordering::Relaxed)) {
+        return;
+    }
+    match super::nan::set_raw_capture_enabled(true) {
+        Ok(()) => {
+            arm_raw_nan_capture_window(window_ms, cadence_ms);
+            telemetry::record_log(format!(
+                "event type=nan.capture enabled=true window_ms={} cadence_ms={}",
+                window_ms, cadence_ms
+            ));
+        }
+        Err(err) => {
+            // The radio may be transitioning. Back off rather than retrying
+            // on every scheduler pass.
+            RAW_NAN_CAPTURE_NEXT_MS.store(now.wrapping_add(1_000), Ordering::Relaxed);
+            telemetry::record_log(format!(
+                "event type=nan.capture enabled=true ok=false msg={}",
+                crate::commands::protocol::escape_value(&err.to_string())
+            ));
         }
     }
 }
@@ -1066,8 +1213,9 @@ fn start_raw_nan_duty(
         )
         .max(active_ms)
     } else {
-        active_ms
+        DEFAULT_INFRA_NAN_ACQUIRE_MS.max(active_ms)
     };
+    arm_raw_nan_capture_window(initial_window_ms, duty_ms);
     RAW_NAN_RECOVERY_ACTIVE.store(initial_recovery, Ordering::Relaxed);
     RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(initial_window_ms), Ordering::Relaxed);
     if matches!(reason, "boot" | "boot_window_done") {
@@ -1110,6 +1258,10 @@ fn ensure_infra_active_radios(settings: &SharedSettings, reason: &'static str) -
             false,
             false,
         );
+        let duty_ms = get_u32(settings, "nan.wake_ms", DEFAULT_NAN_DUTY_MS)
+            .max(active_ms)
+            .clamp(100, 60_000);
+        arm_raw_nan_capture_window(active_ms, duty_ms);
         RAW_NAN_DUTY_ACTIVE.store(true, Ordering::Relaxed);
         RAW_NAN_DUTY_NEXT_MS.store(now_ms().wrapping_add(active_ms), Ordering::Relaxed);
         telemetry::record_log(format!(
@@ -1124,6 +1276,9 @@ pub fn stop_raw_nan_duty() {
     RAW_NAN_DUTY_ENABLED.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_ACTIVE.store(false, Ordering::Relaxed);
     RAW_NAN_DUTY_NEXT_MS.store(0, Ordering::Relaxed);
+    RAW_NAN_CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    RAW_NAN_CAPTURE_UNTIL_MS.store(0, Ordering::Relaxed);
+    RAW_NAN_CAPTURE_NEXT_MS.store(0, Ordering::Relaxed);
     RAW_NAN_MISS_BACKOFF_MS.store(0, Ordering::Relaxed);
     RAW_NAN_SYNC_SOURCE.store(SYNC_SOURCE_NONE, Ordering::Relaxed);
     RAW_NAN_TARGET_WAKE_UNTIL_MS.store(0, Ordering::Release);
@@ -1608,6 +1763,13 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
         )
         .max(RAW_NAN_BEACON_LISTEN_FLOOR_MS);
 
+    // Active sessions keep the Wi-Fi radio powered, but NAN raw management
+    // capture remains a DW0/DW8 operation. The gate is intentionally after
+    // all window sizing so recovery windows retain their extra listen time.
+    if hold_active {
+        poll_raw_nan_capture_gate(window_active_ms, duty_ms);
+    }
+
     // A powered gateway, bounded transfer, or locally woken console owns the
     // radio. If duty sleep had already stopped Wi-Fi, bring it up immediately;
     // otherwise retain the current receiver without churn.
@@ -1690,6 +1852,9 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             return;
         }
         let queued_sent = super::nan::drain_raw_queue();
+        RAW_NAN_CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+        RAW_NAN_CAPTURE_UNTIL_MS.store(0, Ordering::Relaxed);
+        RAW_NAN_CAPTURE_NEXT_MS.store(0, Ordering::Relaxed);
         super::nan::stop_nan().ok();
         if let Err(err) = super::wifi::stop_raw_wifi_for_sleep() {
             telemetry::record_log(format!(
@@ -1779,6 +1944,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
             {
                 Ok(()) => {
                     let queued_sent = super::nan::drain_raw_queue();
+                    arm_raw_nan_capture_window(window_active_ms, duty_ms);
                     record_raw_nan_dw_start(dw_offset_tu, sync_plan.is_some(), true);
                     set_raw_nan_window_start_us(radio_on_start_us);
                     let uart_heartbeat = if sync_plan.is_none() && source_before_window.is_none() {
@@ -1825,6 +1991,7 @@ fn poll_raw_nan_duty(settings: &SharedSettings) {
     match super::nan::start_raw_window(channel, sync_window_filter(settings, recovery_due)) {
         Ok(()) => {
             let queued_sent = super::nan::drain_raw_queue();
+            arm_raw_nan_capture_window(window_active_ms, duty_ms);
             // The non-light-sleep diagnostic path does not retain its prior
             // wake plan across polls, so only mark it synchronized when the
             // active window itself was entered from the light-sleep path.
@@ -2216,7 +2383,11 @@ pub fn raw_nan_status_fields() -> String {
         sync_source_name(RAW_NAN_SYNC_SOURCE.load(Ordering::Relaxed)),
         AP_OWNER_RUNNING.load(Ordering::Relaxed),
         AP_OWNER_AP_ACTIVE.load(Ordering::Relaxed),
-        if AP_OWNER_AP_ACTIVE.load(Ordering::Relaxed) { "ap" } else { "none" },
+        if AP_OWNER_AP_ACTIVE.load(Ordering::Relaxed) {
+            "ap"
+        } else {
+            "none"
+        },
         AP_OWNER_STARTS.load(Ordering::Relaxed),
         AP_OWNER_STOPS.load(Ordering::Relaxed),
         RAW_NAN_RECOVERY_RUNS.load(Ordering::Relaxed),
@@ -2676,7 +2847,7 @@ fn active_status_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{deadline_due, deadline_not_due, ping_packet};
-    use crate::commands::protocol::{decode_binary, CBOR_STATUS};
+    use crate::commands::protocol::{CBOR_STATUS, decode_binary};
 
     #[test]
     fn radio_ping_packets_are_compact_cbor_status_requests() {

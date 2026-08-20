@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use minicbor::Encoder;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -663,7 +663,11 @@ pub fn poll_main(
         let response = registry.dispatch(&request);
         telemetry::record_log(format!(
             "event type=module.structured_event id={} value_type={} flags={} payload_len={} status={:?}",
-            event.event_id, event.value_type, event.flags, request.payload.len(), response.status
+            event.event_id,
+            event.value_type,
+            event.flags,
+            request.payload.len(),
+            response.status
         ));
     }
     for _ in 0..2 {
@@ -880,9 +884,6 @@ pub fn invoke_module(
     name: &str,
     request: &CommandRequest,
 ) -> Result<CommandResponse> {
-    if !crate::components::recovery::command_transport_ready() {
-        return Err(anyhow!("module unavailable while flash transfer is active"));
-    }
     // A module transfer stops the old task before erasing its flash mapping,
     // but Main itself keeps running. Refresh the DMOD header before deciding
     // which ABI/service to invoke so a new image can be loaded immediately

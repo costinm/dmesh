@@ -33,20 +33,9 @@ CONFIG_CONSOLE_UART_NUM=0
 CONFIG_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESPTOOLPY_BAUD_460800B=y
 CONFIG_ESPTOOLPY_BAUD=460800
-# Main deliberately installs Recovery and the second-stage/partition-table
-# images.  Permit those dangerous-region writes; the Recovery command still
-# rejects the running Main target and validates the explicit target/range.
+# The signed-object flash sink may install a bounded Stage2 image.
 CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y
 CONFIG_MONITOR_BAUD=115200
-
-# Main receives the same 4 KiB DRS2 frames as Recovery.  Let TCP pipeline
-# several frames without adding an application-level ACK for each one.
-CONFIG_LWIP_TCP_WND_DEFAULT=23040
-# The flash module sets the socket receive buffer explicitly. Enable the lwIP
-# socket option and run TCP timers more frequently so delayed ACK/retransmit
-# handling does not add the default 250 ms cadence to a short transfer.
-CONFIG_LWIP_SO_RCVBUF=y
-CONFIG_LWIP_TCP_TMR_INTERVAL=20
 
 CONFIG_PM_ENABLE=y
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y

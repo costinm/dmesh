@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 
 pub type SharedSettings = Rc<RefCell<Settings>>;
@@ -144,15 +144,9 @@ impl Settings {
                 // UDP object-store receive window in packets.  Keep this
                 // short because ESP-IDF NVS keys are limited to 15 bytes.
                 "udp.win",
-                // Shared Recovery/Main STA and transport profile. The keys
-                // are defined by dmesh-fw-transport and deliberately do not
-                // have Recovery-specific compatibility aliases.
+                // The one persisted raw-STA preference. Generic NVS get/set
+                // accepts other validated keys without adding them here.
                 "ssid",
-                "server",
-                "ip",
-                "gw",
-                "mask",
-                "port",
             ],
         }
     }
@@ -230,31 +224,6 @@ impl Settings {
     }
 }
 
-// Main uses the same bounded transport-profile contract as no-std Recovery.
-// EspDefaultNvs commits each set operation; `commit` is therefore a no-op at
-// this adapter boundary rather than a second, divergent persistence path.
-impl dmesh_fw_transport::TransportSettings for Settings {
-    fn get_text(&mut self, key: &str, output: &mut [u8]) -> Option<usize> {
-        let value = self.get_str(key).ok().flatten()?;
-        let bytes = value.as_bytes();
-        if bytes.len() > output.len() {
-            return None;
-        }
-        output[..bytes.len()].copy_from_slice(bytes);
-        Some(bytes.len())
-    }
-
-    fn set_text(&mut self, key: &str, value: &[u8]) -> bool {
-        core::str::from_utf8(value)
-            .ok()
-            .is_some_and(|value| self.set_str(key, value).is_ok())
-    }
-
-    fn commit(&mut self) -> bool {
-        true
-    }
-}
-
 /// ESP-IDF NVS keys are limited to 15 bytes. Keep public settings descriptive
 /// and map only the overlong Wi-Fi fallback keys at the persistence boundary.
 fn storage_key(key: &str) -> &str {
@@ -263,6 +232,24 @@ fn storage_key(key: &str) -> &str {
         "nan.ap_recovery_ms" => "nap_recover",
         "nan.ap_recovery_listen_ms" => "nap_listen",
         _ => key,
+    }
+}
+
+impl dmesh_fw_transport::nvs::NvsStore for Settings {
+    fn namespace(&self) -> &str {
+        self.namespace()
+    }
+
+    fn get_str(&self, key: &str) -> Result<Option<String>, String> {
+        self.get_str(key).map_err(|error| error.to_string())
+    }
+
+    fn set_str(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.set_str(key, value).map_err(|error| error.to_string())
+    }
+
+    fn known_keys(&self) -> &[&str] {
+        self.known_keys()
     }
 }
 

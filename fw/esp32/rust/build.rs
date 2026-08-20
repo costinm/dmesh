@@ -1,11 +1,13 @@
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(esp_idf_version_at_least_6_0_0)");
-    // The build wrapper supplies an RFC 3339 UTC timestamp.  Keep this
-    // optional for direct Cargo builds, but always expose a stable status
-    // field so a live device identifies the exact build being exercised.
+    // Packaging may supply an RFC 3339 UTC timestamp. Keep it optional for
+    // interactive and direct Cargo builds: a synthesized wall-clock value
+    // would rerun this build script and force a costly firmware LTO relink on
+    // every otherwise unchanged build. The packaged image SHA-256 remains the
+    // authoritative identity in that case.
     println!("cargo:rerun-if-env-changed=DMESH_BUILD_TIMESTAMP");
-    let build_timestamp = std::env::var("DMESH_BUILD_TIMESTAMP")
-        .unwrap_or_else(|_| "unknown".to_owned());
+    let build_timestamp =
+        std::env::var("DMESH_BUILD_TIMESTAMP").unwrap_or_else(|_| "unknown".to_owned());
     println!("cargo:rustc-env=DMESH_BUILD_TIMESTAMP={build_timestamp}");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let partition_file = std::path::Path::new("../../boot/partitions.csv");
@@ -21,9 +23,6 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_pm/dmesh_pm.c");
     println!("cargo:rerun-if-changed=native/dmesh_pm/include/dmesh_pm.h");
     println!("cargo:rerun-if-changed=native/dmesh_pm/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=native/dmesh_wifi_filter/dmesh_wifi_filter.c");
-    println!("cargo:rerun-if-changed=native/dmesh_wifi_filter/include/dmesh_wifi_filter.h");
-    println!("cargo:rerun-if-changed=native/dmesh_wifi_filter/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/dmesh_boot_health.c");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/dmesh_module_loader/dmesh_module_loader.c");

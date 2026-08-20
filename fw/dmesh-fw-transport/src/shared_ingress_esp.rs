@@ -8,7 +8,7 @@
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use quic_lite::packet_pool::{PacketPool, PacketSlot};
@@ -17,12 +17,11 @@ use quic_lite::packet_pool::{PacketPool, PacketSlot};
 pub const FRAME_CAPACITY: usize = crate::TRANSPORT_MTU + 96;
 /// This is the device-wide count, not a per-bearer multiplier.
 pub const PACKET_SLOTS: usize = 8;
-// E6 diagnostic: establish the actual construction peak for the shared
-// eight-history association.  This is reverted to a named device budget once
-// the on-device result is known.
+/// One active ingress worker needs parser and dispatch call depth only: packet
+/// frames and QUIC response buffers are static/pool-backed rather than task
+/// locals. Keep this allocation bounded and internal, but do not reserve it
+/// in every firmware mode while no raw bearer is active.
 const TASK_STACK_BYTES: u32 = 48 * 1024;
-const TASK_STACK_WORDS: usize =
-    TASK_STACK_BYTES as usize / core::mem::size_of::<esp_idf_sys::StackType_t>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -39,11 +38,26 @@ pub enum IngressKind {
     Work = 5,
 }
 
+/// Link context preserved across the one required driver-buffer copy.
+///
+/// The shared worker is deliberately bearer-neutral, but raw Ethernet has two
+/// distinct ESP data interfaces.  Keeping this byte with the packet prevents
+/// an AP-received request from accidentally being returned as a STA To-DS
+/// frame after it leaves the Wi-Fi callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum IngressLink {
+    None = 0,
+    WifiSta = 1,
+    WifiAp = 2,
+}
+
 /// Slot metadata that can cross the FreeRTOS queue without copying a packet.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IngressPacket {
     pub kind: IngressKind,
+    pub link: IngressLink,
     pub source: [u8; 6],
     pub len: u16,
     slot: PacketSlot,
@@ -52,6 +66,10 @@ pub struct IngressPacket {
 impl IngressPacket {
     pub const fn source(self) -> [u8; 6] {
         self.source
+    }
+
+    pub const fn link(self) -> IngressLink {
+        self.link
     }
 }
 
@@ -68,15 +86,28 @@ static UART_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_RAW_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static WORK_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static DROPS: AtomicU32 = AtomicU32::new(0);
+// The bearer callback itself remains registered while a radio/UART is active,
+// but no ingress task exists while it is idle. The first queued item creates a
+// short-lived drain task; RETIRING closes the race between an empty receive
+// poll and a producer enqueueing a new slot.
+//
+// One tick was short enough for the worker to retire between consecutive UDP
+// packets. The next Wi-Fi RX callback then had to allocate a 48 KiB task
+// stack before it could publish its packet, producing avoidable receive gaps
+// and AP retries. Keep the heap-backed stack only for a short quiet interval
+// after real traffic, then release it exactly as before.
+const WORKER_IDLE_DRAIN_TICKS: esp_idf_sys::TickType_t = 20;
+const WORKER_IDLE: u8 = 0;
+const WORKER_STARTING: u8 = 1;
+const WORKER_RUNNING: u8 = 2;
+const WORKER_RETIRING: u8 = 3;
+static WORKER_STATE: AtomicU8 = AtomicU8::new(WORKER_IDLE);
 
 static mut QUEUE_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticQueue_t> =
     core::mem::MaybeUninit::uninit();
 static mut QUEUE_STORAGE: QueueStorage<{ PACKET_SLOTS * core::mem::size_of::<IngressPacket>() }> =
     QueueStorage([0; PACKET_SLOTS * core::mem::size_of::<IngressPacket>()]);
 static mut TASK_PACKET: core::mem::MaybeUninit<IngressPacket> = core::mem::MaybeUninit::uninit();
-static mut TASK_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticTask_t> =
-    core::mem::MaybeUninit::uninit();
-static mut TASK_STACK: [esp_idf_sys::StackType_t; TASK_STACK_WORDS] = [0; TASK_STACK_WORDS];
 
 pub fn start(kind: IngressKind, handler: IngressHandler) -> bool {
     handler_slot(kind).store(handler as usize, Ordering::Release);
@@ -100,29 +131,32 @@ pub fn start(kind: IngressKind, handler: IngressHandler) -> bool {
         return false;
     }
     QUEUE.store(queue.cast(), Ordering::Release);
-    let task = unsafe {
-        esp_idf_sys::xTaskCreateStaticPinnedToCore(
-            Some(task_entry),
-            b"packet_ingress\0".as_ptr().cast(),
-            TASK_STACK_BYTES,
-            core::ptr::null_mut(),
-            5,
-            core::ptr::addr_of_mut!(TASK_STACK).cast(),
-            core::ptr::addr_of_mut!(TASK_CONTROL).cast(),
-            0,
-        )
-    };
-    if task.is_null() {
-        QUEUE.store(core::ptr::null_mut(), Ordering::Release);
-        STARTED.store(false, Ordering::Release);
-        return false;
-    }
     true
+}
+
+/// Remove an ingress bearer after its hardware callback has been quiesced.
+///
+/// No worker is retained by this operation. Its stack is released after the
+/// short idle drain interval; the queue/pool remain valid for other bearers.
+pub fn stop(kind: IngressKind) {
+    handler_slot(kind).store(0, Ordering::Release);
 }
 
 /// Make one bounded ingress copy.  A full pool is backpressure: adapters must
 /// release their Wi-Fi driver RX buffer and count a drop, never allocate.
 pub fn enqueue(kind: IngressKind, source: [u8; 6], bytes: &[u8]) -> bool {
+    enqueue_on_link(kind, IngressLink::None, source, bytes)
+}
+
+/// Make one bounded ingress copy and retain the data-link interface that
+/// supplied it. UART and action-frame callers use [`enqueue`]; raw Ethernet
+/// uses this form so AP and STA replies cannot cross interfaces.
+pub fn enqueue_on_link(
+    kind: IngressKind,
+    link: IngressLink,
+    source: [u8; 6],
+    bytes: &[u8],
+) -> bool {
     if bytes.len() > FRAME_CAPACITY {
         DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -137,8 +171,17 @@ pub fn enqueue(kind: IngressKind, source: [u8; 6], bytes: &[u8]) -> bool {
         DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    // Task creation happens in caller task context (never an ISR), only when
+    // a frame arrives after an idle interval. Do this before publishing the
+    // slot so a low-memory failure can release it without touching the queue.
+    if !wake_worker() {
+        let _ = PACKETS.release(slot);
+        DROPS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let item = IngressPacket {
         kind,
+        link,
         source,
         len: bytes.len() as u16,
         slot,
@@ -150,6 +193,11 @@ pub fn enqueue(kind: IngressKind, source: [u8; 6], bytes: &[u8]) -> bool {
     if !queued {
         let _ = PACKETS.release(slot);
         DROPS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // A worker can observe an empty queue and begin retirement between
+        // the first wake and this send. Recheck so this item always has a
+        // consumer.
+        let _ = wake_worker();
     }
     queued
 }
@@ -166,23 +214,25 @@ pub fn schedule_work(work: fn()) -> bool {
         return false;
     }
     let queue = QUEUE.load(Ordering::Acquire);
+    if queue.is_null() || !wake_worker() {
+        WORK_HANDLER.store(0, Ordering::Release);
+        return false;
+    }
     let item = IngressPacket {
         kind: IngressKind::Work,
+        link: IngressLink::None,
         source: [0; 6],
         len: 0,
         slot: PacketSlot::sentinel(),
     };
-    let queued = !queue.is_null()
-        && unsafe {
-            esp_idf_sys::xQueueGenericSend(
-                queue.cast(),
-                (&item as *const IngressPacket).cast(),
-                0,
-                0,
-            ) == 1
-        };
+    let queued = unsafe {
+        esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
+            == 1
+    };
     if !queued {
         WORK_HANDLER.store(0, Ordering::Release);
+    } else {
+        let _ = wake_worker();
     }
     queued
 }
@@ -214,11 +264,21 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
             esp_idf_sys::xQueueReceive(
                 queue.cast(),
                 core::ptr::addr_of_mut!(TASK_PACKET).cast(),
-                10,
+                WORKER_IDLE_DRAIN_TICKS,
             )
         } != 1
         {
-            continue;
+            // Transition before the final queue check. Producers that see
+            // RETIRING retry until IDLE, while a producer that had already
+            // seen RUNNING is caught by this check.
+            WORKER_STATE.store(WORKER_RETIRING, Ordering::Release);
+            if unsafe { esp_idf_sys::uxQueueMessagesWaiting(queue.cast()) } != 0 {
+                WORKER_STATE.store(WORKER_RUNNING, Ordering::Release);
+                continue;
+            }
+            WORKER_STATE.store(WORKER_IDLE, Ordering::Release);
+            unsafe { esp_idf_sys::vTaskDeleteWithCaps(core::ptr::null_mut()) };
+            return;
         }
         let item = unsafe { *core::ptr::addr_of!(TASK_PACKET).cast::<IngressPacket>() };
         if item.kind == IngressKind::Work {
@@ -237,5 +297,52 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
             }
         }
         let _ = PACKETS.release(item.slot);
+    }
+}
+
+/// Start the deferred worker only while a packet/control item needs draining.
+/// This runs in normal FreeRTOS task context, including the ESP Wi-Fi RX
+/// callback; it must never be called from an ISR.
+fn wake_worker() -> bool {
+    loop {
+        match WORKER_STATE.load(Ordering::Acquire) {
+            WORKER_RUNNING => return true,
+            WORKER_RETIRING | WORKER_STARTING => core::hint::spin_loop(),
+            WORKER_IDLE => {
+                if WORKER_STATE
+                    .compare_exchange(
+                        WORKER_IDLE,
+                        WORKER_STARTING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                // The new task can run before the create call returns, so it
+                // must never observe STARTING as its own state.
+                WORKER_STATE.store(WORKER_RUNNING, Ordering::Release);
+                let mut task = core::ptr::null_mut();
+                let created = unsafe {
+                    esp_idf_sys::xTaskCreatePinnedToCoreWithCaps(
+                        Some(task_entry),
+                        b"packet_ingress\0".as_ptr().cast(),
+                        TASK_STACK_BYTES,
+                        core::ptr::null_mut(),
+                        5,
+                        &mut task,
+                        0,
+                        esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT,
+                    )
+                };
+                if created != 1 || task.is_null() {
+                    WORKER_STATE.store(WORKER_IDLE, Ordering::Release);
+                    return false;
+                }
+                return true;
+            }
+            _ => return false,
+        }
     }
 }

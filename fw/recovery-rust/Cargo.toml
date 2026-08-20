@@ -6,16 +6,8 @@ resolver = "2"
 
 [workspace]
 
-[features]
-# Recovery's production transport composition is raw IPv6/UDP plus the
-# raw ESP-NOW action bearer. The feature names remain only as crate-internal
-# dependency wiring; operators do not select a socket fallback.
-default = ["wifi-raw-udp6", "wifi-espnow"]
-wifi-raw-udp6 = ["dmesh-fw-transport/wifi-raw-udp6"]
-wifi-espnow = ["dmesh-fw-transport/wifi-espnow"]
-
 [dependencies]
-dmesh-fw-transport = { path = "../dmesh-fw-transport", features = ["esp-idf"] }
+dmesh-fw-transport = { path = "../dmesh-fw-transport" }
 # `no_std` here means no Rust std runtime. ESP-IDF, Wi-Fi, UART, and FreeRTOS
 # are still linked and called through the generated C bindings.
 esp-idf-sys = { version = "0.37", default-features = false, features = ["alloc_handler"] }
@@ -25,11 +17,15 @@ embuild = "0.33.3"
 
 [profile.release]
 codegen-units = 1
-debug = false
+# Keep DWARF and the symbol table in the host-side Recovery ELF. `elf2image`
+# emits only loadable sections, so this does not enlarge the flashed Recovery
+# app but makes a JTAG halt or ESP-IDF coredump attributable to shared Rust
+# and ESP-IDF calls rather than an opaque address.
+debug = 1
 lto = "fat"
 opt-level = "s"
 panic = "abort"
-strip = true
+strip = false
 
 # ESP-IDF 6 removed legacy MbedTLS headers while the released sys crate still
 # includes them unconditionally. Keep the same narrow upstream binding fix as

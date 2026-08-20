@@ -7,21 +7,17 @@ mode. The retired C Recovery is not a fallback.
 Recovery currently owns:
 
 - compact CBOR command/log records over PPP-like UART framing;
-- persisted STA identity/network defaults plus temporary per-command benchmark
-  settings;
-- IPv4 object transfer and IPv6 link-local diagnostics;
+- persisted STA identity/network defaults and raw-bearer association settings;
+- bearer-neutral signed-object transfer over authenticated UART, raw IPv6, or
+  action-frame paths;
 - the ESP datagram adapter for `quic-lite`;
-- ordered object-stream consumption through
-  `dmesh-server::ImageReceiver`;
+- ordered object-stream consumption through `dmesh-server::SignedObjectReceiver`;
 - manifest/signature policy, per-block integrity checks, bounded flash
   buffering, Main partition erase/write, commit, and Stage2 handoff.
 
-`wifi.rs` is a bearer adapter and scheduler. `udp_flash.rs` consumes ordered
-stream bytes and owns flash semantics; it must not contain ACK or
-retransmission logic. `uart.rs` currently shares command records with the
-temporary UDP control endpoint, but UART is not yet a full `quic-lite`
-bearer. That migration is tracked in
-[`docs/plans/main-recovery-transport-reuse.md`](../../docs/plans/main-recovery-transport-reuse.md).
+The ESP bearer adapter supplies packet I/O only. `dmesh-server` owns service
+framing and signed-object verification; `dmesh-fw-transport` owns durable
+partition/Stage2 writes. ACK and retransmission remain QUIC-lite concerns.
 
 Build an explicit CPU family:
 

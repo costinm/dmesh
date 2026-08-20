@@ -1,195 +1,191 @@
-// IMPORTANT: This is shared no-std ESP firmware code. Record framing and
-// object validation belong in dmesh-server; this file owns ESP partition I/O,
-// flash-worker scheduling, and real firmware receive-credit release.
-//! Application stream handler for Main flashing.
+//! ESP partition sink for the bearer-neutral signed-object client.
 //!
-//! `wifi.rs` owns the socket/bearer adapter and passes opaque transport output
-//! back to the bearer. This module receives only ordered stream callbacks,
-//! converts object records into image events, and writes the Main partition.
+//! Record framing, manifest verification, stream ordering, and flow control
+//! belong in `dmesh-server` and the selected transport. This module owns only
+//! durable ESP erase/write operations.
 
 use alloc::{
-    alloc::{alloc_zeroed, Layout},
+    alloc::{Layout, alloc_zeroed},
     boxed::Box,
-    sync::Arc,
     vec::Vec,
 };
 use core::ffi::c_void;
-use dmesh_server::protocol::{verified_object_record_credit, ObjectRecordCredit};
-use dmesh_server::protocol::{
-    FixedRecordDecoder, ImageEvent, ImageReceiver, ImageSink, RecordEvents, BLOCK_SIZE,
-    RECORD_BLOB, RECORD_DONE, RECORD_MANIFEST,
-};
-use quic_lite::{
-    callback::{CallbackStreams, CopyingError, CopyingStreamEvents},
-    StreamFrame,
-};
+use dmesh_server::protocol::{BLOCK_SIZE, ImageSink};
 
-pub(crate) const OBJECT_STREAM: u64 = 3;
-// A 4 MiB image has at most 1024 blocks; its canonical CBOR digest table is
-// below 48 KiB. This allocation is bounded and made once per transfer.
-const MAX_MANIFEST_BYTES: usize = 48 * 1024;
-const MAX_BLOB_RECORD_BYTES: usize = 12 + BLOCK_SIZE;
-// Keep a fixed 32 KiB application pool.  The matching transport bootstrap
-// credit is eight complete blob records; this leaves internal-RAM headroom for
-// the manifest table, lwIP queues, Wi-Fi, and the flash worker. Returning
-// credit only as this pool is reused makes the negotiated number real.
 const PENDING_FLASH_BLOCKS: usize = 8;
-// The ESP-IDF C6 configuration writes flash in 8 KiB chunks.  ImageReceiver
-// authenticates strictly increasing block indices, so two verified 4 KiB
-// blocks can safely share one worker-owned contiguous write buffer.  Four
-// slots retain the same eight-record application credit as before.
 const FLASH_WRITE_BLOCKS: usize = 2;
 const FLASH_WRITE_BATCH_BYTES: usize = BLOCK_SIZE * FLASH_WRITE_BLOCKS;
 const BLOCK_RECORD_OVERHEAD: usize = 5 + 12;
-// Object transfer intentionally finishes one record before opening the next.
-// The peer can therefore be flow-credit blocked just below the byte limit
-// when the remaining credit cannot fit another complete blob record.
-const BOOTSTRAP_ERASE_READY_BYTES: usize =
-    quic_lite::RECOVERY_INITIAL_MAX_DATA as usize - (BLOCK_RECORD_OVERHEAD + BLOCK_SIZE);
-type RecoveryRecordDecoder = FixedRecordDecoder<MAX_MANIFEST_BYTES, MAX_BLOB_RECORD_BYTES>;
+/// Stage2 occupies the boot region below the partition table.  A signed
+/// object may select a narrower address within this region, never raw flash
+/// beyond it.
+const STAGE2_REGION_BYTES: usize = 0x7000;
+/// Firmware bounds for the shared incremental signed-object receiver.
+pub const MAX_MANIFEST_BYTES: usize = 48 * 1024;
+pub const MAX_BLOB_RECORD_BYTES: usize = 12 + BLOCK_SIZE;
+pub type SignedObjectFlashReceiver = dmesh_server::protocol::SignedObjectReceiver<
+    EspPartitionSink,
+    dmesh_server::protocol::NoSignatureVerifier,
+    MAX_MANIFEST_BYTES,
+    MAX_BLOB_RECORD_BYTES,
+>;
 
-struct RecoveryRecordSink<'a> {
-    receiver: &'a mut ImageReceiver<MainSink>,
-    manifest_ok: &'a mut bool,
-    block_records: &'a mut usize,
-    complete: &'a mut bool,
-    benchmark: bool,
+/// One device-owned signed-object download/flash operation. A bearer sends
+/// packets returned by `start`, `receive`, and `poll_*`; it never buffers the
+/// object or performs flash I/O itself.
+pub struct SignedObjectFlashDownload {
+    receiver: SignedObjectFlashReceiver,
+    client: dmesh_server::raw_transport::RawObjectClient<
+        { crate::RAW_SERVICE_HISTORY_CAPACITY },
+        { crate::TRANSPORT_MTU },
+    >,
 }
 
-impl RecordEvents for RecoveryRecordSink<'_> {
-    type Error = ();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlashSinkError {
+    UnsupportedTarget,
+    AddressOverrideUnsupported,
+    MissingModuleName,
+    PartitionUnavailable,
+}
 
-    fn record(&mut self, kind: u8, payload: &[u8]) -> Result<(), Self::Error> {
-        if kind == RECORD_MANIFEST {
-            if *self.manifest_ok || self.receiver.on_manifest(payload).is_err() {
-                crate::commands::send_response(b"udp manifest rejected");
-                return Err(());
-            }
-            // The verified manifest remains in ImageReceiver's one bounded
-            // allocation for the rest of this transfer.  It does not consume
-            // one of the reusable flash slots, so returning its stream
-            // credit cannot make the sender outrun a dynamic buffer.
-            if let Some(ObjectRecordCredit::Immediate(credit)) =
-                verified_object_record_credit(kind, payload.len(), self.benchmark)
-            {
-                self.receiver.sink_mut().release_record_credit(credit);
-            }
-            if !self.benchmark {
-                crate::commands::send_response(b"udp manifest accepted");
-            }
-            *self.manifest_ok = true;
-            return Ok(());
+/// Construct the hardware half of a shared `flash` request.
+///
+/// The caller still owns the signed-object GET and feeds its ordered response
+/// bytes to the returned receiver. Stage2 is the one bounded raw region; all
+/// application and module targets resolve through the partition table.
+pub fn receiver_for_flash_request(
+    request: dmesh_server::protocol::FlashRequest<'_>,
+) -> Result<SignedObjectFlashReceiver, FlashSinkError> {
+    Ok(SignedObjectFlashReceiver::new(sink_for_flash_request(
+        request,
+    )?))
+}
+
+fn sink_for_flash_request(
+    request: dmesh_server::protocol::FlashRequest<'_>,
+) -> Result<EspPartitionSink, FlashSinkError> {
+    let target = request.object.target;
+    let dry_run = request.dry_run;
+    let sink = match target {
+        2 => {
+            let address = request.address.unwrap_or(0) as usize;
+            let capacity = STAGE2_REGION_BYTES
+                .checked_sub(address)
+                .ok_or(FlashSinkError::AddressOverrideUnsupported)?;
+            EspPartitionSink::new_raw(address, capacity, target, dry_run)
         }
-        if kind == RECORD_BLOB {
-            if !*self.manifest_ok {
-                return Err(());
+        6 if request.address.is_none() => EspPartitionSink::new(b"main\0", target, dry_run),
+        3 if request.address.is_none() => EspPartitionSink::new(b"recovery_app\0", target, dry_run)
+            .or_else(|| EspPartitionSink::new(b"recovery\0", target, dry_run)),
+        7 if request.address.is_none() => {
+            let name = request
+                .object
+                .name
+                .ok_or(FlashSinkError::MissingModuleName)?;
+            if name.is_empty() || name.iter().any(|byte| *byte == 0) {
+                return Err(FlashSinkError::MissingModuleName);
             }
-            *self.block_records = self.block_records.saturating_add(1);
-            // Do not emit progress here. UART/UDP logging can block for a
-            // scheduler tick; even one record per sixteen blocks repeatedly
-            // stalls the receive/ACK path. Completion counters are reported
-            // in the final compact numeric record instead.
-            if let Err(error) = self
-                .receiver
-                .on_block_with_hasher(payload, crate::crypto_esp::sha256_native)
-            {
-                crate::commands::send_response(match error {
-                    dmesh_server::protocol::ImageError::Truncated => b"udp block truncated",
-                    dmesh_server::protocol::ImageError::InvalidManifest => {
-                        b"udp block before manifest"
-                    }
-                    dmesh_server::protocol::ImageError::InvalidBlock => b"udp block invalid",
-                    dmesh_server::protocol::ImageError::InvalidSignature => {
-                        b"udp block signature invalid"
-                    }
-                    dmesh_server::protocol::ImageError::Sink => b"udp flash sink failed",
-                });
-                return Err(());
-            }
-            // Production returns this credit when the flash worker gives the
-            // block slot back. Benchmark mode has no worker or retained block
-            // slot, so its verified record is reusable immediately. Without
-            // this, a dry run advances only through the bootstrap window and
-            // then correctly—but permanently—hits flow control.
-            if let Some(ObjectRecordCredit::Immediate(credit)) =
-                verified_object_record_credit(kind, payload.len(), self.benchmark)
-            {
-                self.receiver.sink_mut().release_record_credit(credit);
-            }
-            return Ok(());
+            let mut label = Vec::with_capacity(name.len() + 1);
+            label.extend_from_slice(name);
+            label.push(0);
+            EspPartitionSink::new(&label, target, dry_run)
         }
-        if kind == RECORD_DONE && *self.manifest_ok {
-            match self.receiver.on_done() {
-                Ok(ImageEvent::Complete) => {
-                    if !self.benchmark {
-                        crate::commands::send_response(b"udp done record");
-                    }
-                    *self.complete = true;
-                    if let Some(ObjectRecordCredit::Immediate(credit)) =
-                        verified_object_record_credit(kind, payload.len(), self.benchmark)
-                    {
-                        self.receiver.sink_mut().release_record_credit(credit);
-                    }
-                    return Ok(());
-                }
-                Err(_) => {
-                    crate::commands::send_response(b"udp image rejected");
-                    return Err(());
-                }
-                Ok(_) => return Err(()),
-            }
-        }
-        Err(())
+        6 | 3 | 7 => return Err(FlashSinkError::AddressOverrideUnsupported),
+        _ => return Err(FlashSinkError::UnsupportedTarget),
     }
+    .ok_or(FlashSinkError::PartitionUnavailable)?;
+    Ok(sink)
 }
 
-struct RecoveryStreamSink<'a> {
-    decoder: &'a mut RecoveryRecordDecoder,
-    receiver: &'a mut ImageReceiver<MainSink>,
-    manifest_ok: &'a mut bool,
-    block_records: &'a mut usize,
-    complete: &'a mut bool,
-    bytes: usize,
-    benchmark: bool,
-}
+impl SignedObjectFlashDownload {
+    pub fn new(
+        client_cid: quic_lite::ConnectionId,
+        request: dmesh_server::protocol::FlashRequest<'_>,
+    ) -> Result<Self, FlashSinkError> {
+        let sink = sink_for_flash_request(request)?;
+        let client = dmesh_server::raw_transport::RawObjectClient::new(client_cid, request.object)
+            .map_err(|_| FlashSinkError::UnsupportedTarget)?;
+        Ok(Self {
+            receiver: SignedObjectFlashReceiver::new(sink),
+            client,
+        })
+    }
 
-// ARCHITECTURAL BOUNDARY -- this adapter receives ordered application bytes
-// only. It must never parse or generate datagrams, ACKs, packet numbers,
-// retransmission, flow-control, or duplicate-suppression state. The
-// quic-lite callback driver owns all of those transport concerns; this
-// file only consumes its stream callback and reports application bytes used.
-impl CopyingStreamEvents for RecoveryStreamSink<'_> {
-    type Error = ();
-
-    fn stream_chunk(
+    pub fn start(
         &mut self,
-        stream: u64,
-        _offset: u64,
-        _end: bool,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        if stream == OBJECT_STREAM {
-            let mut records = RecoveryRecordSink {
-                receiver: self.receiver,
-                manifest_ok: self.manifest_ok,
-                block_records: self.block_records,
-                complete: self.complete,
-                benchmark: self.benchmark,
-            };
-            self.decoder.push(bytes, &mut records).map_err(|_| ())?;
-        } else {
-            return Err(());
-        }
-        self.bytes = self.bytes.saturating_add(bytes.len());
-        Ok(())
+        output: &mut [u8; crate::TRANSPORT_MTU],
+    ) -> Result<usize, quic_lite::Error> {
+        self.client.start(output)
     }
 
-    fn stream_finished(&mut self, _stream: u64) {}
+    pub fn accepts(&self, input: &[u8]) -> bool {
+        self.client.accepts(input)
+    }
+
+    pub fn retry_bootstrap(
+        &self,
+        output: &mut [u8; crate::TRANSPORT_MTU],
+    ) -> Result<usize, quic_lite::Error> {
+        self.client.retry_bootstrap(output)
+    }
+
+    pub fn receive(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8; crate::TRANSPORT_MTU],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        let receiver = &mut self.receiver;
+        let result = self.client.receive(input, output, |fragment| {
+            receiver
+                .push_ordered(fragment)
+                .map_err(|_| quic_lite::Error::Invalid)
+        })?;
+        self.receiver
+            .sink_mut()
+            .poll_completed()
+            .map_err(|_| quic_lite::Error::Invalid)?;
+        Ok(result)
+    }
+
+    pub fn poll_transmit(
+        &mut self,
+        output: &mut [u8; crate::TRANSPORT_MTU],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        self.receiver
+            .sink_mut()
+            .poll_completed()
+            .map_err(|_| quic_lite::Error::Invalid)?;
+        self.client.poll_transmit(output)
+    }
+
+    pub fn poll_retransmit(
+        &mut self,
+        now_us: u64,
+        pto_us: u64,
+        output: &mut [u8; crate::TRANSPORT_MTU],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        self.receiver
+            .sink_mut()
+            .poll_completed()
+            .map_err(|_| quic_lite::Error::Invalid)?;
+        self.client.poll_retransmit(now_us, pto_us, output)
+    }
+
+    pub fn is_complete_and_durable(&mut self) -> bool {
+        self.client.is_complete()
+            && self.receiver.is_complete()
+            && self.receiver.sink_mut().is_durable()
+    }
 }
 
-struct MainSink {
+/// ESP-IDF-backed durable sink for one application partition.
+pub struct EspPartitionSink {
     partition: *const esp_idf_sys::esp_partition_t,
-    benchmark: bool,
+    base_address: usize,
+    capacity: usize,
+    target: u8,
+    dry_run: bool,
     free_blocks: Vec<Box<[u8; FLASH_WRITE_BATCH_BYTES]>>,
     worker: Option<FlashWorker>,
     // Blob slots accepted before the initial receive-credit boundary.  The
@@ -203,7 +199,6 @@ struct MainSink {
     // short or odd, so acceptance never depends on an artificial pair.
     staged_write: Option<FlashJob>,
     erase_len: usize,
-    erase_started: bool,
     erase_complete: bool,
     pending_jobs: usize,
     ready_credit: usize,
@@ -217,6 +212,7 @@ struct MainSink {
 struct FlashJob {
     kind: u8,
     partition: *const esp_idf_sys::esp_partition_t,
+    base_address: usize,
     index: u32,
     len: usize,
     data: *mut [u8; FLASH_WRITE_BATCH_BYTES],
@@ -276,7 +272,7 @@ impl FlashWorker {
         }
         let worker = Self { work, done };
         // The recovery process owns this task until it reboots.  Passing a
-        // copied pair of queue handles avoids a borrowed MainSink pointer in
+        // copied pair of queue handles avoids a borrowed EspPartitionSink pointer in
         // the RTOS task, so no callback can observe a dropped handler.
         let task_state = Box::into_raw(Box::new(worker));
         let mut task = core::ptr::null_mut();
@@ -335,12 +331,13 @@ impl FlashWorker {
 
 unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
     // This Box intentionally lives for Recovery's process lifetime; the task
-    // owns no pointer back into FlashHandler or ImageReceiver.
+    // owns no pointer back into the application receiver.
     let worker = unsafe { Box::from_raw(parameter.cast::<FlashWorker>()) };
     loop {
         let mut job = FlashJob {
             kind: 0,
             partition: core::ptr::null(),
+            base_address: 0,
             index: 0,
             len: 0,
             data: core::ptr::null_mut(),
@@ -358,8 +355,23 @@ unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
         }
         let started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
         let result = match job.kind {
+            FLASH_JOB_ERASE if job.partition.is_null() => unsafe {
+                esp_idf_sys::esp_flash_erase_region(
+                    core::ptr::null_mut(),
+                    job.base_address as u32,
+                    job.len as u32,
+                )
+            },
             FLASH_JOB_ERASE => unsafe {
                 esp_idf_sys::esp_partition_erase_range(job.partition, 0, job.len)
+            },
+            FLASH_JOB_WRITE if job.partition.is_null() => unsafe {
+                esp_idf_sys::esp_flash_write(
+                    core::ptr::null_mut(),
+                    job.data.cast(),
+                    (job.base_address + job.index as usize * BLOCK_SIZE) as u32,
+                    job.len as u32,
+                )
             },
             FLASH_JOB_WRITE => unsafe {
                 esp_idf_sys::esp_partition_write(
@@ -401,9 +413,13 @@ fn allocate_block() -> Option<Box<[u8; FLASH_WRITE_BATCH_BYTES]>> {
     (!raw.is_null()).then(|| unsafe { Box::from_raw(raw) })
 }
 
-impl MainSink {
-    fn new(benchmark: bool) -> Option<Self> {
-        let label = b"main\0";
+impl EspPartitionSink {
+    /// Select a partition once for a requested object target. `label` must be
+    /// NUL terminated because ESP-IDF retains no owned partition name.
+    pub fn new(label: &[u8], target: u8, dry_run: bool) -> Option<Self> {
+        if label.is_empty() || *label.last()? != 0 {
+            return None;
+        }
         let partition = unsafe {
             esp_idf_sys::esp_partition_find_first(
                 esp_idf_sys::esp_partition_type_t_ESP_PARTITION_TYPE_APP,
@@ -414,35 +430,71 @@ impl MainSink {
         if partition.is_null() {
             return None;
         }
-        let mut free_blocks = Vec::with_capacity(if benchmark {
+        Self::new_storage(
+            partition,
+            0,
+            unsafe { (*partition).size as usize },
+            target,
+            dry_run,
+        )
+    }
+
+    /// Construct the strictly bounded raw Stage2 region.  This is not a
+    /// general-purpose address writer: callers must have already selected the
+    /// Stage2 target and `base_address + image_size` must remain in `capacity`.
+    pub fn new_raw(
+        base_address: usize,
+        capacity: usize,
+        target: u8,
+        dry_run: bool,
+    ) -> Option<Self> {
+        if capacity == 0
+            || base_address % BLOCK_SIZE != 0
+            || base_address.checked_add(capacity)? > STAGE2_REGION_BYTES
+        {
+            return None;
+        }
+        Self::new_storage(core::ptr::null(), base_address, capacity, target, dry_run)
+    }
+
+    fn new_storage(
+        partition: *const esp_idf_sys::esp_partition_t,
+        base_address: usize,
+        capacity: usize,
+        target: u8,
+        dry_run: bool,
+    ) -> Option<Self> {
+        let mut free_blocks = Vec::with_capacity(if dry_run {
             0
         } else {
             PENDING_FLASH_BLOCKS / FLASH_WRITE_BLOCKS
         });
-        if !benchmark {
+        if !dry_run {
             for _ in 0..PENDING_FLASH_BLOCKS / FLASH_WRITE_BLOCKS {
                 free_blocks.push(allocate_block()?);
             }
         }
-        let worker = if benchmark {
+        let worker = if dry_run {
             None
         } else {
             Some(FlashWorker::new()?)
         };
         Some(Self {
             partition,
-            benchmark,
+            base_address,
+            capacity,
+            target,
+            dry_run,
             free_blocks,
             worker,
-            waiting_writes: Vec::with_capacity(if benchmark {
+            waiting_writes: Vec::with_capacity(if dry_run {
                 0
             } else {
                 PENDING_FLASH_BLOCKS / FLASH_WRITE_BLOCKS
             }),
             staged_write: None,
             erase_len: 0,
-            erase_started: false,
-            erase_complete: benchmark,
+            erase_complete: dry_run,
             pending_jobs: 0,
             ready_credit: 0,
             erase_us: 0,
@@ -451,57 +503,36 @@ impl MainSink {
         })
     }
 
-    fn stats(&self) -> (u64, u64, u64) {
+    pub fn stats(&self) -> (u64, u64, u64) {
         (self.erase_us, self.write_us, self.writes)
     }
 
     fn begin_image(&mut self, size: u32) -> Result<(), ()> {
-        if size == 0 || size > unsafe { (*self.partition).size } {
+        if size == 0 || size as usize > self.capacity {
             return Err(());
         }
-        // Erase once after the verified manifest has bounded the destination.
-        // Per-4 KiB erase calls stall the same task that drains lwIP and emits
-        // transport ACKs, multiplying radio pauses across the whole image.
+        // Start one manifest-bounded erase. The worker is the only blocking
+        // owner; stream callbacks only enqueue verified writes.
         let erase_len = (size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
-        if erase_len > unsafe { (*self.partition).size as usize } {
+        if erase_len > self.capacity {
             return Err(());
         }
-        if self.benchmark {
-            return Ok(());
-        }
-        self.erase_len = erase_len;
-        Ok(())
-    }
-
-    /// Begin the one manifest-bounded erase only after Recovery has received
-    /// the complete bootstrap receive window.  At that point `wifi.rs` has
-    /// emitted its ACK/control for the final bounded packet burst, and the
-    /// peer cannot inject further stream bytes until this sink returns flow
-    /// credit. ESP-IDF yields internally while erasing; Recovery sees only
-    /// this single application job.
-    fn start_erase_after_bootstrap(
-        &mut self,
-        stream_bytes: usize,
-        complete: bool,
-    ) -> Result<(), ()> {
-        if self.benchmark
-            || self.erase_started
-            || (!complete && stream_bytes < BOOTSTRAP_ERASE_READY_BYTES)
-        {
+        if self.dry_run {
             return Ok(());
         }
         let worker = self.worker.ok_or(())?;
         if !worker.enqueue(FlashJob {
             kind: FLASH_JOB_ERASE,
             partition: self.partition,
+            base_address: self.base_address,
             index: 0,
-            len: self.erase_len,
+            len: erase_len,
             data: core::ptr::null_mut(),
             credit: 0,
         }) {
             return Err(());
         }
-        self.erase_started = true;
+        self.erase_len = erase_len;
         self.pending_jobs = self.pending_jobs.saturating_add(1);
         Ok(())
     }
@@ -519,7 +550,7 @@ impl MainSink {
     }
 
     fn write_image_block(&mut self, index: u32, data: &[u8]) -> Result<(), ()> {
-        if self.benchmark {
+        if self.dry_run {
             return Ok(());
         }
         let data_len = data.len();
@@ -548,6 +579,7 @@ impl MainSink {
         let job = FlashJob {
             kind: FLASH_JOB_WRITE,
             partition: self.partition,
+            base_address: self.base_address,
             index,
             len: data_len,
             data: Box::into_raw(slot),
@@ -565,13 +597,11 @@ impl MainSink {
         self.ready_credit = self.ready_credit.saturating_add(credit);
     }
 
-    fn flush(&mut self) -> Result<usize, ()> {
-        if self.benchmark {
-            // Benchmark mode skips erase/write, so accepted records are
-            // immediately reusable storage.  It must return the same
-            // deferred stream credit that production returns after a worker
-            // completion; returning zero here stalls exactly at bootstrap
-            // credit and makes the object benchmark a false throughput test.
+    /// Poll completed flash jobs without blocking the stream receive path.
+    pub fn poll_completed(&mut self) -> Result<usize, ()> {
+        if self.dry_run {
+            // Dry-run mode owns no retained flash block, so all accepted
+            // records are immediately reusable.
             return Ok(core::mem::take(&mut self.ready_credit));
         }
         let worker = self.worker.expect("production worker");
@@ -607,24 +637,24 @@ impl MainSink {
         Ok(core::mem::take(&mut self.ready_credit))
     }
 
-    fn durable(&self) -> bool {
-        self.benchmark || (self.erase_complete && self.pending_jobs == 0)
+    pub fn is_durable(&self) -> bool {
+        self.dry_run || (self.erase_complete && self.pending_jobs == 0)
     }
 
     /// Compact post-DONE diagnostic: queued worker operations.  It is read
     /// only while Recovery waits for durability, never from the packet path.
-    fn pending_jobs(&self) -> u64 {
+    pub fn pending_jobs(&self) -> u64 {
         self.pending_jobs as u64
     }
 }
 
-impl ImageSink for MainSink {
+impl ImageSink for EspPartitionSink {
     type Error = ();
     fn begin(
         &mut self,
         manifest: &dmesh_server::protocol::ImageManifest,
     ) -> Result<(), Self::Error> {
-        if manifest.target != 6 || manifest.block_size as usize != BLOCK_SIZE {
+        if manifest.target != self.target || manifest.block_size as usize != BLOCK_SIZE {
             return Err(());
         }
         self.begin_image(manifest.image_size)
@@ -649,139 +679,5 @@ impl ImageSink for MainSink {
                 self.free_blocks.push(unsafe { Box::from_raw(job.data) });
             }
         }
-    }
-}
-
-pub(crate) struct FlashHandler {
-    records: Box<RecoveryRecordDecoder>,
-    ordered: CallbackStreams<Arc<Vec<u8>>>,
-    receiver: ImageReceiver<MainSink>,
-    manifest_ok: bool,
-    delivered_bytes: usize,
-    block_records: usize,
-    complete: bool,
-    benchmark: bool,
-}
-
-impl FlashHandler {
-    pub(crate) fn new(benchmark: bool) -> Option<Self> {
-        // `RecoveryRecordDecoder::new()` contains a 48 KiB manifest array.
-        // Constructing it as the argument to Box::new first places that array
-        // on Recovery's 16 KiB main-task stack, causing a stack-protection
-        // reset under the first stream callback. All-zero bytes are exactly
-        // its initial state, so allocate the one bounded decoder directly in
-        // the heap and never create a stack-sized temporary.
-        let layout = Layout::new::<RecoveryRecordDecoder>();
-        let raw = unsafe { alloc_zeroed(layout) as *mut RecoveryRecordDecoder };
-        if raw.is_null() {
-            return None;
-        }
-        Some(Self {
-            records: unsafe { Box::from_raw(raw) },
-            // The host may have a full bounded transport window in flight.
-            // Keep enough retained stream bytes for that window so transport
-            // can deliver out of order and the callback layer can release
-            // them in offset order without dropping an already-ACKed packet.
-            // Keep the receiver's retained out-of-order bytes above the
-            // advertised host sender window. A loss of the first packet in a
-            // full burst must not turn into a callback-capacity failure.
-            ordered: CallbackStreams::new(2, quic_lite::RECOVERY_REORDER_CAPACITY_BYTES),
-            // Recovery currently has no configured image-signing public key.
-            // ImageReceiver therefore fails closed on a signed manifest;
-            // provisioning a key must provide a SignatureVerifier here rather
-            // than bypassing the manifest check.
-            receiver: ImageReceiver::new(MainSink::new(benchmark)?),
-            manifest_ok: false,
-            delivered_bytes: 0,
-            block_records: 0,
-            complete: false,
-            benchmark,
-        })
-    }
-
-    pub(crate) fn benchmark_stats(&self) -> (usize, usize) {
-        (self.delivered_bytes, self.block_records)
-    }
-
-    pub(crate) fn flash_stats(&mut self) -> (u64, u64, u64) {
-        self.receiver.sink_mut().stats()
-    }
-
-    /// Collect flash-worker completions after the bearer has emitted an ACK
-    /// for a drained burst. Returned bytes have a reusable storage slot, so
-    /// the bearer may return only that transport stream credit.
-    pub(crate) fn flush_pending(&mut self) -> Result<usize, ()> {
-        self.receiver.sink_mut().flush()
-    }
-
-    /// Start erase after the bearer has ACKed the complete bounded bootstrap
-    /// receive window.  This is application storage scheduling only; it does
-    /// not inspect or encode transport control.
-    pub(crate) fn start_erase_after_bootstrap(&mut self) -> Result<(), ()> {
-        self.receiver
-            .sink_mut()
-            .start_erase_after_bootstrap(self.delivered_bytes, self.complete)
-    }
-
-    pub(crate) fn durable(&mut self) -> bool {
-        self.receiver.sink_mut().durable()
-    }
-
-    pub(crate) fn pending_flash_jobs(&mut self) -> u64 {
-        self.receiver.sink_mut().pending_jobs()
-    }
-
-    /// Consume one already accepted stream callback. Datagram scheduling,
-    /// transport control, and flow credit remain entirely in quic-lite.
-    pub(crate) fn handle_stream(&mut self, stream: StreamFrame<'_>) -> Result<(bool, usize), ()> {
-        if stream.id != OBJECT_STREAM {
-            return Ok((false, 0));
-        }
-        let (consumed, complete) = {
-            let mut complete = false;
-            let mut sink = RecoveryStreamSink {
-                decoder: &mut self.records,
-                receiver: &mut self.receiver,
-                manifest_ok: &mut self.manifest_ok,
-                block_records: &mut self.block_records,
-                complete: &mut complete,
-                bytes: 0,
-                benchmark: self.benchmark,
-            };
-            let callback_result = self.ordered.receive_copying_borrowed(
-                stream.id,
-                stream.data,
-                stream.offset,
-                stream.fin,
-                || Arc::new(stream.data.to_vec()),
-                &mut sink,
-            );
-            if let Err(error) = callback_result {
-                crate::commands::send_response(match error {
-                    CopyingError::Transport(error) => match error {
-                        quic_lite::callback::CallbackError::InvalidOverlap => {
-                            b"udp callback invalid overlap"
-                        }
-                        quic_lite::callback::CallbackError::InvalidFin => {
-                            b"udp callback invalid fin"
-                        }
-                        quic_lite::callback::CallbackError::InvalidCompletion => {
-                            b"udp callback invalid completion"
-                        }
-                        quic_lite::callback::CallbackError::Capacity => b"udp callback capacity",
-                        quic_lite::callback::CallbackError::Reset => b"udp callback reset",
-                    },
-                    CopyingError::Callback(_) => b"udp callback application failed",
-                });
-                return Err(());
-            }
-            (sink.bytes, complete)
-        };
-        self.delivered_bytes = self.delivered_bytes.saturating_add(consumed);
-        self.complete |= complete;
-        // The caller uses this count only to distinguish a newly delivered
-        // range from CallbackStreams' zero-byte retransmission result. Flow
-        // credit remains deferred until `flush_pending()` releases storage.
-        Ok((complete, consumed))
     }
 }
