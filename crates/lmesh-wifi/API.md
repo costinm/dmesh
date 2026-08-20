@@ -130,7 +130,9 @@ wifi.interface.status iface=wlan1
 wifi.interface.up iface=wlan1
 wifi.interface.channel iface=wlan1 channel=6
 wifi.raw.stop iface=wlan1
-wifi.raw.send iface=wlan1 tx_variant=onchannel_noack destination=<mac> bssid=<cluster> payload=hex:...
+wifi.raw.send iface=wlan1 destination=<mac> bssid=<cluster> payload=hex:...
+# `monitor` is the default host NOW/NAN injector; `action` remains an
+# explicit nl80211 management-frame experiment and requires association.
 wifi.raw.send iface=wlan1 tx_variant=action destination=<mac> bssid=<cluster> payload=hex:...
 wifi.raw.send iface=wlan1 tx_variant=nan_data_raw llc=hex:... destination=<mac> bssid=<cluster> payload=hex:...
 wifi.raw.send iface=wlan1 channel=6 tx_variant=monitor frame_hex=<80211-header-and-body-hex>
@@ -142,11 +144,13 @@ messages.history keys=wifi.raw.tx,wifi.raw.rx limit=40
 
 ```sh
 source ./env.sh
-mesh lmesh wifi.ap.start_open iface=wlan1 ssid=dmesh-lmesh6
+mesh lmesh wifi.ap.start_open iface=wlan1 ssid=dmesh-lmesh6 beacon_interval_tu=500
 mesh lmesh-wifi wifi.ap.status iface=wlan0
 mesh lmesh-wifi wifi.rawnan.status iface=wlan0
 ```
 
+The optional `beacon_interval_tu` is clamped to 10--1000 TU and defaults to
+100; larger values reduce beacon contention during raw-action measurements.
 The AP command owns only `wlan1`; `lmesh-wifi` continues to own `wlan0`.
 The former UART command steps are intentionally omitted: transport tests use
 the registered QUIC-lite services over a discovered L2 path. `sync_beacon` is
@@ -203,16 +207,56 @@ LLC marker, payload length, and kernel error/result in `wifi.raw.tx` history.
 The `messages.history` method is exposed by both the full `lmesh` service and
 the standalone `lmesh-wifi` service.
 
+## Host counterpart of the firmware radio laboratory
+
+`wlan1` is the host-side sender/receiver for the Recovery-first raw-frame
+matrix; it avoids reflashing a second ESP merely to change a frame shape or
+rate.  Use the existing explicit operations as the host counterpart of the
+firmware `radio.control` handler:
+
+```text
+wifi.interface.channel iface=wlan1 channel=6
+wifi.rate.profile iface=wlan1 profile=auto disable_80211b=false
+wifi.raw.listen iface=wlan1 channel=6 rx_variant=nl80211 listen_sec=60
+wifi.raw.send iface=wlan1 channel=6 tx_variant=action destination=ff:ff:ff:ff:ff:ff bssid=<cluster> payload=hex:...
+wifi.raw.send iface=wlan1 channel=6 tx_variant=monitor tx_rate_mbps=54 frame_hex=<80211-frame>
+wifi.raw.iperf iface=wlan1 channel=6 destination=<esp-mac> bytes=16384 packet_size=1200 tx_variant=monitor rx_variant=monitor tx_rate_mbps=54 timeout_ms=20000
+wifi.raw.stop iface=wlan1
+messages.history keys=wifi.raw.tx,wifi.raw.rx,wifi.rawnan.rx limit=40
+```
+
+`wifi.raw.iperf` is a host raw-action client using the same bearer-neutral
+`dmesh_server::raw_iperf::RawIperfClient` as firmware. `packet_size`,
+`tx_rate_mbps` (6, 9, 12, 18, 24, 36, 48, or 54), and `timeout_ms` are explicit
+runtime parameters. `tx_variant=monitor` is the default and historically
+proven AF_PACKET/radiotap injection path; `tx_variant=nl80211` is retained as
+an explicit management-frame driver experiment. `rx_variant` is independently
+selectable and defaults to monitor. Its result reports the chosen values and
+counts each received action once.
+
+
+The operations deliberately share frame builders, `dmesh-rawnan` parsing, and
+event history with `lmesh-wifi`; no ESP-specific socket facade is emulated.
+Linux has no equivalent of the ESP private Address-3 hardware comparator or
+its NAN interface.  Consequently, a host result must label monitor capture as
+monitor capture and must not claim a non-promiscuous comparator result.  The
+before/after history samples are the host metric boundary, while the ESP
+`radio.snapshot` counters are the device metric boundary.
+
 For arbitrary injection, `frame_hex` bypasses the structured DMesh builders:
 `monitor`/`monitor_active` takes an 802.11 management or data frame without
-radiotap and adds the required radiotap header; `af_packet` writes a complete
+radiotap and adds the required radiotap header; `action` submits the same
+802.11 header through `NL80211_CMD_FRAME`/`send_mgmt_frame` (driver support is
+adapter-specific); `af_packet` writes a complete
 Ethernet frame directly to `wlan1`. The latter exercises the normal AP/STA
 data path and is not an 802.11-header injection API. `monitor_active` may take
 the parent interface down, so use `monitor` while an AP must remain active.
 
 AP startup is a service policy. `LMESH_AP_ADDRESS` optionally selects the
 static IPv4 address/prefix applied to the owned open AP; the current service
-default is `10.78.0.1/16`.
+default is `10.78.0.1/16`. The AP defaults to HT20 so STA, NAN, and NOW can
+share a single 20 MHz channel.  Set `LMESH_AP_HT40=true`, or pass
+`ht40=true` to `wifi.ap.start_open`, only for a dedicated AP experiment.
 
 `wifi.interface.channel` is an explicit nl80211 channel pin for the owned
 interface (currently 2.4 GHz channels 1-13). It brings only that interface up

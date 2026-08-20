@@ -6,6 +6,7 @@
 //! results. Keeping this state here makes UART, UDP, simulated links, and
 //! firmware use the same bootstrap and response-stream rules.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -14,13 +15,13 @@ use quic_lite::encode_bootstrap_open_ack_packet;
 use quic_lite::mux::MuxRequest;
 use quic_lite::mux::StreamMux;
 use quic_lite::{
-    BootstrapClient, ConnectionId, ConnectionLimits, Error, FIRST_CLIENT_BIDI_STREAM_ID,
-    FIRST_SERVER_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA, PathPolicy, Role, ShortHeader,
-    StreamRegistry, decode_bootstrap_open_packet_with_limits,
-    encode_bootstrap_open_ack_packet_with_limits,
+    decode_bootstrap_open_packet_with_limits, encode_bootstrap_open_ack_packet_with_limits,
+    BootstrapClient, ConnectionId, ConnectionLimits, Error, PathPolicy, Role, ShortHeader,
+    StreamRegistry, FIRST_CLIENT_BIDI_STREAM_ID, FIRST_SERVER_BIDI_STREAM_ID,
+    INITIAL_MAX_STREAM_DATA,
 };
 
-use crate::services::EventRing;
+use crate::services::{EventRing, MAX_BINARY_EVENT_PAYLOAD_BYTES};
 
 /// Compact peer/DCID association retained after an active stream connection
 /// is reclaimed. The peer type is bearer-owned: MACs, socket addresses, and
@@ -112,9 +113,11 @@ impl BinaryEventHistory {
         }
     }
 
-    pub fn push(&mut self, event_id: u16, value_type: u8, flags: u8, payload: &[u8]) {
-        if self.capacity == 0 {
-            return;
+    /// Retain only a bounded payload. At capacity, the oldest complete event
+    /// expires before the newest is copied into the history.
+    pub fn push(&mut self, event_id: u16, value_type: u8, flags: u8, payload: &[u8]) -> bool {
+        if self.capacity == 0 || payload.len() > MAX_BINARY_EVENT_PAYLOAD_BYTES {
+            return false;
         }
         let event = BinaryEvent {
             sequence: self.next_sequence,
@@ -128,6 +131,7 @@ impl BinaryEventHistory {
             self.records.pop_front();
         }
         self.records.push_back(event);
+        true
     }
 
     pub fn next_sequence(&self) -> u64 {
@@ -223,6 +227,68 @@ impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, 
             },
             ack[..used].to_vec(),
         ))
+    }
+
+    /// Heap-backed counterpart to [`Self::accept_open_with_limits`].
+    ///
+    /// A complete-datagram firmware bearer calls this from its shared Wi-Fi
+    /// ingress task. `EndpointState` includes the bounded retransmission
+    /// ledger, so constructing the connection as a local return value can
+    /// transiently consume several copies of that ledger on the task stack.
+    /// Construct the `StreamMux` directly in its final allocation instead;
+    /// this changes neither wire behavior nor the per-association budget.
+    pub fn accept_open_boxed_with_limits(
+        packet: &[u8],
+        server_cid: ConnectionId,
+        registry: StreamRegistry,
+        event_capacity: usize,
+        local_limits: ConnectionLimits,
+    ) -> Result<(Box<Self>, Vec<u8>), Error> {
+        let (bootstrap_header, open) = decode_bootstrap_open_packet_with_limits(packet)?;
+        let client_cid = open.client_receive_cid;
+
+        let mut ack = [0u8; PACKET];
+        let used = encode_bootstrap_open_ack_packet_with_limits(
+            client_cid,
+            server_cid,
+            0,
+            local_limits,
+            &mut ack,
+        )?;
+
+        // `Box::new_uninit` gives `StreamMux::new` its final return place,
+        // avoiding a full endpoint ledger in the caller's stack frame.
+        let mut connection = Box::<Self>::new_uninit();
+        let pointer = connection.as_mut_ptr().cast::<Self>();
+        unsafe {
+            StreamMux::init_in_place(
+                core::ptr::addr_of_mut!((*pointer).mux),
+                Role::Server,
+                local_limits,
+                PACKET as u64,
+                4,
+                4096,
+            );
+            core::ptr::addr_of_mut!((*pointer).registry).write(registry);
+            core::ptr::addr_of_mut!((*pointer).events).write(EventRing::new(event_capacity));
+            core::ptr::addr_of_mut!((*pointer).path_policy).write(PathPolicy::HighestMeasuredSpeed);
+            core::ptr::addr_of_mut!((*pointer).next_response_stream)
+                .write(FIRST_SERVER_BIDI_STREAM_ID);
+            let mut connection = connection.assume_init();
+            connection
+                .mux
+                .install_connection_ids(server_cid, client_cid)?;
+            connection.mux.endpoint.set_initial_peer_budget(
+                open.max_data,
+                open.max_stream_data,
+                open.max_in_flight_packets,
+            )?;
+            connection
+                .mux
+                .endpoint
+                .continue_packet_numbers_from(bootstrap_header.packet_number.saturating_add(1))?;
+            Ok((connection, ack[..used].to_vec()))
+        }
     }
 
     pub fn path_policy(&self) -> PathPolicy {
@@ -343,8 +409,8 @@ impl<const HISTORY: usize, const PACKET: usize> StreamClientConnection<HISTORY, 
 mod tests {
     use super::*;
     use quic_lite::{
-        BootstrapClient, Frame, ShortHeader, StreamRegistry,
-        decode_bootstrap_open_ack_packet_with_limits, decode_frame,
+        decode_bootstrap_open_ack_packet_with_limits, decode_frame, BootstrapClient, Frame,
+        ShortHeader, StreamRegistry,
     };
 
     #[test]
@@ -427,15 +493,22 @@ mod tests {
     #[test]
     fn binary_event_history_is_bounded_and_payload_opaque() {
         let mut history = BinaryEventHistory::new(2);
-        history.push(1, 2, 3, b"first");
-        history.push(4, 5, 6, b"second");
-        history.push(7, 8, 9, b"third");
+        assert!(history.push(1, 2, 3, b"first"));
+        assert!(history.push(4, 5, 6, b"second"));
+        assert!(history.push(7, 8, 9, b"third"));
         let events: Vec<_> = history.records_since(0).collect();
         assert_eq!(history.next_sequence(), 3);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].sequence, 1);
         assert_eq!(events[0].payload, b"second");
         assert_eq!(events[1].payload, b"third");
+    }
+
+    #[test]
+    fn binary_event_history_rejects_an_unbounded_payload() {
+        let mut history = BinaryEventHistory::new(1);
+        assert!(!history.push(1, 2, 3, &[0; MAX_BINARY_EVENT_PAYLOAD_BYTES + 1],));
+        assert_eq!(history.records_since(0).count(), 0);
     }
 
     #[test]

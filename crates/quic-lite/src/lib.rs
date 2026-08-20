@@ -12,7 +12,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 #[cfg(not(any(feature = "std", test)))]
 use alloc::{
-    alloc::{Layout, alloc, dealloc},
+    alloc::{alloc, dealloc, Layout},
     boxed::Box,
 };
 
@@ -32,6 +32,7 @@ pub mod path_bridge;
 pub mod path_router;
 pub mod ram_budget;
 pub mod raw_udp6;
+pub mod sta_selection;
 pub mod uart;
 
 pub use path_router::{
@@ -79,6 +80,9 @@ pub const SERVICE_CONTROL: u8 = 8;
 /// transport only carries this tag; log schemas and retention are server
 /// policy.
 pub const SERVICE_LOG_WATCH: u8 = 9;
+/// Ask a device to fetch one signed object and install it through its local
+/// flash sink. The device, not the command sender, opens the object GET.
+pub const SERVICE_FLASH: u8 = 10;
 
 /// A small CBOR selector used at the beginning of a stream command.  This is
 /// intentionally not a CBOR dependency or a general decoder: transport only
@@ -500,11 +504,7 @@ mod recovery_profile_tests {
         );
         assert_eq!(
             registry.encode_handler_list().get(..11),
-            Some(
-                &[
-                    0x89, 0x82, 1, 0x66, b'o', b'b', b'j', b'e', b'c', b't', 0x82
-                ][..]
-            )
+            Some(&[0x89, 0x82, 1, 0x66, b'o', b'b', b'j', b'e', b'c', b't', 0x82][..])
         );
         assert!(!registry.register(SERVICE_HANDLERS, b"different-name"));
         assert!(!registry.register(42, b"handlers"));
@@ -2459,6 +2459,9 @@ pub struct EndpointState<
     pub receive: ConnectionState<N>,
     pub congestion: CongestionController,
     pub received_packets: AckRangeSet,
+    /// Most recent ACK range set received from the peer. This is diagnostic
+    /// state only; congestion accounting still walks the retained ledger.
+    peer_ack_ranges: AckRangeSet,
     pub next_packet_number: u32,
     pub largest_acked_by_peer: Option<u32>,
     #[cfg(any(feature = "std", test))]
@@ -2584,6 +2587,59 @@ impl<const P: usize> SentPacket<P> {
 }
 
 impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
+    /// Initialize an endpoint in its final allocation. Firmware uses this for
+    /// a boxed connection so the fixed retransmission ledger is never copied
+    /// through an ingress task stack frame.
+    pub unsafe fn init_in_place(
+        out: *mut Self,
+        role: Role,
+        limits: ConnectionLimits,
+        max_datagram_size: u64,
+        history_capacity: usize,
+    ) {
+        assert!(history_capacity > 0 && history_capacity <= H);
+        unsafe {
+            core::ptr::addr_of_mut!((*out).send).write(SendFlowControl::new(
+                limits.max_data,
+                limits.max_stream_data,
+            ));
+            core::ptr::addr_of_mut!((*out).receive).write(ConnectionState::new(role, limits));
+            core::ptr::addr_of_mut!((*out).congestion)
+                .write(CongestionController::new(max_datagram_size));
+            core::ptr::addr_of_mut!((*out).received_packets).write(AckRangeSet::new());
+            core::ptr::addr_of_mut!((*out).peer_ack_ranges).write(AckRangeSet::new());
+            core::ptr::addr_of_mut!((*out).next_packet_number).write(0);
+            core::ptr::addr_of_mut!((*out).largest_acked_by_peer).write(None);
+            #[cfg(any(feature = "std", test))]
+            core::ptr::addr_of_mut!((*out).sent_packets).write(alloc::vec![None; history_capacity]);
+            #[cfg(not(any(feature = "std", test)))]
+            core::ptr::addr_of_mut!((*out).sent_packets).write([None; H]);
+            core::ptr::addr_of_mut!((*out).local_cid).write(None);
+            core::ptr::addr_of_mut!((*out).peer_cid).write(None);
+            core::ptr::addr_of_mut!((*out).control_pending).write(false);
+            core::ptr::addr_of_mut!((*out).ack_pending).write(false);
+            core::ptr::addr_of_mut!((*out).ack_packets).write(0);
+            core::ptr::addr_of_mut!((*out).ack_frequency).write(2);
+            core::ptr::addr_of_mut!((*out).ack_reordering_threshold).write(1);
+            core::ptr::addr_of_mut!((*out).largest_ack_frequency_sequence).write(None);
+            core::ptr::addr_of_mut!((*out).pending_ack_frequency).write(None);
+            core::ptr::addr_of_mut!((*out).last_ack_time).write(0);
+            core::ptr::addr_of_mut!((*out).largest_received_at).write(0);
+            core::ptr::addr_of_mut!((*out).max_ack_delay_ms).write(25);
+            core::ptr::addr_of_mut!((*out).peer_max_ack_delay_ms).write(25);
+            core::ptr::addr_of_mut!((*out).peer_max_in_flight_packets).write(usize::MAX);
+            core::ptr::addr_of_mut!((*out).pending_stream_ids).write([None; N]);
+            core::ptr::addr_of_mut!((*out).send_clock).write(0);
+            core::ptr::addr_of_mut!((*out).rtt).write(RttEstimator::default());
+            core::ptr::addr_of_mut!((*out).last_pto_probe_at).write(None);
+            core::ptr::addr_of_mut!((*out).pto_backoff).write(0);
+            core::ptr::addr_of_mut!((*out).close_code).write(None);
+            core::ptr::addr_of_mut!((*out).history_limit).write(history_capacity);
+            core::ptr::addr_of_mut!((*out).stats).write(TransportStats::default());
+            core::ptr::addr_of_mut!((*out).highest_received_packet).write(None);
+            core::ptr::addr_of_mut!((*out).last_receive_time).write(None);
+        }
+    }
     pub fn new(role: Role, limits: ConnectionLimits, max_datagram_size: u64) -> Self {
         Self::new_with_history_capacity(role, limits, max_datagram_size, H)
     }
@@ -2618,6 +2674,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             receive: ConnectionState::new(role, limits),
             congestion: CongestionController::new(max_datagram_size),
             received_packets: AckRangeSet::new(),
+            peer_ack_ranges: AckRangeSet::new(),
             next_packet_number: 0,
             largest_acked_by_peer: None,
             #[cfg(any(feature = "std", test))]
@@ -2738,6 +2795,13 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.peer_max_in_flight_packets
     }
 
+    /// Largest packet number the peer has acknowledged on this association.
+    /// This is aggregate transport telemetry used to diagnose a stalled
+    /// sender; callers must not infer application delivery from it.
+    pub fn largest_acked_by_peer(&self) -> Option<u32> {
+        self.largest_acked_by_peer
+    }
+
     pub fn install_connection_ids(
         &mut self,
         local: ConnectionId,
@@ -2826,6 +2890,36 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     }
     pub fn bytes_in_flight(&self) -> u64 {
         self.congestion.bytes_in_flight
+    }
+
+    /// Copy the receive ACK ranges for bearer diagnostics.  The ranges are
+    /// newest-first and bounded by the same fixed wire budget used by
+    /// `Frame::AckRanges`; callers cannot observe or mutate endpoint storage.
+    pub fn ack_ranges_snapshot(&self) -> [Option<AckRange>; ACK_RANGE_CAPACITY] {
+        core::array::from_fn(|index| self.received_packets.get(index))
+    }
+
+    /// Copy the newest ACK range set received from the peer. This is separate
+    /// from `ack_ranges_snapshot`, which reports packets received locally.
+    pub fn peer_ack_ranges_snapshot(&self) -> [Option<AckRange>; ACK_RANGE_CAPACITY] {
+        core::array::from_fn(|index| self.peer_ack_ranges.get(index))
+    }
+
+    /// Copy the currently retained wire packet numbers for diagnostics.  A
+    /// retransmission replaces its slot with a fresh packet number, so this
+    /// exposes exactly what the congestion ledger still considers in flight.
+    /// The returned array is fixed-size to remain available on no-std targets;
+    /// `count` is the number of populated entries.
+    pub fn outstanding_packet_numbers(&self) -> ([Option<u32>; H], usize) {
+        let mut numbers = [None; H];
+        let mut count = 0;
+        for (index, slot) in self.sent_packets.iter().take(H).enumerate() {
+            if let Some(packet) = slot {
+                numbers[index] = Some(packet.packet_number);
+                count += 1;
+            }
+        }
+        (numbers, count)
     }
 
     pub const fn retransmission_payload_capacity(&self) -> usize {
@@ -3590,6 +3684,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         if acknowledged.len() == 0 {
             return Err(Error::Invalid);
         }
+        self.peer_ack_ranges = acknowledged;
         self.largest_acked_by_peer = acknowledged.get(0).map(|range| range.end);
         let largest_acked = acknowledged.get(0).map(|range| range.end);
         // A fresh wire packet number can carry a retransmission of an older
@@ -4808,11 +4903,9 @@ mod tests {
         let mut malformed = [0u8; 64];
         let header_len = header.encode(&mut malformed).unwrap();
         malformed[header_len] = FRAME_STREAM_BASE as u8 | 0x04 | 0x02 | 1;
-        assert!(
-            endpoint
-                .receive_datagram(&malformed[..header_len + 1])
-                .is_err()
-        );
+        assert!(endpoint
+            .receive_datagram(&malformed[..header_len + 1])
+            .is_err());
         assert_eq!(endpoint.peer_connection_id(), None);
 
         let frame_len = Frame::Ping.encode(&mut malformed[header_len..]).unwrap();
@@ -5178,13 +5271,11 @@ mod tests {
         sender.set_time(85);
         sender.receive_datagram(&ack[..used]).unwrap();
 
-        assert!(
-            sender
-                .sent_packets
-                .iter()
-                .flatten()
-                .any(|packet| packet.packet_number == first && !packet.lost)
-        );
+        assert!(sender
+            .sent_packets
+            .iter()
+            .flatten()
+            .any(|packet| packet.packet_number == first && !packet.lost));
     }
 
     #[test]
@@ -5477,12 +5568,10 @@ mod tests {
             repairs += 1;
         }
         assert_eq!(repairs, 3);
-        assert!(
-            sender
-                .retransmit_pto_probe(0, 250, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+        assert!(sender
+            .retransmit_pto_probe(0, 250, &mut packet)
+            .unwrap()
+            .is_none());
         let stats = sender.stats();
         assert_eq!(stats.loss_retransmitted_datagrams, 3);
         assert_eq!(stats.pto_retransmitted_datagrams, 0);
@@ -5506,31 +5595,23 @@ mod tests {
 
         // All four packets are overdue together. This must still emit just
         // one PTO probe, rather than a tight-loop burst of four retries.
-        assert!(
-            sender
-                .retransmit_pto_probe(250, 250, &mut packet)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            sender
-                .retransmit_pto_probe(250, 250, &mut packet)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            sender
-                .retransmit_pto_probe(499, 250, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+        assert!(sender
+            .retransmit_pto_probe(250, 250, &mut packet)
+            .unwrap()
+            .is_some());
+        assert!(sender
+            .retransmit_pto_probe(250, 250, &mut packet)
+            .unwrap()
+            .is_none());
+        assert!(sender
+            .retransmit_pto_probe(499, 250, &mut packet)
+            .unwrap()
+            .is_none());
         // PTO backoff doubles the next wait.
-        assert!(
-            sender
-                .retransmit_pto_probe(750, 250, &mut packet)
-                .unwrap()
-                .is_some()
-        );
+        assert!(sender
+            .retransmit_pto_probe(750, 250, &mut packet)
+            .unwrap()
+            .is_some());
         assert_eq!(sender.stats().pto_retransmitted_datagrams, 2);
     }
 
@@ -5744,12 +5825,10 @@ mod tests {
             .encode_stream_packet(peer, 4, 0, true, b"clock", &mut packet)
             .unwrap();
         sender.set_time(109);
-        assert!(
-            sender
-                .retransmit_due(109, 10, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+        assert!(sender
+            .retransmit_due(109, 10, &mut packet)
+            .unwrap()
+            .is_none());
         let (_, retransmitted) = sender
             .retransmit_due(110, 10, &mut packet)
             .unwrap()
@@ -5781,12 +5860,10 @@ mod tests {
             .find(|sent| sent.packet_number == packet_number)
             .unwrap()
             .lost = true;
-        assert!(
-            sender
-                .retransmit_stream_packet(packet_number, &mut packet)
-                .unwrap()
-                .is_some()
-        );
+        assert!(sender
+            .retransmit_stream_packet(packet_number, &mut packet)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

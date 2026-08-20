@@ -90,6 +90,141 @@ const SERIAL_RESET_NONE: u8 = 0;
 const FIRMWARE_UART_FLAG: u8 = UART_FLAG;
 const FIRMWARE_UART_ESCAPE: u8 = UART_ESCAPE;
 
+/// Complete-datagram client contract shared by the bounded IPERF benchmark
+/// and the small production status check.  Raw 802.11 injection/capture stays
+/// below this boundary; service clients stay in `dmesh-server`.
+trait RawActionClient {
+    fn start(&mut self, output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE])
+        -> Result<usize, quic_lite::Error>;
+    fn receive_at(
+        &mut self,
+        input: &[u8],
+        now_ms: u64,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error>;
+    fn is_complete(&self) -> bool;
+    /// Poll delayed ACK/window control.  Action bearers have no socket task
+    /// to drive the QUIC clock, so the adapter must explicitly service this
+    /// timer path between received frames.
+    fn poll_transmit(
+        &mut self,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error>;
+    fn poll_retransmit(
+        &mut self,
+        now_us: u64,
+        pto_us: u64,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error>;
+}
+
+/// A monitor VIF receives every matching action frame, including delayed
+/// packets from a previous association and unrelated NAN/management traffic.
+/// These errors mean that a frame is not for this client CID and must not
+/// poison the active request; actual transport/codec failures remain fatal.
+fn raw_action_receive_error_is_ambient(error: quic_lite::Error) -> bool {
+    matches!(
+        error,
+        quic_lite::Error::WrongConnectionId
+            | quic_lite::Error::BootstrapInvalid
+            | quic_lite::Error::Invalid
+    )
+}
+
+impl RawActionClient
+    for dmesh_server::raw_iperf::RawIperfClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>
+{
+    fn start(
+        &mut self,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<usize, quic_lite::Error> {
+        Self::start(self, output)
+    }
+
+    fn is_complete(&self) -> bool {
+        Self::is_complete(self)
+    }
+
+    fn receive_at(
+        &mut self,
+        input: &[u8],
+        now_ms: u64,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        Self::receive_at(self, input, now_ms, output)
+    }
+
+    fn poll_transmit(
+        &mut self,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        <dmesh_server::raw_iperf::RawIperfClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_transmit_at(self, now_millis_u64(), output)
+    }
+    fn poll_retransmit(
+        &mut self,
+        now_us: u64,
+        pto_us: u64,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        <dmesh_server::raw_iperf::RawIperfClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_retransmit(self, now_us, pto_us, output)
+    }
+}
+
+impl RawActionClient
+    for dmesh_server::raw_iperf::RawCheckClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>
+{
+    fn start(
+        &mut self,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<usize, quic_lite::Error> {
+        Self::start(self, output)
+    }
+
+    fn is_complete(&self) -> bool {
+        Self::is_complete(self)
+    }
+
+    fn receive_at(
+        &mut self,
+        input: &[u8],
+        now_ms: u64,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        Self::receive_at(self, input, now_ms, output)
+    }
+
+    fn poll_transmit(
+        &mut self,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        <dmesh_server::raw_iperf::RawCheckClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_transmit(self, output)
+    }
+    fn poll_retransmit(
+        &mut self,
+        now_us: u64,
+        pto_us: u64,
+        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    ) -> Result<Option<usize>, quic_lite::Error> {
+        <dmesh_server::raw_iperf::RawCheckClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_retransmit(self, now_us, pto_us, output)
+    }
+}
+
+#[derive(Debug)]
+struct RawActionRun {
+    elapsed_us: u128,
+    tx_packets: u64,
+    /// Driver/socket transmission failures. A successful local write is not
+    /// proof that the frame reached the peer (especially for monitor inject).
+    tx_errors: u64,
+    /// Structured result of the most recent raw frame submission. This keeps
+    /// adapter errors (for example nl80211 EINVAL) visible to automated tests
+    /// without retaining packet bytes.
+    last_tx: Option<Value>,
+    rx_packets: u64,
+    retransmit_packets: u64,
+    error: Option<String>,
+}
+
 /// Host-side adapter from the no-std UART codec's raw payloads to the shared
 /// mesh CBOR stream-frame representation used by the Linux service.
 #[derive(Default)]
@@ -195,8 +330,10 @@ const NL80211_PS_DISABLED: u32 = 0;
 const NL80211_PS_ENABLED: u32 = 1;
 const NL80211_CHAN_NO_HT: u32 = 0;
 const NL80211_CHAN_HT20: u32 = 1;
+const NL80211_CHAN_HT40PLUS: u32 = 3;
 const NL80211_CHAN_WIDTH_20_NOHT: u32 = 0;
 const NL80211_CHAN_WIDTH_20: u32 = 1;
+const NL80211_CHAN_WIDTH_40: u32 = 2;
 const WLAN_CIPHER_SUITE_WEP40: u32 = 0x000f_ac01;
 const NL80211_STA_INFO_INACTIVE_TIME: u16 = 1;
 const NL80211_STA_INFO_RX_BYTES: u16 = 2;
@@ -246,10 +383,21 @@ const NL80211_STA_FLAG_ASSOCIATED: u32 = 1 << 7;
 // beacon, probe, association, and the nl80211 AP profile.
 const OPEN_AP_OFDM_BASIC_RATES: [u8; 1] = [0x8c];
 const OPEN_AP_OFDM_EXTENDED_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6c];
+// The AP driver selects HT short-GI data rates when the peer supports them.
+// Advertise SGI-20 in the management IE as well: sending short-GI frames
+// after advertising no SGI leaves an ESP STA with a contradictory negotiated
+// PHY profile. HT40 additionally enables the matching SGI-40 bit below.
 const HOSTAPD_HT20_CAPABILITY: [u8; 28] = [
-    0x2d, 26, 0x0c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x2d, 26, 0x2c, 0x00, 0x1b, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+
+// The manual AP SME must advertise the same width in beacon, probe, and
+// association response as nl80211 operates. Keep the shared channel-6 lab
+// and production default at HT20: NAN/NOW, STA, and AP must all share the
+// same 20 MHz channel without occupying the adjacent channel. HT40 is an
+// explicit opt-in for a dedicated AP experiment only.
+const DEFAULT_OPEN_AP_HT40: bool = false;
 
 fn open_ap_basic_rates() -> &'static [u8] {
     &OPEN_AP_OFDM_BASIC_RATES
@@ -261,8 +409,11 @@ const NLM_F_DUMP: u16 = 0x300;
 // flags; station/rate information is commonly nested.
 const NLA_TYPE_MASK: u16 = 0x3fff;
 const DMESH_ESPNOW_PREFIX: [u8; 4] = [0x7f, 0x18, 0xfe, 0x34];
-const DMESH_ESPNOW_TYPE: u8 = 0x04;
-const DMESH_VENDOR_ACTION_LEN: usize = 9;
+// rawnan owns the ESP-NOW-compatible action prefix.  Its current envelope is
+// category/OUI plus four random bytes; the vendor type lives in the first IE,
+// not after this prefix.
+const DMESH_VENDOR_ACTION_LEN: usize = 8;
+const DMESH_VENDOR_IE_LEN: usize = 7;
 const DMESH_MESH_DST4_BROADCAST: [u8; 4] = [0xff; 4];
 const DMESH_LEGACY_VENDOR_ACTION: [u8; 5] = [0x7f, 0x50, 0x6f, 0x9a, 0x42];
 const IEEE80211_ADDR1: usize = 4;
@@ -288,6 +439,7 @@ const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
 // this eight-byte LLC value is quic-lite directly, not IPv6/UDP.
 const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
+const RAW_ACTION_RESPONSE_REPETITIONS: usize = 1;
 const NLMSG_ERROR: u16 = 2;
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
@@ -299,6 +451,14 @@ pub struct RadioService {
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     radios: Arc<Vec<RadioAdapter>>,
     raw_wifi_listeners: Arc<Mutex<HashSet<String>>>,
+    raw_wifi_stop_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    // The host raw-action receiver uses the same bounded QUIC-lite service
+    // dispatcher as firmware. It is created lazily only after the first
+    // valid NOW packet, so normal AP/NAN operation reserves no transport RAM.
+    raw_action_dispatcher: Arc<Mutex<Option<dmesh_server::raw_iperf::RawIperfDispatcher<
+        16,
+        { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+    >>>>,
     rawnan_subscribers: Arc<Mutex<HashMap<String, usize>>>,
     rawnan_state: Arc<Mutex<NanState>>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
@@ -458,6 +618,8 @@ impl RadioService {
             history: Arc::new(Mutex::new(VecDeque::new())),
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
+            raw_wifi_stop_flags: Arc::new(Mutex::new(HashMap::new())),
+            raw_action_dispatcher: Arc::new(Mutex::new(None)),
             rawnan_subscribers: Arc::new(Mutex::new(HashMap::new())),
             rawnan_state: Arc::new(Mutex::new(NanState::new(5_000_000))),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1205,10 +1367,29 @@ impl RadioService {
     pub fn wifi_raw_stop(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let monitor = monitor_iface_name(&iface);
+        // The action dispatcher owns one association ledger for this radio
+        // service. Stopping its monitor listener is an explicit bearer
+        // lifecycle boundary, so discard that ledger as well; otherwise a
+        // later automated check/IPERF run can inherit an old CID and report
+        // misleading reverse-direction dispatch errors.
+        if let Ok(mut dispatcher) = self.raw_action_dispatcher.lock() {
+            *dispatcher = None;
+        }
         self.raw_wifi_listeners
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|key| !key.starts_with(&format!("{iface}:")));
+        let iface_prefix = format!("{iface}:");
+        let mut stop_flags = self
+            .raw_wifi_stop_flags
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, flag) in stop_flags.iter() {
+            if key.starts_with(&iface_prefix) {
+                flag.store(true, Ordering::Release);
+            }
+        }
+        stop_flags.retain(|key, _| !key.starts_with(&iface_prefix));
         let down = run_command("ip", &["link", "set", &monitor, "down"]);
         let delete = run_command("/sbin/iw", &["dev", &monitor, "del"]);
         let result = json!({
@@ -1220,6 +1401,41 @@ impl RadioService {
         });
         self.record("wifi.raw.stop", result.clone());
         result
+    }
+
+    /// Summarize raw action receive/dispatch activity for E2E diagnostics.
+    /// Counters are derived from the bounded history and therefore allocate
+    /// nothing per packet or retain a second transport ledger.
+    pub fn wifi_raw_metrics(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let history = self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rx = 0_u64;
+        let mut dispatch = 0_u64;
+        let mut dispatch_errors = 0_u64;
+        let mut action_seen = 0_u64;
+        let mut monitor_frames = 0_u64;
+        let mut action_candidates = 0_u64;
+        let mut socket_packets = 0_u64;
+        for event in history.iter() {
+            if !event.source.contains(&iface) {
+                continue;
+            }
+            match event.key.as_str() {
+                "wifi.raw.rx" => rx += 1,
+                "wifi.raw.dispatch" => {
+                    dispatch += 1;
+                    if event.value.get("ok").and_then(Value::as_bool) == Some(false) {
+                        dispatch_errors += 1;
+                    }
+                }
+                "wifi.raw.action" => action_seen += 1,
+                "wifi.raw.monitor" => monitor_frames += 1,
+                "wifi.raw.socket" => socket_packets += 1,
+                "wifi.raw.action_candidate" => action_candidates += 1,
+                _ => {}
+            }
+        }
+        json!({"ok": true, "iface": iface, "rx": rx, "socket_packets": socket_packets, "monitor_frames": monitor_frames, "action_candidates": action_candidates, "action_seen": action_seen, "dispatch": dispatch, "dispatch_errors": dispatch_errors})
     }
 
     /// Return recent radio method results and observed notifications.
@@ -2258,7 +2474,7 @@ impl RadioService {
 
     /// Start an open AP on the default channel using direct nl80211.
     pub fn wifi_ap_start_open(&self, iface: Option<String>, ssid: Option<String>) -> Value {
-        self.wifi_ap_start_open_on_channel(iface, ssid, None)
+        self.wifi_ap_start_open_with_width(iface, ssid, None, DEFAULT_OPEN_AP_HT40, 100)
     }
 
     /// Start an open AP on a 2.4 GHz channel using direct nl80211.
@@ -2270,18 +2486,56 @@ impl RadioService {
         iface: Option<String>,
         ssid: Option<String>,
         requested_channel: Option<u8>,
+        ht40: Option<bool>,
+    ) -> Value {
+        self.wifi_ap_start_open_on_channel_with_interval(
+            iface,
+            ssid,
+            requested_channel,
+            ht40,
+            100,
+        )
+    }
+
+    /// Start an open AP with a runtime beacon interval. Larger intervals are
+    /// useful for raw-action throughput experiments because they reduce AP
+    /// beacon contention without changing the radio channel or transport.
+    pub fn wifi_ap_start_open_on_channel_with_interval(
+        &self,
+        iface: Option<String>,
+        ssid: Option<String>,
+        requested_channel: Option<u8>,
+        ht40: Option<bool>,
+        beacon_interval_tu: u16,
+    ) -> Value {
+        self.wifi_ap_start_open_with_width(
+            iface,
+            ssid,
+            requested_channel,
+            ht40.unwrap_or(DEFAULT_OPEN_AP_HT40),
+            beacon_interval_tu.clamp(10, 1000),
+        )
+    }
+
+    fn wifi_ap_start_open_with_width(
+        &self,
+        iface: Option<String>,
+        ssid: Option<String>,
+        requested_channel: Option<u8>,
+        ht40: bool,
+        beacon_interval_tu: u16,
     ) -> Value {
         let iface = wifi_iface(iface);
         let ssid = ssid.unwrap_or_else(|| default_open_ap_ssid(&iface));
         let channel = requested_channel.unwrap_or(DEFAULT_RAW_WIFI_CHANNEL);
-        if !(1..=13).contains(&channel) {
+        if !(1..=13).contains(&channel) || (ht40 && !(1..=9).contains(&channel)) {
             return json!({
                 "ok": false,
                 "backend": "linux_nl80211",
                 "iface": iface,
                 "ssid": ssid,
                 "channel": channel,
-                "error": "2.4 GHz AP channel must be in 1..=13",
+                "error": if ht40 { "HT40+ primary channel must be in 1..=9" } else { "2.4 GHz AP channel must be in 1..=13" },
             });
         }
         let freq = channel_to_freq(channel);
@@ -2318,16 +2572,16 @@ impl RadioService {
             .and_then(|socket| {
                 let mgmt_socket = Nl80211Socket::open()?;
                 socket.set_interface_type(ifindex, NL80211_IFTYPE_AP)?;
-                steps.push(match socket.set_channel_ht20(ifindex, freq) {
+                steps.push(match if ht40 { socket.set_channel_ht40_plus(ifindex, freq) } else { socket.set_channel_ht20(ifindex, freq) } {
                     Ok(()) => json!({
                         "program": "nl80211",
-                        "args": ["set_wiphy", "channel_ht20"],
+                        "args": ["set_wiphy", if ht40 { "channel_ht40_plus" } else { "channel_ht20" }],
                         "ok": true,
                         "freq": freq,
                     }),
                     Err(error) => json!({
                         "program": "nl80211",
-                        "args": ["set_wiphy", "channel_ht20"],
+                        "args": ["set_wiphy", if ht40 { "channel_ht40_plus" } else { "channel_ht20" }],
                         "ok": false,
                         "freq": freq,
                         "error": format!("{error:#}"),
@@ -2358,7 +2612,7 @@ impl RadioService {
                         "error": format!("{error:#}"),
                     }),
                 });
-                match socket.start_open_ap(ifindex, mac, &ssid, channel, freq) {
+                match socket.start_open_ap(ifindex, mac, &ssid, channel, freq, ht40, beacon_interval_tu) {
                     Ok(report) => {
                         selected_profile = report
                             .get("selected")
@@ -2400,6 +2654,7 @@ impl RadioService {
                         rawnan_state,
                         ap_no_ht_stations,
                         channel,
+                        ht40,
                         stop_for_thread,
                     );
                 });
@@ -2427,9 +2682,9 @@ impl RadioService {
                     "freq": freq,
                     "bssid": colon_mac(&mac),
                     "auth": "open",
-                    "beacon_interval": 100,
+                    "beacon_interval": beacon_interval_tu,
                     "dtim_period": 1,
-                    "channel_width": "20_ht",
+                    "channel_width": if ht40 { "40_ht" } else { "20_ht" },
                     "template_lengths": template_lengths,
                     "selected_profile": selected_profile,
                     "profiles": profiles,
@@ -2446,9 +2701,9 @@ impl RadioService {
                     "freq": freq,
                     "bssid": colon_mac(&mac),
                     "auth": "open",
-                    "beacon_interval": 100,
+                    "beacon_interval": beacon_interval_tu,
                     "dtim_period": 1,
-                    "channel_width": "20_ht",
+                    "channel_width": if ht40 { "40_ht" } else { "20_ht" },
                     "template_lengths": template_lengths,
                     "selected_profile": selected_profile,
                     "profiles": profiles,
@@ -3058,14 +3313,26 @@ impl RadioService {
         let listen_result = if rx_variant == "monitor" || rx_variant == "monitor_active" {
             let monitor_iface = monitor_iface_name(&iface);
             let active = rx_variant == "monitor_active";
-            ensure_monitor_iface(&iface, &monitor_iface, channel, active, active).and_then(|setup| {
+            // A listener is an explicit ownership boundary. Recreate stale
+            // VIFs left by a previous supervised process before opening the
+            // socket; otherwise responses can be accepted locally but never
+            // reach the RF path after a service restart.
+            ensure_monitor_iface(&iface, &monitor_iface, channel, active, true).and_then(|setup| {
                 let socket = MonitorRxSocket::open(&monitor_iface)?;
+                socket.set_receive_timeout(Duration::from_millis(100))?;
                 let history = self.history.clone();
                 let listeners = self.raw_wifi_listeners.clone();
+                let stop_flags = self.raw_wifi_stop_flags.clone();
                 let iface_for_thread = iface.clone();
                 let monitor_for_thread = monitor_iface.clone();
                 let listener_key_for_thread = listener_key.clone();
                 let rawnan_state = self.rawnan_state.clone();
+                let raw_action_dispatcher = self.raw_action_dispatcher.clone();
+                let stop_flag = Arc::new(AtomicBool::new(false));
+                stop_flags
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(listener_key.clone(), stop_flag.clone());
                 std::thread::spawn(move || {
                     monitor_receive_loop(
                         socket,
@@ -3073,8 +3340,14 @@ impl RadioService {
                         &monitor_for_thread,
                         history,
                         rawnan_state,
+                        raw_action_dispatcher,
+                        stop_flag,
                     );
                     listeners
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&listener_key_for_thread);
+                    stop_flags
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&listener_key_for_thread);
@@ -3504,17 +3777,18 @@ impl RadioService {
         channel: Option<u8>,
         tx_variant: Option<String>,
         frame_hex: String,
+        tx_rate_mbps: Option<u8>,
     ) -> Value {
         let iface = wifi_iface(iface);
         let channel = raw_wifi_channel(channel);
         let variant = tx_variant.unwrap_or_else(|| "monitor".to_string());
-        if variant != "monitor" && variant != "monitor_active" && variant != "af_packet" {
+        if variant != "monitor" && variant != "monitor_active" && variant != "af_packet" && variant != "action" {
             return json!({
                 "ok": false,
                 "backend": "linux_af_packet_monitor",
                 "iface": iface,
                 "tx_variant": variant,
-                "error": "arbitrary frame injection requires tx_variant=monitor, monitor_active, or af_packet",
+                "error": "arbitrary frame injection requires tx_variant=monitor, monitor_active, action, or af_packet",
             });
         }
         let frame = match decode_firmware_hex(frame_hex.trim_start_matches("hex:")) {
@@ -3549,15 +3823,46 @@ impl RadioService {
                     "error": format!("{error:#}"),
                 }),
             }
+        } else if variant == "action" {
+            let interface_up = run_command("ip", &["link", "set", &iface, "up"]);
+            let result = if !interface_up.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                Err(anyhow::anyhow!("failed to bring interface up"))
+            } else {
+                Nl80211Socket::open()
+                    .and_then(|socket| socket.send_mgmt_frame(ifindex(&iface)?, &frame, tx_rate_mbps))
+            };
+            match result {
+                Ok(()) => json!({
+                    "ok": true,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                    "channel": channel,
+                    "tx_variant": variant,
+                    "tx_rate_mbps": tx_rate_mbps,
+                    "frame_len": frame.len(),
+                    "interface_up": interface_up,
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "backend": "linux_nl80211",
+                    "iface": iface,
+                    "channel": channel,
+                    "tx_variant": variant,
+                    "frame_len": frame.len(),
+                    "interface_up": interface_up,
+                    "error": format!("{error:#}"),
+                }),
+            }
         } else {
             let active = variant == "monitor_active";
-            match send_monitor_frame(&iface, channel, &frame, active, None) {
+            match send_monitor_frame(&iface, channel, &frame, active, tx_rate_mbps) {
                 Ok(monitor) => json!({
                 "ok": true,
                 "backend": "linux_af_packet_monitor",
                 "iface": iface,
                 "channel": channel,
                 "tx_variant": variant,
+                "tx_rate_mbps": tx_rate_mbps,
                 "frame_len": frame.len(),
                 "monitor": monitor,
                 "note": "frame_hex is an 802.11 header/body; radiotap was added by lmesh",
@@ -3750,6 +4055,267 @@ impl RadioService {
         result
     }
 
+    fn run_raw_action_client<C: RawActionClient>(
+        &self,
+        iface: &str,
+        channel: u8,
+        destination: [u8; 6],
+        source: [u8; 6],
+        timeout_ms: u64,
+        tx_rate_mbps: u8,
+        tx_variant: &str,
+        client: &mut C,
+    ) -> RawActionRun {
+        let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let mut pending = match client.start(&mut packet) {
+            Ok(used) => Some(used),
+            Err(error) => {
+                return RawActionRun {
+                    elapsed_us: 0,
+                    tx_packets: 0,
+                    tx_errors: 0,
+                    last_tx: None,
+                    rx_packets: 0,
+                    retransmit_packets: 0,
+                    error: Some(format!("raw action OPEN: {error:?}")),
+                };
+            }
+        };
+        let started = Instant::now();
+        let start_ms = now_millis_u64();
+        // The sender must not start the long-lived history listener on the
+        // same monitor VIF: active monitor TX may need to recreate that VIF,
+        // and the listener then races deletion/recreation while also making
+        // a local AF_PACKET socket look like a successful peer path. Prepare
+        // one VIF here and use the bounded direct socket below for responses.
+        let _monitor_setup = if matches!(tx_variant, "monitor" | "monitor_active") {
+            // Active mode must own a fresh VIF. Passive mode can reuse the
+            // AP-owned VIF established by the capture/listener topology; the
+            // historical host injector relies on that managed-radio path.
+            if tx_variant == "monitor_active" {
+                let _ = self.wifi_raw_stop(Some(iface.to_owned()));
+            }
+            let monitor_iface = monitor_iface_name(iface);
+            ensure_monitor_iface(
+                iface,
+                &monitor_iface,
+                channel,
+                tx_variant == "monitor_active",
+                tx_variant == "monitor_active",
+            )
+            .ok()
+        } else {
+            None
+        };
+        // Keep one monitor TX socket for the lifetime of the association.
+        // Opening and binding an AF_PACKET socket for every QUIC datagram
+        // adds scheduler/driver latency and makes a burst look like a series
+        // of independent setup operations.  The socket is opened only after
+        // the monitor VIF has been prepared; opening it earlier was observed
+        // to race VIF recreation and produced locally-accepted, zero-RF runs.
+        let monitor_tx = if matches!(tx_variant, "monitor" | "monitor_active") {
+            MonitorTxSocket::open(&monitor_iface_name(iface)).ok()
+        } else {
+            None
+        };
+        // Read the monitor socket directly in the probe loop as well as
+        // consuming the shared history. The history listener is intentionally
+        // long-lived for diagnostics, but a bounded request/response probe
+        // must not depend on its scheduling or on a stale listener instance.
+        let direct_rx = MonitorRxSocket::open(&monitor_iface_name(iface)).ok();
+        let mut direct_buf = [0_u8; 4096];
+        let mut direct_payload = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let mut seen = HashSet::new();
+        let mut tx_packets = 0u64;
+        let mut tx_errors = 0u64;
+        let mut last_tx = None;
+        let mut rx_packets = 0u64;
+        let mut retransmit_packets = 0u64;
+        let mut error = None;
+        let local_source = colon_mac(&source);
+        while started.elapsed() < Duration::from_millis(timeout_ms) {
+            if let Some(used) = pending.take() {
+                // This is the raw ESP-NOW-compatible QUIC bearer, not NAN
+                // service discovery.  `wifi_raw_send` deliberately builds a
+                // NAN public action for its generic host diagnostic API;
+                // sending the QUIC bytes through that builder makes a ROC
+                // receiver classify them as NAN and never feed the shared
+                // NOW ingress. Build the host-tested ESP-NOW IE/action frame
+                // explicitly, then use the same monitor/nl80211 injection
+                // selector as every other raw action test.
+                let mut action = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 64];
+                let action_len = match dmesh_rawnan::espnow::encode_action_frame(
+                    &mut action,
+                    destination,
+                    source,
+                    [0xff; 6],
+                    &packet[..used],
+                ) {
+                    Ok(length) => length,
+                    Err(frame_error) => {
+                        error = Some(format!("raw ESP-NOW action: {frame_error:?}"));
+                        break;
+                    }
+                };
+                let sent = if let Some(socket) = monitor_tx.as_ref() {
+                    let packet = match build_radiotap_packet_at_rate_with_ack(
+                        &action[..action_len],
+                        Some(tx_rate_mbps),
+                        destination != [0xff; 6],
+                    ) {
+                        Ok(packet) => packet,
+                        Err(radiotap_error) => {
+                            error = Some(format!("raw action radiotap: {radiotap_error:#}"));
+                            break;
+                        }
+                    };
+                    match socket.send(&packet) {
+                        Ok(written) if written == packet.len() => json!({
+                            "ok": true,
+                            "backend": "linux_af_packet_monitor_persistent",
+                            "iface": iface,
+                            "channel": channel,
+                            "tx_variant": tx_variant,
+                            "tx_rate_mbps": tx_rate_mbps,
+                            "frame_len": action_len,
+                            "monitor": {"iface": monitor_iface_name(iface), "packet_len": packet.len()},
+                        }),
+                        Ok(written) => json!({
+                            "ok": false,
+                            "error": format!("short monitor frame write: wrote {written}, expected {}", packet.len()),
+                        }),
+                        Err(error) => json!({"ok": false, "error": format!("raw action TX: {error:#}")}),
+                    }
+                } else {
+                    self.wifi_raw_send_frame(
+                        Some(iface.to_owned()),
+                        Some(channel),
+                        Some(tx_variant.to_owned()),
+                        format!("hex:{}", hex_lower(&action[..action_len])),
+                        Some(tx_rate_mbps),
+                    )
+                };
+                last_tx = Some(sent.clone());
+                if !sent.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    tx_errors = tx_errors.saturating_add(1);
+                    error = Some(format!(
+                        "raw action TX: {}",
+                        sent.get("error").and_then(Value::as_str).unwrap_or("unknown error")
+                    ));
+                    break;
+                }
+                tx_packets = tx_packets.saturating_add(1);
+            }
+            if let Some(socket) = direct_rx.as_ref() {
+                if let Ok(Some(len)) = socket.recv_timeout(&mut direct_buf, Duration::from_millis(10))
+                    && let Some(frame) = ieee80211_frame(&direct_buf[..len])
+                    // AF_PACKET monitor sockets can reflect our own injected
+                    // frame. It is never a peer response; accepting it made
+                    // the old raw check falsely report bootstrap success.
+                    && mac_at(frame, IEEE80211_ADDR2) != Some(source)
+                    && let Some((_, payload_len)) =
+                        dmesh_rawnan::espnow::parse_action_frame_into(frame, &mut direct_payload)
+                {
+                    rx_packets = rx_packets.saturating_add(1);
+                    match client.receive_at(
+                        &direct_payload[..payload_len],
+                        now_millis_u64(),
+                        &mut packet,
+                    ) {
+                        Ok(next) => pending = next,
+                        Err(receive_error) => {
+                            // A monitor VIF can deliver a delayed response
+                            // from the association that the preceding test
+                            // row stopped. It is not part of this client CID;
+                            // ignore it and continue waiting for the current
+                            // bearer rather than converting stale RF traffic
+                            // into a test failure.
+                            if !raw_action_receive_error_is_ambient(receive_error) {
+                                error = Some(format!("QUIC-lite direct RX: {receive_error:?}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Delayed ACKs and flow-credit updates are not necessarily
+            // returned from `receive`; unlike UDP, this monitor bearer has no
+            // independent socket worker to poll the QUIC clock.  Queue the
+            // one returned control datagram through the same raw action TX
+            // path, preserving the no-owned-egress-queue invariant.
+            if pending.is_none()
+                && let Ok(Some(used)) = client.poll_transmit(&mut packet)
+            {
+                pending = Some(used);
+            }
+            if pending.is_none()
+                // EndpointState clocks are absolute milliseconds (the same
+                // unit used by receive_at). Passing a run-relative clock here
+                // moves time backwards after the first response and silently
+                // disables client-side PTO recovery.
+                && let Ok(Some(used)) = client.poll_retransmit(
+                    now_millis_u64(),
+                    100,
+                    &mut packet,
+                )
+            {
+                pending = Some(used);
+                retransmit_packets = retransmit_packets.saturating_add(1);
+            }
+            let events = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|event| event.key == "wifi.raw.rx" && event.ts_millis >= u128::from(start_ms))
+                .map(|event| (event.ts_millis, event.value.clone()))
+                .collect::<Vec<_>>();
+            for (timestamp, event) in events {
+                let Some(payload_hex) = event.get("payload").and_then(Value::as_str) else {
+                    continue;
+                };
+                if event.get("source").and_then(Value::as_str) == Some(local_source.as_str())
+                    || event.get("source_mac").and_then(Value::as_str)
+                        == Some(local_source.as_str())
+                {
+                    continue;
+                }
+                if !seen.insert((timestamp, payload_hex.to_owned())) {
+                    continue;
+                }
+                let Ok(payload) = decode_firmware_hex(payload_hex) else {
+                    continue;
+                };
+                rx_packets = rx_packets.saturating_add(1);
+                match client.receive_at(&payload, now_millis_u64(), &mut packet) {
+                    Ok(next) => pending = next,
+                    Err(receive_error) => {
+                        if !raw_action_receive_error_is_ambient(receive_error) {
+                            error = Some(format!("QUIC-lite RX: {receive_error:?}"));
+                            break;
+                        }
+                    }
+                }
+                if client.is_complete() {
+                    break;
+                }
+            }
+            if client.is_complete() || error.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        RawActionRun {
+            elapsed_us: started.elapsed().as_micros(),
+            tx_packets,
+            tx_errors,
+            last_tx,
+            rx_packets,
+            retransmit_packets,
+            error,
+        }
+    }
+
     /// Run the standard QUIC-lite IPERF service through raw ESP-NOW-compatible
     /// vendor action frames. The host owns monitor injection/capture only;
     /// bootstrap, stream request, ACKs, and IPERF validation live in the
@@ -3760,11 +4326,46 @@ impl RadioService {
         channel: Option<u8>,
         destination: String,
         bytes: u64,
+        packet_size: Option<u64>,
         timeout_ms: Option<u64>,
+        tx_rate_mbps: Option<u64>,
+        tx_variant: Option<String>,
+        rx_variant: Option<String>,
     ) -> Value {
         let iface = wifi_iface(iface);
         let channel = raw_wifi_channel(channel);
         let timeout_ms = timeout_ms.unwrap_or(20_000).clamp(1_000, 60_000);
+        let packet_size = packet_size
+            .unwrap_or(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64)
+            .clamp(4, quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64) as u16;
+        let tx_rate_mbps = match tx_rate_mbps {
+            None => 6,
+            Some(rate @ (1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54)) => rate as u8,
+            Some(_) => return json!({
+                "ok": false,
+                "error": "tx_rate_mbps must be one of 1,2,5,6,9,11,12,18,24,36,48,54"
+            }),
+        };
+        // This is deliberately a runtime selection: the host's monitor
+        // injector is the historically proven on-air action path, whereas
+        // NL80211_CMD_FRAME is useful to test a driver-managed route but is
+        // rejected by some adapters. Neither choice changes QUIC-lite.
+        let tx_variant = match tx_variant.as_deref().unwrap_or("monitor") {
+            "monitor" | "monitor_active" => tx_variant.as_deref().unwrap_or("monitor"),
+            "nl80211" => "action",
+            other => return json!({
+                "ok": false,
+                "error": format!("tx_variant must be monitor or nl80211, got {other:?}"),
+            }),
+        };
+        let rx_variant = match rx_variant.as_deref().unwrap_or("monitor") {
+            "monitor" | "monitor_active" => rx_variant.as_deref().unwrap_or("monitor"),
+            "nl80211" => "nl80211",
+            other => return json!({
+                "ok": false,
+                "error": format!("rx_variant must be monitor, monitor_active, or nl80211, got {other:?}"),
+            }),
+        };
         let destination_mac = match parse_mac(Some(&destination)) {
             Some(mac) => mac,
             None => return json!({"ok": false, "error": "destination must be a MAC address"}),
@@ -3778,108 +4379,40 @@ impl RadioService {
         // `nl80211` frame events keep the AP's managed station association
         // intact. Monitor-VIF creation is useful for passive NAN inspection
         // but can sever an active Recovery STA on this chipset.
-        let listen = self.wifi_raw_listen(
-            Some(iface.clone()),
-            Some(channel),
-            Some((timeout_ms / 1_000 + 3).max(3)),
-            Some("nl80211".to_owned()),
-        );
-        if !listen.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return json!({"ok": false, "iface": iface, "channel": channel, "listen": listen, "error": "raw monitor did not start"});
-        }
+        // The sender uses the bounded direct monitor socket prepared by
+        // `run_raw_action_client`; only the peer needs a history listener.
+        // Starting another listener here used to race active monitor TX.
+        let listen = json!({
+            "ok": true,
+            "backend": "linux_af_packet_monitor_direct",
+            "iface": iface,
+            "channel": channel,
+            "rx_variant": rx_variant,
+        });
         let cid_value = now_millis_u64().max(1);
         let client_cid = match quic_lite::ConnectionId::new(cid_value) {
             Some(cid) => cid,
             None => return json!({"ok": false, "error": "could not allocate client CID"}),
         };
         let mut client = match dmesh_server::raw_iperf::RawIperfClient::<
-            4,
+            16,
             { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-        >::new(client_cid, bytes)
+        >::new_with_packet_size(client_cid, bytes, packet_size)
         {
             Ok(client) => client,
             Err(error) => return json!({"ok": false, "error": format!("IPERF client: {error:?}")}),
         };
-        let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-        let mut pending = match client.start(&mut packet) {
-            Ok(used) => Some(used),
-            Err(error) => return json!({"ok": false, "error": format!("IPERF OPEN: {error:?}")}),
-        };
-        let started = Instant::now();
-        let start_ms = now_millis_u64();
-        let mut seen = HashSet::new();
-        let mut tx_count = 0u64;
-        let mut rx_count = 0u64;
-        let mut last_error = None;
-        while started.elapsed() < Duration::from_millis(timeout_ms) {
-            if let Some(used) = pending.take() {
-                // Use the AP-owning interface's nl80211 management-frame
-                // path, not monitor injection. A monitor VIF can transmit a
-                // locally captured frame without the AP delivering it to its
-                // associated STA; `action` reaches the same station path as
-                // the existing raw ESP-NOW command bearer.
-                let sent = self.wifi_raw_send(
-                    Some(iface.clone()),
-                    Some(channel),
-                    Some(1),
-                    Some(colon_mac(&destination_mac)),
-                    Some(colon_mac(&source)),
-                    Some("action".to_owned()),
-                    None,
-                    Some(colon_mac(&source)),
-                    None,
-                    format!("hex:{}", hex_lower(&packet[..used])),
-                    Some(6),
-                );
-                if !sent.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                    last_error = Some(format!(
-                        "raw action TX: {}",
-                        sent.get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error")
-                    ));
-                    break;
-                }
-                tx_count = tx_count.saturating_add(1);
-            }
-            let events = self
-                .history
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .iter()
-                .filter(|event| {
-                    event.key == "wifi.raw.rx" && event.ts_millis >= u128::from(start_ms)
-                })
-                .map(|event| (event.ts_millis, event.value.clone()))
-                .collect::<Vec<_>>();
-            for (timestamp, event) in events {
-                let Some(payload_hex) = event.get("payload").and_then(Value::as_str) else {
-                    continue;
-                };
-                if !seen.insert((timestamp, payload_hex.to_owned())) {
-                    continue;
-                }
-                let Ok(payload) = decode_firmware_hex(payload_hex) else {
-                    continue;
-                };
-                rx_count = rx_count.saturating_add(1);
-                match client.receive(&payload, &mut packet) {
-                    Ok(next) => pending = next,
-                    Err(error) => last_error = Some(format!("QUIC-lite RX: {error:?}")),
-                }
-                if client.is_complete() {
-                    break;
-                }
-            }
-            if client.is_complete() {
-                break;
-            }
-            if last_error.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let elapsed_us = started.elapsed().as_micros();
+        let run = self.run_raw_action_client(
+            &iface,
+            channel,
+            destination_mac,
+            source,
+            timeout_ms,
+            tx_rate_mbps,
+            tx_variant,
+            &mut client,
+        );
+        let elapsed_us = run.elapsed_us;
         let complete = client.is_complete();
         let transferred = client.bytes();
         let bps = if elapsed_us == 0 {
@@ -3894,17 +4427,122 @@ impl RadioService {
             "channel": channel,
             "destination": destination,
             "requested_bytes": bytes,
+            "packet_size": packet_size,
+            "tx_rate_mbps": tx_rate_mbps,
+            "tx_variant": tx_variant,
+            "rx_variant": rx_variant,
             "bytes": transferred,
             "elapsed_us": elapsed_us,
             "bps": bps,
-            "tx_packets": tx_count,
-            "rx_packets": rx_count,
+            "tx_packets": run.tx_packets,
+            "tx_errors": run.tx_errors,
+            "last_tx": run.last_tx,
+            "rx_packets": run.rx_packets,
+            "retransmit_packets": run.retransmit_packets,
             "callback_errors": client.callback_errors(),
             "server_cid": client.server_cid().map(|cid| cid.value()),
             "listen": listen,
-            "error": last_error,
+            "error": run.error,
         });
         self.record("wifi.raw.iperf", result.clone());
+        result
+    }
+
+    /// Send one normal QUIC-lite status request through the raw NOW-like
+    /// bearer.  This is a production liveness/probe operation, not an IPERF
+    /// shortcut: the returned status bytes and shared transport counters are
+    /// useful to both host and firmware matrix runners.
+    pub fn raw_espnow_check(
+        &self,
+        iface: Option<String>,
+        channel: Option<u8>,
+        destination: String,
+        nonce: u64,
+        timeout_ms: Option<u64>,
+        tx_rate_mbps: Option<u64>,
+        tx_variant: Option<String>,
+        rx_variant: Option<String>,
+    ) -> Value {
+        let iface = wifi_iface(iface);
+        let channel = raw_wifi_channel(channel);
+        let timeout_ms = timeout_ms.unwrap_or(5_000).clamp(1_000, 60_000);
+        let tx_rate_mbps = match tx_rate_mbps {
+            None => 6,
+            Some(rate @ (1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54)) => rate as u8,
+            Some(_) => return json!({"ok": false, "error": "tx_rate_mbps must be one of 1,2,5,6,9,11,12,18,24,36,48,54"}),
+        };
+        let tx_variant = match tx_variant.as_deref().unwrap_or("monitor") {
+            "monitor" | "monitor_active" => tx_variant.as_deref().unwrap_or("monitor"),
+            "nl80211" => "action",
+            other => return json!({"ok": false, "error": format!("tx_variant must be monitor or nl80211, got {other:?}")}),
+        };
+        let rx_variant = match rx_variant.as_deref().unwrap_or("monitor") {
+            "monitor" | "monitor_active" => rx_variant.as_deref().unwrap_or("monitor"),
+            "nl80211" => "nl80211",
+            other => return json!({"ok": false, "error": format!("rx_variant must be monitor, monitor_active, or nl80211, got {other:?}")}),
+        };
+        let Some(destination_mac) = parse_mac(Some(&destination)) else {
+            return json!({"ok": false, "error": "destination must be a MAC address"});
+        };
+        let source = match raw_wifi_source(None, &iface) {
+            Ok(mac) => mac,
+            Err(error) => return json!({"ok": false, "iface": iface, "error": format!("source MAC: {error:#}")}),
+        };
+        // As with IPERF, do not create a second history listener on the
+        // sender's monitor VIF. The direct bounded socket is opened by the
+        // raw action loop and shares the same prepared VIF with TX.
+        let listen = json!({
+            "ok": true,
+            "backend": "linux_af_packet_monitor_direct",
+            "iface": iface,
+            "channel": channel,
+            "rx_variant": rx_variant,
+        });
+        let Some(client_cid) = quic_lite::ConnectionId::new(now_millis_u64().max(1)) else {
+            return json!({"ok": false, "error": "could not allocate client CID"});
+        };
+        let mut client = dmesh_server::raw_iperf::RawCheckClient::<
+            16,
+            { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+        >::new(client_cid, nonce);
+        let run = self.run_raw_action_client(
+            &iface,
+            channel,
+            destination_mac,
+            source,
+            timeout_ms,
+            tx_rate_mbps,
+            tx_variant,
+            &mut client,
+        );
+        let response_hex = client.response().map(hex_lower);
+        let counters = client.counters();
+        let result = json!({
+            "ok": client.is_complete() && run.error.is_none(),
+            "bearer": "espnow_raw_action",
+            "service": "status",
+            "iface": iface,
+            "channel": channel,
+            "destination": destination,
+            "nonce": nonce,
+            "tx_rate_mbps": tx_rate_mbps,
+            "tx_variant": tx_variant,
+            "rx_variant": rx_variant,
+            "elapsed_us": run.elapsed_us,
+            "tx_packets": run.tx_packets,
+            "tx_errors": run.tx_errors,
+            "last_tx": run.last_tx,
+            "rx_packets": run.rx_packets,
+            "counters": {
+                "bootstrap_acks": counters.bootstrap_acks,
+                "stream_packets": counters.stream_packets,
+                "other_packets": counters.other_packets,
+            },
+            "response_hex": response_hex,
+            "listen": listen,
+            "error": run.error,
+        });
+        self.record("wifi.raw.check", result.clone());
         result
     }
 
@@ -3943,7 +4581,11 @@ impl RadioService {
                         continue;
                     };
                     let subtype = frame_subtype(frame);
-                    if frame_type(frame) != 0 || !matches!(subtype, 8 | 5) {
+                    // Include action frames as well as beacons/probe
+                    // responses. Host NOW/NAN validation needs an RF-level
+                    // capture before any DMesh-specific parser decides
+                    // whether a payload is a usable command.
+                    if frame_type(frame) != 0 || !matches!(subtype, 5 | 8 | 13) {
                         continue;
                     }
                     frames.push(parse_management_frame(
@@ -6531,79 +7173,40 @@ fn queue_serial_bytes(queue: &mut VecDeque<u8>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Encode Recovery's STA handoff as the compact CBOR payload expected by the
-/// managed UDS exchange. `uds_raw_exchange` adds the UDS length envelope and
-/// the serial forward adds the physical PPP envelope; returning PPP here
-/// would double-wrap the packet and make Recovery see 0x7e as CBOR.
+/// Encode Recovery's preferred-SSID handoff as the compact CBOR payload
+/// expected by the managed UDS exchange. `uds_raw_exchange` adds the UDS
+/// length envelope and the serial forward adds the physical PPP envelope;
+/// returning PPP here would double-wrap the packet and make Recovery see
+/// 0x7e as CBOR.
 fn encode_recovery_sta_packet(command: &str) -> Result<Vec<u8>> {
     let fields = command.split_ascii_whitespace().collect::<Vec<_>>();
-    if (fields.len() < 4 || fields.len() > 6) || fields.first() != Some(&"STA") {
-        bail!("Recovery STA packet requires: STA endpoint local_ip ssid [password] [benchmark]");
+    if (fields.len() < 2 || fields.len() > 3) || fields.first() != Some(&"STA") {
+        bail!("Recovery STA packet requires: STA ssid [benchmark]");
     }
-    let endpoint = fields[1].as_bytes();
-    let local_ip = fields[2].as_bytes();
-    let ssid = fields[3].as_bytes();
-    let gateway = endpoint
-        .split(|byte| *byte == b':')
-        .next()
-        .unwrap_or(endpoint);
-    let mask = b"255.255.0.0";
-    let benchmark = fields.get(4).is_some_and(|value| *value == "benchmark")
-        || fields.get(5).is_some_and(|value| *value == "benchmark");
-    let password = if fields.get(4).is_some_and(|value| *value == "benchmark") {
-        &[]
-    } else {
-        fields.get(4).map(|value| value.as_bytes()).unwrap_or(&[])
-    };
-    if endpoint.is_empty()
-        || endpoint.len() >= 128
-        || local_ip.is_empty()
-        || local_ip.len() >= 32
-        || ssid.is_empty()
+    let ssid = fields[1].as_bytes();
+    let benchmark = fields.get(2).is_some_and(|value| *value == "benchmark");
+    if ssid.is_empty()
         || ssid.len() >= 33
-        || gateway.is_empty()
-        || gateway.len() >= 32
-        || password.len() >= 32
-        || endpoint.len() > u8::MAX as usize
-        || local_ip.len() > u8::MAX as usize
         || ssid.len() > u8::MAX as usize
-        || password.len() > u8::MAX as usize
     {
         bail!("Recovery STA packet field is too long or empty");
     }
-    let mut packet = Vec::with_capacity(
-        96 + endpoint.len()
-            + local_ip.len()
-            + ssid.len()
-            + gateway.len()
-            + mask.len()
-            + password.len(),
-    );
+    let mut packet = Vec::with_capacity(32 + ssid.len());
     packet.extend_from_slice(&[
         0xa2,
         0x00,
         0x18,
         68,
         0x06,
-        if benchmark { 0xa7 } else { 0xa6 },
+        if benchmark { 0xa2 } else { 0xa1 },
     ]);
-    for (key, value) in [
-        ("server", endpoint),
-        ("ip", local_ip),
-        ("ssid", ssid),
-        ("gateway", gateway),
-        ("mask", mask.as_slice()),
-        ("password", password),
-    ] {
-        packet.push(0x60 + key.len() as u8);
-        packet.extend_from_slice(key.as_bytes());
-        if value.len() < 24 {
-            packet.push(0x60 + value.len() as u8);
-        } else {
-            packet.extend_from_slice(&[0x78, value.len() as u8]);
-        }
-        packet.extend_from_slice(value);
+    packet.extend_from_slice(&[0x64, b's', b's', b'i', b'd']);
+    if ssid.len() < 24 {
+        packet.push(0x60 + ssid.len() as u8);
+    } else {
+        packet.extend_from_slice(&[0x78, ssid.len() as u8]);
     }
+    packet.extend_from_slice(ssid);
     if benchmark {
         packet.push(0x69);
         packet.extend_from_slice(b"benchmark");
@@ -8484,7 +9087,11 @@ impl RawWifiTxOptions {
         listen_sec: u64,
         tx_duration_ms: Option<u32>,
     ) -> Result<Self> {
-        let variant = variant.unwrap_or("standard").trim();
+        // Host raw NOW/NAN has no association requirement.  The monitor
+        // injector is therefore the default: nl80211 management-frame TX is
+        // retained as an explicit driver experiment, but returns ENOTCONN on
+        // an unassociated adapter and must not be the production host path.
+        let variant = variant.unwrap_or("monitor").trim();
         let duration_ms = tx_duration_ms
             .unwrap_or_else(|| listen_sec.saturating_mul(1000).min(u32::MAX as u64) as u32);
         let options = match variant {
@@ -9012,6 +9619,30 @@ impl Nl80211Socket {
         self.recv_ack().context("nl80211 set HT20 channel failed")
     }
 
+    fn set_channel_ht40_plus(&self, ifindex: u32, freq: u32) -> Result<()> {
+        let mut payload = genl_payload(NL80211_CMD_SET_WIPHY, NL80211_GENL_VERSION);
+        append_attr(&mut payload, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+        append_attr(&mut payload, NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes());
+        append_attr(
+            &mut payload,
+            NL80211_ATTR_WIPHY_CHANNEL_TYPE,
+            &NL80211_CHAN_HT40PLUS.to_ne_bytes(),
+        );
+        append_attr(
+            &mut payload,
+            NL80211_ATTR_CHANNEL_WIDTH,
+            &NL80211_CHAN_WIDTH_40.to_ne_bytes(),
+        );
+        append_attr(&mut payload, NL80211_ATTR_CENTER_FREQ1, &(freq + 10).to_ne_bytes());
+        self.send_genl(
+            self.family_id,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            16,
+            &payload,
+        )?;
+        self.recv_ack().context("nl80211 set HT40+ channel failed")
+    }
+
     /// Set the per-wiphy 2.4 GHz TX-rate allow-list. Legacy rates are encoded
     /// in 500-kbit/s units; HT rates are MCS indexes. Omitting both restores
     /// the driver's automatic rate policy.
@@ -9064,6 +9695,8 @@ impl Nl80211Socket {
         ssid: &str,
         channel: u8,
         freq: u32,
+        ht40: bool,
+        beacon_interval_tu: u16,
     ) -> std::result::Result<Value, (anyhow::Error, Vec<Value>)> {
         let esp_beacon_head =
             build_open_beacon_head(mac, ssid, channel).map_err(|error| (error, Vec::new()))?;
@@ -9071,20 +9704,20 @@ impl Nl80211Socket {
             build_open_beacon_head_with_capability(mac, ssid, channel, 0x0401)
                 .map_err(|error| (error, Vec::new()))?;
         let esp_beacon_tail = esp_open_ap_beacon_tail(channel);
-        let hostapd_beacon_tail = hostapd_open_ap_beacon_tail(channel);
+        let hostapd_beacon_tail = hostapd_open_ap_beacon_tail(channel, ht40);
         let esp_probe_resp =
             build_open_probe_resp(mac, ssid, channel).map_err(|error| (error, Vec::new()))?;
-        let hostapd_probe_ies =
-            hostapd_open_ap_probe_ies(ssid, channel).map_err(|error| (error, Vec::new()))?;
+        let hostapd_probe_ies = hostapd_open_ap_probe_ies(ssid, channel, ht40)
+            .map_err(|error| (error, Vec::new()))?;
         let hostapd_probe_resp =
             build_open_probe_resp_with_ies(mac, ssid, channel, 0x0401, &hostapd_probe_ies)
                 .map_err(|error| (error, Vec::new()))?;
         let profiles = [
             ApStartProfile {
-                name: "hostapd_exact_ht20",
+                name: "hostapd_exact_ht",
                 probe_resp: true,
-                channel_type: NL80211_CHAN_HT20,
-                channel_width: NL80211_CHAN_WIDTH_20,
+                channel_type: if ht40 { NL80211_CHAN_HT40PLUS } else { NL80211_CHAN_HT20 },
+                channel_width: if ht40 { NL80211_CHAN_WIDTH_40 } else { NL80211_CHAN_WIDTH_20 },
                 explicit_width: false,
                 freq_fixed: false,
                 hostapd_ies: true,
@@ -9194,7 +9827,11 @@ impl Nl80211Socket {
                     NL80211_ATTR_CHANNEL_WIDTH,
                     &profile.channel_width.to_ne_bytes(),
                 );
-                append_attr(&mut payload, NL80211_ATTR_CENTER_FREQ1, &freq.to_ne_bytes());
+                append_attr(
+                    &mut payload,
+                    NL80211_ATTR_CENTER_FREQ1,
+                    &(if ht40 { freq + 10 } else { freq }).to_ne_bytes(),
+                );
             }
             if profile.freq_fixed {
                 append_attr(&mut payload, NL80211_ATTR_FREQ_FIXED, &[]);
@@ -9202,7 +9839,7 @@ impl Nl80211Socket {
             append_attr(
                 &mut payload,
                 NL80211_ATTR_BEACON_INTERVAL,
-                &100_u32.to_ne_bytes(),
+                &u32::from(beacon_interval_tu).to_ne_bytes(),
             );
             append_attr(&mut payload, NL80211_ATTR_DTIM_PERIOD, &1_u32.to_ne_bytes());
             let beacon_head = if profile.capability == 0x0401 {
@@ -9838,7 +10475,7 @@ impl MonitorTxSocket {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL as i32).to_be(),
+                (ETH_P_ALL.to_be()) as i32,
             )
         };
         if fd < 0 {
@@ -9906,7 +10543,7 @@ impl MonitorRxSocket {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL as i32).to_be(),
+                (ETH_P_ALL.to_be()) as i32,
             )
         };
         if fd < 0 {
@@ -9936,6 +10573,20 @@ impl MonitorRxSocket {
             }
             return Err(error).with_context(|| format!("failed to bind AF_PACKET to {iface}"));
         }
+        // Bursty action responses can arrive while the callback is parsing
+        // and re-encoding a QUIC datagram. Increase the kernel receive queue
+        // so a short userspace scheduling delay is measured as QUIC loss only
+        // when the RF frame was actually missed, not as AF_PACKET overflow.
+        let receive_buffer: libc::c_int = 1 << 20;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &receive_buffer as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&receive_buffer) as libc::socklen_t,
+            );
+        }
         Ok(Self { fd })
     }
 
@@ -9947,6 +10598,28 @@ impl MonitorRxSocket {
         } else {
             Ok(read as usize)
         }
+    }
+
+    fn set_receive_timeout(&self, timeout: Duration) -> Result<()> {
+        let micros = timeout.as_micros().min(i64::MAX as u128) as i64;
+        let value = libc::timeval {
+            tv_sec: micros / 1_000_000,
+            tv_usec: micros % 1_000_000,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &value as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to set monitor RX timeout");
+        }
+        Ok(())
     }
 
     fn recv_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<Option<usize>> {
@@ -9976,7 +10649,7 @@ impl DataSocket {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL as i32).to_be(),
+                (ETH_P_ALL.to_be()) as i32,
             )
         };
         if fd < 0 {
@@ -10106,7 +10779,12 @@ fn send_monitor_frame(
     tx_rate_mbps: Option<u8>,
 ) -> Result<Value> {
     let monitor_iface = monitor_iface_name(iface);
-    let setup = ensure_monitor_iface(iface, &monitor_iface, channel, active, false)?;
+    // An existing passive monitor VIF may acknowledge AF_PACKET writes
+    // locally without putting them on RF while its managed AP/STA parent is
+    // still up. An explicit `monitor_active` TX request must therefore
+    // recreate that VIF with the active flag and take exclusive test-radio
+    // ownership, rather than silently reusing the passive listener.
+    let setup = ensure_monitor_iface(iface, &monitor_iface, channel, active, active)?;
     let packet = build_radiotap_packet_at_rate(frame, tx_rate_mbps)?;
     let socket = MonitorTxSocket::open(&monitor_iface)?;
     let written = socket.send(&packet)?;
@@ -10130,13 +10808,40 @@ fn ensure_monitor_iface(
     active: bool,
     recreate: bool,
 ) -> Result<Value> {
+    // Public raw-radio calls may name either the owned base (`wlan0`) or its
+    // conventional monitor child (`wlan0mon`).  A monitor cannot create or
+    // own another monitor VIF, so always perform VIF lifecycle operations on
+    // the base in the latter case.
+    let base_iface = base_iface.strip_suffix("mon").unwrap_or(base_iface);
+    // `send_monitor_frame` is on the packet path. Once the listener/client
+    // has prepared the VIF, repeating `ip`/`iw` setup for every response adds
+    // hundreds of milliseconds and can itself perturb the radio. Reuse the
+    // existing VIF for the non-recreate path; explicit active-mode startup
+    // still takes the full lifecycle below when the caller requested it.
+    if !recreate && ifindex(monitor_iface).is_ok() {
+        return Ok(json!({
+            "iface": monitor_iface,
+            "reused": true,
+            "channel": channel,
+            "active": active,
+        }));
+    }
     let mut steps = Vec::new();
     // A monitor VIF can exist while its parent is administratively down. For
     // active raw-NAN operation the dedicated radio must be owned by monitor
     // mode: leaving the managed parent up makes channel selection succeed only
     // nominally and packets are looped back to AF_PACKET without reaching RF.
-    steps.push(run_command("ip", &["link", "set", base_iface, "up"]));
-    if active && recreate && ifindex(monitor_iface).is_ok() {
+    // An active monitor must own the PHY.  In particular, do not bring the
+    // managed parent up before replacing a passive monitor: mac80211 then
+    // keeps the old VIF busy and AF_PACKET reports a successful local write
+    // without an RF transmit.  Take the parent down first, replace the VIF,
+    // then bring only the active monitor up.
+    if active && recreate {
+        steps.push(run_command("ip", &["link", "set", base_iface, "down"]));
+    } else {
+        steps.push(run_command("ip", &["link", "set", base_iface, "up"]));
+    }
+    if recreate && ifindex(monitor_iface).is_ok() {
         steps.push(run_command("ip", &["link", "set", monitor_iface, "down"]));
         steps.push(run_command("iw", &["dev", monitor_iface, "del"]));
     }
@@ -10151,12 +10856,20 @@ fn ensure_monitor_iface(
             "monitor",
         ];
         if active {
+            // The historical working injector used a transmit-only active
+            // monitor VIF. Extra passive-capture flags can make some drivers
+            // accept AF_PACKET writes without scheduling them on RF.
             add_args.extend(["flags", "active"]);
+        } else {
+            // A passive monitor otherwise commonly filters foreign BSS
+            // traffic. Raw NAN/NOW targets other BSSIDs, so retain the broad
+            // receive flags for the peer capture path.
+            add_args.extend(["flags", "fcsfail", "control", "otherbss"]);
         }
         steps.push(run_command("iw", &add_args));
     }
     steps.push(run_command("ip", &["link", "set", monitor_iface, "up"]));
-    if active {
+    if active && !recreate {
         steps.push(run_command("ip", &["link", "set", base_iface, "down"]));
     }
     let channel_step = run_command(
@@ -10282,6 +10995,14 @@ fn is_nan_control_frame(frame: &[u8]) -> bool {
 }
 
 fn build_radiotap_packet_at_rate(frame: &[u8], rate_mbps: Option<u8>) -> Result<Vec<u8>> {
+    build_radiotap_packet_at_rate_with_ack(frame, rate_mbps, false)
+}
+
+fn build_radiotap_packet_at_rate_with_ack(
+    frame: &[u8],
+    rate_mbps: Option<u8>,
+    request_ack: bool,
+) -> Result<Vec<u8>> {
     let rate_mbps = rate_mbps.unwrap_or(1);
     if !matches!(
         rate_mbps,
@@ -10301,8 +11022,8 @@ fn build_radiotap_packet_at_rate(frame: &[u8], rate_mbps: Option<u8>) -> Result<
         0x00,                        // present: RATE and TX_FLAGS
         rate_mbps.saturating_mul(2), // RATE in 500 kbps units
         0x00,                        // pad TX_FLAGS to u16 alignment
-        0x08,
-        0x00, // TX_FLAGS: no ACK
+        if request_ack { 0x00 } else { 0x08 },
+        0x00, // TX_FLAGS: request MAC ACK for unicast, no ACK for broadcast
     ]);
     packet.extend_from_slice(frame);
     Ok(packet)
@@ -10738,6 +11459,7 @@ fn ap_mgmt_receive_loop(
     rawnan_state: Arc<Mutex<NanState>>,
     ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
     channel: u8,
+    ht40: bool,
     stop: Arc<AtomicBool>,
 ) {
     let _ = socket.set_receive_timeout(Duration::from_millis(100));
@@ -10785,6 +11507,7 @@ fn ap_mgmt_receive_loop(
                     &frame,
                     &ap_no_ht_stations,
                     channel,
+                    ht40,
                 ) && let Some(object) = value.as_object_mut()
                 {
                     object.insert("sme_response".to_string(), response);
@@ -10941,6 +11664,7 @@ fn handle_open_ap_sme_frame(
     frame: &[u8],
     ap_no_ht_stations: &Arc<Mutex<HashSet<[u8; 6]>>>,
     channel: u8,
+    ht40: bool,
 ) -> Option<Value> {
     if frame_type(frame) != 0 {
         return None;
@@ -10980,7 +11704,7 @@ fn handle_open_ap_sme_frame(
                 })
                 .map(|_| json!({ "ok": true }))
                 .unwrap_or_else(|error| json!({ "ok": false, "error": format!("{error:#}") }));
-            let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht, channel);
+            let response = build_open_assoc_response(ap_mac, sta_mac, aid, allow_ht, channel, ht40);
             let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
             json!({
                 "kind": "assoc_resp",
@@ -11059,22 +11783,252 @@ fn send_open_ap_mgmt_response(
     }
 }
 
+/// Encode and send one bearer-neutral QUIC datagram as an ESP-NOW-like
+/// action. Keeping this in one helper makes immediate responses and timer
+/// retransmissions use identical address/rate/framing behavior.
+fn send_raw_action_datagram(
+    iface: &str,
+    peer: [u8; 6],
+    payload: &[u8],
+    tx_rate_mbps: u8,
+) -> Result<()> {
+    let monitor_iface = monitor_iface_name(iface);
+    let socket = MonitorTxSocket::open(&monitor_iface)?;
+    send_raw_action_datagram_on_socket(iface, &socket, peer, payload, tx_rate_mbps)
+}
+
+/// Send using a caller-owned AF_PACKET socket.  The receive loop sends both
+/// immediate QUIC responses and PTO retransmissions; keeping one bound socket
+/// for that loop avoids repeated socket/bind setup and, more importantly,
+/// avoids dropping packets while the driver is switching between short-lived
+/// transmit contexts.
+fn send_raw_action_datagram_on_socket(
+    iface: &str,
+    socket: &MonitorTxSocket,
+    peer: [u8; 6],
+    payload: &[u8],
+    tx_rate_mbps: u8,
+) -> Result<()> {
+    let local = iface_mac(iface).with_context(|| format!("missing local MAC for {iface}"))?;
+    let mut action = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 64];
+    let destination = raw_action_response_address(peer);
+    let action_len = dmesh_rawnan::espnow::encode_action_frame(
+        &mut action,
+        destination,
+        local,
+        [0xff; 6],
+        payload,
+    )
+    .map_err(|error| anyhow::anyhow!("raw NOW response frame: {error:?}"))?;
+    let packet = build_radiotap_packet_at_rate_with_ack(
+        &action[..action_len],
+        Some(tx_rate_mbps),
+        destination != [0xff; 6],
+    )?;
+    for repetition in 0..raw_action_response_repetitions() {
+        if repetition != 0 {
+            // A duplicate sent back-to-back can be discarded by the
+            // monitor/driver queue as one write.  A short gap makes this a
+            // real independent on-air attempt while retaining one shared
+            // QUIC packet buffer.
+            std::thread::sleep(Duration::from_millis(raw_action_burst_gap_ms()));
+        }
+        let written = socket.send(&packet)?;
+        if written != packet.len() {
+            bail!("short raw NOW response write: wrote {written}, expected {}", packet.len());
+        }
+    }
+    Ok(())
+}
+
+/// Broadcast Address-1 is the default ESP-NOW-compatible action path.  Host
+/// tests may select a peer Address-1 to compare MAC-ACK/unicast behavior
+/// without changing the shared QUIC or frame parser. Firmware keeps the
+/// broadcast default because its radio policy is association-specific.
+fn raw_action_response_address(peer: [u8; 6]) -> [u8; 6] {
+    if std::env::var("DMESH_RAW_ACTION_RESPONSE_A1").as_deref() == Ok("peer") {
+        peer
+    } else {
+        [0xff; 6]
+    }
+}
+
+fn raw_action_burst_gap_ms() -> u64 {
+    std::env::var("DMESH_RAW_ACTION_BURST_GAP_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2)
+        .min(100)
+}
+
+fn raw_action_response_repetitions() -> usize {
+    std::env::var("DMESH_RAW_ACTION_RESPONSE_REPETITIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(RAW_ACTION_RESPONSE_REPETITIONS)
+        .clamp(1, 8)
+}
+
+/// Automated host comparisons may adjust the association burst without
+/// rebuilding either supervised service. The shared default remains the
+/// normal eight-packet profile; this is a diagnostic knob, not a retained
+/// one-packet stop-and-wait policy.
+fn raw_action_association_profile() -> dmesh_server::raw_iperf::RawAssociationProfile {
+    let mut profile = dmesh_server::raw_iperf::RawAssociationProfile::c6_default();
+    if let Ok(value) = std::env::var("DMESH_RAW_ACTION_HISTORY") {
+        if let Ok(value) = value.parse::<usize>() {
+            profile.history_packets = value.clamp(1, 16);
+        }
+    }
+    if let Ok(value) = std::env::var("DMESH_RAW_ACTION_ACK_FREQUENCY") {
+        if let Ok(value) = value.parse::<u8>() {
+            profile.ack_frequency = value.clamp(1, quic_lite::ACK_RANGE_CAPACITY as u8);
+        }
+    }
+    if let Ok(value) = std::env::var("DMESH_RAW_ACTION_INITIAL_WINDOW") {
+        if let Ok(value) = value.parse::<usize>() {
+            profile.initial_window_packets = value.clamp(1, 16);
+        }
+    }
+    if let Ok(value) = std::env::var("DMESH_RAW_ACTION_TX_BURST") {
+        if let Ok(value) = value.parse::<usize>() {
+            profile.tx_burst_packets = value.clamp(1, 8);
+        }
+    }
+    profile
+}
+
+fn radiotap_rate_mbps(packet: &[u8]) -> Option<u8> {
+    if packet.len() < 9 || packet[0] != 0 || packet[1] != 0 {
+        return None;
+    }
+    let present = u32::from_le_bytes(packet.get(4..8)?.try_into().ok()?);
+    if present & (1 << 2) == 0 {
+        return None;
+    }
+    let rate = packet[8] / 2;
+    matches!(rate, 1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54).then_some(rate)
+}
+
 fn monitor_receive_loop(
     socket: MonitorRxSocket,
     iface: &str,
     monitor_iface: &str,
     history: Arc<Mutex<VecDeque<RadioEvent>>>,
     rawnan_state: Arc<Mutex<NanState>>,
+    raw_action_dispatcher: Arc<Mutex<Option<dmesh_server::raw_iperf::RawIperfDispatcher<
+        16,
+        { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+    >>>>,
+    stop_flag: Arc<AtomicBool>,
 ) {
     let receive_addresses = raw_wifi_receive_addresses(iface);
     let mut followup_dedup = FollowupDedup::new(256);
     let mut buf = [0_u8; 4096];
+    let mut last_action_rate = 1_u8;
+    let tx_socket = MonitorTxSocket::open(monitor_iface).ok();
     loop {
+        if stop_flag.load(Ordering::Acquire) {
+            break;
+        }
+        // Drive server-side QUIC PTO even when the peer's last request or
+        // response was lost. AF_PACKET timeouts wake this loop without a
+        // second queue or transport-owned packet buffer.
+        let mut timer_response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let timer_path = raw_action_dispatcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|dispatcher| dispatcher.reply_path());
+        if let Some(path) = timer_path
+            && let Ok(Some(used)) = raw_action_dispatcher
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+                .expect("reply path implies dispatcher")
+                // Raw QUIC endpoint clocks are milliseconds.  Keep PTO in the
+                // same unit as the dispatcher set_time call above.
+                .poll_retransmit_for(path, now_millis_u64(), 100, &mut timer_response)
+            && let Err(error) = match tx_socket.as_ref() {
+                Some(socket) => send_raw_action_datagram_on_socket(
+                    iface,
+                    socket,
+                    path.peer,
+                    &timer_response[..used],
+                    last_action_rate,
+                ),
+                None => send_raw_action_datagram(
+                    iface,
+                    path.peer,
+                    &timer_response[..used],
+                    last_action_rate,
+                ),
+            }
+        {
+            push_radio_event(
+                &history,
+                RadioEvent {
+                    ts_millis: now_millis(),
+                    key: "wifi.raw.dispatch".to_string(),
+                    source: monitor_iface.to_string(),
+                    value: json!({
+                        "ok": false,
+                        "timer_retransmit": true,
+                        "peer": colon_mac(&path.peer),
+                        "error": format!("{error:#}"),
+                    }),
+                    message: None,
+                },
+            );
+        }
         match socket.recv(&mut buf) {
             Ok(0) => continue,
             Ok(len) => {
                 let packet = &buf[..len];
+                if let Some(rate) = radiotap_rate_mbps(packet) {
+                    last_action_rate = rate;
+                }
+                push_radio_event(
+                    &history,
+                    RadioEvent {
+                        ts_millis: now_millis(),
+                        key: "wifi.raw.socket".to_string(),
+                        source: monitor_iface.to_string(),
+                        value: json!({"packet_len": len}),
+                        message: None,
+                    },
+                );
                 if let Some(frame) = ieee80211_frame(packet) {
+                    // Keep bounded receive-path evidence separate from the
+                    // parsed DMesh events. This distinguishes a monitor
+                    // socket/driver delivery problem from action-parser or
+                    // QUIC dispatch rejection without retaining packet data.
+                    push_radio_event(
+                        &history,
+                        RadioEvent {
+                            ts_millis: now_millis(),
+                            key: "wifi.raw.monitor".to_string(),
+                            source: monitor_iface.to_string(),
+                            value: json!({
+                                "frame_len": frame.len(),
+                                "frame_type": frame_type(frame),
+                                "frame_subtype": frame_subtype(frame),
+                            }),
+                            message: None,
+                        },
+                    );
+                    if frame_subtype(frame) == 13 {
+                        push_radio_event(
+                            &history,
+                            RadioEvent {
+                                ts_millis: now_millis(),
+                                key: "wifi.raw.action_candidate".to_string(),
+                                source: monitor_iface.to_string(),
+                                value: json!({"frame_len": frame.len()}),
+                                message: None,
+                            },
+                        );
+                    }
                     if frame_subtype(frame) == 8 && dmesh_rawnan::is_nan_beacon(frame) {
                         if let Some(beacon) = handle_beacon_frame(frame, iface, None, &rawnan_state)
                         {
@@ -11178,6 +12132,234 @@ fn monitor_receive_loop(
                             );
                         }
                     }
+                    // ESP-NOW-compatible action frames carry complete
+                    // QUIC-lite datagrams. Dispatch them above the radio
+                    // adapter, exactly as firmware does, and emit a response
+                    // on this same bearer/path. The dispatcher is lazy and
+                    // bounded; receiving ambient management traffic does not
+                    // allocate a connection or a packet queue.
+                    // ESP-NOW-compatible action frames may be delivered by a
+                    // monitor driver with Address-1 rewritten (notably for
+                    // broadcast action traffic). The vendor-action parser is
+                    // the admission check for this bearer; do not apply the
+                    // ordinary data-MAC filter before classifying it.
+                    let mut action_payload = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+                    if let Some((peer, payload_len)) =
+                        dmesh_rawnan::espnow::parse_action_frame_into(frame, &mut action_payload)
+                    {
+                        let local_source = iface_mac(iface).ok();
+                        push_radio_event(
+                            &history,
+                            RadioEvent {
+                                ts_millis: now_millis(),
+                                key: "wifi.raw.action".to_string(),
+                                source: monitor_iface.to_string(),
+                                value: json!({
+                                    "peer": colon_mac(&peer),
+                                    "local": local_source.map(|mac| colon_mac(&mac)),
+                                    "payload_len": payload_len,
+                                }),
+                                message: None,
+                            },
+                        );
+                        // The monitor VIF reflects locally injected frames.
+                        // Do not turn that reflection into a local server
+                        // response; only a different source MAC is a peer.
+                        if iface_mac(iface).ok() == Some(peer) {
+                            continue;
+                        }
+                        let payload = &action_payload[..payload_len];
+                        let mut response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+                        let path = dmesh_server::raw_iperf::RawIngressPath {
+                            transport_id: 2,
+                            peer,
+                        };
+                        let dispatch_result = {
+                            let mut dispatcher = raw_action_dispatcher
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let dispatcher = dispatcher.get_or_insert_with(|| {
+                                let cid = quic_lite::ConnectionId::new(now_millis_u64().max(1))
+                                    .expect("non-zero raw action server CID");
+                                dmesh_server::raw_iperf::RawIperfDispatcher::new(
+                                    cid,
+                                    quic_lite::ConnectionLimits::default(),
+                                    raw_action_association_profile(),
+                                )
+                            });
+                            dispatcher.set_time(now_millis_u64());
+                            dispatcher.receive(path, payload, &mut response)
+                        };
+                        match dispatch_result {
+                            Ok(Some(used)) => {
+                                let sent = match tx_socket.as_ref() {
+                                Some(socket) => send_raw_action_datagram_on_socket(
+                                        iface,
+                                        socket,
+                                        peer,
+                                        &response[..used],
+                                        last_action_rate,
+                                    ),
+                                    None => send_raw_action_datagram(
+                                        iface,
+                                        peer,
+                                        &response[..used],
+                                        last_action_rate,
+                                    ),
+                                };
+                                let transport = raw_action_dispatcher
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .as_ref()
+                                    .and_then(|dispatcher| dispatcher.transport_stats())
+                                    .map(|stats| {
+                                        json!({
+                                            "received_datagrams": stats.received_datagrams,
+                                            "sent_datagrams": stats.sent_datagrams,
+                                            "sent_stream_datagrams": stats.sent_stream_datagrams,
+                                            "sent_control_datagrams": stats.sent_control_datagrams,
+                                            "duplicate_datagrams": stats.duplicate_datagrams,
+                                            "out_of_order_datagrams": stats.out_of_order_datagrams,
+                                            "inferred_missing_packets": stats.inferred_missing_packets,
+                                            "retransmitted_datagrams": stats.retransmitted_datagrams,
+                                            "loss_packet_threshold_datagrams": stats.loss_packet_threshold_datagrams,
+                                            "loss_time_threshold_datagrams": stats.loss_time_threshold_datagrams,
+                                            "loss_events": stats.loss_events,
+                                            "loss_retransmitted_datagrams": stats.loss_retransmitted_datagrams,
+                                            "pto_retransmitted_datagrams": stats.pto_retransmitted_datagrams,
+                                            "ack_datagrams": stats.ack_datagrams,
+                                            "ack_frequency_received": stats.ack_frequency_received,
+                                            "ack_frequency_sent": stats.ack_frequency_sent,
+                                        })
+                                    });
+                                let ack_state = raw_action_dispatcher
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .as_ref()
+                                    .and_then(|dispatcher| dispatcher.transport_ack_state())
+                                    .map(|(largest_acked, bytes_in_flight, congestion_window)| {
+                                        json!({
+                                            "largest_acked_by_peer": largest_acked,
+                                            "bytes_in_flight": bytes_in_flight,
+                                            "congestion_window": congestion_window,
+                                        })
+                                    });
+                                let debug_state = raw_action_dispatcher
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .as_ref()
+                                    .and_then(|dispatcher| dispatcher.transport_debug_state())
+                                    .map(|state| {
+                                        json!({
+                                            "received_ranges": state.received_ranges,
+                                            "peer_ack_ranges": state.peer_ack_ranges,
+                                            "outstanding_packets": state.outstanding_packets,
+                                            "outstanding_count": state.outstanding_count,
+                                        })
+                                    });
+                                push_radio_event(
+                                    &history,
+                                    RadioEvent {
+                                        ts_millis: now_millis(),
+                                        key: "wifi.raw.dispatch".to_string(),
+                                        source: monitor_iface.to_string(),
+                                        value: json!({
+                                            "ok": sent.is_ok(),
+                                            "peer": colon_mac(&peer),
+                                            "response_len": used,
+                                            "transport": transport,
+                                            "ack_state": ack_state,
+                                            "debug_state": debug_state,
+                                            "error": sent.err().map(|error| format!("{error:#}")),
+                                        }),
+                                        message: None,
+                                    },
+                                );
+                                // The association profile permits a bounded
+                                // burst. Ask the shared dispatcher for those
+                                // additional packets while this callback is
+                                // active; no adapter-owned egress queue is
+                                // introduced and QUIC retains every packet in
+                                // its normal bounded ledger.
+                                let burst = raw_action_dispatcher
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .as_ref()
+                                    .map(|dispatcher| dispatcher.tx_burst_packets())
+                                    .unwrap_or(1)
+                                    .max(1);
+                                for _ in 1..burst {
+                                    let mut burst_response =
+                                        [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+                                    // Leave a short airtime gap so the
+                                    // monitor driver can schedule each action
+                                    // without adding an adapter-owned queue.
+                                    std::thread::sleep(Duration::from_millis(raw_action_burst_gap_ms()));
+                                    let next = {
+                                        let mut dispatcher = raw_action_dispatcher
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        dispatcher.as_mut().and_then(|dispatcher| {
+                                            dispatcher
+                                                .poll_for(path, &mut burst_response)
+                                                .ok()
+                                                .flatten()
+                                        })
+                                    };
+                                    let Some(next) = next else { break };
+                                    let burst_sent = match tx_socket.as_ref() {
+                                    Some(socket) => send_raw_action_datagram_on_socket(
+                                            iface,
+                                            socket,
+                                            peer,
+                                            &burst_response[..next],
+                                            last_action_rate,
+                                        ),
+                                        None => send_raw_action_datagram(
+                                            iface,
+                                            peer,
+                                            &burst_response[..next],
+                                            last_action_rate,
+                                        ),
+                                    };
+                                    push_radio_event(
+                                        &history,
+                                        RadioEvent {
+                                            ts_millis: now_millis(),
+                                            key: "wifi.raw.dispatch".to_string(),
+                                            source: monitor_iface.to_string(),
+                                            value: json!({
+                                                "ok": burst_sent.is_ok(),
+                                                "peer": colon_mac(&peer),
+                                                "response_len": next,
+                                                "burst": true,
+                                                "error": burst_sent.as_ref().err().map(|error| format!("{error:#}")),
+                                            }),
+                                            message: None,
+                                        },
+                                    );
+                                    if burst_sent.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => push_radio_event(
+                                &history,
+                                RadioEvent {
+                                    ts_millis: now_millis(),
+                                    key: "wifi.raw.dispatch".to_string(),
+                                    source: monitor_iface.to_string(),
+                                    value: json!({
+                                        "ok": false,
+                                        "peer": colon_mac(&peer),
+                                        "error": format!("QUIC-lite raw NOW receive: {error:?}"),
+                                    }),
+                                    message: None,
+                                },
+                            ),
+                        }
+                    }
                     if !matches!(action, RawNanAction::None) {
                         push_radio_event(
                             &history,
@@ -11210,6 +12392,11 @@ fn monitor_receive_loop(
                         );
                     }
                 }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                continue;
             }
             Err(error) => {
                 push_radio_event(
@@ -11469,6 +12656,28 @@ fn parse_dmesh_vendor_action(frame: &[u8], iface: &str) -> Option<Value> {
 }
 
 fn parse_dmesh_wifi_frame(frame: &[u8], iface: &str, backend: &str) -> Option<Value> {
+    // The raw NOW bearer is a standard 802.11 public/vendor action whose
+    // payload is owned by `rawnan::espnow`. Parse it before the legacy DMesh
+    // vendor-marker path so host monitor events expose the exact complete
+    // QUIC-lite datagram that firmware receives.
+    if let Some((source, payload)) = dmesh_rawnan::espnow::parse_action_frame(frame) {
+        let destination = mac_at(frame, IEEE80211_ADDR1)?;
+        let bssid = mac_at(frame, IEEE80211_ADDR3)?;
+        return Some(json!({
+            "protocol": "dmesh_wifi_raw",
+            "layout": "espnow_action",
+            "backend": backend,
+            "encapsulation": "espnow_v2_vendor_ie",
+            "iface": iface,
+            "frame_type": frame_type(frame),
+            "frame_subtype": frame_subtype(frame),
+            "source": colon_mac(&source),
+            "destination": colon_mac(&destination),
+            "bssid": colon_mac(&bssid),
+            "payload_len": payload.len(),
+            "payload": hex_bytes(payload),
+        }));
+    }
     if frame.len() <= IEEE80211_BODY + DMESH_LEGACY_VENDOR_ACTION.len() {
         return None;
     }
@@ -11627,10 +12836,22 @@ struct DmeshWifiHeader {
 fn parse_dmesh_vendor_action_header(body: &[u8]) -> Option<DmeshWifiHeader> {
     if body.len() >= DMESH_VENDOR_ACTION_LEN
         && body[..DMESH_ESPNOW_PREFIX.len()] == DMESH_ESPNOW_PREFIX
-        && body[8] == DMESH_ESPNOW_TYPE
     {
+        // Native action frames continue with one ESP-NOW vendor IE.  The
+        // Ethernet/LLC diagnostic encapsulation uses the same eight-byte
+        // marker directly, so only skip the IE when it is actually present.
+        let header_len = if body.len() >= DMESH_VENDOR_ACTION_LEN + DMESH_VENDOR_IE_LEN
+            && body[DMESH_VENDOR_ACTION_LEN] == 0xdd
+            && body[DMESH_VENDOR_ACTION_LEN + 2..DMESH_VENDOR_ACTION_LEN + 5]
+                == DMESH_ESPNOW_PREFIX[1..]
+            && body[DMESH_VENDOR_ACTION_LEN + 5] == 0x04
+        {
+            DMESH_VENDOR_ACTION_LEN + DMESH_VENDOR_IE_LEN
+        } else {
+            DMESH_VENDOR_ACTION_LEN
+        };
         return Some(DmeshWifiHeader {
-            header_len: DMESH_VENDOR_ACTION_LEN,
+            header_len,
             marker: "espnow_dmesh",
             mesh_dst4: [body[4], body[5], body[6], body[7]],
         });
@@ -11991,6 +13212,7 @@ fn build_open_assoc_response(
     aid: u16,
     allow_ht: bool,
     channel: u8,
+    ht40: bool,
 ) -> Vec<u8> {
     let mut frame = mgmt_frame_header(0x01, sta, ap, ap);
     frame.extend_from_slice(&0x0401_u16.to_le_bytes());
@@ -12006,8 +13228,8 @@ fn build_open_assoc_response(
     // Capabilities element in the association response, a station can
     // associate successfully but remain on legacy rates.
     if allow_ht {
-        frame.extend_from_slice(&hostapd_open_ap_ht_capability());
-        frame.extend_from_slice(&hostapd_open_ap_ht_operation(channel));
+        frame.extend_from_slice(&hostapd_open_ap_ht_capability(ht40));
+        frame.extend_from_slice(&hostapd_open_ap_ht_operation(channel, ht40));
     }
     frame.extend_from_slice(&hostapd_open_ap_extra_ies());
     // The beacon/probe templates advertise WMM, so the manually generated
@@ -12019,15 +13241,19 @@ fn build_open_assoc_response(
     frame
 }
 
-fn hostapd_open_ap_ht_operation(channel: u8) -> [u8; 24] {
-    [
+fn hostapd_open_ap_ht_operation(channel: u8, ht40: bool) -> [u8; 24] {
+    let mut ie = [
         0x3d, 22, channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]
+    ];
+    if ht40 { ie[3] = 0x05; }
+    ie
 }
 
-fn hostapd_open_ap_ht_capability() -> [u8; 28] {
-    HOSTAPD_HT20_CAPABILITY
+fn hostapd_open_ap_ht_capability(ht40: bool) -> [u8; 28] {
+    let mut ie = HOSTAPD_HT20_CAPABILITY;
+    if ht40 { ie[2] |= 0x42; }
+    ie
 }
 
 fn mgmt_frame_header(subtype: u8, addr1: [u8; 6], addr2: [u8; 6], addr3: [u8; 6]) -> Vec<u8> {
@@ -12091,7 +13317,7 @@ fn esp_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     ies
 }
 
-fn hostapd_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
+fn hostapd_open_ap_beacon_tail(channel: u8, ht40: bool) -> Vec<u8> {
     let mut ies = Vec::with_capacity(101);
     ies.push(0x2a);
     ies.push(1);
@@ -12102,13 +13328,8 @@ fn hostapd_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     ies.push(0x3b);
     ies.push(2);
     ies.extend_from_slice(&[0x51, 0x00]);
-    ies.extend_from_slice(&HOSTAPD_HT20_CAPABILITY);
-    ies.push(0x3d);
-    ies.push(22);
-    ies.extend_from_slice(&[
-        channel, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
+    ies.extend_from_slice(&hostapd_open_ap_ht_capability(ht40));
+    ies.extend_from_slice(&hostapd_open_ap_ht_operation(channel, ht40));
     ies.extend_from_slice(&hostapd_open_ap_extra_ies());
     ies.push(0xdd);
     ies.push(24);
@@ -12119,9 +13340,9 @@ fn hostapd_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
     ies
 }
 
-fn hostapd_open_ap_probe_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
+fn hostapd_open_ap_probe_ies(ssid: &str, channel: u8, ht40: bool) -> Result<Vec<u8>> {
     let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
-    ies.extend_from_slice(&hostapd_open_ap_beacon_tail(channel));
+    ies.extend_from_slice(&hostapd_open_ap_beacon_tail(channel, ht40));
     Ok(ies)
 }
 
@@ -12308,8 +13529,15 @@ fn push_radio_event(history: &Arc<Mutex<VecDeque<RadioEvent>>>, event: RadioEven
     let event_type = event.key.clone();
     let source = event.source.clone();
     let data = event.value.to_string();
+    // Drop only high-rate per-frame monitor diagnostics from the retained
+    // history. Semantic raw receive/dispatch events remain bounded history so
+    // E2E tests and operators can distinguish radio delivery from parser or
+    // QUIC failures without retaining packet payload queues.
     let monitor_event = event.source.ends_with("mon")
-        && (event.key.starts_with("wifi.rawnan") || event.key.starts_with("wifi.raw."));
+        && matches!(
+            event.key.as_str(),
+            "wifi.raw.monitor" | "wifi.raw.socket" | "wifi.raw.action_candidate"
+        );
     if !monitor_event {
         let mut history = history
             .lock()
@@ -12925,6 +14153,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_wifi_default_tx_uses_monitor_injection() {
+        // An unassociated Linux adapter rejects NL80211_CMD_FRAME.  Keep the
+        // no-option operator path aligned with the proven AF_PACKET/radiotap
+        // injector used by the host NOW/NAN laboratory.
+        let options = RawWifiTxOptions::from_variant(None, 5, None).unwrap();
+        assert_eq!(options.variant, "monitor");
+        assert!(!options.include_freq);
+        assert!(options.duration_ms.is_none());
+        assert!(!options.offchannel_tx_ok);
+        assert!(options.dont_wait_for_ack);
+    }
+
+    #[test]
     fn ap_sme_retires_station_on_disassociation_or_deauthentication() {
         assert!(ap_sme_station_departed(10));
         assert!(ap_sme_station_departed(12));
@@ -12944,7 +14185,7 @@ mod tests {
             Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice())
         );
 
-        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, 11);
+        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, 11, false);
         let assoc_ies = &assoc[IEEE80211_BODY + 6..];
         assert_eq!(
             management_ie_bytes(assoc_ies, 1),
@@ -12969,12 +14210,12 @@ mod tests {
             "Direct-test",
             channel,
             0x0401,
-            &hostapd_open_ap_probe_ies("Direct-test", channel).unwrap(),
+            &hostapd_open_ap_probe_ies("Direct-test", channel, false).unwrap(),
         )
         .unwrap();
         let probe_ies = &probe[IEEE80211_BODY + 12..];
-        let beacon_ies = hostapd_open_ap_probe_ies("Direct-test", channel).unwrap();
-        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, channel);
+        let beacon_ies = hostapd_open_ap_probe_ies("Direct-test", channel, false).unwrap();
+        let assoc = build_open_assoc_response([1; 6], [2; 6], 1, true, channel, false);
         let assoc_ies = &assoc[IEEE80211_BODY + 6..];
 
         assert_eq!(read_u16_at(&probe, IEEE80211_BODY + 10), Some(0x0401));
@@ -13169,20 +14410,20 @@ mod tests {
     #[test]
     fn recovery_sta_command_is_typed_and_ppp_framed() {
         let wire = encode_recovery_sta_packet(
-            "STA 10.78.0.1:3336 10.78.84.60 Direct-FCE48415-Dmesh-local",
+            "STA Direct-FCE48415-Dmesh-local",
         )
         .unwrap();
         let packet = wire;
-        assert_eq!(&packet[..6], &[0xa2, 0x00, 0x18, 68, 0x06, 0xa6]);
-        assert!(packet.windows(6).any(|window| window == b"server"));
-        assert!(packet.windows(2).any(|window| window == [0x6e, b'1']));
+        assert_eq!(&packet[..6], &[0xa2, 0x00, 0x18, 68, 0x06, 0xa1]);
+        assert!(packet.windows(4).any(|window| window == b"ssid"));
+        assert!(!packet.windows(6).any(|window| window == b"server"));
         assert!(!packet.windows(7).any(|window| window == b"dry_run"));
     }
 
     #[test]
     fn recovery_sta_benchmark_is_a_typed_boolean_field() {
         let wire = encode_recovery_sta_packet(
-            "STA 10.78.0.1:3336 10.78.84.60 Direct-FCE48415-Dmesh-local benchmark",
+            "STA Direct-FCE48415-Dmesh-local benchmark",
         )
         .unwrap();
         assert!(wire.windows(10).any(|window| window == b"benchmark\xF5"));
@@ -13610,7 +14851,7 @@ mod tests {
     #[test]
     fn gateway_command_parses_text_arguments() {
         let payload = firmware_targeted_command_cbor_with_timeout(
-            "recovery ssid=Direct-Dmesh server=10.78.0.1 reboot=true",
+            "recovery ssid=Direct-Dmesh reboot=true",
             "1d4c5e1d",
             Some(45_000),
         )
@@ -13618,7 +14859,6 @@ mod tests {
         let decoded = mesh::cbor::decode_json(&payload, &mesh::cbor::Catalog::default()).unwrap();
         assert_eq!(decoded["method"], "recovery");
         assert_eq!(decoded["payload"]["ssid"], "Direct-Dmesh");
-        assert_eq!(decoded["payload"]["server"], "10.78.0.1");
         assert_eq!(decoded["payload"]["reboot"], "true");
         assert_eq!(decoded["payload"]["41"], "45000");
     }
@@ -13813,7 +15053,7 @@ mod tests {
             &[0x7f, 0x18, 0xfe, 0x34]
         );
         assert_eq!(&frame[IEEE80211_BODY + 4..IEEE80211_BODY + 8], &[0xff; 4]);
-        assert_eq!(frame[IEEE80211_BODY + 8], 0x04);
+        assert_eq!(frame[IEEE80211_BODY + DMESH_VENDOR_ACTION_LEN], 0xdd);
 
         let parsed = parse_dmesh_vendor_action(&frame, "wlan-test").unwrap();
         assert_eq!(parsed["protocol"], "dmesh_wifi_raw");

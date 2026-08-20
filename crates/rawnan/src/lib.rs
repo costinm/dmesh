@@ -18,6 +18,9 @@ pub use espnow::{
     parse_action_frame as parse_espnow_action_frame,
 };
 
+pub mod channel_observation;
+pub use channel_observation::{ChannelObservation, ChannelObservationSummary};
+
 pub mod service;
 pub use service::{
     active_ack_for_service, build_dmesh_followup_payload, build_dmesh_service_info,
@@ -53,6 +56,21 @@ pub const NAN_AVAILABILITY_BITMAP_TU: u32 = 16;
 /// Maximum post-beacon transmit dwell shared by host and firmware schedulers.
 /// A frame outside this interval cannot be assumed to reach a sleepy peer.
 pub const NAN_TX_DWELL_US: u64 = 32_000;
+
+/// Return the next 512-TU discovery-window start derived from an observed
+/// cluster beacon's *local receive timestamp*.  The radio adapter samples the
+/// timestamp; this pure calculation is shared by host, Recovery, and Main.
+///
+/// NAN peers synchronize to the observed cluster beacon rather than assuming
+/// that their independent TSF counters have phase zero at the same instant.
+pub const fn next_nan_dw_start_us(anchor_local_us: u64, now_us: u64) -> u64 {
+    if now_us <= anchor_local_us {
+        return anchor_local_us;
+    }
+    let elapsed = now_us - anchor_local_us;
+    let periods = elapsed.div_ceil(NAN_DISCOVERY_PERIOD_US);
+    anchor_local_us + periods * NAN_DISCOVERY_PERIOD_US
+}
 pub const DMESH_SERVICE_ID: [u8; 6] = [0x75, 0x94, 0x31, 0x93, 0xea, 0xc9];
 pub const DMESH_MAGIC: [u8; 2] = *b"DM";
 pub const DMESH_VERSION: u8 = 1;
@@ -696,6 +714,44 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_sync_beacon_is_host_testable_and_preserves_nan_attributes() {
+        let original_bssid = [0x50, 0x6f, 0x9a, 0x01, 0x01, 0x02];
+        let transmitter = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c];
+        let cluster_bssid = [0x50, 0x6f, 0x9a, 0x01, 0x55, 0x46];
+        let mut template = vec![0_u8; FRAME_DATA + 18];
+        template[0] = 0x80;
+        template[FRAME_BSSID..FRAME_BSSID + 6].copy_from_slice(&original_bssid);
+        template[FRAME_DATA + 12..].copy_from_slice(b"nan-ie");
+
+        let rewritten =
+            rewrite_nan_sync_beacon(&template, &transmitter, &cluster_bssid, 42).unwrap();
+
+        assert_eq!(&rewritten[FRAME_SRC..FRAME_SRC + 6], transmitter);
+        assert_eq!(&rewritten[FRAME_BSSID..FRAME_BSSID + 6], cluster_bssid);
+        assert_eq!(beacon_tsf_us(&rewritten), Some(42));
+        assert_eq!(&rewritten[FRAME_DATA + 12..], b"nan-ie");
+        assert!(rewrite_nan_sync_beacon(&[0x80; 36], &transmitter, &cluster_bssid, 42).is_err());
+    }
+
+    #[test]
+    fn next_dw_uses_observed_beacon_phase_not_local_epoch() {
+        let anchor = 7_123_456;
+        assert_eq!(next_nan_dw_start_us(anchor, anchor), anchor);
+        assert_eq!(
+            next_nan_dw_start_us(anchor, anchor + 1),
+            anchor + NAN_DISCOVERY_PERIOD_US
+        );
+        assert_eq!(
+            next_nan_dw_start_us(anchor, anchor + NAN_DISCOVERY_PERIOD_US),
+            anchor + NAN_DISCOVERY_PERIOD_US
+        );
+        assert_eq!(
+            next_nan_dw_start_us(anchor, anchor + 2 * NAN_DISCOVERY_PERIOD_US + 7),
+            anchor + 3 * NAN_DISCOVERY_PERIOD_US
+        );
+    }
+
+    #[test]
     fn nan_usd_sdf_matches_raw_action_prefix_and_attributes() {
         let frame = build_nan_usd_sdf(
             NAN_DISCOVERY_MAC,
@@ -961,6 +1017,34 @@ pub fn is_action_frame(frame: &[u8]) -> bool {
 }
 pub fn is_nan_beacon(frame: &[u8]) -> bool {
     is_beacon(frame) && is_nan_bssid(frame)
+}
+
+/// Rewrite a captured NAN synchronization beacon for a local transmitter.
+///
+/// NAN attributes are deliberately preserved byte-for-byte.  Only the
+/// transmitter address, cluster BSSID, and advancing beacon TSF are adapter
+/// state; keeping this operation here lets Recovery, Main, and host tests
+/// construct identical probe beacons without importing Wi-Fi or power code.
+pub fn rewrite_nan_sync_beacon(
+    template: &[u8],
+    transmitter: &[u8; 6],
+    cluster_bssid: &[u8; 6],
+    tsf_us: u64,
+) -> Result<Vec<u8>> {
+    if template.len() < FRAME_DATA + 12 || template.len() > NAN_RX_FRAME_MAX {
+        bail!(
+            "invalid NAN synchronization beacon template length={}",
+            template.len()
+        );
+    }
+    if !is_nan_beacon(template) {
+        bail!("captured frame is not a NAN synchronization beacon");
+    }
+    let mut frame = template.to_vec();
+    frame[FRAME_SRC..FRAME_SRC + 6].copy_from_slice(transmitter);
+    frame[FRAME_BSSID..FRAME_BSSID + 6].copy_from_slice(cluster_bssid);
+    frame[FRAME_DATA..FRAME_DATA + 8].copy_from_slice(&tsf_us.to_le_bytes());
+    Ok(frame)
 }
 pub fn is_direct_dmesh_ssid(frame: &[u8]) -> bool {
     let mut offset = FRAME_DATA + 12;

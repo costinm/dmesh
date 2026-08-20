@@ -51,6 +51,15 @@ impl<'a> Encoder<'a> {
     pub fn uint(&mut self, value: u64) -> Option<()> {
         self.head(0, value)
     }
+    /// Encode a CBOR integer without forcing diagnostics such as RSSI into an
+    /// unsigned surrogate. Negative values use CBOR major type 1 (`-1 - n`).
+    pub fn int(&mut self, value: i64) -> Option<()> {
+        if value >= 0 {
+            self.uint(value as u64)
+        } else {
+            self.head(1, (-1_i64 - value) as u64)
+        }
+    }
     pub fn bytes_value(&mut self, value: &[u8]) -> Option<()> {
         self.head(2, value.len() as u64)?;
         self.bytes(value)
@@ -110,6 +119,14 @@ impl<'a> Decoder<'a> {
     pub fn uint(&mut self) -> Option<u64> {
         let (major, value) = self.head()?;
         (major == 0).then_some(value)
+    }
+    pub fn int(&mut self) -> Option<i64> {
+        let (major, value) = self.head()?;
+        match major {
+            0 => i64::try_from(value).ok(),
+            1 => value.checked_add(1).and_then(|value| i64::try_from(value).ok()).map(|value| -value),
+            _ => None,
+        }
     }
     pub fn bytes_ref(&mut self) -> Option<&'a [u8]> {
         let (major, len) = self.head()?;

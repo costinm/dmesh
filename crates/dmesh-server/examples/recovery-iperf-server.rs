@@ -1,5 +1,5 @@
-//! Standalone current-build transport listener for Recovery hardware tests.
-//! It intentionally does not own or restart lmesh-wifi's stable AP.
+//! Standalone current-build transport listener for host and Recovery IPERF.
+//! It intentionally does not own or restart either managed Wi-Fi service.
 
 use dmesh_server::udp::{TransportControl, UdpConfig, run};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let bind = args
         .next()
-        .unwrap_or_else(|| "10.78.0.1:3339".to_owned())
+        .unwrap_or_else(|| "127.0.0.1:3337".to_owned())
         .parse()?;
     let pace_us = args
         .next()
@@ -28,20 +28,16 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(0);
-    // Keep this independent listener aligned with the advertised Recovery
-    // profile. Leaving UdpConfig at automatic host-memory selection made the
-    // harness silently choose a 27-packet history, which is not a valid
-    // comparison for Recovery's 64-packet receive budget.
+    // This is a host performance listener, not a Recovery-memory emulator.
+    // Use the largest bounded host ledger by default; device comparisons pass
+    // their explicit Recovery window as the fifth argument.
     let history_capacity = args
         .next()
         .map(|value| value.parse::<usize>())
         .transpose()?
-        .unwrap_or(quic_lite::RECOVERY_MAX_HISTORY_PACKETS);
-    if !(1..=quic_lite::RECOVERY_MAX_HISTORY_PACKETS).contains(&history_capacity) {
-        anyhow::bail!(
-            "history packets must be in 1..={}",
-            quic_lite::RECOVERY_MAX_HISTORY_PACKETS
-        );
+        .unwrap_or(512);
+    if !(1..=512).contains(&history_capacity) {
+        anyhow::bail!("history packets must be in 1..={}", 512);
     }
     // Optional bearer-only DSCP/TOS. 0 keeps the normal best-effort class;
     // 0x88 is AF41/video and is useful only for a reversible WMM comparison.

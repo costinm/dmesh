@@ -8,20 +8,21 @@
 use crate::{
     device::{load_device, resolve_udp_peer},
     l2::UartEgressPacer,
-    schema::{encode_direct_command, render_device_record, FirmwareSchema},
+    schema::{FirmwareSchema, encode_direct_command, render_device_record},
 };
 use dmesh_server::{
-    iperf::{decode_iperf_service_request, IperfServicePlan},
-    recovery::{decode_iperf_result, encode_iperf_request, IperfRequest},
+    iperf::{IperfServicePlan, decode_iperf_service_request},
+    recovery::{IperfRequest, decode_iperf_result, encode_iperf_request},
 };
 use quic_lite::{
+    ConnectionLimits, EndpointState, Role, ShortHeader, StreamFrame, TransportPacket,
     iperf::IperfRun,
     path_bridge::{PathBridge, PathBridgeAction},
     uart::encode_uart_datagram,
-    ConnectionLimits, EndpointState, Role, ShortHeader, StreamFrame, TransportPacket,
 };
 use serde::Deserialize;
 use std::{
+    collections::VecDeque,
     env,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Read, Write},
@@ -36,7 +37,224 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use uart_codec::codec::{encode_payload, Decoder};
+use uart_codec::codec::{Decoder, encode_payload};
+
+/// A bounded observation made by a persistent physical-UART device session.
+///
+/// The serial bearer is shared by command/reply traffic, normal QUIC-lite
+/// packets, and the small out-of-band boot/crash diagnostic channel.  Keeping
+/// these observations together lets a hardware test retain the last useful
+/// context when a later operation fails, without treating text as protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceSessionEvent {
+    DirectRecord(Vec<u8>),
+    TransportPacket(Vec<u8>),
+    Diagnostic(String),
+}
+
+/// One explicitly owned UART connection to a firmware device.
+///
+/// A suite opens this once before its cases and closes it after all cases.
+/// It deliberately does not implement an application protocol: callers send
+/// a direct CBOR command or a QUIC-lite packet and inspect the bounded event
+/// history through the same L2 owner.
+pub struct DeviceSession {
+    path: String,
+    serial: File,
+    decoder: Decoder,
+    text_tap: RawTextTap,
+    history: VecDeque<DeviceSessionEvent>,
+    history_limit: usize,
+    fatal_diagnostic: Option<String>,
+}
+
+impl DeviceSession {
+    pub const DEFAULT_HISTORY_LIMIT: usize = 64;
+
+    /// Open one non-controlling, nonblocking UART owner.  Startup backlog is
+    /// discarded before the session starts so a previous CLI invocation cannot
+    /// be mistaken for a callback from the current test case.
+    pub fn open(path: impl Into<String>, baud: Option<u32>) -> Result<Self, String> {
+        let path = path.into();
+        let mut serial = open_serial(&path)?;
+        configure_serial(&serial, baud)?;
+        let mut stale = [0u8; 256];
+        loop {
+            match serial.read(&mut stale) {
+                Ok(used) if used != 0 => {}
+                Ok(_) => break,
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(Self {
+            path,
+            serial,
+            decoder: Decoder::with_max(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1),
+            text_tap: RawTextTap::default(),
+            history: VecDeque::with_capacity(Self::DEFAULT_HISTORY_LIMIT),
+            history_limit: Self::DEFAULT_HISTORY_LIMIT,
+            fatal_diagnostic: None,
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit.max(1);
+        while self.history.len() > self.history_limit {
+            self.history.pop_front();
+        }
+    }
+
+    pub fn recent_events(&self) -> impl ExactSizeIterator<Item = &DeviceSessionEvent> {
+        self.history.iter()
+    }
+
+    pub fn assert_healthy(&self) -> Result<(), String> {
+        self.fatal_diagnostic
+            .as_ref()
+            .map_or(Ok(()), |diagnostic| {
+                Err(format!("device {} reported fatal diagnostic: {diagnostic}", self.path))
+            })
+    }
+
+    /// Send an unmarked, PPP-framed direct record such as a CBOR raw command.
+    pub fn send_direct_record(&mut self, record: &[u8]) -> Result<(), String> {
+        if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1 {
+            return Err("direct record is empty or exceeds the UART MTU".into());
+        }
+        self.assert_healthy()?;
+        send_ppp(&mut self.serial, record)
+    }
+
+    /// Poll the one UART owner and append all received observations to its
+    /// bounded history. Returns the number of complete PPP records received.
+    pub fn poll(&mut self, timeout: Duration) -> Result<usize, String> {
+        self.poll_until(timeout, |_| false).map(|(_, records)| records)
+    }
+
+    /// Poll until a caller-selected decoded event arrives or the bounded
+    /// interval expires.  This lets an E2E suite retain one UART owner while
+    /// correlating a real response instead of sleeping for every command.
+    /// The callback sees the exact event retained in history, so no
+    /// UART-specific response protocol is introduced here.
+    pub fn poll_until<F>(
+        &mut self,
+        timeout: Duration,
+        mut matched: F,
+    ) -> Result<(bool, usize), String>
+    where
+        F: FnMut(&DeviceSessionEvent) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
+        let mut records = 0;
+        while Instant::now() < deadline {
+            match self.serial.read(&mut buffer) {
+                Ok(used) if used != 0 => {
+                    for line in self.text_tap.push(&buffer[..used]) {
+                        if is_fatal_diagnostic(&line) {
+                            self.fatal_diagnostic.get_or_insert_with(|| line.clone());
+                        }
+                        self.push_event(DeviceSessionEvent::Diagnostic(line));
+                    }
+                    for frame in self
+                        .decoder
+                        .push(&buffer[..used])
+                        .map_err(|error| error.to_string())?
+                    {
+                        records += 1;
+                        match quic_lite::uart::classify_uart_payload(&frame) {
+                            Ok(quic_lite::uart::UartIngress::DirectRecord(record)) => {
+                                let event = DeviceSessionEvent::DirectRecord(record.to_vec());
+                                let is_match = matched(&event);
+                                self.push_event(event);
+                                if is_match {
+                                    self.assert_healthy()?;
+                                    return Ok((true, records));
+                                }
+                            }
+                            Ok(quic_lite::uart::UartIngress::Transport(packet)) => {
+                                let event = DeviceSessionEvent::TransportPacket(packet.to_vec());
+                                let is_match = matched(&event);
+                                self.push_event(event);
+                                if is_match {
+                                    self.assert_healthy()?;
+                                    return Ok((true, records));
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Ok(_) => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.assert_healthy()?;
+        Ok((false, records))
+    }
+
+    /// Send a direct record and retain callbacks for the requested interval.
+    /// Callers select/correlate replies from `recent_events`; raw records do
+    /// not have a universal response envelope to manufacture here.
+    pub fn request_direct_record(
+        &mut self,
+        record: &[u8],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.send_direct_record(record)?;
+        self.poll(timeout)?;
+        Ok(())
+    }
+
+    /// Send one direct record and stop once its caller-defined response is
+    /// observed.  The generic predicate keeps raw CBOR, stream packets, and
+    /// future schema-defined diagnostics on the same UART L2 path.
+    pub fn request_direct_record_until<F>(
+        &mut self,
+        record: &[u8],
+        timeout: Duration,
+        matched: F,
+    ) -> Result<bool, String>
+    where
+        F: FnMut(&DeviceSessionEvent) -> bool,
+    {
+        self.send_direct_record(record)?;
+        self.poll_until(timeout, matched).map(|(matched, _)| matched)
+    }
+
+    fn push_event(&mut self, event: DeviceSessionEvent) {
+        if self.history.len() == self.history_limit {
+            self.history.pop_front();
+        }
+        self.history.push_back(event);
+    }
+}
+
+fn is_fatal_diagnostic(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    [
+        "panic",
+        "guru meditation",
+        "assert failed",
+        "backtrace",
+        "abort()",
+        // A ROM reset after the initial session drain means the device
+        // restarted during this suite even if it did not print a panic.
+        "rst:",
+    ]
+        .iter()
+        .any(|marker| line.contains(marker))
+}
 
 /// Bearer-neutral path policy accepted by the host CLI and the future
 /// `lmesh-wifi` egress handler. The policy chooses among registered paths;
@@ -753,7 +971,7 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
             None,
         ),
         Some("--direct-hex") | Some("--command") => {
-            return Err("raw record accepts exactly one payload".into())
+            return Err("raw record accepts exactly one payload".into());
         }
         _ => usage(),
     };
@@ -1561,6 +1779,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
         if service == quic_lite::SERVICE_IPERF {
+            client.set_deferred_receive_credit(true);
             let started = Instant::now();
             let mut frame = client
                 .request_stream_frame(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, &request, true)
@@ -1646,8 +1865,11 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
 /// not first fail in the host client by binding an IPv4 socket.
 fn udp_bind_for_peer(peer: SocketAddr) -> SocketAddr {
     match peer {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid IPv4 UDP bind"),
-        SocketAddr::V6(_) => "[::]:0".parse().expect("valid IPv6 UDP bind"),
+        // Keep the operator/client socket distinct from both managed host
+        // listeners (wlan0:3336, wlan1:3337) and firmware raw UDP6 (3339).
+        // A fixed source port also makes link-local captures reproducible.
+        SocketAddr::V4(_) => "0.0.0.0:3338".parse().expect("valid IPv4 UDP bind"),
+        SocketAddr::V6(_) => "[::]:3338".parse().expect("valid IPv6 UDP bind"),
     }
 }
 
@@ -1688,7 +1910,15 @@ fn parse_udp_peer(value: &str) -> Result<SocketAddr, String> {
 /// Verify only UDP socket ingress and egress.  This intentionally bypasses
 /// QUIC-lite/DCID dispatch and is not a command or a production keepalive.
 fn run_udp_bearer_probe(peer: SocketAddr) -> Result<(), String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+    // A scoped IPv6 link-local peer needs an IPv6 local socket.  Binding an
+    // IPv4 wildcard first makes the diagnostic fail before it exercises the
+    // bearer at all, even though the normal UDP client selects the family
+    // from its peer through `udp_bind_for_peer`.
+    let bind = match peer {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind).map_err(|error| error.to_string())?;
     socket.connect(peer).map_err(|error| error.to_string())?;
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1994,7 +2224,8 @@ fn run_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_udp_peer, render_binary_events, render_handler_list, ClientPathPolicy, RawTextTap,
+        ClientPathPolicy, RawTextTap, is_fatal_diagnostic, parse_udp_peer, render_binary_events,
+        render_handler_list,
     };
 
     #[test]
@@ -2028,7 +2259,9 @@ mod tests {
     #[test]
     fn binary_module_events_keep_numeric_fields_and_payload() {
         assert_eq!(
-            render_binary_events(&[0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c']),
+            render_binary_events(&[
+                0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c'
+            ]),
             "events_next=7;events=seq=3,id=45,type=5,flags=0,payload_hex=616263"
         );
         assert_eq!(render_binary_events(&[0x82, 1]), "invalid_events");
@@ -2041,6 +2274,13 @@ mod tests {
         assert_eq!(tap.push(b"uart\r\n"), vec!["boot step=uart"]);
         assert!(tap.push(&[0x7e, b'a', 0, b'\n', 0x7e]).is_empty());
         assert_eq!(tap.push(b"panic=none\n"), vec!["panic=none"]);
+    }
+
+    #[test]
+    fn session_fatal_diagnostics_cover_panic_and_mid_suite_reset() {
+        assert!(is_fatal_diagnostic("Guru Meditation Error"));
+        assert!(is_fatal_diagnostic("rst:0x1 (POWERON_RESET)"));
+        assert!(!is_fatal_diagnostic("transport status=ready"));
     }
 
     #[test]

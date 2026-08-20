@@ -443,6 +443,75 @@
     }
   },
   {
+    "name": "wifi.raw.iperf",
+    "title": "Raw Action IPERF",
+    "group": "Radio",
+    "description": "Run the shared QUIC-lite IPERF client over raw ESP-NOW-compatible action frames.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "iface": {
+          "type": "string",
+          "title": "Interface",
+          "default": "wlan1"
+        },
+        "channel": {
+          "type": "integer",
+          "title": "Channel",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 13
+        },
+        "destination": {
+          "type": "string",
+          "title": "Destination MAC"
+        },
+        "bytes": {
+          "type": "integer",
+          "title": "Payload bytes",
+          "default": 8192,
+          "minimum": 1
+        },
+        "packet_size": {
+          "type": "integer",
+          "title": "Payload bytes per packet",
+          "default": 1200,
+          "minimum": 4,
+          "maximum": 1200
+        },
+        "tx_variant": {
+          "type": "string",
+          "title": "Host TX path",
+          "enum": ["monitor", "nl80211"],
+          "default": "monitor",
+          "description": "monitor uses the proven AF_PACKET/radiotap injector; nl80211 is a driver-path experiment."
+        },
+        "rx_variant": {
+          "type": "string",
+          "title": "Host RX path",
+          "enum": ["monitor", "nl80211"],
+          "default": "monitor",
+          "description": "Select independently from TX so host action replies can be captured on the same driver path."
+        },
+        "tx_rate_mbps": {
+          "type": "integer",
+          "title": "Fixed TX rate Mbps",
+          "enum": [6, 9, 12, 18, 24, 36, 48, 54],
+          "default": 6
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "title": "Timeout milliseconds",
+          "default": 20000,
+          "minimum": 1000,
+          "maximum": 60000
+        }
+      },
+      "required": ["destination"],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "wifi.raw.ping",
     "title": "Ping Raw Wi-Fi",
     "group": "Radio",

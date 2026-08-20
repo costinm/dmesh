@@ -46,6 +46,12 @@ pub(crate) struct SchemaField {
     #[serde(default)]
     #[allow(dead_code)]
     pub kind: Option<String>,
+    /// Textual enum spelling accepted by `dmesh-cli --command`, mapped to
+    /// the canonical numeric CBOR value.  This keeps command formatting in
+    /// the generated schema instead of hard-coding radio lab vocabulary in
+    /// the UART bearer client.
+    #[serde(default)]
+    pub values: BTreeMap<String, u64>,
 }
 
 /// Host-side vocabulary for compact firmware CBOR. It is independent of a
@@ -122,7 +128,17 @@ impl FirmwareSchema {
         let method_id = object
             .get("method")
             .and_then(Value::as_u64)
-            .and_then(|id| u16::try_from(id).ok());
+            .and_then(|id| u16::try_from(id).ok())
+            // `mesh::cbor::decode_json` may already have replaced the
+            // numeric method tag with its catalog name.  Keep the field and
+            // message schema lookup working in that normal decoded form.
+            .or_else(|| {
+                object.get("method").and_then(Value::as_str).and_then(|name| {
+                    self.methods
+                        .iter()
+                        .find_map(|(id, method)| (method.name == name).then_some(*id))
+                })
+            });
         let method_name =
             method_id.and_then(|id| self.methods.get(&id).map(|method| method.name.clone()));
         if let Some(name) = method_name {
@@ -233,7 +249,7 @@ pub fn render_device_record(schema: &FirmwareSchema, payload: &[u8]) -> String {
 /// Convert a shell-style command to the compact stream frame used only by the
 /// explicitly selected direct-CBOR exception plane. New application operations
 /// should use QUIC-lite service streams, where normal flow control applies.
-fn command_json(command: &str) -> Result<Value> {
+fn command_json(command: &str, schema: &FirmwareSchema) -> Result<Value> {
     let mut words = command.split_ascii_whitespace();
     let method = words.next().context("empty firmware command")?;
     let mut fields = Map::new();
@@ -243,17 +259,61 @@ fn command_json(command: &str) -> Result<Value> {
             let hex = value.strip_prefix("hex:").unwrap_or(value);
             fields.insert("data".to_owned(), Value::Array(decode_hex(hex)?.into_iter().map(Value::from).collect()));
         } else {
-            fields.insert(key.to_owned(), Value::String(value.to_owned()));
+            fields.insert(
+                key.to_owned(),
+                schema.command_value(method, key, value)?,
+            );
         }
     }
     fields.insert("method".to_owned(), Value::String(method.to_owned()));
     Ok(Value::Object(fields))
 }
 
+impl FirmwareSchema {
+    fn command_value(&self, method: &str, name: &str, value: &str) -> Result<Value> {
+        let field = self
+            .methods
+            .values()
+            .find(|entry| entry.name == method)
+            .and_then(|entry| entry.fields.iter().find(|field| field.name == name));
+        let Some(field) = field else {
+            // Existing firmware commands deliberately retain their text
+            // values for forward compatibility. Typed conversion is enabled
+            // only where the installed JSON schema declares it.
+            return Ok(Value::String(value.to_owned()));
+        };
+        match field.kind.as_deref() {
+            Some("bool") => value
+                .parse::<bool>()
+                .map(Value::Bool)
+                .with_context(|| format!("{method} {name} must be bool")),
+            Some("u8") | Some("u16") | Some("u32") | Some("u64") => value
+                .parse::<u64>()
+                .map(Value::from)
+                .with_context(|| format!("{method} {name} must be integer")),
+            Some("enum") => {
+                if let Some(value) = field.values.get(value) {
+                    Ok(Value::from(*value))
+                } else {
+                    value
+                        .parse::<u64>()
+                        .map(Value::from)
+                        .with_context(|| format!("unknown {method} {name} value={value}"))
+                }
+            }
+            // MAC stays a canonical text spelling on the command line.  The
+            // host-owned radio schema validates and converts it at its CBOR
+            // handler boundary, avoiding a UART-only byte convention.
+            Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
+            _ => Ok(Value::String(value.to_owned())),
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn encode_text_command(command: &str) -> Result<Vec<u8>> {
     let schema = FirmwareSchema::load();
-    Ok(mesh::cbor::encode_stream_frame(&mesh::cbor::encode_json(&command_json(command)?, &schema.catalog)?)?)
+    Ok(mesh::cbor::encode_stream_frame(&mesh::cbor::encode_json(&command_json(command, &schema)?, &schema.catalog)?)?)
 }
 
 /// Encode the explicit Recovery direct-control exception without a generic
@@ -262,7 +322,7 @@ pub fn encode_text_command(command: &str) -> Result<Vec<u8>> {
 /// turns the command into unrelated stream data and is correctly rejected.
 pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
     let schema = FirmwareSchema::load();
-    let value = command_json(command)?;
+    let value = command_json(command, &schema)?;
     let method = value.get("method").and_then(Value::as_str).context("command method")?;
     let cbor = mesh::cbor::encode_json(&value, &schema.catalog)?;
     let direct = schema.methods.values().any(|entry| entry.name == method && entry.direct_control);
@@ -476,5 +536,37 @@ mod tests {
         let decoded = dmesh_server::recovery::decode_recovery_command(&command);
         assert!(decoded.is_some(), "command={command:02x?}");
         assert_eq!(decoded.unwrap().raw_tx_rate, Some(24));
+    }
+
+    #[test]
+    fn recovery_direct_command_selects_sta_egress_runtime() {
+        let command = encode_direct_command("recovery sta_driver_tx=true").unwrap();
+        let decoded = dmesh_server::recovery::decode_recovery_command(&command).unwrap();
+        assert_eq!(decoded.sta_driver_tx, Some(true));
+    }
+
+    #[test]
+    fn radio_control_command_uses_schema_types_and_direct_handler_envelope() {
+        let command = encode_direct_command(
+            "radio.control channel=6 sta_state=disconnect_hold comparator_bssid=50:6f:9a:01:34:4a comparator_enabled=true promiscuous=false dw_policy=disabled",
+        )
+        .unwrap();
+        let dmesh_server::raw_wifi::RawWifiLabRequest::Control(control) =
+            dmesh_server::raw_wifi::decode_raw_wifi_handler(&command).unwrap()
+        else {
+            panic!("radio control request")
+        };
+        assert_eq!(control.channel, Some(6));
+        assert_eq!(
+            control.sta_state,
+            Some(dmesh_server::raw_wifi::RawWifiStaState::DisconnectHold)
+        );
+        assert_eq!(control.comparator_bssid, Some([0x50, 0x6f, 0x9a, 0x01, 0x34, 0x4a]));
+        assert_eq!(control.comparator_enabled, Some(true));
+        assert_eq!(control.promiscuous, Some(false));
+        assert_eq!(
+            control.dw_policy,
+            Some(dmesh_server::raw_wifi::RawWifiDwPolicy::Disabled)
+        );
     }
 }

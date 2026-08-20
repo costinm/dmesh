@@ -14,6 +14,11 @@ pub const ICMPV6_NEIGHBOR_SOLICITATION: u8 = 135;
 pub const ICMPV6_NEIGHBOR_ADVERTISEMENT: u8 = 136;
 pub const IEEE80211_DATA_TO_DS_HEADER_LEN: usize = 24;
 pub const IEEE80211_LLC_SNAP_LEN: usize = 8;
+/// Bytes reserved before a raw UDP6 payload on the station data path.
+/// A shared packet writer places a QUIC-lite datagram after this prefix and
+/// [`encode_station_udp6_prefix`] fills it without moving the payload.
+pub const STATION_UDP6_HEADROOM: usize =
+    IEEE80211_DATA_TO_DS_HEADER_LEN + IEEE80211_LLC_SNAP_LEN + IPV6_HEADER_LEN + UDP_HEADER_LEN;
 const ICMPV6_NEIGHBOR_LEN: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +34,25 @@ pub enum Error {
     Port,
     Checksum,
     OutputTooSmall,
+}
+
+/// Stable compact diagnostic code for raw IPv6 framing errors.  ESP adapters
+/// have only a small direct-record channel, while host tests can assert the
+/// exact same parser classification.
+pub const fn error_code(error: Error) -> u8 {
+    match error {
+        Error::Truncated => 1,
+        Error::EtherType => 2,
+        Error::Version => 3,
+        Error::ExtensionHeader => 4,
+        Error::Fragment => 5,
+        Error::NextHeader => 6,
+        Error::Length => 7,
+        Error::Destination => 8,
+        Error::Port => 9,
+        Error::Checksum => 10,
+        Error::OutputTooSmall => 11,
+    }
 }
 
 /// Stable diagnostic label for a rejected wire packet. ESP adapters may render
@@ -327,6 +351,106 @@ pub fn encode_station_ipv6_data_frame(
     Ok(total)
 }
 
+/// Build a complete non-QoS STA-to-DS IPv6/UDP frame without first composing
+/// an Ethernet-II frame. Raw STA transmit otherwise copies every payload from
+/// an Ethernet scratch buffer into the final 802.11 buffer; AP egress still
+/// uses [`encode_udp6`] because its driver consumes Ethernet frames.
+pub fn encode_station_udp6_data_frame(
+    out: &mut [u8],
+    bssid: [u8; 6],
+    station_mac: [u8; 6],
+    destination_mac: [u8; 6],
+    destination_ip: [u8; 16],
+    source_ip: [u8; 16],
+    destination_port: u16,
+    source_port: u16,
+    payload: &[u8],
+) -> Result<usize, Error> {
+    let udp_len = UDP_HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or(Error::Length)?;
+    let ipv6_len = IPV6_HEADER_LEN.checked_add(udp_len).ok_or(Error::Length)?;
+    let total = IEEE80211_DATA_TO_DS_HEADER_LEN
+        .checked_add(IEEE80211_LLC_SNAP_LEN)
+        .and_then(|length| length.checked_add(ipv6_len))
+        .ok_or(Error::Length)?;
+    if udp_len > u16::MAX as usize || out.len() < total {
+        return Err(Error::OutputTooSmall);
+    }
+    out[..IEEE80211_DATA_TO_DS_HEADER_LEN].fill(0);
+    out[0] = 0x08;
+    out[1] = 0x01;
+    out[4..10].copy_from_slice(&bssid);
+    out[10..16].copy_from_slice(&station_mac);
+    out[16..22].copy_from_slice(&destination_mac);
+    out[24..32].copy_from_slice(&[0xaa, 0xaa, 0x03, 0, 0, 0, 0x86, 0xdd]);
+    let ip = &mut out[IEEE80211_DATA_TO_DS_HEADER_LEN + IEEE80211_LLC_SNAP_LEN..total];
+    ip[..IPV6_HEADER_LEN].fill(0);
+    ip[0] = 0x60;
+    ip[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    ip[6] = IPPROTO_UDP;
+    ip[7] = 64;
+    ip[8..24].copy_from_slice(&source_ip);
+    ip[24..40].copy_from_slice(&destination_ip);
+    let udp = &mut ip[IPV6_HEADER_LEN..];
+    udp[..2].copy_from_slice(&source_port.to_be_bytes());
+    udp[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[6..8].fill(0);
+    udp[8..].copy_from_slice(payload);
+    let checksum = udp_checksum(source_ip, destination_ip, udp);
+    udp[6..8].copy_from_slice(&if checksum == 0 { 0xffff } else { checksum }.to_be_bytes());
+    Ok(total)
+}
+
+/// Fill the raw STA 802.11/IPv6/UDP prefix around a payload already written at
+/// [`STATION_UDP6_HEADROOM`]. This is the no-copy companion to a shared
+/// `PacketPool::acquire_writer(STATION_UDP6_HEADROOM)` lease.
+pub fn encode_station_udp6_prefix(
+    frame: &mut [u8],
+    payload_len: usize,
+    bssid: [u8; 6],
+    station_mac: [u8; 6],
+    destination_mac: [u8; 6],
+    destination_ip: [u8; 16],
+    source_ip: [u8; 16],
+    destination_port: u16,
+    source_port: u16,
+) -> Result<usize, Error> {
+    let udp_len = UDP_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(Error::Length)?;
+    let total = STATION_UDP6_HEADROOM
+        .checked_add(payload_len)
+        .ok_or(Error::Length)?;
+    if udp_len > u16::MAX as usize || frame.len() < total {
+        return Err(Error::OutputTooSmall);
+    }
+    frame[..IEEE80211_DATA_TO_DS_HEADER_LEN].fill(0);
+    frame[0] = 0x08;
+    frame[1] = 0x01;
+    frame[4..10].copy_from_slice(&bssid);
+    frame[10..16].copy_from_slice(&station_mac);
+    frame[16..22].copy_from_slice(&destination_mac);
+    frame[24..32].copy_from_slice(&[0xaa, 0xaa, 0x03, 0, 0, 0, 0x86, 0xdd]);
+    let ip = &mut frame[IEEE80211_DATA_TO_DS_HEADER_LEN + IEEE80211_LLC_SNAP_LEN..total];
+    ip[..IPV6_HEADER_LEN].fill(0);
+    ip[0] = 0x60;
+    ip[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    ip[6] = IPPROTO_UDP;
+    ip[7] = 64;
+    ip[8..24].copy_from_slice(&source_ip);
+    ip[24..40].copy_from_slice(&destination_ip);
+    let udp = &mut ip[IPV6_HEADER_LEN..];
+    udp[..2].copy_from_slice(&source_port.to_be_bytes());
+    udp[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[6..8].fill(0);
+    let checksum = udp_checksum(source_ip, destination_ip, udp);
+    udp[6..8].copy_from_slice(&if checksum == 0 { 0xffff } else { checksum }.to_be_bytes());
+    Ok(total)
+}
+
 /// Parse one unfragmented Neighbor Advertisement with a target link-layer
 /// address option. This is also used by the privileged host diagnostic to
 /// prove whether an ESP responder emitted a wire-valid NA.
@@ -487,10 +611,15 @@ mod tests {
     fn link_local_uses_modified_eui64() {
         assert_eq!(
             link_local_from_mac(LOCAL_MAC),
-            [
-                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x16, 0xc1, 0x9f, 0xff, 0xfe, 0xe5, 0x98, 0
-            ]
+            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x16, 0xc1, 0x9f, 0xff, 0xfe, 0xe5, 0x98, 0]
         );
+    }
+
+    #[test]
+    fn raw_error_codes_are_stable_for_bearer_diagnostics() {
+        assert_eq!(error_code(Error::EtherType), 2);
+        assert_eq!(error_code(Error::Destination), 8);
+        assert_eq!(error_code(Error::Checksum), 10);
     }
 
     #[test]
@@ -708,6 +837,87 @@ mod tests {
         assert_eq!(&wifi[16..22], &PEER_MAC);
         assert_eq!(&wifi[24..32], &[0xaa, 0xaa, 0x03, 0, 0, 0, 0x86, 0xdd]);
         assert_eq!(&wifi[32..used], &ethernet[14..ethernet_len]);
+    }
+
+    #[test]
+    fn station_udp6_frame_matches_ethernet_composition() {
+        let local = link_local_from_mac(LOCAL_MAC);
+        let peer = link_local_from_mac(PEER_MAC);
+        let payload = b"odd";
+        let mut ethernet = [0u8; 128];
+        let ethernet_len = encode_udp6(
+            &mut ethernet,
+            PEER_MAC,
+            LOCAL_MAC,
+            peer,
+            local,
+            3339,
+            4444,
+            payload,
+        )
+        .unwrap();
+        let mut expected = [0u8; 160];
+        let expected_len = encode_station_ipv6_data_frame(
+            &mut expected,
+            PEER_MAC,
+            LOCAL_MAC,
+            &ethernet[..ethernet_len],
+        )
+        .unwrap();
+        let mut direct = [0u8; 160];
+        let direct_len = encode_station_udp6_data_frame(
+            &mut direct,
+            PEER_MAC,
+            LOCAL_MAC,
+            PEER_MAC,
+            peer,
+            local,
+            3339,
+            4444,
+            payload,
+        )
+        .unwrap();
+        assert_eq!(direct_len, expected_len);
+        assert_eq!(&direct[..direct_len], &expected[..expected_len]);
+    }
+
+    #[test]
+    fn station_udp6_prefix_preserves_already_serialized_payload() {
+        let local = link_local_from_mac(LOCAL_MAC);
+        let peer = link_local_from_mac(PEER_MAC);
+        let payload = b"write-directly";
+        let mut frame = [0xa5; 160];
+        frame[STATION_UDP6_HEADROOM..STATION_UDP6_HEADROOM + payload.len()]
+            .copy_from_slice(payload);
+        let used = encode_station_udp6_prefix(
+            &mut frame,
+            payload.len(),
+            PEER_MAC,
+            LOCAL_MAC,
+            PEER_MAC,
+            peer,
+            local,
+            3339,
+            4444,
+        )
+        .unwrap();
+        assert_eq!(&frame[STATION_UDP6_HEADROOM..used], payload);
+
+        let mut expected = [0u8; 160];
+        let expected_len = encode_station_udp6_data_frame(
+            &mut expected,
+            PEER_MAC,
+            LOCAL_MAC,
+            PEER_MAC,
+            peer,
+            local,
+            3339,
+            4444,
+            payload,
+        )
+        .unwrap();
+        assert_eq!(used, expected_len);
+        assert_eq!(&frame[..used], &expected[..expected_len]);
     }
 
     #[test]

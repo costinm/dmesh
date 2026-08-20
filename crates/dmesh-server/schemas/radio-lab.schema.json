@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dmesh.local/schema/radio-lab.json",
+  "title": "DMesh radio laboratory handlers",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "radio.control",
+      "properties": {
+        "method": {"const": "radio.control", "x-mesh-cbor": {"id": 72}},
+        "channel": {"type": "integer", "minimum": 1, "maximum": 13, "x-mesh-cbor": {"id": 2}},
+        "interface": {"enum": ["auto", "sta", "ap", "nan"], "x-mesh-cbor": {"id": 3}},
+        "rate": {"enum": ["auto", 6, 9, 12, 18, 24, 36, 48, 54], "x-mesh-cbor": {"id": 5}},
+        "disable_11b": {"type": "boolean", "x-mesh-cbor": {"id": 6}},
+        "sta_state": {"enum": ["reconnect", "disconnect_hold"], "x-mesh-cbor": {"id": 7}},
+        "comparator_bssid": {"type": "string", "pattern": "^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$", "x-mesh-cbor": {"id": 8}},
+        "comparator_enabled": {"type": "boolean", "x-mesh-cbor": {"id": 9}},
+        "promiscuous": {"type": "boolean", "x-mesh-cbor": {"id": 10}},
+        "dw_policy": {"enum": ["normal", "disabled", "manual"], "x-mesh-cbor": {"id": 11}},
+        "rx_filter": {"enum": ["management", "management_data"], "x-mesh-cbor": {"id": 12}},
+        "ap_mode": {"enum": ["disabled", "open"], "x-mesh-cbor": {"id": 13}},
+        "ap_beacon_tu": {"type": "integer", "minimum": 100, "maximum": 60000, "x-mesh-cbor": {"id": 14}},
+        "raw_sta_mode": {"enum": ["main_style"], "x-mesh-cbor": {"id": 15}}
+      },
+      "required": ["method"],
+      "additionalProperties": false
+    },
+    {"title": "radio.snapshot", "properties": {"method": {"const": "radio.snapshot", "x-mesh-cbor": {"id": 73}}}, "required": ["method"], "additionalProperties": false},
+    {"title": "radio.reset_counters", "properties": {"method": {"const": "radio.reset_counters", "x-mesh-cbor": {"id": 74}}}, "required": ["method"], "additionalProperties": false}
+  ]
+}

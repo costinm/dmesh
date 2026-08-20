@@ -6,7 +6,7 @@
 
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
 
 /// Opaque ownership token for one packet slot.
@@ -40,6 +40,73 @@ pub struct PoolLease<'a, const SLOTS: usize, const MTU: usize> {
     slot: PacketSlot,
     start: usize,
     len: usize,
+}
+
+/// Exclusive construction access to one shared packet slot.
+///
+/// A producer reserves bearer headroom, serializes directly into
+/// [`payload_mut`](Self::payload_mut), then commits a normal [`PoolLease`].
+/// Unlike `PoolLease`, this value cannot be cloned, so mutable access cannot
+/// race a relayed or retained read lease. Dropping it without committing
+/// returns the slot to the device-wide pool.
+pub struct PacketWriter<'a, const SLOTS: usize, const MTU: usize> {
+    pool: &'a PacketPool<SLOTS, MTU>,
+    slot: PacketSlot,
+    start: usize,
+    active: bool,
+}
+
+impl<'a, const SLOTS: usize, const MTU: usize> PacketWriter<'a, SLOTS, MTU> {
+    /// Writable application/transport payload after the caller-reserved
+    /// bearer headroom.
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        unsafe { &mut (&mut (*self.pool.packets.get())[self.slot.index()])[self.start..] }
+    }
+
+    /// Full packet storage, including the reserved prefix. A bearer uses this
+    /// after the producer has serialized its payload to fill headers in place.
+    pub fn frame_mut(&mut self) -> &mut [u8] {
+        unsafe { &mut (*self.pool.packets.get())[self.slot.index()] }
+    }
+
+    /// Commit `len` payload bytes and turn exclusive construction access into
+    /// a clonable shared lease. The producer must have initialized those bytes.
+    pub fn commit(mut self, len: usize) -> Option<PoolLease<'a, SLOTS, MTU>> {
+        if len > MTU.saturating_sub(self.start) {
+            return None;
+        }
+        self.active = false;
+        Some(PoolLease {
+            pool: self.pool,
+            slot: self.slot,
+            start: self.start,
+            len,
+        })
+    }
+
+    /// Commit a complete bearer frame after its reserved prefix was filled in
+    /// place. The resulting lease begins at byte zero.
+    pub fn commit_frame(mut self, payload_len: usize) -> Option<PoolLease<'a, SLOTS, MTU>> {
+        let len = self.start.checked_add(payload_len)?;
+        if len > MTU {
+            return None;
+        }
+        self.active = false;
+        Some(PoolLease {
+            pool: self.pool,
+            slot: self.slot,
+            start: 0,
+            len,
+        })
+    }
+}
+
+impl<const SLOTS: usize, const MTU: usize> Drop for PacketWriter<'_, SLOTS, MTU> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.pool.release(self.slot);
+        }
+    }
 }
 
 impl<const SLOTS: usize, const MTU: usize> Clone for PoolLease<'_, SLOTS, MTU> {
@@ -180,6 +247,21 @@ impl<const SLOTS: usize, const MTU: usize> PacketPool<SLOTS, MTU> {
         })
     }
 
+    /// Reserve a shared slot for a producer that can serialize directly into
+    /// the packet. This avoids copying CBOR, stream bytes, or proxy payloads
+    /// into a bearer-owned scratch frame just to add a prefix later.
+    pub fn acquire_writer(&self, headroom: usize) -> Option<PacketWriter<'_, SLOTS, MTU>> {
+        if headroom > MTU {
+            return None;
+        }
+        Some(PacketWriter {
+            pool: self,
+            slot: self.acquire()?,
+            start: headroom,
+            active: true,
+        })
+    }
+
     pub fn write(&self, slot: PacketSlot, data: &[u8]) -> bool {
         self.write_at(slot, 0, data)
     }
@@ -273,5 +355,27 @@ mod tests {
         assert_eq!(packet.payload(), b"udp!ciphertext");
         assert!(packet.strip_prefix(4));
         assert_eq!(packet.payload(), b"ciphertext");
+    }
+
+    #[test]
+    fn writer_reserves_headroom_without_copying_payload() {
+        let pool = PacketPool::<1, 16>::new();
+        let mut writer = pool.acquire_writer(4).unwrap();
+        writer.payload_mut()[..6].copy_from_slice(b"direct");
+        writer.frame_mut()[..4].copy_from_slice(b"wire");
+        let packet = writer.commit_frame(6).unwrap();
+        assert_eq!(packet.payload(), b"wiredirect");
+        assert_eq!(pool.available(), 0);
+        drop(packet);
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn dropped_writer_returns_its_slot() {
+        let pool = PacketPool::<1, 8>::new();
+        let writer = pool.acquire_writer(2).unwrap();
+        assert_eq!(pool.available(), 0);
+        drop(writer);
+        assert_eq!(pool.available(), 1);
     }
 }

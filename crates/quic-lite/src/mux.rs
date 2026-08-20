@@ -72,6 +72,30 @@ pub struct StreamMux<
 }
 
 impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
+    pub unsafe fn init_in_place(
+        out: *mut Self,
+        role: Role,
+        limits: crate::ConnectionLimits,
+        max_datagram_size: u64,
+        max_pending_streams: usize,
+        max_stream_bytes: usize,
+    ) {
+        unsafe {
+            crate::EndpointState::init_in_place(
+                core::ptr::addr_of_mut!((*out).endpoint),
+                role,
+                limits,
+                max_datagram_size,
+                H,
+            );
+            core::ptr::addr_of_mut!((*out).completed).write(Vec::new());
+            core::ptr::addr_of_mut!((*out).max_pending_streams).write(max_pending_streams);
+            core::ptr::addr_of_mut!((*out).ordered)
+                .write(CallbackStreams::new(max_pending_streams, max_stream_bytes));
+            core::ptr::addr_of_mut!((*out).assembled).write(Vec::new());
+            core::ptr::addr_of_mut!((*out).ready).write(Vec::new());
+        }
+    }
     pub fn new(
         role: Role,
         limits: crate::ConnectionLimits,
@@ -287,7 +311,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
 mod tests {
     use super::*;
     use crate::{
-        ConnectionId, ConnectionLimits, FIRST_CLIENT_BIDI_STREAM_ID, Role, SERVICE_METRICS,
+        ConnectionId, ConnectionLimits, Role, FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_METRICS,
     };
 
     #[test]
@@ -339,12 +363,10 @@ mod tests {
             .endpoint
             .encode_stream_packet(s, 4, 4, true, b"ics", &mut packet)
             .unwrap();
-        assert!(
-            server
-                .receive_datagram(&packet[..second_len])
-                .unwrap()
-                .is_none()
-        );
+        assert!(server
+            .receive_datagram(&packet[..second_len])
+            .unwrap()
+            .is_none());
         let (first_len, _) = client
             .endpoint
             .encode_stream_packet(
@@ -455,23 +477,19 @@ mod tests {
                 &mut packet,
             )
             .unwrap();
-        assert!(
-            server
-                .receive_request(&packet[..first_len])
-                .unwrap()
-                .is_none()
-        );
+        assert!(server
+            .receive_request(&packet[..first_len])
+            .unwrap()
+            .is_none());
         let received_before_conflict = server.endpoint.receive.received_data;
         let (conflict_len, _) = client
             .endpoint
             .encode_stream_packet(s, 4, 1, true, b"Z", &mut packet)
             .unwrap();
-        assert!(
-            server
-                .receive_request(&packet[..conflict_len])
-                .unwrap()
-                .is_none()
-        );
+        assert!(server
+            .receive_request(&packet[..conflict_len])
+            .unwrap()
+            .is_none());
         assert_eq!(server.pending_streams(), 1);
         assert_eq!(
             server.endpoint.receive.received_data,

@@ -51,6 +51,12 @@ pub const RAW_UDP6_PORT: u16 = 3339;
 const OBJECT_CHUNK: usize = MTU - 64;
 const MAX_OBJECT_CHUNK: usize = MTU - 64;
 const UDP_MIN_RETRANSMIT_PTO_MS: u64 = 250;
+// The Linux default UDP receive queue is smaller than a normal host benchmark
+// flight.  A host-side socket drop hides the ACK range that would trigger
+// recovery and turns a loopback measurement into a scheduler artefact.  This
+// is deliberately host-only: embedded receive budgets remain negotiated in
+// the bootstrap/profile, not enlarged by a socket setting.
+const HOST_UDP_SOCKET_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
 // A sender that has just declared loss needs a small amount of temporal
 // separation between subsequent new datagrams.  This is scheduler policy
 // derived from transport feedback, not a bearer ACK/retry mechanism.  Keep
@@ -68,8 +74,17 @@ const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const BOOTSTRAP_ATTEMPTS: u32 = 4;
 const STREAM_ATTEMPTS: u32 = 4;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
+// A host IPERF receiver can acknowledge a full congestion window faster than
+// the per-connection task observes it.  This remains bounded and is host-only
+// routing state; tearing down the route on a transient full queue loses the
+// ACK frontier and prevents PTO recovery entirely.
+const CONNECTION_DATAGRAM_QUEUE_CAPACITY: usize = 1024;
 /// Fixed bound shared with the no_std Recovery IPERF receiver.
 const MAX_IPERF_STREAMS: usize = 4;
+// Host UDP IPERF can refill a full host ledger in one scheduler pass. Device
+// receivers still bound the effective burst through their advertised packet
+// flight limit, so this does not enlarge Recovery/ESP receive memory.
+const HOST_IPERF_NORMAL_REFILL_PACKETS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_SERVER_CID: AtomicU64 = AtomicU64::new(0x100);
 
@@ -146,6 +161,7 @@ pub struct ServerTransportStats {
     pub peer_max_in_flight_packets: usize,
     pub bytes_in_flight: u64,
     pub congestion_window: u64,
+    pub largest_acked_by_peer: Option<u32>,
     pub transport: quic_lite::TransportStats,
 }
 
@@ -171,6 +187,7 @@ impl TransportControl {
                 peer_max_in_flight_packets: endpoint.peer_max_in_flight_packets(),
                 bytes_in_flight: endpoint.bytes_in_flight(),
                 congestion_window: endpoint.congestion.congestion_window,
+                largest_acked_by_peer: endpoint.largest_acked_by_peer(),
                 transport: endpoint.stats(),
             });
         }
@@ -517,19 +534,28 @@ impl PendingByteTransfer {
     }
 }
 
-fn report_byte_transfer(transfer: &PendingByteTransfer, stats: quic_lite::TransportStats) {
+fn report_byte_transfer<const H: usize>(
+    transfer: &PendingByteTransfer,
+    endpoint: &EndpointState<8, H>,
+) {
+    let stats = endpoint.stats();
     let elapsed_us = transfer
         .first_send
         .map(|first| first.elapsed().as_micros())
         .unwrap_or(0);
     eprintln!(
-        "iperf_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} fills={} max_fill={} pace_us={} pace_activations={} elapsed_us={} \
+        "iperf_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} history={}/{} peer_flight={} cwnd={} inflight={} fills={} max_fill={} pace_us={} pace_activations={} elapsed_us={} \
          gaps=<1ms:{},1-5ms:{},5-10ms:{},10-25ms:{},25-50ms:{},>=50ms:{} \
          loss=gap:{} time:{} events:{} loss_retx:{} pto_retx:{}",
         transfer.stream_id,
         transfer.sent_datagrams,
         stats.sent_stream_datagrams,
         stats.sent_control_datagrams,
+        endpoint.history_len(),
+        endpoint.history_capacity(),
+        endpoint.peer_max_in_flight_packets(),
+        endpoint.congestion.congestion_window,
+        endpoint.bytes_in_flight(),
         transfer.window_fills,
         transfer.max_window_fill,
         transfer.pacer.delay.as_micros(),
@@ -674,6 +700,35 @@ fn configure_ipv4_tos(socket: &UdpSocket, tos: u8) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn configure_host_udp_buffers(socket: &UdpSocket) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&HOST_UDP_SOCKET_BUFFER_BYTES as *const libc::c_int).cast(),
+                core::mem::size_of_val(&HOST_UDP_SOCKET_BUFFER_BYTES) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            bail!(
+                "set UDP socket buffer option {option}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_host_udp_buffers(_socket: &UdpSocket) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn configure_ipv4_tos(_socket: &UdpSocket, tos: u8) -> Result<()> {
     bail!("IP_TOS=0x{tos:02x} is unsupported on this host")
@@ -708,6 +763,7 @@ pub struct UdpClient {
     peer: SocketAddr,
     endpoint: EndpointState<8, 512>,
     local_cid: quic_lite::ConnectionId,
+    deferred_receive_credit: bool,
 }
 
 /// One committed server-initiated stream frame. This keeps offset and FIN
@@ -722,6 +778,12 @@ pub struct ReceivedStream {
 }
 
 impl UdpClient {
+    /// Allow a high-rate receiver to batch ACK/window control at the
+    /// negotiated cadence. Generic request/object clients retain immediate
+    /// credit because their application sinks may block between records.
+    pub fn set_deferred_receive_credit(&mut self, enabled: bool) {
+        self.deferred_receive_credit = enabled;
+    }
     /// Set the local delayed-ACK packet threshold for a diagnostic client.
     /// The wire ACK logic remains in `EndpointState`.
     pub fn set_ack_frequency(&mut self, frequency: u8) {
@@ -778,6 +840,7 @@ impl UdpClient {
             bail!("UDP history capacity must be in 1..=512");
         }
         let socket = UdpSocket::bind(bind).await?;
+        configure_host_udp_buffers(&socket)?;
         let mut client = Self {
             socket,
             peer,
@@ -788,6 +851,7 @@ impl UdpClient {
                 history_capacity,
             ),
             local_cid: local_cid,
+            deferred_receive_credit: false,
         };
         let mut response = [0u8; MTU];
         // A bootstrap timeout used to discard the only evidence of an L2
@@ -959,11 +1023,16 @@ impl UdpClient {
                             fin: frame.fin,
                             data: frame.data.to_vec(),
                         };
-                        self.endpoint
-                            .stream_consumed(response.id, response.data.len())
-                            .map_err(|error| {
-                                anyhow::anyhow!("client response accounting: {error:?}")
-                            })?;
+                        if self.deferred_receive_credit {
+                            self.endpoint
+                                .stream_consumed_deferred(response.id, response.data.len())
+                        } else {
+                            self.endpoint
+                                .stream_consumed(response.id, response.data.len())
+                        }
+                        .map_err(|error| {
+                            anyhow::anyhow!("client response accounting: {error:?}")
+                        })?;
                         let mut ack = [0u8; MTU];
                         if let Some(ack_len) = self
                             .endpoint
@@ -1019,9 +1088,13 @@ impl UdpClient {
                 quic_lite::TransportPacket::Control => continue,
                 quic_lite::TransportPacket::Stream { frame, .. } => frame,
             };
-            self.endpoint
-                .stream_consumed(stream.id, stream.data.len())
-                .map_err(|error| anyhow::anyhow!("client stream accounting: {error:?}"))?;
+            if self.deferred_receive_credit {
+                self.endpoint
+                    .stream_consumed_deferred(stream.id, stream.data.len())
+            } else {
+                self.endpoint.stream_consumed(stream.id, stream.data.len())
+            }
+            .map_err(|error| anyhow::anyhow!("client stream accounting: {error:?}"))?;
             let mut control = [0u8; MTU];
             if let Some(used) = self
                 .endpoint
@@ -1084,6 +1157,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
         Duration::ZERO
     };
     let socket = Arc::new(UdpSocket::bind(config.bind).await?);
+    configure_host_udp_buffers(&socket)?;
     if let Some(tos) = config.ip_tos {
         configure_ipv4_tos(&socket, tos)?;
     }
@@ -1177,7 +1251,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                     application_started: AtomicBool::new(false),
                 });
                 bootstrap_packet_numbers.insert(key, bootstrap_numbers.clone());
-                let (sender, receiver) = mpsc::channel(128);
+                let (sender, receiver) = mpsc::channel(CONNECTION_DATAGRAM_QUEUE_CAPACITY);
                 connections.insert(allocated.value(), sender);
                 connection_peers.insert(allocated.value(), peer);
                 last_activity.insert(allocated.value(), Instant::now());
@@ -1261,17 +1335,24 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 continue;
             }
             last_activity.insert(key, Instant::now());
-            if sender
-                .try_send(ConnectionDatagram {
-                    peer,
-                    bytes: packet.clone(),
-                })
-                .is_ok()
-            {
-                continue;
+            match sender.try_send(ConnectionDatagram {
+                peer,
+                bytes: packet.clone(),
+            }) {
+                Ok(()) => continue,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Preserve the route. The connection task still owns a
+                    // bounded ledger and its PTO path can recover a dropped
+                    // control packet; removing the route makes that recovery
+                    // impossible and turns a queue burst into a dead session.
+                    tracing::warn!(%peer, dcid = key, "udp_transport_connection_queue_full");
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    connections.remove(&key);
+                    connection_peers.remove(&key);
+                }
             }
-            connections.remove(&key);
-            connection_peers.remove(&key);
         }
 
         // Non-zero CIDs are routable only after bootstrap allocated them.
@@ -1910,7 +1991,7 @@ async fn process_persistent_packet<const H: usize>(
 
 /// Priority scheduler for one connection. High-priority application records
 /// consume up to four packet opportunities, normal IPERF streams share the
-/// remaining seven, and the log-like low stream receives one opportunity.
+/// host refill quantum, and the log-like low stream receives one opportunity.
 /// Every branch remains bounded by endpoint congestion and stream credit.
 async fn schedule_iperf_transfers<const H: usize>(
     socket: &UdpSocket,
@@ -1926,7 +2007,7 @@ async fn schedule_iperf_transfers<const H: usize>(
     if let Some(transfer) = high.as_mut() {
         let filled = fill_byte_window(socket, peer, mux, transfer, packet, 4).await?;
         if filled && transfer.remaining == 0 {
-            report_byte_transfer(transfer, mux.endpoint.stats());
+            report_byte_transfer(transfer, &mux.endpoint);
             *high = None;
         }
     }
@@ -1935,7 +2016,11 @@ async fn schedule_iperf_transfers<const H: usize>(
         .filter(|transfer| transfer.is_some())
         .count()
         .max(1);
-    let budget = if high.is_some() { 3 } else { 7 };
+    let budget = if high.is_some() {
+        HOST_IPERF_NORMAL_REFILL_PACKETS.saturating_sub(4)
+    } else {
+        HOST_IPERF_NORMAL_REFILL_PACKETS
+    };
     for slot in normal.iter_mut() {
         let Some(transfer) = slot.as_mut() else {
             continue;
@@ -1950,14 +2035,14 @@ async fn schedule_iperf_transfers<const H: usize>(
         )
         .await?;
         if filled && transfer.remaining == 0 {
-            report_byte_transfer(transfer, mux.endpoint.stats());
+            report_byte_transfer(transfer, &mux.endpoint);
             *slot = None;
         }
     }
     if let Some(transfer) = low.as_mut() {
         let filled = fill_byte_window(socket, peer, mux, transfer, packet, 1).await?;
         if filled && transfer.remaining == 0 {
-            report_byte_transfer(transfer, mux.endpoint.stats());
+            report_byte_transfer(transfer, &mux.endpoint);
             *low = None;
         }
     }
@@ -2627,6 +2712,7 @@ mod tests {
             peer: server_addr,
             endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
             local_cid: local,
+            deferred_receive_credit: false,
         };
         client.endpoint.install_connection_ids(local, peer).unwrap();
         let task = tokio::spawn(async move {
@@ -2659,6 +2745,7 @@ mod tests {
             peer: server_addr,
             endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
             local_cid: local,
+            deferred_receive_credit: false,
         };
         client.endpoint.install_connection_ids(local, peer).unwrap();
         let task = tokio::spawn(async move {
@@ -4459,6 +4546,80 @@ mod tests {
             }
         }
         assert!(saw_done);
+        server_task.abort();
+    }
+
+    /// Repeatable host-to-host UDP IPERF measurement. It deliberately drives
+    /// the production `run` listener and `UdpClient` through localhost, so it
+    /// catches scheduler, ACK, flow-credit, and socket regressions without a
+    /// shell-launched service or a Wi-Fi device. Keep it ignored: throughput
+    /// is host-load dependent, while the printed conditions are the fast
+    /// iteration signal. It never starts or restarts lmesh/lmesh-wifi.
+    #[tokio::test]
+    #[ignore = "explicit UDP IPERF throughput measurement"]
+    async fn udp_iperf_loopback_measurement() {
+        let bytes = std::env::var("DMESH_IPERF_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(64 * 1024);
+        let packet_size = std::env::var("DMESH_IPERF_PACKET_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(MAX_OBJECT_CHUNK as u16);
+        let root = tempdir().unwrap();
+        let control = Arc::new(TransportControl::default());
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            history_capacity: 512,
+            control: Some(control.clone()),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0x1f3).unwrap(),
+        )
+        .await
+        .unwrap();
+        client.set_deferred_receive_credit(true);
+        let mut request = [0u8; 11];
+        request[0] = SERVICE_IPERF;
+        request[1..9].copy_from_slice(&bytes.to_be_bytes());
+        request[9..11].copy_from_slice(&packet_size.to_be_bytes());
+        let started = Instant::now();
+        let (_, first, mut fin) = client
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &request, true)
+            .await
+            .unwrap();
+        let first_response_us = started.elapsed().as_micros();
+        let mut received = first.len() as u64;
+        while !fin {
+            let received_frame = timeout(Duration::from_secs(5), client.recv_stream()).await;
+            let Ok(Ok((_, frame, frame_fin))) = received_frame else {
+                let stats = control.server_stats();
+                let errors = control.take_errors();
+                server_task.abort();
+                panic!(
+                    "UDP IPERF receive timeout bytes={received} server_stats={stats:?} errors={errors:?}"
+                );
+            };
+            received = received.saturating_add(frame.len() as u64);
+            fin = frame_fin;
+        }
+        let elapsed = started.elapsed();
+        let bps = received.saturating_mul(8).saturating_mul(1_000_000)
+            / elapsed.as_micros().max(1) as u64;
+        let server_stats = control.server_stats();
+        eprintln!(
+            "host-host udp-iperf bytes={received} elapsed_us={} first_response_us={first_response_us} bps={bps} history=512 packet={packet_size} deferred_receive_credit=true server_stats={server_stats:?}",
+            elapsed.as_micros(),
+        );
+        assert_eq!(received, bytes);
         server_task.abort();
     }
 

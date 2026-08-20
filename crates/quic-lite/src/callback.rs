@@ -776,28 +776,24 @@ mod tests {
             .receive_leased(8, Arc::new(b"two".to_vec()), 0, 0..3, true, &mut sink)
             .unwrap();
         assert_eq!(sink.chunks.len(), 2);
-        assert!(
-            streams
-                .done(
-                    StreamDone {
-                        stream: 8,
-                        delivery_id: sink.chunks[1].3
-                    },
-                    &mut sink
-                )
-                .is_ok()
-        );
+        assert!(streams
+            .done(
+                StreamDone {
+                    stream: 8,
+                    delivery_id: sink.chunks[1].3
+                },
+                &mut sink
+            )
+            .is_ok());
         assert_eq!(sink.finished, vec![8]);
-        assert!(
-            streams
-                .done(
-                    StreamDone {
-                        stream: 4,
-                        delivery_id: 99
-                    },
-                    &mut sink
-                )
-                .is_err()
-        );
+        assert!(streams
+            .done(
+                StreamDone {
+                    stream: 4,
+                    delivery_id: 99
+                },
+                &mut sink
+            )
+            .is_err());
     }
 }

@@ -7,7 +7,9 @@
 //! transport/session code is moved out in follow-up cleanup.
 
 pub mod client {
-    pub use lmesh_uart::client::{ClientPathPolicy, run_dmesh_cli, run_dmesh_cli_args};
+    pub use lmesh_uart::client::{
+        ClientPathPolicy, DeviceSession, DeviceSessionEvent, run_dmesh_cli, run_dmesh_cli_args,
+    };
 }
 
-pub use client::{run_dmesh_cli, run_dmesh_cli_args};
+pub use client::{DeviceSession, DeviceSessionEvent, run_dmesh_cli, run_dmesh_cli_args};

@@ -339,6 +339,24 @@ mod tests {
     }
 
     #[test]
+    fn captured_linux_monitor_now_frame_parses() {
+        // Captured by the host E2E management-capture row (wlan1mon).
+        let hex = "d00000007419f817de6500c0cab879ccffffffffffff90aa7f18fe34ffffffffdd2018fe3404024000000f0000140000c00001a01def9db909800400008004000000";
+        let mut frame = Vec::new();
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let value = |byte: u8| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => panic!("invalid hex"),
+            };
+            frame.push((value(pair[0]) << 4) | value(pair[1]));
+        }
+        let mut payload = [0; MAX_ACTION_PAYLOAD];
+        assert!(parse_action_frame_into(&frame, &mut payload).is_some());
+    }
+
+    #[test]
     fn v2_elements_ignore_a_promiscuous_fcs_tail() {
         let destination = [1, 2, 3, 4, 5, 6];
         let source = [6, 5, 4, 3, 2, 1];

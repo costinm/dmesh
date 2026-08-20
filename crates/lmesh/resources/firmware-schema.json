@@ -54,7 +54,50 @@
     {"id": 68, "name": "recovery", "direct_control": true},
     {"id": 69, "name": "reset"},
     {"id": 70, "name": "module"},
-    {"id": 71, "name": "hello"}
+    {"id": 71, "name": "hello"},
+    {"id": 72, "name": "radio.control", "direct_control": true, "fields": [
+      {"id": 2, "name": "channel", "kind": "u8"},
+      {"id": 3, "name": "interface", "kind": "enum", "values": {"auto": 0, "sta": 1, "ap": 2, "nan": 3}},
+      {"id": 5, "name": "rate", "kind": "enum", "values": {"auto": 0, "6": 6, "9": 9, "12": 12, "18": 18, "24": 24, "36": 36, "48": 48, "54": 54}},
+      {"id": 6, "name": "disable_11b", "kind": "bool"},
+      {"id": 7, "name": "sta_state", "kind": "enum", "values": {"reconnect": 0, "disconnect_hold": 1}}, {"id": 16, "name": "mac_ack", "kind": "bool"},
+      {"id": 8, "name": "comparator_bssid", "kind": "mac"},
+      {"id": 9, "name": "comparator_enabled", "kind": "bool"},
+      {"id": 10, "name": "promiscuous", "kind": "bool"},
+      {"id": 11, "name": "dw_policy", "kind": "enum", "values": {"normal": 0, "disabled": 1, "manual": 2}},
+      {"id": 12, "name": "rx_filter", "kind": "enum", "values": {"management": 0, "management_data": 1}},
+      {"id": 13, "name": "ap_mode", "kind": "enum", "values": {"disabled": 0, "open": 1}},
+      {"id": 14, "name": "ap_beacon_tu", "kind": "u16"},
+      {"id": 15, "name": "raw_sta_mode", "kind": "enum", "values": {"main_style": 1}},
+      {"id": 20, "name": "epoch", "kind": "u32"},
+      {"id": 21, "name": "applied_channel", "kind": "u8"},
+      {"id": 22, "name": "sta_associated", "kind": "bool"},
+      {"id": 23, "name": "applied_promiscuous", "kind": "bool"},
+      {"id": 24, "name": "dw_capturing", "kind": "bool"},
+      {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"},
+      {"id": 26, "name": "comparator_armed", "kind": "bool"},
+      {"id": 27, "name": "comparator_errors", "kind": "u32"},
+      {"id": 28, "name": "applied_tx_interface", "kind": "enum"},
+      {"id": 29, "name": "applied_tx_rate", "kind": "enum"},
+      {"id": 30, "name": "ap_active", "kind": "bool"},
+      {"id": 40, "name": "tx_attempted", "kind": "u32"},
+      {"id": 41, "name": "tx_driver_accepted", "kind": "u32"},
+      {"id": 42, "name": "tx_driver_failed", "kind": "u32"},
+      {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"},
+      {"id": 44, "name": "rx_parser_accepted", "kind": "u32"},
+      {"id": 45, "name": "rx_parser_rejected", "kind": "u32"},
+      {"id": 46, "name": "rx_self_echo", "kind": "u32"},
+      {"id": 47, "name": "rx_dropped", "kind": "u32"},
+      {"id": 48, "name": "nan_beacons", "kind": "u32"},
+      {"id": 49, "name": "nan_sdfs", "kind": "u32"},
+      {"id": 50, "name": "nan_followups", "kind": "u32"}
+    ]},
+    {"id": 73, "name": "radio.snapshot", "direct_control": true, "fields": [
+      {"id": 20, "name": "epoch", "kind": "u32"}, {"id": 21, "name": "applied_channel", "kind": "u8"}, {"id": 22, "name": "sta_associated", "kind": "bool"}, {"id": 23, "name": "applied_promiscuous", "kind": "bool"}, {"id": 24, "name": "dw_capturing", "kind": "bool"}, {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"}, {"id": 26, "name": "comparator_armed", "kind": "bool"}, {"id": 27, "name": "comparator_errors", "kind": "u32"}, {"id": 28, "name": "applied_tx_interface", "kind": "enum"}, {"id": 29, "name": "applied_tx_rate", "kind": "enum"}, {"id": 30, "name": "ap_active", "kind": "bool"}, {"id": 31, "name": "mac_ack", "kind": "bool"}, {"id": 40, "name": "tx_attempted", "kind": "u32"}, {"id": 41, "name": "tx_driver_accepted", "kind": "u32"}, {"id": 42, "name": "tx_driver_failed", "kind": "u32"}, {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"}, {"id": 44, "name": "rx_parser_accepted", "kind": "u32"}, {"id": 45, "name": "rx_parser_rejected", "kind": "u32"}, {"id": 46, "name": "rx_self_echo", "kind": "u32"}, {"id": 47, "name": "rx_dropped", "kind": "u32"}, {"id": 48, "name": "nan_beacons", "kind": "u32"}, {"id": 49, "name": "nan_sdfs", "kind": "u32"}, {"id": 50, "name": "nan_followups", "kind": "u32"}, {"id": 51, "name": "tx_duration_us_total", "kind": "u32"}, {"id": 52, "name": "tx_duration_us_max", "kind": "u32"}, {"id": 53, "name": "tx_duration_le_250us", "kind": "u32"}, {"id": 54, "name": "tx_duration_le_750us", "kind": "u32"}, {"id": 55, "name": "tx_duration_le_2ms", "kind": "u32"}, {"id": 56, "name": "tx_duration_gt_2ms", "kind": "u32"}
+    ]},
+    {"id": 74, "name": "radio.reset_counters", "direct_control": true, "fields": [
+      {"id": 20, "name": "epoch", "kind": "u32"}, {"id": 21, "name": "applied_channel", "kind": "u8"}, {"id": 22, "name": "sta_associated", "kind": "bool"}, {"id": 23, "name": "applied_promiscuous", "kind": "bool"}, {"id": 24, "name": "dw_capturing", "kind": "bool"}, {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"}, {"id": 26, "name": "comparator_armed", "kind": "bool"}, {"id": 27, "name": "comparator_errors", "kind": "u32"}, {"id": 28, "name": "applied_tx_interface", "kind": "enum"}, {"id": 29, "name": "applied_tx_rate", "kind": "enum"}, {"id": 30, "name": "ap_active", "kind": "bool"}, {"id": 40, "name": "tx_attempted", "kind": "u32"}, {"id": 41, "name": "tx_driver_accepted", "kind": "u32"}, {"id": 42, "name": "tx_driver_failed", "kind": "u32"}, {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"}, {"id": 44, "name": "rx_parser_accepted", "kind": "u32"}, {"id": 45, "name": "rx_parser_rejected", "kind": "u32"}, {"id": 46, "name": "rx_self_echo", "kind": "u32"}, {"id": 47, "name": "rx_dropped", "kind": "u32"}, {"id": 48, "name": "nan_beacons", "kind": "u32"}, {"id": 49, "name": "nan_sdfs", "kind": "u32"}, {"id": 50, "name": "nan_followups", "kind": "u32"}
+    ]}
   ],
   "module_services": {
     "tag_range": [43, 100],

@@ -15,6 +15,10 @@ use quic_lite::{
 pub use quic_lite::{StreamHandler, StreamRegistry};
 
 const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
+/// A retained binary event must fit in one bounded direct-record response.
+/// This is also a memory boundary: a count-limited history without a payload
+/// limit would still allow one producer to retain an arbitrary allocation.
+pub const MAX_BINARY_EVENT_PAYLOAD_BYTES: usize = 1024;
 pub const LOG_WATCH_MAX_RECORDS: usize = 64;
 /// Control-stream subtype for selecting a bearer-neutral egress policy.
 pub const CONTROL_PATH_POLICY: u8 = 3;
@@ -149,6 +153,32 @@ pub fn encode_status_text(message: &[u8]) -> Option<Vec<u8>> {
         response.extend_from_slice(&[0x78, message.len() as u8]);
     }
     response.extend_from_slice(message);
+    Some(response)
+}
+
+/// Encode one named numeric diagnostic without converting the value to text.
+/// The direct-record envelope remains compatible with ordinary status text,
+/// but its payload is `{name: uint}` so consumers retain a CBOR integer.
+pub fn encode_status_numeric(name: &[u8], value: u64) -> Option<Vec<u8>> {
+    if name.is_empty() || name.len() > 96 || !name.is_ascii() {
+        return None;
+    }
+    // Three outer fields, a one-entry payload map, a 96-byte name, and a u64
+    // fit in this fixed scratch allocation. Truncate after canonical encoding.
+    let mut response = Vec::with_capacity(128);
+    response.resize(128, 0);
+    let mut encoder = crate::cbor::Encoder::new(&mut response);
+    encoder.map(3)?;
+    encoder.uint(0)?;
+    encoder.uint(68)?;
+    encoder.uint(4)?;
+    encoder.text_value(b"ok")?;
+    encoder.uint(6)?;
+    encoder.map(1)?;
+    encoder.text_value(name)?;
+    encoder.uint(value)?;
+    let len = encoder.len();
+    response.truncate(len);
     Some(response)
 }
 
@@ -328,7 +358,11 @@ pub fn handle_stream_with_events<const N: usize, const H: usize, const P: usize>
         return Err("unknown stream service");
     }
     match service {
-        SERVICE_ECHO | SERVICE_STATUS => Ok(connection_status(
+        // Echo is the compact bearer-neutral liveness primitive. In
+        // particular, raw 802.11 action probes must not turn a small nonce
+        // into a verbose status report requiring multiple vendor IEs.
+        SERVICE_ECHO => Ok(data.to_vec()),
+        SERVICE_STATUS => Ok(connection_status(
             endpoint,
             connection_cid,
             stream_id,
@@ -542,9 +576,7 @@ mod tests {
         }];
         assert_eq!(
             encode_binary_events(7, &events, 64).unwrap(),
-            vec![
-                0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c'
-            ]
+            vec![0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c']
         );
         // A too-small response preserves a valid continuation envelope and
         // never emits a partial payload/event.
@@ -563,6 +595,23 @@ mod tests {
         );
         assert!(response.len() < 1400);
         assert!(encode_numeric_result(&vec![(0, 0); 256]).is_none());
+    }
+
+    #[test]
+    fn named_numeric_status_retains_the_integer_as_cbor() {
+        let response = encode_status_numeric(b"wifi raw sta init_ms", 42).unwrap();
+        let mut decoder = crate::cbor::Decoder::new(&response);
+        assert_eq!(decoder.head(), Some((5, 3)));
+        assert_eq!(decoder.uint(), Some(0));
+        assert_eq!(decoder.uint(), Some(68));
+        assert_eq!(decoder.uint(), Some(4));
+        assert_eq!(decoder.text_ref(), Some(b"ok".as_slice()));
+        assert_eq!(decoder.uint(), Some(6));
+        assert_eq!(decoder.head(), Some((5, 1)));
+        assert_eq!(decoder.text_ref(), Some(b"wifi raw sta init_ms".as_slice()));
+        assert_eq!(decoder.uint(), Some(42));
+        assert!(decoder.is_finished());
+        assert!(encode_status_numeric(&[b'x'; 97], 1).is_none());
     }
 
     #[test]

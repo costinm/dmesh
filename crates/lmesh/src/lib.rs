@@ -613,6 +613,10 @@ fn default_rate_profile() -> String {
     "auto".to_owned()
 }
 
+fn default_raw_iperf_bytes() -> u64 {
+    8 * 1024
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum Request {
@@ -903,6 +907,59 @@ pub enum Request {
         #[serde(default)]
         rx_variant: Option<String>,
     },
+    /// Run shared QUIC-lite IPERF over raw ESP-NOW-compatible action frames.
+    #[serde(rename = "wifi.raw.iperf")]
+    WifiRawIperf {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        destination: String,
+        #[serde(default = "default_raw_iperf_bytes")]
+        bytes: u64,
+        #[serde(default)]
+        packet_size: Option<u16>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        tx_rate_mbps: Option<u8>,
+        /// Host raw-frame transmit lane: `monitor` (AF_PACKET/radiotap) or
+        /// `nl80211` (NL80211_CMD_FRAME / send_mgmt_frame).
+        #[serde(default)]
+        tx_variant: Option<String>,
+        /// Host raw-frame receive lane: `monitor`, `monitor_active`, or
+        /// `nl80211`. It is independent from the selected TX lane.
+        #[serde(default)]
+        rx_variant: Option<String>,
+    },
+    /// Run one shared QUIC-lite status/check exchange over a raw
+    /// ESP-NOW-compatible action frame. This uses the same host/firmware
+    /// bearer as `wifi.raw.iperf`, but is suitable for repeated liveness and
+    /// latency/loss probes before a throughput run.
+    #[serde(rename = "wifi.raw.check")]
+    WifiRawCheck {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        destination: String,
+        #[serde(default)]
+        nonce: Option<u64>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        tx_rate_mbps: Option<u8>,
+        #[serde(default)]
+        tx_variant: Option<String>,
+        #[serde(default)]
+        rx_variant: Option<String>,
+    },
+    /// Return bounded raw action receive/dispatch counters for E2E probes.
+    #[serde(rename = "wifi.raw.metrics")]
+    WifiRawMetrics {
+        #[serde(default)]
+        iface: Option<String>,
+    },
     /// Send an ESP32-compatible raw DMesh Wi-Fi action frame.
     #[serde(rename = "wifi.raw.send")]
     WifiRawSend {
@@ -1162,6 +1219,27 @@ impl LmeshService {
                 "wifi_startup_rate_profile"
             );
         }
+        // This is the development/test listener on wlan1.  Its port comes
+        // from lmesh's service environment (3337), distinct from the stable
+        // lmesh-wifi/wlan0 Recovery listener (3336).  Both expose the same
+        // dmesh-server IPERF service and raw-action driver through this
+        // shared RadioService; neither implementation is firmware-specific.
+        let object_udp = radio.object_udp_start(None, None, None);
+        tracing::info!(
+            ok = object_udp
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            port = object_udp
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            error = object_udp
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            "lmesh_development_udp_startup"
+        );
         Self {
             discovery,
             ble: ble::BleService,
@@ -1487,6 +1565,49 @@ impl LmeshService {
                 self.radio
                     .wifi_raw_listen(iface, channel, listen_sec, rx_variant),
             ),
+            Request::WifiRawIperf {
+                iface,
+                channel,
+                destination,
+                bytes,
+                packet_size,
+                timeout_ms,
+                tx_rate_mbps,
+                tx_variant,
+                rx_variant,
+            } => mesh::protocol::Response::ok_with_data(self.radio.raw_espnow_iperf(
+                iface,
+                channel,
+                destination,
+                bytes,
+                packet_size.map(u64::from),
+                timeout_ms,
+                tx_rate_mbps.map(u64::from),
+                tx_variant,
+                rx_variant,
+            )),
+            Request::WifiRawCheck {
+                iface,
+                channel,
+                destination,
+                nonce,
+                timeout_ms,
+                tx_rate_mbps,
+                tx_variant,
+                rx_variant,
+            } => mesh::protocol::Response::ok_with_data(self.radio.raw_espnow_check(
+                iface,
+                channel,
+                destination,
+                nonce.unwrap_or(0),
+                timeout_ms,
+                tx_rate_mbps.map(u64::from),
+                tx_variant,
+                rx_variant,
+            )),
+            Request::WifiRawMetrics { iface } => mesh::protocol::Response::ok_with_data(
+                self.radio.wifi_raw_metrics(iface),
+            ),
             Request::WifiRawSend {
                 iface,
                 channel,
@@ -1503,7 +1624,7 @@ impl LmeshService {
             } => {
                 let result = if let Some(frame_hex) = frame_hex {
                     self.radio
-                        .wifi_raw_send_frame(iface, channel, tx_variant, frame_hex)
+                        .wifi_raw_send_frame(iface, channel, tx_variant, frame_hex, tx_rate_mbps)
                 } else {
                     self.radio.wifi_raw_send(
                         iface,

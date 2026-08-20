@@ -3,8 +3,8 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    EndpointState, Error, INITIAL_MAX_STREAM_DATA, RECOVERY_REORDER_CAPACITY_BYTES, StreamFrame,
     callback::{CallbackError, CallbackStreams, CopyingError, CopyingStreamEvents},
+    EndpointState, Error, StreamFrame, INITIAL_MAX_STREAM_DATA, RECOVERY_REORDER_CAPACITY_BYTES,
 };
 
 /// Bounded producer for one server-initiated diagnostic stream.
@@ -344,16 +344,14 @@ mod tests {
     #[test]
     fn rejects_bad_packet_sequence() {
         let mut receiver = IperfReceiver::new(1);
-        assert!(
-            receiver
-                .handle(StreamFrame {
-                    id: 3,
-                    offset: 0,
-                    fin: true,
-                    data: &[0, 0, 0, 1],
-                })
-                .is_err()
-        );
+        assert!(receiver
+            .handle(StreamFrame {
+                id: 3,
+                offset: 0,
+                fin: true,
+                data: &[0, 0, 0, 1],
+            })
+            .is_err());
         assert_eq!(receiver.callback_errors()[5], 1);
     }
 

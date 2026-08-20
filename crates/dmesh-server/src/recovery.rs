@@ -197,15 +197,15 @@ pub fn decode_iperf_result(packet: &[u8]) -> Option<IperfResult> {
 pub struct RecoveryCommand<'a> {
     pub operation: Option<&'a [u8]>,
     pub ssid: Option<&'a [u8]>,
-    pub server: Option<&'a [u8]>,
-    pub local_ip: Option<&'a [u8]>,
-    pub gateway: Option<&'a [u8]>,
-    pub mask: Option<&'a [u8]>,
     pub port: Option<u16>,
     pub profile_updated: bool,
     pub log_level: Option<u8>,
     pub benchmark: Option<bool>,
     pub transport_test: Option<bool>,
+    /// Legacy no-op retained while old CBOR clients migrate. Raw
+    /// ESP-NOW-compatible actions use the filtered dispatcher and do not
+    /// select promiscuous capture; NAN discovery policy is separate.
+    pub espnow_capture: Option<bool>,
     pub iperf_packet_size: Option<u16>,
     pub iperf_bytes: Option<u32>,
     pub iperf_parallel_streams: Option<u8>,
@@ -222,6 +222,24 @@ pub struct RecoveryCommand<'a> {
     /// Raw injected Wi-Fi PHY rate in Mbit/s; zero leaves the driver rate
     /// control enabled. This is association-scoped, never persistent.
     pub raw_tx_rate: Option<u8>,
+    /// Select e6 STA egress without a rebuild: false uses the explicit raw
+    /// 802.11 injector, true uses ESP-IDF's associated Ethernet handoff.
+    /// This is a diagnostic/association control, never persisted in NVS.
+    pub sta_driver_tx: Option<bool>,
+    /// STA receive-filter diagnostic. `true` disables the private BSSID
+    /// check for the associated STA lane; it is volatile and applies without
+    /// rebuilding or reassociating.
+    pub sta_bssid_check_disabled: Option<bool>,
+    /// Enable 802.11n A-MPDU RX and TX during the next controlled STA driver
+    /// initialization. This is volatile because it changes Wi-Fi driver RAM
+    /// and aggregation behavior, not the persisted network profile.
+    pub sta_ampdu_enabled: Option<bool>,
+    /// Whether the STA suppresses legacy 802.11b rates before it starts.
+    /// This is a pre-start association setting and is volatile.
+    pub sta_11b_rates_disabled: Option<bool>,
+    /// Select the STA RX owner: true installs the raw UDP6 callback, false
+    /// leaves ESP-IDF's default esp-netif/lwIP receive handoff installed.
+    pub sta_raw_rx_enabled: Option<bool>,
     pub timeout_ms: Option<u32>,
     pub path_policy: Option<u8>,
 }
@@ -298,27 +316,29 @@ pub fn decode_recovery_command(packet: &[u8]) -> Option<RecoveryCommand<'_>> {
         } else if named(b"ssid") {
             command.ssid = Some(bytes_or_text(&mut body)?);
             command.profile_updated = true;
-        } else if named(b"server") || (kind == 0 && numeric_key == 246) {
-            command.server = Some(bytes_or_text(&mut body)?);
-            command.profile_updated = true;
-        } else if named(b"ip") {
-            command.local_ip = Some(bytes_or_text(&mut body)?);
-            command.profile_updated = true;
-        } else if named(b"gw") || named(b"gateway") {
-            command.gateway = Some(bytes_or_text(&mut body)?);
-            command.profile_updated = true;
-        } else if named(b"mask") {
-            command.mask = Some(bytes_or_text(&mut body)?);
-            command.profile_updated = true;
-        } else if named(b"port") || (kind == 0 && numeric_key == 191) {
+        } else if named(b"server")
+            || named(b"ip")
+            || named(b"gw")
+            || named(b"gateway")
+            || named(b"mask")
+            || named(b"port")
+            || (kind == 0 && numeric_key == 246)
+        {
+            // Superseded static-IPv4 bootstrap fields. Consume them so an old
+            // client remains wire-compatible, but do not persist or apply
+            // them: raw UDP6 learns both addresses and its port at runtime.
+            body.skip()?;
+        } else if kind == 0 && numeric_key == 191 {
+            // Numeric 191 is the iperf service port, not a STA setting.
             command.port = Some(body.uint_or_text()? as u16);
-            command.profile_updated |= !text_key.is_empty();
         } else if named(b"log_level") {
             command.log_level = Some(body.uint_or_text()?.min(5) as u8);
         } else if named(b"benchmark") || (kind == 0 && numeric_key == 248) {
             command.benchmark = Some(body.boolean_or_text()?);
         } else if named(b"transport_test") || (kind == 0 && numeric_key == 251) {
             command.transport_test = Some(body.boolean_or_text()?);
+        } else if named(b"espnow_capture") || (kind == 0 && numeric_key == 247) {
+            command.espnow_capture = Some(body.boolean_or_text()?);
         } else if named(b"iperf_packet_size") || (kind == 0 && numeric_key == 252) {
             command.iperf_packet_size = Some(
                 body.uint_or_text()?
@@ -367,6 +387,16 @@ pub fn decode_recovery_command(packet: &[u8]) -> Option<RecoveryCommand<'_>> {
             } else {
                 return None;
             }
+        } else if named(b"sta_driver_tx") || named(b"driver_tx") {
+            command.sta_driver_tx = Some(body.boolean_or_text()?);
+        } else if named(b"sta_bssid_check_disabled") || named(b"bssid_check_disabled") {
+            command.sta_bssid_check_disabled = Some(body.boolean_or_text()?);
+        } else if named(b"sta_ampdu_enabled") || named(b"ampdu") {
+            command.sta_ampdu_enabled = Some(body.boolean_or_text()?);
+        } else if named(b"sta_11b_rates_disabled") || named(b"disable_11b") {
+            command.sta_11b_rates_disabled = Some(body.boolean_or_text()?);
+        } else if named(b"sta_raw_rx_enabled") || named(b"raw_rx") {
+            command.sta_raw_rx_enabled = Some(body.boolean_or_text()?);
         } else if named(b"timeout_ms") || (kind == 0 && numeric_key == 250) {
             command.timeout_ms = Some(body.uint_or_text()?.clamp(1_000, 300_000) as u32);
         } else if named(b"path_policy") || named(b"path") {
@@ -427,10 +457,69 @@ mod tests {
     fn decodes_raw_rate_as_an_association_setting() {
         // {0: 68, 6: {"raw_tx_rate": 54}}
         let packet = [
-            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x6b, b'r', b'a', b'w', b'_', b't', b'x',
-            b'_', b'r', b'a', b't', b'e', 0x18, 0x36,
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x6b, b'r', b'a', b'w', b'_', b't', b'x', b'_',
+            b'r', b'a', b't', b'e', 0x18, 0x36,
         ];
-        assert_eq!(decode_recovery_command(&packet).unwrap().raw_tx_rate, Some(54));
+        assert_eq!(
+            decode_recovery_command(&packet).unwrap().raw_tx_rate,
+            Some(54)
+        );
+    }
+
+    #[test]
+    fn decodes_runtime_sta_egress_path() {
+        // {0: 68, 6: {"sta_driver_tx": true}}
+        let packet = [
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x6d, b's', b't', b'a', b'_', b'd',
+            b'r', b'i', b'v', b'e', b'r', b'_', b't', b'x', 0xf5,
+        ];
+        assert_eq!(decode_recovery_command(&packet).unwrap().sta_driver_tx, Some(true));
+    }
+
+    #[test]
+    fn decodes_runtime_sta_bssid_filter_control() {
+        // {0: 68, 6: {"bssid_check_disabled": false}}
+        let packet = [
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x74, b'b', b's', b's', b'i', b'd', b'_',
+            b'c', b'h', b'e', b'c', b'k', b'_', b'd', b'i', b's', b'a', b'b', b'l', b'e',
+            b'd', 0xf4,
+        ];
+        assert_eq!(
+            decode_recovery_command(&packet).unwrap().sta_bssid_check_disabled,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn decodes_runtime_sta_ampdu_control() {
+        // {0: 68, 6: {"ampdu": false}}
+        let packet = [
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x65, b'a', b'm', b'p', b'd', b'u', 0xf4,
+        ];
+        assert_eq!(decode_recovery_command(&packet).unwrap().sta_ampdu_enabled, Some(false));
+    }
+
+    #[test]
+    fn decodes_runtime_sta_11b_rate_policy() {
+        // {0: 68, 6: {"disable_11b": false}}
+        let packet = [
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x6b, b'd', b'i', b's', b'a', b'b', b'l',
+            b'e', b'_', b'1', b'1', b'b', 0xf4,
+        ];
+        assert_eq!(
+            decode_recovery_command(&packet).unwrap().sta_11b_rates_disabled,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn decodes_runtime_sta_raw_rx_owner() {
+        // {0: 68, 6: {"raw_rx": false}}
+        let packet = [
+            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x66, b'r', b'a', b'w', b'_', b'r', b'x',
+            0xf4,
+        ];
+        assert_eq!(decode_recovery_command(&packet).unwrap().sta_raw_rx_enabled, Some(false));
     }
 
     #[test]
@@ -463,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_binary_profile_values_without_copying() {
+    fn ignores_legacy_ipv4_profile_values() {
         let packet = [
             0xa2, 0x00, 0x18, 0x44, 0x06, 0xa2, 0x64, b's', b's', b'i', b'd', 0x43, b'a', 0, b'b',
             0x66, b's', b'e', b'r', b'v', b'e', b'r', 0x68, b'1', b'0', b'.', b'0', b'.', b'0',
@@ -471,7 +560,6 @@ mod tests {
         ];
         let command = decode_recovery_command(&packet).unwrap();
         assert_eq!(command.ssid, Some(&[b'a', 0, b'b'][..]));
-        assert_eq!(command.server, Some(b"10.0.0.1".as_slice()));
         assert!(command.profile_updated);
     }
 

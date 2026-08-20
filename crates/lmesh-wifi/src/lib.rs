@@ -61,10 +61,18 @@ impl WifiService {
                 let channel = std::env::var("LMESH_AP_CHANNEL")
                     .ok()
                     .and_then(|value| value.parse::<u8>().ok());
+                let ht40 = std::env::var("LMESH_AP_HT40")
+                    .ok()
+                    .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                        "1" | "true" | "yes" | "on" => Some(true),
+                        "0" | "false" | "no" | "off" => Some(false),
+                        _ => None,
+                    });
                 results.push(self.radio.wifi_ap_start_open_on_channel(
                     Some(iface.clone()),
                     None,
                     channel,
+                    ht40,
                 ));
                 let cidr =
                     std::env::var("LMESH_AP_ADDRESS").unwrap_or_else(|_| "10.78.0.1/16".to_owned());
@@ -130,8 +138,19 @@ impl InterfaceSet {
     }
 
     /// Return whether this service owns `iface`.
+    ///
+    /// A monitor interface is a child VIF of its base radio, not an
+    /// independently-owned radio.  Permit the conventional `<base>mon` name
+    /// only when the corresponding base interface is in this service's
+    /// allow-list.  This keeps `wlan0mon` with `lmesh-wifi` while rejecting
+    /// unrelated monitor VIFs such as `wlan1mon`.
     pub fn contains(&self, iface: &str) -> bool {
-        self.0.iter().any(|owned| owned == iface)
+        self.0.iter().any(|owned| {
+            owned == iface
+                || iface
+                    .strip_suffix("mon")
+                    .is_some_and(|base| base == owned)
+        })
     }
 
     /// Return the normalized interface names in stable order.
@@ -214,5 +233,13 @@ mod tests {
         let netd = WifiNetd::new(InterfaceSet::parse("wlan0"));
         assert!(netd.authorize(Operation::Ap, "wlan0").is_ok());
         assert!(netd.authorize(Operation::Nan, "wlan1").is_err());
+    }
+
+    #[test]
+    fn monitor_child_is_authorized_with_its_owned_base() {
+        let owned = InterfaceSet::parse("wlan0");
+        assert!(owned.contains("wlan0mon"));
+        assert!(!owned.contains("wlan1mon"));
+        assert!(!owned.contains("wlan0monitor"));
     }
 }

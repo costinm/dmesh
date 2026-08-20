@@ -335,6 +335,94 @@ pub struct GetRequest<'a> {
     pub target: u8,
 }
 
+/// Bearer-neutral request to fetch a signed object and install it through an
+/// application-provided sink.  The caller selects the object by the same
+/// `(name, cpu, target)` tuple used by [`GetRequest`]; transport selection and
+/// dry-run are execution policy, not object-store metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlashRequest<'a> {
+    pub object: GetRequest<'a>,
+    pub address: Option<u32>,
+    /// `0` lets the active connection select a path. Other values are a
+    /// handler-defined path preference, never a bearer-specific wire format.
+    pub transport: u8,
+    pub dry_run: bool,
+}
+
+/// Canonically encode the `flash` handler body.  Field keys are shared by
+/// Recovery, Main, host tests, and future Android clients: 0=name, 1=cpu,
+/// 2=target, 3=address, 4=transport, 5=dry_run.
+pub fn encode_flash_request(request: FlashRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    if request.object.target == 0 {
+        return None;
+    }
+    let mut encoder = super::cbor::Encoder::new(out);
+    let fields = 4 + usize::from(request.object.name.is_some()) + usize::from(request.address.is_some());
+    encoder.map(fields as u64)?;
+    if let Some(name) = request.object.name {
+        encoder.uint(0)?;
+        encoder.bytes_value(name)?;
+    }
+    encoder.uint(1)?;
+    encoder.uint(u64::from(request.object.cpu))?;
+    encoder.uint(2)?;
+    encoder.uint(u64::from(request.object.target))?;
+    if let Some(address) = request.address {
+        encoder.uint(3)?;
+        encoder.uint(u64::from(address))?;
+    }
+    encoder.uint(4)?;
+    encoder.uint(u64::from(request.transport))?;
+    encoder.uint(5)?;
+    encoder.boolean(request.dry_run)?;
+    Some(encoder.len())
+}
+
+/// Decode a complete canonical `flash` handler body. Duplicate, unknown, or
+/// trailing fields are rejected before a platform sink can erase anything.
+pub fn decode_flash_request(input: &[u8]) -> Option<FlashRequest<'_>> {
+    let mut d = Decoder::new(input);
+    let (major, count) = d.head()?;
+    if major != 5 || !(4..=6).contains(&count) {
+        return None;
+    }
+    let mut name = None;
+    let mut cpu = None;
+    let mut target = None;
+    let mut address = None;
+    let mut transport = None;
+    let mut dry_run = None;
+    let mut seen = 0u8;
+    for _ in 0..count {
+        let key = d.uint()?;
+        let bit = 1u8.checked_shl(key as u32)?;
+        if key > 5 || seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
+        match key {
+            0 => name = Some(d.bytes_ref()?),
+            1 => cpu = Some(d.uint()?.try_into().ok()?),
+            2 => target = Some(d.uint()?.try_into().ok()?),
+            3 => address = Some(d.uint()?.try_into().ok()?),
+            4 => transport = Some(d.uint()?.try_into().ok()?),
+            5 => dry_run = Some(d.boolean()?),
+            _ => return None,
+        }
+    }
+    Some(FlashRequest {
+        object: GetRequest {
+            name,
+            cpu: cpu?,
+            target: target.filter(|target| *target != 0)?,
+        },
+        address,
+        transport: transport?,
+        dry_run: dry_run?,
+    })
+    .filter(|_| d.is_finished())
+}
+
 /// Decode the compact CBOR GET map. Numeric keys are 0=name, 1=cpu,
 /// 2=target. Values are byte strings and unsigned integers; no text or UTF-8
 /// is involved.
@@ -655,6 +743,250 @@ pub trait ImageSink {
     fn write_block(&mut self, index: u32, data: &[u8]) -> Result<(), Self::Error>;
     fn finish(&mut self, manifest: &ImageManifest) -> Result<(), Self::Error>;
     fn abort(&mut self);
+}
+
+/// Apply one complete signed-object record sequence to an arbitrary sink.
+///
+/// Host and firmware clients use this same manifest/signature/block validation
+/// path; only the sink differs (a host file versus an ESP partition writer).
+/// Transport code is responsible for feeding complete ordered records and for
+/// returning its own stream credit after a sink has reclaimed storage.
+pub fn apply_signed_object_records<S, V>(
+    receiver: &mut ImageReceiver<S, V>,
+    records: &[(u8, Vec<u8>)],
+) -> Result<ImageEvent, ImageError>
+where
+    S: ImageSink,
+    V: SignatureVerifier,
+{
+    let mut complete = None;
+    for (kind, payload) in records {
+        let event = match *kind {
+            RECORD_MANIFEST => receiver.on_manifest(payload)?,
+            RECORD_BLOB => receiver.on_block(payload)?,
+            RECORD_DONE => receiver.on_done()?,
+            _ => return Err(ImageError::InvalidBlock),
+        };
+        if matches!(event, ImageEvent::Complete) {
+            complete = Some(event);
+        }
+    }
+    complete.ok_or(ImageError::InvalidManifest)
+}
+
+/// Incremental, bearer-neutral consumer for a `signed_object` response.
+///
+/// QUIC-lite (or any later transport) has already put bytes in stream order
+/// before calling [`Self::push_ordered`].  This type owns only record framing
+/// and object verification: it does not retain packet history, select a
+/// bearer, or return transport credit.  The same client therefore works with
+/// an ESP partition sink and the host file sink.
+pub struct SignedObjectReceiver<S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize> {
+    records: FixedRecordDecoder<MAX_MANIFEST, MAX_BLOB>,
+    image: ImageReceiver<S, V>,
+    complete: bool,
+}
+
+
+struct SignedObjectEvents<'a, S, V> {
+    image: &'a mut ImageReceiver<S, V>,
+    complete: &'a mut bool,
+}
+
+impl<S, V> RecordEvents for SignedObjectEvents<'_, S, V>
+where
+    S: ImageSink,
+    V: SignatureVerifier,
+{
+    type Error = ImageError;
+
+    fn record(&mut self, kind: u8, payload: &[u8]) -> Result<(), Self::Error> {
+        if *self.complete {
+            return Err(ImageError::InvalidBlock);
+        }
+        let event = match kind {
+            RECORD_MANIFEST => self.image.on_manifest(payload)?,
+            RECORD_BLOB => self.image.on_block(payload)?,
+            RECORD_DONE => self.image.on_done()?,
+            _ => return Err(ImageError::InvalidBlock),
+        };
+        *self.complete = matches!(event, ImageEvent::Complete);
+        Ok(())
+    }
+}
+
+impl<S, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
+    SignedObjectReceiver<S, NoSignatureVerifier, MAX_MANIFEST, MAX_BLOB>
+{
+    pub const fn new(sink: S) -> Self {
+        Self {
+            records: FixedRecordDecoder::new(),
+            image: ImageReceiver::new(sink),
+            complete: false,
+        }
+    }
+}
+
+impl<S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
+    SignedObjectReceiver<S, V, MAX_MANIFEST, MAX_BLOB>
+where
+    S: ImageSink,
+    V: SignatureVerifier,
+{
+    pub fn new_with_verifier(sink: S, verifier: V) -> Self {
+        Self {
+            records: FixedRecordDecoder::new(),
+            image: ImageReceiver::new_with_verifier(sink, verifier),
+            complete: false,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn sink_mut(&mut self) -> &mut S {
+        self.image.sink_mut()
+    }
+
+    /// Feed any ordered response fragment. A fragment may split either the
+    /// five-byte record header or a blob body.
+    pub fn push_ordered(&mut self, bytes: &[u8]) -> Result<(), ImageError> {
+        let mut events = SignedObjectEvents {
+            image: &mut self.image,
+            complete: &mut self.complete,
+        };
+        self.records.push(bytes, &mut events).map_err(|error| match error {
+            FixedRecordError::Invalid => ImageError::InvalidBlock,
+            FixedRecordError::Callback(error) => error,
+        })
+    }
+}
+
+/// Device-owned state for one asynchronous `flash` operation.
+///
+/// The device command handler sends [`Self::get_request`] through its active
+/// authenticated stream connection, then feeds ordered object-response bytes into
+/// [`Self::receive_ordered`]. Both methods are bounded CPU work only; bearer
+/// I/O and durable-sink polling stay with the platform adapter.
+pub struct SignedObjectFlashSession<'a, S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize> {
+    request: FlashRequest<'a>,
+    receiver: SignedObjectReceiver<S, V, MAX_MANIFEST, MAX_BLOB>,
+}
+
+impl<'a, S, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
+    SignedObjectFlashSession<'a, S, NoSignatureVerifier, MAX_MANIFEST, MAX_BLOB>
+{
+    pub const fn new(request: FlashRequest<'a>, sink: S) -> Self {
+        Self {
+            request,
+            receiver: SignedObjectReceiver::new(sink),
+        }
+    }
+}
+
+impl<'a, S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
+    SignedObjectFlashSession<'a, S, V, MAX_MANIFEST, MAX_BLOB>
+where
+    S: ImageSink,
+    V: SignatureVerifier,
+{
+    pub fn new_with_verifier(request: FlashRequest<'a>, sink: S, verifier: V) -> Self {
+        Self {
+            request,
+            receiver: SignedObjectReceiver::new_with_verifier(sink, verifier),
+        }
+    }
+
+    pub fn request(&self) -> FlashRequest<'a> {
+        self.request
+    }
+
+    /// Encode the signed-object GET body. The selected stream adapter prefixes
+    /// its service tag and handles OPEN/ACK/retransmission separately.
+    pub fn get_request(&self, out: &mut [u8]) -> Option<usize> {
+        encode_get(
+            out,
+            self.request.object.name,
+            self.request.object.cpu,
+            self.request.object.target,
+        )
+    }
+
+    pub fn receive_ordered(&mut self, bytes: &[u8]) -> Result<(), ImageError> {
+        self.receiver.push_ordered(bytes)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.receiver.is_complete()
+    }
+
+    pub fn sink_mut(&mut self) -> &mut S {
+        self.receiver.sink_mut()
+    }
+}
+
+/// Host-only durable sink used by signed-object handler tests and by local
+/// deployment tools. It deliberately follows the same `ImageSink` lifecycle
+/// as firmware: write a temporary image, sync it, then atomically publish it.
+#[cfg(feature = "std")]
+pub struct FileImageSink {
+    destination: std::path::PathBuf,
+    temporary: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    dry_run: bool,
+}
+
+#[cfg(feature = "std")]
+impl FileImageSink {
+    pub fn new(destination: impl Into<std::path::PathBuf>, dry_run: bool) -> Self {
+        let destination = destination.into();
+        let temporary = destination.with_extension("part");
+        Self {
+            destination,
+            temporary,
+            file: None,
+            dry_run,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl ImageSink for FileImageSink {
+    type Error = std::io::Error;
+
+    fn begin(&mut self, _: &ImageManifest) -> Result<(), Self::Error> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.file = Some(std::fs::File::create(&self.temporary)?);
+        Ok(())
+    }
+
+    fn write_block(&mut self, _: u32, data: &[u8]) -> Result<(), Self::Error> {
+        if let Some(file) = self.file.as_mut() {
+            use std::io::Write;
+            file.write_all(data)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &ImageManifest) -> Result<(), Self::Error> {
+        if self.dry_run {
+            return Ok(());
+        }
+        if let Some(file) = self.file.take() {
+            file.sync_all()?;
+        }
+        std::fs::rename(&self.temporary, &self.destination)
+    }
+
+    fn abort(&mut self) {
+        self.file = None;
+        if !self.dry_run {
+            let _ = std::fs::remove_file(&self.temporary);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1202,6 +1534,111 @@ mod tests {
         let mut bytes = [0u8; 64];
         let len = encode_get(&mut bytes, None, 13, 6).unwrap();
         assert_eq!(&bytes[..len], &[0xa2, 0x01, 0x0d, 0x02, 0x06]);
+    }
+
+    #[test]
+    fn flash_request_reuses_signed_object_identity_and_preserves_execution_policy() {
+        let request = FlashRequest {
+            object: GetRequest {
+                name: Some(b"stage2"),
+                cpu: 13,
+                target: 2,
+            },
+            address: Some(0x20_000),
+            transport: 3,
+            dry_run: true,
+        };
+        let mut bytes = [0u8; 96];
+        let used = encode_flash_request(request, &mut bytes).unwrap();
+        assert_eq!(decode_flash_request(&bytes[..used]), Some(request));
+        // Duplicate transport field and trailing bytes are not safe to pass
+        // through to an erase/write implementation.
+        assert!(decode_flash_request(&[0xa5, 0x01, 13, 0x02, 2, 0x04, 0, 0x04, 1, 0x05, 0xf4]).is_none());
+        let mut trailing = bytes[..used].to_vec();
+        trailing.push(0);
+        assert!(decode_flash_request(&trailing).is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn signed_object_records_use_the_same_file_sink_as_firmware() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("main.bin");
+        let manifest = test_image_manifest(None);
+        let block = |index: u32, bytes: &[u8]| {
+            let mut payload = vec![0; 12];
+            payload[4..8].copy_from_slice(&index.to_be_bytes());
+            payload[8..12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+            payload.extend_from_slice(bytes);
+            payload
+        };
+        let records = vec![
+            (RECORD_MANIFEST, manifest),
+            (RECORD_BLOB, block(0, b"1234")),
+            (RECORD_BLOB, block(1, b"5678")),
+            (RECORD_DONE, Vec::new()),
+        ];
+        let mut receiver = ImageReceiver::new(FileImageSink::new(&destination, false));
+        assert_eq!(
+            apply_signed_object_records(&mut receiver, &records),
+            Ok(ImageEvent::Complete)
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), b"12345678");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn signed_object_receiver_accepts_fragmented_ordered_stream_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("stage2.bin");
+        let manifest = test_image_manifest(None);
+        let block = |index: u32, bytes: &[u8]| {
+            let mut payload = vec![0; 12];
+            payload[4..8].copy_from_slice(&index.to_be_bytes());
+            payload[8..12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+            payload.extend_from_slice(bytes);
+            payload
+        };
+        let mut stream = ObjectRecordStream::new(vec![
+            (RECORD_MANIFEST, manifest),
+            (RECORD_BLOB, block(0, b"1234")),
+            (RECORD_BLOB, block(1, b"5678")),
+            (RECORD_DONE, Vec::new()),
+        ]);
+        let mut receiver = SignedObjectReceiver::<_, _, 1024, 4096>::new(
+            FileImageSink::new(&destination, false),
+        );
+        let mut encoded = [0u8; 7];
+        while let Some(chunk) = stream.next_chunk(&mut encoded) {
+            receiver.push_ordered(&encoded[..chunk.len]).unwrap();
+        }
+        assert!(receiver.is_complete());
+        assert_eq!(std::fs::read(destination).unwrap(), b"12345678");
+    }
+
+    #[test]
+    fn flash_session_encodes_the_object_get_without_transport_state() {
+        let request = FlashRequest {
+            object: GetRequest {
+                name: Some(b"stage2"),
+                cpu: 13,
+                target: 2,
+            },
+            address: None,
+            transport: 0,
+            dry_run: true,
+        };
+        let session = SignedObjectFlashSession::<_, _, 64, 4096>::new(
+            request,
+            ImageTestSink {
+                blocks: 0,
+                bytes: 0,
+                done: false,
+            },
+        );
+        let mut out = [0u8; 64];
+        let used = session.get_request(&mut out).unwrap();
+        assert_eq!(decode_get(&out[..used]), Some(request.object));
     }
 
     #[test]

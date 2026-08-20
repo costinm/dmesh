@@ -10,11 +10,18 @@
 extern crate alloc;
 
 pub mod cbor;
+/// Shared, bearer- and ESP-independent Recovery/Main bootstrap profile.
+pub mod firmware_profile;
 pub mod iperf;
 /// Small no-std network-address helpers used by bearer adapters. This module
 /// has no socket runtime or ESP-IDF dependency.
 pub mod net;
 pub mod raw_iperf;
+/// Stable bearer-neutral API for the bounded raw-datagram service.
+pub mod raw_transport;
+/// Bearer-neutral raw-command decoding and handler dispatch. Firmware and
+/// hosts supply handlers; neither UART nor Wi-Fi participates in this layer.
+pub mod raw_dispatch;
 /// CBOR-decoded, socket-free raw 802.11 hardware request schema.
 pub mod raw_wifi;
 pub mod recovery;

@@ -7,3 +7,9 @@ publish = false
 [dependencies]
 lmesh-uart = { path = "../lmesh-uart" }
 
+[dev-dependencies]
+dmesh-server = { path = "../dmesh-server" }
+quic-lite = { path = "../quic-lite", default-features = false, features = ["std"] }
+dmesh-rawnan = { path = "../rawnan", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+serde_json = "1"
