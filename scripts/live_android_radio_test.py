@@ -212,9 +212,16 @@ def main() -> int:
             shell_cmd(args.adb, serial, f"wifi.nan.start reason=live-python-{idx}")
             shell_cmd(args.adb, serial, f"wifi.adv on=1 p2p=0 id4=A{idx:03d}")
 
+        # Discovery is asynchronous; after the requested dwell give every
+        # discovered peer one bounded follow-up. This is a real NAN data-path
+        # row, not merely evidence that both attach callbacks fired.
         time.sleep(args.duration)
+        for idx, serial in enumerate(devices):
+            shell_cmd(args.adb, serial, f"wifi.nan.ping android-live-{idx}")
+        time.sleep(3)
 
         failures: list[str] = []
+        pair_status: list[dict[str, bool]] = []
         for serial in devices:
             hist = shell_cmd(
                 args.adb,
@@ -224,6 +231,7 @@ def main() -> int:
             )
             (out_dir / f"{serial}-history.txt").write_text(hist)
             status = analyze_history(hist)
+            pair_status.append(status)
             print(f"{serial}: {status}")
             if not status["ble_status"]:
                 failures.append(f"{serial}: no BLE status/discovery history")
@@ -231,8 +239,20 @@ def main() -> int:
                 failures.append(f"{serial}: no NAN status history")
             collect_logcat(args.adb, serial, out_dir)
 
+        # This is a two-node interoperability row, not an attach smoke test:
+        # every selected Android node must have discovered its counterpart and
+        # observed the real follow-up data path. A one-sided callback can be
+        # stale session history or an asymmetric framework failure.
+        for serial, status in zip(devices, pair_status):
+            if not status["nan_peer"]:
+                failures.append(f"{serial}: no Android NAN peer discovery")
+            if not status["nan_followup"]:
+                failures.append(f"{serial}: no Android NAN follow-up TX/RX")
+
         for serial in devices:
-            shell_cmd(args.adb, serial, "wifi.nan.stop reason=live-python-cleanup")
+            # NAN is the service's always-on discovery plane. The smoke test
+            # must not undo it during cleanup; service lifecycle and explicit
+            # signed control requests own any future stop.
             shell_cmd(args.adb, serial, "wifi.adv on=0 p2p=0")
 
         print(f"logs: {out_dir}")

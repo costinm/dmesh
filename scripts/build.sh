@@ -72,6 +72,40 @@ mesh = { path = "$override_dir/crates/mesh" }
 EOF
 }
 
+check_lmesh_api() {
+    local ssh_mesh_dir="${DMESH_SSH_MESH_DIR:-}"
+    if [ -z "$ssh_mesh_dir" ]; then
+        for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
+            if [ -f "$candidate/crates/mesh-api-gen/Cargo.toml" ]; then
+                ssh_mesh_dir="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$ssh_mesh_dir" ] || [ ! -f "$ssh_mesh_dir/crates/mesh-api-gen/Cargo.toml" ]; then
+        echo "Missing ssh-mesh mesh-api-gen source; set DMESH_SSH_MESH_DIR" >&2
+        return 1
+    fi
+    (
+        cd "$ssh_mesh_dir"
+        # The generator is owned by this sibling checkout; keep its Cargo
+        # cache and target policy separate from DMesh just like mesh-cli.
+        unset CARGO_TARGET_DIR
+        if [ -f ./env.sh ]; then
+            . ./env.sh
+        fi
+        cargo run -p mesh-api-gen -- \
+            --api "$DMESH_REPO/crates/lmesh/API.md" \
+            --base-tools "$DMESH_REPO/crates/lmesh/resources/tools.json" \
+            --out-tools "$DMESH_REPO/crates/lmesh/resources/tools.json" \
+            --check
+        cargo run -p mesh-api-gen -- \
+            --api "$DMESH_REPO/crates/lmesh-wifi/API.md" \
+            --out-tools "$DMESH_REPO/crates/lmesh-wifi/resources/tools.json" \
+            --check
+    )
+}
+
 deps() {
     mkdir -p "$(dirname "$profile")"
     nix profile install --profile "$profile" "path:$DMESH_REPO#deps"
@@ -107,7 +141,6 @@ musl() {
         -p lmesh \
         -p lmesh-wifi \
         -p dmesh-cli \
-        -p lmesh-uart \
         -p mesh-tun \
         -p dmeshtui
 
@@ -119,17 +152,6 @@ musl() {
             "$DMESH_REPO/target/x86_64-unknown-linux-musl/release/$service" \
             "$DMESH_REPO/target/home/$service/bin/$service"
     done
-
-    # Keep the standalone UART service self-contained under its controlled
-    # service home. The example records the board inventory but explicitly
-    # disables legacy byte forwards; the replacement is the QUIC-lite UART L2
-    # proxy owned by lmesh-uart.
-    mkdir -p "$DMESH_REPO/target/home/lmesh-uart/bin" \
-        "$DMESH_REPO/target/home/lmesh-uart/etc/lmesh-uart"
-    ln -sfn "$DMESH_REPO/target/x86_64-unknown-linux-musl/release/lmesh-uart" \
-        "$DMESH_REPO/target/home/lmesh-uart/bin/lmesh-uart"
-    ln -sfn "$DMESH_REPO/crates/lmesh-uart/examples/lmesh.toml" \
-        "$DMESH_REPO/target/home/lmesh-uart/etc/lmesh-uart/lmesh.toml"
 
     # `mesh` is the generic client from ssh-mesh, not an lmesh-specific
     # wrapper. Let Cargo retain the artifact under ssh-mesh/target, beside its
@@ -174,13 +196,43 @@ check() {
 lmesh_check() {
     require_dmesh_cargo
     configure_ssh_mesh_override
-    "$DMESH_CARGO_BIN" check -p lmesh
+    # The UDS control loop lives in the lmesh binary, not its library. Keep
+    # the local gate from falsely passing after only checking shared helpers.
+    "$DMESH_CARGO_BIN" check -p lmesh --all-targets
+    "$DMESH_CARGO_BIN" check -p lmesh-wifi --all-targets
+    check_lmesh_api
 }
 
 lmesh_test() {
     require_dmesh_cargo
     configure_ssh_mesh_override
     "$DMESH_CARGO_BIN" test -p lmesh
+    "$DMESH_CARGO_BIN" test -p lmesh-wifi --bin lmesh-wifi
+    "$DMESH_CARGO_BIN" test -p lmesh-wifi
+    check_lmesh_api
+}
+
+# Only dmesh-cli may own a physical board UART. Keep this as a dependency
+# gate, rather than trusting that retired forwarding code stays unused at
+# runtime: lmesh and lmesh-wifi must not regain the old client or codec.
+check_host_uart_ownership() {
+    for package in lmesh lmesh-wifi; do
+        if "$DMESH_CARGO_BIN" tree -p "$package" -e normal | grep -Eq '(^| )((dmesh-cli|lmesh-uart|uart-codec) v)'; then
+            echo "$package must not link a host UART owner or codec; dmesh-cli owns direct UART sessions" >&2
+            return 1
+        fi
+    done
+}
+
+lmesh_control_test() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    "$DMESH_CARGO_BIN" test -p lmesh --bin lmesh
+    "$DMESH_CARGO_BIN" test -p lmesh-wifi --bin lmesh-wifi
+    "$DMESH_CARGO_BIN" test -p lmesh-wifi json_rpc_gateway_flattens_params_for_existing_handlers --lib
+    check_host_uart_ownership
+    "$DMESH_CARGO_BIN" test -p dmesh-cli --test firmware_e2e host_control_
+    check_lmesh_api
 }
 
 object_store_test() {
@@ -295,6 +347,7 @@ case "${1:-musl}" in
     check) check ;;
     lmesh-check) lmesh_check ;;
     lmesh-test) lmesh_test ;;
+    lmesh-control-test) lmesh_control_test ;;
     object-store-test) object_store_test ;;
     transport-test) transport_test ;;
     transport-coverage) transport_coverage ;;
@@ -305,5 +358,5 @@ case "${1:-musl}" in
     object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
     lmesh-wifi-restart) lmesh_wifi_restart ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|object-store-test|transport-test|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|lmesh-control-test|object-store-test|transport-test|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
 esac

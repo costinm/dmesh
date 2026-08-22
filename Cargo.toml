@@ -10,7 +10,6 @@ members = [
     "crates/lmesh",
     "crates/lmesh-wifi",
     "crates/uart-codec",
-    "crates/lmesh-uart",
     "crates/lmesh-ble-hci",
     "crates/lmesh-wpa",
     "crates/rawnan",
@@ -22,3 +21,10 @@ resolver = "2"
 edition = "2024"
 version = "0.1.0"
 publish = false
+
+# DMesh routinely builds release artifacts for Android, host radio services,
+# and ESP firmware from one long-lived target directory. Keep release builds
+# incremental too: production optimization remains enabled, while unchanged
+# dependency crates are reused between focused radio iterations.
+[profile.release]
+incremental = true

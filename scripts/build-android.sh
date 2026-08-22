@@ -356,7 +356,9 @@ stage_apks() {
 
     echo ""
     echo "Staged APKs in target/apk/$build_type:"
-    find "$out_dir" -maxdepth 1 -type f -name '*.apk' -printf '  %f\n' | sort
+    find "$out_dir" -maxdepth 1 -type f -name '*.apk' -print \
+        | sed 's#.*/#  #' \
+        | sort
 }
 
 selected_android_devices() {

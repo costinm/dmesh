@@ -8,7 +8,6 @@ else
 fi
 
 export DMESH_REPO="${DMESH_REPO:-${_dmesh_env_dir}}"
-export HOME="${DMESH_LOCAL_HOME:-${DMESH_REPO}/target/home}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${DMESH_REPO}/target/cache}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${DMESH_REPO}/target/config}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-${DMESH_REPO}/target/share}"
@@ -26,6 +25,12 @@ export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${DMESH_REPO}/target/gradle}"
 export TMPDIR="${TMPDIR:-${DMESH_REPO}/target/tmp}"
 export NIX_PROFILE="${DMESH_NIX_PROFILE:-${DMESH_REPO}/target/nix/profile}"
 export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes}"
+# Android tooling is repository-local too.  Keep platform-tools available to
+# interactive callers after sourcing env.sh, not only inside build-android.sh.
+# Do not set or replace HOME here: ADB must use the caller's normal trust-key
+# location, while DMesh-specific build state stays in the XDG/target paths.
+export ANDROID_HOME="${ANDROID_HOME:-${DMESH_REPO}/target/android-sdk}"
+export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
 
 # Keep the default catalog and the lab lmesh endpoint in one sourced place;
 # callers may override either for another component.
@@ -71,7 +76,7 @@ if [ -d "$_dmesh_ssh_mesh_release" ]; then
     _dmesh_ssh_mesh_release="$(cd "$_dmesh_ssh_mesh_release" && pwd -P)"
 fi
 
-mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" \
+mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" \
     "$XDG_STATE_HOME" "$CARGO_HOME" "$RUSTUP_HOME" "$GRADLE_USER_HOME" "$TMPDIR" \
     "$(dirname "$NIX_PROFILE")"
 
@@ -83,6 +88,12 @@ if [ -d "$NIX_PROFILE/bin" ]; then
     export PATH="/usr/bin:/bin:$NIX_PROFILE/bin:$PATH"
 fi
 export PATH="$CARGO_HOME/bin:$PATH"
+if [ -d "$ANDROID_HOME/platform-tools" ]; then
+    export PATH="$ANDROID_HOME/platform-tools:$PATH"
+fi
+if [ -d "$ANDROID_HOME/emulator" ]; then
+    export PATH="$ANDROID_HOME/emulator:$PATH"
+fi
 
 # Some ssh-mesh service environments prepend their BusyBox runtime bundle.
 # It is not a DMesh build toolchain and causes ordinary commands such as
@@ -147,7 +158,6 @@ export PYTHONPATH="$DMESH_REPO${PYTHONPATH:+:$PYTHONPATH}"
 # without repeating the AP/server details; override these for another lab.
 export DMESH_FLASH_SERVER="${DMESH_FLASH_SERVER:-10.78.0.1}"
 export DMESH_FLASH_PORT="${DMESH_FLASH_PORT:-3336}"
-export DMESH_FLASH_SSID="${DMESH_FLASH_SSID:-Direct-FCE48415-Dmesh-local}"
 export DMESH_FLASH_DEVICE_IP="${DMESH_FLASH_DEVICE_IP:-10.78.84.60}"
 export DMESH_FLASH_LOG="${DMESH_FLASH_LOG:-$DMESH_REPO/target/recovery-server/all-${DMESH_FLASH_PORT}.log}"
 export DMESH_TIMING_DIR="${DMESH_TIMING_DIR:-$DMESH_REPO/target/evidence}"

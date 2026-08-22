@@ -1545,6 +1545,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "dmesh-server",
  "dmesh-store",
  "hyper-util",
  "jni 0.21.1",
@@ -1567,12 +1568,22 @@ dependencies = [
 name = "dmesh-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dmesh-rawnan",
  "dmesh-server",
- "lmesh-uart",
+ "libc",
+ "lmesh",
+ "lmesh-wifi",
+ "mesh",
+ "minicbor",
  "quic-lite",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
+ "toml",
+ "tracing",
+ "uart-codec",
 ]
 
 [[package]]
@@ -3331,11 +3342,11 @@ name = "lmesh"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
  "lmesh-ble-hci",
- "lmesh-uart",
  "lmesh-wifi",
  "mesh",
  "minicbor",
@@ -3348,7 +3359,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "uart-codec",
 ]
 
 [[package]]
@@ -3360,36 +3370,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "lmesh-uart"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dmesh-rawnan",
- "dmesh-server",
- "libc",
- "mesh",
- "minicbor",
- "quic-lite",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "toml",
- "tracing",
- "uart-codec",
-]
-
-[[package]]
 name = "lmesh-wifi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dmesh-cli",
+ "async-trait",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
  "mesh",
  "minicbor",
+ "p256",
  "quic-lite",
  "serde",
  "serde_json",
@@ -3398,7 +3389,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "uart-codec",
 ]
 
 [[package]]

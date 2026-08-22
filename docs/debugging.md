@@ -34,6 +34,20 @@ DMESH_SSH_MESH_DIR="$PWD/no-ssh-mesh-override" \
   ./scripts/build-android.sh build release
 ```
 
+### Managed service control
+
+Use the `mesh` CLI for `mesh-init` service control:
+
+```sh
+mesh mesh-init status [SERVICE]
+mesh mesh-init start SERVICE
+mesh mesh-init stop SERVICE
+mesh mesh-init reload
+```
+
+Do not invoke `mesh-init start`, `stop`, or `reload` directly. `mesh-init` is
+the supervisor daemon; `mesh` is the operator-facing CLI.
+
 Do not use the ESP-IDF/ESP toolchain for Android APK work. Firmware work has
 its own local build context under `fw/esp32`; only rebuild or flash
 firmware when that is the task.
@@ -451,8 +465,9 @@ the raw payload; it does not base64-encode the body.
 
 Use this when two Android devices are connected over ADB and `app-dmesh` is
 installed. The script starts `DMService`, sends a BLE advertisement from each
-device, sends a NAN follow-up, then reads the in-memory history buffer through
-the app content provider:
+device, waits for NAN discovery, sends a NAN follow-up, then reads the
+in-memory history buffer through the app content provider. It leaves NAN
+running: the service, rather than test cleanup, owns the persistent cluster.
 
 ```sh
 scripts/live_android_radio_test.py \
