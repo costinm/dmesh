@@ -1,26 +1,8 @@
-pub mod action_stream;
-pub mod battery;
-pub mod ble_bt;
-pub mod button;
-pub mod bytes;
-pub mod gpio;
-pub mod i2c;
-pub mod lora;
-pub mod mode;
-pub mod module;
-pub mod nan;
-pub mod nvs;
-pub mod peripherals;
-pub mod power;
+//! Main-specific shims only.
+//!
+//! The former Main component catalog owns legacy Wi-Fi, NAN, BLE, power, and
+//! command lifecycles. It is intentionally not compiled by the Recovery-core
+//! Main image: each would create a second owner of an ESP-IDF subsystem that
+//! the common transport already owns.
+
 pub mod recovery;
-pub mod reset;
-pub mod rgbled;
-pub mod serial;
-pub mod settings;
-pub mod sleep;
-pub mod telemetry;
-pub mod test;
-pub mod transport_runtime;
-pub mod udp;
-pub mod wake;
-pub mod wifi;

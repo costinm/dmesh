@@ -310,6 +310,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesh-fw-modules"
+version = "0.1.0"
+dependencies = [
+ "dmesh-server",
+]
+
+[[package]]
 name = "dmesh-fw-transport"
 version = "0.1.0"
 dependencies = [
@@ -331,6 +338,7 @@ dependencies = [
 name = "dmesh-recovery-rs"
 version = "0.2.0"
 dependencies = [
+ "dmesh-fw-modules",
  "dmesh-fw-transport",
  "embuild",
  "esp-idf-sys",

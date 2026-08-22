@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use libc::{c_int, c_uchar};
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};

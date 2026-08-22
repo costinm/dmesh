@@ -341,35 +341,29 @@ pub fn raw_client_result() -> (u32, u32, u32) {
     )
 }
 
-/// Bind decoded public-vendor actions to the shared packet pool and the
-/// common QUIC-lite action handler. This does *not* start ESP-NOW: radio
-/// startup owns global callback registration separately, and this function
-/// only installs the Rust-side ingress dispatch.
+/// Bind decoded public-vendor actions to the common QUIC-lite action handler.
+/// Wi-Fi owns callback registration and starts/stops the shared packet pool;
+/// this function never changes a driver callback or buffer lifecycle.
 pub fn install_action_ingress(local_mac: [u8; 6], handler: EspNowHandler) -> bool {
     HANDLER.store(handler as usize, Ordering::Release);
     unsafe {
         LOCAL_MAC = local_mac;
     }
-    if STARTED.swap(true, Ordering::AcqRel) {
-        return crate::wifi_esp::register_now_dispatcher();
-    }
-    if !crate::shared_ingress_esp::start(
-        crate::shared_ingress_esp::IngressKind::EspNow,
-        dispatch_ingress,
-    ) {
-        STARTED.store(false, Ordering::Release);
-        return false;
-    }
+    STARTED.store(true, Ordering::Release);
     true
 }
 
-/// Make the global NOW action callback inert and detach its shared ingress
-/// handler.  ESP-IDF does not document a safe callback unregister operation,
-/// so the registered trampoline remains but cannot enqueue or dispatch data.
+/// Make NOW framing/dispatch inert. ESP-IDF callback registration and shared
+/// ingress-pool stop remain with `wifi_esp`, the sole Wi-Fi owner.
 pub fn stop_action_ingress() {
+    // `transport.start` replaces a complete Wi-Fi epoch. A bounded NOW
+    // client from the previous epoch cannot remain eligible for polling or
+    // prevent the next epoch from starting its own check client. The state
+    // occupies only static storage; clearing this ownership bit is sufficient
+    // and avoids carrying a packet or driver buffer across the replacement.
+    RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
     HANDLER.store(0, Ordering::Release);
     STARTED.store(false, Ordering::Release);
-    crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::EspNow);
 }
 
 /// Start one bounded `SERVICE_ECHO` check over the NOW-like bearer. This
@@ -427,9 +421,7 @@ pub fn start_check_client(peer: EspNowPeer, nonce: u64, timeout_ms: u32) -> bool
 /// The callback supplies a 24-byte 802.11 header separately from the action
 /// body. Reconstitute only enough frame storage for the host-tested rawnan
 /// parser, then make the single shared-ingress copy. No allocation,
-/// promiscuous mode, or remain-on-channel operation is involved. The older
-/// Main hardware BSSID comparator is used only beneath its promiscuous NAN
-/// sniffer, so it is not a candidate for this non-promiscuous bearer.
+/// promiscuous mode, or remain-on-channel operation is involved.
 pub(crate) unsafe extern "C" fn action_rx_callback(
     _driver_context: *mut c_void,
     header: *mut u8,
@@ -440,11 +432,7 @@ pub(crate) unsafe extern "C" fn action_rx_callback(
         return 0;
     }
     RX_DISPATCHER.fetch_add(1, Ordering::Relaxed);
-    // `ieee80211_recv_action` passes the action-body start and exclusive end
-    // pointers. This is verified against Espressif's own vendor-action
-    // handler, which derives its size as `end - body` before parsing.
-    let len = (payload_end as usize).checked_sub(payload as usize);
-    let Some(len) = len else {
+    let Some(len) = (payload_end as usize).checked_sub(payload as usize) else {
         RX_DROPS.fetch_add(1, Ordering::Relaxed);
         return 0;
     };
@@ -515,11 +503,7 @@ fn receive_action_frame(frame: &[u8]) {
         RX_SELF_ECHOES.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    if !crate::shared_ingress_esp::enqueue(
-        crate::shared_ingress_esp::IngressKind::EspNow,
-        source,
-        &output[..used],
-    ) {
+    if !crate::wifi_esp::enqueue_now_payload(source, &output[..used]) {
         RX_DROPS.fetch_add(1, Ordering::Relaxed);
     } else {
         RX_ACTIONS.fetch_add(1, Ordering::Relaxed);
@@ -576,7 +560,7 @@ pub fn poll_raw_client() {
     }
 }
 
-fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
+pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
     unsafe {
         if RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
             let state = &mut *core::ptr::addr_of_mut!(RAW_CLIENT).cast::<RawClientState>();
@@ -761,6 +745,14 @@ pub fn transmit(peer: EspNowPeer, payload: &[u8]) -> bool {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
         false
     }
+}
+
+/// Emit a bounded unsolicited control/event record on the active NOW radio.
+/// This is the action-bearer counterpart of the direct UART boot record: it
+/// deliberately carries the same CBOR bytes and does not create a QUIC-lite
+/// client or retain a peer-specific egress queue.
+pub fn broadcast_record(record: &[u8]) -> bool {
+    transmit(EspNowPeer { mac: [0xff; 6] }, record)
 }
 
 /// Send a pre-built public action body through the same ESP-IDF action-TX

@@ -1,16 +1,16 @@
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uchar, c_ushort};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{SharedSettings, parse_bool, parse_i32};
+use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
 extern "C" {

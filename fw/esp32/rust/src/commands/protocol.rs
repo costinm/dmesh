@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow, bail};
-use minicbor::{Decoder, Encoder, data::Type};
+use anyhow::{anyhow, bail, Result};
+use minicbor::{data::Type, Decoder, Encoder};
 use std::net::IpAddr;
 
 use super::CommandRequest;
@@ -875,10 +875,8 @@ mod tests {
             Some(&[0x20, 0x01, 0xdb, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..])
         );
         let encoded = encode_binary(&request);
-        assert!(
-            encoded
-                .windows(7)
-                .any(|window| window == [0x18, 0xf7, 0x44, 10, 78, 0, 200])
-        );
+        assert!(encoded
+            .windows(7)
+            .any(|window| window == [0x18, 0xf7, 0x44, 10, 78, 0, 200]));
     }
 }

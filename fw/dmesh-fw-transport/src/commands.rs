@@ -1,13 +1,18 @@
 // IMPORTANT: This is shared no-std ESP firmware code. Host-testable CBOR
 // decoding and schemas belong in dmesh-server; this module only applies the
 // result to firmware state and uses the ESP UART adapter for exceptions.
-//! Recovery command handler boundary.
+//! Firmware control-application boundary.
 //!
 //! CBOR decoding is shared in `dmesh-server`; this module applies the decoded
 //! request to the Recovery-owned parameter image. UART, UDP, and future L2
 //! bearers call this handler without inheriting USB, PPP, or FreeRTOS code.
 
-use dmesh_server::services::{encode_status_numeric, encode_status_text};
+use dmesh_server::{
+    connection::{self, ConnectionManager, ConnectionPolicy},
+    control::{self, Handler, TransportConfig, TransportKind},
+    firmware_profile::{apply_connection_policy, apply_transport_config, set_ssid},
+    services::{encode_status_numeric, encode_status_text},
+};
 
 use crate::TransportProfile;
 
@@ -35,18 +40,119 @@ pub fn send_stat(prefix: &[u8], value: u64) {
     let _ = send_record(&cbor);
 }
 
-/// Apply an already-dispatched raw command to the device's transient profile.
-/// Persisting settings is the registered NVS handler's responsibility; packet
-/// decoding and reply routing belong to `dmesh-server` and the shared
-/// dispatcher respectively.
-pub fn apply_profile_command(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
-    let result = crate::apply_recovery_packet(packet, params)?;
-    Some(result.request_main_handoff)
+#[derive(Clone, Copy)]
+enum ProfileControlError {
+    Unsupported,
+    InvalidSetting,
 }
+
+/// ESP application of common typed operations. It owns neither CBOR decoding
+/// nor method routing: those stay in `dmesh-server::control` and are reused by
+/// host adapters. Settings persistence and radio start/stop remain explicitly
+/// unsupported until they have shared store/owner adapters.
+struct ProfileControl<'a> {
+    profile: &'a mut TransportProfile,
+}
+
+impl Handler for ProfileControl<'_> {
+    type Error = ProfileControlError;
+
+    fn settings_get(&mut self, _key: &[u8]) -> Result<(), Self::Error> {
+        Err(ProfileControlError::Unsupported)
+    }
+
+    fn settings_set(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), Self::Error> {
+        Err(ProfileControlError::Unsupported)
+    }
+
+    fn settings_list(&mut self) -> Result<(), Self::Error> {
+        Err(ProfileControlError::Unsupported)
+    }
+
+    fn transport_start(
+        &mut self,
+        kind: TransportKind,
+        config: TransportConfig<'_>,
+    ) -> Result<(), Self::Error> {
+        match kind {
+            TransportKind::Sta => {
+                // One start selects one complete, ephemeral radio profile.
+                // Do not persist it: UART and NAN Service Info must take the
+                // same command path and replace the previous radio epoch.
+                if config.ssid.is_none() && config.bssid.is_none() {
+                    return Err(ProfileControlError::InvalidSetting);
+                }
+                if let Some(ssid) = config.ssid {
+                    if !set_ssid(ssid, self.profile) {
+                        return Err(ProfileControlError::InvalidSetting);
+                    }
+                }
+                apply_transport_config(config, self.profile);
+                self.profile.requested_transport = Some(kind);
+                self.profile.run_requested = true;
+                Ok(())
+            }
+            // Unassociated is the NOW-only radio epoch. It has no SSID, raw
+            // UDP6 bearer, or DW capture unless a future nonzero interval is
+            // explicitly implemented by its Wi-Fi owner.
+            TransportKind::Nan => {
+                apply_transport_config(config, self.profile);
+                self.profile.requested_transport = Some(kind);
+                self.profile.run_requested = true;
+                Ok(())
+            }
+            // UART is Recovery's always-on bootstrap ingress and cannot be
+            // stopped by the only control channel.
+            TransportKind::Uart => Err(ProfileControlError::Unsupported),
+        }
+    }
+
+    fn transport_stop(&mut self, kind: TransportKind) -> Result<(), Self::Error> {
+        if self.profile.requested_transport == Some(kind) {
+            self.profile.requested_transport = None;
+            self.profile.run_requested = false;
+            Ok(())
+        } else {
+            Err(ProfileControlError::Unsupported)
+        }
+    }
+}
+
+/// QUIC-lite owns this policy boundary, independently of bearer start/stop.
+/// The firmware profile is only a fixed-capacity cache used while constructing
+/// the next raw association; it does not make the radio an owner of streams.
+impl ConnectionManager for ProfileControl<'_> {
+    type Error = ProfileControlError;
+
+    fn configure_connection(&mut self, policy: ConnectionPolicy) -> Result<(), Self::Error> {
+        apply_connection_policy(policy, self.profile);
+        Ok(())
+    }
+}
+
+/// Apply one common tagged control request to transient transport state.
+/// The only firmware responsibility is applying typed values to ESP-owned
+/// state. It contains no command grammar, method tags, or CBOR traversal.
+pub fn apply_control_record(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
+    let request = control::decode_request(packet);
+    if let Some(request) = request {
+        return control::dispatch_request(request, &mut ProfileControl { profile: params })
+            .ok()
+            .map(|()| true);
+    }
+    let request = connection::decode_request(packet)?;
+    connection::dispatch_request(request, &mut ProfileControl { profile: params })
+        .ok()
+        .map(|()| true)
+}
+
+/// Response projection is shared with host tests; firmware only selects the
+/// physical direct bearer used to return the encoded record.
+pub use dmesh_server::firmware_profile::encode_profile_control_response as encode_control_response;
 
 #[cfg(test)]
 mod command_tests {
-    use super::apply_profile_command;
+    use super::apply_control_record;
     use crate::{state::direct_record_generation_changed_from, TransportProfile};
 
     #[test]
@@ -56,37 +162,50 @@ mod command_tests {
     }
 
     #[test]
-    fn profile_command_keeps_runtime_values_out_of_device_state() {
-        let packet = [0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x18, 0xf2, 0x18, 0x40];
+    fn tagged_connection_configuration_updates_the_shared_profile() {
+        // {component: connection, method: configure,
+        //  fields: {ack_frequency: 8, path_policy: 3}}
+        let packet = [0xa3, 1, 3, 2, 1, 5, 0xa2, 2, 8, 11, 3];
         let mut params = TransportProfile::new();
-        assert_eq!(apply_profile_command(&packet, &mut params), Some(true));
-        assert_eq!(params.ack_frequency, 0);
-    }
-
-    #[test]
-    fn transport_ack_delay_and_path_policy_are_command_scoped() {
-        let delay = [0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x18, 0xf1, 0x01];
-        let path = [
-            0xa2, 0x00, 0x18, 0x44, 0x06, 0xa1, 0x64, b'p', b'a', b't', b'h', 0x03,
-        ];
-        let mut params = TransportProfile::new();
-        assert_eq!(apply_profile_command(&delay, &mut params), Some(true));
-        assert_eq!(params.ack_delay_ms, 1);
-        assert_eq!(apply_profile_command(&path, &mut params), Some(true));
+        assert_eq!(apply_control_record(&packet, &mut params), Some(true));
+        assert_eq!(params.ack_frequency, 8);
         assert_eq!(params.path_policy, 3);
     }
 
     #[test]
-    fn full_host_transport_command_is_accepted() {
+    fn legacy_profile_map_is_rejected() {
+        let legacy = [0xa2, 0x00, 0x18, 0x44, 0x06, 0xa0];
+        let mut params = TransportProfile::new();
+        assert_eq!(apply_control_record(&legacy, &mut params), None);
+    }
+
+    #[test]
+    fn tagged_ssid_setting_is_bounded() {
         let packet = [
-            0xa2, 0x00, 0x18, 0x44, 0x06, 0xad, 0x18, 0xf8, 0xf5, 0x18, 0xfb, 0xf5, 0x18, 0xfc,
-            0x19, 0x04, 0xb0, 0x18, 0xfd, 0x19, 0x70, 0x80, 0x18, 0xfe, 0x00, 0x18, 0xf9, 0x08,
-            0x18, 0xfa, 0x19, 0x27, 0x10, 0x18, 0xbf, 0x19, 0x0d, 0x0b, 0x18, 0xff, 0x18, 0x7b,
-            0x18, 0xf2, 0x00, 0x18, 0xf3, 0x00, 0x18, 0xf4, 0x00, 0x18, 0xf5, 0x00,
+            0xa3, 1, 1, 2, 2, 5, 0xa2, 1, 0x64, b's', b's', b'i', b'd', 2, 0x64, b't', b'e', b's',
+            b't',
         ];
         let mut params = TransportProfile::new();
-        assert_eq!(apply_profile_command(&packet, &mut params), Some(true));
-        assert_eq!(params.ack_frequency, 8);
-        assert_eq!(params.timeout_ms, 10_000);
+        assert_eq!(apply_control_record(&packet, &mut params), Some(true));
+        assert_eq!(&params.ssid[..params.ssid_len], b"test");
+    }
+
+    #[test]
+    fn transport_lifecycle_is_independent_from_connection_policy() {
+        let mut params = TransportProfile::new();
+        assert!(super::set_ssid(b"DIRECT-test", &mut params));
+        // {1: control, 2: transport.start, 5: {1: sta}}
+        let start_sta = [0xa3, 1, 1, 2, 4, 5, 0xa1, 1, 1];
+        assert_eq!(apply_control_record(&start_sta, &mut params), Some(true));
+        assert_eq!(
+            params.requested_transport,
+            Some(dmesh_server::control::TransportKind::Sta)
+        );
+        assert_eq!(params.ack_frequency, 0);
+
+        // {1: control, 2: transport.stop, 5: {1: sta}}
+        let stop_sta = [0xa3, 1, 1, 2, 5, 5, 0xa1, 1, 1];
+        assert_eq!(apply_control_record(&stop_sta, &mut params), Some(true));
+        assert_eq!(params.requested_transport, None);
     }
 }

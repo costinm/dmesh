@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::protocol::quote_text_value;
@@ -67,7 +67,7 @@ impl NvsCommand {
 
     fn namespace(&self) -> Result<CommandResponse> {
         let mut settings = self.settings.borrow_mut();
-        let handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
+        let handler = dmesh_server::settings::SettingsHandler::new(&mut *settings);
         Ok(CommandResponse::ok(format!(
             "namespace {}",
             handler.namespace()
@@ -98,11 +98,10 @@ impl NvsCommand {
         }
 
         let mut settings = self.settings.borrow_mut();
-        let mut handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
+        let mut handler = dmesh_server::settings::SettingsHandler::new(&mut *settings);
         let mut changed = Vec::new();
         for (key, value) in pairs {
-            handler.set(key, value)
-                .map_err(anyhow::Error::msg)?;
+            handler.set(key, value).map_err(anyhow::Error::msg)?;
             log::info!("setting set: key={} value={}", key, value);
             changed.push(key.to_string());
         }
@@ -119,9 +118,8 @@ impl NvsCommand {
             .or_else(|| request.arg("key"))
             .ok_or_else(|| anyhow!("get requires KEY"))?;
         let mut settings = self.settings.borrow_mut();
-        let handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
-        let value = handler.get(key)
-            .map_err(anyhow::Error::msg)?;
+        let handler = dmesh_server::settings::SettingsHandler::new(&mut *settings);
+        let value = handler.get(key).map_err(anyhow::Error::msg)?;
         Ok(CommandResponse::ok(format!(
             "{key}={}",
             quote_text_value(&value)
@@ -130,8 +128,9 @@ impl NvsCommand {
 
     fn list_values(&self) -> Result<CommandResponse> {
         let mut settings = self.settings.borrow_mut();
-        let handler = dmesh_fw_transport::nvs::NvsHandler::new(&mut *settings);
-        let values = handler.list()
+        let handler = dmesh_server::settings::SettingsHandler::new(&mut *settings);
+        let values = handler
+            .list()
             .map_err(anyhow::Error::msg)?
             .into_iter()
             .map(|(key, value)| format!("{key}={}", quote_text_value(&value)))

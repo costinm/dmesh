@@ -9,7 +9,7 @@ use quic_lite::framed_stream::{FramedStream, FramedStreamEnqueue, FramedStreamSt
 use crate::commands::protocol::quote_text_value;
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{SharedSettings, parse_bool};
+use super::settings::{parse_bool, SharedSettings};
 
 const DEFAULT_DEPTH: usize = 10;
 const DEFAULT_RESPONSE_MAX_BYTES: usize = 2048;
@@ -354,8 +354,8 @@ pub fn record_log(line: impl AsRef<str>) -> LogStreamWriteResult {
 /// Consume one complete queued record from the log stream. The transport
 /// owner calls this from its normal poll loop; it must not be called by a log
 /// producer. A future watcher maps each returned record to one STREAM frame.
-pub fn take_log_stream_record()
--> Option<quic_lite::framed_stream::FramedStreamRecord<LOG_STREAM_RECORD_BYTES>> {
+pub fn take_log_stream_record(
+) -> Option<quic_lite::framed_stream::FramedStreamRecord<LOG_STREAM_RECORD_BYTES>> {
     log_stream_slot().get()?.try_lock().ok()?.pop()
 }
 
@@ -370,8 +370,8 @@ pub fn log_stream_producer_stats() -> LogStreamProducerStats {
     }
 }
 
-fn log_stream_slot()
--> &'static OnceLock<Mutex<FramedStream<LOG_STREAM_RECORDS, LOG_STREAM_RECORD_BYTES>>> {
+fn log_stream_slot(
+) -> &'static OnceLock<Mutex<FramedStream<LOG_STREAM_RECORDS, LOG_STREAM_RECORD_BYTES>>> {
     static LOG_STREAM: OnceLock<Mutex<FramedStream<LOG_STREAM_RECORDS, LOG_STREAM_RECORD_BYTES>>> =
         OnceLock::new();
     &LOG_STREAM
@@ -970,7 +970,11 @@ fn companion_pull_text(after_seq: u64, max_bytes: usize, transport: Option<&str>
         max_bytes
     );
     let _ = append_bounded_line(&mut out, &marker, max_bytes);
-    if out.is_empty() { marker } else { out }
+    if out.is_empty() {
+        marker
+    } else {
+        out
+    }
 }
 
 fn companion_ack_text(seq: u64, hash: u32) -> String {

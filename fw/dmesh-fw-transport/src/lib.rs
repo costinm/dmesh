@@ -14,7 +14,6 @@
 
 extern crate alloc;
 
-pub mod nvs;
 pub mod profile;
 
 // These modules are the shared ESP-IDF runtime.  They are feature-gated so
@@ -48,5 +47,4 @@ pub const RAW_SERVICE_HISTORY_CAPACITY: usize = 8;
 pub type RawService =
     dmesh_server::raw_transport::RawService<RAW_SERVICE_HISTORY_CAPACITY, { TRANSPORT_MTU }>;
 
-pub use dmesh_server::firmware_profile::{apply_recovery_packet, ApplyResult};
 pub use profile::TransportProfile;

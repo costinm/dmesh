@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use minicbor::Encoder;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};

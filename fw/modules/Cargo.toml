@@ -1,0 +1,10 @@
+[package]
+name = "dmesh-fw-modules"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+
+[dependencies]
+dmesh-server = { path = "../../crates/dmesh-server", default-features = false }

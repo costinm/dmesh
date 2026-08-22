@@ -3,21 +3,21 @@
 //! NAN discovers peers; this module owns only complete action-frame datagrams
 //! and routes them by DCID. It is intentionally independent of NAN state.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use dmesh_server::stream_server::{
     BinaryEventHistory, PassiveAssociations, StreamClientConnection, StreamServerConnection,
 };
 use dmesh_server::{
-    iperf::{IperfServicePlan, decode_iperf_service_request},
+    iperf::{decode_iperf_service_request, IperfServicePlan},
     services::{
-        BinaryEventRecord, CONTROL_PATH_POLICY, decode_path_policy, diagnostic_stream_registry,
-        encode_binary_events, encode_path_policy_response, handle_stream_with_events,
+        decode_path_policy, diagnostic_stream_registry, encode_binary_events,
+        encode_path_policy_response, handle_stream_with_events, BinaryEventRecord,
+        CONTROL_PATH_POLICY,
     },
 };
 use quic_lite::{
-    ConnectionId, ConnectionTable, FLAG_FIXED, PathState, SERVICE_CONTROL, SERVICE_EVENTS,
-    SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_STATUS, ShortHeader, StreamRegistry,
-    iperf::IperfSender,
+    iperf::IperfSender, ConnectionId, ConnectionTable, PathState, ShortHeader, StreamRegistry,
+    FLAG_FIXED, SERVICE_CONTROL, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_STATUS,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -986,6 +986,15 @@ pub fn dispatch_uart_raw_ingress(
     _item: dmesh_fw_transport::shared_ingress_esp::IngressPacket,
     record: &[u8],
 ) {
+    // A direct tagged-CBOR record is the same in-band console wake as a
+    // QUIC-lite packet.  Without this, Main parses a bootstrap request after
+    // its bounded UART window expired but drops the correlated response in
+    // `serial::write_direct_record`; Recovery does not have this Main power
+    // gate.  Direct records can arrive while Main's sleepy policy has also
+    // disabled UART debug, so use the bounded wake variant rather than the
+    // no-op-if-disabled `activate_window()`. The request itself is the
+    // physical/in-band wake authority; it never makes UART permanently on.
+    super::serial::activate_window_for(super::serial::DEFAULT_ACTIVE_MS);
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(record) {
         let mut response = [0u8; 192];
         match dmesh_fw_transport::wifi_radio_lab_esp::handle_encoded(request, &mut response) {

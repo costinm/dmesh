@@ -8,6 +8,11 @@ mod platform;
 
 #[no_mangle]
 pub extern "C" fn app_main() {
+    // Recovery can expose the identical optional module control surface as
+    // Main. The loader's weak platform hooks keep hardware-only calls
+    // unsupported here rather than introducing a Recovery-specific dispatcher.
+    #[cfg(feature = "modules")]
+    dmesh_fw_modules::register_tagged_handlers();
     dmesh_fw_transport::recovery_runtime::run(
         platform::complete_main_flash,
     );

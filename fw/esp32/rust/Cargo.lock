@@ -393,6 +393,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesh-fw-modules"
+version = "0.1.0"
+dependencies = [
+ "dmesh-server",
+]
+
+[[package]]
 name = "dmesh-fw-transport"
 version = "0.1.0"
 dependencies = [
@@ -415,6 +422,7 @@ name = "dmesh-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dmesh-fw-modules",
  "dmesh-fw-transport",
  "dmesh-rawnan",
  "dmesh-server",

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub mod protocol;
 

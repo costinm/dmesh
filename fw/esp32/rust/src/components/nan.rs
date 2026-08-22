@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
@@ -16,8 +16,20 @@ use shared_nan::{
     NAN_DW_UNITS_SHIFT, NAN_REQUEST_ID_KEY, NAN_RX_FRAME_MAX,
 };
 
-use super::settings::{SharedSettings, parse_bool, parse_i32};
+use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
+
+// LEGACY REFERENCE ONLY (2026-08): Main no longer compiles this module; both
+// Main and Recovery use `dmesh_fw_transport` for NAN/Wi-Fi ownership. Keep
+// this file while its bounded queue, publish cadence, and sleepy scheduling
+// lessons are deliberately migrated. Do not route new functionality here.
+//
+// Classification used below:
+// - MIGRATED: a shared transport/main-crate implementation is authoritative.
+// - ESP-SPECIFIC: driver callbacks, TSF sampling, and radio submission stay
+//   in firmware, but must be owned by `wifi_esp.rs` and its adapters.
+// - REFERENCE: behavior still needs a portable policy/API before this file
+//   can be deleted. The implementation here must not become a second path.
 
 const NAN_ID: u8 = 1;
 // These offsets are shared wire constants.  Keep hardware-specific code
@@ -197,7 +209,10 @@ static NAN_LAST_SYNC_BEACON_FRAME: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static NAN_LAST_DMESH_SERVICE_FRAME: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 // Android runs both publish and active subscribe sessions. Keep the latter
 // separately: it carries the subscriber instance and NAN MAC required for a
-// solicited ESP publish response.
+// solicited ESP publish response. The planned STA activation request is an
+// active-subscribe service descriptor whose Service Info is the same bounded
+// CBOR command accepted over UART; it is not a NAN follow-up or a second
+// service-discovery wire format.
 static NAN_LAST_DMESH_SUBSCRIBE_FRAME: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static NAN_LAST_ACTION_FRAME: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 // Last SDF handed to the raw transmitter. This is bounded diagnostic evidence
@@ -392,6 +407,9 @@ fn set_solicited_publish_attributes(settings: &SharedSettings) -> Result<()> {
     Ok(())
 }
 
+/// REFERENCE: bounded solicited-publish intent. Its deduplication, expiry,
+/// and Service Info construction should be a shared policy; the ESP adapter
+/// should receive only a ready-to-send frame during a confirmed DW.
 fn queue_solicited_publish(requestor_instance: u8) -> Result<usize> {
     if requestor_instance == 0 {
         bail!("solicited publish requires a nonzero subscriber instance ID");
@@ -593,7 +611,9 @@ fn render_raw_response_history() -> Result<String> {
     ))
 }
 
-/// Drain management frames copied by the Wi-Fi callback.
+/// OBSOLETE: drain the old Main-local receive queue. Shared transport now
+/// copies ingress into the bounded common packet pool before dispatching;
+/// retain this only to document the no-parse/no-allocation callback rule.
 ///
 /// The Wi-Fi promiscuous callback runs in a driver task. It must not allocate,
 /// lock telemetry, parse payloads, or dispatch commands, otherwise action
@@ -670,7 +690,10 @@ pub fn forward_packet(packet: &[u8]) -> Result<()> {
     bail!("NAN is not running")
 }
 
-/// Send a raw-NAN packet now, or queue it for the next duty-cycle window.
+/// REFERENCE: send a raw-NAN packet now, or queue it for the next duty-cycle
+/// window. Retain the bounded-intent behavior, but move the generic queue and
+/// expiry semantics to a host-testable crate; firmware keeps only DW timing
+/// and ESP-IDF submission.
 ///
 /// Control-plane discovery must not depend on a console command landing in the
 /// short active window. The queue makes the normal raw-NAN cadence a first
@@ -693,6 +716,10 @@ pub fn raw_followup_frame(dst: &[u8; 6], data: &[u8]) -> Result<Vec<u8>> {
     nan_followup_frame(dst, NAN_ID, data)
 }
 
+/// OBSOLETE: Main-local radio startup. Mode replacement and callback
+/// registration now belong to `wifi_esp`/shared transport. The only retained
+/// lesson is that a publish must be primed after a stable radio setup, never
+/// from an unrelated command handler.
 pub fn start_raw_window(channel: u8, filter: &str) -> Result<()> {
     NAN_FILTER_MODE.store(parse_filter_mode(filter)?, Ordering::Relaxed);
     super::wifi::reset_raw_first_frame();
@@ -1023,6 +1050,9 @@ pub fn ap_beacon_age_ms() -> Option<u32> {
     beacon_age_ms(load_u64(&AP_LAST_BEACON_LOCAL_LO, &AP_LAST_BEACON_LOCAL_HI))
 }
 
+/// MIGRATED: raw NAN payload classification is now supplied by
+/// `dmesh_rawnan` and used by host, Android Rust, Main, and Recovery. Keep
+/// this wrapper only as a comparison point while the dormant module remains.
 pub fn raw_payload(frame: &[u8]) -> Option<&[u8]> {
     raw_command_info(frame).map(|info| info.payload)
 }
@@ -1075,7 +1105,9 @@ fn raw_command_info(frame: &[u8]) -> Option<RawNanCommandInfo<'_>> {
     None
 }
 
-/// Return the publish/subscribe/follow-up kind of the first DMesh SDA.
+/// MIGRATED: return the publish/subscribe/follow-up kind of the first DMesh
+/// SDA through the shared `dmesh_rawnan` parser. Do not add another parser in
+/// firmware; the common crate is the wire-format authority.
 fn dmesh_service_descriptor_kind(frame: &[u8]) -> Option<u8> {
     shared_nan::service_descriptor(frame, shared_nan::DMESH_SERVICE_ID)
         .filter(|descriptor| shared_nan::is_dmesh_service_info(descriptor.payload))
@@ -1095,7 +1127,7 @@ fn raw_service_descriptor_payload(body: &[u8]) -> Option<(u8, u8, &[u8])> {
     ))
 }
 
-/// Parse the shared DMesh v1 NAN follow-up envelope.  It is deliberately
+/// MIGRATED: parse the shared DMesh v1 NAN follow-up envelope. It is deliberately
 /// separate from compact-CBOR firmware commands: Android service discovery
 /// uses this envelope for hello/ack and packet hints, whereas control traffic
 /// remains compact CBOR.
@@ -1155,11 +1187,14 @@ fn fnv1a32(data: &[u8]) -> u32 {
     shared_nan::fnv1a32(data)
 }
 
-/// Queue a response for a raw-NAN peer.
+/// REFERENCE: queue a response for a raw-NAN peer.
 ///
-/// In duty-cycle mode, the scheduler drains this queue during the next radio
-/// window. In continuously active raw mode, drain it now so interactive
-/// diagnostics retain their request/response behavior.
+/// The essential policy is still required: retain a bounded response intent
+/// and transmit only in the next confirmed DW. The current ESP transport has
+/// migrated this for copied active-subscribe CBOR responses in
+/// `wifi_nan_dw_capture_esp`; `lmesh-wifi` applies the same rule on host.
+/// General command correlation, expiry, and retry policy must move to a
+/// host-testable main crate before this legacy version is removed.
 pub fn queue_response_payload_to(command: &NanIncomingCommand, payload: &[u8]) -> Result<usize> {
     let request_id = crate::commands::protocol::decode_binary(&command.payload)
         .ok()
@@ -1268,8 +1303,11 @@ pub fn raw_response_pending_count() -> u32 {
     NAN_RAW_RESPONSE_PENDING.load(Ordering::Relaxed)
 }
 
-/// Emit one queued service descriptor only immediately after a newly observed
-/// NAN cluster beacon. Called by the mode task, never the Wi-Fi callback.
+/// REFERENCE: emit one queued service descriptor after a newly observed NAN
+/// cluster beacon. The shared transport now owns bounded DW RX and callback
+/// lifetime, but it does not yet provide this complete portable active-publish
+/// scheduler. Preserve the post-beacon-only invariant when migrating it.
+/// Called by the mode task, never the Wi-Fi callback.
 pub fn drain_publish_on_discovery_window() -> usize {
     // The current main-loop wake-to-poll latency is about 34 ms on ESP32.
     // Keep a bounded 64-ms post-beacon transmit guard while measuring the
@@ -1357,7 +1395,10 @@ pub fn drain_publish_on_discovery_window() -> usize {
     }
 }
 
-/// Send one queued publication immediately for an infrastructure node.
+/// REFERENCE: send one queued publication immediately for an infrastructure
+/// node. The active-plus-next-DW retransmission policy is still needed by all
+/// node types; frame policy/history belongs in a main crate, while only the
+/// final action-frame submission is ESP-specific.
 ///
 /// Infrastructure radios are continuously powered and are explicitly allowed
 /// to advertise outside a sleepy peer's DW.  Keep the existing synchronized
@@ -1400,7 +1441,10 @@ pub fn drain_publish_infra_immediate() -> usize {
     }
 }
 
-/// Keep an infrastructure ESP discoverable without a one-shot UART command.
+/// REFERENCE: keep an infrastructure ESP discoverable without a one-shot
+/// UART command. This is the predecessor of the required boot/periodic
+/// announce behavior. Replace it with the common announce/publish scheduler
+/// rather than reviving this Main-local timer.
 /// The queued frame is sent immediately and remains available for the next
 /// synchronized discovery window, matching the active-plus-DW policy.
 pub fn ensure_infra_publish(settings: &SharedSettings) {
@@ -1494,9 +1538,11 @@ fn prime_infra_publish() {
     }
 }
 
-/// Prime an infrastructure publisher when Wi-Fi mode setup, rather than the
+/// OBSOLETE: prime an infrastructure publisher when Wi-Fi mode setup, rather than the
 /// `nan` command, owns startup. Hardware setup supplies only the channel;
 /// frame policy and encoding remain in this module/shared `dmesh-rawnan`.
+/// Current mode startup is owned by `wifi_esp` and shared transport; retain
+/// this only as evidence that APSTA needs a bounded post-start settle period.
 pub fn prime_infra_publish_for_wifi(channel: u8) -> Result<()> {
     if !NAN_RUNNING.load(Ordering::Relaxed) {
         start_raw_sniffer(channel.max(1))?;
@@ -1535,6 +1581,10 @@ pub fn raw_tx_active() -> bool {
     NAN_RUNNING.load(Ordering::Relaxed)
 }
 
+/// REFERENCE: this mixes portable DW policy with Main-local busy waiting.
+/// Keep the requirement to wait for an observed beacon; move any reusable
+/// timing decision to the main crates and leave ESP sleep/wake mechanics in
+/// firmware.
 pub fn sync_to_next_discovery_window(timeout_ms: u64, dw_tu: u64, offset_tu: u64) -> u64 {
     let start_us = now_us();
     let _ = wait_for_discovery_beacon_at_phase(
@@ -1545,7 +1595,7 @@ pub fn sync_to_next_discovery_window(timeout_ms: u64, dw_tu: u64, offset_tu: u64
     now_us().saturating_sub(start_us)
 }
 
-/// Wait for a real matching NAN beacon before a data-plane transmission.
+/// REFERENCE: wait for a real matching NAN beacon before a data-plane transmission.
 /// Unlike the sleep-planning helper above, this fails closed: the caller must
 /// not send merely because its local TSF estimate reached the expected phase.
 pub fn sync_to_observed_discovery_window(
@@ -3405,10 +3455,19 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                         {
                             if wake_flags & NAN_SERVICE_FLAG_UART_WAKE != 0 {
                                 super::mode::request_targeted_wake(duration_ms);
-                                // NAN service discovery is the sleepy
-                                // control plane. It may request the bounded
-                                // STA/stream session, whereas ordinary NAN
-                                // receive windows never start IP transport.
+                                // NAN service discovery is the sleepy control
+                                // plane. It may request the bounded STA/stream
+                                // session, whereas ordinary NAN receive
+                                // windows never start IP transport. Today this
+                                // is only a wake request and therefore uses
+                                // the local persisted STA profile. The planned
+                                // active-subscribe Service Info CBOR command
+                                // (SSID/BSSID, optional IPv6, and
+                                // RSSI/policy-adjusted parameters) must use
+                                // the same bounded profile-command decoder as
+                                // UART, then call the memory-only ephemeral-
+                                // profile entry point. Do not add a parallel
+                                // NAN SD-info schema or use a follow-up.
                                 super::transport_runtime::request_active_session("nan_service");
                                 // A sleepy node acknowledges the negotiated
                                 // active interval in the same DW protocol.

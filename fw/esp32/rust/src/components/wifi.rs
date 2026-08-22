@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_char;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -28,13 +28,13 @@ extern "C" {
     fn dmesh_module_loader_ip_netif_addr(esp_netif: *mut sys::esp_netif_t, which: u8) -> u32;
 }
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::{hex_bytes, parse_bytes};
-use super::settings::{SharedSettings, parse_bool, parse_i32};
+use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
 unsafe extern "C" {
@@ -2248,7 +2248,10 @@ fn low_level_start_ap_sta(
             sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
         };
         ap.max_connection = 4;
-        ap.beacon_interval = 100;
+        // APSTA is also a valid soft-NAN timing source.  Match the Main AP
+        // fallback policy (500 TU, approximately 512 ms) rather than quietly
+        // returning to the ESP-IDF 100-TU default on this legacy path.
+        ap.beacon_interval = 500;
         let mut ap_conf = sys::wifi_config_t { ap };
         esp_ok(sys::esp_wifi_set_config(
             sys::wifi_interface_t_WIFI_IF_AP,
@@ -3657,7 +3660,11 @@ fn wifi_channel_status() -> (i32, &'static str) {
 fn ap_station_count() -> i32 {
     let mut list = sys::wifi_sta_list_t::default();
     let ret = unsafe { sys::esp_wifi_ap_get_sta_list(&mut list) };
-    if ret == sys::ESP_OK { list.num } else { -1 }
+    if ret == sys::ESP_OK {
+        list.num
+    } else {
+        -1
+    }
 }
 
 fn validate_wifi_string(name: &str, value: &str, max: usize) -> Result<()> {

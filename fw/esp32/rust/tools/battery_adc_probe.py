@@ -15,14 +15,21 @@ DEFAULT_ADC1_PINS = "32,33,34,35,36,39"
 DEFAULT_ADC2_PINS = "1,2,4,12,13,14,15,25,26,27"
 
 
-def run_lmesh_commands(port: str, commands: list[str], timeout: float) -> str:
-    """Run firmware diagnostics through the supervised lmesh UDS only."""
+def run_dmesh_cli_commands(port: str, commands: list[str], timeout: float) -> str:
+    """Run direct firmware diagnostics through the owning dmesh-cli session."""
     output: list[str] = []
     mesh = ROOT / "scripts" / "with-env.sh"
     for command in commands:
         proc = subprocess.run(
-            [str(mesh), "mesh", "lmesh-uart", "esp.serial.command", f"port={port}",
-             f"command={command}", f"timeout_sec={timeout}"],
+            [
+                str(mesh),
+                "dmesh-cli",
+                port,
+                "--command",
+                command,
+                "--timeout-secs",
+                str(int(timeout)),
+            ],
             cwd=ROOT,
             check=False,
             text=True,
@@ -62,7 +69,7 @@ def main() -> int:
             ),
             "battery status=true",
         ]
-        output = run_lmesh_commands(port, commands, args.timeout)
+        output = run_dmesh_cli_commands(port, commands, args.timeout)
         print(output.rstrip())
         peak = max_mv(output)
         if peak < 100:

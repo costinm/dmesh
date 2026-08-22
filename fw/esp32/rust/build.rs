@@ -25,9 +25,11 @@ fn main() {
     println!("cargo:rerun-if-changed=native/dmesh_pm/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/dmesh_boot_health.c");
     println!("cargo:rerun-if-changed=native/dmesh_boot_health/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=native/dmesh_module_loader/dmesh_module_loader.c");
-    println!("cargo:rerun-if-changed=native/dmesh_module_loader/include/dmesh_module_loader.h");
-    println!("cargo:rerun-if-changed=native/dmesh_module_loader/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../../modules/native/dmesh_module_loader/dmesh_module_loader.c");
+    println!("cargo:rerun-if-changed=../../modules/native/dmesh_module_loader/dmesh_hw_host.c");
+    println!("cargo:rerun-if-changed=../../modules/native/dmesh_module_loader/dmesh_module_weak_platform.c");
+    println!("cargo:rerun-if-changed=../../modules/native/dmesh_module_loader/include/dmesh_module_loader.h");
+    println!("cargo:rerun-if-changed=../../modules/native/dmesh_module_loader/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../../mod_hello/include/dmesh_module_abi.h");
     println!("cargo:rerun-if-changed=../../modules/include/dmesh_hw_abi.h");
     println!("cargo:rerun-if-changed=../../mod_lora/include/dmesh_lora_abi.h");

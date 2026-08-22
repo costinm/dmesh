@@ -2,12 +2,12 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{SharedSettings, parse_bool};
+use super::settings::{parse_bool, SharedSettings};
 use super::telemetry;
 
 const DEFAULT_BUTTON_GPIO: i32 = 0;

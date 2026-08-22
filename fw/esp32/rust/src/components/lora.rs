@@ -5,12 +5,12 @@
 //! names, packet forwarding, and the mesh transport bridge.  It has no SPI,
 //! GPIO, interrupt, or chip-driver implementation.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::bytes::parse_bytes;
-use super::settings::{SharedSettings, parse_bool, parse_i32};
+use super::settings::{parse_bool, parse_i32, SharedSettings};
 use super::telemetry::{self, Direction};
 
 const DEFAULT_FREQUENCY_HZ: u32 = 913_125_000;

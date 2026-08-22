@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{SharedSettings, parse_bool};
+use super::settings::{parse_bool, SharedSettings};
 
 #[repr(C)]
 #[derive(Default)]

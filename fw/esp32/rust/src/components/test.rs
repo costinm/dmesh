@@ -1,7 +1,7 @@
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use esp_idf_sys as sys;
 
 use super::telemetry;

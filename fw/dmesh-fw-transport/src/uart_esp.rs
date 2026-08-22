@@ -1,11 +1,11 @@
 // IMPORTANT: This is shared no-std ESP firmware code. It owns ESP USB/UART
 // queues and the nonblocking FreeRTOS L2 task shared by Recovery and Main.
-// PPP marker semantics and classification remain in quic-lite.
+// PPP marker semantics and classification are shared server/bearer policy.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use quic_lite::uart::{classify_uart_payload, UartIngress, UART_TRANSPORT_MARKER};
+use dmesh_server::uart::{UART_TRANSPORT_MARKER, UartIngress, classify_uart_payload};
 use uart_codec::codec::{Decoder as UartDecoder, Encoder as UartEncoder};
 
 /// UART is an L2 bearer and therefore uses the transport MTU rather than a

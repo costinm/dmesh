@@ -2,8 +2,23 @@
 //!
 //! Infra starts the shared STA bearer at boot and leaves it active. Sleepy
 //! keeps the same profile and handlers available but does not start STA on a
-//! periodic wake: only a UART or NAN service-discovery request creates a
+//! periodic wake: only a UART or NAN service-discovery wake request creates a
 //! bounded active session.
+//!
+//! This is the current STA lifecycle, not yet the full production rendezvous
+//! policy. A NAN request currently selects the SSID carried by the transient
+//! transport profile;
+//! it does not yet deliver a bounded CBOR command with SSID or BSSID, a
+//! peer-specific IPv6 endpoint, RSSI-derived channel/rate parameters, or a
+//! request for STA+NAN+NOW. That future NAN payload is a command on the same
+//! CBOR/profile path as UART, not a second service-discovery schema. Likewise,
+//! `now=0` (the default) enables the already-associated STA+UDP6+NOW path;
+//! `now=2` explicitly disables NOW for an A/B baseline;
+//! `nan_dw_interval` independently enables bounded NAN receive. The intended default is unassociated
+//! NAN+NOW for powered nodes (and sparse NAN, currently four seconds, for
+//! sleepy nodes), followed by a bounded STA or STA+NAN+NOW session requested
+//! through NAN/NOW service discovery or UART. Keep the missing negotiation
+//! explicit until its wire schema and retry/DW scheduling are implemented.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -25,6 +40,10 @@ static EPHEMERAL_PROFILE: OnceLock<Mutex<Option<dmesh_fw_transport::TransportPro
 static STA_BEARER_OWNS_WIFI: AtomicBool = AtomicBool::new(false);
 static STA_ACTIVE: AtomicBool = AtomicBool::new(false);
 static STA_STARTING: AtomicBool = AtomicBool::new(false);
+/// A UART/NAN `transport.start` received while another epoch is associating.
+/// Keep only the latest profile in `PROFILE`; the active worker consumes this
+/// one-bit request before it returns, so Wi-Fi never has two owners.
+static STA_REPLACE_PENDING: AtomicBool = AtomicBool::new(false);
 static SESSION_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
 static NEXT_RETRY_MS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_STREAMS: AtomicU32 = AtomicU32::new(0);
@@ -86,6 +105,7 @@ fn poll_espnow(
 struct StaStartTask {
     profile: dmesh_fw_transport::TransportProfile,
     source: &'static str,
+    replace: bool,
 }
 
 fn profile() -> &'static Mutex<dmesh_fw_transport::TransportProfile> {
@@ -96,27 +116,14 @@ fn ephemeral_profile() -> &'static Mutex<Option<dmesh_fw_transport::TransportPro
     EPHEMERAL_PROFILE.get_or_init(|| Mutex::new(None))
 }
 
-pub fn initialize(settings: &SharedSettings, infra: bool) {
+pub fn initialize(_settings: &SharedSettings, infra: bool) {
     let Ok(mut profile) = profile().lock() else {
         return;
     };
-    if let Ok(Some(ssid)) = settings.borrow().get_str("ssid") {
-        let bytes = ssid.as_bytes();
-        if bytes.len() <= profile.ssid.len() {
-            profile.ssid[..bytes.len()].copy_from_slice(bytes);
-            profile.ssid_len = bytes.len();
-        } else {
-            telemetry::record_log("event type=transport.profile invalid_ssid=true");
-        }
-    }
     telemetry::record_log(format!(
-        "event type=transport.profile loaded={} role={}",
-        profile.has_flash_profile(),
+        "event type=transport.profile loaded=false role={}",
         if infra { "infra" } else { "sleepy" }
     ));
-    if infra {
-        start_sta_locked(&profile, "boot_infra");
-    }
 }
 
 /// Apply the shared direct Recovery control envelope in Main as well as
@@ -124,14 +131,31 @@ pub fn initialize(settings: &SharedSettings, infra: bool) {
 /// raw-rate programming is the shared ESP adapter and affects either raw
 /// UDP6 data frames or raw ESP-NOW action frames.
 pub fn apply_direct_record(record: &[u8]) -> bool {
+    let starts_sta = matches!(
+        dmesh_server::control::decode_request(record),
+        Some(dmesh_server::control::Request::TransportStart {
+            kind: dmesh_server::control::TransportKind::Sta,
+            ..
+        })
+    );
     let Ok(mut profile) = profile().lock() else {
         return false;
     };
-    if dmesh_fw_transport::commands::apply_profile_command(record, &mut profile).is_none() {
+    if dmesh_fw_transport::commands::apply_control_record(record, &mut profile).is_none() {
         return false;
     }
     dmesh_fw_transport::state::direct_record_accepted();
+    // Match Recovery's correlated direct-CBOR behavior. Requests without an
+    // id remain fire-and-forget; tagged requests get their result back on the
+    // same UART bearer before Main applies its sleepy-session policy.
+    let mut response = [0u8; 128];
+    if let Some(used) =
+        dmesh_fw_transport::commands::encode_control_response(record, &profile, &mut response)
+    {
+        let _ = dmesh_fw_transport::commands::send_record(&response[..used]);
+    }
     let rate = profile.raw_tx_rate;
+    let requested_profile = *profile;
     drop(profile);
     if STA_ACTIVE.load(Ordering::Acquire)
         && !dmesh_fw_transport::wifi_esp::configure_raw_tx_rate(rate)
@@ -140,6 +164,10 @@ pub fn apply_direct_record(record: &[u8]) -> bool {
         return false;
     }
     dmesh_fw_transport::commands::send_stat(b"main raw tx rate=", rate as u64);
+    if starts_sta {
+        replace_sta_locked(&requested_profile, "uart_transport_start");
+        return true;
+    }
     request_active_session("uart_bootstrap");
     true
 }
@@ -152,8 +180,13 @@ pub fn sta_bearer_owns_wifi() -> bool {
     STA_BEARER_OWNS_WIFI.load(Ordering::Acquire) || STA_STARTING.load(Ordering::Acquire)
 }
 
-/// Request a sleepy-node active transport session after an explicit control
-/// plane event. This is intentionally not called from ordinary wake polling.
+/// Request a sleepy-node STA session after an explicit control-plane event.
+/// This is intentionally not called from ordinary wake polling. The current
+/// caller supplies no network parameters, so this uses the persistent profile.
+/// A future *active-subscribe* NAN service descriptor will carry the bounded
+/// CBOR command in its Service Info bytes. Decode it with the same profile
+/// command path accepted from UART, then call `request_ephemeral_nan_session`
+/// with its validated memory-only SSID/BSSID/IPv6/profile values.
 pub fn request_active_session(source: &'static str) {
     if super::mode::infra_mode() {
         return;
@@ -170,8 +203,10 @@ pub fn request_active_session(source: &'static str) {
 }
 
 /// Start one sleepy STA session with parameters learned through NAN service
-/// discovery. The profile is intentionally memory-only: a discovery peer must
-/// never overwrite the device's configured infrastructure profile.
+/// discovery command. This hook is intentionally memory-only: a peer command
+/// must never overwrite the device's configured infrastructure profile. No
+/// current NAN ingress applies the shared CBOR profile command here; the hook
+/// keeps that future command delivery separate from NVS persistence.
 pub fn request_ephemeral_nan_session(
     profile: dmesh_fw_transport::TransportProfile,
     source: &'static str,
@@ -210,7 +245,9 @@ pub fn stream_completed() {
 
 /// Main's normal loop owns the deadline; no FreeRTOS callback sleeps or
 /// blocks waiting for it. Sleepy STA is released only after all known streams
-/// finish and the 200 ms command grace period expires.
+/// finish and the 200 ms command grace period expires. UDP/action requests
+/// count only when they create a tracked DMesh stream; untracked datagrams do
+/// not keep STA powered indefinitely.
 pub fn poll() {
     dmesh_fw_transport::wifi_nonpromisc_probe_esp::poll();
     let infra = super::mode::infra_mode();
@@ -283,7 +320,30 @@ pub fn poll() {
 }
 
 fn start_sta_locked(profile: &dmesh_fw_transport::TransportProfile, source: &'static str) {
-    if STA_ACTIVE.load(Ordering::Acquire)
+    start_sta_locked_with_replace(profile, source, false);
+}
+
+/// Start a replacement radio epoch. The Wi-Fi adapter performs the stop and
+/// next init as one owner transition; callers never touch driver callbacks or
+/// buffers directly.
+fn replace_sta_locked(profile: &dmesh_fw_transport::TransportProfile, source: &'static str) {
+    if STA_STARTING.load(Ordering::Acquire) {
+        STA_REPLACE_PENDING.store(true, Ordering::Release);
+        return;
+    }
+    start_sta_locked_with_replace(
+        profile,
+        source,
+        STA_BEARER_OWNS_WIFI.load(Ordering::Acquire),
+    );
+}
+
+fn start_sta_locked_with_replace(
+    profile: &dmesh_fw_transport::TransportProfile,
+    source: &'static str,
+    replace: bool,
+) {
+    if (!replace && STA_ACTIVE.load(Ordering::Acquire))
         || STA_STARTING.swap(true, Ordering::AcqRel)
         || !profile.has_flash_profile()
     {
@@ -299,6 +359,7 @@ fn start_sta_locked(profile: &dmesh_fw_transport::TransportProfile, source: &'st
     let task_state = Box::into_raw(Box::new(StaStartTask {
         profile: *profile,
         source,
+        replace,
     }));
     NEXT_RETRY_MS.store(now_ms().wrapping_add(RETRY_MS), Ordering::Release);
     let mut task = core::ptr::null_mut();
@@ -327,7 +388,11 @@ fn start_sta_locked(profile: &dmesh_fw_transport::TransportProfile, source: &'st
 
 unsafe extern "C" fn sta_start_task(argument: *mut core::ffi::c_void) {
     let task = unsafe { Box::from_raw(argument.cast::<StaStartTask>()) };
-    dmesh_fw_transport::wifi_esp::init_sta(&task.profile);
+    if task.replace {
+        dmesh_fw_transport::wifi_esp::replace_sta(&task.profile);
+    } else {
+        dmesh_fw_transport::wifi_esp::init_sta(&task.profile);
+    }
     STA_STARTING.store(false, Ordering::Release);
     let associated = dmesh_fw_transport::wifi_esp::sta_associated();
     STA_ACTIVE.store(associated, Ordering::Release);
@@ -344,32 +409,28 @@ unsafe extern "C" fn sta_start_task(argument: *mut core::ffi::c_void) {
         });
         telemetry::record_log(format!("event type=transport.raw_udp6 started={started}"));
     }
-    if associated && task.profile.espnow_capture {
-        let started = dmesh_fw_transport::wifi_esp::start_nan_now(receive_espnow);
+    if associated && task.profile.now != 2 {
+        let started = dmesh_fw_transport::wifi_esp::start_sta_extensions(
+            receive_espnow,
+            task.profile.nan_dw_interval,
+        );
         if started {
-            let burst = profile()
-                .lock()
-                .map(|profile| {
-                    dmesh_fw_transport::recovery_runtime::espnow_association(&profile)
-                        .tx_burst_packets
-                })
-                .unwrap_or(1);
-            dmesh_fw_transport::wifi_espnow_esp::set_tx_burst_packets(burst);
+            let association =
+                dmesh_fw_transport::recovery_runtime::espnow_association(&task.profile);
+            dmesh_fw_transport::wifi_espnow_esp::set_tx_burst_packets(association.tx_burst_packets);
             dmesh_fw_transport::wifi_espnow_esp::set_poll_handler(Some(poll_espnow));
         }
-        dmesh_fw_transport::commands::send_response(if started {
-            b"main NAN/NOW coexistence enabled"
-        } else {
-            b"main NAN/NOW coexistence failed"
-        });
-        telemetry::record_log(format!(
-            "event type=transport.nan_now_coexistence enabled={started}"
-        ));
     }
     telemetry::record_log(format!(
         "event type=transport.session associated={} source={}",
         associated, task.source
     ));
+    if STA_REPLACE_PENDING.swap(false, Ordering::AcqRel) {
+        if let Ok(profile) = profile().lock() {
+            STA_ACTIVE.store(false, Ordering::Release);
+            replace_sta_locked(&profile, "queued_transport_start");
+        }
+    }
     drop(task);
     unsafe { esp_idf_sys::vTaskDelete(core::ptr::null_mut()) };
 }

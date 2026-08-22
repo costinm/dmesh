@@ -6,11 +6,49 @@
 //! The reusable pieces are split by bearer: `uart` handles the command/control
 //! channel, `wifi` owns STA setup and the UDP transport adapter, and
 //! `udp_flash` consumes ordered application stream bytes.
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 static mut TRANSPORT_PROFILE: crate::TransportProfile = crate::TransportProfile::new();
+/// `TRANSPORT_PROFILE` is shared by the UART/NAN command worker and this
+/// runtime task. It is a whole, fixed-size radio epoch, not an atomic scalar:
+/// serialize its copy/update so a start never observes a torn or stale SSID.
+static TRANSPORT_PROFILE_LOCK: AtomicBool = AtomicBool::new(false);
+/// Bumped only after an accepted STA `transport.start` profile is committed.
+/// The runtime consumes each value as one immutable Wi-Fi replacement epoch.
+static STA_START_GENERATION: AtomicU32 = AtomicU32::new(0);
 static mut RAW_ASSOCIATION: dmesh_server::raw_transport::RawAssociation =
     dmesh_server::raw_transport::RawAssociation::c6_default();
 static mut ESPNOW_ASSOCIATION: dmesh_server::raw_transport::RawAssociation =
     dmesh_server::raw_transport::RawAssociation::conservative();
+
+fn with_transport_profile<R>(operation: impl FnOnce(&mut crate::TransportProfile) -> R) -> R {
+    while TRANSPORT_PROFILE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    // The lock excludes the UART/NAN ingress worker while a fixed-size profile
+    // is copied or updated. The callback never retains this reference.
+    let result = operation(unsafe { &mut *core::ptr::addr_of_mut!(TRANSPORT_PROFILE) });
+    TRANSPORT_PROFILE_LOCK.store(false, Ordering::Release);
+    result
+}
+
+fn transport_profile_snapshot() -> crate::TransportProfile {
+    with_transport_profile(|profile| *profile)
+}
+
+fn is_wifi_start(packet: &[u8]) -> bool {
+    matches!(
+        dmesh_server::control::decode_request(packet),
+        Some(dmesh_server::control::Request::TransportStart {
+            kind: dmesh_server::control::TransportKind::Sta
+                | dmesh_server::control::TransportKind::Nan,
+            ..
+        })
+    )
+}
 
 extern "C" {
     fn nvs_open(namespace: *const i8, mode: i32, handle: *mut u32) -> i32;
@@ -36,6 +74,24 @@ unsafe fn command_mode_from_stage2_nvs() -> bool {
 /// Temporary e6 lab run: prove raw NOW receive after STA disconnect while
 /// retaining the channel-6 radio. This is volatile and does not alter NVS.
 const LAB_FORCE_UNASSOCIATED_NOW: bool = false;
+
+fn wants_sta(profile: &crate::TransportProfile) -> bool {
+    matches!(
+        profile.requested_transport,
+        Some(dmesh_server::control::TransportKind::Sta)
+    )
+}
+
+fn wants_nan(profile: &crate::TransportProfile) -> bool {
+    matches!(
+        profile.requested_transport,
+        Some(dmesh_server::control::TransportKind::Nan)
+    )
+}
+
+fn wants_sta_extensions(profile: &crate::TransportProfile) -> bool {
+    profile.now != 2
+}
 
 fn raw_association(
     profile: &crate::TransportProfile,
@@ -133,7 +189,9 @@ unsafe fn raw_service_if_ready() -> Option<&'static mut RawServiceDispatcher> {
 unsafe fn reset_raw_service() {
     if RAW_SERVICE_READY.swap(false, core::sync::atomic::Ordering::AcqRel) {
         unsafe {
-            core::ptr::drop_in_place(core::ptr::addr_of_mut!(RAW_SERVICE).cast::<RawServiceDispatcher>());
+            core::ptr::drop_in_place(
+                core::ptr::addr_of_mut!(RAW_SERVICE).cast::<RawServiceDispatcher>(),
+            );
         }
     }
 }
@@ -311,6 +369,13 @@ fn receive_espnow(
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
+    // Presence is one-way shared CBOR, not a QUIC-lite datagram. Retain it
+    // before the action bearer reaches connection dispatch so unassociated
+    // NAN+NOW nodes keep the same bounded discovery view as STA/UDP6 nodes.
+    if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
+        crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, peer.mac);
+        return None;
+    }
     receive_raw_service(
         dmesh_server::raw_transport::IngressPath {
             transport_id: 2,
@@ -373,6 +438,72 @@ fn receive_uart_ingress(_item: crate::shared_ingress_esp::IngressPacket, packet:
 /// schema-defined bootstrap/profile controls and returns compact CBOR records
 /// on the same physical bearer.
 fn receive_uart_raw_ingress(_item: crate::shared_ingress_esp::IngressPacket, packet: &[u8]) {
+    // A boot/discovery presence record is bearer-neutral. UART does not carry
+    // a remote radio address, so it uses the same shared device table with an
+    // unspecified peer tuple rather than being parsed as a control command.
+    if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
+        crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, [0; 6]);
+        return;
+    }
+    if dmesh_server::announce::is_followups_observed_request(packet) {
+        let mut snapshots = [None; crate::wifi_nan_dw_capture_esp::FOLLOWUP_HISTORY_CAPACITY];
+        crate::wifi_nan_dw_capture_esp::followup_history(&mut snapshots);
+        let mut response = [0u8; crate::TRANSPORT_MTU];
+        let mut entries = [dmesh_server::announce::ObservedFollowup {
+            source: [0; 6], target: [0; 6], msg_type: 0, seq: 0,
+            payload_len: 0, payload_hash: 0, last_seen_ms: 0,
+        }; crate::wifi_nan_dw_capture_esp::FOLLOWUP_HISTORY_CAPACITY];
+        let mut count = 0;
+        for snapshot in snapshots.iter().flatten() {
+            entries[count] = dmesh_server::announce::ObservedFollowup {
+                source: snapshot.source,
+                target: snapshot.target,
+                msg_type: snapshot.msg_type,
+                seq: snapshot.seq,
+                payload_len: snapshot.payload_len,
+                payload_hash: snapshot.payload_hash,
+                last_seen_ms: snapshot.last_seen_ms,
+            };
+            count += 1;
+        }
+        if let Some(used) = dmesh_server::announce::encode_followups_observed_response(
+            &entries[..count],
+            &mut response,
+        ) {
+            let _ = crate::commands::send_record(&response[..used]);
+        }
+        return;
+    }
+    if dmesh_server::announce::is_observed_request(packet) {
+        let mut snapshots = [None; 10];
+        crate::wifi_raw_udp6_esp::announce_peers(&mut snapshots);
+        let mut response = [0u8; crate::TRANSPORT_MTU];
+        let mut entries = [dmesh_server::announce::ObservedAnnounce {
+            device_id: &[], source_mac: [0; 6], source_ip: &[], uptime_secs: 0,
+            transport_mode: 0, counters: 0, kind: 0, last_seen_ms: 0,
+        }; 10];
+        let mut count = 0;
+        for snapshot in snapshots.iter().flatten() {
+            entries[count] = dmesh_server::announce::ObservedAnnounce {
+                device_id: &snapshot.device_id,
+                source_mac: snapshot.source_mac,
+                source_ip: &snapshot.source_ip,
+                uptime_secs: snapshot.uptime_secs,
+                transport_mode: snapshot.transport_mode,
+                counters: snapshot.counters,
+                kind: snapshot.kind,
+                last_seen_ms: snapshot.last_seen_ms,
+            };
+            count += 1;
+        }
+        if let Some(used) = dmesh_server::announce::encode_observed_response(
+            &entries[..count],
+            &mut response,
+        ) {
+            let _ = crate::commands::send_record(&response[..used]);
+        }
+        return;
+    }
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(packet) {
         // Lab control is a bounded exception-plane operation.  It has no
         // QUIC ledger and never changes NVS; stream callers use the identical
@@ -395,11 +526,78 @@ fn receive_uart_raw_ingress(_item: crate::shared_ingress_esp::IngressPacket, pac
         }
         return;
     }
-    let params = unsafe { &mut *core::ptr::addr_of_mut!(TRANSPORT_PROFILE) };
-    if crate::commands::apply_profile_command(packet, params).is_none() {
+    let wifi_start = is_wifi_start(packet);
+    let accepted = with_transport_profile(|params| {
+        if crate::commands::apply_control_record(packet, params).is_none() {
+            return false;
+        }
+        // A tagged request id opts into a correlated direct response.  This
+        // remains the same CBOR envelope as a QUIC-lite handler reply and
+        // does not reserve a response queue for fire-and-forget bootstrap.
+        let mut response = [0u8; 128];
+        if let Some(used) = crate::commands::encode_control_response(packet, params, &mut response)
+        {
+            let _ = crate::commands::send_record(&response[..used]);
+        }
+        true
+    });
+    if !accepted {
         crate::commands::send_response(b"protocol rejected");
     } else {
         crate::state::direct_record_accepted();
+        if wifi_start {
+            // Publish only after the complete profile is visible. A repeated
+            // start is deliberately a replacement, never a live patch.
+            STA_START_GENERATION.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// Apply an active NAN Service Info payload as the same tagged-CBOR control
+/// command accepted on UART. This runs on the common ingress worker after the
+/// Wi-Fi owner has copied and released the promiscuous driver buffer; it must
+/// never run in the NAN callback itself. The active SDF is one-way, so an
+/// accepted correlated control response returns on the already-active NOW
+/// bearer before the normal replacement loop changes radio mode.
+fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
+    if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
+        crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, peer);
+        return;
+    }
+    let wifi_start = is_wifi_start(packet);
+    let mut response = [0u8; 128];
+    let mut response_len = 0;
+    let accepted = with_transport_profile(|params| {
+        if crate::commands::apply_control_record(packet, params).is_none() {
+            return false;
+        }
+        response_len =
+            crate::commands::encode_control_response(packet, params, &mut response).unwrap_or(0);
+        true
+    });
+    if !accepted {
+        crate::commands::send_stat(
+            b"nan sd rejected peer=",
+            u64::from_le_bytes([peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0]),
+        );
+        return;
+    }
+    crate::state::direct_record_accepted();
+    if response_len != 0 {
+        // An active Subscribe is a NAN rendezvous, so its correlated CBOR
+        // response returns as one directed NAN Follow-up in this DW. A normal
+        // Publish SI retains the established NOW broadcast response path.
+        if crate::wifi_nan_dw_capture_esp::take_active_subscribe(peer) {
+            let _ = crate::wifi_nan_dw_capture_esp::send_followup_response(
+                peer,
+                &response[..response_len],
+            );
+        } else {
+            let _ = crate::wifi_espnow_esp::broadcast_record(&response[..response_len]);
+        }
+    }
+    if wifi_start {
+        STA_START_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -409,43 +607,55 @@ fn receive_uart_raw_ingress(_item: crate::shared_ingress_esp::IngressPacket, pac
 /// it selects Main and reboots only after a verified Main image is durable.
 /// Main supplies a different completion policy for its allowed targets.
 pub fn run(_complete_main_flash: fn() -> bool) {
+    run_with_boot_identity(2, 2, b"recovery boot", || {});
+}
+
+/// Run the shared core under Main's boot identity.
+///
+/// Main retains only its Stage2 health transition here.  Its former product
+/// boot loop, power policy, and radio owners must be registered back through
+/// dmesh-server one handler at a time; they may not compete with this shared
+/// UART/STA/raw-service lifecycle.
+pub fn run_main(mark_healthy: fn()) {
+    run_with_boot_identity(1, 1, b"main core boot", mark_healthy);
+}
+
+fn run_with_boot_identity(
+    role: u8,
+    partition: u8,
+    boot_message: &'static [u8],
+    mark_healthy: fn(),
+) {
     esp_idf_sys::link_patches();
     if !unsafe { crate::uart_esp::install_l2_driver() } {
         return;
     }
-    // Populate the shared profile before accepting raw-CBOR commands; this
-    // prevents a first UART record racing an NVS load and being overwritten.
-    let params = core::ptr::addr_of_mut!(TRANSPORT_PROFILE);
-    unsafe {
-        let _ = crate::wifi_esp::initialize_nvs();
-        (*params).command_mode = command_mode_from_stage2_nvs();
-        crate::wifi_esp::load_preferred_ssid(&mut *params);
-    }
-    // A one-shot Stage2 selection reaches Recovery while normal boot remains
-    // Main.  With a complete persisted STA profile, start that requested
-    // recovery transfer immediately. `boot_target=2` is deliberately
-    // different: it is an operator-selected command shell, so it keeps the
-    // profile inert until an explicit command arrives.
-    if unsafe { !(*params).command_mode && (*params).has_flash_profile() } {
-        unsafe {
-            (*params).run_requested = true;
-        }
-    }
+    // The association target comes only from `transport.start`; accept UART
+    // or future NAN commands before considering any STA epoch.
+    with_transport_profile(|params| {
+        params.command_mode = unsafe { command_mode_from_stage2_nvs() };
+    });
     if !unsafe { crate::uart_esp::start_shared_l2(receive_uart_ingress, receive_uart_raw_ingress) }
     {
         return;
     }
-    crate::commands::send_response(b"recovery boot");
-    send_boot_identity(2, 2);
-    // Wait briefly for the preferred SSID. Recovery must not start a
-    // partially configured STA while the managed UART handoff is arriving.
-    for _ in 0..crate::uart_esp::COMMAND_GRACE_TICKS {
-        if unsafe { TRANSPORT_PROFILE.ssid_len != 0 } {
-            break;
-        }
-        unsafe {
-            esp_idf_sys::vTaskDelay(1);
-        }
+    crate::wifi_nan_dw_capture_esp::set_service_info_handler(Some(receive_nan_service_info));
+    // The UART driver and common direct-control receiver are live before the
+    // boot proof is emitted. Main uses this point to clear the Stage2
+    // boot-failure marker; Recovery deliberately supplies a no-op callback.
+    mark_healthy();
+    crate::commands::send_response(boot_message);
+    send_boot_identity(role, partition);
+    send_boot_announce_uart(role, partition);
+    // The idle/default personality is unassociated AP+NAN+NOW. With the
+    // default DW interval of zero this is NOW-only: no raw UDP6 bearer and
+    // no promiscuous NAN capture. Start it immediately and exactly once; an
+    // explicit transport.start later is the only operation that replaces it.
+    let initial_profile = transport_profile_snapshot();
+    let mut nan_now_started = crate::wifi_esp::init_nan_now(&initial_profile, receive_espnow);
+    if nan_now_started {
+        crate::wifi_espnow_esp::set_poll_handler(Some(poll_espnow));
+        send_boot_records_on_now(boot_message, role, partition);
     }
     let mut wifi_started = false;
     let mut applied_raw_tx_rate = None;
@@ -454,16 +664,21 @@ pub fn run(_complete_main_flash: fn() -> bool) {
     let mut applied_sta_ampdu_enabled = None;
     let mut applied_sta_11b_rates_disabled = None;
     let mut applied_sta_raw_rx_enabled = None;
+    let mut applied_ack_frequency = None;
+    let mut applied_ack_delay_ms = None;
     let mut applied_tx_burst_packets = None;
-    // `espnow_capture` is the explicit opt-in for the combined STA/NAN/NOW
-    // radio personality.  It is false for the pure STA/UDP6 performance
-    // baseline, and changing it performs one logged upgrade/downgrade rather
-    // than starting background radio callbacks beside that baseline.
-    let mut nan_now_enabled = false;
+    let mut applied_sta_start_generation = 0;
+    // The boot setup is already the unassociated radio. Do not consume an
+    // absent/default NAN generation by replacing its just-started driver.
+    let mut applied_nan_start_generation = STA_START_GENERATION.load(Ordering::Acquire);
+    // `now` and `nan_dw_interval` independently select STA extensions.
+    let mut sta_extensions_enabled = false;
+    let mut applied_nan_dw_interval = None;
     let mut raw_reported_at_ms = 0u64;
     let mut espnow_reported_at_tick = 0 as esp_idf_sys::TickType_t;
     let mut espnow_last_report = [0u32; 30];
     let mut espnow_has_reported = false;
+    let mut last_discovery_announce_ms = 0u64;
     loop {
         crate::wifi_nonpromisc_probe_esp::poll();
         // Keep Recovery's common NAN acquisition/DW state machine identical
@@ -471,19 +686,59 @@ pub fn run(_complete_main_flash: fn() -> bool) {
         // promiscuous acquisition state stale and makes later radio-control
         // transitions differ by image.
         crate::wifi_nan_dw_capture_esp::poll();
+        let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000;
+        if (nan_now_started || wifi_started)
+            && now_ms.saturating_sub(last_discovery_announce_ms) >= 15 * 60 * 1_000
+        {
+            send_discovery_announce(now_ms / 1_000, nan_now_started, wifi_started);
+            last_discovery_announce_ms = now_ms;
+        }
         // Command parsing and the mutable Recovery image have one owner
         // here. Bearers feed QUIC-lite; no raw command task is
         // started beside this worker.
-        // Direct bootstrap records update this small command image
-        // asynchronously. A plain read of `static mut` is undefined and can
-        // be cached across the idle loop; the command generation provides
-        // release ordering and this volatile snapshot makes it visible here.
-        let snapshot = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(TRANSPORT_PROFILE)) };
-        if (snapshot.command_mode || snapshot.run_requested)
-            && snapshot.has_flash_profile()
+        // A start publishes a complete, locked profile before its generation.
+        // It may therefore replace an active epoch but can never race a
+        // partial SSID/profile update from UART or future NAN Service Info.
+        let requested_sta_start_generation = STA_START_GENERATION.load(Ordering::Acquire);
+        let snapshot = transport_profile_snapshot();
+        if wants_nan(&snapshot)
             && !wifi_started
+            && applied_nan_start_generation != requested_sta_start_generation
         {
-            crate::wifi_esp::init_sta(&snapshot);
+            if nan_now_started {
+                crate::wifi_esp::stop_sta_extensions();
+                crate::wifi_esp::stop_sta();
+                crate::wifi_esp::restart_sta_driver_runtime();
+            }
+            nan_now_started = crate::wifi_esp::init_nan_now(&snapshot, receive_espnow);
+            if nan_now_started {
+                crate::wifi_espnow_esp::set_poll_handler(Some(poll_espnow));
+            }
+            applied_nan_start_generation = requested_sta_start_generation;
+        }
+        if wants_sta(&snapshot)
+            && (!wifi_started || applied_sta_start_generation != requested_sta_start_generation)
+        {
+            if nan_now_started {
+                crate::wifi_esp::stop_sta_extensions();
+                crate::wifi_esp::stop_sta();
+                crate::wifi_esp::restart_sta_driver_runtime();
+                nan_now_started = false;
+            }
+            if wifi_started {
+                if sta_extensions_enabled {
+                    crate::wifi_esp::stop_sta_extensions();
+                    sta_extensions_enabled = false;
+                    applied_nan_dw_interval = None;
+                }
+                crate::wifi_raw_udp6_esp::stop();
+                unsafe { reset_raw_service() };
+                // Wi-Fi owns the complete driver/callback transition.
+                crate::wifi_esp::replace_sta(&snapshot);
+            } else {
+                crate::wifi_esp::init_sta(&snapshot);
+            }
+            applied_sta_start_generation = requested_sta_start_generation;
             applied_raw_tx_rate = Some(snapshot.raw_tx_rate);
             crate::wifi_raw_udp6_esp::set_sta_driver_tx(snapshot.sta_driver_tx);
             applied_sta_driver_tx = Some(snapshot.sta_driver_tx);
@@ -491,6 +746,8 @@ pub fn run(_complete_main_flash: fn() -> bool) {
             applied_sta_ampdu_enabled = Some(snapshot.sta_ampdu_enabled);
             applied_sta_11b_rates_disabled = Some(snapshot.sta_11b_rates_disabled);
             applied_sta_raw_rx_enabled = Some(snapshot.sta_raw_rx_enabled);
+            applied_ack_frequency = Some(snapshot.ack_frequency);
+            applied_ack_delay_ms = Some(snapshot.ack_delay_ms);
             applied_tx_burst_packets = Some(snapshot.tx_burst_packets);
             crate::commands::send_response(if snapshot.sta_driver_tx {
                 b"raw udp6 STA driver tx enabled"
@@ -508,6 +765,7 @@ pub fn run(_complete_main_flash: fn() -> bool) {
                 }
                 crate::wifi_raw_udp6_esp::set_poll_handler(Some(poll_raw_udp6));
                 crate::commands::send_response(b"raw udp6 bearer started");
+                send_sta_boot_announce();
             } else if snapshot.sta_raw_rx_enabled {
                 crate::commands::send_response(b"raw udp6 bearer failed");
             }
@@ -520,6 +778,32 @@ pub fn run(_complete_main_flash: fn() -> bool) {
             // never background companions which can alter callbacks or PHY
             // timing during a UDP reliability measurement.
             wifi_started = true;
+        }
+        if wifi_started && !wants_sta(&snapshot) {
+            if sta_extensions_enabled {
+                crate::wifi_esp::stop_sta_extensions();
+                sta_extensions_enabled = false;
+                applied_nan_dw_interval = None;
+            }
+            crate::wifi_raw_udp6_esp::stop();
+            unsafe { reset_raw_service() };
+            crate::wifi_esp::stop_sta();
+            wifi_started = false;
+            applied_raw_tx_rate = None;
+            applied_sta_driver_tx = None;
+            applied_sta_bssid_check_disabled = None;
+            applied_sta_ampdu_enabled = None;
+            applied_sta_11b_rates_disabled = None;
+            applied_sta_raw_rx_enabled = None;
+            applied_ack_frequency = None;
+            applied_ack_delay_ms = None;
+            applied_tx_burst_packets = None;
+            crate::commands::send_response(b"transport STA stopped");
+            nan_now_started = crate::wifi_esp::init_nan_now(&snapshot, receive_espnow);
+            if nan_now_started {
+                crate::wifi_espnow_esp::set_poll_handler(Some(poll_espnow));
+            }
+            continue;
         }
         if wifi_started && applied_raw_tx_rate != Some(snapshot.raw_tx_rate) {
             // Some C6/AP combinations reject association when the public
@@ -546,7 +830,9 @@ pub fn run(_complete_main_flash: fn() -> bool) {
             unsafe { reset_raw_service() };
             applied_sta_raw_rx_enabled = Some(snapshot.sta_raw_rx_enabled);
             if snapshot.sta_raw_rx_enabled {
-                unsafe { RAW_ASSOCIATION = raw_association(&snapshot); }
+                unsafe {
+                    RAW_ASSOCIATION = raw_association(&snapshot);
+                }
                 if crate::wifi_esp::start_raw_udp6(receive_raw_udp6) {
                     unsafe {
                         crate::wifi_raw_udp6_esp::set_tx_burst_packets(
@@ -569,9 +855,10 @@ pub fn run(_complete_main_flash: fn() -> bool) {
             // AMPDU and the legacy basic-rate policy are applied before STA
             // start. Drop the bounded bearer, release the driver/netif, and
             // associate again; this starts no extra task.
-            if nan_now_enabled {
-                crate::wifi_esp::stop_nan_now();
-                nan_now_enabled = false;
+            if sta_extensions_enabled {
+                crate::wifi_esp::stop_sta_extensions();
+                sta_extensions_enabled = false;
+                applied_nan_dw_interval = None;
             }
             crate::wifi_raw_udp6_esp::stop();
             unsafe { reset_raw_service() };
@@ -583,21 +870,23 @@ pub fn run(_complete_main_flash: fn() -> bool) {
             applied_sta_ampdu_enabled = None;
             applied_sta_11b_rates_disabled = None;
             applied_sta_raw_rx_enabled = None;
+            applied_ack_frequency = None;
+            applied_ack_delay_ms = None;
             applied_tx_burst_packets = None;
             continue;
         }
         if wifi_started
-            && (applied_sta_bssid_check_disabled != Some(snapshot.sta_bssid_check_disabled)
-                || applied_tx_burst_packets != Some(snapshot.tx_burst_packets))
+            && applied_sta_bssid_check_disabled != Some(snapshot.sta_bssid_check_disabled)
         {
             // The private enable/disable pair reports success live, but a
             // false->true transition loses raw NDP on C6 until Wi-Fi is
             // restarted. Apply this pre-association policy through the one
             // existing STA lifecycle instead of claiming a broken live
             // transition succeeded.
-            if nan_now_enabled {
-                crate::wifi_esp::stop_nan_now();
-                nan_now_enabled = false;
+            if sta_extensions_enabled {
+                crate::wifi_esp::stop_sta_extensions();
+                sta_extensions_enabled = false;
+                applied_nan_dw_interval = None;
             }
             crate::wifi_raw_udp6_esp::stop();
             unsafe { reset_raw_service() };
@@ -609,25 +898,58 @@ pub fn run(_complete_main_flash: fn() -> bool) {
             applied_sta_ampdu_enabled = None;
             applied_sta_11b_rates_disabled = None;
             applied_sta_raw_rx_enabled = None;
+            applied_ack_frequency = None;
+            applied_ack_delay_ms = None;
             applied_tx_burst_packets = None;
             continue;
         }
-        if wifi_started && snapshot.espnow_capture != nan_now_enabled {
-            if snapshot.espnow_capture {
-                let enabled = crate::wifi_esp::start_nan_now(receive_espnow);
+        if wifi_started
+            && (applied_ack_frequency != Some(snapshot.ack_frequency)
+                || applied_ack_delay_ms != Some(snapshot.ack_delay_ms)
+                || applied_tx_burst_packets != Some(snapshot.tx_burst_packets))
+        {
+            // Connection policy is applied at association creation. Replace
+            // only the bounded QUIC service so the next OPEN gets one
+            // coherent ACK/burst profile; do not reconfigure the radio.
+            unsafe {
+                RAW_ASSOCIATION = raw_association(&snapshot);
+                if let Some(service) = raw_service_if_ready() {
+                    service.replace_association(RAW_ASSOCIATION);
+                }
+                crate::wifi_raw_udp6_esp::set_tx_burst_packets(RAW_ASSOCIATION.tx_burst_packets);
+            }
+            applied_ack_frequency = Some(snapshot.ack_frequency);
+            applied_ack_delay_ms = Some(snapshot.ack_delay_ms);
+            applied_tx_burst_packets = Some(snapshot.tx_burst_packets);
+            crate::commands::send_response(b"connection association defaults updated");
+        }
+        if wifi_started && wants_sta_extensions(&snapshot) != sta_extensions_enabled {
+            if wants_sta_extensions(&snapshot) {
+                let enabled =
+                    crate::wifi_esp::start_sta_extensions(receive_espnow, snapshot.nan_dw_interval);
                 if enabled {
                     crate::wifi_espnow_esp::set_poll_handler(Some(poll_espnow));
                 }
-                nan_now_enabled = enabled;
+                sta_extensions_enabled = enabled;
+                applied_nan_dw_interval = enabled.then_some(snapshot.nan_dw_interval);
                 crate::commands::send_response(if enabled {
                     b"wifi NAN/NOW coexistence enabled"
                 } else {
                     b"wifi NAN/NOW coexistence failed"
                 });
             } else {
-                crate::wifi_esp::stop_nan_now();
-                nan_now_enabled = false;
-                crate::commands::send_response(b"wifi NAN/NOW coexistence disabled");
+                crate::wifi_esp::stop_sta_extensions();
+                sta_extensions_enabled = false;
+                applied_nan_dw_interval = None;
+                crate::commands::send_response(b"wifi STA/NAN/NOW DW capture disabled");
+            }
+        }
+        if sta_extensions_enabled && applied_nan_dw_interval != Some(snapshot.nan_dw_interval) {
+            if crate::wifi_esp::set_nan_dw_interval(snapshot.nan_dw_interval) {
+                applied_nan_dw_interval = Some(snapshot.nan_dw_interval);
+                crate::commands::send_response(b"wifi STA/NAN/NOW DW interval updated");
+            } else {
+                crate::commands::send_response(b"wifi STA/NAN/NOW DW interval rejected");
             }
         }
         // Raw Ethernet owns its FreeRTOS ingress task and accepts
@@ -641,6 +963,89 @@ pub fn run(_complete_main_flash: fn() -> bool) {
 /// Bounded boot identity exception record. It is a shared firmware bootstrap
 /// event, not a Recovery command or UART-owned schema.
 pub fn send_boot_identity(role: u8, partition: u8) {
-    let payload = dmesh_server::recovery::boot_identity_payload(role, partition);
+    let payload = dmesh_server::direct_iperf::boot_identity_payload(role, partition);
     let _ = crate::commands::send_record(&payload);
+}
+
+/// Publish the same boot records over NOW after the default unassociated
+/// radio is live. UART remains the bootstrap/debug path, but a host should be
+/// able to discover a freshly booted device without first changing its mode.
+fn send_boot_records_on_now(boot_message: &[u8], role: u8, partition: u8) {
+    if let Some(record) = dmesh_server::services::encode_status_text(boot_message) {
+        let _ = crate::wifi_espnow_esp::broadcast_record(&record);
+    }
+    let identity = dmesh_server::direct_iperf::boot_identity_payload(role, partition);
+    let _ = crate::wifi_espnow_esp::broadcast_record(&identity);
+    send_announce_on_now(dmesh_server::announce::ANNOUNCE_BOOT, 0, role, partition);
+}
+
+/// Presence announcements use the same tagged-CBOR bytes on every direct
+/// bearer. UART is available before any association; NOW joins once the boot
+/// NAN+NOW radio is live. The raw UDP6 adapter will add its own multicast
+/// egress once an associated peer/address exists.
+fn send_boot_announce_uart(role: u8, partition: u8) {
+    if let Some((record, used)) =
+        announce_record(dmesh_server::announce::ANNOUNCE_BOOT, 0, role, partition)
+    {
+        let _ = crate::commands::send_record(&record[..used]);
+        // NAN SD carries these exact tagged-CBOR presence bytes once a DW is
+        // available; it is not a second firmware-only discovery protocol.
+        let _ = crate::wifi_nan_dw_capture_esp::configure_active_publish(true, &record[..used]);
+    }
+}
+
+fn send_discovery_announce(uptime_secs: u64, now_active: bool, sta_active: bool) {
+    if let Some((record, used)) = announce_record(
+        dmesh_server::announce::ANNOUNCE_DISCOVERY,
+        uptime_secs,
+        0,
+        0,
+    ) {
+        let _ = crate::commands::send_record(&record[..used]);
+        let _ = crate::wifi_nan_dw_capture_esp::configure_active_publish(true, &record[..used]);
+        if now_active {
+            let _ = crate::wifi_espnow_esp::broadcast_record(&record[..used]);
+        }
+        if sta_active {
+            let _ = crate::wifi_raw_udp6_esp::broadcast_announce(&record[..used]);
+        }
+    }
+}
+
+fn send_sta_boot_announce() {
+    if let Some((record, used)) = announce_record(dmesh_server::announce::ANNOUNCE_BOOT, 0, 0, 0) {
+        let _ = crate::wifi_raw_udp6_esp::broadcast_announce(&record[..used]);
+    }
+}
+
+fn send_announce_on_now(kind: u64, uptime_secs: u64, role: u8, partition: u8) {
+    if let Some((record, used)) = announce_record(kind, uptime_secs, role, partition) {
+        let _ = crate::wifi_espnow_esp::broadcast_record(&record[..used]);
+    }
+}
+
+fn announce_record(
+    kind: u64,
+    uptime_secs: u64,
+    role: u8,
+    partition: u8,
+) -> Option<([u8; 96], usize)> {
+    let mac = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta)
+        .or_else(|| crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap))?;
+    let mut id = [0; 16];
+    id[..6].copy_from_slice(&mac);
+    let transport_mode = if crate::wifi_esp::sta_associated() { 1 } else { 0 };
+    let uptime_secs = u32::try_from(uptime_secs).unwrap_or(u32::MAX);
+    let counters = (u32::from(role) << 8) | u32::from(partition);
+    let announce = if kind == dmesh_server::announce::ANNOUNCE_BOOT {
+        let mut boot = dmesh_server::announce::Announce::boot(id, 6, transport_mode);
+        boot.uptime_secs = uptime_secs;
+        boot.counters = counters;
+        boot
+    } else {
+        dmesh_server::announce::Announce::discovery(id, 6, uptime_secs, transport_mode, counters)
+    };
+    let mut record = [0; 96];
+    let used = dmesh_server::announce::encode(announce, &mut record)?;
+    Some((record, used))
 }

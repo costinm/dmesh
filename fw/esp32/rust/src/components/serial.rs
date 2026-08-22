@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use esp_idf_sys as sys;
-use minicbor::{Encoder, data::Tag};
+use minicbor::{data::Tag, Encoder};
 
 use super::settings::SharedSettings;
 
@@ -377,7 +377,7 @@ fn time_after_or_equal(now: u32, deadline: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::nan_sleepy_start_payload;
-    use uart_codec::codec::{UART_ESCAPE, UART_FLAG, encode_payload};
+    use uart_codec::codec::{encode_payload, UART_ESCAPE, UART_FLAG};
 
     const UART_MAX_BODY: usize = dmesh_fw_transport::TRANSPORT_MTU + 1;
 

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 
 pub type SharedSettings = Rc<RefCell<Settings>>;
@@ -235,7 +235,7 @@ fn storage_key(key: &str) -> &str {
     }
 }
 
-impl dmesh_fw_transport::nvs::NvsStore for Settings {
+impl dmesh_server::settings::SettingsStore for Settings {
     fn namespace(&self) -> &str {
         self.namespace()
     }

@@ -36,6 +36,9 @@ pub enum IngressKind {
     /// bounded raw CBOR/log/control lane, never a second UART queue.
     UartRaw = 4,
     Work = 5,
+    /// NAN active-subscribe/publish Service Info. The Wi-Fi callback copies
+    /// only the bounded CBOR payload, then this common worker applies it.
+    NanServiceInfo = 6,
 }
 
 /// Link context preserved across the one required driver-buffer copy.
@@ -85,6 +88,7 @@ static ESPNOW_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_RAW_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static WORK_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static NAN_SERVICE_INFO_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static DROPS: AtomicU32 = AtomicU32::new(0);
 // The bearer callback itself remains registered while a radio/UART is active,
 // but no ingress task exists while it is idle. The first queued item creates a
@@ -251,6 +255,7 @@ fn handler_slot(kind: IngressKind) -> &'static AtomicUsize {
         IngressKind::Uart => &UART_HANDLER,
         IngressKind::UartRaw => &UART_RAW_HANDLER,
         IngressKind::Work => &WORK_HANDLER,
+        IngressKind::NanServiceInfo => &NAN_SERVICE_INFO_HANDLER,
     }
 }
 

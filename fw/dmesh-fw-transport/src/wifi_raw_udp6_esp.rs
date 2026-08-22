@@ -12,9 +12,14 @@ use core::{
 use quic_lite::raw_udp6::{
     encode_neighbor_advertisement, encode_station_ipv6_data_frame, encode_station_udp6_data_frame,
     encode_udp6, link_local_from_mac, parse_neighbor_solicitation, parse_udp6,
+    parse_udp6_for_destination,
 };
 
 pub const RAW_UDP6_PORT: u16 = 3339;
+/// Shared local-link announce group used by lmesh discovery.
+pub const ANNOUNCE_UDP6_PORT: u16 = 5227;
+const ANNOUNCE_IPV6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x52, 0x27];
+const ANNOUNCE_MAC: [u8; 6] = [0x33, 0x33, 0, 0, 0x52, 0x27];
 const FRAME_CAPACITY: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 96;
 // Temporary e6 MAC-ACK probe. When enabled, the registered STA RX callback
 // releases the driver buffer and returns immediately, without touching the
@@ -24,11 +29,11 @@ const RX_DROP_FOR_MAC_ACK_PROBE: bool = false;
 // Temporary STA-only A/B: use the identical Ethernet-II handoff registered by
 // ESP-IDF's `esp_netif` for lwIP (`esp_wifi_internal_tx`). Raw action/NOW
 // remains on `esp_wifi_80211_tx`; AP already uses its normal Ethernet handoff.
-// The safe starting point remains raw injection until a live command selects
-// the driver's associated Ethernet handoff.  It is deliberately an atomic
-// setting, not a build-time A/B: UART/Recovery control can switch the next
-// egress packet without rebooting the radio.
-static STA_DRIVER_TX_ENABLED: AtomicBool = AtomicBool::new(false);
+// The normal associated-STA path is ESP-IDF Ethernet submission. Raw 802.11
+// injection remains a live diagnostic opt-out.  This is deliberately atomic,
+// not a build-time A/B: UART/Recovery control can switch the next egress
+// packet without rebooting the radio.
+static STA_DRIVER_TX_ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub fn set_sta_driver_tx(enabled: bool) {
     STA_DRIVER_TX_ENABLED.store(enabled, Ordering::Release);
@@ -91,6 +96,9 @@ static LAST_TX_RESULT: AtomicU32 = AtomicU32::new(0);
 static RAW_TX_COMPLETIONS: AtomicU32 = AtomicU32::new(0);
 static RAW_TX_COMPLETION_FAILURES: AtomicU32 = AtomicU32::new(0);
 static RAW_TX_COMPLETION_RATE: AtomicU32 = AtomicU32::new(0);
+static TX_SUBMIT_CALLS: AtomicU32 = AtomicU32::new(0);
+static TX_SUBMIT_US_TOTAL: AtomicU32 = AtomicU32::new(0);
+static TX_SUBMIT_US_MAX: AtomicU32 = AtomicU32::new(0);
 // A one-packet raw burst must not wait indefinitely for a peer packet before
 // it can make its next sender-owned packet eligible.  The continuation uses
 // the existing shared ingress worker (and its already-accounted stack), not
@@ -116,6 +124,101 @@ static START_STATUS: AtomicU32 = AtomicU32::new(0);
 static FIRST_RX_LEN: AtomicU32 = AtomicU32::new(0);
 static FIRST_RX_REPORTED: AtomicBool = AtomicBool::new(false);
 static RX_CALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
+const ANNOUNCE_PEER_CAPACITY: usize = 10;
+
+/// A bounded, lock-free observation record. The shared ingress worker is the
+/// only writer; snapshots may see an older complete record but never retain a
+/// Wi-Fi driver buffer or allocate while receiving a multicast announce.
+struct AnnouncePeerSlot {
+    device_id: [AtomicU32; 4],
+    source_ip: [AtomicU32; 4],
+    source_mac_low: AtomicU32,
+    source_mac_high: AtomicU32,
+    uptime_secs: AtomicU32,
+    counters: AtomicU32,
+    kind_and_mode: AtomicU32,
+    last_seen_ms: AtomicU32,
+}
+
+impl AnnouncePeerSlot {
+    const fn new() -> Self {
+        Self {
+            device_id: [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ],
+            source_ip: [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ],
+            source_mac_low: AtomicU32::new(0),
+            source_mac_high: AtomicU32::new(0),
+            uptime_secs: AtomicU32::new(0),
+            counters: AtomicU32::new(0),
+            kind_and_mode: AtomicU32::new(0),
+            last_seen_ms: AtomicU32::new(0),
+        }
+    }
+}
+
+static ANNOUNCE_PEERS: [AnnouncePeerSlot; ANNOUNCE_PEER_CAPACITY] =
+    [const { AnnouncePeerSlot::new() }; ANNOUNCE_PEER_CAPACITY];
+static ANNOUNCE_NEXT: AtomicUsize = AtomicUsize::new(0);
+static ANNOUNCE_RECEIVED: AtomicU32 = AtomicU32::new(0);
+static ANNOUNCE_INVALID: AtomicU32 = AtomicU32::new(0);
+
+/// A copied presence observation exposed to status adapters. `last_seen_ms`
+/// uses the ESP monotonic millisecond counter and is zero for an unused slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnouncePeerSnapshot {
+    pub device_id: [u8; 16],
+    pub source_ip: [u8; 16],
+    pub source_mac: [u8; 6],
+    pub uptime_secs: u32,
+    pub counters: u32,
+    pub kind: u8,
+    pub transport_mode: u8,
+    pub last_seen_ms: u32,
+}
+
+/// Return the fixed ten-entry ESP discovery cache. Entries are advisory,
+/// unsigned, and replaced round-robin when full.
+pub fn announce_peers(out: &mut [Option<AnnouncePeerSnapshot>; ANNOUNCE_PEER_CAPACITY]) {
+    for (index, slot) in ANNOUNCE_PEERS.iter().enumerate() {
+        let last_seen_ms = slot.last_seen_ms.load(Ordering::Acquire);
+        if last_seen_ms == 0 {
+            out[index] = None;
+            continue;
+        }
+        let mut device_id = [0; 16];
+        let mut source_ip = [0; 16];
+        for (index, word) in slot.device_id.iter().enumerate() {
+            device_id[index * 4..index * 4 + 4]
+                .copy_from_slice(&word.load(Ordering::Relaxed).to_be_bytes());
+        }
+        for (index, word) in slot.source_ip.iter().enumerate() {
+            source_ip[index * 4..index * 4 + 4]
+                .copy_from_slice(&word.load(Ordering::Relaxed).to_be_bytes());
+        }
+        let low = slot.source_mac_low.load(Ordering::Relaxed).to_le_bytes();
+        let high = slot.source_mac_high.load(Ordering::Relaxed).to_le_bytes();
+        let kind_and_mode = slot.kind_and_mode.load(Ordering::Relaxed);
+        out[index] = Some(AnnouncePeerSnapshot {
+            device_id,
+            source_ip,
+            source_mac: [low[0], low[1], low[2], low[3], high[0], high[1]],
+            uptime_secs: slot.uptime_secs.load(Ordering::Relaxed),
+            counters: slot.counters.load(Ordering::Relaxed),
+            kind: kind_and_mode as u8,
+            transport_mode: (kind_and_mode >> 8) as u8,
+            last_seen_ms,
+        });
+    }
+}
 // Only the single shared-ingress consumer calls `dispatch_ingress`, therefore
 // these scratch frames are never accessed concurrently. They are temporary
 // until the common packet-pool conversion lands; no callback retains them.
@@ -174,6 +277,9 @@ pub fn reset_diagnostics() {
     RAW_TX_COMPLETIONS.store(0, Ordering::Relaxed);
     RAW_TX_COMPLETION_FAILURES.store(0, Ordering::Relaxed);
     RAW_TX_COMPLETION_RATE.store(0, Ordering::Relaxed);
+    TX_SUBMIT_CALLS.store(0, Ordering::Relaxed);
+    TX_SUBMIT_US_TOTAL.store(0, Ordering::Relaxed);
+    TX_SUBMIT_US_MAX.store(0, Ordering::Relaxed);
 }
 
 unsafe extern "C" fn raw_tx_done(info: *const esp_idf_sys::esp_80211_tx_info_t) {
@@ -238,10 +344,8 @@ pub fn stop() {
     if !STARTED.swap(false, Ordering::AcqRel) {
         return;
     }
-    let _ = crate::wifi_esp::register_ethernet_rx_callback(
-        crate::wifi_esp::RadioInterface::Sta,
-        None,
-    );
+    let _ =
+        crate::wifi_esp::register_ethernet_rx_callback(crate::wifi_esp::RadioInterface::Sta, None);
     if AP_RX_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
         let _ = crate::wifi_esp::register_ethernet_rx_callback(
             crate::wifi_esp::RadioInterface::Ap,
@@ -251,6 +355,34 @@ pub fn stop() {
     HANDLER.store(0, Ordering::Release);
     crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::RawUdp6);
     START_STATUS.store(0, Ordering::Release);
+}
+
+/// Re-register driver-owned callbacks after a controlled Wi-Fi stop/start.
+///
+/// A lab APSTA transition owns the ESP-IDF lifecycle but not this bearer.  A
+/// Rust-side `STARTED` flag alone is insufficient after `esp_wifi_stop()`:
+/// ESP-IDF has discarded the Ethernet RX and raw-TX completion callbacks.
+/// Keep the shared ingress worker and handler intact, but bind them again to
+/// the newly started STA driver epoch.
+pub fn rebind_sta_after_wifi_restart() -> bool {
+    if !STARTED.load(Ordering::Acquire) {
+        return true;
+    }
+    let rx = crate::wifi_esp::register_ethernet_rx_callback(
+        crate::wifi_esp::RadioInterface::Sta,
+        Some(rx_callback_sta),
+    );
+    if rx != esp_idf_sys::ESP_OK {
+        START_STATUS.store(3, Ordering::Release);
+        crate::commands::send_stat(b"raw udp6 rebind rxcb result=", rx as u32 as u64);
+        return false;
+    }
+    let tx = crate::wifi_esp::register_raw_tx_done_callback(Some(raw_tx_done));
+    if tx != esp_idf_sys::ESP_OK {
+        crate::commands::send_stat(b"raw udp6 rebind txcb result=", tx as u32 as u64);
+    }
+    START_STATUS.store(1, Ordering::Release);
+    true
 }
 
 /// Register the AP raw-Ethernet callback after an APSTA transition.
@@ -271,8 +403,7 @@ pub fn ensure_ap_rx_callback() -> bool {
         crate::commands::send_stat(b"raw udp6 AP rxcb result=", result as u32 as u64);
         return false;
     }
-    let Some(ap_mac) = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap)
-    else {
+    let Some(ap_mac) = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap) else {
         crate::commands::send_response(b"raw udp6 AP mac failed");
         return false;
     };
@@ -307,6 +438,37 @@ pub fn set_tx_burst_packets(packets: usize) {
         packets.clamp(1, crate::RAW_SERVICE_HISTORY_CAPACITY),
         Ordering::Release,
     );
+}
+
+/// Current ingress-turn egress credit, exposed through the shared radio
+/// snapshot so packet-timing investigations do not infer it from gaps.
+pub fn tx_burst_packets() -> u8 {
+    TX_BURST_PACKETS.load(Ordering::Acquire) as u8
+}
+
+pub fn tx_submit_timing() -> (u32, u32, u32) {
+    (
+        TX_SUBMIT_CALLS.load(Ordering::Relaxed),
+        TX_SUBMIT_US_TOTAL.load(Ordering::Relaxed),
+        TX_SUBMIT_US_MAX.load(Ordering::Relaxed),
+    )
+}
+
+fn record_tx_submit(elapsed_us: u32) {
+    TX_SUBMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    TX_SUBMIT_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    let mut observed = TX_SUBMIT_US_MAX.load(Ordering::Relaxed);
+    while elapsed_us > observed {
+        match TX_SUBMIT_US_MAX.compare_exchange_weak(
+            observed,
+            elapsed_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => observed = current,
+        }
+    }
 }
 
 pub fn last_tx_result() -> u32 {
@@ -446,12 +608,31 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
                     b"raw udp6 ndp parse error=",
                     quic_lite::raw_udp6::error_code(error) as u64,
                 );
+                if let Some(info) = quic_lite::raw_udp6::icmpv6_frame_info(frame) {
+                    // ICMPv6 is broader than NDP: Linux can return an error
+                    // quoting a raw UDP6 packet, and routine control traffic
+                    // can be addressed elsewhere.  Preserve the actual type,
+                    // code, hop limit, and declared payload size so a UART
+                    // diagnostic identifies the rejected packet without a
+                    // privileged host packet capture or copying its payload.
+                    crate::commands::send_stat(
+                        b"raw udp6 ndp icmp type/code=",
+                        ((info.icmp_type as u64) << 8) | info.code as u64,
+                    );
+                    crate::commands::send_stat(
+                        b"raw udp6 ndp icmp hop/payload=",
+                        ((info.hop_limit as u64) << 16) | info.payload_length as u64,
+                    );
+                }
                 // An ICMPv6 frame can be a Neighbor Solicitation, a
                 // reachability probe, or unrelated control traffic.  Keep
                 // enough wire shape to distinguish an ESP RX truncation from
                 // an NDP parser rule without copying/logging the frame.
                 crate::commands::send_stat(b"raw udp6 ndp rx len=", frame.len() as u64);
-                if frame.len() >= quic_lite::raw_udp6::ETHERNET_HEADER_LEN + quic_lite::raw_udp6::IPV6_HEADER_LEN {
+                if frame.len()
+                    >= quic_lite::raw_udp6::ETHERNET_HEADER_LEN
+                        + quic_lite::raw_udp6::IPV6_HEADER_LEN
+                {
                     let ip = &frame[quic_lite::raw_udp6::ETHERNET_HEADER_LEN..];
                     crate::commands::send_stat(
                         b"raw udp6 ndp ip payload_len=",
@@ -467,6 +648,17 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
                     );
                 }
             }
+        }
+        return;
+    }
+    // Presence is a separate multicast service, never a QUIC-lite datagram.
+    // Parse it before the unicast bearer so a valid announcement cannot inflate
+    // raw UDP6 error counters or reach a connection handler.
+    if let Ok(packet) = parse_udp6_for_destination(frame, ANNOUNCE_IPV6, ANNOUNCE_UDP6_PORT) {
+        if let Some(announce) = dmesh_server::announce::decode_announce(packet.payload) {
+            record_announce_peer(announce, packet.source_mac, packet.source_ip);
+        } else {
+            ANNOUNCE_INVALID.fetch_add(1, Ordering::Relaxed);
         }
         return;
     }
@@ -526,6 +718,83 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     if result.sent != 0 {
         schedule_paced_poll(item.link(), peer);
     }
+}
+
+fn record_announce_peer(
+    announce: dmesh_server::announce::Announce,
+    source_mac: [u8; 6],
+    source_ip: [u8; 16],
+) {
+    let mut selected = None;
+    for (index, slot) in ANNOUNCE_PEERS.iter().enumerate() {
+        let mut equal = true;
+        // Compare all sixteen bytes. Announce IDs may be shorter (ESP uses a
+        // six-byte MAC) and comparing only complete chunks would otherwise
+        // merge peers that differ in the final two MAC bytes.
+        for (word, bytes) in slot
+            .device_id
+            .iter()
+            .zip(announce.device_id.chunks_exact(4))
+        {
+            if word.load(Ordering::Acquire) != u32::from_be_bytes(bytes.try_into().unwrap()) {
+                equal = false;
+                break;
+            }
+        }
+        if equal && slot.last_seen_ms.load(Ordering::Acquire) != 0 {
+            selected = Some(index);
+            break;
+        }
+    }
+    let index = selected
+        .unwrap_or_else(|| ANNOUNCE_NEXT.fetch_add(1, Ordering::Relaxed) % ANNOUNCE_PEER_CAPACITY);
+    let slot = &ANNOUNCE_PEERS[index];
+    for (word, bytes) in slot
+        .device_id
+        .iter()
+        .zip(announce.device_id.chunks_exact(4))
+    {
+        word.store(
+            u32::from_be_bytes(bytes.try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+    }
+    for (word, bytes) in slot.source_ip.iter().zip(source_ip.chunks_exact(4)) {
+        word.store(
+            u32::from_be_bytes(bytes.try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+    }
+    slot.source_mac_low.store(
+        u32::from_le_bytes([source_mac[0], source_mac[1], source_mac[2], source_mac[3]]),
+        Ordering::Relaxed,
+    );
+    slot.source_mac_high.store(
+        u32::from_le_bytes([source_mac[4], source_mac[5], 0, 0]),
+        Ordering::Relaxed,
+    );
+    slot.uptime_secs
+        .store(announce.uptime_secs, Ordering::Relaxed);
+    slot.counters.store(announce.counters, Ordering::Relaxed);
+    slot.kind_and_mode.store(
+        // `decode_announce` accepts only the two small published method tags.
+        announce.kind as u32 | (u32::from(announce.transport_mode) << 8),
+        Ordering::Relaxed,
+    );
+    let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000).max(1) as u32;
+    slot.last_seen_ms.store(now_ms, Ordering::Release);
+    ANNOUNCE_RECEIVED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an announce from a bearer without an IPv6 source tuple. NAN Service
+/// Info, NOW action frames, and UART use this exact same bounded cache as
+/// multicast UDP6; only the unavailable IPv6 provenance is represented by an
+/// unspecified address. Presence semantics never depend on the bearer.
+pub fn record_connectionless_announce(
+    announce: dmesh_server::announce::Announce,
+    source_mac: [u8; 6],
+) {
+    record_announce_peer(announce, source_mac, [0; 16]);
 }
 
 /// Continue an explicit one-packet burst after yielding the shared worker for
@@ -589,9 +858,15 @@ fn store_paced_peer(link: crate::shared_ingress_esp::IngressLink, peer: RawUdp6P
         u32::from_le_bytes([peer.mac[0], peer.mac[1], peer.mac[2], peer.mac[3]]),
         Ordering::Release,
     );
-    PACED_PEER_MAC_HIGH.store(u32::from_le_bytes([peer.mac[4], peer.mac[5], 0, 0]), Ordering::Release);
+    PACED_PEER_MAC_HIGH.store(
+        u32::from_le_bytes([peer.mac[4], peer.mac[5], 0, 0]),
+        Ordering::Release,
+    );
     for (slot, bytes) in PACED_PEER_IP.iter().zip(peer.ip.chunks_exact(4)) {
-        slot.store(u32::from_be_bytes(bytes.try_into().unwrap()), Ordering::Release);
+        slot.store(
+            u32::from_be_bytes(bytes.try_into().unwrap()),
+            Ordering::Release,
+        );
     }
     PACED_PEER_PORT.store(u32::from(peer.port), Ordering::Release);
 }
@@ -651,6 +926,32 @@ fn transmit_udp6(
     transmit_ipv6(link, peer.mac, local_mac, &ethernet[..frame_len])
 }
 
+/// Send one bounded unsigned presence record once STA/raw-UDP6 is live.
+/// This is intentionally outside the QUIC-lite listener port: multicast
+/// discovery must not be misparsed as a connection datagram.
+pub fn broadcast_announce(payload: &[u8]) -> bool {
+    if payload.is_empty() || payload.len() > crate::TRANSPORT_MTU {
+        return false;
+    }
+    let link = crate::shared_ingress_esp::IngressLink::WifiSta;
+    let local_mac = local_mac_for(link);
+    let local_ip = link_local_from_mac(local_mac);
+    let ethernet = unsafe { &mut *core::ptr::addr_of_mut!(TX_FRAME) };
+    let Ok(frame_len) = encode_udp6(
+        ethernet,
+        ANNOUNCE_MAC,
+        local_mac,
+        ANNOUNCE_IPV6,
+        local_ip,
+        ANNOUNCE_UDP6_PORT,
+        ANNOUNCE_UDP6_PORT,
+        payload,
+    ) else {
+        return false;
+    };
+    transmit_ipv6(link, ANNOUNCE_MAC, local_mac, &ethernet[..frame_len])
+}
+
 fn transmit_ipv6(
     link: crate::shared_ingress_esp::IngressLink,
     destination_mac: [u8; 6],
@@ -660,10 +961,10 @@ fn transmit_ipv6(
     match link {
         crate::shared_ingress_esp::IngressLink::WifiAp => {
             transmit_ethernet(crate::wifi_esp::RadioInterface::Ap, ethernet)
-        },
+        }
         crate::shared_ingress_esp::IngressLink::WifiSta if sta_driver_tx_enabled() => {
             transmit_ethernet(crate::wifi_esp::RadioInterface::Sta, ethernet)
-        },
+        }
         crate::shared_ingress_esp::IngressLink::WifiSta
         | crate::shared_ingress_esp::IngressLink::None => {
             transmit_station_ipv6(destination_mac, local_mac, ethernet)
@@ -674,7 +975,10 @@ fn transmit_ipv6(
 /// This is exactly the ESP-IDF `esp_netif`/lwIP Wi-Fi handoff, including its
 /// driver-owned copy and ordinary associated-STA rate/queue policy.
 fn transmit_ethernet(interface: crate::wifi_esp::RadioInterface, ethernet: &[u8]) -> bool {
+    let started = unsafe { esp_idf_sys::esp_timer_get_time() };
     let result = crate::wifi_esp::transmit_ethernet(interface, ethernet);
+    let elapsed = (unsafe { esp_idf_sys::esp_timer_get_time() } - started).max(0) as u32;
+    record_tx_submit(elapsed);
     LAST_TX_RESULT.store(result as u32, Ordering::Relaxed);
     result == esp_idf_sys::ESP_OK
 }

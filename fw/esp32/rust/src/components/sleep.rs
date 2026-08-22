@@ -1,14 +1,14 @@
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
 use super::lora::{self, LoraChip, LoraConfig};
-use super::settings::{SharedSettings, parse_bool};
+use super::settings::{parse_bool, SharedSettings};
 use super::telemetry;
 
 const RTC_MAGIC: u32 = 0x4453_4c50;

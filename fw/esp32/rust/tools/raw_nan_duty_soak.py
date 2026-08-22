@@ -24,8 +24,8 @@ from dmesh.radio import parse_text_record
 ROOT = Path(os.environ.get("DMESH_ROOT", Path(__file__).resolve().parents[4]))
 
 
-class ManagedRadioResult:
-    """Small CommandResult-compatible wrapper for mesh/lmesh JSON replies."""
+class DirectRadioResult:
+    """Small CommandResult-compatible wrapper for direct dmesh-cli records."""
 
     def __init__(self, command: str, raw: str, records: list[dict]):
         self.command = command
@@ -41,8 +41,8 @@ class ManagedRadioResult:
         return candidates[-1]
 
 
-class ManagedRadioClient:
-    """Issue framed firmware commands through the supervised lmesh API."""
+class DirectRadioClient:
+    """Issue framed firmware commands through one explicit dmesh-cli session."""
 
     def __init__(self, role: str, timeout: float = 15.0):
         self.role = role.removesuffix(".lmesh")
@@ -60,12 +60,12 @@ class ManagedRadioClient:
         proc = subprocess.run(
             [
                 str(ROOT / "scripts" / "with-env.sh"),
-                "mesh",
-                "lmesh-uart",
-                "esp.serial.command",
-                f"port={self.role}",
-                f"command={command}",
-                f"timeout_sec={limit}",
+                "dmesh-cli",
+                self.role,
+                "--command",
+                command,
+                "--timeout-secs",
+                str(limit),
             ],
             cwd=ROOT,
             env=os.environ.copy(),
@@ -75,18 +75,27 @@ class ManagedRadioClient:
             timeout=limit + 15,
             check=True,
         )
-        outer = json.loads(proc.stdout)
-        data = outer.get("data", {})
-        if data.get("ok") is False:
-            raise TimeoutError(data.get("error", f"managed command failed: {proc.stdout[-300:]!r}"))
         records = []
-        for message in data.get("messages", []):
-            console = message.get("console", "")
-            for line in console.splitlines():
-                record = parse_text_record(line)
-                if record is not None:
-                    records.append(record)
-        return ManagedRadioResult(command, proc.stdout, records)
+        for line in proc.stdout.splitlines():
+            record = parse_text_record(line)
+            if record is not None:
+                records.append(record)
+                continue
+            # dmesh-cli preserves printable firmware records as a quoted
+            # `kind=text` payload. Unwrap it before reusing the established
+            # lab record parser; this remains a direct UART session, not a
+            # return to the removed forwarding-service JSON envelope.
+            marker = "kind=text text="
+            if marker in line:
+                try:
+                    text = json.loads(line.split(marker, 1)[1])
+                except json.JSONDecodeError:
+                    continue
+                for text_line in text.splitlines():
+                    record = parse_text_record(text_line)
+                    if record is not None:
+                        records.append(record)
+        return DirectRadioResult(command, proc.stdout, records)
 
 
 RAW_NAN_SETTINGS = (
@@ -137,16 +146,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def fresh_command(client: ManagedRadioClient, command: str, timeout: float, *, expected: str | None = None):
+def fresh_command(client: DirectRadioClient, command: str, timeout: float, *, expected: str | None = None):
     """Issue one framed control request through the managed lmesh API."""
     return client.command(command, timeout=timeout, expected=expected)
 
 
-def stats(client: ManagedRadioClient, timeout: float) -> dict:
+def stats(client: DirectRadioClient, timeout: float) -> dict:
     return fresh_command(client, "nan stats=true", timeout).record("nan")["fields"]
 
 
-def sleep(client: ManagedRadioClient, timeout: float) -> dict:
+def sleep(client: DirectRadioClient, timeout: float) -> dict:
     return fresh_command(client, "sleep status=true", timeout).record("sleep")["fields"]
 
 
@@ -169,7 +178,7 @@ def phase_summary(samples) -> dict:
     }
 
 
-def configure(client: ManagedRadioClient, args: argparse.Namespace, *, infra: bool) -> None:
+def configure(client: DirectRadioClient, args: argparse.Namespace, *, infra: bool) -> None:
     mode = "infra" if infra else "sleepy"
     fresh_command(
         client,
@@ -213,8 +222,8 @@ def main() -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = Path(args.output or "target/esp32-raw-nan-soak/{}".format(stamp))
     artifacts = ArtifactWriter(output)
-    sender = ManagedRadioClient(args.sender, timeout=args.timeout)
-    receiver = ManagedRadioClient(args.receiver, timeout=args.timeout)
+    sender = DirectRadioClient(args.sender, timeout=args.timeout)
+    receiver = DirectRadioClient(args.receiver, timeout=args.timeout)
     meter = PowerCollector(
         PowerMeterConfig("power1", args.meter, "sender", required=True), artifacts
     )

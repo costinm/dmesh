@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use esp_idf_sys as sys;
 
 use crate::commands::{CommandHandler, CommandRegistry, CommandRequest, CommandResponse};
 
-use super::settings::{SharedSettings, parse_bool};
+use super::settings::{parse_bool, SharedSettings};
 use super::telemetry;
 
 const MODE_COMPANION: u8 = 0;
@@ -2847,7 +2847,7 @@ fn active_status_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{deadline_due, deadline_not_due, ping_packet};
-    use crate::commands::protocol::{CBOR_STATUS, decode_binary};
+    use crate::commands::protocol::{decode_binary, CBOR_STATUS};
 
     #[test]
     fn radio_ping_packets_are_compact_cbor_status_requests() {
