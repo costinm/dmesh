@@ -11,7 +11,7 @@ use crate::{TransportProfile, commands as uart};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering},
 };
 
 // Recovery-only PHY policy. It is deliberately not an NVS setting: normal
@@ -388,8 +388,8 @@ unsafe extern "C" fn sta_event_handler(
     if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_CONNECTED as i32 {
         let started = STA_CONNECT_STARTED_MS.load(Ordering::Acquire);
         if started != 0 {
-            let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000)
-                as u32;
+            let now_ms =
+                (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
             // A STA attempt is bounded to seconds, so wrapping subtraction
             // remains correct even though the ESP target has no AtomicU64.
             STA_CONNECT_TO_ASSOCIATED_MS.store(now_ms.wrapping_sub(started), Ordering::Release);
@@ -594,6 +594,15 @@ pub fn init_sta(params: &TransportProfile) {
         };
         for (dst, src) in sta.ssid.iter_mut().zip(ssid.iter().copied()) {
             *dst = src;
+        }
+        if params.sta_passphrase_len != 0 {
+            for (dst, src) in sta.password.iter_mut().zip(
+                params.sta_passphrase[..params.sta_passphrase_len]
+                    .iter()
+                    .copied(),
+            ) {
+                *dst = src;
+            }
         }
         if params.sta_bssid_set {
             sta.bssid_set = true;
@@ -874,6 +883,7 @@ pub fn init_nan_now(
             }
         }
     }
+    LAB_OPEN_AP.store(params.ap == 1, Ordering::Release);
     let enabled = start_sta_extensions(handler, params.nan_dw_interval);
     uart::send_response(if enabled {
         b"wifi NAN/NOW started"
@@ -1184,6 +1194,11 @@ pub fn start_sta_extensions(
         uart::send_response(b"wifi STA/NAN/NOW DW start failed");
         return false;
     }
+    // NAN+NOW owns the same callback/capture extension set whether or not a
+    // STA is associated.  Mark that ownership explicitly so a later
+    // transport.start {mode: sta} quiesces DW capture and NOW ingress before
+    // it stops/reinitializes the ESP-IDF driver.
+    RADIO_MODE.store(RadioMode::StaRawUdp6Extensions as u8, Ordering::Release);
     uart::send_response(if nan_dw_interval == 0 {
         b"wifi STA/NAN/NOW NOW-only started"
     } else {
@@ -1205,9 +1220,7 @@ pub fn set_nan_dw_interval(nan_dw_interval: u8) -> bool {
 /// mode starts from the known STA lifecycle rather than retaining a callback
 /// or driver state across personalities.
 pub fn stop_sta_extensions() {
-    if radio_mode() != RadioMode::StaRawUdp6Extensions {
-        return;
-    }
+    let extensions_active = radio_mode() == RadioMode::StaRawUdp6Extensions;
     crate::wifi_nan_dw_capture_esp::stop();
     // Wi-Fi owns the packet-pool admission lifetime for the hardware action
     // callback. The NOW module only consumes packets that this owner has
@@ -1215,8 +1228,10 @@ pub fn stop_sta_extensions() {
     crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::EspNow);
     crate::wifi_espnow_esp::stop_action_ingress();
     set_now_dispatcher(false);
-    RADIO_MODE.store(RadioMode::StaRawUdp6 as u8, Ordering::Release);
-    uart::send_response(b"wifi STA/NAN/NOW stopped");
+    if extensions_active {
+        RADIO_MODE.store(RadioMode::StaRawUdp6 as u8, Ordering::Release);
+        uart::send_response(b"wifi STA/NAN/NOW stopped");
+    }
 }
 
 /// Admit one already-decoded NOW payload through the Wi-Fi-owned shared pool.
@@ -1524,6 +1539,12 @@ pub fn sta_associated() -> bool {
 pub fn sta_connect_to_associated_ms() -> Option<u32> {
     let elapsed = STA_CONNECT_TO_ASSOCIATED_MS.load(Ordering::Acquire);
     (elapsed != 0).then_some(elapsed)
+}
+
+/// Most recent ESP-IDF STA disconnect reason. Zero means no disconnect event
+/// was observed in this radio epoch; callers must not treat it as success.
+pub fn sta_last_disconnect_reason() -> u8 {
+    STA_LAST_DISCONNECT_REASON.load(Ordering::Acquire)
 }
 
 /// Read the driver's actual promiscuous-mode state for diagnostics. This is

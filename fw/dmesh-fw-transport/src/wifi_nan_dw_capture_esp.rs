@@ -7,13 +7,17 @@
 //! window are handed to the same shared action ingress as the private driver
 //! hook; outside the window there is no promiscuous capture.
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 const NAN_DW_PERIOD_MS: u32 = 512 * 1_024 / 1_000;
 const NAN_DW_CAPTURE_MS: u32 = 64;
-/// Infra startup needs enough uninterrupted time to see a NAN beacon and
-/// establish a cluster/TSF before switching to the low-duty DW cadence.
-const NAN_INITIAL_ACQUIRE_MS: u32 = 1_500;
+/// Infra startup must keep receiving until it has a realistic chance to see
+/// an Android/host NAN beacon and establish a cluster/TSF.  A 1.5-second
+/// acquisition raced Android's active-publish setup; after that it sampled a
+/// 64 ms window on an arbitrary phase and could miss every peer DW forever.
+/// This bounded 15-second cost is paid only after a radio-mode replacement;
+/// normal operation still reduces to the configured low-duty cadence.
+const NAN_INITIAL_ACQUIRE_MS: u32 = 15_000;
 /// Temporary paired-C6 laboratory override.  It bypasses beacon acquisition
 /// only so the private Address-3 comparator can be tested with promiscuous
 /// mode completely disabled.  Normal cluster discovery remains the default
@@ -140,14 +144,25 @@ static PENDING_FOLLOWUPS: [PendingFollowup; PENDING_FOLLOWUP_CAPACITY] =
     [const { PendingFollowup::new() }; PENDING_FOLLOWUP_CAPACITY];
 static ACTIVE_SUBSCRIBE_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SUBSCRIBE_PEER: [AtomicU8; 6] = [
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
 ];
 /// Application-owned CBOR dispatcher. Wi-Fi owns the callback and packet copy;
 /// Recovery/Main only receives a copied Service Info payload on the common
 /// ingress worker.
 pub type NanServiceInfoHandler = fn([u8; 6], &[u8]);
 static SERVICE_INFO_HANDLER: AtomicUsize = AtomicUsize::new(0);
+// These counters distinguish "the radio saw an SDF" from "the SDF contained
+// our Service Info and was safely handed to the common worker".  They are
+// intentionally scalar diagnostics: neither the Wi-Fi callback nor the
+// snapshot retains a driver-owned frame or CBOR payload.
+static SERVICE_INFO_MATCHED: AtomicU32 = AtomicU32::new(0);
+static SERVICE_INFO_ENQUEUED: AtomicU32 = AtomicU32::new(0);
+static SERVICE_INFO_DROPPED: AtomicU32 = AtomicU32::new(0);
 static FILTER_PENDING: AtomicBool = AtomicBool::new(false);
 static FILTER_ARMED: AtomicBool = AtomicBool::new(false);
 static FILTER_ARMS: AtomicU32 = AtomicU32::new(0);
@@ -179,7 +194,10 @@ fn bssid_is_unset(bssid: [u8; 6]) -> bool {
 fn record_followup(followup: dmesh_rawnan::DmeshNanFollowup<'_>) {
     let index = FOLLOWUP_HISTORY_NEXT.fetch_add(1, Ordering::Relaxed) % FOLLOWUP_HISTORY_CAPACITY;
     let slot = &FOLLOWUP_HISTORY[index];
-    let payload = &followup.payload[..followup.payload.len().min(dmesh_rawnan::NAN_COMMAND_MAX_LEN)];
+    let payload = &followup.payload[..followup
+        .payload
+        .len()
+        .min(dmesh_rawnan::NAN_COMMAND_MAX_LEN)];
     for (index, byte) in followup.device_id.iter().enumerate() {
         slot.source[index].store(*byte, Ordering::Relaxed);
     }
@@ -191,7 +209,8 @@ fn record_followup(followup: dmesh_rawnan::DmeshNanFollowup<'_>) {
     }
     slot.msg_type.store(followup.msg_type, Ordering::Relaxed);
     slot.seq.store(followup.seq, Ordering::Relaxed);
-    slot.payload_len.store(payload.len() as u16, Ordering::Relaxed);
+    slot.payload_len
+        .store(payload.len() as u16, Ordering::Relaxed);
     // Publish last so readers see either the previous complete entry or this
     // complete copied entry. The bounded cache is advisory diagnostics only.
     slot.last_seen_ms.store(now_ms(), Ordering::Release);
@@ -199,9 +218,7 @@ fn record_followup(followup: dmesh_rawnan::DmeshNanFollowup<'_>) {
 
 /// Return the fixed-size newest/oldest independent receipt cache. Unused
 /// entries are `None`; callers can choose their presentation order.
-pub fn followup_history(
-    out: &mut [Option<FollowupSnapshot>; FOLLOWUP_HISTORY_CAPACITY],
-) {
+pub fn followup_history(out: &mut [Option<FollowupSnapshot>; FOLLOWUP_HISTORY_CAPACITY]) {
     for (index, slot) in FOLLOWUP_HISTORY.iter().enumerate() {
         let last_seen_ms = slot.last_seen_ms.load(Ordering::Acquire);
         if last_seen_ms == 0 {
@@ -269,9 +286,10 @@ pub fn take_active_subscribe(peer: [u8; 6]) -> bool {
     if !ACTIVE_SUBSCRIBE_PENDING.load(Ordering::Acquire) {
         return false;
     }
-    let matches = ACTIVE_SUBSCRIBE_PEER.iter().enumerate().all(|(index, value)| {
-        value.load(Ordering::Relaxed) == peer[index]
-    });
+    let matches = ACTIVE_SUBSCRIBE_PEER
+        .iter()
+        .enumerate()
+        .all(|(index, value)| value.load(Ordering::Relaxed) == peer[index]);
     if matches {
         ACTIVE_SUBSCRIBE_PENDING.store(false, Ordering::Release);
     }
@@ -285,8 +303,8 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
     let now = now_ms();
     let mut oldest_ready: Option<(&PendingFollowup, u32)> = None;
     for _ in 0..PENDING_FOLLOWUP_CAPACITY {
-        let index = PENDING_FOLLOWUP_NEXT.fetch_add(1, Ordering::Relaxed)
-            % PENDING_FOLLOWUP_CAPACITY;
+        let index =
+            PENDING_FOLLOWUP_NEXT.fetch_add(1, Ordering::Relaxed) % PENDING_FOLLOWUP_CAPACITY;
         let slot = &PENDING_FOLLOWUPS[index];
         if slot
             .state
@@ -329,7 +347,8 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
         for (index, byte) in response.iter().enumerate() {
             slot.payload[index].store(*byte, Ordering::Relaxed);
         }
-        slot.payload_len.store(response.len() as u16, Ordering::Relaxed);
+        slot.payload_len
+            .store(response.len() as u16, Ordering::Relaxed);
         slot.queued_ms.store(now, Ordering::Relaxed);
         slot.state.store(PENDING_READY, Ordering::Release);
         PENDING_FOLLOWUP_QUEUED.fetch_add(1, Ordering::Relaxed);
@@ -355,7 +374,8 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
             for (index, byte) in response.iter().enumerate() {
                 slot.payload[index].store(*byte, Ordering::Relaxed);
             }
-            slot.payload_len.store(response.len() as u16, Ordering::Relaxed);
+            slot.payload_len
+                .store(response.len() as u16, Ordering::Relaxed);
             slot.queued_ms.store(now, Ordering::Relaxed);
             slot.state.store(PENDING_READY, Ordering::Release);
             PENDING_FOLLOWUP_QUEUED.fetch_add(1, Ordering::Relaxed);
@@ -386,10 +406,7 @@ fn transmit_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
     let sequence = FOLLOWUP_SEQUENCE.fetch_add(1, Ordering::Relaxed).max(1);
     let Ok(payload) = dmesh_rawnan::build_dmesh_followup_payload(
         7, // command_cbor
-        sequence,
-        local,
-        peer,
-        response,
+        sequence, local, peer, response,
     ) else {
         return false;
     };
@@ -580,14 +597,18 @@ fn due(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) < (1 << 31)
 }
 
-/// `(all_management_frames, bytes, NAN_beacons, NAN_SDFs, NAN_followups)`.
-pub fn stats() -> (u32, u32, u32, u32, u32) {
+/// `(all_management_frames, bytes, NAN_beacons, NAN_SDFs, NAN_followups,
+/// DMesh_Service_Info_matches, copied_to_ingress, ingress_copy_failures)`.
+pub fn stats() -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     (
         FRAMES.load(Ordering::Relaxed),
         BYTES.load(Ordering::Relaxed),
         BEACONS.load(Ordering::Relaxed),
         SDFS.load(Ordering::Relaxed),
         FOLLOWUPS.load(Ordering::Relaxed),
+        SERVICE_INFO_MATCHED.load(Ordering::Relaxed),
+        SERVICE_INFO_ENQUEUED.load(Ordering::Relaxed),
+        SERVICE_INFO_DROPPED.load(Ordering::Relaxed),
     )
 }
 
@@ -725,6 +746,13 @@ pub fn reset_stats() {
 /// use this only for diagnostics and NAN capture accounting.
 pub fn capturing() -> bool {
     CAPTURING.load(Ordering::Acquire)
+}
+
+/// Configured discovery-window cadence. Unlike [`capturing`], this is stable
+/// between the bounded 64 ms receive windows and is therefore suitable for
+/// control-plane/radio-profile verification.
+pub fn interval() -> u8 {
+    DW_INTERVAL.load(Ordering::Acquire)
 }
 
 /// Whether starting a ROC lease with `duration_ms` would overlap a normal NAN
@@ -955,30 +983,43 @@ fn receive_management_frame(frame: &[u8]) {
             // Active Subscribe puts its custom CBOR Service Info in SDEA;
             // active Publish puts it directly in the SDA. Both are delivered
             // through the same copied ingress record as UART/SD control.
-            let active_subscribe = dmesh_rawnan::active_subscribe_service_info(
-                frame,
-                dmesh_rawnan::DMESH_SERVICE_ID,
-            );
+            let active_subscribe =
+                dmesh_rawnan::active_subscribe_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID);
             let payload = active_subscribe.map(|item| item.service_info).or_else(|| {
-                dmesh_rawnan::service_descriptor_payload(frame, dmesh_rawnan::DMESH_SERVICE_ID)
+                // Android can emit a legacy `DM` descriptor and a current
+                // CBOR descriptor with the same service ID. Select a direct
+                // record here, before the one allowed callback copy; legacy
+                // service state is discovery metadata, never a mode command.
+                dmesh_rawnan::service_descriptor_payload_matching(
+                    frame,
+                    dmesh_rawnan::DMESH_SERVICE_ID,
+                    |candidate| {
+                        dmesh_server::announce::decode_announce(candidate).is_some()
+                            || crate::commands::is_control_record(candidate)
+                    },
+                )
             });
             if let Some(payload) = payload {
+                SERVICE_INFO_MATCHED.fetch_add(1, Ordering::Relaxed);
                 if active_subscribe.is_some() {
                     mark_active_subscribe(source);
                 }
-                let _ = crate::shared_ingress_esp::enqueue(
+                if crate::shared_ingress_esp::enqueue(
                     crate::shared_ingress_esp::IngressKind::NanServiceInfo,
                     source,
                     payload,
-                );
+                ) {
+                    SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         dmesh_rawnan::FrameKind::Followup => {
             FOLLOWUPS.fetch_add(1, Ordering::Relaxed);
-            if let Some(payload) = dmesh_rawnan::service_descriptor_payload(
-                frame,
-                dmesh_rawnan::DMESH_SERVICE_ID,
-            ) {
+            if let Some(payload) =
+                dmesh_rawnan::service_descriptor_payload(frame, dmesh_rawnan::DMESH_SERVICE_ID)
+            {
                 if let Some(followup) = dmesh_rawnan::parse_dmesh_nan_followup(payload) {
                     record_followup(followup);
                 }

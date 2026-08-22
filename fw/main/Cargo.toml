@@ -1,0 +1,33 @@
+[package]
+name = "dmesh-rs"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[workspace]
+
+[features]
+default = []
+modules = ["dep:dmesh-fw-modules"]
+
+[dependencies]
+dmesh-fw-transport = { path = "../dmesh-fw-transport" }
+dmesh-fw-modules = { path = "../modules", optional = true }
+esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
+
+[build-dependencies]
+embuild = "0.33.3"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["../modules/native"]
+
+[profile.release]
+codegen-units = 1
+debug = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = false
+
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git", rev = "8369f610a31e9c90a5479ed7f366f983589dfa0a" }

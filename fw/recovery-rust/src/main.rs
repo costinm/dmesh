@@ -13,7 +13,7 @@ pub extern "C" fn app_main() {
     // unsupported here rather than introducing a Recovery-specific dispatcher.
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();
-    dmesh_fw_transport::recovery_runtime::run(
+    dmesh_fw_transport::firmware_runtime::run(
         platform::complete_main_flash,
     );
 }

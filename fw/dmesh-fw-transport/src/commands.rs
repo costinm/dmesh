@@ -54,6 +54,18 @@ struct ProfileControl<'a> {
     profile: &'a mut TransportProfile,
 }
 
+/// Result of applying one control record to the fixed-size radio profile.
+///
+/// A `transport.start` is a declaration of an immutable radio epoch, not an
+/// imperative restart command.  Its Service Info may be repeated in multiple
+/// NAN DWs, so callers must replace Wi-Fi only when this result reports an
+/// actual profile change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlApplyResult {
+    pub transport_start: bool,
+    pub changed: bool,
+}
+
 impl Handler for ProfileControl<'_> {
     type Error = ProfileControlError;
 
@@ -134,16 +146,42 @@ impl ConnectionManager for ProfileControl<'_> {
 /// The only firmware responsibility is applying typed values to ESP-owned
 /// state. It contains no command grammar, method tags, or CBOR traversal.
 pub fn apply_control_record(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
+    apply_control_record_result(packet, params).map(|_| true)
+}
+
+/// Apply one shared control record and report whether it changed the selected
+/// immutable radio profile.  UART and NAN SD use this exact helper so a
+/// repeated active Subscribe/Publish command remains idempotent.
+pub fn apply_control_record_result(
+    packet: &[u8],
+    params: &mut TransportProfile,
+) -> Option<ControlApplyResult> {
     let request = control::decode_request(packet);
     if let Some(request) = request {
+        let transport_start = matches!(request, control::Request::TransportStart { .. });
+        let before = *params;
         return control::dispatch_request(request, &mut ProfileControl { profile: params })
             .ok()
-            .map(|()| true);
+            .map(|()| ControlApplyResult {
+                transport_start,
+                changed: *params != before,
+            });
     }
     let request = connection::decode_request(packet)?;
     connection::dispatch_request(request, &mut ProfileControl { profile: params })
         .ok()
-        .map(|()| true)
+        .map(|()| ControlApplyResult {
+            transport_start: false,
+            changed: false,
+        })
+}
+
+/// True when bytes use one of the common direct-CBOR command envelopes.
+/// Wi-Fi uses this only to select a Service Descriptor before copying it out
+/// of a driver-owned receive buffer; application of the record remains on the
+/// shared ingress worker through [`apply_control_record_result`].
+pub fn is_control_record(packet: &[u8]) -> bool {
+    control::decode_request(packet).is_some() || connection::decode_request(packet).is_some()
 }
 
 /// Response projection is shared with host tests; firmware only selects the
@@ -152,8 +190,8 @@ pub use dmesh_server::firmware_profile::encode_profile_control_response as encod
 
 #[cfg(test)]
 mod command_tests {
-    use super::apply_control_record;
-    use crate::{state::direct_record_generation_changed_from, TransportProfile};
+    use super::{ControlApplyResult, apply_control_record, apply_control_record_result};
+    use crate::{TransportProfile, state::direct_record_generation_changed_from};
 
     #[test]
     fn direct_record_arrival_during_worker_is_not_missed() {
@@ -207,5 +245,61 @@ mod command_tests {
         let stop_sta = [0xa3, 1, 1, 2, 5, 5, 0xa1, 1, 1];
         assert_eq!(apply_control_record(&stop_sta, &mut params), Some(true));
         assert_eq!(params.requested_transport, None);
+    }
+
+    #[test]
+    fn repeated_nan_transport_start_is_an_idempotent_profile_declaration() {
+        // {1: control, 2: transport.start, 5: {1: nan, 14: DW1}}
+        // This is the same bounded CBOR payload that can arrive in more than
+        // one active NAN Publish/Subscribe discovery window.
+        let start_nan = [0xa3, 1, 1, 2, 4, 5, 0xa2, 1, 6, 14, 1];
+        let mut params = TransportProfile::new();
+        assert_eq!(
+            apply_control_record_result(&start_nan, &mut params),
+            Some(ControlApplyResult {
+                transport_start: true,
+                changed: true,
+            })
+        );
+        let committed = params;
+        assert_eq!(
+            apply_control_record_result(&start_nan, &mut params),
+            Some(ControlApplyResult {
+                transport_start: true,
+                changed: false,
+            })
+        );
+        assert_eq!(params, committed);
+    }
+
+    #[test]
+    fn repeated_android_sta_publish_is_an_idempotent_profile_declaration() {
+        // Captured Android primary DMesh Service Info: STA, SSID, BSSID,
+        // channel 6, DW off, NOW on, AP on, driver TX on, and 11b enabled.
+        // Active Publish repeats this exact payload in later discovery
+        // windows; only the first arrival may request a radio replacement.
+        let start_sta = [
+            0xa3, 1, 1, 2, 4, 5, 0xa9, 1, 1, 2, 0x78, 0x1b, b'D', b'i', b'r', b'e', b'c', b't',
+            b'-', b'F', b'8', b'1', b'7', b'D', b'E', b'6', b'5', b'-', b'D', b'm', b'e', b's',
+            b'h', b'-', b'l', b'o', b'c', b'a', b'l', 3, 0x46, 0x74, 0x19, 0xf8, 0x17, 0xde, 0x65,
+            4, 6, 14, 0, 15, 0, 16, 1, 6, 0xf5, 9, 0xf4,
+        ];
+        let mut params = TransportProfile::new();
+        assert_eq!(
+            apply_control_record_result(&start_sta, &mut params),
+            Some(ControlApplyResult {
+                transport_start: true,
+                changed: true,
+            })
+        );
+        let committed = params;
+        assert_eq!(
+            apply_control_record_result(&start_sta, &mut params),
+            Some(ControlApplyResult {
+                transport_start: true,
+                changed: false,
+            })
+        );
+        assert_eq!(params, committed);
     }
 }

@@ -162,6 +162,9 @@ AP owner and send it over UART, while future NAN Service Info carries the same
 CBOR command. A started setup is immutable for its radio epoch. To change a
 field, issue another start: `wifi_esp` stops the previous STA/NOW/raw ingress
 cleanly, then creates the replacement epoch. There is no live mode mutation.
+An identical UART or NAN Service Info start is an acknowledgement-only no-op:
+active Publish/Subscribe may repeat it in later discovery windows without
+resetting the association, NOW callback, or NAN capture state.
 
 | Control | Default | Effect and transition cost |
 | --- | --- | --- |

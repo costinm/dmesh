@@ -4,13 +4,13 @@
 //! parsing, handler method IDs, snapshots, and delta semantics are in
 //! `dmesh-server`, so direct PPP and QUIC stream callers use identical bytes.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use dmesh_server::raw_wifi::{
-    RawWifiApMode, RawWifiControlRequest, RawWifiCounters, RawWifiDwPolicy, RawWifiInterface,
-    RawWifiLabRequest, RawWifiRate, RawWifiRxFilter, RawWifiSnapshot, RawWifiStaMode,
-    RawWifiStaState, RawWifiTxRequest, RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL,
-    RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT,
+    RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS,
+    RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiControlRequest, RawWifiCounters,
+    RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
+    RawWifiSnapshot, RawWifiStaMode, RawWifiStaState, RawWifiTxRequest,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);
@@ -172,7 +172,16 @@ pub fn snapshot() -> RawWifiSnapshot {
     ) = crate::wifi_espnow_esp::tx_timing();
     let (raw_service_bytes, _raw_service_errors, raw_service_elapsed_us) =
         crate::wifi_espnow_esp::raw_client_result();
-    let (_frames, _bytes, beacons, sdfs, followups) = crate::wifi_nan_dw_capture_esp::stats();
+    let (
+        _frames,
+        _bytes,
+        beacons,
+        sdfs,
+        followups,
+        service_info_matched,
+        service_info_enqueued,
+        service_info_dropped,
+    ) = crate::wifi_nan_dw_capture_esp::stats();
     let (vendor_beacon_ies, vendor_nan_beacon_ies, vendor_other_ies) =
         crate::wifi_nonpromisc_probe_esp::stats();
     let (roc_frames, _roc_bytes, roc_requests, roc_failures, roc_espnow, roc_nan, roc_other) =
@@ -194,8 +203,7 @@ pub fn snapshot() -> RawWifiSnapshot {
         udp6_raw_tx_completions,
         udp6_raw_tx_completion_failures,
         udp6_raw_tx_completion_rate,
-    ) =
-        crate::wifi_raw_udp6_esp::diagnostics();
+    ) = crate::wifi_raw_udp6_esp::diagnostics();
     let (udp6_tx_submit_calls, udp6_tx_submit_us_total, udp6_tx_submit_us_max) =
         crate::wifi_raw_udp6_esp::tx_submit_timing();
     RawWifiSnapshot {
@@ -204,6 +212,7 @@ pub fn snapshot() -> RawWifiSnapshot {
         sta_associated: Some(crate::wifi_esp::sta_associated()),
         promiscuous: crate::wifi_esp::promiscuous_enabled().ok(),
         dw_capturing: Some(capturing),
+        nan_dw_interval: Some(crate::wifi_nan_dw_capture_esp::interval()),
         comparator_bssid: (bssid != [0; 6]).then_some(bssid),
         comparator_armed: Some(armed),
         comparator_errors,
@@ -227,6 +236,7 @@ pub fn snapshot() -> RawWifiSnapshot {
         sta_11b_rates_disabled: Some(crate::wifi_esp::sta_11b_rates_disabled()),
         sta_raw_rx_enabled: Some(crate::wifi_raw_udp6_esp::started()),
         sta_connect_to_associated_ms: crate::wifi_esp::sta_connect_to_associated_ms(),
+        sta_last_disconnect_reason: Some(crate::wifi_esp::sta_last_disconnect_reason()),
         sta_ap_rssi_dbm: crate::wifi_esp::sta_ap_rssi_dbm(),
         udp6_tx_burst_packets: Some(crate::wifi_raw_udp6_esp::tx_burst_packets()),
         udp6_tx_submit_calls: Some(udp6_tx_submit_calls),
@@ -244,6 +254,9 @@ pub fn snapshot() -> RawWifiSnapshot {
             nan_beacons: beacons,
             nan_sdfs: sdfs,
             nan_followups: followups,
+            nan_service_info_matched: service_info_matched,
+            nan_service_info_enqueued: service_info_enqueued,
+            nan_service_info_dropped: service_info_dropped,
             tx_duration_us_total,
             tx_duration_us_max,
             tx_duration_le_250us,
@@ -376,7 +389,8 @@ fn apply_control(control: RawWifiControlRequest) -> Result<(), &'static str> {
     // `roc_loop=true` remains the explicit one-shot operation.
     if control.roc_loop != Some(true) {
         if let Some(duration_ms) = control.roc_listen_ms {
-            if !crate::wifi_nonpromisc_probe_esp::listen_on_current_channel(u32::from(duration_ms)) {
+            if !crate::wifi_nonpromisc_probe_esp::listen_on_current_channel(u32::from(duration_ms))
+            {
                 return Err("ROC action listener rejected");
             }
         }

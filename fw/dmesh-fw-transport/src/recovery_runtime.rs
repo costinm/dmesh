@@ -39,17 +39,6 @@ fn transport_profile_snapshot() -> crate::TransportProfile {
     with_transport_profile(|profile| *profile)
 }
 
-fn is_wifi_start(packet: &[u8]) -> bool {
-    matches!(
-        dmesh_server::control::decode_request(packet),
-        Some(dmesh_server::control::Request::TransportStart {
-            kind: dmesh_server::control::TransportKind::Sta
-                | dmesh_server::control::TransportKind::Nan,
-            ..
-        })
-    )
-}
-
 extern "C" {
     fn nvs_open(namespace: *const i8, mode: i32, handle: *mut u32) -> i32;
     fn nvs_get_u32(handle: u32, key: *const i8, value: *mut u32) -> i32;
@@ -526,11 +515,12 @@ fn receive_uart_raw_ingress(_item: crate::shared_ingress_esp::IngressPacket, pac
         }
         return;
     }
-    let wifi_start = is_wifi_start(packet);
+    let mut control_result = None;
     let accepted = with_transport_profile(|params| {
-        if crate::commands::apply_control_record(packet, params).is_none() {
+        let Some(result) = crate::commands::apply_control_record_result(packet, params) else {
             return false;
-        }
+        };
+        control_result = Some(result);
         // A tagged request id opts into a correlated direct response.  This
         // remains the same CBOR envelope as a QUIC-lite handler reply and
         // does not reserve a response queue for fire-and-forget bootstrap.
@@ -545,9 +535,11 @@ fn receive_uart_raw_ingress(_item: crate::shared_ingress_esp::IngressPacket, pac
         crate::commands::send_response(b"protocol rejected");
     } else {
         crate::state::direct_record_accepted();
-        if wifi_start {
-            // Publish only after the complete profile is visible. A repeated
-            // start is deliberately a replacement, never a live patch.
+        if control_result.is_some_and(|result| result.transport_start && result.changed) {
+            // Publish only after the complete profile is visible. Repeated
+            // NAN SD/Pub records which resolve to the same profile are an
+            // acknowledgement-only no-op: do not tear down Wi-Fi or reset a
+            // usable STA/NOW association.
             STA_START_GENERATION.fetch_add(1, Ordering::Release);
         }
     }
@@ -564,13 +556,14 @@ fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
         crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, peer);
         return;
     }
-    let wifi_start = is_wifi_start(packet);
+    let mut control_result = None;
     let mut response = [0u8; 128];
     let mut response_len = 0;
     let accepted = with_transport_profile(|params| {
-        if crate::commands::apply_control_record(packet, params).is_none() {
+        let Some(result) = crate::commands::apply_control_record_result(packet, params) else {
             return false;
-        }
+        };
+        control_result = Some(result);
         response_len =
             crate::commands::encode_control_response(packet, params, &mut response).unwrap_or(0);
         true
@@ -596,7 +589,7 @@ fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
             let _ = crate::wifi_espnow_esp::broadcast_record(&response[..response_len]);
         }
     }
-    if wifi_start {
+    if control_result.is_some_and(|result| result.transport_start && result.changed) {
         STA_START_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
@@ -606,6 +599,42 @@ fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
 /// The only Recovery-specific operation is supplied as `complete_main_flash`:
 /// it selects Main and reboots only after a verified Main image is durable.
 /// Main supplies a different completion policy for its allowed targets.
+#[derive(Clone, Copy)]
+pub struct RuntimeBehavior {
+    pub role: u8,
+    pub partition: u8,
+    pub boot_message: &'static [u8],
+    pub mark_healthy: fn(),
+}
+
+pub struct FirmwareRuntime {
+    behavior: RuntimeBehavior,
+}
+
+impl FirmwareRuntime {
+    pub const fn new(behavior: RuntimeBehavior) -> Self {
+        Self { behavior }
+    }
+
+    pub const fn main(mark_healthy: fn()) -> Self {
+        Self::new(RuntimeBehavior {
+            role: 1,
+            partition: 1,
+            boot_message: b"main core boot",
+            mark_healthy,
+        })
+    }
+
+    pub fn run(self) {
+        run_with_boot_identity(
+            self.behavior.role,
+            self.behavior.partition,
+            self.behavior.boot_message,
+            self.behavior.mark_healthy,
+        );
+    }
+}
+
 pub fn run(_complete_main_flash: fn() -> bool) {
     run_with_boot_identity(2, 2, b"recovery boot", || {});
 }
@@ -617,7 +646,7 @@ pub fn run(_complete_main_flash: fn() -> bool) {
 /// dmesh-server one handler at a time; they may not compete with this shared
 /// UART/STA/raw-service lifecycle.
 pub fn run_main(mark_healthy: fn()) {
-    run_with_boot_identity(1, 1, b"main core boot", mark_healthy);
+    FirmwareRuntime::main(mark_healthy).run();
 }
 
 fn run_with_boot_identity(
@@ -802,6 +831,11 @@ fn run_with_boot_identity(
             nan_now_started = crate::wifi_esp::init_nan_now(&snapshot, receive_espnow);
             if nan_now_started {
                 crate::wifi_espnow_esp::set_poll_handler(Some(poll_espnow));
+                // This replacement has already consumed the complete NAN
+                // profile that advanced the generation. Without recording it
+                // here, the next loop sees the same generation as pending and
+                // tears down this just-started DW/NOW epoch a second time.
+                applied_nan_start_generation = requested_sta_start_generation;
             }
             continue;
         }

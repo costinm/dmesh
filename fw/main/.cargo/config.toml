@@ -1,0 +1,15 @@
+[build]
+target = "xtensa-esp32-espidf"
+
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+[target.riscv32imac-esp-espidf]
+linker = "ldproxy"
+
+[unstable]
+build-std = ["std", "panic_abort"]

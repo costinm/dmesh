@@ -131,19 +131,14 @@ pub fn initialize(_settings: &SharedSettings, infra: bool) {
 /// raw-rate programming is the shared ESP adapter and affects either raw
 /// UDP6 data frames or raw ESP-NOW action frames.
 pub fn apply_direct_record(record: &[u8]) -> bool {
-    let starts_sta = matches!(
-        dmesh_server::control::decode_request(record),
-        Some(dmesh_server::control::Request::TransportStart {
-            kind: dmesh_server::control::TransportKind::Sta,
-            ..
-        })
-    );
     let Ok(mut profile) = profile().lock() else {
         return false;
     };
-    if dmesh_fw_transport::commands::apply_control_record(record, &mut profile).is_none() {
+    let Some(control_result) =
+        dmesh_fw_transport::commands::apply_control_record_result(record, &mut profile)
+    else {
         return false;
-    }
+    };
     dmesh_fw_transport::state::direct_record_accepted();
     // Match Recovery's correlated direct-CBOR behavior. Requests without an
     // id remain fire-and-forget; tagged requests get their result back on the
@@ -164,7 +159,10 @@ pub fn apply_direct_record(record: &[u8]) -> bool {
         return false;
     }
     dmesh_fw_transport::commands::send_stat(b"main raw tx rate=", rate as u64);
-    if starts_sta {
+    if control_result.transport_start
+        && control_result.changed
+        && requested_profile.requested_transport == Some(dmesh_server::control::TransportKind::Sta)
+    {
         replace_sta_locked(&requested_profile, "uart_transport_start");
         return true;
     }

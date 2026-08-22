@@ -22,7 +22,10 @@ pub mod profile;
 pub mod commands;
 pub mod crypto_esp;
 pub mod flash;
-pub mod recovery_runtime;
+#[path = "recovery_runtime.rs"]
+pub mod firmware_runtime;
+/// Compatibility name for Recovery and the old prototype callers.
+pub use firmware_runtime as recovery_runtime;
 pub mod state;
 pub mod task_esp;
 pub mod uart_esp;
