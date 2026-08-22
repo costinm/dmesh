@@ -30,12 +30,10 @@ The shared DM v1 NAN/BLE wire format and raw frame state machine live in
 [`dmesh-rawnan/API.md`](../rawnan/API.md). This crate owns only the Linux
 interface operations and their AP/STA/raw-NAN orchestration.
 
-Legacy UART forwarding is retired. `lmesh-uart` remains a reusable serial L2
-library, but has no device command, log, or flash socket. A future
-`lmesh-wifi` device manager may own a board's direct serial and STA adapters
-together; it contributes both to the same peer/path record, whose DCID maps to
-one QUIC-lite connection. It may therefore probe, select, or use serial and
-UDP concurrently without making an application command bearer-specific.
+Legacy UART forwarding is retired. The UART L2 implementation is owned only by
+`dmesh-cli`, including its E2E harness; `lmesh-wifi` does not open, proxy,
+enumerate, or select a board serial device. Host service requests use the
+CBOR mesh/UDP/NAN paths instead.
 
 Experimental BLE HCI operations are owned by `lmesh` and are intentionally
 outside this stable library.
@@ -48,15 +46,271 @@ monitor VIF, while `onchannel`, `onchannel_noack`, and `roc` use
 the service socket selected by mesh-init, normally
 `/run/mesh/lmesh-wifi/mesh.sock`.
 
-At startup the service starts the open AP, but does not create a raw-NAN
-monitor. A monitor is acquired only while a live raw-NAN-specific subscription
-such as `dmesh.event.wifi.rawnan.rx`, `.beacon`, or `.discovery` is connected;
-a broad `dmesh.event.wifi` subscription does not start it. The monitor is
-released when the last such subscriber disconnects. Explicit
-`wifi.rawnan.listen` and `wifi.rawnan.ping` requests may still acquire it for a
-bounded diagnostic. `wifi.rawnan.status` reports
-whether that monitor is active and whether a NAN cluster BSSID has been
-learned.
+## Common announce identity
+
+UDP multicast, NAN Service Info, NOW forwarding, and the local
+`wifi.discovery.observe` ingress all update one bounded discovered-device
+registry. An ESP32 announce may be unsigned (no public key and no signature).
+A host or Android announce that includes a public key is admitted only when
+its P-256 signature verifies over the canonical tagged-CBOR record and its
+device ID matches the key digest. Invalid key-bearing records are dropped
+before they reach the registry or its change-only JSONL log. This keeps
+transport provenance separate from identity validation.
+
+## Reviewed tagged-CBOR methods
+
+The Wi-Fi methods below are the reviewed tagged-CBOR surface. They use
+component index 5. The raw listener/check methods are deliberately bounded
+diagnostics: they may create or remove a raw monitor child, but never retune,
+start, stop, or reconfigure the owned AP. Other radio/AP state changes remain
+in the legacy JSON-RPC gateway until their fields and side effects receive the
+same wire review.
+
+The corresponding request structs in [`src/api.rs`](src/api.rs) are a
+dependency-free source for a review draft. This does not replace this file:
+stable numeric IDs remain reviewed here before catalog generation.
+
+```sh
+cd ../rust/ssh-mesh
+cargo run -p mesh-api-gen -- --rust /ws/dmesh/crates/lmesh-wifi/src/api.rs \
+  --out-api /tmp/lmesh-wifi-api-from-rust.md
+```
+
+```mesh-api
+id = "wifi.ap.status"
+component = "wifi"
+method = "ap.status"
+component-index = 5
+method-index = 1
+summary = "Return owned open-AP status"
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.sta.status"
+component = "wifi"
+method = "sta.status"
+component-index = 5
+method-index = 2
+summary = "Return owned station status"
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.rawnan.status"
+component = "wifi"
+method = "rawnan.status"
+component-index = 5
+method-index = 3
+summary = "Return raw-NAN status, the bounded one-hour cross-bearer discovered-device inventory, and NAN follow-ups. New/dropped devices append JSONL records to LMESH_DISCOVERY_LOG or LMESH_WIFI_DISCOVERY_LOG (default /run/mesh/lmesh-wifi/discovery.jsonl); routine refreshes do not log."
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.rawnan.active_publish"
+component = "wifi"
+method = "rawnan.active_publish"
+component-index = 5
+method-index = 15
+summary = "Replace the local active NAN Publish Service Info. An enabled descriptor is emitted once in the next confirmed discovery window and then at the bounded refresh cadence; this request never transmits immediately or changes interface state. service_info_hex is the bounded CBOR Service Info payload."
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "enabled", index = 2, type = "bool" },
+  { name = "service_info_hex", index = 3, type = "string", optional = true },
+]
+```
+
+```mesh-api
+id = "wifi.interface.status"
+component = "wifi"
+method = "interface.status"
+component-index = 5
+method-index = 4
+summary = "Return owned interface status"
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.ap.stations"
+component = "wifi"
+method = "ap.stations"
+component-index = 5
+method-index = 5
+summary = "Return associated station metrics for an AP interface"
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.raw.metrics"
+component = "wifi"
+method = "raw.metrics"
+component-index = 5
+method-index = 6
+summary = "Return bounded raw action receive and dispatch counters"
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.raw.stop"
+component = "wifi"
+method = "raw.stop"
+component-index = 5
+method-index = 7
+summary = "Stop the raw action listener"
+[request]
+fields = [{ name = "iface", index = 1, type = "string" }]
+```
+
+```mesh-api
+id = "wifi.raw.listen"
+component = "wifi"
+method = "raw.listen"
+component-index = 5
+method-index = 8
+summary = "Start or renew a bounded raw action listener"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "channel", index = 2, type = "u8" },
+  { name = "listen_sec", index = 3, type = "u64" },
+  { name = "rx_variant", index = 4, type = "string" },
+]
+```
+
+```mesh-api
+id = "wifi.raw.check"
+component = "wifi"
+method = "raw.check"
+component-index = 5
+method-index = 9
+summary = "Run one raw action liveness check"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "channel", index = 2, type = "u8" },
+  { name = "destination", index = 3, type = "string", required = true },
+  { name = "nonce", index = 4, type = "u64" },
+  { name = "timeout_ms", index = 5, type = "u64" },
+  { name = "tx_rate_mbps", index = 6, type = "u8" },
+  { name = "tx_variant", index = 7, type = "string" },
+  { name = "rx_variant", index = 8, type = "string" },
+  { name = "expected_peer", index = 9, type = "string" },
+]
+```
+
+```mesh-api
+id = "wifi.raw.iperf"
+component = "wifi"
+method = "raw.iperf"
+component-index = 5
+method-index = 10
+summary = "Run raw action QUIC-lite IPERF"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "channel", index = 2, type = "u8" },
+  { name = "destination", index = 3, type = "string", required = true },
+  { name = "bytes", index = 4, type = "u64" },
+  { name = "packet_size", index = 5, type = "u16" },
+  { name = "timeout_ms", index = 6, type = "u64" },
+  { name = "tx_rate_mbps", index = 7, type = "u8" },
+  { name = "tx_variant", index = 8, type = "string" },
+  { name = "rx_variant", index = 9, type = "string" },
+  { name = "expected_peer", index = 10, type = "string" },
+]
+```
+
+```mesh-api
+id = "wifi.raw.send"
+component = "wifi"
+method = "raw.send"
+component-index = 5
+method-index = 11
+summary = "Send one raw Wi-Fi validation frame"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "channel", index = 2, type = "u8" },
+  { name = "tx_variant", index = 3, type = "string" },
+  { name = "tx_rate_mbps", index = 4, type = "u8" },
+  { name = "frame_hex", index = 5, type = "string" },
+]
+```
+
+```mesh-api
+id = "wifi.rawnan.ping"
+component = "wifi"
+method = "rawnan.ping"
+component-index = 5
+method-index = 12
+summary = "Send a bounded NAN discovery probe"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "channel", index = 2, type = "u8" },
+  { name = "destination", index = 3, type = "string" },
+  { name = "bssid", index = 4, type = "string" },
+  { name = "payload", index = 5, type = "string" },
+  { name = "wait_ms", index = 6, type = "u64" },
+]
+```
+
+```mesh-api
+id = "wifi.rawnan.listen"
+component = "wifi"
+method = "rawnan.listen"
+component-index = 5
+method-index = 14
+summary = "Start or renew a bounded raw-NAN listener"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "channel", index = 2, type = "u8" },
+  { name = "listen_sec", index = 3, type = "u64" },
+]
+```
+
+At startup the service prepares the service-owned monitor fixture and keeps
+the receive loop active. A raw-NAN-specific subscription such as
+`dmesh.event.wifi.rawnan.rx`, `.beacon`, or `.discovery` only consumes that
+existing loop; test requests never create, stop, retune, or administratively
+change an interface. `wifi.rawnan.status` reports whether that monitor is
+active, whether a NAN cluster BSSID has been learned, and a newest-first
+bounded receipt list for DMesh NAN Follow-ups. Each receipt retains
+peer/BSSID, DMesh message type and sequence, and the bounded payload for E2E
+attribution.
+
+The inventory is bearer-neutral: raw NAN receives enter it directly, while
+the sibling `lmesh` service forwards its already validated multicast announce
+records over the local supervised socket as `wifi.discovery.observe`. That
+local-only ingress accepts the canonical CBOR announce, cannot change radio
+state, and uses the same one-hour expiry and change-only log. Standalone
+`lmesh-wifi` defaults to `/run/mesh/lmesh-wifi/discovery.jsonl`; embedded
+`lmesh` uses `/run/mesh/lmesh/discovery.jsonl` to avoid duplicate service
+records. Set `LMESH_DISCOVERY_LOG` (or the compatibility
+`LMESH_WIFI_DISCOVERY_LOG`) only when one explicit durable aggregate log is
+intended.
+
+The permanent active monitor is retained for NOW transmission. At startup the
+service also registers management beacons through nl80211 and feeds either RX
+lane into the same NAN synchronization state. This is needed on adapters that
+deliver SDF actions to an active monitor but suppress beacon RX there; the
+registration does not start, stop, or retune an interface.
+
+`mesh.send radio=nan destination=<peer-mac> payload=<text>` and
+`mesh.tagged.forward destination=<peer-mac>` are the explicit Follow-up test
+senders. They construct a NAN Follow-up SDF, rather than a generic vendor
+action, and return `NAN follow-up outside discovery window` unless the
+selected cluster beacon opened the current DW. They reuse the service-owned
+permanent monitor; neither command starts, stops, nor reconfigures a host
+interface.
 
 The host experiment commands are available on the service socket:
 
@@ -84,39 +338,10 @@ compatibility listener remains.
 
 ## ESP-NOW/action validation
 
-`dmesh-cli` is the standalone UART/STA test client and UDP server. Do not
-use `lmesh-wifi` as a gateway IPERF client for those bearers. This service is
-needed only when validating raw ESP-NOW/vendor-action frames, because it owns
-the required WLAN capabilities and raw injection/receive path.
-
-The following gateway operations are experimental compatibility helpers, not
-the normal UART/STA test path:
-
-```text
-mesh lmesh-wifi transport.client.iperf iface=wlan0 \
-  serial=/dev/serial/by-id/<device> bootstrap=10.78.0.1:0 \
-  backend=10.78.0.1:3339 bytes=2097152 bearer=spill
-```
-
-The current host gateway slice requires a direct serial L2 plus an IP backend.
-`bearer` accepts `uart`, `udp`, `aggregate`/`fastest`, or `spill`; the same
-policy values will select ESP-NOW and LoRa/FSK paths once those adapters enter
-the shared connection owner. The request returns once the bounded client task
-starts; its terminal report is emitted by the shared client, not inferred from
-that start acknowledgement.
-
-`transport.client.service` remains an experimental helper for raw-action work;
-use `dmesh-cli` directly for UART/STA service requests and bounded log
-watching.
-
-```text
-mesh lmesh-wifi transport.client.service iface=wlan0 \
-  target=udp://10.78.0.42:3339 service=log-watch log_records=16
-```
-
-It records completion in service history. `log-watch` is presently a bounded
-poll; a persistent framed subscription is planned and will use this same
-connection/path owner.
+`dmesh-cli` is the standalone UART/STA test client and UDP server. It is also
+the only host process allowed to open a board UART. `lmesh-wifi` owns only the
+WLAN capabilities needed to validate raw ESP-NOW/vendor-action frames; it does
+not proxy an IPERF or service request through a serial device.
 
 NAN remains discovery/bootstrap only. The extended ESP-NOW/DMesh vendor-action
 frame is the planned QUIC-lite data bearer and will carry the same
@@ -220,13 +445,14 @@ wifi.rate.profile iface=wlan1 profile=auto disable_80211b=false
 wifi.raw.listen iface=wlan1 channel=6 rx_variant=nl80211 listen_sec=60
 wifi.raw.send iface=wlan1 channel=6 tx_variant=action destination=ff:ff:ff:ff:ff:ff bssid=<cluster> payload=hex:...
 wifi.raw.send iface=wlan1 channel=6 tx_variant=monitor tx_rate_mbps=54 frame_hex=<80211-frame>
-wifi.raw.iperf iface=wlan1 channel=6 destination=<esp-mac> bytes=16384 packet_size=1200 tx_variant=monitor rx_variant=monitor tx_rate_mbps=54 timeout_ms=20000
+wifi.raw.iperf iface=wlan1 channel=6 destination=<esp-mac> bytes=16384 packet_size=1100 tx_variant=monitor rx_variant=monitor tx_rate_mbps=54 timeout_ms=20000
 wifi.raw.stop iface=wlan1
 messages.history keys=wifi.raw.tx,wifi.raw.rx,wifi.rawnan.rx limit=40
 ```
 
 `wifi.raw.iperf` is a host raw-action client using the same bearer-neutral
-`dmesh_server::raw_iperf::RawIperfClient` as firmware. `packet_size`,
+`dmesh_server::raw_iperf::RawIperfClient` as firmware. All current bearers
+share the 1100-byte maximum transport packet; `packet_size`,
 `tx_rate_mbps` (6, 9, 12, 18, 24, 36, 48, or 54), and `timeout_ms` are explicit
 runtime parameters. `tx_variant=monitor` is the default and historically
 proven AF_PACKET/radiotap injection path; `tx_variant=nl80211` is retained as
@@ -245,17 +471,21 @@ before/after history samples are the host metric boundary, while the ESP
 
 For arbitrary injection, `frame_hex` bypasses the structured DMesh builders:
 `monitor`/`monitor_active` takes an 802.11 management or data frame without
-radiotap and adds the required radiotap header; `action` submits the same
+radiotap and adds the required radiotap header; both use the already-prepared
+NAN+NOW monitor and do not change radio state. `action` submits the same
 802.11 header through `NL80211_CMD_FRAME`/`send_mgmt_frame` (driver support is
 adapter-specific); `af_packet` writes a complete
 Ethernet frame directly to `wlan1`. The latter exercises the normal AP/STA
-data path and is not an 802.11-header injection API. `monitor_active` may take
-the parent interface down, so use `monitor` while an AP must remain active.
+data path and is not an 802.11-header injection API.
 
 AP startup is a service policy. `LMESH_AP_ADDRESS` optionally selects the
 static IPv4 address/prefix applied to the owned open AP; the current service
-default is `10.78.0.1/16`. The AP defaults to HT20 so STA, NAN, and NOW can
-share a single 20 MHz channel.  Set `LMESH_AP_HT40=true`, or pass
+default is `10.78.0.1/16`. `lmesh-wifi` uses the normal 100-TU interval
+(`LMESH_AP_BEACON_INTERVAL_TU=100`). `lmesh` defaults its independently owned
+`wlan1` lab AP to 500 TU; setting `LMESH_AP_AUTOSTART=0` restores the AP-off
+NAN+NOW experiment. The AP defaults to HT20 so STA, NAN, and NOW can share a
+single 20 MHz channel. Set
+`LMESH_AP_HT40=true`, or pass
 `ht40=true` to `wifi.ap.start_open`, only for a dedicated AP experiment.
 
 `wifi.interface.channel` is an explicit nl80211 channel pin for the owned
@@ -265,6 +495,26 @@ that holds channel 6, use the existing explicit `wifi.ap.start_open iface=wlan1`
 command; stop it with `wifi.ap.stop iface=wlan1` before returning to an
 unassociated raw-NAN experiment. Ad-hoc and P2P modes remain driver-specific
 and are not enabled implicitly by this command.
+
+> TODO(host AP-off NAN+NOW): make the permanent `wlan1mon` fixture retain its
+> requested channel while `wlan1` is unassociated, then validate NAN/NOW
+> receive without an AP carrier. On the current mt7921u setup, a successful
+> `wifi.interface.channel` call is not sufficient to keep an unassociated
+> managed-plus-monitor radio tuned; the explicit wlan1 AP is the temporary
+> lab anchor only, never an automated-test setup step.
+>
+> `lmesh` preserves `channel`, `ht40`, and `beacon_interval_tu` when it
+> forwards this explicit lab/startup operation. They are not E2E test setup.
+
+For an operator-only scan-path diagnostic, use a passive, single-channel
+scan. It does not bring an interface up, start or stop an AP, or create/delete
+a monitor VIF; it only asks cfg80211 to dwell on channel 6 and returns the BSS
+cache result. It is not permitted in automated tests and cannot replace a
+received NAN sync beacon as a DW clock.
+
+```text
+wifi.scan iface=wlan1 channel=6 passive=true
+```
 
 To replace the AP with an unassociated 802.11 OCB carrier on channel 6, use:
 

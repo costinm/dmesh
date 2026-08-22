@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use mesh::tagged::{NameOrTag, TaggedCatalog, TaggedRecord};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -6,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 // The canonical schema is compiled in. `SCHEMA_DIR` supplies every
-// optional schema that lmesh-uart should translate at runtime.
+// optional schema that dmesh-cli should translate at runtime.
 const CORE_SCHEMA: &str = include_str!("../../lmesh/resources/firmware-schema.json");
 const SCHEMA_DIRECTORY_RELATIVE_PATH: &str = "schemas";
 
@@ -22,6 +23,11 @@ pub(crate) struct FirmwareSchemaFile {
 pub(crate) struct SchemaMethod {
     pub id: u16,
     pub name: String,
+    /// Optional common tagged component. Its presence means direct requests
+    /// are wrapped as `{1:component,2:method,5:fields}` rather than emitted
+    /// as the retired `{0:method,...}` catalog map.
+    #[serde(default)]
+    pub component: Option<u16>,
     #[serde(default)]
     pub direct_control: bool,
     #[serde(default)]
@@ -63,6 +69,10 @@ pub struct FirmwareSchema {
     fields: BTreeMap<u16, BTreeMap<u16, String>>,
     messages: BTreeMap<String, SchemaMessage>,
     catalog: mesh::cbor::Catalog,
+    /// Numeric tagged-CBOR catalog for the direct-record boundary.  It is
+    /// built from the installed schema artifact, so the CLI never needs to
+    /// manufacture the retired compact `{0,6}` map and translate it again.
+    tagged_catalog: TaggedCatalog,
 }
 
 impl FirmwareSchema {
@@ -90,18 +100,50 @@ impl FirmwareSchema {
     }
 
     fn refresh_catalog(&mut self) {
-        let tools = self.methods.values().map(|method| {
-            let properties = method.fields.iter().map(|field| {
-                (field.name.clone(), json!({"x-mesh-cbor": {"id": field.id}}))
-            }).collect::<Map<String, Value>>();
-            json!({
-                "name": method.name,
-                "x-mesh-cbor": {"id": method.id},
-                "inputSchema": {"type": "object", "properties": properties},
+        let tools = self
+            .methods
+            .values()
+            .map(|method| {
+                let properties = method
+                    .fields
+                    .iter()
+                    .map(|field| (field.name.clone(), json!({"x-mesh-cbor": {"id": field.id}})))
+                    .collect::<Map<String, Value>>();
+                json!({
+                    "name": method.name,
+                    "x-mesh-cbor": {"id": method.id},
+                    "inputSchema": {"type": "object", "properties": properties},
+                })
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
         self.catalog = mesh::cbor::Catalog::from_tools_json(&Value::Array(tools))
             .expect("firmware JSON schema has valid u16 CBOR tags");
+        // `TaggedCatalog` is the canonical command encoder. Keep the older
+        // compact catalog above only for rendering historical diagnostic
+        // records until every producer has moved to tagged CBOR.
+        self.tagged_catalog = TaggedCatalog::from_tools_json(&Value::Array(
+            self.methods
+                .values()
+                .map(|method| {
+                    let properties = method
+                        .fields
+                        .iter()
+                        .filter_map(|field| {
+                            field
+                                .id
+                                .map(|id| (field.name.clone(), json!({"x-protobuf-index": id})))
+                        })
+                        .collect::<Map<String, Value>>();
+                    json!({
+                        "name": method.name,
+                        "x-component-index": method.component,
+                        "x-method-index": method.id,
+                        "inputSchema": {"type": "object", "properties": properties},
+                    })
+                })
+                .collect(),
+        ))
+        .expect("firmware JSON schema has valid tagged-CBOR metadata");
     }
 
     fn merge(&mut self, file: FirmwareSchemaFile) {
@@ -133,11 +175,14 @@ impl FirmwareSchema {
             // numeric method tag with its catalog name.  Keep the field and
             // message schema lookup working in that normal decoded form.
             .or_else(|| {
-                object.get("method").and_then(Value::as_str).and_then(|name| {
-                    self.methods
-                        .iter()
-                        .find_map(|(id, method)| (method.name == name).then_some(*id))
-                })
+                object
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .and_then(|name| {
+                        self.methods
+                            .iter()
+                            .find_map(|(id, method)| (method.name == name).then_some(*id))
+                    })
             });
         let method_name =
             method_id.and_then(|id| self.methods.get(&id).map(|method| method.name.clone()));
@@ -257,12 +302,12 @@ fn command_json(command: &str, schema: &FirmwareSchema) -> Result<Value> {
         let (key, value) = word.split_once('=').unwrap_or((word, "true"));
         if key == "payload" {
             let hex = value.strip_prefix("hex:").unwrap_or(value);
-            fields.insert("data".to_owned(), Value::Array(decode_hex(hex)?.into_iter().map(Value::from).collect()));
-        } else {
             fields.insert(
-                key.to_owned(),
-                schema.command_value(method, key, value)?,
+                "data".to_owned(),
+                Value::Array(decode_hex(hex)?.into_iter().map(Value::from).collect()),
             );
+        } else {
+            fields.insert(key.to_owned(), schema.command_value(method, key, value)?);
         }
     }
     fields.insert("method".to_owned(), Value::String(method.to_owned()));
@@ -310,23 +355,80 @@ impl FirmwareSchema {
     }
 }
 
-#[cfg(test)]
-pub fn encode_text_command(command: &str) -> Result<Vec<u8>> {
-    let schema = FirmwareSchema::load();
-    Ok(mesh::cbor::encode_stream_frame(&mesh::cbor::encode_json(&command_json(command, &schema)?, &schema.catalog)?)?)
-}
-
-/// Encode the explicit Recovery direct-control exception without a generic
-/// stream-frame wrapper. Recovery accepts the canonical `{0: "recovery",
-/// 6: {...}}` CBOR envelope before a QUIC-lite connection exists; wrapping it
-/// turns the command into unrelated stream data and is correctly rejected.
+/// Encode a schema-guided direct command as one canonical tagged-CBOR record.
+///
+/// The installed schema remains the temporary catalog artifact during the
+/// generator migration, but this function no longer creates the retired
+/// compact `{0: method, 6: payload}` map and decodes it again.  Direct records
+/// require numeric component and method tags; an unreviewed schema entry must
+/// use the explicit JSON-RPC compatibility path instead of unnamed CBOR.
 pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
     let schema = FirmwareSchema::load();
-    let value = command_json(command, &schema)?;
-    let method = value.get("method").and_then(Value::as_str).context("command method")?;
-    let cbor = mesh::cbor::encode_json(&value, &schema.catalog)?;
-    let direct = schema.methods.values().any(|entry| entry.name == method && entry.direct_control);
-    if direct { Ok(cbor) } else { Ok(mesh::cbor::encode_stream_frame(&cbor)?) }
+    let mut value = command_json(command, &schema)?;
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .context("command method")?
+        .to_owned();
+    let entry = schema
+        .methods
+        .values()
+        .find(|entry| entry.name == method)
+        .context("unknown firmware command")?;
+    if !entry.direct_control || entry.component.is_none() {
+        anyhow::bail!(
+            "{method} has no reviewed direct tagged-CBOR schema; use --direct-hex or a schema-backed stream service"
+        );
+    }
+    value
+        .as_object_mut()
+        .context("command object")?
+        .remove("method");
+    // The pinned mesh catalog translates text and JSONL but does not expose
+    // the newer `record_from_value` helper. Direct firmware commands already
+    // carry reviewed numeric component/method/field IDs in `FirmwareSchema`,
+    // so construct that tagged record here without a text round trip.
+    let component = entry
+        .component
+        .context("direct firmware command has no component")?;
+    let fields = value.as_object().context("command fields")?;
+    // Raw-radio snapshot/reset use a registered empty *fields map*, not an
+    // omitted payload. `mesh::cbor::encode_record` correctly omits an empty
+    // generic environment, but that would make the embedded raw handler
+    // distinguish this request from its documented `{5:{}}` envelope. Keep
+    // CLI, direct UART, and E2E on the one shared constructor.
+    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u16
+        && fields.is_empty()
+        && (u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT
+            || u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS)
+    {
+        let mut wire = [0u8; 16];
+        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request(
+            u64::from(entry.id),
+            &mut wire,
+        )
+        .context("raw radio snapshot request")?;
+        return Ok(wire[..used].to_vec());
+    }
+    let mut record = TaggedRecord {
+        component: NameOrTag::Tag(u32::from(component)),
+        method: NameOrTag::Tag(u32::from(entry.id)),
+        ..TaggedRecord::default()
+    };
+    for (name, field_value) in fields {
+        let field = entry
+            .fields
+            .iter()
+            .find(|field| field.name == *name)
+            .with_context(|| format!("unknown direct field {method}.{name}"))?;
+        let id = field
+            .id
+            .with_context(|| format!("direct field {method}.{name} has no numeric ID"))?;
+        record
+            .env
+            .insert(NameOrTag::Tag(u32::from(id)), field_value.clone());
+    }
+    mesh::cbor::encode_record(&record)
 }
 
 /// Compact logfmt renderer shared by the session CLI and the remaining
@@ -465,7 +567,7 @@ fn resolve_schema_directory(path: PathBuf) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FirmwareSchema, encode_direct_command, encode_text_command, render_device_record};
+    use super::{FirmwareSchema, encode_direct_command, render_device_record};
     use minicbor::Encoder;
     use serde_json::json;
 
@@ -525,24 +627,33 @@ mod tests {
             render_device_record(&schema, b"boot ready\n"),
             "kind=text text=\"boot ready\""
         );
-        let command = encode_text_command("mode active_ms=1000").unwrap();
-        let payload = mesh::cbor::decode_stream_frame(&command).unwrap();
-        assert!(schema.decode_packet(payload).is_ok());
     }
 
     #[test]
-    fn recovery_direct_command_is_not_stream_wrapped() {
-        let command = encode_direct_command("recovery raw_tx_rate=24").unwrap();
-        let decoded = dmesh_server::recovery::decode_recovery_command(&command);
-        assert!(decoded.is_some(), "command={command:02x?}");
-        assert_eq!(decoded.unwrap().raw_tx_rate, Some(24));
-    }
-
-    #[test]
-    fn recovery_direct_command_selects_sta_egress_runtime() {
-        let command = encode_direct_command("recovery sta_driver_tx=true").unwrap();
-        let decoded = dmesh_server::recovery::decode_recovery_command(&command).unwrap();
-        assert_eq!(decoded.sta_driver_tx, Some(true));
+    fn direct_transport_control_uses_the_common_tagged_envelope() {
+        let mut command = [0u8; 96];
+        let config = dmesh_server::control::TransportConfig {
+            ssid: Some(b"Direct-test"),
+            raw_tx_rate: Some(24),
+            sta_driver_tx: Some(true),
+            ..dmesh_server::control::TransportConfig::default()
+        };
+        let used = dmesh_server::control::encode_request(
+            dmesh_server::control::Request::TransportStart {
+                kind: dmesh_server::control::TransportKind::Sta,
+                config,
+            },
+            Some(9),
+            &mut command,
+        )
+        .unwrap();
+        assert_eq!(
+            dmesh_server::control::decode_request(&command[..used]),
+            Some(dmesh_server::control::Request::TransportStart {
+                kind: dmesh_server::control::TransportKind::Sta,
+                config,
+            })
+        );
     }
 
     #[test]
@@ -551,6 +662,10 @@ mod tests {
             "radio.control channel=6 sta_state=disconnect_hold comparator_bssid=50:6f:9a:01:34:4a comparator_enabled=true promiscuous=false dw_policy=disabled",
         )
         .unwrap();
+        let envelope = dmesh_server::tagged::decode(&command).expect("tagged direct envelope");
+        assert_eq!(envelope.component, Some(dmesh_server::tagged::Name::Tag(4)));
+        assert_eq!(envelope.method, Some(dmesh_server::tagged::Name::Tag(72)));
+        assert!(envelope.fields.is_some());
         let dmesh_server::raw_wifi::RawWifiLabRequest::Control(control) =
             dmesh_server::raw_wifi::decode_raw_wifi_handler(&command).unwrap()
         else {
@@ -561,12 +676,31 @@ mod tests {
             control.sta_state,
             Some(dmesh_server::raw_wifi::RawWifiStaState::DisconnectHold)
         );
-        assert_eq!(control.comparator_bssid, Some([0x50, 0x6f, 0x9a, 0x01, 0x34, 0x4a]));
+        assert_eq!(
+            control.comparator_bssid,
+            Some([0x50, 0x6f, 0x9a, 0x01, 0x34, 0x4a])
+        );
         assert_eq!(control.comparator_enabled, Some(true));
         assert_eq!(control.promiscuous, Some(false));
         assert_eq!(
             control.dw_policy,
             Some(dmesh_server::raw_wifi::RawWifiDwPolicy::Disabled)
+        );
+    }
+
+    #[test]
+    fn direct_radio_snapshot_keeps_the_required_empty_fields_map() {
+        let encoded = encode_direct_command("radio.snapshot").unwrap();
+        let mut expected = [0u8; 16];
+        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request(
+            dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(encoded, expected[..used]);
+        assert_eq!(
+            dmesh_server::raw_wifi::decode_raw_wifi_handler(&encoded),
+            Ok(dmesh_server::raw_wifi::RawWifiLabRequest::Snapshot)
         );
     }
 }

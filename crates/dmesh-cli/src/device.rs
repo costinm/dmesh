@@ -2,7 +2,7 @@
 //!
 //! This module contains names and stable bearer addresses only. It does not
 //! create a transport connection, open a serial adapter, or read credentials.
-//! `lmesh-uart`, `lmesh-wifi`, and `lmesh` can therefore make identical target
+//! `dmesh-cli`, `lmesh-wifi`, and `lmesh` can therefore make identical target
 //! choices without recreating the retired forwarding configuration.
 
 use serde::Deserialize;

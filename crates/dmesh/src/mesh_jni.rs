@@ -17,7 +17,7 @@ use jni::{JNIEnv, JavaVM};
 use serde_json::{Map, Value, json};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(target_os = "android")]
 use std::ffi::{CString, c_char, c_int, c_void};
 #[cfg(target_os = "android")]
@@ -45,6 +45,56 @@ const LEGACY_BRIDGE_HOST: &str = "local";
 const BRIDGE_PORT: u16 = 1;
 static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<String>>>> = OnceLock::new();
 static STORE_SENDER: OnceLock<UnboundedSender<StoreCommand>> = OnceLock::new();
+/// Every discovery bearer updates this Rust-owned view before Java keeps any
+/// short-lived NAN `PeerHandle`. The inventory is advisory and unsigned;
+/// entries expire after one hour. NAN Service Info, UDP multicast announces,
+/// and future control-plane observations therefore share one device map.
+static DISCOVERED_DEVICES: OnceLock<Mutex<BTreeMap<String, DiscoveredDevice>>> = OnceLock::new();
+/// Last received NAN follow-ups are retained independently of the optional
+/// persistent frame store so Android status and E2E use the same bounded
+/// receipt view as host/ESP adapters.
+static NAN_FOLLOWUPS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
+/// Android framework lifecycle/configuration events are forwarded to Rust as
+/// well, but they are not directed NAN follow-ups. Keep their diagnostic
+/// history distinct so `radio.nan.followups` has the same receipt semantics
+/// as the host and ESP handlers.
+static NAN_EVENTS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
+const DISCOVERED_DEVICE_TTL_MS: i64 = 60 * 60 * 1000;
+const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
+const NAN_EVENT_HISTORY_LEN: usize = 64;
+
+#[derive(Clone)]
+struct DiscoveredDevice {
+    last_seen_ms: i64,
+    peer: String,
+    info: Value,
+}
+
+fn nan_followups() -> &'static Mutex<VecDeque<FrameRecord>> {
+    NAN_FOLLOWUPS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_FOLLOWUP_HISTORY_LEN)))
+}
+
+fn nan_events() -> &'static Mutex<VecDeque<FrameRecord>> {
+    NAN_EVENTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_EVENT_HISTORY_LEN)))
+}
+
+fn record_nan_followup(frame: FrameRecord) {
+    if let Ok(mut history) = nan_followups().lock() {
+        if history.len() == NAN_FOLLOWUP_HISTORY_LEN {
+            history.pop_front();
+        }
+        history.push_back(frame);
+    }
+}
+
+fn record_nan_event(frame: FrameRecord) {
+    if let Ok(mut history) = nan_events().lock() {
+        if history.len() == NAN_EVENT_HISTORY_LEN {
+            history.pop_front();
+        }
+        history.push_back(frame);
+    }
+}
 const WEB_BRIDGE_CLIENT_ID: u64 = 9_000_000;
 #[cfg(target_os = "android")]
 static WEB_BRIDGE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -76,6 +126,46 @@ pub fn init_store_sender(sender: UnboundedSender<StoreCommand>) {
 
 fn store_sender() -> Option<&'static UnboundedSender<StoreCommand>> {
     STORE_SENDER.get()
+}
+
+fn discovered_devices() -> &'static Mutex<BTreeMap<String, DiscoveredDevice>> {
+    DISCOVERED_DEVICES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn prune_discovered_devices(devices: &mut BTreeMap<String, DiscoveredDevice>, now_ms: i64) {
+    devices
+        .retain(|_, device| now_ms.saturating_sub(device.last_seen_ms) <= DISCOVERED_DEVICE_TTL_MS);
+}
+
+/// Record a validated common announce from any Android discovery bearer.
+/// `source` is provenance only: boot and periodic presence records update one
+/// Rust-owned inventory whether UDP multicast, NAN Service Info, or a future
+/// control-plane adapter delivered them.
+pub(crate) fn observe_announce(
+    announce: dmesh_server::announce::Announce,
+    peer: String,
+    source: &str,
+) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let Ok(mut devices) = discovered_devices().lock() else {
+        return;
+    };
+    prune_discovered_devices(&mut devices, now_ms);
+    devices.insert(
+        bytes_to_hex(announce.device_id()),
+        DiscoveredDevice {
+            last_seen_ms: now_ms,
+            peer,
+            info: json!({
+                "protocol": "dmesh_announce",
+                "source": source,
+                "kind": announce.kind,
+                "uptime_secs": announce.uptime_secs,
+                "transport_mode": announce.transport_mode,
+                "counters": announce.counters,
+            }),
+        },
+    );
 }
 
 #[cfg(target_os = "android")]
@@ -600,9 +690,166 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let wake_count = parse_u32(&cmd, "wake_count", 0)?;
             radio_protocol::build_nan_service_info(role, &device_id, wake_count)?
         }
+        "radio.nan.build_announce" => {
+            let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
+            let uptime_secs = parse_u32(&cmd, "uptime_secs", 0)?;
+            let transport_mode = parse_u32(&cmd, "transport_mode", 0)? as u8;
+            let counters = parse_u32(&cmd, "counters", 0)?;
+            let kind = match cmd.data.get("kind").map(String::as_str) {
+                Some("boot") => dmesh_server::announce::ANNOUNCE_BOOT,
+                _ => dmesh_server::announce::ANNOUNCE_DISCOVERY,
+            };
+            let mut id = [0; 16];
+            if device_id.is_empty() || device_id.len() > id.len() {
+                anyhow::bail!("announce device id must be 1..16 bytes");
+            }
+            id[..device_id.len()].copy_from_slice(&device_id);
+            let announce = if kind == dmesh_server::announce::ANNOUNCE_BOOT {
+                let mut boot = dmesh_server::announce::Announce::boot(
+                    id,
+                    device_id.len() as u8,
+                    transport_mode,
+                );
+                boot.uptime_secs = uptime_secs;
+                boot.counters = counters;
+                boot
+            } else {
+                dmesh_server::announce::Announce::discovery(
+                    id,
+                    device_id.len() as u8,
+                    uptime_secs,
+                    transport_mode,
+                    counters,
+                )
+            };
+            let mut out = [0; 96];
+            let used = dmesh_server::announce::encode(announce, &mut out)
+                .ok_or_else(|| anyhow::anyhow!("announce encoding exceeded bound"))?;
+            out[..used].to_vec()
+        }
         "radio.nan.parse_service_info" => radio_protocol::parse_nan_service_info(payload)?
             .to_string()
             .into_bytes(),
+        "radio.nan.observe_service_info" => {
+            let peer = cmd.data.get("peer").cloned().unwrap_or_default();
+            let announce = dmesh_server::announce::decode_announce(payload);
+            let parsed = if let Some(announce) = announce {
+                // This is exactly the same presence ingress as UDP multicast,
+                // not a NAN-specific device cache.
+                observe_announce(announce, peer.clone(), "nan_sd");
+                json!({
+                    "protocol": "dmesh_announce",
+                    "source": "nan_sd",
+                    "device_id": bytes_to_hex(announce.device_id()),
+                    "kind": announce.kind,
+                    "uptime_secs": announce.uptime_secs,
+                    "transport_mode": announce.transport_mode,
+                    "counters": announce.counters,
+                })
+            } else {
+                radio_protocol::parse_nan_service_info(payload)?
+            };
+            let device_id = parsed
+                .get("device_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            // Non-announce NAN Service Info has its own wire schema but
+            // still belongs in the same cross-bearer device inventory.
+            if announce.is_none() && !device_id.is_empty() {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut devices = discovered_devices()
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
+                prune_discovered_devices(&mut devices, now_ms);
+                devices.insert(
+                    device_id.to_ascii_lowercase(),
+                    DiscoveredDevice {
+                        last_seen_ms: now_ms,
+                        peer,
+                        info: parsed.clone(),
+                    },
+                );
+            }
+            parsed.to_string().into_bytes()
+        }
+        "radio.devices" | "radio.nan.known_devices" => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut devices = discovered_devices()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
+            prune_discovered_devices(&mut devices, now_ms);
+            let devices: Vec<Value> = devices
+                .iter()
+                .map(|(id, device)| {
+                    json!({
+                        "id": id,
+                        "last_seen_ms": device.last_seen_ms,
+                        "peer": device.peer,
+                        "info": device.info,
+                    })
+                })
+                .collect();
+            json!({"devices": devices}).to_string().into_bytes()
+        }
+        "radio.nan.followups" => {
+            let history = nan_followups()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("NAN follow-up cache poisoned"))?;
+            let entries = history
+                .iter()
+                .rev()
+                .map(|entry| {
+                    json!({
+                        "last_seen_ms": entry.timestamp,
+                        "source": entry.src_device,
+                        "target": entry.target_device,
+                        "seq": entry.seq,
+                        "msg_type": entry.msg_type,
+                        "payload_hash": entry.payload_hash,
+                        "payload_hex": bytes_to_hex(&entry.payload),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({"followups": entries}).to_string().into_bytes()
+        }
+        "radio.nan.events" => {
+            let history = nan_events()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("NAN event cache poisoned"))?;
+            let entries = history
+                .iter()
+                .rev()
+                .map(|entry| {
+                    json!({
+                        "last_seen_ms": entry.timestamp,
+                        "event": entry.msg_type,
+                        "peer": entry.src_device,
+                        "payload_hex": bytes_to_hex(&entry.payload),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({"events": entries}).to_string().into_bytes()
+        }
+        "radio.nan.event" => {
+            let event = cmd.data.get("event").cloned().unwrap_or_default();
+            let peer = cmd.data.get("peer").cloned().unwrap_or_default();
+            let frame = FrameRecord {
+                protocol: "android_nan_event".to_string(),
+                payload_hash: 0,
+                src_device: peer,
+                target_device: None,
+                seq: None,
+                msg_type: (!event.is_empty()).then_some(event),
+                payload: payload.to_vec(),
+                rssi: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            record_nan_event(frame.clone());
+            if let Some(sender) = store_sender() {
+                let _ = sender.send(StoreCommand::InsertFrame(frame));
+            }
+            json!({"status": "ok"}).to_string().into_bytes()
+        }
         "radio.nan.build_followup" => {
             let msg_type = cmd
                 .data
@@ -655,6 +902,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 rssi: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
+            // The framework callback has supplied an actual directed
+            // follow-up. Retain it in the Rust-owned bounded receipt view;
+            // generic NAN lifecycle events use the separate `nan.events`
+            // cache above and must not pollute this protocol-level list.
+            record_nan_followup(frame.clone());
             if let Some(sender) = store_sender() {
                 let _ = sender.send(StoreCommand::InsertFrame(frame));
             }
@@ -779,6 +1031,16 @@ fn hex_to_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
         out.push((hi << 4) | lo);
     }
     Ok(out)
+}
+
+fn bytes_to_hex(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 fn hex_nibble(byte: u8) -> anyhow::Result<u8> {
@@ -1961,5 +2223,75 @@ mod tests {
         let parsed = String::from_utf8(parsed).unwrap();
         assert!(parsed.contains(r#""msg_type":"command_text""#));
         assert!(parsed.contains(r#""payload_text":"ble stats=true""#));
+    }
+
+    #[test]
+    fn android_nan_followup_receipts_are_bounded_rust_state() {
+        nan_followups().lock().unwrap().clear();
+        nan_events().lock().unwrap().clear();
+        radio_message("radio.nan.event", "event=attached peer=framework", &[], -1).unwrap();
+        let followup = radio_message(
+            "radio.nan.build_followup",
+            "msg_type=command_cbor device_id=010101010101 target_id=020202020202",
+            &[0xa1, 1, 1],
+            -1,
+        )
+        .unwrap();
+        radio_message("radio.nan.inject_frame", "rssi=-55", &followup, -1).unwrap();
+        let receipts = radio_message("radio.nan.followups", "", &[], -1).unwrap();
+        let receipts: Value = serde_json::from_slice(&receipts).unwrap();
+        assert_eq!(receipts["followups"].as_array().unwrap().len(), 1);
+        assert_eq!(receipts["followups"][0]["msg_type"], "command_cbor");
+        let events = radio_message("radio.nan.events", "", &[], -1).unwrap();
+        let events: Value = serde_json::from_slice(&events).unwrap();
+        assert_eq!(events["events"].as_array().unwrap().len(), 1);
+        assert_eq!(events["events"][0]["event"], "attached");
+    }
+
+    #[test]
+    fn android_device_inventory_unifies_udp_and_nan_discovery() {
+        discovered_devices().lock().unwrap().clear();
+        let mut id = [0_u8; 16];
+        id[..6].copy_from_slice(b"udp-a1");
+        observe_announce(
+            dmesh_server::announce::Announce::discovery(id, 6, 12, 1, 3),
+            "[fe80::1]:5227".to_string(),
+            "udp_multicast",
+        );
+        let service_info = radio_message(
+            "radio.nan.build_announce",
+            "kind=discovery device_id=6e616e2d6232 uptime_secs=13 transport_mode=0 counters=4",
+            &[],
+            -1,
+        )
+        .unwrap();
+        radio_message(
+            "radio.nan.observe_service_info",
+            "peer=aware:7",
+            &service_info,
+            -1,
+        )
+        .unwrap();
+        let devices = radio_message("radio.devices", "", &[], -1).unwrap();
+        let devices: Value = serde_json::from_slice(&devices).unwrap();
+        let ids = devices["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"7564702d6131"));
+        assert!(ids.contains(&"6e616e2d6232"));
+        let entries = devices["devices"].as_array().unwrap();
+        let udp = entries
+            .iter()
+            .find(|device| device["id"] == "7564702d6131")
+            .unwrap();
+        let nan = entries
+            .iter()
+            .find(|device| device["id"] == "6e616e2d6232")
+            .unwrap();
+        assert_eq!(udp["info"]["source"], "udp_multicast");
+        assert_eq!(nan["info"]["source"], "nan_sd");
     }
 }

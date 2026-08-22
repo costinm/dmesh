@@ -2,18 +2,39 @@
 //!
 //! The full `lmesh` service and the Wi-Fi-only `lmesh-wifi` service use this
 //! crate. Linux Wi-Fi, host NAN transport, discovery, and AP/STA operations
-//! live here; UART forwarding is provided by the separate `lmesh-uart` crate.
+//! live here; direct UART sessions are owned by `dmesh-cli`, not this service.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
+#[path = "api.rs"]
+mod api_generated;
 pub mod dispatch;
+/// Generated API structs plus stable compatibility aliases used by the
+/// reviewed service adapters. The generated artifact itself remains untouched.
+pub mod api {
+    pub use super::api_generated::*;
+    pub type ApStatusRequest = WifiApStatusRequest;
+    pub type StaStatusRequest = WifiStaStatusRequest;
+    pub type RawNanStatusRequest = WifiRawnanStatusRequest;
+    pub type InterfaceStatusRequest = WifiInterfaceStatusRequest;
+    pub type ApStationsRequest = WifiApStationsRequest;
+    pub type RawMetricsRequest = WifiRawMetricsRequest;
+    pub type RawStopRequest = WifiRawStopRequest;
+    pub type RawListenRequest = WifiRawListenRequest;
+    pub type RawCheckRequest = WifiRawCheckRequest;
+    pub type RawIperfRequest = WifiRawIperfRequest;
+    pub type RawSendRequest = WifiRawSendRequest;
+    pub type RawNanPingRequest = WifiRawnanPingRequest;
+    pub type RawNanListenRequest = WifiRawnanListenRequest;
+}
 mod ndp;
 mod radio;
 /// Host-side JSON/compatibility conversion for raw NAN and legacy BLE commands.
 /// The byte/state core remains in `dmesh-rawnan`.
 pub mod radio_protocol;
-mod schema;
+pub mod reviewed;
 
 pub use radio::RadioService;
 
@@ -41,6 +62,16 @@ impl WifiService {
         )
     }
 
+    /// Construct an independently supervised service with its own default
+    /// change log. `LMESH_DISCOVERY_LOG` remains an explicit operator override
+    /// when multiple services intentionally feed one durable inventory.
+    pub fn from_environment_with_discovery_log(default_change_log: impl Into<PathBuf>) -> Self {
+        Self::new(
+            WifiNetd::from_environment(),
+            RadioService::from_environment_with_discovery_log(default_change_log),
+        )
+    }
+
     pub fn netd(&self) -> &WifiNetd {
         &self.netd
     }
@@ -61,18 +92,24 @@ impl WifiService {
                 let channel = std::env::var("LMESH_AP_CHANNEL")
                     .ok()
                     .and_then(|value| value.parse::<u8>().ok());
-                let ht40 = std::env::var("LMESH_AP_HT40")
-                    .ok()
-                    .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                let ht40 = std::env::var("LMESH_AP_HT40").ok().and_then(|value| {
+                    match value.trim().to_ascii_lowercase().as_str() {
                         "1" | "true" | "yes" | "on" => Some(true),
                         "0" | "false" | "no" | "off" => Some(false),
                         _ => None,
-                    });
-                results.push(self.radio.wifi_ap_start_open_on_channel(
+                    }
+                });
+                let beacon_interval_tu = std::env::var("LMESH_AP_BEACON_INTERVAL_TU")
+                    .ok()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .map(|value| value.clamp(10, 1000))
+                    .unwrap_or(100);
+                results.push(self.radio.wifi_ap_start_open_on_channel_with_interval(
                     Some(iface.clone()),
                     None,
                     channel,
                     ht40,
+                    beacon_interval_tu,
                 ));
                 let cidr =
                     std::env::var("LMESH_AP_ADDRESS").unwrap_or_else(|_| "10.78.0.1/16".to_owned());
@@ -85,6 +122,25 @@ impl WifiService {
                         ));
                     }
                 }
+                // NAN and NOW share one permanent active monitor.  The AP
+                // remains the channel anchor; the monitor has broad receive
+                // flags for foreign cluster beacons and also injects NOW.
+                results.push(
+                    self.radio
+                        .prepare_ap_raw_monitor_fixture(Some(iface.clone()), channel),
+                );
+                // Listeners only consume the fixture; packet tests never
+                // create, retune, or otherwise alter host radio state.
+                results.push(self.radio.wifi_raw_listen(
+                    Some(iface.clone()),
+                    Some(6),
+                    Some(86_400),
+                    Some("monitor".to_owned()),
+                ));
+                // Some adapters only deliver foreign NAN beacons through an
+                // nl80211 management registration while the monitor remains
+                // active for NOW TX. Keep that receive lane permanent too.
+                results.push(self.radio.wifi_nan_beacon_listen(Some(iface)));
             }
         }
         results
@@ -98,12 +154,36 @@ impl WifiService {
         if let Err(error) = self.netd.authorize(Operation::Nan, &iface) {
             return serde_json::json!({"ok": false, "iface": iface, "error": error.to_string()});
         }
-        self.radio.wifi_raw_listen(
+        let monitor = self.radio.wifi_raw_listen(
             Some(iface),
             Some(6),
             Some(86_400),
             Some("monitor".to_owned()),
-        )
+        );
+        let beacon = self.radio.wifi_nan_beacon_listen(None);
+        serde_json::json!({
+            "ok": monitor.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            "monitor": monitor,
+            "beacon_listener": beacon,
+        })
+    }
+
+    /// Prepare the long-lived AP-off raw monitor before attaching the
+    /// canary receiver.  Only supervised startup calls this; E2E uses the
+    /// existing fixture without reconfiguring it.
+    pub fn prepare_canary_rawnan_monitor(
+        &self,
+        iface: Option<String>,
+        channel: Option<u8>,
+    ) -> serde_json::Value {
+        let iface = iface.or_else(|| self.netd.owned_interfaces().names().first().cloned());
+        let Some(iface) = iface else {
+            return serde_json::json!({"ok": false, "error": "LMESH_INTERFACES is empty"});
+        };
+        if let Err(error) = self.netd.authorize(Operation::Nan, &iface) {
+            return serde_json::json!({"ok": false, "iface": iface, "error": error.to_string()});
+        }
+        self.radio.prepare_raw_monitor_fixture(Some(iface), channel)
     }
 }
 
@@ -146,10 +226,7 @@ impl InterfaceSet {
     /// unrelated monitor VIFs such as `wlan1mon`.
     pub fn contains(&self, iface: &str) -> bool {
         self.0.iter().any(|owned| {
-            owned == iface
-                || iface
-                    .strip_suffix("mon")
-                    .is_some_and(|base| base == owned)
+            owned == iface || iface.strip_suffix("mon").is_some_and(|base| base == owned)
         })
     }
 

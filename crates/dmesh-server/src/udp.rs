@@ -7,7 +7,8 @@
 //! additional host-test services on other stream IDs.
 
 use crate::services::{
-    CONTROL_PATH_POLICY, CONTROL_RESPONSE, decode_path_policy, handle_stream_with_events,
+    CONTROL_PATH_POLICY, CONTROL_RESPONSE, decode_path_policy, dispatch_tagged_stream,
+    handle_stream_with_events,
 };
 pub use crate::services::{EventRing, StreamHandler, StreamRegistry};
 use crate::{ObjectServer, ServerConfig};
@@ -778,6 +779,30 @@ pub struct ReceivedStream {
 }
 
 impl UdpClient {
+    /// Snapshot endpoint-owned loss, retransmission, ACK, and ordering
+    /// counters for a completed diagnostic transfer. The socket adapter does
+    /// not infer these from packet timing; QUIC-lite remains the authority.
+    pub const fn transport_stats(&self) -> quic_lite::TransportStats {
+        self.endpoint.stats()
+    }
+
+    /// Explicitly retire this diagnostic association on its bearer.  Dropping
+    /// a UDP socket does not notify a fixed-size embedded service dispatcher;
+    /// callers that run repeated probes must send CLOSE so the peer can admit
+    /// the next fresh connection without waiting for an idle timeout.
+    pub async fn close(&mut self, code: u64) -> Result<()> {
+        self.endpoint.close(code);
+        let mut packet = [0u8; MTU];
+        if let Some(used) = self
+            .endpoint
+            .poll_close(&mut packet)
+            .map_err(|error| anyhow::anyhow!("UDP close: {error:?}"))?
+        {
+            self.socket.send_to(&packet[..used], self.peer).await?;
+        }
+        Ok(())
+    }
+
     /// Allow a high-rate receiver to batch ACK/window control at the
     /// negotiated cadence. Generic request/object clients retain immediate
     /// credit because their application sinks may block between records.
@@ -1753,6 +1778,19 @@ async fn process_persistent_packet<const H: usize>(
         .receive_request(bytes)
         .map_err(|error| anyhow::anyhow!("persistent input: {error:?}"))?;
     if let Some(request) = request {
+        // Tagged-CBOR is the normal stream request envelope. It carries the
+        // component/method itself, so no service byte is consumed from the
+        // stream. The branches below are compatibility for legacy clients.
+        if let Some(response) = dispatch_tagged_stream(&request.data) {
+            mux.complete_request(request.stream_id, request.data.len())
+                .map_err(|error| anyhow::anyhow!("tagged request accounting: {error:?}"))?;
+            let (used, _) = mux
+                .encode_response(*response_stream, &response, true, &mut packet)
+                .map_err(|error| anyhow::anyhow!("tagged response: {error:?}"))?;
+            socket.send_to(&packet[..used], peer).await?;
+            *response_stream = response_stream.saturating_add(4);
+            return Ok(());
+        }
         if let Some(control) = control {
             control.record_event(format!(
                 "request peer={peer} stream={} service={} bytes={}",
@@ -2562,6 +2600,12 @@ mod tests {
                     assert_eq!(response[0], 1);
                     assert_eq!(u64::from_be_bytes(response[1..9].try_into().unwrap()), 128);
                     assert_eq!(u64::from_be_bytes(response[9..17].try_into().unwrap()), 32);
+                    continue;
+                }
+                if service == SERVICE_ECHO {
+                    // Echo is deliberately payload-only so direct action
+                    // checks and a QUIC stream share one small response.
+                    assert_eq!(response, b"probe");
                     continue;
                 }
                 let response_text = String::from_utf8(response).unwrap();
@@ -3593,7 +3637,7 @@ mod tests {
     fn recovery_production_window_fits_callback_reorder_budget() {
         const RECEIVER_PACKET_BUDGET: usize =
             quic_lite::RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS as usize;
-        const HOST_PAYLOAD_BYTES: usize = 1200;
+        const HOST_PAYLOAD_BYTES: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
         assert!(
             RECEIVER_PACKET_BUDGET * HOST_PAYLOAD_BYTES <= RECOVERY_REORDER_CAPACITY_BYTES,
             "Recovery callback reassembly must cover every outstanding host payload"
@@ -3832,13 +3876,17 @@ mod tests {
             assert!(core::str::from_utf8(&events).unwrap().contains("events="));
             let echo_stream = event_stream + 4;
             let (_, echo, _) = client
-                .request_stream(echo_stream, &[SERVICE_ECHO, b'p', b'r', b'o', b'b'], true)
+                .request_stream(
+                    echo_stream,
+                    &[SERVICE_ECHO, b'p', b'r', b'o', b'b', b'e'],
+                    true,
+                )
                 .await
                 .unwrap();
-            let echo_text = core::str::from_utf8(&echo).unwrap();
-            assert!(echo_text.contains("service=2"));
-            assert!(echo_text.contains("connection_dcid="));
-            assert!(echo_text.contains("stream_id="));
+            // Echo is a payload-preserving liveness primitive, not a
+            // connection-status formatter. Status/metrics are separate
+            // services and may be requested on adjacent streams.
+            assert_eq!(echo, b"probe");
             let iperf_stream = echo_stream + 4;
             let mut iperf_request = Vec::from([SERVICE_IPERF]);
             iperf_request.extend_from_slice(&4096u64.to_be_bytes());

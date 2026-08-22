@@ -3,7 +3,10 @@
 //! This is deliberately host- and ESP-independent. Adapters apply the typed
 //! request to their radio APIs; the request never implies a socket API.
 
-use crate::cbor::{Decoder, Encoder};
+use crate::{
+    cbor::{Decoder, Encoder},
+    tagged::{Name, decode},
+};
 
 pub const RAW_WIFI_OP_TX: u64 = 1;
 /// Configure the receiver/transmitter lab state, then return a snapshot.
@@ -18,6 +21,7 @@ pub const RAW_WIFI_OP_CHECK: u64 = 5;
 pub const RAW_WIFI_OP_IPERF: u64 = 6;
 /// Registered CBOR method identifiers for the independently callable radio
 /// control, snapshot, and counter-reset handlers.
+pub const RAW_WIFI_METHOD_TX: u64 = 71;
 pub const RAW_WIFI_METHOD_CONTROL: u64 = 72;
 pub const RAW_WIFI_METHOD_SNAPSHOT: u64 = 73;
 pub const RAW_WIFI_METHOD_RESET_COUNTERS: u64 = 74;
@@ -28,11 +32,47 @@ pub const RAW_WIFI_METHOD_CHECK: u64 = 75;
 /// Start one runtime-configured raw IPERF client without a private text or
 /// socket command grammar.
 pub const RAW_WIFI_METHOD_IPERF: u64 = 76;
+/// Common tagged component for raw-radio laboratory and diagnostics.  The
+/// methods intentionally retain their existing numeric identities so only the
+/// retired outer envelope changes.
+pub const RAW_WIFI_COMPONENT: u64 = 4;
 pub const RAW_WIFI_MAX_FRAME: usize = 1500;
 /// Maximum encoded snapshot response. The response carries a fixed set of
 /// monotonic counters plus optional applied radio state, so callers can use a
 /// small fixed stack/packet buffer rather than allocate for diagnostics.
 pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 256;
+
+/// Encode a complete tagged raw-frame injection request. The frame stays a
+/// borrowed byte string at the decoder boundary; this constructor does not
+/// fragment, copy into a transport queue, or imply a particular Wi-Fi API.
+pub fn encode_raw_wifi_tx_request(request: RawWifiTxRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    if !(24..=RAW_WIFI_MAX_FRAME).contains(&request.frame.len())
+        || !(1..=13).contains(&request.channel)
+    {
+        return None;
+    }
+    let mut encoder = Encoder::new(out);
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(RAW_WIFI_METHOD_TX)?;
+    encoder.uint(5)?;
+    encoder.map(6)?;
+    encoder.uint(1)?;
+    encoder.bytes_value(request.frame)?;
+    encoder.uint(2)?;
+    encoder.uint(u64::from(request.channel))?;
+    encoder.uint(3)?;
+    encoder.uint(interface_value(request.interface))?;
+    encoder.uint(4)?;
+    encoder.boolean(request.system_sequence)?;
+    encoder.uint(5)?;
+    encoder.uint(rate_value(request.rate))?;
+    encoder.uint(6)?;
+    encoder.boolean(request.disable_11b)?;
+    Some(encoder.len())
+}
 
 /// Encode an empty-payload registered snapshot/reset request.  This is shared
 /// by direct UART control, QUIC hardware service callers, and Rust E2E tests;
@@ -46,10 +86,12 @@ pub fn encode_raw_wifi_snapshot_request(method: u64, out: &mut [u8]) -> Option<u
         return None;
     }
     let mut encoder = Encoder::new(out);
-    encoder.map(2)?;
-    encoder.uint(0)?;
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
     encoder.uint(method)?;
-    encoder.uint(6)?;
+    encoder.uint(5)?;
     encoder.map(0)?;
     Some(encoder.len())
 }
@@ -62,8 +104,7 @@ pub fn encode_raw_wifi_control_request(
     control: RawWifiControlRequest,
     out: &mut [u8],
 ) -> Option<usize> {
-    let entries = 1
-        + usize::from(control.channel.is_some())
+    let entries = usize::from(control.channel.is_some())
         + usize::from(control.interface.is_some())
         + usize::from(control.rate.is_some())
         + usize::from(control.disable_11b.is_some())
@@ -82,13 +123,13 @@ pub fn encode_raw_wifi_control_request(
         + usize::from(control.roc_loop.is_some())
         + usize::from(control.action_dispatcher.is_some());
     let mut encoder = Encoder::new(out);
-    encoder.map(2)?;
-    encoder.uint(0)?;
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
     encoder.uint(RAW_WIFI_METHOD_CONTROL)?;
-    encoder.uint(6)?;
+    encoder.uint(5)?;
     encoder.map(entries as u64)?;
-    encoder.uint(0)?;
-    encoder.uint(RAW_WIFI_OP_CONTROL)?;
     if let Some(value) = control.channel {
         encoder.uint(2)?;
         encoder.uint(u64::from(value))?;
@@ -187,13 +228,13 @@ pub fn encode_raw_wifi_check_request(check: RawWifiCheckRequest, out: &mut [u8])
         return None;
     }
     let mut encoder = Encoder::new(out);
-    encoder.map(2)?;
-    encoder.uint(0)?;
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
     encoder.uint(RAW_WIFI_METHOD_CHECK)?;
-    encoder.uint(6)?;
-    encoder.map(4)?;
-    encoder.uint(0)?;
-    encoder.uint(RAW_WIFI_OP_CHECK)?;
+    encoder.uint(5)?;
+    encoder.map(3)?;
     encoder.uint(17)?;
     encoder.bytes_value(&check.peer)?;
     encoder.uint(18)?;
@@ -214,13 +255,13 @@ pub fn encode_raw_wifi_iperf_request(
         return None;
     }
     let mut encoder = Encoder::new(out);
-    encoder.map(2)?;
-    encoder.uint(0)?;
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(RAW_WIFI_COMPONENT)?;
+    encoder.uint(2)?;
     encoder.uint(RAW_WIFI_METHOD_IPERF)?;
-    encoder.uint(6)?;
-    encoder.map(5)?;
-    encoder.uint(0)?;
-    encoder.uint(RAW_WIFI_OP_IPERF)?;
+    encoder.uint(5)?;
+    encoder.map(4)?;
     encoder.uint(21)?;
     encoder.bytes_value(&request.peer)?;
     encoder.uint(22)?;
@@ -436,6 +477,97 @@ pub struct RawWifiCounters {
     pub udp6_raw_tx_completion_rate: u32,
 }
 
+/// Version of the cross-platform per-peer Wi-Fi metrics record.
+///
+/// Producers must omit observations their driver cannot provide rather than
+/// substituting a zero.  In particular, Linux nl80211 exposes AP-side MAC
+/// retries/failures while ESP-IDF currently exposes raw-TX completion results.
+/// Keeping both in one optional record lets the metrics exporter use one
+/// OpenTelemetry mapping without pretending the observations are identical.
+pub const WIFI_LINK_METRICS_SCHEMA_VERSION: u8 = 1;
+
+/// Per-peer Wi-Fi link observations suitable for a metrics exporter.
+///
+/// This is intentionally a small, allocation-free common vocabulary.  The
+/// transport-specific [`RawWifiCounters`] stay attached to a radio snapshot;
+/// this record holds link/MAC observations that can come from either a Linux
+/// AP's nl80211 station dump or a device-side radio snapshot.  Optional fields
+/// distinguish unavailable driver telemetry from a measured zero.
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WifiLinkMetrics {
+    pub schema_version: u8,
+    pub interface_index: Option<u32>,
+    pub peer_mac: Option<[u8; 6]>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub rx_packets: Option<u64>,
+    pub tx_packets: Option<u64>,
+    /// AP/host driver MAC retries (`NL80211_STA_INFO_TX_RETRIES`).
+    pub mac_tx_retries: Option<u64>,
+    /// AP/host driver MAC failures (`NL80211_STA_INFO_TX_FAILED`).
+    pub mac_tx_failed: Option<u64>,
+    pub rx_dropped: Option<u64>,
+    pub rx_airtime_us: Option<u64>,
+    pub tx_airtime_us: Option<u64>,
+    pub signal_dbm: Option<i8>,
+    pub signal_avg_dbm: Option<i8>,
+    pub ack_signal_dbm: Option<i8>,
+    pub ack_signal_avg_dbm: Option<i8>,
+    pub rx_bitrate_kbit_s: Option<u64>,
+    pub tx_bitrate_kbit_s: Option<u64>,
+    pub expected_throughput_kbit_s: Option<u64>,
+    /// Device raw-bearer observations; absent on a host-only station dump.
+    pub bearer_rx_frames: Option<u64>,
+    pub bearer_rx_drops: Option<u64>,
+    pub bearer_rx_invalid: Option<u64>,
+    pub bearer_udp_delivered: Option<u64>,
+    pub bearer_ndp_advertisements: Option<u64>,
+    pub bearer_tx_failures: Option<u64>,
+    /// ESP raw-injection MAC completion failures, not equivalent to Linux's
+    /// cumulative `mac_tx_failed` counter.
+    pub raw_tx_completion_failures: Option<u64>,
+}
+
+impl WifiLinkMetrics {
+    pub const fn new() -> Self {
+        Self {
+            schema_version: WIFI_LINK_METRICS_SCHEMA_VERSION,
+            interface_index: None,
+            peer_mac: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            rx_packets: None,
+            tx_packets: None,
+            mac_tx_retries: None,
+            mac_tx_failed: None,
+            rx_dropped: None,
+            rx_airtime_us: None,
+            tx_airtime_us: None,
+            signal_dbm: None,
+            signal_avg_dbm: None,
+            ack_signal_dbm: None,
+            ack_signal_avg_dbm: None,
+            rx_bitrate_kbit_s: None,
+            tx_bitrate_kbit_s: None,
+            expected_throughput_kbit_s: None,
+            bearer_rx_frames: None,
+            bearer_rx_drops: None,
+            bearer_rx_invalid: None,
+            bearer_udp_delivered: None,
+            bearer_ndp_advertisements: None,
+            bearer_tx_failures: None,
+            raw_tx_completion_failures: None,
+        }
+    }
+}
+
+impl Default for WifiLinkMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RawWifiCounters {
     /// Counter delta for a single test case.  Saturation makes an epoch/reset
     /// mismatch visible as zero rather than wrapping into a false success.
@@ -502,11 +634,15 @@ impl RawWifiCounters {
             roc_action_frames: self
                 .roc_action_frames
                 .saturating_sub(before.roc_action_frames),
-            vendor_beacon_ies: self.vendor_beacon_ies.saturating_sub(before.vendor_beacon_ies),
+            vendor_beacon_ies: self
+                .vendor_beacon_ies
+                .saturating_sub(before.vendor_beacon_ies),
             vendor_nan_beacon_ies: self
                 .vendor_nan_beacon_ies
                 .saturating_sub(before.vendor_nan_beacon_ies),
-            vendor_other_ies: self.vendor_other_ies.saturating_sub(before.vendor_other_ies),
+            vendor_other_ies: self
+                .vendor_other_ies
+                .saturating_sub(before.vendor_other_ies),
             roc_espnow_actions: self
                 .roc_espnow_actions
                 .saturating_sub(before.roc_espnow_actions),
@@ -525,7 +661,9 @@ impl RawWifiCounters {
             udp6_ndp_advertisements: self
                 .udp6_ndp_advertisements
                 .saturating_sub(before.udp6_ndp_advertisements),
-            udp6_tx_failures: self.udp6_tx_failures.saturating_sub(before.udp6_tx_failures),
+            udp6_tx_failures: self
+                .udp6_tx_failures
+                .saturating_sub(before.udp6_tx_failures),
             udp6_last_tx_result: self.udp6_last_tx_result,
             udp6_raw_tx_completions: self
                 .udp6_raw_tx_completions
@@ -595,10 +733,48 @@ pub struct RawWifiSnapshot {
     /// Whether the raw bearer currently owns the STA driver's Ethernet RX
     /// callback rather than ESP-IDF's normal esp-netif/lwIP path.
     pub sta_raw_rx_enabled: Option<bool>,
+    /// Driver-observed elapsed time from `esp_wifi_connect` to the connected
+    /// event. This intentionally excludes radio-epoch setup and is absent
+    /// until the current STA epoch has associated.
+    pub sta_connect_to_associated_ms: Option<u32>,
     /// RSSI reported by the ESP STA for its associated AP. This is a
     /// best-effort local PHY observation; it is not association authority.
     pub sta_ap_rssi_dbm: Option<i8>,
+    /// Effective raw-bearer transmit credit for one ingress turn. A value of
+    /// one enables the deliberate one-tick paced continuation; larger values
+    /// emit the bounded burst synchronously.
+    pub udp6_tx_burst_packets: Option<u8>,
+    /// Device-side duration of the immediate Wi-Fi TX submission call. This
+    /// distinguishes a blocked submitter from later driver/radio airtime.
+    pub udp6_tx_submit_calls: Option<u32>,
+    pub udp6_tx_submit_us_total: Option<u32>,
+    pub udp6_tx_submit_us_max: Option<u32>,
     pub counters: RawWifiCounters,
+}
+
+impl RawWifiSnapshot {
+    /// Project device-side raw-bearer observations into the shared per-link
+    /// metrics vocabulary.  ESP-IDF has no peer MAC retry/failure aggregate,
+    /// so those host-only fields remain absent rather than being synthesized
+    /// from raw injection completions.
+    pub fn link_metrics(&self) -> WifiLinkMetrics {
+        let mut metrics = WifiLinkMetrics::new();
+        metrics.peer_mac = if self.sta_associated == Some(true) {
+            self.comparator_bssid
+        } else {
+            None
+        };
+        metrics.signal_dbm = self.sta_ap_rssi_dbm;
+        metrics.bearer_rx_frames = Some(self.counters.udp6_rx_frames as u64);
+        metrics.bearer_rx_drops = Some(self.counters.udp6_rx_queue_drops as u64);
+        metrics.bearer_rx_invalid = Some(self.counters.udp6_rx_invalid as u64);
+        metrics.bearer_udp_delivered = Some(self.counters.udp6_udp_delivered as u64);
+        metrics.bearer_ndp_advertisements = Some(self.counters.udp6_ndp_advertisements as u64);
+        metrics.bearer_tx_failures = Some(self.counters.udp6_tx_failures as u64);
+        metrics.raw_tx_completion_failures =
+            Some(self.counters.udp6_raw_tx_completion_failures as u64);
+        metrics
+    }
 }
 
 const fn interface_value(value: RawWifiInterface) -> u64 {
@@ -667,10 +843,17 @@ pub fn encode_raw_wifi_snapshot(
         + usize::from(snapshot.sta_ampdu_enabled.is_some())
         + usize::from(snapshot.sta_11b_rates_disabled.is_some())
         + usize::from(snapshot.sta_raw_rx_enabled.is_some())
-        + usize::from(snapshot.sta_ap_rssi_dbm.is_some());
+        + usize::from(snapshot.sta_connect_to_associated_ms.is_some())
+        + usize::from(snapshot.sta_ap_rssi_dbm.is_some())
+        + usize::from(snapshot.udp6_tx_burst_packets.is_some())
+        + usize::from(snapshot.udp6_tx_submit_calls.is_some())
+        + usize::from(snapshot.udp6_tx_submit_us_total.is_some())
+        + usize::from(snapshot.udp6_tx_submit_us_max.is_some());
     let mut e = Encoder::new(out);
-    e.map(2)?;
-    e.uint(0)?;
+    e.map(3)?;
+    e.uint(1)?;
+    e.uint(RAW_WIFI_COMPONENT)?;
+    e.uint(2)?;
     e.uint(method)?;
     e.uint(6)?;
     // Epoch, comparator errors, and monotonic counters are always
@@ -772,9 +955,29 @@ pub fn encode_raw_wifi_snapshot(
         e.uint(85)?;
         e.boolean(value)?;
     }
+    if let Some(value) = snapshot.sta_connect_to_associated_ms {
+        e.uint(91)?;
+        e.uint(u64::from(value))?;
+    }
     if let Some(value) = snapshot.sta_ap_rssi_dbm {
         e.uint(86)?;
         e.int(i64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_burst_packets {
+        e.uint(87)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_submit_calls {
+        e.uint(88)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_submit_us_total {
+        e.uint(89)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.udp6_tx_submit_us_max {
+        e.uint(90)?;
+        e.uint(u64::from(value))?;
     }
     for (key, value) in [
         (40, snapshot.counters.tx_attempted),
@@ -829,39 +1032,14 @@ pub fn encode_raw_wifi_snapshot(
 /// This is intentionally in the shared schema crate so the Rust E2E runner
 /// and firmware/host adapters compare the same counter names.
 pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &'static str> {
-    // UART direct commands retain the standard firmware response envelope
-    // `{0: 68, 4: "ok", 6: <handler-response>}`.  Unwrap it here so the
-    // same decoder serves direct UART, QUIC hardware service, and host tests.
-    let mut outer = Decoder::new(data);
-    // Firmware's common direct-response envelope is a map whose optional
-    // diagnostic fields vary by transport.  Do not require a historical
-    // fixed map size here: UART can return the minimal `{0,4,6}` form while
-    // QUIC/host adapters may add metadata.
-    if let Some((5, entries)) = outer.head() {
-        let mut response_method = None;
-        let mut payload = None;
-        for _ in 0..entries {
-            let key = outer.uint().ok_or("radio response key")?;
-            if key == 0 {
-                response_method = Some(outer.uint().ok_or("radio response method")?);
-            } else if key == 6 {
-                let start = outer.position();
-                outer.skip().ok_or("radio response payload")?;
-                payload = Some(&data[start..outer.position()]);
-            } else {
-                outer.skip().ok_or("radio response value")?;
-            }
-        }
-        if response_method == Some(68) {
-            return decode_raw_wifi_snapshot(payload.ok_or("radio response payload")?);
-        }
+    let record = decode(data).ok_or("radio snapshot CBOR")?;
+    if record.component != Some(Name::Tag(RAW_WIFI_COMPONENT)) {
+        return Err("radio snapshot component");
     }
-    let mut decoder = Decoder::new(data);
-    let (major, entries) = decoder.head().ok_or("radio snapshot CBOR")?;
-    if major != 5 || entries != 2 || decoder.uint() != Some(0) {
-        return Err("radio snapshot envelope");
-    }
-    let method = decoder.uint().ok_or("radio snapshot method")?;
+    let method = match record.method {
+        Some(Name::Tag(method)) => method,
+        _ => return Err("radio snapshot method"),
+    };
     if !matches!(
         method,
         RAW_WIFI_METHOD_CONTROL
@@ -869,16 +1047,16 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
             | RAW_WIFI_METHOD_RESET_COUNTERS
             | RAW_WIFI_METHOD_CHECK
             | RAW_WIFI_METHOD_IPERF
-    ) || decoder.uint() != Some(6)
-    {
+    ) {
         return Err("radio snapshot method");
     }
-    let (major, fields) = decoder.head().ok_or("radio snapshot fields")?;
-    if major != 5 || fields == u64::MAX {
-        return Err("radio snapshot fields");
+    let mut decoder = Decoder::new(record.result.ok_or("radio snapshot fields")?);
+    let (major, entries) = decoder.head().ok_or("radio snapshot CBOR")?;
+    if major != 5 || entries == u64::MAX {
+        return Err("radio snapshot envelope");
     }
     let mut snapshot = RawWifiSnapshot::default();
-    for _ in 0..fields {
+    for _ in 0..entries {
         let key = decoder.uint().ok_or("radio snapshot key")?;
         match key {
             20 => {
@@ -971,10 +1149,40 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                     Some(decoder.boolean().ok_or("radio STA 11b policy")?)
             }
             85 => snapshot.sta_raw_rx_enabled = Some(decoder.boolean().ok_or("radio raw RX")?),
+            91 => {
+                snapshot.sta_connect_to_associated_ms = Some(
+                    u32::try_from(decoder.uint().ok_or("radio STA association time")?)
+                        .map_err(|_| "radio STA association time")?,
+                )
+            }
             86 => {
                 snapshot.sta_ap_rssi_dbm = Some(
                     i8::try_from(decoder.int().ok_or("radio STA AP RSSI")?)
                         .map_err(|_| "radio STA AP RSSI")?,
+                )
+            }
+            87 => {
+                snapshot.udp6_tx_burst_packets = Some(
+                    u8::try_from(decoder.uint().ok_or("radio UDP6 TX burst")?)
+                        .map_err(|_| "radio UDP6 TX burst")?,
+                )
+            }
+            88 => {
+                snapshot.udp6_tx_submit_calls = Some(
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX submits")?)
+                        .map_err(|_| "radio UDP6 TX submits")?,
+                )
+            }
+            89 => {
+                snapshot.udp6_tx_submit_us_total = Some(
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX submit time")?)
+                        .map_err(|_| "radio UDP6 TX submit time")?,
+                )
+            }
+            90 => {
+                snapshot.udp6_tx_submit_us_max = Some(
+                    u32::try_from(decoder.uint().ok_or("radio UDP6 TX submit max")?)
+                        .map_err(|_| "radio UDP6 TX submit max")?,
                 )
             }
             40 => {
@@ -1253,17 +1461,27 @@ fn decode_bytes_or_text<'a>(decoder: &mut Decoder<'a>) -> Option<&'a [u8]> {
     decoder.text_ref()
 }
 
-/// Decode canonical CBOR map keys: 0=operation, 1=frame bytes, 2=channel,
+/// Decode the radio-TX handler fields: 1=frame bytes, 2=channel,
 /// 3=interface (0 auto, 1 sta, 2 ap, 3 nan), 4=system sequence, 5=rate, 6=disable
 /// 11b. Unknown keys are skipped so host tooling can add observation-only
 /// fields without changing firmware parsers.
 pub fn decode_raw_wifi_tx(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static str> {
+    let record = decode(data).ok_or("raw wifi CBOR")?;
+    if record.to.is_some()
+        || record.component != Some(Name::Tag(RAW_WIFI_COMPONENT))
+        || record.method != Some(Name::Tag(RAW_WIFI_METHOD_TX))
+    {
+        return Err("raw wifi handler");
+    }
+    decode_raw_wifi_tx_fields(record.fields.ok_or("raw wifi fields")?)
+}
+
+fn decode_raw_wifi_tx_fields(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static str> {
     let mut decoder = Decoder::new(data);
     let (major, entries) = decoder.head().ok_or("raw wifi CBOR")?;
     if major != 5 {
         return Err("raw wifi map");
     }
-    let mut operation = None;
     let mut frame = None;
     let mut channel = 6u8;
     let mut interface = RawWifiInterface::Auto;
@@ -1277,7 +1495,6 @@ pub fn decode_raw_wifi_tx(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static 
         entry += 1;
         let key = decoder.uint().ok_or("raw wifi key")?;
         match key {
-            0 => operation = Some(decoder.uint().ok_or("raw wifi operation")?),
             1 => frame = Some(decoder.bytes_ref().ok_or("raw wifi frame")?),
             2 => {
                 channel = u8::try_from(decoder.uint().ok_or("raw wifi channel")?)
@@ -1290,8 +1507,8 @@ pub fn decode_raw_wifi_tx(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static 
             _ => decoder.skip().ok_or("raw wifi value")?,
         }
     }
-    if !decoder.is_finished() || operation != Some(RAW_WIFI_OP_TX) {
-        return Err("raw wifi operation");
+    if !decoder.is_finished() {
+        return Err("raw wifi trailing data");
     }
     let frame = frame.ok_or("raw wifi frame")?;
     if !(24..=RAW_WIFI_MAX_FRAME).contains(&frame.len()) || !(1..=13).contains(&channel) {
@@ -1418,7 +1635,10 @@ fn decode_raw_wifi_lab_inner(
                 )
             }
             26 => control.roc_loop = Some(decoder.boolean().ok_or("raw wifi ROC loop")?),
-            27 => control.action_dispatcher = Some(decoder.boolean().ok_or("raw wifi action dispatcher")?),
+            27 => {
+                control.action_dispatcher =
+                    Some(decoder.boolean().ok_or("raw wifi action dispatcher")?)
+            }
             17 => {
                 let peer = decoder.bytes_ref().ok_or("raw wifi check peer")?;
                 check_peer = Some(peer.try_into().map_err(|_| "raw wifi check peer")?);
@@ -1516,79 +1736,30 @@ pub fn decode_raw_wifi_lab(data: &[u8]) -> Result<RawWifiLabRequest, &'static st
     decode_raw_wifi_lab_inner(data, None)
 }
 
-fn command_payload(packet: &[u8], expected_method: u64) -> Result<&[u8], &'static str> {
-    let mut root = Decoder::new(packet);
-    let (major, fields) = root.head().ok_or("radio command CBOR")?;
-    if major != 5 {
-        return Err("radio command map");
-    }
-    let mut method = None;
-    let mut payload = None;
-    let mut entry = 0;
-    while (fields == u64::MAX && !root.consume_break()) || (fields != u64::MAX && entry < fields) {
-        entry += 1;
-        let key = root.uint().ok_or("radio command key")?;
-        if key == 0 {
-            method = Some(root.uint().ok_or("radio command method")?);
-        } else if key == 6 {
-            let start = root.position();
-            root.skip().ok_or("radio command payload")?;
-            payload = Some(&packet[start..root.position()]);
-        } else {
-            root.skip().ok_or("radio command value")?;
-        }
-    }
-    if method != Some(expected_method) {
-        return Err("radio command method");
-    }
-    let payload = payload.ok_or("radio command payload")?;
-    let mut body = Decoder::new(payload);
-    if !matches!(body.head(), Some((5, _))) {
-        return Err("radio command payload");
-    }
-    Ok(payload)
-}
-
 /// Decode a complete registered handler envelope.  Direct PPP and QUIC
 /// service bodies call this exact function; no UART-specific parser exists.
 pub fn decode_raw_wifi_handler(packet: &[u8]) -> Result<RawWifiLabRequest, &'static str> {
-    let mut root = Decoder::new(packet);
-    let (major, fields) = root.head().ok_or("radio command CBOR")?;
-    if major != 5 {
-        return Err("radio command map");
+    let record = decode(packet).ok_or("radio command CBOR")?;
+    if record.to.is_some() || record.component != Some(Name::Tag(RAW_WIFI_COMPONENT)) {
+        return Err("radio command component");
     }
-    let mut method = None;
-    let mut entry = 0;
-    while (fields == u64::MAX && !root.consume_break()) || (fields != u64::MAX && entry < fields) {
-        entry += 1;
-        let key = root.uint().ok_or("radio command key")?;
-        if key == 0 {
-            method = Some(root.uint().ok_or("radio command method")?);
-        } else {
-            root.skip().ok_or("radio command value")?;
+    let fields = record.fields.ok_or("radio command payload")?;
+    match record.method {
+        Some(Name::Tag(RAW_WIFI_METHOD_CONTROL)) => {
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_CONTROL))
         }
-    }
-    match method {
-        Some(RAW_WIFI_METHOD_CONTROL) => decode_raw_wifi_lab_inner(
-            command_payload(packet, RAW_WIFI_METHOD_CONTROL)?,
-            Some(RAW_WIFI_OP_CONTROL),
-        ),
-        Some(RAW_WIFI_METHOD_SNAPSHOT) => decode_raw_wifi_lab_inner(
-            command_payload(packet, RAW_WIFI_METHOD_SNAPSHOT)?,
-            Some(RAW_WIFI_OP_SNAPSHOT),
-        ),
-        Some(RAW_WIFI_METHOD_RESET_COUNTERS) => decode_raw_wifi_lab_inner(
-            command_payload(packet, RAW_WIFI_METHOD_RESET_COUNTERS)?,
-            Some(RAW_WIFI_OP_RESET_COUNTERS),
-        ),
-        Some(RAW_WIFI_METHOD_CHECK) => decode_raw_wifi_lab_inner(
-            command_payload(packet, RAW_WIFI_METHOD_CHECK)?,
-            Some(RAW_WIFI_OP_CHECK),
-        ),
-        Some(RAW_WIFI_METHOD_IPERF) => decode_raw_wifi_lab_inner(
-            command_payload(packet, RAW_WIFI_METHOD_IPERF)?,
-            Some(RAW_WIFI_OP_IPERF),
-        ),
+        Some(Name::Tag(RAW_WIFI_METHOD_SNAPSHOT)) => {
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_SNAPSHOT))
+        }
+        Some(Name::Tag(RAW_WIFI_METHOD_RESET_COUNTERS)) => {
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_RESET_COUNTERS))
+        }
+        Some(Name::Tag(RAW_WIFI_METHOD_CHECK)) => {
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_CHECK))
+        }
+        Some(Name::Tag(RAW_WIFI_METHOD_IPERF)) => {
+            decode_raw_wifi_lab_inner(fields, Some(RAW_WIFI_OP_IPERF))
+        }
         _ => Err("radio command method"),
     }
 }
@@ -1602,24 +1773,18 @@ mod tests {
     fn raw_tx_schema_decodes_all_radio_controls() {
         let frame = [0xd0; 24];
         let mut wire = [0; 80];
-        let mut e = Encoder::new(&mut wire);
-        e.map(7).unwrap();
-        e.uint(0).unwrap();
-        e.uint(RAW_WIFI_OP_TX).unwrap();
-        e.uint(1).unwrap();
-        e.bytes_value(&frame).unwrap();
-        e.uint(2).unwrap();
-        e.uint(6).unwrap();
-        e.uint(3).unwrap();
-        e.uint(2).unwrap();
-        e.uint(4).unwrap();
-        e.boolean(false).unwrap();
-        e.uint(5).unwrap();
-        e.uint(24).unwrap();
-        e.uint(6).unwrap();
-        e.boolean(false).unwrap();
-        let used = e.len();
-        drop(e);
+        let used = encode_raw_wifi_tx_request(
+            RawWifiTxRequest {
+                channel: 6,
+                interface: RawWifiInterface::Ap,
+                system_sequence: false,
+                rate: RawWifiRate::Mbps24,
+                disable_11b: false,
+                frame: &frame,
+            },
+            &mut wire,
+        )
+        .unwrap();
         let request = decode_raw_wifi_tx(&wire[..used]).unwrap();
         assert_eq!(request.interface, RawWifiInterface::Ap);
         assert_eq!(request.rate, RawWifiRate::Mbps24);
@@ -1631,18 +1796,18 @@ mod tests {
     fn raw_tx_schema_preserves_nan_interface_request() {
         let frame = [0xd0; 24];
         let mut wire = [0; 64];
-        let mut e = Encoder::new(&mut wire);
-        e.map(4).unwrap();
-        e.uint(0).unwrap();
-        e.uint(RAW_WIFI_OP_TX).unwrap();
-        e.uint(1).unwrap();
-        e.bytes_value(&frame).unwrap();
-        e.uint(2).unwrap();
-        e.uint(6).unwrap();
-        e.uint(3).unwrap();
-        e.uint(3).unwrap();
-        let used = e.len();
-        drop(e);
+        let used = encode_raw_wifi_tx_request(
+            RawWifiTxRequest {
+                channel: 6,
+                interface: RawWifiInterface::Nan,
+                system_sequence: true,
+                rate: RawWifiRate::Auto,
+                disable_11b: true,
+                frame: &frame,
+            },
+            &mut wire,
+        )
+        .unwrap();
         assert_eq!(
             decode_raw_wifi_tx(&wire[..used]).unwrap().interface,
             RawWifiInterface::Nan
@@ -1741,11 +1906,18 @@ mod tests {
 
     #[test]
     fn registered_control_handler_uses_the_same_typed_schema() {
-        // {0: 72, 6: {2: 6, 7: 1, 10: false, 11: 1}}
-        let command = [
-            0xa2, 0x00, 0x18, 0x48, 0x06, 0xa4, 0x02, 0x06, 0x07, 0x01, 0x0a, 0xf4, 0x0b, 0x01,
-        ];
-        let RawWifiLabRequest::Control(control) = decode_raw_wifi_handler(&command).unwrap() else {
+        let request = RawWifiControlRequest {
+            channel: Some(6),
+            sta_state: Some(RawWifiStaState::DisconnectHold),
+            promiscuous: Some(false),
+            dw_policy: Some(RawWifiDwPolicy::Disabled),
+            ..RawWifiControlRequest::default()
+        };
+        let mut command = [0; 64];
+        let used = encode_raw_wifi_control_request(request, &mut command).unwrap();
+        let RawWifiLabRequest::Control(control) =
+            decode_raw_wifi_handler(&command[..used]).unwrap()
+        else {
             panic!("control request")
         };
         assert_eq!(control.channel, Some(6));
@@ -1756,14 +1928,44 @@ mod tests {
 
     #[test]
     fn registered_snapshot_and_reset_are_separate_handlers() {
+        let mut command = [0; 32];
+        let snapshot =
+            encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_SNAPSHOT, &mut command).unwrap();
         assert_eq!(
-            decode_raw_wifi_handler(&[0xa2, 0x00, 0x18, 0x49, 0x06, 0xa0]),
+            decode_raw_wifi_handler(&command[..snapshot]),
             Ok(RawWifiLabRequest::Snapshot)
         );
+        let reset =
+            encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_RESET_COUNTERS, &mut command).unwrap();
         assert_eq!(
-            decode_raw_wifi_handler(&[0xa2, 0x00, 0x18, 0x4a, 0x06, 0xa0]),
+            decode_raw_wifi_handler(&command[..reset]),
             Ok(RawWifiLabRequest::ResetCounters)
         );
+    }
+
+    #[test]
+    fn device_snapshot_projects_only_observed_fields_into_link_metrics() {
+        let snapshot = RawWifiSnapshot {
+            sta_associated: Some(true),
+            comparator_bssid: Some([1, 2, 3, 4, 5, 6]),
+            sta_ap_rssi_dbm: Some(-41),
+            counters: RawWifiCounters {
+                udp6_rx_frames: 9,
+                udp6_tx_failures: 2,
+                udp6_raw_tx_completion_failures: 3,
+                ..RawWifiCounters::default()
+            },
+            ..RawWifiSnapshot::default()
+        };
+        let metrics = snapshot.link_metrics();
+        assert_eq!(metrics.schema_version, WIFI_LINK_METRICS_SCHEMA_VERSION);
+        assert_eq!(metrics.peer_mac, Some([1, 2, 3, 4, 5, 6]));
+        assert_eq!(metrics.signal_dbm, Some(-41));
+        assert_eq!(metrics.bearer_rx_frames, Some(9));
+        assert_eq!(metrics.bearer_tx_failures, Some(2));
+        assert_eq!(metrics.raw_tx_completion_failures, Some(3));
+        assert_eq!(metrics.mac_tx_retries, None);
+        assert_eq!(metrics.mac_tx_failed, None);
     }
 
     #[test]
@@ -1807,7 +2009,7 @@ mod tests {
         let request = RawWifiIperfRequest {
             peer: [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00],
             bytes: 64 * 1024,
-            packet_size: 1_136,
+            packet_size: quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u16,
             timeout_ms: 10_000,
         };
         let mut wire = [0; 64];
@@ -1901,8 +2103,10 @@ mod tests {
         )
         .unwrap();
         let mut decoder = Decoder::new(&out[..used]);
-        assert_eq!(decoder.head(), Some((5, 2)));
-        assert_eq!(decoder.uint(), Some(0));
+        assert_eq!(decoder.head(), Some((5, 3)));
+        assert_eq!(decoder.uint(), Some(1));
+        assert_eq!(decoder.uint(), Some(RAW_WIFI_COMPONENT));
+        assert_eq!(decoder.uint(), Some(2));
         assert_eq!(decoder.uint(), Some(RAW_WIFI_METHOD_SNAPSHOT));
         assert_eq!(decoder.uint(), Some(6));
         let (major, fields) = decoder.head().unwrap();
@@ -1938,6 +2142,7 @@ mod tests {
             dw_capturing: Some(true),
             sta_mac: Some([0x10, 0, 0, 0, 0, 1]),
             ap_mac: Some([0x10, 0, 0, 0, 0, 2]),
+            sta_connect_to_associated_ms: Some(487),
             sta_ap_rssi_dbm: Some(-42),
             counters: RawWifiCounters {
                 rx_parser_accepted: 7,

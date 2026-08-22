@@ -103,6 +103,33 @@ pub fn is_icmpv6_frame(frame: &[u8]) -> bool {
         && frame[ETHERNET_HEADER_LEN + 6] == IPPROTO_ICMPV6
 }
 
+/// Wire metadata for an Ethernet-II IPv6 ICMPv6 frame.
+///
+/// This deliberately performs no NDP validation: callers use it to explain
+/// why a frame was rejected by the stricter Neighbor Solicitation parser.
+/// Keeping it in the portable framing crate makes the same diagnostics
+/// available to host captures and ESP direct-record counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Icmpv6FrameInfo {
+    pub hop_limit: u8,
+    pub payload_length: u16,
+    pub icmp_type: u8,
+    pub code: u8,
+}
+
+pub fn icmpv6_frame_info(frame: &[u8]) -> Option<Icmpv6FrameInfo> {
+    if !is_icmpv6_frame(frame) || frame.len() < ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + 2 {
+        return None;
+    }
+    let ip = &frame[ETHERNET_HEADER_LEN..];
+    Some(Icmpv6FrameInfo {
+        hop_limit: ip[7],
+        payload_length: read_u16(&ip[4..6]),
+        icmp_type: ip[IPV6_HEADER_LEN],
+        code: ip[IPV6_HEADER_LEN + 1],
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Udp6Packet<'a> {
     pub source_mac: [u8; 6],
@@ -167,6 +194,19 @@ pub fn parse_udp6<'a>(
     local_ip: [u8; 16],
     destination_port: u16,
 ) -> Result<Udp6Packet<'a>, Error> {
+    parse_udp6_for_destination(frame, local_ip, destination_port)
+}
+
+/// Parse one raw UDP6 datagram addressed to a known explicit destination.
+///
+/// The normal raw bearer uses [`parse_udp6`] with its unicast link-local
+/// address. Local-link discovery uses this form with its fixed IPv6 multicast
+/// group, retaining the same Ethernet, IPv6, port, and checksum validation.
+pub fn parse_udp6_for_destination<'a>(
+    frame: &'a [u8],
+    expected_destination_ip: [u8; 16],
+    destination_port: u16,
+) -> Result<Udp6Packet<'a>, Error> {
     if frame.len() < ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + UDP_HEADER_LEN {
         return Err(Error::Truncated);
     }
@@ -195,7 +235,7 @@ pub fn parse_udp6<'a>(
     let ip = &ip[..expected_len];
     let source_ip: [u8; 16] = ip[8..24].try_into().map_err(|_| Error::Truncated)?;
     let destination_ip: [u8; 16] = ip[24..40].try_into().map_err(|_| Error::Truncated)?;
-    if destination_ip != local_ip {
+    if destination_ip != expected_destination_ip {
         return Err(Error::Destination);
     }
     let udp = &ip[IPV6_HEADER_LEN..];
@@ -611,7 +651,9 @@ mod tests {
     fn link_local_uses_modified_eui64() {
         assert_eq!(
             link_local_from_mac(LOCAL_MAC),
-            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x16, 0xc1, 0x9f, 0xff, 0xfe, 0xe5, 0x98, 0]
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x16, 0xc1, 0x9f, 0xff, 0xfe, 0xe5, 0x98, 0
+            ]
         );
     }
 
@@ -653,6 +695,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_multicast_destination_keeps_udp6_validation() {
+        let local = link_local_from_mac(LOCAL_MAC);
+        let peer = link_local_from_mac(PEER_MAC);
+        let group = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x52, 0x27];
+        let mut frame = [0u8; 256];
+        let used = encode_udp6(
+            &mut frame,
+            [0x33, 0x33, 0, 0, 0x52, 0x27],
+            PEER_MAC,
+            group,
+            peer,
+            5227,
+            5227,
+            b"announce",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_udp6(&frame[..used], local, 5227),
+            Err(Error::Destination)
+        );
+        let parsed = parse_udp6_for_destination(&frame[..used], group, 5227).unwrap();
+        assert_eq!(parsed.payload, b"announce");
+    }
+
+    #[test]
     fn rejects_corruption_and_unsupported_ipv6_forms() {
         let local = link_local_from_mac(LOCAL_MAC);
         let peer = link_local_from_mac(PEER_MAC);
@@ -676,13 +743,27 @@ mod tests {
 
     #[test]
     fn icmpv6_classifier_and_error_labels_are_host_tested() {
-        let mut frame = [0u8; ETHERNET_HEADER_LEN + IPV6_HEADER_LEN];
+        let mut frame = [0u8; ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + 2];
         frame[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
         frame[14] = 0x60;
+        frame[18..20].copy_from_slice(&48u16.to_be_bytes());
         frame[20] = IPPROTO_ICMPV6;
+        frame[21] = 255;
+        frame[54] = 1;
+        frame[55] = 4;
         assert!(is_icmpv6_frame(&frame));
+        assert_eq!(
+            icmpv6_frame_info(&frame),
+            Some(Icmpv6FrameInfo {
+                hop_limit: 255,
+                payload_length: 48,
+                icmp_type: 1,
+                code: 4,
+            })
+        );
         frame[20] = IPPROTO_UDP;
         assert!(!is_icmpv6_frame(&frame));
+        assert_eq!(icmpv6_frame_info(&frame), None);
         assert_eq!(error_label(Error::Length), "length/option");
         assert_eq!(ndp_error_text(Error::Checksum), b"ndp rejected checksum");
         assert_eq!(udp6_error_text(Error::Port), b"udp6 rejected port");

@@ -1,8 +1,8 @@
-# UART L2 library API
+# UART device-session API
 
-`lmesh-uart` is the reusable host UART L2 library. New serial ownership belongs
-to `dmesh-cli`; do not deploy or start the old forwarding service. Legacy byte
-forwards are retired. PPP/HDLC carries
+`dmesh-cli` owns direct serial sessions. Do not deploy or start a UART
+forwarding service or control socket. Legacy byte forwards are retired.
+PPP/HDLC carries
 QUIC-lite bearer packets, while
 commands, logs, and object transfer are `dmesh-server` stream services. The low-level
 PPP/HDLC codec is documented in [`uart-codec/API.md`](../uart-codec/API.md)
@@ -29,10 +29,11 @@ Current UDP sessions prefer `static_ipv4`; a serial-only profile resolves to
 its `/dev/serial/by-id/<serial_id>` path. IPv6 link-local is recorded now but
 needs a caller-selected interface scope before it becomes a UDP path.
 
-The binary is a foreground shell, not a managed UART protocol daemon. It takes
-the session target directly and has no default control socket or forwarding
-configuration. UART access still requires filesystem access to the selected
-`/dev/serial/by-id` device and membership in the relevant device groups.
+The `dmesh-cli` binary is a foreground shell, not a managed UART protocol
+daemon. It takes the session target directly and has no default control socket
+or forwarding configuration. UART access still requires filesystem access to
+the selected `/dev/serial/by-id` device and membership in the relevant device
+groups.
 
 ## Session socket
 
@@ -44,6 +45,11 @@ text or schema-labelled compact CBOR. `--command TEXT` encodes the explicitly
 selected direct-CBOR diagnostic/boot record; normal operations remain service
 streams. `log-watch` currently performs the bounded server poll; framed
 long-lived log delivery is pending its server handler.
+
+`--command` and `--direct-hex` are explicitly serial operations. When their
+target is an inventory name with both UDP and serial addresses, `dmesh-cli`
+selects `serial_id`; it never silently changes a direct diagnostic into a UDP
+request. Use service-stream options for an intentional UDP operation.
 
 `dmesh-cli <serial-or-device> --watch` is a passive UART diagnostic for
 raw boot/platform text and direct-CBOR exception records. It labels marked
@@ -91,7 +97,6 @@ The optional `--socket PATH` is created only by an explicitly requested device
 session. It exposes service streams on that one connection and is removed only
 when the session owner exits; there are no per-forward sockets or TCP ports.
 
-The small `UartService` library type remains for explicit local USB inventory
-and safe modem-line operations used by provisioning tools. Its old
-`esp.serial.command`, boot, forwarding, and TCP methods are intentionally
-retired; command/log traffic belongs to the session client.
+There is no UDS service adapter for UART control. Provisioning uses
+[`scripts/flash-device.py`](../../scripts/flash-device.py), while direct
+commands, logs, and service streams use the selected `dmesh-cli` session.

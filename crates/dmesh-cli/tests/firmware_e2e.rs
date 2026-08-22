@@ -2,7 +2,9 @@
 //!
 //! This is intentionally one ignored test: it holds one UART owner for e6
 //! and one for e7 for the entire matrix rather than reopening USB serial for
-//! each case. Run only on the lab host after both images are flashed:
+//! each case. Run only on the lab host after both images are flashed and have
+//! remained booted for at least 20 seconds; the suite never flashes, resets,
+//! or starts/stops host Wi-Fi interfaces.
 //!
 //! ```sh
 //! DMESH_E2E_E6=/dev/serial/by-id/...98:00-if00 \
@@ -11,6 +13,8 @@
 //! ```
 
 use dmesh_cli::{DeviceSession, DeviceSessionEvent};
+use dmesh_server::cbor::Encoder;
+use dmesh_server::probe::{ProbeEndpoint, ProbeEndpointKind, ProbeMode, ProbeRequest};
 use dmesh_server::raw_wifi::{
     RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiCheckRequest,
     RawWifiControlRequest, RawWifiDwPolicy, RawWifiInterface, RawWifiIperfRequest, RawWifiStaMode,
@@ -18,19 +22,25 @@ use dmesh_server::raw_wifi::{
     encode_raw_wifi_control_request, encode_raw_wifi_iperf_request,
     encode_raw_wifi_snapshot_request,
 };
-use dmesh_server::cbor::Encoder;
 use dmesh_server::{
+    control::{self, Request as ControlRequest, TransportKind},
     iperf::{IperfServiceRequest, encode_iperf_service_request},
+    tagged::decode as decode_tagged_record,
     udp::{ReceivedStream, UdpClient},
 };
+use mesh::{
+    cbor::{decode_record, decode_stream_frame, encode_record, encode_stream_frame},
+    tagged::{NameOrTag, TaggedCatalog, TaggedRecord},
+};
 use quic_lite::{ConnectionId, FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_ECHO};
+use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    io::{BufRead, BufReader, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    os::unix::net::{UnixListener, UnixStream},
+    sync::LazyLock,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::time::timeout;
 
@@ -43,9 +53,94 @@ const STABLE_WIFI_UDP_PORT: u16 = 3336;
 /// transport change. Set `DMESH_E2E_UDP6_BYTES=1048576` for the reproducible
 /// sustained-goodput row without changing or reflashing firmware.
 const E2E_UDP6_DEFAULT_BYTES: u64 = 64 * 1024;
-const E2E_UDP6_PACKET_SIZE: u16 = 1_136;
+const E2E_UDP6_PACKET_SIZE: u16 = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u16;
 const E2E_UDP6_TRANSFER_DEADLINE: Duration = Duration::from_secs(45);
 const E2E_ACTION_IPERF_BYTES: u64 = 64 * 1024;
+
+/// Apply one endpoint mode as a complete replacement, never as a setting
+/// overlay. The device side remains a low-level radio/control endpoint; the
+/// privileged host controller owns this A-to-B orchestration and its signed
+/// production counterpart records the same snapshots.
+fn configure_probe_endpoint(
+    session: &mut DeviceSession,
+    mode: ProbeMode,
+    ssid: &str,
+    request_id: u64,
+) {
+    match mode.transport_kind {
+        6 => configure_nan_for_channel(session, 6, request_id),
+        1 => configure_sta_for_wlan0(session, ssid, request_id),
+        unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
+    }
+}
+
+/// Establish the requested endpoint personalities and capture the common
+/// NAN/DW/RSSI baseline. Bearer rows remain explicit below: this prevents a
+/// successful NOW echo from being mistaken for UDP6 or NAN SD completion.
+fn probe(
+    source: &mut DeviceSession,
+    target: &mut DeviceSession,
+    request: ProbeRequest,
+    ssid: &str,
+    source_id: u64,
+    target_id: u64,
+) -> (
+    dmesh_server::raw_wifi::RawWifiSnapshot,
+    dmesh_server::raw_wifi::RawWifiSnapshot,
+) {
+    configure_probe_endpoint(source, request.source.mode, ssid, source_id);
+    configure_probe_endpoint(target, request.target.mode, ssid, target_id);
+    let source_snapshot = match request.source.mode.transport_kind {
+        6 => wait_for_unassociated_channel_6(source),
+        1 => wait_for_associated_channel_6(source),
+        unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
+    };
+    let target_snapshot = match request.target.mode.transport_kind {
+        6 => wait_for_unassociated_channel_6(target),
+        1 => wait_for_associated_channel_6(target),
+        unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
+    };
+    eprintln!(
+        "firmware-e2e row=probe setup source_mode={:?} target_mode={:?} nan={} now={} udp6={} source=({}) target=({})",
+        request.source.mode,
+        request.target.mode,
+        request.test_nan,
+        request.test_now,
+        request.test_udp6,
+        snapshot_summary(&source_snapshot),
+        snapshot_summary(&target_snapshot),
+    );
+    (source_snapshot, target_snapshot)
+}
+
+static LMESH_CATALOG: LazyLock<TaggedCatalog> = LazyLock::new(|| {
+    let mut tools =
+        serde_json::from_str::<serde_json::Value>(include_str!("../../lmesh/resources/tools.json"))
+            .expect("lmesh tools catalog must be valid JSON");
+    let wifi_tools = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../lmesh-wifi/resources/tools.json"
+    ))
+    .expect("lmesh-wifi tools catalog must be valid JSON");
+    tools
+        .as_array_mut()
+        .expect("lmesh tools catalog must be an array")
+        .extend(
+            wifi_tools
+                .as_array()
+                .expect("lmesh-wifi tools catalog must be an array")
+                .iter()
+                .cloned(),
+        );
+    TaggedCatalog::from_tools_json(&tools).expect("lmesh tools catalog must be valid")
+});
+
+static LMESH_WIFI_CATALOG: LazyLock<TaggedCatalog> = LazyLock::new(|| {
+    TaggedCatalog::from_tools_json(
+        &serde_json::from_str(include_str!("../../lmesh-wifi/resources/tools.json"))
+            .expect("lmesh-wifi tools catalog must be valid JSON"),
+    )
+    .expect("lmesh-wifi tools catalog must be valid")
+});
 
 fn action_iperf_enabled() -> bool {
     matches!(
@@ -113,7 +208,7 @@ fn e2e_now_packet_size() -> u64 {
         // bearer. Small control packets remain testable with an explicit
         // `DMESH_E2E_NOW_PACKET_SIZE=256` diagnostic run, but using them as
         // the throughput default amplifies one RF loss into a long PTO stall.
-        Err(std::env::VarError::NotPresent) => 1200,
+        Err(std::env::VarError::NotPresent) => quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64,
         Err(error) => panic!("read DMESH_E2E_NOW_PACKET_SIZE: {error}"),
     }
 }
@@ -122,12 +217,18 @@ fn e2e_now_bytes() -> u64 {
     std::env::var("DMESH_E2E_NOW_BYTES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(8_192)
+        // The separate `wifi.raw.check` row is the short bootstrap gate.
+        // Once it succeeds, measure a meaningful sustained transfer by
+        // default; callers can still choose a bounded diagnostic size.
+        .unwrap_or(64 * 1024)
         .clamp(256, 1_048_576)
 }
 
 fn e2e_now_destination() -> String {
-    if matches!(std::env::var("DMESH_E2E_NOW_A1").as_deref(), Ok("peer" | "unicast")) {
+    if matches!(
+        std::env::var("DMESH_E2E_NOW_A1").as_deref(),
+        Ok("peer" | "unicast")
+    ) {
         interface_mac("wlan1")
     } else {
         "ff:ff:ff:ff:ff:ff".to_owned()
@@ -135,6 +236,8 @@ fn e2e_now_destination() -> String {
 }
 
 fn e2e_now_tx_variant() -> String {
+    // The permanent active monitor is the connectionless NOW transmitter.
+    // Managed nl80211 vendor-action TX remains an explicit driver diagnostic.
     std::env::var("DMESH_E2E_NOW_TX_VARIANT").unwrap_or_else(|_| "monitor".to_owned())
 }
 
@@ -181,27 +284,291 @@ fn mem_available_kib() -> Option<u64> {
         })
 }
 
-/// Invoke a supervised host service through its existing JSONL Unix socket.
-/// This is the same wire surface used by the `mesh` crate/client, but avoids
-/// spawning a CLI process for every packet test. Each request owns a short
-/// socket connection so concurrent capture/probe rows cannot serialize behind
-/// one subscription stream; no AP or service process is created here.
-fn mesh_rpc(service: &str, method: &str, args: &[&str]) -> serde_json::Value {
-    let mut params = BTreeMap::new();
-    for arg in args {
-        let (key, value) = arg.split_once('=').unwrap_or((arg, "true"));
-        params.insert(key.to_owned(), text_json_value(value));
+/// Invoke a supervised host service through its existing Unix socket with a
+/// typed request. The request is serialized directly into catalog-tagged
+/// fields; it never makes a `key=value` text round trip.
+fn mesh_rpc_typed<T: Serialize>(service: &str, method: &str, request: &T) -> serde_json::Value {
+    mesh_rpc_typed_at(
+        service,
+        method,
+        request,
+        &format!("/run/mesh/{service}/mesh.sock"),
+    )
+}
+
+fn mesh_rpc_typed_at<T: Serialize>(
+    service: &str,
+    method: &str,
+    request: &T,
+    socket_path: &str,
+) -> serde_json::Value {
+    mesh_rpc_value_at(
+        service,
+        method,
+        serde_json::to_value(request)
+            .unwrap_or_else(|error| panic!("serialize {service} {method} request: {error}")),
+        socket_path,
+    )
+}
+
+/// The production AP fixture is externally provisioned. Tests may select the
+/// development AP without changing it: `lmesh-wifi`/`wlan0` remains the
+/// default, while `DMESH_E2E_AP_SERVICE=lmesh DMESH_E2E_AP_IFACE=wlan1`
+/// selects the independent test service.
+fn e2e_ap_service() -> String {
+    std::env::var("DMESH_E2E_AP_SERVICE").unwrap_or_else(|_| "lmesh-wifi".to_owned())
+}
+
+fn e2e_ap_iface() -> String {
+    std::env::var("DMESH_E2E_AP_IFACE").unwrap_or_else(|_| "wlan0".to_owned())
+}
+
+/// Read the AP identity from its owner.  Device association is deliberately
+/// an explicit test action: no UDP row may depend on whichever SSID happened
+/// to be left in a board's NVS by a prior flash or lab experiment.
+fn wlan0_ssid() -> String {
+    let service = e2e_ap_service();
+    let iface = e2e_ap_iface();
+    let response = mesh_rpc_typed(
+        &service,
+        "wifi.ap.status",
+        &lmesh_wifi::api::ApStatusRequest {
+            iface: Some(iface.clone()),
+        },
+    );
+    response["data"]["ssid_default"]
+        .as_str()
+        .filter(|ssid| !ssid.is_empty())
+        .unwrap_or_else(|| panic!("{service} did not report {iface} SSID: {response}"))
+        .to_owned()
+}
+
+/// The supervised AP is the source of the complete ephemeral STA target.
+/// Future NAN Service Info carries this same identity in one CBOR command.
+fn wlan0_bssid_channel() -> ([u8; 6], u8) {
+    let service = e2e_ap_service();
+    let iface = e2e_ap_iface();
+    let response = mesh_rpc_typed(
+        &service,
+        "wifi.ap.status",
+        &lmesh_wifi::api::ApStatusRequest {
+            iface: Some(iface.clone()),
+        },
+    );
+    let bssid_text = response["data"]["bssid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{service} did not report {iface} BSSID: {response}"));
+    let mut bssid = [0u8; 6];
+    for (byte, text) in bssid.iter_mut().zip(bssid_text.split(':')) {
+        *byte = u8::from_str_radix(text, 16)
+            .unwrap_or_else(|_| panic!("invalid wlan0 BSSID {bssid_text:?}"));
     }
-    let mut request = serde_json::Map::new();
-    request.insert("method".to_owned(), serde_json::json!(method));
-    for (key, value) in params {
-        request.insert(key, value);
-    }
-    let encoded = serde_json::to_string(&request).expect("encode mesh JSONL request");
-    let socket_path = format!("/run/mesh/{service}/mesh.sock");
+    assert_eq!(
+        bssid_text.split(':').count(),
+        6,
+        "invalid wlan0 BSSID {bssid_text:?}"
+    );
+    let channel = response["data"]["channel"]
+        .as_u64()
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|channel| (1..=14).contains(channel))
+        .unwrap_or_else(|| panic!("{service} did not report {iface} channel: {response}"));
+    (bssid, channel)
+}
+
+/// E2E consumes managed host radio fixtures. It may inspect their state but
+/// must never bring an interface up/down, recreate a monitor, or retune it.
+fn require_host_iface_up(service: &str, iface: &str) {
+    let status = mesh_rpc_typed(
+        service,
+        "wifi.interface.status",
+        &lmesh_wifi::api::InterfaceStatusRequest {
+            iface: Some(iface.to_owned()),
+        },
+    );
+    let link = status["data"]["link"]["stdout"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{service} did not report {iface} link state: {status}"));
+    let flags = link
+        .split('<')
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or_default();
+    assert!(
+        flags.split(',').any(|flag| flag == "UP"),
+        "{service} fixture {iface} is down: {status}"
+    );
+}
+
+fn wifi_raw_check(
+    service: &str,
+    iface: &str,
+    destination: String,
+    nonce: u64,
+    timeout_ms: u64,
+    tx_rate_mbps: u8,
+    tx_variant: &str,
+    rx_variant: &str,
+) -> serde_json::Value {
+    mesh_rpc_typed(
+        service,
+        "wifi.raw.check",
+        &lmesh_wifi::api::RawCheckRequest {
+            iface: Some(iface.to_owned()),
+            channel: Some(6),
+            destination,
+            nonce: Some(nonce),
+            timeout_ms: Some(timeout_ms),
+            tx_rate_mbps: Some(tx_rate_mbps),
+            tx_variant: Some(tx_variant.to_owned()),
+            rx_variant: Some(rx_variant.to_owned()),
+            expected_peer: None,
+        },
+    )
+}
+
+fn wifi_raw_iperf(
+    service: &str,
+    iface: &str,
+    destination: String,
+    bytes: u64,
+    packet_size: u16,
+    timeout_ms: u64,
+    tx_rate_mbps: u8,
+    tx_variant: &str,
+    rx_variant: &str,
+) -> serde_json::Value {
+    mesh_rpc_typed(
+        service,
+        "wifi.raw.iperf",
+        &lmesh_wifi::api::RawIperfRequest {
+            iface: Some(iface.to_owned()),
+            channel: Some(6),
+            destination,
+            bytes: Some(bytes),
+            packet_size: Some(packet_size),
+            timeout_ms: Some(timeout_ms),
+            tx_rate_mbps: Some(tx_rate_mbps),
+            tx_variant: Some(tx_variant.to_owned()),
+            rx_variant: Some(rx_variant.to_owned()),
+            expected_peer: None,
+        },
+    )
+}
+
+fn wifi_raw_check_for_peer(
+    service: &str,
+    iface: &str,
+    destination: String,
+    expected_peer: String,
+    nonce: u64,
+    timeout_ms: u64,
+    tx_rate_mbps: u8,
+    tx_variant: &str,
+    rx_variant: &str,
+) -> serde_json::Value {
+    mesh_rpc_typed(
+        service,
+        "wifi.raw.check",
+        &lmesh_wifi::api::RawCheckRequest {
+            iface: Some(iface.to_owned()),
+            channel: Some(6),
+            destination,
+            nonce: Some(nonce),
+            timeout_ms: Some(timeout_ms),
+            tx_rate_mbps: Some(tx_rate_mbps),
+            tx_variant: Some(tx_variant.to_owned()),
+            rx_variant: Some(rx_variant.to_owned()),
+            expected_peer: Some(expected_peer),
+        },
+    )
+}
+
+fn wifi_raw_iperf_for_peer(
+    service: &str,
+    iface: &str,
+    destination: String,
+    expected_peer: String,
+    bytes: u64,
+    packet_size: u16,
+    timeout_ms: u64,
+    tx_rate_mbps: u8,
+    tx_variant: &str,
+    rx_variant: &str,
+) -> serde_json::Value {
+    mesh_rpc_typed(
+        service,
+        "wifi.raw.iperf",
+        &lmesh_wifi::api::RawIperfRequest {
+            iface: Some(iface.to_owned()),
+            channel: Some(6),
+            destination,
+            bytes: Some(bytes),
+            packet_size: Some(packet_size),
+            timeout_ms: Some(timeout_ms),
+            tx_rate_mbps: Some(tx_rate_mbps),
+            tx_variant: Some(tx_variant.to_owned()),
+            rx_variant: Some(rx_variant.to_owned()),
+            expected_peer: Some(expected_peer),
+        },
+    )
+}
+
+/// Invoke a supervised host service through its existing Unix socket.
+///
+/// A fully numeric component/method pair uses framed tagged CBOR; everything
+/// else uses JSON-RPC, never the former flat JSONL dialect. This explicit
+/// `Value` variant is only for unreviewed operations that do not yet have a
+/// reviewed Rust request struct. Each request owns a short socket connection
+/// so concurrent capture/probe rows cannot serialize behind one subscription
+/// stream; no AP or service process is created here.
+fn mesh_rpc_value(service: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+    mesh_rpc_value_at(
+        service,
+        method,
+        params,
+        &format!("/run/mesh/{service}/mesh.sock"),
+    )
+}
+
+/// Same request policy as [`mesh_rpc_value`], with an explicit path for local
+/// codec tests. Production E2E calls retain the supervised mesh-init socket.
+fn mesh_rpc_value_at(
+    service: &str,
+    method: &str,
+    params: serde_json::Value,
+    socket_path: &str,
+) -> serde_json::Value {
+    let catalog = control_catalog(service);
+    let mut record = catalog
+        .record_from_value(method, &params)
+        .unwrap_or_else(|error| panic!("build {service} {method}: {error}"));
+    record.id = Some(serde_json::json!(1));
+    let tagged_cbor = uses_tagged_cbor(&record);
+    let encoded = if tagged_cbor {
+        encode_stream_frame(
+            &encode_record(&record)
+                .unwrap_or_else(|error| panic!("encode CBOR {service} {method}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("frame CBOR {service} {method}: {error}"))
+    } else {
+        let mut flat = catalog.to_jsonl(&record);
+        let flat = flat
+            .as_object_mut()
+            .expect("catalog JSON conversion must be an object");
+        let rpc_method = flat.remove("method").expect("catalog JSON has method");
+        let id = flat.remove("id").expect("catalog JSON has id");
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": rpc_method,
+            "params": flat,
+        }))
+        .unwrap_or_else(|error| panic!("encode JSON-RPC {service} {method}: {error}"))
+    };
     let mut last_error = None;
     for _ in 0..6 {
-        match UnixStream::connect(&socket_path) {
+        match UnixStream::connect(socket_path) {
             Ok(mut stream) => {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(20)))
@@ -209,17 +576,30 @@ fn mesh_rpc(service: &str, method: &str, args: &[&str]) -> serde_json::Value {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(20)))
                     .expect("set mesh socket write timeout");
-                if let Err(error) = writeln!(stream, "{encoded}").and_then(|_| stream.flush()) {
+                let write = if tagged_cbor {
+                    stream.write_all(&encoded).and_then(|_| stream.flush())
+                } else {
+                    stream
+                        .write_all(&encoded)
+                        .and_then(|_| stream.write_all(b"\n"))
+                        .and_then(|_| stream.flush())
+                };
+                if let Err(error) = write {
                     last_error = Some(format!("write {socket_path}: {error}"));
                     continue;
                 }
-                let mut line = String::new();
-                if let Err(error) = BufReader::new(stream).read_line(&mut line) {
-                    last_error = Some(format!("read {socket_path}: {error}"));
-                    continue;
-                }
-                let response: serde_json::Value = serde_json::from_str(line.trim())
-                    .unwrap_or_else(|error| panic!("decode mesh {service} {method}: {error}; response={line:?}"));
+                let response = if tagged_cbor {
+                    read_cbor_response(&mut stream, service, method)
+                } else {
+                    read_json_rpc_response(&mut stream, service, method)
+                };
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        last_error = Some(format!("read {socket_path}: {error}"));
+                        continue;
+                    }
+                };
                 assert!(
                     response.get("success").and_then(serde_json::Value::as_bool) != Some(false),
                     "mesh {service} {method} failed: {response}"
@@ -232,117 +612,560 @@ fn mesh_rpc(service: &str, method: &str, args: &[&str]) -> serde_json::Value {
             }
         }
     }
-    panic!("mesh {service} {method} failed after retries: {}", last_error.unwrap_or_default());
+    panic!(
+        "mesh {service} {method} failed after retries: {}",
+        last_error.unwrap_or_default()
+    );
 }
 
-fn text_json_value(value: &str) -> serde_json::Value {
-    if value.eq_ignore_ascii_case("true") {
-        return serde_json::Value::Bool(true);
+/// Only a catalog-selected pair of numeric identifiers is eligible for CBOR.
+/// Named CBOR would create a third compatibility dialect, so unreviewed
+/// commands intentionally use JSON-RPC until their API.md fields are stable.
+fn uses_tagged_cbor(record: &TaggedRecord) -> bool {
+    matches!(
+        (&record.component, &record.method),
+        (NameOrTag::Tag(_), NameOrTag::Tag(_))
+    )
+}
+
+fn control_catalog(service: &str) -> &'static TaggedCatalog {
+    match service {
+        "lmesh" => &LMESH_CATALOG,
+        "lmesh-wifi" => &LMESH_WIFI_CATALOG,
+        _ => panic!("no installed generated catalog for host service {service:?}"),
     }
-    if value.eq_ignore_ascii_case("false") {
-        return serde_json::Value::Bool(false);
+}
+
+fn read_cbor_response(
+    stream: &mut UnixStream,
+    service: &str,
+    method: &str,
+) -> Result<serde_json::Value, String> {
+    let mut header = [0_u8; 4];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read CBOR header: {error}"))?;
+    let len = u32::from_be_bytes(header) as usize;
+    let mut frame = Vec::with_capacity(len + 4);
+    frame.extend_from_slice(&header);
+    frame.resize(len + 4, 0);
+    stream
+        .read_exact(&mut frame[4..])
+        .map_err(|error| format!("read CBOR frame: {error}"))?;
+    let response = decode_record(
+        decode_stream_frame(&frame).map_err(|error| format!("decode CBOR frame: {error}"))?,
+    )
+    .map_err(|error| format!("decode CBOR record: {error}"))?;
+    response.result.ok_or_else(|| {
+        format!(
+            "{service} {method} returned CBOR error {}",
+            response.error.unwrap_or(serde_json::Value::Null)
+        )
+    })
+}
+
+fn read_json_rpc_response(
+    stream: &mut UnixStream,
+    service: &str,
+    method: &str,
+) -> Result<serde_json::Value, String> {
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| format!("read JSON-RPC line: {error}"))?;
+    let response: serde_json::Value = serde_json::from_str(line.trim()).map_err(|error| {
+        format!("decode JSON-RPC {service} {method}: {error}; response={line:?}")
+    })?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("JSON-RPC error: {error}"));
     }
-    if value.eq_ignore_ascii_case("null") || value.eq_ignore_ascii_case("none") {
-        return serde_json::Value::Null;
-    }
-    if let Ok(number) = value.parse::<i64>() {
-        return serde_json::json!(number);
-    }
-    if let Ok(number) = value.parse::<f64>() {
-        return serde_json::json!(number);
-    }
-    serde_json::Value::String(value.to_owned())
+    Ok(response.get("result").cloned().unwrap_or(response))
+}
+
+/// Reviewed CBOR replies retain a `data` wrapper, while legacy JSON-RPC
+/// replies return their `result` directly. History is intentionally available
+/// through both during the migration, so E2E must inspect the semantic events
+/// rather than mistake that envelope difference for missing RF delivery.
+fn history_events(response: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    response
+        .get("data")
+        .unwrap_or(response)
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+}
+
+#[test]
+fn host_control_catalog_selects_cbor_only_for_reviewed_methods() {
+    let status = control_catalog("lmesh-wifi")
+        .record_from_value("wifi.ap.status", &serde_json::json!({"iface": "wlan0"}))
+        .expect("reviewed status method builds");
+    assert!(uses_tagged_cbor(&status));
+
+    let lmesh_status = control_catalog("lmesh")
+        .record_from_value("wifi.ap.status", &serde_json::json!({"iface": "wlan1"}))
+        .expect("merged lmesh Wi-Fi status method builds");
+    assert!(uses_tagged_cbor(&lmesh_status));
+
+    let raw_send = control_catalog("lmesh-wifi")
+        .record_from_value(
+            "wifi.raw.send",
+            &serde_json::json!({"iface": "wlan0", "channel": 6, "payload": "probe"}),
+        )
+        .expect("reviewed raw send method builds");
+    assert!(uses_tagged_cbor(&raw_send));
+
+    let management_capture = control_catalog("lmesh")
+        .record_from_value(
+            "wifi.mgmt.capture",
+            &serde_json::json!({"iface": "wlan1", "channel": 6}),
+        )
+        .expect("reviewed management capture method builds");
+    assert!(uses_tagged_cbor(&management_capture));
+
+    let unreviewed = control_catalog("lmesh-wifi")
+        .record_from_value(
+            "wifi.experimental.inspect",
+            &serde_json::json!({"iface": "wlan0"}),
+        )
+        .expect("unreviewed inspection method builds");
+    assert!(!uses_tagged_cbor(&unreviewed));
+}
+
+fn codec_test_socket(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "dmesh-{name}-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos(),
+    ))
+}
+
+#[test]
+fn host_control_cbor_request_and_response_use_framed_numeric_records() {
+    let path = codec_test_socket("cbor");
+    let listener = UnixListener::bind(&path).expect("bind local CBOR test socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept CBOR test request");
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).expect("read request header");
+        let length = u32::from_be_bytes(header) as usize;
+        let mut frame = header.to_vec();
+        frame.resize(length + 4, 0);
+        stream
+            .read_exact(&mut frame[4..])
+            .expect("read request frame");
+        let record = decode_record(decode_stream_frame(&frame).expect("decode request frame"))
+            .expect("decode request record");
+        assert!(matches!(record.component, NameOrTag::Tag(5)));
+        assert!(matches!(record.method, NameOrTag::Tag(1)));
+        assert_eq!(
+            record.env.get(&NameOrTag::Tag(1)),
+            Some(&serde_json::json!("wlan0"))
+        );
+        let response = mesh::wire::response_ok(
+            record.id.expect("request id"),
+            serde_json::json!({"success": true, "data": {"codec": "cbor"}}),
+        );
+        let frame = encode_stream_frame(&encode_record(&response).expect("encode response"))
+            .expect("frame response");
+        stream.write_all(&frame).expect("write CBOR response");
+    });
+
+    let response = mesh_rpc_typed_at(
+        "lmesh-wifi",
+        "wifi.ap.status",
+        &lmesh_wifi::api::ApStatusRequest {
+            iface: Some("wlan0".to_owned()),
+        },
+        path.to_str().expect("UTF-8 socket path"),
+    );
+    assert_eq!(response["data"]["codec"], "cbor");
+    server.join().expect("CBOR test server panicked");
+    std::fs::remove_file(path).expect("remove CBOR test socket");
+}
+
+#[test]
+fn host_control_unreviewed_inspection_request_and_response_use_json_rpc() {
+    let path = codec_test_socket("json-rpc");
+    let listener = UnixListener::bind(&path).expect("bind local JSON-RPC test socket");
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept JSON-RPC test request");
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().expect("clone test stream"));
+        reader.read_line(&mut line).expect("read JSON-RPC request");
+        let request: serde_json::Value =
+            serde_json::from_str(&line).expect("decode JSON-RPC request");
+        assert_eq!(request["jsonrpc"], "2.0");
+        assert_eq!(request["method"], "wifi.experimental.inspect");
+        assert_eq!(request["params"]["iface"], "wlan0");
+        let mut stream = stream;
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {"success": true, "data": {"codec": "json-rpc"}},
+            })
+        )
+        .expect("write JSON-RPC response");
+    });
+
+    let response = mesh_rpc_value_at(
+        "lmesh-wifi",
+        "wifi.experimental.inspect",
+        serde_json::json!({"iface": "wlan0"}),
+        path.to_str().expect("UTF-8 socket path"),
+    );
+    assert_eq!(response["data"]["codec"], "json-rpc");
+    server.join().expect("JSON-RPC test server panicked");
+    std::fs::remove_file(path).expect("remove JSON-RPC test socket");
 }
 
 #[test]
 #[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
 fn host_host_nan_sync_and_sd_e2e() {
-    // Equivalent commands:
-    //   mesh lmesh-wifi wifi.rawnan.status iface=wlan0
+    // Manual equivalence, for the one-time fixture proof before changing this
+    // row. The automated test below is the permanent version: it builds the
+    // same SDF from the shared Rust encoder, sends it once, and asserts the
+    // peer's semantic receipt rather than relying on a shell transcript.
+    //
     //   mesh lmesh wifi.rawnan.status iface=wlan1
-    //   mesh lmesh-wifi wifi.rawnan.ping iface=wlan0 channel=6 \
-    //     destination=74:19:f8:17:de:65 bssid=<cluster> payload=ping wait_ms=2000
-    // Both host services must observe the same NAN cluster before the SD
-    // action is sent; otherwise a successful TX would only prove monitor
-    // injection, not host-to-host discovery alignment.
-    // Status is passive; explicitly arm both monitor listeners as part of
-    // the suite so this row never depends on a previous manual experiment.
-    for (service, iface) in [("lmesh-wifi", "wlan0"), ("lmesh", "wlan1")] {
-        let listen = mesh_rpc(
-            service,
-            "wifi.raw.listen",
-            &["channel=6", "listen_sec=10", &format!("iface={iface}"), "rx_variant=monitor"],
+    //   mesh lmesh-wifi wifi.raw.send iface=wlan0 channel=6 \
+    //     tx_variant=monitor tx_rate_mbps=6 frame_hex=<build_nan_publish_sdf>
+    //   mesh lmesh messages.history keys=wifi.rawnan.discovery limit=64
+    //
+    // The active-subscribe half similarly corresponds to
+    // `build_nan_usd_sdf`; its response is a DW-gated NAN Follow-up, not an
+    // ESP-NOW/vendor action or a host-interface lifecycle operation.
+    // wlan0 is the associated/AP fixture and wlan1 is the unassociated
+    // monitor fixture.  Neither radio is started, stopped, retuned, or
+    // otherwise reconfigured here: the receiver only opens a bounded socket
+    // on its permanent monitor.
+    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan1mon");
+    let listen = mesh_rpc_typed(
+        "lmesh",
+        "wifi.rawnan.listen",
+        &lmesh_wifi::api::RawNanListenRequest {
+            iface: Some("wlan1".to_owned()),
+            channel: Some(6),
+            listen_sec: Some(5),
+        },
+    );
+    assert_eq!(
+        listen["data"]["ok"].as_bool(),
+        Some(true),
+        "NAN listener: {listen}"
+    );
+
+    // Android normally supplies a NAN cluster beacon. If Android is absent,
+    // an ESP AP configured at the 500-TU fallback interval can supply it.
+    // The host AP is deliberately not a fallback: this test must not pretend
+    // an ordinary host beacon is a NAN clock or reconfigure any host radio.
+    let source = interface_mac("wlan0");
+    // History is a long-lived diagnostic ring. Scope every assertion to this
+    // probe epoch so yesterday's identical transport.start CBOR or follow-up
+    // cannot satisfy a fresh on-air NAN test.
+    let probe_started_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after Unix epoch")
+        .as_millis() as u64;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let nan_sync = loop {
+        let status = mesh_rpc_typed(
+            "lmesh",
+            "wifi.rawnan.status",
+            &lmesh_wifi::api::RawNanStatusRequest {
+                iface: Some("wlan1".to_owned()),
+            },
         );
-        assert!(
-            listen.get("success").and_then(serde_json::Value::as_bool) == Some(true),
-            "{service} NAN listener setup failed: {listen}"
-        );
-    }
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let (wlan0, wlan1) = loop {
-        let wlan0 = mesh_rpc("lmesh-wifi", "wifi.rawnan.status", &["iface=wlan0"]);
-        let wlan1 = mesh_rpc("lmesh", "wifi.rawnan.status", &["iface=wlan1"]);
-        let ready = |value: &serde_json::Value| {
-            value
-                .get("data")
-                .and_then(|data| data.get("cluster_bssid"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|cluster| !cluster.is_empty())
-        };
-        if ready(&wlan0) && ready(&wlan1) || Instant::now() >= deadline {
-            break (wlan0, wlan1);
+        if status["data"]["sync_bssid"].as_str().is_some()
+            && status["data"]["last_beacon_tsf_us"].as_u64().unwrap_or(0) != 0
+        {
+            break status;
         }
-        thread::sleep(Duration::from_millis(250));
-    };
-    let first = wlan0
-        .get("data")
-        .and_then(|value| value.get("cluster_bssid"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .expect("wlan0 did not synchronize on a NAN cluster");
-    let second = wlan1
-        .get("data")
-        .and_then(|value| value.get("cluster_bssid"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .expect("wlan1 did not synchronize on a NAN cluster");
-    assert_eq!(first, second, "host radios selected different NAN clusters");
-    for status in [&wlan0, &wlan1] {
         assert!(
-            status
-                .get("data")
-                .and_then(|value| value.get("last_beacon_tsf_us"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0,
-            "NAN beacon timestamp was not observed: {status}"
+            Instant::now() < deadline,
+            "wlan1 did not observe an Android or ESP NAN timing beacon: {status}"
         );
+        thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("firmware-e2e row=host-host-nan sync={nan_sync}");
+
+    // The startup service owns a real active-Publish descriptor. Prove that
+    // its queued CBOR announce was emitted from a synchronized DW before
+    // injecting any bespoke E2E SDF below; otherwise a manual frame could
+    // hide a regression in the production periodic-publish path.
+    let default_publish_deadline = Instant::now() + Duration::from_secs(3);
+    let default_publish = loop {
+        let status = mesh_rpc_typed(
+            "lmesh",
+            "wifi.rawnan.status",
+            &lmesh_wifi::api::RawNanStatusRequest {
+                iface: Some("wlan1".to_owned()),
+            },
+        );
+        let active = &status["data"]["active_publish"];
+        if active["enabled"].as_bool() == Some(true)
+            && active["pending"].as_bool() == Some(false)
+            && active["last_sent_ms"].as_u64().unwrap_or(0) != 0
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < default_publish_deadline,
+            "wlan1 default active Publish did not transmit in a synchronized DW: {status}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("firmware-e2e row=host-host-nan default_publish={default_publish}");
+
+    // The active-subscribe/publish Service Info is a CBOR control command,
+    // not text or a second discovery protocol: `{1: control,
+    // 2: transport.start, 5: {1: nan}}`.
+    let command = [0xa3, 1, 1, 2, 4, 5, 0xa1, 1, 6];
+    let mut source_mac = [0u8; 6];
+    for (dst, text) in source_mac.iter_mut().zip(source.split(':')) {
+        *dst = u8::from_str_radix(text, 16).expect("wlan0 MAC byte");
     }
-    let bssid_arg = format!("bssid={first}");
-    let sd_args = [
-        "iface=wlan0".to_owned(),
-        "channel=6".to_owned(),
-        "destination=74:19:f8:17:de:65".to_owned(),
-        bssid_arg,
-        "payload=ping".to_owned(),
-        "wait_ms=2000".to_owned(),
-    ];
-    let sd_refs = sd_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let sd = mesh_rpc("lmesh-wifi", "wifi.rawnan.ping", &sd_refs);
+    let cluster_bssid = nan_sync["data"]["sync_bssid"]
+        .as_str()
+        .expect("NAN timing BSSID")
+        .to_owned();
+    let mut cluster_mac = [0u8; 6];
+    for (dst, text) in cluster_mac.iter_mut().zip(cluster_bssid.split(':')) {
+        *dst = u8::from_str_radix(text, 16).expect("NAN timing BSSID byte");
+    }
+    let frame = dmesh_rawnan::build_nan_publish_sdf(
+        dmesh_rawnan::NAN_DISCOVERY_MAC,
+        source_mac,
+        cluster_mac,
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        1,
+        &command,
+    );
+    let publish_hex = hex(&frame);
+    let send_publish = || {
+        mesh_rpc_typed(
+            "lmesh-wifi",
+            "wifi.raw.send",
+            &lmesh_wifi::api::RawSendRequest {
+                iface: Some("wlan0".to_owned()),
+                channel: Some(6),
+                // The permanent active monitor is the proven on-air action
+                // lane. `wifi.raw.send` only consumes it; it never recreates
+                // or retunes host radio state during this E2E row.
+                tx_variant: Some("monitor".to_owned()),
+                tx_rate_mbps: Some(6),
+                frame_hex: Some(publish_hex.clone()),
+            },
+        )
+    };
+    eprintln!(
+        "firmware-e2e row=host-host-nan publish source={source} cluster={cluster_bssid} frame_hex={publish_hex}"
+    );
+    let sd = send_publish();
     assert!(
         sd.get("data")
             .and_then(|value| value.get("ok"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        "host NAN SD injection failed: {sd}"
+        "host NAN SDF injection failed: {sd}"
     );
-    assert_eq!(
-        sd.get("data")
-            .and_then(|value| value.get("tx"))
-            .and_then(|value| value.get("ok"))
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "host NAN SD TX failed: {sd}"
+    let command_hex = hex(&command);
+    // Do not treat a single 512-TU DW as a deadline. The paired ESP and
+    // Android configurations can legitimately select DW8, roughly 4.2 s;
+    // poll through two opportunities and leave evidence of the last history
+    // response if the permanent listeners did not observe the active SDF.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut next_publish = Instant::now() + Duration::from_millis(1_000);
+    let mut publishes = 1_u8;
+    let (delivered, received) = loop {
+        let received = mesh_rpc_value(
+            "lmesh",
+            "messages.history",
+            serde_json::json!({"keys": "wifi.rawnan.discovery", "limit": 64}),
+        );
+        let delivered = history_events(&received).is_some_and(|events| {
+            events.iter().any(|event| {
+                event["ts_millis"]
+                    .as_u64()
+                    .is_some_and(|ts| ts >= probe_started_ms)
+                    && event["value"]["peer"].as_str() == Some(source.as_str())
+                    && event["value"]["service_info_hex"].as_str() == Some(command_hex.as_str())
+            })
+        });
+        if delivered || Instant::now() >= deadline {
+            break (delivered, received);
+        }
+        // Active publish is periodic in production. Re-send the identical
+        // bounded CBOR Service Info over several 512-TU opportunities so a
+        // single monitor-frame loss cannot turn the semantic test into a
+        // flaky one-shot RF test. This does not alter either host interface.
+        if Instant::now() >= next_publish && publishes < 5 {
+            let retry = send_publish();
+            assert_eq!(
+                retry["data"]["ok"].as_bool(),
+                Some(true),
+                "host NAN SDF retry failed: {retry}"
+            );
+            publishes += 1;
+            next_publish += Duration::from_millis(1_000);
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+    assert!(
+        delivered,
+        "wlan1 did not receive the NAN SDF/CBOR command from wlan0 after {publishes} active publishes: {received}"
+    );
+
+    // The companion active-subscribe row verifies the distinct SDEA carrier
+    // for custom SSI. It is intentionally a second on-air frame: a peer may
+    // choose DW8, so never infer SDEA support from the preceding Publish.
+    let active_subscribe = dmesh_rawnan::build_nan_usd_sdf(
+        dmesh_rawnan::NAN_DISCOVERY_MAC,
+        source_mac,
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        7,
+        0x11,
+        &command,
+    );
+    let active_subscribe_tx = mesh_rpc_typed(
+        "lmesh-wifi",
+        "wifi.raw.send",
+        &lmesh_wifi::api::RawSendRequest {
+            iface: Some("wlan0".to_owned()),
+            channel: Some(6),
+            // See the publish row above: consume the already-prepared active
+            // monitor and do not alter host radio lifecycle.
+            tx_variant: Some("monitor".to_owned()),
+            tx_rate_mbps: Some(6),
+            frame_hex: Some(hex(&active_subscribe)),
+        },
+    );
+    assert!(
+        active_subscribe_tx["data"]["ok"].as_bool() == Some(true),
+        "host NAN active-subscribe injection failed: {active_subscribe_tx}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let active_subscribe_hex = hex(&command);
+    let (active_subscribe_seen, active_subscribe_events) = loop {
+        let events = mesh_rpc_value(
+            "lmesh",
+            "messages.history",
+            serde_json::json!({"keys": "wifi.rawnan.discovery", "limit": 64}),
+        );
+        let seen = history_events(&events).is_some_and(|items| {
+            items.iter().any(|event| {
+                event["ts_millis"]
+                    .as_u64()
+                    .is_some_and(|ts| ts >= probe_started_ms)
+                    && event["value"]["active_subscribe"]["service_info_hex"].as_str()
+                        == Some(active_subscribe_hex.as_str())
+            })
+        });
+        if seen || Instant::now() >= deadline {
+            break (seen, events);
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+    assert!(
+        active_subscribe_seen,
+        "wlan1 did not recover custom active-subscribe SDEA Service Info: {active_subscribe_events}"
+    );
+    // The subscriber replies once on its permanent monitor; wait through the
+    // return DW rather than treating the transmitter's local write as proof.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (followup_seen, followup_events) = loop {
+        let events = mesh_rpc_value(
+            "lmesh-wifi",
+            "messages.history",
+            serde_json::json!({"keys": "wifi.rawnan.discovery", "limit": 64}),
+        );
+        let seen = history_events(&events).is_some_and(|items| {
+            items.iter().any(|event| {
+                event["ts_millis"]
+                    .as_u64()
+                    .is_some_and(|ts| ts >= probe_started_ms)
+                    && event["value"]["followup"]["msg_type"].as_u64() == Some(7)
+                    && event["value"]["followup"]["payload_hex"].as_str()
+                        == Some(active_subscribe_hex.as_str())
+            })
+        });
+        if seen || Instant::now() >= deadline {
+            break (seen, events);
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+    assert!(
+        followup_seen,
+        "wlan0 did not receive the active-subscribe NAN follow-up: {followup_events}"
+    );
+}
+
+#[test]
+#[ignore = "requires an Android DMesh service already publishing NAN on channel 6"]
+fn host_observes_android_nan_announce_e2e() {
+    // Manual equivalent (read-only; no host-interface lifecycle operation):
+    //
+    //   mesh lmesh wifi.rawnan.status iface=wlan1
+    //   mesh lmesh messages.history keys=wifi.rawnan.discovery limit=128
+    //
+    // Android's Wi-Fi Aware service continuously publishes its DMesh announce
+    // and service descriptor. The permanent wlan1 monitor must report both a
+    // fresh announce and its enclosing DMesh SDF; this proves raw host
+    // observation of the Android on-air format, not merely Android's own
+    // framework callback history.
+    require_host_iface_up("lmesh", "wlan1mon");
+    let started_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after Unix epoch")
+        .as_millis() as u64;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (observed, history) = loop {
+        let status = mesh_rpc_typed(
+            "lmesh",
+            "wifi.rawnan.status",
+            &lmesh_wifi::api::RawNanStatusRequest {
+                iface: Some("wlan1".to_owned()),
+            },
+        );
+        let announce_peers = status["data"]["observed_announces"]
+            .as_array()
+            .map(|announces| {
+                announces
+                    .iter()
+                    .filter_map(|item| item["peer"].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let history = mesh_rpc_value(
+            "lmesh",
+            "messages.history",
+            serde_json::json!({"keys": "wifi.rawnan.discovery", "limit": 128}),
+        );
+        let observed = !announce_peers.is_empty()
+            && history_events(&history).is_some_and(|events| {
+                events.iter().any(|event| {
+                    event["ts_millis"]
+                        .as_u64()
+                        .is_some_and(|ts| ts >= started_ms)
+                        && event["value"]["service_id"].as_str()
+                            == Some(hex(&dmesh_rawnan::DMESH_SERVICE_ID).as_str())
+                        && event["value"]["announce"].is_object()
+                })
+            });
+        if observed || Instant::now() >= deadline {
+            break (observed, history);
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+    assert!(
+        observed,
+        "wlan1 did not observe a fresh Android DMesh NAN announce/SDF: {history}"
     );
 }
 
@@ -350,9 +1173,9 @@ fn host_host_nan_sync_and_sd_e2e() {
 #[ignore = "requires the supervised lmesh/lmesh-wifi host radios"]
 fn host_host_now_check_e2e() {
     // Equivalent command:
-    //   mesh lmesh-wifi wifi.raw.check iface=wlan0 channel=6 \
-    //     destination=74:19:f8:17:de:65 nonce=... timeout_ms=5000 \
-    //     tx_rate_mbps=6 tx_variant=monitor rx_variant=monitor
+    //   mesh lmesh wifi.raw.check iface=wlan1 channel=6 \
+    //     destination=<wlan0 MAC> nonce=... timeout_ms=5000 \
+    //     tx_rate_mbps=6 tx_variant=monitor rx_variant=nl80211
     // This is the always-on connectionless NOW sanity row.  Keep it separate
     // from IPERF so a throughput regression cannot be hidden by a successful
     // bootstrap/echo exchange.
@@ -360,45 +1183,34 @@ fn host_host_now_check_e2e() {
     // recreate wlan1 with a different locally-administered MAC; keeping the
     // old lab address here makes the automated check silently transmit to a
     // nonexistent peer.
-    let destination = format!("destination={}", e2e_now_destination());
-    // The supervised APs are production fixtures. Do not stop them, retune
-    // either interface, or rewrite beacon/HT settings in a transport test.
-    // The listener handler only adds/reuses a monitor child on the existing
-    // channel; AP ownership remains with lmesh/lmesh-wifi.
-    // Reset only the monitor child/QUIC action ledger; wifi.raw.stop does not
-    // stop or reconfigure the AP parent.
-    for (service, iface) in [("lmesh-wifi", "wlan0"), ("lmesh", "wlan1")] {
-        let stopped = mesh_rpc(service, "wifi.raw.stop", &[&format!("iface={iface}")]);
-        assert!(stopped.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "{service} raw listener reset: {stopped}");
-    }
-    thread::sleep(Duration::from_millis(500));
-    let listen = mesh_rpc(
-        "lmesh",
-        "wifi.raw.listen",
-        &["iface=wlan1", "channel=6", "listen_sec=15", "rx_variant=monitor"],
-    );
-    assert!(listen.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "peer monitor setup: {listen}");
-    thread::sleep(Duration::from_millis(500));
+    // The supervised AP and its permanent monitor are fixtures. This test
+    // wlan0 is the stable AP fixture; wlan1mon is lmesh's AP-off NOW
+    // transport. The test only consumes their existing radio state.
+    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan1mon");
+    // ESP-NOW-compatible bootstrap uses broadcast Address-1. The remote
+    // dispatcher returns its response to the sender's Address-2, so do not
+    // substitute the monitor VIF's unicast MAC here.
+    let destination = e2e_now_destination();
     let mut last = serde_json::Value::Null;
     for attempt in 0..3 {
-        let nonce = format!("nonce={}", 0x4e4f_5700_u64 + attempt);
-        let result = mesh_rpc(
-            "lmesh-wifi",
-            "wifi.raw.check",
-            &[
-                "iface=wlan0",
-                "channel=6",
-                &destination,
-                &nonce,
-                "timeout_ms=5000",
-                &format!("tx_rate_mbps={}", e2e_now_rate()),
-                "tx_variant=monitor",
-                "rx_variant=monitor",
-            ],
+        let result = wifi_raw_check(
+            "lmesh",
+            "wlan1",
+            destination.clone(),
+            0x4e4f_5700_u64 + attempt,
+            5_000,
+            e2e_now_rate() as u8,
+            &e2e_now_tx_variant(),
+            "monitor",
         );
         let data = result.get("data").unwrap_or(&result);
         if data.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-            && data.get("rx_packets").and_then(serde_json::Value::as_u64).unwrap_or(0) > 0
+            && data
+                .get("rx_packets")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
         {
             return;
         }
@@ -416,30 +1228,25 @@ fn host_host_now_monitor_capture_e2e() {
     // Run the capture and probe concurrently; this intentionally does not
     // install the QUIC dispatcher, so it isolates monitor RX/TX from service
     // dispatch and reports whether any action frame reached the second radio.
-    let destination = format!("destination={}", e2e_now_destination());
-    // Capture and probe the already-running APs. No interface up/down,
-    // channel retune, or AP start/stop is permitted in this diagnostic.
-    for (service, iface) in [("lmesh-wifi", "wlan0"), ("lmesh", "wlan1")] {
-        let stopped = mesh_rpc(service, "wifi.raw.stop", &[&format!("iface={iface}")]);
-        assert!(stopped.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "{service} raw listener reset: {stopped}");
-    }
-    thread::sleep(Duration::from_millis(500));
+    let destination = e2e_now_destination();
+    // Capture and probe the permanently provisioned monitor; no test-owned
+    // interface, channel, AP, or monitor lifecycle is allowed here.
     let capture_thread = thread::spawn(move || {
-        mesh_rpc(
+        mesh_rpc_value(
             "lmesh",
             "wifi.mgmt.capture",
-            &["iface=wlan1", "channel=6", "capture_ms=5000", "max_frames=256", "active=false"],
+            serde_json::json!({"iface": "wlan1", "channel": 6, "capture_ms": 5000, "max_frames": 256, "active": false}),
         )
     });
     thread::sleep(Duration::from_millis(500));
-    let destination_arg = format!("destination={destination}");
-    let probe = mesh_rpc(
+    let probe = mesh_rpc_value(
         "lmesh-wifi",
         "wifi.raw.check",
-        &[
-            "iface=wlan0", "channel=6", &destination_arg, "nonce=131074",
-            "timeout_ms=3000", &format!("tx_rate_mbps={}", e2e_now_rate()), "tx_variant=monitor", "rx_variant=monitor",
-        ],
+        serde_json::json!({
+            "iface": "wlan0", "channel": 6, "destination": destination, "nonce": 131074,
+            "timeout_ms": 3000, "tx_rate_mbps": e2e_now_rate(),
+            "tx_variant": "monitor", "rx_variant": "monitor",
+        }),
     );
     let capture = capture_thread.join().expect("capture thread");
     let frame_count = capture
@@ -454,7 +1261,12 @@ fn host_host_now_monitor_capture_e2e() {
         .map(|frames| {
             frames
                 .iter()
-                .filter(|frame| frame.get("frame_subtype").and_then(serde_json::Value::as_u64) == Some(13))
+                .filter(|frame| {
+                    frame
+                        .get("frame_subtype")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(13)
+                })
                 .count() as u64
         })
         .unwrap_or(0);
@@ -466,8 +1278,16 @@ fn host_host_now_monitor_capture_e2e() {
         .map(|frames| {
             frames
                 .iter()
-                .filter(|frame| frame.get("frame_subtype").and_then(serde_json::Value::as_u64) == Some(13))
-                .filter(|frame| frame.get("source").and_then(serde_json::Value::as_str) == Some(sender_mac.as_str()))
+                .filter(|frame| {
+                    frame
+                        .get("frame_subtype")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(13)
+                })
+                .filter(|frame| {
+                    frame.get("source").and_then(serde_json::Value::as_str)
+                        == Some(sender_mac.as_str())
+                })
                 .count() as u64
         })
         .unwrap_or(0);
@@ -476,8 +1296,13 @@ fn host_host_now_monitor_capture_e2e() {
         .and_then(|v| v.get("ok"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    eprintln!("NOW monitor diagnostic probe_ok={probe_ok} frames={frame_count} actions={action_count} sender_actions={sender_action_count} sender_mac={sender_mac}");
-    assert!(frame_count > 0 && sender_action_count > 0, "monitor saw frames={frame_count} actions={action_count} sender_actions={sender_action_count}, but no sender RF action: probe={probe}");
+    eprintln!(
+        "NOW monitor diagnostic probe_ok={probe_ok} frames={frame_count} actions={action_count} sender_actions={sender_action_count} sender_mac={sender_mac}"
+    );
+    assert!(
+        frame_count > 0 && sender_action_count > 0,
+        "monitor saw frames={frame_count} actions={action_count} sender_actions={sender_action_count}, but no sender RF action: probe={probe}"
+    );
 }
 
 #[test]
@@ -487,33 +1312,54 @@ fn host_host_now_raw_frame_injection_e2e() {
     // receiver wlan1 as Address-1. This bypasses QUIC and the action builder
     // so the row proves only monitor-mode RF injection and capture.
     let frame_hex = "d0000000ffffffffffff00c0cab879ccffffffffffff90aa7f18fe3404024000000f0000140000c00001a01def9db909800400008004000000";
-    let tx_variant = std::env::var("DMESH_E2E_RAW_TX_VARIANT").unwrap_or_else(|_| "action".to_owned());
-    // Use the existing APs exactly as configured by mesh-init. Raw injection
-    // and capture must not alter AP ownership, channel, beacon, or HT mode.
-    for (service, iface) in [("lmesh-wifi", "wlan0"), ("lmesh", "wlan1")] {
-        let stopped = mesh_rpc(service, "wifi.raw.stop", &[&format!("iface={iface}")]);
-        assert!(stopped.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "{service} raw listener reset: {stopped}");
-    }
-    thread::sleep(Duration::from_millis(500));
+    let tx_variant =
+        std::env::var("DMESH_E2E_RAW_TX_VARIANT").unwrap_or_else(|_| "action".to_owned());
+    // Use the permanent monitor/AP fixtures exactly as provisioned.
     let capture_thread = thread::spawn(|| {
-        mesh_rpc("lmesh", "wifi.mgmt.capture", &["iface=wlan1", "channel=6", "capture_ms=4000", "max_frames=128", "active=false"])
+        mesh_rpc_value(
+            "lmesh",
+            "wifi.mgmt.capture",
+            serde_json::json!({"iface": "wlan1", "channel": 6, "capture_ms": 4000, "max_frames": 128, "active": false}),
+        )
     });
     thread::sleep(Duration::from_millis(500));
-    let tx_variant_arg = format!("tx_variant={tx_variant}");
-    let send = mesh_rpc(
+    let send = mesh_rpc_typed(
         "lmesh-wifi",
         "wifi.raw.send",
-        &["iface=wlan0", "channel=6", &tx_variant_arg, &format!("tx_rate_mbps={}", e2e_now_rate()), &format!("frame_hex={frame_hex}")],
+        &lmesh_wifi::api::RawSendRequest {
+            iface: Some("wlan0".to_owned()),
+            channel: Some(6),
+            tx_variant: Some(tx_variant),
+            tx_rate_mbps: Some(e2e_now_rate() as u8),
+            frame_hex: Some(frame_hex.to_owned()),
+        },
     );
     let capture = capture_thread.join().expect("capture thread");
     let sender_frames = capture
         .get("data")
         .and_then(|v| v.get("frames"))
         .and_then(serde_json::Value::as_array)
-        .map(|frames| frames.iter().filter(|frame| frame.get("source").and_then(serde_json::Value::as_str) == Some("00:c0:ca:b8:79:cc")).count())
+        .map(|frames| {
+            frames
+                .iter()
+                .filter(|frame| {
+                    frame.get("source").and_then(serde_json::Value::as_str)
+                        == Some("00:c0:ca:b8:79:cc")
+                })
+                .count()
+        })
         .unwrap_or(0);
-    assert!(send.get("data").and_then(|v| v.get("ok")).and_then(serde_json::Value::as_bool).unwrap_or(false), "raw NOW injection failed: {send}");
-    assert!(sender_frames > 0, "raw NOW frame did not reach receiver: send={send}; sender_frames={sender_frames}");
+    assert!(
+        send.get("data")
+            .and_then(|v| v.get("ok"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "raw NOW injection failed: {send}"
+    );
+    assert!(
+        sender_frames > 0,
+        "raw NOW frame did not reach receiver: send={send}; sender_frames={sender_frames}"
+    );
 }
 
 #[test]
@@ -521,54 +1367,29 @@ fn host_host_now_raw_frame_injection_e2e() {
 fn host_host_now_iperf_e2e() {
     // Equivalent command:
     //   mesh lmesh-wifi wifi.raw.iperf iface=wlan0 channel=6 \
-    //     destination=74:19:f8:17:de:65 bytes=8192 packet_size=1200 \
+    //     destination=74:19:f8:17:de:65 bytes=65536 packet_size=1100 \
     //     timeout_ms=10000 tx_rate_mbps=6 tx_variant=monitor rx_variant=monitor
     // Keep this as a real completion assertion: a bootstrap ACK plus one
     // stream packet is not a throughput result.
-    // AP/channel state is owned by mesh-init and remains untouched. The row
-    // resets only raw monitor children/QUIC ledgers before opening listeners;
-    // this avoids stale CIDs without changing the production AP fixture.
+    // AP/channel state is owned by mesh-init and remains untouched.
+    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan1mon");
     thread::sleep(Duration::from_secs(2));
     // Host monitor delivery is proven with ESP-NOW's broadcast Address-1;
     // keep the peer MAC only in Address-2/QUIC path identity.
-    let destination = format!("destination={}", e2e_now_destination());
-    // AP/channel state belongs to the supervised services and is deliberately
-    // left untouched. The existing APs are expected to already be on channel
-    // 6; this row only opens/reuses the monitor listener for observation.
-    for (service, iface) in [("lmesh-wifi", "wlan0"), ("lmesh", "wlan1")] {
-        let stopped = mesh_rpc(service, "wifi.raw.stop", &[&format!("iface={iface}")]);
-        assert!(stopped.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "{service} raw listener reset: {stopped}");
-    }
-    thread::sleep(Duration::from_millis(500));
-    let listen = mesh_rpc(
-        "lmesh",
-        "wifi.raw.listen",
-        &[
-            "iface=wlan1",
-            "channel=6",
-            "listen_sec=15",
-            &format!("rx_variant={}", e2e_now_rx_variant()),
-        ],
-    );
-    assert!(listen.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "wlan1 monitor setup: {listen}");
+    let destination = e2e_now_destination();
     thread::sleep(Duration::from_secs(2));
-    let tx_variant_arg = format!("tx_variant={}", e2e_now_tx_variant());
-    let rx_variant_arg = format!("rx_variant={}", e2e_now_rx_variant());
     let mut sanity = serde_json::Value::Null;
     for attempt in 0..3_u64 {
-        sanity = mesh_rpc(
+        sanity = mesh_rpc_value(
             "lmesh-wifi",
             "wifi.raw.check",
-            &[
-                "iface=wlan0",
-                "channel=6",
-            &destination,
-                &format!("nonce={}", 131073 + attempt),
-                "timeout_ms=5000",
-                &format!("tx_rate_mbps={}", e2e_now_rate()),
-                &tx_variant_arg,
-                &rx_variant_arg,
-            ],
+            serde_json::json!({
+                "iface": "wlan0", "channel": 6, "destination": destination,
+                "nonce": 131073 + attempt, "timeout_ms": 5000,
+                "tx_rate_mbps": e2e_now_rate(), "tx_variant": e2e_now_tx_variant(),
+                "rx_variant": e2e_now_rx_variant(),
+            }),
         );
         if sanity
             .get("data")
@@ -586,44 +1407,93 @@ fn host_host_now_iperf_e2e() {
             .and_then(|value| value.get("ok"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        "NOW sanity check failed before IPERF: {sanity}; receiver metrics={}; dispatch history={}; listener={listen}",
-        mesh_rpc("lmesh", "wifi.raw.metrics", &["iface=wlan1"]),
-        mesh_rpc("lmesh", "messages.history", &["keys=wifi.raw.dispatch", "limit=20"]),
+        "NOW sanity check failed before IPERF: {sanity}; receiver metrics={}; dispatch history={}",
+        mesh_rpc_typed(
+            "lmesh",
+            "wifi.raw.metrics",
+            &lmesh_wifi::api::RawMetricsRequest {
+                iface: Some("wlan1".to_owned())
+            }
+        ),
+        mesh_rpc_typed(
+            "lmesh",
+            "messages.history",
+            &lmesh::api::LmeshMessagesHistoryRequest {
+                keys: Some("wifi.raw.dispatch".to_owned()),
+                limit: Some(20)
+            }
+        ),
     );
-    let result = mesh_rpc(
+    let result = wifi_raw_iperf(
         "lmesh-wifi",
-        "wifi.raw.iperf",
-        &[
-            "iface=wlan0",
-            "channel=6",
-            &destination,
-            &format!("bytes={}", e2e_now_bytes()),
-            &format!("packet_size={}", e2e_now_packet_size()),
-            &format!("timeout_ms={}", e2e_now_timeout_ms()),
-            &format!("tx_rate_mbps={}", e2e_now_rate()),
-            &tx_variant_arg,
-            &rx_variant_arg,
-        ],
+        "wlan0",
+        destination,
+        e2e_now_bytes(),
+        u16::try_from(e2e_now_packet_size()).expect("NOW packet size fits u16"),
+        e2e_now_timeout_ms(),
+        e2e_now_rate() as u8,
+        &e2e_now_tx_variant(),
+        &e2e_now_rx_variant(),
     );
     let data = result.get("data").unwrap_or(&result);
     if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let history = mesh_rpc(
+        let history = mesh_rpc_typed(
             "lmesh",
             "wifi.raw.metrics",
-            &["iface=wlan1"],
+            &lmesh_wifi::api::RawMetricsRequest {
+                iface: Some("wlan1".to_owned()),
+            },
         );
-        let sender_metrics = mesh_rpc("lmesh-wifi", "wifi.raw.metrics", &["iface=wlan0"]);
-        let dispatch = mesh_rpc("lmesh", "messages.history", &["keys=wifi.raw.dispatch", "limit=40"]);
-        panic!("NOW IPERF did not complete: {result}; sender metrics={sender_metrics}; receiver metrics={history}; dispatch={dispatch}; listen={listen}");
+        let sender_metrics = mesh_rpc_typed(
+            "lmesh-wifi",
+            "wifi.raw.metrics",
+            &lmesh_wifi::api::RawMetricsRequest {
+                iface: Some("wlan0".to_owned()),
+            },
+        );
+        let dispatch = mesh_rpc_typed(
+            "lmesh",
+            "messages.history",
+            &lmesh::api::LmeshMessagesHistoryRequest {
+                keys: Some("wifi.raw.dispatch".to_owned()),
+                limit: Some(40),
+            },
+        );
+        panic!(
+            "NOW IPERF did not complete: {result}; sender metrics={sender_metrics}; receiver metrics={history}; dispatch={dispatch}"
+        );
     }
-    assert_eq!(data.get("bytes").and_then(serde_json::Value::as_u64), Some(e2e_now_bytes()), "NOW IPERF byte count: {result}");
-    let bps = data.get("bps").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    assert_eq!(
+        data.get("bytes").and_then(serde_json::Value::as_u64),
+        Some(e2e_now_bytes()),
+        "NOW IPERF byte count: {result}"
+    );
+    let bps = data
+        .get("bps")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     eprintln!(
         "host-host NOW IPERF result={result} receiver_metrics={} dispatch_tail={}",
-        mesh_rpc("lmesh", "wifi.raw.metrics", &["iface=wlan1"]),
-        mesh_rpc("lmesh", "messages.history", &["keys=wifi.raw.dispatch", "limit=8"]),
+        mesh_rpc_typed(
+            "lmesh",
+            "wifi.raw.metrics",
+            &lmesh_wifi::api::RawMetricsRequest {
+                iface: Some("wlan1".to_owned())
+            }
+        ),
+        mesh_rpc_typed(
+            "lmesh",
+            "messages.history",
+            &lmesh::api::LmeshMessagesHistoryRequest {
+                keys: Some("wifi.raw.dispatch".to_owned()),
+                limit: Some(8)
+            }
+        ),
     );
-    assert!(bps > e2e_now_min_bps(), "NOW IPERF throughput is implausibly low: {result}");
+    assert!(
+        bps > e2e_now_min_bps(),
+        "NOW IPERF throughput is implausibly low: {result}"
+    );
 }
 
 #[test]
@@ -631,46 +1501,55 @@ fn host_host_now_iperf_e2e() {
 fn host_host_now_reverse_iperf_e2e() {
     // Equivalent command:
     //   mesh lmesh wifi.raw.iperf iface=wlan1 channel=6 \
-    //     destination=00:c0:ca:b8:79:cc bytes=8192 packet_size=1200 \
+    //     destination=00:c0:ca:b8:79:cc bytes=65536 packet_size=1100 \
     //     timeout_ms=10000 tx_rate_mbps=6 tx_variant=monitor rx_variant=monitor
     let destination = "ff:ff:ff:ff:ff:ff".to_owned();
-    // Keep the existing APs and channel untouched. The reverse row exercises
-    // only the raw action/QUIC handlers on the already-running radios.
-    for (service, iface) in [("lmesh-wifi", "wlan0"), ("lmesh", "wlan1")] {
-        let stopped = mesh_rpc(service, "wifi.raw.stop", &[&format!("iface={iface}")]);
-        assert!(stopped.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "{service} raw listener reset: {stopped}");
-    }
-    thread::sleep(Duration::from_millis(500));
-    let listen = mesh_rpc("lmesh-wifi", "wifi.raw.listen", &["iface=wlan0", "channel=6", "listen_sec=15", "rx_variant=monitor"]);
-    assert!(listen.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false), "wlan0 monitor setup: {listen}");
+    // The reverse row consumes the permanent monitor/AP fixtures only.
+    require_host_iface_up("lmesh-wifi", "wlan0");
+    require_host_iface_up("lmesh", "wlan1mon");
     thread::sleep(Duration::from_secs(1));
-    let destination_arg = format!("destination={destination}");
-    let result = mesh_rpc(
+    let result = wifi_raw_iperf(
         "lmesh",
-        "wifi.raw.iperf",
-        &[
-            "iface=wlan1",
-            "channel=6",
-            &destination_arg,
-            "bytes=8192",
-            &format!("packet_size={}", e2e_now_packet_size()),
-            &format!("timeout_ms={}", e2e_now_timeout_ms()),
-            &format!("tx_rate_mbps={}", e2e_now_rate()),
-            "tx_variant=monitor",
-            "rx_variant=monitor",
-        ],
+        "wlan1",
+        destination,
+        e2e_now_bytes(),
+        u16::try_from(e2e_now_packet_size()).expect("NOW packet size fits u16"),
+        e2e_now_timeout_ms(),
+        e2e_now_rate() as u8,
+        "monitor",
+        "monitor",
     );
     let data = result.get("data").unwrap_or(&result);
     if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        let metrics = mesh_rpc("lmesh-wifi", "wifi.raw.metrics", &["iface=wlan0"]);
+        let metrics = mesh_rpc_typed(
+            "lmesh-wifi",
+            "wifi.raw.metrics",
+            &lmesh_wifi::api::RawMetricsRequest {
+                iface: Some("wlan0".to_owned()),
+            },
+        );
         panic!("reverse NOW IPERF did not complete: {result}; receiver metrics={metrics}");
     }
     eprintln!(
         "host-host reverse NOW IPERF result={result} receiver_metrics={}",
-        mesh_rpc("lmesh-wifi", "wifi.raw.metrics", &["iface=wlan0"]),
+        mesh_rpc_typed(
+            "lmesh-wifi",
+            "wifi.raw.metrics",
+            &lmesh_wifi::api::RawMetricsRequest {
+                iface: Some("wlan0".to_owned())
+            }
+        ),
     );
-    assert_eq!(data.get("ok").and_then(serde_json::Value::as_bool), Some(true), "reverse NOW IPERF did not complete: {result}");
-    assert_eq!(data.get("bytes").and_then(serde_json::Value::as_u64), Some(8192), "reverse NOW IPERF byte count: {result}");
+    assert_eq!(
+        data.get("ok").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "reverse NOW IPERF did not complete: {result}"
+    );
+    assert_eq!(
+        data.get("bytes").and_then(serde_json::Value::as_u64),
+        Some(e2e_now_bytes()),
+        "reverse NOW IPERF byte count: {result}"
+    );
 }
 
 fn udp6_transfer_bytes() -> u64 {
@@ -680,6 +1559,22 @@ fn udp6_transfer_bytes() -> u64 {
         }),
         Err(std::env::VarError::NotPresent) => E2E_UDP6_DEFAULT_BYTES,
         Err(error) => panic!("read DMESH_E2E_UDP6_BYTES: {error}"),
+    }
+}
+
+/// Sustained row follows the short request/response sanity pass in the same
+/// generic device test. It deliberately has a separate knob so callers can
+/// retain the 64 KiB first-response signal while increasing only the
+/// throughput sample.
+fn udp6_sustained_bytes() -> u64 {
+    match std::env::var("DMESH_E2E_UDP6_SUSTAINED_BYTES") {
+        Ok(value) => value.parse::<u64>().unwrap_or_else(|error| {
+            panic!(
+                "DMESH_E2E_UDP6_SUSTAINED_BYTES must be an unsigned byte count, got {value:?}: {error}"
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => 1024 * 1024,
+        Err(error) => panic!("read DMESH_E2E_UDP6_SUSTAINED_BYTES: {error}"),
     }
 }
 
@@ -714,6 +1609,8 @@ async fn udp_iperf_row(
     let mut ranges = Vec::new();
     let mut received = record_logical_stream_bytes(&mut ranges, &first);
     let mut finished = first.fin;
+    let mut previous_receive = Instant::now();
+    let mut gaps = [0_u64; 6];
     // The raw Ethernet bearer can reorder physical frames. The QUIC-lite
     // stream offset, not receive order, defines completion and goodput.
     while !finished || received < bytes {
@@ -731,16 +1628,49 @@ async fn udp_iperf_row(
             panic!("{label} receive deadline: bytes={received}/{bytes} fin={finished}")
         })
         .unwrap_or_else(|error| panic!("{label} stream receive: {error:#}"));
+        let gap_us = previous_receive.elapsed().as_micros() as u64;
+        previous_receive = Instant::now();
+        gaps[match gap_us {
+            0..=999 => 0,
+            1_000..=4_999 => 1,
+            5_000..=9_999 => 2,
+            10_000..=24_999 => 3,
+            25_000..=49_999 => 4,
+            _ => 5,
+        }] += 1;
         received = received.saturating_add(record_logical_stream_bytes(&mut ranges, &frame));
         finished |= frame.fin;
     }
     let elapsed_us = started_at.elapsed().as_micros().max(1) as u64;
     let bps = received.saturating_mul(8_000_000) / elapsed_us;
     let after_mem_kib = mem_available_kib();
+    let stats = client.transport_stats();
     eprintln!(
-        "firmware-e2e row={label} kind=iperf bytes={received} elapsed_us={elapsed_us} first_response_us={first_response_us} bps={bps} packet={E2E_UDP6_PACKET_SIZE} history=512 ack_frequency=default deferred_receive_credit=false host_mem_available_kib={before_mem_kib:?}->{after_mem_kib:?}",
+        "firmware-e2e row={label} kind=iperf bytes={received} elapsed_us={elapsed_us} first_response_us={first_response_us} bps={bps} packet={E2E_UDP6_PACKET_SIZE} history=512 deferred_receive_credit=false host_mem_available_kib={before_mem_kib:?}->{after_mem_kib:?} gaps_us=<1ms:{},1-5ms:{},5-10ms:{},10-25ms:{},25-50ms:{},>=50ms:{} transport=received:{} sent:{} duplicate:{} reorder:{} missing:{} retransmitted:{} loss_gap:{} loss_time:{} loss_events:{} loss_retx:{} pto_retx:{} ack:{}",
+        gaps[0],
+        gaps[1],
+        gaps[2],
+        gaps[3],
+        gaps[4],
+        gaps[5],
+        stats.received_datagrams,
+        stats.sent_datagrams,
+        stats.duplicate_datagrams,
+        stats.out_of_order_datagrams,
+        stats.inferred_missing_packets,
+        stats.retransmitted_datagrams,
+        stats.loss_packet_threshold_datagrams,
+        stats.loss_time_threshold_datagrams,
+        stats.loss_events,
+        stats.loss_retransmitted_datagrams,
+        stats.pto_retransmitted_datagrams,
+        stats.ack_datagrams,
     );
     assert_eq!(received, bytes, "{label} logical byte count");
+    client
+        .close(0)
+        .await
+        .unwrap_or_else(|error| panic!("{label} close: {error:#}"));
 }
 
 async fn host_to_lmesh_wifi_iperf() {
@@ -760,6 +1690,165 @@ async fn host_to_lmesh_wifi_iperf() {
 }
 
 async fn host_to_e6_udp6_iperf() {
+    host_to_device_udp6_iperf("host wlan0->e6 raw-udp6", E6_MAC, 0xE6_0D_0601).await;
+}
+
+async fn host_to_e7_udp6_iperf() {
+    host_to_device_udp6_iperf("host wlan0->e7 raw-udp6", E7_MAC, 0xE7_0D_0601).await;
+}
+
+/// Target-neutral scoped link-local endpoint for the focused UDP6 gate.
+///
+/// The endpoint is supplied separately from the USB path because a test may
+/// use a Recovery or Main image on any board. Keep the interface scope: IPv6
+/// link-local routing is otherwise ambiguous on a multi-radio host.
+fn udp6_peer_from_env() -> SocketAddr {
+    let value = std::env::var("DMESH_E2E_UDP6_IP")
+        .expect("DMESH_E2E_UDP6_IP must be a scoped link-local address, e.g. fe80::...%wlan0");
+    let (address, scope) = value
+        .trim_matches(['[', ']'])
+        .split_once('%')
+        .unwrap_or_else(|| panic!("DMESH_E2E_UDP6_IP must include %<interface>: {value:?}"));
+    let address = address
+        .parse::<Ipv6Addr>()
+        .unwrap_or_else(|error| panic!("DMESH_E2E_UDP6_IP address {address:?}: {error}"));
+    let scope_id = scope
+        .parse::<u32>()
+        .unwrap_or_else(|_| interface_index(scope));
+    SocketAddr::V6(SocketAddrV6::new(address, RAW_UDP6_PORT, 0, scope_id))
+}
+
+/// Prove that Main exposes the same minimal tagged-control surface as
+/// Recovery before enabling any Main-only radio or power policy.
+///
+/// Equivalent command shape (the test serializes this as tagged CBOR):
+///
+/// ```text
+/// dmesh-cli <e7-uart> settings.list
+/// ```
+///
+/// This deliberately does not configure an SSID, start STA, or alter NVS.
+/// It is the regression gate for the Recovery-core control surface carried by
+/// Main while optional modules remain dormant.
+#[test]
+#[ignore = "requires e7 Main flashed and exclusive UART ownership"]
+fn firmware_e7_main_common_control_surface() {
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e7.set_history_limit(128);
+    control_request(&mut e7, ControlRequest::SettingsList, 0xE7_43_54_4C);
+}
+
+/// Read the shared radio snapshot without changing e7 state. This is the
+/// post-failure evidence companion for the Main UDP6 E2E row: it separates
+/// NDP/association from raw Ethernet callback delivery before a retry alters
+/// any radio configuration.
+#[test]
+#[ignore = "requires e7 Main UART and exclusive UART ownership"]
+fn firmware_e7_main_radio_snapshot() {
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e7.set_history_limit(128);
+    let radio = snapshot(&mut e7, RAW_WIFI_METHOD_SNAPSHOT);
+    eprintln!("firmware-e2e row=e7-main-radio-snapshot {radio:?}");
+    e7.assert_healthy().unwrap();
+}
+
+/// Focused host-to-device UDP6 performance gate.
+///
+/// The board and image are deliberately not encoded in this test. Run the
+/// same row against Recovery or Main by supplying its USB control path and
+/// scoped link-local address:
+///
+/// ```text
+/// DMESH_E2E_USB=/dev/serial/by-id/... \
+/// DMESH_E2E_UDP6_IP=fe80::16c1:9fff:fee4:5d48%wlan0 \
+/// DMESH_E2E_NOW=2 \
+/// cargo test -p dmesh-cli --test firmware_e2e firmware_udp6_performance -- --ignored --nocapture
+/// ```
+///
+/// Repeat with the default (omit `DMESH_E2E_NOW`) or `DMESH_E2E_NOW=0`; both
+/// rows keep NAN DW capture off and must retain the same raw-UDP6 service
+/// behavior and comparable throughput.
+#[test]
+#[ignore = "requires DMESH_E2E_USB, DMESH_E2E_UDP6_IP, and the supervised wlan0 AP"]
+fn firmware_udp6_performance() {
+    let mut device = DeviceSession::open(serial_from_env("DMESH_E2E_USB"), None).unwrap();
+    device.set_history_limit(128);
+    let ssid = wlan0_ssid();
+    let now_enabled = e2e_now_enabled();
+    let sta_driver_tx = e2e_sta_driver_tx();
+    configure_sta_for_wlan0_with_now(&mut device, &ssid, now_enabled, sta_driver_tx, 0xF0_6000);
+    let radio = wait_for_associated_channel_6_with_driver_tx(&mut device, sta_driver_tx);
+    assert_eq!(
+        radio.sta_driver_tx,
+        Some(sta_driver_tx),
+        "focused UDP6 row must report its requested STA TX path"
+    );
+    assert_eq!(radio.promiscuous, Some(false));
+    assert_eq!(radio.dw_capturing, Some(false));
+    eprintln!(
+        "firmware-e2e row=host-to-device-udp6 now={now_enabled} sta_driver_tx={sta_driver_tx}"
+    );
+    let peer = udp6_peer_from_env();
+    let bind = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3338, 0, 0));
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("focused UDP6 runtime")
+        .block_on(async {
+            eprintln!(
+                "firmware-e2e row=host-to-device-udp6-short peer={peer} bytes={}",
+                udp6_transfer_bytes(),
+            );
+            udp_iperf_row(
+                "host wlan0->device raw-udp6 short",
+                bind,
+                peer,
+                ConnectionId::new(0xF0_0D_0601).expect("nonzero short UDP6 CID"),
+                udp6_transfer_bytes(),
+            )
+            .await;
+            eprintln!(
+                "firmware-e2e row=host-to-device-udp6-sustained peer={peer} bytes={}",
+                udp6_sustained_bytes(),
+            );
+            udp_iperf_row(
+                "host wlan0->device raw-udp6 sustained",
+                // The short association's CLOSE ACK can still be in flight.
+                // Use a fresh host source port for the independent sustained
+                // connection so its endpoint cannot decode that old packet.
+                // The device keeps the reply UDP port from each received
+                // datagram; its bearer identity remains the peer MAC.
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+                peer,
+                ConnectionId::new(0xF0_0D_0602).expect("nonzero sustained UDP6 CID"),
+                udp6_sustained_bytes(),
+            )
+            .await;
+        });
+}
+
+/// Select the explicit-off UDP6 baseline when requested. The ordinary test
+/// path does not mention NOW: `transport.start` defaults it on.
+fn e2e_now_enabled() -> bool {
+    match std::env::var("DMESH_E2E_NOW").as_deref() {
+        Err(_) | Ok("0" | "1") => true,
+        Ok("2" | "off") => false,
+        Ok(value) => panic!("DMESH_E2E_NOW must be 0, 1, 2, or off, got {value:?}"),
+    }
+}
+
+/// The normal associated-STA measurement uses ESP-IDF's Ethernet handoff.
+/// The raw-802.11 station path is an explicit diagnostic A/B only; it is not
+/// the default result reported for STA+NOW.
+fn e2e_sta_driver_tx() -> bool {
+    match std::env::var("DMESH_E2E_STA_DRIVER_TX").as_deref() {
+        Err(_) | Ok("1" | "on") => true,
+        Ok("0" | "off") => false,
+        Ok(value) => panic!("DMESH_E2E_STA_DRIVER_TX must be 0, 1, on, or off, got {value:?}"),
+    }
+}
+
+async fn host_to_device_udp6_iperf(label: &str, mac: [u8; 6], cid: u64) {
     // This is equivalent to the historic CLI form:
     // dmesh-cli 'udp://[fe80::16c1:9fff:fee5:9800%wlan0]:3339' --iperf-bytes 65536
     // The Rust test uses the same UdpClient/service schema directly, so it
@@ -767,20 +1856,55 @@ async fn host_to_e6_udp6_iperf() {
     let bytes = udp6_transfer_bytes();
     let ifindex = interface_index("wlan0");
     let peer = SocketAddr::V6(SocketAddrV6::new(
-        Ipv6Addr::from(quic_lite::raw_udp6::link_local_from_mac(E6_MAC)),
+        Ipv6Addr::from(quic_lite::raw_udp6::link_local_from_mac(mac)),
         RAW_UDP6_PORT,
         0,
         ifindex,
     ));
-    let bind = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, ifindex));
+    // Match `dmesh-cli udp://…`: raw UDP6 replies are path-bound by the
+    // firmware dispatcher, so an ephemeral source port can make a retry look
+    // like a different bearer path after a previous interrupted run.  Port
+    // 3338 is reserved for the host test/client and is distinct from host
+    // listeners (3336/3337) and the firmware bearer (3339).
+    let bind = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3338, 0, 0));
     udp_iperf_row(
-        "host wlan0->e6 raw-udp6",
+        label,
         bind,
         peer,
-        ConnectionId::new(0xE6_0D_0601).expect("nonzero e2e UDP6 CID"),
+        ConnectionId::new(cid).expect("nonzero e2e UDP6 CID"),
         bytes,
     )
     .await;
+}
+
+/// Focused STA UDP6 performance gate. Unlike [`firmware_transport_matrix`],
+/// this leaves both devices associated to the supervised host AP and measures
+/// their independent host-to-device raw-UDP6 IPERF services. It deliberately
+/// does not enable NOW, NAN, APSTA, ROC, or an unassociated hold, so a result
+/// is directly comparable across AP adapters.
+#[test]
+#[ignore = "requires the e6/e7 radio lab and exclusive UART ownership"]
+fn firmware_sta_udp6_performance() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(4_096);
+    e7.set_history_limit(4_096);
+
+    let ssid = wlan0_ssid();
+    configure_sta_for_wlan0(&mut e6, &ssid, 0xE6_6100);
+    configure_sta_for_wlan0(&mut e7, &ssid, 0xE7_6100);
+    wait_for_associated_channel_6(&mut e6);
+    wait_for_associated_channel_6(&mut e7);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("STA performance UDP6 runtime")
+        .block_on(async {
+            host_to_lmesh_wifi_iperf().await;
+            host_to_e6_udp6_iperf().await;
+            host_to_e7_udp6_iperf().await;
+        });
 }
 
 /// Run the same compact `SERVICE_ECHO` handler over raw UDP6.  It deliberately
@@ -795,7 +1919,10 @@ async fn host_to_e6_udp6_echo_checks(samples: u64) -> Vec<Result<u128, String>> 
         0,
         ifindex,
     ));
-    let bind = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, ifindex));
+    // Keep echo/check probes on the same stable host raw-UDP6 path as IPERF.
+    // The device records the reply path per association; an ephemeral port
+    // would turn each retry into a new path and make failures non-diagnostic.
+    let bind = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3338, 0, 0));
     let mut results = Vec::with_capacity(samples as usize);
     for sample in 0..samples {
         let started = Instant::now();
@@ -985,11 +2112,133 @@ fn radio_request(
             )),
             _ => None,
         })
+        .take(24)
         .collect::<Vec<_>>();
     panic!(
         "{} did not return a decodable radio response after retries; direct records={recent:?}",
         session.path()
     )
+}
+
+/// Send one correlated common control request through the direct UART bearer.
+///
+/// This stays below QUIC-lite on purpose: it is the bootstrap operation that
+/// makes the raw UDP6 bearer available.  The response must still use the
+/// canonical tagged envelope and preserve the correlation ID, so it exercises
+/// the same control schema as direct UDP6, NAN, and action messages.
+fn control_request(session: &mut DeviceSession, request: ControlRequest<'_>, id: u64) {
+    let mut wire = [0u8; 128];
+    let used = control::encode_request(request, Some(id), &mut wire)
+        .unwrap_or_else(|| panic!("encode common control request"));
+    let history_before = session.recent_events().len();
+    let matched = session
+        .request_direct_record_until(&wire[..used], COMMAND_TIMEOUT, |event| {
+            matches!(
+                event,
+                DeviceSessionEvent::DirectRecord(record)
+                    if decode_tagged_record(record).is_some_and(|response| {
+                        response.id == Some(id)
+                            && response.result.is_some()
+                            && response.error.is_none()
+                    })
+            )
+        })
+        .unwrap_or_else(|error| panic!("{} control request: {error}", session.path()));
+    assert!(
+        matched,
+        "{} did not return tagged control response id={id}; records={:?}",
+        session.path(),
+        session
+            .recent_events()
+            .skip(history_before)
+            .filter_map(|event| match event {
+                DeviceSessionEvent::DirectRecord(record) => Some(hex(record)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+    );
+    session.assert_healthy().unwrap();
+}
+
+/// Query the managed AP owner, then send one volatile UART radio-mode command.
+/// It never writes an SSID to NVS: NAN Service Info will use this exact
+/// `transport.start` payload when it becomes the initiator.
+fn configure_sta_for_wlan0(session: &mut DeviceSession, ssid: &str, id_base: u64) {
+    let (bssid, channel) = wlan0_bssid_channel();
+    control_request(
+        session,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Sta,
+            config: dmesh_server::control::TransportConfig {
+                ssid: Some(ssid.as_bytes()),
+                bssid: Some(bssid),
+                channel: Some(channel),
+                // e6's current open wlan0 AP advertises a legacy basic rate;
+                // keep that association prerequisite explicit for the shared
+                // UDP6/NOW comparison rather than inheriting a radio-lab PHY
+                // preference from a prior epoch.
+                sta_11b_rates_disabled: Some(false),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        id_base,
+    );
+}
+
+/// Configure the focused STA performance row through the same tagged control
+/// schema used by UART, NAN SD, and future host adapters. `transport.start`
+/// holds the entire immutable radio epoch, so its replacement is explicit.
+fn configure_sta_for_wlan0_with_now(
+    session: &mut DeviceSession,
+    ssid: &str,
+    now_enabled: bool,
+    sta_driver_tx: bool,
+    id_base: u64,
+) {
+    let (bssid, channel) = wlan0_bssid_channel();
+    control_request(
+        session,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Sta,
+            config: dmesh_server::control::TransportConfig {
+                ssid: Some(ssid.as_bytes()),
+                bssid: Some(bssid),
+                channel: Some(channel),
+                now: Some(if now_enabled { 0 } else { 2 }),
+                sta_driver_tx: Some(sta_driver_tx),
+                nan_dw_interval: Some(0),
+                // The shared host AP still advertises a legacy basic rate.
+                // Retain the proven association prerequisite for the NOW
+                // row as well; this does not affect the later raw/NOW rate.
+                sta_11b_rates_disabled: Some(false),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        id_base,
+    );
+}
+
+fn configure_nan_for_channel(session: &mut DeviceSession, channel: u8, id: u64) {
+    control_request(
+        session,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(channel),
+                now: Some(0),
+                nan_dw_interval: Some(0),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        id,
+    );
+    // `transport.start` acknowledges after committing the complete immutable
+    // profile; Wi-Fi then performs its owned replacement asynchronously. Drain
+    // that bounded transition before the first snapshot so its diagnostics and
+    // channel state cannot be confused with the synchronous CBOR acceptance.
+    session
+        .poll(Duration::from_millis(750))
+        .unwrap_or_else(|error| panic!("{} NAN/NOW transition: {error}", session.path()));
 }
 
 /// Inject one complete raw action through the same direct-CBOR raw-radio
@@ -999,13 +2248,25 @@ fn send_raw_action(session: &mut DeviceSession, frame: &[u8], interface: RawWifi
     let mut wire = [0u8; 1600];
     let mut encoder = Encoder::new(&mut wire);
     encoder.map(7).unwrap();
-    encoder.uint(0).unwrap(); encoder.uint(1).unwrap();
-    encoder.uint(1).unwrap(); encoder.bytes_value(frame).unwrap();
-    encoder.uint(2).unwrap(); encoder.uint(6).unwrap();
-    encoder.uint(3).unwrap(); encoder.uint(match interface { RawWifiInterface::Ap => 2, _ => 1 }).unwrap();
-    encoder.uint(4).unwrap(); encoder.boolean(false).unwrap();
-    encoder.uint(5).unwrap(); encoder.uint(0).unwrap();
-    encoder.uint(6).unwrap(); encoder.boolean(false).unwrap();
+    encoder.uint(0).unwrap();
+    encoder.uint(1).unwrap();
+    encoder.uint(1).unwrap();
+    encoder.bytes_value(frame).unwrap();
+    encoder.uint(2).unwrap();
+    encoder.uint(6).unwrap();
+    encoder.uint(3).unwrap();
+    encoder
+        .uint(match interface {
+            RawWifiInterface::Ap => 2,
+            _ => 1,
+        })
+        .unwrap();
+    encoder.uint(4).unwrap();
+    encoder.boolean(false).unwrap();
+    encoder.uint(5).unwrap();
+    encoder.uint(0).unwrap();
+    encoder.uint(6).unwrap();
+    encoder.boolean(false).unwrap();
     let used = encoder.len();
     drop(encoder);
     session.send_direct_record(&wire[..used]).unwrap();
@@ -1028,11 +2289,19 @@ const ROC_MIN_OBSERVED_PERCENT: u64 = 75;
 /// here, after `radio.control {25:4000,26:false,27:false}`. Repeating ROC
 /// leases are deliberately not part of this quality row: ESP-IDF completion,
 /// rather than a nominal timer, must own a future reissue.
-fn roc_only_unassociated_action_matrix(e6: &mut DeviceSession, e7: &mut DeviceSession, e6_ap_mac: [u8; 6]) {
+fn roc_only_unassociated_action_matrix(
+    e6: &mut DeviceSession,
+    e7: &mut DeviceSession,
+    e6_ap_mac: [u8; 6],
+) {
     let control = RawWifiControlRequest {
-        channel: Some(6), raw_sta_mode: Some(RawWifiStaMode::MainStyle),
-        promiscuous: Some(false), dw_policy: Some(RawWifiDwPolicy::Disabled),
-        roc_listen_ms: Some(ROC_SUSTAINED_WINDOW_MS), roc_loop: Some(false), action_dispatcher: Some(false),
+        channel: Some(6),
+        raw_sta_mode: Some(RawWifiStaMode::MainStyle),
+        promiscuous: Some(false),
+        dw_policy: Some(RawWifiDwPolicy::Disabled),
+        roc_listen_ms: Some(ROC_SUSTAINED_WINDOW_MS),
+        roc_loop: Some(false),
+        action_dispatcher: Some(false),
         ..RawWifiControlRequest::default()
     };
     let mut control_wire = [0u8; 96];
@@ -1043,9 +2312,15 @@ fn roc_only_unassociated_action_matrix(e6: &mut DeviceSession, e7: &mut DeviceSe
     let mut now = [0u8; 64];
     let now_len = dmesh_rawnan::espnow::encode_action_frame(
         &mut now, [0xff; 6], e6_ap_mac, [0xff; 6], b"roc-now",
-    ).unwrap();
+    )
+    .unwrap();
     let nan = dmesh_rawnan::build_nan_publish_sdf(
-        dmesh_rawnan::NAN_DISCOVERY_MAC, e6_ap_mac, [0xff; 6], [0; 6], 1, b"roc-nan",
+        dmesh_rawnan::NAN_DISCOVERY_MAC,
+        e6_ap_mac,
+        [0xff; 6],
+        [0; 6],
+        1,
+        b"roc-nan",
     );
     let started = Instant::now();
     let mut sent_actions = 0u32;
@@ -1055,10 +2330,13 @@ fn roc_only_unassociated_action_matrix(e6: &mut DeviceSession, e7: &mut DeviceSe
         sent_actions = sent_actions.saturating_add(2);
         thread::sleep(ROC_SUSTAINED_ACTION_INTERVAL);
     }
-    let snapshot_len = encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_SNAPSHOT, &mut control_wire).unwrap();
+    let snapshot_len =
+        encode_raw_wifi_snapshot_request(RAW_WIFI_METHOD_SNAPSHOT, &mut control_wire).unwrap();
     let snapshot = radio_request(e6, &control_wire[..snapshot_len]);
     let delta = snapshot.counters.delta_since(before.counters);
-    let observed_actions = delta.roc_espnow_actions.saturating_add(delta.roc_nan_actions);
+    let observed_actions = delta
+        .roc_espnow_actions
+        .saturating_add(delta.roc_nan_actions);
     let observed_percent = u64::from(observed_actions)
         .saturating_mul(100)
         .checked_div(u64::from(sent_actions))
@@ -1078,10 +2356,23 @@ fn roc_only_unassociated_action_matrix(e6: &mut DeviceSession, e7: &mut DeviceSe
         delta.vendor_nan_beacon_ies,
         delta.vendor_other_ies,
     );
-    assert!(delta.roc_action_listen_requests >= 1, "ROC request was not accepted: {delta:?}");
-    assert_eq!(delta.roc_action_listen_failures, 0, "ROC request failed: {delta:?}");
-    assert!(observed_percent >= ROC_MIN_OBSERVED_PERCENT, "ROC action reception below {ROC_MIN_OBSERVED_PERCENT}%: sent={sent_actions} observed={observed_actions} delta={delta:?}");
-    let restore = RawWifiControlRequest { roc_loop: Some(false), action_dispatcher: Some(true), ..RawWifiControlRequest::default() };
+    assert!(
+        delta.roc_action_listen_requests >= 1,
+        "ROC request was not accepted: {delta:?}"
+    );
+    assert_eq!(
+        delta.roc_action_listen_failures, 0,
+        "ROC request failed: {delta:?}"
+    );
+    assert!(
+        observed_percent >= ROC_MIN_OBSERVED_PERCENT,
+        "ROC action reception below {ROC_MIN_OBSERVED_PERCENT}%: sent={sent_actions} observed={observed_actions} delta={delta:?}"
+    );
+    let restore = RawWifiControlRequest {
+        roc_loop: Some(false),
+        action_dispatcher: Some(true),
+        ..RawWifiControlRequest::default()
+    };
     let used = encode_raw_wifi_control_request(restore, &mut control_wire).unwrap();
     let _ = radio_request(e6, &control_wire[..used]);
 }
@@ -1093,12 +2384,14 @@ fn hex(bytes: &[u8]) -> String {
 fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> String {
     let service_bps = raw_service_bps(snapshot);
     format!(
-        "ch={:?} sta={:?} prom={:?} ap={:?} active={:?} tx={}/{} rx_dispatch={} parsed={} bootstrap={} stream={} client_errors={} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}",
+        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} ap={:?} active={:?} assoc_phase_ms={:?} tx={}/{} rx_dispatch={} parsed={} bootstrap={} stream={} client_errors={} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}",
         snapshot.channel,
         snapshot.sta_associated,
+        snapshot.sta_ap_rssi_dbm,
         snapshot.promiscuous,
         snapshot.ap_active,
         snapshot.raw_service_active,
+        snapshot.sta_connect_to_associated_ms,
         snapshot.counters.tx_driver_accepted,
         snapshot.counters.tx_attempted,
         snapshot.counters.rx_driver_dispatch,
@@ -1136,8 +2429,8 @@ fn snapshot(session: &mut DeviceSession, method: u64) -> dmesh_server::raw_wifi:
 }
 
 fn enable_normal_dw(session: &mut DeviceSession) -> dmesh_server::raw_wifi::RawWifiSnapshot {
-    // CLI equivalent: dmesh-cli "$DMESH_E2E_E6" --direct-hex a200184806a300020af40b00
-    // {0:72, 6:{0:2, 10:false, 11:0}} means control, promiscuous off,
+    // The shared encoder emits {1:4, 2:72, 5:{10:false, 11:0}}: control,
+    // promiscuous off,
     // DW policy normal. It deliberately leaves an associated STA's channel
     // unchanged; the driver rightfully rejects an on-channel STA retune.
     let control = RawWifiControlRequest {
@@ -1168,8 +2461,8 @@ fn set_action_mac_ack(
         ..RawWifiControlRequest::default()
     };
     let mut request = [0u8; 64];
-    let used = encode_raw_wifi_control_request(control, &mut request)
-        .expect("MAC ACK control request");
+    let used =
+        encode_raw_wifi_control_request(control, &mut request).expect("MAC ACK control request");
     let snapshot = radio_request(session, &request[..used]);
     assert_eq!(snapshot.mac_ack, Some(enabled));
     snapshot
@@ -1178,25 +2471,192 @@ fn set_action_mac_ack(
 fn wait_for_associated_channel_6(
     session: &mut DeviceSession,
 ) -> dmesh_server::raw_wifi::RawWifiSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_associated_channel_6_matching(session, None)
+}
+
+/// A transport start replaces an asynchronous radio epoch. Association and
+/// channel alone can still describe the previous epoch, so performance A/Bs
+/// must wait for the requested egress selection as well.
+fn wait_for_associated_channel_6_with_driver_tx(
+    session: &mut DeviceSession,
+    sta_driver_tx: bool,
+) -> dmesh_server::raw_wifi::RawWifiSnapshot {
+    wait_for_associated_channel_6_matching(session, Some(sta_driver_tx))
+}
+
+fn wait_for_associated_channel_6_matching(
+    session: &mut DeviceSession,
+    expected_sta_driver_tx: Option<bool>,
+) -> dmesh_server::raw_wifi::RawWifiSnapshot {
+    // `wifi_esp::init_sta` uses a bounded 50-second association window. A
+    // UART/NAN start must be allowed to complete that first radio epoch before
+    // this test classifies the AP target or NOW setup as broken.
+    let association_started = Instant::now();
+    let deadline = association_started + Duration::from_secs(65);
     let mut observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
-    while !(observed.sta_associated == Some(true) && observed.channel == Some(6))
+    while !(observed.sta_associated == Some(true)
+        && observed.channel == Some(6)
+        && expected_sta_driver_tx.is_none_or(|expected| observed.sta_driver_tx == Some(expected)))
         && Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(100));
         observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
     }
+    // Snapshots are requested on every poll and would swamp the useful UART
+    // history here. Keep only decoded non-radio-control records: these carry
+    // the Wi-Fi owner's mode/start diagnostics and the correlated start reply.
+    let diagnostics = session
+        .recent_events()
+        .filter_map(|event| match event {
+            DeviceSessionEvent::DirectRecord(record) => {
+                if let Some(response) = decode_tagged_record(record) {
+                    (!matches!(
+                        (response.component, response.method),
+                        (
+                            Some(dmesh_server::tagged::Name::Tag(4)),
+                            Some(dmesh_server::tagged::Name::Tag(73))
+                        )
+                    ))
+                    .then(|| format!("{response:?}"))
+                } else {
+                    core::str::from_utf8(record)
+                        .ok()
+                        .map(|text| format!("status={text}"))
+                }
+            }
+            _ => None,
+        })
+        .take(16)
+        .collect::<Vec<_>>();
     assert_eq!(
         observed.sta_associated,
         Some(true),
-        "{} did not reassociate before the action matrix: {observed:?}",
-        session.path()
+        "{} did not reassociate before the action matrix: {observed:?}; UART history={diagnostics:?}",
+        session.path(),
     );
     assert_eq!(
         observed.channel,
         Some(6),
         "{} did not return to lab channel 6 before the action matrix: {observed:?}",
         session.path()
+    );
+    if let Some(expected) = expected_sta_driver_tx {
+        assert_eq!(
+            observed.sta_driver_tx,
+            Some(expected),
+            "{} did not apply requested STA TX path before the performance row: {observed:?}",
+            session.path(),
+        );
+    }
+    eprintln!(
+        "STA association settled device={} bssid-directed elapsed_ms={} channel={:?} diagnostics={diagnostics:?}",
+        session.path(),
+        association_started.elapsed().as_millis(),
+        observed.channel,
+    );
+    observed
+}
+
+/// A directed STA start must not depend on observing the AP's next beacon.
+/// The AP identity comes from the supervised owner and is carried in the one
+/// UART `transport.start` CBOR record as SSID, BSSID, and channel. Select the
+/// 500-TU lab AP without changing test code through
+/// `DMESH_E2E_AP_SERVICE=lmesh DMESH_E2E_AP_IFACE=wlan1`.
+#[test]
+#[ignore = "requires flashed e6 and an already-running supervised AP; never changes host radio state"]
+fn firmware_e6_bssid_directed_sta_association() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    e6.set_history_limit(1_024);
+    // Do not let an already-associated epoch satisfy the first snapshot. The
+    // timing gate begins only after the device has proved the normal default
+    // NAN+NOW/unassociated state.
+    configure_nan_for_channel(&mut e6, 6, 0xE6_B5_50F0);
+    wait_for_unassociated_channel_6(&mut e6);
+    let ssid = wlan0_ssid();
+    let started = Instant::now();
+    configure_sta_for_wlan0_with_now(&mut e6, &ssid, true, true, 0xE6_B5_5100);
+    // A failed association must not strand the device in a partial STA epoch.
+    // Restore the default NAN+NOW personality before re-raising the detailed
+    // association assertion from the common wait helper.
+    let association = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_associated_channel_6_with_driver_tx(&mut e6, true)
+    }));
+    let snapshot = match association {
+        Ok(snapshot) => snapshot,
+        Err(payload) => {
+            configure_nan_for_channel(&mut e6, 6, 0xE6_B5_5101);
+            wait_for_unassociated_channel_6(&mut e6);
+            std::panic::resume_unwind(payload);
+        }
+    };
+    let elapsed = started.elapsed();
+    let max_ms = std::env::var("DMESH_E2E_BSSID_CONNECT_MAX_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(500);
+    eprintln!(
+        "firmware-e2e row=e6 bssid-directed-association epoch_elapsed_ms={} connect_phase_ms={:?} max_ms={} state=({})",
+        elapsed.as_millis(),
+        snapshot.sta_connect_to_associated_ms,
+        max_ms,
+        snapshot_summary(&snapshot),
+    );
+    let connect_phase_ms = snapshot
+        .sta_connect_to_associated_ms
+        .expect("e6 did not report ESP-IDF connect-to-CONNECTED timing");
+    let within_bound = u64::from(connect_phase_ms) <= max_ms;
+    // Restore the default NAN+NOW epoch before reporting a timing regression,
+    // so an expected/diagnostic failure cannot leave the board associated.
+    configure_nan_for_channel(&mut e6, 6, 0xE6_B5_5101);
+    wait_for_unassociated_channel_6(&mut e6);
+    assert!(
+        within_bound,
+        "BSSID-directed connect phase took {connect_phase_ms} ms (limit {max_ms} ms); full epoch took {} ms: {snapshot:?}",
+        elapsed.as_millis(),
+    );
+}
+
+fn wait_for_unassociated_channel_6(
+    session: &mut DeviceSession,
+) -> dmesh_server::raw_wifi::RawWifiSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
+    while !(observed.sta_associated == Some(false) && observed.channel == Some(6))
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(100));
+        observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
+    }
+    let diagnostics = session
+        .recent_events()
+        .filter_map(|event| match event {
+            DeviceSessionEvent::DirectRecord(record) => {
+                if let Some(response) = decode_tagged_record(record) {
+                    (!matches!(
+                        (response.component, response.method),
+                        (
+                            Some(dmesh_server::tagged::Name::Tag(4)),
+                            Some(dmesh_server::tagged::Name::Tag(73))
+                        )
+                    ))
+                    .then(|| format!("{response:?}"))
+                } else {
+                    core::str::from_utf8(record).ok().map(str::to_owned)
+                }
+            }
+            _ => None,
+        })
+        .take(24)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed.sta_associated,
+        Some(false),
+        "unassociated NOW mode: {observed:?}; UART history={diagnostics:?}"
+    );
+    assert_eq!(
+        observed.channel,
+        Some(6),
+        "unassociated NOW channel: {observed:?}; UART history={diagnostics:?}"
     );
     observed
 }
@@ -1207,7 +2667,7 @@ fn start_espnow_check(
     nonce: u64,
 ) -> dmesh_server::raw_wifi::RawWifiSnapshot {
     // Exact direct-PPP request, rendered by the shared encoder rather than a
-    // CLI string: `{0:75,6:{0:5,17:h'E6_MAC',18:nonce,19:5000}}`.
+    // The shared encoder emits `{1:4,2:75,5:{17:h'E6_MAC',18:nonce,19:5000}}`.
     // The same CBOR body may be sent to the registered hardware stream
     // handler; direct PPP keeps radio matrix setup independent of QUIC/UART
     // stream admission while retaining the identical handler schema.
@@ -1316,12 +2776,261 @@ fn complete_action_check(
     );
 }
 
+/// Focused STA+NOW gate for the default transport profile. Both devices use a
+/// plain STA start; NAN DW capture remains off. This proves that e6 accepts
+/// and originates an action-bearer exchange without special NOW setup.
+#[test]
+#[ignore = "requires flashed e6/e7 firmware, the supervised wlan0 AP, and exclusive UART ownership"]
+fn firmware_sta_now_e6_e7() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(4_096);
+    e7.set_history_limit(4_096);
+
+    let ssid = wlan0_ssid();
+    configure_sta_for_wlan0(&mut e6, &ssid, 0xE6_6E00);
+    configure_sta_for_wlan0(&mut e7, &ssid, 0xE7_6E00);
+    let e6_mode = wait_for_associated_channel_6(&mut e6);
+    let e7_mode = wait_for_associated_channel_6(&mut e7);
+    for (name, mode) in [("e6", e6_mode), ("e7", e7_mode)] {
+        assert_eq!(mode.sta_associated, Some(true), "{name} STA association");
+        assert_eq!(
+            mode.promiscuous,
+            Some(false),
+            "{name} must not be promiscuous"
+        );
+        assert_eq!(mode.dw_capturing, Some(false), "{name} NAN DW must be off");
+    }
+
+    let (e6_source, e7_client) =
+        complete_action_check(&mut e7, &mut e6, E6_MAC, 0xE6_6E01, "STA+NOW e7->e6");
+    assert!(
+        e6_source.counters.rx_driver_dispatch > 0,
+        "e6 did not dispatch NOW"
+    );
+    assert!(
+        e6_source.counters.rx_parser_accepted > 0,
+        "e6 did not parse NOW"
+    );
+    assert!(
+        e7_client.counters.raw_client_stream_packets > 0,
+        "e7 did not receive the e6 response"
+    );
+    assert_eq!(e7_client.counters.raw_client_receive_errors, 0);
+
+    let (e7_source, e6_client) =
+        complete_action_check(&mut e6, &mut e7, E7_MAC, 0xE6_6E02, "STA+NOW e6->e7");
+    assert!(
+        e7_source.counters.rx_driver_dispatch > 0,
+        "e7 did not dispatch NOW"
+    );
+    assert!(
+        e7_source.counters.rx_parser_accepted > 0,
+        "e7 did not parse NOW"
+    );
+    assert!(
+        e6_client.counters.raw_client_stream_packets > 0,
+        "e6 did not receive the e7 response"
+    );
+    assert_eq!(e6_client.counters.raw_client_receive_errors, 0);
+}
+
+/// Host-to-e6 action-bearer IPERF using the same raw QUIC-lite client as the
+/// firmware. The host keeps the established broadcast Address-1 action mode;
+/// e6 binds replies to the host action source. This is deliberately distinct
+/// from the raw-UDP6 performance row.
+#[test]
+#[ignore = "requires flashed e6 firmware, the supervised wlan0 AP, and exclusive e6 UART ownership"]
+fn firmware_host_to_e6_now_iperf() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    e6.set_history_limit(4_096);
+    let ap_service = e2e_ap_service();
+    let ap_iface = e2e_ap_iface();
+    let ssid = wlan0_ssid();
+    let unassociated = std::env::var("DMESH_E2E_UNASSOCIATED_NOW").ok().as_deref() == Some("1");
+    let mode = if unassociated {
+        configure_nan_for_channel(&mut e6, 6, 0xE6_6F10);
+        wait_for_unassociated_channel_6(&mut e6)
+    } else {
+        configure_sta_for_wlan0(&mut e6, &ssid, 0xE6_6F00);
+        wait_for_associated_channel_6(&mut e6)
+    };
+    assert_eq!(mode.sta_associated, Some(!unassociated));
+    assert_eq!(mode.promiscuous, Some(false));
+    assert_eq!(mode.dw_capturing, Some(false));
+    snapshot(&mut e6, RAW_WIFI_METHOD_RESET_COUNTERS);
+
+    // Keep the action health exchange distinct from bulk transfer. A large
+    // run is meaningful only after the current radio epoch has answered a
+    // complete NOW request/response without changing host infrastructure.
+    let e6_peer = "14:c1:9f:e5:98:00".to_owned();
+    let check = wifi_raw_check_for_peer(
+        &ap_service,
+        &ap_iface,
+        "ff:ff:ff:ff:ff:ff".to_owned(),
+        e6_peer.clone(),
+        0xE6_6F11,
+        e2e_now_timeout_ms(),
+        e2e_now_rate() as u8,
+        &e2e_now_tx_variant(),
+        &e2e_now_rx_variant(),
+    );
+    let e6_after_check = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    eprintln!(
+        "firmware-e2e row=host->e6-now-check result={check} e6=({})",
+        snapshot_summary(&e6_after_check)
+    );
+    assert_eq!(
+        check
+            .get("data")
+            .and_then(|data| data.get("ok"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "host->e6 NOW short check failed before IPERF: {check}; e6={e6_after_check:?}"
+    );
+
+    let bytes = e2e_now_bytes();
+    let result = wifi_raw_iperf_for_peer(
+        &ap_service,
+        &ap_iface,
+        "ff:ff:ff:ff:ff:ff".to_owned(),
+        e6_peer,
+        bytes,
+        // Firmware action ingress uses the shared 1,100-byte transport MTU.
+        // A single common bound prevents the host action client from sending
+        // a final datagram the e6 responder cannot complete.
+        E2E_UDP6_PACKET_SIZE,
+        e2e_now_timeout_ms(),
+        e2e_now_rate() as u8,
+        &e2e_now_tx_variant(),
+        &e2e_now_rx_variant(),
+    );
+    let data = result.get("data").unwrap_or(&result);
+    let e6_after = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    eprintln!(
+        "firmware-e2e row=host->e6-now-iperf result={result} e6=({})",
+        snapshot_summary(&e6_after)
+    );
+    assert_eq!(
+        data.get("ok").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        data.get("bytes").and_then(serde_json::Value::as_u64),
+        Some(bytes)
+    );
+    assert!(
+        e6_after.counters.rx_driver_dispatch > 0,
+        "e6 did not dispatch host NOW frames: {e6_after:?}"
+    );
+    assert!(
+        e6_after.counters.rx_parser_accepted > 0,
+        "e6 did not parse host NOW frames: {e6_after:?}"
+    );
+}
+
+/// Alternate complete radio epochs on e7/Main without changing host radio
+/// infrastructure.  Each `transport.start` replaces the prior Wi-Fi owner:
+/// NAN is the unassociated NAN+NOW control-plane state, while STA is the
+/// associated STA+NAN+NOW state (DW disabled for this NOW reachability gate).
+/// The elapsed time is command acceptance through the first snapshot that
+/// proves the requested state, rather than merely UART CBOR acknowledgement.
+#[test]
+#[ignore = "requires flashed e7 Main, supervised wlan0 AP, and exclusive e7 UART ownership"]
+fn firmware_e7_nan_now_sta_transition_cycles() {
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e7.set_history_limit(4_096);
+    let cycles = std::env::var("DMESH_E2E_TRANSITION_CYCLES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3)
+        .clamp(1, 8);
+    let ssid = wlan0_ssid();
+    let e7_peer = "14:c1:9f:e4:5d:48".to_owned();
+    let ap_service = e2e_ap_service();
+    let ap_iface = e2e_ap_iface();
+    let mut checks = Vec::new();
+
+    for cycle in 0..cycles {
+        let nan_started = Instant::now();
+        configure_nan_for_channel(&mut e7, 6, 0xE7_4E_0000 + cycle * 16);
+        let nan = wait_for_unassociated_channel_6(&mut e7);
+        let nan_elapsed = nan_started.elapsed();
+        let nan_check = wifi_raw_check_for_peer(
+            &ap_service,
+            &ap_iface,
+            "ff:ff:ff:ff:ff:ff".to_owned(),
+            e7_peer.clone(),
+            0xE7_4E_0001 + cycle * 16,
+            5_000,
+            6,
+            "monitor",
+            "monitor",
+        );
+        let nan_ok = nan_check["data"]["ok"].as_bool() == Some(true);
+        eprintln!(
+            "firmware-e2e row=e7 transition={} mode=nan-now settled_ms={} state=({}) host_now_ok={} check={}",
+            cycle,
+            nan_elapsed.as_millis(),
+            snapshot_summary(&nan),
+            nan_ok,
+            nan_check,
+        );
+        checks.push(("nan-now", cycle, nan_ok, nan_check));
+
+        let sta_started = Instant::now();
+        configure_sta_for_wlan0_with_now(&mut e7, &ssid, true, true, 0xE7_4E_0008 + cycle * 16);
+        let sta = wait_for_associated_channel_6_with_driver_tx(&mut e7, true);
+        let sta_elapsed = sta_started.elapsed();
+        let sta_check = wifi_raw_check_for_peer(
+            &ap_service,
+            &ap_iface,
+            "ff:ff:ff:ff:ff:ff".to_owned(),
+            e7_peer.clone(),
+            0xE7_4E_0009 + cycle * 16,
+            5_000,
+            6,
+            "monitor",
+            "monitor",
+        );
+        let sta_ok = sta_check["data"]["ok"].as_bool() == Some(true);
+        eprintln!(
+            "firmware-e2e row=e7 transition={} mode=sta-nan-now settled_ms={} state=({}) host_now_ok={} check={}",
+            cycle,
+            sta_elapsed.as_millis(),
+            snapshot_summary(&sta),
+            sta_ok,
+            sta_check,
+        );
+        checks.push(("sta-nan-now", cycle, sta_ok, sta_check));
+    }
+
+    // Restore the normal boot personality even when a reachability assertion
+    // below fails, so this diagnostic test cannot leave the device associated.
+    let restore_started = Instant::now();
+    configure_nan_for_channel(&mut e7, 6, 0xE7_4E_FFF0);
+    let restored = wait_for_unassociated_channel_6(&mut e7);
+    eprintln!(
+        "firmware-e2e row=e7 transition=restore mode=nan-now settled_ms={} state=({})",
+        restore_started.elapsed().as_millis(),
+        snapshot_summary(&restored),
+    );
+
+    let failed = checks
+        .iter()
+        .filter(|(_, _, ok, _)| !ok)
+        .map(|(mode, cycle, _, result)| format!("cycle={cycle} mode={mode} result={result}"))
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "host->e7 NOW checks failed: {failed:?}");
+}
+
 #[test]
 #[ignore = "requires the e6/e7 radio lab and exclusive UART ownership"]
 fn firmware_transport_matrix() {
     // CLI equivalent preflight (the suite keeps both ports open instead):
-    // dmesh-cli "$DMESH_E2E_E6" --direct-hex a200184906a0
-    // dmesh-cli "$DMESH_E2E_E7" --direct-hex a200184906a0
+    // The shared snapshot encoder emits component 4 / method 73. Keep this
+    // test constructor-based so an envelope change cannot leave a stale hex
+    // reproduction command behind.
     let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
     let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
     // A direct radio response is not tagged with a request ID. Keep the
@@ -1330,13 +3039,42 @@ fn firmware_transport_matrix() {
     e6.set_history_limit(4_096);
     e7.set_history_limit(4_096);
 
-    // Every later matrix row begins with an explicit counter epoch and ends
-    // with a snapshot on these same sessions.  The raw host/device check
-    // cases are added below as their host-radio and firmware initiators land.
+    // The host-owned probe is the common setup primitive for the matrix and
+    // eventual control-plane UI: it places e6 and e7 in independent complete
+    // modes before any bearer row, then records their NAN/DW/RSSI baseline.
+    // It never asks either ESP to implement a probe service.
+    let ssid = wlan0_ssid();
+    let (ap_bssid, _) = wlan0_bssid_channel();
+    let _baseline = probe(
+        &mut e6,
+        &mut e7,
+        ProbeRequest {
+            request_id: 0x4553_0000,
+            source: ProbeEndpoint {
+                kind: ProbeEndpointKind::Esp,
+                node: E6_MAC,
+                mode: ProbeMode::STA_NAN_NOW,
+                bssid: Some(ap_bssid),
+            },
+            target: ProbeEndpoint {
+                kind: ProbeEndpointKind::Esp,
+                node: E7_MAC,
+                mode: ProbeMode::STA_NAN_NOW,
+                bssid: Some(ap_bssid),
+            },
+            test_nan: true,
+            test_now: true,
+            test_udp6: true,
+            short_bytes: E2E_UDP6_PACKET_SIZE.into(),
+            long_bytes: E2E_UDP6_DEFAULT_BYTES as u32,
+            measure_mode_switch: true,
+        },
+        &ssid,
+        0xE6_6200,
+        0xE7_6200,
+    );
     enable_normal_dw(&mut e6);
     enable_normal_dw(&mut e7);
-    wait_for_associated_channel_6(&mut e6);
-    wait_for_associated_channel_6(&mut e7);
 
     // Permanent preflight: both devices are associated STA on channel 6,
     // normal NAN DW policy is enabled, and continuous promiscuous capture is
@@ -1351,7 +3089,9 @@ fn firmware_transport_matrix() {
             .enable_all()
             .build()
             .expect("UDP6 echo runtime")
-            .block_on(host_to_e6_udp6_echo_checks(action_samples.saturating_mul(2)))
+            .block_on(host_to_e6_udp6_echo_checks(
+                action_samples.saturating_mul(2),
+            ))
     });
     for sample in 0..action_samples {
         let nonce = 0x4553_0001 + sample.saturating_mul(2);
@@ -1362,11 +3102,26 @@ fn firmware_transport_matrix() {
             nonce,
             &format!("STA e7->e6 sample={sample} mac_ack={mac_ack}"),
         );
-        assert!(e7_after.counters.tx_attempted > 0, "e7 did not issue a NOW action");
-        assert!(e6_after.counters.rx_driver_dispatch > 0, "e6 did not dispatch a NOW action");
-        assert!(e6_after.counters.rx_parser_accepted > 0, "e6 did not accept the raw service packet");
-        assert!(e7_after.counters.raw_client_stream_packets > 0, "e7 did not receive the check stream response");
-        assert_eq!(e7_after.counters.raw_client_receive_errors, 0, "e7 check client rejected a response");
+        assert!(
+            e7_after.counters.tx_attempted > 0,
+            "e7 did not issue a NOW action"
+        );
+        assert!(
+            e6_after.counters.rx_driver_dispatch > 0,
+            "e6 did not dispatch a NOW action"
+        );
+        assert!(
+            e6_after.counters.rx_parser_accepted > 0,
+            "e6 did not accept the raw service packet"
+        );
+        assert!(
+            e7_after.counters.raw_client_stream_packets > 0,
+            "e7 did not receive the check stream response"
+        );
+        assert_eq!(
+            e7_after.counters.raw_client_receive_errors, 0,
+            "e7 check client rejected a response"
+        );
 
         // Reverse direction proves Recovery owns the same client state
         // machine, not merely the smaller receiver canary.
@@ -1377,15 +3132,34 @@ fn firmware_transport_matrix() {
             nonce + 1,
             &format!("STA e6->e7 sample={sample} mac_ack={mac_ack}"),
         );
-        assert!(e6_reverse.counters.tx_attempted > 0, "e6 did not issue a NOW action");
-        assert!(e7_reverse.counters.rx_driver_dispatch > 0, "e7 did not dispatch a NOW action");
-        assert!(e7_reverse.counters.rx_parser_accepted > 0, "e7 did not accept the raw service packet");
-        assert!(e6_reverse.counters.raw_client_stream_packets > 0, "e6 did not receive the check stream response");
-        assert_eq!(e6_reverse.counters.raw_client_receive_errors, 0, "e6 check client rejected a response");
+        assert!(
+            e6_reverse.counters.tx_attempted > 0,
+            "e6 did not issue a NOW action"
+        );
+        assert!(
+            e7_reverse.counters.rx_driver_dispatch > 0,
+            "e7 did not dispatch a NOW action"
+        );
+        assert!(
+            e7_reverse.counters.rx_parser_accepted > 0,
+            "e7 did not accept the raw service packet"
+        );
+        assert!(
+            e6_reverse.counters.raw_client_stream_packets > 0,
+            "e6 did not receive the check stream response"
+        );
+        assert_eq!(
+            e6_reverse.counters.raw_client_receive_errors, 0,
+            "e6 check client rejected a response"
+        );
     }
     let udp_echo = udp_echo_worker.join().expect("UDP6 echo worker panicked");
     let udp_echo_failures = udp_echo.iter().filter(|result| result.is_err()).count();
-    let mut udp_echo_latencies = udp_echo.iter().filter_map(|result| result.as_ref().ok()).copied().collect::<Vec<_>>();
+    let mut udp_echo_latencies = udp_echo
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .copied()
+        .collect::<Vec<_>>();
     udp_echo_latencies.sort_unstable();
     eprintln!(
         "firmware-e2e row=concurrent-udp6-echo samples={} failures={} min_us={:?} median_us={:?} max_us={:?} mac_ack={mac_ack}",
@@ -1395,14 +3169,20 @@ fn firmware_transport_matrix() {
         udp_echo_latencies.get(udp_echo_latencies.len() / 2),
         udp_echo_latencies.last(),
     );
-    assert_eq!(udp_echo_failures, 0, "concurrent UDP6 echo failures: {udp_echo:?}");
+    assert_eq!(
+        udp_echo_failures, 0,
+        "concurrent UDP6 echo failures: {udp_echo:?}"
+    );
 
     // Bulk counterpart of the liveness check above. Keep it opt-in while the
     // C6 action bootstrap retry path is characterized.
     if action_iperf_enabled() {
         let (_e6_bulk, e7_bulk) =
             complete_action_iperf(&mut e7, &mut e6, E6_MAC, "STA e7->e6 NOW bulk");
-        assert_eq!(e7_bulk.raw_service_bytes, Some(E2E_ACTION_IPERF_BYTES as u32));
+        assert_eq!(
+            e7_bulk.raw_service_bytes,
+            Some(E2E_ACTION_IPERF_BYTES as u32)
+        );
     }
 
     // No IPERF row may run until the same current radio configuration has

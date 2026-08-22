@@ -6,7 +6,7 @@
 
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU32, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 
 /// Opaque ownership token for one packet slot.

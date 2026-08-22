@@ -5,11 +5,11 @@
 //! not a benchmark protocol or a particular radio.
 
 pub use crate::raw_iperf::{
-    receive_error_code, RawAssociationProfile as RawAssociation, RawCheckClient,
-    RawIngressPath as IngressPath, RawIperfClient as RawClient,
-    RawIperfDispatcher as RawServiceDispatcher, RawIperfServer as RawService, RawObjectClient,
-    RawServiceCounters, RAW_ACTION_IPERF_DEFAULT_TIMEOUT_MS as RAW_ACTION_DEFAULT_TIMEOUT_MS,
+    RAW_ACTION_IPERF_DEFAULT_TIMEOUT_MS as RAW_ACTION_DEFAULT_TIMEOUT_MS,
     RAW_ACTION_IPERF_MAX_TIMEOUT_MS as RAW_ACTION_MAX_TIMEOUT_MS,
+    RawAssociationProfile as RawAssociation, RawCheckClient, RawIngressPath as IngressPath,
+    RawIperfClient as RawClient, RawIperfDispatcher as RawServiceDispatcher,
+    RawIperfServer as RawService, RawObjectClient, RawServiceCounters, receive_error_code,
 };
 
 /// Result of driving a bounded service egress burst.

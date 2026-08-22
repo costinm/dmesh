@@ -6,6 +6,7 @@
 
 use alloc::format;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use quic_lite::{
     ConnectionId, EndpointState, PathPolicy, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS,
     SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS,
@@ -24,6 +25,76 @@ pub const LOG_WATCH_MAX_RECORDS: usize = 64;
 pub const CONTROL_PATH_POLICY: u8 = 3;
 /// First byte in a compact control-handler response.
 pub const CONTROL_RESPONSE: u8 = 2;
+
+/// Platform extension for tagged-CBOR requests carried directly in an
+/// application stream. Component IDs remain `u64` inside the envelope, so
+/// board modules can use the 1000+ range without colliding with legacy
+/// one-byte stream-service selectors. Handlers are registered per component
+/// by an application (Main, Recovery, or a host server); the bearer runtime
+/// remains unaware of them.
+pub type TaggedComponentHandler = fn(crate::tagged::Record<'_>) -> Option<Vec<u8>>;
+
+const TAGGED_COMPONENT_CAPACITY: usize = 16;
+// Each slot is published handler-first, component-second. A reader that sees
+// the component with Acquire ordering therefore sees the matching function.
+// Components use small numeric IDs today (1000+) and fit `usize` on every
+// ESP target; the decoded `u64` is checked before the cast.
+static TAGGED_COMPONENT_IDS: [AtomicUsize; TAGGED_COMPONENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; TAGGED_COMPONENT_CAPACITY];
+static TAGGED_COMPONENT_HANDLERS: [AtomicUsize; TAGGED_COMPONENT_CAPACITY] =
+    [const { AtomicUsize::new(0) }; TAGGED_COMPONENT_CAPACITY];
+
+/// Register one tagged-CBOR component. It is called at application startup,
+/// before transports accept traffic; duplicate component IDs are rejected.
+/// The fixed table bounds the handler surface without heap allocations.
+pub fn register_tagged_component(component: u64, handler: TaggedComponentHandler) -> bool {
+    let Ok(component) = usize::try_from(component) else {
+        return false;
+    };
+    if component == 0 {
+        return false;
+    }
+    for index in 0..TAGGED_COMPONENT_CAPACITY {
+        let existing = TAGGED_COMPONENT_IDS[index].load(Ordering::Acquire);
+        if existing == component {
+            return false;
+        }
+        if existing == 0
+            && TAGGED_COMPONENT_IDS[index]
+                .compare_exchange(0, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            TAGGED_COMPONENT_HANDLERS[index].store(handler as usize, Ordering::Release);
+            TAGGED_COMPONENT_IDS[index].store(component, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// Dispatch a complete tagged-CBOR stream request.
+///
+/// This is deliberately attempted before decoding the historical service
+/// byte. A stream is an HTTP-like request channel, not a handler identity:
+/// each stream may carry any component and multiple streams may concurrently
+/// call the same component. Service-byte framing remains a compatibility
+/// adapter for the existing echo/iperf/object endpoints.
+pub fn dispatch_tagged_stream(data: &[u8]) -> Option<Vec<u8>> {
+    let record = crate::tagged::decode(data)?;
+    let crate::tagged::Name::Tag(component) = record.component? else {
+        return None;
+    };
+    let component = usize::try_from(component).ok()?;
+    for index in 0..TAGGED_COMPONENT_CAPACITY {
+        if TAGGED_COMPONENT_IDS[index].load(Ordering::Acquire) == component {
+            let handler = TAGGED_COMPONENT_HANDLERS[index].load(Ordering::Acquire);
+            let handler: TaggedComponentHandler =
+                (handler != 0).then(|| unsafe { core::mem::transmute(handler) })?;
+            return handler(record);
+        }
+    }
+    None
+}
 
 /// Common diagnostic/control handler set that does not require an object
 /// receiver. ESP-NOW, UART, and UDP endpoints use it until their object sink
@@ -154,6 +225,24 @@ pub fn encode_status_text(message: &[u8]) -> Option<Vec<u8>> {
     }
     response.extend_from_slice(message);
     Some(response)
+}
+
+/// Decode the text form of the bounded direct status record. This is useful
+/// on connectionless bearers during discovery: the record is intentionally
+/// not a QUIC-lite datagram and must be recognized before a bearer attempts
+/// transport dispatch.
+pub fn decode_status_text(record: &[u8]) -> Option<&[u8]> {
+    let mut decoder = crate::cbor::Decoder::new(record);
+    (decoder.head()? == (5, 3)).then_some(())?;
+    (decoder.uint()? == 0).then_some(())?;
+    (decoder.uint()? == 68).then_some(())?;
+    (decoder.uint()? == 4).then_some(())?;
+    (decoder.text_ref()? == b"ok").then_some(())?;
+    (decoder.uint()? == 6).then_some(())?;
+    (decoder.head()? == (5, 1)).then_some(())?;
+    (decoder.uint()? == 32).then_some(())?;
+    let message = decoder.text_ref()?;
+    decoder.is_finished().then_some(message)
 }
 
 /// Encode one named numeric diagnostic without converting the value to text.
@@ -379,8 +468,9 @@ pub fn handle_stream_with_events<const N: usize, const H: usize, const P: usize>
             data,
         )),
         SERVICE_STREAM => Ok(registry.encode_handler_list()),
-        // The UDP adapter supplies the command mailbox. Keep a harmless
-        // registered fallback for bearer tests which use handlers directly.
+        // The historical control byte remains a harmless acknowledgement.
+        // New tagged-CBOR handlers are dispatched from the entire stream by
+        // [`dispatch_tagged_stream`], before this legacy service decoding.
         SERVICE_CONTROL => Ok(Vec::new()),
         // Log retention and authentication are server policy.  This compact
         // baseline acknowledges the stream without making command or object
@@ -452,8 +542,9 @@ fn metrics_status<const N: usize, const H: usize, const P: usize>(
     cid: ConnectionId,
     stream_id: u64,
 ) -> Vec<u8> {
+    let stats = endpoint.stats();
     format!(
-        "metrics_version=1;connection_dcid={};local_cid={:?};peer_cid={:?};stream_id={stream_id};received_packets={};largest_received={:?};next_packet_number={};bytes_in_flight={};congestion_window={};slow_start_threshold={};latest_rtt={:?};smoothed_rtt={:?};rtt_variance={};pto_timeout={};history_used={};history_capacity={};history_storage_slots={};history_storage_bytes={};retained_payload_bytes={};retransmission_capacity_bytes={};max_data={};max_stream_data={};max_streams_bidi={};max_streams_uni={}",
+        "metrics_version=1;connection_dcid={};local_cid={:?};peer_cid={:?};stream_id={stream_id};received_packets={};largest_received={:?};next_packet_number={};bytes_in_flight={};congestion_window={};slow_start_threshold={};latest_rtt={:?};smoothed_rtt={:?};rtt_variance={};pto_timeout={};history_used={};history_capacity={};history_storage_slots={};history_storage_bytes={};retained_payload_bytes={};retransmission_capacity_bytes={};max_data={};max_stream_data={};max_streams_bidi={};max_streams_uni={};received_datagrams={};stream_datagrams={};control_datagrams={};duplicate_datagrams={};out_of_order_datagrams={};inferred_missing_packets={};sent_datagrams={};sent_stream_datagrams={};sent_control_datagrams={};retransmitted_datagrams={};loss_packet_threshold_datagrams={};loss_time_threshold_datagrams={};loss_events={};loss_retransmitted_datagrams={};pto_retransmitted_datagrams={};ack_datagrams={};ack_immediate_datagrams={};ack_threshold_datagrams={};ack_timer_datagrams={}",
         cid.value(), endpoint.local_connection_id().map(|v| v.value()), endpoint.peer_connection_id().map(|v| v.value()),
         endpoint.received_packet_count(), endpoint.largest_received(), endpoint.next_packet_number,
         endpoint.bytes_in_flight(), endpoint.congestion.congestion_window, endpoint.congestion.slow_start_threshold,
@@ -462,6 +553,14 @@ fn metrics_status<const N: usize, const H: usize, const P: usize>(
         endpoint.retransmission_capacity_bytes(), endpoint.receive.limits.max_data,
         endpoint.receive.limits.max_stream_data, endpoint.receive.limits.max_streams_bidi,
         endpoint.receive.limits.max_streams_uni,
+        stats.received_datagrams, stats.stream_datagrams, stats.control_datagrams,
+        stats.duplicate_datagrams, stats.out_of_order_datagrams, stats.inferred_missing_packets,
+        stats.sent_datagrams, stats.sent_stream_datagrams, stats.sent_control_datagrams,
+        stats.retransmitted_datagrams, stats.loss_packet_threshold_datagrams,
+        stats.loss_time_threshold_datagrams, stats.loss_events,
+        stats.loss_retransmitted_datagrams, stats.pto_retransmitted_datagrams,
+        stats.ack_datagrams, stats.ack_immediate_datagrams, stats.ack_threshold_datagrams,
+        stats.ack_timer_datagrams,
     ).into_bytes()
 }
 
@@ -551,6 +650,23 @@ mod tests {
     use super::*;
     use quic_lite::{ConnectionLimits, EndpointState, Role};
 
+    fn tagged_test_handler(record: crate::tagged::Record<'_>) -> Option<Vec<u8>> {
+        matches!(record.component, Some(crate::tagged::Name::Tag(1999)))
+            .then(|| b"module-response".to_vec())
+    }
+
+    #[test]
+    fn tagged_stream_dispatch_uses_component_not_stream_or_service_id() {
+        // {1: 1999, 2: 1}; there is intentionally no leading service byte.
+        let request = [0xa2, 1, 0x19, 0x07, 0xcf, 2, 1];
+        assert!(register_tagged_component(1999, tagged_test_handler));
+        assert_eq!(
+            dispatch_tagged_stream(&request),
+            Some(b"module-response".to_vec())
+        );
+        assert!(!register_tagged_component(1999, tagged_test_handler));
+    }
+
     #[test]
     fn event_ring_is_bounded_and_pollable() {
         let mut ring = EventRing::new(2);
@@ -576,7 +692,9 @@ mod tests {
         }];
         assert_eq!(
             encode_binary_events(7, &events, 64).unwrap(),
-            vec![0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c']
+            vec![
+                0x82, 7, 0x81, 0x85, 3, 0x18, 45, 5, 0, 0x43, b'a', b'b', b'c'
+            ]
         );
         // A too-small response preserves a valid continuation envelope and
         // never emits a partial payload/event.
@@ -612,6 +730,12 @@ mod tests {
         assert_eq!(decoder.uint(), Some(42));
         assert!(decoder.is_finished());
         assert!(encode_status_numeric(&[b'x'; 97], 1).is_none());
+    }
+
+    #[test]
+    fn text_status_round_trips_without_a_transport_envelope() {
+        let record = encode_status_text(b"recovery boot").unwrap();
+        assert_eq!(decode_status_text(&record), Some(&b"recovery boot"[..]));
     }
 
     #[test]

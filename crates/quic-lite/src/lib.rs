@@ -12,7 +12,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 #[cfg(not(any(feature = "std", test)))]
 use alloc::{
-    alloc::{alloc, dealloc, Layout},
+    alloc::{Layout, alloc, dealloc},
     boxed::Box,
 };
 
@@ -21,6 +21,7 @@ extern crate std;
 
 pub mod bearer_probe;
 pub mod callback;
+pub mod connection;
 pub mod iperf;
 pub mod ledger;
 
@@ -32,8 +33,6 @@ pub mod path_bridge;
 pub mod path_router;
 pub mod ram_budget;
 pub mod raw_udp6;
-pub mod sta_selection;
-pub mod uart;
 
 pub use path_router::{
     ConnectionTable, ConnectionTableError, DcidRouter, DcidRouterError, PathCapacity, PathPolicy,
@@ -308,9 +307,10 @@ pub const FIRST_SERVER_BIDI_STREAM_ID: u64 = 1;
 pub const FIRST_CLIENT_UNI_STREAM_ID: u64 = 2;
 pub const FIRST_SERVER_UNI_STREAM_ID: u64 = 3;
 /// Default bearer payload bound shared by UART, UDP, and the current extended
-/// ESP-NOW/vendor-action frame. The action-frame adapter is presently capped
-/// at 1200 bytes, so no bearer may silently use a larger transport packet.
-pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
+/// ESP-NOW/vendor-action frame. Keep every current bearer at 1,100 bytes:
+/// this fits the proven firmware action ingress without relying on L2
+/// fragmentation or per-bearer MTU negotiation.
+pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1100;
 /// Conservative one-datagram application payload after short-header and
 /// stream-frame overhead. Commands using this bound never rely on L2
 /// fragmentation, even when CID/varint widths grow.
@@ -376,7 +376,7 @@ pub const RECOVERY_MAX_HISTORY_PACKETS: usize = 64;
 /// holes before a pacing policy exists.
 pub const RECOVERY_MAX_IN_FLIGHT_PACKETS: u16 = 32;
 /// Largest explicit diagnostic receive window accepted by Recovery. At the
-/// 1200-byte Wi-Fi payload profile, 64 packets are 76,800 bytes, below the
+/// 1100-byte Wi-Fi payload profile, 64 packets are 70,400 bytes, below the
 /// fixed 89,600-byte callback/reorder budget below.
 pub const RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS: u16 = 64;
 /// Callback/reassembly storage is deliberately larger than the send window:
@@ -406,7 +406,7 @@ pub fn recovery_connection_limits(
         } else {
             u16::from(requested_packets).min(RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS)
         };
-        u64::from(packets) * 1200
+        u64::from(packets) * DEFAULT_MAX_DATAGRAM_SIZE as u64
     } else {
         RECOVERY_INITIAL_MAX_DATA
     };
@@ -445,9 +445,9 @@ mod recovery_profile_tests {
         assert_eq!(flash.max_data, RECOVERY_INITIAL_MAX_DATA);
         assert_eq!(
             default_diagnostic.max_data,
-            u64::from(RECOVERY_MAX_IN_FLIGHT_PACKETS) * 1200
+            u64::from(RECOVERY_MAX_IN_FLIGHT_PACKETS) * DEFAULT_MAX_DATAGRAM_SIZE as u64
         );
-        assert_eq!(diagnostic.max_data, 24 * 1200);
+        assert_eq!(diagnostic.max_data, 24 * DEFAULT_MAX_DATAGRAM_SIZE as u64);
     }
 
     #[test]
@@ -504,7 +504,11 @@ mod recovery_profile_tests {
         );
         assert_eq!(
             registry.encode_handler_list().get(..11),
-            Some(&[0x89, 0x82, 1, 0x66, b'o', b'b', b'j', b'e', b'c', b't', 0x82][..])
+            Some(
+                &[
+                    0x89, 0x82, 1, 0x66, b'o', b'b', b'j', b'e', b'c', b't', 0x82
+                ][..]
+            )
         );
         assert!(!registry.register(SERVICE_HANDLERS, b"different-name"));
         assert!(!registry.register(42, b"handlers"));
@@ -4903,9 +4907,11 @@ mod tests {
         let mut malformed = [0u8; 64];
         let header_len = header.encode(&mut malformed).unwrap();
         malformed[header_len] = FRAME_STREAM_BASE as u8 | 0x04 | 0x02 | 1;
-        assert!(endpoint
-            .receive_datagram(&malformed[..header_len + 1])
-            .is_err());
+        assert!(
+            endpoint
+                .receive_datagram(&malformed[..header_len + 1])
+                .is_err()
+        );
         assert_eq!(endpoint.peer_connection_id(), None);
 
         let frame_len = Frame::Ping.encode(&mut malformed[header_len..]).unwrap();
@@ -5271,11 +5277,13 @@ mod tests {
         sender.set_time(85);
         sender.receive_datagram(&ack[..used]).unwrap();
 
-        assert!(sender
-            .sent_packets
-            .iter()
-            .flatten()
-            .any(|packet| packet.packet_number == first && !packet.lost));
+        assert!(
+            sender
+                .sent_packets
+                .iter()
+                .flatten()
+                .any(|packet| packet.packet_number == first && !packet.lost)
+        );
     }
 
     #[test]
@@ -5568,10 +5576,12 @@ mod tests {
             repairs += 1;
         }
         assert_eq!(repairs, 3);
-        assert!(sender
-            .retransmit_pto_probe(0, 250, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_pto_probe(0, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         let stats = sender.stats();
         assert_eq!(stats.loss_retransmitted_datagrams, 3);
         assert_eq!(stats.pto_retransmitted_datagrams, 0);
@@ -5595,23 +5605,31 @@ mod tests {
 
         // All four packets are overdue together. This must still emit just
         // one PTO probe, rather than a tight-loop burst of four retries.
-        assert!(sender
-            .retransmit_pto_probe(250, 250, &mut packet)
-            .unwrap()
-            .is_some());
-        assert!(sender
-            .retransmit_pto_probe(250, 250, &mut packet)
-            .unwrap()
-            .is_none());
-        assert!(sender
-            .retransmit_pto_probe(499, 250, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_pto_probe(250, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(250, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sender
+                .retransmit_pto_probe(499, 250, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         // PTO backoff doubles the next wait.
-        assert!(sender
-            .retransmit_pto_probe(750, 250, &mut packet)
-            .unwrap()
-            .is_some());
+        assert!(
+            sender
+                .retransmit_pto_probe(750, 250, &mut packet)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(sender.stats().pto_retransmitted_datagrams, 2);
     }
 
@@ -5825,10 +5843,12 @@ mod tests {
             .encode_stream_packet(peer, 4, 0, true, b"clock", &mut packet)
             .unwrap();
         sender.set_time(109);
-        assert!(sender
-            .retransmit_due(109, 10, &mut packet)
-            .unwrap()
-            .is_none());
+        assert!(
+            sender
+                .retransmit_due(109, 10, &mut packet)
+                .unwrap()
+                .is_none()
+        );
         let (_, retransmitted) = sender
             .retransmit_due(110, 10, &mut packet)
             .unwrap()
@@ -5860,10 +5880,12 @@ mod tests {
             .find(|sent| sent.packet_number == packet_number)
             .unwrap()
             .lost = true;
-        assert!(sender
-            .retransmit_stream_packet(packet_number, &mut packet)
-            .unwrap()
-            .is_some());
+        assert!(
+            sender
+                .retransmit_stream_packet(packet_number, &mut packet)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

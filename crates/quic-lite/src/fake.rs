@@ -602,14 +602,18 @@ mod tests {
         .unwrap();
         assert_eq!(first.len(), operations.len());
         assert_eq!(second.len(), operations.len());
-        assert!(first
-            .iter()
-            .any(|result| result.operation == StreamOperation::Metrics
-                && result.response == vec![SERVICE_METRICS]));
-        assert!(second
-            .iter()
-            .any(|result| result.operation == StreamOperation::Metrics
-                && result.response == vec![SERVICE_METRICS]));
+        assert!(
+            first
+                .iter()
+                .any(|result| result.operation == StreamOperation::Metrics
+                    && result.response == vec![SERVICE_METRICS])
+        );
+        assert!(
+            second
+                .iter()
+                .any(|result| result.operation == StreamOperation::Metrics
+                    && result.response == vec![SERVICE_METRICS])
+        );
     }
 
     #[test]

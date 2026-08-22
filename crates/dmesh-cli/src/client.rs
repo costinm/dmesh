@@ -1,6 +1,6 @@
 //! Direct serial L2 adapter for the standalone `dmesh-cli` host client.
 //!
-//! This is intentionally part of `lmesh-uart`, not Recovery or firmware. It
+//! This belongs to `dmesh-cli`, not Recovery or firmware. It
 //! opens an explicitly supplied serial port with no managed forward. The
 //! optional initial record is opaque: commands/logs remain higher-level
 //! transport services and this adapter never decodes them.
@@ -11,14 +11,14 @@ use crate::{
     schema::{FirmwareSchema, encode_direct_command, render_device_record},
 };
 use dmesh_server::{
+    direct_iperf::{IperfRequest, decode_iperf_result, encode_iperf_request},
     iperf::{IperfServicePlan, decode_iperf_service_request},
-    recovery::{IperfRequest, decode_iperf_result, encode_iperf_request},
+    uart::{UartIngress, classify_uart_payload, encode_uart_datagram},
 };
 use quic_lite::{
     ConnectionLimits, EndpointState, Role, ShortHeader, StreamFrame, TransportPacket,
     iperf::IperfRun,
     path_bridge::{PathBridge, PathBridgeAction},
-    uart::encode_uart_datagram,
 };
 use serde::Deserialize;
 use std::{
@@ -114,11 +114,12 @@ impl DeviceSession {
     }
 
     pub fn assert_healthy(&self) -> Result<(), String> {
-        self.fatal_diagnostic
-            .as_ref()
-            .map_or(Ok(()), |diagnostic| {
-                Err(format!("device {} reported fatal diagnostic: {diagnostic}", self.path))
-            })
+        self.fatal_diagnostic.as_ref().map_or(Ok(()), |diagnostic| {
+            Err(format!(
+                "device {} reported fatal diagnostic: {diagnostic}",
+                self.path
+            ))
+        })
     }
 
     /// Send an unmarked, PPP-framed direct record such as a CBOR raw command.
@@ -133,7 +134,8 @@ impl DeviceSession {
     /// Poll the one UART owner and append all received observations to its
     /// bounded history. Returns the number of complete PPP records received.
     pub fn poll(&mut self, timeout: Duration) -> Result<usize, String> {
-        self.poll_until(timeout, |_| false).map(|(_, records)| records)
+        self.poll_until(timeout, |_| false)
+            .map(|(_, records)| records)
     }
 
     /// Poll until a caller-selected decoded event arrives or the bounded
@@ -167,8 +169,8 @@ impl DeviceSession {
                         .map_err(|error| error.to_string())?
                     {
                         records += 1;
-                        match quic_lite::uart::classify_uart_payload(&frame) {
-                            Ok(quic_lite::uart::UartIngress::DirectRecord(record)) => {
+                        match classify_uart_payload(&frame) {
+                            Ok(UartIngress::DirectRecord(record)) => {
                                 let event = DeviceSessionEvent::DirectRecord(record.to_vec());
                                 let is_match = matched(&event);
                                 self.push_event(event);
@@ -177,7 +179,7 @@ impl DeviceSession {
                                     return Ok((true, records));
                                 }
                             }
-                            Ok(quic_lite::uart::UartIngress::Transport(packet)) => {
+                            Ok(UartIngress::Transport(packet)) => {
                                 let event = DeviceSessionEvent::TransportPacket(packet.to_vec());
                                 let is_match = matched(&event);
                                 self.push_event(event);
@@ -229,7 +231,8 @@ impl DeviceSession {
         F: FnMut(&DeviceSessionEvent) -> bool,
     {
         self.send_direct_record(record)?;
-        self.poll_until(timeout, matched).map(|(matched, _)| matched)
+        self.poll_until(timeout, matched)
+            .map(|(matched, _)| matched)
     }
 
     fn push_event(&mut self, event: DeviceSessionEvent) {
@@ -252,8 +255,8 @@ fn is_fatal_diagnostic(line: &str) -> bool {
         // restarted during this suite even if it did not print a panic.
         "rst:",
     ]
-        .iter()
-        .any(|marker| line.contains(marker))
+    .iter()
+    .any(|marker| line.contains(marker))
 }
 
 /// Bearer-neutral path policy accepted by the host CLI and the future
@@ -294,7 +297,7 @@ impl ClientPathPolicy {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--command TEXT | --direct-hex HEX | --iperf-bytes N] [--parallel-streams 1..4] [--high-priority-bytes N] [--low-priority-bytes N] [--target-bps N] [--timeout-secs N]\n       dmesh-cli udp://HOST:PORT|IP|DEVICE --udp-probe\n       dmesh-cli udp://HOST:PORT|IP|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N] [--socket PATH]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--command TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--command TEXT | --direct-hex HEX | --iperf-bytes N] [--parallel-streams 1..4] [--high-priority-bytes N] [--low-priority-bytes N] [--target-bps N] [--timeout-secs N]\n       dmesh-cli udp://HOST:PORT|IP|DEVICE --udp-probe\n       dmesh-cli udp://HOST:PORT|IP|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N] [--socket PATH]"
     );
     std::process::exit(2)
 }
@@ -448,6 +451,30 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         }
         return run_serial_watch(&arguments);
     }
+    // Raw records are an intentional, bounded physical-bearer lane for
+    // schema-defined bootstrap/control and diagnostics. Resolve a named
+    // device to its serial identity *before* normal UDP preference: a profile
+    // may describe both bearers, but `--command` must never silently become a
+    // UDP request.
+    if arguments
+        .get(1)
+        .is_some_and(|argument| matches!(argument.as_str(), "--direct-hex" | "--command"))
+    {
+        let target = arguments.first().cloned().unwrap_or_else(|| usage());
+        if !target.starts_with('/') {
+            if target.starts_with("udp://") || target.contains(':') {
+                return Err(
+                    "--command requires a serial path or device profile, not a UDP target".into(),
+                );
+            }
+            let profile = load_device(&target)?;
+            let serial = profile
+                .serial_path()
+                .ok_or_else(|| format!("device {target:?} has no serial_id for --command"))?;
+            arguments[0] = serial.display().to_string();
+        }
+        return run_serial_direct_record(&arguments);
+    }
     if let Some(target) = arguments
         .first()
         .cloned()
@@ -477,16 +504,6 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         .is_some_and(|target| target.starts_with("udp://"))
     {
         return run_udp_service_client(&arguments);
-    }
-    // Raw records are an intentional, bounded physical-bearer lane for
-    // schema-defined bootstrap/control and diagnostics. They are not a
-    // degenerate UDP bridge and must not synthesize a QUIC-lite OPEN just to
-    // send one CBOR method.
-    if arguments
-        .get(1)
-        .is_some_and(|argument| matches!(argument.as_str(), "--direct-hex" | "--command"))
-    {
-        return run_serial_direct_record(&arguments);
     }
     // A serial service probe is a direct QUIC-lite client, not the older
     // UART-to-UDP bridge mode below.  It is the smallest end-to-end check for
@@ -666,7 +683,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
     let mut serial = open_serial(&path)?;
-    configure_serial(&serial, baud)?;
+    configure_serial(&serial, None)?;
     if let Some(record) = direct {
         send_ppp(&mut serial, &record)?;
     }
@@ -766,8 +783,8 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
                     .push(&buffer[..used])
                     .map_err(|error| error.to_string())?
                 {
-                    match quic_lite::uart::classify_uart_payload(&record) {
-                        Ok(quic_lite::uart::UartIngress::Transport(packet)) => {
+                    match classify_uart_payload(&record) {
+                        Ok(UartIngress::Transport(packet)) => {
                             egress.on_path_feedback();
                             if let PathBridgeAction::ToBackend(packet) =
                                 bridge.on_secondary_path(packet)
@@ -777,7 +794,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
                                     .map_err(|error| error.to_string())?;
                             }
                         }
-                        Ok(quic_lite::uart::UartIngress::DirectRecord(record)) => {
+                        Ok(UartIngress::DirectRecord(record)) => {
                             eprintln!(
                                 "dmesh_device_record bearer=uart bytes={} {}",
                                 record.len(),
@@ -847,7 +864,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
 }
 
 /// Direct physical reset for the client that owns the serial port.  This is
-/// intentionally outside lmesh-uart's retired forwarding service.
+/// intentionally outside any retired forwarding service.
 fn reset_serial(path: &str) -> Result<(), String> {
     let file = open_serial(path)?;
     let mut mask = libc::TIOCM_RTS;
@@ -964,22 +981,45 @@ fn run_serial_service_probe(arguments: &[String]) -> Result<(), String> {
 /// normal PPP framing, serial ownership, and schema rendering.
 fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
     let path = arguments.first().ok_or("missing serial path")?;
-    let (record, baud) = match arguments.get(1).map(String::as_str) {
-        Some("--direct-hex") if arguments.len() == 3 => (hex(&arguments[2])?, None),
-        Some("--command") if arguments.len() == 3 => (
-            encode_direct_command(&arguments[2]).map_err(|error| error.to_string())?,
-            None,
-        ),
-        Some("--direct-hex") | Some("--command") => {
-            return Err("raw record accepts exactly one payload".into());
+    let mut index = 1;
+    let mut timeout = Duration::from_secs(2);
+    let record = match arguments.get(index).map(String::as_str) {
+        Some("--direct-hex") => {
+            index += 1;
+            hex(arguments.get(index).ok_or("missing --direct-hex value")?)?
+        }
+        Some("--command") => {
+            index += 1;
+            encode_direct_command(arguments.get(index).ok_or("missing --command value")?)
+                .map_err(|error| error.to_string())?
         }
         _ => usage(),
     };
+    index += 1;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--timeout-secs" => {
+                index += 1;
+                timeout = Duration::from_secs(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --timeout-secs value")?
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            argument => return Err(format!("raw record does not support {argument}")),
+        }
+        index += 1;
+    }
     if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1 {
         return Err("raw record is empty or exceeds the UART MTU".into());
     }
     let mut serial = open_serial(path)?;
-    configure_serial(&serial, baud)?;
+    // Direct PPP records use the platform's normal serial speed. Baud-rate
+    // selection is a stream-session option and intentionally is not part of
+    // this one-record diagnostic path.
+    configure_serial(&serial, None)?;
     // USB-JTAG retains diagnostic records across short-lived CLI owners. Do
     // not mistake that old backlog for the reply to the record below.
     let mut stale = [0u8; 256];
@@ -997,7 +1037,7 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
     let schema = FirmwareSchema::load();
     let mut decoder = Decoder::with_max(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1);
     let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout;
     let mut replies = 0u32;
     while Instant::now() < deadline {
         match serial.read(&mut buffer) {
@@ -1006,9 +1046,7 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
                     .push(&buffer[..used])
                     .map_err(|error| error.to_string())?
                 {
-                    if let Ok(quic_lite::uart::UartIngress::DirectRecord(record)) =
-                        quic_lite::uart::classify_uart_payload(&frame)
-                    {
+                    if let Ok(UartIngress::DirectRecord(record)) = classify_uart_payload(&frame) {
                         println!(
                             "dmesh_cli_raw_reply bytes={} {}",
                             record.len(),
@@ -1064,9 +1102,9 @@ fn run_serial_service_request(
                     .push(&buffer[..used])
                     .map_err(|error| error.to_string())?
                 {
-                    let packet = match quic_lite::uart::classify_uart_payload(&record) {
-                        Ok(quic_lite::uart::UartIngress::Transport(packet)) => packet,
-                        Ok(quic_lite::uart::UartIngress::DirectRecord(record)) => {
+                    let packet = match classify_uart_payload(&record) {
+                        Ok(UartIngress::Transport(packet)) => packet,
+                        Ok(UartIngress::DirectRecord(record)) => {
                             report_uart_direct_record(path, record);
                             continue;
                         }
@@ -1155,9 +1193,9 @@ fn run_serial_service_request(
                     .push(&buffer[..used])
                     .map_err(|error| error.to_string())?
                 {
-                    let packet = match quic_lite::uart::classify_uart_payload(&record) {
-                        Ok(quic_lite::uart::UartIngress::Transport(packet)) => packet,
-                        Ok(quic_lite::uart::UartIngress::DirectRecord(record)) => {
+                    let packet = match classify_uart_payload(&record) {
+                        Ok(UartIngress::Transport(packet)) => packet,
+                        Ok(UartIngress::DirectRecord(record)) => {
                             report_uart_direct_record(path, record);
                             continue;
                         }
@@ -1364,8 +1402,8 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
                     .push(&buffer[..used])
                     .map_err(|error| error.to_string())?
                 {
-                    match quic_lite::uart::classify_uart_payload(&record) {
-                        Ok(quic_lite::uart::UartIngress::DirectRecord(record)) => {
+                    match classify_uart_payload(&record) {
+                        Ok(UartIngress::DirectRecord(record)) => {
                             direct_records = direct_records.saturating_add(1);
                             println!(
                                 "dmesh_uart_watch_record bytes={} {}",
@@ -1373,7 +1411,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
                                 render_device_record(&schema, record)
                             );
                         }
-                        Ok(quic_lite::uart::UartIngress::Transport(packet)) => {
+                        Ok(UartIngress::Transport(packet)) => {
                             transport_packets = transport_packets.saturating_add(1);
                             match ShortHeader::decode(packet) {
                                 Ok((header, _)) => println!(

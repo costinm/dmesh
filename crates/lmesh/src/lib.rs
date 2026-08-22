@@ -7,8 +7,10 @@
 use anyhow::{Context, Result};
 
 use p256::SecretKey;
+use p256::ecdsa::signature::{Signer, Verifier};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::Generate;
-use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,9 +28,29 @@ use tokio::sync::RwLock;
 
 use tracing::{debug, error, info, instrument, warn};
 
+/// A decoded common announce delivered by a local-link bearer. The callback
+/// takes semantic data, never a UDP buffer, so another local owner can merge
+/// it into its inventory without coupling the multicast receive loop to a
+/// particular Wi-Fi implementation.
+type AnnounceObserver = Arc<dyn Fn(SocketAddr, dmesh_server::announce::Announce) + Send + Sync>;
+
+/// Decode local control's bounded CBOR Service Info without creating another
+/// text wire for NAN. The same spelling is accepted by lmesh and lmesh-wifi.
+fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>> {
+    let value = value.trim().strip_prefix("hex:").unwrap_or(value.trim());
+    if value.is_empty() || value.len() % 2 != 0 {
+        anyhow::bail!("{field} must contain complete hexadecimal bytes");
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(Into::into))
+        .collect()
+}
+
 // The Wi-Fi crate owns the radio implementation. Re-export the wire protocol
 // here so existing Android/JNI callers keep the established lmesh path.
 pub use lmesh_wifi::radio_protocol;
+pub mod api;
 mod ble;
 
 const MULTICAST_PORT: u16 = 5227;
@@ -71,6 +93,20 @@ pub struct Node {
     pub last_seen: std::time::Instant,
     /// Optional metadata from the announcement
     pub metadata: Option<HashMap<String, String>>,
+    /// Typed common announce fields. Legacy JSON peers leave these absent.
+    pub announce: Option<ObservedAnnounce>,
+}
+
+/// Bounded, bearer-neutral announce information retained for one observed
+/// peer.  It is intentionally a schema, not a map of stringly typed tags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedAnnounce {
+    pub device_id: String,
+    pub kind: u64,
+    pub uptime_secs: u32,
+    pub transport_mode: u8,
+    pub counters: u32,
+    pub authenticated: bool,
 }
 
 /// Link-local discovery service
@@ -91,6 +127,10 @@ pub struct LocalDiscovery {
     socket_v4: Option<Arc<UdpSocket>>,
     /// IPv6 UDP socket
     socket_v6: Option<Arc<UdpSocket>>,
+    /// Optional semantic sink for signed/validated common CBOR announces.
+    /// The node map remains the compatibility view; this lets the owning
+    /// host radio expose one device inventory across UDP and NAN.
+    announce_observer: Arc<RwLock<Option<AnnounceObserver>>>,
 }
 
 impl LocalDiscovery {
@@ -130,7 +170,17 @@ impl LocalDiscovery {
             node_store_dir: Arc::new(Self::default_node_store_dir()?),
             socket_v4: None,
             socket_v6: None,
+            announce_observer: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Install the local semantic sink for common tagged-CBOR announces.
+    ///
+    /// This is deliberately a host-local integration point, not a network
+    /// control handler: UDP validation remains here, and the receiver owns
+    /// the ingress buffer before the bounded device registry is updated.
+    pub async fn set_announce_observer(&self, observer: AnnounceObserver) {
+        *self.announce_observer.write().await = Some(observer);
     }
 
     /// Load key from file or generate a new one
@@ -229,9 +279,16 @@ impl LocalDiscovery {
             let socket = socket.clone();
             let local_public_key = self.public_key_b64.clone();
             let node_store_dir = self.node_store_dir.clone();
+            let announce_observer = self.announce_observer.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    Self::receive_loop(socket, nodes, local_public_key, node_store_dir).await
+                if let Err(e) = Self::receive_loop(
+                    socket,
+                    nodes,
+                    local_public_key,
+                    node_store_dir,
+                    announce_observer,
+                )
+                .await
                 {
                     error!("IPv4 receive loop error: {}", e);
                 }
@@ -243,9 +300,16 @@ impl LocalDiscovery {
             let socket = socket.clone();
             let local_public_key = self.public_key_b64.clone();
             let node_store_dir = self.node_store_dir.clone();
+            let announce_observer = self.announce_observer.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    Self::receive_loop(socket, nodes, local_public_key, node_store_dir).await
+                if let Err(e) = Self::receive_loop(
+                    socket,
+                    nodes,
+                    local_public_key,
+                    node_store_dir,
+                    announce_observer,
+                )
+                .await
                 {
                     error!("IPv6 receive loop error: {}", e);
                 }
@@ -346,7 +410,7 @@ impl LocalDiscovery {
 
     /// Receive and process announcements
     #[instrument(
-        skip(socket, nodes, local_public_key, node_store_dir),
+        skip(socket, nodes, local_public_key, node_store_dir, announce_observer),
         fields(buf_size = 65536)
     )]
     async fn receive_loop(
@@ -354,6 +418,7 @@ impl LocalDiscovery {
         nodes: Arc<RwLock<HashMap<String, Node>>>,
         local_public_key: String,
         node_store_dir: Arc<PathBuf>,
+        announce_observer: Arc<RwLock<Option<AnnounceObserver>>>,
     ) -> Result<()> {
         let mut buf = vec![0u8; 65536];
 
@@ -364,6 +429,66 @@ impl LocalDiscovery {
                 .context("Failed to receive from socket")?;
 
             let data = &buf[..len];
+
+            // New unsigned presence wire. It deliberately shares the old
+            // local-link multicast socket but not its JSON envelope, so
+            // UART/NOW/NAN/UDP observe one bounded CBOR record.
+            if let Some(announce) = dmesh_server::announce::decode_announce(data) {
+                // ESP32 deliberately emits the unsigned form. A host or
+                // Android sender that supplies an identity must prove it:
+                // the key hash is its stable device id and the signature
+                // covers the canonical tagged-CBOR fields.
+                let public_key = if announce.has_identity() {
+                    let digest = Sha256::digest(announce.public_key());
+                    let signature = Signature::from_slice(announce.signature()).ok();
+                    let verifying_key =
+                        VerifyingKey::from_public_key_der(announce.public_key()).ok();
+                    let mut signed = [0u8; 384];
+                    let valid = signature.zip(verifying_key).and_then(|(signature, key)| {
+                        dmesh_server::announce::signing_bytes(announce, &mut signed)
+                            .map(|used| key.verify(&signed[..used], &signature).is_ok())
+                    }) == Some(true);
+                    if !valid || announce.device_id() != &digest[..announce.device_id().len()] {
+                        warn!(address = %addr, "dropping announce with invalid identity");
+                        continue;
+                    }
+                    base64_url_encode(announce.public_key())
+                } else {
+                    hex_encode(announce.device_id())
+                };
+                if public_key == local_public_key {
+                    continue;
+                }
+                // The validation above is authoritative. Forward only the
+                // validated semantic record, never an untrusted UDP frame,
+                // so NAN and UDP use one device-inventory schema.
+                Self::notify_announce_observer(&announce_observer, addr, announce).await;
+                let announce_info = ObservedAnnounce {
+                    device_id: hex_encode(announce.device_id()),
+                    kind: announce.kind,
+                    uptime_secs: announce.uptime_secs,
+                    transport_mode: announce.transport_mode,
+                    counters: announce.counters,
+                    authenticated: announce.has_identity(),
+                };
+                let node = Node {
+                    public_key: public_key.clone(),
+                    address: addr,
+                    last_seen: std::time::Instant::now(),
+                    metadata: None,
+                    announce: Some(announce_info.clone()),
+                };
+                let is_new = {
+                    let mut nodes_map = nodes.write().await;
+                    let is_new = !nodes_map.contains_key(&public_key);
+                    nodes_map.insert(public_key.clone(), node);
+                    is_new
+                };
+                info!(public_key = %public_key, address = %addr, announce = ?announce_info,
+                    event = if is_new { "node_seen" } else { "node_updated" },
+                    "announce_rx");
+                continue;
+            }
 
             // Parse the announcement
             match serde_json::from_slice::<Announce>(data) {
@@ -382,6 +507,7 @@ impl LocalDiscovery {
                         address: addr,
                         last_seen: std::time::Instant::now(),
                         metadata: announce.metadata.clone(),
+                        announce: None,
                     };
 
                     let public_key = node.public_key.clone();
@@ -426,30 +552,106 @@ impl LocalDiscovery {
         }
     }
 
+    async fn notify_announce_observer(
+        announce_observer: &Arc<RwLock<Option<AnnounceObserver>>>,
+        peer: SocketAddr,
+        announce: dmesh_server::announce::Announce,
+    ) {
+        if let Some(observer) = announce_observer.read().await.clone() {
+            observer(peer, announce);
+        }
+    }
+
     /// Send an announcement to the multicast group
     #[instrument(skip(self))]
     pub async fn announce(&self) -> Result<()> {
         self.announce_with_metadata(None).await
     }
 
+    /// Build the compact signed host presence record used as NAN Publish
+    /// Service Info. ESP32 uses the explicitly unsigned form, but a host has
+    /// a key pair and must not silently drop its identity merely because the
+    /// bearer is NAN. Reject a key/signature combination that cannot fit the
+    /// NAN Service-Info bound rather than emitting an unverifiable key.
+    pub fn nan_announce_service_info(&self, uptime_secs: u64) -> Result<Vec<u8>> {
+        let digest = Sha256::digest(&self.public_key);
+        let mut device_id = [0; 16];
+        device_id.copy_from_slice(&digest[..16]);
+        let mut announce = dmesh_server::announce::Announce::discovery(
+            device_id,
+            device_id.len() as u8,
+            uptime_secs.min(u64::from(u32::MAX)) as u32,
+            0,
+            0,
+        );
+        if !announce.set_public_key(&self.public_key) {
+            anyhow::bail!("local public key exceeds announce bound");
+        }
+        let signing_key = SigningKey::from(
+            SecretKey::from_pkcs8_der(&self.private_key)
+                .context("Failed to decode local NAN announce signing key")?,
+        );
+        let mut signing_wire = [0u8; 384];
+        let signing_len = dmesh_server::announce::signing_bytes(announce, &mut signing_wire)
+            .context("Failed to encode local NAN announce signing bytes")?;
+        let signature: Signature = signing_key.sign(&signing_wire[..signing_len]);
+        if !announce.set_signature(signature.to_bytes().as_ref()) {
+            anyhow::bail!("local NAN announce signature has invalid length");
+        }
+        let mut wire = [0; 384];
+        let used = dmesh_server::announce::encode(announce, &mut wire)
+            .context("Failed to encode NAN Service Info announce")?;
+        if used > dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN {
+            anyhow::bail!(
+                "signed NAN Service Info announce is {used} bytes; limit is {}",
+                dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN
+            );
+        }
+        Ok(wire[..used].to_vec())
+    }
+
     /// Send an announcement with optional metadata
-    #[instrument(skip(self, metadata))]
+    #[instrument(skip(self, _metadata))]
     pub async fn announce_with_metadata(
         &self,
-        metadata: Option<HashMap<String, String>>,
+        _metadata: Option<HashMap<String, String>>,
     ) -> Result<()> {
-        let announce = Announce {
-            public_key: self.public_key_b64.clone(),
-            metadata,
-        };
-
-        let json = serde_json::to_vec(&announce).context("Failed to serialize announcement")?;
+        // Keep the radio record identical across UDP/NOW/NAN/UART. Unlike an
+        // ESP32 presence hint, a host carries its P-256 identity and signs the
+        // canonical fields. Receivers accept unsigned records only when no
+        // public key is present.
+        let digest = Sha256::digest(&self.public_key);
+        let mut device_id = [0; 16];
+        device_id.copy_from_slice(&digest[..16]);
+        let mut announce =
+            dmesh_server::announce::Announce::discovery(device_id, device_id.len() as u8, 0, 0, 0);
+        if !announce.set_public_key(&self.public_key) {
+            anyhow::bail!("local public key exceeds announce bound");
+        }
+        let signing_key = SigningKey::from(
+            SecretKey::from_pkcs8_der(&self.private_key)
+                .context("Failed to decode local announce signing key")?,
+        );
+        // A signed host record contains the public-key DER in addition to
+        // the common announce fields. Keep this host-only scratch larger than
+        // the ESP/NAN unsigned wire; 256 bytes can reject valid P-256 keys
+        // before the service has opened its control socket.
+        let mut signing_wire = [0u8; 384];
+        let signing_len = dmesh_server::announce::signing_bytes(announce, &mut signing_wire)
+            .context("Failed to encode local announce signing bytes")?;
+        let signature: Signature = signing_key.sign(&signing_wire[..signing_len]);
+        if !announce.set_signature(signature.to_bytes().as_ref()) {
+            anyhow::bail!("local announce signature has invalid length");
+        }
+        let mut wire = [0; 384];
+        let used = dmesh_server::announce::encode(announce, &mut wire)
+            .context("Failed to encode local announce")?;
 
         // Send to IPv4 multicast
         if let Some(socket) = &self.socket_v4 {
             let addr = SocketAddr::new(IpAddr::V4(MULTICAST_IPV4), MULTICAST_PORT);
             socket
-                .send_to(&json, addr)
+                .send_to(&wire[..used], addr)
                 .await
                 .context("Failed to send IPv4 announcement")?;
         }
@@ -458,7 +660,7 @@ impl LocalDiscovery {
         if let Some(socket) = &self.socket_v6 {
             let addr = SocketAddr::new(IpAddr::V6(MULTICAST_IPV6), MULTICAST_PORT);
             socket
-                .send_to(&json, addr)
+                .send_to(&wire[..used], addr)
                 .await
                 .context("Failed to send IPv6 announcement")?;
         }
@@ -474,6 +676,7 @@ impl LocalDiscovery {
     /// Get a snapshot of currently discovered nodes
     #[instrument(skip(self))]
     pub async fn get_nodes(&self) -> HashMap<String, Node> {
+        self.prune_expired_nodes().await;
         self.nodes.read().await.clone()
     }
 
@@ -481,10 +684,23 @@ impl LocalDiscovery {
     #[instrument(skip(self), fields(public_key = %public_key))]
     pub async fn get_node(&self, public_key: &str) -> Option<Node> {
         debug!("Getting node by public key");
+        self.prune_expired_nodes().await;
         let nodes = self.nodes.read().await;
         let result = nodes.get(public_key).cloned();
         debug!("Node {}found", if result.is_some() { "" } else { "not " });
         result
+    }
+
+    /// Discovery records are soft state. Keep the host inventory useful after
+    /// a peer disappears rather than presenting stale unsigned announcements
+    /// indefinitely.
+    async fn prune_expired_nodes(&self) {
+        const NODE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+        let now = std::time::Instant::now();
+        self.nodes
+            .write()
+            .await
+            .retain(|_, node| now.duration_since(node.last_seen) <= NODE_TTL);
     }
 
     fn default_node_store_dir() -> Result<PathBuf> {
@@ -596,6 +812,10 @@ pub struct NodeInfo {
     /// Optional metadata from the announcement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+    /// Common tagged-CBOR announce fields, when the peer used the current
+    /// bearer-neutral presence protocol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announce: Option<ObservedAnnounce>,
 }
 
 impl From<Node> for NodeInfo {
@@ -604,6 +824,7 @@ impl From<Node> for NodeInfo {
             public_key: node.public_key,
             address: node.address,
             metadata: node.metadata,
+            announce: node.announce,
         }
     }
 }
@@ -623,6 +844,9 @@ pub enum Request {
     /// Return all currently discovered nodes.
     #[serde(rename = "nodes", alias = "list_nodes")]
     Nodes,
+    /// Return typed presence announcements observed across all local bearers.
+    #[serde(rename = "announces")]
+    Announces,
     /// Return one discovered node by public key.
     #[serde(rename = "get_node")]
     GetNode { public_key: String },
@@ -669,165 +893,6 @@ pub enum Request {
         #[serde(default)]
         destination: Option<String>,
         payload: String,
-    },
-    /// List USB serial devices visible to lmesh.
-    #[serde(rename = "usb.serial.list")]
-    UsbSerialList {
-        #[serde(default)]
-        handshake: Option<bool>,
-    },
-    /// Run a generic or firmware-specific USB serial handshake.
-    #[serde(rename = "usb.serial.handshake")]
-    UsbSerialHandshake {
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        profile: Option<String>,
-        #[serde(default)]
-        timeout_sec: Option<f64>,
-        #[serde(default)]
-        baud: Option<u32>,
-    },
-    /// Send a fixed PPP-framed stage2 boot command through a managed forward.
-    #[serde(rename = "usb.serial.boot")]
-    UsbSerialBoot {
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        command: Option<String>,
-        #[serde(default)]
-        timeout_sec: Option<f64>,
-        #[serde(default)]
-        reset: Option<bool>,
-    },
-    /// Pulse RTS to reset a board through a USB-UART bridge (explicit recovery tool).
-    #[serde(rename = "usb.serial.rst", alias = "usb.serial.reset")]
-    UsbSerialReset {
-        #[serde(default)]
-        port: Option<String>,
-    },
-    /// Set or pulse DTR on a USB-UART bridge (explicit hardware test tool).
-    #[serde(rename = "usb.serial.dtr")]
-    UsbSerialDtr {
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        asserted: Option<bool>,
-        #[serde(default)]
-        pulse_ms: Option<u64>,
-    },
-    /// Run one low-level command against an ESP firmware adapter.
-    #[serde(rename = "esp.serial.command")]
-    EspSerialCommand {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-        command: String,
-        #[serde(default)]
-        timeout_sec: Option<f64>,
-        /// Optional infrastructure gateway for a raw-NAN addressed command.
-        #[serde(default)]
-        gateway: Option<String>,
-        /// Target ESP MAC or eight-hex suffix when `gateway` is present.
-        #[serde(default)]
-        target: Option<String>,
-        /// Optional bounded "I want to talk" window before the command. If
-        /// omitted, the command is sent as one DW-gated message.
-        #[serde(default)]
-        active_ms: Option<u32>,
-        /// Force one managed-forward request through immediately. This is a
-        /// diagnostic escape for a board already known to be awake; normal
-        /// callers must leave it unset so sleepy-node queueing is preserved.
-        #[serde(default)]
-        force_direct: Option<bool>,
-    },
-    /// Enter or leave the runtime-only ESP powered/transfer radio mode.
-    #[serde(rename = "esp.active")]
-    EspActive {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        active: Option<bool>,
-        #[serde(default)]
-        active_ms: Option<u32>,
-        /// Powered serial gateway that queues an addressed raw-NAN command.
-        /// When absent, operate on the directly attached adapter/port.
-        #[serde(default)]
-        gateway: Option<String>,
-        /// Destination Wi-Fi MAC or four-byte suffix for gateway delivery.
-        #[serde(default)]
-        target: Option<String>,
-    },
-    /// Return LoRa status from an ESP firmware adapter.
-    #[serde(rename = "esp.lora.status")]
-    EspLoraStatus {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-    },
-    /// Return raw Wi-Fi status from an ESP firmware adapter.
-    #[serde(rename = "esp.wifi.raw_status")]
-    EspWifiRawStatus {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-    },
-    /// Return power/sleep status from an ESP firmware adapter.
-    #[serde(rename = "esp.sleep.status")]
-    EspSleepStatus {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-    },
-    /// Return telemetry counters from an ESP firmware adapter.
-    #[serde(rename = "esp.telemetry.stats")]
-    EspTelemetryStats {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        reset: Option<bool>,
-    },
-    /// Start a background LoRa and host-NAN discovery stability runner.
-    #[serde(rename = "esp.stability.start")]
-    EspStabilityStart {
-        #[serde(default)]
-        source: Option<String>,
-        #[serde(default)]
-        expected: Option<String>,
-        #[serde(default)]
-        interval_sec: Option<u64>,
-        #[serde(default)]
-        wait_sec: Option<u64>,
-        #[serde(default)]
-        cycles: Option<u32>,
-        #[serde(default)]
-        host_nan: Option<bool>,
-    },
-    /// Return the latest managed LoRa discovery stability result.
-    #[serde(rename = "esp.stability.status")]
-    EspStabilityStatus,
-    /// Stop the managed LoRa discovery stability runner.
-    #[serde(rename = "esp.stability.stop")]
-    EspStabilityStop,
-    /// Probe ESP ADC pins used for battery detection.
-    #[serde(rename = "esp.battery.adc_probe")]
-    EspBatteryAdcProbe {
-        #[serde(default)]
-        adapter: Option<String>,
-        #[serde(default)]
-        port: Option<String>,
-        #[serde(default)]
-        adc1_pins: Option<String>,
-        #[serde(default)]
-        count: Option<u32>,
     },
     /// Record an explicit steering hint for a peer.
     #[serde(rename = "link.steer")]
@@ -1040,6 +1105,17 @@ pub enum Request {
         #[serde(default)]
         iface: Option<String>,
     },
+    /// Replace the active NAN Publish Service Info on the lmesh-owned radio.
+    /// The bytes are canonical CBOR and actual emission stays DW-gated in the
+    /// Wi-Fi adapter; this control request never touches interface state.
+    #[serde(rename = "wifi.rawnan.active_publish")]
+    WifiRawNanActivePublish {
+        #[serde(default)]
+        iface: Option<String>,
+        enabled: bool,
+        #[serde(default)]
+        service_info_hex: Option<String>,
+    },
     /// Size a NAN object transfer without opening an IP socket or touching a
     /// device. The same envelope is used by data frames and action diagnostics.
     #[serde(rename = "object.nan.dry_run")]
@@ -1086,6 +1162,14 @@ pub enum Request {
         iface: Option<String>,
         #[serde(default)]
         ssid: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        ht40: Option<bool>,
+        /// AP timing is a lab/startup property, never an automated test
+        /// action. The radio implementation clamps this to 10--1000 TU.
+        #[serde(default)]
+        beacon_interval_tu: Option<u16>,
     },
     /// Stop AP operation.
     #[serde(rename = "wifi.ap.stop")]
@@ -1121,6 +1205,10 @@ pub enum Request {
         iface: Option<String>,
         #[serde(default)]
         ssid: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        passive: Option<bool>,
     },
     /// Join an open AP on the shared DMesh channel.
     #[serde(rename = "wifi.sta.join_open")]
@@ -1166,19 +1254,6 @@ pub enum Request {
     },
 }
 
-/// Reusable lmesh command service.
-fn uart_dispatch_response(value: serde_json::Value) -> mesh::protocol::Response {
-    if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
-        return mesh::protocol::Response::err(
-            value
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("UART request failed"),
-        );
-    }
-    mesh::protocol::Response::ok_with_data(value.get("data").cloned().unwrap_or_default())
-}
-
 pub struct LmeshService {
     discovery: Arc<LocalDiscovery>,
     ble: ble::BleService,
@@ -1188,14 +1263,15 @@ pub struct LmeshService {
     /// wlan1), while lmesh-wifi remains an independent wlan0 instance.
     wifi_service: lmesh_wifi::WifiService,
     radio: lmesh_wifi::RadioService,
-    uart: lmesh_uart::UartService,
     wifi: lmesh_wifi::WifiNetd,
 }
 
 impl LmeshService {
     /// Create a service around an initialized discovery instance.
     pub fn new(discovery: Arc<LocalDiscovery>) -> Self {
-        let wifi_service = lmesh_wifi::WifiService::from_environment();
+        let wifi_service = lmesh_wifi::WifiService::from_environment_with_discovery_log(
+            "/run/mesh/lmesh/discovery.jsonl",
+        );
         let radio = wifi_service.radio().clone();
         let wifi = wifi_service.netd().clone();
         for result in radio.apply_startup_rate_profile(wifi.owned_interfaces().names()) {
@@ -1244,27 +1320,68 @@ impl LmeshService {
             discovery,
             ble: ble::BleService,
             wifi_service,
-            // UART ownership is isolated in lmesh-uart. Keep the full lmesh
-            // service's UART API available for compatibility, but do not
-            // open serial devices or start configured forwards here.
             radio,
-            uart: lmesh_uart::UartService::from_environment_without_uart(),
             wifi,
         }
     }
 
-    /// Start the default open channel-6 access point on the supplied interface.
-    pub fn start_default_open_ap(&self, iface: String) -> serde_json::Value {
+    /// Start the optional lmesh lab AP. lmesh-wifi remains the normal 100-TU
+    /// infrastructure AP; this independently owned AP defaults to 500 TU.
+    pub fn start_default_open_ap(
+        &self,
+        iface: String,
+        channel: u8,
+        beacon_interval_tu: u16,
+    ) -> serde_json::Value {
         if let Err(error) = self.wifi.authorize(lmesh_wifi::Operation::Ap, &iface) {
             return serde_json::json!({"success": false, "error": error.to_string()});
         }
-        self.radio.wifi_ap_start_open(Some(iface), None)
+        self.radio.wifi_ap_start_open_on_channel_with_interval(
+            Some(iface),
+            None,
+            Some(channel),
+            Some(false),
+            beacon_interval_tu,
+        )
     }
 
-    /// Start the experimental raw-NAN monitor on this service's owned
-    /// interface (normally wlan1).
+    /// Attach the experimental raw-NAN receiver to this service's permanent
+    /// monitor fixture (normally `wlan1mon`).
     pub fn start_default_rawnan(&self) -> serde_json::Value {
         self.wifi_service.start_canary_rawnan(None)
+    }
+
+    /// Refresh lmesh's always-on active NAN Publish descriptor with the same
+    /// compact CBOR announce used by other bearer discovery. The radio adapter
+    /// queues it for an observed DW; this method never starts/stops a host
+    /// interface or sends immediately.
+    pub fn refresh_active_nan_publish(&self, uptime_secs: u64) -> Result<serde_json::Value> {
+        let service_info = self.discovery.nan_announce_service_info(uptime_secs)?;
+        self.radio
+            .rawnan_active_publish_configure(true, &service_info)
+    }
+
+    /// Prepare the AP-off, fixed-channel monitor fixture before raw-NAN/NOW
+    /// listeners attach.  The caller owns this startup transition.
+    pub fn prepare_default_rawnan_monitor(&self, channel: u8) -> serde_json::Value {
+        self.wifi_service
+            .prepare_canary_rawnan_monitor(None, Some(channel))
+    }
+
+    /// Prepare the shared NAN+NOW monitor without disturbing the optional AP
+    /// which is the channel anchor for this lmesh startup personality.
+    pub fn prepare_default_ap_rawnan_monitor(&self, channel: u8) -> serde_json::Value {
+        self.radio
+            .prepare_ap_raw_monitor_fixture(None, Some(channel))
+    }
+
+    /// Associate the owned interface with an open AP after the common NAN/NOW
+    /// monitor fixture has been prepared.
+    pub fn start_default_open_sta(&self, ssid: String) -> serde_json::Value {
+        match self.owned_wifi_iface(None, lmesh_wifi::Operation::Sta) {
+            Ok(iface) => self.radio.wifi_sta_join_open(Some(iface), ssid),
+            Err(error) => serde_json::json!({"ok": false, "error": error}),
+        }
     }
 
     fn owned_wifi_iface(
@@ -1286,6 +1403,26 @@ impl LmeshService {
         self.discovery.public_key_b64()
     }
 
+    /// Merge an already validated multicast observation with the host radio's
+    /// bounded device inventory. This uses the same change-only log policy as
+    /// raw NAN observations; it does not expose an unauthenticated remote
+    /// mutation surface.
+    pub fn observe_multicast_announce(
+        &self,
+        peer: SocketAddr,
+        announce: dmesh_server::announce::Announce,
+    ) {
+        self.radio
+            .observe_discovered_announce("udp_multicast", peer.to_string(), None, announce);
+    }
+
+    /// Submit a complete canonical tagged-CBOR record to the selected mesh
+    /// next hop.  The radio adapter receives bytes, not a JSON projection, so
+    /// opaque envelope data remains binary end-to-end.
+    pub fn forward_tagged_record(&self, destination: &str, record: &[u8]) -> serde_json::Value {
+        self.radio.send_tagged_record(destination, record)
+    }
+
     /// Handle a single JSON-lines request.
     pub async fn handle_request(&self, request: Request) -> mesh::protocol::Response {
         match request {
@@ -1298,6 +1435,17 @@ impl LmeshService {
                     .map(NodeInfo::from)
                     .collect::<Vec<_>>();
                 mesh::protocol::Response::ok_with_data(serde_json::json!(nodes))
+            }
+            Request::Announces => {
+                let announces = self
+                    .discovery
+                    .get_nodes()
+                    .await
+                    .into_values()
+                    .filter(|node| node.announce.is_some())
+                    .map(NodeInfo::from)
+                    .collect::<Vec<_>>();
+                mesh::protocol::Response::ok_with_data(serde_json::json!(announces))
             }
             Request::GetNode { public_key } => match self.discovery.get_node(&public_key).await {
                 Some(node) => {
@@ -1331,164 +1479,6 @@ impl LmeshService {
             } => {
                 mesh::protocol::Response::ok_with_data(self.radio.send(radio, payload, destination))
             }
-            Request::UsbSerialList { handshake } => {
-                uart_dispatch_response(lmesh_uart::handle_request(
-                    &self.uart,
-                    serde_json::json!({"method": "usb.serial.list", "handshake": handshake}),
-                ))
-            }
-            Request::UsbSerialHandshake {
-                port,
-                profile,
-                timeout_sec,
-                baud,
-            } => uart_dispatch_response(lmesh_uart::handle_request(
-                &self.uart,
-                serde_json::json!({
-                    "method": "usb.serial.handshake",
-                    "port": port,
-                    "profile": profile,
-                    "timeout_sec": timeout_sec,
-                    "baud": baud,
-                }),
-            )),
-            Request::UsbSerialBoot {
-                port,
-                command,
-                timeout_sec,
-                reset,
-            } => uart_dispatch_response(lmesh_uart::handle_request(
-                &self.uart,
-                serde_json::json!({
-                    "method": "usb.serial.boot",
-                    "port": port,
-                    "command": command,
-                    "timeout_sec": timeout_sec,
-                    "reset": reset,
-                }),
-            )),
-            Request::UsbSerialReset { port } => uart_dispatch_response(lmesh_uart::handle_request(
-                &self.uart,
-                serde_json::json!({"method": "usb.serial.reset", "port": port}),
-            )),
-            Request::UsbSerialDtr {
-                port,
-                asserted,
-                pulse_ms,
-            } => uart_dispatch_response(lmesh_uart::handle_request(
-                &self.uart,
-                serde_json::json!({
-                    "method": "usb.serial.dtr",
-                    "port": port,
-                    "asserted": asserted,
-                    "pulse_ms": pulse_ms,
-                }),
-            )),
-            Request::EspSerialCommand {
-                adapter,
-                port,
-                command,
-                timeout_sec,
-                gateway,
-                target,
-                active_ms,
-                force_direct,
-            } => {
-                let default_route = gateway
-                    .is_none()
-                    .then(|| {
-                        self.radio
-                            .default_esp_route(port.as_deref(), adapter.as_deref())
-                    })
-                    .flatten();
-                let route = gateway
-                    .map(|gateway| (gateway, target))
-                    .or(default_route.map(|(gateway, target)| (gateway, Some(target))));
-                mesh::protocol::Response::ok_with_data(if let Some((gateway, target)) = route {
-                    self.radio
-                        .esp_remote_command(gateway, target, command, timeout_sec, active_ms)
-                } else {
-                    self.radio.esp_serial_command_with_options(
-                        adapter,
-                        port,
-                        command,
-                        timeout_sec,
-                        force_direct.unwrap_or(false),
-                    )
-                })
-            }
-            Request::EspActive {
-                adapter,
-                port,
-                active,
-                active_ms,
-                gateway,
-                target,
-            } => {
-                let default_route = gateway
-                    .is_none()
-                    .then(|| {
-                        self.radio
-                            .default_esp_route(port.as_deref(), adapter.as_deref())
-                    })
-                    .flatten();
-                let (gateway, target) = gateway
-                    .map(|gateway| (Some(gateway), target.clone()))
-                    .or_else(|| {
-                        default_route.map(|(gateway, target)| (Some(gateway), Some(target)))
-                    })
-                    .unwrap_or((None, target));
-                mesh::protocol::Response::ok_with_data(
-                    self.radio
-                        .esp_active(adapter, port, active, active_ms, gateway, target),
-                )
-            }
-            Request::EspLoraStatus { adapter, port } => {
-                mesh::protocol::Response::ok_with_data(self.radio.esp_lora_status(adapter, port))
-            }
-            Request::EspWifiRawStatus { adapter, port } => mesh::protocol::Response::ok_with_data(
-                self.radio.esp_wifi_raw_status(adapter, port),
-            ),
-            Request::EspSleepStatus { adapter, port } => {
-                mesh::protocol::Response::ok_with_data(self.radio.esp_sleep_status(adapter, port))
-            }
-            Request::EspTelemetryStats {
-                adapter,
-                port,
-                reset,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio.esp_telemetry_stats(adapter, port, reset),
-            ),
-            Request::EspStabilityStart {
-                source,
-                expected,
-                interval_sec,
-                wait_sec,
-                cycles,
-                host_nan,
-            } => mesh::protocol::Response::ok_with_data(self.radio.stability_start(
-                source,
-                expected,
-                interval_sec,
-                wait_sec,
-                cycles,
-                host_nan,
-            )),
-            Request::EspStabilityStatus => {
-                mesh::protocol::Response::ok_with_data(self.radio.stability_status())
-            }
-            Request::EspStabilityStop => {
-                mesh::protocol::Response::ok_with_data(self.radio.stability_stop())
-            }
-            Request::EspBatteryAdcProbe {
-                adapter,
-                port,
-                adc1_pins,
-                count,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio
-                    .esp_battery_adc_probe(adapter, port, adc1_pins, count),
-            ),
             Request::LinkSteer {
                 node,
                 radio,
@@ -1585,6 +1575,7 @@ impl LmeshService {
                 tx_rate_mbps.map(u64::from),
                 tx_variant,
                 rx_variant,
+                None,
             )),
             Request::WifiRawCheck {
                 iface,
@@ -1604,10 +1595,11 @@ impl LmeshService {
                 tx_rate_mbps.map(u64::from),
                 tx_variant,
                 rx_variant,
+                None,
             )),
-            Request::WifiRawMetrics { iface } => mesh::protocol::Response::ok_with_data(
-                self.radio.wifi_raw_metrics(iface),
-            ),
+            Request::WifiRawMetrics { iface } => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_metrics(iface))
+            }
             Request::WifiRawSend {
                 iface,
                 channel,
@@ -1623,8 +1615,13 @@ impl LmeshService {
                 tx_rate_mbps,
             } => {
                 let result = if let Some(frame_hex) = frame_hex {
-                    self.radio
-                        .wifi_raw_send_frame(iface, channel, tx_variant, frame_hex, tx_rate_mbps)
+                    self.radio.wifi_raw_send_frame(
+                        iface,
+                        channel,
+                        tx_variant,
+                        frame_hex,
+                        tx_rate_mbps,
+                    )
                 } else {
                     self.radio.wifi_raw_send(
                         iface,
@@ -1680,6 +1677,24 @@ impl LmeshService {
             Request::WifiRawNanStatus { iface } => {
                 mesh::protocol::Response::ok_with_data(self.radio.rawnan_status(iface))
             }
+            Request::WifiRawNanActivePublish {
+                iface: _,
+                enabled,
+                service_info_hex,
+            } => {
+                let decoded = match service_info_hex {
+                    Some(value) => decode_hex(&value, "service_info_hex"),
+                    None if !enabled => Ok(Vec::new()),
+                    None => Err(anyhow::anyhow!("service_info_hex is required when enabled")),
+                };
+                match decoded.and_then(|service_info| {
+                    self.radio
+                        .rawnan_active_publish_configure(enabled, &service_info)
+                }) {
+                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
             Request::ObjectNanDryRun { image_size, mtu } => mesh::protocol::Response::ok_with_data(
                 nan_object_dry_run(image_size, mtu.unwrap_or(1_200)),
             ),
@@ -1712,10 +1727,26 @@ impl LmeshService {
                     mesh::protocol::Response::err(format!("wifi.mgmt.capture failed: {error:#}"))
                 }
             },
-            Request::WifiApStartOpen { iface, ssid } => {
+            Request::WifiApStartOpen {
+                iface,
+                ssid,
+                channel,
+                ht40,
+                beacon_interval_tu,
+            } => {
                 match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Ap) {
                     Ok(iface) => mesh::protocol::Response::ok_with_data(
-                        self.radio.wifi_ap_start_open(Some(iface), ssid),
+                        self.radio.wifi_ap_start_open_on_channel_with_interval(
+                            Some(iface),
+                            ssid,
+                            channel,
+                            ht40,
+                            // lmesh owns the optional lab AP; its quiet
+                            // channel anchor is 500 TU by default. The
+                            // independently supervised lmesh-wifi AP keeps
+                            // the normal 100-TU default in its own handler.
+                            beacon_interval_tu.unwrap_or(500),
+                        ),
                     ),
                     Err(error) => mesh::protocol::Response::err(error),
                 }
@@ -1752,9 +1783,17 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error),
                 }
             }
-            Request::WifiScan { iface, ssid } => {
-                mesh::protocol::Response::ok_with_data(self.radio.wifi_scan(iface, ssid))
-            }
+            Request::WifiScan {
+                iface,
+                ssid,
+                channel,
+                passive,
+            } => mesh::protocol::Response::ok_with_data(self.radio.wifi_scan(
+                iface,
+                ssid,
+                channel,
+                passive.unwrap_or(false),
+            )),
             Request::WifiStaJoinOpen { iface, ssid } => {
                 mesh::protocol::Response::ok_with_data(self.radio.wifi_sta_join_open(iface, ssid))
             }
@@ -1876,6 +1915,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nan_publish_service_info_is_a_common_bounded_announce() {
+        let discovery = LocalDiscovery::new(None).await.unwrap();
+        let wire = discovery.nan_announce_service_info(17).unwrap();
+        assert!(wire.len() <= dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN);
+        let announce = dmesh_server::announce::decode_announce(&wire).unwrap();
+        assert_eq!(announce.kind, dmesh_server::announce::ANNOUNCE_DISCOVERY);
+        assert_eq!(announce.uptime_secs, 17);
+        assert!(announce.has_identity());
+        let signature = Signature::from_slice(announce.signature()).unwrap();
+        let key = VerifyingKey::from_public_key_der(announce.public_key()).unwrap();
+        let mut signing_wire = [0u8; 384];
+        let used = dmesh_server::announce::signing_bytes(announce, &mut signing_wire).unwrap();
+        assert!(key.verify(&signing_wire[..used], &signature).is_ok());
+    }
+
+    #[tokio::test]
     async fn test_announce_serialization() {
         let mut metadata = HashMap::new();
         metadata.insert("version".to_string(), "1.0.0".to_string());
@@ -1907,6 +1962,26 @@ mod tests {
         // Get a non-existent node
         let node = discovery.get_node("non_existent_key").await;
         assert!(node.is_none());
+    }
+
+    #[tokio::test]
+    async fn common_multicast_announce_notifies_the_radio_inventory_sink() {
+        let discovery = LocalDiscovery::new(None).await.unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_by_sink = received.clone();
+        discovery
+            .set_announce_observer(Arc::new(move |peer, announce| {
+                received_by_sink.lock().unwrap().push((peer, announce));
+            }))
+            .await;
+
+        let peer = SocketAddr::from(([192, 0, 2, 24], 5_227));
+        let announce = dmesh_server::announce::Announce::discovery([0xA5; 16], 16, 42, 1, 7);
+        LocalDiscovery::notify_announce_observer(&discovery.announce_observer, peer, announce)
+            .await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.as_slice(), &[(peer, announce)]);
     }
 
     #[tokio::test]

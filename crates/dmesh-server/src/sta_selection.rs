@@ -1,9 +1,7 @@
 //! Host-testable STA candidate policy shared by ESP firmware variants.
 //!
-//! This module deliberately does not perform a scan or call a Wi-Fi driver.
-//! The ESP adapter supplies observed beacon/scan records; this policy decides
-//! whether an association attempt is worthwhile.  A configured SSID is a
-//! preference, not a command to attach to an unusable AP.
+//! Wi-Fi adapters supply scan records; this policy chooses an eligible DMesh
+//! AP without performing scans or calling a Wi-Fi driver.
 
 /// Minimal observation needed for association choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,13 +20,7 @@ pub struct StaSelection<'a> {
     pub server_link_local: [u8; 16],
 }
 
-/// True for the open DMesh AP naming family.  `lmesh-wifi` currently emits
-/// names such as `Direct-CAB879CC-Dmesh-local`; discovery input is an
-/// 802.11 SSID, so compare its ASCII branding case-insensitively and accept
-/// the optional deployment suffix after `-dmesh`.
-///
-/// It intentionally accepts the variable identifier between the fixed
-/// `DIRECT-` prefix and the `-dmesh` marker.
+/// True for the DMesh `DIRECT-...-dmesh` AP naming family.
 pub const fn is_dmesh_direct_ssid(ssid: &[u8]) -> bool {
     const PREFIX: &[u8] = b"DIRECT-";
     const MARKER: &[u8] = b"-dmesh";
@@ -45,9 +37,8 @@ pub const fn is_dmesh_direct_ssid(ssid: &[u8]) -> bool {
     false
 }
 
-/// Pick an eligible DMesh AP.  The preferred SSID wins only when it meets the
-/// same RSSI floor as a fallback; otherwise the strongest eligible fallback
-/// provides a fast, low-power recovery path.
+/// Prefer the configured SSID when it is usable, otherwise choose the
+/// strongest eligible DMesh AP.
 pub fn select_sta_candidate<'a>(
     candidates: &'a [StaCandidate<'a>],
     preferred_ssid: &[u8],
@@ -62,7 +53,7 @@ pub fn select_sta_candidate<'a>(
             return Some(StaSelection {
                 candidate: *candidate,
                 preferred: true,
-                server_link_local: crate::raw_udp6::link_local_from_mac(candidate.bssid),
+                server_link_local: quic_lite::raw_udp6::link_local_from_mac(candidate.bssid),
             });
         }
         if strongest.is_none_or(|current: StaCandidate<'a>| candidate.rssi_dbm > current.rssi_dbm) {
@@ -72,7 +63,7 @@ pub fn select_sta_candidate<'a>(
     strongest.map(|candidate| StaSelection {
         candidate,
         preferred: false,
-        server_link_local: crate::raw_udp6::link_local_from_mac(candidate.bssid),
+        server_link_local: quic_lite::raw_udp6::link_local_from_mac(candidate.bssid),
     })
 }
 
@@ -137,7 +128,9 @@ mod tests {
         assert_eq!(selected.candidate.ssid, b"DIRECT-fast-dmesh");
         assert_eq!(
             selected.server_link_local,
-            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 2, 0xc0, 0xca, 0xff, 0xfe, 0xb8, 0x79, 0xcc]
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 2, 0xc0, 0xca, 0xff, 0xfe, 0xb8, 0x79, 0xcc
+            ]
         );
     }
 

@@ -311,7 +311,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
 mod tests {
     use super::*;
     use crate::{
-        ConnectionId, ConnectionLimits, Role, FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_METRICS,
+        ConnectionId, ConnectionLimits, FIRST_CLIENT_BIDI_STREAM_ID, Role, SERVICE_METRICS,
     };
 
     #[test]
@@ -363,10 +363,12 @@ mod tests {
             .endpoint
             .encode_stream_packet(s, 4, 4, true, b"ics", &mut packet)
             .unwrap();
-        assert!(server
-            .receive_datagram(&packet[..second_len])
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .receive_datagram(&packet[..second_len])
+                .unwrap()
+                .is_none()
+        );
         let (first_len, _) = client
             .endpoint
             .encode_stream_packet(
@@ -477,19 +479,23 @@ mod tests {
                 &mut packet,
             )
             .unwrap();
-        assert!(server
-            .receive_request(&packet[..first_len])
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .receive_request(&packet[..first_len])
+                .unwrap()
+                .is_none()
+        );
         let received_before_conflict = server.endpoint.receive.received_data;
         let (conflict_len, _) = client
             .endpoint
             .encode_stream_packet(s, 4, 1, true, b"Z", &mut packet)
             .unwrap();
-        assert!(server
-            .receive_request(&packet[..conflict_len])
-            .unwrap()
-            .is_none());
+        assert!(
+            server
+                .receive_request(&packet[..conflict_len])
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(server.pending_streams(), 1);
         assert_eq!(
             server.endpoint.receive.received_data,

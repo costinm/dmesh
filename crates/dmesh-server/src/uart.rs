@@ -1,14 +1,11 @@
-//! UART PPP L2 framing classification for QUIC-lite datagrams.
+//! UART PPP-information-field framing for direct records and QUIC-lite datagrams.
 //!
-//! This module deliberately does not encode PPP bytes or know about commands,
-//! logs, serial devices, or FreeRTOS. It defines the bearer-neutral marker
-//! carried inside one PPP information field so host and firmware adapters use
-//! exactly the same datagram boundary.
+//! Serial I/O remains in host and ESP bearer adapters; this only distinguishes
+//! their direct records from complete transport datagrams.
 
-use crate::DEFAULT_MAX_DATAGRAM_SIZE;
+use quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
 
 /// Non-ASCII marker preceding one complete QUIC-lite datagram in PPP.
-/// It is also a valid CBOR simple value, keeping direct CBOR records distinct.
 pub const UART_TRANSPORT_MARKER: u8 = 0xf7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +54,6 @@ pub fn classify_uart_payload(payload: &[u8]) -> Result<UartIngress<'_>, UartIngr
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn marker_is_unambiguous_and_empty_is_invalid() {
         assert_eq!(
@@ -70,7 +66,6 @@ mod tests {
         );
         assert_eq!(classify_uart_payload(&[]), Err(UartIngressError::Empty));
     }
-
     #[test]
     fn egress_uses_the_shared_mtu_and_marker() {
         let mut out = [0u8; DEFAULT_MAX_DATAGRAM_SIZE + 1];

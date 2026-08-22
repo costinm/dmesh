@@ -2,8 +2,23 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dmesh.local/schema/radio-lab.json",
   "title": "DMesh radio laboratory handlers",
+  "x-mesh-cbor": {"component": 4},
   "type": "object",
   "oneOf": [
+    {
+      "title": "radio.tx",
+      "properties": {
+        "method": {"const": "radio.tx", "x-mesh-cbor": {"id": 71}},
+        "frame": {"type": "string", "contentEncoding": "base64", "x-mesh-cbor": {"id": 1}},
+        "channel": {"type": "integer", "minimum": 1, "maximum": 13, "x-mesh-cbor": {"id": 2}},
+        "interface": {"enum": ["auto", "sta", "ap", "nan"], "x-mesh-cbor": {"id": 3}},
+        "system_sequence": {"type": "boolean", "x-mesh-cbor": {"id": 4}},
+        "rate": {"enum": ["auto", 6, 9, 12, 18, 24, 36, 48, 54], "x-mesh-cbor": {"id": 5}},
+        "disable_11b": {"type": "boolean", "x-mesh-cbor": {"id": 6}}
+      },
+      "required": ["method", "frame"],
+      "additionalProperties": false
+    },
     {
       "title": "radio.control",
       "properties": {

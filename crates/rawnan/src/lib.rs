@@ -23,11 +23,13 @@ pub use channel_observation::{ChannelObservation, ChannelObservationSummary};
 
 pub mod service;
 pub use service::{
-    active_ack_for_service, build_dmesh_followup_payload, build_dmesh_service_info,
-    build_nan_followup_sdf, build_nan_publish_sdf, build_nan_publish_sdf_with_sdea,
-    build_nan_service_extension, build_nan_usd_sdf, is_dmesh_service_info,
-    parse_dmesh_nan_followup, parse_dmesh_service_info, wake_request_for_service, DmeshNanFollowup,
-    DmeshServiceInfo,
+    active_ack_for_service, active_subscribe_service_info, build_dmesh_followup_payload,
+    build_dmesh_service_info, build_nan_followup_sdf, build_nan_publish_sdf,
+    build_nan_publish_sdf_with_sdea, build_nan_service_extension, build_nan_usd_sdf,
+    is_dmesh_service_info, parse_dmesh_nan_followup, parse_dmesh_service_info,
+    wake_request_for_service, ActiveSubscribeServiceInfo, DmeshNanFollowup, DmeshServiceInfo,
+    NanActivePublish, NanFollowupEnqueue, NanFollowupIntent, NanFollowupQueue,
+    NAN_ACTIVE_PUBLISH_INTERVAL_MS, NAN_ACTIVE_PUBLISH_MAX_LEN,
 };
 
 pub const FRAME_DST: usize = 4;
@@ -779,7 +781,38 @@ mod tests {
         assert_eq!(classify(&frame), FrameKind::Sdf);
         let descriptor = service_descriptor(&frame, [7, 8, 9, 10, 11, 12]).expect("USD SDA");
         assert_eq!(descriptor.control, 0);
+        let descriptors = service_descriptors(&frame);
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].service_id, [7, 8, 9, 10, 11, 12]);
+        assert_eq!(descriptors[0].descriptor, descriptor);
         assert_eq!(peer_availability(&frame), PeerAvailability::Dw0Dw8);
+    }
+
+    #[test]
+    fn service_descriptor_scan_keeps_primary_and_announce_services() {
+        let primary = [7, 8, 9, 10, 11, 12];
+        let announce = [13, 14, 15, 16, 17, 18];
+        let mut frame = build_nan_publish_sdf(
+            NAN_DISCOVERY_MAC,
+            [1, 2, 3, 4, 5, 6],
+            NAN_CLUSTER_BSSID_DEFAULT,
+            primary,
+            1,
+            b"primary",
+        );
+        let announce_payload = b"announce";
+        frame.push(0x03);
+        frame.extend_from_slice(&((10 + announce_payload.len()) as u16).to_le_bytes());
+        frame.extend_from_slice(&announce);
+        frame.extend_from_slice(&[2, 0, 0x10, announce_payload.len() as u8]);
+        frame.extend_from_slice(announce_payload);
+
+        let descriptors = service_descriptors(&frame);
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].service_id, primary);
+        assert_eq!(descriptors[0].descriptor.payload, b"primary");
+        assert_eq!(descriptors[1].service_id, announce);
+        assert_eq!(descriptors[1].descriptor.payload, announce_payload);
     }
 
     #[test]
@@ -858,6 +891,13 @@ mod tests {
         assert!(publish
             .windows(7)
             .any(|window| window == [0x0e, 0x04, 0x00, 1, 0, 2, 3]));
+        // Active publish SDF carries opaque Service Info verbatim. Firmware
+        // dispatches these bytes as a direct CBOR command only after copying
+        // them out of the Wi-Fi callback into the shared ingress pool.
+        assert_eq!(
+            service_descriptor_payload(&publish, service),
+            Some(info.as_slice())
+        );
 
         let followup = build_nan_followup_sdf(destination, source, cluster, service, 1, b"hello");
         assert_eq!(&followup[4..10], &destination);
@@ -950,6 +990,18 @@ pub struct ServiceDescriptor<'a> {
     pub requestor_instance: u8,
     pub control: u8,
     pub payload: &'a [u8],
+}
+
+/// One NAN service descriptor together with the six-byte service ID which
+/// selects it.  A single SDF can carry several descriptors: Android uses the
+/// primary `dmesh` service for connection creation and a separate
+/// `dmesh-announce` service for low-rate presence.  Adapters must therefore
+/// inspect every descriptor, rather than treating the first DMesh service as
+/// the whole frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamedServiceDescriptor<'a> {
+    pub service_id: [u8; 6],
+    pub descriptor: ServiceDescriptor<'a>,
 }
 
 /// Coarse peer availability used for follow-up scheduling.  We deliberately
@@ -1110,28 +1162,50 @@ pub fn service_descriptor_payload<'a>(frame: &'a [u8], service_id: [u8; 6]) -> O
     service_descriptor(frame, service_id).map(|descriptor| descriptor.payload)
 }
 
-pub fn service_descriptor<'a>(
-    frame: &'a [u8],
-    service_id: [u8; 6],
-) -> Option<ServiceDescriptor<'a>> {
+/// Return every complete Service Descriptor Attribute carried by an SDF.
+///
+/// Malformed trailing attributes are ignored, while a malformed outer frame
+/// returns no descriptors.  This keeps monitor/callback handling bounded and
+/// lets callers independently recognize service IDs they own.
+pub fn service_descriptors(frame: &[u8]) -> Vec<NamedServiceDescriptor<'_>> {
     if !is_nan_sdf(frame) {
-        return None;
+        return Vec::new();
     }
+    let mut descriptors = Vec::new();
     let mut offset = NAN_ACTION_START;
     while offset + 3 <= frame.len() {
         let attr_id = frame[offset];
         let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
         let start = offset + 3;
-        let end = start.checked_add(len)?;
-        let body = frame.get(start..end)?;
-        if attr_id == 0x03 {
+        let Some(end) = start.checked_add(len) else {
+            break;
+        };
+        let Some(body) = frame.get(start..end) else {
+            break;
+        };
+        if attr_id == 0x03 && body.len() >= 9 {
+            let mut service_id = [0; 6];
+            service_id.copy_from_slice(&body[..6]);
             if let Some(descriptor) = service_descriptor_body(body, service_id) {
-                return Some(descriptor);
+                descriptors.push(NamedServiceDescriptor {
+                    service_id,
+                    descriptor,
+                });
             }
         }
         offset = end;
     }
-    None
+    descriptors
+}
+
+pub fn service_descriptor<'a>(
+    frame: &'a [u8],
+    service_id: [u8; 6],
+) -> Option<ServiceDescriptor<'a>> {
+    service_descriptors(frame)
+        .into_iter()
+        .find(|item| item.service_id == service_id)
+        .map(|item| item.descriptor)
 }
 
 pub fn service_descriptor_body<'a>(
@@ -1142,6 +1216,17 @@ pub fn service_descriptor_body<'a>(
         return None;
     }
     if matches!(body[8], 0x10..=0x12) {
+        // Active Subscribe USD carries SSI in the following SDEA, so its SDA
+        // has no direct payload-length byte. Keep the descriptor visible and
+        // let `active_subscribe_service_info` recover the SDEA payload.
+        if body.len() == 9 {
+            return Some(ServiceDescriptor {
+                instance: body[6],
+                requestor_instance: body[7],
+                control: body[8],
+                payload: &[],
+            });
+        }
         let payload_len = *body.get(9)? as usize;
         return Some(ServiceDescriptor {
             instance: body[6],

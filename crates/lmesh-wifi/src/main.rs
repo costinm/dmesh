@@ -1,11 +1,83 @@
 use anyhow::Result;
 use lmesh_wifi::{
     WifiService,
-    dispatch::{handle_request, subscription_config},
+    dispatch::{
+        handle_request, handle_reviewed_request, normalize_json_rpc_request, subscription_config,
+    },
+    reviewed::ReviewedWifiRequest,
 };
 use serde_json::json;
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::{Arc, LazyLock};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(|| {
+    mesh::tagged::TaggedCatalog::from_tools_json(
+        &serde_json::from_str(include_str!("../resources/tools.json"))
+            .expect("lmesh-wifi tools.json must be valid JSON"),
+    )
+    .expect("lmesh-wifi tools.json must be a valid tagged catalog")
+});
+
+struct WifiCborHandler {
+    netd: Arc<lmesh_wifi::WifiNetd>,
+    radio: Arc<lmesh_wifi::RadioService>,
+}
+
+#[async_trait::async_trait]
+impl mesh::wire::TaggedRecordHandler for WifiCborHandler {
+    async fn handle_record(
+        &self,
+        record: mesh::tagged::TaggedRecord,
+    ) -> anyhow::Result<Option<mesh::tagged::TaggedRecord>> {
+        let id = record
+            .id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("tagged-CBOR request missing id"))?;
+        let request = match decode_wifi_tagged_request(&record) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Some(mesh::wire::response_error(
+                    id,
+                    json!({"error": error.to_string()}),
+                )));
+            }
+        };
+        let response = handle_reviewed_request(&self.netd, &self.radio, request);
+        Ok(Some(mesh::wire::response_ok(id, response)))
+    }
+}
+
+fn decode_wifi_tagged_request(
+    record: &mesh::tagged::TaggedRecord,
+) -> anyhow::Result<ReviewedWifiRequest> {
+    let Some(method) = CONTROL_CATALOG.method_name(record) else {
+        anyhow::bail!("tagged-CBOR method is outside the reviewed wifi catalog");
+    };
+    let value = CONTROL_CATALOG.to_jsonl(record);
+    match method {
+        "wifi.ap.status" => serde_json::from_value(value).map(ReviewedWifiRequest::ApStatus),
+        "wifi.sta.status" => serde_json::from_value(value).map(ReviewedWifiRequest::StaStatus),
+        "wifi.rawnan.status" => {
+            serde_json::from_value(value).map(ReviewedWifiRequest::RawNanStatus)
+        }
+        "wifi.interface.status" => {
+            serde_json::from_value(value).map(ReviewedWifiRequest::InterfaceStatus)
+        }
+        "wifi.ap.stations" => serde_json::from_value(value).map(ReviewedWifiRequest::ApStations),
+        "wifi.raw.metrics" => serde_json::from_value(value).map(ReviewedWifiRequest::RawMetrics),
+        "wifi.raw.stop" => serde_json::from_value(value).map(ReviewedWifiRequest::RawStop),
+        "wifi.raw.listen" => serde_json::from_value(value).map(ReviewedWifiRequest::RawListen),
+        "wifi.raw.check" => serde_json::from_value(value).map(ReviewedWifiRequest::RawCheck),
+        "wifi.raw.iperf" => serde_json::from_value(value).map(ReviewedWifiRequest::RawIperf),
+        "wifi.raw.send" => serde_json::from_value(value).map(ReviewedWifiRequest::RawSend),
+        "wifi.rawnan.ping" => serde_json::from_value(value).map(ReviewedWifiRequest::RawNanPing),
+        "wifi.rawnan.listen" => {
+            serde_json::from_value(value).map(ReviewedWifiRequest::RawNanListen)
+        }
+        _ => unreachable!("the reviewed wifi catalog contains only typed read-only methods"),
+    }
+    .map_err(Into::into)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,6 +86,8 @@ async fn main() -> Result<()> {
     let radio = Arc::new(service.radio().clone());
     let (trace, _guard) = mesh::local_trace::init("lmesh-wifi");
     mesh::local_trace::serve("lmesh-wifi", trace.clone());
+    // wlan0 is the stable infrastructure fixture: start its AP at service
+    // launch. lmesh owns the independent AP-off NAN+NOW/STA+NOW radio.
     for result in service.start_stable() {
         tracing::info!(
             ok = result
@@ -73,6 +147,21 @@ async fn main() -> Result<()> {
         let radio = radio.clone();
         let trace = trace.clone();
         tokio::spawn(async move {
+            let mut stream = stream;
+            let mut first = [0_u8; 1];
+            let Ok(bytes_read) = stream.read(&mut first).await else {
+                return;
+            };
+            if bytes_read == 0 {
+                return;
+            }
+            let mut stream = mesh::wire::PrefixedStream::new(first[0], stream);
+            if first[0] == 0 {
+                let _ =
+                    mesh::wire::serve_cbor_session(&mut stream, &WifiCborHandler { netd, radio })
+                        .await;
+                return;
+            }
             let (reader, mut writer) = tokio::io::split(stream);
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
@@ -87,7 +176,9 @@ async fn main() -> Result<()> {
                 {
                     break;
                 }
-                let request = serde_json::from_str(line.trim()).unwrap_or_else(|_| json!({}));
+                let request = normalize_json_rpc_request(
+                    serde_json::from_str(line.trim()).unwrap_or_else(|_| json!({})),
+                );
                 if let Some(config) = subscription_config(&request) {
                     let rawnan_subscription = radio.rawnan_subscription_start(&config);
                     let ack = json!({
@@ -153,4 +244,56 @@ async fn main() -> Result<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reviewed_wifi_status_decodes_numeric_tags() {
+        let request = decode_wifi_tagged_request(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(5),
+            method: mesh::tagged::NameOrTag::Tag(1),
+            id: Some(json!(11)),
+            env: [(mesh::tagged::NameOrTag::Tag(1), json!("wlan0"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            matches!(request, ReviewedWifiRequest::ApStatus(request) if request.iface.as_deref() == Some("wlan0"))
+        );
+    }
+
+    #[test]
+    fn reviewed_wifi_metrics_decode_numeric_tags() {
+        let request = decode_wifi_tagged_request(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(5),
+            method: mesh::tagged::NameOrTag::Tag(6),
+            id: Some(json!(12)),
+            env: [(mesh::tagged::NameOrTag::Tag(1), json!("wlan0"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            matches!(request, ReviewedWifiRequest::RawMetrics(request) if request.iface.as_deref() == Some("wlan0"))
+        );
+    }
+
+    #[test]
+    fn unreviewed_wifi_method_is_not_named_cbor() {
+        assert!(
+            decode_wifi_tagged_request(&mesh::tagged::TaggedRecord {
+                component: mesh::tagged::NameOrTag::Name("wifi".to_owned()),
+                method: mesh::tagged::NameOrTag::Name("ap.stop".to_owned()),
+                id: Some(json!(11)),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
 }

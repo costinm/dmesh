@@ -71,6 +71,14 @@ impl<'a> Encoder<'a> {
     pub fn boolean(&mut self, value: bool) -> Option<()> {
         self.put(if value { 0xf5 } else { 0xf4 })
     }
+    /// Append one already-validated, complete CBOR value. This is used by
+    /// tagged-envelope adapters to preserve a bounded field/result value
+    /// without decoding it into an allocation or a lossy JSON form.
+    pub fn encoded_value(&mut self, value: &[u8]) -> Option<()> {
+        let mut decoder = Decoder::new(value);
+        decoder.skip()?;
+        decoder.is_finished().then(|| self.bytes(value))?
+    }
 }
 
 impl<'a> Decoder<'a> {
@@ -124,7 +132,10 @@ impl<'a> Decoder<'a> {
         let (major, value) = self.head()?;
         match major {
             0 => i64::try_from(value).ok(),
-            1 => value.checked_add(1).and_then(|value| i64::try_from(value).ok()).map(|value| -value),
+            1 => value
+                .checked_add(1)
+                .and_then(|value| i64::try_from(value).ok())
+                .map(|value| -value),
             _ => None,
         }
     }
@@ -201,7 +212,8 @@ impl<'a> Decoder<'a> {
             }
             4 => {
                 let mut index = 0;
-                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len) {
+                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len)
+                {
                     index += 1;
                     self.skip()?;
                 }
@@ -209,7 +221,8 @@ impl<'a> Decoder<'a> {
             }
             5 => {
                 let mut index = 0;
-                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len) {
+                while (len == u64::MAX && !self.consume_break()) || (len != u64::MAX && index < len)
+                {
                     index += 1;
                     self.skip()?;
                     self.skip()?;

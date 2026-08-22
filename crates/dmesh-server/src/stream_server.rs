@@ -15,10 +15,10 @@ use quic_lite::encode_bootstrap_open_ack_packet;
 use quic_lite::mux::MuxRequest;
 use quic_lite::mux::StreamMux;
 use quic_lite::{
-    decode_bootstrap_open_packet_with_limits, encode_bootstrap_open_ack_packet_with_limits,
-    BootstrapClient, ConnectionId, ConnectionLimits, Error, PathPolicy, Role, ShortHeader,
-    StreamRegistry, FIRST_CLIENT_BIDI_STREAM_ID, FIRST_SERVER_BIDI_STREAM_ID,
-    INITIAL_MAX_STREAM_DATA,
+    BootstrapClient, ConnectionId, ConnectionLimits, Error, FIRST_CLIENT_BIDI_STREAM_ID,
+    FIRST_SERVER_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA, PathPolicy, Role, ShortHeader,
+    StreamRegistry, decode_bootstrap_open_packet_with_limits,
+    encode_bootstrap_open_ack_packet_with_limits,
 };
 
 use crate::services::{EventRing, MAX_BINARY_EVENT_PAYLOAD_BYTES};
@@ -409,8 +409,8 @@ impl<const HISTORY: usize, const PACKET: usize> StreamClientConnection<HISTORY, 
 mod tests {
     use super::*;
     use quic_lite::{
-        decode_bootstrap_open_ack_packet_with_limits, decode_frame, BootstrapClient, Frame,
-        ShortHeader, StreamRegistry,
+        BootstrapClient, Frame, ShortHeader, StreamRegistry,
+        decode_bootstrap_open_ack_packet_with_limits, decode_frame,
     };
 
     #[test]

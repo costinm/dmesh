@@ -6,6 +6,12 @@
 use dmesh_store::StoreService;
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server};
+#[cfg(target_os = "android")]
+use std::collections::BTreeSet;
+#[cfg(target_os = "android")]
+use std::ffi::CStr;
+#[cfg(target_os = "android")]
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -14,13 +20,15 @@ use tokio::runtime::Runtime;
 /// Opaque handle for a running mesh node instance.
 ///
 /// Owns the tokio runtime, the `MeshNode`, the SSH client manager,
-/// and join handles for the SSH and HTTP server tasks.
+/// and join handles for the SSH, HTTP, and shared UDP service tasks.
 pub struct MeshHandle {
     pub node: Arc<MeshNode>,
     pub client_manager: Arc<SshClientManager>,
     pub runtime: Runtime,
     pub ssh_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub http_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub udp_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub announce_server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Opaque handle for a bidirectional stream (channel).
@@ -115,12 +123,51 @@ pub fn start_mesh(
         }));
     }
 
+    // Android participates in the same bearer-neutral service surface as
+    // lmesh-wifi and firmware. Bind IPv6 explicitly: link-local and NAN
+    // data-path tests use scoped IPv6 addresses, while the shared registry
+    // supplies status/handlers/iperf without an Android-only replacement.
+    // Keep this Android-only: host MeshNode users must not unexpectedly claim
+    // the stable Wi-Fi UDP port merely by constructing a node.
+    #[cfg(target_os = "android")]
+    let udp_server_handle = {
+        let udp_config = dmesh_server::udp::UdpConfig {
+            bind: SocketAddr::from((
+                Ipv6Addr::UNSPECIFIED,
+                dmesh_server::udp::STABLE_WIFI_UDP_PORT,
+            )),
+            artifact_root: base_path.clone(),
+            ..dmesh_server::udp::UdpConfig::default()
+        };
+        Some(runtime.spawn(async move {
+            if let Err(error) = dmesh_server::udp::run(udp_config).await {
+                log::error!("Android UDP service failed: {error}");
+            }
+        }))
+    };
+    #[cfg(not(target_os = "android"))]
+    let udp_server_handle = None;
+
+    #[cfg(target_os = "android")]
+    let announce_server_handle = {
+        let public_key = node
+            .private_key()
+            .public_key()
+            .to_openssh()
+            .unwrap_or_default();
+        Some(runtime.spawn(android_announce_loop(public_key)))
+    };
+    #[cfg(not(target_os = "android"))]
+    let announce_server_handle = None;
+
     Ok(MeshHandle {
         node,
         client_manager,
         runtime,
         ssh_server_handle: Some(ssh_server_handle),
         http_server_handle,
+        udp_server_handle,
+        announce_server_handle,
     })
 }
 
@@ -132,7 +179,136 @@ pub fn stop_mesh(handle: MeshHandle) {
     if let Some(h) = handle.http_server_handle {
         h.abort();
     }
+    if let Some(h) = handle.udp_server_handle {
+        h.abort();
+    }
+    if let Some(h) = handle.announce_server_handle {
+        h.abort();
+    }
     handle.runtime.shutdown_background();
+}
+
+/// Android's local-link presence socket is intentionally distinct from the
+/// QUIC-lite port. It uses the established lmesh group and shared CBOR record,
+/// while the QUIC UDP listener remains unicast-only.
+#[cfg(target_os = "android")]
+async fn android_announce_loop(public_key: String) {
+    const PORT: u16 = 5227;
+    let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
+    let socket = match tokio::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, PORT)).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            log::error!("Android announce UDP bind failed: {error}");
+            return;
+        }
+    };
+    let mut id = [0; 16];
+    let key_bytes = public_key.as_bytes();
+    let take = key_bytes.len().min(id.len());
+    id[..take].copy_from_slice(&key_bytes[..take]);
+    let started = tokio::time::Instant::now();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+    let mut receive = [0u8; 256];
+    let mut boot_pending = true;
+    let mut joined_interfaces = BTreeSet::new();
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let kind = if boot_pending {
+                    dmesh_server::announce::ANNOUNCE_BOOT
+                } else {
+                    dmesh_server::announce::ANNOUNCE_DISCOVERY
+                };
+                let announce = if kind == dmesh_server::announce::ANNOUNCE_BOOT {
+                    dmesh_server::announce::Announce::boot(id, take as u8, 0)
+                } else {
+                    dmesh_server::announce::Announce::discovery(
+                        id,
+                        take as u8,
+                        u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX),
+                        0,
+                        0,
+                    )
+                };
+                let mut wire = [0u8; 96];
+                if let Some(used) = dmesh_server::announce::encode(announce, &mut wire) {
+                    let interfaces = multicast_interface_indices();
+                    for interface_index in &interfaces {
+                        if joined_interfaces.insert(*interface_index) {
+                            if let Err(error) = socket.join_multicast_v6(&group, *interface_index) {
+                                log::warn!("Android announce multicast join failed on interface {interface_index}: {error}");
+                            }
+                        }
+                    }
+                    let mut sent = false;
+                    for interface_index in interfaces {
+                        let destination = SocketAddr::V6(SocketAddrV6::new(group, PORT, 0, interface_index));
+                        match socket.send_to(&wire[..used], destination).await {
+                            Ok(_) => sent = true,
+                            Err(error) => log::warn!("Android announce multicast send failed on interface {interface_index}: {error}"),
+                        }
+                    }
+                    // Do not silently lose the boot event when the service starts before
+                    // Wi-Fi/NAN has an IPv6 interface. The first successful emission is boot.
+                    if sent {
+                        boot_pending = false;
+                    }
+                }
+            }
+            received = socket.recv_from(&mut receive) => match received {
+                Ok((len, sender)) => {
+                    if let Some(announce) = dmesh_server::announce::decode_announce(&receive[..len]) {
+                        crate::mesh_jni::observe_announce(
+                            announce,
+                            sender.to_string(),
+                            "udp_multicast",
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::warn!("Android announce UDP receive failed: {error}");
+                }
+            },
+        }
+    }
+}
+
+/// Return each enabled, non-loopback IPv6 interface index. Android's
+/// link-local multicast routes require this scope; `0` is not enough to select
+/// Wi-Fi and would make a service-start boot announce disappear before a
+/// network becomes available.
+#[cfg(target_os = "android")]
+fn multicast_interface_indices() -> Vec<u32> {
+    let mut interfaces = BTreeSet::new();
+    unsafe {
+        let mut head = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            log::warn!(
+                "Android announce could not enumerate interfaces: {}",
+                std::io::Error::last_os_error()
+            );
+            return Vec::new();
+        }
+        let mut current = head;
+        while !current.is_null() {
+            let entry = &*current;
+            let enabled = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
+            let loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
+            if enabled
+                && !loopback
+                && !entry.ifa_addr.is_null()
+                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
+            {
+                let index = libc::if_nametoindex(CStr::from_ptr(entry.ifa_name).as_ptr());
+                if index != 0 {
+                    interfaces.insert(index);
+                }
+            }
+            current = entry.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    interfaces.into_iter().collect()
 }
 
 /// Connect to a remote SSH server.

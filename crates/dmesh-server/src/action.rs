@@ -6,7 +6,7 @@
 //! The returned payloads are sent back over that same action bearer.
 
 use crate::protocol::{ObjectRecordStream, decode_get};
-use crate::services::{handle_stream, object_stream_registry};
+use crate::services::{dispatch_tagged_stream, handle_stream, object_stream_registry};
 use crate::{ObjectServer, ServerConfig};
 use anyhow::{Result, anyhow, bail};
 use quic_lite::callback::{CallbackStreams, CopyingError, CopyingStreamEvents};
@@ -369,6 +369,24 @@ impl ActionServer {
             .receive_request(packet)
             .map_err(|error| anyhow!("action transport input: {error:?}"))?;
         if let Some(request) = request {
+            // Direct tagged-CBOR is the common handler envelope. QUIC stream
+            // IDs only provide ordering/lifetime; component+method select
+            // the handler and may be used on many concurrent streams.
+            if let Some(response) = dispatch_tagged_stream(&request.data) {
+                connection
+                    .mux
+                    .complete_request(request.stream_id, request.data.len())
+                    .map_err(|error| anyhow!("action tagged accounting: {error:?}"))?;
+                let response_stream_id = server_response_stream_id(request.stream_id)?;
+                let mut response_packet = [0u8; MTU];
+                let (used, _) = connection
+                    .mux
+                    .encode_response(response_stream_id, &response, true, &mut response_packet)
+                    .map_err(|error| anyhow!("action tagged response: {error:?}"))?;
+                let mut output = vec![response_packet[..used].to_vec()];
+                output.extend(Self::drain(connection, self.object_chunk)?);
+                return Ok(output);
+            }
             let Some((&service, body)) = request.data.split_first() else {
                 bail!("empty action stream service");
             };

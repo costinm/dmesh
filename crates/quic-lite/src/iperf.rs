@@ -3,8 +3,8 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
+    EndpointState, Error, INITIAL_MAX_STREAM_DATA, RECOVERY_REORDER_CAPACITY_BYTES, StreamFrame,
     callback::{CallbackError, CallbackStreams, CopyingError, CopyingStreamEvents},
-    EndpointState, Error, StreamFrame, INITIAL_MAX_STREAM_DATA, RECOVERY_REORDER_CAPACITY_BYTES,
 };
 
 /// Bounded producer for one server-initiated diagnostic stream.
@@ -344,14 +344,16 @@ mod tests {
     #[test]
     fn rejects_bad_packet_sequence() {
         let mut receiver = IperfReceiver::new(1);
-        assert!(receiver
-            .handle(StreamFrame {
-                id: 3,
-                offset: 0,
-                fin: true,
-                data: &[0, 0, 0, 1],
-            })
-            .is_err());
+        assert!(
+            receiver
+                .handle(StreamFrame {
+                    id: 3,
+                    offset: 0,
+                    fin: true,
+                    data: &[0, 0, 0, 1],
+                })
+                .is_err()
+        );
         assert_eq!(receiver.callback_errors()[5], 1);
     }
 
@@ -382,21 +384,27 @@ mod tests {
     fn sender_uses_ordered_payload_and_fin_without_a_bearer() {
         let client = ConnectionId::new(7).unwrap();
         let server = ConnectionId::new(8).unwrap();
-        let mut sender_endpoint =
-            EndpointState::<4, 8>::new(Role::Server, ConnectionLimits::default(), 1200);
+        let mut sender_endpoint = EndpointState::<4, 8>::new(
+            Role::Server,
+            ConnectionLimits::default(),
+            crate::DEFAULT_MAX_DATAGRAM_SIZE as u64,
+        );
         sender_endpoint
             .install_connection_ids(server, client)
             .unwrap();
         sender_endpoint
             .set_initial_peer_credit(16 * 1024, 16 * 1024)
             .unwrap();
-        let mut receiver_endpoint =
-            EndpointState::<4, 8>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver_endpoint = EndpointState::<4, 8>::new(
+            Role::Client,
+            ConnectionLimits::default(),
+            crate::DEFAULT_MAX_DATAGRAM_SIZE as u64,
+        );
         receiver_endpoint
             .install_connection_ids(client, server)
             .unwrap();
         let mut sender = IperfSender::new(3, 12, 8).unwrap();
-        let mut wire = [0u8; 1200];
+        let mut wire = [0u8; crate::DEFAULT_MAX_DATAGRAM_SIZE];
         let mut receiver = IperfReceiver::new(2);
         let (first, first_fin) = sender
             .poll(&mut sender_endpoint, &mut wire)

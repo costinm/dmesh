@@ -14,6 +14,7 @@ ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
 mesh-tun = { path = "../tun", default-features = false }
 lmesh = { path = "../lmesh" }
 dmesh-store = { path = "../dmesh-store" }
+dmesh-server = { path = "../dmesh-server", features = ["udp"] }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"

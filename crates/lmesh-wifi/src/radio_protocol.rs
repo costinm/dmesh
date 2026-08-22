@@ -44,6 +44,9 @@ const NAN_MSG_PACKET_HINT: u8 = 3;
 const NAN_MSG_PACKET_CHUNK: u8 = 4;
 const NAN_MSG_ACK: u8 = 5;
 const NAN_MSG_COMMAND_TEXT: u8 = 6;
+/// A complete framed tagged-CBOR control record.  Unlike `command_text`, its
+/// payload is binary and must not be passed through a JSON/base64 gateway.
+const NAN_MSG_COMMAND_CBOR: u8 = 7;
 
 static BLE_DEDUPE: OnceLock<Mutex<Dedupe>> = OnceLock::new();
 static NAN_DEDUPE: OnceLock<Mutex<Dedupe>> = OnceLock::new();
@@ -441,6 +444,7 @@ fn nan_msg_type(value: &str) -> u8 {
         "chunk" | "packet_chunk" => NAN_MSG_PACKET_CHUNK,
         "ack" => NAN_MSG_ACK,
         "command" | "command_text" => NAN_MSG_COMMAND_TEXT,
+        "command_cbor" => NAN_MSG_COMMAND_CBOR,
         _ => NAN_MSG_HELLO,
     }
 }
@@ -453,6 +457,7 @@ fn nan_msg_name(msg_type: u8) -> &'static str {
         NAN_MSG_PACKET_CHUNK => "packet_chunk",
         NAN_MSG_ACK => "ack",
         NAN_MSG_COMMAND_TEXT => "command_text",
+        NAN_MSG_COMMAND_CBOR => "command_cbor",
         _ => "unknown",
     }
 }
@@ -512,5 +517,18 @@ mod tests {
         assert_eq!(parsed["device_id"], "010101010101");
         assert_eq!(parsed["target_id"], "020202020202");
         assert_eq!(parsed["payload_text"], "ble stats=true");
+    }
+
+    #[test]
+    fn nan_followup_preserves_tagged_cbor_bytes() {
+        let source = [1, 1, 1, 1, 1, 1];
+        let target = [2, 2, 2, 2, 2, 2];
+        let tagged = [
+            0xa4, 1, 4, 2, 8, 9, 0x46, 2, 2, 2, 2, 2, 2, 10, 0x42, 0, 0xff,
+        ];
+        let data = build_nan_followup("command_cbor", &source, &target, &tagged).unwrap();
+        let parsed = parse_nan_followup(&data).unwrap();
+        assert_eq!(parsed["msg_type"], "command_cbor");
+        assert_eq!(parsed["payload"], "a40104020809460202020202020a4200ff");
     }
 }

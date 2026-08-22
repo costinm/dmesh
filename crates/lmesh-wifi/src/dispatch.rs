@@ -1,11 +1,31 @@
 //! JSONL request dispatch shared by the lmesh-wifi launcher and embedders.
 
-use crate::{Operation, RadioService, WifiNetd};
+use crate::{Operation, RadioService, WifiNetd, reviewed::ReviewedWifiRequest};
 use anyhow::Result;
 use serde_json::{Value, json};
 
 fn string_arg(request: &Value, name: &str) -> Option<String> {
     request.get(name).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Decode a bounded tagged-CBOR record supplied by a local sibling service.
+/// This is intentionally kept at the control boundary: the registry receives
+/// the same semantic `Announce` type as NAN, never another process's buffer.
+fn decode_announce_hex(value: &str) -> Result<dmesh_server::announce::Announce> {
+    let wire = decode_hex(value, "announce_hex")?;
+    dmesh_server::announce::decode_announce(&wire)
+        .ok_or_else(|| anyhow::anyhow!("announce_hex is not a common tagged-CBOR announce"))
+}
+
+fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>> {
+    let value = value.trim().strip_prefix("hex:").unwrap_or(value.trim());
+    if value.is_empty() || value.len() % 2 != 0 {
+        anyhow::bail!("{field} must contain complete hexadecimal bytes");
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(Into::into))
+        .collect()
 }
 
 /// The text mesh CLI transmits `key=value` arguments as strings, while JSON
@@ -40,6 +60,14 @@ fn u64_arg(request: &Value, name: &str) -> Option<u64> {
     })
 }
 
+fn i16_arg(request: &Value, name: &str) -> Option<i16> {
+    request.get(name).and_then(|value| match value {
+        Value::Number(value) => value.as_i64().and_then(|value| i16::try_from(value).ok()),
+        Value::String(value) => value.parse::<i16>().ok(),
+        _ => None,
+    })
+}
+
 /// The mesh CLI deliberately parses bare numeric values as JSON numbers.
 /// Rate profiles use human-readable values ("12", "24", "auto"), so accept
 /// those numeric CLI forms instead of silently falling back to `auto`.
@@ -60,6 +88,133 @@ fn authorize(netd: &WifiNetd, request: &Value, operation: Operation) -> Result<S
         .ok_or_else(|| anyhow::anyhow!("LMESH_INTERFACES must name an owned Wi-Fi interface"))?;
     netd.authorize(operation, &iface)?;
     Ok(iface)
+}
+
+fn authorize_iface(netd: &WifiNetd, iface: Option<&str>, operation: Operation) -> Result<String> {
+    let iface = iface
+        .map(str::to_owned)
+        .or_else(crate::default_interface)
+        .ok_or_else(|| anyhow::anyhow!("LMESH_INTERFACES must name an owned Wi-Fi interface"))?;
+    netd.authorize(operation, &iface)?;
+    Ok(iface)
+}
+
+/// Dispatch the reviewed numeric-CBOR Wi-Fi request set without translating it
+/// into the old flat JSON handler request. Keep state-changing and unreviewed
+/// methods on the JSON-RPC compatibility path until they have a documented
+/// typed request and stable catalog ID.
+pub fn handle_reviewed_request(
+    netd: &WifiNetd,
+    radio: &RadioService,
+    request: ReviewedWifiRequest,
+) -> Value {
+    let result = (|| -> Result<Value> {
+        match request {
+            ReviewedWifiRequest::ApStatus(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Ap)?;
+                Ok(radio.wifi_ap_status(Some(iface)))
+            }
+            ReviewedWifiRequest::StaStatus(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Sta)?;
+                Ok(radio.wifi_sta_status(Some(iface)))
+            }
+            ReviewedWifiRequest::RawNanStatus(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.rawnan_status(Some(iface)))
+            }
+            ReviewedWifiRequest::InterfaceStatus(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.wifi_interface_status(Some(iface)))
+            }
+            ReviewedWifiRequest::ApStations(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Ap)?;
+                Ok(radio.wifi_ap_stations(Some(iface)))
+            }
+            ReviewedWifiRequest::RawMetrics(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.wifi_raw_metrics(Some(iface)))
+            }
+            ReviewedWifiRequest::RawStop(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.wifi_raw_stop(Some(iface)))
+            }
+            ReviewedWifiRequest::RawListen(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.wifi_raw_listen(
+                    Some(iface),
+                    request.channel,
+                    request.listen_sec,
+                    request.rx_variant.or(Some("monitor".to_owned())),
+                ))
+            }
+            ReviewedWifiRequest::RawCheck(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.raw_espnow_check(
+                    Some(iface),
+                    request.channel,
+                    request.destination,
+                    request.nonce.unwrap_or(0),
+                    request.timeout_ms,
+                    request.tx_rate_mbps.map(u64::from),
+                    request.tx_variant,
+                    request.rx_variant,
+                    request.expected_peer,
+                ))
+            }
+            ReviewedWifiRequest::RawIperf(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.raw_espnow_iperf(
+                    Some(iface),
+                    request.channel,
+                    request.destination,
+                    request.bytes.unwrap_or(8 * 1024),
+                    request.packet_size.map(u64::from),
+                    request.timeout_ms,
+                    request.tx_rate_mbps.map(u64::from),
+                    request.tx_variant,
+                    request.rx_variant,
+                    request.expected_peer,
+                ))
+            }
+            ReviewedWifiRequest::RawSend(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                let frame_hex = request.frame_hex.ok_or_else(|| {
+                    anyhow::anyhow!("frame_hex is required for reviewed wifi.raw.send")
+                })?;
+                Ok(radio.wifi_raw_send_frame(
+                    Some(iface),
+                    request.channel,
+                    request.tx_variant,
+                    frame_hex,
+                    request.tx_rate_mbps,
+                ))
+            }
+            ReviewedWifiRequest::RawNanPing(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.rawnan_ping(
+                    Some(iface),
+                    request.channel,
+                    request.destination,
+                    request.bssid,
+                    request.payload.unwrap_or_else(|| "ping".to_owned()),
+                    request.wait_ms,
+                ))
+            }
+            ReviewedWifiRequest::RawNanListen(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                Ok(radio.wifi_raw_listen(
+                    Some(iface),
+                    request.channel,
+                    request.listen_sec,
+                    Some("monitor".to_owned()),
+                ))
+            }
+        }
+    })();
+    match result {
+        Ok(data) => json!({"success": true, "data": data}),
+        Err(error) => json!({"success": false, "error": error.to_string()}),
+    }
 }
 
 pub fn subscription_config(request: &Value) -> Option<mesh::local_trace::TraceConfig> {
@@ -102,6 +257,28 @@ pub fn subscription_config(request: &Value) -> Option<mesh::local_trace::TraceCo
         }
     }
     serde_json::from_value(config).ok()
+}
+
+/// Convert the standard JSON-RPC gateway envelope into the long-standing flat
+/// handler shape. Tagged CBOR never reaches this adapter; it is only the
+/// schema-less compatibility path used when no reviewed numeric catalog exists.
+pub fn normalize_json_rpc_request(request: Value) -> Value {
+    if request.get("jsonrpc").is_none() {
+        return request;
+    }
+    let Some(method) = request.get("method").cloned() else {
+        return request;
+    };
+    let mut normalized = request
+        .get("params")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    normalized.insert("method".to_owned(), method);
+    if let Some(id) = request.get("id") {
+        normalized.insert("id".to_owned(), id.clone());
+    }
+    Value::Object(normalized)
 }
 
 pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> Value {
@@ -198,7 +375,12 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
             }
             "wifi.scan" => {
                 let iface = authorize(netd, &request, Operation::Sta)?;
-                Ok(radio.wifi_scan(Some(iface), string_arg(&request, "ssid")))
+                Ok(radio.wifi_scan(
+                    Some(iface),
+                    string_arg(&request, "ssid"),
+                    u8_arg(&request, "channel"),
+                    bool_arg(&request, "passive").unwrap_or(false),
+                ))
             }
             "wifi.sta.status" => {
                 let iface = authorize(netd, &request, Operation::Sta)?;
@@ -220,7 +402,10 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                 let iface = authorize(netd, &request, Operation::Nan)?;
                 Ok(radio.wifi_raw_listen(
                     Some(iface),
-                    request.get("channel").and_then(Value::as_u64).map(|v| v.min(13) as u8),
+                    request
+                        .get("channel")
+                        .and_then(Value::as_u64)
+                        .map(|v| v.min(13) as u8),
                     request.get("listen_sec").and_then(Value::as_u64),
                     string_arg(&request, "rx_variant"),
                 ))
@@ -228,6 +413,38 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
             "wifi.rawnan.status" => {
                 let iface = authorize(netd, &request, Operation::Nan)?;
                 Ok(radio.rawnan_status(Some(iface)))
+            }
+            "wifi.rawnan.active_publish" => {
+                let _iface = authorize(netd, &request, Operation::Nan)?;
+                let enabled = bool_arg(&request, "enabled")
+                    .ok_or_else(|| anyhow::anyhow!("enabled is required"))?;
+                let service_info = match string_arg(&request, "service_info_hex") {
+                    Some(value) => decode_hex(&value, "service_info_hex")?,
+                    None if !enabled => Vec::new(),
+                    None => anyhow::bail!("service_info_hex is required when enabled"),
+                };
+                radio.rawnan_active_publish_configure(enabled, &service_info)
+            }
+            // A sibling host service forwards only a locally validated
+            // announce here. This operation cannot retune or otherwise
+            // mutate Wi-Fi; it is the control-plane ingress for a semantic
+            // cross-bearer inventory update.
+            "wifi.discovery.observe" => {
+                let source = string_arg(&request, "source")
+                    .ok_or_else(|| anyhow::anyhow!("source is required"))?;
+                let peer = string_arg(&request, "peer")
+                    .ok_or_else(|| anyhow::anyhow!("peer is required"))?;
+                let announce_hex = string_arg(&request, "announce_hex")
+                    .ok_or_else(|| anyhow::anyhow!("announce_hex is required"))?;
+                let announce = decode_announce_hex(&announce_hex)?;
+                let device_id = announce.device_id().to_vec();
+                let accepted = radio.observe_discovered_announce(
+                    &source,
+                    peer,
+                    string_arg(&request, "bssid"),
+                    announce,
+                );
+                Ok(json!({"ok": accepted, "device_id": hex_bytes(&device_id)}))
             }
             "wifi.interface.status" => {
                 let iface = authorize(netd, &request, Operation::Nan)?;
@@ -286,6 +503,7 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                     request.get("tx_rate_mbps").and_then(Value::as_u64),
                     string_arg(&request, "tx_variant"),
                     string_arg(&request, "rx_variant"),
+                    string_arg(&request, "expected_peer"),
                 ))
             }
             "wifi.raw.iperf" => {
@@ -305,6 +523,7 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                     request.get("tx_rate_mbps").and_then(Value::as_u64),
                     string_arg(&request, "tx_variant"),
                     string_arg(&request, "rx_variant"),
+                    string_arg(&request, "expected_peer"),
                 ))
             }
             "wifi.rate.profile" => {
@@ -325,6 +544,10 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                     .and_then(Value::as_bool)
                     .ok_or_else(|| anyhow::anyhow!("enabled is required"))?;
                 Ok(radio.wifi_power_save(Some(iface), enabled))
+            }
+            "wifi.tx_power" => {
+                let iface = authorize(netd, &request, Operation::Ap)?;
+                Ok(radio.wifi_tx_power(Some(iface), i16_arg(&request, "dbm")))
             }
             "wifi.raw.send" => {
                 let iface = authorize(netd, &request, Operation::Nan)?;
@@ -378,57 +601,12 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                 ))
             }
             "wifi.object.udp.status" => Ok(radio.object_udp_status()),
-            "transport.client.iperf" => {
-                let _iface = authorize(netd, &request, Operation::Sta)?;
-                let serial = string_arg(&request, "serial")
-                    .ok_or_else(|| anyhow::anyhow!("serial is required"))?;
-                let bootstrap = string_arg(&request, "bootstrap")
-                    .ok_or_else(|| anyhow::anyhow!("bootstrap is required"))?;
-                let backend = string_arg(&request, "backend")
-                    .ok_or_else(|| anyhow::anyhow!("backend is required"))?;
-                let bytes = request
-                    .get("bytes")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("bytes is required"))?
-                    .min(u32::MAX as u64) as u32;
-                Ok(radio.transport_client_iperf(
-                    serial,
-                    bootstrap,
-                    backend,
-                    bytes,
-                    string_arg(&request, "bearer"),
-                ))
-            }
-            "transport.client.service" => {
-                let _iface = authorize(netd, &request, Operation::Sta)?;
-                let target = string_arg(&request, "target")
-                    .ok_or_else(|| anyhow::anyhow!("target is required (udp://HOST:PORT)"))?;
-                Ok(radio.transport_client_service(
-                    target,
-                    string_arg(&request, "service").unwrap_or_else(|| "status".to_owned()),
-                    string_arg(&request, "body_hex"),
-                    request
-                        .get("log_records")
-                        .and_then(Value::as_u64)
-                        .map(|value| value.min(u8::MAX as u64) as u8),
-                ))
-            }
             "messages.history" => Ok(radio.history(
                 string_arg(&request, "keys"),
                 request
                     .get("limit")
                     .and_then(Value::as_u64)
                     .map(|v| v as usize),
-            )),
-            "esp.serial.command" => Ok(radio.esp_remote_command(
-                string_arg(&request, "gateway").unwrap_or_default(),
-                string_arg(&request, "target"),
-                string_arg(&request, "command").unwrap_or_default(),
-                request.get("timeout_sec").and_then(Value::as_f64),
-                request
-                    .get("active_ms")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32),
             )),
             "status" => Ok(json!({
                 "service": "lmesh-wifi",
@@ -442,6 +620,16 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
         Ok(data) => json!({"success": true, "data": data}),
         Err(error) => json!({"success": false, "error": error.to_string()}),
     }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -466,5 +654,56 @@ mod tests {
         assert_eq!(u8_arg(&json!({"channel": "11"}), "channel"), Some(11));
         assert_eq!(u8_arg(&json!({"channel": 1}), "channel"), Some(1));
         assert_eq!(u8_arg(&json!({"channel": true}), "channel"), None);
+    }
+
+    #[test]
+    fn json_rpc_gateway_flattens_params_for_existing_handlers() {
+        assert_eq!(
+            normalize_json_rpc_request(json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "wifi.ap.stop",
+                "params": {"iface": "wlan0"}
+            })),
+            json!({"id": 7, "method": "wifi.ap.stop", "iface": "wlan0"})
+        );
+    }
+
+    #[test]
+    fn local_observe_ingress_accepts_the_common_announce_wire() {
+        let announce = dmesh_server::announce::Announce::discovery([0x4D; 16], 16, 7, 0, 3);
+        let mut wire = [0_u8; 96];
+        let used = dmesh_server::announce::encode(announce, &mut wire).unwrap();
+        assert_eq!(
+            decode_announce_hex(&hex_bytes(&wire[..used])).unwrap(),
+            announce,
+        );
+        assert!(decode_announce_hex("not hex").is_err());
+    }
+
+    #[test]
+    fn local_observe_ingress_updates_the_shared_device_inventory() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let radio = RadioService::from_environment_with_discovery_log(log.path());
+        let announce = dmesh_server::announce::Announce::discovery([0x54; 16], 16, 8, 1, 5);
+        let mut wire = [0_u8; 96];
+        let used = dmesh_server::announce::encode(announce, &mut wire).unwrap();
+        let response = handle_request(
+            &WifiNetd::from_environment(),
+            &radio,
+            json!({
+                "method": "wifi.discovery.observe",
+                "source": "udp_multicast",
+                "peer": "[fe80::54]:5227",
+                "announce_hex": hex_bytes(&wire[..used]),
+            }),
+        );
+        assert_eq!(response["success"], true);
+        let status = radio.rawnan_status(None);
+        assert_eq!(
+            status["discovered_devices"][0]["id"],
+            "54545454545454545454545454545454"
+        );
+        assert_eq!(status["discovered_devices"][0]["source"], "udp_multicast");
     }
 }

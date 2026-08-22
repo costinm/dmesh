@@ -4,8 +4,8 @@
 an explicit UART, UDP endpoint, or named device profile, then uses the common
 stream handlers for service discovery, commands, log watch, and IPERF.
 
-It does not create or use a managed UART forward. `lmesh-uart` remains a
-reusable UART L2 library; it is not the operator CLI.
+It does not create or use a managed UART forward. `dmesh-cli` owns the UART
+L2 implementation and is the only operator CLI.
 
 ```sh
 cargo run -p dmesh-cli -- /dev/serial/by-id/DEVICE --services
