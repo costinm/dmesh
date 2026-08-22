@@ -110,8 +110,52 @@ public class MeshNode implements AutoCloseable {
                 new byte[0], -1);
     }
 
+    /** Build the bounded CBOR boot/periodic presence Service Info record. */
+    public static byte[] buildNanAnnounce(String kind, byte[] deviceId, long uptimeSecs,
+                                          int transportMode, long counters) {
+        return radioMessage("radio.nan.build_announce",
+                "kind=" + textArg(kind)
+                        + " device_id=" + hex(deviceId)
+                        + " uptime_secs=" + uptimeSecs
+                        + " transport_mode=" + transportMode
+                        + " counters=" + counters,
+                new byte[0], -1);
+    }
+
     public static String parseNanServiceInfo(byte[] serviceInfo) {
         return radioMessageText("radio.nan.parse_service_info", "", serviceInfo, -1);
+    }
+
+    /**
+     * Record a framework NAN discovery in Rust before Java retains its
+     * session-scoped peer handle. The returned JSON is the canonical decoded
+     * identity/info for UI and routing decisions.
+     */
+    public static String observeNanServiceInfo(String peer, byte[] serviceInfo) {
+        return radioMessageText("radio.nan.observe_service_info",
+                "peer=" + textArg(peer), serviceInfo, -1);
+    }
+
+    /** Rust-owned one-hour inventory across NAN, UDP multicast, and control-plane discovery. */
+    public static String knownDevices() {
+        return radioMessageText("radio.devices", "", new byte[0], -1);
+    }
+
+    /** @deprecated Use {@link #knownDevices()}; the inventory is not NAN-only. */
+    @Deprecated
+    public static String knownNanDevices() {
+        return knownDevices();
+    }
+
+    /** Rust-owned bounded receipt list for NAN follow-ups. */
+    public static String knownNanFollowups() {
+        return radioMessageText("radio.nan.followups", "", new byte[0], -1);
+    }
+
+    /** Forward one Android Wi-Fi Aware lifecycle/callback event to Rust. */
+    public static void recordNanEvent(String event, String peer, byte[] payload) {
+        radioMessage("radio.nan.event", "event=" + textArg(event)
+                + " peer=" + textArg(peer), payload, -1);
     }
 
     public static byte[] buildNanFollowup(String msgType, byte[] deviceId, byte[] targetId,

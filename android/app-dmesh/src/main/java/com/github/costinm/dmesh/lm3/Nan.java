@@ -34,6 +34,7 @@ import com.github.costinm.dmesh.android.util.Hex;
 import com.github.costinm.dmeshnative.MeshNode;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,8 +55,13 @@ public class Nan {
     LocalMesh lm;
     volatile WifiAwareSession nanSession;
     boolean attachInProgress;
+    boolean retryScheduled;
     // Not null if publish session active and nan active
     volatile PublishDiscoverySession pubSession;
+    // Separate service type for low-rate boot/periodic presence. It never
+    // replaces `dmesh`, whose Service Info remains the connection command.
+    volatile PublishDiscoverySession announcePubSession;
+    volatile SubscribeDiscoverySession announceSubSession;
     // publish()/subscribe() complete asynchronously. State-change broadcasts
     // may arrive before their Started callbacks; these guards prevent duplicate
     // discovery sessions and peer handles scoped to a superseded session.
@@ -73,12 +79,13 @@ public class Nan {
     private boolean subscribeServiceInfoEnabled = true;
     private String discoveryRole = ROLE_BOTH;
 
-    // Default DMesh discovery uses an active subscription and a solicited
-    // publisher. Android calls the publish alternatives solicited and
-    // unsolicited; "active" applies to the subscribe type.
+    // Test and production discovery actively advertises from every node and
+    // actively subscribes. Android calls the publish alternatives solicited
+    // and unsolicited; the latter is the continuously advertised form, while
+    // "active" applies to the subscribe type.
     int subType = SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
 
-    int pubType = PublishConfig.PUBLISH_TYPE_SOLICITED;
+    int pubType = PublishConfig.PUBLISH_TYPE_UNSOLICITED;
 
     byte[] nanMac;
 
@@ -95,6 +102,21 @@ public class Nan {
     // retaining a message across a match-expiry/session-replacement boundary.
     private String armedPeerId;
     private String armedFollowupText;
+    // An explicit NAN Service Info payload is a complete CBOR command, with
+    // the same meaning as a UART direct record. It is deliberately ephemeral:
+    // restarting the Android service returns to identity advertising.
+    private byte[] publishServiceInfoCbor;
+    // The active-subscribe test surface uses the same bounded Service Info
+    // bytes. A matching publisher gets one follow-up response, allowing the
+    // caller to prove matching and the post-match path separately.
+    private byte[] subscribeServiceInfoCbor;
+    private byte[] activeSubscribeFollowup =
+            "NAN_ACTIVE_SUB_ACK".getBytes(StandardCharsets.UTF_8);
+    // Framework callbacks are asynchronous. Keep an explicit in-flight bit
+    // for each announce session so periodic maintenance cannot submit a new
+    // publish/subscribe while the prior request is still pending.
+    private boolean announcePubStarting;
+    private boolean announceSubStarting;
 
     private long startCount;
     private long attachAttempts;
@@ -110,6 +132,29 @@ public class Nan {
     private long followupTxOk;
     private long followupTxFailed;
     private long followupRx;
+
+    private byte[] announceServiceInfo(String kind) {
+        return MeshNode.buildNanAnnounce(kind, lm.deviceIdBytes(),
+                SystemClock.elapsedRealtime() / 1000, 0,
+                discoveredByPublish + discoveredBySubscribe + followupRx);
+    }
+
+    private PublishConfig buildAnnouncePublishConfig(String kind) {
+        return new PublishConfig.Builder()
+                .setServiceName("dmesh-announce")
+                .setPublishType(PublishConfig.PUBLISH_TYPE_UNSOLICITED)
+                .setServiceSpecificInfo(announceServiceInfo(kind))
+                .setTerminateNotificationEnabled(true)
+                .build();
+    }
+
+    private SubscribeConfig buildAnnounceSubscribeConfig() {
+        return new SubscribeConfig.Builder()
+                .setServiceName("dmesh-announce")
+                .setSubscribeType(SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE)
+                .setTerminateNotificationEnabled(true)
+                .build();
+    }
 
     public Nan(LocalMesh wifi) {
         this.lm = wifi;
@@ -137,8 +182,31 @@ public class Nan {
     public void start() {
         enabled = true;
         startCount++;
+        rustEvent("start", "", null);
         MsgMux.get(ctx).publish("net.NAN.START");
         onWifiAwareStateChanged(new Intent());
+    }
+
+    /** Keep the desired NAN attachment and both discovery sessions alive. */
+    public void ensureActive() {
+        if (!enabled) {
+            start();
+        } else {
+            onWifiAwareStateChanged(new Intent());
+        }
+    }
+
+    private void retryLater() {
+        if (!enabled || retryScheduled) {
+            return;
+        }
+        retryScheduled = true;
+        lm.delayHandler.postDelayed(() -> {
+            retryScheduled = false;
+            if (enabled) {
+                onWifiAwareStateChanged(new Intent());
+            }
+        }, 30_000);
     }
 
     public boolean isEnabled() {
@@ -176,6 +244,7 @@ public class Nan {
 
     /** Publish the bounded state/counters used by shell and SSH evidence collection. */
     public synchronized void emitStatus() {
+        rustEvent("status", "", null);
         MsgMux.get(ctx).publish("net.NAN.Status",
                 "enabled", Boolean.toString(enabled),
                 "role", discoveryRole,
@@ -214,8 +283,11 @@ public class Nan {
         // lab role isolates vendor handling of SubscribeConfig service-specific
         // info without changing the production `sub-passive` descriptor.
         subscribeServiceInfoEnabled = !ROLE_SUB_PASSIVE_EMPTY_SSI.equals(role);
-        pubType = ROLE_PUB_UNSOLICITED.equals(role)
-                ? PublishConfig.PUBLISH_TYPE_UNSOLICITED : PublishConfig.PUBLISH_TYPE_SOLICITED;
+        // `both` is the stable interoperable mode: every peer advertises its
+        // Service Info without first requiring a matching active subscribe.
+        // Keep `pub-solicited` only as a focused framework experiment.
+        pubType = ROLE_PUB_SOLICITED.equals(role)
+                ? PublishConfig.PUBLISH_TYPE_SOLICITED : PublishConfig.PUBLISH_TYPE_UNSOLICITED;
         subType = (ROLE_SUB_PASSIVE.equals(role) || ROLE_SUB_PASSIVE_EMPTY_SSI.equals(role))
                 ? SubscribeConfig.SUBSCRIBE_TYPE_PASSIVE : SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
     }
@@ -238,6 +310,7 @@ public class Nan {
     }
 
     public void stop() {
+        rustEvent("stop", "", null);
         enabled = false;
         pubStarting = false;
         attachInProgress = false;
@@ -253,8 +326,12 @@ public class Nan {
         // cannot recreate discovery sessions.
         PublishDiscoverySession publishing = pubSession;
         SubscribeDiscoverySession subscribing = subSession;
+        PublishDiscoverySession announcePublishing = announcePubSession;
+        SubscribeDiscoverySession announceSubscribing = announceSubSession;
         pubSession = null;
         subSession = null;
+        announcePubSession = null;
+        announceSubSession = null;
         if (publishing != null) {
             try {
                 publishing.close();
@@ -268,6 +345,12 @@ public class Nan {
             } catch (IllegalStateException ignored) {
                 // The session may already have terminated asynchronously.
             }
+        }
+        if (announcePublishing != null) {
+            try { announcePublishing.close(); } catch (IllegalStateException ignored) { }
+        }
+        if (announceSubscribing != null) {
+            try { announceSubscribing.close(); } catch (IllegalStateException ignored) { }
         }
         WifiAwareSession attachment = nanSession;
         nanSession = null;
@@ -345,6 +428,7 @@ public class Nan {
     }
 
     public void onWifiAwareStateChanged(Intent i) {
+        rustEvent("state_changed", "", null);
         if (!enabled) {
             return;
         }
@@ -354,6 +438,7 @@ public class Nan {
                 ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
                 ctx.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "Missing permissions");
+            rustEvent("permission_missing", "", null);
             MsgMux.get(ctx).publish("net.NAN.ERR.permission");
             return;
         }
@@ -361,6 +446,7 @@ public class Nan {
             nanMgr = ctx.getSystemService(WifiAwareManager.class);
             if (nanMgr == null) {
                 Log.d(TAG, "State changed - no system service" + i.getAction() + " " + i.getExtras());
+                rustEvent("manager_unavailable", "", null);
                 MsgMux.get(ctx).publish("net.NAN.ERR.service");
                 return;
             }
@@ -377,6 +463,7 @@ public class Nan {
                     if (subscribeEnabled && subSession == null && !nanSub) {
                         startNanSub();
                     }
+                    startAnnounceSessions();
                     return;
                 }
                 if (attachInProgress) {
@@ -397,10 +484,12 @@ public class Nan {
                         Log.w(TAG, "Unable to enable NAN opportunistic mode", se);
                         MsgMux.get(ctx).publish("net.NAN.OpportunisticError",
                                 "error", se.toString());
+                        rustEvent("opportunistic_error", "", null);
                     } catch (RuntimeException re) {
                         Log.w(TAG, "Unable to enable NAN opportunistic mode", re);
                         MsgMux.get(ctx).publish("net.NAN.OpportunisticError",
                                 "error", re.toString());
+                        rustEvent("opportunistic_error", "", null);
                     }
                 }
                 // TODO: add a setting to control 'on' or 'off' for local mesh.
@@ -415,6 +504,7 @@ public class Nan {
                         attachInProgress = false;
                         nanSession = session;
                         attachSuccesses++;
+                        rustEvent("attached", "", null);
 
                         // No point being attached and not using discovery.
                         if (enabled) {
@@ -424,6 +514,7 @@ public class Nan {
                             if (subscribeEnabled) {
                                 startNanSub();
                             }
+                            startAnnounceSessions();
                         }
 
                         MsgMux.get(ctx).publish("net.NAN.Attach");
@@ -434,8 +525,13 @@ public class Nan {
                         super.onAttachFailed();
                         attachInProgress = false;
                         attachFailures++;
-                        enabled = false;
-                        MsgMux.get(ctx).publish("net.NAN.AttachError", "retry", "explicit-start-required");
+                        // Keep NAN desired. A foreground service and its
+                        // 15-minute repair job both retry attachment; a
+                        // transient framework failure must not silently
+                        // turn the always-on discovery cluster off.
+                        rustEvent("attach_failed", "", null);
+                        MsgMux.get(ctx).publish("net.NAN.AttachError", "retry", "scheduled");
+                        retryLater();
                     }
                 }, new IdentityChangedListener() {
                     @Override
@@ -444,6 +540,7 @@ public class Nan {
                         nanMac = mac;
                         nanId = new String(Hex.encode(mac));
                         MsgMux.get(ctx).publish("net.NAN.MAC." + nanId);
+                        rustEvent("identity", nanId, mac);
                         // onAttached() normally starts discovery before the framework has
                         // delivered this identity callback. Refresh the session descriptors
                         // rather than retaining the legacy placeholder identity in service
@@ -454,8 +551,9 @@ public class Nan {
                 }, lm.delayHandler);
             } else {
                 Log.d(TAG, "WifiAware unavailabe");
+                rustEvent("unavailable", "", null);
                 MsgMux.get(ctx).publish("net.NAN.unavailable");
-                stop();
+                retryLater();
             }
         } catch(Throwable t) {
             Log.w(TAG, "NAN attach failed", t);
@@ -463,6 +561,8 @@ public class Nan {
             MsgMux.get(ctx).publish("net.NAN.AttachError",
                     "error", t.getClass().getName(),
                     "message", t.toString());
+            rustEvent("attach_exception", "", null);
+            retryLater();
         }
     }
 
@@ -472,7 +572,9 @@ public class Nan {
             return;
         }
         Device bd = new Device(peerHandle, serviceSpecificInfo);
-        String parsed = MeshNode.parseNanServiceInfo(serviceSpecificInfo);
+        // Rust owns retained discovery state and expiry. Java holds only the
+        // session-scoped PeerHandle needed to call Android's NAN APIs.
+        String parsed = MeshNode.observeNanServiceInfo(peerHandle.toString(), serviceSpecificInfo);
         String deviceId = jsonField(parsed, "device_id");
         if (isUsableDmeshIdentity(deviceId)) {
             bd.id = deviceId;
@@ -523,6 +625,13 @@ public class Nan {
         MsgMux.get(ctx).publish("net.NAN.PeerReady",
                 "id", bd.id == null ? "" : bd.id,
                 "peer", peerHandle.toString());
+        rustEvent("service_discovered", peerHandle.toString(), serviceSpecificInfo);
+        // Android delivers a matching active subscribe to the publisher's
+        // callback. Respond once per callback with the configured bounded
+        // follow-up; this is intentionally not an unbounded hello loop.
+        if (byPublisher && activeSubscribeFollowup != null) {
+            sendFollowup(bd, "command_cbor", activeSubscribeFollowup);
+        }
         sendArmedFollowupIfMatched(bd);
     }
 
@@ -561,6 +670,16 @@ public class Nan {
             return false;
         }
         return !"000000000000".equals(deviceId) && !"303030303030".equals(deviceId);
+    }
+
+    private void rustEvent(String event, String peer, byte[] payload) {
+        try {
+            MeshNode.recordNanEvent(event, peer == null ? "" : peer,
+                    payload == null ? new byte[0] : payload);
+        } catch (RuntimeException ignored) {
+            // NAN must keep running if the optional native event store is
+            // temporarily unavailable during process startup/teardown.
+        }
     }
 
     private void onDiscovery(Device bd, String id, boolean b) {
@@ -602,13 +721,84 @@ public class Nan {
     }
 
     private PublishConfig buildPublishConfig() {
+        byte[] serviceInfo = publishServiceInfoCbor != null
+                ? publishServiceInfoCbor
+                : MeshNode.buildNanServiceInfo("android", lm.deviceIdBytes(), wakeCount++);
         PublishConfig.Builder builder = new PublishConfig.Builder().setServiceName(pubServiceName)
                 .setPublishType(pubType) // silent, but respond to active requests
                 .setTerminateNotificationEnabled(true)
-                .setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
-                        lm.deviceIdBytes(),
-                        wakeCount++));
+                .setServiceSpecificInfo(serviceInfo);
         return builder.build();
+    }
+
+    /** Publish one bounded CBOR command as NAN Service Info. */
+    public synchronized boolean setServiceInfoCbor(byte[] command) {
+        if (command == null || command.length == 0 || command.length > 255) {
+            return false;
+        }
+        publishServiceInfoCbor = Arrays.copyOf(command, command.length);
+        if (pubSession != null) {
+            try {
+                pubSession.updatePublish(buildPublishConfig());
+                MsgMux.get(ctx).publish("net.NAN.ServiceInfoUpdated",
+                        "bytes", Integer.toString(command.length));
+            } catch (IllegalStateException error) {
+                MsgMux.get(ctx).publish("net.NAN.ServiceInfoUpdateError",
+                        "error", error.toString());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Enable/disable the normal active publisher without changing NAN attachment. */
+    public synchronized void setActivePublishEnabled(boolean enabled) {
+        publishEnabled = enabled;
+        if (!enabled && pubSession != null) {
+            pubSession.close();
+            pubSession = null;
+            pubStarting = false;
+        } else if (enabled) {
+            publish();
+        }
+        MsgMux.get(ctx).publish("net.NAN.ActivePublish",
+                "enabled", Boolean.toString(enabled));
+    }
+
+    /** Configure active-subscribe SSI and its bounded response follow-up. */
+    public synchronized boolean setActiveSubscribe(byte[] serviceInfo, byte[] followup) {
+        if (serviceInfo == null || serviceInfo.length == 0 || serviceInfo.length > 255
+                || followup == null || followup.length == 0 || followup.length > 231) {
+            return false;
+        }
+        subscribeServiceInfoCbor = Arrays.copyOf(serviceInfo, serviceInfo.length);
+        activeSubscribeFollowup = Arrays.copyOf(followup, followup.length);
+        subscribeEnabled = true;
+        subType = SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE;
+        if (subSession != null) {
+            try {
+                subSession.updateSubscribe(buildSubscribeConfig());
+            } catch (IllegalStateException error) {
+                return false;
+            }
+        }
+        MsgMux.get(ctx).publish("net.NAN.ActiveSubscribe",
+                "serviceInfoBytes", Integer.toString(serviceInfo.length),
+                "followupBytes", Integer.toString(followup.length));
+        return true;
+    }
+
+    /** Clear an explicit CBOR command and resume normal DMesh identity SSI. */
+    public synchronized void clearServiceInfoCbor() {
+        publishServiceInfoCbor = null;
+        if (pubSession != null) {
+            try {
+                pubSession.updatePublish(buildPublishConfig());
+            } catch (IllegalStateException error) {
+                MsgMux.get(ctx).publish("net.NAN.ServiceInfoUpdateError",
+                        "error", error.toString());
+            }
+        }
     }
 
     public void stopSub() {
@@ -656,15 +846,113 @@ public class Nan {
 
     }
 
+    /** Start the separate low-rate boot/discovery Service-Info type. */
+    private synchronized void startAnnounceSessions() {
+        if (nanSession == null) {
+            return;
+        }
+        if (announcePubSession == null && !announcePubStarting) {
+            announcePubStarting = true;
+            try {
+                nanSession.publish(buildAnnouncePublishConfig("boot"), new DiscoverySessionCallback() {
+                    @Override public void onPublishStarted(PublishDiscoverySession session) {
+                        synchronized (Nan.this) {
+                            announcePubStarting = false;
+                            announcePubSession = session;
+                        }
+                        rustEvent("announce_publish_started", "", null);
+                    }
+                    @Override public void onSessionTerminated() {
+                        synchronized (Nan.this) {
+                            announcePubStarting = false;
+                            announcePubSession = null;
+                        }
+                        rustEvent("announce_publish_terminated", "", null);
+                        // Aware can terminate one discovery session while the
+                        // attachment survives. Do not wait for the 15-minute
+                        // job: the shared retry coalesces all callback races.
+                        retryLater();
+                    }
+                    @Override public void onSessionConfigFailed() {
+                        synchronized (Nan.this) { announcePubStarting = false; }
+                        rustEvent("announce_publish_failed", "", null);
+                        retryLater();
+                    }
+                    @Override public void onSessionConfigUpdated() {
+                        rustEvent("announce_publish_updated", "", null);
+                    }
+                }, lm.delayHandler);
+            } catch (RuntimeException e) {
+                announcePubStarting = false;
+                rustEvent("announce_publish_exception", "", null);
+            }
+        }
+        if (announceSubSession == null && !announceSubStarting) {
+            announceSubStarting = true;
+            try {
+                nanSession.subscribe(buildAnnounceSubscribeConfig(), new DiscoverySessionCallback() {
+                    @Override public void onSubscribeStarted(SubscribeDiscoverySession session) {
+                        synchronized (Nan.this) {
+                            announceSubStarting = false;
+                            announceSubSession = session;
+                        }
+                        rustEvent("announce_subscribe_started", "", null);
+                    }
+                    @Override public void onServiceDiscovered(PeerHandle peer, byte[] serviceInfo,
+                                                               List<byte[]> matchFilter) {
+                        String parsed = MeshNode.observeNanServiceInfo(peer.toString(), serviceInfo);
+                        rustEvent("announce_discovered", peer.toString(), serviceInfo);
+                        MsgMux.get(ctx).publish("net.NAN.AnnounceDiscovered",
+                                "peer", peer.toString(), "json", parsed);
+                    }
+                    @Override public void onSessionTerminated() {
+                        synchronized (Nan.this) {
+                            announceSubStarting = false;
+                            announceSubSession = null;
+                        }
+                        rustEvent("announce_subscribe_terminated", "", null);
+                        retryLater();
+                    }
+                    @Override public void onSessionConfigFailed() {
+                        synchronized (Nan.this) { announceSubStarting = false; }
+                        rustEvent("announce_subscribe_failed", "", null);
+                        retryLater();
+                    }
+                    @Override public void onSessionConfigUpdated() {
+                        rustEvent("announce_subscribe_updated", "", null);
+                    }
+                }, lm.delayHandler);
+            } catch (RuntimeException e) {
+                announceSubStarting = false;
+                rustEvent("announce_subscribe_exception", "", null);
+            }
+        }
+    }
+
+    /** Called at the Android periodic-job cadence: update only the announce SSI. */
+    public synchronized void publishDiscoveryAnnounce() {
+        ensureActive();
+        startAnnounceSessions();
+        if (announcePubSession != null) {
+            try {
+                announcePubSession.updatePublish(buildAnnouncePublishConfig("discovery"));
+                rustEvent("announce_discovery", "", null);
+            } catch (IllegalStateException e) {
+                announcePubSession = null;
+                rustEvent("announce_update_failed", "", null);
+            }
+        }
+    }
+
     private SubscribeConfig buildSubscribeConfig() {
         SubscribeConfig.Builder builder = new SubscribeConfig.Builder()
                 .setServiceName("dmesh")
                 .setSubscribeType(subType)
                 .setTerminateNotificationEnabled(true);
         if (subscribeServiceInfoEnabled) {
-            builder.setServiceSpecificInfo(MeshNode.buildNanServiceInfo("android",
-                    lm.deviceIdBytes(),
-                    wakeCount++));
+            builder.setServiceSpecificInfo(subscribeServiceInfoCbor != null
+                    ? subscribeServiceInfoCbor
+                    : MeshNode.buildNanServiceInfo("android", lm.deviceIdBytes(), wakeCount++));
         }
         return builder.build();
     }
@@ -685,6 +973,19 @@ public class Nan {
                 MsgMux.get(ctx).publish("net.NAN.SubIdentityUpdated", "id", nanId);
             } catch (IllegalStateException e) {
                 MsgMux.get(ctx).publish("net.NAN.SubIdentityUpdateError", "error", e.toString());
+            }
+        }
+        if (announcePubSession != null) {
+            try {
+                // The announce publisher may start before Android delivers
+                // IdentityChanged. Refresh its CBOR record too, otherwise
+                // the host sees the shared legacy "000000" ID even though
+                // the primary DMesh service has the real NAN identity.
+                announcePubSession.updatePublish(buildAnnouncePublishConfig("boot"));
+                MsgMux.get(ctx).publish("net.NAN.AnnounceIdentityUpdated", "id", nanId);
+            } catch (IllegalStateException e) {
+                MsgMux.get(ctx).publish("net.NAN.AnnounceIdentityUpdateError",
+                        "error", e.toString());
             }
         }
     }
@@ -871,11 +1172,13 @@ public class Nan {
         public void onSessionConfigUpdated() {
             super.onSessionConfigUpdated();
             Log.d(TAG, "/NAN/PubSessionConfigUpdated");
+            rustEvent(pub ? "publish_config_updated" : "subscribe_config_updated", "", null);
         }
 
         @Override
         public void onSessionConfigFailed() {
             super.onSessionConfigFailed();
+            rustEvent(pub ? "publish_config_failed" : "subscribe_config_failed", "", null);
             synchronized (Nan.this) {
                 if (pub) {
                     pubStarting = false;
@@ -891,12 +1194,14 @@ public class Nan {
 
         @Override
         public void onServiceDiscoveredWithinRange(PeerHandle peerHandle, byte[] serviceSpecificInfo, List<byte[]> matchFilter, int distanceMm) {
+            rustEvent("service_discovered_within_range", peerHandle.toString(), serviceSpecificInfo);
             onServiceDiscovered(peerHandle, serviceSpecificInfo, matchFilter);
         }
 
         @Override
         public void onMessageSendSucceeded(int messageId) {
             super.onMessageSendSucceeded(messageId);
+            rustEvent("followup_tx_ok", Integer.toString(messageId), null);
             String pending = pendingFollowups.remove(messageId);
             followupTxOk++;
             MsgMux.get(ctx).publish("net.NAN.FollowupTxOk",
@@ -908,6 +1213,7 @@ public class Nan {
         @Override
         public void onMessageSendFailed(int messageId) {
             super.onMessageSendFailed(messageId);
+            rustEvent("followup_tx_failed", Integer.toString(messageId), null);
             String pending = pendingFollowups.remove(messageId);
             followupTxFailed++;
             MsgMux.get(ctx).publish("net.NAN.MSGERR",
@@ -918,6 +1224,7 @@ public class Nan {
         @Override
         public void onSubscribeStarted(SubscribeDiscoverySession session) {
             super.onSubscribeStarted(session);
+            rustEvent("subscribe_started", "", null);
             Log.d(TAG, "/NAN/SubStart" + session);
             MsgMux.get(ctx).publish("net.NAN.SubStart");
             synchronized (Nan.this) {
@@ -933,6 +1240,7 @@ public class Nan {
         @Override
         public void onPublishStarted(PublishDiscoverySession session) {
             super.onPublishStarted(session);
+            rustEvent("publish_started", "", null);
             Log.d(TAG, "/NAN/PubStart");
             MsgMux.get(ctx).publish("net.NAN.PubStart");
             synchronized (Nan.this) {
@@ -949,6 +1257,7 @@ public class Nan {
         @Override
         public void onSessionTerminated() {
             super.onSessionTerminated();
+            rustEvent(pub ? "publish_terminated" : "subscribe_terminated", "", null);
             DiscoverySession endedSession = discoverySession;
             devices.entrySet().removeIf(entry -> entry.getValue().nanSession == endedSession);
             pendingFollowups.clear();
@@ -966,11 +1275,17 @@ public class Nan {
                 }
                 MsgMux.get(ctx).publish("net.NAN.SubStop", "dev", "" + devices);
             }
+            // `nanSession` is still attached, but its independently owned
+            // publish/subscribe counterpart has gone away. Repair promptly;
+            // retryLater is coalesced and keeps framework callbacks off the
+            // immediate callback stack.
+            retryLater();
         }
 
         @Override
         public void onMessageReceived(PeerHandle peerHandle, byte[] message) {
             super.onMessageReceived(peerHandle, message);
+            rustEvent("followup_rx", peerHandle.toString(), message);
             String msg = new String(message);
             followupRx++;
             String parsed = MeshNode.parseNanFollowup(message);

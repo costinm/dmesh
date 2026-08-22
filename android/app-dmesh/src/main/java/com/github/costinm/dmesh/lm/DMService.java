@@ -191,6 +191,10 @@ public class DMService extends BaseMsgService implements MessageHandler {
             Log.w(TAG, "Rust dmesh library unavailable", e);
         }
         wifi = LocalMesh.get(this.getApplicationContext());
+        // NAN is a continuous discovery/control plane, just like the native
+        // UDP listener started below. Do not wait for a UI command or the
+        // periodic repair job to join/publish the cluster.
+        wifi.listen();
 
         // Dispatching messages on this service.
         mux.subscribe("ble", wifi.ble);

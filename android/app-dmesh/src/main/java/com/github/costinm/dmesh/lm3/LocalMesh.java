@@ -7,12 +7,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
+import android.net.MacAddress;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiNetworkSpecifier;
 import android.net.wifi.WpsInfo;
 import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pInfo;
@@ -170,6 +172,11 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     public P2P p2p;
 
     ConnectivityManager cm;
+    // A requested infrastructure STA attachment.  It is intentionally
+    // separate from the historical Wi-Fi Direct group state in P2P: the
+    // control plane may measure AP+STA capability without silently replacing
+    // one with the other.
+    ConnectivityManager.NetworkCallback staAttachment;
 
     // Advertised URL - for NAN, BLE, TXT
     // Current format: 16 bytes, PSK8 + SSIDHASH4 + ID4
@@ -260,9 +267,92 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      * Will leave AP and connections in last known state. May exit.
      */
     public void onDestroy() {
+        releaseStaAttachment();
         ctx.unregisterReceiver(this);
         p2p.stopPeerAndSDDiscovery();
         //bt.close();
+    }
+
+    /**
+     * Ask Android to attach this app to one explicit infrastructure AP.
+     *
+     * This is deliberately an app-scoped {@link WifiNetworkSpecifier}
+     * request: it does not save credentials, change the user's global Wi-Fi
+     * choice, or tear down NAN/P2P. Android may present its normal approval
+     * UI and an OEM may reject AP+STA concurrency; both outcomes are emitted
+     * so the shared probe response can report measured capability.
+     */
+    private void requestStaAttachment(Bundle data) {
+        String ssid = data.getString("ssid", "");
+        String bssid = data.getString("bssid", "");
+        String passphrase = data.getString("passphrase", "");
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || ssid.isEmpty()) {
+            MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "error",
+                    ssid.isEmpty() ? "missing_ssid" : "requires_android_10");
+            return;
+        }
+        if (ctx.checkSelfPermission(android.Manifest.permission.NEARBY_WIFI_DEVICES)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "error",
+                    "missing_NEARBY_WIFI_DEVICES");
+            return;
+        }
+
+        WifiNetworkSpecifier.Builder specifier = new WifiNetworkSpecifier.Builder().setSsid(ssid);
+        try {
+            if (!bssid.isEmpty()) {
+                specifier.setBssid(MacAddress.fromString(bssid));
+            }
+            if (!passphrase.isEmpty()) {
+                specifier.setWpa2Passphrase(passphrase);
+            }
+        } catch (IllegalArgumentException error) {
+            MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "error",
+                    "invalid_bssid_or_passphrase");
+            return;
+        }
+
+        releaseStaAttachment();
+        NetworkRequest request = new NetworkRequest.Builder()
+                .addTransportType(TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .setNetworkSpecifier(specifier.build())
+                .build();
+        staAttachment = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "1", "state",
+                        "available", "ssid", ssid, "bssid", bssid);
+            }
+
+            @Override
+            public void onUnavailable() {
+                MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "state",
+                        "unavailable", "ssid", ssid, "bssid", bssid);
+            }
+
+            @Override
+            public void onLost(Network network) {
+                MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "state",
+                        "lost", "ssid", ssid, "bssid", bssid);
+            }
+        };
+        cm.requestNetwork(request, staAttachment, 20_000);
+        MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "1", "state", "requested",
+                "ssid", ssid, "bssid", bssid);
+    }
+
+    private void releaseStaAttachment() {
+        if (staAttachment == null) {
+            return;
+        }
+        try {
+            cm.unregisterNetworkCallback(staAttachment);
+        } catch (IllegalArgumentException ignored) {
+            // Android already retired the request.
+        }
+        staAttachment = null;
+        MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "1", "state", "released");
     }
 
     /**
@@ -299,6 +389,11 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      */
     public void update() {
         listen();
+        if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Android's periodic-job floor is 15 minutes, suitable for a
+            // low-rate presence refresh but never for radio timing.
+            nan.publishDiscoveryAnnounce();
+        }
     }
 
     public void listen() {
@@ -306,7 +401,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             ble.scan();
         }
         if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nan.start();
+            nan.ensureActive();
         }
     }
 
@@ -381,6 +476,19 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                 updateP2P(msg);
                 break;
 
+            // `wifi.sta.attach` is the platform half of a signed
+            // transport.start/probe request. Rust supplies the policy and
+            // records the result; Java only asks Android to attach to the
+            // explicit SSID/BSSID. `wifi.sta.detach` releases only this
+            // request, never NAN or an independently running AP.
+            case "sta":
+                if (args.length >= 3 && "attach".equals(args[2])) {
+                    requestStaAttachment(b);
+                } else if (args.length >= 3 && "detach".equals(args[2])) {
+                    releaseStaAttachment();
+                }
+                break;
+
             // Actions and testing
 
             case "scan":
@@ -411,6 +519,9 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                 break;
 
 
+            // Rust reaches this Android-only Wi-Fi Aware adapter through the
+            // native SSH/proxy bridge -> MsgMux. Keep platform calls here;
+            // Rust owns the command meaning, event inventory, and CBOR wire.
             case "nan":
                 Log.d(TAG, "NAN command " + args);
                 if (nan != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && args.length >= 3) {
@@ -433,6 +544,47 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                         nan.start();
                     } else if ("status".equals(args[2])) {
                         nan.emitStatus();
+                    } else if ("sd".equals(args[2])) {
+                        String cborHex = args.length >= 4 ? args[3]
+                                : b.getString("cbor_hex", b.getString("cbor", ""));
+                        if ("clear".equalsIgnoreCase(cborHex)) {
+                            nan.clearServiceInfoCbor();
+                            MsgMux.get(ctx).publish("net.NAN.ServiceInfoCleared");
+                        } else {
+                            byte[] cbor = decodeHex(cborHex);
+                            if (nan.setServiceInfoCbor(cbor)) {
+                                // Start is idempotent and ensures a publisher exists when
+                                // this command arrives before NAN attachment completes.
+                                nan.start();
+                                MsgMux.get(ctx).publish("net.NAN.ServiceInfoActive",
+                                        "bytes", Integer.toString(cbor.length));
+                            } else {
+                                MsgMux.get(ctx).publish("net.NAN.ServiceInfoError",
+                                        "error", "cbor must be 1..255 bytes of hex");
+                            }
+                        }
+                    } else if ("publish".equals(args[2])) {
+                        String value = args.length >= 4 ? args[3]
+                                : b.getString("enabled", "on");
+                        boolean enabled = !"off".equalsIgnoreCase(value)
+                                && !"0".equals(value) && !"false".equalsIgnoreCase(value);
+                        nan.setActivePublishEnabled(enabled);
+                        if (enabled) {
+                            nan.start();
+                        }
+                    } else if ("active-sub".equals(args[2])) {
+                        String serviceHex = args.length >= 4 ? args[3]
+                                : b.getString("service_info_hex", "");
+                        String followupHex = args.length >= 5 ? args[4]
+                                : b.getString("followup_hex", "");
+                        byte[] serviceInfo = decodeHex(serviceHex);
+                        byte[] followup = decodeHex(followupHex);
+                        if (nan.setActiveSubscribe(serviceInfo, followup)) {
+                            nan.start();
+                        } else {
+                            MsgMux.get(ctx).publish("net.NAN.ActiveSubscribeError",
+                                    "error", "service info must be 1..255 bytes and follow-up 1..231 bytes of hex");
+                        }
                     } else if ("con".equals(args[2])) {
                         String peerId = args.length >= 4 ? args[3]
                                 : b.getString("peer", b.getString("id"));
@@ -790,6 +942,26 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
     }
 
+
+    private static byte[] decodeHex(String value) {
+        if (value == null) {
+            return new byte[0];
+        }
+        String hex = value.startsWith("hex:") ? value.substring(4) : value;
+        if ((hex.length() & 1) != 0) {
+            return new byte[0];
+        }
+        byte[] result = new byte[hex.length() / 2];
+        for (int i = 0; i < result.length; i++) {
+            int high = Character.digit(hex.charAt(i * 2), 16);
+            int low = Character.digit(hex.charAt(i * 2 + 1), 16);
+            if (high < 0 || low < 0) {
+                return new byte[0];
+            }
+            result[i] = (byte) ((high << 4) | low);
+        }
+        return result;
+    }
 
     static class ConnectivityCallback extends ConnectivityManager.NetworkCallback {
         private final LocalMesh wifi;

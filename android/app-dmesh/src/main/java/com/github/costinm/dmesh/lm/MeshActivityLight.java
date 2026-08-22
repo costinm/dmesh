@@ -26,6 +26,10 @@ import com.github.costinm.dmesh.android.util.DMeshCompanionPrefs;
 import com.github.costinm.dmesh.android.util.UiUtil;
 import com.github.costinm.dmesh.lm3.Device;
 import com.github.costinm.dmesh.lm3.P2P;
+import com.github.costinm.dmeshnative.MeshNode;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.net.InterfaceAddress;
 import java.net.InetAddress;
@@ -442,7 +446,36 @@ public class MeshActivityLight extends Activity implements MessageHandler {
                 sb.append(client.deviceAddress).append(" ").append(client.deviceName).append("\n");
             }
         }
+        appendRustDiscoveredDevices(sb);
         ifText.setText(sb.length() == 0 ? "No active interfaces" : sb.toString());
+    }
+
+    /** Render the native one-hour cross-bearer inventory, not Java's session-scoped NAN handles. */
+    private void appendRustDiscoveredDevices(StringBuilder sb) {
+        try {
+            JSONArray devices = new JSONObject(MeshNode.knownDevices()).optJSONArray("devices");
+            int count = devices == null ? 0 : devices.length();
+            sb.append("Discovered devices: ").append(count).append("\n");
+            for (int i = 0; devices != null && i < count; i++) {
+                JSONObject device = devices.optJSONObject(i);
+                if (device == null) {
+                    continue;
+                }
+                sb.append("  ").append(device.optString("id", "peer"));
+                String peer = device.optString("peer", "");
+                if (!peer.isEmpty()) {
+                    sb.append(" ").append(peer);
+                }
+                String source = device.optJSONObject("info") == null ? ""
+                        : device.optJSONObject("info").optString("source", "");
+                if (!source.isEmpty()) {
+                    sb.append(" via ").append(source);
+                }
+                sb.append("\n");
+            }
+        } catch (Exception ignored) {
+            // The native library can be unavailable while the service starts.
+        }
     }
 
     private void setServiceStatus(String text) {
