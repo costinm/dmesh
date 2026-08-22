@@ -17,10 +17,13 @@ use quic_lite::connection::ConnectionPolicy;
 /// is not persisted as part of STA association.
 pub const DEFAULT_EVENT_PORT: u16 = 3336;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportProfile {
     pub ssid: [u8; 33],
     pub ssid_len: usize,
+    /// Ephemeral WPA2 credential from transport.start; never stored in NVS.
+    pub sta_passphrase: [u8; 64],
+    pub sta_passphrase_len: usize,
     /// Optional exact AP identity supplied with the transient STA start.
     pub sta_bssid: [u8; 6],
     pub sta_bssid_set: bool,
@@ -84,6 +87,8 @@ impl TransportProfile {
         Self {
             ssid: [0; 33],
             ssid_len: 0,
+            sta_passphrase: [0; 64],
+            sta_passphrase_len: 0,
             sta_bssid: [0; 6],
             sta_bssid_set: false,
             sta_channel: 0,
@@ -129,6 +134,10 @@ impl Default for TransportProfile {
 /// Apply a physical-bearer configuration. Omitted fields leave the active
 /// bearer unchanged; persistence is handled through `settings.*`.
 pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportProfile) {
+    if let Some(value) = config.passphrase {
+        profile.sta_passphrase[..value.len()].copy_from_slice(value);
+        profile.sta_passphrase_len = value.len();
+    }
     if let Some(value) = config.bssid {
         profile.sta_bssid = value;
         profile.sta_bssid_set = true;

@@ -39,8 +39,9 @@ pub const RAW_WIFI_COMPONENT: u64 = 4;
 pub const RAW_WIFI_MAX_FRAME: usize = 1500;
 /// Maximum encoded snapshot response. The response carries a fixed set of
 /// monotonic counters plus optional applied radio state, so callers can use a
-/// small fixed stack/packet buffer rather than allocate for diagnostics.
-pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 256;
+/// small fixed stack/packet buffer rather than allocate for diagnostics. It
+/// remains deliberately below the common 1100-byte bearer MTU.
+pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 384;
 
 /// Encode a complete tagged raw-frame injection request. The frame stays a
 /// borrowed byte string at the decoder boundary; this constructor does not
@@ -435,6 +436,14 @@ pub struct RawWifiCounters {
     pub nan_beacons: u32,
     pub nan_sdfs: u32,
     pub nan_followups: u32,
+    /// DMesh Service Info records recognized inside NAN SDFs.
+    pub nan_service_info_matched: u32,
+    /// Recognized Service Info records copied from the Wi-Fi callback to the
+    /// shared ingress worker.
+    pub nan_service_info_enqueued: u32,
+    /// Recognized Service Info records that could not be copied because the
+    /// bounded shared ingress pool was full or unavailable.
+    pub nan_service_info_dropped: u32,
     pub tx_duration_us_total: u32,
     pub tx_duration_us_max: u32,
     pub tx_duration_le_250us: u32,
@@ -594,6 +603,15 @@ impl RawWifiCounters {
             nan_beacons: self.nan_beacons.saturating_sub(before.nan_beacons),
             nan_sdfs: self.nan_sdfs.saturating_sub(before.nan_sdfs),
             nan_followups: self.nan_followups.saturating_sub(before.nan_followups),
+            nan_service_info_matched: self
+                .nan_service_info_matched
+                .saturating_sub(before.nan_service_info_matched),
+            nan_service_info_enqueued: self
+                .nan_service_info_enqueued
+                .saturating_sub(before.nan_service_info_enqueued),
+            nan_service_info_dropped: self
+                .nan_service_info_dropped
+                .saturating_sub(before.nan_service_info_dropped),
             tx_duration_us_total: self
                 .tx_duration_us_total
                 .saturating_sub(before.tx_duration_us_total),
@@ -687,6 +705,9 @@ pub struct RawWifiSnapshot {
     pub sta_associated: Option<bool>,
     pub promiscuous: Option<bool>,
     pub dw_capturing: Option<bool>,
+    /// Configured NAN DW cadence; unlike `dw_capturing`, it remains present
+    /// between the bounded capture windows.
+    pub nan_dw_interval: Option<u8>,
     pub comparator_bssid: Option<[u8; 6]>,
     pub comparator_armed: Option<bool>,
     pub comparator_errors: u32,
@@ -737,6 +758,9 @@ pub struct RawWifiSnapshot {
     /// event. This intentionally excludes radio-epoch setup and is absent
     /// until the current STA epoch has associated.
     pub sta_connect_to_associated_ms: Option<u32>,
+    /// ESP-IDF STA disconnect reason from the current radio epoch. `0` means
+    /// no disconnect event was observed; it is not a success indication.
+    pub sta_last_disconnect_reason: Option<u8>,
     /// RSSI reported by the ESP STA for its associated AP. This is a
     /// best-effort local PHY observation; it is not association authority.
     pub sta_ap_rssi_dbm: Option<i8>,
@@ -824,6 +848,7 @@ pub fn encode_raw_wifi_snapshot(
         + usize::from(snapshot.sta_associated.is_some())
         + usize::from(snapshot.promiscuous.is_some())
         + usize::from(snapshot.dw_capturing.is_some())
+        + usize::from(snapshot.nan_dw_interval.is_some())
         + usize::from(snapshot.comparator_bssid.is_some())
         + usize::from(snapshot.comparator_armed.is_some())
         + usize::from(snapshot.tx_interface.is_some())
@@ -844,6 +869,7 @@ pub fn encode_raw_wifi_snapshot(
         + usize::from(snapshot.sta_11b_rates_disabled.is_some())
         + usize::from(snapshot.sta_raw_rx_enabled.is_some())
         + usize::from(snapshot.sta_connect_to_associated_ms.is_some())
+        + usize::from(snapshot.sta_last_disconnect_reason.is_some())
         + usize::from(snapshot.sta_ap_rssi_dbm.is_some())
         + usize::from(snapshot.udp6_tx_burst_packets.is_some())
         + usize::from(snapshot.udp6_tx_submit_calls.is_some())
@@ -858,7 +884,7 @@ pub fn encode_raw_wifi_snapshot(
     e.uint(6)?;
     // Epoch, comparator errors, and monotonic counters are always
     // present, letting the host calculate deltas without retaining FW state.
-    e.map((43 + optional) as u64)?;
+    e.map((46 + optional) as u64)?;
     e.uint(20)?;
     e.uint(u64::from(snapshot.epoch))?;
     if let Some(channel) = snapshot.channel {
@@ -876,6 +902,10 @@ pub fn encode_raw_wifi_snapshot(
     if let Some(value) = snapshot.dw_capturing {
         e.uint(24)?;
         e.boolean(value)?;
+    }
+    if let Some(value) = snapshot.nan_dw_interval {
+        e.uint(96)?;
+        e.uint(u64::from(value))?;
     }
     if let Some(bssid) = snapshot.comparator_bssid {
         e.uint(25)?;
@@ -959,6 +989,10 @@ pub fn encode_raw_wifi_snapshot(
         e.uint(91)?;
         e.uint(u64::from(value))?;
     }
+    if let Some(value) = snapshot.sta_last_disconnect_reason {
+        e.uint(95)?;
+        e.uint(u64::from(value))?;
+    }
     if let Some(value) = snapshot.sta_ap_rssi_dbm {
         e.uint(86)?;
         e.int(i64::from(value))?;
@@ -991,6 +1025,9 @@ pub fn encode_raw_wifi_snapshot(
         (48, snapshot.counters.nan_beacons),
         (49, snapshot.counters.nan_sdfs),
         (50, snapshot.counters.nan_followups),
+        (92, snapshot.counters.nan_service_info_matched),
+        (93, snapshot.counters.nan_service_info_enqueued),
+        (94, snapshot.counters.nan_service_info_dropped),
         (51, snapshot.counters.tx_duration_us_total),
         (52, snapshot.counters.tx_duration_us_max),
         (53, snapshot.counters.tx_duration_le_250us),
@@ -1072,6 +1109,10 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
             22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
             23 => snapshot.promiscuous = Some(decoder.boolean().ok_or("radio promiscuous")?),
             24 => snapshot.dw_capturing = Some(decoder.boolean().ok_or("radio DW")?),
+            96 => snapshot.nan_dw_interval = Some(
+                u8::try_from(decoder.uint().ok_or("radio DW interval")?)
+                    .map_err(|_| "radio DW interval")?,
+            ),
             25 => {
                 snapshot.comparator_bssid = Some(
                     decoder
@@ -1155,6 +1196,12 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                         .map_err(|_| "radio STA association time")?,
                 )
             }
+            95 => {
+                snapshot.sta_last_disconnect_reason = Some(
+                    u8::try_from(decoder.uint().ok_or("radio STA disconnect reason")?)
+                        .map_err(|_| "radio STA disconnect reason")?,
+                )
+            }
             86 => {
                 snapshot.sta_ap_rssi_dbm = Some(
                     i8::try_from(decoder.int().ok_or("radio STA AP RSSI")?)
@@ -1236,6 +1283,21 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
             50 => {
                 snapshot.counters.nan_followups =
                     u32::try_from(decoder.uint().ok_or("radio NAN followup")?)
+                        .map_err(|_| "radio counter")?
+            }
+            92 => {
+                snapshot.counters.nan_service_info_matched =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info match")?)
+                        .map_err(|_| "radio counter")?
+            }
+            93 => {
+                snapshot.counters.nan_service_info_enqueued =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info ingress")?)
+                        .map_err(|_| "radio counter")?
+            }
+            94 => {
+                snapshot.counters.nan_service_info_dropped =
+                    u32::try_from(decoder.uint().ok_or("radio NAN Service Info drop")?)
                         .map_err(|_| "radio counter")?
             }
             51 => {

@@ -47,10 +47,15 @@ firmware command grammar.
 radio profile: `2:ssid` (STA target), `5:raw_tx_rate`, `6:sta_driver_tx`,
 `7:sta_bssid_check_disabled`, `8:sta_ampdu_enabled`, `9:sta_11b_rates_disabled`,
 `10:sta_raw_rx_enabled`, `13:espnow_capture`, `14:nan_dw_interval`, `15:now`,
-and `16:ap`. Omitted fields use the current profile defaults only while this
+`16:ap`, and optional `17:sta_passphrase` (8..63 bytes, volatile WPA2
+credential). Omitted fields use the current profile defaults only while this
 new epoch is constructed; they cannot be patched afterward. A later start is
 the only way to replace a selected radio setup. `ssid` is session data, not an
-NVS write, so UART and future NAN Service Info use identical CBOR.
+NVS write, so UART and future NAN Service Info use identical CBOR. Replaying
+the same complete start (as an active NAN Publish/Subscribe may do in several
+discovery windows) is an acknowledgement-only no-op: it must not stop Wi-Fi,
+reset NOW, or begin another association. A different complete profile is the
+only start that replaces the current epoch.
 
 `now=0` is the default/on spelling, `now=1` is explicit on, and `now=2` is
 explicit off for the raw-UDP6 baseline. The initial ESP adapter currently

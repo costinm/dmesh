@@ -187,19 +187,49 @@ pub mod metrics {
     pub fn format_nan_metrics(metrics: &NanMetricsSnapshot) -> String {
         format!(
             "nan_metrics dispatch={} accepted={} rx_mgmt={} rx_data={} rx_matched={} rx_action={} rx_beacon={} rx_sdf={} rx_other={} rx_bytes={} sync_beacon_tx={} ap_beacon={} command_rx={} command_tx={} command_drops={} response_rx={} response_tx={} outgoing_drops={} service_rx={} followup_rx={} followup_tx={} prefilter_drops={} queue_drops={} oversize_drops={} ipv6_udp_rx={} ipv6_udp_bytes={} cluster_foreign_drops={} cluster_reselects={} hw_filter_arms={} hw_filter_reprobes={} hw_filter_errors={} publish_dw_tx={} publish_dw_skipped={} publish_guard_drops={} queue_len={} publish_queue_len={} last_beacon_local_us={} last_beacon_tsf_us={} last_raw_tx_offset_us={} last_raw_tx_slot={} last_publish_beacon={} last_publish_slot={} last_publish_offset_us={}",
-            metrics.dispatch, metrics.accepted, metrics.rx_mgmt, metrics.rx_data,
-            metrics.rx_matched, metrics.rx_action, metrics.rx_beacon, metrics.rx_sdf,
-            metrics.rx_other, metrics.rx_bytes, metrics.sync_beacon_tx, metrics.ap_beacon,
-            metrics.command_rx, metrics.command_tx, metrics.command_drops, metrics.response_rx,
-            metrics.response_tx, metrics.outgoing_drops, metrics.service_rx, metrics.followup_rx,
-            metrics.followup_tx, metrics.prefilter_drops, metrics.queue_drops,
-            metrics.oversize_drops, metrics.ipv6_udp_rx, metrics.ipv6_udp_bytes,
-            metrics.cluster_foreign_drops, metrics.cluster_reselects, metrics.hw_filter_arms,
-            metrics.hw_filter_reprobes, metrics.hw_filter_errors, metrics.publish_dw_tx,
-            metrics.publish_dw_skipped, metrics.publish_guard_drops, metrics.queue_len,
-            metrics.publish_queue_len, metrics.last_beacon_local_us, metrics.last_beacon_tsf_us,
-            metrics.last_raw_tx_offset_us, metrics.last_raw_tx_slot, metrics.last_publish_beacon,
-            metrics.last_publish_slot, metrics.last_publish_offset_us,
+            metrics.dispatch,
+            metrics.accepted,
+            metrics.rx_mgmt,
+            metrics.rx_data,
+            metrics.rx_matched,
+            metrics.rx_action,
+            metrics.rx_beacon,
+            metrics.rx_sdf,
+            metrics.rx_other,
+            metrics.rx_bytes,
+            metrics.sync_beacon_tx,
+            metrics.ap_beacon,
+            metrics.command_rx,
+            metrics.command_tx,
+            metrics.command_drops,
+            metrics.response_rx,
+            metrics.response_tx,
+            metrics.outgoing_drops,
+            metrics.service_rx,
+            metrics.followup_rx,
+            metrics.followup_tx,
+            metrics.prefilter_drops,
+            metrics.queue_drops,
+            metrics.oversize_drops,
+            metrics.ipv6_udp_rx,
+            metrics.ipv6_udp_bytes,
+            metrics.cluster_foreign_drops,
+            metrics.cluster_reselects,
+            metrics.hw_filter_arms,
+            metrics.hw_filter_reprobes,
+            metrics.hw_filter_errors,
+            metrics.publish_dw_tx,
+            metrics.publish_dw_skipped,
+            metrics.publish_guard_drops,
+            metrics.queue_len,
+            metrics.publish_queue_len,
+            metrics.last_beacon_local_us,
+            metrics.last_beacon_tsf_us,
+            metrics.last_raw_tx_offset_us,
+            metrics.last_raw_tx_slot,
+            metrics.last_publish_beacon,
+            metrics.last_publish_slot,
+            metrics.last_publish_offset_us,
         )
     }
 
@@ -378,14 +408,29 @@ pub mod metrics {
         format!(
             "beacon_stats source={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} interval_tu={} stride={} accepted={} selected_seen={} selected_missed={} duplicates={} tsf_regressions={} phase_min_us={} phase_max_us={} phase_span_us={} last_phase_us={} tsf_delta_min_us={} tsf_delta_max_us={} local_delta_min_us={} local_delta_max_us={} first_tsf_us={} last_tsf_us={}",
             source,
-            stats.bssid[0], stats.bssid[1], stats.bssid[2], stats.bssid[3], stats.bssid[4], stats.bssid[5],
-            stats.interval_tu, stats.stride, stats.accepted, stats.selected_seen,
-            stats.selected_missed, stats.duplicates, stats.tsf_regressions,
-            stats.phase_min_us, stats.phase_max_us,
-            stats.phase_max_us.saturating_sub(stats.phase_min_us), stats.last_phase_us,
-            stats.tsf_delta_min_us, stats.tsf_delta_max_us,
-            stats.local_delta_min_us, stats.local_delta_max_us,
-            stats.first_tsf_us, stats.last_tsf_us,
+            stats.bssid[0],
+            stats.bssid[1],
+            stats.bssid[2],
+            stats.bssid[3],
+            stats.bssid[4],
+            stats.bssid[5],
+            stats.interval_tu,
+            stats.stride,
+            stats.accepted,
+            stats.selected_seen,
+            stats.selected_missed,
+            stats.duplicates,
+            stats.tsf_regressions,
+            stats.phase_min_us,
+            stats.phase_max_us,
+            stats.phase_max_us.saturating_sub(stats.phase_min_us),
+            stats.last_phase_us,
+            stats.tsf_delta_min_us,
+            stats.tsf_delta_max_us,
+            stats.local_delta_min_us,
+            stats.local_delta_max_us,
+            stats.first_tsf_us,
+            stats.last_tsf_us,
         )
     }
 
@@ -1160,6 +1205,45 @@ pub fn fnv1a32(data: &[u8]) -> u32 {
 
 pub fn service_descriptor_payload<'a>(frame: &'a [u8], service_id: [u8; 6]) -> Option<&'a [u8]> {
     service_descriptor(frame, service_id).map(|descriptor| descriptor.payload)
+}
+
+/// Return the first Service Descriptor payload for `service_id` accepted by
+/// `predicate`, without allocating.  An Android peer may include both its
+/// legacy `DM` service-state descriptor and a CBOR control/announce descriptor
+/// under the same service ID in one SDF; radio callbacks must select the
+/// useful record without retaining or heap-allocating the driver frame.
+pub fn service_descriptor_payload_matching<'a, F>(
+    frame: &'a [u8],
+    service_id: [u8; 6],
+    mut predicate: F,
+) -> Option<&'a [u8]>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    if !is_nan_sdf(frame) {
+        return None;
+    }
+    let mut offset = NAN_ACTION_START;
+    while offset + 3 <= frame.len() {
+        let attr_id = frame[offset];
+        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
+        let start = offset + 3;
+        let Some(end) = start.checked_add(len) else {
+            break;
+        };
+        let Some(body) = frame.get(start..end) else {
+            break;
+        };
+        if attr_id == 0x03 {
+            if let Some(descriptor) = service_descriptor_body(body, service_id) {
+                if predicate(descriptor.payload) {
+                    return Some(descriptor.payload);
+                }
+            }
+        }
+        offset = end;
+    }
+    None
 }
 
 /// Return every complete Service Descriptor Attribute carried by an SDF.

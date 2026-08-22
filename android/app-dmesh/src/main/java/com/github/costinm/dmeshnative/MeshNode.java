@@ -122,6 +122,20 @@ public class MeshNode implements AutoCloseable {
                 new byte[0], -1);
     }
 
+    /** Decode the shared CBOR transport.start declaration for the Android adapter. */
+    public static String decodeTransportStart(byte[] record) {
+        return radioMessageText("radio.control.transport_start", "", record, -1);
+    }
+
+    /** Build the same volatile transport.start CBOR carried by UART or NAN SD. */
+    public static byte[] buildTransportStart(String mode, String ssid, String passphrase,
+                                             boolean ap) {
+        return radioMessage("radio.control.build_transport_start",
+                "mode=" + textArg(mode) + " ssid=" + textArg(ssid)
+                        + " passphrase=" + textArg(passphrase)
+                        + " ap=" + (ap ? "1" : "0"), new byte[0], -1);
+    }
+
     public static String parseNanServiceInfo(byte[] serviceInfo) {
         return radioMessageText("radio.nan.parse_service_info", "", serviceInfo, -1);
     }

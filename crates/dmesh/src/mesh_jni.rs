@@ -727,6 +727,54 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .ok_or_else(|| anyhow::anyhow!("announce encoding exceeded bound"))?;
             out[..used].to_vec()
         }
+        "radio.control.transport_start" => {
+            let request = dmesh_server::control::decode_request(payload)
+                .ok_or_else(|| anyhow::anyhow!("invalid local control record"))?;
+            let dmesh_server::control::Request::TransportStart { kind, config } = request else {
+                anyhow::bail!("control record is not transport.start");
+            };
+            let mode = match kind {
+                dmesh_server::control::TransportKind::Sta => "sta",
+                dmesh_server::control::TransportKind::Nan => "nan",
+                dmesh_server::control::TransportKind::Uart => "uart",
+            };
+            json!({
+                "mode": mode,
+                "ssid_hex": config.ssid.map(bytes_to_hex).unwrap_or_default(),
+                "passphrase_hex": config.passphrase.map(bytes_to_hex).unwrap_or_default(),
+                "bssid_hex": config.bssid.map(|value| bytes_to_hex(&value)).unwrap_or_default(),
+                "channel": config.channel.map(|value| value.to_string()).unwrap_or_default(),
+                "now": config.now.map(|value| value.to_string()).unwrap_or_default(),
+                "nan_dw_interval": config.nan_dw_interval.map(|value| value.to_string()).unwrap_or_default(),
+                "ap": config.ap.map(|value| value.to_string()).unwrap_or_default(),
+            })
+            .to_string()
+            .into_bytes()
+        }
+        "radio.control.build_transport_start" => {
+            let mode = required_data(&cmd, "mode")?;
+            let kind = match mode {
+                "sta" => dmesh_server::control::TransportKind::Sta,
+                "nan" => dmesh_server::control::TransportKind::Nan,
+                _ => anyhow::bail!("transport mode must be sta or nan"),
+            };
+            let ssid = cmd.data.get("ssid").map(String::as_bytes);
+            let passphrase = cmd.data.get("passphrase").map(String::as_bytes);
+            let ap = cmd.data.get("ap").map(|value| u8::from(value == "1"));
+            let request = dmesh_server::control::Request::TransportStart {
+                kind,
+                config: dmesh_server::control::TransportConfig {
+                    ssid,
+                    passphrase,
+                    ap,
+                    ..dmesh_server::control::TransportConfig::default()
+                },
+            };
+            let mut out = [0; 128];
+            let used = dmesh_server::control::encode_request(request, None, &mut out)
+                .ok_or_else(|| anyhow::anyhow!("transport.start encoding exceeded bound"))?;
+            out[..used].to_vec()
+        }
         "radio.nan.parse_service_info" => radio_protocol::parse_nan_service_info(payload)?
             .to_string()
             .into_bytes(),

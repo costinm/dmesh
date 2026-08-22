@@ -249,9 +249,14 @@ public class P2P extends BroadcastReceiver {
     public void apOn(boolean started) {
         if (started) {
             if (Build.VERSION.SDK_INT >= 28) {
-                // TODO: can it skip DIRECT-DM- ? How long can id be ?
+                // Android requires the Wi-Fi Direct group name to begin
+                // `DIRECT-xy`. Keep that prefix, but also keep the common
+                // `-dmesh` suffix so host, Android, and ESP channel-6 scans
+                // can classify this as a DMesh AP without OEM-specific P2P
+                // metadata.
                 WifiP2pConfig cfg = new WifiP2pConfig.Builder().enablePersistentMode(false)
-                        .setNetworkName("DIRECT-DM-ESH-" + lm.id4).setPassphrase(DEFAULT_PSK).build();
+                        .setNetworkName("DIRECT-DM-" + lm.id4 + "-dmesh")
+                        .setPassphrase(DEFAULT_PSK).build();
                 mP2PManager.createGroup(getmChannel(), cfg, new MyActionListener("createGroupQ"));
             } else {
                 // Override the P2P device name with the ID.

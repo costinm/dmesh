@@ -33,14 +33,17 @@ use mesh::{
     tagged::{NameOrTag, TaggedCatalog, TaggedRecord},
 };
 use quic_lite::{ConnectionId, FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_ECHO};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     os::unix::net::{UnixListener, UnixStream},
+    process::Command,
     sync::LazyLock,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::timeout;
 
@@ -56,6 +59,124 @@ const E2E_UDP6_DEFAULT_BYTES: u64 = 64 * 1024;
 const E2E_UDP6_PACKET_SIZE: u16 = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u16;
 const E2E_UDP6_TRANSFER_DEADLINE: Duration = Duration::from_secs(45);
 const E2E_ACTION_IPERF_BYTES: u64 = 64 * 1024;
+
+/// Stable, human-selected identity for a lab node. Android keeps its USB
+/// serial because Wi-Fi MAC randomization means a MAC is only an observation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NodeIdentity {
+    name: String,
+    kind: String,
+    mac: Option<String>,
+    android_serial: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PairProbeStatus {
+    peer: String,
+    test: String,
+    last_result: String,
+    last_seen_unix_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nan_service_info: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sta_associated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    association_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rssi_dbm: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    throughput_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_us: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct NodeStatus {
+    schema_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<NodeIdentity>,
+    #[serde(default)]
+    pairs: BTreeMap<String, PairProbeStatus>,
+}
+
+fn node_store_root() -> std::path::PathBuf {
+    std::env::var_os("DMESH_E2E_NODES_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("nodes"))
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis()
+}
+
+fn android_node_identity(serial: &str) -> NodeIdentity {
+    let name = match serial {
+        "94AAY0LALC" => "ap3a1",
+        "RFCNB05AJ7E" => "agal1",
+        _ => "andrunk",
+    };
+    NodeIdentity {
+        name: name.to_owned(),
+        kind: "android".to_owned(),
+        mac: None,
+        android_serial: Some(serial.to_owned()),
+    }
+}
+
+fn e6_node_identity() -> NodeIdentity {
+    NodeIdentity {
+        name: "e6".to_owned(),
+        kind: "esp32c6-recovery".to_owned(),
+        mac: Some(hex(&E6_MAC)),
+        android_serial: None,
+    }
+}
+
+/// Persist the latest pair row in both node directories and append every run
+/// to history.jsonl. TOML stays readable while JSONL remains analysis-ready.
+fn record_pair_probe(left: &NodeIdentity, right: &NodeIdentity, mut observation: PairProbeStatus) {
+    let root = node_store_root();
+    let now = unix_millis();
+    observation.last_seen_unix_ms = now;
+    for (node, peer) in [(left, right), (right, left)] {
+        let directory = root.join(&node.name);
+        fs::create_dir_all(&directory)
+            .unwrap_or_else(|error| panic!("create node directory {}: {error}", directory.display()));
+        let status_path = directory.join("status.toml");
+        let mut status = fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|text| toml::from_str::<NodeStatus>(&text).ok())
+            .unwrap_or_else(|| NodeStatus {
+                schema_version: 1,
+                identity: None,
+                pairs: BTreeMap::new(),
+            });
+        status.schema_version = 1;
+        status.identity = Some(node.clone());
+        let mut pair = observation.clone();
+        pair.peer = peer.name.clone();
+        status.pairs.insert(peer.name.clone(), pair.clone());
+        let encoded = toml::to_string_pretty(&status)
+            .unwrap_or_else(|error| panic!("encode node status {}: {error}", node.name));
+        fs::write(&status_path, encoded)
+            .unwrap_or_else(|error| panic!("write node status {}: {error}", status_path.display()));
+        let event = serde_json::json!({
+            "schema_version": 1,
+            "at_unix_ms": now,
+            "node": node,
+            "peer": peer,
+            "result": pair,
+        });
+        let mut history = OpenOptions::new().create(true).append(true)
+            .open(directory.join("history.jsonl"))
+            .unwrap_or_else(|error| panic!("open node history {}: {error}", node.name));
+        writeln!(history, "{event}")
+            .unwrap_or_else(|error| panic!("append node history {}: {error}", node.name));
+    }
+}
 
 /// Apply one endpoint mode as a complete replacement, never as a setting
 /// overlay. The device side remains a low-level radio/control endpoint; the
@@ -2076,7 +2197,6 @@ fn radio_request(
     // suite obtains its single owner. Retry this idempotent snapshot/control
     // request, retaining the same session and without reopening/resetting it.
     for _ in 0..3 {
-        let history_before = session.recent_events().len();
         let matched = session
             .request_direct_record_until(request, COMMAND_TIMEOUT, |event| matches!(
                 event,
@@ -2084,12 +2204,13 @@ fn radio_request(
             ))
             .unwrap_or_else(|error| panic!("{} radio request: {error}", session.path()));
         if matched {
-            // The matching record was just appended. The suite reserves
-            // enough bounded host history for the entire matrix, preserving
-            // the causal boundary rather than accepting a stale snapshot.
+            // `matched` proves this request appended a decodable snapshot.
+            // Some focused fixtures retain only a very small serial history,
+            // so a length-based slice can be evicted between the match and
+            // this lookup. Take the latest decodable record instead; it is
+            // still causally guarded by the just-completed matcher.
             let response = session
                 .recent_events()
-                .skip(history_before)
                 .filter_map(|event| match event {
                     DeviceSessionEvent::DirectRecord(record) => {
                         decode_raw_wifi_snapshot(record).ok()
@@ -2241,6 +2362,464 @@ fn configure_nan_for_channel(session: &mut DeviceSession, channel: u8, id: u64) 
         .unwrap_or_else(|error| panic!("{} NAN/NOW transition: {error}", session.path()));
 }
 
+/// Put e6 in the NAN+NOW receiver state used before an Android active-Publish
+/// carries a CBOR `transport.start`. Manual equivalent is a UART
+/// transport.start with `{mode:nan, channel:6, now:0, nan_dw_interval:1}`;
+/// this test owns only e6's volatile radio profile and never mutates host
+/// wlan0/wlan1 state.
+#[test]
+#[ignore = "requires flashed e6 and exclusive UART ownership"]
+fn firmware_e6_nan_sd_transport_receiver() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_4E_414E,
+    );
+    // Replacing a failed STA epoch has to stop/deinitialize its driver before
+    // NAN+NOW can claim the radio again. Keep this longer than the boot-only
+    // path; a three-second deadline turns a correct clean replacement into a
+    // flaky test failure.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if snapshot.channel == Some(6) && snapshot.nan_dw_interval == Some(1) {
+            assert_eq!(snapshot.sta_associated, Some(false));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 did not enable NAN DW capture: {}",
+            snapshot_summary(&snapshot)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Android is the control plane for this row: it starts a fresh local-only
+/// AP, publishes the complete volatile STA declaration as active NAN service
+/// info, and e6 replaces its NAN-only radio setup with that STA setup.  The
+/// test never changes wlan0/wlan1; their permanently-running monitors merely
+/// remain available to the lab.
+///
+/// Manual equivalent (after putting e6 in the NAN DW receiver state):
+///
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg 'wifi.transport.start mode=nan ap=0'
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg 'wifi.transport.start mode=nan ap=1'
+/// ```
+#[test]
+#[ignore = "requires flashed e6 plus an Android DMesh service with Wi-Fi Aware enabled"]
+fn android_nan_sd_starts_e6_sta() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_414E_01,
+    );
+    let receiver_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.channel == Some(6) && radio.nan_dw_interval == Some(1) {
+            assert_eq!(radio.sta_associated, Some(false));
+            break;
+        }
+        assert!(
+            Instant::now() < receiver_deadline,
+            "e6 did not enter NAN DW receiver state: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Let the active-publish update cross at least one complete DW after the
+    // receiver confirms capture is enabled.
+    thread::sleep(Duration::from_millis(750));
+
+    let before_android_ap_sd = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Android adb serial");
+    for command in [
+        "wifi.transport.start mode=nan ap=0",
+        "wifi.transport.start mode=nan ap=1",
+    ] {
+        let shell_command = format!(
+            "content call --uri content://com.github.costinm.dmesh.lm.shell --method command --arg '{command}'"
+        );
+        let output = Command::new("adb")
+            // One remote shell argument preserves the complete command
+            // string, including `mode` and `ap`; separate adb arguments drop
+            // the second key/value before the content provider parses it.
+            .args(["-s", &android, "shell", &shell_command])
+            .output()
+            .expect("adb content command");
+        assert!(
+            output.status.success(),
+            "Android transport command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The Android local-hotspot callback is the only place that constructs
+    // and publishes its ephemeral SSID/passphrase control record. Require E6
+    // to copy that SD before trying to associate; a content-provider result
+    // or a filtered Android history query is not evidence that the AP started.
+    let sd_deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio
+            .counters
+            .delta_since(before_android_ap_sd.counters)
+            .nan_service_info_enqueued
+            != 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < sd_deadline,
+            "Android local AP did not emit its NAN transport.start SD: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    // Active publish and its closest discovery window are asynchronous.  A
+    // completed association is the only acceptance criterion: Android's local
+    // command acknowledgement and its service-info callback do not prove e6
+    // received the SD or replaced its previous radio mode.
+    let association_timeout_secs = std::env::var("DMESH_E2E_NAN_SD_STA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(25);
+    let deadline = Instant::now() + Duration::from_secs(association_timeout_secs);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.sta_associated == Some(true) {
+            eprintln!(
+                "android->e6 NAN SD association: {}",
+                snapshot_summary(&radio)
+            );
+            assert_eq!(radio.channel, Some(6));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 did not associate after Android NAN transport.start SD: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Android control-plane adapter gate. This does not change host radio state:
+/// it asks Android for an app-scoped attachment to the already-running wlan0
+/// AP, proves Android emitted the correctly targeted `requested` event, then
+/// returns it to NAN-only. `available` versus `unavailable` is an Android
+/// policy/concurrency measurement and is intentionally reported separately.
+///
+/// Manual equivalent:
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg 'wifi.transport.start mode=sta ssid=<wlan0-ssid> bssid=<wlan0-bssid> ap=0'
+/// ```
+#[test]
+#[ignore = "requires the Android DMesh service and the pre-existing wlan0 AP"]
+fn android_transport_start_requests_wlan0_sta() {
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Android adb serial");
+    let ssid = wlan0_ssid();
+    let (bssid, _) = wlan0_bssid_channel();
+    let bssid = bssid
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let command = format!(
+        "content call --uri content://com.github.costinm.dmesh.lm.shell --method command \\
+         --arg 'wifi.transport.start mode=sta ssid={ssid} bssid={bssid} ap=0'"
+    );
+    let output = Command::new("adb")
+        .args(["-s", &android, "shell", &command])
+        .output()
+        .expect("Android STA transport.start");
+    assert!(
+        output.status.success(),
+        "Android STA transport.start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    thread::sleep(Duration::from_millis(250));
+    let history = Command::new("adb")
+        .args([
+            "-s",
+            &android,
+            "shell",
+            "content call --uri content://com.github.costinm.dmesh.lm.shell --method command \\
+             --arg 'history durationMs=1000 limit=8 keys=all'",
+        ])
+        .output()
+        .expect("Android STA transport history");
+    let history = String::from_utf8_lossy(&history.stdout);
+    assert!(
+        history.contains("net.StaAttach")
+            && history.contains("\"state\":\"requested\"")
+            && history.contains(&bssid),
+        "Android did not issue the targeted STA request: {history}"
+    );
+    let detach = "content call --uri content://com.github.costinm.dmesh.lm.shell --method command \\
+                  --arg 'wifi.transport.start mode=nan ap=0'";
+    let output = Command::new("adb")
+        .args(["-s", &android, "shell", detach])
+        .output()
+        .expect("Android NAN detach");
+    assert!(output.status.success(), "Android NAN detach failed");
+}
+
+/// Verified Android-to-E6 NAN control row using the already-running open
+/// wlan0 AP. Unlike the local-hotspot row above, this isolates the common
+/// active-Publish CBOR mechanism from Android's optional AP lifecycle: the
+/// Android shell tells its primary `dmesh` publisher to carry this exact
+/// `transport.start`, and E6 must associate to the host AP after receiving
+/// it in a NAN discovery window. No host interface is created, restarted, or
+/// reconfigured.
+///
+/// Manual equivalent:
+///
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg 'wifi.nan.sd cbor_hex=<canonical transport.start>'
+/// ```
+#[test]
+#[ignore = "requires flashed e6, Android Wi-Fi Aware, and the pre-existing wlan0 AP"]
+fn android_nan_sd_sta_declaration_associates_e6_wlan0() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Android adb serial");
+    // A preceding Android/AP row may have left a temporary active-Publish
+    // descriptor on air. Clear it before arming E6 so this row alone owns the
+    // NAN SD that selects host wlan0.
+    let output = Command::new("adb")
+        .args([
+            "-s",
+            &android,
+            "shell",
+            "content call --uri content://com.github.costinm.dmesh.lm.shell --method command \\
+             --arg 'wifi.nan.sd clear'",
+        ])
+        .output()
+        .expect("clear Android NAN SD");
+    assert!(output.status.success(), "clear Android NAN SD failed");
+    thread::sleep(Duration::from_millis(750));
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_414E_02,
+    );
+    let receive_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.nan_dw_interval == Some(1) && radio.sta_associated == Some(false) {
+            break;
+        }
+        assert!(
+            Instant::now() < receive_deadline,
+            "e6 did not enter the Android SD receive state: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let before_sd = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+
+    let ssid = wlan0_ssid();
+    let (bssid, channel) = wlan0_bssid_channel();
+    let request = ControlRequest::TransportStart {
+        kind: TransportKind::Sta,
+        config: dmesh_server::control::TransportConfig {
+            ssid: Some(ssid.as_bytes()),
+            // A NAN SD already carries the AP identity. Supplying it makes
+            // this the intended direct-association path, not a scan-time
+            // measurement hidden inside the control-plane test.
+            bssid: Some(bssid),
+            channel: Some(channel),
+            // Keep this target identical to the proven UART STA setup: the
+            // current open wlan0 AP advertises a legacy basic rate.
+            sta_11b_rates_disabled: Some(false),
+            sta_driver_tx: Some(true),
+            now: Some(0),
+            nan_dw_interval: Some(0),
+            // E6's current proven STA profile retains its local AP while it
+            // attaches to wlan0. AP-off STA is a separate capability row;
+            // do not turn this NAN-control interoperability gate into that
+            // unvalidated topology change.
+            ap: Some(1),
+            ..dmesh_server::control::TransportConfig::default()
+        },
+    };
+    let mut wire = [0u8; 128];
+    let used = control::encode_request(request, None, &mut wire)
+        .expect("canonical Android NAN transport.start");
+    let command = format!(
+        "content call --uri content://com.github.costinm.dmesh.lm.shell --method command --arg 'wifi.nan.sd cbor_hex={}'",
+        hex(&wire[..used])
+    );
+    let output = Command::new("adb")
+        // Keep the complete remote command in one ADB-shell argument. ADB
+        // otherwise re-splits `--arg wifi.nan.sd cbor_hex=...`, dropping the
+        // named CBOR value before Android's content provider sees it.
+        .args(["-s", &android, "shell", &command])
+        .output()
+        .expect("Android NAN SD command");
+    assert!(
+        output.status.success(),
+        "Android NAN SD command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // An Android active Publish may repeat this descriptor in every suitable
+    // discovery window. Send one explicit duplicate as well: the firmware
+    // must acknowledge the identical complete profile without allocating a
+    // new STA epoch or tearing down the association it is about to create.
+    let output = Command::new("adb")
+        .args(["-s", &android, "shell", &command])
+        .output()
+        .expect("duplicate Android NAN SD command");
+    assert!(
+        output.status.success(),
+        "duplicate Android NAN SD command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // An Android active Publish can repeat in successive discovery windows.
+    // Require the E6 callback to recognize and copy the exact DMesh Service
+    // Info before testing the slower STA replacement; this keeps a receive
+    // parser/pool failure distinct from association timing.
+    let ingress_deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        let delta = radio.counters.delta_since(before_sd.counters);
+        if delta.nan_service_info_enqueued != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < ingress_deadline,
+            "e6 did not enqueue Android primary DMesh SD: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    // The current E6 BSSID-directed association observation is around 11 s.
+    // Keep this functional NAN-SD gate above that while the dedicated STA
+    // timing row reports and tightens the connection-phase regression.
+    let association_timeout_secs = std::env::var("DMESH_E2E_NAN_SD_STA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(25);
+    let deadline = Instant::now() + Duration::from_secs(association_timeout_secs);
+    let associated_radio = loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.sta_associated == Some(true) {
+            eprintln!(
+                "Android NAN SD -> e6 host STA: {}",
+                snapshot_summary(&radio)
+            );
+            assert_eq!(radio.channel, Some(6));
+            break radio;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 did not associate from Android primary DMesh SD within {association_timeout_secs}s: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(250));
+    };
+    // This row is the first persistent pair baseline: it proves Android NAN
+    // Service Info reached E6 and records the completed directed STA timing.
+    // Later UDP6/NOW rows add their own throughput and latency fields rather
+    // than replacing this control-plane evidence.
+    record_pair_probe(
+        &android_node_identity(&android),
+        &e6_node_identity(),
+        PairProbeStatus {
+            peer: String::new(),
+            test: "android_nan_sd_to_e6_sta_wlan0".to_owned(),
+            last_result: "passed".to_owned(),
+            last_seen_unix_ms: 0,
+            nan_service_info: Some(true),
+            sta_associated: associated_radio.sta_associated,
+            association_ms: associated_radio.sta_connect_to_associated_ms,
+            rssi_dbm: associated_radio.sta_ap_rssi_dbm,
+            throughput_bps: None,
+            latency_us: None,
+        },
+    );
+
+    // This pure-STA declaration deliberately requests `nan_dw_interval=0`.
+    // It therefore cannot receive a follow-up NAN SD while associated. The
+    // host control plane replaces it with the normal unassociated NAN state;
+    // a later STA+NAN row will exercise an in-band SD replacement with a
+    // nonzero DW interval.
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ap: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_414E_03,
+    );
+
+    let revert_deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.sta_associated == Some(false) && radio.nan_dw_interval == Some(1) {
+            eprintln!(
+                "host transport.start -> e6 returned to NAN: {}",
+                snapshot_summary(&radio)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < revert_deadline,
+            "e6 did not return to NAN after host transport.start: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Inject one complete raw action through the same direct-CBOR raw-radio
 /// handler used by operator tooling. The receiver test intentionally does not
 /// await a text acknowledgement: each send is followed by its own snapshot.
@@ -2384,18 +2963,27 @@ fn hex(bytes: &[u8]) -> String {
 fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> String {
     let service_bps = raw_service_bps(snapshot);
     format!(
-        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} ap={:?} active={:?} assoc_phase_ms={:?} tx={}/{} rx_dispatch={} parsed={} bootstrap={} stream={} client_errors={} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}",
+        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} dw={:?}/{:?} ap={:?} active={:?} assoc_phase_ms={:?} disconnect_reason={:?} tx={}/{} rx_dispatch={} parsed={} nan={}/{}/{} service_info={}/{}/{} bootstrap={} stream={} client_errors={} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}",
         snapshot.channel,
         snapshot.sta_associated,
         snapshot.sta_ap_rssi_dbm,
         snapshot.promiscuous,
+        snapshot.dw_capturing,
+        snapshot.nan_dw_interval,
         snapshot.ap_active,
         snapshot.raw_service_active,
         snapshot.sta_connect_to_associated_ms,
+        snapshot.sta_last_disconnect_reason,
         snapshot.counters.tx_driver_accepted,
         snapshot.counters.tx_attempted,
         snapshot.counters.rx_driver_dispatch,
         snapshot.counters.rx_parser_accepted,
+        snapshot.counters.nan_beacons,
+        snapshot.counters.nan_sdfs,
+        snapshot.counters.nan_followups,
+        snapshot.counters.nan_service_info_matched,
+        snapshot.counters.nan_service_info_enqueued,
+        snapshot.counters.nan_service_info_dropped,
         snapshot.counters.raw_client_bootstrap_acks,
         snapshot.counters.raw_client_stream_packets,
         snapshot.counters.raw_client_receive_errors,

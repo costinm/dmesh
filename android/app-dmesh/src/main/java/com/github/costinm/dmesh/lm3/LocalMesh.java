@@ -14,6 +14,8 @@ import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
+import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiNetworkSpecifier;
 import android.net.wifi.WpsInfo;
 import android.net.wifi.p2p.WifiP2pDevice;
@@ -30,6 +32,7 @@ import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
 import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.UiUtil;
+import com.github.costinm.dmesh.android.util.Hex;
 import com.github.costinm.dmeshnative.MeshNode;
 
 import java.util.ArrayList;
@@ -177,6 +180,9 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     // control plane may measure AP+STA capability without silently replacing
     // one with the other.
     ConnectivityManager.NetworkCallback staAttachment;
+    private WifiManager.LocalOnlyHotspotReservation localOnlyHotspot;
+    private boolean localOnlyHotspotStarting;
+    private String appliedTransportStart = "";
 
     // Advertised URL - for NAN, BLE, TXT
     // Current format: 16 bytes, PSK8 + SSIDHASH4 + ID4
@@ -268,6 +274,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      */
     public void onDestroy() {
         releaseStaAttachment();
+        releaseLocalOnlyHotspot();
         ctx.unregisterReceiver(this);
         p2p.stopPeerAndSDDiscovery();
         //bt.close();
@@ -287,29 +294,36 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         String bssid = data.getString("bssid", "");
         String passphrase = data.getString("passphrase", "");
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || ssid.isEmpty()) {
-            MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "error",
+            MsgMux.get(ctx).publish("net.StaAttach", "ok", "0", "error",
                     ssid.isEmpty() ? "missing_ssid" : "requires_android_10");
             return;
         }
         if (ctx.checkSelfPermission(android.Manifest.permission.NEARBY_WIFI_DEVICES)
                 != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "error",
+            MsgMux.get(ctx).publish("net.StaAttach", "ok", "0", "error",
                     "missing_NEARBY_WIFI_DEVICES");
             return;
         }
 
         WifiNetworkSpecifier.Builder specifier = new WifiNetworkSpecifier.Builder().setSsid(ssid);
-        try {
-            if (!bssid.isEmpty()) {
+        if (!bssid.isEmpty()) {
+            try {
                 specifier.setBssid(MacAddress.fromString(bssid));
+            } catch (IllegalArgumentException error) {
+                MsgMux.get(ctx).publish("net.StaAttach", "ok", "0", "error",
+                        "invalid_bssid", "detail", String.valueOf(error.getMessage()));
+                return;
             }
-            if (!passphrase.isEmpty()) {
+        }
+        if (!passphrase.isEmpty()) {
+            try {
                 specifier.setWpa2Passphrase(passphrase);
+            } catch (IllegalArgumentException error) {
+                // Never include the passphrase itself in an event/log.
+                MsgMux.get(ctx).publish("net.StaAttach", "ok", "0", "error",
+                        "invalid_passphrase", "detail", String.valueOf(error.getMessage()));
+                return;
             }
-        } catch (IllegalArgumentException error) {
-            MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "error",
-                    "invalid_bssid_or_passphrase");
-            return;
         }
 
         releaseStaAttachment();
@@ -321,24 +335,24 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         staAttachment = new ConnectivityManager.NetworkCallback() {
             @Override
             public void onAvailable(Network network) {
-                MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "1", "state",
+                MsgMux.get(ctx).publish("net.StaAttach", "ok", "1", "state",
                         "available", "ssid", ssid, "bssid", bssid);
             }
 
             @Override
             public void onUnavailable() {
-                MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "state",
+                MsgMux.get(ctx).publish("net.StaAttach", "ok", "0", "state",
                         "unavailable", "ssid", ssid, "bssid", bssid);
             }
 
             @Override
             public void onLost(Network network) {
-                MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "0", "state",
+                MsgMux.get(ctx).publish("net.StaAttach", "ok", "0", "state",
                         "lost", "ssid", ssid, "bssid", bssid);
             }
         };
         cm.requestNetwork(request, staAttachment, 20_000);
-        MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "1", "state", "requested",
+        MsgMux.get(ctx).publish("net.StaAttach", "ok", "1", "state", "requested",
                 "ssid", ssid, "bssid", bssid);
     }
 
@@ -352,7 +366,161 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             // Android already retired the request.
         }
         staAttachment = null;
-        MsgMux.get(ctx).publish("wifi.sta.attach", "ok", "1", "state", "released");
+        MsgMux.get(ctx).publish("net.StaAttach", "ok", "1", "state", "released");
+    }
+
+    /**
+     * Apply the platform portion of a validated shared transport.start.
+     *
+     * Android keeps NAN desired throughout. `sta` requests an app-scoped
+     * attachment; `nan` releases it. `ap=1` requests Android's local-only
+     * hotspot. The framework chooses its credentials, so this is a measured
+     * local AP capability, not a claim that unprivileged Android can create
+     * an arbitrary open SoftAP.
+     */
+    public synchronized void applyTransportStart(String json, String source, String peer) {
+        String mode = jsonField(json, "mode");
+        if (!"sta".equals(mode) && !"nan".equals(mode)) {
+            return;
+        }
+        String ssidHex = jsonField(json, "ssid_hex");
+        String passphraseHex = jsonField(json, "passphrase_hex");
+        String bssidHex = jsonField(json, "bssid_hex");
+        String ap = jsonField(json, "ap");
+        String key = mode + ":" + ssidHex + ":" + passphraseHex + ":" + bssidHex + ":" + ap;
+        if (key.equals(appliedTransportStart)) {
+            MsgMux.get(ctx).publish("net.TransportStart", "ok", "1", "state", "unchanged",
+                    "source", source, "peer", peer, "mode", mode);
+            return;
+        }
+        if ("sta".equals(mode)) {
+            Bundle target = new Bundle();
+            target.putString("ssid", hexText(ssidHex));
+            target.putString("passphrase", hexText(passphraseHex));
+            target.putString("bssid", colonMac(bssidHex));
+            requestStaAttachment(target);
+        } else {
+            releaseStaAttachment();
+            if (nan != null) nan.ensureActive();
+        }
+        if ("1".equals(ap)) requestLocalOnlyHotspot(); else releaseLocalOnlyHotspot();
+        appliedTransportStart = key;
+        MsgMux.get(ctx).publish("net.TransportStart", "ok", "1", "state", "applied",
+                "source", source, "peer", peer, "mode", mode, "ap", ap);
+    }
+
+    private static String hexText(String value) {
+        if (value == null || (value.length() & 1) != 0) return "";
+        byte[] bytes = new byte[value.length() / 2];
+        for (int i = 0; i < bytes.length; i++) {
+            try { bytes[i] = (byte) Integer.parseInt(value.substring(i * 2, i * 2 + 2), 16); }
+            catch (RuntimeException error) { return ""; }
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private static String jsonField(String json, String field) {
+        if (json == null) return "";
+        String needle = "\"" + field + "\":\"";
+        int start = json.indexOf(needle);
+        if (start < 0) return "";
+        start += needle.length();
+        int end = json.indexOf('"', start);
+        return end < 0 ? "" : json.substring(start, end);
+    }
+
+    private static String colonMac(String value) {
+        if (value == null || value.length() != 12) return "";
+        StringBuilder out = new StringBuilder(17);
+        for (int index = 0; index < value.length(); index += 2) {
+            if (index != 0) out.append(':');
+            out.append(value, index, index + 2);
+        }
+        return out.toString();
+    }
+
+    private static String argumentValue(String[] args, String key, String fallback) {
+        String prefix = key + "=";
+        for (String arg : args) if (arg.startsWith(prefix)) return arg.substring(prefix.length());
+        return fallback;
+    }
+
+    private void requestLocalOnlyHotspot() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error",
+                    "requires_android_8");
+            return;
+        }
+        if (localOnlyHotspot != null) {
+            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "already_active");
+            return;
+        }
+        if (localOnlyHotspotStarting) {
+            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "starting");
+            return;
+        }
+        if (p2p == null || p2p.mWifiManager == null) {
+            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error",
+                    "wifi_manager_unavailable");
+            return;
+        }
+        localOnlyHotspotStarting = true;
+        MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "requested");
+        WifiManager.LocalOnlyHotspotCallback callback = new WifiManager.LocalOnlyHotspotCallback() {
+                @Override public void onStarted(WifiManager.LocalOnlyHotspotReservation reservation) {
+                    localOnlyHotspotStarting = false;
+                    localOnlyHotspot = reservation;
+                    WifiConfiguration config = reservation.getWifiConfiguration();
+                    String ssid = config == null ? "" : config.SSID;
+                    String passphrase = config == null ? "" : config.preSharedKey;
+                    MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "started",
+                            "ssid", ssid,
+                            // This stays local to the privileged control-plane
+                            // event. A later NAN SD transport.start may carry
+                            // it as volatile association data; it is never an
+                            // Android preference or ESP NVS setting.
+                            "passphrase", passphrase);
+                    // The Android AP is ready before its peers can attach.
+                    // Publish the complete ephemeral STA target through the
+                    // common NAN Service Info control wire; e6 handles it
+                    // through the exact UART/NAN profile path, with normal
+                    // repeated-SD idempotence.
+                    if (nan != null && !ssid.isEmpty() && !passphrase.isEmpty()) {
+                        byte[] transportStart = MeshNode.buildTransportStart(
+                                "sta", ssid, passphrase, false);
+                        if (nan.setServiceInfoCbor(transportStart)) {
+                            nan.ensureActive();
+                            MsgMux.get(ctx).publish("net.TransportStartSd", "ok", "1",
+                                    "state", "queued", "bytes",
+                                    Integer.toString(transportStart.length));
+                        }
+                    }
+                }
+                @Override public void onStopped() {
+                    localOnlyHotspotStarting = false;
+                    localOnlyHotspot = null;
+                    MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "stopped");
+                }
+                @Override public void onFailed(int reason) {
+                    localOnlyHotspotStarting = false;
+                    MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "reason", Integer.toString(reason));
+                }
+            };
+        try {
+            // Some devices reject the configured local-hotspot API despite
+            // accepting the older public callback form. Keep the known-good
+            // path until its channel/band capability can be probed first.
+            p2p.mWifiManager.startLocalOnlyHotspot(callback, delayHandler);
+        } catch (RuntimeException error) {
+            localOnlyHotspotStarting = false;
+            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error", error.toString());
+        }
+    }
+
+    private void releaseLocalOnlyHotspot() {
+        if (localOnlyHotspot != null) localOnlyHotspot.close();
+        localOnlyHotspot = null;
+        localOnlyHotspotStarting = false;
     }
 
     /**
@@ -416,6 +584,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         delayHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
+                publishWifiScanResults();
                 ble.scan();
             }
         }, 3000);
@@ -431,6 +600,54 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                     nan.update(delayHandler);
                 }
             }, 6000);
+    }
+
+    /**
+     * Publish the bounded common scan summary after Android completes the
+     * requested scan. This is observational only: it neither attaches STA nor
+     * changes NAN/P2P state. Channel 6 is the current probe scope; the full
+     * count remains useful to distinguish an empty scan from no DMesh AP.
+     */
+    private void publishWifiScanResults() {
+        if (p2p == null || p2p.mWifiManager == null) return;
+        try {
+            List<ScanResult> results = p2p.mWifiManager.getScanResults();
+            int total = results == null ? 0 : results.size();
+            int channel6 = 0;
+            int directAny = 0;
+            int direct = 0;
+            StringBuilder allDirect = new StringBuilder();
+            StringBuilder dmesh = new StringBuilder();
+            if (results != null) for (ScanResult result : results) {
+                if (result.frequency >= 2432 && result.frequency <= 2442) channel6++;
+                String ssid = result.SSID == null ? "" : result.SSID;
+                if (!ssid.startsWith("DIRECT-")) continue;
+                directAny++;
+                if (directAny <= 16) {
+                    if (allDirect.length() != 0) allDirect.append(',');
+                    allDirect.append(ssid).append('@').append(result.BSSID)
+                            .append(':').append(result.level);
+                }
+                if (!ssid.endsWith("-dmesh")) continue;
+                if (direct++ != 0) dmesh.append(',');
+                // The bounded event is sufficient for probe persistence:
+                // SSID, observed BSSID, and RSSI. Android may randomize its
+                // own MAC, but the observed AP BSSID is still meaningful.
+                dmesh.append(ssid).append('@').append(result.BSSID)
+                        .append(':').append(result.level);
+                if (direct >= 16) break;
+            }
+            MsgMux.get(ctx).publish("wifi.scan", "ok", "1",
+                    "count", Integer.toString(total),
+                    "channel6_count", Integer.toString(channel6),
+                    "direct_count", Integer.toString(directAny),
+                    "direct", allDirect.toString(),
+                    "direct_dmesh_count", Integer.toString(direct),
+                    "direct_dmesh", dmesh.toString());
+        } catch (SecurityException error) {
+            MsgMux.get(ctx).publish("wifi.scan", "ok", "0", "error",
+                    "missing_wifi_scan_permission");
+        }
     }
 
     public void send(String method, String... parms) {
@@ -472,6 +689,25 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         Log.d(TAG, "WIFI Command: " + Arrays.toString(args) + " " + b);
 
         switch (type) {
+            case "transport":
+                if (args.length >= 3 && "start".equals(args[2])) {
+                    // Local control-plane entry point. NAN SD uses the same
+                    // method through Nan.applyTransportStart after Rust has
+                    // decoded the tagged CBOR record.
+                    String mode = b.getString("mode", argumentValue(args, "mode", "nan"));
+                    String ssid = b.getString("ssid", argumentValue(args, "ssid", ""));
+                    String passphrase = b.getString("passphrase", argumentValue(args, "passphrase", ""));
+                    String bssid = b.getString("bssid", argumentValue(args, "bssid", ""));
+                    String ap = b.getString("ap", argumentValue(args, "ap", "0"));
+                    String json = "{\"mode\":\"" + mode + "\",\"ssid_hex\":\""
+                            + new String(Hex.encode(ssid.getBytes(StandardCharsets.UTF_8)))
+                            + "\",\"passphrase_hex\":\""
+                            + new String(Hex.encode(passphrase.getBytes(StandardCharsets.UTF_8)))
+                            + "\",\"bssid_hex\":\"" + bssid.replace(":", "")
+                            + "\",\"ap\":\"" + ap + "\"}";
+                    applyTransportStart(json, "local_control", "");
+                }
+                break;
             case "p2p":
                 updateP2P(msg);
                 break;

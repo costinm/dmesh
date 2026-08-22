@@ -106,6 +106,11 @@ public class Nan {
     // the same meaning as a UART direct record. It is deliberately ephemeral:
     // restarting the Android service returns to identity advertising.
     private byte[] publishServiceInfoCbor;
+    // `updatePublish()` only queues a framework operation. Keep the pending
+    // bit until the Android callback confirms the new Service Info is live;
+    // a local AP must not claim that its STA transport.start reached RF just
+    // because the synchronous Java call returned.
+    private boolean publishServiceInfoPending;
     // The active-subscribe test surface uses the same bounded Service Info
     // bytes. A matching publisher gets one follow-up response, allowing the
     // caller to prove matching and the post-match path separately.
@@ -575,6 +580,16 @@ public class Nan {
         // Rust owns retained discovery state and expiry. Java holds only the
         // session-scoped PeerHandle needed to call Android's NAN APIs.
         String parsed = MeshNode.observeNanServiceInfo(peerHandle.toString(), serviceSpecificInfo);
+        // A NAN Service Info control command has the exact same tagged-CBOR
+        // wire as UART. Rust validates/decodes it; Java only performs the
+        // Android-specific requested transition. Repeated Publish/Subscribe
+        // callbacks are safe because LocalMesh compares the immutable mode.
+        try {
+            lm.applyTransportStart(MeshNode.decodeTransportStart(serviceSpecificInfo),
+                    "nan_sd", peerHandle.toString());
+        } catch (RuntimeException ignored) {
+            // Ordinary discovery/announce records are not control commands.
+        }
         String deviceId = jsonField(parsed, "device_id");
         if (isUsableDmeshIdentity(deviceId)) {
             bd.id = deviceId;
@@ -737,10 +752,11 @@ public class Nan {
             return false;
         }
         publishServiceInfoCbor = Arrays.copyOf(command, command.length);
+        publishServiceInfoPending = true;
         if (pubSession != null) {
             try {
                 pubSession.updatePublish(buildPublishConfig());
-                MsgMux.get(ctx).publish("net.NAN.ServiceInfoUpdated",
+                MsgMux.get(ctx).publish("net.NAN.ServiceInfoQueued",
                         "bytes", Integer.toString(command.length));
             } catch (IllegalStateException error) {
                 MsgMux.get(ctx).publish("net.NAN.ServiceInfoUpdateError",
@@ -791,6 +807,7 @@ public class Nan {
     /** Clear an explicit CBOR command and resume normal DMesh identity SSI. */
     public synchronized void clearServiceInfoCbor() {
         publishServiceInfoCbor = null;
+        publishServiceInfoPending = false;
         if (pubSession != null) {
             try {
                 pubSession.updatePublish(buildPublishConfig());
@@ -1173,6 +1190,14 @@ public class Nan {
             super.onSessionConfigUpdated();
             Log.d(TAG, "/NAN/PubSessionConfigUpdated");
             rustEvent(pub ? "publish_config_updated" : "subscribe_config_updated", "", null);
+            synchronized (Nan.this) {
+                if (pub && publishServiceInfoPending) {
+                    publishServiceInfoPending = false;
+                    MsgMux.get(ctx).publish("net.NAN.ServiceInfoApplied", "ok", "1",
+                            "bytes", Integer.toString(publishServiceInfoCbor == null
+                                    ? 0 : publishServiceInfoCbor.length));
+                }
+            }
         }
 
         @Override
@@ -1181,9 +1206,22 @@ public class Nan {
             rustEvent(pub ? "publish_config_failed" : "subscribe_config_failed", "", null);
             synchronized (Nan.this) {
                 if (pub) {
+                    // A failed update leaves the old service descriptor on
+                    // air. Close exactly that session and retry once through
+                    // the normal publisher so its initial configuration uses
+                    // the latest complete CBOR Service Info.
+                    if (pubSession == discoverySession) {
+                        pubSession.close();
+                        pubSession = null;
+                    }
                     pubStarting = false;
                     publishFailures++;
                     MsgMux.get(ctx).publish("net.NAN.PubSessionConfigFailed");
+                    lm.delayHandler.postDelayed(() -> {
+                        synchronized (Nan.this) {
+                            publish();
+                        }
+                    }, 1_000);
                 } else {
                     nanSub = false;
                     subscribeFailures++;
@@ -1248,6 +1286,12 @@ public class Nan {
                 pubSession = session;
                 pubStarting = false;
                 publishStarts++;
+                if (publishServiceInfoPending) {
+                    publishServiceInfoPending = false;
+                    MsgMux.get(ctx).publish("net.NAN.ServiceInfoApplied", "ok", "1",
+                            "bytes", Integer.toString(publishServiceInfoCbor == null
+                                    ? 0 : publishServiceInfoCbor.length));
+                }
                 // IdentityChanged may have arrived before this asynchronous
                 // callback. Apply the real NAN identity in either ordering.
                 refreshDiscoveryIdentity();

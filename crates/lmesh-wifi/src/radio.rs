@@ -2386,6 +2386,36 @@ impl RadioService {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let entries = parse_iw_scan(&stdout);
+                // Keep the raw list for operators, and expose the DMesh AP
+                // subset separately so the common host/Android/ESP probe can
+                // record candidate AP identity and RSSI without guessing from
+                // a human-formatted `iw` transcript.
+                let direct = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("ssid")
+                            .and_then(Value::as_str)
+                            .is_some_and(|ssid| ssid.starts_with("DIRECT-"))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let direct_dmesh = direct
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("ssid").and_then(Value::as_str)
+                            .is_some_and(|ssid| ssid.ends_with("-dmesh"))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let channel_ap_count = entries
+                    .iter()
+                    .filter(|entry| {
+                        channel.is_none()
+                            || entry.get("channel").and_then(Value::as_u64)
+                                == channel.map(u64::from)
+                    })
+                    .count();
                 json!({
                     "ok": output.status.success(),
                     "backend": "iw",
@@ -2395,7 +2425,10 @@ impl RadioService {
                     "freq": frequency,
                     "passive": passive,
                     "count": entries.len(),
+                    "channel_ap_count": channel_ap_count,
                     "entries": entries,
+                    "direct": direct,
+                    "direct_dmesh": direct_dmesh,
                     "link": link,
                     "status": output.status.code(),
                     "stderr": stderr,
@@ -4215,6 +4248,42 @@ impl RadioService {
                 }
             }
         }
+        // A passive scan is not available on these active AP interfaces, but
+        // the permanent monitor already observes the same beacon/probe
+        // traffic. Normalize that capture into one observation per BSSID for
+        // the control-plane probe without discarding its underlying frames.
+        let mut aps = BTreeMap::<String, Value>::new();
+        for frame in &frames {
+            if !matches!(frame.get("kind").and_then(Value::as_str), Some("beacon" | "probe_resp")) {
+                continue;
+            }
+            let Some(bssid) = frame.get("bssid").and_then(Value::as_str) else {
+                continue;
+            };
+            aps.insert(
+                bssid.to_owned(),
+                json!({
+                    "bssid": bssid,
+                    "ssid": frame.get("ssid").cloned().unwrap_or(Value::Null),
+                    "channel": frame.get("channel").cloned().unwrap_or(Value::Null),
+                    "beacon_interval": frame.get("fixed")
+                        .and_then(|fixed| fixed.get("beacon_interval"))
+                        .cloned().unwrap_or(Value::Null),
+                }),
+            );
+        }
+        let direct = aps
+            .values()
+            .filter(|ap| ap.get("ssid").and_then(Value::as_str)
+                .is_some_and(|ssid| ssid.starts_with("DIRECT-")))
+            .cloned()
+            .collect::<Vec<_>>();
+        let direct_dmesh = direct
+            .iter()
+            .filter(|ap| ap.get("ssid").and_then(Value::as_str)
+                .is_some_and(|ssid| ssid.ends_with("-dmesh")))
+            .cloned()
+            .collect::<Vec<_>>();
         let result = json!({
             "ok": true,
             "backend": "linux_af_packet_monitor",
@@ -4224,6 +4293,10 @@ impl RadioService {
             "capture_ms": capture_ms,
             "max_frames": max_frames,
             "frame_count": frames.len(),
+            "ap_count": aps.len(),
+            "aps": aps.into_values().collect::<Vec<_>>(),
+            "direct": direct,
+            "direct_dmesh": direct_dmesh,
             "setup": setup,
             "frames": frames,
         });

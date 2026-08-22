@@ -47,6 +47,10 @@ const FIELD_NAN_DW_INTERVAL: u64 = 14;
 const FIELD_NOW: u64 = 15;
 /// Start a local AP alongside either physical mode. `0` is off and `1` is on.
 const FIELD_AP: u64 = 16;
+/// Optional WPA2 passphrase for an ephemeral STA target, for example an
+/// Android local-only hotspot. It is transport-start session data, never a
+/// setting or persisted credential.
+const FIELD_STA_PASSPHRASE: u64 = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
@@ -63,6 +67,7 @@ pub enum TransportKind {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransportConfig<'a> {
     pub ssid: Option<&'a [u8]>,
+    pub passphrase: Option<&'a [u8]>,
     pub bssid: Option<[u8; 6]>,
     pub channel: Option<u8>,
     pub raw_tx_rate: Option<u8>,
@@ -216,6 +221,13 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
                 }
                 config.channel = Some(channel);
             }
+            FIELD_STA_PASSPHRASE => {
+                let passphrase = d.text_ref().or_else(|| d.bytes_ref())?;
+                if !(8..=63).contains(&passphrase.len()) || passphrase.contains(&0) {
+                    return None;
+                }
+                config.passphrase = Some(passphrase);
+            }
             FIELD_RAW_TX_RATE => {
                 let rate = d.uint()? as u8;
                 if !matches!(rate, 0 | 6 | 9 | 12 | 18 | 24 | 36 | 48 | 54) {
@@ -361,6 +373,7 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
 fn transport_config_count(config: TransportConfig<'_>) -> u64 {
     [
         config.ssid.is_some(),
+        config.passphrase.is_some(),
         config.bssid.is_some(),
         config.channel.is_some(),
         config.raw_tx_rate.is_some(),
@@ -386,6 +399,13 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
         }
         e.uint(FIELD_STA_SSID)?;
         e.text_value(ssid)?;
+    }
+    if let Some(passphrase) = config.passphrase {
+        if !(8..=63).contains(&passphrase.len()) || passphrase.contains(&0) {
+            return None;
+        }
+        e.uint(FIELD_STA_PASSPHRASE)?;
+        e.text_value(passphrase)?;
     }
     if let Some(bssid) = config.bssid {
         e.uint(FIELD_STA_BSSID)?;
