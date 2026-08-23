@@ -102,7 +102,36 @@ check_lmesh_api() {
         cargo run -p mesh-api-gen -- \
             --api "$DMESH_REPO/crates/lmesh-wifi/API.md" \
             --out-tools "$DMESH_REPO/crates/lmesh-wifi/resources/tools.json" \
+            --out-rust "$DMESH_REPO/crates/lmesh-wifi/src/api.rs" \
             --check
+    )
+}
+
+# Generated tagged-CBOR request types are reviewed from API.md and checked in.
+# Keep generation behind the repository harness so contributors never need to
+# invoke the sibling mesh-api-gen Cargo project by hand.
+lmesh_api_generate() {
+    local ssh_mesh_dir="${DMESH_SSH_MESH_DIR:-}"
+    if [ -z "$ssh_mesh_dir" ]; then
+        for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
+            if [ -f "$candidate/crates/mesh-api-gen/Cargo.toml" ]; then
+                ssh_mesh_dir="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$ssh_mesh_dir" ] || [ ! -f "$ssh_mesh_dir/crates/mesh-api-gen/Cargo.toml" ]; then
+        echo "Missing ssh-mesh mesh-api-gen source; set DMESH_SSH_MESH_DIR" >&2
+        return 1
+    fi
+    (
+        cd "$ssh_mesh_dir"
+        unset CARGO_TARGET_DIR
+        if [ -f ./env.sh ]; then . ./env.sh; fi
+        cargo run -p mesh-api-gen -- \
+            --api "$DMESH_REPO/crates/lmesh-wifi/API.md" \
+            --out-tools "$DMESH_REPO/crates/lmesh-wifi/resources/tools.json" \
+            --out-rust "$DMESH_REPO/crates/lmesh-wifi/src/api.rs"
     )
 }
 
@@ -249,6 +278,17 @@ transport_test() {
     "$DMESH_CARGO_BIN" test -p dmesh-server --features udp --test object_store_stream
 }
 
+# Hardware E2E stays behind the repository build harness so operators never
+# need to invoke Cargo directly. The selected test owns the configured serial
+# endpoints exclusively; the generic default is the NAN-first pair prober.
+firmware_e2e() {
+    require_dmesh_cargo
+    configure_ssh_mesh_override
+    local test_name="${DMESH_E2E_TEST:-firmware_pair_prober}"
+    "$DMESH_CARGO_BIN" test -p dmesh-cli --test firmware_e2e "$test_name" \
+        -- --ignored --nocapture --test-threads=1
+}
+
 transport_coverage() {
     require_dmesh_cargo
     configure_ssh_mesh_override
@@ -348,8 +388,10 @@ case "${1:-musl}" in
     lmesh-check) lmesh_check ;;
     lmesh-test) lmesh_test ;;
     lmesh-control-test) lmesh_control_test ;;
+    lmesh-api-generate) lmesh_api_generate ;;
     object-store-test) object_store_test ;;
     transport-test) transport_test ;;
+    firmware-e2e) firmware_e2e ;;
     transport-coverage) transport_coverage ;;
     transport-fuzz-smoke) transport_fuzz_smoke ;;
     transport-loopback) transport_loopback "$@" ;;
@@ -358,5 +400,5 @@ case "${1:-musl}" in
     object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
     lmesh-wifi-restart) lmesh_wifi_restart ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|lmesh-control-test|object-store-test|transport-test|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|firmware-e2e|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
 esac

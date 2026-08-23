@@ -67,6 +67,11 @@ public class MeshNode implements AutoCloseable {
         nativeSetCallback(nativeHandle, callback);
     }
 
+    /** Emit the shared UDP6 presence record on a newly available local link. */
+    public boolean triggerAnnounce() {
+        return nativeHandle != 0 && nativeTriggerAnnounce(nativeHandle);
+    }
+
     public static long testTunFd(int fd) {
         return nativeStartTunFd(fd);
     }
@@ -119,6 +124,21 @@ public class MeshNode implements AutoCloseable {
                         + " uptime_secs=" + uptimeSecs
                         + " transport_mode=" + transportMode
                         + " counters=" + counters,
+                new byte[0], -1);
+    }
+
+    /**
+     * Resolve the shared comprehensive pair-probe matrix from Android's live
+     * discovery inventory. This is planning only: it never changes the phone
+     * radio mode; the selected endpoint adapters execute the returned rows.
+     */
+    public static String planProbePair(String sourceId, String targetId,
+                                       int shortBytes, int longBytes) {
+        return radioMessageText("radio.probe.plan",
+                "source_id=" + textArg(sourceId)
+                        + " target_id=" + textArg(targetId)
+                        + " short_bytes=" + shortBytes
+                        + " long_bytes=" + longBytes,
                 new byte[0], -1);
     }
 
@@ -269,6 +289,7 @@ public class MeshNode implements AutoCloseable {
     private native void nativeAddLocalForward(long handle, long connId, int localPort, String remoteHost, int remotePort);
     private native int nativeAddRemoteForward(long handle, long connId, int remotePort, String localHost, int localPort);
     private native void nativeSetCallback(long handle, MeshCallback callback);
+    private native boolean nativeTriggerAnnounce(long handle);
     private static native long nativeTestTunFd(int fd);
     private static native long nativeStartTunFd(int fd);
     private static native void nativeStopTunFd(long handle);

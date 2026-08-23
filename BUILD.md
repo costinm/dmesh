@@ -197,15 +197,17 @@ The build scripts expose side-effect-free help and state their defaults:
 ```sh
 scripts/build-fw.sh --help
 scripts/build-stage2.sh --help
-scripts/build-recovery-rust.sh --help
 ```
 
 `scripts/build-fw.sh` builds Rust Main images; no argument means `all`. Pass
-`e5`/`esp32`, `recovery-s3`/`esp32s3`, or `e6`/`esp32c6` for one CPU family.
-The C Stage2 builder also defaults to `all`. Rust Recovery currently supports
-classic ESP32 and ESP32-C6 and defaults to classic ESP32, so use an explicit
-target in automation. Main artifacts are under `target/flash/`, Stage2 under
-`target/stage2/`, and Recovery under `target/recovery-rust/`.
+`e5`/`esp32`, `esp32s3`, or `e6`/`esp32c6` for one CPU family.
+The C Stage2 builder also defaults to `all`. Main artifacts are under
+`target/flash/` and Stage2 under `target/stage2/`.
+
+Rust Recovery is frozen and low priority. `scripts/build-recovery-rust.sh`
+fails deliberately; do not use it in current build or deployment workflows.
+For a compile/size check only, set `DMESH_ALLOW_RECOVERY_BUILD=1`; this does
+not make Recovery a supported deployment lane.
 
 Current development and provisioning use the direct USB/esptool implementation
 inside `flash-device.py`. Its target defaults to `main`:
@@ -215,13 +217,13 @@ scripts/flash-device.py <board>
 scripts/flash-device.py <board> main
 scripts/flash-device.py <board> module --module lora
 scripts/flash-device.py <board> stage
-scripts/flash-device.py <board> recovery
+scripts/flash-device.py <board> recovery  # emergency rollback only
 ```
 
 Legacy UART byte forwarding is retired. Explicit USB provisioning opens only
 the requested physical port for esptool's verified write; it neither starts
 nor restores a service-owned serial forward. This is the current development
-path for Main, Recovery, Stage2, modules, and NVS. Wi-Fi Recovery is the
+path for Main, Stage2, modules, and NVS. Wi-Fi Recovery is the
 intended production Main-update path, but it is not the default flashing
 transport in this checkout.
 

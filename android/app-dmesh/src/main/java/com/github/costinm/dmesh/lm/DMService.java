@@ -690,6 +690,7 @@ public class DMService extends BaseMsgService implements MessageHandler {
             node.start(RUST_SSH_PORT, RUST_HTTP_PORT);
             node.setCallback(new SshJsonlMsgBridge(this, mux));
             meshNode = node;
+            LocalMesh.get(this).setMeshNode(node);
             Log.d(TAG, "Rust mesh node started: ssh=" + RUST_SSH_PORT
                     + " http=" + RUST_HTTP_PORT
                     + " pubkey=" + meshNode.getPublicKey());

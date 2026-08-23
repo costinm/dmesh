@@ -41,6 +41,11 @@ import java.util.Map;
 
 public class Nan {
     private static final String TAG = "nan";
+    // A radio personality replacement (LocalOnly AP/P2P) can leave the HAL
+    // briefly unavailable after the framework reports the old request closed.
+    // This is deliberately not a tight callback retry, but it is short enough
+    // to restore the default discovery state without waiting for maintenance.
+    private static final long ATTACH_RETRY_DELAY_MS = 5_000;
     private static final String PREF_DISCOVERY_ROLE = "nan_discovery_role";
     private static final String ROLE_BOTH = "both";
     private static final String ROLE_SUB_ACTIVE = "sub-active";
@@ -219,6 +224,17 @@ public class Nan {
         }
     }
 
+    /**
+     * Recreate the complete Aware attachment after another Wi-Fi personality
+     * owned the radio. This is intentionally distinct from `ensureActive()`:
+     * an unchanged NAN control record normally leaves healthy sessions alone,
+     * while Android P2P can invalidate child sessions behind our back.
+     */
+    public void restartAfterRadioReplacement() {
+        stop();
+        start();
+    }
+
     private void retryLater() {
         if (!enabled || retryScheduled) {
             return;
@@ -229,7 +245,7 @@ public class Nan {
             if (enabled) {
                 onWifiAwareStateChanged(new Intent());
             }
-        }, 30_000);
+        }, ATTACH_RETRY_DELAY_MS);
     }
 
     public boolean isEnabled() {

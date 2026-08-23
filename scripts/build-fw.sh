@@ -14,7 +14,7 @@ esac
 . "$SCRIPT_DIR/env.sh"
 # shellcheck disable=SC1091
 
-FIRMWARE_DIR="$DMESH_REPO/fw/esp32/rust"
+FIRMWARE_DIR="${DMESH_MAIN_FIRMWARE_DIR:-$DMESH_REPO/fw/main}"
 BUILD_MODE="${DMESH_FW_PROFILE:-release}"
 REQUESTED_TARGET="${1:-all}"
 now_ms() { "$DMESH_PYTHON" -c 'import time; print(time.time_ns() // 1_000_000)'; }
@@ -27,6 +27,7 @@ fi
 
 export PATH="$RUST_ESP_TOOLCHAIN_BIN:$CARGO_HOME/bin:$PATH"
 export CARGO_TARGET_DIR="${DMESH_FW_TARGET_DIR:-${CARGO_TARGET_DIR:-$DMESH_REPO/target/fw}}"
+FLASH_ROOT="${DMESH_MAIN_FLASH_ROOT:-$CARGO_TARGET_DIR/flash}"
 # Cargo unifies features per target directory. A previous raw-UDP or ESP-NOW
 # lab build must not silently leak its one-shot client into the next image.
 # Keep the normal default composition implicit, but clean only the two local
@@ -55,7 +56,7 @@ build_one() {
     local args=(build --target "$target")
     local config_dir="$CARGO_TARGET_DIR/sdkconfig"
     local partition_overlay="$config_dir/${name}-partition.defaults"
-    local image_dir="$CARGO_TARGET_DIR/flash/$name"
+    local image_dir="$FLASH_ROOT/$name"
     local image_path="$image_dir/dmesh-rs-merged.bin"
     local image_flash_size="${DMESH_FLASH_HEADER_SIZE:-$flash_size}"
     local elf_path="$CARGO_TARGET_DIR/$target/release/dmesh-rs"
@@ -177,11 +178,11 @@ case "$REQUESTED_TARGET" in
 esac
 
 build_elapsed_ms=$(( $(now_ms) - build_started_ms ))
-main_image="$CARGO_TARGET_DIR/flash/esp32s3/main-app.bin"
+main_image="$FLASH_ROOT/esp32s3/main-app.bin"
 if [ "$REQUESTED_TARGET" = esp32 ] || [ "$REQUESTED_TARGET" = e5 ]; then
-    main_image="$CARGO_TARGET_DIR/flash/esp32/main-app.bin"
+    main_image="$FLASH_ROOT/esp32/main-app.bin"
 elif [ "$REQUESTED_TARGET" = esp32c6 ] || [ "$REQUESTED_TARGET" = c6 ] || [ "$REQUESTED_TARGET" = e6 ]; then
-    main_image="$CARGO_TARGET_DIR/flash/esp32c6/main-app.bin"
+    main_image="$FLASH_ROOT/esp32c6/main-app.bin"
 fi
 if [ -f "$main_image" ]; then
     main_image_size="$(stat -c '%s' "$main_image")"

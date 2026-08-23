@@ -48,10 +48,22 @@ final class DMeshCommand {
                 String action = parsed.arg(0, "status");
                 return runRequest(mux, parsed.toFrame("companion." + action, 1), parsed);
             }
+            if ("devices".equals(parsed.command) || "radio.devices".equals(parsed.command)) {
+                if (node == null) return Result.error("Rust mesh node is not running");
+                // The Rust inventory merges NAN, UDP multicast, and future
+                // control-plane observations. Keep this shell adapter thin:
+                // it exposes the canonical record for the controller/E2E
+                // probe without introducing an Android-only device schema.
+                return Result.ok("devices").field("devices", MeshNode.knownDevices());
+            }
             if (parsed.command != null && parsed.command.contains(".")) {
                 return runMessage(mux, parsed.toFrame(parsed.command, 0));
             }
             if (parsed.frame != null) {
+                if ("radio.devices".equals(parsed.frame.method)) {
+                    if (node == null) return Result.error("Rust mesh node is not running");
+                    return Result.ok("devices").field("devices", MeshNode.knownDevices());
+                }
                 if (parsed.frame.method != null && parsed.frame.method.startsWith("ssh.")) {
                     return runSshFrame(node, parsed.frame);
                 }
@@ -149,15 +161,20 @@ final class DMeshCommand {
         }
         // A JSON-RPC-style request is allowed to wait for its correlated
         // platform result.  This matters for transport.start: an AP password
-        // does not exist until Android invokes LocalOnlyHotspotCallback.
+        // is returned by the Android Wi-Fi Direct group-info callback.
         if (frame.id != null && !frame.id.isEmpty()
                 && ("wifi.transport.start".equals(frame.method)
-                || "wifi.scan".equals(frame.method))) {
+                || "wifi.scan".equals(frame.method)
+                || "wifi.localap.start".equals(frame.method))) {
             CapturingConn conn = new CapturingConn(mux, "shell-request:" + System.nanoTime(), 1,
                     "wifi");
             mux.receiveFrame("shell", conn, frame);
             try {
-                conn.await(10_000);
+                // WifiNetworkSpecifier may use its full 20-second platform
+                // request window. Keep the privileged shell correlation open
+                // long enough to distinguish `associated`/`unavailable` from
+                // mere request admission.
+                conn.await("wifi.transport.start".equals(frame.method) ? 25_000 : 10_000);
             } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
                 return Result.error("interrupted waiting for " + frame.method);
