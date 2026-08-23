@@ -4,7 +4,6 @@ import android.bluetooth.BluetoothDevice;
 import android.net.wifi.ScanResult;
 import android.net.wifi.aware.DiscoverySession;
 import android.net.wifi.aware.PeerHandle;
-import android.net.wifi.p2p.WifiP2pDevice;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Base64;
@@ -17,13 +16,13 @@ import java.util.Map;
 /**
  * Info about a discovered device, common across communication protocols.
  * <p>
- * Discovery may use Wifi scan, Wifi-Direct, BLE, legacy BT, NAN.
+ * Discovery may use Wi-Fi scan, BLE, and NAN.
  * <p>
  * A device may be:
  * - 'visible' - i.e. known to be nearby, but whithout knowing its capabilities
  * - 'discovered' - a connectivity method is avaialble, device is mesh capable.
- * Currently Wifi SSID+PSK or WifiDirect Q method are used. In future BT, BLE, NAN might also
- * be used.
+ * NAN is the primary rendezvous mechanism; Wi-Fi scan only observes nearby
+ * DMesh APs.
  * <p>
  */
 public class Device {
@@ -53,14 +52,8 @@ public class Device {
      */
     public static final String CAP = "c";
 
-    /**
-     * Set if device was found in a P2P peer. Other fields will not be set unless a TXT discovery
-     * also happened.
-     */
-    public static final String P2PAddr = "d";
-    public static final String P2PName = "N";
-
-    public static final String P2PConnected = "gc";
+    /** Cross-bearer device address or opaque discovery identifier. */
+    public static final String RADIO_ADDR = "d";
 
     // ------------- Data about the device -------------------
 
@@ -76,8 +69,6 @@ public class Device {
     // Depending on how the device was found.
     public DiscoverySession nanSession;
 
-    WifiP2pDevice wifi;
-
     BluetoothDevice dev;
 
     PeerHandle nan;
@@ -88,59 +79,10 @@ public class Device {
     }
 
     /**
-     * Create a device from P2P peer discovery.
-     */
-    public Device(WifiP2pDevice wifiP2pDevice) {
-        this.wifi = wifiP2pDevice;
-
-        id = wifiP2pDevice.deviceAddress;
-
-        data.putString(P2PAddr, wifiP2pDevice.deviceAddress);
-        data.putString(P2PName, wifiP2pDevice.deviceName);
-
-//        Map<String, String> txt = LocalMesh.txtDiscoveryByP2P.get(wifiP2pDevice.deviceAddress);
-//        if (txt != null) {
-//            for (String k : txt.keySet()) {
-//                data.putString(k, txt.get(k));
-//            }
-//        }
-
-        StringBuilder sb = new StringBuilder();
-        if (!wifi.isGroupOwner()) {
-            sb.append(" !GO");
-        }
-        if (!wifi.isServiceDiscoveryCapable()) {
-            sb.append(" !SD");
-        }
-        if (!wifi.wpsPbcSupported()) {
-            sb.append(" !PBC");
-        }
-        if (!wifi.wpsDisplaySupported()) {
-            sb.append(" !DIS");
-        }
-        if (!wifi.wpsKeypadSupported()) {
-            sb.append(" !KPA");
-        }
-
-        if (sb.length() > 0) {
-            data.putString("p2pcap", sb.toString());
-        }
-
-        lastScan = SystemClock.elapsedRealtime();
-    }
-
-    /**
      * Createa device from a scan result.
      */
     public Device(ScanResult sr) {
         setScanResult(sr);
-
-        Map<String, String> txt = P2P.txtDiscoveryBySSID.get(sr.SSID);
-        if (txt != null) {
-            for (String k : txt.keySet()) {
-                data.putString(k, txt.get(k));
-            }
-        }
 
         lastScan = SystemClock.elapsedRealtime();
     }
@@ -170,13 +112,13 @@ public class Device {
             id = new String(si, 12, 4);
         }
 
-        data.putString(P2PAddr, "/nan/" + id);
+        data.putString(RADIO_ADDR, "/nan/" + id);
     }
 
     // Unmarshal
     public Device(Bundle b) {
         data = b;
-        id = data.getString(P2PAddr);
+        id = data.getString(RADIO_ADDR);
     }
 
     /**
@@ -204,7 +146,7 @@ public class Device {
         }
         id = ssidFlags.substring(12, 16);
 
-        data.putString(P2PAddr, idPrefix + id);
+        data.putString(RADIO_ADDR, idPrefix + id);
     }
 
     public String getSD(String key) {
@@ -217,10 +159,6 @@ public class Device {
         data.putInt(FREQ, sr.frequency);
         data.putInt(LEVEL, sr.level);
         data.putString(CAP, sr.capabilities);
-    }
-
-    public boolean isConnected() {
-        return data.getString("gc", "0").equals("1");
     }
 
     public int getLevel() {

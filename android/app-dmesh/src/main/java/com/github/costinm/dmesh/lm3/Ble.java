@@ -393,7 +393,7 @@ public class Ble implements MessageHandler {
         }
         Device bd = new Device(id, parsed);
         bd.dev = device;
-        bd.data.putString(Device.P2PAddr, "/ble/" + id);
+        bd.data.putString(Device.RADIO_ADDR, "/ble/" + id);
         bd.data.putString("proto", "dmesh_ble");
         bd.data.putString("ble_layout", optText(data, "layout"));
         bd.data.putString("ble_event", dmeshEvent(data));
@@ -563,7 +563,7 @@ public class Ble implements MessageHandler {
         Device bd = new Device(address, "dmesh_pairing");
         bd.dev = device;
         bd.lastScan = now;
-        bd.data.putString(Device.P2PAddr, "/ble/" + address);
+        bd.data.putString(Device.RADIO_ADDR, "/ble/" + address);
         bd.data.putString("proto", "dmesh_pairing");
         bd.data.putString("ble_addr", address);
         bd.data.putString("name", name);

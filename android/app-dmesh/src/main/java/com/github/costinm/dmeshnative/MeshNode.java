@@ -129,11 +129,13 @@ public class MeshNode implements AutoCloseable {
 
     /** Build the same volatile transport.start CBOR carried by UART or NAN SD. */
     public static byte[] buildTransportStart(String mode, String ssid, String passphrase,
-                                             boolean ap) {
+                                             String bssid, boolean ap, boolean ndp) {
         return radioMessage("radio.control.build_transport_start",
                 "mode=" + textArg(mode) + " ssid=" + textArg(ssid)
                         + " passphrase=" + textArg(passphrase)
-                        + " ap=" + (ap ? "1" : "0"), new byte[0], -1);
+                        + " bssid=" + textArg(bssid)
+                        + " ap=" + (ap ? "1" : "0")
+                        + " ndp=" + (ndp ? "1" : "0"), new byte[0], -1);
     }
 
     public static String parseNanServiceInfo(byte[] serviceInfo) {

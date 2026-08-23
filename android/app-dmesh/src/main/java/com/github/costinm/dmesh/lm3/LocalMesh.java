@@ -13,13 +13,11 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.wifi.ScanResult;
+import android.net.wifi.SoftApConfiguration;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
-import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiNetworkSpecifier;
-import android.net.wifi.WpsInfo;
-import android.net.wifi.p2p.WifiP2pDevice;
-import android.net.wifi.p2p.WifiP2pInfo;
+import android.net.wifi.WifiSsid;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -30,6 +28,7 @@ import android.util.Log;
 
 import com.github.costinm.dmesh.android.msg.MessageHandler;
 import com.github.costinm.dmesh.android.msg.MsgConn;
+import com.github.costinm.dmesh.android.msg.MsgFrame;
 import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.UiUtil;
 import com.github.costinm.dmesh.android.util.Hex;
@@ -42,73 +41,10 @@ import java.util.List;
 import java.util.Map;
 import java.nio.charset.StandardCharsets;
 
-/*
-Debug:
-2019-05-18 19:41:24.893 1260-1470/? D/SupplicantP2pIfaceHal: groupAdd(DIRECT-BD-angler_n6p, <Non-Empty>, true, 0, 02:00:00:00:00:00, true) completed successfully.
-2019-05-18 19:41:26.248 2401-2401/? D/wpa_supplicant: p2p0: Request association with 26:1f:a0:30:26:e0
-2019-05-18 19:41:26.250 2401-2401/? D/wpa_supplicant: p2p0: Starting radio work 'connect'@0x7a88e13240 after 0.001833 second wait
-2019-05-18 19:41:26.256 2401-2401/? D/wpa_supplicant: p2p0: P2P: WLAN AP allows cross connection
-2019-05-18 19:41:26.256 2401-2401/? D/wpa_supplicant: p2p0: State: SCANNING -> ASSOCIATING
-2019-05-18 19:41:26.299 2401-2401/? D/wpa_supplicant: nl80211: Connect request send successfully
-2019-05-18 19:41:26.299 2401-2401/? D/wpa_supplicant: p2p0: Setting authentication timeout: 10 sec 0 usec
-
-2019-05-18 19:41:26.365 1260-1507/? D/WifiVendorHal: onRadioModeChange [{.radioId = 0, .bandInfo = BAND_5GHZ, .ifaceInfos = [{.name = wlan0, .channel = 5785}, {.name = p2p0, .channel = 5785}]}]
-
-2019-05-18 19:41:26.492 2401-2401/? D/wpa_supplicant: nl80211: Connect event (status=0 ignore_next_local_disconnect=0)
-2019-05-18 19:41:26.494 1260-1306/? I/EthernetTracker: interfaceLinkStateChanged, iface: p2p0, up: true
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Associated on 5785 MHz
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Associated with 26:1f:a0:30:26:e0
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Operating frequency for the associated BSS from scan results: 5785 MHz
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Associated on 5785 MHz
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Associated with 26:1f:a0:30:26:e0
-2019-05-18 19:41:26.498 2401-2401/? D/wpa_supplicant: nl80211: Set drv->mySSID based on scan res info to 'DIRECT-BD-angler_n6p'
-
-
-2019-05-18 19:41:26.542 2401-2401/? I/wpa_supplicant: P2P-GROUP-STARTED p2p0 client mySSID="DIRECT-BD-angler_n6p" freq=5785 go_dev_addr=26:1f:a0:30:a6:e0 [PERSISTENT]
-
-2019-05-18 19:41:26.544 1260-1470/? D/WifiP2pService: GroupNegotiationState{ when=0 what=147485 obj=network: DIRECT-BD-angler_n6p
-
-2019-05-18 19:41:26.583 752-9556/? I/netd: interfaceSetEnableIPv6("false", "p2p0") <7.553491ms>
-2019-05-18 19:41:26.584 752-9556/? I/netd: interfaceClearAddrs("p2p0") <0.454532ms>
-
-
-2019-05-18 19:41:26.589 12529-12529/com.github.costinm.dmwifi D/MsgMux: /wifi/P2P [GO, -1, groupOnwerAddress, ]
-2019-05-18 19:41:26.589 12529-12529/com.github.costinm.dmwifi D/MsgMux: /wifi/AP [on, 0]
-
-2019-05-18 19:41:26.592 1801-12650/? D/DhcpClient: Broadcasting DHCPDISCOVER
-
-2019-05-18 19:42:02.598 1801-12650/? D/DhcpClient: doQuit
-2019-05-18 19:42:02.598 1260-1470/? E/WifiP2pService: IP provisioning failed
-
-
-.....
-
-2019-05-18 19:57:37.051 2401-2401/? D/wpa_supplicant: P2P: Group Formation timed out
-2019-05-18 19:57:37.052 2401-2401/? D/wpa_supplicant: P2P: No pending Group Formation - ignore group formation failure notification
-2019-05-18 19:57:37.052 2401-2401/? I/wpa_supplicant: P2P-GROUP-FORMATION-FAILURE
-2019-05-18 19:57:37.052 2401-2401/? D/wpa_supplicant: Notifying P2P Group formation failure to hidl control:
-2019-05-18 19:57:37.052 2401-2401/? D/wpa_supplicant: Notifying P2P Group removed to hidl control: 9
-2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: p2p0: Request to deauthenticate - bssid=42:4e:36:81:d4:1f pending_bssid=00:00:00:00:00:00 reason=3 state=DISCONNECTED
-2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: TDLS: Tear down peers
-2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: wpa_driver_nl80211_disconnect(reason_code=3)
-2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: p2p0: Event DEAUTH (11) received
-2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: p2p0: Deauthentication notification
-2019-05-18 19:57:37.053 2401-2401/? D/wpa_supplicant: p2p0:  * reason 3 (locally generated)
- */
-
-/*
-
-TODO:
-- BLE, BT and NAN allow sending some messages without connecting. This can be integrated.
-
-
- */
-
 /**
- * Local mesh - Wifi NAN/P2P, BLE. The main local protocol is NAN - with BLE used to communicate
+ * Local mesh - Wi-Fi Aware NAN and BLE. NAN is the Wi-Fi discovery and timing
+ * mechanism; LocalOnly Hotspot is the optional AP/STA data fallback.
  * with 'modem' like devices - like LoRA or ESP raw WiFi protocls.
- *
- * P2P was used in the past, before NAN was broadly available on phones. Same for BT.
  *
  * This requires a lot of permissions - and a persistent foreground service
  * that is not frozen. It can also be used from a system app.
@@ -121,7 +57,7 @@ TODO:
  *
  * REST API:
  * <p>
- * -  net/{NET}: ap, wlan, p2p, inet, ... - network interfaces
+ * -  net/{NET}: ap, wlan, inet, ... - network interfaces
  * --  on: 0|1
  * --  if: wlan0, ...
  * --  ip: IP1, IP2, ...
@@ -139,14 +75,19 @@ TODO:
  * -- p: PSK  // if it was previously discovered with SD
  * -- i: ID   // same
  * -- n: NET  // same
- * -- name: P2P name // if found as peer
+ * -- name: radio-advertised name, when available
  */
 public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     public static final int UPDATE = 3;
     public static final int MSG = 2;
     static final Map<String, String> empty = new HashMap<>();
-    // Used for P2P announce
     static final String TAG = "DM/wifi";
+    /**
+     * Lab-only WPA2 credential for Android releases which expose configured
+     * LocalOnly Hotspot. It is intentionally volatile transport-start data,
+     * never a preference or discovery identity.
+     */
+    private static final String LOCAL_ONLY_HOTSPOT_WPA2_PASSPHRASE = "untrusted-open-mode";
     private static final String PREF_ENABLED = "wifi_enabled";
 
 
@@ -158,7 +99,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
     Context ctx;
 
-    // All callbacks from system for P2P (and others) will trigger messages on this thread.
+    // All platform callbacks are marshalled to this thread.
     // Callbacks run on this thread, should be non-blocking.
     final Looper looper;
 
@@ -170,27 +111,42 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
     public Ble ble;
 
-    // P2P support - includes WifiManager and scanning.
-    // No longer the mechanism for forming the mesh, it was used before NAN.
-    public P2P p2p;
+    // Wi-Fi manager is used only for LocalOnly Hotspot and observational scans.
+    private final WifiManager wifiManager;
 
     ConnectivityManager cm;
     // A requested infrastructure STA attachment.  It is intentionally
-    // separate from the historical Wi-Fi Direct group state in P2P: the
-    // control plane may measure AP+STA capability without silently replacing
-    // one with the other.
+    // App-scoped infrastructure attachment: separate from NAN and the local
+    // hotspot so a transport.start can replace only its intended radio epoch.
     ConnectivityManager.NetworkCallback staAttachment;
     private WifiManager.LocalOnlyHotspotReservation localOnlyHotspot;
     private boolean localOnlyHotspotStarting;
+    // Volatile framework credentials: never preferences/NVS. Retain only for
+    // the life of this reservation so an idempotent repeated request can
+    // return the same usable AP target to its privileged caller.
+    private String localOnlyHotspotSsid = "";
+    private String localOnlyHotspotPassphrase = "";
     private String appliedTransportStart = "";
+
+    /**
+     * Stable lab SSID for a configured local-only hotspot.  The suffix is the
+     * short node identity already used by the local radio advertisements.
+     * Android versions which only expose the legacy LocalOnlyHotspot API own
+     * the resulting SSID and passphrase; callers must use the returned values
+     * rather than assuming this name.
+     */
+    private String configuredLocalOnlyHotspotSsid() {
+        String suffix = id4 == null ? "0000" : id4;
+        if (suffix.length() > 4) {
+            suffix = suffix.substring(0, 4);
+        }
+        return "DIRECT-dmesh-" + suffix;
+    }
 
     // Advertised URL - for NAN, BLE, TXT
     // Current format: 16 bytes, PSK8 + SSIDHASH4 + ID4
     String adv = "12345678SSIDID04";
     byte[] deviceId = new byte[] {'A', 'N', 'D', 'R', '0', '0'};
-    // Last requested state for the AP.
-    // TODO: leave it as is at startup.
-    boolean requestedAp;
     String id4 = "0000";
     // Last scan results. Updated when result happens. Data is merged with txt info to
     // select DMesh APs.
@@ -220,7 +176,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
         looper = mainLooper;
         this.delayHandler = delayHandler;
-        p2p = new P2P(this);
+        wifiManager = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
 
         cm = (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
 
@@ -233,8 +189,6 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
 
         nan.onCreate();
-        p2p.onCreate();
-        p2p.stopAll();
         delayHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -256,15 +210,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         if (ssid.startsWith("DM-")) {
             return true;
         }
-        if (!ssid.startsWith("DIRECT-")) {
-            return false;
-        }
-        // exclude known non-android DIRECT servers
-        if (ssid.length() > 10 &&
-                (ssid.substring(10).startsWith("HP "))) {
-            return false;
-        }
-        return true;
+        return ssid.startsWith("dmesh-");
     }
 
     /**
@@ -276,7 +222,6 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         releaseStaAttachment();
         releaseLocalOnlyHotspot();
         ctx.unregisterReceiver(this);
-        p2p.stopPeerAndSDDiscovery();
         //bt.close();
     }
 
@@ -285,7 +230,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      *
      * This is deliberately an app-scoped {@link WifiNetworkSpecifier}
      * request: it does not save credentials, change the user's global Wi-Fi
-     * choice, or tear down NAN/P2P. Android may present its normal approval
+     * choice, or tear down NAN. Android may present its normal approval
      * UI and an OEM may reject AP+STA concurrency; both outcomes are emitted
      * so the shared probe response can report measured capability.
      */
@@ -379,18 +324,32 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
      * an arbitrary open SoftAP.
      */
     public synchronized void applyTransportStart(String json, String source, String peer) {
+        applyTransportStart(json, source, peer, "", null);
+    }
+
+    /**
+     * Apply a shared transport.start and keep the caller's request id through
+     * the asynchronous Android Wi-Fi callback.  The direct result is the
+     * control-plane response; the matching broadcast is retained for status
+     * subscribers and historical diagnostics.
+     */
+    private synchronized void applyTransportStart(String json, String source, String peer,
+                                                  String requestId, MsgConn replyTo) {
         String mode = jsonField(json, "mode");
         if (!"sta".equals(mode) && !"nan".equals(mode)) {
+            publishTransportResult(requestId, replyTo, "error", "invalid_mode", "", "");
             return;
         }
         String ssidHex = jsonField(json, "ssid_hex");
         String passphraseHex = jsonField(json, "passphrase_hex");
         String bssidHex = jsonField(json, "bssid_hex");
+        String ndp = jsonField(json, "ndp");
         String ap = jsonField(json, "ap");
-        String key = mode + ":" + ssidHex + ":" + passphraseHex + ":" + bssidHex + ":" + ap;
+        String key = mode + ":" + ssidHex + ":" + passphraseHex + ":" + bssidHex + ":" + ndp + ":" + ap;
         if (key.equals(appliedTransportStart)) {
             MsgMux.get(ctx).publish("net.TransportStart", "ok", "1", "state", "unchanged",
-                    "source", source, "peer", peer, "mode", mode);
+                    "source", source, "peer", peer, "mode", mode, "request_id", requestId);
+            publishTransportResult(requestId, replyTo, "unchanged", "", "", "");
             return;
         }
         if ("sta".equals(mode)) {
@@ -403,10 +362,15 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             releaseStaAttachment();
             if (nan != null) nan.ensureActive();
         }
-        if ("1".equals(ap)) requestLocalOnlyHotspot(); else releaseLocalOnlyHotspot();
+        if (nan != null) nan.setNdpEnabled("1".equals(ndp));
+        if ("1".equals(ap)) requestLocalOnlyHotspot(requestId, replyTo); else {
+            releaseLocalOnlyHotspot();
+            publishTransportResult(requestId, replyTo, "ap_stopped", "", "", "");
+        }
         appliedTransportStart = key;
         MsgMux.get(ctx).publish("net.TransportStart", "ok", "1", "state", "applied",
-                "source", source, "peer", peer, "mode", mode, "ap", ap);
+                "source", source, "peer", peer, "mode", mode, "ndp", ndp, "ap", ap,
+                "request_id", requestId);
     }
 
     private static String hexText(String value) {
@@ -445,49 +409,91 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         return fallback;
     }
 
-    private void requestLocalOnlyHotspot() {
+    private void requestLocalOnlyHotspot(String requestId, MsgConn replyTo) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error",
                     "requires_android_8");
+            publishTransportResult(requestId, replyTo, "error", "requires_android_8", "", "");
             return;
         }
         if (localOnlyHotspot != null) {
             MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "already_active");
+            publishTransportResult(requestId, replyTo, "already_active", "",
+                    localOnlyHotspotSsid, localOnlyHotspotPassphrase);
             return;
         }
         if (localOnlyHotspotStarting) {
             MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "starting");
+            publishTransportResult(requestId, replyTo, "accepted", "", "", "");
             return;
         }
-        if (p2p == null || p2p.mWifiManager == null) {
+        if (wifiManager == null) {
             MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error",
                     "wifi_manager_unavailable");
+            publishTransportResult(requestId, replyTo, "error", "wifi_manager_unavailable", "", "");
             return;
         }
         localOnlyHotspotStarting = true;
-        MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "requested");
+        MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "requested",
+                "request_id", requestId);
         WifiManager.LocalOnlyHotspotCallback callback = new WifiManager.LocalOnlyHotspotCallback() {
                 @Override public void onStarted(WifiManager.LocalOnlyHotspotReservation reservation) {
                     localOnlyHotspotStarting = false;
                     localOnlyHotspot = reservation;
-                    WifiConfiguration config = reservation.getWifiConfiguration();
-                    String ssid = config == null ? "" : config.SSID;
-                    String passphrase = config == null ? "" : config.preSharedKey;
+                    // WifiConfiguration was deprecated in API 30 and may be
+                    // null for a valid modern hotspot. SoftApConfiguration is
+                    // the credential source on the API 33/35 pool and SDK 36.
+                    // The common ESP/Android station path currently supports
+                    // WPA2-PSK. WPA3 transition mode is also attachable: it
+                    // advertises a WPA2-PSK option, unlike WPA3-SAE-only.
+                    SoftApConfiguration config = reservation.getSoftApConfiguration();
+                    String ssid = config.getSsid();
+                    String passphrase = config.getPassphrase();
+                    MacAddress bssid = config.getBssid();
+                    String bssidHex = bssid == null ? ""
+                            : String.valueOf(Hex.encode(bssid.toByteArray()));
+                    int securityType = config.getSecurityType();
+                    boolean wpa2Compatible = securityType == SoftApConfiguration.SECURITY_TYPE_WPA2_PSK
+                            || securityType == SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION;
+                    Log.i(TAG, "LocalOnlyHotspot started ssid=" + ssid
+                            + " securityType=" + securityType
+                            + " passphraseLength=" + (passphrase == null ? 0 : passphrase.length()));
+                    if (ssid == null || ssid.isEmpty() || passphrase == null || passphrase.isEmpty()) {
+                        localOnlyHotspot.close();
+                        localOnlyHotspot = null;
+                        localOnlyHotspotSsid = "";
+                        localOnlyHotspotPassphrase = "";
+                        String securityError = "missing_softap_credentials type=" + securityType;
+                        MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error",
+                                securityError, "request_id", requestId);
+                        publishTransportResult(requestId, replyTo, "error", securityError, "", "");
+                        return;
+                    }
+                    localOnlyHotspotSsid = ssid;
+                    localOnlyHotspotPassphrase = passphrase;
+                    String compatibilityError = wpa2Compatible ? "" : "unsupported_softap_security type="
+                            + securityType + " passphrase_length=" + passphrase.length();
                     MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "started",
                             "ssid", ssid,
                             // This stays local to the privileged control-plane
                             // event. A later NAN SD transport.start may carry
                             // it as volatile association data; it is never an
                             // Android preference or ESP NVS setting.
-                            "passphrase", passphrase);
+                            "passphrase", passphrase, "request_id", requestId);
+                    // A reservation without a WPA2-compatible option is observable and may still be
+                    // used to test AP/NAN coexistence, but must never be
+                    // treated as an attachable ESP target.
+                    publishTransportResult(requestId, replyTo,
+                            wpa2Compatible ? "started" : "started_unusable_for_esp",
+                            compatibilityError, ssid, passphrase);
                     // The Android AP is ready before its peers can attach.
                     // Publish the complete ephemeral STA target through the
                     // common NAN Service Info control wire; e6 handles it
                     // through the exact UART/NAN profile path, with normal
                     // repeated-SD idempotence.
-                    if (nan != null && !ssid.isEmpty() && !passphrase.isEmpty()) {
+                    if (nan != null && !ssid.isEmpty()) {
                         byte[] transportStart = MeshNode.buildTransportStart(
-                                "sta", ssid, passphrase, false);
+                                "sta", ssid, passphrase, bssidHex, false, false);
                         if (nan.setServiceInfoCbor(transportStart)) {
                             nan.ensureActive();
                             MsgMux.get(ctx).publish("net.TransportStartSd", "ok", "1",
@@ -499,56 +505,68 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                 @Override public void onStopped() {
                     localOnlyHotspotStarting = false;
                     localOnlyHotspot = null;
+                    localOnlyHotspotSsid = "";
+                    localOnlyHotspotPassphrase = "";
                     MsgMux.get(ctx).publish("wifi.ap.local", "ok", "1", "state", "stopped");
                 }
                 @Override public void onFailed(int reason) {
                     localOnlyHotspotStarting = false;
-                    MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "reason", Integer.toString(reason));
+                    String error = Integer.toString(reason);
+                    MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "reason", error,
+                            "request_id", requestId);
+                    publishTransportResult(requestId, replyTo, "error", error, "", "");
                 }
             };
         try {
-            // Some devices reject the configured local-hotspot API despite
-            // accepting the older public callback form. Keep the known-good
-            // path until its channel/band capability can be probed first.
-            p2p.mWifiManager.startLocalOnlyHotspot(callback, delayHandler);
+            if (Build.VERSION.SDK_INT >= 36
+                    && Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1) {
+                // Android 16 QPR2 (36.1) is the first public API with both
+                // setters. It gives every capable Android device the same
+                // DMesh AP family and WPA2 credential as the ESP validation
+                // path, with no reflection or hidden API use.
+                SoftApConfiguration.Builder builder = new SoftApConfiguration.Builder();
+                builder.setWifiSsid(WifiSsid.fromBytes(
+                                configuredLocalOnlyHotspotSsid().getBytes(StandardCharsets.UTF_8)))
+                        .setPassphrase(LOCAL_ONLY_HOTSPOT_WPA2_PASSPHRASE,
+                                SoftApConfiguration.SECURITY_TYPE_WPA2_PSK);
+                SoftApConfiguration config = builder.build();
+                wifiManager.startLocalOnlyHotspotWithConfiguration(config,
+                        command -> delayHandler.post(command), callback);
+            } else {
+                // API 26 through 36.0: the public request has a
+                // framework-chosen SSID and security type. onStarted rejects
+                // anything other than WPA2-PSK before advertising it to ESP.
+                wifiManager.startLocalOnlyHotspot(callback, delayHandler);
+            }
         } catch (RuntimeException error) {
             localOnlyHotspotStarting = false;
-            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error", error.toString());
+            String reason = error.toString();
+            MsgMux.get(ctx).publish("wifi.ap.local", "ok", "0", "error", reason,
+                    "request_id", requestId);
+            publishTransportResult(requestId, replyTo, "error", reason, "", "");
         }
+    }
+
+    private void publishTransportResult(String requestId, MsgConn replyTo, String state,
+                                        String error, String ssid, String passphrase) {
+        if (requestId == null || requestId.isEmpty()) return;
+        MsgFrame result = new MsgFrame("wifi.transport.result");
+        result.id = requestId;
+        result.fields.put("state", state);
+        if (error != null && !error.isEmpty()) result.fields.put("error", error);
+        if (ssid != null && !ssid.isEmpty()) result.fields.put("ssid", ssid);
+        if (passphrase != null && !passphrase.isEmpty()) result.fields.put("passphrase", passphrase);
+        if (replyTo != null) replyTo.sendFrame(result);
+        MsgMux.get(ctx).publish("wifi.transport.result", "request_id", requestId,
+                "state", state, "error", error, "ssid", ssid, "passphrase", passphrase);
     }
 
     private void releaseLocalOnlyHotspot() {
         if (localOnlyHotspot != null) localOnlyHotspot.close();
         localOnlyHotspot = null;
         localOnlyHotspotStarting = false;
-    }
-
-    /**
-     * Update p2p link based on status specified in mst.
-     */
-    private void updateP2P(Message msg) {
-        Bundle data = msg.getData();
-        String ap = data.getString("ap", "");
-        if (ap.length() > 0) {
-            requestedAp = "1".equals(ap);
-            p2p.apOn(requestedAp);
-        }
-
-        // Intended state/type of discovery.
-        String disc = data.getString("disc", "");
-        if (disc.length() > 0) {
-            if ("1".equals(disc)) { // Start Peer discovery, with SD. Can be used for P2P and similar
-                p2p.discoverPeersStart(msg);
-            } else if ("0".equals(disc)) {
-                p2p.stopPeerAndSDDiscovery();
-            }
-        }
-
-        // P2P connection to a different node.
-        String con = data.getString("con", "");
-        if (con.length() > 0) {
-            con(msg, con, data.getString("mode", ""));
-        }
+        localOnlyHotspotSsid = "";
+        localOnlyHotspotPassphrase = "";
     }
 
     /**
@@ -574,9 +592,24 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     }
 
     public void scan() {
+        scan("", null);
+    }
+
+    /**
+     * Request an observational Wi-Fi scan.  A request with an id receives the
+     * completed bounded result directly; the broadcast remains the source for
+     * status subscribers.  It deliberately does not alter STA, NAN, or
+     * AP state.
+     */
+    public void scan(String requestId, MsgConn replyTo) {
+
+        if (wifiManager == null) {
+            publishWifiScanResult(requestId, replyTo, false, 0, 0, 0, 0, "", "", "wifi_manager_unavailable");
+            return;
+        }
 
         // Method is deprecated, will be removed. System can scan.
-        boolean s = p2p.mWifiManager.startScan();
+        boolean s = wifiManager.startScan();
         if (!s) {
             Log.d(TAG, "Request wifi scan failed " + s);
         }
@@ -584,70 +617,94 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         delayHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                publishWifiScanResults();
+                publishWifiScanResults(requestId, replyTo);
                 ble.scan();
             }
         }, 3000);
 
-        // Will activate nan - but not detach, so beacons will continue to be sent.
-        // Also requires the other end to be attached - sending beacons. If we take the hit of
-        // sending beacons - P2P mode is more efficient anyways.
-        // Using NAN for discovery doesn't seem to present any benefits.
-
-            delayHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    nan.update(delayHandler);
-                }
-            }, 6000);
+        if (nan != null) nan.ensureActive();
     }
 
     /**
      * Publish the bounded common scan summary after Android completes the
      * requested scan. This is observational only: it neither attaches STA nor
-     * changes NAN/P2P state. Channel 6 is the current probe scope; the full
+     * changes NAN state. Channel 6 is the current probe scope; the full
      * count remains useful to distinguish an empty scan from no DMesh AP.
      */
-    private void publishWifiScanResults() {
-        if (p2p == null || p2p.mWifiManager == null) return;
+    private void publishWifiScanResults(String requestId, MsgConn replyTo) {
+        if (wifiManager == null) {
+            publishWifiScanResult(requestId, replyTo, false, 0, 0, 0, 0, "", "", "wifi_manager_unavailable");
+            return;
+        }
         try {
-            List<ScanResult> results = p2p.mWifiManager.getScanResults();
+            List<ScanResult> results = wifiManager.getScanResults();
             int total = results == null ? 0 : results.size();
             int channel6 = 0;
             int directAny = 0;
-            int direct = 0;
+            int dmeshAny = 0;
             StringBuilder allDirect = new StringBuilder();
             StringBuilder dmesh = new StringBuilder();
             if (results != null) for (ScanResult result : results) {
                 if (result.frequency >= 2432 && result.frequency <= 2442) channel6++;
                 String ssid = result.SSID == null ? "" : result.SSID;
-                if (!ssid.startsWith("DIRECT-")) continue;
-                directAny++;
-                if (directAny <= 16) {
+                boolean isDirect = ssid.startsWith("DIRECT-");
+                // LocalOnly Hotspot chooses its own SSID on current Android
+                // releases. A future configurable SoftAP uses `dmesh-`; keep
+                // that discovery class distinct from arbitrary DIRECT peers.
+                boolean isDmesh = ssid.endsWith("-dmesh") || ssid.startsWith("dmesh-");
+                if (isDirect) {
+                    directAny++;
+                }
+                if (isDirect && directAny <= 16) {
                     if (allDirect.length() != 0) allDirect.append(',');
                     allDirect.append(ssid).append('@').append(result.BSSID)
                             .append(':').append(result.level);
                 }
-                if (!ssid.endsWith("-dmesh")) continue;
-                if (direct++ != 0) dmesh.append(',');
+                if (!isDmesh) continue;
+                dmeshAny++;
+                if (dmeshAny > 16) continue;
+                if (dmesh.length() != 0) dmesh.append(',');
                 // The bounded event is sufficient for probe persistence:
                 // SSID, observed BSSID, and RSSI. Android may randomize its
                 // own MAC, but the observed AP BSSID is still meaningful.
                 dmesh.append(ssid).append('@').append(result.BSSID)
                         .append(':').append(result.level);
-                if (direct >= 16) break;
             }
-            MsgMux.get(ctx).publish("wifi.scan", "ok", "1",
-                    "count", Integer.toString(total),
-                    "channel6_count", Integer.toString(channel6),
-                    "direct_count", Integer.toString(directAny),
-                    "direct", allDirect.toString(),
-                    "direct_dmesh_count", Integer.toString(direct),
-                    "direct_dmesh", dmesh.toString());
+            publishWifiScanResult(requestId, replyTo, true, total, channel6, directAny,
+                    dmeshAny, allDirect.toString(), dmesh.toString(), "");
         } catch (SecurityException error) {
-            MsgMux.get(ctx).publish("wifi.scan", "ok", "0", "error",
+            publishWifiScanResult(requestId, replyTo, false, 0, 0, 0, 0, "", "",
                     "missing_wifi_scan_permission");
         }
+    }
+
+    private void publishWifiScanResult(String requestId, MsgConn replyTo, boolean succeeded,
+                                       int total, int channel6, int direct, int dmesh,
+                                       String allDirect, String dmeshEntries, String error) {
+        String ok = succeeded ? "1" : "0";
+        MsgMux.get(ctx).publish("wifi.scan", "ok", ok,
+                "count", Integer.toString(total),
+                "channel6_count", Integer.toString(channel6),
+                "direct_count", Integer.toString(direct),
+                "direct", allDirect,
+                "dmesh_count", Integer.toString(dmesh),
+                "dmesh", dmeshEntries,
+                // Keep the old names during the control-plane migration.
+                "direct_dmesh_count", Integer.toString(dmesh),
+                "direct_dmesh", dmeshEntries,
+                "error", error);
+        if (requestId == null || requestId.isEmpty()) return;
+        MsgFrame result = new MsgFrame("wifi.scan.result");
+        result.id = requestId;
+        result.fields.put("ok", ok);
+        result.fields.put("count", Integer.toString(total));
+        result.fields.put("channel6_count", Integer.toString(channel6));
+        result.fields.put("direct_count", Integer.toString(direct));
+        result.fields.put("direct", allDirect);
+        result.fields.put("dmesh_count", Integer.toString(dmesh));
+        result.fields.put("dmesh", dmeshEntries);
+        if (error != null && !error.isEmpty()) result.fields.put("error", error);
+        if (replyTo != null) replyTo.sendFrame(result);
     }
 
     public void send(String method, String... parms) {
@@ -698,20 +755,18 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                     String ssid = b.getString("ssid", argumentValue(args, "ssid", ""));
                     String passphrase = b.getString("passphrase", argumentValue(args, "passphrase", ""));
                     String bssid = b.getString("bssid", argumentValue(args, "bssid", ""));
+                    String ndp = b.getString("ndp", argumentValue(args, "ndp", "0"));
                     String ap = b.getString("ap", argumentValue(args, "ap", "0"));
                     String json = "{\"mode\":\"" + mode + "\",\"ssid_hex\":\""
                             + new String(Hex.encode(ssid.getBytes(StandardCharsets.UTF_8)))
                             + "\",\"passphrase_hex\":\""
                             + new String(Hex.encode(passphrase.getBytes(StandardCharsets.UTF_8)))
                             + "\",\"bssid_hex\":\"" + bssid.replace(":", "")
+                            + "\",\"ndp\":\"" + ndp
                             + "\",\"ap\":\"" + ap + "\"}";
-                    applyTransportStart(json, "local_control", "");
+                    applyTransportStart(json, "local_control", "", b.getString(":rid", ""), replyTo);
                 }
                 break;
-            case "p2p":
-                updateP2P(msg);
-                break;
-
             // `wifi.sta.attach` is the platform half of a signed
             // transport.start/probe request. Rust supplies the policy and
             // records the result; Java only asks Android to attach to the
@@ -729,29 +784,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
             case "scan":
                 // Wifi, BLE and NAN scan. No BT yet.
-                scan();
-                break;
-
-            case "disc":
-                // Should be used after wifi scan, if new DIRECT devices are
-                // found - to show the neigbor info.
-                //
-                // about 6 seconds
-                p2p.discoveryWifiP2POnce();
-                break;
-
-            // p2p discovery must be started for con
-            case "con":
-                if (args.length >= 3 && "start".equals(args[2])) {
-                    p2p.discoverPeersStart(msg);
-                } else if (args.length >= 3 && "stop".equals(args[2])) {
-                    p2p.stopAll();
-                } else if (args.length >= 3 && "cancel".equals(args[2])) {
-                    p2p.stopAll();
-                    p2p.disconnect();
-                } else if (args.length >= 5 && "peer".equals(args[2])) {
-                    con(msg, args[3], args[4]);
-                }
+                scan(b.getString(":rid", ""), replyTo);
                 break;
 
 
@@ -885,67 +918,15 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                     announce(false);
                 }
 
-                String p2pv = b.getString("p2p", "-1");
-                if ("1".equals(p2pv)) {
-                    // TODO: optional parameters, use BLE/BT as well
-                    p2p.announceWifiP2P(true);
-                } else if ("0".equals(p2pv)) {
-                    p2p.announceWifiP2P(false);
-                }
                 break;
 
         }
     }
 
-    // List of currently visible devices and status (/wifi/status)
-    //
-    // 1. List of devices - as a ArrayList<Bundle> "scan".
-    //
-    // Includes:
-    //  - last wifi scan (typie DIRECT- and DM-) - with additional info if SD txt available
-    //  - P2P discovery - name and p2p address, excluding SD/scan
-    //  - TODO: Nan discovery
-    //  - TODO: BLE discovery
-    //
-    // 2.
-    //
-    //
-    // Merging:
-    // -
+    /** Publish the current scan, BLE, and NAN observations. */
     public void sendWifiDiscoveryStatus(String event, String id) {
-
-        // Key is SSID - combines last scan results and DNS-SD ( based on P2P peers and
-        // previous or current DNS-SD TXT records that addMap2Bundle the SSID and ID )
         Map<String, Device> devicesBySSID = new HashMap<>();
-
-        // Key is P2P discovery address - only if SSID is not found (peer without SD).
-        // The devices can still be paired with - or may be DMesh devices that failed DNS-SD.
-        // TODO: do we need this ? Can be safely ignored for must purposes, good mostly for debugging.
-        // It also includes connected clients.
-        Map<String, Device> p2pPeersWithoutDNSSDByMAC = new HashMap<>();
-
-        // Used to avoid dups for connected clients. All p2p peers.
-        Map<String, Device> allP2PDiscovered = new HashMap<>();
-
         Bundle scanStatusMsg = new Bundle();
-
-
-        // Add other P2P devices - some may be visible as SSID, but we don't know the association
-        // because we didn't discover TXT yet.
-        if (p2p.wifiP2pDeviceList != null) {
-            for (WifiP2pDevice pd : p2p.wifiP2pDeviceList.getDeviceList()) {
-                Device d = new Device(pd);
-                // will populate TXT records, if previous SD found them. We cache since SD is not
-                // very reliable.
-                String ssid = d.data.getString(Device.SSID);
-                if (ssid != null) {
-                    devicesBySSID.put(ssid, d);
-                } else {
-                    p2pPeersWithoutDNSSDByMAC.put(pd.deviceAddress, d);
-                }
-                allP2PDiscovered.put(pd.deviceAddress, d);
-            }
-        }
         if (lscanResults != null) {
             for (ScanResult sr : lscanResults) {
                 if (!isLM(sr.SSID)) {
@@ -960,21 +941,9 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
                 }
             }
         }
-        for (WifiP2pDevice c : p2p.currentClientList) {
-            Device d = allP2PDiscovered.get(c.deviceAddress);
-            if (d == null) {
-                d = new Device(c);
-                p2pPeersWithoutDNSSDByMAC.put(c.deviceAddress, d);
-                allP2PDiscovered.put(c.deviceAddress, d);
-            }
-            d.data.putString("gc", "1");
-        }
 
         ArrayList<Bundle> scanList = new ArrayList<>();
         for (Device d : devicesBySSID.values()) {
-            scanList.add(d.data);
-        }
-        for (Device d : p2pPeersWithoutDNSSDByMAC.values()) {
             scanList.add(d.data);
         }
         for (Device d : Ble.devices.values()) {
@@ -987,52 +956,9 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
         }
         scanStatusMsg.putParcelableArrayList("scan", scanList);
 
-        // Normal key/value pairs, next to :uri
         ArrayList<String> extra = new ArrayList<>();
         extra.add("visible");
         extra.add(lscanResults == null ? "0" : "" + lscanResults.size());
-
-        extra.add("s");
-        extra.add(p2p.mySSID);
-        extra.add("p");
-        extra.add(p2p.psk);
-
-        WifiP2pInfo pinfo = p2p.pinfo;
-        if (pinfo != null && pinfo.groupFormed && !pinfo.isGroupOwner) {
-            // if groupOnwer - group will be set and used in next block
-            extra.add("go");
-            extra.add("0");
-            if (pinfo.groupOwnerAddress != null) {
-                extra.add("goAddress");
-                extra.add(pinfo.groupOwnerAddress.toString());
-            }
-        }
-
-        if (p2p.group != null) {
-            if (!p2p.group.isGroupOwner()) {
-                WifiP2pDevice owner = p2p.group.getOwner();
-                if (owner != null) {
-                    extra.add("owner");
-                    extra.add(owner.toString());
-                }
-            } else {
-                extra.add("go");
-                extra.add("1");
-                if (pinfo.groupOwnerAddress != null) {
-                    extra.add("goAddress");
-                    extra.add(pinfo.groupOwnerAddress.toString());
-                }
-                WifiP2pDevice owner = p2p.group.getOwner();
-                if (owner != null) {
-                    extra.add("owner");
-                    extra.add(owner.toString());
-                }
-
-                extra.add("ap");
-                extra.add("1");
-            }
-        }
-
         extra.add("event");
         extra.add(event);
 
@@ -1046,14 +972,15 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             extra.add(nan.nanId);
         }
 
-        String wifiSsid = p2p.mWifiManager.getConnectionInfo().getSSID();
-        if (wifiSsid != null) {
+        WifiInfo connectionInfo = wifiManager == null ? null : wifiManager.getConnectionInfo();
+        String wifiSsid = connectionInfo == null ? "" : connectionInfo.getSSID();
+        if (wifiSsid != null && !wifiSsid.isEmpty()) {
             extra.add(Device.WIFISSID);
             extra.add(wifiSsid);
             extra.add(Device.FREQ);
-            extra.add("" + p2p.mWifiManager.getConnectionInfo().getFrequency());
+            extra.add("" + connectionInfo.getFrequency());
             extra.add(Device.LEVEL);
-            extra.add("" + p2p.mWifiManager.getConnectionInfo().getRssi());
+            extra.add("" + connectionInfo.getRssi());
         }
 
         MsgMux.get(ctx).publish("net.status", scanStatusMsg, extra.toArray(new String[]{}));
@@ -1077,7 +1004,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             return;
         }
 
-        byte[] payload = p2p.mySSID.isEmpty() ? new byte[0] : p2p.mySSID.getBytes(StandardCharsets.UTF_8);
+        byte[] payload = new byte[0];
         adv = new String(MeshNode.buildBleServiceData("wake_request", deviceIdBytes(), payload, 0, 0),
                 StandardCharsets.ISO_8859_1);
         ble.advertise(MeshNode.buildBleServiceData("wake_request", deviceIdBytes(), payload, 0, 0));
@@ -1090,8 +1017,8 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
 
     private void updateDeviceId() {
         // Wi-Fi Aware peers are scoped by the framework's NAN interface MAC.
-        // Do not overwrite it with the legacy P2P `id4` placeholder: the
-        // default produced the shared ASCII identity "000000", causing every
+        // Do not use the old short-ID placeholder: it produced the shared
+        // ASCII identity "000000", causing every
         // discovered DMesh NAN peer to collide and follow-ups to be routed to
         // stale zero-ID entries.
         if (nan != null && nan.nanMac != null && nan.nanMac.length == deviceId.length) {
@@ -1106,69 +1033,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
     }
 
 
-    /**
-     * @param devId - P2P device MAC ( found in discovery ) or SSID.
-     * @param modeS - connect mode to attempt
-     */
-    public void con(Message msg, final String devId, String modeS) {
-        Bundle param = msg.getData();
-        Log.d(TAG, "CONNECT " + param);
-        int mode = -1;
-        switch (modeS) {
-            case "":
-            case "Q":
-                mode = -1;
-                p2p.con(param, mode);
-                return;
-            case "PBC":
-                mode = WpsInfo.PBC;
-                break;
-            case "DISPLAY":
-                mode = WpsInfo.DISPLAY;
-                break;
-            case "KEYPAD":
-                mode = WpsInfo.KEYPAD;
-                break;
-            case "LABEL":
-                mode = WpsInfo.LABEL;
-                break;
-            default:
-                return;
-        }
-
-        p2p.con(param, mode);
-    }
-
-
-
     // Will be needed for privacy - change name when wifi mac changes
-//    public void setDeviceName(String name) {
-//        try {
-//            Reflect.callMethod(mP2PManager, "setDeviceName",
-//                    new Class[]{WifiP2pManager.Channel.class, String.class, WifiP2pManager.ActionListener.class},
-//                    new Object[]{getmChannel(), name, new WifiP2pManager.ActionListener() {
-//                        @Override
-//                        public void onSuccess() {
-//                            Log.d(TAG, "XXX setName ");
-//                        }
-//
-//                        @Override
-//                        public void onFailure(int reason) {
-//                            Log.d(TAG, "XXX setName error " + reason);
-//                        }
-//                    }});
-//        } catch (ClassNotFoundException e) {
-//            e.printStackTrace();
-//        } catch (IllegalAccessException e) {
-//            e.printStackTrace();
-//        } catch (InvocationTargetException e) {
-//            e.printStackTrace();
-//        } catch (NoSuchMethodException e) {
-//            e.printStackTrace();
-//        }
-//    }
-
-
     @Override
     public void onReceive(Context context, Intent intent) {
         String action = intent.getAction();
@@ -1217,8 +1082,8 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             NetworkInfo ninfo = wifi.cm.getNetworkInfo(network);
 
             String ssid = "";
-            if (wifi.p2p != null && wifi.p2p.mWifiManager != null) {
-                WifiInfo connectionInfo = wifi.p2p.mWifiManager.getConnectionInfo();
+            if (wifi.wifiManager != null) {
+                WifiInfo connectionInfo = wifi.wifiManager.getConnectionInfo();
                 ssid = connectionInfo == null ? "" : connectionInfo.getSSID();
             }
 
@@ -1237,7 +1102,7 @@ public class LocalMesh extends BroadcastReceiver implements MessageHandler {
             super.onLinkPropertiesChanged(network, lp);
             NetworkCapabilities cap = wifi.cm.getNetworkCapabilities(network);
             NetworkInfo ninfo = wifi.cm.getNetworkInfo(network);
-            WifiInfo connectionInfo = wifi.p2p.mWifiManager.getConnectionInfo();
+            WifiInfo connectionInfo = wifi.wifiManager == null ? null : wifi.wifiManager.getConnectionInfo();
             String ssid = connectionInfo == null ? "" : connectionInfo.getSSID();
 
             MsgMux.get(wifi.ctx).publish("wifi.net." + lp.getInterfaceName(),

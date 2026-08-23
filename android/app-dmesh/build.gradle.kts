@@ -29,7 +29,14 @@ android {
             }
         }
     }
-    compileSdkVersion(providers.gradleProperty("COMPILE_SDK_VERSION").get())
+    // Android 16 QPR2 (36.1) exposes the public LocalOnly Hotspot WPA2 and
+    // SSID setters. The app still targets 36 and retains the API 26 legacy
+    // hotspot fallback for older devices.
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
 
     defaultConfig {
         applicationId = "com.github.costinm.dmesh.lm"

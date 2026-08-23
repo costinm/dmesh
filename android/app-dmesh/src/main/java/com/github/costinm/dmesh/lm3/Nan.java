@@ -66,11 +66,29 @@ public class Nan {
     // may arrive before their Started callbacks; these guards prevent duplicate
     // discovery sessions and peer handles scoped to a superseded session.
     volatile boolean pubStarting;
+    // A framework can deliver several config-failure callbacks for the same
+    // invalidated publish session (notably during Wi-Fi Direct coexistence).
+    // Keep one delayed recovery attempt outstanding instead of turning that
+    // transient condition into an unbounded callback/retry storm.
+    volatile boolean publishRetryScheduled;
     // Not null if sub session active
     volatile SubscribeDiscoverySession subSession;
     // Intended status of NAN subscription. subType indicates the type.
     volatile boolean nanSub;
     boolean enabled;
+    // This is the common transport.start `ndp=0/1` epoch setting. It does
+    // not create a data path without a discovered peer; it authorizes the
+    // Android adapter to accept or initiate one when the control plane asks.
+    private boolean ndpEnabled;
+
+    public synchronized void setNdpEnabled(boolean enabled) {
+        ndpEnabled = enabled;
+        MsgMux.get(ctx).publish("net.NAN.DataPathPolicy", "enabled", enabled ? "1" : "0");
+    }
+
+    public synchronized boolean isNdpEnabled() {
+        return ndpEnabled;
+    }
 
     // Discovery roles are deliberately independent.  A normal DMesh service
     // uses both, while lab runs can isolate Android framework matching rules.
@@ -91,8 +109,8 @@ public class Nan {
 
     String pubServiceName = "dmesh";
 
-    // called when mgr reports 'isAvailable'. NAN may be turned off when P2P is enabled or in
-    // many other cases. When it returns, if we sub or adv attach will be called again.
+    // Called when the manager reports availability. Platform radio or concurrency policy may
+    // revoke NAN; when it returns, existing subscribe/publish state is attached again.
     int msgId;
     int wakeCount;
     final Map<Integer, String> pendingFollowups = new HashMap<>();
@@ -196,7 +214,7 @@ public class Nan {
     public void ensureActive() {
         if (!enabled) {
             start();
-        } else {
+        } else if (!retryScheduled) {
             onWifiAwareStateChanged(new Intent());
         }
     }
@@ -318,6 +336,7 @@ public class Nan {
         rustEvent("stop", "", null);
         enabled = false;
         pubStarting = false;
+        publishRetryScheduled = false;
         attachInProgress = false;
         nanSub = false;
         synchronized (this) {
@@ -435,6 +454,13 @@ public class Nan {
     public void onWifiAwareStateChanged(Intent i) {
         rustEvent("state_changed", "", null);
         if (!enabled) {
+            return;
+        }
+        // A failed attachment is retried by retryLater().  `ensureActive()`
+        // is intentionally called by several service lifecycle paths, so it
+        // must not bypass that backoff and turn a platform-unavailable NAN
+        // radio into a tight attach loop.
+        if (retryScheduled && nanSession == null) {
             return;
         }
         i.getBooleanExtra("foo", true);
@@ -593,7 +619,7 @@ public class Nan {
         String deviceId = jsonField(parsed, "device_id");
         if (isUsableDmeshIdentity(deviceId)) {
             bd.id = deviceId;
-            bd.data.putString(Device.P2PAddr, "/nan/" + deviceId);
+            bd.data.putString(Device.RADIO_ADDR, "/nan/" + deviceId);
             bd.data.putString("proto", "dmesh_nan");
             bd.data.putString("nan", parsed);
         } else {
@@ -974,37 +1000,18 @@ public class Nan {
         return builder.build();
     }
 
-    /** Update active discovery descriptors after Wi-Fi Aware supplies our NAN MAC. */
+    /**
+     * Record the framework NAN MAC after it becomes available.
+     *
+     * DMesh Service Info identifies this node with the stable Rust device id,
+     * not the randomized framework NAN MAC.  Re-submitting identical publish
+     * and subscribe descriptors from this callback used to create a perpetual
+     * onSessionConfigFailed -> retry loop on some Android HALs.  Explicit
+     * Service Info changes still use updatePublish/updateSubscribe at their
+     * owning API entry point.
+     */
     private synchronized void refreshDiscoveryIdentity() {
-        if (pubSession != null) {
-            try {
-                pubSession.updatePublish(buildPublishConfig());
-                MsgMux.get(ctx).publish("net.NAN.PubIdentityUpdated", "id", nanId);
-            } catch (IllegalStateException e) {
-                MsgMux.get(ctx).publish("net.NAN.PubIdentityUpdateError", "error", e.toString());
-            }
-        }
-        if (subSession != null) {
-            try {
-                subSession.updateSubscribe(buildSubscribeConfig());
-                MsgMux.get(ctx).publish("net.NAN.SubIdentityUpdated", "id", nanId);
-            } catch (IllegalStateException e) {
-                MsgMux.get(ctx).publish("net.NAN.SubIdentityUpdateError", "error", e.toString());
-            }
-        }
-        if (announcePubSession != null) {
-            try {
-                // The announce publisher may start before Android delivers
-                // IdentityChanged. Refresh its CBOR record too, otherwise
-                // the host sees the shared legacy "000000" ID even though
-                // the primary DMesh service has the real NAN identity.
-                announcePubSession.updatePublish(buildAnnouncePublishConfig("boot"));
-                MsgMux.get(ctx).publish("net.NAN.AnnounceIdentityUpdated", "id", nanId);
-            } catch (IllegalStateException e) {
-                MsgMux.get(ctx).publish("net.NAN.AnnounceIdentityUpdateError",
-                        "error", e.toString());
-            }
-        }
+        MsgMux.get(ctx).publish("net.NAN.IdentityReady", "id", nanId == null ? "" : nanId);
     }
 
     /**
@@ -1210,18 +1217,26 @@ public class Nan {
                     // air. Close exactly that session and retry once through
                     // the normal publisher so its initial configuration uses
                     // the latest complete CBOR Service Info.
-                    if (pubSession == discoverySession) {
+                    // Framework callbacks may arrive after an earlier
+                    // termination already cleared both references. Do not
+                    // turn that recoverable NAN configuration failure into
+                    // an application-process crash.
+                    if (pubSession != null && pubSession == discoverySession) {
                         pubSession.close();
                         pubSession = null;
                     }
                     pubStarting = false;
                     publishFailures++;
                     MsgMux.get(ctx).publish("net.NAN.PubSessionConfigFailed");
-                    lm.delayHandler.postDelayed(() -> {
-                        synchronized (Nan.this) {
-                            publish();
-                        }
-                    }, 1_000);
+                    if (!publishRetryScheduled) {
+                        publishRetryScheduled = true;
+                        lm.delayHandler.postDelayed(() -> {
+                            synchronized (Nan.this) {
+                                publishRetryScheduled = false;
+                                publish();
+                            }
+                        }, 1_000);
+                    }
                 } else {
                     nanSub = false;
                     subscribeFailures++;
@@ -1285,6 +1300,7 @@ public class Nan {
                 discoverySession = session;
                 pubSession = session;
                 pubStarting = false;
+                publishRetryScheduled = false;
                 publishStarts++;
                 if (publishServiceInfoPending) {
                     publishServiceInfoPending = false;

@@ -8,7 +8,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
-import android.net.wifi.p2p.WifiP2pDevice;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
@@ -25,7 +24,6 @@ import com.github.costinm.dmesh.android.msg.MsgMux;
 import com.github.costinm.dmesh.android.util.DMeshCompanionPrefs;
 import com.github.costinm.dmesh.android.util.UiUtil;
 import com.github.costinm.dmesh.lm3.Device;
-import com.github.costinm.dmesh.lm3.P2P;
 import com.github.costinm.dmeshnative.MeshNode;
 
 import org.json.JSONArray;
@@ -383,18 +381,13 @@ public class MeshActivityLight extends Activity implements MessageHandler {
     private void updateStatus(Bundle data) {
         lastStatus = new Bundle(data);
         int scanCount = 0;
-        int directNeighbors = 0;
+        int nearbyDevices = 0;
         Bundle nested = data.getBundle("data");
         if (nested != null) {
             ArrayList<Bundle> scan = nested.getParcelableArrayList("scan");
             if (scan != null) {
                 scanCount = scan.size();
-                for (Bundle deviceBundle : scan) {
-                    Device device = new Device(deviceBundle);
-                    if ("1".equals(device.data.getString("gc", "0")) || device.isConnected()) {
-                        directNeighbors++;
-                    }
-                }
+                nearbyDevices = scan.size();
             }
         }
         String visible = data.getString("visible", "0");
@@ -402,7 +395,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         String ssid = data.getString(Device.WIFISSID, data.getString("s", ""));
         StringBuilder status = new StringBuilder();
         status.append("Service active");
-        status.append("\nDirect neighbors: ").append(directNeighbors);
+        status.append("\nNearby radio devices: ").append(nearbyDevices);
         status.append("\nVisible: ").append(visible);
         status.append("\nScan entries: ").append(scanCount);
         appendCompanionStatus(status);
@@ -413,7 +406,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
             status.append("\nSSID: ").append(ssid);
         }
         conText.setText(status);
-        conText.setBackgroundColor(directNeighbors > 0 ? Color.rgb(209, 250, 229) : Color.TRANSPARENT);
+        conText.setBackgroundColor(nearbyDevices > 0 ? Color.rgb(209, 250, 229) : Color.TRANSPARENT);
         updateInterfaces();
     }
 
@@ -439,12 +432,6 @@ public class MeshActivityLight extends Activity implements MessageHandler {
             }
         } catch (SocketException e) {
             sb.append("Interface error: ").append(e.getMessage()).append("\n");
-        }
-        if (!P2P.currentClientList.isEmpty()) {
-            sb.append("P2P clients: ").append(P2P.currentClientList.size()).append("\n");
-            for (WifiP2pDevice client : P2P.currentClientList) {
-                sb.append(client.deviceAddress).append(" ").append(client.deviceName).append("\n");
-            }
         }
         appendRustDiscoveredDevices(sb);
         ifText.setText(sb.length() == 0 ? "No active interfaces" : sb.toString());

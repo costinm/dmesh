@@ -40,9 +40,9 @@ import java.util.UUID;
  * <p>
  * Use for:
  * - devices without BLE
- * - GB..JB where Wifi P2P is missing. KK is present - but not supported (mostly because
- * VPN lacks some functionality, so the line for 'modern' is cut at LMP)
- * - devices with broken P2P
+ * - GB..JB devices without supported Wi-Fi peer facilities. KK is present but
+ *   unreliable for the app's network path (the modern baseline is LMP)
+ * - devices with broken Wi-Fi concurrency
  * <p>
  * The legacy device will provide a menu/button to become discoverable and expose
  * the provisioning service. Pairing is not required. BT discovery requires user interaction
@@ -316,8 +316,7 @@ public class Bt2 implements MessageHandler {
 
     /**
      * Requires a system pop-up
-     * Should be called from the legacy device ( without support for P2P ), to
-     * bootstrap itself.
+     * Called by a legacy device without the modern Wi-Fi radio path to bootstrap itself.
      */
     public void makeDiscoverable() {
         // This is the only way I know to bypass the lack of SDP.

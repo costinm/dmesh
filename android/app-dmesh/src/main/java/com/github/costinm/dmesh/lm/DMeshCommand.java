@@ -147,6 +147,32 @@ final class DMeshCommand {
         if (mux == null) {
             return Result.error("MsgMux is not available");
         }
+        // A JSON-RPC-style request is allowed to wait for its correlated
+        // platform result.  This matters for transport.start: an AP password
+        // does not exist until Android invokes LocalOnlyHotspotCallback.
+        if (frame.id != null && !frame.id.isEmpty()
+                && ("wifi.transport.start".equals(frame.method)
+                || "wifi.scan".equals(frame.method))) {
+            CapturingConn conn = new CapturingConn(mux, "shell-request:" + System.nanoTime(), 1,
+                    "wifi");
+            mux.receiveFrame("shell", conn, frame);
+            try {
+                conn.await(10_000);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                return Result.error("interrupted waiting for " + frame.method);
+            }
+            String response = conn.lines();
+            if (!response.isEmpty()) {
+                return Result.ok("completed")
+                        .field("id", frame.id)
+                        .field("method", frame.method)
+                        .field("response", response.trim());
+            }
+            return Result.ok("accepted")
+                    .field("id", frame.id)
+                    .field("method", frame.method);
+        }
         MsgConn conn = new MsgConn(mux);
         conn.name = "shell";
         mux.receiveFrame("shell", conn, frame);
