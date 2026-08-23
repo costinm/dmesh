@@ -68,6 +68,16 @@ whether UDP6 multicast, NOW, or NAN SD delivered them; only provenance differs.
 A host records received NAN Service Info announcements as
 `wifi.rawnan.discovery`.
 
+Mode replacement emits additional announce methods using the same schema:
+`5=transition-begin`, `6=sleep-pending`, `7=transition-complete`, and
+`8=wake`. Each marker is sent before/after the radio owner changes state on
+every currently available bearer; UART is the host timing ledger. In
+particular, `sleep-pending` is emitted before UART is disabled and before
+light sleep, so a prober can distinguish an intentional idle-sleep gap from a
+reset or lost device. A transition-cycle prober should correlate these markers
+with the request id and record elapsed time for sleepy -> active-STA -> sleepy
+-> active-STA -> sleepy cycles.
+
 When NAN DW capture is enabled, firmware also keeps that same current CBOR
 announce as its active Publish Service Info. It is emitted only after the
 Wi-Fi owner has opened a confirmed discovery window, once after boot/update
@@ -148,7 +158,7 @@ Discovery data must never write device Wi-Fi NVS.
 
 The physical choice is `control.transport.start {mode: Sta}` (associate with an
 infrastructure AP) or `{mode: Nan}` (do not associate). `now`,
-`nan_dw_interval`, and `ap` are independent settings on either mode. Default
+`nan_dw_interval`, `ndp`, and `ap` are independent settings on either mode. Default
 `now=0` adds the private non-promiscuous action callback; NAN DW
 capture is independently scheduled. The mode uses the shared ingress/pool
 and poll handlers; it is neither the default nor an unassociated
@@ -169,12 +179,14 @@ resetting the association, NOW callback, or NAN capture state.
 | Control | Default | Effect and transition cost |
 | --- | --- | --- |
 | `transport.start.ssid`, `sta_bssid`, `sta_channel` | unset | Ephemeral association target, queried from the managed AP owner by Rust e2e and sent over UART. `sta_bssid` and `sta_channel` select the intended AP without an application-owned discovery scan; all three values stay in RAM and never change NVS. A future optional IPv6 field is only needed when the peer is not the BSSID-derived link-local endpoint. |
+| `sta_passphrase` | unset | Optional 8..63-byte WPA2-PSK credential for an Android P2P or other protected STA target. It is accepted only in `transport.start`, copied into RAM for the selected epoch, and never written to NVS. A later STA start without it clears the old credential before configuring an open AP. WPA2 PMF is capable but not required for Android compatibility. |
 | Main `mode=infra` | n/a | Keeps the infrastructure policy active but does not associate from NVS. |
 | Main `mode=sleepy` | n/a | Keeps STA off until UART or future NAN Service Info; uses the bounded session lifecycle. |
 | `control.transport.start {mode: Sta, ssid: ...}` | n/a | Required ephemeral STA target and full associated STA/raw-UDP6 setup. It replaces the boot setup. |
 | boot default / `control.transport.start {mode: Nan}` | n/a | Unassociated NOW setup. At boot it starts once as open APSTA on channel 6; an explicit later Nan start deliberately replaces the current setup. |
 | `now` | `0` | Private action callback: `0` default/on, `1` explicit on, `2` explicit off. A future `udp6` setting will be independent. |
 | `nan_dw_interval` | `0` | NAN promiscuous capture cadence in 512 ms DWs: `0` off, `1` each DW, `8` four seconds, `16` eight seconds. Requires NOW enabled (`now != 2`). |
+| `ndp` | `0` | Common NAN Data Path policy: `0` off, `1` on. Android currently implements NDP; ESP retains this requested common profile until an NDP adapter is added. |
 | `ap` | `1` at boot | Local AP: `0` off, `1` on. The default unassociated start configures APSTA before its one Wi-Fi start, so the AP holds channel 6. STA+AP is not part of this first test path. |
 | `espnow_capture` | `false` | Legacy volatile setting; do not use it to select staged Main coexistence. |
 | `sta_driver_tx` | `true` | ESP-IDF associated Ethernet TX for raw UDP6 egress. Set `false` only for the raw-802.11-injection diagnostic A/B; it takes effect on the next replacement start. |

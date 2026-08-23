@@ -11,7 +11,7 @@ default = []
 modules = ["dep:dmesh-fw-modules"]
 
 [dependencies]
-dmesh-fw-transport = { path = "../dmesh-fw-transport" }
+dmesh-fw-transport = { path = "../dmesh-fw-transport", features = ["main-runtime"] }
 dmesh-fw-modules = { path = "../modules", optional = true }
 esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
 

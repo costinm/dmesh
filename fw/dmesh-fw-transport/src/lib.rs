@@ -22,10 +22,15 @@ pub mod profile;
 pub mod commands;
 pub mod crypto_esp;
 pub mod flash;
-#[path = "recovery_runtime.rs"]
-pub mod firmware_runtime;
-/// Compatibility name for Recovery and the old prototype callers.
-pub use firmware_runtime as recovery_runtime;
+/// Shared transport engine used by the Main and Recovery policy wrappers.
+pub mod core_runtime;
+/// Main-specific policy entry point. The implementation is intentionally
+/// separate from the shared engine so Main can evolve without making the
+/// frozen Recovery lane link or execute its policy.
+pub mod main_runtime;
+/// Recovery-specific policy entry point. This remains a thin compatibility
+/// shell until Recovery is reduced to open-STA UDP6 flashing.
+pub mod recovery_runtime;
 pub mod state;
 pub mod task_esp;
 pub mod uart_esp;

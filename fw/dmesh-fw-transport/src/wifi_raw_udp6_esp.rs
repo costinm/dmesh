@@ -6,6 +6,7 @@
 
 use core::{
     ffi::c_void,
+    mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
@@ -226,6 +227,28 @@ static mut TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
 static mut IEEE80211_TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
 static mut RESPONSE_BUFFER: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
     [0; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+/// One device-originated raw UDP6 IPERF client. It shares the raw Ethernet
+/// ingress worker and its response scratch; the STA bearer never gains a
+/// second receive task or packet queue merely to originate a pair probe.
+struct RawUdp6ClientState {
+    peer: RawUdp6Peer,
+    client: dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
+    started_at_us: i64,
+    deadline_us: i64,
+}
+
+static RAW_CLIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RAW_CLIENT_GENERATION: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_BYTES: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_ERRORS: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_ELAPSED_US: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_RECEIVE_OK: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_RECEIVE_ERRORS: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_BOOTSTRAP_ACKS: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_STREAM_PACKETS: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_OTHER_PACKETS: AtomicU32 = AtomicU32::new(0);
+static RAW_CLIENT_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+static mut RAW_CLIENT: MaybeUninit<RawUdp6ClientState> = MaybeUninit::uninit();
 /// Snapshot counters for status/log adapters.  The counters are deliberately
 /// separate from the packet ingress path and remain meaningful across bearers.
 pub fn stats() -> (u32, u32, u32, u32, u32, u32) {
@@ -237,6 +260,122 @@ pub fn stats() -> (u32, u32, u32, u32, u32, u32) {
         TX_FRAMES.load(Ordering::Relaxed),
         TX_FAILURES.load(Ordering::Relaxed),
     )
+}
+
+/// True while the STA raw-UDP6 lane owns the single bounded client run.
+/// Sampled by the radio snapshot; it is an operation state, not a queue size.
+pub fn raw_client_active() -> bool {
+    RAW_CLIENT_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Completion/progress evidence for a device-originated UDP6 IPERF request.
+/// It has the same meaning as the NOW client result so a control-plane probe
+/// can calculate goodput without inspecting serial logs.
+pub fn raw_client_result() -> (u32, u32, u32) {
+    (
+        RAW_CLIENT_BYTES.load(Ordering::Acquire),
+        RAW_CLIENT_ERRORS.load(Ordering::Acquire),
+        RAW_CLIENT_ELAPSED_US.load(Ordering::Acquire),
+    )
+}
+
+/// Counters follow the shared raw-action snapshot vocabulary. The bearer is
+/// different, but bootstrap, stream, and parser progress mean the same thing
+/// to a pair-probe controller.
+pub fn raw_client_diagnostics() -> (u32, u32, u32, u32, u32) {
+    (
+        RAW_CLIENT_RECEIVE_OK.load(Ordering::Acquire),
+        RAW_CLIENT_RECEIVE_ERRORS.load(Ordering::Acquire),
+        RAW_CLIENT_LAST_ERROR.load(Ordering::Acquire),
+        RAW_CLIENT_BOOTSTRAP_ACKS.load(Ordering::Acquire),
+        RAW_CLIENT_STREAM_PACKETS.load(Ordering::Acquire),
+    )
+}
+
+/// Start a bounded STA-to-peer raw UDP6 IPERF run. Called by the shared
+/// numeric radio handler after the pair probe has put this endpoint in STA
+/// mode; it returns promptly and all subsequent packets flow through
+/// `dispatch_ingress`, the existing single worker owner.
+pub fn start_iperf_client(
+    peer_mac: [u8; 6],
+    bytes: u64,
+    packet_size: u16,
+    timeout_ms: u32,
+) -> bool {
+    if !STARTED.load(Ordering::Acquire) {
+        return false;
+    }
+    let now = unsafe { esp_idf_sys::esp_timer_get_time() };
+    if RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
+        // No periodic polling task owns this client. A later explicit probe
+        // command retires a genuinely expired operation and starts a fresh
+        // one; a live transfer remains exclusively owned by its original
+        // request. This keeps timeout recovery event-driven rather than a
+        // permanent firmware service tick.
+        let deadline = unsafe {
+            (*core::ptr::addr_of!(RAW_CLIENT).cast::<RawUdp6ClientState>()).deadline_us
+        };
+        if now < deadline {
+            return false;
+        }
+        RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
+        RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+    }
+    if RAW_CLIENT_ACTIVE.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let generation = RAW_CLIENT_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let cid = match quic_lite::ConnectionId::new(0x5550_8000 | u64::from(generation.max(1))) {
+        Some(cid) => cid,
+        None => {
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+    };
+    let mut client = match dmesh_server::raw_transport::RawClient::new_with_packet_size(
+        cid,
+        bytes,
+        packet_size,
+    ) {
+        Ok(client) => client,
+        Err(_) => {
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+    };
+    let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
+    let used = match client.start(response) {
+        Ok(used) => used,
+        Err(_) => {
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+    };
+    let peer = RawUdp6Peer {
+        mac: peer_mac,
+        ip: link_local_from_mac(peer_mac),
+        port: RAW_UDP6_PORT,
+    };
+    unsafe {
+        core::ptr::addr_of_mut!(RAW_CLIENT).write(MaybeUninit::new(RawUdp6ClientState {
+            peer,
+            client,
+            started_at_us: now,
+            deadline_us: now + i64::from(timeout_ms.clamp(1_000, 60_000)) * 1_000,
+        }));
+    }
+    if !transmit_udp6(
+        crate::shared_ingress_esp::IngressLink::WifiSta,
+        peer,
+        RAW_UDP6_PORT,
+        &response[..used],
+    ) {
+        RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+        return false;
+    }
+    true
 }
 
 pub fn start_status() -> u32 {
@@ -280,6 +419,15 @@ pub fn reset_diagnostics() {
     TX_SUBMIT_CALLS.store(0, Ordering::Relaxed);
     TX_SUBMIT_US_TOTAL.store(0, Ordering::Relaxed);
     TX_SUBMIT_US_MAX.store(0, Ordering::Relaxed);
+    RAW_CLIENT_BYTES.store(0, Ordering::Relaxed);
+    RAW_CLIENT_ERRORS.store(0, Ordering::Relaxed);
+    RAW_CLIENT_ELAPSED_US.store(0, Ordering::Relaxed);
+    RAW_CLIENT_RECEIVE_OK.store(0, Ordering::Relaxed);
+    RAW_CLIENT_RECEIVE_ERRORS.store(0, Ordering::Relaxed);
+    RAW_CLIENT_BOOTSTRAP_ACKS.store(0, Ordering::Relaxed);
+    RAW_CLIENT_STREAM_PACKETS.store(0, Ordering::Relaxed);
+    RAW_CLIENT_OTHER_PACKETS.store(0, Ordering::Relaxed);
+    RAW_CLIENT_LAST_ERROR.store(0, Ordering::Relaxed);
 }
 
 unsafe extern "C" fn raw_tx_done(info: *const esp_idf_sys::esp_80211_tx_info_t) {
@@ -692,6 +840,13 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
         ip: packet.source_ip,
         port: packet.source_port,
     };
+    // A device-originated pair run consumes only packets from its requested
+    // peer before the normal server dispatcher sees them. This mirrors the
+    // NOW client path and prevents a client ACK from being mistaken for a new
+    // server-side service request on the same bounded raw-UDP6 endpoint.
+    if dispatch_raw_client(item.link(), peer, packet.payload) {
+        return;
+    }
     let immediate = handler(peer, packet.payload, response);
     if immediate.is_none() && UDP_HANDLER_NO_RESPONSE.fetch_add(1, Ordering::Relaxed) == 0 {
         // This is expected for an ACK-only transport packet; retain one
@@ -718,6 +873,71 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     if result.sent != 0 {
         schedule_paced_poll(item.link(), peer);
     }
+}
+
+/// Deliver one received UDP6 datagram to the active device-originated client.
+/// Called by the shared ingress worker on each valid port-3339 packet; it does
+/// no allocation and immediately submits any resulting packet through the
+/// existing raw Ethernet sender.
+fn dispatch_raw_client(
+    link: crate::shared_ingress_esp::IngressLink,
+    peer: RawUdp6Peer,
+    payload: &[u8],
+) -> bool {
+    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+    unsafe {
+        let state = &mut *core::ptr::addr_of_mut!(RAW_CLIENT).cast::<RawUdp6ClientState>();
+        if state.peer != peer || !state.client.accepts(payload) {
+            return false;
+        }
+        let now = esp_idf_sys::esp_timer_get_time();
+        if now >= state.deadline_us {
+            RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            return true;
+        }
+        let response = &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER);
+        let outbound = match state.client.receive(payload, response) {
+            Ok(packet) => {
+                RAW_CLIENT_RECEIVE_OK.fetch_add(1, Ordering::Relaxed);
+                packet
+            }
+            Err(error) => {
+                RAW_CLIENT_LAST_ERROR.store(
+                    u32::from(dmesh_server::raw_transport::receive_error_code(error)),
+                    Ordering::Release,
+                );
+                RAW_CLIENT_RECEIVE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
+                RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+                return true;
+            }
+        };
+        let counters = state.client.counters();
+        RAW_CLIENT_BOOTSTRAP_ACKS.store(counters.bootstrap_acks, Ordering::Release);
+        RAW_CLIENT_STREAM_PACKETS.store(counters.stream_packets, Ordering::Release);
+        RAW_CLIENT_OTHER_PACKETS.store(counters.other_packets, Ordering::Release);
+        let bytes = state.client.bytes();
+        RAW_CLIENT_BYTES.store(bytes.min(u64::from(u32::MAX)) as u32, Ordering::Release);
+        if state.client.is_complete() {
+            let elapsed_us = (now - state.started_at_us).max(1) as u64;
+            let errors: u64 = state.client.callback_errors().into_iter().sum();
+            RAW_CLIENT_ERRORS.store(errors.min(u64::from(u32::MAX)) as u32, Ordering::Release);
+            RAW_CLIENT_ELAPSED_US.store(
+                elapsed_us.min(u64::from(u32::MAX)) as u32,
+                Ordering::Release,
+            );
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+        }
+        if let Some(used) = outbound {
+            if !transmit_udp6(link, state.peer, RAW_UDP6_PORT, &response[..used]) {
+                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    true
 }
 
 fn record_announce_peer(

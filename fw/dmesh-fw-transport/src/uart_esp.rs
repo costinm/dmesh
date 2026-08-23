@@ -73,6 +73,23 @@ static UART_ACTIVE_WINDOW_MS: AtomicU32 = AtomicU32::new(4_000);
 static UART_DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
 pub const COMMAND_GRACE_TICKS: u32 = 8000;
 
+/// Convert the compact transport.start selector to a physical baud rate.
+/// Zero means UART off; selector one is the protocol default. USB-JTAG builds
+/// never call this mapping because their bearer is packetized, not serial.
+pub const fn baud_from_selector(selector: u8) -> Option<i32> {
+    match selector {
+        0 => None,
+        1 => Some(115_200),
+        2 => Some(9_600),
+        3 => Some(19_200),
+        4 => Some(38_400),
+        5 => Some(57_600),
+        6 => Some(230_400),
+        7 => Some(460_800),
+        _ => None,
+    }
+}
+
 /// Physical UART L2 receive observability. These counters deliberately stop
 /// below PPP/QUIC parsing so a host status query can distinguish a missing
 /// RX event from a malformed transport datagram.
@@ -95,7 +112,7 @@ pub fn uart_l2_stats() -> UartL2Stats {
 /// the sole ESP UART0/USB-JTAG setup path used by both Main and Recovery.
 /// Callers provide only higher-layer dispatch policy; they must never create
 /// a competing UART driver, reader, writer, or RX event queue.
-pub unsafe fn install_l2_driver() -> bool {
+pub unsafe fn install_l2_driver(baud_selector: u8) -> bool {
     #[cfg(target_arch = "riscv32")]
     {
         let mut config = esp_idf_sys::usb_serial_jtag_driver_config_t {
@@ -110,7 +127,10 @@ pub unsafe fn install_l2_driver() -> bool {
     {
         const UART0: esp_idf_sys::uart_port_t = esp_idf_sys::uart_port_t_UART_NUM_0;
         let mut config = esp_idf_sys::uart_config_t::default();
-        config.baud_rate = PHYSICAL_UART_BAUD;
+        let Some(baud) = baud_from_selector(baud_selector) else {
+            return false;
+        };
+        config.baud_rate = baud;
         config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
         config.parity = esp_idf_sys::uart_parity_t_UART_PARITY_DISABLE;
         config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;

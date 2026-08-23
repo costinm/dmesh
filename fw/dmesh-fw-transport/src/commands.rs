@@ -10,7 +10,9 @@
 use dmesh_server::{
     connection::{self, ConnectionManager, ConnectionPolicy},
     control::{self, Handler, TransportConfig, TransportKind},
-    firmware_profile::{apply_connection_policy, apply_transport_config, set_ssid},
+    firmware_profile::{
+        apply_connection_policy, apply_transport_config, clear_sta_passphrase, set_ssid,
+    },
     services::{encode_status_numeric, encode_status_text},
 };
 
@@ -40,8 +42,8 @@ pub fn send_stat(prefix: &[u8], value: u64) {
     let _ = send_record(&cbor);
 }
 
-#[derive(Clone, Copy)]
-enum ProfileControlError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileControlError {
     Unsupported,
     InvalidSetting,
 }
@@ -70,7 +72,7 @@ impl Handler for ProfileControl<'_> {
     type Error = ProfileControlError;
 
     fn settings_get(&mut self, _key: &[u8]) -> Result<(), Self::Error> {
-        Err(ProfileControlError::Unsupported)
+        Ok(())
     }
 
     fn settings_set(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), Self::Error> {
@@ -78,7 +80,7 @@ impl Handler for ProfileControl<'_> {
     }
 
     fn settings_list(&mut self) -> Result<(), Self::Error> {
-        Err(ProfileControlError::Unsupported)
+        Ok(())
     }
 
     fn transport_start(
@@ -94,23 +96,43 @@ impl Handler for ProfileControl<'_> {
                 if config.ssid.is_none() && config.bssid.is_none() {
                     return Err(ProfileControlError::InvalidSetting);
                 }
+                let mut candidate = *self.profile;
                 if let Some(ssid) = config.ssid {
-                    if !set_ssid(ssid, self.profile) {
+                    if !set_ssid(ssid, &mut candidate) {
                         return Err(ProfileControlError::InvalidSetting);
                     }
                 }
-                apply_transport_config(config, self.profile);
-                self.profile.requested_transport = Some(kind);
-                self.profile.run_requested = true;
+                // A transport.start replaces the radio epoch. In particular,
+                // an open-AP start must not accidentally reuse the WPA2
+                // passphrase of a prior Android P2P AP. Clear the
+                // fixed buffer as well as its visible length so the volatile
+                // secret is not retained in the shared profile.
+                clear_sta_passphrase(&mut candidate);
+                apply_transport_config(config, &mut candidate);
+                candidate.requested_transport = Some(kind);
+                candidate.run_requested = true;
+                *self.profile = candidate;
                 Ok(())
             }
             // Unassociated is the NOW-only radio epoch. It has no SSID, raw
             // UDP6 bearer, or DW capture unless a future nonzero interval is
             // explicitly implemented by its Wi-Fi owner.
             TransportKind::Nan => {
-                apply_transport_config(config, self.profile);
-                self.profile.requested_transport = Some(kind);
-                self.profile.run_requested = true;
+                let mut candidate = *self.profile;
+                apply_transport_config(config, &mut candidate);
+                // DW8 NAN+NOW is the sleepy profile. Keeping UART enabled in
+                // that profile is contradictory, so reject it before any
+                // shared state is mutated and let the caller correlate `err`.
+                if candidate.nan_dw_interval == 8
+                    && candidate.now == 2
+                    && candidate.ap == 0
+                    && candidate.uart != 0
+                {
+                    return Err(ProfileControlError::InvalidSetting);
+                }
+                candidate.requested_transport = Some(kind);
+                candidate.run_requested = true;
+                *self.profile = candidate;
                 Ok(())
             }
             // UART is Recovery's always-on bootstrap ingress and cannot be
@@ -146,7 +168,9 @@ impl ConnectionManager for ProfileControl<'_> {
 /// The only firmware responsibility is applying typed values to ESP-owned
 /// state. It contains no command grammar, method tags, or CBOR traversal.
 pub fn apply_control_record(packet: &[u8], params: &mut TransportProfile) -> Option<bool> {
-    apply_control_record_result(packet, params).map(|_| true)
+    apply_control_record_result(packet, params)
+        .and_then(Result::ok)
+        .map(|_| true)
 }
 
 /// Apply one shared control record and report whether it changed the selected
@@ -155,25 +179,80 @@ pub fn apply_control_record(packet: &[u8], params: &mut TransportProfile) -> Opt
 pub fn apply_control_record_result(
     packet: &[u8],
     params: &mut TransportProfile,
-) -> Option<ControlApplyResult> {
+) -> Option<Result<ControlApplyResult, ProfileControlError>> {
     let request = control::decode_request(packet);
     if let Some(request) = request {
         let transport_start = matches!(request, control::Request::TransportStart { .. });
         let before = *params;
-        return control::dispatch_request(request, &mut ProfileControl { profile: params })
-            .ok()
+        return Some(control::dispatch_request(request, &mut ProfileControl { profile: params })
             .map(|()| ControlApplyResult {
                 transport_start,
                 changed: *params != before,
-            });
+            }));
     }
     let request = connection::decode_request(packet)?;
-    connection::dispatch_request(request, &mut ProfileControl { profile: params })
-        .ok()
+    Some(connection::dispatch_request(request, &mut ProfileControl { profile: params })
         .map(|()| ControlApplyResult {
             transport_start: false,
             changed: false,
-        })
+        }))
+}
+
+/// Apply a decoded local tagged record. UDP6/QUIC dispatch has already parsed
+/// the envelope before invoking the registered firmware handler, so retaining
+/// this record-based entry point avoids rebuilding a temporary packet merely
+/// to reuse the UART/NAN profile implementation.
+pub fn apply_control_record_decoded(
+    record: dmesh_server::tagged::Record<'_>,
+    params: &mut TransportProfile,
+) -> Option<Result<ControlApplyResult, ProfileControlError>> {
+    if record.to.is_some() {
+        return None;
+    }
+    if let Some(request) = control::decode_record(record) {
+        let transport_start = matches!(request, control::Request::TransportStart { .. });
+        let before = *params;
+        return Some(control::dispatch_request(request, &mut ProfileControl { profile: params })
+            .map(|()| ControlApplyResult {
+                transport_start,
+                changed: *params != before,
+            }));
+    }
+    let request = connection::decode_record(record)?;
+    Some(connection::dispatch_request(request, &mut ProfileControl { profile: params })
+        .map(|()| ControlApplyResult {
+            transport_start: false,
+            changed: false,
+        }))
+}
+
+/// Encode the empty successful result for a decoded control/connection record.
+/// The request id and method remain in the common tagged envelope, allowing a
+/// UDP6 caller to correlate a one-shot `transport.start` response.
+pub fn encode_control_response_decoded(
+    record: dmesh_server::tagged::Record<'_>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let id = record.id?;
+    if let Some(request) = control::decode_record(record) {
+        return dmesh_server::tagged::encode_numeric_response(
+            control::CONTROL_COMPONENT,
+            control_method(request),
+            id,
+            &[0xa0],
+            out,
+        );
+    }
+    if let Some(request) = connection::decode_record(record) {
+        return dmesh_server::tagged::encode_numeric_response(
+            connection::CONNECTION_COMPONENT,
+            connection_method(request),
+            id,
+            &[0xa0],
+            out,
+        );
+    }
+    None
 }
 
 /// True when bytes use one of the common direct-CBOR command envelopes.
@@ -187,6 +266,69 @@ pub fn is_control_record(packet: &[u8]) -> bool {
 /// Response projection is shared with host tests; firmware only selects the
 /// physical direct bearer used to return the encoded record.
 pub use dmesh_server::firmware_profile::encode_profile_control_response as encode_control_response;
+
+/// Encode a handler rejection with the original request id. Fire-and-forget
+/// records have no id and therefore continue to use the bounded text fallback
+/// at the bearer adapter; correlated callers always receive `err` instead.
+pub fn encode_control_error(
+    packet: &[u8],
+    error: ProfileControlError,
+    out: &mut [u8],
+) -> Option<usize> {
+    let record = dmesh_server::tagged::decode(packet)?;
+    let id = record.id?;
+    let (component, method) = if let Some(request) = control::decode_record(record) {
+        (control::CONTROL_COMPONENT, control_method(request))
+    } else if let Some(request) = connection::decode_record(record) {
+        (connection::CONNECTION_COMPONENT, connection_method(request))
+    } else {
+        return None;
+    };
+    dmesh_server::tagged::encode_numeric_error(component, method, id, error.as_bytes(), out)
+}
+
+/// Decoded-record counterpart used by the UDP6 tagged handler. Rejections keep
+/// the request id instead of becoming an uncorrelated diagnostic string.
+pub fn encode_control_error_decoded(
+    record: dmesh_server::tagged::Record<'_>,
+    error: ProfileControlError,
+    out: &mut [u8],
+) -> Option<usize> {
+    let id = record.id?;
+    let (component, method) = if let Some(request) = control::decode_record(record) {
+        (control::CONTROL_COMPONENT, control_method(request))
+    } else if let Some(request) = connection::decode_record(record) {
+        (connection::CONNECTION_COMPONENT, connection_method(request))
+    } else {
+        return None;
+    };
+    dmesh_server::tagged::encode_numeric_error(component, method, id, error.as_bytes(), out)
+}
+
+fn control_method(request: control::Request<'_>) -> u64 {
+    match request {
+        control::Request::SettingsGet { .. } => control::SETTINGS_GET,
+        control::Request::SettingsSet { .. } => control::SETTINGS_SET,
+        control::Request::SettingsList => control::SETTINGS_LIST,
+        control::Request::TransportStart { .. } => control::TRANSPORT_START,
+        control::Request::TransportStop { .. } => control::TRANSPORT_STOP,
+    }
+}
+
+fn connection_method(request: connection::Request) -> u64 {
+    match request {
+        connection::Request::Configure(_) => connection::CONNECTION_CONFIGURE,
+    }
+}
+
+impl ProfileControlError {
+    fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Unsupported => b"unsupported",
+            Self::InvalidSetting => b"invalid_setting",
+        }
+    }
+}
 
 #[cfg(test)]
 mod command_tests {
@@ -256,18 +398,18 @@ mod command_tests {
         let mut params = TransportProfile::new();
         assert_eq!(
             apply_control_record_result(&start_nan, &mut params),
-            Some(ControlApplyResult {
+            Some(Ok(ControlApplyResult {
                 transport_start: true,
                 changed: true,
-            })
+            }))
         );
         let committed = params;
         assert_eq!(
             apply_control_record_result(&start_nan, &mut params),
-            Some(ControlApplyResult {
+            Some(Ok(ControlApplyResult {
                 transport_start: true,
                 changed: false,
-            })
+            }))
         );
         assert_eq!(params, committed);
     }
@@ -287,18 +429,18 @@ mod command_tests {
         let mut params = TransportProfile::new();
         assert_eq!(
             apply_control_record_result(&start_sta, &mut params),
-            Some(ControlApplyResult {
+            Some(Ok(ControlApplyResult {
                 transport_start: true,
                 changed: true,
-            })
+            }))
         );
         let committed = params;
         assert_eq!(
             apply_control_record_result(&start_sta, &mut params),
-            Some(ControlApplyResult {
+            Some(Ok(ControlApplyResult {
                 transport_start: true,
                 changed: false,
-            })
+            }))
         );
         assert_eq!(params, committed);
     }

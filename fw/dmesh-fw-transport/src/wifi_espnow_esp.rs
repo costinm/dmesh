@@ -87,6 +87,10 @@ static mut ACTION_TX_REQUEST: core::mem::MaybeUninit<ActionTxRequest> =
     core::mem::MaybeUninit::uninit();
 enum RawServiceClient {
     Check(dmesh_server::raw_transport::RawCheckClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>),
+    /// Same one-client ownership as Check, but drives the bounded shared
+    /// IPERF stream.  It adds no bearer queue or task: normal ingress and the
+    /// existing poll callback supply every packet.
+    Iperf(dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>),
 }
 struct RawClientState {
     peer: EspNowPeer,
@@ -98,15 +102,19 @@ struct RawClientState {
 
 impl RawServiceClient {
     fn server_cid(&self) -> Option<quic_lite::ConnectionId> {
-        let Self::Check(client) = self;
-        client.server_cid()
+        match self {
+            Self::Check(client) => client.server_cid(),
+            Self::Iperf(client) => client.server_cid(),
+        }
     }
     fn retry_bootstrap(
         &self,
         out: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
     ) -> Result<usize, quic_lite::Error> {
-        let Self::Check(client) = self;
-        client.retry_bootstrap(out)
+        match self {
+            Self::Check(client) => client.retry_bootstrap(out),
+            Self::Iperf(client) => client.retry_bootstrap(out),
+        }
     }
     fn receive(
         &mut self,
@@ -114,13 +122,19 @@ impl RawServiceClient {
         now_ms: u64,
         out: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
     ) -> Result<Option<usize>, quic_lite::Error> {
-        let Self::Check(client) = self;
-        let _ = now_ms;
-        client.receive(packet, out)
+        match self {
+            Self::Check(client) => {
+                let _ = now_ms;
+                client.receive(packet, out)
+            }
+            Self::Iperf(client) => client.receive_at(packet, now_ms, out),
+        }
     }
     fn accepts(&self, packet: &[u8]) -> bool {
-        let Self::Check(client) = self;
-        client.accepts(packet)
+        match self {
+            Self::Check(client) => client.accepts(packet),
+            Self::Iperf(client) => client.accepts(packet),
+        }
     }
     fn poll(
         &mut self,
@@ -128,28 +142,45 @@ impl RawServiceClient {
         now_us: u64,
         out: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
     ) -> Result<Option<usize>, quic_lite::Error> {
-        let Self::Check(client) = self;
-        let _ = now_ms;
-        match client.poll_transmit(out) {
-            Ok(Some(packet)) => Ok(Some(packet)),
-            Ok(None) => client.poll_retransmit(now_us, 600_000, out),
-            Err(error) => Err(error),
+        match self {
+            Self::Check(client) => {
+                let _ = now_ms;
+                match client.poll_transmit(out) {
+                    Ok(Some(packet)) => Ok(Some(packet)),
+                    Ok(None) => client.poll_retransmit(now_us, 600_000, out),
+                    Err(error) => Err(error),
+                }
+            }
+            Self::Iperf(client) => match client.poll_transmit_at(now_ms, out) {
+                Ok(Some(packet)) => Ok(Some(packet)),
+                Ok(None) => client.poll_retransmit(now_us, 600_000, out),
+                Err(error) => Err(error),
+            },
         }
     }
     fn counters(&self) -> dmesh_server::raw_transport::RawServiceCounters {
-        let Self::Check(client) = self;
-        client.counters()
+        match self {
+            Self::Check(client) => client.counters(),
+            Self::Iperf(client) => client.counters(),
+        }
     }
     fn is_complete(&self) -> bool {
-        let Self::Check(client) = self;
-        client.is_complete()
+        match self {
+            Self::Check(client) => client.is_complete(),
+            Self::Iperf(client) => client.is_complete(),
+        }
     }
     fn bytes(&self) -> u64 {
-        let Self::Check(client) = self;
-        client.bytes()
+        match self {
+            Self::Check(client) => client.bytes(),
+            Self::Iperf(client) => client.bytes(),
+        }
     }
     fn errors(&self) -> u64 {
-        0
+        match self {
+            Self::Check(_) => 0,
+            Self::Iperf(client) => client.callback_errors().into_iter().sum(),
+        }
     }
 }
 static RAW_CLIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -370,16 +401,12 @@ pub fn stop_action_ingress() {
 /// shares the same packet slot, timeout, receive callback, and counters as
 /// a normal stream service; only the `dmesh-server` client differs.
 pub fn start_check_client(peer: EspNowPeer, nonce: u64, timeout_ms: u32) -> bool {
-    // An unassociated STA has no infrastructure BSSID context for the
-    // private action dispatcher. Request a bounded same-channel ROC receive
-    // lease with `allow_broadcast`; it does not enable promiscuous mode or
-    // retune the radio because this lab keeps all peers on channel six.
-    // Associated and APSTA checks use the continuous callback alone.
-    if crate::wifi_esp::lab_force_unassociated()
-        && !crate::wifi_nonpromisc_probe_esp::listen_on_current_channel(timeout_ms)
-    {
-        return false;
-    }
+    // NAN+NOW keeps the private action callback registered even while the
+    // endpoint is unassociated.  Do not acquire a blocking ROC lease here:
+    // ROC is a diagnostic receive mode and would hold the client before its
+    // first OPEN transmission, making the normal NAN+NOW bearer appear dead.
+    // The dedicated ROC tests configure that mode explicitly through the raw
+    // radio control handler instead.
     if RAW_CLIENT_ACTIVE.swap(true, Ordering::AcqRel) {
         return false;
     }
@@ -403,6 +430,63 @@ pub fn start_check_client(peer: EspNowPeer, nonce: u64, timeout_ms: u32) -> bool
         core::ptr::addr_of_mut!(RAW_CLIENT).write(MaybeUninit::new(RawClientState {
             peer,
             client: RawServiceClient::Check(client),
+            started_at_us: esp_idf_sys::esp_timer_get_time(),
+            next_bootstrap_retry_us: esp_idf_sys::esp_timer_get_time() + 400_000,
+            deadline_us: esp_idf_sys::esp_timer_get_time()
+                + i64::from(timeout_ms.clamp(1_000, 60_000)) * 1_000,
+        }));
+        let response = &*core::ptr::addr_of!(RESPONSE);
+        if !transmit(peer, &response[..used]) {
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+    }
+    true
+}
+
+/// Start one bounded device-to-device NOW IPERF run.  The control record may
+/// arrive through NAN Service Discovery, a QUIC stream, or UART; all paths
+/// enter this one client and therefore get identical packet, timeout, and
+/// completion accounting.
+pub fn start_iperf_client(
+    peer: EspNowPeer,
+    bytes: u64,
+    packet_size: u16,
+    timeout_ms: u32,
+) -> bool {
+    if RAW_CLIENT_ACTIVE.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let generation = RAW_CLIENT_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let cid = quic_lite::ConnectionId::new(0x4553_8000 | u64::from(generation.max(1)))
+        .expect("nonzero NOW CID");
+    let mut client = match dmesh_server::raw_transport::RawClient::new_with_packet_size(
+        cid,
+        bytes,
+        packet_size,
+    ) {
+        Ok(client) => client,
+        Err(_) => {
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+    };
+    let used = unsafe {
+        let response = &mut *core::ptr::addr_of_mut!(RESPONSE);
+        match client.start(response) {
+            Ok(used) => used,
+            Err(_) => {
+                RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+                return false;
+            }
+        }
+    };
+    unsafe {
+        core::ptr::addr_of_mut!(RAW_CLIENT).write(MaybeUninit::new(RawClientState {
+            peer,
+            client: RawServiceClient::Iperf(client),
             started_at_us: esp_idf_sys::esp_timer_get_time(),
             next_bootstrap_retry_us: esp_idf_sys::esp_timer_get_time() + 400_000,
             deadline_us: esp_idf_sys::esp_timer_get_time()

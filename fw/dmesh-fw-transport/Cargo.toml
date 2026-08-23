@@ -10,6 +10,11 @@ build = "build.rs"
 # workspace while allowing Recovery and Main to share it directly.
 [workspace]
 
+[features]
+# Main enables the optional sleepy/NVS policy. Recovery deliberately keeps the
+# feature off so the linker can discard mode lookup and light-sleep code.
+main-runtime = []
+
 [lib]
 name = "dmesh_fw_transport"
 path = "src/lib.rs"

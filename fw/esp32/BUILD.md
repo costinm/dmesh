@@ -1,8 +1,9 @@
 # ESP32 Build
 
-The active Main firmware is the Rust ESP-IDF application under
-`fw/esp32/rust`. Stage2 is under `fw/boot`; Rust Recovery is under
-`fw/recovery-rust`. The retired C Recovery must not be restored. The canonical
+The active Main firmware is the Rust ESP-IDF application under `fw/main`.
+Stage2 is under `fw/boot`; the old prototype under `fw/esp32/rust` is retained
+only as `oldmain`. Rust Recovery is frozen and low priority. The retired C
+Recovery must not be restored. The canonical
 build/provisioning procedure is [../../BUILD.md](../../BUILD.md), and the
 active shared-transport cleanup is
 [../../notes/plans/main-recovery-transport-reuse.md](../../notes/plans/main-recovery-transport-reuse.md).
@@ -24,19 +25,16 @@ Build the current Rust fleet images from the repository root:
 ```bash
 scripts/build-fw.sh --help
 scripts/build-stage2.sh --help
-scripts/build-recovery-rust.sh --help
 scripts/build-fw.sh e5          # classic ESP32 Main
-scripts/build-fw.sh recovery-s3 # ESP32-S3 Main, common 4 MiB image
+scripts/build-fw.sh esp32s3     # ESP32-S3 Main, common 4 MiB image
 scripts/build-stage2.sh all
-scripts/build-recovery-rust.sh esp32c6
 ```
 
 The scripts source `env.sh` themselves. Main and Stage2 default to `all` when
-no target is supplied; Recovery defaults to classic ESP32. Prefer an explicit
-CPU target during iteration.
+no target is supplied. Recovery builds are deliberately disabled. Prefer an
+explicit CPU target during iteration.
 
-Artifacts are kept under `target/flash/`, `target/stage2/`, and
-`target/recovery-rust/`.
+Artifacts are kept under `target/flash/` and `target/stage2/`.
 Use `scripts/flash-device.py` for every firmware target, including Main. It is
 the sole supported flashing entry point and currently provisions images through
 its direct USB/esptool implementation. Do not call `esptool`, `idf.py flash`,

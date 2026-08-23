@@ -146,6 +146,21 @@ static NOW_DISPATCHER_ENABLED: AtomicBool = AtomicBool::new(true);
 static LAB_OPEN_AP: AtomicBool = AtomicBool::new(false);
 static STA_BSSID_CHECK_DISABLED: AtomicBool = AtomicBool::new(true);
 
+// P2P Service Discovery is an on-demand public-action exchange. The
+// promiscuous callback only retains this tiny response intent; the normal
+// Wi-Fi worker below owns the ESP-IDF action transmit. It is one coalescing
+// record, not a second packet queue or a protocol-specific buffer pool.
+static P2P_GAS_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
+static P2P_GAS_DIALOG_TOKEN: AtomicU8 = AtomicU8::new(0);
+static P2P_GAS_PEER: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static P2P_PROBE_RESPONSE_PENDING: AtomicBool = AtomicBool::new(false);
+static P2P_PROBE_PEER: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static P2P_PROBE_REQUESTS: AtomicU32 = AtomicU32::new(0);
+static P2P_PROBE_RESPONSES: AtomicU32 = AtomicU32::new(0);
+static P2P_GAS_REQUESTS: AtomicU32 = AtomicU32::new(0);
+static P2P_GAS_RESPONSES: AtomicU32 = AtomicU32::new(0);
+static P2P_GAS_RESPONSE_DROPS: AtomicU32 = AtomicU32::new(0);
+
 unsafe extern "C" {
     fn esp_wifi_config_11b_rate(interface: esp_idf_sys::wifi_interface_t, disable: bool) -> i32;
     // Private libpp receive-filter hooks. C6 exposes only the STA/AP lanes;
@@ -603,6 +618,14 @@ pub fn init_sta(params: &TransportProfile) {
             ) {
                 *dst = src;
             }
+            // Android P2P Group Owner APs are WPA2-PSK. Explicitly
+            // admit that security class instead of relying on an all-zero
+            // scan threshold inherited from an open-AP test. `required`
+            // remains false: WPA2 PMF is optional and Android devices vary
+            // in whether they advertise it for a local hotspot.
+            sta.threshold.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK;
+            sta.pmf_cfg.capable = true;
+            sta.pmf_cfg.required = false;
         }
         if params.sta_bssid_set {
             sta.bssid_set = true;
@@ -610,9 +633,35 @@ pub fn init_sta(params: &TransportProfile) {
         }
         sta.channel = params.sta_channel;
         let mut config = esp_idf_sys::wifi_config_t { sta };
-        let mode_result = esp_idf_sys::esp_wifi_set_mode(esp_idf_sys::wifi_mode_t_WIFI_MODE_STA);
+        // `transport.start { mode=sta, ap=1 }` is a complete APSTA epoch,
+        // not an after-the-fact lab toggle.  Configure both personalities
+        // before the single Wi-Fi start so the STA association and NAN/NOW
+        // callback ownership survive the colocated open AP.
+        let open_ap = params.ap == 1;
+        let mode = if open_ap {
+            esp_idf_sys::wifi_mode_t_WIFI_MODE_APSTA
+        } else {
+            esp_idf_sys::wifi_mode_t_WIFI_MODE_STA
+        };
+        let mode_result = esp_idf_sys::esp_wifi_set_mode(mode);
         if mode_result != esp_idf_sys::ESP_OK && mode_result != esp_idf_sys::ESP_ERR_INVALID_STATE {
             uart::send_stat(b"wifi STA mode result=", mode_result as u32 as u64);
+            return;
+        }
+        if open_ap {
+            let channel = if params.sta_channel == 0 {
+                6
+            } else {
+                params.sta_channel.clamp(1, 13)
+            };
+            if !configure_unassociated_open_ap(channel)
+                || !configure_passive_p2p_advertisement(true)
+            {
+                uart::send_response(b"wifi STA+AP setup failed");
+                return;
+            }
+        } else if !configure_passive_p2p_advertisement(false) {
+            uart::send_response(b"wifi STA P2P marker clear failed");
             return;
         }
         let config_result = esp_idf_sys::esp_wifi_set_config(
@@ -663,6 +712,7 @@ pub fn init_sta(params: &TransportProfile) {
             uart::send_response(b"wifi STA start failed");
             return;
         }
+        LAB_OPEN_AP.store(open_ap, Ordering::Release);
         if !set_bssid_check_disabled(0, params.sta_bssid_check_disabled) {
             uart::send_response(b"wifi STA BSSID policy failed");
             return;
@@ -799,6 +849,7 @@ pub fn init_nan_now(
         };
         if esp_idf_sys::esp_wifi_set_mode(mode) != esp_idf_sys::ESP_OK
             || (params.ap == 1 && !configure_unassociated_open_ap(nan_channel))
+            || !configure_passive_p2p_advertisement(params.ap == 1)
         {
             uart::send_response(b"wifi NAN/NOW AP setup failed");
             leave_radio_mode(RadioMode::StaRawUdp6);
@@ -1052,6 +1103,223 @@ unsafe fn configure_unassociated_open_ap(channel: u8) -> bool {
     let mut config = esp_idf_sys::wifi_config_t { ap };
     esp_idf_sys::esp_wifi_set_config(esp_idf_sys::wifi_interface_t_WIFI_IF_AP, &mut config)
         == esp_idf_sys::ESP_OK
+}
+
+/// Attach the one shared passive P2P capability marker to the AP's beacon and
+/// probe response.  This is radio-owner work because ESP-IDF stores the
+/// vendor IE in the driver. It does not start active P2P Service Discovery or
+/// alter NAN/NOW receive, association, or packet-buffer ownership.
+unsafe fn configure_passive_p2p_advertisement(enabled: bool) -> bool {
+    let mut marker = [0u8; 64];
+    let marker_len = if enabled {
+        let mut ap_mac = [0u8; 6];
+        if esp_idf_sys::esp_read_mac(
+            ap_mac.as_mut_ptr(),
+            esp_idf_sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP,
+        ) != esp_idf_sys::ESP_OK
+        {
+            return false;
+        }
+        match dmesh_rawnan::p2p::encode_discovery_advertisement(&mut marker, ap_mac, 6) {
+            Ok(used) => used,
+            Err(_) => return false,
+        }
+    } else {
+        0
+    };
+    for kind in [
+        esp_idf_sys::wifi_vendor_ie_type_t_WIFI_VND_IE_TYPE_BEACON,
+        esp_idf_sys::wifi_vendor_ie_type_t_WIFI_VND_IE_TYPE_PROBE_RESP,
+    ] {
+        // A radio epoch may replace an AP-enabled profile with another AP
+        // profile. Clear the slot first so ESP-IDF does not reject a repeated
+        // identical configuration as a duplicate.
+        let _ = esp_idf_sys::esp_wifi_set_vendor_ie(
+            false,
+            kind,
+            esp_idf_sys::wifi_vendor_ie_id_t_WIFI_VND_IE_ID_0,
+            core::ptr::null(),
+        );
+        if enabled
+            && esp_idf_sys::esp_wifi_set_vendor_ie(
+                true,
+                kind,
+                esp_idf_sys::wifi_vendor_ie_id_t_WIFI_VND_IE_ID_0,
+                marker[..marker_len].as_ptr().cast(),
+            ) != esp_idf_sys::ESP_OK
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Record a P2P GAS Initial Request received through the bounded management
+/// capture lane. This is called from the radio callback and therefore only
+/// retains primitive state for the worker; it never submits a driver TX.
+pub(crate) fn observe_p2p_management_frame(frame: &[u8]) {
+    if dmesh_rawnan::is_p2p_probe_request(frame) {
+        P2P_PROBE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        if let Some(peer) = frame.get(dmesh_rawnan::FRAME_SRC..dmesh_rawnan::FRAME_SRC + 6) {
+            for (slot, byte) in P2P_PROBE_PEER.iter().zip(peer) {
+                slot.store(*byte, Ordering::Relaxed);
+            }
+            if P2P_PROBE_RESPONSE_PENDING.swap(true, Ordering::AcqRel) {
+                P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+    let Some(dialog_token) = dmesh_rawnan::p2p::gas_initial_request_dialog_token(frame) else {
+        return;
+    };
+    if !dmesh_rawnan::p2p::is_dmesh_dns_sd_request(frame) {
+        return;
+    }
+    let Some(peer) = frame.get(dmesh_rawnan::FRAME_SRC..dmesh_rawnan::FRAME_SRC + 6) else {
+        return;
+    };
+    for (slot, byte) in P2P_GAS_PEER.iter().zip(peer) {
+        slot.store(*byte, Ordering::Relaxed);
+    }
+    P2P_GAS_DIALOG_TOKEN.store(dialog_token, Ordering::Relaxed);
+    P2P_GAS_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    if P2P_GAS_RESPONSE_PENDING.swap(true, Ordering::AcqRel) {
+        P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Monotonic P2P discovery/Service-Discovery evidence for the common radio
+/// snapshot. These are deliberately receipt/submission counts, never a claim
+/// that Android accepted the peer or that a DMesh service was decoded.
+pub fn p2p_action_stats() -> (u32, u32, u32, u32, u32) {
+    (
+        P2P_PROBE_REQUESTS.load(Ordering::Relaxed),
+        P2P_PROBE_RESPONSES.load(Ordering::Relaxed),
+        P2P_GAS_REQUESTS.load(Ordering::Relaxed),
+        P2P_GAS_RESPONSES.load(Ordering::Relaxed),
+        P2P_GAS_RESPONSE_DROPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Drain one received P2P SD request from the normal Wi-Fi worker. This
+/// initial response carries the shared bounded `dmesh` DNS-SD TXT record.
+/// The ESP adapter keeps all ESP-IDF transmit ownership here; the portable
+/// P2P codec owns the GAS/DNS-SD bytes and CBOR text representation.
+pub fn poll_p2p_action_responses() {
+    if P2P_PROBE_RESPONSE_PENDING.swap(false, Ordering::AcqRel) {
+        let mut peer = [0u8; 6];
+        for (dst, slot) in peer.iter_mut().zip(&P2P_PROBE_PEER) {
+            *dst = slot.load(Ordering::Acquire);
+        }
+        if send_p2p_probe_response(peer) {
+            P2P_PROBE_RESPONSES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if !P2P_GAS_RESPONSE_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let interface = if lab_open_ap_active() {
+        RadioInterface::Ap
+    } else {
+        RadioInterface::Sta
+    };
+    let Some(bssid) = interface_mac(interface) else {
+        P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut peer = [0u8; 6];
+    for (dst, slot) in peer.iter_mut().zip(&P2P_GAS_PEER) {
+        *dst = slot.load(Ordering::Acquire);
+    }
+    let mut request = [0u8; dmesh_rawnan::FRAME_DATA + 64];
+    request[dmesh_rawnan::FRAME_SRC..dmesh_rawnan::FRAME_SRC + 6].copy_from_slice(&peer);
+    let Ok(action_len) = dmesh_rawnan::p2p::encode_dmesh_dns_sd_gas_initial_request(
+        &mut request[dmesh_rawnan::FRAME_DATA..],
+        P2P_GAS_DIALOG_TOKEN.load(Ordering::Acquire),
+    ) else {
+        P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let request_len = dmesh_rawnan::FRAME_DATA + action_len;
+    let mut presence = [0u8; 18];
+    let Ok(presence_len) =
+        dmesh_rawnan::p2p::encode_dmesh_service_presence_txt(&mut presence, &bssid)
+    else {
+        P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut body = [0u8; 192];
+    let Ok(used) = dmesh_rawnan::p2p::encode_dmesh_dns_sd_gas_initial_response(
+        &mut body,
+        &request[..request_len],
+        &presence[..presence_len],
+    ) else {
+        P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if crate::wifi_espnow_esp::transmit_public_action_on_interface(
+        interface,
+        peer,
+        bssid,
+        &body[..used],
+    ) {
+        P2P_GAS_RESPONSES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        P2P_GAS_RESPONSE_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Send the directed P2P discovery Probe Response in normal worker context.
+/// ESP-IDF accepts raw Probe Response management frames on the AP interface;
+/// no callback sends or retains a driver buffer. Its P2P IE is the same
+/// portable bytes as the Linux host response.
+fn send_p2p_probe_response(destination: [u8; 6]) -> bool {
+    if !lab_open_ap_active() {
+        return false;
+    }
+    let Some(source) = interface_mac(RadioInterface::Ap) else {
+        return false;
+    };
+    let Some((channel, _)) = current_channel() else {
+        return false;
+    };
+    let mut frame = [0u8; 128];
+    frame[..2].copy_from_slice(&[0x50, 0]);
+    frame[4..10].copy_from_slice(&destination);
+    frame[10..16].copy_from_slice(&source);
+    frame[16..22].copy_from_slice(&source);
+    let mut at = dmesh_rawnan::FRAME_DATA;
+    // Timestamp, beacon interval, and capability information mirror the
+    // existing host P2P responder. The P2P peer identity lives in the IE.
+    at += 8;
+    frame[at..at + 2].copy_from_slice(&100u16.to_le_bytes());
+    at += 2;
+    frame[at..at + 2].copy_from_slice(&0x0421u16.to_le_bytes());
+    at += 2;
+    frame[at..at + 2].copy_from_slice(&[0, 7]);
+    at += 2;
+    frame[at..at + 7].copy_from_slice(b"DIRECT-");
+    at += 7;
+    frame[at..at + 3].copy_from_slice(&[1, 1, 0x8c]);
+    at += 3;
+    frame[at..at + 3].copy_from_slice(&[3, 1, channel]);
+    at += 3;
+    let Ok(used) =
+        dmesh_rawnan::p2p::encode_discovery_advertisement(&mut frame[at..], source, channel)
+    else {
+        return false;
+    };
+    unsafe {
+        esp_idf_sys::esp_wifi_80211_tx(
+            esp_idf_sys::wifi_interface_t_WIFI_IF_AP,
+            frame.as_ptr().cast_mut().cast(),
+            (at + used) as i32,
+            true,
+        ) == esp_idf_sys::ESP_OK
+    }
 }
 
 /// Submit one caller-constructed ESP-IDF action TX request.  Framing remains

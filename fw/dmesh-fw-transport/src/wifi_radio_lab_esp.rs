@@ -9,14 +9,17 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use dmesh_server::raw_wifi::{
     RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS,
     RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiControlRequest, RawWifiCounters,
-    RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
+    RawWifiBearer, RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
     RawWifiSnapshot, RawWifiStaMode, RawWifiStaState, RawWifiTxRequest,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);
 static TX_INTERFACE: AtomicU8 = AtomicU8::new(0);
 static TX_RATE: AtomicU8 = AtomicU8::new(0);
-static ACTION_DESTINATION_BROADCAST: AtomicBool = AtomicBool::new(false);
+// Unassociated NAN/NOW starts with broadcast Address-1.  The peer identity is
+// still carried by the QUIC/raw-service handshake; unicast can be selected by
+// an explicit lab control once a driver-specific peer path is known.
+static ACTION_DESTINATION_BROADCAST: AtomicBool = AtomicBool::new(true);
 
 /// Return the runtime-selected action egress interface.
 ///
@@ -74,7 +77,7 @@ pub const fn response_method(request: RawWifiLabRequest) -> Option<u64> {
         RawWifiLabRequest::Snapshot => Some(RAW_WIFI_METHOD_SNAPSHOT),
         RawWifiLabRequest::ResetCounters => Some(RAW_WIFI_METHOD_RESET_COUNTERS),
         RawWifiLabRequest::Check(_) => Some(RAW_WIFI_METHOD_CHECK),
-        _ => None,
+        RawWifiLabRequest::Iperf(_) => Some(dmesh_server::raw_wifi::RAW_WIFI_METHOD_IPERF),
     }
 }
 
@@ -170,8 +173,21 @@ pub fn snapshot() -> RawWifiSnapshot {
         tx_duration_le_2ms,
         tx_duration_gt_2ms,
     ) = crate::wifi_espnow_esp::tx_timing();
-    let (raw_service_bytes, _raw_service_errors, raw_service_elapsed_us) =
+    let (action_service_bytes, _action_service_errors, action_service_elapsed_us) =
         crate::wifi_espnow_esp::raw_client_result();
+    let (udp6_service_bytes, _udp6_service_errors, udp6_service_elapsed_us) =
+        crate::wifi_raw_udp6_esp::raw_client_result();
+    // One raw service is admitted at a time by the probe executor. Select
+    // the active/recent bearer result rather than inventing a separate
+    // response schema for UDP6; the shared snapshot records bytes and time
+    // identically for NOW and raw IPv6.
+    let use_udp6_client = crate::wifi_raw_udp6_esp::raw_client_active()
+        || (udp6_service_bytes != 0 && action_service_bytes == 0);
+    let (raw_service_bytes, raw_service_elapsed_us) = if use_udp6_client {
+        (udp6_service_bytes, udp6_service_elapsed_us)
+    } else {
+        (action_service_bytes, action_service_elapsed_us)
+    };
     let (
         _frames,
         _bytes,
@@ -206,6 +222,13 @@ pub fn snapshot() -> RawWifiSnapshot {
     ) = crate::wifi_raw_udp6_esp::diagnostics();
     let (udp6_tx_submit_calls, udp6_tx_submit_us_total, udp6_tx_submit_us_max) =
         crate::wifi_raw_udp6_esp::tx_submit_timing();
+    let (
+        p2p_probe_requests,
+        p2p_probe_responses,
+        p2p_gas_requests,
+        p2p_gas_responses,
+        p2p_response_drops,
+    ) = crate::wifi_esp::p2p_action_stats();
     RawWifiSnapshot {
         epoch: EPOCH.load(Ordering::Acquire),
         channel: channel(),
@@ -220,7 +243,10 @@ pub fn snapshot() -> RawWifiSnapshot {
         tx_rate: rate_from(TX_RATE.load(Ordering::Acquire)),
         ap_active: Some(crate::wifi_esp::lab_open_ap_active()),
         mac_ack: Some(crate::wifi_espnow_esp::mac_ack_enabled()),
-        raw_service_active: Some(crate::wifi_espnow_esp::raw_client_active()),
+        raw_service_active: Some(
+            crate::wifi_espnow_esp::raw_client_active()
+                || crate::wifi_raw_udp6_esp::raw_client_active(),
+        ),
         last_tx_error: Some(crate::wifi_espnow_esp::last_tx_error() as u32),
         last_raw_client_error: Some(last_client_error),
         sta_mac: crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta),
@@ -287,6 +313,11 @@ pub fn snapshot() -> RawWifiSnapshot {
             udp6_raw_tx_completions,
             udp6_raw_tx_completion_failures,
             udp6_raw_tx_completion_rate,
+            p2p_probe_requests,
+            p2p_probe_responses,
+            p2p_gas_requests,
+            p2p_gas_responses,
+            p2p_response_drops,
         },
     }
 }
@@ -318,6 +349,11 @@ fn apply_control(control: RawWifiControlRequest) -> Result<(), &'static str> {
     if let Some(enabled) = control.action_dispatcher {
         if !crate::wifi_esp::set_now_dispatcher(enabled) {
             return Err("action dispatcher rejected");
+        }
+    }
+    if let Some(duration_ms) = control.nan_capture_ms {
+        if !crate::wifi_nan_dw_capture_esp::request_permissive_capture(duration_ms) {
+            return Err("NAN permissive capture rejected");
         }
     }
     if let Some(state) = control.sta_state {
@@ -432,7 +468,37 @@ pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static st
                 check.timeout_ms,
             );
         }
-        _ => return Err("unsupported radio lab request"),
+        RawWifiLabRequest::Iperf(iperf) => {
+            // This starts a device-originated peer run.  The immediate
+            // snapshot records admission; the same bounded client publishes
+            // live/final bytes and errors through the normal radio counters.
+            let bearer = match iperf.bearer {
+                RawWifiBearer::Auto if crate::wifi_esp::sta_associated() => RawWifiBearer::Udp6,
+                RawWifiBearer::Auto => RawWifiBearer::Now,
+                bearer => bearer,
+            };
+            let started = if bearer == RawWifiBearer::Udp6 {
+                // In an associated probe row, raw UDP6 is the pair data
+                // bearer. The initiating STA targets the peer's link-local
+                // address derived from this same six-byte radio identity.
+                crate::wifi_raw_udp6_esp::start_iperf_client(
+                    iperf.peer,
+                    iperf.bytes,
+                    iperf.packet_size,
+                    iperf.timeout_ms,
+                )
+            } else {
+                crate::wifi_espnow_esp::start_iperf_client(
+                    crate::wifi_espnow_esp::EspNowPeer { mac: iperf.peer },
+                    iperf.bytes,
+                    iperf.packet_size,
+                    iperf.timeout_ms,
+                )
+            };
+            if !started {
+                return Err("raw IPERF client busy or rejected");
+            }
+        }
     }
     Ok(snapshot())
 }

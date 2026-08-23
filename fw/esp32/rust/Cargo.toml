@@ -10,7 +10,7 @@ resolver = "2"
 dmesh-rawnan = { path = "../../../crates/rawnan", default-features = false }
 quic-lite = { path = "../../../crates/quic-lite" }
 dmesh-server = { path = "../../../crates/dmesh-server", default-features = false }
-dmesh-fw-transport = { path = "../../dmesh-fw-transport" }
+dmesh-fw-transport = { path = "../../dmesh-fw-transport", features = ["main-runtime"] }
 dmesh-fw-modules = { path = "../../modules" }
 uart-codec = { path = "../../../crates/uart-codec" }
 anyhow = "1"

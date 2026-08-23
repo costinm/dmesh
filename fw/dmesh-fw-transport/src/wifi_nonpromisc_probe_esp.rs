@@ -186,6 +186,9 @@ pub fn configure_loop(enabled: bool, duration_ms: u32) -> bool {
 
 /// Reissue ROC after each requested window. The driver is the completion
 /// authority; request/failure counters remain explicit evidence of coverage.
+/// This is a deadline service, not a packet loop: the ESP-IDF completion
+/// callback only releases `ROC_IN_FLIGHT`, and the Main owner calls `poll`
+/// after the bounded lease expires so no callback blocks or re-enters Wi-Fi.
 pub fn poll() {
     if !ROC_LOOP_ENABLED.load(Ordering::Acquire) {
         return;
@@ -211,6 +214,26 @@ pub fn poll() {
         .saturating_add(ROC_REISSUE_GUARD_MS)
         .saturating_mul(1_000);
     ROC_LOOP_NEXT_US.store(now.wrapping_add(next_us), Ordering::Release);
+}
+
+/// Return the next ROC-service deadline in milliseconds relative to `now`.
+/// The Main owner uses this as a task-notification timeout; it does not wake
+/// on a fixed polling cadence when no ROC lease is active.
+pub fn next_service_delay_ms() -> Option<u32> {
+    if !ROC_LOOP_ENABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    let next_us = ROC_LOOP_NEXT_US.load(Ordering::Acquire);
+    if next_us == 0 {
+        return Some(0);
+    }
+    let now_us = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u32;
+    let remaining_us = next_us.wrapping_sub(now_us);
+    if remaining_us > 0x8000_0000 {
+        Some(0)
+    } else {
+        Some((remaining_us / 1_000).max(1))
+    }
 }
 
 unsafe extern "C" fn callback(

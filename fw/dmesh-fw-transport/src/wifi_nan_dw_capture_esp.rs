@@ -755,6 +755,37 @@ pub fn interval() -> u8 {
     DW_INTERVAL.load(Ordering::Acquire)
 }
 
+/// Extend the existing NAN management receive window for one explicit
+/// channel-6 observation request. This is deliberately bounded to 600 ms so
+/// it can see a 500-TU infrastructure beacon without becoming continuous
+/// promiscuous receive. The Wi-Fi owner invokes it from its normal worker,
+/// never from the ESP-IDF callback.
+pub fn request_permissive_capture(duration_ms: u16) -> bool {
+    if !STARTED.load(Ordering::Acquire)
+        || lab_dw_policy() != 0
+        || !(100..=600).contains(&duration_ms)
+        || crate::wifi_nonpromisc_probe_esp::roc_in_flight()
+    {
+        return false;
+    }
+    let now = now_ms();
+    let requested_until = now.wrapping_add(u32::from(duration_ms));
+    if !CAPTURING.load(Ordering::Acquire) {
+        if !crate::wifi_esp::set_promiscuous(true) {
+            return false;
+        }
+        CAPTURING.store(true, Ordering::Release);
+    }
+    let current_until = UNTIL_MS.load(Ordering::Acquire);
+    if due(requested_until, current_until) {
+        UNTIL_MS.store(requested_until, Ordering::Release);
+    }
+    // Resume ordinary DW scheduling only after this bounded observation
+    // closes; do not alter the configured cadence.
+    NEXT_MS.store(requested_until.wrapping_add(dw_period_ms()), Ordering::Release);
+    true
+}
+
 /// Whether starting a ROC lease with `duration_ms` would overlap a normal NAN
 /// permissive window.  The caller supplies the ROC duration plus its driver
 /// completion guard. This is the shared scheduling boundary between the two
@@ -851,12 +882,17 @@ pub fn stop() {
     DW_INTERVAL.store(0, Ordering::Release);
 }
 
-/// Advance the fixed Recovery discovery cadence. Call from the normal worker;
-/// all radio state changes occur outside the Wi-Fi driver callback.
+/// Advance the fixed discovery-window cadence. Call from the normal worker;
+/// all radio state changes occur outside the Wi-Fi driver callback. Frame
+/// callbacks copy bounded Service Info into `shared_ingress_esp` (which wakes
+/// its deferred task); this function remains necessary only to service the
+/// independent acquisition/DW deadlines and to perform the driver calls that
+/// callbacks are not allowed to make.
 pub fn poll() {
     if !STARTED.load(Ordering::Acquire) {
         return;
     }
+    crate::wifi_esp::poll_p2p_action_responses();
     if lab_dw_policy() != 0 {
         return;
     }
@@ -924,6 +960,23 @@ pub fn poll() {
     }
 }
 
+/// Return the next NAN acquisition/DW deadline in milliseconds. The Main
+/// owner combines this with task notifications so the runtime sleeps until a
+/// real radio timer expires or a control transition wakes it.
+pub fn next_service_delay_ms() -> Option<u32> {
+    if !STARTED.load(Ordering::Acquire) {
+        return None;
+    }
+    let now = now_ms();
+    let deadline = if CAPTURING.load(Ordering::Acquire) {
+        UNTIL_MS.load(Ordering::Acquire)
+    } else {
+        NEXT_MS.load(Ordering::Acquire)
+    };
+    let remaining = deadline.wrapping_sub(now);
+    Some(if remaining > 0x8000_0000 { 0 } else { remaining.max(1) })
+}
+
 fn dw_period_ms() -> u32 {
     NAN_DW_PERIOD_MS.saturating_mul(u32::from(DW_INTERVAL.load(Ordering::Acquire).max(1)))
 }
@@ -947,6 +1000,11 @@ unsafe extern "C" fn callback(
 fn receive_management_frame(frame: &[u8]) {
     FRAMES.fetch_add(1, Ordering::Relaxed);
     BYTES.fetch_add(frame.len().min(u32::MAX as usize) as u32, Ordering::Relaxed);
+    // P2P Probe Requests are answered by the AP driver from its configured
+    // vendor IE. The subsequent GAS action arrives in this bounded management
+    // capture; dispatch it to the Wi-Fi owner, which retains and transmits
+    // the reply from worker context.
+    crate::wifi_esp::observe_p2p_management_frame(frame);
     // The private action dispatcher is useful when the driver admits a frame,
     // but C6 does not continuously accept unsolicited peer actions through
     // it. DW capture is the reliable, explicitly bounded fallback.

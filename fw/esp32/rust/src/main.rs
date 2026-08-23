@@ -19,7 +19,5 @@ pub extern "C" fn app_main() {
     // control handler. This registers no Wi-Fi callback and does not start a
     // module; the shared Recovery runtime remains the only radio owner.
     dmesh_fw_modules::register_tagged_handlers();
-    dmesh_fw_transport::recovery_runtime::run_main(
-        components::recovery::mark_main_boot_healthy,
-    );
+    dmesh_fw_transport::main_runtime::run(components::recovery::mark_main_boot_healthy);
 }

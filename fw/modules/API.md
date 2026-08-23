@@ -42,16 +42,12 @@ with loader ABI result `-2`; they are intentionally not routed through the
 deleted Main string-command dispatcher. They will be connected to the common
 `dmesh-server` settings/event/direct-record handlers in the next migration.
 
-## Recovery build option
+## Frozen Recovery build option
 
-The native loader and this Rust crate are optional in Recovery so their cost is
-measurable independently of the raw UDP6 transport core:
+Recovery is currently frozen and its build entry point is deliberately
+disabled. Do not use the historical commands below; Main is the active
+firmware lane. They are retained only as migration notes:
 
-```sh
-scripts/build-recovery-rust.sh esp32c6
-DMESH_RECOVERY_MODULES=1 scripts/build-recovery-rust.sh esp32c6
-```
-
-On the C6 build measured on 2026-08-21, the first image was 911,360 bytes and
-the second was 949,136 bytes: +37,776 bytes. The one-MiB recovery partition
+The last C6 measurement (2026-08-21) produced 911,360 bytes without modules
+and 949,136 bytes with modules: +37,776 bytes. The one-MiB recovery partition
 therefore retains 99,440 bytes of headroom with module support.
