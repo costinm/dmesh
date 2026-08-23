@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[path = "api.rs"]
 mod api_generated;
 pub mod dispatch;
+mod infra_credentials;
 /// Generated API structs plus stable compatibility aliases used by the
 /// reviewed service adapters. The generated artifact itself remains untouched.
 pub mod api {
@@ -18,6 +19,7 @@ pub mod api {
     pub type ApStatusRequest = WifiApStatusRequest;
     pub type StaStatusRequest = WifiStaStatusRequest;
     pub type RawNanStatusRequest = WifiRawnanStatusRequest;
+    pub type ProbePlanRequest = WifiProbePlanRequest;
     pub type InterfaceStatusRequest = WifiInterfaceStatusRequest;
     pub type ApStationsRequest = WifiApStationsRequest;
     pub type RawMetricsRequest = WifiRawMetricsRequest;
@@ -37,6 +39,10 @@ pub mod radio_protocol;
 pub mod reviewed;
 
 pub use radio::RadioService;
+pub use infra_credentials::{
+    INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials,
+    load_default_infrastructure_credentials, load_infrastructure_credentials,
+};
 
 /// Reusable Wi-Fi service instance.
 ///
@@ -226,7 +232,8 @@ impl InterfaceSet {
     /// unrelated monitor VIFs such as `wlan1mon`.
     pub fn contains(&self, iface: &str) -> bool {
         self.0.iter().any(|owned| {
-            owned == iface || iface.strip_suffix("mon").is_some_and(|base| base == owned)
+            owned == iface
+                || iface.strip_suffix("mon").is_some_and(|base| base == owned)
         })
     }
 
@@ -319,4 +326,5 @@ mod tests {
         assert!(!owned.contains("wlan1mon"));
         assert!(!owned.contains("wlan0monitor"));
     }
+
 }

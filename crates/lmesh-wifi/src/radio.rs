@@ -82,6 +82,7 @@ trait RawActionClient {
         now_ms: u64,
         output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
     ) -> Result<Option<usize>, quic_lite::Error>;
+    fn accepts(&self, input: &[u8]) -> bool;
     fn is_complete(&self) -> bool;
     /// Poll delayed ACK/window control.  Action bearers have no socket task
     /// to drive the QUIC clock, so the adapter must explicitly service this
@@ -100,13 +101,16 @@ trait RawActionClient {
 
 /// A monitor VIF receives every matching action frame, including delayed
 /// packets from a previous association and unrelated NAN/management traffic.
-/// These errors mean that a frame is not for this client CID and must not
-/// poison the active request; actual transport/codec failures remain fatal.
+/// These errors mean that a captured frame is not usable for this client. A
+/// monitor capture can contain a stale/partially received action frame even
+/// after the CID filter, so the bearer must wait for QUIC-lite recovery rather
+/// than fail the whole probe on one damaged RF datagram.
 fn raw_action_receive_error_is_ambient(error: quic_lite::Error) -> bool {
     matches!(
         error,
         quic_lite::Error::WrongConnectionId
             | quic_lite::Error::BootstrapInvalid
+            | quic_lite::Error::Truncated
             | quic_lite::Error::Invalid
     )
 }
@@ -132,6 +136,10 @@ impl RawActionClient
         output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
     ) -> Result<Option<usize>, quic_lite::Error> {
         Self::receive_at(self, input, now_ms, output)
+    }
+
+    fn accepts(&self, input: &[u8]) -> bool {
+        Self::accepts(self, input)
     }
 
     fn poll_transmit(
@@ -171,6 +179,10 @@ impl RawActionClient
         output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
     ) -> Result<Option<usize>, quic_lite::Error> {
         Self::receive_at(self, input, now_ms, output)
+    }
+
+    fn accepts(&self, input: &[u8]) -> bool {
+        Self::accepts(self, input)
     }
 
     fn poll_transmit(
@@ -442,10 +454,23 @@ impl Default for RadioService {
 struct DiscoveredDevice {
     device_id: String,
     last_seen_ms: u128,
+    /// Last receiving path for compatibility with older status consumers.
+    /// `observations` below retains the corresponding per-bearer evidence.
     source: String,
     peer: String,
     bssid: Option<String>,
     announce: Value,
+    observations: BTreeMap<String, DiscoveryObservation>,
+}
+
+/// Latest semantic receipt for one bearer. The control-plane registry keeps
+/// one of these per source instead of allowing a UDP6 refresh to erase an
+/// earlier NAN observation (or vice versa).
+#[derive(Clone, Debug)]
+struct DiscoveryObservation {
+    last_seen_ms: u128,
+    peer: String,
+    bssid: Option<String>,
 }
 
 struct DiscoveredDeviceRegistry {
@@ -542,6 +567,17 @@ impl DiscoveredDeviceRegistry {
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
                             announce: announce.clone(),
+                            observations: BTreeMap::from([(
+                                source.to_owned(),
+                                DiscoveryObservation {
+                                    last_seen_ms,
+                                    peer: peer.to_owned(),
+                                    bssid: record
+                                        .get("bssid")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                },
+                            )]),
                         },
                     );
                 }
@@ -579,6 +615,19 @@ impl DiscoveredDeviceRegistry {
         let now_ms = entry.last_seen_ms;
         self.expire(now_ms);
         let is_new = !self.devices.contains_key(&entry.device_id);
+        if let Some(previous) = self.devices.get(&entry.device_id) {
+            // Retain every recent bearer observation while using the newest
+            // semantic announce as the active transport/capability state.
+            entry.observations = previous.observations.clone();
+        }
+        entry.observations.insert(
+            entry.source.clone(),
+            DiscoveryObservation {
+                last_seen_ms: now_ms,
+                peer: entry.peer.clone(),
+                bssid: entry.bssid.clone(),
+            },
+        );
         if is_new
             && self.devices.len() >= MAX_DISCOVERED_DEVICES
             && let Some(oldest) = self
@@ -619,7 +668,10 @@ impl DiscoveredDeviceRegistry {
                 "uptime_secs": announce.uptime_secs,
                 "transport_mode": announce.transport_mode,
                 "counters": announce.counters,
+                "device_class": announce.device_class,
+                "probe_capabilities": announce.probe_capabilities,
             }),
+            observations: BTreeMap::new(),
         });
     }
 
@@ -658,6 +710,39 @@ impl DiscoveredDeviceRegistry {
 }
 
 fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
+    let now_ms = now_millis();
+    let observations = entry
+        .observations
+        .iter()
+        .map(|(source, observation)| {
+            (
+                source.clone(),
+                json!({
+                    "last_seen_ms": observation.last_seen_ms,
+                    "age_ms": now_ms.saturating_sub(observation.last_seen_ms),
+                    "peer": observation.peer,
+                    "bssid": observation.bssid,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let nan = entry.observations.get("nan").map(|observation| {
+        json!({
+            "observed": true,
+            "last_seen_ms": observation.last_seen_ms,
+            "age_ms": now_ms.saturating_sub(observation.last_seen_ms),
+            "peer": observation.peer,
+            "bssid": observation.bssid,
+        })
+    }).unwrap_or_else(|| json!({"observed": false}));
+    let transport_mode = entry.announce.get("transport_mode").and_then(Value::as_u64);
+    let transport_state = match transport_mode {
+        Some(0) => "nan_now",
+        Some(1) => "sta",
+        Some(2) => "uart_only",
+        Some(_) => "unknown",
+        None => "unknown",
+    };
     json!({
         "id": entry.device_id,
         "last_seen_ms": entry.last_seen_ms,
@@ -665,6 +750,16 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
         "peer": entry.peer,
         "bssid": entry.bssid,
         "announce": entry.announce,
+        // `nan` reports local observation, not a claim inferred from the
+        // device's desired configuration. A UDP6-only Android therefore
+        // remains discoverable with `nan.observed=false`.
+        "nan": nan,
+        "active_transport": {
+            "mode": transport_mode,
+            "state": transport_state,
+            "observed_bearers": entry.observations.keys().collect::<Vec<_>>(),
+        },
+        "observations": observations,
     })
 }
 
@@ -731,6 +826,28 @@ impl RadioService {
                 )
             })
             .unwrap_or(false);
+        // Automatic/default rate selection is already the driver's startup
+        // state.  Do not issue a SET_TX_BITRATE_MASK while an interface is
+        // still down: mt7921u reports ENETDOWN for that request and the
+        // failed pre-AP netlink operation can leave the following AP
+        // transition stuck.  An explicit 802.11b policy still needs the
+        // request even when the rate profile is automatic.
+        let normalized_profile = profile.trim().to_ascii_lowercase();
+        if matches!(normalized_profile.as_str(), "auto" | "default" | "reset") && !disable_b {
+            return interfaces
+                .iter()
+                .map(|iface| {
+                    json!({
+                        "ok": true,
+                        "backend": "linux_nl80211",
+                        "iface": iface,
+                        "profile": normalized_profile,
+                        "skipped": true,
+                        "reason": "driver default rate selection",
+                    })
+                })
+                .collect();
+        }
         interfaces
             .iter()
             .map(|iface| self.wifi_rate_profile(Some(iface.clone()), profile.clone(), disable_b))
@@ -1070,6 +1187,9 @@ impl RadioService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cluster = state.cluster().map(|mac| colon_mac(&mac.0));
+        let last_beacon_local_us = state.last_beacon_local_us();
+        let sync_age_ms =
+            (now_micros_u64().saturating_sub(last_beacon_local_us) / 1_000).min(u64::MAX);
         let history = self
             .history
             .lock()
@@ -1137,6 +1257,8 @@ impl RadioService {
             "cluster_bssid": cluster,
             "sync_bssid": state.sync_bssid().map(|mac| colon_mac(&mac.0)),
             "last_beacon_tsf_us": state.last_beacon_tsf_us(),
+            "last_beacon_local_us": last_beacon_local_us,
+            "sync_age_ms": (last_beacon_local_us != 0).then_some(sync_age_ms),
             "beacon_interval_tu": state.beacon_interval_tu(),
             "nan_events": events,
             "discovered_devices": discovered_devices,
@@ -1917,6 +2039,13 @@ impl RadioService {
                 });
             }
         };
+        // AP startup is also the recovery boundary after a failed STA/NAN
+        // transition or a supervised restart.  A previous monitor fixture
+        // owns the same PHY and can leave the managed parent down; remove it
+        // before changing the parent into AP mode.  The operation is
+        // intentionally best-effort because the normal AP path has no
+        // monitor child yet.
+        let _ = self.wifi_raw_stop(Some(iface.clone()));
         self.stop_ap_runtime(&iface);
         let mac = iface_mac(&iface).unwrap_or([0; 6]);
         let template_lengths = open_ap_template_lengths(&ssid, channel)
@@ -2403,8 +2532,22 @@ impl RadioService {
                 let direct_dmesh = direct
                     .iter()
                     .filter(|entry| {
-                        entry.get("ssid").and_then(Value::as_str)
+                        entry
+                            .get("ssid")
+                            .and_then(Value::as_str)
                             .is_some_and(|ssid| ssid.ends_with("-dmesh"))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let dmesh = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("ssid")
+                            .and_then(Value::as_str)
+                            .is_some_and(|ssid| {
+                                ssid.ends_with("-dmesh") || ssid.starts_with("dmesh-")
+                            })
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -2429,6 +2572,7 @@ impl RadioService {
                     "entries": entries,
                     "direct": direct,
                     "direct_dmesh": direct_dmesh,
+                    "dmesh": dmesh,
                     "link": link,
                     "status": output.status.code(),
                     "stderr": stderr,
@@ -3652,8 +3796,14 @@ impl RadioService {
         client: &mut C,
     ) -> RawActionRun {
         let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-        let mut pending = match client.start(&mut packet) {
-            Ok(used) => Some(used),
+        // A bootstrap OPEN has no peer CID yet, so the normal QUIC PTO path
+        // cannot retransmit it. Keep a bounded copy for the NAN/DW window.
+        let mut bootstrap_packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let (mut pending, bootstrap_used) = match client.start(&mut packet) {
+            Ok(used) => {
+                bootstrap_packet[..used].copy_from_slice(&packet[..used]);
+                (Some(used), used)
+            }
             Err(error) => {
                 return RawActionRun {
                     elapsed_us: 0,
@@ -3667,6 +3817,7 @@ impl RadioService {
             }
         };
         let started = Instant::now();
+        let mut last_bootstrap_tx = started;
         let start_ms = now_millis_u64();
         // The sender must not start the long-lived history listener on the
         // same monitor VIF: active monitor TX may need to recreate that VIF,
@@ -3721,6 +3872,7 @@ impl RadioService {
         let mut last_tx = None;
         let mut rx_packets = 0u64;
         let mut retransmit_packets = 0u64;
+        let mut bootstrap_pending = true;
         let mut error = None;
         let local_source = colon_mac(&source);
         while started.elapsed() < Duration::from_millis(timeout_ms) {
@@ -3803,6 +3955,9 @@ impl RadioService {
                     break;
                 }
                 tx_packets = tx_packets.saturating_add(1);
+                if bootstrap_pending {
+                    last_bootstrap_tx = Instant::now();
+                }
             }
             if let Some(socket) = direct_rx.as_ref() {
                 if let Ok(Some(len)) = socket.recv_timeout(&mut direct_buf, Duration::from_millis(10))
@@ -3815,6 +3970,15 @@ impl RadioService {
                         dmesh_rawnan::espnow::parse_action_frame_into(frame, &mut direct_payload)
                     && expected_peer.is_none_or(|expected| peer == expected)
                 {
+                    // The monitor VIF can deliver other complete action
+                    // bearers from the same peer.  Admit only packets for
+                    // this client before invoking the QUIC decoder; a
+                    // foreign/stale payload must not become a fatal
+                    // `Truncated` codec error for the active request.
+                    if !client.accepts(&direct_payload[..payload_len]) {
+                        continue;
+                    }
+                    bootstrap_pending = false;
                     rx_packets = rx_packets.saturating_add(1);
                     match client.receive_at(
                         &direct_payload[..payload_len],
@@ -3861,6 +4025,18 @@ impl RadioService {
                 pending = Some(used);
                 retransmit_packets = retransmit_packets.saturating_add(1);
             }
+            // Before the server CID is learned, explicitly repeat the OPEN
+            // at a modest cadence. Once a response establishes the peer CID,
+            // normal QUIC retransmission and flow-control polling takes over.
+            if pending.is_none()
+                && bootstrap_used != 0
+                && bootstrap_pending
+                && last_bootstrap_tx.elapsed() >= Duration::from_millis(400)
+            {
+                packet[..bootstrap_used].copy_from_slice(&bootstrap_packet[..bootstrap_used]);
+                pending = Some(bootstrap_used);
+                retransmit_packets = retransmit_packets.saturating_add(1);
+            }
             let events = self
                 .history
                 .lock()
@@ -3897,6 +4073,14 @@ impl RadioService {
                 let Ok(payload) = decode_firmware_hex(payload_hex) else {
                     continue;
                 };
+                // History contains all raw action traffic, not just this
+                // request's QUIC connection.  Filter by destination CID
+                // before decoding so stale or unrelated action payloads are
+                // ambient traffic rather than a bulk-transfer failure.
+                if !client.accepts(&payload) {
+                    continue;
+                }
+                bootstrap_pending = false;
                 rx_packets = rx_packets.saturating_add(1);
                 match client.receive_at(&payload, now_millis_u64(), &mut packet) {
                     Ok(next) => pending = next,
@@ -4254,7 +4438,10 @@ impl RadioService {
         // the control-plane probe without discarding its underlying frames.
         let mut aps = BTreeMap::<String, Value>::new();
         for frame in &frames {
-            if !matches!(frame.get("kind").and_then(Value::as_str), Some("beacon" | "probe_resp")) {
+            if !matches!(
+                frame.get("kind").and_then(Value::as_str),
+                Some("beacon" | "probe_resp")
+            ) {
                 continue;
             }
             let Some(bssid) = frame.get("bssid").and_then(Value::as_str) else {
@@ -4274,14 +4461,29 @@ impl RadioService {
         }
         let direct = aps
             .values()
-            .filter(|ap| ap.get("ssid").and_then(Value::as_str)
-                .is_some_and(|ssid| ssid.starts_with("DIRECT-")))
+            .filter(|ap| {
+                ap.get("ssid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ssid| ssid.starts_with("DIRECT-"))
+            })
             .cloned()
             .collect::<Vec<_>>();
         let direct_dmesh = direct
             .iter()
-            .filter(|ap| ap.get("ssid").and_then(Value::as_str)
-                .is_some_and(|ssid| ssid.ends_with("-dmesh")))
+            .filter(|ap| {
+                ap.get("ssid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ssid| ssid.ends_with("-dmesh"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let dmesh = aps
+            .values()
+            .filter(|ap| {
+                ap.get("ssid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ssid| ssid.ends_with("-dmesh") || ssid.starts_with("dmesh-"))
+            })
             .cloned()
             .collect::<Vec<_>>();
         let result = json!({
@@ -4297,6 +4499,7 @@ impl RadioService {
             "aps": aps.into_values().collect::<Vec<_>>(),
             "direct": direct,
             "direct_dmesh": direct_dmesh,
+            "dmesh": dmesh,
             "setup": setup,
             "frames": frames,
         });
@@ -5422,12 +5625,15 @@ impl Nl80211Socket {
         let hostapd_beacon_head =
             build_open_beacon_head_with_capability(mac, ssid, channel, 0x0401)
                 .map_err(|error| (error, Vec::new()))?;
-        let esp_beacon_tail = esp_open_ap_beacon_tail(channel);
-        let hostapd_beacon_tail = hostapd_open_ap_beacon_tail(channel, ht40);
+        let esp_beacon_tail = esp_open_ap_beacon_tail_for_device(mac, channel);
+        let hostapd_beacon_tail = hostapd_open_ap_beacon_tail_for_device(mac, channel, ht40);
+        let esp_probe_ies = esp_open_ap_probe_ies_for_device(ssid, mac, channel)
+            .map_err(|error| (error, Vec::new()))?;
         let esp_probe_resp =
-            build_open_probe_resp(mac, ssid, channel).map_err(|error| (error, Vec::new()))?;
-        let hostapd_probe_ies =
-            hostapd_open_ap_probe_ies(ssid, channel, ht40).map_err(|error| (error, Vec::new()))?;
+            build_open_probe_resp_with_ies(mac, ssid, channel, 0x0421, &esp_probe_ies)
+                .map_err(|error| (error, Vec::new()))?;
+        let hostapd_probe_ies = hostapd_open_ap_probe_ies_for_device(ssid, mac, channel, ht40)
+            .map_err(|error| (error, Vec::new()))?;
         let hostapd_probe_resp =
             build_open_probe_resp_with_ies(mac, ssid, channel, 0x0401, &hostapd_probe_ies)
                 .map_err(|error| (error, Vec::new()))?;
@@ -7367,6 +7573,23 @@ fn ap_mgmt_receive_loop(
                     {
                         object.insert("action_frame".to_string(), action);
                     }
+                    if let Some(response) = build_dmesh_p2p_sd_response(ap_mac, &frame) {
+                        let tx =
+                            send_open_ap_mgmt_response(&socket, iface, ifindex, channel, &response);
+                        if let Some(object) = value.as_object_mut() {
+                            // This proves that a validated DMesh GAS request
+                            // reached shared host ingress and its matching
+                            // DNS-SD/CBOR public-action response was emitted.
+                            object.insert(
+                                "p2p_sd_response".to_string(),
+                                json!({
+                                    "kind": "gas_initial_response_dmesh",
+                                    "frame_len": response.len(),
+                                    "tx": tx,
+                                }),
+                            );
+                        }
+                    }
                     // The AP management socket may be the only receiver to
                     // see a host-generated SDF. Feed it through the same
                     // semantic event/follow-up path as monitor ingress;
@@ -7870,6 +8093,8 @@ fn handle_action_frame(
             dmesh_rawnan::FrameKind::Beacon => "beacon",
             dmesh_rawnan::FrameKind::Sdf => "service_discovery",
             dmesh_rawnan::FrameKind::Followup => "followup",
+            dmesh_rawnan::FrameKind::P2p => "p2p",
+            dmesh_rawnan::FrameKind::Gas => "gas",
             dmesh_rawnan::FrameKind::Other => "other",
         },
         "nan_filter_action": match nan_action {
@@ -7878,6 +8103,7 @@ fn handle_action_frame(
             RawNanAction::DropForeign => "drop_foreign",
             RawNanAction::Rediscover => "rediscover",
         },
+        "p2p_gas_initial_request": dmesh_rawnan::is_gas_initial_request(frame),
     });
     if let Some(signal) = rx_signal_dbm
         && let Some(object) = result.as_object_mut()
@@ -7914,6 +8140,22 @@ fn handle_open_ap_sme_frame(
     let sta_mac = mac_at(frame, IEEE80211_ADDR2)?;
     let subtype = frame_subtype(frame);
     let response = match subtype {
+        4 if dmesh_rawnan::is_p2p_probe_request(frame) => {
+            // P2P peer discovery uses a management Probe Request, not an
+            // action frame. Respond on the AP's already-registered nl80211
+            // management socket with device/channel discovery attributes.
+            // This does not form a group or answer the later GAS SD request.
+            let response = build_p2p_probe_response(ap_mac, sta_mac, channel)
+                .expect("bounded P2P probe response");
+            let tx = send_open_ap_mgmt_response(socket, iface, ifindex, channel, &response);
+            json!({
+                "kind": "p2p_probe_response",
+                "destination": colon_mac(&sta_mac),
+                "channel": channel,
+                "frame_len": response.len(),
+                "tx": tx,
+            })
+        }
         11 => {
             if read_u16_at(frame, IEEE80211_BODY) != Some(NL80211_AUTHTYPE_OPEN_SYSTEM as u16) {
                 return None;
@@ -7962,6 +8204,46 @@ fn handle_open_ap_sme_frame(
         _ => return None,
     };
     Some(response)
+}
+
+/// Build a directed P2P discovery Probe Response for one received P2P Probe
+/// Request. The common codec owns the vendor IE; this Linux adapter only owns
+/// the management header and on-channel transmission.
+fn build_p2p_probe_response(source: [u8; 6], destination: [u8; 6], channel: u8) -> Result<Vec<u8>> {
+    let mut frame = mgmt_frame_header(5, destination, source, source);
+    frame.extend_from_slice(&[0; 8]);
+    frame.extend_from_slice(&100_u16.to_le_bytes());
+    frame.extend_from_slice(&0x0421_u16.to_le_bytes());
+    frame.extend_from_slice(&[0, 7]);
+    frame.extend_from_slice(b"DIRECT-");
+    frame.extend_from_slice(&[1, OPEN_AP_OFDM_BASIC_RATES.len() as u8]);
+    frame.extend_from_slice(&OPEN_AP_OFDM_BASIC_RATES);
+    frame.extend_from_slice(&[3, 1, channel]);
+    let mut p2p = [0u8; 64];
+    let used = dmesh_rawnan::p2p::encode_discovery_advertisement(&mut p2p, source, channel)
+        .map_err(|error| anyhow::anyhow!("P2P probe-response IE: {error:?}"))?;
+    frame.extend_from_slice(&p2p[..used]);
+    Ok(frame)
+}
+
+/// Build a successful `dmesh._dmesh._tcp` DNS-SD response for a received P2P
+/// SD request. The portable codec validates and echoes the query key and
+/// transaction; this Linux adapter supplies only the management header.
+fn build_dmesh_p2p_sd_response(source: [u8; 6], request: &[u8]) -> Option<Vec<u8>> {
+    let destination = mac_at(request, IEEE80211_ADDR2)?;
+    let mut frame = mgmt_frame_header(13, destination, source, source);
+    let mut presence = [0u8; 18];
+    let presence_len =
+        dmesh_rawnan::p2p::encode_dmesh_service_presence_txt(&mut presence, &source).ok()?;
+    let mut body = [0u8; 192];
+    let used = dmesh_rawnan::p2p::encode_dmesh_dns_sd_gas_initial_response(
+        &mut body,
+        request,
+        &presence[..presence_len],
+    )
+    .ok()?;
+    frame.extend_from_slice(&body[..used]);
+    Some(frame)
 }
 
 fn send_open_ap_mgmt_response(
@@ -9652,6 +9934,24 @@ fn esp_open_ap_beacon_tail(channel: u8) -> Vec<u8> {
         0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x04, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27, 0xa4, 0x00,
         0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
     ]);
+    // Passive P2P presence only.  It keeps the AP discoverable on channel 6
+    // without starting a probe, GAS, P2P SD, or group-negotiation exchange.
+    // Those stateful frames are controller-triggered Phase-2 work.
+    ies.extend_from_slice(&dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE);
+    ies
+}
+
+/// Replace the static capability-only marker with the complete device/channel
+/// advertisement when a real AP MAC is available. Android creates a P2P peer
+/// only after it sees Device Info and Listen Channel, not capability alone.
+fn esp_open_ap_beacon_tail_for_device(mac: [u8; 6], channel: u8) -> Vec<u8> {
+    let mut ies = esp_open_ap_beacon_tail(channel);
+    let marker = dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE.len();
+    ies.truncate(ies.len().saturating_sub(marker));
+    let mut p2p = [0u8; 64];
+    let used = dmesh_rawnan::p2p::encode_discovery_advertisement(&mut p2p, mac, channel)
+        .expect("bounded P2P discovery IE");
+    ies.extend_from_slice(&p2p[..used]);
     ies
 }
 
@@ -9675,12 +9975,38 @@ fn hostapd_open_ap_beacon_tail(channel: u8, ht40: bool) -> Vec<u8> {
         0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00, 0x03, 0xa4, 0x00, 0x00, 0x27, 0xa4, 0x00,
         0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00,
     ]);
+    // Match the ESP-compatible and hostapd-compatible templates: any DMesh
+    // AP passively exposes the same P2P capability marker in beacon and
+    // probe-response IEs, while active P2P remains controller initiated.
+    ies.extend_from_slice(&dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE);
+    ies
+}
+
+fn hostapd_open_ap_beacon_tail_for_device(mac: [u8; 6], channel: u8, ht40: bool) -> Vec<u8> {
+    let mut ies = hostapd_open_ap_beacon_tail(channel, ht40);
+    let marker = dmesh_rawnan::p2p::PASSIVE_DISCOVERY_IE.len();
+    ies.truncate(ies.len().saturating_sub(marker));
+    let mut p2p = [0u8; 64];
+    let used = dmesh_rawnan::p2p::encode_discovery_advertisement(&mut p2p, mac, channel)
+        .expect("bounded P2P discovery IE");
+    ies.extend_from_slice(&p2p[..used]);
     ies
 }
 
 fn hostapd_open_ap_probe_ies(ssid: &str, channel: u8, ht40: bool) -> Result<Vec<u8>> {
     let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
     ies.extend_from_slice(&hostapd_open_ap_beacon_tail(channel, ht40));
+    Ok(ies)
+}
+
+fn hostapd_open_ap_probe_ies_for_device(
+    ssid: &str,
+    mac: [u8; 6],
+    channel: u8,
+    ht40: bool,
+) -> Result<Vec<u8>> {
+    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
+    ies.extend_from_slice(&hostapd_open_ap_beacon_tail_for_device(mac, channel, ht40));
     Ok(ies)
 }
 
@@ -9698,6 +10024,12 @@ fn wmm_parameter_ie() -> [u8; 26] {
 fn esp_open_ap_probe_ies(ssid: &str, channel: u8) -> Result<Vec<u8>> {
     let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
     ies.extend_from_slice(&esp_open_ap_beacon_tail(channel));
+    Ok(ies)
+}
+
+fn esp_open_ap_probe_ies_for_device(ssid: &str, mac: [u8; 6], channel: u8) -> Result<Vec<u8>> {
+    let mut ies = esp_open_ap_beacon_head_ies(ssid, channel)?;
+    ies.extend_from_slice(&esp_open_ap_beacon_tail_for_device(mac, channel));
     Ok(ies)
 }
 
@@ -10545,6 +10877,7 @@ mod tests {
                 peer: "[fe80::1]:5227".to_string(),
                 bssid: None,
                 announce: json!({"device_id": "stale"}),
+                observations: BTreeMap::new(),
             },
         );
         registry.snapshot();
@@ -10722,6 +11055,11 @@ mod tests {
             Some(OPEN_AP_OFDM_EXTENDED_RATES.as_slice())
         );
         assert_eq!(management_ie_bytes(&ies, 3), Some(&[11][..]));
+        assert!(
+            dmesh_rawnan::p2p::parse_advertisement(&ies)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(management_ie_bytes(assoc_ies, 61).map(|ie| ie[0]), Some(11));
         assert_eq!(OPEN_AP_OFDM_BASIC_RATES, [0x8c]);
         assert_eq!(OPEN_AP_OFDM_EXTENDED_RATES, [0x30, 0x48, 0x60, 0x6c]);
@@ -10760,6 +11098,11 @@ mod tests {
             management_ie_bytes(assoc_ies, 61)
         );
         assert!(management_ie_bytes(probe_ies, 221).is_some());
+        assert!(
+            dmesh_rawnan::p2p::parse_advertisement(probe_ies)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

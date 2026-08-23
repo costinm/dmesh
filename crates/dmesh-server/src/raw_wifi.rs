@@ -122,7 +122,8 @@ pub fn encode_raw_wifi_control_request(
         + usize::from(control.action_destination_broadcast.is_some())
         + usize::from(control.roc_listen_ms.is_some())
         + usize::from(control.roc_loop.is_some())
-        + usize::from(control.action_dispatcher.is_some());
+        + usize::from(control.action_dispatcher.is_some())
+        + usize::from(control.nan_capture_ms.is_some());
     let mut encoder = Encoder::new(out);
     encoder.map(3)?;
     encoder.uint(1)?;
@@ -218,6 +219,10 @@ pub fn encode_raw_wifi_control_request(
         encoder.uint(27)?;
         encoder.boolean(value)?;
     }
+    if let Some(value) = control.nan_capture_ms {
+        encoder.uint(28)?;
+        encoder.uint(u64::from(value))?;
+    }
     Some(encoder.len())
 }
 
@@ -262,7 +267,7 @@ pub fn encode_raw_wifi_iperf_request(
     encoder.uint(2)?;
     encoder.uint(RAW_WIFI_METHOD_IPERF)?;
     encoder.uint(5)?;
-    encoder.map(4)?;
+    encoder.map(5)?;
     encoder.uint(21)?;
     encoder.bytes_value(&request.peer)?;
     encoder.uint(22)?;
@@ -271,6 +276,8 @@ pub fn encode_raw_wifi_iperf_request(
     encoder.uint(u64::from(request.packet_size))?;
     encoder.uint(24)?;
     encoder.uint(u64::from(request.timeout_ms))?;
+    encoder.uint(29)?;
+    encoder.uint(u64::from(request.bearer as u8))?;
     Some(encoder.len())
 }
 
@@ -376,6 +383,9 @@ pub struct RawWifiControlRequest {
     /// Enable the continuous private NOW dispatcher. ROC-only experiments
     /// disable this so private callback delivery cannot mask ROC evidence.
     pub action_dispatcher: Option<bool>,
+    /// One bounded permissive NAN management-capture window on the current
+    /// channel. This is an observation request, not an ESP-IDF scan/retune.
+    pub nan_capture_ms: Option<u16>,
 }
 
 /// One bounded action-bearer health check.  The adapter owns only raw frame
@@ -387,7 +397,19 @@ pub struct RawWifiCheckRequest {
     pub timeout_ms: u32,
 }
 
-/// One bounded raw action IPERF request. This does not create a socket or a
+/// Explicit data bearer for a device-originated pair IPERF run. `Auto` keeps
+/// the compatibility policy (NOW when unassociated, UDP6 when associated);
+/// the comprehensive probe names the bearer so its STA+NOW regression row
+/// cannot silently become an UDP6 test.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawWifiBearer {
+    Auto = 0,
+    Now = 1,
+    Udp6 = 2,
+}
+
+/// One bounded raw IPERF request. This does not create a socket or a
 /// per-packet queue: the common QUIC-lite client retains the bounded ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawWifiIperfRequest {
@@ -395,6 +417,7 @@ pub struct RawWifiIperfRequest {
     pub bytes: u64,
     pub packet_size: u16,
     pub timeout_ms: u32,
+    pub bearer: RawWifiBearer,
 }
 
 impl RawWifiIperfRequest {
@@ -484,6 +507,18 @@ pub struct RawWifiCounters {
     pub udp6_raw_tx_completions: u32,
     pub udp6_raw_tx_completion_failures: u32,
     pub udp6_raw_tx_completion_rate: u32,
+    /// P2P management Probe Requests observed by the radio owner. This is
+    /// receipt evidence only; an AP driver may produce its Probe Response.
+    pub p2p_probe_requests: u32,
+    /// P2P Probe Responses submitted by the Wi-Fi owner.
+    pub p2p_probe_responses: u32,
+    /// P2P Service Discovery GAS Initial Requests accepted by the bounded
+    /// management ingress.
+    pub p2p_gas_requests: u32,
+    /// GAS Initial Responses submitted by the Wi-Fi owner.
+    pub p2p_gas_responses: u32,
+    /// P2P response intents dropped before a successful driver submission.
+    pub p2p_response_drops: u32,
 }
 
 /// Version of the cross-platform per-peer Wi-Fi metrics record.
@@ -690,6 +725,21 @@ impl RawWifiCounters {
                 .udp6_raw_tx_completion_failures
                 .saturating_sub(before.udp6_raw_tx_completion_failures),
             udp6_raw_tx_completion_rate: self.udp6_raw_tx_completion_rate,
+            p2p_probe_requests: self
+                .p2p_probe_requests
+                .saturating_sub(before.p2p_probe_requests),
+            p2p_probe_responses: self
+                .p2p_probe_responses
+                .saturating_sub(before.p2p_probe_responses),
+            p2p_gas_requests: self
+                .p2p_gas_requests
+                .saturating_sub(before.p2p_gas_requests),
+            p2p_gas_responses: self
+                .p2p_gas_responses
+                .saturating_sub(before.p2p_gas_responses),
+            p2p_response_drops: self
+                .p2p_response_drops
+                .saturating_sub(before.p2p_response_drops),
         }
     }
 }
@@ -884,7 +934,7 @@ pub fn encode_raw_wifi_snapshot(
     e.uint(6)?;
     // Epoch, comparator errors, and monotonic counters are always
     // present, letting the host calculate deltas without retaining FW state.
-    e.map((46 + optional) as u64)?;
+    e.map((51 + optional) as u64)?;
     e.uint(20)?;
     e.uint(u64::from(snapshot.epoch))?;
     if let Some(channel) = snapshot.channel {
@@ -1058,6 +1108,11 @@ pub fn encode_raw_wifi_snapshot(
         (75, snapshot.counters.udp6_raw_tx_completions),
         (76, snapshot.counters.udp6_raw_tx_completion_failures),
         (77, snapshot.counters.udp6_raw_tx_completion_rate),
+        (97, snapshot.counters.p2p_probe_requests),
+        (101, snapshot.counters.p2p_probe_responses),
+        (98, snapshot.counters.p2p_gas_requests),
+        (99, snapshot.counters.p2p_gas_responses),
+        (100, snapshot.counters.p2p_response_drops),
     ] {
         e.uint(key)?;
         e.uint(u64::from(value))?;
@@ -1109,10 +1164,37 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
             22 => snapshot.sta_associated = Some(decoder.boolean().ok_or("radio STA")?),
             23 => snapshot.promiscuous = Some(decoder.boolean().ok_or("radio promiscuous")?),
             24 => snapshot.dw_capturing = Some(decoder.boolean().ok_or("radio DW")?),
-            96 => snapshot.nan_dw_interval = Some(
-                u8::try_from(decoder.uint().ok_or("radio DW interval")?)
-                    .map_err(|_| "radio DW interval")?,
-            ),
+            96 => {
+                snapshot.nan_dw_interval = Some(
+                    u8::try_from(decoder.uint().ok_or("radio DW interval")?)
+                        .map_err(|_| "radio DW interval")?,
+                )
+            }
+            97 => {
+                snapshot.counters.p2p_probe_requests =
+                    u32::try_from(decoder.uint().ok_or("radio P2P Probe Requests")?)
+                        .map_err(|_| "radio P2P Probe Requests")?
+            }
+            101 => {
+                snapshot.counters.p2p_probe_responses =
+                    u32::try_from(decoder.uint().ok_or("radio P2P Probe Responses")?)
+                        .map_err(|_| "radio P2P Probe Responses")?
+            }
+            98 => {
+                snapshot.counters.p2p_gas_requests =
+                    u32::try_from(decoder.uint().ok_or("radio P2P GAS requests")?)
+                        .map_err(|_| "radio P2P GAS requests")?
+            }
+            99 => {
+                snapshot.counters.p2p_gas_responses =
+                    u32::try_from(decoder.uint().ok_or("radio P2P GAS responses")?)
+                        .map_err(|_| "radio P2P GAS responses")?
+            }
+            100 => {
+                snapshot.counters.p2p_response_drops =
+                    u32::try_from(decoder.uint().ok_or("radio P2P response drops")?)
+                        .map_err(|_| "radio P2P response drops")?
+            }
             25 => {
                 snapshot.comparator_bssid = Some(
                     decoder
@@ -1596,6 +1678,7 @@ fn decode_raw_wifi_tx_fields(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'stat
 /// 1 mgmt+data), 13=AP mode (0 disabled, 1 open), 14=AP beacon interval in
 /// TU, 15=raw STA mode (1 Main-style non-promiscuous), and 16=MAC ACK
 /// required. 25 is one bounded same-channel ROC listener duration in ms.
+/// IPERF key 29 selects 0=auto, 1=NOW, or 2=raw UDP6.
 /// Unknown keys are
 /// skipped for forward-compatible snapshots.
 fn decode_raw_wifi_lab_inner(
@@ -1616,6 +1699,7 @@ fn decode_raw_wifi_lab_inner(
     let mut iperf_bytes = None;
     let mut iperf_packet_size = None;
     let mut iperf_timeout_ms = None;
+    let mut iperf_bearer = RawWifiBearer::Auto;
     let mut entry = 0;
     while (entries == u64::MAX && !decoder.consume_break())
         || (entries != u64::MAX && entry < entries)
@@ -1701,6 +1785,12 @@ fn decode_raw_wifi_lab_inner(
                 control.action_dispatcher =
                     Some(decoder.boolean().ok_or("raw wifi action dispatcher")?)
             }
+            28 => {
+                control.nan_capture_ms = Some(
+                    u16::try_from(decoder.uint().ok_or("raw wifi NAN capture duration")?)
+                        .map_err(|_| "raw wifi NAN capture duration")?,
+                )
+            }
             17 => {
                 let peer = decoder.bytes_ref().ok_or("raw wifi check peer")?;
                 check_peer = Some(peer.try_into().map_err(|_| "raw wifi check peer")?);
@@ -1728,6 +1818,14 @@ fn decode_raw_wifi_lab_inner(
                     u32::try_from(decoder.uint().ok_or("raw wifi iperf timeout")?)
                         .map_err(|_| "raw wifi iperf timeout")?,
                 )
+            }
+            29 => {
+                iperf_bearer = match decoder.uint().ok_or("raw wifi iperf bearer")? {
+                    0 => RawWifiBearer::Auto,
+                    1 => RawWifiBearer::Now,
+                    2 => RawWifiBearer::Udp6,
+                    _ => return Err("raw wifi iperf bearer"),
+                }
             }
             _ => decoder.skip().ok_or("raw wifi value")?,
         }
@@ -1761,6 +1859,12 @@ fn decode_raw_wifi_lab_inner(
             if control.roc_loop == Some(true) && control.roc_listen_ms.is_none() {
                 return Err("raw wifi ROC loop duration");
             }
+            if control
+                .nan_capture_ms
+                .is_some_and(|value| !(100..=600).contains(&value))
+            {
+                return Err("raw wifi NAN capture duration");
+            }
             Ok(RawWifiLabRequest::Control(control))
         }
         Some(RAW_WIFI_OP_SNAPSHOT) => Ok(RawWifiLabRequest::Snapshot),
@@ -1782,6 +1886,7 @@ fn decode_raw_wifi_lab_inner(
                 bytes: iperf_bytes.ok_or("raw wifi iperf bytes")?,
                 packet_size: iperf_packet_size.ok_or("raw wifi iperf packet size")?,
                 timeout_ms: iperf_timeout_ms.ok_or("raw wifi iperf timeout")?,
+                bearer: iperf_bearer,
             };
             request
                 .valid()
@@ -1973,6 +2078,7 @@ mod tests {
             sta_state: Some(RawWifiStaState::DisconnectHold),
             promiscuous: Some(false),
             dw_policy: Some(RawWifiDwPolicy::Disabled),
+            nan_capture_ms: Some(600),
             ..RawWifiControlRequest::default()
         };
         let mut command = [0; 64];
@@ -1986,6 +2092,7 @@ mod tests {
         assert_eq!(control.sta_state, Some(RawWifiStaState::DisconnectHold));
         assert_eq!(control.promiscuous, Some(false));
         assert_eq!(control.dw_policy, Some(RawWifiDwPolicy::Disabled));
+        assert_eq!(control.nan_capture_ms, Some(600));
     }
 
     #[test]
@@ -2073,6 +2180,7 @@ mod tests {
             bytes: 64 * 1024,
             packet_size: quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u16,
             timeout_ms: 10_000,
+            bearer: RawWifiBearer::Now,
         };
         let mut wire = [0; 64];
         let used = encode_raw_wifi_iperf_request(request, &mut wire).unwrap();

@@ -163,6 +163,8 @@ pub(crate) fn observe_announce(
                 "uptime_secs": announce.uptime_secs,
                 "transport_mode": announce.transport_mode,
                 "counters": announce.counters,
+                "device_class": announce.device_class,
+                "probe_capabilities": announce.probe_capabilities,
             }),
         },
     );
@@ -722,6 +724,18 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     counters,
                 )
             };
+            // Android emits the same descriptor used by Linux and ESP.  The
+            // advertised subset avoids scheduling ESP-NOW rows for phones;
+            // Android-specific NAN data-path capability remains a separate
+            // request bit because it is framework- and permission-dependent.
+            let mut announce = announce;
+            announce.set_probe_descriptor(
+                dmesh_server::announce::DEVICE_CLASS_ANDROID,
+                dmesh_server::probe::PROBE_CAP_NAN
+                    | dmesh_server::probe::PROBE_CAP_STA
+                    | dmesh_server::probe::PROBE_CAP_AP
+                    | dmesh_server::probe::PROBE_CAP_UDP6,
+            );
             let mut out = [0; 96];
             let used = dmesh_server::announce::encode(announce, &mut out)
                 .ok_or_else(|| anyhow::anyhow!("announce encoding exceeded bound"))?;
@@ -745,6 +759,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 "bssid_hex": config.bssid.map(|value| bytes_to_hex(&value)).unwrap_or_default(),
                 "channel": config.channel.map(|value| value.to_string()).unwrap_or_default(),
                 "now": config.now.map(|value| value.to_string()).unwrap_or_default(),
+                "ndp": config.ndp.map(|value| value.to_string()).unwrap_or_default(),
                 "nan_dw_interval": config.nan_dw_interval.map(|value| value.to_string()).unwrap_or_default(),
                 "ap": config.ap.map(|value| value.to_string()).unwrap_or_default(),
             })
@@ -759,14 +774,40 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 _ => anyhow::bail!("transport mode must be sta or nan"),
             };
             let ssid = cmd.data.get("ssid").map(String::as_bytes);
-            let passphrase = cmd.data.get("passphrase").map(String::as_bytes);
+            // Open APs intentionally omit the credential.  An empty CBOR
+            // passphrase is not a valid WPA2 value and must not prevent the
+            // firmware from clearing a previous volatile WPA profile.
+            let passphrase = cmd
+                .data
+                .get("passphrase")
+                .filter(|value| !value.is_empty())
+                .map(String::as_bytes);
             let ap = cmd.data.get("ap").map(|value| u8::from(value == "1"));
+            let ndp = cmd.data.get("ndp").map(|value| u8::from(value == "1"));
+            let bssid = cmd
+                .data
+                .get("bssid")
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    if value.len() != 12 {
+                        anyhow::bail!("BSSID must be 12 hexadecimal characters");
+                    }
+                    let mut bytes = [0u8; 6];
+                    for (index, byte) in bytes.iter_mut().enumerate() {
+                        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                            .map_err(|_| anyhow::anyhow!("BSSID is not hexadecimal"))?;
+                    }
+                    Ok::<_, anyhow::Error>(bytes)
+                })
+                .transpose()?;
             let request = dmesh_server::control::Request::TransportStart {
                 kind,
                 config: dmesh_server::control::TransportConfig {
                     ssid,
                     passphrase,
+                    bssid,
                     ap,
+                    ndp,
                     ..dmesh_server::control::TransportConfig::default()
                 },
             };
@@ -838,6 +879,98 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 })
                 .collect();
             json!({"devices": devices}).to_string().into_bytes()
+        }
+        "radio.probe.plan" => {
+            let source_id = required_data(&cmd, "source_id")?;
+            let target_id = required_data(&cmd, "target_id")?;
+            if source_id == target_id {
+                anyhow::bail!("source_id and target_id must differ");
+            }
+            let short_bytes = parse_u32(&cmd, "short_bytes", 4 * 1024)?;
+            let long_bytes = parse_u32(&cmd, "long_bytes", 64 * 1024)?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut devices = discovered_devices()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
+            prune_discovered_devices(&mut devices, now_ms);
+            let descriptor = |id: &str| -> anyhow::Result<dmesh_server::probe::ProbeDeviceDescriptor> {
+                let device = devices
+                    .get(id)
+                    .ok_or_else(|| anyhow::anyhow!("Android discovery has no device {id:?}"))?;
+                let class = device.info.get("device_class").and_then(Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(dmesh_server::announce::DEVICE_CLASS_UNKNOWN);
+                let kind = match class {
+                    dmesh_server::announce::DEVICE_CLASS_ESP => dmesh_server::probe::ProbeEndpointKind::Esp,
+                    dmesh_server::announce::DEVICE_CLASS_HOST => dmesh_server::probe::ProbeEndpointKind::Host,
+                    dmesh_server::announce::DEVICE_CLASS_ANDROID => dmesh_server::probe::ProbeEndpointKind::Android,
+                    _ => anyhow::bail!("Android discovery device {id:?} has no supported device_class"),
+                };
+                let capabilities = device.info.get("probe_capabilities").and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .filter(|value| *value != 0)
+                    .ok_or_else(|| anyhow::anyhow!("Android discovery device {id:?} has no probe capabilities"))?;
+                let id_bytes = hex_to_bytes(id)?;
+                if id_bytes.len() < 6 {
+                    anyhow::bail!("Android discovery device {id:?} has no six-byte radio identity");
+                }
+                let mut node = [0; 6];
+                node.copy_from_slice(&id_bytes[..6]);
+                Ok(dmesh_server::probe::ProbeDeviceDescriptor {
+                    endpoint: dmesh_server::probe::ProbeEndpoint {
+                        kind,
+                        node,
+                        mode: dmesh_server::probe::ProbeMode::NAN_NOW,
+                        bssid: None,
+                    },
+                    capabilities,
+                })
+            };
+            let source = descriptor(source_id)?;
+            let target = descriptor(target_id)?;
+            let rows = dmesh_server::probe::full_pair_probe_requests(
+                0x4D_50_3000,
+                source,
+                target,
+                short_bytes,
+                long_bytes,
+            );
+            if rows.is_empty() {
+                anyhow::bail!("selected Android-control-plane endpoints share no NAN row");
+            }
+            // Match the lmesh-wifi plan response: the local controller can
+            // present a live ESP/Android/Host fleet picker before it selects
+            // two endpoints. This is observation only and does not alter the
+            // Android controller's own NAN, AP, or STA state.
+            let discovered = devices
+                .iter()
+                .filter_map(|(id, device)| {
+                    let class = device.info.get("device_class")?.as_u64()? as u8;
+                    let kind = match class {
+                        dmesh_server::announce::DEVICE_CLASS_ESP => "esp",
+                        dmesh_server::announce::DEVICE_CLASS_HOST => "host",
+                        dmesh_server::announce::DEVICE_CLASS_ANDROID => "android",
+                        _ => return None,
+                    };
+                    let capabilities = device.info.get("probe_capabilities")?.as_u64()?;
+                    Some(json!({
+                        "id": id,
+                        "kind": kind,
+                        "capabilities": capabilities,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "ok": true,
+                "control_plane": "android",
+                "control_plane_mode_changed": false,
+                "discovered": discovered,
+                "source": source,
+                "target": target,
+                "rows": rows,
+            })
+            .to_string()
+            .into_bytes()
         }
         "radio.nan.followups" => {
             let history = nan_followups()
@@ -1764,6 +1897,26 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStop(
     if handle != 0 {
         let handle = unsafe { Box::from_raw(handle as *mut MeshHandle) };
         crate::mesh_common::stop_mesh(*handle);
+    }
+}
+
+/// Notify the Rust-owned announce worker that Android has gained a new local
+/// link. The Java P2P adapter supplies no address or payload; it only signals
+/// a platform lifecycle transition.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeTriggerAnnounce(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return JNI_FALSE;
+    }
+    let handle = unsafe { &*(handle as *const MeshHandle) };
+    if crate::mesh_common::trigger_announce(handle) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
     }
 }
 

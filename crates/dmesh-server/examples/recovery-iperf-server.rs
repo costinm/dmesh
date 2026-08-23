@@ -1,4 +1,4 @@
-//! Standalone current-build transport listener for host and Recovery IPERF.
+//! Standalone current-build transport listener for host and firmware IPERF.
 //! It intentionally does not own or restart either managed Wi-Fi service.
 
 use dmesh_server::udp::{TransportControl, UdpConfig, run};
@@ -28,9 +28,9 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| value.parse::<u64>())
         .transpose()?
         .unwrap_or(0);
-    // This is a host performance listener, not a Recovery-memory emulator.
+    // This is a host performance listener, not a device-memory emulator.
     // Use the largest bounded host ledger by default; device comparisons pass
-    // their explicit Recovery window as the fifth argument.
+    // their explicit device window as the fifth argument.
     let history_capacity = args
         .next()
         .map(|value| value.parse::<usize>())

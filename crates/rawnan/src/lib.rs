@@ -1,5 +1,6 @@
 #![no_std]
-//! Shared wire-level NAN definitions for Linux, ESP32, and Android adapters.
+//! Shared wire-level light-Wi-Fi definitions for Linux, ESP32, and Android
+//! adapters: NAN for clock/discovery, DMesh NOW, and the bounded P2P subset.
 //!
 //! The important boundary is intentional: this crate owns bytes on the air
 //! (802.11 offsets, NAN attributes, SDF layout, service descriptors, and
@@ -17,6 +18,10 @@ pub use espnow::{
     action_header as espnow_action_header, build_action_frame as build_espnow_action_frame,
     parse_action_frame as parse_espnow_action_frame,
 };
+
+/// Wi-Fi Direct/P2P passive-discovery wire primitives. Active Service
+/// Discovery and negotiation are deliberately controller-triggered.
+pub mod p2p;
 
 pub mod channel_observation;
 pub use channel_observation::{ChannelObservation, ChannelObservationSummary};
@@ -834,6 +839,15 @@ mod tests {
     }
 
     #[test]
+    fn p2p_public_action_is_not_misclassified_as_nan() {
+        let mut frame = vec![0_u8; FRAME_DATA];
+        frame[0] = 0xd0;
+        frame.extend_from_slice(&[0x04, 0x09, 0x50, 0x6f, 0x9a, 0x09]);
+        assert!(is_p2p_public_action(&frame));
+        assert_eq!(classify(&frame), FrameKind::P2p);
+    }
+
+    #[test]
     fn service_descriptor_scan_keeps_primary_and_announce_services() {
         let primary = [7, 8, 9, 10, 11, 12];
         let announce = [13, 14, 15, 16, 17, 18];
@@ -1090,6 +1104,12 @@ pub enum FrameKind {
     Beacon,
     Sdf,
     Followup,
+    /// Wi-Fi Direct public action. Phase 1 only classifies this; P2P Service
+    /// Discovery and negotiation remain explicit controller operations.
+    P2p,
+    /// Generic Advertisement Service request/response. P2P Service Discovery
+    /// is carried inside GAS rather than the P2P public-action subtype.
+    Gas,
 }
 
 pub fn bssid(frame: &[u8]) -> Option<[u8; 6]> {
@@ -1180,6 +1200,33 @@ pub fn is_nan_sdf(frame: &[u8]) -> bool {
     frame.len() > NAN_ACTION_START
         && frame.get(FRAME_DATA..FRAME_DATA + 6) == Some(&[0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13])
 }
+/// Whether an 802.11 action frame carries the Wi-Fi Direct public-action
+/// prefix. The portable P2P parser receives the action body after this cheap
+/// classifier has selected it.
+pub fn is_p2p_public_action(frame: &[u8]) -> bool {
+    is_action_frame(frame)
+        && frame
+            .get(FRAME_DATA..)
+            .map(p2p::is_public_action)
+            .unwrap_or(false)
+}
+/// Whether a frame is the beginning of a P2P Service Discovery GAS request.
+pub fn is_gas_initial_request(frame: &[u8]) -> bool {
+    is_action_frame(frame)
+        && frame
+            .get(FRAME_DATA..)
+            .map(p2p::is_gas_initial_request)
+            .unwrap_or(false)
+}
+/// Return whether a management Probe Request contains a P2P vendor IE.
+/// Probe Requests have no fixed body, so their IEs begin at `FRAME_DATA`.
+pub fn is_p2p_probe_request(frame: &[u8]) -> bool {
+    frame.first() == Some(&0x40)
+        && p2p::parse_advertisement(frame.get(FRAME_DATA..).unwrap_or_default())
+            .ok()
+            .flatten()
+            .is_some()
+}
 pub fn classify(frame: &[u8]) -> FrameKind {
     if is_nan_beacon(frame) {
         FrameKind::Beacon
@@ -1187,6 +1234,10 @@ pub fn classify(frame: &[u8]) -> FrameKind {
         FrameKind::Followup
     } else if is_nan_sdf(frame) {
         FrameKind::Sdf
+    } else if is_p2p_public_action(frame) {
+        FrameKind::P2p
+    } else if is_gas_initial_request(frame) {
+        FrameKind::Gas
     } else {
         FrameKind::Other
     }
@@ -1413,6 +1464,12 @@ impl NanState {
     }
     pub const fn last_beacon_tsf_us(&self) -> u64 {
         self.last_beacon_tsf_us
+    }
+    /// Local monotonic receive timestamp for the selected NAN beacon. This is
+    /// exposed to host control-plane diagnostics so a prober can distinguish
+    /// a live cluster from a stale historical TSF value.
+    pub const fn last_beacon_local_us(&self) -> u64 {
+        self.last_beacon_us
     }
     pub const fn beacon_interval_tu(&self) -> u32 {
         self.beacon_interval_tu

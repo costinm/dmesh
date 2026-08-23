@@ -47,7 +47,7 @@ firmware command grammar.
 radio profile: `2:ssid` (STA target), `5:raw_tx_rate`, `6:sta_driver_tx`,
 `7:sta_bssid_check_disabled`, `8:sta_ampdu_enabled`, `9:sta_11b_rates_disabled`,
 `10:sta_raw_rx_enabled`, `13:espnow_capture`, `14:nan_dw_interval`, `15:now`,
-`16:ap`, and optional `17:sta_passphrase` (8..63 bytes, volatile WPA2
+`16:ap`, optional `17:sta_passphrase` (8..63 bytes, volatile WPA2
 credential). Omitted fields use the current profile defaults only while this
 new epoch is constructed; they cannot be patched afterward. A later start is
 the only way to replace a selected radio setup. `ssid` is session data, not an
@@ -55,7 +55,10 @@ NVS write, so UART and future NAN Service Info use identical CBOR. Replaying
 the same complete start (as an active NAN Publish/Subscribe may do in several
 discovery windows) is an acknowledgement-only no-op: it must not stop Wi-Fi,
 reset NOW, or begin another association. A different complete profile is the
-only start that replaces the current epoch.
+only start that replaces the current epoch. `19:ndp` is the common NAN Data
+Path policy (`0` off, `1` on). Android implements it today; adapters without
+NDP retain the requested profile and report unsupported capability rather than
+interpreting it as a different bearer.
 
 `now=0` is the default/on spelling, `now=1` is explicit on, and `now=2` is
 explicit off for the raw-UDP6 baseline. The initial ESP adapter currently
@@ -82,14 +85,18 @@ then returns one structured response.
 
 The request contains each endpoint's implementation (`Host`, `Android`, or
 `ESP`), identity, and full desired mode
-(`transport_kind`, `now`, `nan_dw_interval`, and `ap`), optional directed STA
-`bssid`, requested bearer checks (`test_nan`, `test_now`, `test_udp6`), short
-and sustained byte counts, and `measure_mode_switch`. It supports a
+(`transport_kind`, `now`, `nan_dw_interval`, `ndp`, and `ap`), optional directed STA
+`bssid`, requested bearer checks (`test_nan`, `test_nan_data`, `test_now`, `test_udp6`), short
+and sustained byte counts, and `measure_mode_switch`. `test_scan` requests a
+bounded passive AP observation; `test_soft_ap` measures Android/host local
+SoftAP creation. It supports a
 NAN+NOW-only ESP pair (`udp6=false`) and an Android path (`now=false,
 udp6=true`) without minting distinct APIs.
 
 The response records per-endpoint mode replacement/BSSID-association timing,
-whether a requested colocated AP stayed active,
+whether a requested colocated AP stayed active, per-endpoint SoftAP outcomes,
+and source/target scan counts (all APs, channel-6 APs, DMesh
+candidates, and the last DMesh RSSI),
 and per-bearer attempt/success, packet loss, latency, bytes, elapsed time, and
 RSSI. Unknown metrics are omitted rather than represented as zero. The
 controller uses the recommendation and raw measurements to select a forwarder,

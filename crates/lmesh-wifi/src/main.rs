@@ -60,6 +60,7 @@ fn decode_wifi_tagged_request(
         "wifi.rawnan.status" => {
             serde_json::from_value(value).map(ReviewedWifiRequest::RawNanStatus)
         }
+        "wifi.probe.plan" => serde_json::from_value(value).map(ReviewedWifiRequest::ProbePlan),
         "wifi.interface.status" => {
             serde_json::from_value(value).map(ReviewedWifiRequest::InterfaceStatus)
         }
@@ -89,7 +90,17 @@ async fn main() -> Result<()> {
     // wlan0 is the stable infrastructure fixture: start its AP at service
     // launch. lmesh owns the independent AP-off NAN+NOW/STA+NOW radio.
     for result in service.start_stable() {
+        let phase = if result.get("ssid").is_some() {
+            "ap_start"
+        } else if result.get("monitor_iface").is_some() {
+            "raw_monitor"
+        } else if result.get("profile").is_some() {
+            "rate_profile"
+        } else {
+            "startup"
+        };
         tracing::info!(
+            phase,
             ok = result
                 .get("ok")
                 .and_then(serde_json::Value::as_bool)
@@ -106,7 +117,8 @@ async fn main() -> Result<()> {
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(""),
-            "wifi_startup_rate_profile"
+            result = ?result,
+            "wifi_startup_result"
         );
     }
 
@@ -282,6 +294,31 @@ mod tests {
         assert!(
             matches!(request, ReviewedWifiRequest::RawMetrics(request) if request.iface.as_deref() == Some("wlan0"))
         );
+    }
+
+    #[test]
+    fn reviewed_pair_probe_plan_decodes_numeric_tags() {
+        let request = decode_wifi_tagged_request(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(5),
+            method: mesh::tagged::NameOrTag::Tag(16),
+            id: Some(json!(13)),
+            env: [
+                (mesh::tagged::NameOrTag::Tag(1), json!("wlan0")),
+                (mesh::tagged::NameOrTag::Tag(2), json!("111111111111")),
+                (mesh::tagged::NameOrTag::Tag(3), json!("222222222222")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            request,
+            ReviewedWifiRequest::ProbePlan(request)
+                if request.iface.as_deref() == Some("wlan0")
+                    && request.source_id == "111111111111"
+                    && request.target_id == "222222222222"
+        ));
     }
 
     #[test]

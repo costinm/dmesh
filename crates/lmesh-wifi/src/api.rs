@@ -128,6 +128,53 @@ pub struct WifiRawnanActivePublishRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WifiRawnanActivePublishResponse;
 
+/// Resolve a discovery-selected comprehensive pair probe and return the live ESP/Android/Host fleet without changing the control-plane radio
+/// mesh-api: summary = "Resolve a discovery-selected comprehensive pair probe and return the live ESP/Android/Host fleet without changing the control-plane radio"
+/// mesh-api: id = "wifi.probe.plan"
+/// mesh-api: component = "wifi"
+/// mesh-api: method = "probe.plan"
+/// mesh-api: visibility = "public"
+/// mesh-api: component-index = 5
+/// mesh-api: method-index = 16
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiProbePlanRequest {
+    /// API field `iface`.
+    /// mesh-api-field: index = 1
+    /// mesh-api-field: required = false
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// API field `source_id`.
+    /// mesh-api-field: index = 2
+    /// mesh-api-field: required = true
+    pub source_id: String,
+    /// API field `target_id`.
+    /// mesh-api-field: index = 3
+    /// mesh-api-field: required = true
+    pub target_id: String,
+    /// API field `short_bytes`.
+    /// mesh-api-field: index = 4
+    /// mesh-api-field: required = false
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_bytes: Option<u32>,
+    /// API field `long_bytes`.
+    /// mesh-api-field: index = 5
+    /// mesh-api-field: required = false
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_bytes: Option<u32>,
+}
+
+/// Resolve a discovery-selected comprehensive pair probe and return the live ESP/Android/Host fleet without changing the control-plane radio
+/// mesh-api: summary = "Resolve a discovery-selected comprehensive pair probe and return the live ESP/Android/Host fleet without changing the control-plane radio"
+/// mesh-api: id = "wifi.probe.plan"
+/// mesh-api: component = "wifi"
+/// mesh-api: method = "probe.plan"
+/// mesh-api: visibility = "public"
+/// mesh-api: component-index = 5
+/// mesh-api: method-index = 16
+/// mesh-api: shape = "response"
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WifiProbePlanResponse;
+
 /// Return owned interface status
 /// mesh-api: summary = "Return owned interface status"
 /// mesh-api: id = "wifi.interface.status"

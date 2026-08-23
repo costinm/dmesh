@@ -80,7 +80,13 @@ pub fn register_tagged_component(component: u64, handler: TaggedComponentHandler
 /// call the same component. Service-byte framing remains a compatibility
 /// adapter for the existing echo/iperf/object endpoints.
 pub fn dispatch_tagged_stream(data: &[u8]) -> Option<Vec<u8>> {
-    let record = crate::tagged::decode(data)?;
+    dispatch_tagged_record(crate::tagged::decode(data)?)
+}
+
+/// Dispatch an already-decoded tagged record. UDP/QUIC stream adapters use
+/// [`dispatch_tagged_stream`], while small firmware handlers can avoid a
+/// second decode when their ingress has already inspected the envelope.
+pub fn dispatch_tagged_record(record: crate::tagged::Record<'_>) -> Option<Vec<u8>> {
     let crate::tagged::Name::Tag(component) = record.component? else {
         return None;
     };

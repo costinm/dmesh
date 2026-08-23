@@ -20,11 +20,28 @@ pub const ANNOUNCE_DISCOVERY: u64 = 2;
 pub const ANNOUNCE_OBSERVED: u64 = 3;
 /// Local request/response for bounded DMesh NAN Follow-up receipts.
 pub const ANNOUNCE_FOLLOWUPS_OBSERVED: u64 = 4;
+/// Transition markers use the same presence schema so every bearer can carry
+/// timing evidence without inventing a UART-only event format.
+pub const ANNOUNCE_TRANSITION_BEGIN: u64 = 5;
+pub const ANNOUNCE_SLEEP_PENDING: u64 = 6;
+pub const ANNOUNCE_TRANSITION_COMPLETE: u64 = 7;
+pub const ANNOUNCE_WAKE: u64 = 8;
 
 const FIELD_DEVICE_ID: u64 = 1;
 const FIELD_UPTIME_SECS: u64 = 2;
 const FIELD_TRANSPORT_MODE: u64 = 3;
 const FIELD_COUNTERS: u64 = 4;
+/// Optional producer class for discovery-driven control-plane selection.
+/// `0` deliberately means legacy/unknown so existing records remain valid.
+pub const FIELD_DEVICE_CLASS: u64 = 7;
+/// Optional supported probe-feature bit set.  The values are shared with
+/// `probe::PROBE_CAP_*`; absence means the control plane must use a local
+/// descriptor override or decline capability-dependent rows.
+pub const FIELD_PROBE_CAPABILITIES: u64 = 8;
+pub const DEVICE_CLASS_UNKNOWN: u8 = 0;
+pub const DEVICE_CLASS_ESP: u8 = 1;
+pub const DEVICE_CLASS_HOST: u8 = 2;
+pub const DEVICE_CLASS_ANDROID: u8 = 3;
 /// Optional DER SubjectPublicKeyInfo. Hosts currently use P-256; the tagged
 /// field leaves the key algorithm to the public-key encoding itself.
 pub const FIELD_PUBLIC_KEY: u64 = 5;
@@ -45,6 +62,10 @@ pub struct Announce {
     pub transport_mode: u8,
     /// A compact implementation-defined golden-counter summary.
     pub counters: u32,
+    /// Producer class advertised for discovery-driven pair selection.
+    pub device_class: u8,
+    /// Shared `probe::PROBE_CAP_*` capability set, or zero for legacy peers.
+    pub probe_capabilities: u16,
     /// Optional public-key identity for hosts/Android. ESP leaves this empty.
     pub public_key: [u8; MAX_PUBLIC_KEY],
     pub public_key_len: u8,
@@ -94,6 +115,8 @@ impl Announce {
             uptime_secs: 0,
             transport_mode,
             counters: 0,
+            device_class: DEVICE_CLASS_UNKNOWN,
+            probe_capabilities: 0,
             public_key: [0; MAX_PUBLIC_KEY],
             public_key_len: 0,
             signature: [0; SIGNATURE_LEN],
@@ -115,6 +138,8 @@ impl Announce {
             uptime_secs,
             transport_mode,
             counters,
+            device_class: DEVICE_CLASS_UNKNOWN,
+            probe_capabilities: 0,
             public_key: [0; MAX_PUBLIC_KEY],
             public_key_len: 0,
             signature: [0; SIGNATURE_LEN],
@@ -136,6 +161,14 @@ impl Announce {
 
     pub fn has_identity(&self) -> bool {
         !self.public_key().is_empty() && !self.signature().is_empty()
+    }
+
+    /// Attach optional discovery-only selection metadata.  It is not a trust
+    /// assertion: signed hosts still require their existing key/signature and
+    /// unsigned ESP records remain hints until the control exchange succeeds.
+    pub fn set_probe_descriptor(&mut self, device_class: u8, probe_capabilities: u16) {
+        self.device_class = device_class;
+        self.probe_capabilities = probe_capabilities;
     }
 
     /// Attach a host/Android public key before calculating its signature.
@@ -198,7 +231,9 @@ fn encode_inner(announce: Announce, include_signature: bool, out: &mut [u8]) -> 
     e.uint(2)?;
     e.uint(announce.kind)?;
     e.uint(5)?;
-    e.map(4 + u64::from(has_key) + u64::from(has_signature))?;
+    let has_descriptor = announce.device_class != DEVICE_CLASS_UNKNOWN
+        || announce.probe_capabilities != 0;
+    e.map(4 + u64::from(has_key) + u64::from(has_signature) + 2 * u64::from(has_descriptor))?;
     e.uint(FIELD_DEVICE_ID)?;
     e.bytes_value(id)?;
     e.uint(FIELD_UPTIME_SECS)?;
@@ -207,6 +242,12 @@ fn encode_inner(announce: Announce, include_signature: bool, out: &mut [u8]) -> 
     e.uint(u64::from(announce.transport_mode))?;
     e.uint(FIELD_COUNTERS)?;
     e.uint(u64::from(announce.counters))?;
+    if has_descriptor {
+        e.uint(FIELD_DEVICE_CLASS)?;
+        e.uint(u64::from(announce.device_class))?;
+        e.uint(FIELD_PROBE_CAPABILITIES)?;
+        e.uint(u64::from(announce.probe_capabilities))?;
+    }
     if has_key {
         e.uint(FIELD_PUBLIC_KEY)?;
         e.bytes_value(announce.public_key())?;
@@ -350,7 +391,12 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
         return None;
     }
     let kind = match record.method? {
-        Name::Tag(value @ (ANNOUNCE_BOOT | ANNOUNCE_DISCOVERY)) => value,
+        Name::Tag(value @ (ANNOUNCE_BOOT
+            | ANNOUNCE_DISCOVERY
+            | ANNOUNCE_TRANSITION_BEGIN
+            | ANNOUNCE_SLEEP_PENDING
+            | ANNOUNCE_TRANSITION_COMPLETE
+            | ANNOUNCE_WAKE)) => value,
         _ => return None,
     };
     let mut d = Decoder::new(record.fields?);
@@ -365,6 +411,8 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
         uptime_secs: 0,
         transport_mode: 0,
         counters: 0,
+        device_class: DEVICE_CLASS_UNKNOWN,
+        probe_capabilities: 0,
         public_key: [0; MAX_PUBLIC_KEY],
         public_key_len: 0,
         signature: [0; SIGNATURE_LEN],
@@ -383,6 +431,10 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
             FIELD_UPTIME_SECS => announce.uptime_secs = u32::try_from(d.uint()?).ok()?,
             FIELD_TRANSPORT_MODE => announce.transport_mode = u8::try_from(d.uint()?).ok()?,
             FIELD_COUNTERS => announce.counters = u32::try_from(d.uint()?).ok()?,
+            FIELD_DEVICE_CLASS => announce.device_class = u8::try_from(d.uint()?).ok()?,
+            FIELD_PROBE_CAPABILITIES => {
+                announce.probe_capabilities = u16::try_from(d.uint()?).ok()?
+            }
             FIELD_PUBLIC_KEY => {
                 let key = d.bytes_ref()?;
                 if key.is_empty() || key.len() > MAX_PUBLIC_KEY || !announce.public_key().is_empty()
@@ -417,7 +469,8 @@ mod tests {
     fn announce_round_trips_as_one_direct_record() {
         let mut id = [0; MAX_DEVICE_ID];
         id[..6].copy_from_slice(b"e6-c6!");
-        let announce = Announce::discovery(id, 6, 900, 1, 17);
+        let mut announce = Announce::discovery(id, 6, 900, 1, 17);
+        announce.set_probe_descriptor(DEVICE_CLASS_ESP, 0x1f);
         let mut wire = [0; 96];
         let used = encode(announce, &mut wire).unwrap();
         assert_eq!(decode_announce(&wire[..used]), Some(announce));

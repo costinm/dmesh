@@ -47,8 +47,15 @@ pub struct TransportProfile {
     /// on spelling and `now=2` is the raw-UDP6-only regression baseline. A
     /// future `udp6` setting remains independent.
     pub now: u8,
+    /// Requested NAN Data Path policy. ESP adapters currently retain this
+    /// common transport-start parameter without implementing NDP; Android
+    /// turns it into a Wi-Fi Aware data-path capability for the epoch.
+    pub ndp: u8,
     /// `ap=1` enables a local AP alongside the selected STA or NAN mode.
     pub ap: u8,
+    /// UART selector: `0` disables it, `1` is 115200 baud, and `2..=7` are
+    /// other common speeds. USB packet mode ignores the speed value.
+    pub uart: u8,
     pub run_requested: bool,
     pub command_mode: bool,
     /// Requested physical bearer personality. `None` means the shared Wi-Fi
@@ -99,10 +106,12 @@ impl TransportProfile {
             espnow_capture: false,
             nan_dw_interval: 0,
             now: 0,
+            ndp: 0,
             // The out-of-box unassociated radio is AP+NOW on channel 6 for
             // the current NOW/NAN validation lane. An explicit start can
             // replace it with `ap=0` or associated STA later.
             ap: 1,
+            uart: 1,
             run_requested: false,
             command_mode: false,
             requested_transport: None,
@@ -151,11 +160,17 @@ pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportPr
     if let Some(value) = config.nan_dw_interval {
         profile.nan_dw_interval = value;
     }
+    if let Some(value) = config.ndp {
+        profile.ndp = value;
+    }
     if let Some(value) = config.now {
         profile.now = value;
     }
     if let Some(value) = config.ap {
         profile.ap = value;
+    }
+    if let Some(value) = config.uart {
+        profile.uart = value;
     }
     if let Some(value) = config.raw_tx_rate {
         profile.raw_tx_rate = value;
@@ -175,6 +190,17 @@ pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportPr
     if let Some(value) = config.sta_raw_rx_enabled {
         profile.sta_raw_rx_enabled = value;
     }
+}
+
+/// Remove the volatile WPA2 credential before applying a replacement STA
+/// epoch. `transport.start` is a complete radio declaration: an omitted
+/// passphrase means open authentication, never "reuse the old secret".
+///
+/// This is portable policy, not an ESP adapter concern, so host-side command
+/// tests can verify the credential lifecycle without ESP-IDF.
+pub fn clear_sta_passphrase(profile: &mut TransportProfile) {
+    profile.sta_passphrase.fill(0);
+    profile.sta_passphrase_len = 0;
 }
 
 /// Apply bearer-neutral QUIC-lite association policy.  The profile is merely
@@ -294,11 +320,13 @@ mod tests {
         apply_transport_config(
             TransportConfig {
                 sta_driver_tx: Some(true),
+                ndp: Some(1),
                 ..TransportConfig::default()
             },
             &mut profile,
         );
         assert!(profile.sta_driver_tx);
+        assert_eq!(profile.ndp, 1);
         assert!(profile.espnow_capture);
         assert_eq!(profile.raw_tx_rate, 24);
         assert_eq!(profile.ack_frequency, 8);
@@ -310,6 +338,22 @@ mod tests {
             &mut profile,
         );
         assert_eq!(profile.tx_burst_packets, 1);
+    }
+
+    #[test]
+    fn replacement_sta_epoch_clears_the_volatile_wpa_credential() {
+        let mut profile = TransportProfile::new();
+        apply_transport_config(
+            TransportConfig {
+                passphrase: Some(b"correct-horse-battery-staple"),
+                ..TransportConfig::default()
+            },
+            &mut profile,
+        );
+        assert_eq!(profile.sta_passphrase_len, 28);
+        clear_sta_passphrase(&mut profile);
+        assert_eq!(profile.sta_passphrase_len, 0);
+        assert!(profile.sta_passphrase.iter().all(|byte| *byte == 0));
     }
 
     #[test]

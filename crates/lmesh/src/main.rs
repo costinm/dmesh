@@ -625,6 +625,14 @@ fn decode_lmesh_tagged_request(record: &mesh::tagged::TaggedRecord) -> Result<lm
             .map(|request| lmesh::Request::WifiRawMetrics {
                 iface: request.iface,
             }),
+        "wifi.probe.plan" => serde_json::from_value::<lmesh_wifi::api::ProbePlanRequest>(value)
+            .map(|request| lmesh::Request::WifiProbePlan {
+                iface: request.iface,
+                source_id: request.source_id,
+                target_id: request.target_id,
+                short_bytes: request.short_bytes,
+                long_bytes: request.long_bytes,
+            }),
         "wifi.mgmt.capture" => serde_json::from_value::<lmesh::api::WifiMgmtCaptureRequest>(value)
             .map(|request| lmesh::Request::WifiMgmtCapture {
                 iface: request.iface,
@@ -842,6 +850,36 @@ mod tests {
         assert!(matches!(
             request,
             lmesh::Request::WifiRawMetrics { iface: Some(iface) } if iface == "wlan1"
+        ));
+    }
+
+    #[test]
+    fn reviewed_pair_probe_plan_is_available_from_lmesh_too() {
+        let request = decode_lmesh_tagged_request(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(5),
+            method: mesh::tagged::NameOrTag::Tag(16),
+            id: Some(serde_json::json!(16)),
+            env: [
+                (mesh::tagged::NameOrTag::Tag(1), serde_json::json!("wlan1")),
+                (mesh::tagged::NameOrTag::Tag(2), serde_json::json!("111111111111")),
+                (mesh::tagged::NameOrTag::Tag(3), serde_json::json!("222222222222")),
+                (mesh::tagged::NameOrTag::Tag(4), serde_json::json!(4096)),
+                (mesh::tagged::NameOrTag::Tag(5), serde_json::json!(65536)),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            request,
+            lmesh::Request::WifiProbePlan {
+                iface: Some(iface),
+                source_id,
+                target_id,
+                short_bytes: Some(4096),
+                long_bytes: Some(65536),
+            } if iface == "wlan1" && source_id == "111111111111" && target_id == "222222222222"
         ));
     }
 

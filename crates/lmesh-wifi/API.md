@@ -125,6 +125,23 @@ fields = [
 ```
 
 ```mesh-api
+id = "wifi.probe.plan"
+component = "wifi"
+method = "probe.plan"
+component-index = 5
+method-index = 16
+summary = "Resolve a discovery-selected comprehensive pair probe and return the live ESP/Android/Host fleet without changing the control-plane radio"
+[request]
+fields = [
+  { name = "iface", index = 1, type = "string" },
+  { name = "source_id", index = 2, type = "string", required = true },
+  { name = "target_id", index = 3, type = "string", required = true },
+  { name = "short_bytes", index = 4, type = "u32" },
+  { name = "long_bytes", index = 5, type = "u32" },
+]
+```
+
+```mesh-api
 id = "wifi.interface.status"
 component = "wifi"
 method = "interface.status"
@@ -283,7 +300,12 @@ the receive loop active. A raw-NAN-specific subscription such as
 existing loop; test requests never create, stop, retune, or administratively
 change an interface. `wifi.rawnan.status` reports whether that monitor is
 active, whether a NAN cluster BSSID has been learned, and a newest-first
-bounded receipt list for DMesh NAN Follow-ups. Each receipt retains
+bounded receipt list for DMesh NAN Follow-ups. Its `discovered_devices`
+inventory is keyed by device identity and retains the latest observation for
+every bearer: `nan` states whether this host actually observed NAN from the
+device, `active_transport` projects the advertised transport mode, and
+`observations` preserves the peer/timestamp per source. A UDP6-only Android
+record therefore remains visible even when `nan.observed=false`. Each receipt retains
 peer/BSSID, DMesh message type and sequence, and the bounded payload for E2E
 attribution.
 

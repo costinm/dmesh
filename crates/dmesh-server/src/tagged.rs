@@ -146,6 +146,29 @@ pub fn encode_numeric_response(
     Some(encoder.len())
 }
 
+/// Encode a correlated handler failure. Keeping the request id and method in
+/// the same envelope lets UART, NAN Follow-up, and QUIC callers report a
+/// rejected request without falling back to an uncorrelated text message.
+pub fn encode_numeric_error(
+    component: u64,
+    method: u64,
+    id: u64,
+    error: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut encoder = Encoder::new(out);
+    encoder.map(4)?;
+    encoder.uint(1)?;
+    encoder.uint(component)?;
+    encoder.uint(2)?;
+    encoder.uint(method)?;
+    encoder.uint(3)?;
+    encoder.uint(id)?;
+    encoder.uint(7)?;
+    encoder.text_value(error)?;
+    Some(encoder.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Name, decode, destination, encode_numeric_response};

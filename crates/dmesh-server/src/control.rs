@@ -48,9 +48,19 @@ const FIELD_NOW: u64 = 15;
 /// Start a local AP alongside either physical mode. `0` is off and `1` is on.
 const FIELD_AP: u64 = 16;
 /// Optional WPA2 passphrase for an ephemeral STA target, for example an
-/// Android local-only hotspot. It is transport-start session data, never a
+/// Android P2P Group Owner. It is transport-start session data, never a
 /// setting or persisted credential.
 const FIELD_STA_PASSPHRASE: u64 = 17;
+/// UART ownership/speed selector for the applied profile. Tag 18 preserves the
+/// existing passphrase field while keeping this addition backward-compatible.
+/// `0` disables UART, `1` means 115200 baud, and `2..=7` select the other
+/// common baud rates. USB packet mode ignores the numeric speed.
+const FIELD_UART: u64 = 18;
+/// Enable the NAN Data Path (NDP) bearer for this immutable radio epoch.
+/// NDP is meaningful only to adapters that implement it today (Android), but
+/// it belongs in the common start record so peers can negotiate it without an
+/// Android-only control schema.
+const FIELD_NDP: u64 = 19;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
@@ -79,7 +89,12 @@ pub struct TransportConfig<'a> {
     pub espnow_capture: Option<bool>,
     pub nan_dw_interval: Option<u8>,
     pub now: Option<u8>,
+    /// `0` disables and `1` enables NAN Data Path where the adapter supports
+    /// it. Unsupported adapters retain the requested profile and report their
+    /// capability separately rather than reinterpreting the field.
+    pub ndp: Option<u8>,
     pub ap: Option<u8>,
+    pub uart: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,12 +270,26 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
                 }
                 config.now = Some(enabled);
             }
+            FIELD_NDP => {
+                let enabled = d.uint()? as u8;
+                if enabled > 1 {
+                    return None;
+                }
+                config.ndp = Some(enabled);
+            }
             FIELD_AP => {
                 let enabled = d.uint()? as u8;
                 if enabled > 1 {
                     return None;
                 }
                 config.ap = Some(enabled);
+            }
+            FIELD_UART => {
+                let speed = u8::try_from(d.uint()?).ok()?;
+                if speed > 7 {
+                    return None;
+                }
+                config.uart = Some(speed);
             }
             _ => d.skip()?,
         }
@@ -385,7 +414,9 @@ fn transport_config_count(config: TransportConfig<'_>) -> u64 {
         config.espnow_capture.is_some(),
         config.nan_dw_interval.is_some(),
         config.now.is_some(),
+        config.ndp.is_some(),
         config.ap.is_some(),
+        config.uart.is_some(),
     ]
     .into_iter()
     .filter(|present| *present)
@@ -432,9 +463,20 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
         e.uint(FIELD_NOW)?;
         e.uint(value as u64)?;
     }
+    if let Some(value) = config.ndp {
+        if value > 1 {
+            return None;
+        }
+        e.uint(FIELD_NDP)?;
+        e.uint(value as u64)?;
+    }
     if let Some(value) = config.ap {
         e.uint(FIELD_AP)?;
         e.uint(value as u64)?;
+    }
+    if let Some(value) = config.uart {
+        e.uint(FIELD_UART)?;
+        e.uint(u64::from(value))?;
     }
     for (field, value) in [
         (FIELD_STA_DRIVER_TX, config.sta_driver_tx),
@@ -504,6 +546,7 @@ mod tests {
             sta_driver_tx: Some(true),
             now: Some(1),
             nan_dw_interval: Some(8),
+            ndp: Some(1),
             ap: Some(1),
             ..TransportConfig::default()
         };

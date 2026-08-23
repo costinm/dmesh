@@ -584,6 +584,18 @@ impl LocalDiscovery {
             0,
             0,
         );
+        // This is the stable host control-plane identity.  It advertises its
+        // measured radio capabilities so a pair probe may select it as an
+        // endpoint, while the executor still promises never to reconfigure
+        // this host as part of the probe.
+        announce.set_probe_descriptor(
+            dmesh_server::announce::DEVICE_CLASS_HOST,
+            dmesh_server::probe::PROBE_CAP_NAN
+                | dmesh_server::probe::PROBE_CAP_NOW
+                | dmesh_server::probe::PROBE_CAP_STA
+                | dmesh_server::probe::PROBE_CAP_AP
+                | dmesh_server::probe::PROBE_CAP_UDP6,
+        );
         if !announce.set_public_key(&self.public_key) {
             anyhow::bail!("local public key exceeds announce bound");
         }
@@ -1024,6 +1036,20 @@ pub enum Request {
     WifiRawMetrics {
         #[serde(default)]
         iface: Option<String>,
+    },
+    /// Resolve the comprehensive pair matrix from live discovery inventory.
+    /// This delegates to the Wi-Fi owner and does not alter this host's AP,
+    /// STA, NAN, or interface mode.
+    #[serde(rename = "wifi.probe.plan")]
+    WifiProbePlan {
+        #[serde(default)]
+        iface: Option<String>,
+        source_id: String,
+        target_id: String,
+        #[serde(default)]
+        short_bytes: Option<u32>,
+        #[serde(default)]
+        long_bytes: Option<u32>,
     },
     /// Send an ESP32-compatible raw DMesh Wi-Fi action frame.
     #[serde(rename = "wifi.raw.send")]
@@ -1600,6 +1626,26 @@ impl LmeshService {
             Request::WifiRawMetrics { iface } => {
                 mesh::protocol::Response::ok_with_data(self.radio.wifi_raw_metrics(iface))
             }
+            Request::WifiProbePlan {
+                iface,
+                source_id,
+                target_id,
+                short_bytes,
+                long_bytes,
+            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => match lmesh_wifi::dispatch::discovery_pair_plan(
+                    &self.radio,
+                    &iface,
+                    &source_id,
+                    &target_id,
+                    short_bytes.unwrap_or(4 * 1024),
+                    long_bytes.unwrap_or(64 * 1024),
+                ) {
+                    Ok(plan) => mesh::protocol::Response::ok_with_data(plan),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                },
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::WifiRawSend {
                 iface,
                 channel,

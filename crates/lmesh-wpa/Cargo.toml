@@ -1,0 +1,9 @@
+[package]
+name = "lmesh-wpa"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+

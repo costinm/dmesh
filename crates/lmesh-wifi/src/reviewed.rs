@@ -10,6 +10,7 @@ pub enum ReviewedWifiRequest {
     ApStatus(WifiApStatusRequest),
     StaStatus(WifiStaStatusRequest),
     RawNanStatus(WifiRawnanStatusRequest),
+    ProbePlan(WifiProbePlanRequest),
     InterfaceStatus(WifiInterfaceStatusRequest),
     ApStations(WifiApStationsRequest),
     RawMetrics(WifiRawMetricsRequest),

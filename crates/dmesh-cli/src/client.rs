@@ -2072,7 +2072,15 @@ fn render_handler_list(records: &[u8]) -> String {
 fn render_binary_events(records: &[u8]) -> String {
     let mut index = 0;
     if decode_cbor_unsigned(records, &mut index, 4) != Some(2) {
-        return "invalid_events".into();
+        // Recovery and older Android adapters expose the same event service
+        // as the bounded textual snapshot used by the original server. Keep
+        // that response visible instead of reporting a decoder failure; the
+        // wire service was reached successfully and its payload is still
+        // useful to the operator.
+        return format!(
+            "legacy_events={}",
+            String::from_utf8_lossy(records).replace('\n', "\\n")
+        );
     }
     let Some(next) = decode_cbor_unsigned(records, &mut index, 0) else {
         return "invalid_events".into();

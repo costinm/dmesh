@@ -29,6 +29,9 @@ pub struct MeshHandle {
     pub http_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub udp_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub announce_server_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Platform network transitions request an immediate announce without
+    /// changing the fifteen-minute periodic cadence.
+    pub announce_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Opaque handle for a bidirectional stream (channel).
@@ -149,16 +152,17 @@ pub fn start_mesh(
     let udp_server_handle = None;
 
     #[cfg(target_os = "android")]
-    let announce_server_handle = {
+    let (announce_server_handle, announce_trigger) = {
         let public_key = node
             .private_key()
             .public_key()
             .to_openssh()
             .unwrap_or_default();
-        Some(runtime.spawn(android_announce_loop(public_key)))
+        let (trigger, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (Some(runtime.spawn(android_announce_loop(public_key, receiver))), Some(trigger))
     };
     #[cfg(not(target_os = "android"))]
-    let announce_server_handle = None;
+    let (announce_server_handle, announce_trigger) = (None, None);
 
     Ok(MeshHandle {
         node,
@@ -168,7 +172,17 @@ pub fn start_mesh(
         http_server_handle,
         udp_server_handle,
         announce_server_handle,
+        announce_trigger,
     })
+}
+
+/// Ask the Android announce worker to join/send on a newly available local
+/// link, such as a P2P group. The message contains no radio policy or payload.
+pub fn trigger_announce(handle: &MeshHandle) -> bool {
+    handle
+        .announce_trigger
+        .as_ref()
+        .is_some_and(|trigger| trigger.send(()).is_ok())
 }
 
 /// Stop a mesh node, aborting all server tasks and shutting down the runtime.
@@ -192,7 +206,10 @@ pub fn stop_mesh(handle: MeshHandle) {
 /// QUIC-lite port. It uses the established lmesh group and shared CBOR record,
 /// while the QUIC UDP listener remains unicast-only.
 #[cfg(target_os = "android")]
-async fn android_announce_loop(public_key: String) {
+async fn android_announce_loop(
+    public_key: String,
+    mut trigger: tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
     const PORT: u16 = 5227;
     let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
     let socket = match tokio::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, PORT)).await {
@@ -214,46 +231,17 @@ async fn android_announce_loop(public_key: String) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let kind = if boot_pending {
-                    dmesh_server::announce::ANNOUNCE_BOOT
-                } else {
-                    dmesh_server::announce::ANNOUNCE_DISCOVERY
-                };
-                let announce = if kind == dmesh_server::announce::ANNOUNCE_BOOT {
-                    dmesh_server::announce::Announce::boot(id, take as u8, 0)
-                } else {
-                    dmesh_server::announce::Announce::discovery(
-                        id,
-                        take as u8,
-                        u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX),
-                        0,
-                        0,
-                    )
-                };
-                let mut wire = [0u8; 96];
-                if let Some(used) = dmesh_server::announce::encode(announce, &mut wire) {
-                    let interfaces = multicast_interface_indices();
-                    for interface_index in &interfaces {
-                        if joined_interfaces.insert(*interface_index) {
-                            if let Err(error) = socket.join_multicast_v6(&group, *interface_index) {
-                                log::warn!("Android announce multicast join failed on interface {interface_index}: {error}");
-                            }
-                        }
-                    }
-                    let mut sent = false;
-                    for interface_index in interfaces {
-                        let destination = SocketAddr::V6(SocketAddrV6::new(group, PORT, 0, interface_index));
-                        match socket.send_to(&wire[..used], destination).await {
-                            Ok(_) => sent = true,
-                            Err(error) => log::warn!("Android announce multicast send failed on interface {interface_index}: {error}"),
-                        }
-                    }
-                    // Do not silently lose the boot event when the service starts before
-                    // Wi-Fi/NAN has an IPv6 interface. The first successful emission is boot.
-                    if sent {
-                        boot_pending = false;
-                    }
-                }
+                let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
+                    id, take as u8, started.elapsed().as_secs(), boot_pending).await;
+                if sent { boot_pending = false; }
+            }
+            Some(()) = trigger.recv() => {
+                // A P2P group may appear long after service boot. Join its
+                // scoped multicast interface and emit the same bounded record
+                // now, rather than waiting for the periodic interval.
+                let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
+                    id, take as u8, started.elapsed().as_secs(), boot_pending).await;
+                if sent { boot_pending = false; }
             }
             received = socket.recv_from(&mut receive) => match received {
                 Ok((len, sender)) => {
@@ -271,6 +259,47 @@ async fn android_announce_loop(public_key: String) {
             },
         }
     }
+}
+
+#[cfg(target_os = "android")]
+async fn send_android_announce(
+    socket: &tokio::net::UdpSocket,
+    group: Ipv6Addr,
+    port: u16,
+    joined_interfaces: &mut BTreeSet<u32>,
+    id: [u8; 16],
+    id_len: u8,
+    uptime_secs: u64,
+    boot: bool,
+) -> bool {
+    let announce = if boot {
+        dmesh_server::announce::Announce::boot(id, id_len, 0)
+    } else {
+        dmesh_server::announce::Announce::discovery(
+            id, id_len, u32::try_from(uptime_secs).unwrap_or(u32::MAX), 0, 0,
+        )
+    };
+    let mut wire = [0u8; 96];
+    let Some(used) = dmesh_server::announce::encode(announce, &mut wire) else {
+        return false;
+    };
+    let interfaces = multicast_interface_indices();
+    for interface_index in &interfaces {
+        if joined_interfaces.insert(*interface_index)
+            && let Err(error) = socket.join_multicast_v6(&group, *interface_index)
+        {
+            log::warn!("Android announce multicast join failed on interface {interface_index}: {error}");
+        }
+    }
+    let mut sent = false;
+    for interface_index in interfaces {
+        let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, interface_index));
+        match socket.send_to(&wire[..used], destination).await {
+            Ok(_) => sent = true,
+            Err(error) => log::warn!("Android announce multicast send failed on interface {interface_index}: {error}"),
+        }
+    }
+    sent
 }
 
 /// Return each enabled, non-loopback IPv6 interface index. Android's

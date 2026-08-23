@@ -4,6 +4,121 @@ use crate::{Operation, RadioService, WifiNetd, reviewed::ReviewedWifiRequest};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+/// Resolve the live discovery inventory into the portable pair-probe
+/// descriptors.  This is a planning operation only: `wlan0` is read for
+/// inventory evidence and is never brought down, retuned, or associated by a
+/// probe request.  The executor receives the returned rows and configures
+/// only the two selected endpoints.
+pub fn discovery_pair_plan(
+    radio: &RadioService,
+    iface: &str,
+    source_id: &str,
+    target_id: &str,
+    short_bytes: u32,
+    long_bytes: u32,
+) -> Result<Value> {
+    if source_id == target_id {
+        anyhow::bail!("source_id and target_id must identify different devices");
+    }
+    let inventory = radio.rawnan_status(Some(iface.to_owned()));
+    let devices = inventory
+        .get("discovered_devices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("raw-NAN inventory is unavailable"))?;
+    // Return the complete portable fleet view with the plan.  Callers use it
+    // to choose two ESPs, two Androids, or two Hosts without hard-coding lab
+    // names.  This is inventory only: a Host may be selected as an endpoint,
+    // but the executor still must not change the control-plane host's mode.
+    let discovered = devices
+        .iter()
+        .filter_map(|device| {
+            let id = device.get("id").and_then(Value::as_str)?;
+            let announce = device.get("announce")?;
+            let class = announce.get("device_class").and_then(Value::as_u64)?;
+            let capabilities = announce.get("probe_capabilities").and_then(Value::as_u64)?;
+            let kind = match class as u8 {
+                dmesh_server::announce::DEVICE_CLASS_ESP => "esp",
+                dmesh_server::announce::DEVICE_CLASS_HOST => "host",
+                dmesh_server::announce::DEVICE_CLASS_ANDROID => "android",
+                _ => return None,
+            };
+            Some(json!({
+                "id": id,
+                "kind": kind,
+                "capabilities": capabilities,
+            }))
+        })
+        .collect::<Vec<_>>();
+    let descriptor = |id: &str| -> Result<dmesh_server::probe::ProbeDeviceDescriptor> {
+        let device = devices
+            .iter()
+            .find(|device| device.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("discovery inventory has no device {id:?}"))?;
+        let announce = device
+            .get("announce")
+            .ok_or_else(|| anyhow::anyhow!("discovered device {id:?} has no announce"))?;
+        let class = announce
+            .get("device_class")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(dmesh_server::announce::DEVICE_CLASS_UNKNOWN);
+        let kind = match class {
+            dmesh_server::announce::DEVICE_CLASS_ESP => {
+                dmesh_server::probe::ProbeEndpointKind::Esp
+            }
+            dmesh_server::announce::DEVICE_CLASS_HOST => {
+                dmesh_server::probe::ProbeEndpointKind::Host
+            }
+            dmesh_server::announce::DEVICE_CLASS_ANDROID => {
+                dmesh_server::probe::ProbeEndpointKind::Android
+            }
+            _ => anyhow::bail!("discovered device {id:?} has no supported device_class"),
+        };
+        let capabilities = announce
+            .get("probe_capabilities")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| anyhow::anyhow!("discovered device {id:?} has no probe capabilities"))?;
+        let bytes = decode_hex(id, "device id")?;
+        if bytes.len() < 6 {
+            anyhow::bail!("discovered device {id:?} cannot supply a six-byte radio identity");
+        }
+        let mut node = [0; 6];
+        node.copy_from_slice(&bytes[..6]);
+        Ok(dmesh_server::probe::ProbeDeviceDescriptor {
+            endpoint: dmesh_server::probe::ProbeEndpoint {
+                kind,
+                node,
+                mode: dmesh_server::probe::ProbeMode::NAN_NOW,
+                bssid: None,
+            },
+            capabilities,
+        })
+    };
+    let source = descriptor(source_id)?;
+    let target = descriptor(target_id)?;
+    let rows = dmesh_server::probe::full_pair_probe_requests(
+        0x4D_50_2000,
+        source,
+        target,
+        short_bytes,
+        long_bytes,
+    );
+    if rows.is_empty() {
+        anyhow::bail!("selected devices share no NAN-capable pair-probe row");
+    }
+    Ok(json!({
+        "ok": true,
+        "control_plane_iface": iface,
+        "control_plane_mode_changed": false,
+        "discovered": discovered,
+        "source": source,
+        "target": target,
+        "rows": rows,
+    }))
+}
+
 fn string_arg(request: &Value, name: &str) -> Option<String> {
     request.get(name).and_then(Value::as_str).map(str::to_owned)
 }
@@ -121,6 +236,17 @@ pub fn handle_reviewed_request(
             ReviewedWifiRequest::RawNanStatus(request) => {
                 let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
                 Ok(radio.rawnan_status(Some(iface)))
+            }
+            ReviewedWifiRequest::ProbePlan(request) => {
+                let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
+                discovery_pair_plan(
+                    radio,
+                    &iface,
+                    &request.source_id,
+                    &request.target_id,
+                    request.short_bytes.unwrap_or(4 * 1024),
+                    request.long_bytes.unwrap_or(64 * 1024),
+                )
             }
             ReviewedWifiRequest::InterfaceStatus(request) => {
                 let iface = authorize_iface(netd, request.iface.as_deref(), Operation::Nan)?;
@@ -705,5 +831,66 @@ mod tests {
             "54545454545454545454545454545454"
         );
         assert_eq!(status["discovered_devices"][0]["source"], "udp_multicast");
+        assert_eq!(status["discovered_devices"][0]["nan"]["observed"], false);
+        assert_eq!(status["discovered_devices"][0]["active_transport"]["state"], "sta");
+    }
+
+    #[test]
+    fn discovery_inventory_retains_nan_and_udp6_observations_for_one_device() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let radio = RadioService::from_environment_with_discovery_log(log.path());
+        let mut announce = dmesh_server::announce::Announce::discovery([0x55; 16], 16, 8, 0, 5);
+        announce.set_probe_descriptor(
+            dmesh_server::announce::DEVICE_CLASS_ANDROID,
+            dmesh_server::probe::PROBE_CAP_NAN | dmesh_server::probe::PROBE_CAP_UDP6,
+        );
+        assert!(radio.observe_discovered_announce(
+            "udp_multicast",
+            "[fe80::55]:5227".to_owned(),
+            None,
+            announce,
+        ));
+        assert!(radio.observe_discovered_announce(
+            "nan",
+            "02:00:00:00:00:55".to_owned(),
+            Some("50:6f:9a:01:54:6c".to_owned()),
+            announce,
+        ));
+        let status = radio.rawnan_status(None);
+        let device = &status["discovered_devices"][0];
+        assert_eq!(device["nan"]["observed"], true);
+        assert!(device["observations"].get("nan").is_some());
+        assert!(device["observations"].get("udp_multicast").is_some());
+        assert_eq!(device["active_transport"]["state"], "nan_now");
+    }
+
+    #[test]
+    fn probe_plan_uses_live_inventory_without_touching_control_plane_state() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let radio = RadioService::from_environment_with_discovery_log(log.path());
+        for (id, peer) in [([0x11; 6], "esp-a"), ([0x22; 6], "esp-b")] {
+            let mut full_id = [0; 16];
+            full_id[..6].copy_from_slice(&id);
+            let mut announce = dmesh_server::announce::Announce::discovery(full_id, 6, 1, 0, 0);
+            announce.set_probe_descriptor(
+                dmesh_server::announce::DEVICE_CLASS_ESP,
+                dmesh_server::probe::PROBE_CAP_NAN
+                    | dmesh_server::probe::PROBE_CAP_NOW
+                    | dmesh_server::probe::PROBE_CAP_STA
+                    | dmesh_server::probe::PROBE_CAP_AP
+                    | dmesh_server::probe::PROBE_CAP_UDP6,
+            );
+            assert!(radio.observe_discovered_announce("nan", peer.to_owned(), None, announce));
+        }
+        let plan = discovery_pair_plan(&radio, "wlan0", "111111111111", "222222222222", 100, 1000)
+            .unwrap();
+        assert_eq!(plan["control_plane_iface"], "wlan0");
+        assert_eq!(plan["control_plane_mode_changed"], false);
+        assert_eq!(plan["rows"].as_array().unwrap().len(), 4);
+        assert!(plan["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["request"]["test_nan"] == true));
     }
 }
