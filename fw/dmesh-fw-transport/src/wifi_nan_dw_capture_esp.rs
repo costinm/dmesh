@@ -28,7 +28,7 @@ const NAN_INITIAL_ACQUIRE_MS: u32 = 15_000;
 const LAB_FIXED_CLUSTER_BSSID: Option<[u8; 6]> = None;
 
 /// `0=normal`, `1=disabled`, `2=manual`.  Normal is the only policy which
-/// lets `poll()` schedule acquisition/DW capture.  Disabled/manual both keep
+/// lets `service_deadline()` schedule acquisition/DW capture. Disabled/manual both keep
 /// promiscuous RX off until an explicit future manual-capture operation.
 static LAB_DW_POLICY: AtomicU8 = AtomicU8::new(0);
 /// Requested cadence in 512 ms discovery windows. This is separate from the
@@ -38,6 +38,34 @@ static DW_INTERVAL: AtomicU8 = AtomicU8::new(0);
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 static CAPTURING: AtomicBool = AtomicBool::new(false);
+/// A bounded raw-NOW client needs continuous management receive after its
+/// OPEN succeeds. The private C6 action dispatcher can receive the bootstrap
+/// but is not reliable for the peer's unsolicited stream flight once the
+/// ordinary 64 ms NAN DW closes. This flag is set only for the lifetime of
+/// one explicit client; it is not a background monitor or a timer-driven
+/// service tick.
+///
+/// The NAN capture owner is also the only code that changes promiscuous mode,
+/// so NOW extends that owner's lease instead of creating a competing receive
+/// callback or a bearer-private queue.  `end_now_receive_lease` restores the
+/// normal low-duty DW cadence after the client finishes or times out.
+static NOW_CLIENT_RECEIVE_LEASE: AtomicBool = AtomicBool::new(false);
+/// Active non-sleepy NOW is a standing control plane.  Unlike the bounded
+/// client/responder leases below, it is selected only when Main commits an
+/// active DW1 profile and lets an idle peer hear the very first broadcast
+/// action.  DW8 sleepy mode never enables this flag.
+static NOW_ACTIVE_RECEIVE: AtomicBool = AtomicBool::new(false);
+/// A responder needs the same receive coverage while its accepted association
+/// waits for the client's request or ACK. Unlike the client lease this is
+/// explicitly time-bounded and rearmed only by an accepted NOW datagram. The
+/// Main task includes this deadline in its blocking wait, so expiry does not
+/// add a service tick or keep an idle device in promiscuous mode.
+static NOW_SERVICE_RECEIVE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+/// C6 action replies commonly arrive several seconds after the peer's driver
+/// accepted the first action. Eight seconds covers that observed one-flight
+/// delay while bounding a stalled responder much more tightly than a client
+/// operation deadline.
+const NOW_SERVICE_RECEIVE_LEASE_MS: u32 = 8_000;
 static UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 static NEXT_MS: AtomicU32 = AtomicU32::new(0);
 static ACQUIRING: AtomicBool = AtomicBool::new(false);
@@ -65,6 +93,11 @@ const PENDING_FOLLOWUP_CAPACITY: usize = 4;
 /// at the point of DW-gated transmission.
 const ACTIVE_PUBLISH_MAX_LEN: usize = dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN;
 const ACTIVE_PUBLISH_REFRESH_MS: u32 = dmesh_rawnan::NAN_ACTIVE_PUBLISH_INTERVAL_MS as u32;
+/// One externally requested active-Subscribe SDF waits for the next local
+/// NAN discovery window. Public-action transmission from a UART/raw-radio
+/// handler would usually miss the peer's bounded DW. This holds one complete
+/// frame, not a packet queue.
+const PENDING_SDF_MAX_LEN: usize = 384;
 const PENDING_EMPTY: u8 = 0;
 const PENDING_WRITING: u8 = 1;
 const PENDING_READY: u8 = 2;
@@ -119,6 +152,10 @@ static ACTIVE_PUBLISH_LEN: AtomicU16 = AtomicU16::new(0);
 static ACTIVE_PUBLISH_LAST_SENT_MS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_PUBLISH_INFO: [AtomicU8; ACTIVE_PUBLISH_MAX_LEN] =
     [const { AtomicU8::new(0) }; ACTIVE_PUBLISH_MAX_LEN];
+static PENDING_SDF_READY: AtomicBool = AtomicBool::new(false);
+static PENDING_SDF_LEN: AtomicU16 = AtomicU16::new(0);
+static PENDING_SDF: [AtomicU8; PENDING_SDF_MAX_LEN] =
+    [const { AtomicU8::new(0) }; PENDING_SDF_MAX_LEN];
 
 struct PendingFollowup {
     state: AtomicU8,
@@ -418,12 +455,59 @@ fn transmit_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
         1,
         &payload,
     );
-    crate::wifi_espnow_esp::transmit_public_action_on_interface(
+    transmit_public_action_from_dw(
         interface,
         peer,
         bssid,
         &frame[24..],
     )
+}
+
+/// Submit one NAN public action inside a DW without leaving ESP-IDF in
+/// promiscuous receive mode for the transmit call.  This is called only by
+/// the one-shot NAN deadline while `CAPTURING` is true: ESP-IDF rejects an
+/// off-channel public-action request while promiscuous capture owns the radio.
+/// We therefore yield only the source's capture for the short driver submit,
+/// immediately restore it, and leave the peer's independently scheduled DW
+/// receiver untouched.  It is not a polling path and it creates no task.
+fn transmit_public_action_from_dw(
+    interface: crate::wifi_esp::RadioInterface,
+    destination: [u8; 6],
+    bssid: [u8; 6],
+    body: &[u8],
+) -> bool {
+    yield_capture_for_action_tx(|| crate::wifi_espnow_esp::transmit_public_action_on_interface(
+        interface,
+        destination,
+        bssid,
+        body,
+    ))
+}
+
+/// Yield the capture owner for one ESP-IDF action submission, then restore it.
+///
+/// Called only from the shared radio worker/deadline owner. ESP-IDF cannot
+/// reliably submit an off-channel action while promiscuous capture owns the
+/// radio; this provides the same short, explicit handoff for NAN and NOW.
+/// It is not a receive loop and never retains a packet.
+pub(crate) fn yield_capture_for_action_tx(send: impl FnOnce() -> bool) -> bool {
+    yield_capture_for_action_tx_result(|| if send() { esp_idf_sys::ESP_OK } else { esp_idf_sys::ESP_FAIL }) == esp_idf_sys::ESP_OK
+}
+
+/// Integer-result counterpart for raw action TX, which preserves the ESP-IDF
+/// error code in radio diagnostics.
+pub(crate) fn yield_capture_for_action_tx_result(send: impl FnOnce() -> i32) -> i32 {
+    let was_capturing = CAPTURING.load(Ordering::Acquire);
+    if was_capturing && !crate::wifi_esp::set_promiscuous(false) {
+        return esp_idf_sys::ESP_FAIL;
+    }
+    let sent = send();
+    if was_capturing && !crate::wifi_esp::set_promiscuous(true) {
+        // Do not report a capture that the driver could not restore. The next
+        // deadline will attempt a normal capture transition from this state.
+        CAPTURING.store(false, Ordering::Release);
+    }
+    sent
 }
 
 fn drain_pending_followup_responses() {
@@ -504,7 +588,7 @@ fn drain_active_publish() {
         1,
         &service_info[..len],
     );
-    if crate::wifi_espnow_esp::transmit_public_action_on_interface(
+    if transmit_public_action_from_dw(
         interface,
         dmesh_rawnan::NAN_DISCOVERY_MAC,
         bssid,
@@ -512,6 +596,48 @@ fn drain_active_publish() {
     ) {
         ACTIVE_PUBLISH_LAST_SENT_MS.store(now, Ordering::Release);
         ACTIVE_PUBLISH_PENDING.store(false, Ordering::Release);
+    }
+}
+
+/// Submit the one pending raw SDF only while the source's selected NAN DW is
+/// open. The existing one-shot NAN deadline calls this on capture entry; it
+/// adds neither a busy service tick nor callback-side Wi-Fi transmission.
+fn drain_pending_sdf() {
+    if !CAPTURING.load(Ordering::Acquire) || !PENDING_SDF_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let len = usize::from(PENDING_SDF_LEN.load(Ordering::Acquire)).min(PENDING_SDF_MAX_LEN);
+    if len < dmesh_rawnan::FRAME_DATA {
+        PENDING_SDF_READY.store(false, Ordering::Release);
+        return;
+    }
+    let mut frame = [0u8; PENDING_SDF_MAX_LEN];
+    for (index, byte) in frame[..len].iter_mut().enumerate() {
+        *byte = PENDING_SDF[index].load(Ordering::Relaxed);
+    }
+    let Some(destination) = frame.get(4..10).and_then(|bytes| bytes.try_into().ok()) else {
+        PENDING_SDF_READY.store(false, Ordering::Release);
+        return;
+    };
+    let Some(bssid) = frame
+        .get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6)
+        .and_then(|bytes| bytes.try_into().ok())
+    else {
+        PENDING_SDF_READY.store(false, Ordering::Release);
+        return;
+    };
+    let interface = if crate::wifi_esp::sta_associated() || !crate::wifi_esp::lab_open_ap_active() {
+        crate::wifi_esp::RadioInterface::Sta
+    } else {
+        crate::wifi_esp::RadioInterface::Ap
+    };
+    if transmit_public_action_from_dw(
+        interface,
+        destination,
+        bssid,
+        &frame[dmesh_rawnan::FRAME_DATA..len],
+    ) {
+        PENDING_SDF_READY.store(false, Ordering::Release);
     }
 }
 
@@ -549,7 +675,7 @@ pub fn send_followup_frame(frame: &[u8]) -> Result<usize, &'static str> {
     } else {
         crate::wifi_esp::RadioInterface::Ap
     };
-    crate::wifi_espnow_esp::transmit_public_action_on_interface(
+    transmit_public_action_from_dw(
         interface,
         destination,
         bssid,
@@ -651,6 +777,38 @@ pub fn set_service_info_handler(handler: Option<NanServiceInfoHandler>) {
     );
 }
 
+/// Queue one active-Subscribe SDF for the next local discovery window.
+///
+/// This is called by the raw-radio control adapter from normal worker
+/// context. The frame must name the cluster already selected by this radio;
+/// a repeated idempotent request replaces the one pending frame, preserving
+/// a fixed one-frame memory bound.
+pub fn queue_sdf_frame(frame: &[u8]) -> bool {
+    if !dmesh_rawnan::is_nan_sdf(frame)
+        || frame.len() > PENDING_SDF_MAX_LEN
+        || frame.len() < dmesh_rawnan::FRAME_BSSID + 6
+        || bssid_is_unset(selected_bssid())
+        || frame[dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6]
+            != selected_bssid()
+    {
+        return false;
+    }
+    for (index, byte) in frame.iter().enumerate() {
+        PENDING_SDF[index].store(*byte, Ordering::Relaxed);
+    }
+    PENDING_SDF_LEN.store(frame.len() as u16, Ordering::Release);
+    PENDING_SDF_READY.store(true, Ordering::Release);
+    // This direct control request runs on Main's normal worker, never a Wi-Fi
+    // callback.  If the selected DW is already open, submit it now through
+    // the same capture-yield helper used by the deadline.  Otherwise the
+    // pending flag is consumed at the next one-shot DW timer; no periodic
+    // poll is introduced merely to service a newly queued SDF.
+    if CAPTURING.load(Ordering::Acquire) {
+        drain_pending_sdf();
+    }
+    true
+}
+
 fn dispatch_service_info(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
     let handler = SERVICE_INFO_HANDLER.load(Ordering::Acquire);
     if handler != 0 {
@@ -741,9 +899,10 @@ pub fn reset_stats() {
     FILTER_ERRORS.store(0, Ordering::Release);
 }
 
-/// Whether the bounded discovery-window receiver is currently enabled.
-/// Normal UDP6 and NOW-like traffic continues outside this interval; callers
-/// use this only for diagnostics and NAN capture accounting.
+/// Whether management promiscuous receive is currently enabled.  This is
+/// normally one bounded NAN discovery window; while an explicit NOW client is
+/// active it can instead be the client's bounded receive lease.  Normal UDP6
+/// traffic never requires this mode.
 pub fn capturing() -> bool {
     CAPTURING.load(Ordering::Acquire)
 }
@@ -784,6 +943,119 @@ pub fn request_permissive_capture(duration_ms: u16) -> bool {
     // closes; do not alter the configured cadence.
     NEXT_MS.store(requested_until.wrapping_add(dw_period_ms()), Ordering::Release);
     true
+}
+
+/// Start the receive lease for one explicit raw-NOW client association.
+///
+/// Called synchronously from the normal shared-ingress worker immediately
+/// before that worker transmits the client's OPEN.  It is never called from a
+/// Wi-Fi callback, allocates no packet storage, and does not create a task.
+/// The client has its own one-shot retry/PTO deadlines; this lease merely
+/// keeps the existing management callback capable of receiving the peer's
+/// stream packets between ordinary NAN DWs.  A caller must pair success with
+/// [`end_now_receive_lease`] on every terminal client path.
+pub fn begin_now_receive_lease() -> bool {
+    if !STARTED.load(Ordering::Acquire)
+        || lab_dw_policy() != 0
+        || crate::wifi_nonpromisc_probe_esp::roc_in_flight()
+    {
+        return false;
+    }
+    if NOW_CLIENT_RECEIVE_LEASE.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    if CAPTURING.load(Ordering::Acquire) || crate::wifi_esp::set_promiscuous(true) {
+        CAPTURING.store(true, Ordering::Release);
+        return true;
+    }
+    NOW_CLIENT_RECEIVE_LEASE.store(false, Ordering::Release);
+    false
+}
+
+/// Keep the responder receive-capable for one active NOW association.
+///
+/// Called by the shared packet worker only after the raw dispatcher has
+/// accepted a packet for its current NOW path. Each accepted packet extends
+/// the one explicit deadline; unrelated action frames cannot hold the radio
+/// awake. This complements, rather than replaces, the initiator lease above:
+/// either side may temporarily be both a client and a responder.
+pub fn begin_now_service_receive_lease() -> bool {
+    if !STARTED.load(Ordering::Acquire)
+        || lab_dw_policy() != 0
+        || crate::wifi_nonpromisc_probe_esp::roc_in_flight()
+    {
+        return false;
+    }
+    let now = now_ms();
+    NOW_SERVICE_RECEIVE_UNTIL_MS.store(
+        now.wrapping_add(NOW_SERVICE_RECEIVE_LEASE_MS),
+        Ordering::Release,
+    );
+    if CAPTURING.load(Ordering::Acquire) || crate::wifi_esp::set_promiscuous(true) {
+        CAPTURING.store(true, Ordering::Release);
+        true
+    } else {
+        NOW_SERVICE_RECEIVE_UNTIL_MS.store(0, Ordering::Release);
+        false
+    }
+}
+
+/// Release responder coverage once its raw association is explicitly retired.
+///
+/// Profile replacement and a clean QUIC CLOSE call this immediately. An
+/// unclean peer is covered by the deadline above; no periodic cleanup task is
+/// needed. A simultaneous local client continues to own the radio lease.
+pub fn end_now_service_receive_lease() {
+    NOW_SERVICE_RECEIVE_UNTIL_MS.store(0, Ordering::Release);
+    if NOW_CLIENT_RECEIVE_LEASE.load(Ordering::Acquire)
+        || NOW_ACTIVE_RECEIVE.load(Ordering::Acquire)
+        || !STARTED.load(Ordering::Acquire)
+    {
+        return;
+    }
+    if crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
+        return;
+    }
+    let now = now_ms();
+    let _ = crate::wifi_esp::set_promiscuous(false);
+    CAPTURING.store(false, Ordering::Release);
+    ACQUIRING.store(false, Ordering::Release);
+    NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Release);
+}
+
+/// Return from an active raw-NOW client to the normal NAN DW receive policy.
+///
+/// Called only from a raw client's completion, timeout, start-failure, or
+/// radio-teardown path.  It performs no packet parsing and does not wait for a
+/// timer: after disabling the temporary receive lease, the next ordinary DW
+/// begins after one configured period.  This avoids an immediate close/open
+/// bounce that would otherwise keep an idle active device in promiscuous mode.
+pub fn end_now_receive_lease() {
+    if !NOW_CLIENT_RECEIVE_LEASE.swap(false, Ordering::AcqRel) || !STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    if NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire) != 0
+        || NOW_ACTIVE_RECEIVE.load(Ordering::Acquire)
+    {
+        return;
+    }
+    if crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
+        // ROC owns the driver receive transition.  Its completion event will
+        // re-enter the normal deadline service, which observes that the NOW
+        // lease is gone and resumes DW scheduling without a conflicting call.
+        return;
+    }
+    let now = now_ms();
+    let _ = crate::wifi_esp::set_promiscuous(false);
+    CAPTURING.store(false, Ordering::Release);
+    ACQUIRING.store(false, Ordering::Release);
+    NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Release);
+    // Lease release originates on the shared ingress worker, whereas the
+    // normal DW deadline is armed by Main's blocking event owner.  Notify it
+    // once for this state transition so it recomputes the next timer; without
+    // that notification a completed NOW session could leave NAN idle until
+    // some unrelated control event happened to wake Main.
+    crate::main_runtime::request_transport_service();
 }
 
 /// Whether starting a ROC lease with `duration_ms` would overlap a normal NAN
@@ -845,6 +1117,41 @@ pub fn start(interval: u8) -> bool {
     true
 }
 
+/// Select whether an active NOW epoch listens continuously for initial
+/// actions.
+///
+/// Main calls this once while applying a committed radio profile, never from
+/// an ESP-IDF callback or a timer tick.  An unassociated active device cannot
+/// otherwise know which peer will initiate the next action, so limiting it to
+/// a 64 ms NAN capture window makes NOW bootstrap probabilistic.  Sleepy DW8
+/// profiles pass `false` and retain their normal bounded discovery windows.
+pub fn set_active_now_receive(enabled: bool) -> bool {
+    NOW_ACTIVE_RECEIVE.store(enabled, Ordering::Release);
+    if !STARTED.load(Ordering::Acquire) || crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
+        return !enabled;
+    }
+    let now = now_ms();
+    if enabled {
+        if CAPTURING.load(Ordering::Acquire) || crate::wifi_esp::set_promiscuous(true) {
+            CAPTURING.store(true, Ordering::Release);
+            ACQUIRING.store(false, Ordering::Release);
+            return true;
+        }
+        NOW_ACTIVE_RECEIVE.store(false, Ordering::Release);
+        return false;
+    }
+    if NOW_CLIENT_RECEIVE_LEASE.load(Ordering::Acquire)
+        || NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire) != 0
+    {
+        return true;
+    }
+    let _ = crate::wifi_esp::set_promiscuous(false);
+    CAPTURING.store(false, Ordering::Release);
+    ACQUIRING.store(false, Ordering::Release);
+    NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Release);
+    true
+}
+
 /// Change an active mode's DW cadence. Zero stops the NAN capture layer;
 /// nonzero values are measured in 512 ms DWs. The Wi-Fi owner invokes this
 /// from its normal worker path, never from a driver callback.
@@ -875,6 +1182,9 @@ pub fn stop() {
     let _ = crate::wifi_esp::configure_promiscuous_rx(None, &mut filter);
     crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::NanServiceInfo);
     CAPTURING.store(false, Ordering::Release);
+    NOW_CLIENT_RECEIVE_LEASE.store(false, Ordering::Release);
+    NOW_ACTIVE_RECEIVE.store(false, Ordering::Release);
+    NOW_SERVICE_RECEIVE_UNTIL_MS.store(0, Ordering::Release);
     ACQUIRING.store(false, Ordering::Release);
     ACQUIRE_PENDING.store(false, Ordering::Release);
     UNTIL_MS.store(0, Ordering::Release);
@@ -888,7 +1198,12 @@ pub fn stop() {
 /// its deferred task); this function remains necessary only to service the
 /// independent acquisition/DW deadlines and to perform the driver calls that
 /// callbacks are not allowed to make.
-pub fn poll() {
+///
+/// Main calls this exactly once after the adapter's nearest acquisition, DW,
+/// publish-refresh, or bounded ROC deadline. It does not inspect packets and
+/// it has no idle cadence: [`next_service_delay_ms`] returns `None` when NAN
+/// capture is stopped, leaving the Main task blocked on its event queue.
+pub fn service_deadline() {
     if !STARTED.load(Ordering::Acquire) {
         return;
     }
@@ -911,6 +1226,7 @@ pub fn poll() {
         NEXT_MS.store(now.wrapping_add(NAN_INITIAL_ACQUIRE_MS), Ordering::Release);
         drain_pending_followup_responses();
         drain_active_publish();
+        drain_pending_sdf();
         return;
     }
     // A direct one-shot ROC request may have been made between periodic
@@ -919,6 +1235,51 @@ pub fn poll() {
     // underneath ROC.
     if crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
         return;
+    }
+    if NOW_ACTIVE_RECEIVE.load(Ordering::Acquire) {
+        // This is not a service cadence: Main does not arm NAN deadlines in
+        // this state.  A queued control/radio event can enter here to restore
+        // promiscuous receive after ROC, then the task blocks again.
+        if !CAPTURING.load(Ordering::Acquire) && crate::wifi_esp::set_promiscuous(true) {
+            CAPTURING.store(true, Ordering::Release);
+        }
+        drain_pending_followup_responses();
+        drain_active_publish();
+        drain_pending_sdf();
+        return;
+    }
+    // An explicit raw-NOW association temporarily extends the same receive
+    // owner used by NAN.  Its client task is driven by exact PTO/deadline
+    // events, not by this function; while the lease is held there is no NAN
+    // capture deadline to wake for and no service-loop work to perform.
+    if NOW_CLIENT_RECEIVE_LEASE.load(Ordering::Acquire) {
+        if !CAPTURING.load(Ordering::Acquire) && crate::wifi_esp::set_promiscuous(true) {
+            CAPTURING.store(true, Ordering::Release);
+        }
+        drain_pending_followup_responses();
+        drain_active_publish();
+        drain_pending_sdf();
+        return;
+    }
+    let service_until = NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire);
+    if service_until != 0 {
+        if !due(now, service_until) {
+            if !CAPTURING.load(Ordering::Acquire) && crate::wifi_esp::set_promiscuous(true) {
+                CAPTURING.store(true, Ordering::Release);
+            }
+            drain_pending_followup_responses();
+            drain_active_publish();
+            drain_pending_sdf();
+            return;
+        }
+        // The responder received no traffic before its explicit lease
+        // deadline. Return to normal DW scheduling; the peer's QUIC PTO will
+        // initiate another bounded action if the association is still alive.
+        NOW_SERVICE_RECEIVE_UNTIL_MS.store(0, Ordering::Release);
+        let _ = crate::wifi_esp::set_promiscuous(false);
+        CAPTURING.store(false, Ordering::Release);
+        ACQUIRING.store(false, Ordering::Release);
+        NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Release);
     }
     // A beacon observed during acquisition or a DW defines the next DW in
     // local time. This aligns independent devices to the same cluster beacon
@@ -939,6 +1300,7 @@ pub fn poll() {
     if CAPTURING.load(Ordering::Acquire) {
         drain_pending_followup_responses();
         drain_active_publish();
+        drain_pending_sdf();
         if due(now, UNTIL_MS.load(Ordering::Relaxed)) {
             let _ = crate::wifi_esp::set_promiscuous(false);
             CAPTURING.store(false, Ordering::Release);
@@ -957,6 +1319,7 @@ pub fn poll() {
         NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Relaxed);
         drain_pending_followup_responses();
         drain_active_publish();
+        drain_pending_sdf();
     }
 }
 
@@ -967,7 +1330,34 @@ pub fn next_service_delay_ms() -> Option<u32> {
     if !STARTED.load(Ordering::Acquire) {
         return None;
     }
+    // ROC owns the Wi-Fi request slot and `service_deadline` cannot legally
+    // change promiscuous state until ESP-IDF's done callback releases it.
+    // Returning an already-expired DW deadline here used to rearm Main's
+    // one-shot timer at 1 ms, creating a pointless wake loop. The ROC adapter
+    // now enqueues a NAN completion event after release, so Main blocks until
+    // that real state transition instead of polling the lease.
+    if crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
+        return None;
+    }
+    // The active NOW receive owner is event-driven: it remains armed until a
+    // profile transition or ROC completion queues Main.  Returning no NAN
+    // deadline prevents an artificial capture tick while no radio action is
+    // due.
+    if NOW_ACTIVE_RECEIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    // The active NOW client owns its own exact retry/PTO deadline in Main.
+    // Returning `None` here prevents a second synthetic timer wake while the
+    // receive lease is intentionally held open for real stream traffic.
+    if NOW_CLIENT_RECEIVE_LEASE.load(Ordering::Acquire) {
+        return None;
+    }
     let now = now_ms();
+    let service_until = NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire);
+    if service_until != 0 {
+        let remaining = service_until.wrapping_sub(now);
+        return Some(if remaining > 0x8000_0000 { 1 } else { remaining.max(1) });
+    }
     let deadline = if CAPTURING.load(Ordering::Acquire) {
         UNTIL_MS.load(Ordering::Acquire)
     } else {

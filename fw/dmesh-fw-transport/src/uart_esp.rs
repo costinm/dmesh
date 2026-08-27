@@ -5,7 +5,10 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use dmesh_server::uart::{UART_TRANSPORT_MARKER, UartIngress, classify_uart_payload};
+use dmesh_server::{
+    firmware_profile::{UART_DEFAULT, UART_OFF},
+    uart::{UART_TRANSPORT_MARKER, UartIngress, classify_uart_payload},
+};
 use uart_codec::codec::{Decoder as UartDecoder, Encoder as UartEncoder};
 
 /// UART is an L2 bearer and therefore uses the transport MTU rather than a
@@ -20,17 +23,16 @@ pub const UART_MAX_PACKET: usize = crate::TRANSPORT_MTU + 1;
 include!(concat!(env!("OUT_DIR"), "/physical_uart_baud.rs"));
 #[cfg(target_arch = "riscv32")]
 pub const PHYSICAL_UART_BAUD: i32 = 0;
-// Classic ESP32 has materially less usable DRAM after Wi-Fi/BT and Main's
-// platform modules are linked. It therefore uses smaller bearer queues, not
-// a different UART protocol: all sizes remain whole-MTU record slots and a
-// full queue is explicit path backpressure. C6/S3 retain the deeper USB/UART
-// flight needed for the faster host links.
+// UART egress is a bounded flight of complete MTU records. Classic ESP32
+// chooses its depth at startup from internal-heap headroom; C6/S3 retain their
+// established fixed upper bounds. The common capacity-edge wake below prevents
+// a short queue from becoming a protocol dead end.
 #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-pub(crate) const UART_EGRESS_CAPACITY: usize = 1;
+const UART_EGRESS_MAX_CAPACITY: usize = 4;
 #[cfg(target_arch = "riscv32")]
-pub(crate) const UART_EGRESS_CAPACITY: usize = 2;
+const UART_EGRESS_MAX_CAPACITY: usize = 2;
 #[cfg(target_feature = "esp32s3ops")]
-pub(crate) const UART_EGRESS_CAPACITY: usize = 8;
+const UART_EGRESS_MAX_CAPACITY: usize = 8;
 #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
 pub(crate) const UART_L2_STACK_BYTES: u32 = 8 * 1024;
 #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
@@ -52,8 +54,16 @@ static UART_RX_BYTE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// one-shot notification so its dispatcher need not wait for a housekeeping
 /// timeout after an ingress queue transition.
 static INGRESS_NOTIFY: AtomicUsize = AtomicUsize::new(0);
+/// Optional task-context notification after the physical writer dequeues one
+/// complete record.  It does not carry a packet: the shared QUIC-lite owner
+/// retains its own ledger and consults the real egress queue capacity when it
+/// receives this writable transition.
+static EGRESS_NOTIFY: AtomicUsize = AtomicUsize::new(0);
 static UART_EGRESS_QUEUE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static UART_EGRESS_QUEUED: AtomicUsize = AtomicUsize::new(0);
+/// Actual queue depth selected at startup. Keeping it atomic allows the
+/// shared worker to use the same capacity feedback without a UART lock.
+static UART_EGRESS_CAPACITY: AtomicUsize = AtomicUsize::new(0);
 // Solely owned by the UART writer task.  This is deliberately a short driver
 // write chunk, not a packet or an escaped-frame buffer.
 static mut UART_TX_SCRATCH: [u8; 64] = [0; 64];
@@ -74,20 +84,28 @@ static UART_DEBUG_ENABLED: AtomicBool = AtomicBool::new(true);
 pub const COMMAND_GRACE_TICKS: u32 = 8000;
 
 /// Convert the compact transport.start selector to a physical baud rate.
-/// Zero means UART off; selector one is the protocol default. USB-JTAG builds
-/// never call this mapping because their bearer is packetized, not serial.
+/// Zero is the product-default spelling for 115200; `UART_OFF` has no baud.
+/// USB-JTAG builds never call this mapping because their bearer is packetized,
+/// not serial.
 pub const fn baud_from_selector(selector: u8) -> Option<i32> {
     match selector {
-        0 => None,
-        1 => Some(115_200),
+        UART_DEFAULT | 1 => Some(115_200),
         2 => Some(9_600),
         3 => Some(19_200),
         4 => Some(38_400),
         5 => Some(57_600),
         6 => Some(230_400),
         7 => Some(460_800),
+        UART_OFF => None,
         _ => None,
     }
+}
+
+/// Whether this profile explicitly disables a real UART bearer. USB-JTAG is
+/// intentionally not governed by this predicate so hardware debug remains
+/// usable when a radio-only profile asks to turn UART off.
+pub const fn uart_is_off(selector: u8) -> bool {
+    selector == UART_OFF
 }
 
 /// Physical UART L2 receive observability. These counters deliberately stop
@@ -456,26 +474,8 @@ struct QueuedUartPayload {
     bytes: [u8; UART_MAX_PACKET],
 }
 
-// C6/S3 queues are dynamically allocated only while UART L2 is enabled. On
-// classic ESP32, FreeRTOS heap-backed queue creation currently faults during
-// early Main bootstrap; its deliberately tiny 2/1/1 profile uses static
-// backing until that platform issue is resolved. This is a profile constraint,
-// not a different UART protocol or a Main-owned driver.
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-#[repr(align(4))]
-struct QueueStorage<const N: usize>([u8; N]);
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-static mut UART_EGRESS_QUEUE_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticQueue_t> =
-    core::mem::MaybeUninit::uninit();
-#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-static mut UART_EGRESS_QUEUE_STORAGE: QueueStorage<
-    { UART_EGRESS_CAPACITY * core::mem::size_of::<QueuedUartPayload>() },
-> = QueueStorage([0; UART_EGRESS_CAPACITY * core::mem::size_of::<QueuedUartPayload>()]);
-
-// The classic profile retains static task backing with its static queues; the
-// fuller C6/S3 profiles use dynamic task and queue allocation.  Keep the
+// Classic retains static task backing, but egress records are allocated only
+// while UART is enabled and can be sized from measured headroom. Keep the
 // classic UART receive and transmit tasks separate, as in the proven original
 // Main/Recovery implementation: RX waits indefinitely for the driver's event
 // queue at priority 6 while TX waits independently for framed egress at
@@ -513,17 +513,9 @@ pub unsafe fn init_uart_egress_queue() -> bool {
     if !UART_EGRESS_QUEUE.load(Ordering::Acquire).is_null() {
         return true;
     }
-    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-    let queue = esp_idf_sys::xQueueGenericCreateStatic(
-        UART_EGRESS_CAPACITY as _,
-        core::mem::size_of::<QueuedUartPayload>() as _,
-        core::ptr::addr_of_mut!(UART_EGRESS_QUEUE_STORAGE.0).cast(),
-        core::ptr::addr_of_mut!(UART_EGRESS_QUEUE_CONTROL).cast(),
-        0,
-    );
-    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+    let capacity = select_egress_capacity();
     let queue = esp_idf_sys::xQueueGenericCreate(
-        UART_EGRESS_CAPACITY as _,
+        capacity as _,
         core::mem::size_of::<QueuedUartPayload>() as _,
         0,
     );
@@ -536,8 +528,35 @@ pub unsafe fn init_uart_egress_queue() -> bool {
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => true,
+        Ok(_) => {
+            UART_EGRESS_CAPACITY.store(capacity, Ordering::Release);
+            true
+        }
         Err(_) => true,
+    }
+}
+
+/// Select a small UART flight from the actual internal heap before Wi-Fi
+/// owns its dynamic buffers. Four records cost roughly 5 KiB plus FreeRTOS
+/// metadata, so only choose it with a deliberately conservative 72 KiB
+/// headroom. A constrained classic board still has a functional one-record
+/// queue because the shared worker is woken by each dequeue edge.
+fn select_egress_capacity() -> usize {
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    {
+        let caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+        let free = unsafe { esp_idf_sys::heap_caps_get_free_size(caps) as usize };
+        if free >= 72 * 1024 {
+            4
+        } else if free >= 48 * 1024 {
+            2
+        } else {
+            1
+        }
+    }
+    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+    {
+        UART_EGRESS_MAX_CAPACITY
     }
 }
 
@@ -547,7 +566,7 @@ pub unsafe fn init_uart_egress_queue() -> bool {
 pub(crate) fn transport_egress_capacity() -> (usize, usize) {
     (
         UART_EGRESS_QUEUED.load(Ordering::Acquire),
-        UART_EGRESS_CAPACITY,
+        UART_EGRESS_CAPACITY.load(Ordering::Acquire),
     )
 }
 
@@ -664,6 +683,15 @@ pub fn set_ingress_notify(callback: Option<fn()>) {
     INGRESS_NOTIFY.store(callback, Ordering::Release);
 }
 
+/// Install or clear the task-context notification for newly available UART
+/// egress capacity. The dedicated UART writer calls it after dequeuing a
+/// record, never from an interrupt, so its recipient may safely enqueue a
+/// typed shared-worker event without allocating or touching the UART driver.
+pub fn set_egress_notify(callback: Option<fn()>) {
+    let callback = callback.map_or(0, |callback| callback as usize);
+    EGRESS_NOTIFY.store(callback, Ordering::Release);
+}
+
 fn notify_ingress() {
     let callback = INGRESS_NOTIFY.load(Ordering::Acquire);
     if callback != 0 {
@@ -675,10 +703,28 @@ fn notify_ingress() {
     }
 }
 
+fn notify_egress_ready() {
+    let callback = EGRESS_NOTIFY.load(Ordering::Acquire);
+    if callback != 0 {
+        // The writer has already dequeued the record, so the callback observes
+        // one available queue slot. It is only a wake edge; packet production
+        // remains serialized on shared_ingress_esp.
+        let callback: fn() = unsafe { core::mem::transmute(callback) };
+        callback();
+    }
+}
+
 /// Emit one complete QUIC-lite packet on the physical UART. This is an ESP32
 /// adapter only: the marker and PPP framing are L2 details, while routing and
 /// retransmission remain in the shared connection owner.
 pub fn send_transport_packet(packet: &[u8]) -> bool {
+    #[cfg(not(target_arch = "riscv32"))]
+    if !is_active() {
+        // `uart=off` means no parser, packet handling, or physical egress on
+        // a real bridge. USB-JTAG is excluded so C6 debug/recovery remains
+        // independently available in radio-only profiles.
+        return false;
+    }
     if packet.is_empty() || packet.len() >= UART_MAX_PACKET {
         return false;
     }
@@ -714,6 +760,10 @@ pub fn send_transport_packet(packet: &[u8]) -> bool {
 /// inspect CBOR, text, service tags, or command responses: those are
 /// dispatcher responsibilities.
 pub fn send_direct_record(record: &[u8]) -> bool {
+    #[cfg(not(target_arch = "riscv32"))]
+    if !is_active() {
+        return false;
+    }
     if record.is_empty() || record.len() > UART_MAX_PACKET {
         return false;
     }
@@ -984,6 +1034,7 @@ fn classic_tx_task() {
         if !dequeue_uart_current(esp_idf_sys::TickType_t::MAX) {
             continue;
         }
+        notify_egress_ready();
         write_uart_current();
     }
 }
@@ -996,6 +1047,7 @@ fn command_task() {
     loop {
         let has_pending = dequeue_uart_current(0);
         if has_pending {
+            notify_egress_ready();
             write_uart_current();
         }
         #[cfg(target_arch = "riscv32")]
@@ -1074,6 +1126,13 @@ fn drain_uart_driver(decoder: &mut UartDecoder, bytes: &mut [u8; 256]) {
 }
 
 fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
+    #[cfg(not(target_arch = "riscv32"))]
+    if !is_active() {
+        // Keep the ESP-IDF driver owner alive so an enabled profile can
+        // resume without reinstalling UART0, but discard bytes before PPP
+        // decode and shared-pool admission while UART is explicitly off.
+        return;
+    }
     let Ok(records) = decoder.push(bytes) else {
         return;
     };

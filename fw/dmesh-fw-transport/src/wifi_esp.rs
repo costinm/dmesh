@@ -11,7 +11,7 @@ use crate::{TransportProfile, commands as uart};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 // Recovery-only PHY policy. It is deliberately not an NVS setting: normal
@@ -320,6 +320,28 @@ const STA_RECONNECT_SCAN_COOLDOWN_OBSERVATIONS: u8 = 20;
 const STA_MINIMUM_RSSI_DBM: i8 = -70;
 const STA_SCAN_MAX_RECORDS: usize = 16;
 
+/// Request one explicit reconnect after an ESP-IDF disconnect completion.
+/// Main calls this at most once per queued disconnect event and then waits for
+/// the next connected/disconnected callback; it is not a timer or retry loop.
+pub fn reconnect_sta_once() -> bool {
+    if STA_ASSOCIATED_EVENT.load(Ordering::Acquire) {
+        return true;
+    }
+    STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
+    STA_CONNECT_STARTED_MS.store(
+        (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32,
+        Ordering::Release,
+    );
+    let result = unsafe { esp_idf_sys::esp_wifi_connect() };
+    if result == esp_idf_sys::ESP_OK || result == esp_idf_sys::ESP_ERR_WIFI_CONN {
+        uart::send_response(b"wifi STA reconnect requested");
+        true
+    } else {
+        uart::send_stat(b"wifi STA reconnect result=", result as u32 as u64);
+        false
+    }
+}
+
 /// Task-owned copy of the ephemeral transport.start association target. An
 /// explicit BSSID is authoritative and reconnects directly; SSID-only starts
 /// may scan to select an eligible DMesh AP.
@@ -372,6 +394,11 @@ static STA_11B_RATES_DISABLED: AtomicBool = AtomicBool::new(true);
 // ESP_ERR_NO_MEM. Retrying that exact initialization leaks/fragmentates the
 // remaining heap, so a reboot or a changed image/profile is required.
 static STA_DRIVER_INIT_FAILED: AtomicBool = AtomicBool::new(false);
+/// Optional product lifecycle hook. Main registers a fixed queue producer at
+/// boot; Recovery leaves it unset and continues to use the shared adapter
+/// without pulling Main policy into this module.
+pub type StaLifecycleHandler = fn(bool, u8);
+static STA_LIFECYCLE_HANDLER: AtomicUsize = AtomicUsize::new(0);
 // PHY calibration requires an initialized NVS partition even though the Wi-Fi
 // driver is forbidden from loading or saving a persisted STA configuration.
 static PHY_NVS_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -410,6 +437,7 @@ unsafe extern "C" fn sta_event_handler(
             STA_CONNECT_TO_ASSOCIATED_MS.store(now_ms.wrapping_sub(started), Ordering::Release);
         }
         STA_ASSOCIATED_EVENT.store(true, Ordering::Release);
+        notify_sta_lifecycle(true, 0);
     } else if event_id == esp_idf_sys::wifi_event_t_WIFI_EVENT_STA_DISCONNECTED as i32 {
         let reason = if event_data.is_null() {
             0
@@ -419,6 +447,24 @@ unsafe extern "C" fn sta_event_handler(
         STA_LAST_DISCONNECT_REASON.store(reason, Ordering::Release);
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
         STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
+        notify_sta_lifecycle(false, reason);
+    }
+}
+
+/// Register a product callback that copies ESP-IDF association transitions to
+/// its own queue. Called once during Main startup; the Wi-Fi event task never
+/// performs radio work or takes a profile lock through this hook.
+pub fn set_sta_lifecycle_handler(handler: Option<StaLifecycleHandler>) {
+    STA_LIFECYCLE_HANDLER.store(handler.map(|handler| handler as usize).unwrap_or(0), Ordering::Release);
+}
+
+fn notify_sta_lifecycle(associated: bool, reason: u8) {
+    let handler = STA_LIFECYCLE_HANDLER.load(Ordering::Acquire);
+    if handler != 0 {
+        // Installed only through `set_sta_lifecycle_handler`; the callback
+        // has no captured state and only copies a bounded event to Main.
+        let handler: StaLifecycleHandler = unsafe { core::mem::transmute(handler) };
+        handler(associated, reason);
     }
 }
 
@@ -610,23 +656,29 @@ pub fn init_sta(params: &TransportProfile) {
         for (dst, src) in sta.ssid.iter_mut().zip(ssid.iter().copied()) {
             *dst = src;
         }
-        if params.sta_passphrase_len != 0 {
-            for (dst, src) in sta.password.iter_mut().zip(
-                params.sta_passphrase[..params.sta_passphrase_len]
-                    .iter()
-                    .copied(),
-            ) {
+        // WPA2 is the normal DMesh STA policy. `open=1` is a distinct,
+        // volatile transport.start choice for measurements/interoperability;
+        // an omitted passphrase alone never downgrades authentication.
+        let passphrase = if params.sta_passphrase_len != 0 {
+            &params.sta_passphrase[..params.sta_passphrase_len]
+        } else {
+            DMESH_AP_PASSPHRASE
+        };
+        if !params.open {
+            for (dst, src) in sta.password.iter_mut().zip(passphrase.iter().copied()) {
                 *dst = src;
             }
-            // Android P2P Group Owner APs are WPA2-PSK. Explicitly
-            // admit that security class instead of relying on an all-zero
-            // scan threshold inherited from an open-AP test. `required`
-            // remains false: WPA2 PMF is optional and Android devices vary
-            // in whether they advertise it for a local hotspot.
-            sta.threshold.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK;
-            sta.pmf_cfg.capable = true;
-            sta.pmf_cfg.required = false;
         }
+        sta.threshold.authmode = if params.open {
+            esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+        } else {
+            esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+        };
+        // PMF belongs to protected associations. Leaving it disabled for an
+        // explicit open epoch avoids presenting WPA capabilities to an AP
+        // which must accept unauthenticated association.
+        sta.pmf_cfg.capable = !params.open;
+        sta.pmf_cfg.required = false;
         if params.sta_bssid_set {
             sta.bssid_set = true;
             sta.bssid.copy_from_slice(&params.sta_bssid);
@@ -636,9 +688,9 @@ pub fn init_sta(params: &TransportProfile) {
         // `transport.start { mode=sta, ap=1 }` is a complete APSTA epoch,
         // not an after-the-fact lab toggle.  Configure both personalities
         // before the single Wi-Fi start so the STA association and NAN/NOW
-        // callback ownership survive the colocated open AP.
-        let open_ap = params.ap == 1;
-        let mode = if open_ap {
+        // callback ownership survive the colocated WPA2 AP.
+        let ap_enabled = params.ap == 1;
+        let mode = if ap_enabled {
             esp_idf_sys::wifi_mode_t_WIFI_MODE_APSTA
         } else {
             esp_idf_sys::wifi_mode_t_WIFI_MODE_STA
@@ -648,13 +700,17 @@ pub fn init_sta(params: &TransportProfile) {
             uart::send_stat(b"wifi STA mode result=", mode_result as u32 as u64);
             return;
         }
-        if open_ap {
+        if ap_enabled {
             let channel = if params.sta_channel == 0 {
                 6
             } else {
                 params.sta_channel.clamp(1, 13)
             };
-            if !configure_unassociated_open_ap(channel)
+            if !configure_unassociated_dmesh_ap(
+                channel,
+                NAN_FALLBACK_AP_BEACON_TU,
+                params.open,
+            )
                 || !configure_passive_p2p_advertisement(true)
             {
                 uart::send_response(b"wifi STA+AP setup failed");
@@ -712,7 +768,7 @@ pub fn init_sta(params: &TransportProfile) {
             uart::send_response(b"wifi STA start failed");
             return;
         }
-        LAB_OPEN_AP.store(open_ap, Ordering::Release);
+        LAB_OPEN_AP.store(ap_enabled, Ordering::Release);
         if !set_bssid_check_disabled(0, params.sta_bssid_check_disabled) {
             uart::send_response(b"wifi STA BSSID policy failed");
             return;
@@ -748,24 +804,11 @@ pub fn init_sta(params: &TransportProfile) {
         if connect != esp_idf_sys::ESP_OK && connect != esp_idf_sys::ESP_ERR_WIFI_CONN {
             uart::send_stat(b"wifi raw sta connect_result=", connect as u32 as u64);
         }
-        start_sta_reconnect_task(params);
-        let mut associated = false;
-        for attempt in 0..50 {
-            esp_idf_sys::vTaskDelay(100);
-            associated = STA_ASSOCIATED_EVENT.load(Ordering::Acquire);
-            if associated {
-                break;
-            }
-            if attempt != 0 && attempt % 10 == 0 {
-                let _ = esp_idf_sys::esp_wifi_connect();
-            }
-        }
-        uart::send_response(if associated {
-            b"wifi raw STA associated"
-        } else {
-            b"wifi raw STA association failed"
-        });
-        uart::send_stat(b"wifi raw sta associated_ms=", elapsed_ms(init_started_us));
+        // Association is asynchronous.  Do not spend five seconds in a
+        // delay/check loop here: ESP-IDF's STA event callback reports the
+        // authoritative connected/disconnected completion to Main's bounded
+        // queue, which starts raw UDP6 only after the association exists.
+        uart::send_response(b"wifi raw STA connecting");
         // Action/NOW registration is a separately requested radio mode.
         // Do not install it as a side effect of raw UDP6 association: its
         // driver callback is global and would make Recovery run two modes.
@@ -839,7 +882,7 @@ pub fn init_nan_now(
         } else {
             params.sta_channel.clamp(1, 13)
         };
-        // The default unassociated setup starts APSTA once. Its open AP
+        // The default unassociated setup starts APSTA once. Its WPA2 AP
         // provides the channel anchor for NOW/NAN validation; it is not a
         // later lab overlay on top of a running STA driver.
         let mode = if params.ap == 1 {
@@ -848,7 +891,12 @@ pub fn init_nan_now(
             esp_idf_sys::wifi_mode_t_WIFI_MODE_STA
         };
         if esp_idf_sys::esp_wifi_set_mode(mode) != esp_idf_sys::ESP_OK
-            || (params.ap == 1 && !configure_unassociated_open_ap(nan_channel))
+            || (params.ap == 1
+                && !configure_unassociated_dmesh_ap(
+                    nan_channel,
+                    NAN_FALLBACK_AP_BEACON_TU,
+                    params.open,
+                ))
             || !configure_passive_p2p_advertisement(params.ap == 1)
         {
             uart::send_response(b"wifi NAN/NOW AP setup failed");
@@ -935,7 +983,7 @@ pub fn init_nan_now(
         }
     }
     LAB_OPEN_AP.store(params.ap == 1, Ordering::Release);
-    let enabled = start_sta_extensions(handler, params.nan_dw_interval);
+    let enabled = start_sta_extensions(handler, params.nan_dw_interval, params.now);
     uart::send_response(if enabled {
         b"wifi NAN/NOW started"
     } else {
@@ -992,6 +1040,24 @@ pub fn interface_mac(interface: RadioInterface) -> Option<[u8; 6]> {
     let mut mac = [0u8; 6];
     (unsafe { esp_idf_sys::esp_wifi_get_mac(radio_interface_native(interface), mac.as_mut_ptr()) }
         == esp_idf_sys::ESP_OK)
+        .then_some(mac)
+}
+
+/// Return the factory STA address without requiring a running Wi-Fi interface.
+///
+/// Runtime connection IDs are created before the radio personality is fully
+/// configured and must remain stable across NAN/NOW and STA transitions.  The
+/// eFuse-backed address is available at that point, unlike `interface_mac`,
+/// which asks the active driver.  Callers use it only as local identity; it
+/// does not transmit or change radio state.
+pub fn factory_sta_mac() -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    (unsafe {
+        esp_idf_sys::esp_read_mac(
+            mac.as_mut_ptr(),
+            esp_idf_sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
+        )
+    } == esp_idf_sys::ESP_OK)
         .then_some(mac)
 }
 
@@ -1075,31 +1141,43 @@ pub fn set_ht20_channel(channel: u8) -> bool {
     true
 }
 
-/// Configure the open AP before the one Wi-Fi start for the default
-/// unassociated radio. A later AP toggle would require a stop/start and lose
-/// the driver callback that NOW is validating.
-unsafe fn configure_unassociated_open_ap(channel: u8) -> bool {
+/// Fixed Android-compatible credentials for every ESP-owned fallback AP.
+///
+/// Android's `WifiController` uses these values for both P2P and local-only
+/// hotspot qualification. Keeping the ESP fallback AP identical lets one
+/// ordinary WPA2 STA credential set work across Android and ESP peers; these
+/// are intentionally not NVS settings or per-board secrets.
+const DMESH_AP_SSID: &[u8] = b"DIRECT-dmesh";
+const DMESH_AP_PASSPHRASE: &[u8] = b"untrusted-open-mode";
+
+/// Configure the fixed WPA2 fallback AP before the one Wi-Fi start for an
+/// unassociated or APSTA epoch. Called only while the radio owner creates an
+/// epoch, never from a receive callback or service tick. A later AP policy
+/// change requires a replacement epoch so NOW's driver callbacks stay owned
+/// by one complete radio setup.
+unsafe fn configure_unassociated_dmesh_ap(
+    channel: u8,
+    beacon_interval: u16,
+    open: bool,
+) -> bool {
     let mut ap = esp_idf_sys::wifi_ap_config_t::default();
-    let mut mac = [0u8; 6];
-    if esp_idf_sys::esp_read_mac(
-        mac.as_mut_ptr(),
-        esp_idf_sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP,
-    ) != esp_idf_sys::ESP_OK
-    {
-        return false;
+    ap.ssid[..DMESH_AP_SSID.len()].copy_from_slice(DMESH_AP_SSID);
+    ap.ssid_len = DMESH_AP_SSID.len() as u8;
+    if !open {
+        ap.password[..DMESH_AP_PASSPHRASE.len()].copy_from_slice(DMESH_AP_PASSPHRASE);
     }
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut ssid = *b"DIRECT-000000-dmesh";
-    for (index, byte) in mac[3..].iter().enumerate() {
-        ssid[7 + index * 2] = HEX[(byte >> 4) as usize];
-        ssid[8 + index * 2] = HEX[(byte & 0x0f) as usize];
-    }
-    ap.ssid[..ssid.len()].copy_from_slice(&ssid);
-    ap.ssid_len = ssid.len() as u8;
     ap.channel = channel;
-    ap.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
+    ap.authmode = if open {
+        esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
+    } else {
+        esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+    };
+    // Android's app-scoped WPA2 requests must not require PMF, but accepting
+    // it permits modern Android devices to negotiate PMF when they select it.
+    ap.pmf_cfg.capable = !open;
+    ap.pmf_cfg.required = false;
     ap.max_connection = 4;
-    ap.beacon_interval = NAN_FALLBACK_AP_BEACON_TU;
+    ap.beacon_interval = beacon_interval.clamp(100, 60_000);
     let mut config = esp_idf_sys::wifi_config_t { ap };
     esp_idf_sys::esp_wifi_set_config(esp_idf_sys::wifi_interface_t_WIFI_IF_AP, &mut config)
         == esp_idf_sys::ESP_OK
@@ -1381,6 +1459,12 @@ pub fn start_raw_udp6(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool
     crate::wifi_raw_udp6_esp::start(mac, ap.bssid, handler)
 }
 
+/// Start raw UDP6 for an unassociated open-AP epoch.  This has no STA AP
+/// record by design, so it selects the AP Ethernet ingress directly.
+pub fn start_raw_udp6_ap(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool {
+    crate::wifi_raw_udp6_esp::start_ap(handler)
+}
+
 /// Bind the caller-owned QUIC-lite action handler to the shared radio ingress.
 ///
 /// This does not start an ESP-NOW subsystem or decide radio state. Wi-Fi
@@ -1418,6 +1502,7 @@ pub fn install_action_ingress(handler: crate::wifi_espnow_esp::EspNowHandler) ->
 pub fn start_sta_extensions(
     handler: crate::wifi_espnow_esp::EspNowHandler,
     nan_dw_interval: u8,
+    now: u8,
 ) -> bool {
     if RADIO_MODE
         .compare_exchange(
@@ -1460,6 +1545,18 @@ pub fn start_sta_extensions(
     if nan_dw_interval != 0 && !crate::wifi_nan_dw_capture_esp::start(nan_dw_interval) {
         stop_sta_extensions();
         uart::send_response(b"wifi STA/NAN/NOW DW start failed");
+        return false;
+    }
+    // Active DW1 NOW is the standing unassociated control plane.  Keep the
+    // management receiver armed so an idle peer can receive an initiating
+    // action; the narrow DW8/now=2 profile remains sleepy/windowed.
+    if nan_dw_interval != 0
+        && !crate::wifi_nan_dw_capture_esp::set_active_now_receive(
+            now != 2 && nan_dw_interval == 1,
+        )
+    {
+        stop_sta_extensions();
+        uart::send_response(b"wifi STA/NAN/NOW active receive failed");
         return false;
     }
     // NAN+NOW owns the same callback/capture extension set whether or not a
@@ -1633,7 +1730,7 @@ pub fn lab_force_unassociated() -> bool {
     LAB_FORCE_UNASSOCIATED.load(Ordering::Acquire)
 }
 
-/// Enable or disable the shared, open APSTA laboratory owner.  This is an
+/// Enable or disable the shared, WPA2 APSTA laboratory owner. This is an
 /// ephemeral radio transition for Recovery and Main alike; it does not touch
 /// the persisted STA profile/NVS and deliberately does not create an IP data
 /// plane.  Its SSID is deterministically derived from the AP MAC so a peer
@@ -1652,30 +1749,10 @@ pub fn set_lab_open_ap(enabled: bool, channel: u8, beacon_tu: u16) -> bool {
             return false;
         }
         if enabled {
-            let mut ap = esp_idf_sys::wifi_ap_config_t::default();
-            let mut mac = [0u8; 6];
-            let _ = esp_idf_sys::esp_wifi_get_mac(
-                esp_idf_sys::wifi_interface_t_WIFI_IF_AP,
-                mac.as_mut_ptr(),
-            );
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            let mut ssid = *b"DIRECT-000000-dmesh";
-            for (index, byte) in mac[3..].iter().enumerate() {
-                ssid[7 + index * 2] = HEX[(byte >> 4) as usize];
-                ssid[8 + index * 2] = HEX[(byte & 0x0f) as usize];
-            }
-            ap.ssid[..ssid.len()].copy_from_slice(&ssid);
-            ap.ssid_len = ssid.len() as u8;
-            ap.channel = channel;
-            ap.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
-            ap.max_connection = 4;
-            ap.beacon_interval = beacon_tu.clamp(100, 60_000);
-            let mut config = esp_idf_sys::wifi_config_t { ap };
-            if esp_idf_sys::esp_wifi_set_config(
-                esp_idf_sys::wifi_interface_t_WIFI_IF_AP,
-                &mut config,
-            ) != esp_idf_sys::ESP_OK
-            {
+            // The raw-radio lab's `Open` spelling remains an explicit
+            // unauthenticated diagnostic. Main transport.start has the same
+            // behavior through its `open=1` profile field.
+            if !configure_unassociated_dmesh_ap(channel, beacon_tu, true) {
                 return false;
             }
         }
@@ -1835,7 +1912,15 @@ pub fn promiscuous_enabled() -> Result<bool, esp_idf_sys::esp_err_t> {
 /// blind `esp_wifi_connect` loop.  The selected BSSID is also the advertised
 /// server MAC: `quic_lite::raw_udp6::link_local_from_mac` derives its IPv6 LL
 /// endpoint without a separate raw-UDP address setting.
-fn start_sta_reconnect_task(params: &TransportProfile) {
+/// Start Recovery's legacy STA observation/reconnect worker.
+///
+/// This is called exactly once by the frozen Recovery entry point after its
+/// initial STA setup.  It remains outside `init_sta` so Main cannot retain a
+/// periodic observer merely by using the shared ESP-IDF association setup;
+/// Main owns reconnects through queued connect/disconnect callbacks instead.
+/// Recovery will remove this worker when its RTC-supplied open-AP client is
+/// implemented.
+pub fn start_legacy_sta_reconnect_task(params: &TransportProfile) {
     if STA_RECONNECT_TASK_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }

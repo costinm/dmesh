@@ -3515,11 +3515,7 @@ fn parse_mac(value: &str) -> Result<[u8; 6]> {
 }
 
 fn default_direct_ssid() -> Result<String> {
-    let mac = station_mac()?;
-    Ok(format!(
-        "DIRECT-DMESH-{:02X}{:02X}{:02X}{:02X}",
-        mac[2], mac[3], mac[4], mac[5]
-    ))
+    Ok("DIRECT-dmesh".to_owned())
 }
 
 fn copy_cstr_bytes<const N: usize>(dst: &mut [u8; N], src: &[u8]) {

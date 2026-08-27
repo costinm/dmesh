@@ -1,10 +1,7 @@
 //! Recovery binary shell. Shared transport, flash, STA, UART, NVS, and ESP
-//! SHA code live in `dmesh-fw-transport`; only the final Recovery-to-Main
-//! Stage2/RTC/reboot policy stays here.
+//! SHA code live in `dmesh-fw-transport`.
 #![no_std]
 #![no_main]
-
-mod platform;
 
 #[no_mangle]
 pub extern "C" fn app_main() {
@@ -13,7 +10,7 @@ pub extern "C" fn app_main() {
     // unsupported here rather than introducing a Recovery-specific dispatcher.
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();
-    dmesh_fw_transport::recovery_runtime::run(platform::complete_main_flash);
+    dmesh_fw_transport::recovery_runtime::run();
 }
 
 #[panic_handler]

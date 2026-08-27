@@ -2,7 +2,14 @@ const RTC_HANDOFF_OFFSET: usize = 12 + 5;
 const RTC_HEALTH_EVENT_OFFSET: usize = 12 + 4;
 #[cfg(target_arch = "riscv32")]
 const RTC_RETAIN_BASE: usize = 0x5000_4000 - 56;
-#[cfg(not(target_arch = "riscv32"))]
+// Classic ESP32 retains this block at the RTC DRAM low address. ESP32-S3 does
+// not have `ESP_ROM_HAS_LP_ROM`, so Stage2's C contract places it at
+// `SOC_RTC_DRAM_HIGH - 56`, not at the S3 RTC DRAM low boundary. Do not fold
+// these targets together: writing the wrong S3 address faults before Main
+// can reach its healthy marker.
+#[cfg(all(not(target_arch = "riscv32"), target_feature = "esp32s3ops"))]
+const RTC_RETAIN_BASE: usize = 0x6010_0000 - 56;
+#[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
 const RTC_RETAIN_BASE: usize = 0x3ff8_0000;
 
 unsafe fn rtc_write(offset: usize, value: u8) {

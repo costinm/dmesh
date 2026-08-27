@@ -232,10 +232,19 @@ static mut RESPONSE_BUFFER: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
 /// second receive task or packet queue merely to originate a pair probe.
 struct RawUdp6ClientState {
     peer: RawUdp6Peer,
-    client: dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
     started_at_us: i64,
     deadline_us: i64,
+    next_bootstrap_retry_us: i64,
 }
+
+// The shared raw service advertises an eight-packet C6 association. The
+// client must retain the same bounded receive history: four slots happen to
+// finish a small transfer, but cannot acknowledge the next flight of a
+// 16 KiB+ run. Keep the sizeable fixed ledger in static storage rather than
+// constructing it on the radio command task's stack; it is reused by exactly
+// one explicit client run and never becomes a per-packet queue.
+type RawUdp6Client =
+    dmesh_server::raw_transport::RawClient<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
 
 static RAW_CLIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_CLIENT_GENERATION: AtomicU32 = AtomicU32::new(0);
@@ -248,7 +257,13 @@ static RAW_CLIENT_BOOTSTRAP_ACKS: AtomicU32 = AtomicU32::new(0);
 static RAW_CLIENT_STREAM_PACKETS: AtomicU32 = AtomicU32::new(0);
 static RAW_CLIENT_OTHER_PACKETS: AtomicU32 = AtomicU32::new(0);
 static RAW_CLIENT_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+/// Earliest client-owned bootstrap/ACK/PTO/timeout wake in Main's millisecond
+/// clock. The owner reads only this scalar; client state remains exclusively
+/// on the shared ingress worker.
+static RAW_CLIENT_NEXT_DUE_MS: AtomicU32 = AtomicU32::new(0);
 static mut RAW_CLIENT: MaybeUninit<RawUdp6ClientState> = MaybeUninit::uninit();
+static RAW_CLIENT_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static mut RAW_CLIENT_ENGINE: MaybeUninit<RawUdp6Client> = MaybeUninit::uninit();
 /// Snapshot counters for status/log adapters.  The counters are deliberately
 /// separate from the packet ingress path and remain meaningful across bearers.
 pub fn stats() -> (u32, u32, u32, u32, u32, u32) {
@@ -292,6 +307,57 @@ pub fn raw_client_diagnostics() -> (u32, u32, u32, u32, u32) {
     )
 }
 
+/// Return the exact next raw-UDP6 client deadline for Main's blocking event
+/// wait. This is active only during an explicit device-originated probe; it
+/// is not a UDP service tick and therefore adds no idle radio wakeups.
+pub fn next_raw_client_delay_ms() -> Option<u32> {
+    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    let due_ms = RAW_CLIENT_NEXT_DUE_MS.load(Ordering::Acquire);
+    if due_ms == 0 {
+        return None;
+    }
+    let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
+    let remaining = due_ms.wrapping_sub(now_ms);
+    Some(if remaining > 0x8000_0000 { 1 } else { remaining.clamp(1, 1_000) })
+}
+
+/// Publish the active client's next genuine QUIC-lite deadline and wake Main
+/// once to recompute its blocking timeout. Called after client creation or a
+/// received client packet, never from the Ethernet callback.
+fn schedule_raw_client_service() {
+    publish_raw_client_deadline();
+    crate::main_runtime::request_transport_service();
+}
+
+/// Recompute only the deadline scalar. A due timer worker calls this after it
+/// has advanced the ledger, avoiding a wake-loop while the client is idle.
+fn publish_raw_client_deadline() {
+    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
+        RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
+        return;
+    }
+    unsafe {
+        let state = &*core::ptr::addr_of!(RAW_CLIENT).cast::<RawUdp6ClientState>();
+        let client = &*core::ptr::addr_of!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>();
+        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
+        let due_us = if client.server_cid().is_some() {
+            client
+                .next_service_deadline_ms(600)
+                .map(|deadline_ms| deadline_ms.saturating_mul(1_000))
+                .unwrap_or(state.deadline_us.max(0) as u64)
+        } else {
+            state
+                .next_bootstrap_retry_us
+                .min(state.deadline_us)
+                .max(0) as u64
+        };
+        let due_ms = due_us.max(now_us.saturating_sub(1)) / 1_000;
+        RAW_CLIENT_NEXT_DUE_MS.store(due_ms as u32, Ordering::Release);
+    }
+}
+
 /// Start a bounded STA-to-peer raw UDP6 IPERF run. Called by the shared
 /// numeric radio handler after the pair probe has put this endpoint in STA
 /// mode; it returns promptly and all subsequent packets flow through
@@ -312,9 +378,8 @@ pub fn start_iperf_client(
         // one; a live transfer remains exclusively owned by its original
         // request. This keeps timeout recovery event-driven rather than a
         // permanent firmware service tick.
-        let deadline = unsafe {
-            (*core::ptr::addr_of!(RAW_CLIENT).cast::<RawUdp6ClientState>()).deadline_us
-        };
+        let deadline =
+            unsafe { (*core::ptr::addr_of!(RAW_CLIENT).cast::<RawUdp6ClientState>()).deadline_us };
         if now < deadline {
             return false;
         }
@@ -324,6 +389,19 @@ pub fn start_iperf_client(
     if RAW_CLIENT_ACTIVE.swap(true, Ordering::AcqRel) {
         return false;
     }
+    // A radio snapshot is sampled across independent probe requests.  Clear
+    // completion evidence only after this request has exclusively acquired
+    // the client slot, so `raw_service_bytes` always describes this run and
+    // cannot make a later failed IPERF request look complete.
+    RAW_CLIENT_BYTES.store(0, Ordering::Release);
+    RAW_CLIENT_ERRORS.store(0, Ordering::Release);
+    RAW_CLIENT_ELAPSED_US.store(0, Ordering::Release);
+    RAW_CLIENT_RECEIVE_OK.store(0, Ordering::Release);
+    RAW_CLIENT_RECEIVE_ERRORS.store(0, Ordering::Release);
+    RAW_CLIENT_BOOTSTRAP_ACKS.store(0, Ordering::Release);
+    RAW_CLIENT_STREAM_PACKETS.store(0, Ordering::Release);
+    RAW_CLIENT_OTHER_PACKETS.store(0, Ordering::Release);
+    RAW_CLIENT_LAST_ERROR.store(0, Ordering::Release);
     let generation = RAW_CLIENT_GENERATION
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
@@ -334,7 +412,16 @@ pub fn start_iperf_client(
             return false;
         }
     };
-    let mut client = match dmesh_server::raw_transport::RawClient::new_with_packet_size(
+    if RAW_CLIENT_INITIALIZED.swap(false, Ordering::AcqRel) {
+        // A new explicit run replaces only an already-retired client. The
+        // client is currently allocation-free, but dropping here keeps this
+        // lifecycle correct if the bounded QUIC state later owns a resource.
+        unsafe {
+            core::ptr::drop_in_place(core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>());
+        }
+    }
+    let client = match dmesh_server::raw_transport::RawClient::new_in_place(
+        unsafe { &mut *core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE) },
         cid,
         bytes,
         packet_size,
@@ -345,6 +432,7 @@ pub fn start_iperf_client(
             return false;
         }
     };
+    RAW_CLIENT_INITIALIZED.store(true, Ordering::Release);
     let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
     let used = match client.start(response) {
         Ok(used) => used,
@@ -361,9 +449,9 @@ pub fn start_iperf_client(
     unsafe {
         core::ptr::addr_of_mut!(RAW_CLIENT).write(MaybeUninit::new(RawUdp6ClientState {
             peer,
-            client,
             started_at_us: now,
             deadline_us: now + i64::from(timeout_ms.clamp(1_000, 60_000)) * 1_000,
+            next_bootstrap_retry_us: now + 400_000,
         }));
     }
     if !transmit_udp6(
@@ -373,8 +461,13 @@ pub fn start_iperf_client(
         &response[..used],
     ) {
         RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+        RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
         return false;
     }
+    // The opening packet has been submitted. If its reply is lost, the Main
+    // owner now has the exact bootstrap retry deadline instead of waiting for
+    // an unrelated raw Ethernet frame to make the client progress.
+    schedule_raw_client_service();
     true
 }
 
@@ -485,6 +578,42 @@ pub fn start(local_mac: [u8; 6], ap_bssid: [u8; 6], handler: RawUdp6Handler) -> 
     true
 }
 
+/// Start the same raw UDP6 bearer on an open AP when no STA association
+/// exists.  AP mode has a distinct ESP-IDF Ethernet RX registration; it must
+/// not be gated on `esp_wifi_sta_get_ap_info()`.  The packet worker, handler,
+/// and response path remain shared with the STA bearer.
+pub fn start_ap(handler: RawUdp6Handler) -> bool {
+    let Some(ap_mac) = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap) else {
+        crate::commands::send_response(b"raw udp6 AP mac failed");
+        return false;
+    };
+    HANDLER.store(handler as usize, Ordering::Release);
+    store_local_mac(ap_mac);
+    store_ap_bssid(ap_mac);
+    if !STARTED.swap(true, Ordering::AcqRel)
+        && !crate::shared_ingress_esp::start(
+            crate::shared_ingress_esp::IngressKind::RawUdp6,
+            dispatch_ingress,
+        )
+    {
+        crate::commands::send_response(b"raw udp6 queue failed");
+        STARTED.store(false, Ordering::Release);
+        START_STATUS.store(2, Ordering::Release);
+        return false;
+    }
+    if !ensure_ap_rx_callback() {
+        STARTED.store(false, Ordering::Release);
+        START_STATUS.store(3, Ordering::Release);
+        return false;
+    }
+    let tx_callback = crate::wifi_esp::register_raw_tx_done_callback(Some(raw_tx_done));
+    if tx_callback != esp_idf_sys::ESP_OK {
+        crate::commands::send_stat(b"raw udp6 txcb result=", tx_callback as u32 as u64);
+    }
+    START_STATUS.store(1, Ordering::Release);
+    true
+}
+
 /// Remove raw Ethernet ingress before STA teardown or a personality change.
 /// The shared packet pool remains available to another bearer; only this
 /// driver's callback and dispatch handler are disabled.
@@ -516,6 +645,9 @@ pub fn rebind_sta_after_wifi_restart() -> bool {
     if !STARTED.load(Ordering::Acquire) {
         return true;
     }
+    // ESP-IDF discarded both interface callbacks with the driver.  The AP
+    // owner calls `ensure_ap_rx_callback` after this STA baseline rebind.
+    AP_RX_CALLBACK_REGISTERED.store(false, Ordering::Release);
     let rx = crate::wifi_esp::register_ethernet_rx_callback(
         crate::wifi_esp::RadioInterface::Sta,
         Some(rx_callback_sta),
@@ -722,13 +854,12 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
                     solicitation.source_ip,
                     local_ip,
                 ) {
-                    // The normal STA Ethernet handoff accepts this tiny
-                    // control frame but, on the C6/AP combination under
-                    // test, can leave it undrained after an association
-                    // transition.  Send only NDP replies through the proven
-                    // associated-STA raw injector; bulk UDP still uses the
-                    // driver's AMPDU-capable Ethernet path below.
-                    if transmit_station_ipv6(
+                    // AP and STA own distinct Ethernet egress.  An AP-side
+                    // Neighbor Advertisement must follow the received AP
+                    // link; sending it through the STA raw injector can
+                    // reset an unassociated APSTA epoch.
+                    if transmit_ipv6(
+                        item.link(),
                         solicitation.source_mac,
                         local_mac,
                         &advertisement[..frame_len],
@@ -889,7 +1020,8 @@ fn dispatch_raw_client(
     }
     unsafe {
         let state = &mut *core::ptr::addr_of_mut!(RAW_CLIENT).cast::<RawUdp6ClientState>();
-        if state.peer != peer || !state.client.accepts(payload) {
+        let client = &mut *core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>();
+        if state.peer != peer || !client.accepts(payload) {
             return false;
         }
         let now = esp_idf_sys::esp_timer_get_time();
@@ -899,7 +1031,11 @@ fn dispatch_raw_client(
             return true;
         }
         let response = &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER);
-        let outbound = match state.client.receive(payload, response) {
+        let outbound = match client.receive_at(
+            payload,
+            (now.max(0) as u64) / 1_000,
+            response,
+        ) {
             Ok(packet) => {
                 RAW_CLIENT_RECEIVE_OK.fetch_add(1, Ordering::Relaxed);
                 packet
@@ -915,29 +1051,101 @@ fn dispatch_raw_client(
                 return true;
             }
         };
-        let counters = state.client.counters();
+        let counters = client.counters();
         RAW_CLIENT_BOOTSTRAP_ACKS.store(counters.bootstrap_acks, Ordering::Release);
         RAW_CLIENT_STREAM_PACKETS.store(counters.stream_packets, Ordering::Release);
         RAW_CLIENT_OTHER_PACKETS.store(counters.other_packets, Ordering::Release);
-        let bytes = state.client.bytes();
+        let bytes = client.bytes();
         RAW_CLIENT_BYTES.store(bytes.min(u64::from(u32::MAX)) as u32, Ordering::Release);
-        if state.client.is_complete() {
+        if client.is_complete() {
             let elapsed_us = (now - state.started_at_us).max(1) as u64;
-            let errors: u64 = state.client.callback_errors().into_iter().sum();
+            let errors: u64 = client.callback_errors().into_iter().sum();
             RAW_CLIENT_ERRORS.store(errors.min(u64::from(u32::MAX)) as u32, Ordering::Release);
             RAW_CLIENT_ELAPSED_US.store(
                 elapsed_us.min(u64::from(u32::MAX)) as u32,
                 Ordering::Release,
             );
             RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
         }
         if let Some(used) = outbound {
             if !transmit_udp6(link, state.peer, RAW_UDP6_PORT, &response[..used]) {
                 TX_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
         }
+        if RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
+            schedule_raw_client_service();
+        }
     }
     true
+}
+
+/// Queue the raw-UDP6 client turn after Main's exact one-shot deadline. The
+/// shared worker owns this callback and raw Ethernet ingress, so it cannot
+/// race a received ACK while reusing `RESPONSE_BUFFER`.
+pub fn schedule_raw_client_timer() {
+    let _ = crate::shared_ingress_esp::schedule_raw_udp6_client_timer(poll_raw_client);
+}
+
+/// Advance one due device-originated raw-UDP6 client deadline. This method is
+/// called only for an explicit probe's bootstrap retry, delayed ACK/PTO, or
+/// terminal timeout; there is no periodic UDP polling service.
+fn poll_raw_client() {
+    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        let state = &mut *core::ptr::addr_of_mut!(RAW_CLIENT).cast::<RawUdp6ClientState>();
+        let client = &mut *core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>();
+        let now = esp_idf_sys::esp_timer_get_time();
+        if now >= state.deadline_us {
+            RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
+            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
+            RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
+            crate::commands::send_stat(
+                b"raw udp6 client timeout_us=",
+                (state.deadline_us - state.started_at_us).max(0) as u64,
+            );
+            return;
+        }
+        let response = &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER);
+        let outbound = if client.server_cid().is_some() {
+            client
+                .poll_transmit_at((now.max(0) as u64) / 1_000, response)
+                .or_else(|error| {
+                    RAW_CLIENT_LAST_ERROR.store(
+                        u32::from(dmesh_server::raw_transport::receive_error_code(error)),
+                        Ordering::Release,
+                    );
+                    Err(error)
+                })
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    client
+                        .poll_retransmit((now.max(0) as u64) / 1_000, 600, response)
+                        .ok()
+                        .flatten()
+                })
+        } else if now >= state.next_bootstrap_retry_us {
+            let packet = client.retry_bootstrap(response).ok();
+            state.next_bootstrap_retry_us = now.saturating_add(400_000);
+            packet
+        } else {
+            None
+        };
+        if let Some(used) = outbound {
+            if !transmit_udp6(
+                crate::shared_ingress_esp::IngressLink::WifiSta,
+                state.peer,
+                RAW_UDP6_PORT,
+                &response[..used],
+            ) {
+                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    publish_raw_client_deadline();
 }
 
 fn record_announce_peer(

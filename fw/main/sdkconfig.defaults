@@ -4,6 +4,10 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+# Stack canaries turn an undersized task into a reboot with a serial panic
+# record instead of silent adjacent-memory corruption. High-water telemetry
+# then supplies the evidence for reducing task stacks safely.
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

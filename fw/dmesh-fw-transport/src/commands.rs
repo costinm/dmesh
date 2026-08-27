@@ -65,6 +65,10 @@ struct ProfileControl<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlApplyResult {
     pub transport_start: bool,
+    /// `transport.discover` is a one-shot presence request. It must not
+    /// replace the current radio epoch, but the Main owner uses this signal
+    /// to publish a fresh canonical announce on every live bearer.
+    pub transport_discover: bool,
     pub changed: bool,
 }
 
@@ -103,10 +107,10 @@ impl Handler for ProfileControl<'_> {
                     }
                 }
                 // A transport.start replaces the radio epoch. In particular,
-                // an open-AP start must not accidentally reuse the WPA2
-                // passphrase of a prior Android P2P AP. Clear the
-                // fixed buffer as well as its visible length so the volatile
-                // secret is not retained in the shared profile.
+                // an omitted-PSK start selects the fixed DMesh WPA2 key and
+                // must not accidentally reuse a prior Android P2P secret.
+                // Clear the fixed buffer as well as its visible length so the
+                // volatile override is not retained in the shared profile.
                 clear_sta_passphrase(&mut candidate);
                 apply_transport_config(config, &mut candidate);
                 candidate.requested_transport = Some(kind);
@@ -120,13 +124,13 @@ impl Handler for ProfileControl<'_> {
             TransportKind::Nan => {
                 let mut candidate = *self.profile;
                 apply_transport_config(config, &mut candidate);
-                // DW8 NAN+NOW is the sleepy profile. Keeping UART enabled in
-                // that profile is contradictory, so reject it before any
+                // DW8 NAN+NOW is the sleepy profile. Keeping a real UART
+                // bearer enabled in that profile is contradictory, so reject it before any
                 // shared state is mutated and let the caller correlate `err`.
                 if candidate.nan_dw_interval == 8
                     && candidate.now == 2
                     && candidate.ap == 0
-                    && candidate.uart != 0
+                    && !crate::uart_esp::uart_is_off(candidate.uart)
                 {
                     return Err(ProfileControlError::InvalidSetting);
                 }
@@ -183,19 +187,28 @@ pub fn apply_control_record_result(
     let request = control::decode_request(packet);
     if let Some(request) = request {
         let transport_start = matches!(request, control::Request::TransportStart { .. });
+        let transport_discover = matches!(request, control::Request::TransportDiscover { .. });
         let before = *params;
-        return Some(control::dispatch_request(request, &mut ProfileControl { profile: params })
-            .map(|()| ControlApplyResult {
-                transport_start,
-                changed: *params != before,
-            }));
+        return Some(
+            control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
+                ControlApplyResult {
+                    transport_start,
+                    transport_discover,
+                    changed: *params != before,
+                }
+            }),
+        );
     }
     let request = connection::decode_request(packet)?;
-    Some(connection::dispatch_request(request, &mut ProfileControl { profile: params })
-        .map(|()| ControlApplyResult {
-            transport_start: false,
-            changed: false,
-        }))
+    Some(
+        connection::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
+            ControlApplyResult {
+                transport_start: false,
+                transport_discover: false,
+                changed: false,
+            }
+        }),
+    )
 }
 
 /// Apply a decoded local tagged record. UDP6/QUIC dispatch has already parsed
@@ -211,19 +224,28 @@ pub fn apply_control_record_decoded(
     }
     if let Some(request) = control::decode_record(record) {
         let transport_start = matches!(request, control::Request::TransportStart { .. });
+        let transport_discover = matches!(request, control::Request::TransportDiscover { .. });
         let before = *params;
-        return Some(control::dispatch_request(request, &mut ProfileControl { profile: params })
-            .map(|()| ControlApplyResult {
-                transport_start,
-                changed: *params != before,
-            }));
+        return Some(
+            control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
+                ControlApplyResult {
+                    transport_start,
+                    transport_discover,
+                    changed: *params != before,
+                }
+            }),
+        );
     }
     let request = connection::decode_record(record)?;
-    Some(connection::dispatch_request(request, &mut ProfileControl { profile: params })
-        .map(|()| ControlApplyResult {
-            transport_start: false,
-            changed: false,
-        }))
+    Some(
+        connection::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
+            ControlApplyResult {
+                transport_start: false,
+                transport_discover: false,
+                changed: false,
+            }
+        }),
+    )
 }
 
 /// Encode the empty successful result for a decoded control/connection record.
@@ -312,6 +334,9 @@ fn control_method(request: control::Request<'_>) -> u64 {
         control::Request::SettingsList => control::SETTINGS_LIST,
         control::Request::TransportStart { .. } => control::TRANSPORT_START,
         control::Request::TransportStop { .. } => control::TRANSPORT_STOP,
+        // Main currently leaves the discovery operation to the platform
+        // radio owner, but error responses must preserve its request method.
+        control::Request::TransportDiscover { .. } => control::TRANSPORT_DISCOVER,
     }
 }
 

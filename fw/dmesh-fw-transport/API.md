@@ -179,15 +179,15 @@ resetting the association, NOW callback, or NAN capture state.
 | Control | Default | Effect and transition cost |
 | --- | --- | --- |
 | `transport.start.ssid`, `sta_bssid`, `sta_channel` | unset | Ephemeral association target, queried from the managed AP owner by Rust e2e and sent over UART. `sta_bssid` and `sta_channel` select the intended AP without an application-owned discovery scan; all three values stay in RAM and never change NVS. A future optional IPv6 field is only needed when the peer is not the BSSID-derived link-local endpoint. |
-| `sta_passphrase` | unset | Optional 8..63-byte WPA2-PSK credential for an Android P2P or other protected STA target. It is accepted only in `transport.start`, copied into RAM for the selected epoch, and never written to NVS. A later STA start without it clears the old credential before configuring an open AP. WPA2 PMF is capable but not required for Android compatibility. |
+| `sta_passphrase` | fixed DMesh key | Optional 8..63-byte WPA2-PSK override for an Android P2P or other protected STA target. It is accepted only in `transport.start`, copied into RAM for the selected epoch, and never written to NVS. Its absence selects the fixed `DIRECT-dmesh`/`untrusted-open-mode` WPA2 key; it never means open authentication or reuse of an old override. WPA2 PMF is capable but not required for Android compatibility. |
 | Main `mode=infra` | n/a | Keeps the infrastructure policy active but does not associate from NVS. |
 | Main `mode=sleepy` | n/a | Keeps STA off until UART or future NAN Service Info; uses the bounded session lifecycle. |
 | `control.transport.start {mode: Sta, ssid: ...}` | n/a | Required ephemeral STA target and full associated STA/raw-UDP6 setup. It replaces the boot setup. |
-| boot default / `control.transport.start {mode: Nan}` | n/a | Unassociated NOW setup. At boot it starts once as open APSTA on channel 6; an explicit later Nan start deliberately replaces the current setup. |
+| boot default / `control.transport.start {mode: Nan}` | n/a | Unassociated NOW setup. When AP is selected, it starts APSTA on channel 6 using Android's fixed `DIRECT-dmesh`/`untrusted-open-mode` WPA2 credentials; an explicit later Nan start deliberately replaces the current setup. |
 | `now` | `0` | Private action callback: `0` default/on, `1` explicit on, `2` explicit off. A future `udp6` setting will be independent. |
 | `nan_dw_interval` | `0` | NAN promiscuous capture cadence in 512 ms DWs: `0` off, `1` each DW, `8` four seconds, `16` eight seconds. Requires NOW enabled (`now != 2`). |
 | `ndp` | `0` | Common NAN Data Path policy: `0` off, `1` on. Android currently implements NDP; ESP retains this requested common profile until an NDP adapter is added. |
-| `ap` | `1` at boot | Local AP: `0` off, `1` on. The default unassociated start configures APSTA before its one Wi-Fi start, so the AP holds channel 6. STA+AP is not part of this first test path. |
+| `ap` | `1` at boot | Local AP: `0` off, `1` on. Every ESP-owned AP is WPA2-PSK with Android's fixed `DIRECT-dmesh`/`untrusted-open-mode` credentials. The unassociated start configures APSTA before its one Wi-Fi start, so the AP holds channel 6. STA+AP is not part of this first test path. |
 | `espnow_capture` | `false` | Legacy volatile setting; do not use it to select staged Main coexistence. |
 | `sta_driver_tx` | `true` | ESP-IDF associated Ethernet TX for raw UDP6 egress. Set `false` only for the raw-802.11-injection diagnostic A/B; it takes effect on the next replacement start. |
 | `raw_tx_rate` | `0` | Request raw injection PHY rate; live diagnostic and driver/capture verification required. |

@@ -9,7 +9,7 @@
 use core::{
     ffi::c_void,
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -32,6 +32,11 @@ static ROC_LOOP_NEXT_US: AtomicU32 = AtomicU32::new(0);
 // request for the entire ROC lease. One slot also makes the transport's memory
 // bound explicit and prevents overlapping leases from racing the driver.
 static ROC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Optional product-runtime completion hook. Recovery leaves this unset;
+/// Main registers a bounded queue producer during boot. The Wi-Fi callback
+/// invokes it only after releasing the static ROC request slot.
+pub type RocCompletionHandler = fn();
+static ROC_COMPLETION_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static mut ROC_REQUEST: MaybeUninit<esp_idf_sys::wifi_roc_req_t> = MaybeUninit::uninit();
 // ESP-IDF's ROC completion is asynchronous. Do not reissue at the nominal
 // expiry instant: on C6 that can overlap the old lease in the Wi-Fi task and
@@ -45,6 +50,23 @@ const ROC_REISSUE_GUARD_MS: u32 = 50;
 /// block the C6 Wi-Fi control task.
 pub fn roc_in_flight() -> bool {
     ROC_IN_FLIGHT.load(Ordering::Acquire)
+}
+
+/// Register Main's callback-to-queue completion producer. Called once during
+/// Main boot before ROC can be requested; it is not a per-window operation.
+/// The adapter remains usable by Recovery without this optional product hook.
+pub fn set_completion_handler(handler: Option<RocCompletionHandler>) {
+    ROC_COMPLETION_HANDLER.store(handler.map(|handler| handler as usize).unwrap_or(0), Ordering::Release);
+}
+
+fn notify_completion() {
+    let handler = ROC_COMPLETION_HANDLER.load(Ordering::Acquire);
+    if handler != 0 {
+        // Function pointers are installed only by `set_completion_handler`
+        // and never point at a driver-owned buffer or allocation.
+        let handler: RocCompletionHandler = unsafe { core::mem::transmute(handler) };
+        handler();
+    }
 }
 /// `(beacon_vendor_ies, nan_beacon_vendor_ies, other_vendor_ies)` observed
 /// through ESP-IDF while promiscuous mode remains disabled.
@@ -152,6 +174,10 @@ unsafe extern "C" fn roc_done_callback(
     _status: esp_idf_sys::wifi_roc_done_status_t,
 ) {
     ROC_IN_FLIGHT.store(false, Ordering::Release);
+    // The actual driver completion is the authority that releases the static
+    // request slot. Notify Main afterwards so it can service a deferred NAN
+    // acquisition immediately; the callback itself performs no radio work.
+    notify_completion();
 }
 
 /// Schedule one listener on the channel currently retained by the radio. A
@@ -170,7 +196,8 @@ pub fn listen_on_current_channel(duration_ms: u32) -> bool {
 }
 
 /// Configure a repeating same-channel ROC observer. The common transport
-/// worker calls [`poll`] so this has no task, queue, or packet allocation.
+/// Main calls [`service_deadline`] only after its one-shot timer fires, so this
+/// adapter owns no task, queue, or packet allocation.
 pub fn configure_loop(enabled: bool, duration_ms: u32) -> bool {
     // The shared schema allows the ESP-IDF-tested ten-second maximum. Normal
     // measurements use four seconds; the bound remains finite so the common
@@ -187,9 +214,14 @@ pub fn configure_loop(enabled: bool, duration_ms: u32) -> bool {
 /// Reissue ROC after each requested window. The driver is the completion
 /// authority; request/failure counters remain explicit evidence of coverage.
 /// This is a deadline service, not a packet loop: the ESP-IDF completion
-/// callback only releases `ROC_IN_FLIGHT`, and the Main owner calls `poll`
-/// after the bounded lease expires so no callback blocks or re-enters Wi-Fi.
-pub fn poll() {
+/// callback only releases `ROC_IN_FLIGHT`, and Main calls this once at the
+/// next computed lease deadline so no callback blocks or re-enters Wi-Fi.
+///
+/// This is never a periodic tick: when the ROC loop is disabled,
+/// [`next_service_delay_ms`] returns `None` and the Main task has no ROC timer
+/// armed.  When enabled, it runs at most once per requested ROC duration plus
+/// the 50-ms driver-completion guard.
+pub fn service_deadline() {
     if !ROC_LOOP_ENABLED.load(Ordering::Acquire) {
         return;
     }

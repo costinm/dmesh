@@ -15,10 +15,14 @@
 extern crate alloc;
 
 pub mod profile;
+/// Main desired-profile publication. This is separate from the Main applied
+/// radio state so bearer ingress cannot mutate a live driver epoch directly.
+pub mod profile_store;
 
-// These modules are the shared ESP-IDF runtime.  They are feature-gated so
-// profile/schema/queue tests remain ordinary host tests.  Recovery and Main
-// both enable this feature; neither depends on the other firmware binary.
+// These modules are the shared ESP-IDF runtime.  The crate is built only by
+// firmware targets; portable profile/schema/queue tests stay in dmesh-server
+// and quic-lite. Main and Recovery select concrete entry points, not Cargo
+// product-role features.
 pub mod commands;
 pub mod crypto_esp;
 pub mod flash;
@@ -28,6 +32,8 @@ pub mod core_runtime;
 /// separate from the shared engine so Main can evolve without making the
 /// frozen Recovery lane link or execute its policy.
 pub mod main_runtime;
+/// ESP-IDF PM adapter used only by Main's explicit power policy transitions.
+pub mod power_esp;
 /// Recovery-specific policy entry point. This remains a thin compatibility
 /// shell until Recovery is reduced to open-STA UDP6 flashing.
 pub mod recovery_runtime;

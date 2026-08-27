@@ -8,18 +8,23 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use dmesh_server::raw_wifi::{
     RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS,
-    RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiControlRequest, RawWifiCounters,
-    RawWifiBearer, RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
+    RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiBearer, RawWifiControlRequest, RawWifiCounters,
+    RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
     RawWifiSnapshot, RawWifiStaMode, RawWifiStaState, RawWifiTxRequest,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);
 static TX_INTERFACE: AtomicU8 = AtomicU8::new(0);
 static TX_RATE: AtomicU8 = AtomicU8::new(0);
-// Unassociated NAN/NOW starts with broadcast Address-1.  The peer identity is
-// still carried by the QUIC/raw-service handshake; unicast can be selected by
-// an explicit lab control once a driver-specific peer path is known.
-static ACTION_DESTINATION_BROADCAST: AtomicBool = AtomicBool::new(true);
+// Direct QUIC-lite traffic is peer-directed.  Active Main keeps its filtered
+// management receive path armed, so C6 can receive those frames without
+// relying on a discovery-window race; MAC ACK/retry then gives the physical
+// hop the reliability that a multi-frame stream needs.  Announcements remain
+// explicitly broadcast in `wifi_espnow_esp`, where they also force no-ACK.
+//
+// This remains a runtime lab control because APSTA/ROC experiments sometimes
+// need broadcast Address-1.  It is not the normal application default.
+static ACTION_DESTINATION_BROADCAST: AtomicBool = AtomicBool::new(false);
 
 /// Return the runtime-selected action egress interface.
 ///
@@ -33,9 +38,8 @@ pub(crate) fn action_tx_interface() -> RawWifiInterface {
     interface_from(TX_INTERFACE.load(Ordering::Acquire)).unwrap_or(RawWifiInterface::Auto)
 }
 
-/// Whether the shared action bearer sends broadcast Address-1 for a
-/// non-promiscuous receive-filter experiment. Its QUIC/raw-service peer
-/// identity remains the source MAC, so this is not another transport.
+/// Whether an explicit radio-lab override forces direct action traffic onto
+/// broadcast Address-1.  Normal Main traffic uses the peer MAC.
 pub(crate) fn action_destination_broadcast() -> bool {
     ACTION_DESTINATION_BROADCAST.load(Ordering::Acquire)
 }
@@ -175,6 +179,12 @@ pub fn snapshot() -> RawWifiSnapshot {
     ) = crate::wifi_espnow_esp::tx_timing();
     let (action_service_bytes, _action_service_errors, action_service_elapsed_us) =
         crate::wifi_espnow_esp::raw_client_result();
+    let (
+        raw_client_expected_server_cid,
+        raw_client_last_other_dcid,
+        raw_client_last_other_peer_suffix,
+    ) =
+        crate::wifi_espnow_esp::raw_client_cid_diagnostics();
     let (udp6_service_bytes, _udp6_service_errors, udp6_service_elapsed_us) =
         crate::wifi_raw_udp6_esp::raw_client_result();
     // One raw service is admitted at a time by the probe executor. Select
@@ -249,6 +259,10 @@ pub fn snapshot() -> RawWifiSnapshot {
         ),
         last_tx_error: Some(crate::wifi_espnow_esp::last_tx_error() as u32),
         last_raw_client_error: Some(last_client_error),
+        last_raw_service_error: Some(crate::core_runtime::raw_service_last_error()),
+        raw_client_expected_server_cid,
+        raw_client_last_other_dcid,
+        raw_client_last_other_peer_suffix,
         sta_mac: crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta),
         ap_mac: crate::wifi_esp::lab_open_ap_active()
             .then(|| crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap))
@@ -385,6 +399,14 @@ fn apply_control(control: RawWifiControlRequest) -> Result<(), &'static str> {
         ) {
             return Err("open AP transition rejected");
         }
+        if matches!(ap_mode, RawWifiApMode::Open)
+            && !crate::wifi_esp::start_raw_udp6_ap(crate::core_runtime::receive_raw_udp6)
+        {
+            return Err("open AP raw UDP6 ingress rejected");
+        }
+        if matches!(ap_mode, RawWifiApMode::Open) {
+            crate::wifi_raw_udp6_esp::set_poll_handler(Some(crate::core_runtime::poll_raw_udp6));
+        }
     }
     if matches!(control.raw_sta_mode, Some(RawWifiStaMode::MainStyle)) {
         let channel = control.channel.unwrap_or_else(|| channel().unwrap_or(6));
@@ -462,11 +484,16 @@ pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static st
             // the common snapshot even if the client cannot be acquired or
             // its first action TX is rejected; `raw_service_active` and
             // `last_tx_error` make that result testable on the same bearer.
-            let _ = crate::wifi_espnow_esp::start_check_client(
+            if crate::wifi_espnow_esp::start_check_client(
                 crate::wifi_espnow_esp::EspNowPeer { mac: check.peer },
                 check.nonce,
                 check.timeout_ms,
-            );
+            ) {
+                // Main blocks when idle. Tell its timer owner that this
+                // client has a concrete retry/PTO deadline; do not create a
+                // per-radio polling task here.
+                crate::wifi_espnow_esp::schedule_raw_client_service();
+            }
         }
         RawWifiLabRequest::Iperf(iperf) => {
             // This starts a device-originated peer run.  The immediate
@@ -497,6 +524,9 @@ pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static st
             };
             if !started {
                 return Err("raw IPERF client busy or rejected");
+            }
+            if bearer != RawWifiBearer::Udp6 {
+                crate::wifi_espnow_esp::schedule_raw_client_service();
             }
         }
     }
@@ -531,6 +561,14 @@ pub fn transmit_raw_action(request: RawWifiTxRequest<'_>) -> Result<usize, &'sta
     // a host probe outside its bounded capture/send interval.
     if dmesh_rawnan::is_nan_followup(request.frame) {
         return crate::wifi_nan_dw_capture_esp::send_followup_frame(request.frame);
+    }
+    // Active Subscribe Service Info is useful only while the peer is inside
+    // its DW. Let the NAN owner send it from the next local discovery window
+    // rather than attempting immediate off-channel transmission here.
+    if dmesh_rawnan::is_nan_sdf(request.frame) {
+        return crate::wifi_nan_dw_capture_esp::queue_sdf_frame(request.frame)
+            .then_some(request.frame.len())
+            .ok_or("NAN SDF queue rejected");
     }
     if request.rate != RawWifiRate::Auto
         && !crate::wifi_esp::configure_raw_tx_rate(rate_value(request.rate))
