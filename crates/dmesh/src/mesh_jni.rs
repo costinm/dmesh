@@ -14,14 +14,16 @@ use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(target_os = "android")]
 use std::ffi::{CString, c_char, c_int, c_void};
 #[cfg(target_os = "android")]
-use std::io::{self, Write};
+use std::io::Write;
+use std::io;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 #[cfg(target_os = "android")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -41,15 +43,23 @@ use crate::mesh_common::{MeshHandle, MeshStreamHandle};
 use lmesh::radio_protocol::{self, BleEvent};
 
 const BRIDGE_HOST: &str = "dmesh-msg";
-const LEGACY_BRIDGE_HOST: &str = "local";
 const BRIDGE_PORT: u16 = 1;
-static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<String>>>> = OnceLock::new();
+const MAX_BRIDGE_MESSAGE_BYTES: usize = 2 * 1024;
+static BRIDGE_SENDERS: OnceLock<Mutex<HashMap<u64, UnboundedSender<Vec<u8>>>>> = OnceLock::new();
 static STORE_SENDER: OnceLock<UnboundedSender<StoreCommand>> = OnceLock::new();
 /// Every discovery bearer updates this Rust-owned view before Java keeps any
 /// short-lived NAN `PeerHandle`. The inventory is advisory and unsigned;
 /// entries expire after one hour. NAN Service Info, UDP multicast announces,
 /// and future control-plane observations therefore share one device map.
 static DISCOVERED_DEVICES: OnceLock<Mutex<BTreeMap<String, DiscoveredDevice>>> = OnceLock::new();
+/// Platform adapters report the device's current interface/address snapshot;
+/// Rust owns this table so routing and multicast discovery make the same
+/// decision on Android and Linux.  It is a replacement snapshot, not a Java
+/// policy cache.
+static LOCAL_NETWORKS: OnceLock<Mutex<BTreeMap<String, dmesh_server::local_networks::LocalNetwork>>> = OnceLock::new();
+/// Latest Android platform power/memory telemetry. This is an input to Rust
+/// scheduling; Java reports facts and does not decide admission policy.
+static POWER_STATE: OnceLock<Mutex<dmesh_server::power::PowerState>> = OnceLock::new();
 /// Last received NAN follow-ups are retained independently of the optional
 /// persistent frame store so Android status and E2E use the same bounded
 /// receipt view as host/ESP adapters.
@@ -62,6 +72,8 @@ static NAN_EVENTS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
 const DISCOVERED_DEVICE_TTL_MS: i64 = 60 * 60 * 1000;
 const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
 const NAN_EVENT_HISTORY_LEN: usize = 64;
+const MAX_LOCAL_NETWORK_TEXT: usize = 256;
+const MAX_POWER_TELEMETRY_BYTES: usize = 2 * 1024;
 
 #[derive(Clone)]
 struct DiscoveredDevice {
@@ -95,9 +107,6 @@ fn record_nan_event(frame: FrameRecord) {
         history.push_back(frame);
     }
 }
-const WEB_BRIDGE_CLIENT_ID: u64 = 9_000_000;
-#[cfg(target_os = "android")]
-static WEB_BRIDGE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 #[cfg(target_os = "android")]
 static ANDROID_LOGGER: AndroidLog = AndroidLog;
 #[cfg(target_os = "android")]
@@ -116,7 +125,7 @@ struct AndroidVpnHandle {
     _injector: Arc<dyn mesh::tun::TunInjector>,
 }
 
-fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<String>>> {
+fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<Vec<u8>>>> {
     BRIDGE_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -130,6 +139,139 @@ fn store_sender() -> Option<&'static UnboundedSender<StoreCommand>> {
 
 fn discovered_devices() -> &'static Mutex<BTreeMap<String, DiscoveredDevice>> {
     DISCOVERED_DEVICES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn local_networks() -> &'static Mutex<BTreeMap<String, dmesh_server::local_networks::LocalNetwork>> {
+    LOCAL_NETWORKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn power_state() -> &'static Mutex<dmesh_server::power::PowerState> {
+    POWER_STATE.get_or_init(|| Mutex::new(dmesh_server::power::PowerState::default()))
+}
+
+fn power_state_json(state: dmesh_server::power::PowerState) -> Value {
+    json!({
+        "battery_percent": state.battery_percent,
+        "charging": state.charging,
+        "power_save": state.power_save,
+        "idle": state.idle,
+        "idle_ms": state.idle_ms,
+        "total_idle_ms": state.total_idle_ms,
+        "charging_ms": state.charging_ms,
+        "memory_available_bytes": state.memory_available_bytes,
+        "memory_low": state.memory_low,
+        "memory_threshold_bytes": state.memory_threshold_bytes,
+        "trim_level": state.trim_level,
+    })
+}
+
+fn power_u64(update: &serde_json::Map<String, Value>, key: &str) -> anyhow::Result<Option<u64>> {
+    update.get(key).map_or(Ok(None), |value| {
+        value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("power telemetry {key} must be unsigned"))
+    })
+}
+
+fn power_bool(update: &serde_json::Map<String, Value>, key: &str) -> anyhow::Result<Option<bool>> {
+    update.get(key).map_or(Ok(None), |value| {
+        value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("power telemetry {key} must be boolean"))
+    })
+}
+
+fn update_power_state(payload: &[u8]) -> anyhow::Result<Value> {
+    if payload.len() > MAX_POWER_TELEMETRY_BYTES {
+        anyhow::bail!("power telemetry exceeds byte bound");
+    }
+    let update: Value = serde_json::from_slice(payload)
+        .map_err(|error| anyhow::anyhow!("invalid power telemetry: {error}"))?;
+    let update = update
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("power telemetry must be an object"))?;
+    let allowed = [
+        "source", "event", "battery_percent", "charging", "status", "plugged", "power_save", "idle",
+        "idle_ms", "total_idle_ms", "charging_ms", "memory_available_bytes",
+        "memory_low", "memory_threshold_bytes", "trim_level",
+    ];
+    if update.keys().any(|key| !allowed.contains(&key.as_str())) {
+        anyhow::bail!("power telemetry contains unsupported field");
+    }
+    for key in ["source", "event"] {
+        if let Some(value) = update.get(key)
+            && value
+                .as_str()
+                .map(|text| text.len() <= MAX_LOCAL_NETWORK_TEXT)
+                .unwrap_or(false)
+        {
+            continue;
+        } else if update.contains_key(key) {
+            anyhow::bail!("power telemetry {key} must be bounded text");
+        }
+    }
+    let battery_percent = power_u64(update, "battery_percent")?
+        .map(|value| u8::try_from(value).map_err(|_| anyhow::anyhow!("battery percentage exceeds 100")))
+        .transpose()?
+        .filter(|value| *value <= 100);
+    if update.contains_key("battery_percent") && battery_percent.is_none() {
+        anyhow::bail!("battery percentage must be 0..100");
+    }
+    let _status = power_u64(update, "status")?;
+    let _plugged = power_u64(update, "plugged")?;
+    let observation = dmesh_server::power::PowerObservation {
+        battery_percent,
+        charging: power_bool(update, "charging")?,
+        power_save: power_bool(update, "power_save")?,
+        idle: power_bool(update, "idle")?,
+        idle_ms: power_u64(update, "idle_ms")?,
+        total_idle_ms: power_u64(update, "total_idle_ms")?,
+        charging_ms: power_u64(update, "charging_ms")?,
+        memory_available_bytes: power_u64(update, "memory_available_bytes")?,
+        memory_low: power_bool(update, "memory_low")?,
+        memory_threshold_bytes: power_u64(update, "memory_threshold_bytes")?,
+        trim_level: power_u64(update, "trim_level")?
+            .map(|value| u32::try_from(value).map_err(|_| anyhow::anyhow!("trim level exceeds u32")))
+            .transpose()?,
+    };
+    let mut state = power_state().lock().map_err(|_| anyhow::anyhow!("power state poisoned"))?;
+    state.apply(observation);
+    Ok(power_state_json(*state))
+}
+
+fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
+    let snapshot = dmesh_server::local_networks::decode_snapshot(payload)
+        .ok_or_else(|| anyhow::anyhow!("invalid local-networks CBOR snapshot"))?;
+    let mut replacement = BTreeMap::new();
+    for row in snapshot.networks {
+        if replacement.insert(row.interface.clone(), row).is_some() {
+            anyhow::bail!("local-networks snapshot has duplicate interface");
+        }
+    }
+    let len = replacement.len();
+    let mut current = local_networks()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?;
+    *current = replacement;
+    Ok(len)
+}
+
+fn local_network_json(network: &dmesh_server::local_networks::LocalNetwork) -> Value {
+    json!({
+        "interface": network.interface,
+        "up": network.up,
+        "multicast": network.multicast,
+        "active": network.active,
+        "internet": network.internet,
+        "validated": network.validated,
+        "metered": network.metered,
+        "addresses": network.addresses,
+        "dns_servers": network.dns_servers,
+        "gateways": network.gateways,
+        "transports": network.transports,
+    })
 }
 
 fn prune_discovered_devices(devices: &mut BTreeMap<String, DiscoveredDevice>, now_ms: i64) {
@@ -171,100 +313,6 @@ pub(crate) fn observe_announce(
 }
 
 #[cfg(target_os = "android")]
-fn register_android_proxy_bridge() {
-    static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        let _ =
-            ssh_mesh::generic_proxy::set_generic_proxy_bridge(|app, method, params| async move {
-                if app != "lmesh" && app != "dmesh" {
-                    return Err(format!("android bridge does not handle app {app}"));
-                }
-                dispatch_android_proxy_command(method, params).await
-            });
-    });
-}
-
-#[cfg(target_os = "android")]
-async fn dispatch_android_proxy_command(method: String, params: Value) -> Result<Value, String> {
-    let _guard = WEB_BRIDGE_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    let callback = android_message_callback()
-        .lock()
-        .map_err(|_| "android callback lock poisoned".to_string())?
-        .clone()
-        .ok_or_else(|| "android message callback not registered".to_string())?;
-
-    let client_id = WEB_BRIDGE_CLIENT_ID;
-    let (tx, mut rx) = unbounded_channel::<String>();
-    bridge_senders()
-        .lock()
-        .map_err(|_| "bridge sender map lock poisoned".to_string())?
-        .insert(client_id, tx);
-
-    let command = bridge_command_from_proxy(method, params);
-    let dispatch_result = dispatch_bridge_command(&callback.0, &callback.1, client_id, &command)
-        .map_err(|e| e.to_string());
-    if dispatch_result.is_err() {
-        let _ = bridge_senders().lock().map(|mut senders| {
-            senders.remove(&client_id);
-        });
-        return dispatch_result.map(|_| Value::Null);
-    }
-
-    let timeout = tokio::time::sleep(std::time::Duration::from_millis(650));
-    tokio::pin!(timeout);
-    let mut last = None;
-    loop {
-        tokio::select! {
-            line = rx.recv() => {
-                let Some(line) = line else {
-                    break;
-                };
-                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                    last = Some(android_proxy_response_value(value));
-                    break;
-                }
-            }
-            _ = &mut timeout => {
-                break;
-            }
-        }
-    }
-
-    let _ = bridge_senders().lock().map(|mut senders| {
-        senders.remove(&client_id);
-    });
-
-    Ok(last.unwrap_or_else(|| {
-        json!({
-            "ok": true,
-            "status": "sent",
-            "method": command.method,
-        })
-    }))
-}
-
-#[cfg(target_os = "android")]
-fn bridge_command_from_proxy(method: String, params: Value) -> BridgeCommand {
-    let mut data = BTreeMap::new();
-    if let Some(obj) = params.as_object() {
-        insert_json_map(&mut data, obj);
-    }
-    let method = match method.as_str() {
-        "status" => "messages.status".to_string(),
-        "messages.history" => "messages.history".to_string(),
-        value => value.to_string(),
-    };
-    BridgeCommand {
-        id: None,
-        method,
-        data,
-    }
-}
-
-#[cfg(target_os = "android")]
 fn configure_android_mesh_paths(base_dir: &str) {
     let base = std::path::Path::new(base_dir);
     let run_base = base.join("run").join("mesh");
@@ -295,25 +343,6 @@ fn configure_android_mesh_paths(base_dir: &str) {
             run_base.join("mesh-init").join("mesh.sock"),
         );
     }
-}
-
-#[cfg(target_os = "android")]
-fn android_proxy_response_value(mut value: Value) -> Value {
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_default();
-    if let Some(data) = value.get_mut("data") {
-        if let Some(obj) = data.as_object_mut()
-            && !method.is_empty()
-        {
-            obj.entry("method".to_string())
-                .or_insert(Value::String(method));
-        }
-        return data.take();
-    }
-    value
 }
 
 #[cfg(target_os = "android")]
@@ -349,7 +378,6 @@ impl log::Log for AndroidLog {
             })
             .to_string();
             android_log_write(android_log_priority(record.level()), "dmesh-rust", &line);
-            emit_android_message_line(0, rust_trace_frame(&line));
         }
     }
 
@@ -380,7 +408,6 @@ impl Drop for AndroidTraceWriter {
         let line = line.trim();
         if !line.is_empty() {
             android_log_write(ANDROID_LOG_INFO, "dmesh-trace", line);
-            emit_android_message_line(0, rust_trace_frame(line));
         }
     }
 }
@@ -422,55 +449,6 @@ fn android_message_callback() -> &'static Mutex<Option<(Arc<JavaVM>, GlobalRef)>
 }
 
 #[cfg(target_os = "android")]
-fn emit_android_message_line(client_id: u64, line: String) {
-    // Rust tracing is useful to both Android's local message history and open
-    // SSH clients. Do not route it through MsgMux first: the bridge sender is
-    // the transport-neutral remote socket surface.
-    if client_id == 0 {
-        if let Ok(senders) = bridge_senders().lock() {
-            for sender in senders.values() {
-                let _ = sender.send(line.clone());
-            }
-        }
-    }
-    let callback = match android_message_callback().lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => None,
-    };
-    let Some((jvm, callback)) = callback else {
-        return;
-    };
-    let mut env = match jvm.attach_current_thread() {
-        Ok(env) => env,
-        Err(_) => return,
-    };
-    let j_line = match env.new_string(line) {
-        Ok(line) => line,
-        Err(_) => return,
-    };
-    let _ = env.call_method(
-        &callback,
-        "onMessage",
-        "(JLjava/lang/String;)V",
-        &[(client_id as i64).into(), (&j_line).into()],
-    );
-}
-
-#[cfg(target_os = "android")]
-fn rust_trace_frame(line: &str) -> String {
-    let payload =
-        serde_json::from_str::<Value>(line).unwrap_or_else(|_| Value::String(line.into()));
-    json!({
-        "method": "messages.event",
-        "data": {
-            "source": "rust.trace",
-            "json": payload,
-        }
-    })
-    .to_string()
-}
-
-#[cfg(target_os = "android")]
 fn cstring_lossy(value: &str) -> CString {
     CString::new(value).unwrap_or_else(|_| {
         CString::new(value.replace('\0', "\\0")).unwrap_or_else(|_| CString::default())
@@ -501,50 +479,6 @@ fn init_android_logging() {
 
         log::info!("Android Rust logging initialized");
     });
-}
-
-#[cfg(target_os = "android")]
-fn local_bridge_response(cmd: &BridgeCommand) -> Option<Value> {
-    if cmd.method != "telemetry.history" && cmd.method != "telemetry.status" {
-        return None;
-    }
-    let buffer = ANDROID_TELEMETRY.get();
-    let limit = cmd
-        .data
-        .get("limit")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(100)
-        .min(1000);
-    let entries = buffer
-        .map(|buffer| {
-            let mut entries = buffer.get_all();
-            if entries.len() > limit {
-                entries.drain(..entries.len() - limit);
-            }
-            entries
-        })
-        .unwrap_or_default();
-    let count = entries.len();
-    let entries = if cmd.method == "telemetry.history" {
-        serde_json::to_value(entries).unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    };
-    Some(json!({
-        "id": cmd.id,
-        "ok": true,
-        "method": cmd.method,
-        "data": {
-            "entries": entries,
-            "count": count,
-            "capacity": 1000,
-        },
-    }))
-}
-
-#[cfg(not(target_os = "android"))]
-fn local_bridge_response(_cmd: &BridgeCommand) -> Option<Value> {
-    None
 }
 
 #[cfg(target_os = "android")]
@@ -582,77 +516,6 @@ struct BridgeCommand {
     id: Option<String>,
     method: String,
     data: BTreeMap<String, String>,
-}
-
-impl BridgeCommand {
-    fn to_json_value(&self) -> Value {
-        let mut root = Map::new();
-        if let Some(id) = &self.id {
-            root.insert("id".to_string(), Value::String(id.clone()));
-        }
-        root.insert("method".to_string(), Value::String(self.method.clone()));
-        let mut data = Map::new();
-        for (key, value) in &self.data {
-            data.insert(key.clone(), Value::String(value.clone()));
-        }
-        if !data.is_empty() {
-            root.insert("data".to_string(), Value::Object(data));
-        }
-        Value::Object(root)
-    }
-
-    fn to_json_line(&self) -> String {
-        self.to_json_value().to_string()
-    }
-}
-
-fn parse_bridge_line(line: &str) -> anyhow::Result<BridgeCommand> {
-    let line = line.trim();
-    if line.is_empty() {
-        anyhow::bail!("empty command");
-    }
-    if line.starts_with('{') {
-        parse_bridge_json(line)
-    } else {
-        parse_bridge_human(line)
-    }
-}
-
-fn parse_bridge_json(line: &str) -> anyhow::Result<BridgeCommand> {
-    let value: Value = serde_json::from_str(line)?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("command must be a JSON object"))?;
-    let method = obj
-        .get("method")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing method"))?
-        .to_string();
-    let id = obj.get("id").map(json_value_to_string);
-    let mut data = BTreeMap::new();
-
-    if let Some(payload) = obj.get("data").and_then(Value::as_object) {
-        insert_json_map(&mut data, payload);
-    } else {
-        insert_json_map(&mut data, obj);
-        data.remove("id");
-        data.remove("method");
-        data.remove("data");
-    }
-
-    Ok(BridgeCommand { id, method, data })
-}
-
-fn insert_json_map(data: &mut BTreeMap<String, String>, obj: &Map<String, Value>) {
-    for (k, v) in obj {
-        data.insert(k.clone(), json_value_to_string(v));
-    }
-}
-
-fn json_value_to_string(v: &Value) -> String {
-    v.as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| v.to_string())
 }
 
 fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::Result<Vec<u8>> {
@@ -741,81 +604,6 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .ok_or_else(|| anyhow::anyhow!("announce encoding exceeded bound"))?;
             out[..used].to_vec()
         }
-        "radio.control.transport_start" => {
-            let request = dmesh_server::control::decode_request(payload)
-                .ok_or_else(|| anyhow::anyhow!("invalid local control record"))?;
-            let dmesh_server::control::Request::TransportStart { kind, config } = request else {
-                anyhow::bail!("control record is not transport.start");
-            };
-            let mode = match kind {
-                dmesh_server::control::TransportKind::Sta => "sta",
-                dmesh_server::control::TransportKind::Nan => "nan",
-                dmesh_server::control::TransportKind::Uart => "uart",
-            };
-            json!({
-                "mode": mode,
-                "ssid_hex": config.ssid.map(bytes_to_hex).unwrap_or_default(),
-                "passphrase_hex": config.passphrase.map(bytes_to_hex).unwrap_or_default(),
-                "bssid_hex": config.bssid.map(|value| bytes_to_hex(&value)).unwrap_or_default(),
-                "channel": config.channel.map(|value| value.to_string()).unwrap_or_default(),
-                "now": config.now.map(|value| value.to_string()).unwrap_or_default(),
-                "ndp": config.ndp.map(|value| value.to_string()).unwrap_or_default(),
-                "nan_dw_interval": config.nan_dw_interval.map(|value| value.to_string()).unwrap_or_default(),
-                "ap": config.ap.map(|value| value.to_string()).unwrap_or_default(),
-            })
-            .to_string()
-            .into_bytes()
-        }
-        "radio.control.build_transport_start" => {
-            let mode = required_data(&cmd, "mode")?;
-            let kind = match mode {
-                "sta" => dmesh_server::control::TransportKind::Sta,
-                "nan" => dmesh_server::control::TransportKind::Nan,
-                _ => anyhow::bail!("transport mode must be sta or nan"),
-            };
-            let ssid = cmd.data.get("ssid").map(String::as_bytes);
-            // Open APs intentionally omit the credential.  An empty CBOR
-            // passphrase is not a valid WPA2 value and must not prevent the
-            // firmware from clearing a previous volatile WPA profile.
-            let passphrase = cmd
-                .data
-                .get("passphrase")
-                .filter(|value| !value.is_empty())
-                .map(String::as_bytes);
-            let ap = cmd.data.get("ap").map(|value| u8::from(value == "1"));
-            let ndp = cmd.data.get("ndp").map(|value| u8::from(value == "1"));
-            let bssid = cmd
-                .data
-                .get("bssid")
-                .filter(|value| !value.is_empty())
-                .map(|value| {
-                    if value.len() != 12 {
-                        anyhow::bail!("BSSID must be 12 hexadecimal characters");
-                    }
-                    let mut bytes = [0u8; 6];
-                    for (index, byte) in bytes.iter_mut().enumerate() {
-                        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-                            .map_err(|_| anyhow::anyhow!("BSSID is not hexadecimal"))?;
-                    }
-                    Ok::<_, anyhow::Error>(bytes)
-                })
-                .transpose()?;
-            let request = dmesh_server::control::Request::TransportStart {
-                kind,
-                config: dmesh_server::control::TransportConfig {
-                    ssid,
-                    passphrase,
-                    bssid,
-                    ap,
-                    ndp,
-                    ..dmesh_server::control::TransportConfig::default()
-                },
-            };
-            let mut out = [0; 128];
-            let used = dmesh_server::control::encode_request(request, None, &mut out)
-                .ok_or_else(|| anyhow::anyhow!("transport.start encoding exceeded bound"))?;
-            out[..used].to_vec()
-        }
         "radio.nan.parse_service_info" => radio_protocol::parse_nan_service_info(payload)?
             .to_string()
             .into_bytes(),
@@ -861,6 +649,27 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             }
             parsed.to_string().into_bytes()
         }
+        "radio.local_networks.update" => {
+            let count = update_local_networks(payload)?;
+            json!({"ok": true, "interfaces": count}).to_string().into_bytes()
+        }
+        "radio.local_networks" => {
+            let networks = local_networks()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?
+                .values()
+                .map(local_network_json)
+                .collect::<Vec<_>>();
+            json!({"networks": networks}).to_string().into_bytes()
+        }
+        "radio.power.status" => update_power_state(payload)?.to_string().into_bytes(),
+        "radio.power.state" => power_state_json(
+            *power_state()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("power state poisoned"))?,
+        )
+        .to_string()
+        .into_bytes(),
         "radio.devices" | "radio.nan.known_devices" => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let mut devices = discovered_devices()
@@ -880,6 +689,48 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .collect();
             json!({"devices": devices}).to_string().into_bytes()
         }
+        "radio.status_text" => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut devices = discovered_devices()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
+            prune_discovered_devices(&mut devices, now_ms);
+            let networks = local_networks()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?;
+            let internet = networks.values().any(|network| network.validated && network.internet);
+            let mut text = format!(
+                "DMesh\nLocal networks: {}{}\nDiscovered devices: {}",
+                networks.len(),
+                if internet { " (validated internet)" } else { "" },
+                devices.len()
+            );
+            if let Ok(power) = power_state().lock() {
+                if let Some(percent) = power.battery_percent {
+                    text.push_str("\nBattery: ");
+                    text.push_str(&percent.to_string());
+                    text.push('%');
+                }
+                if power.power_save.unwrap_or(false) {
+                    text.push_str(" (power save)");
+                }
+            }
+            for (id, device) in devices.iter() {
+                text.push_str("\n- ");
+                text.push_str(id);
+                if !device.peer.is_empty() {
+                    text.push(' ');
+                    text.push_str(&device.peer);
+                }
+                if let Some(source) = device.info.get("source").and_then(Value::as_str) {
+                    if !source.is_empty() {
+                        text.push_str(" via ");
+                        text.push_str(source);
+                    }
+                }
+            }
+            text.into_bytes()
+        }
         "radio.probe.plan" => {
             let source_id = required_data(&cmd, "source_id")?;
             let target_id = required_data(&cmd, "target_id")?;
@@ -893,39 +744,60 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .lock()
                 .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
             prune_discovered_devices(&mut devices, now_ms);
-            let descriptor = |id: &str| -> anyhow::Result<dmesh_server::probe::ProbeDeviceDescriptor> {
-                let device = devices
-                    .get(id)
-                    .ok_or_else(|| anyhow::anyhow!("Android discovery has no device {id:?}"))?;
-                let class = device.info.get("device_class").and_then(Value::as_u64)
-                    .and_then(|value| u8::try_from(value).ok())
-                    .unwrap_or(dmesh_server::announce::DEVICE_CLASS_UNKNOWN);
-                let kind = match class {
-                    dmesh_server::announce::DEVICE_CLASS_ESP => dmesh_server::probe::ProbeEndpointKind::Esp,
-                    dmesh_server::announce::DEVICE_CLASS_HOST => dmesh_server::probe::ProbeEndpointKind::Host,
-                    dmesh_server::announce::DEVICE_CLASS_ANDROID => dmesh_server::probe::ProbeEndpointKind::Android,
-                    _ => anyhow::bail!("Android discovery device {id:?} has no supported device_class"),
+            let descriptor =
+                |id: &str| -> anyhow::Result<dmesh_server::probe::ProbeDeviceDescriptor> {
+                    let device = devices
+                        .get(id)
+                        .ok_or_else(|| anyhow::anyhow!("Android discovery has no device {id:?}"))?;
+                    let class = device
+                        .info
+                        .get("device_class")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u8::try_from(value).ok())
+                        .unwrap_or(dmesh_server::announce::DEVICE_CLASS_UNKNOWN);
+                    let kind = match class {
+                        dmesh_server::announce::DEVICE_CLASS_ESP => {
+                            dmesh_server::probe::ProbeEndpointKind::Esp
+                        }
+                        dmesh_server::announce::DEVICE_CLASS_HOST => {
+                            dmesh_server::probe::ProbeEndpointKind::Host
+                        }
+                        dmesh_server::announce::DEVICE_CLASS_ANDROID => {
+                            dmesh_server::probe::ProbeEndpointKind::Android
+                        }
+                        _ => anyhow::bail!(
+                            "Android discovery device {id:?} has no supported device_class"
+                        ),
+                    };
+                    let capabilities = device
+                        .info
+                        .get("probe_capabilities")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u16::try_from(value).ok())
+                        .filter(|value| *value != 0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Android discovery device {id:?} has no probe capabilities"
+                            )
+                        })?;
+                    let id_bytes = hex_to_bytes(id)?;
+                    if id_bytes.len() < 6 {
+                        anyhow::bail!(
+                            "Android discovery device {id:?} has no six-byte radio identity"
+                        );
+                    }
+                    let mut node = [0; 6];
+                    node.copy_from_slice(&id_bytes[..6]);
+                    Ok(dmesh_server::probe::ProbeDeviceDescriptor {
+                        endpoint: dmesh_server::probe::ProbeEndpoint {
+                            kind,
+                            node,
+                            mode: dmesh_server::probe::ProbeMode::NAN_NOW,
+                            bssid: None,
+                        },
+                        capabilities,
+                    })
                 };
-                let capabilities = device.info.get("probe_capabilities").and_then(Value::as_u64)
-                    .and_then(|value| u16::try_from(value).ok())
-                    .filter(|value| *value != 0)
-                    .ok_or_else(|| anyhow::anyhow!("Android discovery device {id:?} has no probe capabilities"))?;
-                let id_bytes = hex_to_bytes(id)?;
-                if id_bytes.len() < 6 {
-                    anyhow::bail!("Android discovery device {id:?} has no six-byte radio identity");
-                }
-                let mut node = [0; 6];
-                node.copy_from_slice(&id_bytes[..6]);
-                Ok(dmesh_server::probe::ProbeDeviceDescriptor {
-                    endpoint: dmesh_server::probe::ProbeEndpoint {
-                        kind,
-                        node,
-                        mode: dmesh_server::probe::ProbeMode::NAN_NOW,
-                        bssid: None,
-                    },
-                    capabilities,
-                })
-            };
             let source = descriptor(source_id)?;
             let target = descriptor(target_id)?;
             let rows = dmesh_server::probe::full_pair_probe_requests(
@@ -968,6 +840,192 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 "source": source,
                 "target": target,
                 "rows": rows,
+            })
+            .to_string()
+            .into_bytes()
+        }
+        "radio.probe.udp6_echo" => {
+            // The controller supplies the address learned from the shared
+            // multicast announce and the *local* P2P interface index. A
+            // link-local address without that scope is not a usable P2P
+            // destination, so reject it here rather than silently using an
+            // unrelated default Wi-Fi route.
+            let address = required_data(&cmd, "address")?
+                .parse::<Ipv6Addr>()
+                .map_err(|_| anyhow::anyhow!("udp6 echo address must be IPv6"))?;
+            if !address.is_unicast_link_local() {
+                anyhow::bail!("udp6 echo requires an IPv6 link-local address");
+            }
+            let scope = parse_u32(&cmd, "scope", 0)?;
+            if scope == 0 {
+                anyhow::bail!("udp6 echo requires a nonzero local interface scope");
+            }
+            let port = u16::try_from(parse_u32(
+                &cmd,
+                "port",
+                u32::from(dmesh_server::udp::STABLE_WIFI_UDP_PORT),
+            )?)
+            .map_err(|_| anyhow::anyhow!("udp6 echo port is outside u16"))?;
+            let body = cmd
+                .data
+                .get("payload")
+                .map(String::as_bytes)
+                .unwrap_or(b"dmesh-p2p-probe");
+            if body.is_empty() || body.len() > 256 {
+                anyhow::bail!("udp6 echo payload must be 1..=256 bytes");
+            }
+            let peer = SocketAddr::V6(SocketAddrV6::new(address, port, 0, scope));
+            let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow::anyhow!("udp6 echo runtime: {error}"))?;
+            let started = std::time::Instant::now();
+            let payload = body.to_vec();
+            let payload_len = payload.len();
+            let result = runtime.block_on(async move {
+                let cid_value = (chrono::Utc::now().timestamp_micros() as u64) | 1;
+                let cid = quic_lite::ConnectionId::new(cid_value)
+                    .ok_or_else(|| anyhow::anyhow!("udp6 echo CID"))?;
+                let mut client = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    dmesh_server::udp::UdpClient::connect(bind, peer, cid),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("udp6 echo bootstrap timeout"))??;
+                let mut request = Vec::with_capacity(1 + payload.len());
+                request.push(quic_lite::SERVICE_ECHO);
+                request.extend_from_slice(&payload);
+                let (_, echoed, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    client.request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, &request, true),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("udp6 echo response timeout"))??;
+                let _ = client.close(0).await;
+                if echoed != payload {
+                    anyhow::bail!("udp6 echo payload mismatch");
+                }
+                Ok::<_, anyhow::Error>(client.transport_stats())
+            })?;
+            json!({
+                "ok": true,
+                "peer": peer.to_string(),
+                "bytes": payload_len,
+                "elapsed_us": started.elapsed().as_micros(),
+                "packets_tx": result.sent_datagrams,
+                "packets_rx": result.received_datagrams,
+            })
+            .to_string()
+            .into_bytes()
+        }
+        "radio.probe.udp6_iperf" => {
+            // This is the same scoped-P2P UDP bearer and common SERVICE_IPERF
+            // schema used by host/firmware tests. Java only marshals the
+            // request; stream reassembly and transport accounting stay Rust.
+            let address = required_data(&cmd, "address")?
+                .parse::<Ipv6Addr>()
+                .map_err(|_| anyhow::anyhow!("udp6 iperf address must be IPv6"))?;
+            if !address.is_unicast_link_local() {
+                anyhow::bail!("udp6 iperf requires an IPv6 link-local address");
+            }
+            let scope = parse_u32(&cmd, "scope", 0)?;
+            if scope == 0 {
+                anyhow::bail!("udp6 iperf requires a nonzero local interface scope");
+            }
+            let port = u16::try_from(parse_u32(
+                &cmd,
+                "port",
+                u32::from(dmesh_server::udp::STABLE_WIFI_UDP_PORT),
+            )?)
+            .map_err(|_| anyhow::anyhow!("udp6 iperf port is outside u16"))?;
+            let bytes = u64::from(parse_u32(&cmd, "bytes", 32 * 1024)?);
+            if !(1..=256 * 1024).contains(&bytes) {
+                anyhow::bail!("udp6 iperf bytes must be 1..=262144");
+            }
+            let packet_size = u16::try_from(parse_u32(&cmd, "packet_size", 1_100)?)
+                .map_err(|_| anyhow::anyhow!("udp6 iperf packet size is outside u16"))?;
+            if !(64..=1_100).contains(&packet_size) {
+                anyhow::bail!("udp6 iperf packet size must be 64..=1100");
+            }
+            let peer = SocketAddr::V6(SocketAddrV6::new(address, port, 0, scope));
+            let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| anyhow::anyhow!("udp6 iperf runtime: {error}"))?;
+            let started = std::time::Instant::now();
+            let result = runtime.block_on(async move {
+                let cid_value = (chrono::Utc::now().timestamp_micros() as u64) | 1;
+                let cid = quic_lite::ConnectionId::new(cid_value)
+                    .ok_or_else(|| anyhow::anyhow!("udp6 iperf CID"))?;
+                let mut client = tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    dmesh_server::udp::UdpClient::connect(bind, peer, cid),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("udp6 iperf bootstrap timeout"))??;
+                let mut request = [0u8; 64];
+                let request_len = dmesh_server::iperf::encode_iperf_service_request(
+                    dmesh_server::iperf::IperfServiceRequest::new(bytes, packet_size),
+                    &mut request,
+                )
+                .ok_or_else(|| anyhow::anyhow!("udp6 iperf request encoding"))?;
+                // IPERF is an asymmetric service: the client opens the
+                // request stream, while the server schedules its payload on
+                // a server-initiated response stream (normally ID 1). Do
+                // not use `request_stream_all`, which correctly enforces
+                // same-stream request/response semantics for RPC services
+                // but would reject this IPERF response as `1 expected 4`.
+                let expected =
+                    usize::try_from(bytes).map_err(|_| anyhow::anyhow!("udp6 iperf size"))?;
+                let (response_stream, first, mut finished) = tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    client.request_stream(
+                        quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                        &request[..request_len],
+                        true,
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("udp6 iperf first response timeout"))??;
+                let mut received = first;
+                while !finished {
+                    let (stream, chunk, fin) = tokio::time::timeout(
+                        std::time::Duration::from_secs(12),
+                        client.recv_stream(),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("udp6 iperf transfer timeout"))??;
+                    if stream != response_stream {
+                        anyhow::bail!(
+                            "udp6 iperf response stream {stream} expected {response_stream}"
+                        );
+                    }
+                    if received.len().saturating_add(chunk.len()) > expected {
+                        anyhow::bail!("udp6 iperf response exceeds requested {bytes} bytes");
+                    }
+                    received.extend_from_slice(&chunk);
+                    finished = fin;
+                }
+                if received.len() != usize::try_from(bytes).unwrap_or(usize::MAX) {
+                    anyhow::bail!("udp6 iperf received {} expected {bytes}", received.len());
+                }
+                let stats = client.transport_stats();
+                let _ = client.close(0).await;
+                Ok::<_, anyhow::Error>(stats)
+            })?;
+            let elapsed_us = started.elapsed().as_micros().max(1) as u64;
+            json!({
+                "ok": true,
+                "peer": peer.to_string(),
+                "bytes": bytes,
+                "packet_size": packet_size,
+                "elapsed_us": elapsed_us,
+                "bps": bytes.saturating_mul(8_000_000) / elapsed_us,
+                "packets_tx": result.sent_datagrams,
+                "packets_rx": result.received_datagrams,
+                "retransmitted": result.retransmitted_datagrams,
             })
             .to_string()
             .into_bytes()
@@ -1030,6 +1088,54 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 let _ = sender.send(StoreCommand::InsertFrame(frame));
             }
             json!({"status": "ok"}).to_string().into_bytes()
+        }
+        "radio.transport.event" => {
+            let transport = cmd.data.get("transport").cloned().unwrap_or_default();
+            let event = cmd.data.get("event").cloned().unwrap_or_default();
+            let frame = FrameRecord {
+                protocol: format!("android_{transport}_event"),
+                payload_hash: 0,
+                src_device: String::new(),
+                target_device: None,
+                seq: None,
+                msg_type: (!event.is_empty()).then_some(event),
+                payload: payload.to_vec(),
+                rssi: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            if let Some(sender) = store_sender() {
+                let _ = sender.send(StoreCommand::InsertFrame(frame));
+            }
+            json!({"status": "ok"}).to_string().into_bytes()
+        }
+        "radio.shell.command" => {
+            let line = std::str::from_utf8(payload)?.trim();
+            let schema = mesh::schema::ResourceSchema::from_embedded(include_str!("../../lmesh/resources/firmware-schema.json"))?;
+            let request = schema.parse_shell(line)?;
+            let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
+            let params = request.get("params").and_then(Value::as_object);
+            let mode_nan = method == "transport.start" && params
+                .and_then(|params| params.get("mode")).and_then(Value::as_str)
+                .is_some_and(|mode| mode == "nan" || mode == "aware");
+            let p2p_go = params.and_then(|params| params.get("ap"))
+                .and_then(Value::as_str).is_some_and(|value| value == "1")
+                || params.and_then(|params| params.get("p2p_go"))
+                    .and_then(Value::as_str).is_some_and(|value| value == "1");
+            let sta = method == "transport.start" && params
+                .and_then(|params| params.get("mode")).and_then(Value::as_str)
+                .is_some_and(|mode| mode == "sta");
+            let operation = if method == "transport.stop" {
+                "stop"
+            } else if sta {
+                "sta"
+            } else if mode_nan && p2p_go {
+                "p2p_go"
+            } else if mode_nan {
+                "nan"
+            } else {
+                anyhow::bail!("no Android backend for schema command: {method}");
+            };
+            json!({"status": "accepted", "operation": operation, "request": request}).to_string().into_bytes()
         }
         "radio.nan.build_followup" => {
             let msg_type = cmd
@@ -1128,6 +1234,21 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     .map(|r| r as i32),
                 timestamp: chrono::Utc::now().timestamp_millis(),
             };
+            if !src_hex.is_empty() {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut devices = discovered_devices()
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
+                prune_discovered_devices(&mut devices, now_ms);
+                devices.insert(
+                    src_hex.to_ascii_lowercase(),
+                    DiscoveredDevice {
+                        last_seen_ms: now_ms,
+                        peer: cmd.data.get("address").cloned().unwrap_or_default(),
+                        info: parsed.clone(),
+                    },
+                );
+            }
             if let Some(sender) = store_sender() {
                 let _ = sender.send(StoreCommand::InsertFrame(frame));
             }
@@ -1387,7 +1508,7 @@ impl MeshListener for JniMeshListener {
             };
             let _ = env.call_method(
                 &callback,
-                "onSshConnection",
+                "onTransportConnection",
                 "(JLjava/lang/String;)V",
                 &[(client_id as i64).into(), (&j_user).into()],
             );
@@ -1395,7 +1516,7 @@ impl MeshListener for JniMeshListener {
     }
 
     fn on_stream(&self, client_id: u64, host: &str, port: u16, stream: DuplexStream) {
-        if (host == BRIDGE_HOST || host == LEGACY_BRIDGE_HOST) && port == BRIDGE_PORT {
+        if host == BRIDGE_HOST && port == BRIDGE_PORT {
             let jvm = self.jvm.clone();
             let callback = self.callback.clone();
             self.runtime.spawn(async move {
@@ -1434,7 +1555,7 @@ impl MeshListener for JniMeshListener {
 
             let _ = env.call_method(
                 &callback,
-                "onStream",
+                "onInboundStream",
                 "(JLjava/lang/String;IJ)V",
                 &[
                     (client_id as i64).into(),
@@ -1470,74 +1591,17 @@ impl MeshListener for JniMeshListener {
 }
 
 async fn handle_exec_session(
-    jvm: Arc<JavaVM>,
-    callback: GlobalRef,
-    client_id: u64,
-    command: String,
+    _jvm: Arc<JavaVM>,
+    _callback: GlobalRef,
+    _client_id: u64,
+    _command: String,
     mut stream: DuplexStream,
 ) {
-    let (tx, mut rx) = unbounded_channel::<String>();
-    match bridge_senders().lock() {
-        Ok(mut senders) => {
-            senders.insert(client_id, tx);
-        }
-        Err(e) => {
-            log::error!("SSH exec sender map is poisoned: {}", e);
-            return;
-        }
-    }
-
-    let response = match parse_bridge_line(&command) {
-        Ok(cmd) => local_bridge_response(&cmd).unwrap_or_else(|| {
-            match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
-                Ok(()) => json!({
-                    "id": cmd.id,
-                    "ok": true,
-                    "method": cmd.method,
-                }),
-                Err(e) => json!({
-                    "id": cmd.id,
-                    "ok": false,
-                    "error": e.to_string(),
-                }),
-            }
-        }),
-        Err(e) => json!({
-            "id": Value::Null,
-            "ok": false,
-            "error": e.to_string(),
-        }),
-    };
-
-    let mut out = response.to_string();
-    out.push('\n');
-    if let Err(e) = stream.write_all(out.as_bytes()).await {
+    let message = b"dmesh-msg:1 accepts length-prefixed message records; SSH exec text is not a message API\n";
+    if let Err(e) = stream.write_all(message).await {
         log::warn!("SSH exec response write failed: {}", e);
     }
-
-    let drain_until = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
-    loop {
-        tokio::select! {
-            outbound = rx.recv() => {
-                let Some(mut out) = outbound else {
-                    break;
-                };
-                out.push('\n');
-                if let Err(e) = stream.write_all(out.as_bytes()).await {
-                    log::warn!("SSH exec event write failed: {}", e);
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(drain_until) => {
-                break;
-            }
-        }
-    }
-
     let _ = stream.shutdown().await;
-    if let Ok(mut senders) = bridge_senders().lock() {
-        senders.remove(&client_id);
-    }
 }
 
 async fn handle_bridge_stream(
@@ -1546,7 +1610,7 @@ async fn handle_bridge_stream(
     client_id: u64,
     mut stream: DuplexStream,
 ) {
-    let (tx, mut rx) = unbounded_channel::<String>();
+    let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
     match bridge_senders().lock() {
         Ok(mut senders) => {
             senders.insert(client_id, tx);
@@ -1570,79 +1634,26 @@ async fn handle_bridge_stream(
                         break;
                     }
                 };
-                for b in &buf[..n] {
-                    if *b == b'\n' {
-                        let line = String::from_utf8_lossy(&pending).trim().to_string();
-                        pending.clear();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if line == "exit" || line == "quit" {
-                            let response = json!({
-                                "ok": true,
-                                "method": "shell.exit",
-                            });
-                            let mut out = response.to_string();
-                            out.push('\n');
-                            let _ = stream.write_all(out.as_bytes()).await;
+                pending.extend_from_slice(&buf[..n]);
+                loop {
+                    let record = match take_bridge_record(&mut pending) {
+                        Ok(Some(record)) => record,
+                        Ok(None) => break,
+                        Err(error) => {
+                            log::warn!("SSH message bridge rejected record: {}", error);
                             break 'stream_loop;
                         }
-                        let response = match parse_bridge_line(&line) {
-                            Ok(cmd) => {
-                                if let Some(open) = mesh::message::StreamOpenRequest::parse(
-                                    &cmd.to_json_value(),
-                                    format!("ssh:{client_id}"),
-                                ) {
-                                    let ack = open.opened_response();
-                                    let mut out = ack.to_string();
-                                    out.push('\n');
-                                    if let Err(e) = stream.write_all(out.as_bytes()).await {
-                                        log::warn!("SSH stream upgrade ACK write failed: {}", e);
-                                        break 'stream_loop;
-                                    }
-                                    if let Err(e) = notify_stream_opened(&jvm, &callback, client_id, &ack.to_string()) {
-                                        log::warn!("stream-opened callback failed: {}", e);
-                                    }
-                                    hand_stream_to_java(&jvm, &callback, client_id, stream, "mesh-stream", 0);
-                                    break 'stream_loop;
-                                }
-                                local_bridge_response(&cmd).unwrap_or_else(|| {
-                                    match dispatch_bridge_command(&jvm, &callback, client_id, &cmd) {
-                                        Ok(()) => json!({
-                                            "id": cmd.id,
-                                            "ok": true,
-                                            "method": cmd.method,
-                                        }),
-                                        Err(e) => json!({
-                                            "id": cmd.id,
-                                            "ok": false,
-                                            "error": e.to_string(),
-                                        }),
-                                    }
-                                })
-                            },
-                            Err(e) => json!({
-                                "id": Value::Null,
-                                "ok": false,
-                                "error": e.to_string(),
-                            }),
-                        };
-                        let mut out = response.to_string();
-                        out.push('\n');
-                        if let Err(e) = stream.write_all(out.as_bytes()).await {
-                            log::warn!("SSH message bridge write failed: {}", e);
-                            break 'stream_loop;
-                        }
-                    } else if *b != b'\r' {
-                        pending.push(*b);
+                    };
+                    if let Err(error) = dispatch_bridge_message(&jvm, &callback, client_id, &record) {
+                        log::warn!("SSH message bridge Java callback failed: {}", error);
+                        break 'stream_loop;
                     }
                 }
             }
             outbound = rx.recv() => {
                 match outbound {
-                    Some(mut out) => {
-                        out.push('\n');
-                        if let Err(e) = stream.write_all(out.as_bytes()).await {
+                    Some(record) => {
+                        if let Err(e) = write_bridge_record(&mut stream, &record).await {
                             log::warn!("SSH message bridge event write failed: {}", e);
                             break 'stream_loop;
                         }
@@ -1656,80 +1667,66 @@ async fn handle_bridge_stream(
     if let Ok(mut senders) = bridge_senders().lock() {
         senders.remove(&client_id);
     }
+    dispatch_bridge_closed(&jvm, &callback, client_id);
 }
 
-fn notify_stream_opened(
+fn dispatch_bridge_message(
     jvm: &JavaVM,
     callback: &GlobalRef,
     client_id: u64,
-    line: &str,
+    record: &[u8],
 ) -> anyhow::Result<()> {
     let mut env = jvm.attach_current_thread()?;
-    let j_line = env.new_string(line)?;
-    env.call_method(
-        callback,
-        "onStreamOpened",
-        "(JLjava/lang/String;)V",
-        &[(client_id as i64).into(), (&j_line).into()],
-    )?;
-    Ok(())
-}
-
-fn hand_stream_to_java(
-    jvm: &JavaVM,
-    callback: &GlobalRef,
-    client_id: u64,
-    stream: DuplexStream,
-    host: &str,
-    port: u16,
-) {
-    let mut env = match jvm.attach_current_thread() {
-        Ok(env) => env,
-        Err(e) => {
-            log::error!("Failed to attach thread for upgraded stream: {}", e);
-            return;
-        }
-    };
-    let j_host = match env.new_string(host) {
-        Ok(value) => value,
-        Err(e) => {
-            log::error!("Failed to create upgraded stream host string: {}", e);
-            return;
-        }
-    };
-    let stream_handle = MeshStreamHandle {
-        stream,
-        runtime_handle: tokio::runtime::Handle::current(),
-    };
-    let h = Box::into_raw(Box::new(stream_handle)) as jlong;
-    let _ = env.call_method(
-        callback,
-        "onStream",
-        "(JLjava/lang/String;IJ)V",
-        &[
-            (client_id as i64).into(),
-            (&j_host).into(),
-            (port as i32).into(),
-            h.into(),
-        ],
-    );
-}
-
-fn dispatch_bridge_command(
-    jvm: &JavaVM,
-    callback: &GlobalRef,
-    client_id: u64,
-    cmd: &BridgeCommand,
-) -> anyhow::Result<()> {
-    let mut env = jvm.attach_current_thread()?;
-    let j_line = env.new_string(cmd.to_json_line())?;
+    let bytes = env.byte_array_from_slice(record)?;
     env.call_method(
         callback,
         "onMessage",
-        "(JLjava/lang/String;)V",
-        &[(client_id as i64).into(), (&j_line).into()],
+        "(J[B)V",
+        &[(client_id as i64).into(), (&bytes).into()],
     )?;
     Ok(())
+}
+
+fn dispatch_bridge_closed(jvm: &JavaVM, callback: &GlobalRef, client_id: u64) {
+    let mut env = match jvm.attach_current_thread() {
+        Ok(env) => env,
+        Err(error) => {
+            log::warn!("SSH message bridge close callback attach failed: {}", error);
+            return;
+        }
+    };
+    if let Err(error) = env.call_method(
+        callback,
+        "onMessageClosed",
+        "(J)V",
+        &[(client_id as i64).into()],
+    ) {
+        log::warn!("SSH message bridge close callback failed: {}", error);
+    }
+}
+
+fn take_bridge_record(pending: &mut Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
+    if pending.len() < 4 {
+        return Ok(None);
+    }
+    let size = u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+    if size == 0 || size > MAX_BRIDGE_MESSAGE_BYTES {
+        anyhow::bail!("message size {} is outside 1..={}", size, MAX_BRIDGE_MESSAGE_BYTES);
+    }
+    if pending.len() < size + 4 {
+        return Ok(None);
+    }
+    let record = pending[4..size + 4].to_vec();
+    pending.drain(..size + 4);
+    Ok(Some(record))
+}
+
+async fn write_bridge_record(stream: &mut DuplexStream, record: &[u8]) -> io::Result<()> {
+    if record.is_empty() || record.len() > MAX_BRIDGE_MESSAGE_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid bridge message size"));
+    }
+    stream.write_all(&(record.len() as u32).to_be_bytes()).await?;
+    stream.write_all(record).await
 }
 
 struct JniSshClientListener {
@@ -1770,7 +1767,7 @@ impl SshClientListener for JniSshClientListener {
 
             let _ = env.call_method(
                 &callback,
-                "onForwardedTcpip",
+                "onForwardedStream",
                 "(JLjava/lang/String;IJ)V",
                 &[
                     (conn_id as i64).into(),
@@ -1814,9 +1811,6 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
     if let Ok(mut message_callback) = android_message_callback().lock() {
         *message_callback = Some((jvm.clone(), callback_ref.clone()));
     }
-    #[cfg(target_os = "android")]
-    register_android_proxy_bridge();
-
     let mesh_listener = Arc::new(JniMeshListener {
         jvm: jvm.clone(),
         callback: callback_ref.clone(),
@@ -1834,15 +1828,19 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSendBridgeMessage(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     client_id: jlong,
-    line: JString,
+    message: JByteArray,
 ) -> jboolean {
-    let line: String = match env.get_string(&line) {
-        Ok(line) => line.into(),
+    let message = match env.convert_byte_array(&message) {
+        Ok(message) if !message.is_empty() && message.len() <= MAX_BRIDGE_MESSAGE_BYTES => message,
+        Ok(message) => {
+            log::warn!("Rejected bridge message of {} bytes", message.len());
+            return JNI_FALSE;
+        }
         Err(e) => {
-            log::warn!("Failed to read bridge line: {}", e);
+            log::warn!("Failed to read bridge message bytes: {}", e);
             return JNI_FALSE;
         }
     };
@@ -1856,7 +1854,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSendBr
         }
     };
     match sender {
-        Some(tx) if tx.send(line).is_ok() => JNI_TRUE,
+        Some(tx) if tx.send(message).is_ok() => JNI_TRUE,
         _ => JNI_FALSE,
     }
 }
@@ -2148,6 +2146,47 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeRadioM
         .unwrap_or_else(|_| JByteArray::from(JObject::null()))
 }
 
+/// Text-only companion to `nativeRadioMessage`.
+///
+/// Binary radio builders intentionally receive an empty byte array on failure:
+/// returning an error string there could be transmitted as malformed service
+/// data.  Control and probe callers instead need a structured error so their
+/// persisted result distinguishes a failed handler from an empty success.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeRadioMessageText<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    method: JString<'a>,
+    args: JString<'a>,
+    data: JByteArray<'a>,
+    fd: jint,
+) -> JString<'a> {
+    let method: String = env
+        .get_string(&method)
+        .map(|value| value.into())
+        .unwrap_or_default();
+    let args: String = env
+        .get_string(&args)
+        .map(|value| value.into())
+        .unwrap_or_default();
+    let data = env.convert_byte_array(&data).unwrap_or_default();
+    let text = match radio_message(&method, &args, &data, fd) {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|error| {
+            serde_json::json!({
+                "ok": false,
+                "error": "radio_text_non_utf8",
+                "detail": error.to_string(),
+            })
+            .to_string()
+        }),
+        Err(error) => {
+            log::error!("nativeRadioMessageText failed: {}", error);
+            serde_json::json!({"ok": false, "error": error.to_string()}).to_string()
+        }
+    };
+    env.new_string(text).unwrap_or_else(|_| JString::default())
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshStream_nativeStreamRead(
     env: JNIEnv,
@@ -2317,65 +2356,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_json_command() {
-        let cmd =
-            parse_bridge_line(r#"{"id":"j1","method":"wifi.scan","data":{"reason":"json","n":2}}"#)
-                .unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("j1"));
-        assert_eq!(cmd.method, "wifi.scan");
-        assert_eq!(cmd.data.get("reason").unwrap(), "json");
-        assert_eq!(cmd.data.get("n").unwrap(), "2");
+    fn bridge_record_accepts_fragmented_bounded_messages() {
+        let mut pending = vec![0, 0, 0, 3, 1];
+        assert!(take_bridge_record(&mut pending).unwrap().is_none());
+        pending.extend_from_slice(&[2, 3, 0, 0, 0, 1, 4]);
+        assert_eq!(take_bridge_record(&mut pending).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(take_bridge_record(&mut pending).unwrap(), Some(vec![4]));
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn parses_json_method_command() {
-        let cmd =
-            parse_bridge_line(r#"{"id":"m1","method":"wifi.scan","data":{"reason":"json","n":2}}"#)
-                .unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("m1"));
-        assert_eq!(cmd.method, "wifi.scan");
-        assert_eq!(cmd.to_json_value()["method"], "wifi.scan");
-    }
-
-    #[test]
-    fn parses_human_key_value_command() {
-        let cmd = parse_bridge_line(r#"wifi scan id=h1 reason="human value""#).unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("h1"));
-        assert_eq!(cmd.method, "wifi.scan");
-        assert_eq!(cmd.data.get("reason").unwrap(), "human value");
-    }
-
-    #[test]
-    fn parses_human_method_name_command() {
-        let cmd = parse_bridge_line(r#"wifi.scan id=h3 reason="human value""#).unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("h3"));
-        assert_eq!(cmd.method, "wifi.scan");
-        assert_eq!(cmd.data.get("reason").unwrap(), "human value");
-    }
-
-    #[test]
-    fn parses_app_alias_method_name_command() {
-        let cmd = parse_bridge_line(r#"app.chat.send id=a1 text=hello"#).unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("a1"));
-        assert_eq!(cmd.method, "app.chat.send");
-        assert_eq!(cmd.to_json_value()["method"], "app.chat.send");
-    }
-
-    #[test]
-    fn parses_telemetry_text_command() {
-        let cmd = parse_bridge_line("telemetry.history --id traces --limit 8").unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("traces"));
-        assert_eq!(cmd.method, "telemetry.history");
-        assert_eq!(cmd.data.get("limit").unwrap(), "8");
-    }
-
-    #[test]
-    fn parses_human_long_options_command() {
-        let cmd = parse_bridge_line("wifi.scan --id h2 --reason human --enabled").unwrap();
-        assert_eq!(cmd.id.as_deref(), Some("h2"));
-        assert_eq!(cmd.method, "wifi.scan");
-        assert_eq!(cmd.data.get("reason").unwrap(), "human");
-        assert_eq!(cmd.data.get("enabled").unwrap(), "1");
+    fn bridge_record_rejects_empty_and_oversized_messages() {
+        let mut empty = vec![0, 0, 0, 0];
+        assert!(take_bridge_record(&mut empty).is_err());
+        let mut oversized = ((MAX_BRIDGE_MESSAGE_BYTES + 1) as u32).to_be_bytes().to_vec();
+        assert!(take_bridge_record(&mut oversized).is_err());
     }
 
     #[test]
@@ -2407,6 +2402,100 @@ mod tests {
         assert!(parsed.contains(r#""layout":"esp32_service_data""#));
         assert!(parsed.contains(r#""event":"lora_rx""#));
         assert!(parsed.contains(r#""src_hex":"0x04030201""#));
+    }
+
+    #[test]
+    fn local_network_snapshot_is_bounded_and_rust_owned() {
+        local_networks().lock().unwrap().clear();
+        let mut snapshot = [0u8; 512];
+        let mut cbor = dmesh_server::cbor::Encoder::new(&mut snapshot);
+        cbor.map(1).unwrap();
+        cbor.text_value(b"networks").unwrap();
+        cbor.array(1).unwrap();
+        cbor.map(11).unwrap();
+        cbor.text_value(b"interface").unwrap(); cbor.text_value(b"wlan0").unwrap();
+        for key in [b"up".as_slice(), b"multicast", b"active", b"internet", b"validated"] {
+            cbor.text_value(key).unwrap(); cbor.boolean(true).unwrap();
+        }
+        cbor.text_value(b"metered").unwrap(); cbor.boolean(false).unwrap();
+        for (key, values) in [
+            (b"addresses".as_slice(), &[b"192.0.2.10".as_slice(), b"fe80::10%wlan0".as_slice()][..]),
+            (b"dns_servers".as_slice(), &[b"192.0.2.53".as_slice()][..]),
+            (b"gateways".as_slice(), &[b"192.0.2.1".as_slice()][..]),
+            (b"transports".as_slice(), &[b"wifi".as_slice()][..]),
+        ] {
+            cbor.text_value(key).unwrap(); cbor.array(values.len() as u64).unwrap();
+            for value in values { cbor.text_value(value).unwrap(); }
+        }
+        let length = cbor.len();
+        let update = radio_message(
+            "radio.local_networks.update",
+            "",
+            &snapshot[..length],
+            -1,
+        )
+        .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&update).unwrap()["interfaces"], 1);
+        let table = radio_message("radio.local_networks", "", &[], -1).unwrap();
+        let table: Value = serde_json::from_slice(&table).unwrap();
+        assert_eq!(table["networks"][0]["interface"], "wlan0");
+        assert_eq!(table["networks"][0]["validated"], true);
+        let status = String::from_utf8(radio_message("radio.status_text", "", &[], -1).unwrap())
+            .unwrap();
+        assert!(status.contains("Local networks: 1 (validated internet)"));
+    }
+
+    #[test]
+    fn power_telemetry_is_validated_and_retained_in_rust() {
+        *power_state().lock().unwrap() = dmesh_server::power::PowerState::default();
+        radio_message(
+            "radio.power.status",
+            "",
+            br#"{"source":"android","event":"battery","battery_percent":67,"power_save":true,"idle":false,"idle_ms":0,"total_idle_ms":2,"charging_ms":3,"status":2,"plugged":1}"#,
+            -1,
+        )
+        .unwrap();
+        let state: Value = serde_json::from_slice(
+            &radio_message("radio.power.state", "", &[], -1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["battery_percent"], 67);
+        assert_eq!(state["power_save"], true);
+        assert!(radio_message("radio.power.status", "", br#"{"unexpected":1}"#, -1).is_err());
+    }
+
+    #[test]
+    fn android_ble_discovery_updates_rust_inventory_and_status_text() {
+        discovered_devices().lock().unwrap().clear();
+        let advertisement = radio_message(
+            "radio.ble.build_service_data",
+            "event=lora_rx device_id=010203040506 rssi=-70 snr_q4=6",
+            b"payload",
+            -1,
+        )
+        .unwrap();
+        radio_message(
+            "radio.ble.inject_frame",
+            "scan_rssi=-62 address=aa:bb:cc:dd:ee:ff",
+            &advertisement,
+            -1,
+        )
+        .unwrap();
+
+        let devices = radio_message("radio.devices", "", &[], -1).unwrap();
+        let devices: Value = serde_json::from_slice(&devices).unwrap();
+        let entry = devices["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["id"] == "0x04030201")
+            .unwrap();
+        assert_eq!(entry["peer"], "aa:bb:cc:dd:ee:ff");
+
+        let status = radio_message("radio.status_text", "", &[], -1).unwrap();
+        let status = String::from_utf8(status).unwrap();
+        assert!(status.contains("Discovered devices: 1"));
+        assert!(status.contains("0x04030201 aa:bb:cc:dd:ee:ff"));
     }
 
     #[test]

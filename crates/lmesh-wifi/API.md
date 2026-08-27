@@ -46,6 +46,14 @@ monitor VIF, while `onchannel`, `onchannel_noack`, and `roc` use
 the service socket selected by mesh-init, normally
 `/run/mesh/lmesh-wifi/mesh.sock`.
 
+`transport.discover` is the device-neutral discovery operation paired with
+`transport.start`. It never changes the selected transport. Passive calls
+return the bounded inventory accumulated so far. With `active=1 nan=1`, Linux
+sends a NAN active Subscribe containing the shared tagged-CBOR request and
+collects fresh follow-ups/announces for `wait_ms`; a receiving DMesh node
+responds immediately with a newly generated announce on its live NAN, NOW,
+and UDP6 bearers rather than waiting for periodic presence refresh.
+
 ## Common announce identity
 
 UDP multicast, NAN Service Info, NOW forwarding, and the local
@@ -304,10 +312,13 @@ bounded receipt list for DMesh NAN Follow-ups. Its `discovered_devices`
 inventory is keyed by device identity and retains the latest observation for
 every bearer: `nan` states whether this host actually observed NAN from the
 device, `active_transport` projects the advertised transport mode, and
-`observations` preserves the peer/timestamp per source. A UDP6-only Android
-record therefore remains visible even when `nan.observed=false`. Each receipt retains
-peer/BSSID, DMesh message type and sequence, and the bounded payload for E2E
-attribution.
+`observations` preserves the peer/timestamp per source. Android and ESP32
+announces therefore occupy this one identity-keyed inventory (with a
+`platform` projection), not platform-specific device lists. A UDP6-only
+Android record remains visible even when `nan.observed=false`. Each receipt
+retains peer/BSSID, DMesh message type and sequence, and the bounded payload
+for E2E attribution. `radio_bss` and `channel_discovery` add provisional
+passive/active AP evidence until a semantic DMesh announce identifies it.
 
 The inventory is bearer-neutral: raw NAN receives enter it directly, while
 the sibling `lmesh` service forwards its already validated multicast announce
@@ -500,23 +511,28 @@ adapter-specific); `af_packet` writes a complete
 Ethernet frame directly to `wlan1`. The latter exercises the normal AP/STA
 data path and is not an 802.11-header injection API.
 
-AP startup is a service policy. `LMESH_AP_ADDRESS` optionally selects the
-static IPv4 address/prefix applied to the owned open AP; the current service
-default is `10.78.0.1/16`. `lmesh-wifi` uses the normal 100-TU interval
-(`LMESH_AP_BEACON_INTERVAL_TU=100`). `lmesh` defaults its independently owned
-`wlan1` lab AP to 500 TU; setting `LMESH_AP_AUTOSTART=0` restores the AP-off
-NAN+NOW experiment. The AP defaults to HT20 so STA, NAN, and NOW can share a
-single 20 MHz channel. Set
-`LMESH_AP_HT40=true`, or pass
-`ht40=true` to `wifi.ap.start_open`, only for a dedicated AP experiment.
+AP-equivalent startup is a service policy. Stable `lmesh-wifi` uses a secured
+P2P group rather than an ordinary open AP. Its retained supplicant has a
+service-specific control directory (`/run/mesh/lmesh-wifi/wpa` by default);
+`lmesh` uses its own directory. Static IPv4 configuration and open-AP tuning
+are not applied to the P2P group interface.
+
+`transport.start kind=nan ap=1` is the common AP-equivalent request. By
+default Linux uses one retained foreground
+`wpa_supplicant` owns P2P discovery, DNS-SD, WPS, and the dynamically named
+group interface. P2P failure is returned after cleanup; it never silently
+downgrades to an open AP. `transport.start kind=nan ap=1 open=1` deliberately
+selects the ordinary raw open-AP backend for Linux/ESP performance comparison.
+The shared near-term P2P identity is `DIRECT-dmesh` on channel 6; credentials
+never appear in control requests, logs, or status.
 
 `wifi.interface.channel` is an explicit nl80211 channel pin for the owned
 interface (currently 2.4 GHz channels 1-13). It brings only that interface up
 and does not reconfigure `wlan0` or restart `lmesh-wifi`. To create a carrier
 that holds channel 6, use the existing explicit `wifi.ap.start_open iface=wlan1`
 command; stop it with `wifi.ap.stop iface=wlan1` before returning to an
-unassociated raw-NAN experiment. Ad-hoc and P2P modes remain driver-specific
-and are not enabled implicitly by this command.
+unassociated raw-NAN experiment. P2P is selected only by the common
+`transport.start kind=nan ap=1` transition, never by this legacy AP command.
 
 > TODO(host AP-off NAN+NOW): make the permanent `wlan1mon` fixture retain its
 > requested channel while `wlan1` is unassociated, then validate NAN/NOW

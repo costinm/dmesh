@@ -231,8 +231,8 @@ fn encode_inner(announce: Announce, include_signature: bool, out: &mut [u8]) -> 
     e.uint(2)?;
     e.uint(announce.kind)?;
     e.uint(5)?;
-    let has_descriptor = announce.device_class != DEVICE_CLASS_UNKNOWN
-        || announce.probe_capabilities != 0;
+    let has_descriptor =
+        announce.device_class != DEVICE_CLASS_UNKNOWN || announce.probe_capabilities != 0;
     e.map(4 + u64::from(has_key) + u64::from(has_signature) + 2 * u64::from(has_descriptor))?;
     e.uint(FIELD_DEVICE_ID)?;
     e.bytes_value(id)?;
@@ -391,12 +391,14 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
         return None;
     }
     let kind = match record.method? {
-        Name::Tag(value @ (ANNOUNCE_BOOT
+        Name::Tag(
+            value @ (ANNOUNCE_BOOT
             | ANNOUNCE_DISCOVERY
             | ANNOUNCE_TRANSITION_BEGIN
             | ANNOUNCE_SLEEP_PENDING
             | ANNOUNCE_TRANSITION_COMPLETE
-            | ANNOUNCE_WAKE)) => value,
+            | ANNOUNCE_WAKE),
+        ) => value,
         _ => return None,
     };
     let mut d = Decoder::new(record.fields?);

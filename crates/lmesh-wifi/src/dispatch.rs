@@ -63,9 +63,7 @@ pub fn discovery_pair_plan(
             .and_then(|value| u8::try_from(value).ok())
             .unwrap_or(dmesh_server::announce::DEVICE_CLASS_UNKNOWN);
         let kind = match class {
-            dmesh_server::announce::DEVICE_CLASS_ESP => {
-                dmesh_server::probe::ProbeEndpointKind::Esp
-            }
+            dmesh_server::announce::DEVICE_CLASS_ESP => dmesh_server::probe::ProbeEndpointKind::Esp,
             dmesh_server::announce::DEVICE_CLASS_HOST => {
                 dmesh_server::probe::ProbeEndpointKind::Host
             }
@@ -411,6 +409,58 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let result = (|| -> Result<Value> {
         match method {
+            "transport.start" => {
+                let kind = string_arg(&request, "kind")
+                    .ok_or_else(|| anyhow::anyhow!("transport.start kind is required"))?;
+                let ap =
+                    bool_arg(&request, "ap").unwrap_or(false) || u8_arg(&request, "ap") == Some(1);
+                let open = bool_arg(&request, "open").unwrap_or(false)
+                    || u8_arg(&request, "open") == Some(1);
+                if kind != "sta" && !(kind == "nan" && ap) {
+                    anyhow::bail!("Linux transport.start supports kind=sta or kind=nan with ap=1");
+                }
+                let iface = authorize(netd, &request, Operation::Sta)?;
+                let ssid = string_arg(&request, "ssid").unwrap_or_default();
+                if !ap && ssid.is_empty() {
+                    anyhow::bail!("transport.start STA ssid is required");
+                }
+                let bssid = string_arg(&request, "bssid")
+                    .map(|value| parse_mac(&value))
+                    .transpose()?;
+                if ap {
+                    Ok(radio
+                        .wifi_p2p_transport_start(Some(iface), if open { "open" } else { "p2p" }))
+                } else {
+                    Ok(radio.wifi_sta_transport_start(
+                        Some(iface),
+                        ssid,
+                        string_arg(&request, "passphrase"),
+                        bssid,
+                        u8_arg(&request, "channel"),
+                    ))
+                }
+            }
+            "transport.stop" => {
+                let iface = authorize(netd, &request, Operation::Sta)?;
+                Ok(radio.wifi_sta_transport_stop(Some(iface)))
+            }
+            "transport.discover" => {
+                let iface = authorize(netd, &request, Operation::Nan)?;
+                let active = bool_arg(&request, "active").unwrap_or(false)
+                    || u8_arg(&request, "active") == Some(1);
+                let nan =
+                    bool_arg(&request, "nan").unwrap_or(true) || u8_arg(&request, "nan") == Some(1);
+                Ok(radio.transport_discover(
+                    Some(iface),
+                    u8_arg(&request, "channel"),
+                    active,
+                    nan,
+                    bool_arg(&request, "passive_scan").unwrap_or(true),
+                    bool_arg(&request, "active_scan").unwrap_or(false),
+                    bool_arg(&request, "dns_sd").unwrap_or(false),
+                    request.get("wait_ms").and_then(Value::as_u64),
+                ))
+            }
             "wifi.ap.start_open" => {
                 let iface = authorize(netd, &request, Operation::Ap)?;
                 let channel = u8_arg(&request, "channel");
@@ -576,6 +626,7 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
                 let iface = authorize(netd, &request, Operation::Nan)?;
                 Ok(radio.wifi_interface_status(Some(iface)))
             }
+            "wifi.interface.list" => Ok(radio.wifi_interface_list()),
             "wifi.interface.up" => {
                 let iface = authorize(netd, &request, Operation::Nan)?;
                 Ok(radio.wifi_interface_up(Some(iface)))
@@ -748,6 +799,17 @@ pub fn handle_request(netd: &WifiNetd, radio: &RadioService, request: Value) -> 
     }
 }
 
+fn parse_mac(value: &str) -> Result<[u8; 6]> {
+    let bytes = value
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16).ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow::anyhow!("bssid must be six colon-separated hexadecimal bytes"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bssid must be six colon-separated hexadecimal bytes"))
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -832,15 +894,18 @@ mod tests {
         );
         assert_eq!(status["discovered_devices"][0]["source"], "udp_multicast");
         assert_eq!(status["discovered_devices"][0]["nan"]["observed"], false);
-        assert_eq!(status["discovered_devices"][0]["active_transport"]["state"], "sta");
+        assert_eq!(
+            status["discovered_devices"][0]["active_transport"]["state"],
+            "sta"
+        );
     }
 
     #[test]
-    fn discovery_inventory_retains_nan_and_udp6_observations_for_one_device() {
+    fn discovery_inventory_consolidates_android_and_esp32_observations() {
         let log = tempfile::NamedTempFile::new().unwrap();
         let radio = RadioService::from_environment_with_discovery_log(log.path());
-        let mut announce = dmesh_server::announce::Announce::discovery([0x55; 16], 16, 8, 0, 5);
-        announce.set_probe_descriptor(
+        let mut android = dmesh_server::announce::Announce::discovery([0x55; 16], 16, 8, 0, 5);
+        android.set_probe_descriptor(
             dmesh_server::announce::DEVICE_CLASS_ANDROID,
             dmesh_server::probe::PROBE_CAP_NAN | dmesh_server::probe::PROBE_CAP_UDP6,
         );
@@ -848,20 +913,42 @@ mod tests {
             "udp_multicast",
             "[fe80::55]:5227".to_owned(),
             None,
-            announce,
+            android,
         ));
         assert!(radio.observe_discovered_announce(
             "nan",
             "02:00:00:00:00:55".to_owned(),
             Some("50:6f:9a:01:54:6c".to_owned()),
-            announce,
+            android,
+        ));
+        let mut esp32 = dmesh_server::announce::Announce::discovery([0x66; 16], 16, 8, 0, 5);
+        esp32.set_probe_descriptor(
+            dmesh_server::announce::DEVICE_CLASS_ESP,
+            dmesh_server::probe::PROBE_CAP_NAN | dmesh_server::probe::PROBE_CAP_STA,
+        );
+        assert!(radio.observe_discovered_announce(
+            "nan",
+            "02:00:00:00:00:66".to_owned(),
+            Some("50:6f:9a:01:54:66".to_owned()),
+            esp32,
         ));
         let status = radio.rawnan_status(None);
-        let device = &status["discovered_devices"][0];
-        assert_eq!(device["nan"]["observed"], true);
-        assert!(device["observations"].get("nan").is_some());
-        assert!(device["observations"].get("udp_multicast").is_some());
-        assert_eq!(device["active_transport"]["state"], "nan_now");
+        let devices = status["discovered_devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        let android = devices
+            .iter()
+            .find(|device| device["id"] == "55555555555555555555555555555555")
+            .unwrap();
+        assert_eq!(android["platform"], "android");
+        assert_eq!(android["nan"]["observed"], true);
+        assert!(android["observations"].get("nan").is_some());
+        assert!(android["observations"].get("udp_multicast").is_some());
+        let esp32 = devices
+            .iter()
+            .find(|device| device["id"] == "66666666666666666666666666666666")
+            .unwrap();
+        assert_eq!(esp32["platform"], "esp32");
+        assert!(esp32["observations"].get("nan").is_some());
     }
 
     #[test]
@@ -887,10 +974,12 @@ mod tests {
         assert_eq!(plan["control_plane_iface"], "wlan0");
         assert_eq!(plan["control_plane_mode_changed"], false);
         assert_eq!(plan["rows"].as_array().unwrap().len(), 4);
-        assert!(plan["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["request"]["test_nan"] == true));
+        assert!(
+            plan["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["request"]["test_nan"] == true)
+        );
     }
 }

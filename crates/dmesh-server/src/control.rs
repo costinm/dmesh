@@ -19,6 +19,9 @@ pub const SETTINGS_SET: u64 = 2;
 pub const SETTINGS_LIST: u64 = 3;
 pub const TRANSPORT_START: u64 = 4;
 pub const TRANSPORT_STOP: u64 = 5;
+/// Discover bearer candidates without changing the selected transport epoch.
+/// Platform adapters may implement one or more requested discovery mechanisms.
+pub const TRANSPORT_DISCOVER: u64 = 6;
 
 const FIELD_KEY: u64 = 1;
 const FIELD_VALUE: u64 = 2;
@@ -53,14 +56,27 @@ const FIELD_AP: u64 = 16;
 const FIELD_STA_PASSPHRASE: u64 = 17;
 /// UART ownership/speed selector for the applied profile. Tag 18 preserves the
 /// existing passphrase field while keeping this addition backward-compatible.
-/// `0` disables UART, `1` means 115200 baud, and `2..=7` select the other
-/// common baud rates. USB packet mode ignores the numeric speed.
+/// `0` selects the default 115200 UART rate, `1` explicitly means 115200,
+/// `2..=7` select other common rates, and `8` explicitly turns off a real
+/// UART bearer. USB packet mode ignores the selector.
 const FIELD_UART: u64 = 18;
 /// Enable the NAN Data Path (NDP) bearer for this immutable radio epoch.
 /// NDP is meaningful only to adapters that implement it today (Android), but
 /// it belongs in the common start record so peers can negotiate it without an
 /// Android-only control schema.
 const FIELD_NDP: u64 = 19;
+/// Discovery mechanism selectors.  SSID and channel reuse the bounded STA
+/// field representation above; these flags keep discovery independent from a
+/// transport replacement so probes can discover first and call
+/// `transport.start` only for their chosen candidate.
+const FIELD_DISCOVER_ACTIVE_SCAN: u64 = 20;
+const FIELD_DISCOVER_PASSIVE_SCAN: u64 = 21;
+const FIELD_DISCOVER_NAN: u64 = 22;
+const FIELD_DISCOVER_DNS_SD: u64 = 23;
+/// Select unauthenticated 802.11 only for this volatile AP/STA epoch. The
+/// default remains WPA2-PSK; `open=1` is an explicit interoperability and
+/// measurement choice, never an implicit fallback for a missing passphrase.
+const FIELD_OPEN: u64 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
@@ -94,7 +110,22 @@ pub struct TransportConfig<'a> {
     /// capability separately rather than reinterpreting the field.
     pub ndp: Option<u8>,
     pub ap: Option<u8>,
+    pub open: Option<bool>,
     pub uart: Option<u8>,
+}
+
+/// Device-neutral discovery request.  It is deliberately separate from
+/// [`TransportConfig`]: discovery must not create, stop, or replace the
+/// current radio epoch.  An adapter reports the mechanisms it actually
+/// supports; callers then select a result with `transport.start`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportDiscoverConfig<'a> {
+    pub ssid: Option<&'a [u8]>,
+    pub channel: Option<u8>,
+    pub active_scan: bool,
+    pub passive_scan: bool,
+    pub nan: bool,
+    pub dns_sd: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +145,9 @@ pub enum Request<'a> {
     TransportStop {
         kind: TransportKind,
     },
+    TransportDiscover {
+        config: TransportDiscoverConfig<'a>,
+    },
 }
 
 /// Platform adapter for the common control component. The trait deliberately
@@ -131,6 +165,15 @@ pub trait Handler {
         config: TransportConfig<'_>,
     ) -> Result<(), Self::Error>;
     fn transport_stop(&mut self, kind: TransportKind) -> Result<(), Self::Error>;
+    /// Optional platform hook.  Existing adapters remain source-compatible
+    /// while they add discovery mechanisms; a request must never mutate an
+    /// active transport merely because discovery is unsupported.
+    fn transport_discover(
+        &mut self,
+        _config: TransportDiscoverConfig<'_>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// Error returned by the shared tagged-control dispatcher.
@@ -157,6 +200,7 @@ pub fn dispatch_request<H: Handler>(request: Request<'_>, handler: &mut H) -> Re
         Request::SettingsList => handler.settings_list(),
         Request::TransportStart { kind, config } => handler.transport_start(kind, config),
         Request::TransportStop { kind } => handler.transport_stop(kind),
+        Request::TransportDiscover { config } => handler.transport_discover(config),
     }
 }
 
@@ -193,6 +237,9 @@ pub fn decode_record(record: Record<'_>) -> Option<Request<'_>> {
         }),
         Name::Tag(TRANSPORT_STOP) => Some(Request::TransportStop {
             kind: transport_kind(field_uint(fields, FIELD_MODE)?)?,
+        }),
+        Name::Tag(TRANSPORT_DISCOVER) => Some(Request::TransportDiscover {
+            config: decode_transport_discover_config(fields)?,
         }),
         _ => None,
     }
@@ -284,9 +331,10 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
                 }
                 config.ap = Some(enabled);
             }
+            FIELD_OPEN => config.open = Some(d.boolean()?),
             FIELD_UART => {
                 let speed = u8::try_from(d.uint()?).ok()?;
-                if speed > 7 {
+                if speed > 8 {
                     return None;
                 }
                 config.uart = Some(speed);
@@ -295,6 +343,42 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
         }
     }
     d.is_finished().then_some(config)
+}
+
+fn decode_transport_discover_config(encoded: &[u8]) -> Option<TransportDiscoverConfig<'_>> {
+    let mut d = Decoder::new(encoded);
+    let (major, count) = d.head()?;
+    if major != 5 || count == u64::MAX {
+        return None;
+    }
+    let mut config = TransportDiscoverConfig::default();
+    for _ in 0..count {
+        match d.uint()? {
+            FIELD_STA_SSID => {
+                let ssid = d.text_ref().or_else(|| d.bytes_ref())?;
+                if ssid.is_empty() || ssid.len() > 32 || ssid.contains(&0) {
+                    return None;
+                }
+                config.ssid = Some(ssid);
+            }
+            FIELD_STA_CHANNEL => {
+                let channel = u8::try_from(d.uint()?).ok()?;
+                if !(1..=14).contains(&channel) {
+                    return None;
+                }
+                config.channel = Some(channel);
+            }
+            FIELD_DISCOVER_ACTIVE_SCAN => config.active_scan = d.boolean()?,
+            FIELD_DISCOVER_PASSIVE_SCAN => config.passive_scan = d.boolean()?,
+            FIELD_DISCOVER_NAN => config.nan = d.boolean()?,
+            FIELD_DISCOVER_DNS_SD => config.dns_sd = d.boolean()?,
+            _ => d.skip()?,
+        }
+    }
+    if !(config.active_scan || config.passive_scan || config.nan || config.dns_sd) {
+        return None;
+    }
+    Some(config)
 }
 
 fn map_is_empty(encoded: &[u8]) -> bool {
@@ -346,6 +430,7 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
         Request::SettingsSet { .. } => 2,
         Request::SettingsList => 0,
         Request::TransportStart { config, .. } => 1 + transport_config_count(config),
+        Request::TransportDiscover { config } => transport_discover_config_count(config),
         _ => 1,
     };
     let mut e = Encoder::new(out);
@@ -359,6 +444,7 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
         Request::SettingsList => SETTINGS_LIST,
         Request::TransportStart { .. } => TRANSPORT_START,
         Request::TransportStop { .. } => TRANSPORT_STOP,
+        Request::TransportDiscover { .. } => TRANSPORT_DISCOVER,
     })?;
     if let Some(id) = id {
         e.uint(3)?;
@@ -395,8 +481,23 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
                 TransportKind::Nan => 6,
             })?;
         }
+        Request::TransportDiscover { config } => encode_discover_config(config, &mut e)?,
     }
     Some(e.len())
+}
+
+fn transport_discover_config_count(config: TransportDiscoverConfig<'_>) -> u64 {
+    [
+        config.ssid.is_some(),
+        config.channel.is_some(),
+        config.active_scan,
+        config.passive_scan,
+        config.nan,
+        config.dns_sd,
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count() as u64
 }
 
 fn transport_config_count(config: TransportConfig<'_>) -> u64 {
@@ -416,6 +517,7 @@ fn transport_config_count(config: TransportConfig<'_>) -> u64 {
         config.now.is_some(),
         config.ndp.is_some(),
         config.ap.is_some(),
+        config.open.is_some(),
         config.uart.is_some(),
     ]
     .into_iter()
@@ -474,7 +576,17 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
         e.uint(FIELD_AP)?;
         e.uint(value as u64)?;
     }
+    if let Some(value) = config.open {
+        e.uint(FIELD_OPEN)?;
+        e.boolean(value)?;
+    }
     if let Some(value) = config.uart {
+        // Keep locally generated control records subject to the same selector
+        // contract as decoded records.  In particular, zero means the product
+        // default and eight is the explicit real-UART shutdown request.
+        if crate::firmware_profile::normalize_uart_selector(value).is_none() {
+            return None;
+        }
         e.uint(FIELD_UART)?;
         e.uint(u64::from(value))?;
     }
@@ -492,6 +604,38 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
         if let Some(value) = value {
             e.uint(field)?;
             e.boolean(value)?;
+        }
+    }
+    Some(())
+}
+
+fn encode_discover_config(config: TransportDiscoverConfig<'_>, e: &mut Encoder<'_>) -> Option<()> {
+    if !(config.active_scan || config.passive_scan || config.nan || config.dns_sd) {
+        return None;
+    }
+    if let Some(ssid) = config.ssid {
+        if ssid.is_empty() || ssid.len() > 32 || ssid.contains(&0) {
+            return None;
+        }
+        e.uint(FIELD_STA_SSID)?;
+        e.text_value(ssid)?;
+    }
+    if let Some(channel) = config.channel {
+        if !(1..=14).contains(&channel) {
+            return None;
+        }
+        e.uint(FIELD_STA_CHANNEL)?;
+        e.uint(u64::from(channel))?;
+    }
+    for (field, value) in [
+        (FIELD_DISCOVER_ACTIVE_SCAN, config.active_scan),
+        (FIELD_DISCOVER_PASSIVE_SCAN, config.passive_scan),
+        (FIELD_DISCOVER_NAN, config.nan),
+        (FIELD_DISCOVER_DNS_SD, config.dns_sd),
+    ] {
+        if value {
+            e.uint(field)?;
+            e.boolean(true)?;
         }
     }
     Some(())
@@ -604,6 +748,12 @@ mod tests {
         fn transport_stop(&mut self, _: TransportKind) -> Result<(), Self::Error> {
             Ok(())
         }
+        fn transport_discover(
+            &mut self,
+            _: TransportDiscoverConfig<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -625,5 +775,47 @@ mod tests {
         let mut handler = RecordingHandler::default();
         dispatch(&wire[..used], &mut handler).unwrap();
         assert_eq!(handler.transport, Some(TransportKind::Sta));
+    }
+
+    #[test]
+    fn transport_discover_round_trips_without_replacing_transport() {
+        let mut wire = [0; 96];
+        let request = Request::TransportDiscover {
+            config: TransportDiscoverConfig {
+                ssid: Some(b"DIRECT-test-dmesh"),
+                channel: Some(6),
+                active_scan: true,
+                nan: true,
+                ..TransportDiscoverConfig::default()
+            },
+        };
+        let used = encode_request(request, Some(9), &mut wire).unwrap();
+        assert_eq!(
+            decode_request(&wire[..used]),
+            Some(Request::TransportDiscover {
+                config: TransportDiscoverConfig {
+                    ssid: Some(b"DIRECT-test-dmesh"),
+                    channel: Some(6),
+                    active_scan: true,
+                    nan: true,
+                    ..TransportDiscoverConfig::default()
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn transport_start_round_trips_explicit_open_mode() {
+        let mut wire = [0; 96];
+        let request = Request::TransportStart {
+            kind: TransportKind::Sta,
+            config: TransportConfig {
+                ssid: Some(b"DIRECT-dmesh"),
+                open: Some(true),
+                ..TransportConfig::default()
+            },
+        };
+        let used = encode_request(request, Some(10), &mut wire).unwrap();
+        assert_eq!(decode_request(&wire[..used]), Some(request));
     }
 }

@@ -15,6 +15,10 @@ pub struct E2eDeviceConfig {
     pub kind: String,
     #[serde(default)]
     pub serial: Option<String>,
+    /// Physical speed for a real USB-UART bridge. Packetized USB/JTAG
+    /// endpoints omit this because their transport is not baud-clocked.
+    #[serde(default)]
+    pub uart_baud: Option<u32>,
     #[serde(default)]
     pub mac: Option<String>,
     /// Radio identity used by NAN advertisements (often the AP MAC, which
@@ -98,14 +102,32 @@ impl E2eConfig {
         let mut names = std::collections::BTreeSet::new();
         for device in &self.devices {
             if !names.insert(device.name.as_str()) {
-                return Err(format!("duplicate device {:?} in {}", device.name, path.display()));
+                return Err(format!(
+                    "duplicate device {:?} in {}",
+                    device.name,
+                    path.display()
+                ));
             }
             if !matches!(device.kind.as_str(), "host" | "android" | "esp") {
-                return Err(format!("device {} has unsupported kind {:?}", device.name, device.kind));
+                return Err(format!(
+                    "device {} has unsupported kind {:?}",
+                    device.name, device.kind
+                ));
             }
             // Serial is optional: production control-plane evaluation uses
             // the descriptor MAC plus host NAN/UDP6, while the legacy local
             // matrix may still require a serial adapter explicitly.
+            if let Some(baud) = device.uart_baud {
+                if !matches!(
+                    baud,
+                    9_600 | 19_200 | 38_400 | 57_600 | 115_200 | 230_400 | 460_800 | 921_600
+                ) {
+                    return Err(format!(
+                        "device {} has unsupported uart_baud {baud}",
+                        device.name
+                    ));
+                }
+            }
         }
         let known = names;
         for pair in &self.pairs {
@@ -118,9 +140,18 @@ impl E2eConfig {
             for test in &pair.tests {
                 if !matches!(
                     test.as_str(),
-                    "now-short" | "now-iperf" | "udp6-association" | "udp6-iperf" | "nan" | "scan" | "android-handlers"
+                    "now-short"
+                        | "now-iperf"
+                        | "udp6-association"
+                        | "udp6-iperf"
+                        | "nan"
+                        | "scan"
+                        | "android-handlers"
                 ) {
-                    return Err(format!("pair {} has unsupported test {:?}", pair.name, test));
+                    return Err(format!(
+                        "pair {} has unsupported test {:?}",
+                        pair.name, test
+                    ));
                 }
             }
         }
@@ -140,6 +171,33 @@ impl E2eConfig {
         self.pairs
             .iter()
             .find(|pair| pair.source == source && pair.target == target)
+    }
+
+    /// Resolve the two human-selected descriptor names used by a local bench
+    /// invocation.  Names select local adapters only; radio discovery still
+    /// uses `nan_mac`/`mac` after the executor has begun the probe.
+    pub fn select_esp_pair_by_name(
+        &self,
+        source_name: Option<&str>,
+        target_name: Option<&str>,
+    ) -> Result<(&E2eDeviceConfig, &E2eDeviceConfig), String> {
+        match (source_name, target_name) {
+            (Some(source_name), Some(target_name)) => {
+                let source = self.require_device(source_name)?;
+                let target = self.require_device(target_name)?;
+                if source.name == target.name {
+                    return Err("source and target must select distinct devices".to_owned());
+                }
+                if source.kind != "esp" || target.kind != "esp" {
+                    return Err(
+                        "the current firmware pair prober requires two ESP descriptors".to_owned(),
+                    );
+                }
+                Ok((source, target))
+            }
+            (None, None) => self.select_esp_pair(None, None),
+            _ => Err("set both DMESH_E2E_SOURCE and DMESH_E2E_TARGET, or neither".to_owned()),
+        }
     }
 
     /// Resolve a live discovery identity to its local adapter descriptor.
@@ -172,12 +230,12 @@ impl E2eConfig {
     ) -> Result<(&E2eDeviceConfig, &E2eDeviceConfig), String> {
         match (source_id, target_id) {
             (Some(source_id), Some(target_id)) => {
-                let source = self
-                    .device_by_discovery_id(source_id)
-                    .ok_or_else(|| format!("no configured device advertises discovery id {source_id:?}"))?;
-                let target = self
-                    .device_by_discovery_id(target_id)
-                    .ok_or_else(|| format!("no configured device advertises discovery id {target_id:?}"))?;
+                let source = self.device_by_discovery_id(source_id).ok_or_else(|| {
+                    format!("no configured device advertises discovery id {source_id:?}")
+                })?;
+                let target = self.device_by_discovery_id(target_id).ok_or_else(|| {
+                    format!("no configured device advertises discovery id {target_id:?}")
+                })?;
                 if source.name == target.name {
                     return Err("source_id and target_id must select distinct devices".to_owned());
                 }
@@ -185,7 +243,9 @@ impl E2eConfig {
             }
             (None, None) => {
                 let mut endpoints = self.devices.iter().filter(|device| device.kind == "esp");
-                let source = endpoints.next().ok_or_else(|| "no configured ESP device".to_owned())?;
+                let source = endpoints
+                    .next()
+                    .ok_or_else(|| "no configured ESP device".to_owned())?;
                 let target = endpoints.next().ok_or_else(|| "need exactly two configured ESP devices or DMESH_E2E_SOURCE_ID/DMESH_E2E_TARGET_ID".to_owned())?;
                 if endpoints.next().is_some() {
                     return Err("more than two configured ESP devices: select the pair with DMESH_E2E_SOURCE_ID and DMESH_E2E_TARGET_ID".to_owned());
@@ -230,8 +290,34 @@ mod tests {
         )
         .unwrap();
         config.validate(Path::new("fixture.toml")).unwrap();
-        assert_eq!(config.require_device("a").unwrap().serial.as_deref(), Some("/dev/a"));
+        assert_eq!(
+            config.require_device("a").unwrap().serial.as_deref(),
+            Some("/dev/a")
+        );
         assert_eq!(config.pair("a", "b").unwrap().name, "a-b");
+    }
+
+    #[test]
+    fn resolves_explicit_esp_descriptor_names() {
+        let config: E2eConfig = toml::from_str(
+            r#"
+                [[devices]]
+                name = "one"
+                kind = "esp"
+                [[devices]]
+                name = "two"
+                kind = "esp"
+                [[devices]]
+                name = "phone"
+                kind = "android"
+            "#,
+        )
+        .unwrap();
+        let (source, target) = config
+            .select_esp_pair_by_name(Some("two"), Some("one"))
+            .unwrap();
+        assert_eq!(source.name, "two");
+        assert_eq!(target.name, "one");
     }
 
     #[test]

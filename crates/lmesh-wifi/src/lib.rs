@@ -38,11 +38,11 @@ mod radio;
 pub mod radio_protocol;
 pub mod reviewed;
 
-pub use radio::RadioService;
 pub use infra_credentials::{
-    INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials,
-    load_default_infrastructure_credentials, load_infrastructure_credentials,
+    INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials, load_default_infrastructure_credentials,
+    load_infrastructure_credentials,
 };
+pub use radio::RadioService;
 
 /// Reusable Wi-Fi service instance.
 ///
@@ -86,70 +86,160 @@ impl WifiService {
         &self.radio
     }
 
-    /// Apply the common startup policy used by the stable service.  The
-    /// canary service can call the individual operations instead, allowing it
-    /// to restart without changing the stable AP policy.
+    /// Start one owned STA transport epoch.  Both host binaries use this
+    /// boundary so interface ownership, BSSID decoding, and the complete
+    /// previous-epoch cleanup remain in the shared Wi-Fi implementation.
+    pub fn transport_start(
+        &self,
+        iface: Option<String>,
+        ssid: String,
+        passphrase: Option<String>,
+        bssid: Option<String>,
+        channel: Option<u8>,
+        ap: bool,
+        open: bool,
+    ) -> serde_json::Value {
+        let iface = match self.owned_sta_iface(iface) {
+            Ok(iface) => iface,
+            Err(error) => return serde_json::json!({"ok": false, "error": error.to_string()}),
+        };
+        if ap {
+            let backend = if open { "open" } else { "p2p" };
+            return self
+                .radio
+                .wifi_p2p_transport_start(Some(iface), &backend);
+        }
+        let bssid = match parse_bssid(bssid.as_deref()) {
+            Ok(bssid) => bssid,
+            Err(error) => {
+                return serde_json::json!({"ok": false, "iface": iface, "error": error.to_string()});
+            }
+        };
+        self.radio
+            .wifi_sta_transport_start(Some(iface), ssid, passphrase, bssid, channel)
+    }
+
+    /// End the owned STA transport epoch through the same shared cleanup path
+    /// used before every replacement `transport.start`.
+    pub fn transport_stop(&self, iface: Option<String>) -> serde_json::Value {
+        match self.owned_sta_iface(iface) {
+            Ok(iface) => self.radio.wifi_sta_transport_stop(Some(iface)),
+            Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+        }
+    }
+
+    /// Start the default channel-6 P2P Group Owner and then attach the same
+    /// long-lived NAN/NOW monitor fixture used beside an ordinary AP.  The
+    /// P2P transition owns replacement cleanup; monitor setup is deliberately
+    /// subsequent so it follows the actual settled radio channel.
+    pub fn start_p2p_go_with_rawnan(
+        &self,
+        iface: Option<String>,
+        channel: u8,
+    ) -> serde_json::Value {
+        let iface = match self.owned_sta_iface(iface) {
+            Ok(iface) => iface,
+            Err(error) => return serde_json::json!({"ok": false, "error": error.to_string()}),
+        };
+        let transport = self
+            .radio
+            .wifi_p2p_transport_start(Some(iface.clone()), "p2p");
+        if transport.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return serde_json::json!({
+                "ok": false,
+                "iface": iface,
+                "transport": transport,
+            });
+        }
+        let monitor = self
+            .radio
+            .prepare_ap_raw_monitor_fixture(Some(iface.clone()), Some(channel));
+        let listener = if monitor.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            self.radio.wifi_raw_listen(
+                Some(iface.clone()),
+                Some(channel),
+                Some(86_400),
+                Some("monitor".to_owned()),
+            )
+        } else {
+            serde_json::json!({"ok": false, "state": "not_started", "reason": "monitor setup failed"})
+        };
+        let beacon_listener = if monitor.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            self.radio.wifi_nan_beacon_listen(Some(iface.clone()))
+        } else {
+            serde_json::json!({"ok": false, "state": "not_started", "reason": "monitor setup failed"})
+        };
+        serde_json::json!({
+            "ok": transport.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+                && monitor.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+                && listener.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
+            "iface": iface,
+            "transport": transport,
+            "monitor": monitor,
+            "listener": listener,
+            "beacon_listener": beacon_listener,
+        })
+    }
+
+    fn owned_sta_iface(&self, iface: Option<String>) -> Result<String> {
+        let iface = iface
+            .or_else(|| self.netd.owned_interfaces().names().first().cloned())
+            .ok_or_else(|| {
+                anyhow::anyhow!("LMESH_INTERFACES must name an owned Wi-Fi interface")
+            })?;
+        self.netd.authorize(Operation::Sta, &iface)?;
+        Ok(iface)
+    }
+
+    /// Apply the common startup policy used by the stable service. The stable
+    /// AP-equivalent is a WPA2-PSK P2P Group Owner; the legacy raw open AP is
+    /// an explicitly enabled diagnostic backend only.
     pub fn start_stable(&self) -> Vec<serde_json::Value> {
         let mut results = self
             .radio
             .apply_startup_rate_profile(self.netd.owned_interfaces().names());
         if let Some(iface) = self.netd.owned_interfaces().names().first().cloned() {
-            if self.netd.authorize(Operation::Ap, &iface).is_ok() {
+            if self.netd.authorize(Operation::Sta, &iface).is_ok() {
                 let channel = std::env::var("LMESH_AP_CHANNEL")
                     .ok()
-                    .and_then(|value| value.parse::<u8>().ok());
-                let ht40 = std::env::var("LMESH_AP_HT40").ok().and_then(|value| {
-                    match value.trim().to_ascii_lowercase().as_str() {
-                        "1" | "true" | "yes" | "on" => Some(true),
-                        "0" | "false" | "no" | "off" => Some(false),
-                        _ => None,
-                    }
-                });
-                let beacon_interval_tu = std::env::var("LMESH_AP_BEACON_INTERVAL_TU")
-                    .ok()
-                    .and_then(|value| value.parse::<u16>().ok())
-                    .map(|value| value.clamp(10, 1000))
-                    .unwrap_or(100);
-                results.push(self.radio.wifi_ap_start_open_on_channel_with_interval(
-                    Some(iface.clone()),
-                    None,
-                    channel,
-                    ht40,
-                    beacon_interval_tu,
-                ));
-                let cidr =
-                    std::env::var("LMESH_AP_ADDRESS").unwrap_or_else(|_| "10.78.0.1/16".to_owned());
-                if let Some((address, prefix)) = cidr.split_once('/') {
-                    if let Ok(prefix) = prefix.parse::<u8>() {
-                        results.push(self.radio.wifi_sta_configure_ipv4(
-                            Some(iface.clone()),
-                            address.to_owned(),
-                            Some(prefix),
-                        ));
-                    }
-                }
-                // NAN and NOW share one permanent active monitor.  The AP
-                // remains the channel anchor; the monitor has broad receive
-                // flags for foreign cluster beacons and also injects NOW.
-                results.push(
-                    self.radio
-                        .prepare_ap_raw_monitor_fixture(Some(iface.clone()), channel),
-                );
-                // Listeners only consume the fixture; packet tests never
-                // create, retune, or otherwise alter host radio state.
-                results.push(self.radio.wifi_raw_listen(
-                    Some(iface.clone()),
-                    Some(6),
-                    Some(86_400),
-                    Some("monitor".to_owned()),
-                ));
-                // Some adapters only deliver foreign NAN beacons through an
-                // nl80211 management registration while the monitor remains
-                // active for NOW TX. Keep that receive lane permanent too.
-                results.push(self.radio.wifi_nan_beacon_listen(Some(iface)));
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .unwrap_or(6)
+                    .clamp(1, 13);
+                results.push(self.start_p2p_go_with_rawnan(Some(iface), channel));
             }
         }
         results
+    }
+
+    /// Bounded stable-service recovery.  It is intentionally limited to this
+    /// service's owned AP fixture: a lost/down adapter is rebuilt through the
+    /// same startup sequence, never by
+    /// manipulating another service's radio.
+    pub fn reconcile_stable_health(&self) -> serde_json::Value {
+        let Some(iface) = self.netd.owned_interfaces().names().first().cloned() else {
+            return serde_json::json!({"ok": true, "state": "no_owned_interface"});
+        };
+        if self.netd.authorize(Operation::Ap, &iface).is_err() {
+            return serde_json::json!({"ok": true, "state": "not_an_ap_owner", "iface": iface});
+        }
+        let link = self.radio.wifi_interface_status(Some(iface.clone()));
+        let flags = link
+            .pointer("/link/flags")
+            .and_then(serde_json::Value::as_u64);
+        let up_and_running = flags.is_some_and(|flags| {
+            flags & libc::IFF_UP as u64 != 0 && flags & libc::IFF_RUNNING as u64 != 0
+        });
+        if up_and_running {
+            return serde_json::json!({"ok": true, "state": "healthy", "iface": iface, "link": link});
+        }
+        let recovery = self.start_stable();
+        serde_json::json!({
+            "ok": recovery.iter().any(|result| result.get("ok").and_then(serde_json::Value::as_bool) == Some(true)),
+            "state": "reconciled",
+            "iface": iface,
+            "prior_link": link,
+            "recovery": recovery,
+        })
     }
 
     pub fn start_canary_rawnan(&self, iface: Option<String>) -> serde_json::Value {
@@ -232,8 +322,7 @@ impl InterfaceSet {
     /// unrelated monitor VIFs such as `wlan1mon`.
     pub fn contains(&self, iface: &str) -> bool {
         self.0.iter().any(|owned| {
-            owned == iface
-                || iface.strip_suffix("mon").is_some_and(|base| base == owned)
+            owned == iface || iface.strip_suffix("mon").is_some_and(|base| base == owned)
         })
     }
 
@@ -295,6 +384,23 @@ pub fn default_interface() -> Option<String> {
     InterfaceSet::from_environment().names().first().cloned()
 }
 
+fn parse_bssid(value: Option<&str>) -> Result<Option<[u8; 6]>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let hex = value.trim().replace([':', '-'], "");
+    if hex.len() != 12 {
+        bail!("bssid must contain exactly six octets");
+    }
+    let mut bssid = [0_u8; 6];
+    for (index, byte) in bssid.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&hex[offset..offset + 2], 16)
+            .map_err(|_| anyhow::anyhow!("bssid must contain hexadecimal octets"))?;
+    }
+    Ok(Some(bssid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,4 +433,13 @@ mod tests {
         assert!(!owned.contains("wlan0monitor"));
     }
 
+    #[test]
+    fn parses_transport_bssid_without_lmesh_adapter() {
+        assert_eq!(
+            parse_bssid(Some("14:c1:9f:e5:98:01")).unwrap(),
+            Some([0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x01])
+        );
+        assert!(parse_bssid(Some("14:c1:9f:e5:98")).is_err());
+        assert!(parse_bssid(Some("14:c1:9f:e5:98:zz")).is_err());
+    }
 }

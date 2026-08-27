@@ -24,7 +24,7 @@ use quic_lite::ledger::{
 use quic_lite::mux::StreamMux;
 use quic_lite::{ConnectionLimits, EndpointState, INITIAL_MAX_STREAM_DATA, PathPolicy, Role};
 use std::boxed::Box;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::eprintln;
 use std::format;
 use std::net::SocketAddr;
@@ -1087,6 +1087,73 @@ impl UdpClient {
             self.socket.send_to(&retry[..retry_len], self.peer).await?;
         }
         bail!("UDP stream request timeout after {STREAM_ATTEMPTS} attempts")
+    }
+
+    /// Send one request and collect its complete ordered response stream.
+    ///
+    /// IPERF and object-like services may return many independently received
+    /// frames.  Preserve offsets here so a bearer client does not mistake
+    /// reordering or a retransmission for a successful byte-count transfer.
+    /// `max_bytes` is an explicit caller-provided memory bound.
+    pub async fn request_stream_all(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let first = self.request_stream_frame(stream_id, data, fin).await?;
+        if first.id != stream_id {
+            bail!("UDP stream response id {} expected {stream_id}", first.id);
+        }
+        let mut frames = BTreeMap::<u64, Vec<u8>>::new();
+        let mut final_offset = None;
+        let mut frame = first;
+        loop {
+            if frame.data.len() > max_bytes {
+                bail!("UDP stream response frame exceeds bound");
+            }
+            let end = frame
+                .offset
+                .checked_add(u64::try_from(frame.data.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| anyhow::anyhow!("UDP stream response offset overflow"))?;
+            if end > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+                bail!("UDP stream response exceeds bound");
+            }
+            if frame.fin {
+                if let Some(previous) = final_offset
+                    && previous != end
+                {
+                    bail!("UDP stream has conflicting final offsets");
+                }
+                final_offset = Some(end);
+            }
+            frames.entry(frame.offset).or_insert(frame.data);
+
+            let mut assembled = Vec::new();
+            let mut next = 0u64;
+            for (offset, chunk) in &frames {
+                if *offset > next {
+                    break;
+                }
+                let chunk_end =
+                    offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                if chunk_end <= next {
+                    continue;
+                }
+                let start = usize::try_from(next - *offset)
+                    .map_err(|_| anyhow::anyhow!("UDP stream overlap offset"))?;
+                assembled.extend_from_slice(&chunk[start..]);
+                next = chunk_end;
+            }
+            if final_offset == Some(next) {
+                return Ok(assembled);
+            }
+            frame = self.recv_stream_frame().await?;
+            if frame.id != stream_id {
+                bail!("UDP stream response id {} expected {stream_id}", frame.id);
+            }
+        }
     }
 
     /// Receive one application stream packet and return its bytes. ACK and

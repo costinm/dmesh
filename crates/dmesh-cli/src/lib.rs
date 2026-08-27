@@ -6,9 +6,9 @@
 //! has no standalone forwarding service or control socket.
 
 pub mod client;
-pub mod prober;
 mod device;
 mod l2;
+pub mod prober;
 mod schema;
 
 pub use client::{

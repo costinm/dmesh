@@ -39,6 +39,8 @@ const DNS_SD_TXT_TYPE: [u8; 3] = [0, 16, 1];
 /// configuration or credential. The Android Group Owner publishes the
 /// actionable STA SSID/passphrase after a group is formed.
 pub const DMESH_SERVICE_PRESENCE_PREFIX: &[u8] = b"dmesh=";
+/// DNS-SD TXT key carrying the canonical DMesh control/announce record.
+pub const DMESH_CBOR_TXT_PREFIX: &[u8] = b"cbor=";
 
 /// Encode the host/ESP P2P SD TXT marker with a stable local identifier.
 /// MAC addresses are used at this discovery layer because they are already
@@ -55,6 +57,49 @@ pub fn encode_dmesh_service_presence_txt(
         let at = DMESH_SERVICE_PRESENCE_PREFIX.len() + index * 2;
         dst[at] = b"0123456789abcdef"[(byte >> 4) as usize];
         dst[at + 1] = b"0123456789abcdef"[(byte & 0x0f) as usize];
+    }
+    Ok(required)
+}
+
+/// Encode the canonical DMesh record for a DNS-SD TXT field using the URL-safe
+/// unpadded base64 alphabet. It is denser than hex and uses only printable TXT
+/// bytes that Android's `WifiP2pDnsSdServiceInfo` can carry unchanged.
+pub fn encode_dmesh_cbor_txt(out: &mut [u8], cbor: &[u8]) -> Result<usize, P2pError> {
+    let encoded = cbor.len().div_ceil(3) * 4
+        - match cbor.len() % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 1,
+        };
+    let required = DMESH_CBOR_TXT_PREFIX.len() + encoded;
+    let dst = out.get_mut(..required).ok_or(P2pError::OutputTooSmall)?;
+    dst[..DMESH_CBOR_TXT_PREFIX.len()].copy_from_slice(DMESH_CBOR_TXT_PREFIX);
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut source = 0;
+    let mut target = DMESH_CBOR_TXT_PREFIX.len();
+    while source + 3 <= cbor.len() {
+        let value = (u32::from(cbor[source]) << 16)
+            | (u32::from(cbor[source + 1]) << 8)
+            | u32::from(cbor[source + 2]);
+        for shift in [18, 12, 6, 0] {
+            dst[target] = alphabet[((value >> shift) & 0x3f) as usize];
+            target += 1;
+        }
+        source += 3;
+    }
+    match cbor.len() - source {
+        1 => {
+            let value = u32::from(cbor[source]) << 16;
+            dst[target] = alphabet[((value >> 18) & 0x3f) as usize];
+            dst[target + 1] = alphabet[((value >> 12) & 0x3f) as usize];
+        }
+        2 => {
+            let value = (u32::from(cbor[source]) << 16) | (u32::from(cbor[source + 1]) << 8);
+            dst[target] = alphabet[((value >> 18) & 0x3f) as usize];
+            dst[target + 1] = alphabet[((value >> 12) & 0x3f) as usize];
+            dst[target + 2] = alphabet[((value >> 6) & 0x3f) as usize];
+        }
+        _ => {}
     }
     Ok(required)
 }
@@ -130,7 +175,8 @@ pub fn encode_empty_gas_initial_response(
 ///
 /// `txt` is one complete DNS-SD TXT item such as `dmesh=7419f817de65`. Host/ESP use the
 /// small presence marker; Android, once it is Group Owner, publishes its
-/// credential-bearing `cbor=<hex>` record through the platform DNS-SD API.
+/// credential-bearing `cbor=<unpadded URL-safe base64>` record through the
+/// platform DNS-SD API.
 pub fn encode_dmesh_dns_sd_gas_initial_response(
     out: &mut [u8],
     request: &[u8],
@@ -414,6 +460,14 @@ pub const fn is_gas_initial_request(body: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbor_txt_uses_unpadded_url_safe_base64() {
+        let mut txt = [0u8; 32];
+        let used = encode_dmesh_cbor_txt(&mut txt, &[0xfb, 0xff, 0, 1]).unwrap();
+        assert_eq!(&txt[..used], b"cbor=-_8AAQ");
+        assert!(!txt[DMESH_CBOR_TXT_PREFIX.len()..used].contains(&b'='));
+    }
 
     #[test]
     fn advertisement_round_trip_and_truncation() {

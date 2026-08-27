@@ -1,37 +1,43 @@
 //! Hardware matrix for the shared raw UDP6/NOW transport.
 //!
-//! This is intentionally one ignored test: it holds one UART owner for e6
-//! and one for e7 for the entire matrix rather than reopening USB serial for
-//! each case. Run only on the lab host after both images are flashed and have
-//! remained booted for at least 20 seconds; the suite never flashes, resets,
-//! or starts/stops host Wi-Fi interfaces.
+//! USB-pair rows are intentionally ignored hardware tests: each holds one
+//! local USB owner per configured ESP32 rather than reopening serial for each
+//! case. They are reproducible for any two compatible ESP32 Main descriptors,
+//! not tied to e6/e7, and minimize infrastructure dependencies: the boards
+//! exercise their own NOW, NAN, and AP/STA links without host Wi-Fi changes.
+//! Run only after both images are flashed and have remained booted for at
+//! least 20 seconds; the suite never flashes, resets, or starts/stops host
+//! Wi-Fi interfaces.
 //!
 //! ```sh
 //! DMESH_E2E_CONFIG=target/e2e-devices.toml \
 //! scripts/build.sh firmware-e2e
 //! ```
 
-use dmesh_cli::{DeviceSession, DeviceSessionEvent};
 use dmesh_cli::prober::{E2eConfig, E2eDeviceConfig, E2ePairConfig};
-use dmesh_server::cbor::Encoder;
+use dmesh_cli::{DeviceSession, DeviceSessionEvent};
 use dmesh_server::probe::{
-    PairProbeRequest, ProbeApResult, ProbeDeviceDescriptor, ProbeEndpoint, ProbeEndpointKind,
-    ProbeMeasurement, ProbeMode, ProbeModeResult, ProbeRequest, ProbeResponse, ProbeScanResult,
-    ProbeUdp6AssociationResult,
-    PROBE_CAP_AP, PROBE_CAP_NAN, PROBE_CAP_NOW, PROBE_CAP_STA, PROBE_CAP_UDP6,
-    full_pair_probe_requests,
+    PROBE_CAP_AP, PROBE_CAP_NAN, PROBE_CAP_NOW, PROBE_CAP_STA, PROBE_CAP_UDP6, PairProbeRequest,
+    ProbeActivation, ProbeApResult, ProbeDeviceDescriptor, ProbeEndpoint, ProbeEndpointKind,
+    ProbeMeasurement, ProbeMode, ProbeModeResult, ProbePairDiscoverySequence, ProbeRequest, ProbeResponse, ProbeScanResult,
+    ProbeUdp6AssociationResult, full_pair_probe_requests,
 };
 use dmesh_server::raw_wifi::{
-    RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiBearer, RawWifiCheckRequest,
-    RawWifiControlRequest, RawWifiDwPolicy, RawWifiInterface, RawWifiIperfRequest, RawWifiStaMode,
-    RawWifiStaState, decode_raw_wifi_snapshot, encode_raw_wifi_check_request,
-    encode_raw_wifi_control_request, encode_raw_wifi_iperf_request,
-    encode_raw_wifi_snapshot_request,
+    RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiBearer,
+    RawWifiCheckRequest, RawWifiControlRequest, RawWifiDwPolicy, RawWifiInterface,
+    RawWifiIperfRequest, RawWifiRate, RawWifiStaMode, RawWifiStaState, RawWifiTxRequest,
+    decode_raw_wifi_snapshot,
+    encode_raw_wifi_check_request, encode_raw_wifi_control_request, encode_raw_wifi_iperf_request,
+    encode_raw_wifi_snapshot_request, encode_raw_wifi_tx_request,
 };
 use dmesh_server::{
-    announce::{ANNOUNCE_SLEEP_PENDING, ANNOUNCE_TRANSITION_BEGIN, ANNOUNCE_TRANSITION_COMPLETE, ANNOUNCE_WAKE, decode_announce},
+    announce::{
+        ANNOUNCE_SLEEP_PENDING, ANNOUNCE_TRANSITION_BEGIN, ANNOUNCE_TRANSITION_COMPLETE,
+        ANNOUNCE_WAKE, decode_announce,
+    },
     control::{self, Request as ControlRequest, TransportKind},
     iperf::{IperfServiceRequest, encode_iperf_service_request},
+    services::decode_status_text,
     tagged::decode as decode_tagged_record,
     udp::{ReceivedStream, UdpClient},
 };
@@ -57,6 +63,9 @@ use tokio::time::timeout;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const E6_MAC: [u8; 6] = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00];
+/// e6's channel-6 AP BSSID/address.  An AP raw-UDP6 endpoint derives its
+/// link-local address from this interface MAC, not the base/STA MAC above.
+const E6_AP_MAC: [u8; 6] = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x01];
 const E7_MAC: [u8; 6] = [0x14, 0xc1, 0x9f, 0xe4, 0x5d, 0x48];
 const RAW_UDP6_PORT: u16 = 3339;
 const STABLE_WIFI_UDP_PORT: u16 = 3336;
@@ -95,7 +104,9 @@ fn load_e2e_config() -> Option<E2eConfig> {
 }
 
 fn configured_device<'a>(config: &'a E2eConfig, name: &str) -> &'a E2eDeviceConfig {
-    config.require_device(name).unwrap_or_else(|error| panic!("{error}"))
+    config
+        .require_device(name)
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn configured_pair<'a>(config: &'a E2eConfig, name: &str) -> &'a E2ePairConfig {
@@ -115,10 +126,24 @@ fn configured_mac(device: &E2eDeviceConfig) -> [u8; 6] {
 }
 
 fn configured_nan_mac(device: &E2eDeviceConfig) -> [u8; 6] {
-    let text = device.nan_mac.as_deref().or(device.mac.as_deref()).unwrap_or_else(|| {
-        panic!("configured device {} needs mac or nan_mac", device.name)
-    });
+    let text = device
+        .nan_mac
+        .as_deref()
+        .or(device.mac.as_deref())
+        .unwrap_or_else(|| panic!("configured device {} needs mac or nan_mac", device.name));
     parse_mac_text(text, &format!("{} nan_mac", device.name))
+}
+
+/// Open the local control bearer declared by the descriptor. CP210x/FTDI
+/// bridges need their physical speed restored after esptool, while native
+/// USB/JTAG endpoints intentionally leave this as `None`.
+fn open_configured_usb_session(device: &E2eDeviceConfig) -> Result<DeviceSession, String> {
+    let serial = device
+        .serial
+        .as_deref()
+        .ok_or_else(|| format!("{} has no USB serial descriptor", device.name))?;
+    DeviceSession::open(serial, device.uart_baud)
+        .map_err(|error| format!("open {} USB: {error}", device.name))
 }
 
 fn parse_mac_text(text: &str, name: &str) -> [u8; 6] {
@@ -140,7 +165,9 @@ fn configured_mode(device: &E2eDeviceConfig) -> ProbeMode {
     };
     ProbeMode {
         transport_kind,
-        now: device.now.unwrap_or(if device.supports_now { 0 } else { 2 }),
+        now: device
+            .now
+            .unwrap_or(if device.supports_now { 0 } else { 2 }),
         nan_dw_interval: device.nan_dw_interval.unwrap_or(0),
         ndp: device.ndp.unwrap_or(false),
         ap: device.ap.unwrap_or(false),
@@ -155,7 +182,11 @@ fn configured_endpoint(device: &E2eDeviceConfig) -> ProbeEndpoint {
             "esp" => ProbeEndpointKind::Esp,
             other => panic!("unsupported configured endpoint kind {other:?}"),
         },
-        node: device.mac.as_deref().map(|_| configured_mac(device)).unwrap_or([0; 6]),
+        node: device
+            .mac
+            .as_deref()
+            .map(|_| configured_mac(device))
+            .unwrap_or([0; 6]),
         mode: configured_mode(device),
         bssid: device
             .bssid
@@ -196,7 +227,14 @@ fn configured_pair_tests(config: &E2eConfig, source: &str, target: &str) -> Vec<
         .iter()
         .find(|pair| pair.source == source && pair.target == target)
         .map(|pair| pair.tests.clone())
-        .unwrap_or_else(|| vec!["nan".to_owned(), "udp6-iperf".to_owned(), "now-short".to_owned(), "now-iperf".to_owned()])
+        .unwrap_or_else(|| {
+            vec![
+                "nan".to_owned(),
+                "udp6-iperf".to_owned(),
+                "now-short".to_owned(),
+                "now-iperf".to_owned(),
+            ]
+        })
 }
 
 /// Load the actual generic-prober input. Device descriptors remain separate:
@@ -215,6 +253,7 @@ fn configured_pair_probe_requests(
             request,
             source: configured_probe_descriptor(source),
             target: configured_probe_descriptor(target),
+            discovery: ProbePairDiscoverySequence::default(),
         }];
     }
     let tests = configured_pair_tests(config, &source.name, &target.name);
@@ -236,12 +275,100 @@ fn configured_pair_probe_requests(
 
 fn descriptor_with_probe_mode(device: &E2eDeviceConfig, mode: ProbeMode) -> E2eDeviceConfig {
     let mut selected = device.clone();
-    selected.baseline = if mode.transport_kind == 1 { "sta" } else { "nan" }.to_owned();
+    selected.baseline = if mode.transport_kind == 1 {
+        "sta"
+    } else {
+        "nan"
+    }
+    .to_owned();
     selected.now = Some(mode.now);
     selected.nan_dw_interval = Some(mode.nan_dw_interval);
     selected.ndp = Some(mode.ndp);
     selected.ap = Some(mode.ap);
     selected
+}
+
+/// Apply the active NAN+NOW probe epoch through explicitly selected local USB
+/// adapters. This is never an automatic recovery path: callers choose
+/// `DMESH_E2E_PROBE_ACTIVATION=usb`, and both descriptors must name a serial
+/// endpoint. The subsequent bearer checks still use their requested radio
+/// transport; USB merely establishes the starting profile for a lab fixture.
+/// The two physical UART owners retained across USB activation and its
+/// subsequent device-to-device bearer checks.  CP210x adapters are part of
+/// the test fixture: reopening one can change modem state on some boards, so
+/// a pair probe must not turn an otherwise radio-only test into a serial
+/// reset experiment.
+struct UsbPairSessions {
+    source: DeviceSession,
+    target: DeviceSession,
+}
+
+fn usb_activate_pair(
+    source: &E2eDeviceConfig,
+    target: &E2eDeviceConfig,
+) -> Result<UsbPairSessions, String> {
+    let mode_for = |device: &E2eDeviceConfig| ProbeMode {
+        transport_kind: 6,
+        now: device
+            .now
+            .unwrap_or(if device.supports_now { 0 } else { 2 }),
+        nan_dw_interval: 1,
+        ndp: false,
+        ap: false,
+    };
+    let mut sessions = UsbPairSessions {
+        source: open_configured_usb_session(source)?,
+        target: open_configured_usb_session(target)?,
+    };
+    // CP210x-backed ESP boards can still be emitting a reset backlog from the
+    // previous test process closing its port.  This is deliberately before
+    // any control record is sent: a reset after this point remains a hard
+    // probe failure with its UART evidence retained.
+    sessions
+        .source
+        .discard_startup_backlog(Duration::from_millis(1_500))
+        .map_err(|error| format!("settle {} USB: {error}", source.name))?;
+    sessions
+        .target
+        .discard_startup_backlog(Duration::from_millis(1_500))
+        .map_err(|error| format!("settle {} USB: {error}", target.name))?;
+    configure_probe_endpoint(
+        &mut sessions.source,
+        mode_for(source),
+        "",
+        0x4D50_5550_0001,
+    );
+    configure_probe_endpoint(
+        &mut sessions.target,
+        mode_for(target),
+        "",
+        0x4D50_5550_0002,
+    );
+    Ok(sessions)
+}
+
+/// Execute the active, unassociated NOW row with USB as the control bearer.
+/// This is called exactly once after an explicit USB bootstrap, never from a
+/// fallback timer: USB sends the typed setup/check requests to e6 and e7,
+/// then e6/e7 exchange the status and stream packets directly over NOW.  It
+/// deliberately excludes STA/UDP6 rows because those require the separate
+/// host AP fixture and would hide this device-to-device proof.
+fn usb_run_active_now_pair(
+    sessions: &mut UsbPairSessions,
+    source: &E2eDeviceConfig,
+    target: &E2eDeviceConfig,
+    request: ProbeRequest,
+) -> Result<(), String> {
+    sessions.source.set_history_limit(1_024);
+    sessions.target.set_history_limit(1_024);
+    run_esp_pair_probe(
+        &mut sessions.source,
+        &mut sessions.target,
+        source,
+        target,
+        request,
+    );
+    Ok(())
 }
 
 fn mac_text(mac: [u8; 6]) -> String {
@@ -273,7 +400,9 @@ fn descriptor_transport_wire(
     // descriptor can add an explicit channel field; never infer one from the
     // first byte of a BSSID.
     let channel = Some(6);
-    let now = device.now.unwrap_or(if device.supports_now { 0 } else { 2 });
+    let now = device
+        .now
+        .unwrap_or(if device.supports_now { 0 } else { 2 });
     let (kind, config) = if device.baseline == "sta" {
         (
             TransportKind::Sta,
@@ -284,7 +413,7 @@ fn descriptor_transport_wire(
                 now: Some(now),
                 nan_dw_interval: Some(device.nan_dw_interval.unwrap_or(0)),
                 ap: Some(if device.ap.unwrap_or(false) { 1 } else { 0 }),
-                uart: Some(0),
+                uart: Some(dmesh_server::firmware_profile::UART_OFF),
                 sta_11b_rates_disabled: Some(false),
                 ..dmesh_server::control::TransportConfig::default()
             },
@@ -297,7 +426,7 @@ fn descriptor_transport_wire(
                 now: Some(now),
                 nan_dw_interval: Some(device.nan_dw_interval.unwrap_or(1)),
                 ap: Some(if device.ap.unwrap_or(false) { 1 } else { 0 }),
-                uart: Some(0),
+                uart: Some(dmesh_server::firmware_profile::UART_OFF),
                 ..dmesh_server::control::TransportConfig::default()
             },
         )
@@ -439,6 +568,20 @@ fn e2e_nan_service() -> String {
     std::env::var("DMESH_E2E_NAN_SERVICE").unwrap_or_else(|_| "lmesh-wifi".to_owned())
 }
 
+/// Select the existing host raw-action adapter for active-Main fallback
+/// checks.  Defaults preserve the stable wlan0 control plane, while a lab can
+/// select a ready development adapter without encoding host device names in
+/// the pair prober itself.  The probe never changes this interface's mode.
+fn e2e_now_iface() -> String {
+    std::env::var("DMESH_E2E_NOW_IFACE").unwrap_or_else(|_| "wlan0".to_owned())
+}
+
+/// Service owning `DMESH_E2E_NOW_IFACE`; see `e2e_now_iface`. This remains a
+/// host-side transport adapter choice, not a property of either probed device.
+fn e2e_now_service() -> String {
+    std::env::var("DMESH_E2E_NOW_SERVICE").unwrap_or_else(|_| "lmesh-wifi".to_owned())
+}
+
 fn host_nan_peer_seen(status: &serde_json::Value, mac: [u8; 6], started_ms: u64) -> bool {
     let expected = mac_text(mac);
     let data = controller_data(status);
@@ -461,7 +604,9 @@ fn host_nan_peer_seen(status: &serde_json::Value, mac: [u8; 6], started_ms: u64)
 }
 
 fn host_nan_peer_seen_any(status: &serde_json::Value, macs: &[[u8; 6]], started_ms: u64) -> bool {
-    macs.iter().copied().any(|mac| host_nan_peer_seen(status, mac, started_ms))
+    macs.iter()
+        .copied()
+        .any(|mac| host_nan_peer_seen(status, mac, started_ms))
 }
 
 /// Send each descriptor's mode command to both endpoints through the host
@@ -676,11 +821,15 @@ fn configured_android_udp_target() -> (String, String) {
                 .unwrap_or_else(|| panic!("pair {pair_name} has no Android endpoint"))
                 .to_owned()
         } else {
-            std::env::var("DMESH_E2E_ANDROID_DEVICE")
-                .expect("DMESH_E2E_ANDROID_DEVICE or DMESH_E2E_PAIR is required with DMESH_E2E_CONFIG")
+            std::env::var("DMESH_E2E_ANDROID_DEVICE").expect(
+                "DMESH_E2E_ANDROID_DEVICE or DMESH_E2E_PAIR is required with DMESH_E2E_CONFIG",
+            )
         };
         let device = configured_device(&config, &device_name);
-        assert_eq!(device.kind, "android", "configured device {device_name} is not Android");
+        assert_eq!(
+            device.kind, "android",
+            "configured device {device_name} is not Android"
+        );
         let serial = device
             .serial
             .clone()
@@ -712,7 +861,14 @@ fn android_udp_handlers_and_iperf() {
     );
     let inventory = String::from_utf8_lossy(&services.stdout);
     for handler in [
-        "object", "echo", "status", "handlers", "iperf", "metrics", "events", "control",
+        "object",
+        "echo",
+        "status",
+        "handlers",
+        "iperf",
+        "metrics",
+        "events",
+        "control",
         "log-watch",
     ] {
         assert!(
@@ -724,8 +880,14 @@ fn android_udp_handlers_and_iperf() {
     for (service, args) in [
         ("status", vec!["--service", "status"]),
         ("metrics", vec!["--service", "metrics"]),
-        ("events", vec!["--service", "events", "--body-hex", "73696e63653d30"]),
-        ("log-watch", vec!["--service", "log-watch", "--log-records", "4"]),
+        (
+            "events",
+            vec!["--service", "events", "--body-hex", "73696e63653d30"],
+        ),
+        (
+            "log-watch",
+            vec!["--service", "log-watch", "--log-records", "4"],
+        ),
     ] {
         let args = args.iter().copied().collect::<Vec<_>>();
         let response = run_android_udp_cli(&target, &args);
@@ -795,7 +957,11 @@ fn panic_detail(error: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn emit_pair_probe_outcomes(source: &E2eDeviceConfig, target: &E2eDeviceConfig, outcomes: &[PairProbeOutcome]) {
+fn emit_pair_probe_outcomes(
+    source: &E2eDeviceConfig,
+    target: &E2eDeviceConfig,
+    outcomes: &[PairProbeOutcome],
+) {
     // This is deliberately one machine-readable final record. Individual
     // diagnostic messages remain useful live, but a control plane needs a
     // complete list of successes and failures to characterize a pair.
@@ -820,6 +986,23 @@ struct NodeCapabilityStatus {
     last_seen_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     soft_ap: Option<bool>,
+    /// Whether a framework LocalOnly AP remained usable while its exact
+    /// credentials were registered as a P2P DNS-SD local service. This is a
+    /// measured platform capability: Pixel 7 currently retains the AP but
+    /// rejects `addLocalService(BUSY)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_ap_p2p_sd: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_ap_p2p_sd_error: Option<String>,
+    /// Whether a temporary P2P GO can return this Android device to a live
+    /// NAN Publish/Subscribe baseline using only public framework teardown.
+    /// This is deliberately independent of group removal: a retained
+    /// `p2p-dev-*` control interface is a failed restoration even when
+    /// `requestGroupInfo()` has already returned null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p2p_go_nan_restores: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p2p_go_cleanup_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scan_ap_count: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -865,6 +1048,7 @@ fn unix_millis() -> u64 {
 
 fn android_node_identity(serial: &str) -> NodeIdentity {
     let name = match serial {
+        "29301FDH2001A0" => "apx7",
         "94AAY0LALC" => "ap3a1",
         "RFCNB05AJ7E" => "agal1",
         _ => "andrunk",
@@ -885,16 +1069,48 @@ fn android_json_command(serial: &str, request: serde_json::Value) -> String {
         "content call --uri content://com.github.costinm.dmesh.lm.shell --method command --arg '{}'",
         request
     );
-    let output = Command::new("adb")
-        .args(["-s", serial, "shell", &shell_command])
+    // `content call` may wait indefinitely when Android has restarted the
+    // foreground service while P2P is changing the Wi-Fi interface. A probe
+    // must report that control-plane failure and proceed to its cleanup, not
+    // strand the Rust test process (and its subsequent P2P teardown).
+    let output = Command::new("timeout")
+        .args(["30s", "adb", "-s", serial, "shell", &shell_command])
         .output()
         .expect("Android content command");
     assert!(
         output.status.success(),
-        "Android command failed: {}",
+        "Android command timed out or failed status={:?}: {}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Send an immutable Android radio request until the Rust-owned handler has
+/// actually applied it. The shell provider can accept a request while a
+/// freshly restarted foreground service has not subscribed its Wi-Fi handler
+/// yet; `accepted` is therefore not radio-state evidence.
+fn android_transport_start_wait(serial: &str, request_id: &str, mode: &str, ap: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..8 {
+        last = android_json_command(
+            serial,
+            serde_json::json!({
+                "id": request_id,
+                "method": "wifi.transport.start",
+                "data": {"mode": mode, "ap": ap},
+            }),
+        );
+        if last.contains("\"state\":\"started\"")
+            || last.contains("\"state\":\"ap_stopped\"")
+            || last.contains("\"state\":\"unchanged\"")
+            || last.contains("\"state\":\"error\"")
+        {
+            return last;
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    last
 }
 
 /// Read the Rust-owned cross-bearer inventory through the privileged Android
@@ -911,8 +1127,74 @@ fn android_known_devices(serial: &str, request_id: &str) -> String {
     )
 }
 
+/// Read-only Android interface evidence for a probe row. This deliberately
+/// does not alter Wi-Fi: it lets the controller record whether ordinary wlan0
+/// remains present while P2P owns its group-client interface.
+fn android_interface_state(serial: &str) -> String {
+    let output = Command::new("adb")
+        .args(["-s", serial, "shell", "ip -o addr show; ip route show"])
+        .output()
+        .expect("Android interface state");
+    assert!(
+        output.status.success(),
+        "Android interface-state read failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Read the framework-owned interface cache without initializing or changing
+/// Wi-Fi. Unlike `ip link`, this also exposes Android's private `p2p-dev-*`
+/// and `aware_nmi*` interfaces, which are the authoritative transition
+/// evidence on current Pixels.
+fn android_wifi_interface_cache(serial: &str) -> String {
+    let output = Command::new("adb")
+        .args(["-s", serial, "shell", "dumpsys", "wifi"])
+        .output()
+        .expect("Android Wi-Fi interface cache");
+    assert!(
+        output.status.success(),
+        "Android Wi-Fi cache read failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = String::from_utf8_lossy(&output.stdout);
+    status
+        .lines()
+        .find(|line| line.contains("mInterfaceInfoCache:"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn udp_multicast_observation_count(inventory: &str) -> usize {
     inventory.match_indices("udp_multicast").count()
+}
+
+/// Return the IPv6 interface scope for the active Android P2P group. The
+/// inventory retains sender scopes, so this distinguishes a P2P multicast
+/// observation from the phone's unrelated cellular/USB/WLAN multicast.
+fn android_p2p_interface_index(interface_state: &str) -> Option<u32> {
+    interface_state.lines().find_map(|line| {
+        let (index, rest) = line.split_once(':')?;
+        let is_p2p = rest.trim_start().starts_with("p2p-");
+        is_p2p.then(|| index.trim().parse().ok()).flatten()
+    })
+}
+
+/// Extract the P2P link-local address exported by Android's read-only
+/// interface snapshot. The destination's address is paired with the caller's
+/// local P2P interface index when issuing a scoped IPv6 probe.
+fn android_p2p_link_local(interface_state: &str) -> Option<String> {
+    interface_state.lines().find_map(|line| {
+        let (_, after_p2p) = line.split_once("p2p-")?;
+        let (_, after_inet6) = after_p2p.split_once("inet6 fe80::")?;
+        let address = after_inet6.split_once('/')?.0;
+        Some(format!("fe80::{address}"))
+    })
+}
+
+fn p2p_udp_multicast_observation_count(inventory: &str, interface_index: u32) -> usize {
+    let scope = format!("%{interface_index}]");
+    usize::from(inventory.contains("udp_multicast") && inventory.contains(&scope))
 }
 
 fn e6_node_identity() -> NodeIdentity {
@@ -932,8 +1214,9 @@ fn record_pair_probe(left: &NodeIdentity, right: &NodeIdentity, mut observation:
     observation.last_seen_unix_ms = now;
     for (node, peer) in [(left, right), (right, left)] {
         let directory = root.join(&node.name);
-        fs::create_dir_all(&directory)
-            .unwrap_or_else(|error| panic!("create node directory {}: {error}", directory.display()));
+        fs::create_dir_all(&directory).unwrap_or_else(|error| {
+            panic!("create node directory {}: {error}", directory.display())
+        });
         let status_path = directory.join("status.toml");
         let mut status = fs::read_to_string(&status_path)
             .ok()
@@ -960,7 +1243,9 @@ fn record_pair_probe(left: &NodeIdentity, right: &NodeIdentity, mut observation:
             "peer": peer,
             "result": pair,
         });
-        let mut history = OpenOptions::new().create(true).append(true)
+        let mut history = OpenOptions::new()
+            .create(true)
+            .append(true)
             .open(directory.join("history.jsonl"))
             .unwrap_or_else(|error| panic!("open node history {}: {error}", node.name));
         writeln!(history, "{event}")
@@ -989,6 +1274,37 @@ fn record_node_capability(node: &NodeIdentity, mut capability: NodeCapabilitySta
     capability.last_seen_unix_ms = now;
     status.schema_version = 1;
     status.identity = Some(node.clone());
+    // Capability rows run independently (scan, SoftAP, P2P SD). Preserve
+    // previously observed facts when this row does not measure them.
+    if let Some(previous) = status.capability.take() {
+        if capability.soft_ap.is_none() {
+            capability.soft_ap = previous.soft_ap;
+        }
+        if capability.local_ap_p2p_sd.is_none() {
+            capability.local_ap_p2p_sd = previous.local_ap_p2p_sd;
+        }
+        if capability.local_ap_p2p_sd_error.is_none() {
+            capability.local_ap_p2p_sd_error = previous.local_ap_p2p_sd_error;
+        }
+        if capability.p2p_go_nan_restores.is_none() {
+            capability.p2p_go_nan_restores = previous.p2p_go_nan_restores;
+        }
+        if capability.p2p_go_cleanup_detail.is_none() {
+            capability.p2p_go_cleanup_detail = previous.p2p_go_cleanup_detail;
+        }
+        if capability.scan_ap_count.is_none() {
+            capability.scan_ap_count = previous.scan_ap_count;
+        }
+        if capability.scan_channel6_ap_count.is_none() {
+            capability.scan_channel6_ap_count = previous.scan_channel6_ap_count;
+        }
+        if capability.scan_dmesh_ap_count.is_none() {
+            capability.scan_dmesh_ap_count = previous.scan_dmesh_ap_count;
+        }
+        if capability.scan_dmesh.is_none() {
+            capability.scan_dmesh = previous.scan_dmesh;
+        }
+    }
     status.capability = Some(capability.clone());
     let encoded = toml::to_string_pretty(&status)
         .unwrap_or_else(|error| panic!("encode node status {}: {error}", node.name));
@@ -1000,7 +1316,9 @@ fn record_node_capability(node: &NodeIdentity, mut capability: NodeCapabilitySta
         "node": node,
         "capability": capability,
     });
-    let mut history = OpenOptions::new().create(true).append(true)
+    let mut history = OpenOptions::new()
+        .create(true)
+        .append(true)
         .open(directory.join("history.jsonl"))
         .unwrap_or_else(|error| panic!("open node history {}: {error}", node.name));
     writeln!(history, "{event}")
@@ -1064,8 +1382,14 @@ fn android_capability_probe_response(
                 "data": {"mode": "nan", "ap": "0"},
             }),
         );
-        assert!(start.contains("wifi.transport.result"), "missing SoftAP result: {start}");
-        assert!(stop.contains("wifi.transport.result"), "missing SoftAP stop result: {stop}");
+        assert!(
+            start.contains("wifi.transport.result"),
+            "missing SoftAP result: {start}"
+        );
+        assert!(
+            stop.contains("wifi.transport.result"),
+            "missing SoftAP stop result: {stop}"
+        );
         source_mode.soft_ap = ProbeApResult {
             attempted: true,
             succeeded: response_state_started(&start),
@@ -1082,7 +1406,10 @@ fn android_capability_probe_response(
                 "data": {"reason": "probe"},
             }),
         );
-        assert!(scan.contains("wifi.scan.result"), "missing Android scan result: {scan}");
+        assert!(
+            scan.contains("wifi.scan.result"),
+            "missing Android scan result: {scan}"
+        );
         source_scan = ProbeScanResult {
             attempted: true,
             succeeded: json_string_field(&scan, "ok").as_deref() == Some("1"),
@@ -1099,19 +1426,31 @@ fn android_capability_probe_response(
     AndroidCapabilityProbeExecution {
         response: ProbeResponse {
             request_id: request.request_id,
+            source_discovery: dmesh_server::probe::ProbeDiscoveryResult::default(),
+            target_discovery: dmesh_server::probe::ProbeDiscoveryResult::default(),
+            selected_target: dmesh_server::probe::ProbeSelectedTarget::default(),
             source_mode,
             target_mode: ProbeModeResult::default(),
-            nan: ProbeMeasurement { attempted: request.test_nan, ..ProbeMeasurement::default() },
+            nan: ProbeMeasurement {
+                attempted: request.test_nan,
+                ..ProbeMeasurement::default()
+            },
             nan_data: ProbeMeasurement {
                 attempted: request.test_nan_data,
                 ..ProbeMeasurement::default()
             },
-            now: ProbeMeasurement { attempted: request.test_now, ..ProbeMeasurement::default() },
+            now: ProbeMeasurement {
+                attempted: request.test_now,
+                ..ProbeMeasurement::default()
+            },
             udp6_association: ProbeUdp6AssociationResult {
                 attempted: request.test_udp6_association,
                 ..ProbeUdp6AssociationResult::default()
             },
-            udp6: ProbeMeasurement { attempted: request.test_udp6, ..ProbeMeasurement::default() },
+            udp6: ProbeMeasurement {
+                attempted: request.test_udp6,
+                ..ProbeMeasurement::default()
+            },
             source_scan,
             target_scan: ProbeScanResult::default(),
             recommendation: 0,
@@ -1168,7 +1507,11 @@ fn configure_probe_endpoint(
         }
         unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
     };
-    control_request(session, ControlRequest::TransportStart { kind, config }, request_id);
+    control_request(
+        session,
+        ControlRequest::TransportStart { kind, config },
+        request_id,
+    );
     // Radio lab rows are allowed to disable the private action dispatcher or
     // leave a ROC lease behind.  A descriptor-driven probe must restore the
     // normal NOW ingress before measuring the bearer, otherwise a prior
@@ -1180,9 +1523,18 @@ fn restore_probe_action_path(session: &mut DeviceSession) {
     let control = RawWifiControlRequest {
         action_dispatcher: Some(true),
         interface: Some(RawWifiInterface::Auto),
-        // Broadcast Address-1 is the interoperable unassociated NOW mode;
-        // the peer identity remains in the QUIC payload and response path.
-        action_destination_broadcast: Some(true),
+        // The generic pair-prober measures a bulk NOW row after its liveness
+        // checks. Use the same fixed 6 Mbps OFDM policy documented by the
+        // other automated action rows instead of inheriting ESP-IDF's raw
+        // 1 Mbps Auto default from whichever earlier lab action ran.
+        rate: Some(RawWifiRate::Mbps6),
+        // This is the production Main default: active DW1 keeps filtered
+        // management receive armed, while direct peer actions use their MAC
+        // destination and normal 802.11 acknowledgement.  State it here so
+        // a previous focused radio-lab row cannot leave the pair prober in a
+        // different lane.
+        action_destination_broadcast: Some(false),
+        mac_ack: Some(true),
         dw_policy: Some(RawWifiDwPolicy::Normal),
         ..RawWifiControlRequest::default()
     };
@@ -1208,16 +1560,8 @@ fn probe(
 ) {
     configure_probe_endpoint(source, request.source.mode, ssid, source_id);
     configure_probe_endpoint(target, request.target.mode, ssid, target_id);
-    let source_snapshot = match request.source.mode.transport_kind {
-        6 => wait_for_unassociated_channel_6(source),
-        1 => wait_for_associated_channel_6(source),
-        unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
-    };
-    let target_snapshot = match request.target.mode.transport_kind {
-        6 => wait_for_unassociated_channel_6(target),
-        1 => wait_for_associated_channel_6(target),
-        unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
-    };
+    let source_snapshot = wait_for_probe_mode(source, request.source.mode);
+    let target_snapshot = wait_for_probe_mode(target, request.target.mode);
     eprintln!(
         "firmware-e2e row=probe setup source_mode={:?} target_mode={:?} nan={} nan_data={} now={} udp6={} source=({}) target=({})",
         request.source.mode,
@@ -1263,12 +1607,16 @@ fn wait_for_nan_iperf(
             && u64::from(snapshot.raw_service_bytes.unwrap_or(0)) >= expected_bytes
         {
             let elapsed = u64::from(snapshot.raw_service_elapsed_us.unwrap_or(0));
-            assert!(elapsed != 0, "{label}: completed transfer lacks elapsed time");
+            assert!(
+                elapsed != 0,
+                "{label}: completed transfer lacks elapsed time"
+            );
             eprintln!(
                 "firmware-e2e row=pair-iperf label={label} bytes={} elapsed_us={} bps={}",
                 snapshot.raw_service_bytes.unwrap_or(0),
                 elapsed,
-                u64::from(snapshot.raw_service_bytes.unwrap_or(0)).saturating_mul(8_000_000) / elapsed,
+                u64::from(snapshot.raw_service_bytes.unwrap_or(0)).saturating_mul(8_000_000)
+                    / elapsed,
             );
             return snapshot;
         }
@@ -1302,10 +1650,18 @@ fn run_esp_pair_probe_via_nan(
     let source_ready = host_nan_snapshot(source_control);
     let target_ready = host_nan_snapshot(target_control);
     if request.source.mode.transport_kind == 1 {
-        assert_eq!(source_ready.sta_associated, Some(true), "source STA readiness");
+        assert_eq!(
+            source_ready.sta_associated,
+            Some(true),
+            "source STA readiness"
+        );
     }
     if request.target.mode.transport_kind == 1 {
-        assert_eq!(target_ready.sta_associated, Some(true), "target STA readiness");
+        assert_eq!(
+            target_ready.sta_associated,
+            Some(true),
+            "target STA readiness"
+        );
     }
 
     if request.test_now {
@@ -1322,7 +1678,11 @@ fn run_esp_pair_probe_via_nan(
             dmesh_server::raw_wifi::RAW_WIFI_METHOD_CHECK,
             Duration::from_secs(8),
         );
-        assert_eq!(admitted.raw_service_active, Some(true), "NOW check admission");
+        assert_eq!(
+            admitted.raw_service_active,
+            Some(true),
+            "NOW check admission"
+        );
         let deadline = Instant::now() + Duration::from_secs(12);
         loop {
             let snapshot = host_nan_snapshot(source_control);
@@ -1331,7 +1691,10 @@ fn run_esp_pair_probe_via_nan(
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "NOW check did not complete: {snapshot:?}");
+            assert!(
+                Instant::now() < deadline,
+                "NOW check did not complete: {snapshot:?}"
+            );
         }
     }
 
@@ -1359,26 +1722,58 @@ fn run_esp_pair_probe_via_nan(
             dmesh_server::raw_wifi::RAW_WIFI_METHOD_IPERF,
             Duration::from_secs(8),
         );
-        assert_eq!(admitted.raw_service_active, Some(true), "{label}: IPERF admission");
+        assert_eq!(
+            admitted.raw_service_active,
+            Some(true),
+            "{label}: IPERF admission"
+        );
         let _ = initiator; // documents that `control` is that endpoint's NAN identity.
         wait_for_nan_iperf(control, bytes, label);
     };
     if request.test_now {
         if request.short_bytes > 1 {
-            run_bulk(source, source_control, configured_mac(target), u64::from(request.short_bytes), RawWifiBearer::Now, "NOW short");
+            run_bulk(
+                source,
+                source_control,
+                configured_mac(target),
+                u64::from(request.short_bytes),
+                RawWifiBearer::Now,
+                "NOW short",
+            );
         }
         if request.long_bytes != 0 {
-            run_bulk(target, target_control, configured_mac(source), u64::from(request.long_bytes), RawWifiBearer::Now, "NOW long");
+            run_bulk(
+                target,
+                target_control,
+                configured_mac(source),
+                u64::from(request.long_bytes),
+                RawWifiBearer::Now,
+                "NOW long",
+            );
         }
     }
     if request.test_udp6 {
         // The associated target is the client and the source is the open AP;
         // neither payload crosses the host control plane.
         if request.short_bytes > 1 {
-            run_bulk(target, target_control, configured_mac(source), u64::from(request.short_bytes), RawWifiBearer::Udp6, "UDP6 short");
+            run_bulk(
+                target,
+                target_control,
+                configured_mac(source),
+                u64::from(request.short_bytes),
+                RawWifiBearer::Udp6,
+                "UDP6 short",
+            );
         }
         if request.long_bytes != 0 {
-            run_bulk(target, target_control, configured_mac(source), u64::from(request.long_bytes), RawWifiBearer::Udp6, "UDP6 long");
+            run_bulk(
+                target,
+                target_control,
+                configured_mac(source),
+                u64::from(request.long_bytes),
+                RawWifiBearer::Udp6,
+                "UDP6 long",
+            );
         }
     }
 }
@@ -1415,7 +1810,10 @@ fn run_esp_pair_probe(
             target_session,
             configured_mac(target),
             request.request_id + 3,
-            &format!("pair request={} {} -> {} NOW", request.request_id, source.name, target.name),
+            &format!(
+                "pair request={} {} -> {} NOW",
+                request.request_id, source.name, target.name
+            ),
         );
         assert!(target_after.counters.rx_parser_accepted > 0);
         assert!(source_after.counters.raw_client_stream_packets > 0);
@@ -1424,10 +1822,38 @@ fn run_esp_pair_probe(
             source_session,
             configured_mac(source),
             request.request_id + 4,
-            &format!("pair request={} {} -> {} NOW", request.request_id, target.name, source.name),
+            &format!(
+                "pair request={} {} -> {} NOW",
+                request.request_id, target.name, source.name
+            ),
         );
         assert!(source_after.counters.rx_parser_accepted > 0);
         assert!(target_after.counters.raw_client_stream_packets > 0);
+
+        // The two liveness associations above deliberately exercise fresh
+        // CIDs in both directions. Replace the complete NAN+NOW epoch before
+        // bulk transfer, rather than assuming ESP-IDF retains its private
+        // `(127,0)` action registration across a completed association. This
+        // is an explicit, descriptor-neutral transition the prober must also
+        // validate for real control-plane use.
+        let active_now = ProbeMode {
+            transport_kind: 6,
+            now: source.now.unwrap_or(0),
+            nan_dw_interval: 1,
+            ndp: false,
+            ap: false,
+        };
+        configure_probe_endpoint(source_session, active_now, "", request.request_id + 0x40);
+        configure_probe_endpoint(target_session, active_now, "", request.request_id + 0x41);
+        let _ = wait_for_probe_mode(source_session, active_now);
+        let _ = wait_for_probe_mode(target_session, active_now);
+        // transport.start is accepted by the direct-control worker before
+        // Main has necessarily completed the Wi-Fi stop/start it requested.
+        // The snapshot proves the desired visible mode; this bounded grace
+        // permits the old action callback and raw-service ledger to retire
+        // before the first bulk OPEN. It is a test-side transition barrier,
+        // not a firmware service tick or a substitute for completion events.
+        thread::sleep(Duration::from_millis(750));
 
         if request.short_bytes > 1 {
             let _ = complete_action_iperf_bytes(
@@ -1435,7 +1861,10 @@ fn run_esp_pair_probe(
                 target_session,
                 configured_mac(target),
                 u64::from(request.short_bytes),
-                &format!("pair request={} {} -> {} NOW short", request.request_id, source.name, target.name),
+                &format!(
+                    "pair request={} {} -> {} NOW short",
+                    request.request_id, source.name, target.name
+                ),
             );
         }
         if request.long_bytes != 0 {
@@ -1444,7 +1873,10 @@ fn run_esp_pair_probe(
                 source_session,
                 configured_mac(source),
                 u64::from(request.long_bytes),
-                &format!("pair request={} {} -> {} NOW long", request.request_id, target.name, source.name),
+                &format!(
+                    "pair request={} {} -> {} NOW long",
+                    request.request_id, target.name, source.name
+                ),
             );
         }
     } else if request.test_now {
@@ -1469,7 +1901,10 @@ fn run_esp_pair_probe(
             .expect("pair UDP6 runtime");
         if request.short_bytes > 1 {
             runtime.block_on(host_to_device_udp6_iperf_bytes(
-                &format!("pair request={} {} UDP6 short", request.request_id, source.name),
+                &format!(
+                    "pair request={} {} UDP6 short",
+                    request.request_id, source.name
+                ),
                 configured_mac(source),
                 request.request_id + 7,
                 u64::from(request.short_bytes),
@@ -1477,7 +1912,10 @@ fn run_esp_pair_probe(
         }
         if request.long_bytes != 0 {
             runtime.block_on(host_to_device_udp6_iperf_bytes(
-                &format!("pair request={} {} UDP6 long", request.request_id, target.name),
+                &format!(
+                    "pair request={} {} UDP6 long",
+                    request.request_id, target.name
+                ),
                 configured_mac(target),
                 request.request_id + 8,
                 u64::from(request.long_bytes),
@@ -1579,9 +2017,7 @@ fn host_to_esp_now_probe(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         now.bytes = data.get("bytes").and_then(serde_json::Value::as_u64);
-        now.elapsed_us = data
-            .get("elapsed_us")
-            .and_then(serde_json::Value::as_u64);
+        now.elapsed_us = data.get("elapsed_us").and_then(serde_json::Value::as_u64);
         now.tx_packets = data
             .get("tx_packets")
             .and_then(serde_json::Value::as_u64)
@@ -1603,6 +2039,9 @@ fn host_to_esp_now_probe(
     );
     ProbeResponse {
         request_id: request.request_id,
+        source_discovery: dmesh_server::probe::ProbeDiscoveryResult::default(),
+        target_discovery: dmesh_server::probe::ProbeDiscoveryResult::default(),
+        selected_target: dmesh_server::probe::ProbeSelectedTarget::default(),
         source_mode: ProbeModeResult {
             attempted: true,
             succeeded: true,
@@ -1725,16 +2164,39 @@ fn e2e_now_timeout_ms() -> u64 {
     }
 }
 
+/// Give a requested NOW stream enough time for the conservative action lane.
+/// A one-packet broadcast flight on classic ESP can sustain roughly 20 kbit/s
+/// under normal discovery traffic, so a fixed 10/60-second check deadline is
+/// too short for a valid 256 KiB transfer.  An environment value remains a
+/// useful operator floor, but cannot make a larger requested stream fail only
+/// because the previous short-test default was reused.  Firmware still owns
+/// the hard 180-second operation bound and sleeps between exact deadlines.
+fn e2e_now_iperf_timeout_ms(bytes: u64) -> u64 {
+    const MIN_ACTION_GOODPUT_BPS: u64 = 20_000;
+    const SETUP_ALLOWANCE_MS: u64 = 10_000;
+    let scaled = bytes
+        .saturating_mul(8_000)
+        .saturating_div(MIN_ACTION_GOODPUT_BPS)
+        .saturating_add(SETUP_ALLOWANCE_MS);
+    e2e_now_timeout_ms()
+        .max(scaled)
+        .clamp(1_000, u64::from(dmesh_server::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS))
+}
+
 fn e2e_now_packet_size() -> u64 {
     match std::env::var("DMESH_E2E_NOW_PACKET_SIZE") {
         Ok(value) => value.parse::<u64>().unwrap_or_else(|error| {
             panic!("DMESH_E2E_NOW_PACKET_SIZE must be an integer, got {value:?}: {error}")
         }),
-        // Bulk IPERF uses the largest raw QUIC datagram that fits the action
-        // bearer. Small control packets remain testable with an explicit
-        // `DMESH_E2E_NOW_PACKET_SIZE=256` diagnostic run, but using them as
-        // the throughput default amplifies one RF loss into a long PTO stall.
-        Err(std::env::VarError::NotPresent) => quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64,
+        // C6's unassociated vendor-action receiver has a much smaller
+        // reliable service payload than raw UDP6.  A 200-byte stream packet
+        // keeps the complete QUIC-lite packet below the action-frame size at
+        // which repeated request/response turns became lossy in live tests.
+        // This controls only the NOW test's per-packet payload: a stream may
+        // still be 256 KiB or 1 MiB, without retaining its contents in device
+        // memory.  UDP6 and UART select their packet sizes independently.
+        // Callers may explicitly characterize a larger action MTU.
+        Err(std::env::VarError::NotPresent) => 200,
         Err(error) => panic!("read DMESH_E2E_NOW_PACKET_SIZE: {error}"),
     }
 }
@@ -1797,6 +2259,28 @@ fn interface_mac(name: &str) -> String {
         .to_owned()
 }
 
+/// Resolve the kernel-assigned IPv6 link-local address for exactly one
+/// interface.  A scoped peer alone does not select the source address when a
+/// test has bound `::`; bind this returned address with the same interface
+/// index so the UDP6 row cannot silently use another radio.
+fn interface_link_local(name: &str) -> Ipv6Addr {
+    let addresses = std::fs::read_to_string("/proc/net/if_inet6")
+        .unwrap_or_else(|error| panic!("read IPv6 addresses: {error}"));
+    for line in addresses.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 6 || fields[5] != name || fields[3] != "20" {
+            continue;
+        }
+        let raw = u128::from_str_radix(fields[0], 16)
+            .unwrap_or_else(|error| panic!("parse {name} link-local address: {error}"));
+        let address = Ipv6Addr::from(raw);
+        if address.is_unicast_link_local() {
+            return address;
+        }
+    }
+    panic!("{name} has no non-tentative IPv6 link-local address")
+}
+
 fn mem_available_kib() -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()?
@@ -1821,7 +2305,10 @@ fn nan_wake_timeout_from_host() -> Option<Duration> {
         let seconds = value.parse::<u64>().unwrap_or_else(|error| {
             panic!("DMESH_E2E_NAN_WAKE_TIMEOUT_SECS must be seconds: {value:?}: {error}")
         });
-        assert!(seconds > 0, "DMESH_E2E_NAN_WAKE_TIMEOUT_SECS must be nonzero");
+        assert!(
+            seconds > 0,
+            "DMESH_E2E_NAN_WAKE_TIMEOUT_SECS must be nonzero"
+        );
         return Some(Duration::from_secs(seconds));
     }
     let status = match std::panic::catch_unwind(|| {
@@ -1852,18 +2339,50 @@ fn nan_wake_timeout_from_host() -> Option<Duration> {
     }
 }
 
+/// Select the initial control bearer for the generic pair prober. This runs
+/// once, before the matrix is planned. Active pairs default to NOW: their
+/// Main image already starts NAN+NOW, so the first raw-action status exchange
+/// proves discovery and control without requiring a host NAN clock. NAN is
+/// selected explicitly for sleepy endpoints because it supplies DW timing.
+/// USB is also explicit and opens only the two descriptors' local adapters;
+/// it is never a hidden fallback for a failed radio probe.
+fn e2e_probe_activation() -> ProbeActivation {
+    match std::env::var("DMESH_E2E_PROBE_ACTIVATION") {
+        Ok(value) if value == "now" => ProbeActivation::Now,
+        Ok(value) if value == "nan" => ProbeActivation::Nan,
+        Ok(value) if value == "usb" => ProbeActivation::Usb,
+        Ok(value) => panic!("DMESH_E2E_PROBE_ACTIVATION must be now, nan, or usb, got {value:?}"),
+        // A caller-supplied shared ProbeRequest is the production-shaped
+        // option. The environment spelling is retained as a lab override so
+        // an operator can change only the bootstrap bearer while reproducing
+        // an otherwise identical matrix.
+        Err(std::env::VarError::NotPresent) => std::env::var("DMESH_E2E_PROBE_REQUEST_JSON")
+            .ok()
+            .map(|json| {
+                serde_json::from_str::<ProbeRequest>(&json).unwrap_or_else(|error| {
+                    panic!("DMESH_E2E_PROBE_REQUEST_JSON must be a ProbeRequest: {error}")
+                })
+            })
+            .map(|request| request.activation)
+            .unwrap_or_default(),
+        Err(error) => panic!("read DMESH_E2E_PROBE_ACTIVATION: {error}"),
+    }
+}
+
 /// Check the regular raw-action/NOW service without assuming a NAN cluster.
 /// This uses the same QUIC-lite status handler as other transport clients;
 /// it neither changes the host's radio mode nor reconfigures either endpoint.
-/// It is called once per active endpoint only after NAN rendezvous is known
-/// unavailable, so it is a fallback observation rather than a polling tick.
+/// It is called once per active endpoint at the initial NOW boundary, not from
+/// a periodic loop or retry tick.
 fn host_now_status(device: &E2eDeviceConfig, nonce: u64) -> Result<serde_json::Value, String> {
+    let service = e2e_now_service();
+    let iface = e2e_now_iface();
     let response = std::panic::catch_unwind(|| {
         mesh_rpc_typed(
-            "lmesh-wifi",
+            &service,
             "wifi.raw.check",
             &lmesh_wifi::api::WifiRawCheckRequest {
-                iface: Some("wlan0".to_owned()),
+                iface: Some(iface),
                 channel: Some(6),
                 destination: hex(&configured_mac(device)),
                 nonce: Some(nonce),
@@ -1926,12 +2445,25 @@ fn wait_for_stable_control_plane_devices(
             .unwrap_or_default();
         let found = wanted
             .iter()
-            .filter(|id| devices.iter().any(|entry| entry["id"].as_str() == Some(id.as_str())))
+            .filter(|id| {
+                devices
+                    .iter()
+                    .any(|entry| entry["id"].as_str() == Some(id.as_str()))
+            })
             .count();
         if found == wanted.len() {
-            let esp = devices.iter().filter(|entry| entry["announce"]["device_class"].as_u64() == Some(1)).count();
-            let android = devices.iter().filter(|entry| entry["announce"]["device_class"].as_u64() == Some(3)).count();
-            let hosts = devices.iter().filter(|entry| entry["announce"]["device_class"].as_u64() == Some(2)).count();
+            let esp = devices
+                .iter()
+                .filter(|entry| entry["announce"]["device_class"].as_u64() == Some(1))
+                .count();
+            let android = devices
+                .iter()
+                .filter(|entry| entry["announce"]["device_class"].as_u64() == Some(3))
+                .count();
+            let hosts = devices
+                .iter()
+                .filter(|entry| entry["announce"]["device_class"].as_u64() == Some(2))
+                .count();
             eprintln!(
                 "firmware-e2e stable-discovery source={} target={} inventory esp={} android={} host={}",
                 source.name, target.name, esp, android, hosts
@@ -1971,8 +2503,9 @@ fn stable_control_plane_pair_plan(
         .cloned()
         .unwrap_or_else(|| panic!("wifi.probe.plan missing data: {response}"));
     assert_eq!(data["control_plane_mode_changed"], false);
-    serde_json::from_value(data["rows"].clone())
-        .unwrap_or_else(|error| panic!("wifi.probe.plan returned invalid rows: {error}; data={data}"))
+    serde_json::from_value(data["rows"].clone()).unwrap_or_else(|error| {
+        panic!("wifi.probe.plan returned invalid rows: {error}; data={data}")
+    })
 }
 
 /// Invoke a supervised host service through its existing Unix socket with a
@@ -3381,6 +3914,35 @@ async fn host_to_e7_udp6_iperf() {
     host_to_device_udp6_iperf("host wlan0->e7 raw-udp6", E7_MAC, 0xE7_0D_0601).await;
 }
 
+/// Focused Linux open-STA row. The caller first associates the persistent
+/// `wlan1` station with e6's channel-6 open AP; this test then proves the
+/// bearer/application response without retuning either radio or creating a
+/// monitor fixture.
+#[test]
+#[ignore = "requires wlan1 associated with e6's open AP"]
+fn firmware_wlan1_open_sta_to_e6_udp6_iperf() {
+    let ifindex = interface_index("wlan1");
+    let local = interface_link_local("wlan1");
+    let peer = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::from(quic_lite::raw_udp6::link_local_from_mac(E6_AP_MAC)),
+        RAW_UDP6_PORT,
+        0,
+        ifindex,
+    ));
+    let bind = SocketAddr::V6(SocketAddrV6::new(local, 3338, 0, ifindex));
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("wlan1 open-STA UDP6 runtime")
+        .block_on(udp_iperf_row(
+            "host wlan1 open-STA->e6 raw-udp6",
+            bind,
+            peer,
+            ConnectionId::new(0xE6_1D_0601).expect("nonzero wlan1 UDP6 CID"),
+            udp6_transfer_bytes(),
+        ));
+}
+
 /// Target-neutral scoped link-local endpoint for the focused UDP6 gate.
 ///
 /// The endpoint is supplied separately from the USB path because a test may
@@ -3434,6 +3996,456 @@ fn firmware_e7_main_radio_snapshot() {
     let radio = snapshot(&mut e7, RAW_WIFI_METHOD_SNAPSHOT);
     eprintln!("firmware-e2e row=e7-main-radio-snapshot {radio:?}");
     e7.assert_healthy().unwrap();
+}
+
+/// Read e6's shared raw-radio counters without changing its current AP/NAN
+/// epoch.  This is used alongside a host UDP6 probe to distinguish an
+/// Ethernet receive/dispatch failure on e6 from a missing reply on wlan1.
+#[test]
+#[ignore = "requires e6 UART and exclusive UART ownership"]
+fn firmware_e6_radio_snapshot() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    e6.set_history_limit(128);
+    let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    eprintln!(
+        "firmware-e2e row=e6-radio-snapshot {}",
+        snapshot_summary(&radio)
+    );
+    e6.assert_healthy().unwrap();
+}
+
+/// Put e6 into the normal channel-6 NAN/AP epoch through the same
+/// `transport.start` handler used by UART and future NAN Service Info.  The
+/// AP bearer must be live before a Linux STA attempts the scoped UDP6 row.
+#[test]
+#[ignore = "requires e6 UART and exclusive UART ownership"]
+fn firmware_e6_transport_start_open_ap() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(1),
+                nan_dw_interval: Some(1),
+                ap: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_1D_0600,
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.channel == Some(6)
+            && radio.ap_active == Some(true)
+            && radio.sta_associated == Some(false)
+            && radio.sta_raw_rx_enabled == Some(true)
+        {
+            eprintln!(
+                "firmware-e2e row=e6-transport-start-open-ap {}",
+                snapshot_summary(&radio)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 transport.start open AP did not register raw UDP6 receive: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    e6.assert_healthy().unwrap();
+}
+
+/// Run the infrastructure-independent AP/STA row for any two ESP32 Main
+/// descriptors that provide a local USB connection. The source board owns its
+/// selected AP (WPA2-PSK by default, or explicit `open=1`); the target
+/// associates directly to that AP; then the boards prove
+/// raw UDP6 and NAN Service Info without using wlan0, lmesh, or an external
+/// AP. USB is only the local control/modem bearer, never the bearer under
+/// test. This makes the method reproducible for an arbitrary compatible pair
+/// selected by `DMESH_E2E_CONFIG`, `DMESH_E2E_SOURCE`, and
+/// `DMESH_E2E_TARGET`.
+#[test]
+#[ignore = "requires two configured ESP Main USB descriptors and exclusive USB ownership"]
+fn firmware_usb_esp_pair_ap_sta_udp6_and_nan() {
+    let config = load_e2e_config().expect("set DMESH_E2E_CONFIG for the USB ESP pair suite");
+    let source_name = std::env::var("DMESH_E2E_SOURCE").ok();
+    let target_name = std::env::var("DMESH_E2E_TARGET").ok();
+    let (source, target) = config
+        .select_esp_pair_by_name(source_name.as_deref(), target_name.as_deref())
+        .unwrap_or_else(|error| panic!("USB ESP pair selection: {error}"));
+    assert!(
+        source.supports_ap && source.supports_nan && source.supports_udp6,
+        "{} must support AP, NAN, and UDP6 for the USB AP/STA row",
+        source.name
+    );
+    assert!(
+        target.supports_sta && target.supports_nan && target.supports_udp6,
+        "{} must support STA, NAN, and UDP6 for the USB AP/STA row",
+        target.name
+    );
+    let mut source_session = open_configured_usb_session(source).unwrap();
+    let mut target_session = open_configured_usb_session(target).unwrap();
+    let open = e2e_pair_open_mode();
+    source_session.set_history_limit(1_024);
+    target_session.set_history_limit(1_024);
+
+    control_request(
+        &mut source_session,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ap: Some(1),
+                open: Some(open),
+                uart: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0x4D50_A6_0001,
+    );
+    let ap_deadline = Instant::now() + Duration::from_secs(10);
+    let source_ap = loop {
+        let snapshot = snapshot(&mut source_session, RAW_WIFI_METHOD_SNAPSHOT);
+        if snapshot.ap_active == Some(true)
+            && snapshot.sta_associated == Some(false)
+            && snapshot.sta_raw_rx_enabled == Some(true)
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < ap_deadline,
+            "{} selected AP/raw UDP6 did not settle: {}",
+            source.name,
+            snapshot_summary(&snapshot)
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    let ap_mac = source_ap.ap_mac.expect("source selected AP MAC");
+    let ssid = "DIRECT-dmesh";
+
+    control_request(
+        &mut target_session,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Sta,
+            config: dmesh_server::control::TransportConfig {
+                ssid: Some(ssid.as_bytes()),
+                bssid: Some(ap_mac),
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ap: Some(0),
+                open: Some(open),
+                uart: Some(1),
+                sta_raw_rx_enabled: Some(true),
+                // Keep the normal driver Ethernet handoff as the default,
+                // while allowing the bounded raw-802.11 A/B requested by
+                // DMESH_E2E_STA_DRIVER_TX=off.  This lets a generic pair
+                // descriptor characterize an ESP family regression without
+                // encoding board names or TX policy in the test itself.
+                sta_driver_tx: Some(e2e_sta_driver_tx()),
+                sta_11b_rates_disabled: Some(false),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0x4D50_A6_0002,
+    );
+    let sta_deadline = Instant::now() + Duration::from_secs(15);
+    let _target_sta = loop {
+        let snapshot = snapshot(&mut target_session, RAW_WIFI_METHOD_SNAPSHOT);
+        if snapshot.sta_associated == Some(true)
+            && snapshot.channel == Some(6)
+            && snapshot.sta_raw_rx_enabled == Some(true)
+            && snapshot.nan_dw_interval == Some(1)
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < sta_deadline,
+            "{} did not associate to {} AP {ssid}: {}",
+            target.name,
+            source.name,
+            snapshot_summary(&snapshot)
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    // The UDP6 transfer itself does not require management capture, and a
+    // previous focused row may have left the lab DW switch disabled.  Restore
+    // the normal action/DW owner explicitly before this composite row resets
+    // counters: the following SDF assertion is a NAN result, not a side
+    // effect of the AP/STA setup above.  This is a one-shot transition on
+    // each endpoint, not a periodic test-side service tick.
+    restore_probe_action_path(&mut source_session);
+    restore_probe_action_path(&mut target_session);
+
+    // An associated STA+NAN+NOW epoch must retain the action control bearer;
+    // otherwise a successful AP/STA UDP6 row could hide a Wi-Fi restart that
+    // dropped the NOW dispatcher.  Address the AP by its live AP MAC (not
+    // the source board's base/STA MAC), then prove the reverse reply path to
+    // the associated target's normal station identity.  These are bounded
+    // service exchanges, not a host monitor observation.
+    let (e6_ap_now, e7_sta_now) = complete_action_check(
+        &mut target_session,
+        &mut source_session,
+        ap_mac,
+        0x4D50_A6_0011,
+        &format!("associated NOW {} STA -> {} AP", target.name, source.name),
+    );
+    assert!(
+        e6_ap_now.counters.rx_parser_accepted > 0
+            && e7_sta_now.counters.raw_client_stream_packets > 0,
+        "associated STA->AP NOW did not complete: ap={} sta={}",
+        snapshot_summary(&e6_ap_now),
+        snapshot_summary(&e7_sta_now),
+    );
+    let (e7_sta_now, e6_ap_now) = complete_action_check(
+        &mut source_session,
+        &mut target_session,
+        configured_mac(target),
+        0x4D50_A6_0012,
+        &format!("associated NOW {} AP -> {} STA", source.name, target.name),
+    );
+    assert!(
+        e7_sta_now.counters.rx_parser_accepted > 0
+            && e6_ap_now.counters.raw_client_stream_packets > 0,
+        "associated AP->STA NOW did not complete: ap={} sta={}",
+        snapshot_summary(&e6_ap_now),
+        snapshot_summary(&e7_sta_now),
+    );
+    eprintln!(
+        "firmware-e2e row=usb-esp-pair-associated-now source={} target={} ap=({}) sta=({})",
+        source.name,
+        target.name,
+        snapshot_summary(&e6_ap_now),
+        snapshot_summary(&e7_sta_now),
+    );
+
+    // The pair owns both radio personalities, so measure sustained NOW on
+    // this exact associated AP/STA epoch before replacing it with UDP6 work.
+    // This is intentionally bidirectional: the physical action callback and
+    // the client-side one-shot ACK/PTO scheduler are distinct on each board.
+    // `e2e_now_bytes` is externally bounded and streamed through QUIC-lite;
+    // neither board retains the requested payload in memory.
+    let now_bytes = e2e_now_bytes();
+    let (_, target_now_bulk) = complete_action_iperf_bytes(
+        &mut target_session,
+        &mut source_session,
+        ap_mac,
+        now_bytes,
+        &format!(
+            "associated NOW {} STA -> {} AP bulk",
+            target.name, source.name
+        ),
+    );
+    assert_eq!(
+        target_now_bulk.raw_service_bytes,
+        Some(now_bytes as u32),
+        "{} STA->{} AP NOW bulk completion",
+        target.name,
+        source.name,
+    );
+    let (_, source_now_bulk) = complete_action_iperf_bytes(
+        &mut source_session,
+        &mut target_session,
+        configured_mac(target),
+        now_bytes,
+        &format!(
+            "associated NOW {} AP -> {} STA bulk",
+            source.name, target.name
+        ),
+    );
+    assert_eq!(
+        source_now_bulk.raw_service_bytes,
+        Some(now_bytes as u32),
+        "{} AP->{} STA NOW bulk completion",
+        source.name,
+        target.name,
+    );
+
+    snapshot(&mut source_session, RAW_WIFI_METHOD_RESET_COUNTERS);
+    snapshot(&mut target_session, RAW_WIFI_METHOD_RESET_COUNTERS);
+    // Keep this board-to-board row aligned with the configurable UDP6
+    // measurement size used elsewhere in the prober.  The default is 64 KiB
+    // (rather than a handshake-sized 4 KiB sample); callers can raise it with
+    // DMESH_E2E_UDP6_BYTES without changing the generic pair implementation.
+    let udp_bytes = udp6_transfer_bytes();
+    let expected_udp_bytes = u32::try_from(udp_bytes)
+        .expect("DMESH_E2E_UDP6_BYTES must fit the embedded raw client counter");
+    let mut wire = [0u8; 64];
+    let used = encode_raw_wifi_iperf_request(
+        RawWifiIperfRequest {
+            peer: ap_mac,
+            bytes: udp_bytes,
+            packet_size: E2E_UDP6_PACKET_SIZE,
+            timeout_ms: E2E_UDP6_TRANSFER_DEADLINE.as_millis() as u32,
+            bearer: RawWifiBearer::Udp6,
+        },
+        &mut wire,
+    )
+    .expect("bounded e7-to-e6 UDP6 request");
+    assert_eq!(
+        radio_request(&mut target_session, &wire[..used]).raw_service_active,
+        Some(true),
+        "e7 UDP6 client admission"
+    );
+    let udp_deadline = Instant::now() + E2E_UDP6_TRANSFER_DEADLINE;
+    let target_udp = loop {
+        let target_snapshot = snapshot(&mut target_session, RAW_WIFI_METHOD_SNAPSHOT);
+        // `raw_service_bytes` is a lifetime diagnostic, not a per-request
+        // sequence number.  A completed earlier IPERF transfer may therefore
+        // leave the requested byte count in this field.  Require the AP-side
+        // raw UDP6 delivery counter to advance after RESET_COUNTERS as well:
+        // this path dispatches straight to the raw service, so the generic
+        // action-frame parser counter correctly remains zero.  Without this
+        // peer-side evidence a stale client result could turn a failed
+        // cross-device transfer into a passing test row.
+        let source_after = snapshot(&mut source_session, RAW_WIFI_METHOD_SNAPSHOT);
+        if target_snapshot.raw_service_active == Some(false)
+            && target_snapshot.raw_service_bytes == Some(expected_udp_bytes)
+            && target_snapshot.counters.raw_client_receive_errors == 0
+            && source_after.counters.udp6_udp_delivered > 0
+        {
+            break target_snapshot;
+        }
+        assert!(
+            Instant::now() < udp_deadline,
+            "{}-to-{} UDP6 did not complete: {}",
+            target.name,
+            source.name,
+            snapshot_summary(&target_snapshot)
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    let source_udp = snapshot(&mut source_session, RAW_WIFI_METHOD_SNAPSHOT);
+    assert!(
+        source_udp.counters.udp6_udp_delivered > 0,
+        "{} did not deliver {} UDP6 service: {}",
+        source.name,
+        target.name,
+        snapshot_summary(&source_udp)
+    );
+    // Print the completed data-plane measurement before the independent NAN
+    // postcondition.  This preserves the 64 KiB WPA/open result when NAN is
+    // the only failing subsystem, rather than making a control-plane failure
+    // look like a packet-pool or UDP6 throughput failure.
+    eprintln!(
+        "firmware-e2e row=usb-esp-pair security={} source={} target={} source_nan_bssid={:?} target_nan_bssid={:?} udp6_source=({}) udp6_target=({})",
+        if open { "open" } else { "wpa2-psk" },
+        source.name,
+        target.name,
+        source_udp.comparator_bssid,
+        target_udp.comparator_bssid,
+        snapshot_summary(&source_udp),
+        snapshot_summary(&target_udp),
+    );
+
+    // STA association and NAN timing acquisition are independent driver
+    // transitions.  The target can already carry UDP6 while its first
+    // 15-second post-replacement NAN acquisition interval is still looking
+    // for a beacon; asserting immediately here falsely reports a working
+    // receiver as a NAN failure.  Five seconds remains the normal expected
+    // rendezvous time for an established cluster, while the full firmware
+    // acquisition budget is an explicit, bounded diagnostic allowance.
+    let nan_started = Instant::now();
+    let nan_deadline = nan_started + Duration::from_secs(15);
+    let (source_before_nan, target_before_nan, nan_bssid) = loop {
+        let source_snapshot = snapshot(&mut source_session, RAW_WIFI_METHOD_SNAPSHOT);
+        let target_snapshot = snapshot(&mut target_session, RAW_WIFI_METHOD_SNAPSHOT);
+        if let (Some(source_bssid), Some(target_bssid)) = (
+            source_snapshot.comparator_bssid,
+            target_snapshot.comparator_bssid,
+        ) {
+            if source_bssid == target_bssid {
+                let elapsed = nan_started.elapsed();
+                if elapsed > Duration::from_secs(5) {
+                    eprintln!(
+                        "firmware-e2e NAN pair acquisition warning source={} target={} elapsed_ms={}",
+                        source.name,
+                        target.name,
+                        elapsed.as_millis(),
+                    );
+                }
+                break (source_snapshot, target_snapshot, target_bssid);
+            }
+        }
+        assert!(
+            Instant::now() < nan_deadline,
+            "{} and {} did not select one NAN cluster within {:?}: source={} target={}",
+            source.name,
+            target.name,
+            Duration::from_secs(15),
+            snapshot_summary(&source_snapshot),
+            snapshot_summary(&target_snapshot),
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        source_before_nan.comparator_bssid,
+        Some(nan_bssid),
+        "pair must share one NAN cluster before source schedules Service Info"
+    );
+    let request = ControlRequest::SettingsList;
+    let mut command = [0u8; 64];
+    let used = control::encode_request(request, Some(0x4D50_A6_0003), &mut command).unwrap();
+    let mut frame = dmesh_rawnan::build_nan_usd_sdf(
+        configured_nan_mac(target),
+        configured_nan_mac(source),
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        7,
+        0x11,
+        &command[..used],
+    );
+    // The e6 raw-radio adapter queues NAN SDFs until its next DW. The frame
+    // must use the shared NAN cluster BSSID, not the AP BSSID used for UDP6.
+    frame[16..22].copy_from_slice(&nan_bssid);
+    let nan_deadline = Instant::now() + Duration::from_secs(5);
+    let mut next_nan_send = Instant::now();
+    loop {
+        // NAN Service Discovery is an unacknowledged management action.  A
+        // single directed frame can overlap a dwell boundary, especially
+        // immediately after STA association.  Re-send the same idempotent
+        // SettingsList probe during this bounded observation window instead
+        // of turning one missed management frame into a chip-specific result.
+        if Instant::now() >= next_nan_send {
+            send_raw_action(&mut source_session, &frame, RawWifiInterface::Ap);
+            next_nan_send = Instant::now() + Duration::from_millis(250);
+        }
+        let target_snapshot = snapshot(&mut target_session, RAW_WIFI_METHOD_SNAPSHOT);
+        if target_snapshot.counters.nan_service_info_matched
+            > target_before_nan.counters.nan_service_info_matched
+            && target_snapshot.counters.nan_service_info_enqueued
+                > target_before_nan.counters.nan_service_info_enqueued
+        {
+            eprintln!(
+                "firmware-e2e row=usb-esp-pair-nan security={} source={} target={} nan_target=({})",
+                if open { "open" } else { "wpa2-psk" },
+                source.name,
+                target.name,
+                snapshot_summary(&target_snapshot),
+            );
+            break;
+        }
+        if Instant::now() >= nan_deadline {
+            // Capture e6's submit counters only at the bounded failure
+            // boundary. Sampling it on every retry would add control traffic
+            // to the same narrow DW cadence being diagnosed.
+            let source_snapshot = snapshot(&mut source_session, RAW_WIFI_METHOD_SNAPSHOT);
+            panic!(
+                "{} did not receive {} NAN Service Info after UDP6: target={} source={}",
+                target.name,
+                source.name,
+                snapshot_summary(&target_snapshot),
+                snapshot_summary(&source_snapshot),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Focused host-to-device UDP6 performance gate.
@@ -3529,6 +4541,17 @@ fn e2e_sta_driver_tx() -> bool {
         Err(_) | Ok("1" | "on") => true,
         Ok("0" | "off") => false,
         Ok(value) => panic!("DMESH_E2E_STA_DRIVER_TX must be 0, 1, on, or off, got {value:?}"),
+    }
+}
+
+/// The secure DMesh AP is the normal pair-probe baseline.  Open mode is an
+/// explicit comparison requested by an operator; it is never inferred from a
+/// missing passphrase, so production callers cannot silently downgrade WPA2.
+fn e2e_pair_open_mode() -> bool {
+    match std::env::var("DMESH_E2E_OPEN") .as_deref() {
+        Err(_) | Ok("0" | "off") => false,
+        Ok("1" | "on") => true,
+        Ok(value) => panic!("DMESH_E2E_OPEN must be 0, 1, off, or on, got {value:?}"),
     }
 }
 
@@ -3705,11 +4728,14 @@ fn complete_action_iperf_bytes(
 ) {
     snapshot(client, RAW_WIFI_METHOD_RESET_COUNTERS);
     snapshot(source, RAW_WIFI_METHOD_RESET_COUNTERS);
+    let timeout_ms = u32::try_from(e2e_now_iperf_timeout_ms(bytes))
+        .expect("NOW timeout fits firmware u32")
+        .clamp(1_000, dmesh_server::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS);
     let request = RawWifiIperfRequest {
         peer,
         bytes,
-        packet_size: E2E_UDP6_PACKET_SIZE,
-        timeout_ms: 20_000,
+        packet_size: u16::try_from(e2e_now_packet_size()).expect("NOW packet size fits u16"),
+        timeout_ms,
         bearer: RawWifiBearer::Now,
     };
     let mut wire = [0u8; 64];
@@ -3722,10 +4748,40 @@ fn complete_action_iperf_bytes(
     );
     let started = Instant::now();
     let complete = loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(25),
-            "{label} action IPERF deadline; last={initial:?}"
-        );
+        if started.elapsed() >= Duration::from_millis(u64::from(timeout_ms) + 5_000) {
+            // The initial snapshot only proves that the initiating firmware
+            // admitted and submitted its OPEN.  Capture both USB-visible
+            // endpoints at the deadline so a failed action IPERF can tell
+            // apart a lost frame, a receiver/parser rejection, and a client
+            // timer that never advanced beyond bootstrap.
+            let client_last = snapshot(client, RAW_WIFI_METHOD_SNAPSHOT);
+            let source_last = snapshot(source, RAW_WIFI_METHOD_SNAPSHOT);
+            let diagnostics = |session: &DeviceSession| {
+                session
+                    .recent_events()
+                    .filter_map(|event| match event {
+                        // Raw-Wi-Fi snapshots are large tagged-CBOR records.
+                        // They are already printed above, so dumping every
+                        // historical snapshot here hides the concise status
+                        // text that explains a transport failure.
+                        DeviceSessionEvent::DirectRecord(record) => decode_status_text(record)
+                            .and_then(|text| core::str::from_utf8(text).ok())
+                            .filter(|text| text.contains("raw service") || text.contains("espnow"))
+                            .map(str::to_owned),
+                        DeviceSessionEvent::Diagnostic(text) => text
+                            .contains("raw service")
+                            .then(|| text.clone()),
+                        DeviceSessionEvent::TransportPacket(_) => None,
+                    })
+                    .take(32)
+                    .collect::<Vec<_>>()
+            };
+            panic!(
+                "{label} action IPERF deadline; initial={initial:?}; client_last={client_last:?}; source_last={source_last:?}; client_diagnostics={:?}; source_diagnostics={:?}",
+                diagnostics(client),
+                diagnostics(source),
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
         let snapshot = snapshot(client, RAW_WIFI_METHOD_SNAPSHOT);
         if snapshot.raw_service_active == Some(false)
@@ -3747,10 +4803,7 @@ fn complete_action_iperf_bytes(
         snapshot_summary(&source_snapshot),
         snapshot_summary(&complete),
     );
-    assert_eq!(
-        complete.raw_service_bytes,
-        Some(bytes as u32)
-    );
+    assert_eq!(complete.raw_service_bytes, Some(bytes as u32));
     assert_eq!(complete.counters.raw_client_receive_errors, 0);
     assert!(
         source_snapshot.counters.rx_parser_accepted > 0,
@@ -3838,8 +4891,16 @@ fn control_request(session: &mut DeviceSession, request: ControlRequest<'_>, id:
     let used = control::encode_request(request, Some(id), &mut wire)
         .unwrap_or_else(|| panic!("encode common control request"));
     let history_before = session.recent_events().len();
-    let matched = session
-        .request_direct_record_until(&wire[..used], COMMAND_TIMEOUT, |event| {
+    // A transport.start response is emitted before its radio transition is
+    // queued, but a newly opened USB adapter can still race the preceding
+    // transition's UART drain.  Retry this idempotent tagged request a small,
+    // bounded number of times rather than turning the pair test into a
+    // board-specific startup delay.  The stable request ID lets the firmware
+    // and the assertion identify one logical operation across attempts.
+    let mut matched = false;
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match session.request_direct_record_until(&wire[..used], COMMAND_TIMEOUT, |event| {
             matches!(
                 event,
                 DeviceSessionEvent::DirectRecord(record)
@@ -3849,11 +4910,21 @@ fn control_request(session: &mut DeviceSession, request: ControlRequest<'_>, id:
                             && response.error.is_none()
                     })
             )
-        })
-        .unwrap_or_else(|error| panic!("{} control request: {error}", session.path()));
+        }) {
+            Ok(true) => {
+                matched = true;
+                break;
+            }
+            Ok(false) => {}
+            Err(error) => last_error = Some(error),
+        }
+        if attempt != 2 {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
     assert!(
         matched,
-        "{} did not return tagged control response id={id}; records={:?}",
+        "{} did not return tagged control response id={id}; last_error={last_error:?}; records={:?}",
         session.path(),
         session
             .recent_events()
@@ -3885,7 +4956,11 @@ fn collect_transition_markers(
     while Instant::now() < deadline {
         let _ = session.poll(Duration::from_millis(50));
         let received_at = Instant::now();
-        let events = session.recent_events().skip(seen).cloned().collect::<Vec<_>>();
+        let events = session
+            .recent_events()
+            .skip(seen)
+            .cloned()
+            .collect::<Vec<_>>();
         seen += events.len();
         for event in events {
             if let DeviceSessionEvent::DirectRecord(record) = event {
@@ -3928,7 +5003,7 @@ fn firmware_e7_transition_markers_timing() {
                 nan_dw_interval: Some(8),
                 now: Some(2),
                 ap: Some(0),
-                uart: Some(0),
+                uart: Some(dmesh_server::firmware_profile::UART_OFF),
                 ..dmesh_server::control::TransportConfig::default()
             },
         },
@@ -3937,8 +5012,14 @@ fn firmware_e7_transition_markers_timing() {
     let started = Instant::now();
     let markers = collect_transition_markers(&mut e7, Duration::from_secs(2), history_before);
     let kinds = markers.iter().map(|(_, kind)| *kind).collect::<Vec<_>>();
-    assert!(kinds.contains(&ANNOUNCE_TRANSITION_BEGIN), "missing transition begin: {kinds:?}");
-    assert!(kinds.contains(&ANNOUNCE_SLEEP_PENDING), "missing sleep pending: {kinds:?}");
+    assert!(
+        kinds.contains(&ANNOUNCE_TRANSITION_BEGIN),
+        "missing transition begin: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&ANNOUNCE_SLEEP_PENDING),
+        "missing sleep pending: {kinds:?}"
+    );
     let pending = markers
         .iter()
         .find(|(_, kind)| *kind == ANNOUNCE_SLEEP_PENDING)
@@ -4003,7 +5084,10 @@ fn firmware_e6_activates_e7_nan_ap() {
     match DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None) {
         Ok(mut e7) => {
             let radio = snapshot(&mut e7, RAW_WIFI_METHOD_SNAPSHOT);
-            eprintln!("e7 NAN/AP activation snapshot: {}", snapshot_summary(&radio));
+            eprintln!(
+                "e7 NAN/AP activation snapshot: {}",
+                snapshot_summary(&radio)
+            );
         }
         Err(error) => eprintln!("e7 UART unavailable after NAN/AP activation: {error}"),
     }
@@ -4115,11 +5199,7 @@ fn firmware_e6_repeats_active_nan_wake() {
             .block_on(async {
                 let mut client = timeout(
                     Duration::from_secs(2),
-                    UdpClient::connect(
-                        bind,
-                        peer,
-                        ConnectionId::new(0xE6_7A00_02).unwrap(),
-                    ),
+                    UdpClient::connect(bind, peer, ConnectionId::new(0xE6_7A00_02).unwrap()),
                 )
                 .await
                 .map_err(|_| "UDP6 wake bootstrap timeout".to_owned())?
@@ -4483,39 +5563,66 @@ fn android_sta_to_e6_open_ap_keeps_nan_sd() {
     let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
     let android = std::env::var("DMESH_E2E_ANDROID")
         .expect("DMESH_E2E_ANDROID must name the Pixel 7 adb serial");
-    control_request(&mut e6, ControlRequest::TransportStart {
-        kind: TransportKind::Nan,
-        config: dmesh_server::control::TransportConfig {
-            channel: Some(6), now: Some(0), nan_dw_interval: Some(1), ap: Some(1),
-            ..dmesh_server::control::TransportConfig::default()
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(0),
+                nan_dw_interval: Some(1),
+                ap: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
         },
-    }, 0xE6_4150_37);
+        0xE6_4150_37,
+    );
     let deadline = Instant::now() + Duration::from_secs(6);
     let ap = loop {
         let snapshot = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
-        if snapshot.ap_active == Some(true) && snapshot.sta_associated == Some(false)
-            && snapshot.nan_dw_interval == Some(1) { break snapshot; }
-        assert!(Instant::now() < deadline, "e6 NAN+AP start: {}", snapshot_summary(&snapshot));
+        if snapshot.ap_active == Some(true)
+            && snapshot.sta_associated == Some(false)
+            && snapshot.nan_dw_interval == Some(1)
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 NAN+AP start: {}",
+            snapshot_summary(&snapshot)
+        );
         thread::sleep(Duration::from_millis(200));
     };
     assert_eq!(ap.ap_active, Some(true), "e6 AP start: {ap:?}");
     assert_eq!(ap.channel, Some(6), "e6 AP channel: {ap:?}");
     let mac = ap.ap_mac.expect("e6 AP MAC");
-    let ssid = format!("DIRECT-{:02X}{:02X}{:02X}-dmesh", mac[3], mac[4], mac[5]);
-    let bssid = mac.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(":");
-    let attach = android_json_command(&android, serde_json::json!({
-        "id": "pixel7-e6-ap-sta",
-        "method": "wifi.transport.start",
-        "data": {"mode": "sta", "ssid": ssid, "bssid": bssid, "ap": "0"},
-    }));
-    assert!(attach.contains("ap_stopped"), "Android STA request: {attach}");
+    let ssid = "DIRECT-dmesh";
+    let bssid = mac
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let attach = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "pixel7-e6-ap-sta",
+            "method": "wifi.transport.start",
+            "data": {"mode": "sta", "ssid": ssid, "bssid": bssid, "ap": "0"},
+        }),
+    );
+    assert!(
+        attach.contains("ap_stopped"),
+        "Android STA request: {attach}"
+    );
     thread::sleep(Duration::from_secs(3));
 
     let before = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
     let cbor = ControlRequest::TransportStart {
         kind: TransportKind::Nan,
         config: dmesh_server::control::TransportConfig {
-            channel: Some(6), now: Some(0), nan_dw_interval: Some(1),
+            channel: Some(6),
+            now: Some(0),
+            nan_dw_interval: Some(1),
             ..dmesh_server::control::TransportConfig::default()
         },
     };
@@ -4525,23 +5632,44 @@ fn android_sta_to_e6_open_ap_keeps_nan_sd() {
         "content call --uri content://com.github.costinm.dmesh.lm.shell --method command --arg 'wifi.nan.sd cbor_hex={}'",
         hex(&wire[..used])
     );
-    let output = Command::new("adb").args(["-s", &android, "shell", &command])
-        .output().expect("Pixel 7 NAN SD command");
-    assert!(output.status.success(), "Pixel 7 NAN SD: {}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("adb")
+        .args(["-s", &android, "shell", &command])
+        .output()
+        .expect("Pixel 7 NAN SD command");
+    assert!(
+        output.status.success(),
+        "Pixel 7 NAN SD: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         let after = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
-        if after.counters.delta_since(before.counters).nan_service_info_enqueued != 0 {
-            eprintln!("Pixel7 STA->e6 AP retained NAN SD: {}", snapshot_summary(&after));
+        if after
+            .counters
+            .delta_since(before.counters)
+            .nan_service_info_enqueued
+            != 0
+        {
+            eprintln!(
+                "Pixel7 STA->e6 AP retained NAN SD: {}",
+                snapshot_summary(&after)
+            );
             break;
         }
-        assert!(Instant::now() < deadline, "e6 did not receive Pixel7 NAN SD while AP owner: {}", snapshot_summary(&after));
+        assert!(
+            Instant::now() < deadline,
+            "e6 did not receive Pixel7 NAN SD while AP owner: {}",
+            snapshot_summary(&after)
+        );
         thread::sleep(Duration::from_millis(250));
     }
-    let _ = android_json_command(&android, serde_json::json!({
-        "id": "pixel7-e6-ap-detach", "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "0"},
-    }));
+    let _ = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "pixel7-e6-ap-detach", "method": "wifi.transport.start",
+            "data": {"mode": "nan", "ap": "0"},
+        }),
+    );
 }
 
 /// Exercise Android's Wi-Fi Direct Group Owner capability without modifying
@@ -4579,6 +5707,7 @@ fn android_ap_capability_probe() {
                 mode: ProbeMode::NAN_NOW,
                 bssid: None,
             },
+            activation: ProbeActivation::Usb,
             test_nan: false,
             test_nan_data: false,
             test_now: false,
@@ -4604,6 +5733,10 @@ fn android_ap_capability_probe() {
             last_result: "android_ap_capability_probe".to_owned(),
             last_seen_unix_ms: 0,
             soft_ap: Some(response.source_mode.soft_ap.succeeded),
+            local_ap_p2p_sd: None,
+            local_ap_p2p_sd_error: None,
+            p2p_go_nan_restores: None,
+            p2p_go_cleanup_detail: None,
             scan_ap_count: response.source_scan.ap_count,
             scan_channel6_ap_count: response.source_scan.channel6_ap_count,
             scan_dmesh_ap_count: response.source_scan.dmesh_ap_count,
@@ -4613,9 +5746,11 @@ fn android_ap_capability_probe() {
 }
 
 /// First live Android-to-Android UDP6-association row. Pixel 7 is the
-/// fixed-channel P2P GO and Pixel 3a is an ordinary WPA2 STA client; this is
-/// intentionally the same AP/P2P/STA shape used for ESP clients, not a
-/// special Android data path. The controller requires both apps to observe a
+/// fixed-channel P2P GO and Pixel 3a is the requested P2P client. This is
+/// intentionally a P2P association rather than a generic Android STA request:
+/// Android is expected to retain ordinary STA when possible while P2P owns its
+/// group client. The controller records the interface state on both ends and
+/// requires both apps to observe a
 /// fresh `ff02::5227:5227` announce before it may use a learned scoped IPv6
 /// address for a one-way datagram, QUIC-lite, or IPERF.
 ///
@@ -4626,7 +5761,7 @@ fn android_ap_capability_probe() {
 ///   --arg '{"id":"p7-go","method":"wifi.transport.start","data":{"mode":"nan","ap":"1"}}'
 /// adb -s "$DMESH_E2E_ANDROID_P3A" shell content call \
 ///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
-///   --arg '{"id":"p3-sta","method":"wifi.transport.start","data":{"mode":"sta","ssid":"DIRECT-dm-dmesh","passphrase":"untrusted-open-mode","ap":"0"}}'
+///   --arg '{"id":"p3-p2p","method":"wifi.p2p.connect","data":{}}'
 /// adb -s "$DMESH_E2E_ANDROID_P7" shell content call \
 ///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
 ///   --arg '{"id":"p7-devices","method":"radio.devices"}'
@@ -4645,15 +5780,19 @@ fn android_p2p_udp6_association_probe() {
         source: ProbeEndpoint {
             kind: ProbeEndpointKind::Android,
             node: [0; 6],
-            mode: ProbeMode { ap: true, ..ProbeMode::NAN_NOW },
+            mode: ProbeMode {
+                ap: true,
+                ..ProbeMode::NAN_NOW
+            },
             bssid: None,
         },
         target: ProbeEndpoint {
             kind: ProbeEndpointKind::Android,
             node: [0; 6],
-            mode: ProbeMode::STA_NAN_NOW,
+            mode: ProbeMode::NAN_NOW,
             bssid: None,
         },
+        activation: ProbeActivation::Nan,
         test_nan: false,
         test_nan_data: false,
         test_now: false,
@@ -4668,50 +5807,85 @@ fn android_p2p_udp6_association_probe() {
 
     // Ensure the GO command does not inherit a stale temporary group. The
     // app waits for the P2P disconnect action plus requestGroupInfo(null).
-    let _ = android_json_command(&pixel7, serde_json::json!({
-        "id": "p7-p2p-clean", "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "0"},
-    }));
+    let _ = android_transport_start_wait(&pixel7, "p7-p2p-clean", "nan", "0");
     let before_source = android_known_devices(&pixel7, "p7-devices-before");
     let before_target = android_known_devices(&pixel3a, "p3-devices-before");
+    let source_interfaces_before = android_interface_state(&pixel7);
+    let target_interfaces_before = android_interface_state(&pixel3a);
     let source_before_multicast = udp_multicast_observation_count(&before_source);
     let target_before_multicast = udp_multicast_observation_count(&before_target);
 
-    let go_started = android_json_command(&pixel7, serde_json::json!({
-        "id": "p7-go", "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "1"},
-    }));
+    let go_started = android_transport_start_wait(&pixel7, "p7-go", "nan", "1");
     let source_ready = response_state_started(&go_started);
     let associated_started = Instant::now();
     let client_result = if source_ready {
-        android_json_command(&pixel3a, serde_json::json!({
-            "id": "p3-sta", "method": "wifi.transport.start",
-            "data": {
-                "mode": "sta", "ssid": "DIRECT-dm-dmesh",
-                "passphrase": "untrusted-open-mode", "ap": "0",
-            },
-        }))
+        android_json_command(
+            &pixel3a,
+            serde_json::json!({
+                "id": "p3-p2p", "method": "wifi.p2p.connect", "data": {},
+            }),
+        )
     } else {
-        "GO did not start; client request not issued".to_owned()
+        "GO did not start; P2P client request not issued".to_owned()
     };
-    let target_ready = client_result.contains("\"state\":\"associated\"");
+    let target_ready = client_result.contains("\"state\":\"connected\"");
+    let source_interfaces_after = android_interface_state(&pixel7);
+    let target_interfaces_after = android_interface_state(&pixel3a);
+    let source_p2p_index = android_p2p_interface_index(&source_interfaces_after);
+    let target_p2p_index = android_p2p_interface_index(&target_interfaces_after);
+    let source_p2p_address = android_p2p_link_local(&source_interfaces_after);
+    let target_p2p_address = android_p2p_link_local(&target_interfaces_after);
 
     // GO creation announces once before the client is connected. Reissue the
     // identical immutable GO request after the client's onAvailable callback
     // so the source sends the shared CBOR announce onto the new P2P link.
     if target_ready {
-        let _ = android_json_command(&pixel7, serde_json::json!({
-            "id": "p7-go-announce", "method": "wifi.transport.start",
-            "data": {"mode": "nan", "ap": "1"},
-        }));
+        let _ = android_transport_start_wait(&pixel7, "p7-go-announce", "nan", "1");
+        // Group callbacks already schedule bounded boot/discovery announces.
+        // Signal that same Rust-owned worker once both P2P interfaces exist,
+        // avoiding an OEM-specific callback-ordering race in this probe.
+        let _ = android_json_command(
+            &pixel7,
+            serde_json::json!({
+                "id": "p7-p2p-announce", "method": "radio.announce", "data": {},
+            }),
+        );
+        let _ = android_json_command(
+            &pixel3a,
+            serde_json::json!({
+                "id": "p3-p2p-announce", "method": "radio.announce", "data": {},
+            }),
+        );
     }
 
     let deadline = Instant::now() + Duration::from_secs(12);
+    let mut next_announce = Instant::now() + Duration::from_secs(2);
     let (source_inventory, target_inventory, multicast_ok) = loop {
+        if Instant::now() >= next_announce {
+            // Link-local multicast can become usable a short interval after
+            // the framework's P2P-connected callback. Reuse the production
+            // announce trigger at a bounded cadence while observing, rather
+            // than changing interface state or accepting a one-off packet.
+            let _ = android_json_command(
+                &pixel7,
+                serde_json::json!({
+                    "id": "p7-p2p-announce-retry", "method": "radio.announce", "data": {},
+                }),
+            );
+            let _ = android_json_command(
+                &pixel3a,
+                serde_json::json!({
+                    "id": "p3-p2p-announce-retry", "method": "radio.announce", "data": {},
+                }),
+            );
+            next_announce = Instant::now() + Duration::from_secs(2);
+        }
         let source_inventory = android_known_devices(&pixel7, "p7-devices-after");
         let target_inventory = android_known_devices(&pixel3a, "p3-devices-after");
-        let source_seen = udp_multicast_observation_count(&source_inventory) > source_before_multicast;
-        let target_seen = udp_multicast_observation_count(&target_inventory) > target_before_multicast;
+        let source_seen = source_p2p_index
+            .is_some_and(|index| p2p_udp_multicast_observation_count(&source_inventory, index) > 0);
+        let target_seen = target_p2p_index
+            .is_some_and(|index| p2p_udp_multicast_observation_count(&target_inventory, index) > 0);
         if source_seen && target_seen {
             break (source_inventory, target_inventory, true);
         }
@@ -4721,56 +5895,177 @@ fn android_p2p_udp6_association_probe() {
         thread::sleep(Duration::from_millis(250));
     };
     let association_elapsed = u32::try_from(associated_started.elapsed().as_millis()).ok();
+    // Manual equivalent (after the group has formed):
+    // `adb -s <source> shell content call ... method=radio.probe.udp6_echo
+    // data={address:<target P2P IPv6>,scope:<source P2P ifindex>,port:3336}`.
+    // Each side owns its local scope; do not use the remote interface index.
+    let source_echo = match (&target_p2p_address, source_p2p_index) {
+        (Some(address), Some(scope)) if multicast_ok => android_json_command(
+            &pixel7,
+            serde_json::json!({
+                "id": "p7-p2p-echo", "method": "radio.probe.udp6_echo",
+                "data": {"address": address, "scope": scope, "port": 3336,
+                    "payload": "p7-to-p3"},
+            }),
+        ),
+        _ => "P2P multicast/address evidence unavailable".to_owned(),
+    };
+    let target_echo = match (&source_p2p_address, target_p2p_index) {
+        (Some(address), Some(scope)) if multicast_ok => android_json_command(
+            &pixel3a,
+            serde_json::json!({
+                "id": "p3-p2p-echo", "method": "radio.probe.udp6_echo",
+                "data": {"address": address, "scope": scope, "port": 3336,
+                    "payload": "p3-to-p7"},
+            }),
+        ),
+        _ => "P2P multicast/address evidence unavailable".to_owned(),
+    };
+    // `content call` renders the nested Rust result as ordinary JSON inside
+    // its Bundle text. History serialization escapes those quotes later, but
+    // the direct command output itself contains `"ok":true`.
+    let quic_lite_ok = source_echo.contains("\"ok\":true") && target_echo.contains("\"ok\":true");
+    // The shared Android Rust handler uses the same SERVICE_IPERF schema as
+    // host and firmware.  Exercise it in both directions after multicast has
+    // established each caller's scoped link-local destination; a P2P group
+    // or a successful framework callback alone is not a usable mesh bearer.
+    // Manual equivalent (after the group has formed):
+    // `adb -s <source> shell content call ... method=radio.probe.udp6_iperf
+    // data={address:<target P2P IPv6>,scope:<source P2P ifindex>,port:3336,
+    // bytes:65536,packet_size:1100}`.
+    let source_iperf = match (&target_p2p_address, source_p2p_index) {
+        (Some(address), Some(scope)) if multicast_ok => android_json_command(
+            &pixel7,
+            serde_json::json!({
+                "id": "p7-p2p-iperf", "method": "radio.probe.udp6_iperf",
+                "data": {"address": address, "scope": scope, "port": 3336,
+                    "bytes": 65_536, "packet_size": 1_100},
+            }),
+        ),
+        _ => "P2P multicast/address evidence unavailable".to_owned(),
+    };
+    let target_iperf = match (&source_p2p_address, target_p2p_index) {
+        (Some(address), Some(scope)) if multicast_ok => android_json_command(
+            &pixel3a,
+            serde_json::json!({
+                "id": "p3-p2p-iperf", "method": "radio.probe.udp6_iperf",
+                "data": {"address": address, "scope": scope, "port": 3336,
+                    "bytes": 65_536, "packet_size": 1_100},
+            }),
+        ),
+        _ => "P2P multicast/address evidence unavailable".to_owned(),
+    };
+    let iperf_ok = source_iperf.contains("\"ok\":true") && target_iperf.contains("\"ok\":true");
+    let udp6_association = ProbeUdp6AssociationResult {
+        attempted: true,
+        source_ready,
+        target_ready,
+        multicast: ProbeMeasurement {
+            attempted: true,
+            succeeded: multicast_ok,
+            ..ProbeMeasurement::default()
+        },
+        // The regular DMesh announce is the pre-QUIC one-way application
+        // datagram. Both endpoints must record the fresh P2P-scoped
+        // multicast record before directed QUIC-lite traffic is attempted.
+        one_way: ProbeMeasurement {
+            attempted: true,
+            succeeded: multicast_ok,
+            ..ProbeMeasurement::default()
+        },
+        quic_lite: ProbeMeasurement {
+            attempted: multicast_ok,
+            succeeded: quic_lite_ok,
+            ..ProbeMeasurement::default()
+        },
+        iperf: ProbeMeasurement {
+            attempted: multicast_ok,
+            succeeded: iperf_ok,
+            bytes: iperf_ok.then_some(131_072),
+            ..ProbeMeasurement::default()
+        },
+    };
     let response = ProbeResponse {
         request_id: request.request_id,
+        source_discovery: dmesh_server::probe::ProbeDiscoveryResult::default(),
+        target_discovery: dmesh_server::probe::ProbeDiscoveryResult::default(),
+        selected_target: dmesh_server::probe::ProbeSelectedTarget::default(),
         source_mode: ProbeModeResult {
-            attempted: true, succeeded: source_ready, ap_active: Some(source_ready),
+            attempted: true,
+            succeeded: source_ready,
+            ap_active: Some(source_ready),
             ..ProbeModeResult::default()
         },
         target_mode: ProbeModeResult {
-            attempted: true, succeeded: target_ready, associated: Some(target_ready),
+            attempted: true,
+            succeeded: target_ready,
+            associated: Some(target_ready),
             elapsed_us: association_elapsed.map(|value| u64::from(value) * 1_000),
             ..ProbeModeResult::default()
         },
         nan: ProbeMeasurement::default(),
         nan_data: ProbeMeasurement::default(),
         now: ProbeMeasurement::default(),
-        udp6_association: ProbeUdp6AssociationResult {
+        udp6_association,
+        udp6: ProbeMeasurement {
             attempted: true,
-            source_ready,
-            target_ready,
-            multicast: ProbeMeasurement { attempted: true, succeeded: multicast_ok, ..ProbeMeasurement::default() },
-            // These stages are intentionally not attempted until multicast
-            // yields a scoped IPv6 peer address. The next executor change
-            // sends raw datagram, QUIC-lite, and IPERF using that observation.
-            one_way: ProbeMeasurement::default(),
-            quic_lite: ProbeMeasurement::default(),
-            iperf: ProbeMeasurement::default(),
+            succeeded: udp6_association.completed(),
+            ..ProbeMeasurement::default()
         },
-        udp6: ProbeMeasurement { attempted: true, succeeded: multicast_ok, ..ProbeMeasurement::default() },
         source_scan: ProbeScanResult::default(),
         target_scan: ProbeScanResult::default(),
-        recommendation: if multicast_ok { 3 } else { 0 },
+        recommendation: if udp6_association.completed() { 3 } else { 0 },
     };
-    record_pair_probe(&source, &target, PairProbeStatus {
-        peer: String::new(), test: "udp6-association".to_owned(),
-        last_result: format!("{response:?}; go={go_started}; client={client_result}; source_inventory={source_inventory}; target_inventory={target_inventory}"),
-        last_seen_unix_ms: 0, sta_associated: Some(target_ready),
-        association_ms: association_elapsed, ..PairProbeStatus::default()
-    });
-
-    let _ = android_json_command(&pixel3a, serde_json::json!({
-        "id": "p3-p2p-clean", "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "0"},
-    }));
-    let _ = android_json_command(&pixel7, serde_json::json!({
-        "id": "p7-p2p-clean", "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "0"},
-    }));
+    let _ = android_transport_start_wait(&pixel3a, "p3-p2p-clean", "nan", "0");
+    let _ = android_transport_start_wait(&pixel7, "p7-p2p-clean", "nan", "0");
+    // Cleanup acknowledgement means the group is gone, not that NAN survived
+    // the P2P replacement. Record the independently reported baseline for
+    // the controller/device history; this remains capability evidence rather
+    // than an assertion until the current Pixels support that coexistence.
+    let source_nan_after = android_json_command(
+        &pixel7,
+        serde_json::json!({
+            "id": "p7-nan-after-p2p", "method": "wifi.nan.status", "data": {},
+        }),
+    );
+    let target_nan_after = android_json_command(
+        &pixel3a,
+        serde_json::json!({
+            "id": "p3-nan-after-p2p", "method": "wifi.nan.status", "data": {},
+        }),
+    );
+    record_pair_probe(
+        &source,
+        &target,
+        PairProbeStatus {
+            peer: String::new(),
+            test: "udp6-association".to_owned(),
+            last_result: format!(
+                "{response:?}; go={go_started}; client={client_result}; source_echo={source_echo}; target_echo={target_echo}; source_iperf={source_iperf}; target_iperf={target_iperf}; source_nan_after={source_nan_after}; target_nan_after={target_nan_after}; source_inventory={source_inventory}; target_inventory={target_inventory}; source_interfaces_before={source_interfaces_before:?}; source_interfaces_after={source_interfaces_after:?}; target_interfaces_before={target_interfaces_before:?}; target_interfaces_after={target_interfaces_after:?}; source_p2p_index={source_p2p_index:?}; target_p2p_index={target_p2p_index:?}; source_p2p_address={source_p2p_address:?}; target_p2p_address={target_p2p_address:?}; unrelated_source_multicast={source_before_multicast}; unrelated_target_multicast={target_before_multicast}"
+            ),
+            last_seen_unix_ms: 0,
+            sta_associated: Some(target_ready),
+            association_ms: association_elapsed,
+            ..PairProbeStatus::default()
+        },
+    );
     assert!(source_ready, "Pixel 7 P2P GO did not start: {go_started}");
-    assert!(target_ready, "Pixel 3a did not associate to Pixel 7 P2P GO: {client_result}");
-    assert!(multicast_ok,
-        "P2P association did not yield bidirectional UDP6 multicast; source={source_inventory}; target={target_inventory}");
+    assert!(
+        target_ready,
+        "Pixel 3a did not join Pixel 7 P2P GO: {client_result}"
+    );
+    assert!(
+        multicast_ok,
+        "P2P association did not yield bidirectional UDP6 multicast; source={source_inventory}; target={target_inventory}"
+    );
+    assert!(
+        quic_lite_ok,
+        "P2P multicast did not yield bidirectional scoped QUIC-lite echo; source={source_echo}; target={target_echo}"
+    );
+    assert!(
+        iperf_ok,
+        "P2P QUIC-lite echo did not yield bidirectional 64 KiB IPERF; source={source_iperf}; target={target_iperf}"
+    );
 }
 
 /// Prove the Android Wi-Fi Direct Group Owner path with the same volatile WPA2
@@ -4882,12 +6177,302 @@ fn android_p2p_go_uart_associates_e6() {
             thread::sleep(Duration::from_millis(250));
         }
     })();
-    let _ = android_json_command(&android, serde_json::json!({
-        "id": "android-e6-ap-cleanup",
-        "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "0"},
-    }));
+    let _ = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "android-e6-ap-cleanup",
+            "method": "wifi.transport.start",
+            "data": {"mode": "nan", "ap": "0"},
+        }),
+    );
     outcome
+}
+
+/// Pixel 7 LocalOnly AP state-transition gate. It deliberately uses no other
+/// Android or ESP endpoint: this proves that the platform AP replacement is
+/// released before the normal NAN publish/subscribe baseline is considered
+/// restored. The host WLAN is read-only throughout.
+///
+/// Manual equivalent:
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p7-lohs-start","method":"wifi.localap.start","data":{}}'
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p7-lohs-stop","method":"wifi.localap.stop","data":{}}'
+/// ```
+#[test]
+#[ignore = "requires the Pixel 7 DMesh service; does not change host WLAN"]
+fn pixel7_local_only_ap_restores_nan() {
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Pixel 7 adb serial");
+    let start = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p7-lohs-start", "method": "wifi.localap.start", "data": {},
+        }),
+    );
+    assert!(
+        response_state_started(&start),
+        "Pixel 7 LocalOnly AP did not start: {start}"
+    );
+    assert!(json_string_field(&start, "ssid").is_some_and(|value| !value.is_empty()));
+    assert!(json_string_field(&start, "passphrase").is_some_and(|value| !value.is_empty()));
+
+    let active_deadline = Instant::now() + Duration::from_secs(15);
+    let active = loop {
+        let cache = android_wifi_interface_cache(&android);
+        if cache.contains("type=1") && !cache.contains("aware_nmi") {
+            break cache;
+        }
+        assert!(
+            Instant::now() < active_deadline,
+            "Pixel 7 LocalOnly AP did not replace NAN: {cache}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!("Pixel7 LocalOnly active interfaces: {active}");
+
+    let stop = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p7-lohs-stop", "method": "wifi.localap.stop", "data": {},
+        }),
+    );
+    assert!(
+        stop.contains("status=sent") || stop.contains("\"state\":\"stopped\""),
+        "Pixel 7 LocalOnly stop was not accepted: {stop}"
+    );
+    let restore_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let cache = android_wifi_interface_cache(&android);
+        if cache.contains("aware_nmi") && !cache.contains("type=1") {
+            eprintln!("Pixel7 LocalOnly NAN restored interfaces: {cache}");
+            break;
+        }
+        assert!(
+            Instant::now() < restore_deadline,
+            "Pixel 7 did not restore NAN after LocalOnly AP: {cache}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Pixel 7 capability probe for the legacy credential-publication fallback:
+/// keep a LocalOnly AP alive while registering its returned WPA2 credentials
+/// through P2P DNS-SD.  This row deliberately records the framework's
+/// callback-confirmed capability instead of assuming it from API level.  On
+/// the current Pixel 7 it records `false`/`p2p_sd_add_failed_2`; a later
+/// framework change that permits advertising becomes visible to the control
+/// plane without making an expected platform limitation look like a test
+/// failure.
+///
+/// Manual equivalent:
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p7-lohs-sd-start","method":"wifi.localap.start","data":{}}'
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p7-lohs-sd","method":"wifi.localap.advertise-p2p","data":{}}'
+/// ```
+#[test]
+#[ignore = "requires the Pixel 7 DMesh service; does not change host WLAN"]
+fn pixel7_local_only_ap_p2p_sd_capability() {
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Pixel 7 adb serial");
+    let identity = android_node_identity(&android);
+    let start = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p7-lohs-sd-start", "method": "wifi.localap.start", "data": {},
+        }),
+    );
+    assert!(
+        response_state_started(&start),
+        "Pixel 7 LocalOnly AP did not start: {start}"
+    );
+
+    let advertise = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p7-lohs-sd", "method": "wifi.localap.advertise-p2p", "data": {},
+        }),
+    );
+    assert!(
+        advertise.contains("status=completed"),
+        "Pixel 7 LocalOnly/P2P-SD callback did not complete: {advertise}"
+    );
+    let advertised = advertise.contains("\"p2p_sd_state\":\"advertising\"");
+    let callback_error = json_string_field(&advertise, "p2p_sd_error")
+        .or_else(|| json_string_field(&advertise, "error"));
+    let cache = android_wifi_interface_cache(&android);
+    assert!(
+        cache.contains("type=1"),
+        "Pixel 7 LocalOnly AP disappeared while P2P-SD was requested: {cache}"
+    );
+    eprintln!(
+        "Pixel7 LocalOnly/P2P-SD advertised={advertised} error={callback_error:?} interfaces={cache}"
+    );
+    record_node_capability(
+        &identity,
+        NodeCapabilityStatus {
+            last_result: "pixel7_local_only_ap_p2p_sd".to_owned(),
+            last_seen_unix_ms: 0,
+            soft_ap: Some(true),
+            local_ap_p2p_sd: Some(advertised),
+            local_ap_p2p_sd_error: callback_error,
+            ..NodeCapabilityStatus::default()
+        },
+    );
+
+    let stop = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p7-lohs-sd-stop", "method":"wifi.localap.stop", "data": {},
+        }),
+    );
+    assert!(
+        stop.contains("status=sent") || stop.contains("\"state\":\"stopped\""),
+        "Pixel 7 LocalOnly AP stop was not accepted: {stop}"
+    );
+    let restore_deadline = Instant::now() + Duration::from_secs(35);
+    loop {
+        let restored = android_wifi_interface_cache(&android);
+        if restored.contains("aware_nmi") && !restored.contains("type=1") {
+            break;
+        }
+        assert!(
+            Instant::now() < restore_deadline,
+            "Pixel 7 did not restore NAN after LocalOnly/P2P-SD probe: {restored}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Pixel 7 P2P GO teardown capability probe. A transport result of
+/// `ap_stopped` is intentionally insufficient here: the only passing result
+/// is a new Wi-Fi Aware interface plus a live NAN publish/subscribe baseline,
+/// with the framework P2P device interface absent. The row records a current
+/// platform limitation as device capability evidence instead of hiding it
+/// behind a successful `removeGroup` acknowledgement.
+///
+/// Manual equivalent:
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p7-go-cleanup-start","method":"wifi.transport.start","data":{"mode":"nan","ap":"1"}}'
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p7-go-cleanup-stop","method":"wifi.transport.start","data":{"mode":"nan","ap":"0"}}'
+/// ```
+#[test]
+#[ignore = "requires the Pixel 7 DMesh service; records P2P-to-NAN restoration without changing host WLAN"]
+fn pixel7_p2p_go_nan_restoration_capability() {
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Pixel 7 adb serial");
+    let identity = android_node_identity(&android);
+
+    // The start command itself exercises any persisted P2P state left by a
+    // previous process. It must form a real, controller-addressable group
+    // before this row can characterize its cleanup.
+    let start = android_transport_start_wait(&android, "p7-go-cleanup-start", "nan", "1");
+    assert!(
+        response_state_started(&start),
+        "Pixel 7 P2P GO did not start: {start}"
+    );
+    let stop = android_transport_start_wait(&android, "p7-go-cleanup-stop", "nan", "0");
+    assert!(
+        stop.contains("\"state\":\"ap_stopped\""),
+        "Pixel 7 P2P GO stop did not complete group teardown: {stop}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let (nan_status, cache, restored) = loop {
+        let status = android_json_command(
+            &android,
+            serde_json::json!({
+                "id": "p7-go-cleanup-nan-status", "method": "wifi.nan.status", "data": {},
+            }),
+        );
+        let cache = android_wifi_interface_cache(&android);
+        let ready = status.contains("\"active\":\"1\"")
+            && cache.contains("aware_nmi")
+            && !cache.contains("p2p-dev-");
+        if ready || Instant::now() >= deadline {
+            break (status, cache, ready);
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
+    let detail = format!("stop={stop}; nan={nan_status}; interfaces={cache}");
+    eprintln!("Pixel7 P2P GO -> NAN restored={restored} {detail}");
+    record_node_capability(
+        &identity,
+        NodeCapabilityStatus {
+            last_result: "pixel7_p2p_go_nan_restoration".to_owned(),
+            last_seen_unix_ms: 0,
+            p2p_go_nan_restores: Some(restored),
+            p2p_go_cleanup_detail: Some(detail),
+            ..NodeCapabilityStatus::default()
+        },
+    );
+}
+
+/// A standalone P2P DNS-SD service allocation must not silently replace the
+/// normal NAN rest state.  On current Pixels `WifiP2pManager.initialize()`
+/// creates `p2p-dev-wlan0`, which prevents Aware from owning its interface;
+/// LocalMesh therefore rejects this request unless a controller has first
+/// selected a deliberate P2P epoch through `transport.start {ap:1}`.
+///
+/// Manual equivalent:
+/// ```sh
+/// adb -s "$DMESH_E2E_ANDROID" shell content call \
+///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
+///   --arg '{"id":"p2p-sd-guard","method":"wifi.p2p.advertise","data":{}}'
+/// ```
+#[test]
+#[ignore = "requires Pixel 7 DMesh service in its normal NAN baseline; no host WLAN changes"]
+fn pixel7_p2p_sd_guard_preserves_nan_baseline() {
+    let android = std::env::var("DMESH_E2E_ANDROID")
+        .expect("DMESH_E2E_ANDROID must name the Pixel 7 adb serial");
+
+    let before = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p2p-sd-guard-before", "method": "wifi.nan.status", "data": {},
+        }),
+    );
+    assert!(
+        before.contains("\"active\":\"1\""),
+        "Pixel 7 must begin this non-disruptive guard test in NAN baseline: {before}"
+    );
+
+    let rejected = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p2p-sd-guard", "method": "wifi.p2p.advertise", "data": {},
+        }),
+    );
+    assert!(
+        rejected.contains("\"state\":\"error\"")
+            && rejected.contains("p2p_service_requires_p2p_epoch"),
+        "standalone P2P SD allocation was not explicitly rejected: {rejected}"
+    );
+
+    let after = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "p2p-sd-guard-after", "method": "wifi.nan.status", "data": {},
+        }),
+    );
+    let cache = android_wifi_interface_cache(&android);
+    assert!(
+        after.contains("\"active\":\"1\"")
+            && cache.contains("aware_nmi")
+            && !cache.contains("p2p-dev-"),
+        "standalone P2P SD guard disturbed NAN baseline: status={after}; interfaces={cache}"
+    );
 }
 
 /// Verify the current Android LocalOnly AP as an ordinary WPA2 STA target.
@@ -4914,7 +6499,10 @@ fn pixel7_local_ap_uart_associates_e6() {
             "method": "wifi.localap.start",
         }),
     );
-    assert!(response_state_started(&start), "Pixel 7 LocalOnly AP did not start: {start}");
+    assert!(
+        response_state_started(&start),
+        "Pixel 7 LocalOnly AP did not start: {start}"
+    );
     let ssid = json_string_field(&start, "ssid")
         .filter(|value| !value.is_empty())
         .expect("Pixel 7 LocalOnly AP omitted SSID");
@@ -4966,16 +6554,22 @@ fn pixel7_local_ap_uart_associates_e6() {
             ControlRequest::TransportStart {
                 kind: TransportKind::Nan,
                 config: dmesh_server::control::TransportConfig {
-                    channel: Some(6), now: Some(0), nan_dw_interval: Some(0), ap: Some(0),
+                    channel: Some(6),
+                    now: Some(0),
+                    nan_dw_interval: Some(0),
+                    ap: Some(0),
                     ..dmesh_server::control::TransportConfig::default()
                 },
             },
             0xE6_4C_4F_02,
         );
     })();
-    let _ = android_json_command(&android, serde_json::json!({
-        "id": "pixel7-local-ap-stop", "method": "wifi.localap.stop",
-    }));
+    let _ = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "pixel7-local-ap-stop", "method": "wifi.localap.stop",
+        }),
+    );
     // LocalOnly reservation close is asynchronous and Android does not call
     // the app's onStopped callback for an app-initiated close. The platform
     // adapter waits 10 seconds for wlan2 teardown and retries attachment every
@@ -5025,10 +6619,13 @@ fn pixel3a_fixed_p2p_go_uart_associates_e7() {
             "data": {"mode": "nan", "ap": "1"},
         }),
     );
-    assert!(response_state_started(&start), "Pixel 3a P2P GO did not start: {start}");
+    assert!(
+        response_state_started(&start),
+        "Pixel 3a P2P GO did not start: {start}"
+    );
     let ssid = json_string_field(&start, "ssid").expect("Pixel 3a P2P GO omitted SSID");
-    let passphrase = json_string_field(&start, "passphrase")
-        .expect("Pixel 3a P2P GO omitted passphrase");
+    let passphrase =
+        json_string_field(&start, "passphrase").expect("Pixel 3a P2P GO omitted passphrase");
     assert_eq!(ssid, "DIRECT-dm-dmesh");
     assert_eq!(passphrase, "untrusted-open-mode");
 
@@ -5041,7 +6638,9 @@ fn pixel3a_fixed_p2p_go_uart_associates_e7() {
                 config: dmesh_server::control::TransportConfig {
                     ssid: Some(ssid.as_bytes()),
                     passphrase: Some(passphrase.as_bytes()),
-                    now: Some(0), ap: Some(0), sta_11b_rates_disabled: Some(false),
+                    now: Some(0),
+                    ap: Some(0),
+                    sta_11b_rates_disabled: Some(false),
                     ..dmesh_server::control::TransportConfig::default()
                 },
             },
@@ -5054,13 +6653,17 @@ fn pixel3a_fixed_p2p_go_uart_associates_e7() {
             if radio.sta_associated == Some(true) {
                 eprintln!(
                     "Pixel3a fixed P2P GO -> E7 association elapsed_ms={} {}",
-                    began.elapsed().as_millis(), snapshot_summary(&radio),
+                    began.elapsed().as_millis(),
+                    snapshot_summary(&radio),
                 );
                 assert_eq!(radio.channel, Some(6));
                 break;
             }
-            assert!(Instant::now() < deadline,
-                "E7 did not associate to Pixel 3a fixed P2P GO: {}", snapshot_summary(&radio));
+            assert!(
+                Instant::now() < deadline,
+                "E7 did not associate to Pixel 3a fixed P2P GO: {}",
+                snapshot_summary(&radio)
+            );
             thread::sleep(Duration::from_millis(250));
         }
         control_request(
@@ -5068,20 +6671,28 @@ fn pixel3a_fixed_p2p_go_uart_associates_e7() {
             ControlRequest::TransportStart {
                 kind: TransportKind::Nan,
                 config: dmesh_server::control::TransportConfig {
-                    channel: Some(6), now: Some(0), nan_dw_interval: Some(0), ap: Some(0),
+                    channel: Some(6),
+                    now: Some(0),
+                    nan_dw_interval: Some(0),
+                    ap: Some(0),
                     ..dmesh_server::control::TransportConfig::default()
                 },
             },
             0xE7_5032_02,
         );
     })();
-    let stop = android_json_command(&android, serde_json::json!({
-        "id": "pixel3a-p2p-e7-stop",
-        "method": "wifi.transport.start",
-        "data": {"mode": "nan", "ap": "0"},
-    }));
-    assert!(stop.contains("\"state\":\"ap_stopped\""),
-        "Pixel 3a P2P GO did not stop: {stop}");
+    let stop = android_json_command(
+        &android,
+        serde_json::json!({
+            "id": "pixel3a-p2p-e7-stop",
+            "method": "wifi.transport.start",
+            "data": {"mode": "nan", "ap": "0"},
+        }),
+    );
+    assert!(
+        stop.contains("\"state\":\"ap_stopped\""),
+        "Pixel 3a P2P GO did not stop: {stop}"
+    );
     result
 }
 
@@ -5312,35 +6923,51 @@ fn android_nan_sd_sta_declaration_associates_e6_wlan0() {
     }
 }
 
-/// Inject one complete raw action through the same direct-CBOR raw-radio
-/// handler used by operator tooling. The receiver test intentionally does not
-/// await a text acknowledgement: each send is followed by its own snapshot.
+/// Inject one complete raw action through the canonical tagged-CBOR schema.
+/// Called only by the bounded NAN matrix retry loop (every 250 ms for at most
+/// five seconds).  Keeping the encoding shared with operator tooling avoids a
+/// hand-written test record silently drifting away from the firmware handler.
+/// The raw-management action itself has no peer reply, but the source handler
+/// returns a bounded local status record.  Waiting for that record proves the
+/// request entered the firmware before a later snapshot is used to judge
+/// on-air delivery.
 fn send_raw_action(session: &mut DeviceSession, frame: &[u8], interface: RawWifiInterface) {
     let mut wire = [0u8; 1600];
-    let mut encoder = Encoder::new(&mut wire);
-    encoder.map(7).unwrap();
-    encoder.uint(0).unwrap();
-    encoder.uint(1).unwrap();
-    encoder.uint(1).unwrap();
-    encoder.bytes_value(frame).unwrap();
-    encoder.uint(2).unwrap();
-    encoder.uint(6).unwrap();
-    encoder.uint(3).unwrap();
-    encoder
-        .uint(match interface {
-            RawWifiInterface::Ap => 2,
-            _ => 1,
+    let used = encode_raw_wifi_tx_request(
+        RawWifiTxRequest {
+            frame,
+            channel: 6,
+            interface,
+            system_sequence: false,
+            rate: RawWifiRate::Auto,
+            disable_11b: false,
+        },
+        &mut wire,
+    )
+    .expect("raw action request must fit test buffer");
+    let matched = session
+        .request_direct_record_until(&wire[..used], COMMAND_TIMEOUT, |event| {
+            matches!(
+                event,
+                DeviceSessionEvent::DirectRecord(record) if decode_status_text(record).is_some()
+            )
         })
-        .unwrap();
-    encoder.uint(4).unwrap();
-    encoder.boolean(false).unwrap();
-    encoder.uint(5).unwrap();
-    encoder.uint(0).unwrap();
-    encoder.uint(6).unwrap();
-    encoder.boolean(false).unwrap();
-    let used = encoder.len();
-    drop(encoder);
-    session.send_direct_record(&wire[..used]).unwrap();
+        .unwrap_or_else(|error| panic!("{} raw action request: {error}", session.path()));
+    assert!(matched, "{} raw action status timeout", session.path());
+    let status = session
+        .recent_events()
+        .filter_map(|event| match event {
+            DeviceSessionEvent::DirectRecord(record) => decode_status_text(record),
+            _ => None,
+        })
+        .last()
+        .expect("raw action status record");
+    assert!(
+        status.starts_with(b"radio raw action sent bytes="),
+        "{} rejected raw NAN SDF: {}",
+        session.path(),
+        String::from_utf8_lossy(status)
+    );
 }
 
 /// Opt-in Main sleepy transition probe. It keeps the canary active by default;
@@ -5355,7 +6982,9 @@ fn firmware_e7_sleepy_nan_roundtrip() {
         eprintln!("firmware-e2e sleepy row skipped; set DMESH_E2E_SLEEPY=1");
         return;
     }
-    let mut e7_bootstrap = if std::env::var("DMESH_E2E_SLEEPY_BOOTSTRAP_UART").ok().as_deref()
+    let mut e7_bootstrap = if std::env::var("DMESH_E2E_SLEEPY_BOOTSTRAP_UART")
+        .ok()
+        .as_deref()
         == Some("1")
     {
         Some(DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap())
@@ -5417,12 +7046,13 @@ fn firmware_e7_sleepy_nan_roundtrip() {
             nan_dw_interval: Some(8),
             now: Some(2),
             ap: Some(0),
-            uart: Some(0),
+            uart: Some(dmesh_server::firmware_profile::UART_OFF),
             ..dmesh_server::control::TransportConfig::default()
         },
     };
     let mut sleepy_wire = [0u8; 128];
-    let sleepy_used = control::encode_request(sleepy, Some(0xE7_5EE0_01), &mut sleepy_wire).unwrap();
+    let sleepy_used =
+        control::encode_request(sleepy, Some(0xE7_5EE0_01), &mut sleepy_wire).unwrap();
     let control_ifindex = interface_index("wlan0");
     let control_peer = SocketAddr::V6(SocketAddrV6::new(
         Ipv6Addr::from(quic_lite::raw_udp6::link_local_from_mac(E7_MAC)),
@@ -5474,7 +7104,9 @@ fn firmware_e7_sleepy_nan_roundtrip() {
         // bootstrapped run to continue when the freshly associated raw path
         // has not opened yet.  The later NAN wake still must produce the
         // authoritative remote UDP6 status response.
-        if std::env::var("DMESH_E2E_SLEEPY_UART_CONTROL_FALLBACK").ok().as_deref()
+        if std::env::var("DMESH_E2E_SLEEPY_UART_CONTROL_FALLBACK")
+            .ok()
+            .as_deref()
             == Some("1")
         {
             let e7 = e7_bootstrap
@@ -5489,7 +7121,7 @@ fn firmware_e7_sleepy_nan_roundtrip() {
                         nan_dw_interval: Some(8),
                         now: Some(2),
                         ap: Some(0),
-                        uart: Some(0),
+                        uart: Some(dmesh_server::firmware_profile::UART_OFF),
                         ..dmesh_server::control::TransportConfig::default()
                     },
                 },
@@ -5586,7 +7218,10 @@ fn firmware_e7_sleepy_nan_roundtrip() {
         status = result;
         thread::sleep(Duration::from_millis(250));
     }
-    assert!(status.is_ok(), "e7 did not become remotely active over UDP6: {status:?}");
+    assert!(
+        status.is_ok(),
+        "e7 did not become remotely active over UDP6: {status:?}"
+    );
 }
 
 const ROC_SUSTAINED_WINDOW: Duration = Duration::from_secs(4);
@@ -5705,7 +7340,7 @@ fn hex(bytes: &[u8]) -> String {
 fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> String {
     let service_bps = raw_service_bps(snapshot);
     format!(
-        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} dw={:?}/{:?} ap={:?} active={:?} assoc_phase_ms={:?} disconnect_reason={:?} tx={}/{} rx_dispatch={} parsed={} nan={}/{}/{} service_info={}/{}/{} bootstrap={} stream={} client_errors={} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}",
+        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} dw={:?}/{:?} ap={:?} active={:?} raw_rx={:?} assoc_phase_ms={:?} disconnect_reason={:?} tx={}/{} rx_dispatch={} parsed={} udp6={}/{}/{}/txfail={}/txresult={} nan={}/{}/{} service_info={}/{}/{} bootstrap={} stream={} other={} client_errors={} client_cid={:?}/{:?} peer_suffix={:?} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}/{:?}",
         snapshot.channel,
         snapshot.sta_associated,
         snapshot.sta_ap_rssi_dbm,
@@ -5714,12 +7349,18 @@ fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> Strin
         snapshot.nan_dw_interval,
         snapshot.ap_active,
         snapshot.raw_service_active,
+        snapshot.sta_raw_rx_enabled,
         snapshot.sta_connect_to_associated_ms,
         snapshot.sta_last_disconnect_reason,
         snapshot.counters.tx_driver_accepted,
         snapshot.counters.tx_attempted,
         snapshot.counters.rx_driver_dispatch,
         snapshot.counters.rx_parser_accepted,
+        snapshot.counters.udp6_rx_frames,
+        snapshot.counters.udp6_rx_invalid,
+        snapshot.counters.udp6_udp_delivered,
+        snapshot.counters.udp6_tx_failures,
+        snapshot.counters.udp6_last_tx_result,
         snapshot.counters.nan_beacons,
         snapshot.counters.nan_sdfs,
         snapshot.counters.nan_followups,
@@ -5728,13 +7369,18 @@ fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> Strin
         snapshot.counters.nan_service_info_dropped,
         snapshot.counters.raw_client_bootstrap_acks,
         snapshot.counters.raw_client_stream_packets,
+        snapshot.counters.raw_client_other_packets,
         snapshot.counters.raw_client_receive_errors,
+        snapshot.raw_client_expected_server_cid,
+        snapshot.raw_client_last_other_dcid,
+        snapshot.raw_client_last_other_peer_suffix,
         snapshot.raw_service_bytes,
         snapshot.raw_service_elapsed_us,
         snapshot.counters.roc_action_listen_requests,
         snapshot.counters.roc_action_listen_failures,
         snapshot.counters.roc_action_frames,
         snapshot.last_raw_client_error,
+        snapshot.last_raw_service_error,
     )
 }
 
@@ -5991,6 +7637,43 @@ fn wait_for_unassociated_channel_6(
     observed
 }
 
+/// Wait for a complete direct-control epoch, rather than accepting the old
+/// channel-six state that happened to be visible before `transport.start` was
+/// applied. Called once after each USB control request by the pair prober;
+/// normal firmware operation remains event-driven and does not use this host
+/// observation loop. NAN DW capture itself may begin on the next window, so
+/// this checks the configured interval instead of requiring an instantaneous
+/// capture flag.
+fn wait_for_probe_mode(
+    session: &mut DeviceSession,
+    mode: ProbeMode,
+) -> dmesh_server::raw_wifi::RawWifiSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
+    loop {
+        let ready = match mode.transport_kind {
+            6 => {
+                observed.sta_associated == Some(false)
+                    && observed.channel == Some(6)
+                    && observed.ap_active == Some(mode.ap)
+                    && observed.nan_dw_interval == Some(mode.nan_dw_interval)
+            }
+            1 => observed.sta_associated == Some(true) && observed.channel == Some(6),
+            unsupported => panic!("unsupported control-plane probe mode {unsupported}"),
+        };
+        if ready {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "probe mode {mode:?} did not settle: {}",
+            snapshot_summary(&observed)
+        );
+        thread::sleep(Duration::from_millis(100));
+        observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
+    }
+}
+
 fn start_espnow_check(
     session: &mut DeviceSession,
     peer: [u8; 6],
@@ -6035,10 +7718,13 @@ fn complete_action_check(
         snapshot(initiator, RAW_WIFI_METHOD_RESET_COUNTERS);
         snapshot(responder, RAW_WIFI_METHOD_RESET_COUNTERS);
         // `check` is deliberately a one-request/one-response liveness probe.
-        // Measure time to the first completed client counter sample rather
-        // than two fixed-duration UART polls. This is a bounded completion
-        // latency (25 ms sampling granularity), not bulk throughput; the
-        // separately parameterized IPERF rows own goodput measurements.
+        // Do not treat the first received stream packet as completion: the
+        // client may still need to emit its terminal ACK/close on its one-shot
+        // timer. Starting IPERF while that one-client slot remains active
+        // makes its admission look successful in a snapshot even though the
+        // new request was rejected as busy. Wait for the actual retirement
+        // boundary, then measure its bounded latency (25 ms observation
+        // granularity); the separately parameterized IPERF rows own goodput.
         let started_at = Instant::now();
         let started = start_espnow_check(initiator, peer, nonce + attempt);
         if started.raw_service_active != Some(true) {
@@ -6048,7 +7734,8 @@ fn complete_action_check(
         }
         let deadline = Instant::now() + COMMAND_TIMEOUT;
         let mut client = snapshot(initiator, RAW_WIFI_METHOD_SNAPSHOT);
-        while client.counters.raw_client_stream_packets == 0
+        while (client.raw_service_active != Some(false)
+            || client.counters.raw_client_stream_packets == 0)
             && client.counters.raw_client_receive_errors == 0
             && Instant::now() < deadline
         {
@@ -6056,7 +7743,8 @@ fn complete_action_check(
             client = snapshot(initiator, RAW_WIFI_METHOD_SNAPSHOT);
         }
         let source = snapshot(responder, RAW_WIFI_METHOD_SNAPSHOT);
-        if client.counters.raw_client_stream_packets > 0
+        if client.raw_service_active == Some(false)
+            && client.counters.raw_client_stream_packets > 0
             && client.counters.raw_client_receive_errors == 0
         {
             eprintln!(
@@ -6100,9 +7788,27 @@ fn complete_action_check(
             )
         })
         .collect::<Vec<_>>();
+    let diagnostics = |session: &DeviceSession| {
+        session
+            .recent_events()
+            .filter_map(|event| match event {
+                DeviceSessionEvent::DirectRecord(record) => core::str::from_utf8(record)
+                    .ok()
+                    .filter(|text| text.contains("espnow") || text.contains("raw service"))
+                    .map(str::to_owned),
+                DeviceSessionEvent::Diagnostic(text) => (text.contains("espnow")
+                    || text.contains("raw service"))
+                    .then(|| text.clone()),
+                DeviceSessionEvent::TransportPacket(_) => None,
+            })
+            .take(32)
+            .collect::<Vec<_>>()
+    };
     panic!(
-        "{label} did not complete after {} fresh associations: {attempts:?}",
-        attempts.len()
+        "{label} did not complete after {} fresh associations: {attempts:?}; initiator UART={:?}; responder UART={:?}",
+        attempts.len(),
+        diagnostics(initiator),
+        diagnostics(responder),
     );
 }
 
@@ -6199,6 +7905,7 @@ fn firmware_host_to_e6_now_iperf() {
                 mode: target_mode,
                 bssid: if unassociated { None } else { Some(host_bssid) },
             },
+            activation: ProbeActivation::Now,
             test_nan: false,
             test_nan_data: false,
             test_now: true,
@@ -6215,10 +7922,19 @@ fn firmware_host_to_e6_now_iperf() {
         &e2e_ap_iface(),
     );
     let after = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
-    assert!(response.now.succeeded, "host->e6 NOW probe failed: {response:?}");
+    assert!(
+        response.now.succeeded,
+        "host->e6 NOW probe failed: {response:?}"
+    );
     assert_eq!(response.now.bytes, Some(bytes));
-    assert!(after.counters.rx_driver_dispatch > 0, "e6 did not dispatch host NOW frames: {after:?}");
-    assert!(after.counters.rx_parser_accepted > 0, "e6 did not parse host NOW frames: {after:?}");
+    assert!(
+        after.counters.rx_driver_dispatch > 0,
+        "e6 did not dispatch host NOW frames: {after:?}"
+    );
+    assert!(
+        after.counters.rx_parser_accepted > 0,
+        "e6 did not parse host NOW frames: {after:?}"
+    );
 }
 
 /// Alternate complete radio epochs on e7/Main without changing host radio
@@ -6322,16 +8038,14 @@ fn firmware_e7_nan_now_sta_transition_cycles() {
 #[ignore = "requires DMESH_E2E_CONFIG, the configured radio lab, and exclusive UART ownership"]
 fn firmware_configured_pairs() {
     let config = load_e2e_config().expect("set DMESH_E2E_CONFIG for the configured matrix");
-    let selected = std::env::var("DMESH_E2E_PAIRS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
+    let selected = std::env::var("DMESH_E2E_PAIRS").ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
     if let Some(selected) = &selected {
         for name in selected {
             configured_pair(&config, name);
@@ -6368,6 +8082,7 @@ fn firmware_configured_pairs() {
             request_id: 0x4d41_0000 + pair.name.len() as u64,
             source: configured_endpoint(source),
             target: configured_endpoint(target),
+            activation: ProbeActivation::Now,
             test_nan: pair.tests.iter().any(|test| test == "nan"),
             test_nan_data: false,
             test_now: pair.tests.iter().any(|test| test.starts_with("now-")),
@@ -6407,7 +8122,10 @@ fn firmware_configured_pairs() {
                 &mut target_session,
                 configured_mac(target),
                 request.request_id + 3,
-                &format!("configured pair {} {} -> {} NOW", pair.name, source.name, target.name),
+                &format!(
+                    "configured pair {} {} -> {} NOW",
+                    pair.name, source.name, target.name
+                ),
             );
             assert!(target_after.counters.rx_parser_accepted > 0);
             assert!(source_after.counters.raw_client_stream_packets > 0);
@@ -6417,7 +8135,10 @@ fn firmware_configured_pairs() {
                 &mut source_session,
                 configured_mac(source),
                 request.request_id + 4,
-                &format!("configured pair {} {} -> {} NOW", pair.name, target.name, source.name),
+                &format!(
+                    "configured pair {} {} -> {} NOW",
+                    pair.name, target.name, source.name
+                ),
             );
             assert!(source_after.counters.rx_parser_accepted > 0);
             assert!(target_after.counters.raw_client_stream_packets > 0);
@@ -6427,16 +8148,28 @@ fn firmware_configured_pairs() {
                     &mut source_session,
                     &mut target_session,
                     configured_mac(target),
-                    &format!("configured pair {} {} -> {} NOW bulk", pair.name, source.name, target.name),
+                    &format!(
+                        "configured pair {} {} -> {} NOW bulk",
+                        pair.name, source.name, target.name
+                    ),
                 );
-                assert_eq!(source_client.raw_service_bytes, Some(E2E_ACTION_IPERF_BYTES as u32));
+                assert_eq!(
+                    source_client.raw_service_bytes,
+                    Some(E2E_ACTION_IPERF_BYTES as u32)
+                );
                 let (_, target_client) = complete_action_iperf(
                     &mut target_session,
                     &mut source_session,
                     configured_mac(source),
-                    &format!("configured pair {} {} -> {} NOW bulk", pair.name, target.name, source.name),
+                    &format!(
+                        "configured pair {} {} -> {} NOW bulk",
+                        pair.name, target.name, source.name
+                    ),
                 );
-                assert_eq!(target_client.raw_service_bytes, Some(E2E_ACTION_IPERF_BYTES as u32));
+                assert_eq!(
+                    target_client.raw_service_bytes,
+                    Some(E2E_ACTION_IPERF_BYTES as u32)
+                );
             }
         }
     }
@@ -6445,14 +8178,18 @@ fn firmware_configured_pairs() {
 /// Discovery-selected two-device prober. `DMESH_E2E_CONFIG` supplies only
 /// local adapter details such as optional serial diagnostics; endpoint choice
 /// is by advertised NAN identity, never a board nickname. Set both
-/// `DMESH_E2E_SOURCE_ID` and `DMESH_E2E_TARGET_ID` when the config has more
-/// than two ESP descriptors. With exactly two ESP descriptors, the config is
-/// unambiguous and no pair selection variables are needed. The test then
-/// proves that both identities are actually present in stable `wlan0`
-/// discovery before using either optional serial adapter.
+/// `DMESH_E2E_SOURCE` and `DMESH_E2E_TARGET` select two descriptor names.
+/// With exactly two ESP descriptors, the config is unambiguous and no pair
+/// selection variables are needed. Discovery IDs remain available through
+/// `DMESH_E2E_SOURCE_ID`/`DMESH_E2E_TARGET_ID` for an inventory-driven
+/// controller. The test then proves NAN identity only when NAN is selected;
+/// NOW and USB activation do not need a host NAN cluster. The initial bearer
+/// is selected by `DMESH_E2E_PROBE_ACTIVATION=now|nan|usb`: `now` is the
+/// active-pair default, `nan` is required for sleepy endpoints, and `usb` is
+/// an explicit local-lab bootstrap only.
 ///
-/// The initial NAN discovery defaults to five seconds when host wlan0 reports
-/// a recent cluster, and can be diagnostically extended with
+/// A NAN bootstrap defaults to five seconds when host wlan0 reports a recent
+/// cluster, and can be diagnostically extended with
 /// `DMESH_E2E_NAN_WAKE_TIMEOUT_SECS=40`.
 #[test]
 #[ignore = "requires DMESH_E2E_CONFIG, optional discovery IDs, host wlan0 NAN, and remote UDP6"]
@@ -6465,28 +8202,60 @@ fn firmware_pair_prober() {
         eprintln!("firmware-e2e skipped: set DMESH_E2E_CONFIG for the pair prober");
         return;
     };
+    let source_name = std::env::var("DMESH_E2E_SOURCE").ok();
+    let target_name = std::env::var("DMESH_E2E_TARGET").ok();
     let source_id = std::env::var("DMESH_E2E_SOURCE_ID").ok();
     let target_id = std::env::var("DMESH_E2E_TARGET_ID").ok();
-    let (source, target) = config
-        .select_esp_pair(source_id.as_deref(), target_id.as_deref())
-        .unwrap_or_else(|error| panic!("pair selection: {error}"));
+    assert!(
+        !(source_name.is_some() && source_id.is_some())
+            && !(target_name.is_some() && target_id.is_some()),
+        "select the pair by descriptor names or discovery IDs, not both"
+    );
+    let (source, target) = if source_name.is_some() || target_name.is_some() {
+        config.select_esp_pair_by_name(source_name.as_deref(), target_name.as_deref())
+    } else {
+        config.select_esp_pair(source_id.as_deref(), target_id.as_deref())
+    }
+    .unwrap_or_else(|error| panic!("pair selection: {error}"));
     let source_name = &source.name;
     let target_name = &target.name;
-    assert_eq!(source.kind, "esp", "pair prober currently requires ESP source descriptors");
-    assert_eq!(target.kind, "esp", "pair prober currently requires ESP target descriptors");
+    assert_eq!(
+        source.kind, "esp",
+        "pair prober currently requires ESP source descriptors"
+    );
+    assert_eq!(
+        target.kind, "esp",
+        "pair prober currently requires ESP target descriptors"
+    );
     let source_nan_mac = configured_nan_mac(source);
     let target_nan_mac = configured_nan_mac(target);
     let sleepy = source.sleepy || target.sleepy;
     let mut outcomes = Vec::new();
-    let nan_timeout = nan_wake_timeout_from_host();
-    // Activate both endpoints in the common NAN control personality first.
-    // The regular wlan0 `wifi.probe.plan` handler selects every subsequent
-    // row from live advertised capability after the discovery proof below.
+    let activation = e2e_probe_activation();
+    if sleepy && activation != ProbeActivation::Nan {
+        outcomes.push(PairProbeOutcome {
+            row: "initial-activation".to_owned(),
+            bearer: format!("{activation:?}").to_lowercase(),
+            succeeded: false,
+            required: true,
+            detail: "sleepy endpoints require NAN timing/control activation".to_owned(),
+        });
+        emit_pair_probe_outcomes(source, target, &outcomes);
+        panic!("sleepy pair cannot use {activation:?} activation");
+    }
+    let nan_timeout = (activation == ProbeActivation::Nan)
+        .then(nan_wake_timeout_from_host)
+        .flatten();
+    // Describe the common active NAN+NOW epoch used by the selected bootstrap
+    // bearer. The regular wlan0 `wifi.probe.plan` handler selects subsequent
+    // rows from live advertised capability only after NAN discovery succeeds.
     let source_mode = descriptor_with_probe_mode(
         source,
         ProbeMode {
             transport_kind: 6,
-            now: source.now.unwrap_or(if source.supports_now { 0 } else { 2 }),
+            now: source
+                .now
+                .unwrap_or(if source.supports_now { 0 } else { 2 }),
             nan_dw_interval: 1,
             ndp: false,
             ap: false,
@@ -6496,60 +8265,165 @@ fn firmware_pair_prober() {
         target,
         ProbeMode {
             transport_kind: 6,
-            now: target.now.unwrap_or(if target.supports_now { 0 } else { 2 }),
+            now: target
+                .now
+                .unwrap_or(if target.supports_now { 0 } else { 2 }),
             nan_dw_interval: 1,
             ndp: false,
             ap: false,
         },
     );
-    // Initial control normally uses NAN SDEA, even when the requested final
-    // mode is STA. A host that cannot currently observe a NAN cluster records
-    // that failed bearer row and then checks the active devices over NOW.
-    let nan_ready = match nan_timeout {
-        Some(timeout) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            host_nan_activate_pair(
-                &source_mode,
-                &target_mode,
-                source_nan_mac,
-                target_nan_mac,
-                timeout,
-            );
-            wait_for_stable_control_plane_devices(source, target, timeout);
-        })) {
-            Ok(()) => {
+    // Initial control is selected explicitly. A NOW or USB activation does
+    // not claim that host NAN discovery happened; it records its own result
+    // and then performs the active endpoint NOW checks below.
+    let mut usb_sessions = None;
+    let usb_ready = if activation == ProbeActivation::Usb {
+        match usb_activate_pair(&source_mode, &target_mode) {
+            Ok(sessions) => {
+                usb_sessions = Some(sessions);
                 outcomes.push(PairProbeOutcome {
                     row: "initial-activation".to_owned(),
-                    bearer: "nan-sdea".to_owned(),
+                    bearer: "usb".to_owned(),
                     succeeded: true,
-                    required: sleepy,
-                    detail: "host cluster and both endpoint announcements observed".to_owned(),
+                    required: true,
+                    detail: "both explicitly configured USB adapters accepted NAN+NOW".to_owned(),
                 });
                 true
             }
             Err(error) => {
                 outcomes.push(PairProbeOutcome {
                     row: "initial-activation".to_owned(),
-                    bearer: "nan-sdea".to_owned(),
+                    bearer: "usb".to_owned(),
                     succeeded: false,
-                    required: sleepy,
-                    detail: panic_detail(error),
+                    required: true,
+                    detail: error,
                 });
                 false
             }
-        },
-        None => {
-            outcomes.push(PairProbeOutcome {
-                row: "initial-activation".to_owned(),
-                bearer: "nan-sdea".to_owned(),
-                succeeded: false,
-                required: sleepy,
-                detail: "wlan0 has no recent NAN cluster".to_owned(),
-            });
-            false
+        }
+    } else {
+        false
+    };
+    let nan_ready = if usb_ready {
+        // USB starts an active test epoch but does not manufacture a host NAN
+        // inventory. Continue with NOW checks below instead of pretending
+        // discovery was observed.
+        false
+    } else {
+        match nan_timeout {
+            Some(timeout) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                host_nan_activate_pair(
+                    &source_mode,
+                    &target_mode,
+                    source_nan_mac,
+                    target_nan_mac,
+                    timeout,
+                );
+                wait_for_stable_control_plane_devices(source, target, timeout);
+            })) {
+                Ok(()) => {
+                    outcomes.push(PairProbeOutcome {
+                        row: "initial-activation".to_owned(),
+                        bearer: "nan-sdea".to_owned(),
+                        succeeded: true,
+                        required: sleepy,
+                        detail: "host cluster and both endpoint announcements observed".to_owned(),
+                    });
+                    true
+                }
+                Err(error) => {
+                    outcomes.push(PairProbeOutcome {
+                        row: "initial-activation".to_owned(),
+                        bearer: "nan-sdea".to_owned(),
+                        succeeded: false,
+                        required: sleepy,
+                        detail: panic_detail(error),
+                    });
+                    false
+                }
+            },
+            None => {
+                outcomes.push(PairProbeOutcome {
+                    row: "initial-activation".to_owned(),
+                    bearer: if activation == ProbeActivation::Now {
+                        "now".to_owned()
+                    } else {
+                        "nan-sdea".to_owned()
+                    },
+                    succeeded: false,
+                    required: sleepy,
+                    detail: if activation == ProbeActivation::Now {
+                        "NAN intentionally skipped; active pair starts with NOW".to_owned()
+                    } else {
+                        "wlan0 has no recent NAN cluster".to_owned()
+                    },
+                });
+                false
+            }
         }
     };
 
     if !nan_ready {
+        if usb_ready {
+            let custom_request = std::env::var_os("DMESH_E2E_PROBE_REQUEST_JSON").is_some();
+            let configured = configured_pair_probe_requests(&config, source, target);
+            // Without a NAN cluster, the default matrix begins with the
+            // portable NAN+NOW-only row: neither setup nor its direct NOW
+            // exchange needs wlan0 or an AP.  A caller-supplied ProbeRequest
+            // is different: USB is only the control bearer, so execute that
+            // exact requested row even when it is AP/STA UDP6-only.  This
+            // keeps narrow bearer regression tests independent of NAN
+            // availability and avoids inventing a NOW prerequisite for UDP6.
+            let requests: Vec<ProbeRequest> = if custom_request {
+                configured.into_iter().map(|row| row.request).collect()
+            } else {
+                configured
+                    .into_iter()
+                    .map(|row| row.request)
+                    .filter(|request| request.test_now && !request.test_udp6)
+                    .take(1)
+                    .collect()
+            };
+            for request in requests {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    usb_run_active_now_pair(
+                        usb_sessions
+                            .as_mut()
+                            .expect("successful USB activation retains both sessions"),
+                        source,
+                        target,
+                        request,
+                    )
+                }));
+                let bearer = if request.test_udp6 {
+                    "usb-control+udp6"
+                } else if request.test_now {
+                    "usb-control+now"
+                } else {
+                    "usb-control"
+                };
+                outcomes.push(PairProbeOutcome {
+                    row: format!("request-{}", request.request_id),
+                    bearer: bearer.to_owned(),
+                    succeeded: result.is_ok(),
+                    required: true,
+                    detail: result.err().map(panic_detail).unwrap_or_else(|| {
+                        format!(
+                            "USB configured {} and {}; completed requested now={} udp6={}",
+                            source.name, target.name, request.test_now, request.test_udp6
+                        )
+                    }),
+                });
+            }
+            emit_pair_probe_outcomes(source, target, &outcomes);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| !outcome.required || outcome.succeeded),
+                "required pair-probe rows failed; see firmware-e2e pair-probe-report"
+            );
+            return;
+        }
         // NOW is the active Main fallback, not an emulated NAN result. Each
         // independent status exchange proves the same registered service
         // handler can be reached even though the host NAN monitor is silent.
@@ -6583,7 +8457,9 @@ fn firmware_pair_prober() {
         }
         emit_pair_probe_outcomes(source, target, &outcomes);
         assert!(
-            outcomes.iter().all(|outcome| !outcome.required || outcome.succeeded),
+            outcomes
+                .iter()
+                .all(|outcome| !outcome.required || outcome.succeeded),
             "required pair-probe rows failed; see firmware-e2e pair-probe-report"
         );
         return;
@@ -6600,7 +8476,10 @@ fn firmware_pair_prober() {
                     bearer: "control-plane".to_owned(),
                     succeeded: false,
                     required: false,
-                    detail: format!("live handler unavailable; local capability fallback: {}", panic_detail(error)),
+                    detail: format!(
+                        "live handler unavailable; local capability fallback: {}",
+                        panic_detail(error)
+                    ),
                 });
                 configured_pair_probe_requests(&config, source, target)
             }
@@ -6622,20 +8501,31 @@ fn firmware_pair_prober() {
         }));
         outcomes.push(PairProbeOutcome {
             row: format!("request-{}", request.request_id),
-            bearer: if request.test_udp6 { "nan-control+udp6" } else if request.test_now { "nan-control+now" } else { "nan-control" }.to_owned(),
+            bearer: if request.test_udp6 {
+                "nan-control+udp6"
+            } else if request.test_now {
+                "nan-control+now"
+            } else {
+                "nan-control"
+            }
+            .to_owned(),
             succeeded: result.is_ok(),
             required: true,
-            detail: result.err().map(panic_detail).unwrap_or_else(|| format!(
-                "source={source_name} target={target_name} nan={} udp6={} now={}",
-                request.test_nan,
-                request.test_udp6,
-                request.test_now && source.supports_now && target.supports_now,
-            )),
+            detail: result.err().map(panic_detail).unwrap_or_else(|| {
+                format!(
+                    "source={source_name} target={target_name} nan={} udp6={} now={}",
+                    request.test_nan,
+                    request.test_udp6,
+                    request.test_now && source.supports_now && target.supports_now,
+                )
+            }),
         });
     }
     emit_pair_probe_outcomes(source, target, &outcomes);
     assert!(
-        outcomes.iter().all(|outcome| !outcome.required || outcome.succeeded),
+        outcomes
+            .iter()
+            .all(|outcome| !outcome.required || outcome.succeeded),
         "required pair-probe rows failed; see firmware-e2e pair-probe-report"
     );
 }
@@ -6678,6 +8568,7 @@ fn firmware_transport_matrix() {
                 mode: ProbeMode::STA_NAN_NOW,
                 bssid: Some(ap_bssid),
             },
+            activation: ProbeActivation::Nan,
             test_nan: true,
             test_nan_data: false,
             test_now: true,

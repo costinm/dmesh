@@ -1,13 +1,16 @@
 use anyhow::Result;
 use lmesh_wifi::{
-    WifiService,
+    InterfaceSet, WifiService,
     dispatch::{
         handle_request, handle_reviewed_request, normalize_json_rpc_request, subscription_config,
     },
     reviewed::ReviewedWifiRequest,
 };
 use serde_json::json;
-use std::sync::{Arc, LazyLock};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(|| {
@@ -121,6 +124,26 @@ async fn main() -> Result<()> {
             "wifi_startup_result"
         );
     }
+
+    // A USB/radio reset can leave the supervised process alive while its AP
+    // netdev disappears. Watch rtnetlink events only for this service's
+    // configured interfaces; STA/NAN events from lmesh/wlan1 must never
+    // trigger lmesh-wifi/wlan0 recovery.
+    let owned_interfaces = netd.owned_interfaces().clone();
+    let (link_events, mut link_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || watch_rtnetlink_link_events(owned_interfaces, link_events));
+    let stable_health = service.clone();
+    tokio::spawn(async move {
+        while let Some(event) = link_event_rx.recv().await {
+            // A burst accompanies USB reprobe. Let rtnetlink finish naming
+            // and registering the device before asking nl80211 to rebuild it.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let result = stable_health.reconcile_stable_health();
+            if result.get("state").and_then(serde_json::Value::as_str) != Some("healthy") {
+                tracing::warn!(?event, ?result, "wifi_stable_link_reconcile");
+            }
+        }
+    });
 
     if netd.owned_interfaces().names().is_empty() {
         tracing::warn!("LMESH_INTERFACES is empty; Wi-Fi AP was not started");
@@ -256,6 +279,202 @@ async fn main() -> Result<()> {
         });
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct LinkEvent {
+    kind: u16,
+    ifindex: i32,
+    iface: Option<String>,
+    mac: Option<String>,
+}
+
+const RTMGRP_LINK: u32 = 1;
+const IFLA_ADDRESS: u16 = 1;
+const IFLA_IFNAME: u16 = 3;
+const NLMSG_ALIGNTO: usize = 4;
+
+fn parse_mac(value: &str) -> Option<[u8; 6]> {
+    let bytes = value
+        .trim()
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    bytes.try_into().ok()
+}
+
+fn watch_rtnetlink_link_events(
+    owned_interfaces: InterfaceSet,
+    sender: tokio::sync::mpsc::UnboundedSender<LinkEvent>,
+) {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        tracing::error!(error = %std::io::Error::last_os_error(), "rtnetlink link watcher unavailable");
+        return;
+    }
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    address.nl_pid = 0;
+    address.nl_groups = RTMGRP_LINK;
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            &address as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    if bound != 0 {
+        tracing::error!(error = %std::io::Error::last_os_error(), "rtnetlink link watcher bind failed");
+        unsafe {
+            libc::close(fd);
+        }
+        return;
+    }
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+        if read < 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                tracing::warn!(error = %std::io::Error::last_os_error(), "rtnetlink link watcher read failed");
+            }
+            continue;
+        }
+        for event in parse_link_events(&buffer[..read as usize]) {
+            // Link deletion can be represented without an interface name on
+            // some kernels. Ignore such ambiguous events rather than
+            // treating an unrelated device as a reason to disturb the AP.
+            let Some(iface) = event.iface.as_deref() else {
+                continue;
+            };
+            if owned_interfaces.contains(iface) && sender.send(event).is_err() {
+                unsafe {
+                    libc::close(fd);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn parse_link_events(mut bytes: &[u8]) -> Vec<LinkEvent> {
+    const NLMSG_HDR_LEN: usize = 16;
+    const IFINFO_LEN: usize = 16;
+    let mut events = Vec::new();
+    while bytes.len() >= NLMSG_HDR_LEN {
+        let length = u32::from_ne_bytes(bytes[..4].try_into().expect("header length")) as usize;
+        let kind = u16::from_ne_bytes(bytes[4..6].try_into().expect("header type"));
+        if length < NLMSG_HDR_LEN || length > bytes.len() {
+            break;
+        }
+        if matches!(kind, libc::RTM_NEWLINK | libc::RTM_DELLINK)
+            && length >= NLMSG_HDR_LEN + IFINFO_LEN
+        {
+            let info = &bytes[NLMSG_HDR_LEN..NLMSG_HDR_LEN + IFINFO_LEN];
+            let ifindex = i32::from_ne_bytes(info[4..8].try_into().expect("ifindex"));
+            let mut iface = None;
+            let mut mac = None;
+            let mut attrs = &bytes[NLMSG_HDR_LEN + IFINFO_LEN..length];
+            while attrs.len() >= 4 {
+                let attr_len =
+                    u16::from_ne_bytes(attrs[..2].try_into().expect("attribute length")) as usize;
+                let attr_type = u16::from_ne_bytes(attrs[2..4].try_into().expect("attribute type"));
+                if attr_len < 4 || attr_len > attrs.len() {
+                    break;
+                }
+                let value = &attrs[4..attr_len];
+                match attr_type {
+                    IFLA_IFNAME => {
+                        iface = std::ffi::CStr::from_bytes_until_nul(value)
+                            .ok()
+                            .and_then(|name| name.to_str().ok())
+                            .map(str::to_owned)
+                    }
+                    IFLA_ADDRESS if value.len() == 6 => {
+                        mac = Some(
+                            value
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(":"),
+                        )
+                    }
+                    _ => {}
+                }
+                let aligned = (attr_len + (NLMSG_ALIGNTO - 1)) & !(NLMSG_ALIGNTO - 1);
+                if aligned > attrs.len() {
+                    break;
+                }
+                attrs = &attrs[aligned..];
+            }
+            events.push(LinkEvent {
+                kind,
+                ifindex,
+                iface,
+                mac,
+            });
+        }
+        let aligned = (length + (NLMSG_ALIGNTO - 1)) & !(NLMSG_ALIGNTO - 1);
+        if aligned > bytes.len() {
+            break;
+        }
+        bytes = &bytes[aligned..];
+    }
+    events
+}
+
+#[cfg(test)]
+mod link_event_tests {
+    use super::*;
+
+    #[test]
+    fn parses_mac_and_link_attributes() {
+        let mut message = vec![0_u8; 16 + 16];
+        message[4..6].copy_from_slice(&(libc::RTM_NEWLINK as u16).to_ne_bytes());
+        message[20..24].copy_from_slice(&42_i32.to_ne_bytes());
+        message.extend_from_slice(&[
+            10,
+            0,
+            IFLA_IFNAME as u8,
+            0,
+            b'w',
+            b'l',
+            b'a',
+            b'n',
+            b'0',
+            0,
+            0,
+            0,
+        ]);
+        message.extend_from_slice(&[
+            10,
+            0,
+            IFLA_ADDRESS as u8,
+            0,
+            0x9c,
+            0xef,
+            0xd5,
+            0xf6,
+            0x36,
+            0x47,
+        ]);
+        let length = message.len() as u32;
+        message[..4].copy_from_slice(&length.to_ne_bytes());
+        let events = parse_link_events(&message);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ifindex, 42);
+        assert_eq!(events[0].iface.as_deref(), Some("wlan0"));
+        assert_eq!(events[0].mac.as_deref(), Some("9c:ef:d5:f6:36:47"));
+        assert_eq!(
+            parse_mac("9C:EF:D5:F6:36:47"),
+            Some([0x9c, 0xef, 0xd5, 0xf6, 0x36, 0x47])
+        );
+    }
 }
 
 #[cfg(test)]

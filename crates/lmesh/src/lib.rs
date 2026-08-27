@@ -935,6 +935,8 @@ pub enum Request {
         #[serde(default)]
         iface: Option<String>,
     },
+    #[serde(rename = "wifi.interface.list")]
+    WifiInterfaceList,
     #[serde(rename = "wifi.interface.up")]
     WifiInterfaceUp {
         #[serde(default)]
@@ -1142,6 +1144,27 @@ pub enum Request {
         #[serde(default)]
         service_info_hex: Option<String>,
     },
+    /// Request current passive inventory or an active NAN discovery response
+    /// without replacing the current transport epoch.
+    #[serde(rename = "transport.discover")]
+    TransportDiscover {
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        #[serde(default)]
+        active: Option<u8>,
+        #[serde(default)]
+        nan: Option<u8>,
+        #[serde(default)]
+        passive_scan: Option<bool>,
+        #[serde(default)]
+        active_scan: Option<bool>,
+        #[serde(default)]
+        dns_sd: Option<bool>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+    },
     /// Size a NAN object transfer without opening an IP socket or touching a
     /// device. The same envelope is used by data frames and action diagnostics.
     #[serde(rename = "object.nan.dry_run")]
@@ -1243,6 +1266,39 @@ pub enum Request {
         iface: Option<String>,
         ssid: String,
     },
+    /// Start a station through the common transport transition. An omitted
+    /// passphrase selects open nl80211 unless the deployment credentials file
+    /// contains a matching SSID.
+    #[serde(rename = "transport.start")]
+    TransportStart {
+        /// Device-neutral bearer kind. Linux accepts `nan` with `ap=1` for
+        /// the P2P AP-equivalent and retains `sta` for ordinary association.
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        iface: Option<String>,
+        #[serde(default)]
+        ssid: String,
+        #[serde(default)]
+        passphrase: Option<String>,
+        #[serde(default)]
+        bssid: Option<String>,
+        #[serde(default)]
+        channel: Option<u8>,
+        /// `transport.start` AP-equivalent request.
+        #[serde(default)]
+        ap: Option<u8>,
+        /// Select the ordinary raw open AP backend for Linux/ESP comparison.
+        /// Omitted/zero selects the default P2P WPA2-PSK Group Owner.
+        #[serde(default)]
+        open: Option<u8>,
+    },
+    /// End the current Linux Wi-Fi transport and remove service-created VIFs.
+    #[serde(rename = "transport.stop")]
+    TransportStop {
+        #[serde(default)]
+        iface: Option<String>,
+    },
     /// Return station-mode association metrics.
     #[serde(rename = "wifi.sta.status")]
     WifiStaStatus {
@@ -1300,27 +1356,9 @@ impl LmeshService {
         );
         let radio = wifi_service.radio().clone();
         let wifi = wifi_service.netd().clone();
-        for result in radio.apply_startup_rate_profile(wifi.owned_interfaces().names()) {
-            tracing::info!(
-                ok = result
-                    .get("ok")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                iface = result
-                    .get("iface")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-                profile = result
-                    .get("profile")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-                error = result
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-                "wifi_startup_rate_profile"
-            );
-        }
+        // Construction is deliberately radio-neutral. A lmesh restart must
+        // not retune, create a monitor, or change link state on wlan1; each
+        // transport/AP operation owns its own explicit transition.
         // This is the development/test listener on wlan1.  Its port comes
         // from lmesh's service environment (3337), distinct from the stable
         // lmesh-wifi/wlan0 Recovery listener (3336).  Both expose the same
@@ -1362,7 +1400,7 @@ impl LmeshService {
         if let Err(error) = self.wifi.authorize(lmesh_wifi::Operation::Ap, &iface) {
             return serde_json::json!({"success": false, "error": error.to_string()});
         }
-        self.radio.wifi_ap_start_open_on_channel_with_interval(
+        self.radio.wifi_ap_start_open_on_child(
             Some(iface),
             None,
             Some(channel),
@@ -1401,13 +1439,27 @@ impl LmeshService {
             .prepare_ap_raw_monitor_fixture(None, Some(channel))
     }
 
+    /// Default Linux radio personality: a channel-6 P2P GO plus the shared
+    /// NAN/NOW monitor fixture. `LMESH_AP_BACKEND=open` retains the explicit
+    /// pure-Rust AP fallback when the driver or supplicant lacks P2P.
+    pub fn start_default_p2p_go(&self, channel: u8) -> serde_json::Value {
+        self.wifi_service.start_p2p_go_with_rawnan(None, channel)
+    }
+
     /// Associate the owned interface with an open AP after the common NAN/NOW
     /// monitor fixture has been prepared.
     pub fn start_default_open_sta(&self, ssid: String) -> serde_json::Value {
         match self.owned_wifi_iface(None, lmesh_wifi::Operation::Sta) {
-            Ok(iface) => self.radio.wifi_sta_join_open(Some(iface), ssid),
+            Ok(iface) => self.radio.wifi_sta_join_open(Some(iface), ssid, None, None),
             Err(error) => serde_json::json!({"ok": false, "error": error}),
         }
+    }
+
+    /// End the current Wi-Fi transport epoch and prove that service-created
+    /// AP/monitor/legacy-STA children are gone while retaining the primary
+    /// interface as a down station VIF.
+    pub fn stop_wifi_transport(&self, iface: Option<String>) -> serde_json::Value {
+        self.wifi_service.transport_stop(iface)
     }
 
     fn owned_wifi_iface(
@@ -1523,6 +1575,9 @@ impl LmeshService {
                     ),
                     Err(error) => mesh::protocol::Response::err(error.to_string()),
                 }
+            }
+            Request::WifiInterfaceList => {
+                mesh::protocol::Response::ok_with_data(self.radio.wifi_interface_list())
             }
             Request::WifiInterfaceUp { iface } => {
                 match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
@@ -1741,6 +1796,28 @@ impl LmeshService {
                     Err(error) => mesh::protocol::Response::err(error.to_string()),
                 }
             }
+            Request::TransportDiscover {
+                iface,
+                channel,
+                active,
+                nan,
+                passive_scan,
+                active_scan,
+                dns_sd,
+                wait_ms,
+            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => mesh::protocol::Response::ok_with_data(self.radio.transport_discover(
+                    Some(iface),
+                    channel,
+                    active == Some(1),
+                    nan != Some(0),
+                    passive_scan.unwrap_or(true),
+                    active_scan.unwrap_or(false),
+                    dns_sd.unwrap_or(false),
+                    wait_ms,
+                )),
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::ObjectNanDryRun { image_size, mtu } => mesh::protocol::Response::ok_with_data(
                 nan_object_dry_run(image_size, mtu.unwrap_or(1_200)),
             ),
@@ -1782,7 +1859,7 @@ impl LmeshService {
             } => {
                 match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Ap) {
                     Ok(iface) => mesh::protocol::Response::ok_with_data(
-                        self.radio.wifi_ap_start_open_on_channel_with_interval(
+                        self.radio.wifi_ap_start_open_on_child(
                             Some(iface),
                             ssid,
                             channel,
@@ -1840,8 +1917,39 @@ impl LmeshService {
                 channel,
                 passive.unwrap_or(false),
             )),
-            Request::WifiStaJoinOpen { iface, ssid } => {
-                mesh::protocol::Response::ok_with_data(self.radio.wifi_sta_join_open(iface, ssid))
+            Request::WifiStaJoinOpen { iface, ssid } => mesh::protocol::Response::ok_with_data(
+                self.radio.wifi_sta_join_open(iface, ssid, None, None),
+            ),
+            Request::TransportStart {
+                kind,
+                iface,
+                ssid,
+                passphrase,
+                bssid,
+                channel,
+                ap,
+                open,
+            } => {
+                let ap = ap == Some(1);
+                let open = open == Some(1);
+                let kind_ok = match kind.as_deref() {
+                    None | Some("sta") if !ap => true,
+                    None | Some("nan") if ap => true,
+                    _ => false,
+                };
+                if !kind_ok {
+                    mesh::protocol::Response::err(
+                        "Linux transport.start expects kind=sta or kind=nan with ap=1",
+                    )
+                } else {
+                    mesh::protocol::Response::ok_with_data(
+                        self.wifi_service
+                            .transport_start(iface, ssid, passphrase, bssid, channel, ap, open),
+                    )
+                }
+            }
+            Request::TransportStop { iface } => {
+                mesh::protocol::Response::ok_with_data(self.stop_wifi_transport(iface))
             }
             Request::WifiStaStatus { iface } => {
                 mesh::protocol::Response::ok_with_data(self.radio.wifi_sta_status(iface))

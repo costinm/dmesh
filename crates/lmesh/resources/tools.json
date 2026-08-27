@@ -691,7 +691,7 @@
     "x-method-index": 13
   },
   {
-    "description": "Start a password-less open AP on channel 6. Default SSID is Direct-XXXXXXXX-Dmesh-local from the interface MAC suffix. Records AP SME auth/assoc/probe/deauth frames as wifi.ap.mgmt while running.",
+    "description": "Start a password-less open AP on channel 6. Default SSID is the fixed DIRECT-dmesh. Records AP SME auth/assoc/probe/deauth frames as wifi.ap.mgmt while running.",
     "group": "Wi-Fi",
     "inputSchema": {
       "additionalProperties": false,

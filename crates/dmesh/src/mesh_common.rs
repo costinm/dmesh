@@ -4,6 +4,8 @@
 //! mesh logic. JNI-specific marshalling stays in the wrapper module.
 
 use dmesh_store::StoreService;
+#[cfg(target_os = "android")]
+use sha2::{Digest, Sha256};
 use ssh_mesh::sshc::SshClientManager;
 use ssh_mesh::{MeshNode, MeshNodeConfig, run_ssh_server};
 #[cfg(target_os = "android")]
@@ -159,7 +161,10 @@ pub fn start_mesh(
             .to_openssh()
             .unwrap_or_default();
         let (trigger, receiver) = tokio::sync::mpsc::unbounded_channel();
-        (Some(runtime.spawn(android_announce_loop(public_key, receiver))), Some(trigger))
+        (
+            Some(runtime.spawn(android_announce_loop(public_key, receiver))),
+            Some(trigger),
+        )
     };
     #[cfg(not(target_os = "android"))]
     let (announce_server_handle, announce_trigger) = (None, None);
@@ -219,10 +224,14 @@ async fn android_announce_loop(
             return;
         }
     };
+    // OpenSSH public-key text begins with the same algorithm label on every
+    // device (for example `ecdsa-sha2-nistp...`). Hash the complete stable
+    // public identity instead of copying that common prefix into every
+    // announce record.
+    let digest = Sha256::digest(public_key.as_bytes());
     let mut id = [0; 16];
-    let key_bytes = public_key.as_bytes();
-    let take = key_bytes.len().min(id.len());
-    id[..take].copy_from_slice(&key_bytes[..take]);
+    id.copy_from_slice(&digest[..16]);
+    let take = id.len();
     let started = tokio::time::Instant::now();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
     let mut receive = [0u8; 256];
@@ -245,7 +254,9 @@ async fn android_announce_loop(
             }
             received = socket.recv_from(&mut receive) => match received {
                 Ok((len, sender)) => {
-                    if let Some(announce) = dmesh_server::announce::decode_announce(&receive[..len]) {
+                    if let Some(announce) = dmesh_server::announce::decode_announce(&receive[..len])
+                        && announce.device_id() != &id[..take]
+                    {
                         crate::mesh_jni::observe_announce(
                             announce,
                             sender.to_string(),
@@ -276,7 +287,11 @@ async fn send_android_announce(
         dmesh_server::announce::Announce::boot(id, id_len, 0)
     } else {
         dmesh_server::announce::Announce::discovery(
-            id, id_len, u32::try_from(uptime_secs).unwrap_or(u32::MAX), 0, 0,
+            id,
+            id_len,
+            u32::try_from(uptime_secs).unwrap_or(u32::MAX),
+            0,
+            0,
         )
     };
     let mut wire = [0u8; 96];
@@ -288,7 +303,9 @@ async fn send_android_announce(
         if joined_interfaces.insert(*interface_index)
             && let Err(error) = socket.join_multicast_v6(&group, *interface_index)
         {
-            log::warn!("Android announce multicast join failed on interface {interface_index}: {error}");
+            log::warn!(
+                "Android announce multicast join failed on interface {interface_index}: {error}"
+            );
         }
     }
     let mut sent = false;
@@ -296,7 +313,9 @@ async fn send_android_announce(
         let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, interface_index));
         match socket.send_to(&wire[..used], destination).await {
             Ok(_) => sent = true,
-            Err(error) => log::warn!("Android announce multicast send failed on interface {interface_index}: {error}"),
+            Err(error) => log::warn!(
+                "Android announce multicast send failed on interface {interface_index}: {error}"
+            ),
         }
     }
     sent

@@ -94,63 +94,15 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
         Err(error) => warn!(%error, "rawnan_active_publish_configure_failed"),
     }
     let channel = raw_wifi_channel();
-    // `lmesh` starts unassociated by default. A lab AP is an explicit startup
-    // choice; unlike lmesh-wifi's normal infrastructure AP it uses 500 TU so
-    // it can be a quiet channel-6 fallback NAN timing anchor.
-    let ap_started = if ap_autostart_enabled() {
-        let iface = std::env::var(AP_IFACE_ENV).unwrap_or_else(|_| "wlan1".to_owned());
-        let result = service.start_default_open_ap(iface, channel, ap_beacon_interval_tu());
-        if !result
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            warn!(?result, "lmesh_optional_ap_start_failed");
-        }
-        result
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+    // lmesh owns wlan1 as the experimental/default peer radio: boot a
+    // channel-6 P2P GO and then attach the same monitor receive/TX fixture
+    // used by the stable wlan0 AP. The P2P implementation has an explicit
+    // pure-Rust open-AP fallback when unsupported.
+    let p2p_started = service.start_default_p2p_go(channel);
+    if p2p_started.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        debug!(?p2p_started, channel, "lmesh_default_p2p_nan_started");
     } else {
-        false
-    };
-    let monitor_fixture = if ap_started {
-        service.prepare_default_ap_rawnan_monitor(channel)
-    } else {
-        service.prepare_default_rawnan_monitor(channel)
-    };
-    let monitor_ready = monitor_fixture
-        .get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if monitor_ready {
-        debug!(?monitor_fixture, channel, "raw_monitor_fixture_started");
-    } else {
-        warn!(
-            ?monitor_fixture,
-            channel, "raw_monitor_fixture_start_failed"
-        );
-    }
-    // Startup is always the unassociated NAN+NOW monitor personality.  STA
-    // is a replacement epoch selected later by the common transport.start
-    // CBOR command, exactly as on firmware.
-    // The fixture preparation report is diagnostic only. An externally
-    // prepared permanent monitor can be usable even when that report is not
-    // affirmative (for example after a supervised process restart), and the
-    // listener itself is the non-mutating capability check. Do not leave NAN
-    // receive disabled merely because a prior lifecycle step was inconclusive.
-    let rawnan_started = if rawnan_autostart_enabled() {
-        let result = service.start_default_rawnan();
-        debug!(?result, "rawnan_default_started");
-        result
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    if !rawnan_started && rawnan_autostart_enabled() {
-        warn!("rawnan_autostart_failed");
+        warn!(?p2p_started, channel, "lmesh_default_p2p_nan_start_failed");
     }
     debug!(
         public_key = %service.public_key_b64(),
@@ -214,17 +166,15 @@ fn announce_interval() -> Duration {
 fn rawnan_autostart_enabled() -> bool {
     std::env::var(RAWNAN_AUTOSTART_ENV)
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-        .unwrap_or(true)
+        // Radio-neutral startup is the default. NAN/NOW is still available,
+        // but must be selected explicitly by the service environment.
+        .unwrap_or(false)
 }
 
 fn ap_autostart_enabled() -> bool {
     std::env::var(AP_AUTOSTART_ENV)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-        // lmesh is the channel-6 NAN/NOW lab service. Keep its independently
-        // owned AP up at the 500-TU fallback cadence unless an operator
-        // explicitly selects the AP-off experiment. This is startup policy,
-        // never an E2E-test side effect.
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn ap_beacon_interval_tu() -> u16 {
@@ -861,8 +811,14 @@ mod tests {
             id: Some(serde_json::json!(16)),
             env: [
                 (mesh::tagged::NameOrTag::Tag(1), serde_json::json!("wlan1")),
-                (mesh::tagged::NameOrTag::Tag(2), serde_json::json!("111111111111")),
-                (mesh::tagged::NameOrTag::Tag(3), serde_json::json!("222222222222")),
+                (
+                    mesh::tagged::NameOrTag::Tag(2),
+                    serde_json::json!("111111111111"),
+                ),
+                (
+                    mesh::tagged::NameOrTag::Tag(3),
+                    serde_json::json!("222222222222"),
+                ),
                 (mesh::tagged::NameOrTag::Tag(4), serde_json::json!(4096)),
                 (mesh::tagged::NameOrTag::Tag(5), serde_json::json!(65536)),
             ]

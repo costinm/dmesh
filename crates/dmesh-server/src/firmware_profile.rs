@@ -17,11 +17,34 @@ use quic_lite::connection::ConnectionPolicy;
 /// is not persisted as part of STA association.
 pub const DEFAULT_EVENT_PORT: u16 = 3336;
 
+/// A zero UART selector means "use the product default", currently 115200.
+/// This lets a controller avoid board-specific baud knowledge without making
+/// the default spelling ambiguous with an explicit bearer shutdown.
+pub const UART_DEFAULT: u8 = 0;
+/// The product's default physical UART rate.
+pub const UART_115200: u8 = 1;
+/// Explicitly stop a real UART bearer. USB-Serial/JTAG deliberately ignores
+/// this selector: it is a debug/JTAG path, not a controllable UART peripheral.
+pub const UART_OFF: u8 = 8;
+
+/// Normalize a public UART selector before storing it in a profile.
+/// `0` requests the 115200 default; malformed selectors are rejected by the
+/// wire decoder before they reach this helper.
+pub const fn normalize_uart_selector(selector: u8) -> Option<u8> {
+    match selector {
+        UART_DEFAULT => Some(UART_115200),
+        UART_115200..=7 | UART_OFF => Some(selector),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportProfile {
     pub ssid: [u8; 33],
     pub ssid_len: usize,
-    /// Ephemeral WPA2 credential from transport.start; never stored in NVS.
+    /// Optional per-epoch WPA2 override from transport.start; never stored in
+    /// NVS. A zero length selects the fixed DMesh WPA2 key unless `open` was
+    /// explicitly selected for this transient radio epoch.
     pub sta_passphrase: [u8; 64],
     pub sta_passphrase_len: usize,
     /// Optional exact AP identity supplied with the transient STA start.
@@ -53,8 +76,12 @@ pub struct TransportProfile {
     pub ndp: u8,
     /// `ap=1` enables a local AP alongside the selected STA or NAN mode.
     pub ap: u8,
-    /// UART selector: `0` disables it, `1` is 115200 baud, and `2..=7` are
-    /// other common speeds. USB packet mode ignores the speed value.
+    /// Explicit unauthenticated AP/STA epoch. This is volatile and defaults
+    /// to false: absent credentials retain the fixed DMesh WPA2 policy.
+    pub open: bool,
+    /// UART selector: `0` is the default 115200 setting, `1` explicitly means
+    /// 115200, `2..=7` select other common rates, and `8` is explicitly off.
+    /// USB packet mode ignores this selector.
     pub uart: u8,
     pub run_requested: bool,
     pub command_mode: bool,
@@ -111,7 +138,8 @@ impl TransportProfile {
             // the current NOW/NAN validation lane. An explicit start can
             // replace it with `ap=0` or associated STA later.
             ap: 1,
-            uart: 1,
+            open: false,
+            uart: UART_115200,
             run_requested: false,
             command_mode: false,
             requested_transport: None,
@@ -169,8 +197,15 @@ pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportPr
     if let Some(value) = config.ap {
         profile.ap = value;
     }
+    if let Some(value) = config.open {
+        profile.open = value;
+    }
     if let Some(value) = config.uart {
-        profile.uart = value;
+        // Preserve the active profile on an invalid in-process value. Normal
+        // tagged-CBOR callers are already rejected by the decoder below.
+        if let Some(selector) = normalize_uart_selector(value) {
+            profile.uart = selector;
+        }
     }
     if let Some(value) = config.raw_tx_rate {
         profile.raw_tx_rate = value;
@@ -194,7 +229,8 @@ pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportPr
 
 /// Remove the volatile WPA2 credential before applying a replacement STA
 /// epoch. `transport.start` is a complete radio declaration: an omitted
-/// passphrase means open authentication, never "reuse the old secret".
+/// passphrase selects the fixed DMesh WPA2 key unless the replacement epoch
+/// explicitly selected `open=1`; neither spelling retains a prior secret.
 ///
 /// This is portable policy, not an ESP adapter concern, so host-side command
 /// tests can verify the credential lifecycle without ESP-IDF.
@@ -286,6 +322,7 @@ fn control_method(request: control::Request<'_>) -> u64 {
         control::Request::SettingsList => control::SETTINGS_LIST,
         control::Request::TransportStart { .. } => control::TRANSPORT_START,
         control::Request::TransportStop { .. } => control::TRANSPORT_STOP,
+        control::Request::TransportDiscover { .. } => control::TRANSPORT_DISCOVER,
     }
 }
 
@@ -309,6 +346,53 @@ mod tests {
     #[test]
     fn associated_sta_driver_egress_is_the_default() {
         assert!(TransportProfile::new().sta_driver_tx);
+    }
+
+    #[test]
+    fn open_requires_an_explicit_transport_start_field() {
+        let mut profile = TransportProfile::new();
+        assert!(!profile.open, "WPA2 is the safe boot default");
+
+        apply_transport_config(
+            TransportConfig {
+                open: Some(true),
+                ..TransportConfig::default()
+            },
+            &mut profile,
+        );
+        assert!(profile.open);
+
+        apply_transport_config(
+            TransportConfig {
+                open: Some(false),
+                ..TransportConfig::default()
+            },
+            &mut profile,
+        );
+        assert!(!profile.open);
+    }
+
+    #[test]
+    fn uart_zero_selects_the_default_and_eight_is_explicit_off() {
+        let mut profile = TransportProfile::new();
+        apply_transport_config(
+            TransportConfig {
+                uart: Some(UART_DEFAULT),
+                ..TransportConfig::default()
+            },
+            &mut profile,
+        );
+        assert_eq!(profile.uart, UART_115200);
+
+        apply_transport_config(
+            TransportConfig {
+                uart: Some(UART_OFF),
+                ..TransportConfig::default()
+            },
+            &mut profile,
+        );
+        assert_eq!(profile.uart, UART_OFF);
+        assert_eq!(normalize_uart_selector(9), None);
     }
 
     #[test]

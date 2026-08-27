@@ -8,12 +8,12 @@
 //! frames and exposes bounded service receipts.
 
 use crate::{
-    fnv1a32, DMESH_MAGIC, DMESH_NAN_FOLLOWUP_HEADER_LEN, DMESH_VERSION, NAN_COMMAND_MAX_LEN,
+    DMESH_MAGIC, DMESH_NAN_FOLLOWUP_HEADER_LEN, DMESH_VERSION, NAN_COMMAND_MAX_LEN,
     NAN_SDEA_SERVICE_UPDATE_CONTROL, NAN_SERVICE_FLAG_ACTIVE_ACK, NAN_SERVICE_FLAG_BLE_WAKE,
-    NAN_SERVICE_FLAG_UART_WAKE, NAN_SERVICE_INFO_LEN,
+    NAN_SERVICE_FLAG_UART_WAKE, NAN_SERVICE_INFO_LEN, fnv1a32,
 };
 use alloc::{collections::VecDeque, vec::Vec};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Maximum Service Info carried by a NAN Publish service descriptor.
 pub const NAN_ACTIVE_PUBLISH_MAX_LEN: usize = 255;
@@ -214,12 +214,35 @@ pub fn build_nan_usd_sdf(
     control: u8,
     service_info: &[u8],
 ) -> Vec<u8> {
+    build_nan_usd_sdf_with_bssid(
+        destination,
+        source,
+        [0xff; 6],
+        service_id,
+        instance_id,
+        control,
+        service_info,
+    )
+}
+
+/// Build an active NAN service-discovery frame for a selected cluster.
+/// A1 may be the discovery multicast address while A3 remains the selected
+/// cluster BSSID used by receivers for discovery-window admission.
+pub fn build_nan_usd_sdf_with_bssid(
+    destination: [u8; 6],
+    source: [u8; 6],
+    bssid: [u8; 6],
+    service_id: [u8; 6],
+    instance_id: u8,
+    control: u8,
+    service_info: &[u8],
+) -> Vec<u8> {
     let info_len = service_info.len().min(231);
     let mut frame = Vec::with_capacity(24 + 6 + 3 + 9 + 3 + 11 + info_len);
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
-    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&bssid);
     frame.extend_from_slice(&[0x00, 0x00, 0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13]);
     frame.push(0x03);
     frame.extend_from_slice(&9_u16.to_le_bytes());
@@ -595,14 +618,17 @@ mod tests {
     fn active_subscribe_recovers_custom_sdea_service_info() {
         let service_id = [7, 8, 9, 10, 11, 12];
         let custom = [0xa1, 0x01, 0x01];
-        let frame = build_nan_usd_sdf(
+        let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x8f, 0xf8];
+        let frame = build_nan_usd_sdf_with_bssid(
             crate::NAN_DISCOVERY_MAC,
             [1, 2, 3, 4, 5, 6],
+            bssid,
             service_id,
             9,
             0x11,
             &custom,
         );
+        assert_eq!(&frame[16..22], &bssid);
         let descriptor = crate::service_descriptor(&frame, service_id).unwrap();
         assert_eq!(descriptor.control, 0x11);
         assert!(descriptor.payload.is_empty());

@@ -7,7 +7,6 @@
 use serde_json::{Value, json};
 use std::{
     ffi::CString,
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -18,25 +17,11 @@ pub fn clear_neighbor(iface: &str, address: &str) -> Value {
         Ok(address) if address.is_unicast_link_local() => address,
         _ => return json!({"ok": false, "error": "address must be an IPv6 link-local unicast"}),
     };
-    // The service's Nix PATH may contain a limited `ip` implementation.
-    // Use the system iproute2 binary that owns the full neighbor subcommand.
-    let output = match Command::new("/usr/sbin/ip")
-        .args(["-6", "neigh", "delete", &address.to_string(), "dev", iface])
-        .output()
-    {
-        Ok(output) => output,
-        Err(command_error) => return error("run ip neighbor delete", command_error),
-    };
-    // A missing entry is already the desired state; all other command errors
-    // remain observable to the caller.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let absent = stderr.contains("No such file or directory");
     json!({
-        "ok": output.status.success() || absent,
+        "ok": false,
         "iface": iface,
         "address": address.to_string(),
-        "absent": absent,
-        "stderr": stderr.trim(),
+        "error": "neighbor mutation is not implemented through rtnetlink; host command execution is disabled",
     })
 }
 
@@ -56,30 +41,12 @@ pub fn set_static_neighbor(iface: &str, address: &str, mac_text: &str) -> Value 
         None => return json!({"ok": false, "error": "mac must be six hexadecimal octets"}),
     };
     let mac = mac(mac_bytes);
-    let output = match Command::new("/usr/sbin/ip")
-        .args([
-            "-6",
-            "neigh",
-            "replace",
-            &address.to_string(),
-            "lladdr",
-            &mac,
-            "nud",
-            "permanent",
-            "dev",
-            iface,
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(command_error) => return error("run ip neighbor replace", command_error),
-    };
     json!({
-        "ok": output.status.success(),
+        "ok": false,
         "iface": iface,
         "address": address.to_string(),
         "mac": mac,
-        "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+        "error": "neighbor mutation is not implemented through rtnetlink; host command execution is disabled",
     })
 }
 

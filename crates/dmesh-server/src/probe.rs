@@ -99,6 +99,25 @@ pub struct ProbeEndpoint {
     pub bssid: Option<[u8; 6]>,
 }
 
+/// Bearer used to establish the initial probe epoch before the pair matrix.
+///
+/// Active devices normally use NOW so a control plane can characterize them
+/// without a NAN cluster. NAN remains mandatory for sleepy devices because it
+/// supplies their discovery-window timing. USB is a local diagnostic option
+/// and must never be assumed available on a production control plane.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
+pub enum ProbeActivation {
+    /// Direct raw-action/NOW control for active endpoints.
+    #[default]
+    Now,
+    /// NAN Service Discovery / active-Subscribe control for sleepy endpoints.
+    Nan,
+    /// Direct serial/USB diagnostic control, when both local adapters exist.
+    Usb,
+}
+
 /// A signed-control-plane request to configure endpoint A and B, then measure
 /// whether either can safely serve as a mesh-chain forwarder. `udp6=false` is
 /// normal for unassociated NAN+NOW-only endpoints; `now=false` is normal for
@@ -109,6 +128,11 @@ pub struct ProbeRequest {
     pub request_id: u64,
     pub source: ProbeEndpoint,
     pub target: ProbeEndpoint,
+    /// Initial control bearer. It is independent of the subsequent NAN/NOW/
+    /// UDP6 measurement bits so a NOW-activated active pair can still test
+    /// NAN later in its requested mode matrix.
+    #[cfg_attr(feature = "std", serde(default))]
+    pub activation: ProbeActivation,
     pub test_nan: bool,
     /// Request an Android-to-Android Wi-Fi Aware data path after discovery.
     /// This is distinct from NAN Service Discovery: it yields an IPv6 link
@@ -133,6 +157,93 @@ pub struct ProbeRequest {
     pub measure_mode_switch: bool,
 }
 
+/// Discovery mechanisms requested before a STA transport is selected.  This
+/// is a capability request, not a platform path: each endpoint adapter maps
+/// it to nl80211, Android framework discovery, or firmware discovery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
+pub struct ProbeDiscoverOptions {
+    pub active_ssid_scan: bool,
+    pub passive_scan: bool,
+    pub nan: bool,
+    pub dns_sd: bool,
+    pub channel: Option<u8>,
+    /// Reject stale candidates during auto-selection. `None` leaves platform
+    /// policy in control; the selected result always reports its last sighting.
+    pub max_age_ms: Option<u32>,
+}
+
+/// How the pair-probe target is chosen. `Exact` uses `ProbeRequest.target` as
+/// supplied. `AutoOpenDmesh` permits the local adapter to choose one open
+/// DMesh candidate discovered under [`ProbeDiscoverOptions`].
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "std", serde(rename_all = "snake_case"))]
+pub enum ProbeTargetSelection {
+    #[default]
+    Exact,
+    AutoOpenDmesh,
+}
+
+/// The target actually used by a pair-radio probe.  `node` is the stable
+/// device/radio identity when known; `bssid` and `channel` preserve the exact
+/// association evidence needed to reproduce the selected link.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
+pub struct ProbeSelectedTarget {
+    pub attempted: bool,
+    pub selected: bool,
+    pub node: Option<[u8; 6]>,
+    pub bssid: Option<[u8; 6]>,
+    pub channel: Option<u8>,
+    pub last_seen_ms: Option<u64>,
+    pub last_seen_age_ms: Option<u32>,
+}
+
+/// Per-endpoint discovery evidence collected as part of a pair-health probe.
+/// Adapters fill the mechanisms they implement and leave unrelated counters
+/// unset; zero is reserved for an observed zero, not an unsupported metric.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
+pub struct ProbeDiscoveryResult {
+    pub attempted: bool,
+    pub succeeded: bool,
+    pub active_scan_attempted: bool,
+    pub active_scan_succeeded: bool,
+    pub passive_scan_attempted: bool,
+    pub passive_scan_succeeded: bool,
+    pub nan_attempted: bool,
+    pub nan_succeeded: bool,
+    pub dns_sd_attempted: bool,
+    pub dns_sd_succeeded: bool,
+    pub candidates: Option<u16>,
+    pub dmesh_candidates: Option<u16>,
+    pub rx_events: Option<u32>,
+    pub tx_events: Option<u32>,
+    pub accepted_events: Option<u32>,
+    /// Counts are aggregate evidence; adapters keep detailed per-channel BSS
+    /// records in their normal device-inventory status projection.
+    pub non_dmesh_candidates: Option<u16>,
+    pub newest_dmesh_age_ms: Option<u32>,
+}
+
+/// Explicit pair-radio state sequence for a discovery-selected STA probe. A
+/// successful discovery response alone never counts as a connection: the
+/// executor resolves the target endpoint from the selected candidate, then
+/// records final association state, scoped link-local readiness, and terminal
+/// cleanup state for the locally controlled endpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
+pub struct ProbePairDiscoverySequence {
+    pub discover: ProbeDiscoverOptions,
+    pub target_selection: ProbeTargetSelection,
+    pub select_open_dmesh: bool,
+    pub start_transport: bool,
+    pub inspect_stats: bool,
+    pub cleanup: bool,
+}
+
 /// One regular control-plane handler input.  `request` says what to measure;
 /// the two descriptors say which devices can perform it.  An adapter must
 /// configure only these descriptors' endpoints.  It must never change its
@@ -143,6 +254,9 @@ pub struct PairProbeRequest {
     pub request: ProbeRequest,
     pub source: ProbeDeviceDescriptor,
     pub target: ProbeDeviceDescriptor,
+    /// Discovery is part of the existing pair probe. Legacy rows use the
+    /// default: no additional discovery and an exact target.
+    pub discovery: ProbePairDiscoverySequence,
 }
 
 /// Build the complete ESP pair characterization matrix.
@@ -172,13 +286,23 @@ pub fn full_pair_probe_requests(
     let mut rows = Vec::new();
     let now = has(PROBE_CAP_NOW);
     let has_nan = has(PROBE_CAP_NAN);
-    let mut push = |offset: u64, source_mode: ProbeMode, target_mode: ProbeMode,
-                    test_now: bool, test_udp6: bool| {
+    let mut push = |offset: u64,
+                    source_mode: ProbeMode,
+                    target_mode: ProbeMode,
+                    test_now: bool,
+                    test_udp6: bool| {
         rows.push(PairProbeRequest {
             request: ProbeRequest {
                 request_id: request_id.saturating_add(offset),
-                source: ProbeEndpoint { mode: source_mode, ..source.endpoint },
-                target: ProbeEndpoint { mode: target_mode, ..target.endpoint },
+                source: ProbeEndpoint {
+                    mode: source_mode,
+                    ..source.endpoint
+                },
+                target: ProbeEndpoint {
+                    mode: target_mode,
+                    ..target.endpoint
+                },
+                activation: ProbeActivation::Now,
                 // NAN is measured when both endpoints support it, but an
                 // active device pair can still be characterized over NOW if
                 // a particular host cannot form or observe a NAN cluster.
@@ -195,6 +319,7 @@ pub fn full_pair_probe_requests(
             },
             source,
             target,
+            discovery: ProbePairDiscoverySequence::default(),
         });
     };
 
@@ -208,7 +333,10 @@ pub fn full_pair_probe_requests(
     if has(PROBE_CAP_AP | PROBE_CAP_STA | PROBE_CAP_UDP6) {
         push(
             1,
-            ProbeMode { ap: true, ..ProbeMode::NAN_NOW },
+            ProbeMode {
+                ap: true,
+                ..ProbeMode::NAN_NOW
+            },
             ProbeMode::STA_NAN_NOW,
             false,
             true,
@@ -217,8 +345,14 @@ pub fn full_pair_probe_requests(
         // an explicit requested mode and must be measured by the executor.
         push(
             2,
-            ProbeMode { ap: true, ..ProbeMode::NAN_NOW },
-            ProbeMode { ap: true, ..ProbeMode::STA_NAN_NOW },
+            ProbeMode {
+                ap: true,
+                ..ProbeMode::NAN_NOW
+            },
+            ProbeMode {
+                ap: true,
+                ..ProbeMode::STA_NAN_NOW
+            },
             false,
             true,
         );
@@ -228,7 +362,13 @@ pub fn full_pair_probe_requests(
     // regressions where NAN remains visible but coexistence breaks raw action
     // traffic after an STA epoch.
     if now && has(PROBE_CAP_STA) {
-        push(3, ProbeMode::STA_NAN_NOW, ProbeMode::STA_NAN_NOW, true, false);
+        push(
+            3,
+            ProbeMode::STA_NAN_NOW,
+            ProbeMode::STA_NAN_NOW,
+            true,
+            false,
+        );
     }
     rows
 }
@@ -263,6 +403,21 @@ pub struct ProbeUdp6AssociationResult {
     pub one_way: ProbeMeasurement,
     pub quic_lite: ProbeMeasurement,
     pub iperf: ProbeMeasurement,
+}
+
+impl ProbeUdp6AssociationResult {
+    /// A usable associated bearer is more than an AP/P2P group or a multicast
+    /// receipt.  The controller must have progressed through every data
+    /// stage using the scoped peer learned from multicast discovery.
+    pub const fn completed(&self) -> bool {
+        self.attempted
+            && self.source_ready
+            && self.target_ready
+            && self.multicast.succeeded
+            && self.one_way.succeeded
+            && self.quic_lite.succeeded
+            && self.iperf.succeeded
+    }
 }
 
 /// Timing and result of replacing an endpoint's immutable radio epoch.
@@ -316,6 +471,11 @@ pub struct ProbeScanResult {
 #[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
 pub struct ProbeResponse {
     pub request_id: u64,
+    /// Discovery health from each endpoint precedes any selected association.
+    pub source_discovery: ProbeDiscoveryResult,
+    pub target_discovery: ProbeDiscoveryResult,
+    /// The exact requested or auto-selected target used for this row.
+    pub selected_target: ProbeSelectedTarget,
     pub source_mode: ProbeModeResult,
     pub target_mode: ProbeModeResult,
     pub nan: ProbeMeasurement,
@@ -364,6 +524,7 @@ mod tests {
                 mode: ProbeMode::STA_NAN_NOW,
                 bssid: Some([3; 6]),
             },
+            activation: ProbeActivation::Nan,
             test_nan: true,
             test_nan_data: false,
             test_now: false,
@@ -385,9 +546,20 @@ mod tests {
 
     #[test]
     fn full_pair_matrix_is_capability_driven_and_keeps_nan_in_every_row() {
-        let capabilities = PROBE_CAP_NAN | PROBE_CAP_NOW | PROBE_CAP_STA | PROBE_CAP_AP | PROBE_CAP_UDP6;
-        let rows = full_pair_probe_requests(40, descriptor(1, capabilities), descriptor(2, capabilities), 4096, 65536);
+        let capabilities =
+            PROBE_CAP_NAN | PROBE_CAP_NOW | PROBE_CAP_STA | PROBE_CAP_AP | PROBE_CAP_UDP6;
+        let rows = full_pair_probe_requests(
+            40,
+            descriptor(1, capabilities),
+            descriptor(2, capabilities),
+            4096,
+            65536,
+        );
         assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter()
+                .all(|row| row.request.activation == ProbeActivation::Now)
+        );
         assert!(rows.iter().all(|row| row.request.test_nan));
         assert!(rows[0].request.test_now);
         assert!(rows[1].request.test_udp6);
@@ -395,13 +567,42 @@ mod tests {
         assert!(rows[2].request.target.mode.ap);
         assert!(rows[3].request.test_now);
         assert_eq!(rows[3].request.source.mode.transport_kind, 1);
+        assert_eq!(rows[0].discovery, ProbePairDiscoverySequence::default());
+    }
+
+    #[test]
+    fn association_probe_requires_every_bearer_stage() {
+        let mut result = ProbeUdp6AssociationResult {
+            attempted: true,
+            source_ready: true,
+            target_ready: true,
+            multicast: ProbeMeasurement {
+                succeeded: true,
+                ..ProbeMeasurement::default()
+            },
+            one_way: ProbeMeasurement {
+                succeeded: true,
+                ..ProbeMeasurement::default()
+            },
+            quic_lite: ProbeMeasurement {
+                succeeded: true,
+                ..ProbeMeasurement::default()
+            },
+            iperf: ProbeMeasurement::default(),
+        };
+        assert!(!result.completed());
+        result.iperf.succeeded = true;
+        assert!(result.completed());
     }
 
     #[test]
     fn full_pair_matrix_skips_now_and_udp_rows_not_supported_by_both_nodes() {
         let rows = full_pair_probe_requests(
             1,
-            descriptor(1, PROBE_CAP_NAN | PROBE_CAP_STA | PROBE_CAP_AP | PROBE_CAP_UDP6),
+            descriptor(
+                1,
+                PROBE_CAP_NAN | PROBE_CAP_STA | PROBE_CAP_AP | PROBE_CAP_UDP6,
+            ),
             descriptor(2, PROBE_CAP_NAN),
             0,
             0,

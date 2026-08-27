@@ -109,15 +109,69 @@ impl DeviceSession {
         }
     }
 
+    /// Discard delayed boot output before a caller starts its first operation.
+    ///
+    /// This is for a USB-pair fixture immediately after it obtains exclusive
+    /// ownership of a CP210x port.  Some boards reset when the previous test
+    /// process closes its last port owner; their ROM/ESP-IDF text can arrive
+    /// after the next process has opened the same device.  Waiting and
+    /// draining here keeps that *pre-test* reset from being attributed to the
+    /// first radio operation.  It never runs during a probe: after the caller
+    /// sends any record, [`poll_until`] retains diagnostics and treats a reset
+    /// as a real failure.
+    pub fn discard_startup_backlog(&mut self, settle: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + settle;
+        let mut discarded = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
+        while Instant::now() < deadline {
+            match self.serial.read(&mut discarded) {
+                Ok(_) => {}
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        // A reset can split a PPP delimiter across the drain boundary.  Start
+        // the actual test with no partial binary frame, diagnostic line, or
+        // stale fatal marker from the preceding serial owner.
+        self.decoder = Decoder::with_max(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1);
+        self.text_tap = RawTextTap::default();
+        self.history.clear();
+        self.fatal_diagnostic = None;
+        Ok(())
+    }
+
     pub fn recent_events(&self) -> impl ExactSizeIterator<Item = &DeviceSessionEvent> {
         self.history.iter()
     }
 
     pub fn assert_healthy(&self) -> Result<(), String> {
         self.fatal_diagnostic.as_ref().map_or(Ok(()), |diagnostic| {
+            // The first marker makes the session unhealthy, but its position
+            // matters. ESP-IDF prints the panic/reset cause, register dump,
+            // and backtrace footer as distinct UART lines. Keep the ordered
+            // diagnostic window surrounding the *first* fatal line so a
+            // long-running bearer test can distinguish a device reset from
+            // an unrelated later boot banner. This is diagnostics only; the
+            // serial session still stops at the first fatal condition.
+            let diagnostics = self
+                .history
+                .iter()
+                .filter_map(|event| match event {
+                    DeviceSessionEvent::Diagnostic(line) => Some(line.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let first_fatal = diagnostics
+                .iter()
+                .position(|line| is_fatal_diagnostic(line))
+                .unwrap_or(0);
+            let context_start = first_fatal.saturating_sub(12);
+            let context_end = (first_fatal + 33).min(diagnostics.len());
+            let context = diagnostics[context_start..context_end].to_vec();
             Err(format!(
-                "device {} reported fatal diagnostic: {diagnostic}",
-                self.path
+                "device {} reported fatal diagnostic={diagnostic:?}; ordered UART diagnostics around first fatal={context:?}",
+                self.path,
             ))
         })
     }
@@ -297,7 +351,7 @@ impl ClientPathPolicy {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--command TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--command TEXT | --direct-hex HEX | --iperf-bytes N] [--parallel-streams 1..4] [--high-priority-bytes N] [--low-priority-bytes N] [--target-bps N] [--timeout-secs N]\n       dmesh-cli udp://HOST:PORT|IP|DEVICE --udp-probe\n       dmesh-cli udp://HOST:PORT|IP|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N] [--socket PATH]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--command TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--command TEXT | --direct-hex HEX | --iperf-bytes N] [--parallel-streams 1..4] [--high-priority-bytes N] [--low-priority-bytes N] [--target-bps N] [--timeout-secs N]\n       dmesh-cli udp://HOST:PORT|IP|DEVICE --udp-probe\n       dmesh-cli udp://HOST:PORT|IP|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N] [--socket PATH]"
     );
     std::process::exit(2)
 }
@@ -867,19 +921,42 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
 /// intentionally outside any retired forwarding service.
 fn reset_serial(path: &str) -> Result<(), String> {
     let file = open_serial(path)?;
-    let mut mask = libc::TIOCM_RTS;
+    pulse_serial_reset(&file)?;
+    println!("dmesh_cli_reset target={path} line=RTS pulse_ms=120");
+    Ok(())
+}
+
+/// Pulse RTS while the caller retains exclusive ownership of the serial port.
+///
+/// A boot diagnostic watch must use this instead of the standalone reset
+/// command: closing and reopening a CP210x port after the pulse can lose the
+/// ROM, Stage2, and early Main records that explain an otherwise silent UART
+/// bootstrap failure.  It is intentionally available only to the direct
+/// physical UART client, never to a routed transport operation.
+fn pulse_serial_reset(file: &File) -> Result<(), String> {
+    // CP210x LoRa boards wire RTS to EN and DTR to GPIO0.  RTS is therefore
+    // the only reset line; DTR must be released before it, otherwise a reset
+    // can enter the ROM serial downloader rather than Stage2/Main.  A prior
+    // flasher owns these lines and may have closed while DTR was asserted, so
+    // do not rely on the port driver's inherited modem state here.
+    let mut released = libc::TIOCM_DTR | libc::TIOCM_RTS;
     unsafe {
-        if libc::ioctl(file.as_raw_fd(), libc::TIOCMBIS, &mut mask) < 0 {
+        if libc::ioctl(file.as_raw_fd(), libc::TIOCMBIC, &mut released) < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    let mut rts = libc::TIOCM_RTS;
+    unsafe {
+        if libc::ioctl(file.as_raw_fd(), libc::TIOCMBIS, &mut rts) < 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
     }
     thread::sleep(Duration::from_millis(120));
     unsafe {
-        if libc::ioctl(file.as_raw_fd(), libc::TIOCMBIC, &mut mask) < 0 {
+        if libc::ioctl(file.as_raw_fd(), libc::TIOCMBIC, &mut rts) < 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
     }
-    println!("dmesh_cli_reset target={path} line=RTS pulse_ms=120");
     Ok(())
 }
 
@@ -1304,10 +1381,16 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
     let mut baud = None;
     let mut timeout = Duration::from_secs(90);
     let mut interactive = false;
+    let mut reset_after_open = false;
     let mut index = 2;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--interactive" => interactive = true,
+            // Keep the serial file open while resetting so the following
+            // watch captures ROM, Stage2, and Main output. This is a
+            // troubleshooting-only opt-in; a normal watch never toggles a
+            // modem-control line.
+            "--reset" => reset_after_open = true,
             "--baud" => {
                 index += 1;
                 baud = Some(
@@ -1334,6 +1417,19 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
     }
     let mut serial = open_serial(path)?;
     configure_serial(&serial, baud)?;
+    // Print the resolved physical contract before touching RTS.  A board name
+    // has already been expanded to this exact `/dev/serial/by-id` path, and
+    // an explicit baud makes a CP210x capture reproducible instead of relying
+    // on whichever termios settings a prior owner left behind.  `None` is the
+    // intentional packetized-native-USB case (for example C6 USB-JTAG).
+    println!(
+        "dmesh_uart_watch_open target={path} baud={}",
+        baud.map_or("driver-default".to_owned(), |value| value.to_string())
+    );
+    if reset_after_open {
+        pulse_serial_reset(&serial)?;
+        println!("dmesh_uart_watch_reset target={path} line=RTS pulse_ms=120");
+    }
     if interactive {
         unsafe {
             let flags = libc::fcntl(std::io::stdin().as_raw_fd(), libc::F_GETFL);
@@ -1357,6 +1453,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
     let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
     let mut direct_records = 0u64;
     let mut transport_packets = 0u64;
+    let mut received_bytes = 0u64;
     let mut stdin_buffer = String::new();
     let mut stdin_bytes = [0u8; 256];
     let deadline = Instant::now() + timeout;
@@ -1392,6 +1489,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
         }
         match serial.read(&mut buffer) {
             Ok(used) if used != 0 => {
+                received_bytes = received_bytes.saturating_add(used as u64);
                 for line in raw_text.push(&buffer[..used]) {
                     println!(
                         "dmesh_uart_watch_text {}",
@@ -1438,8 +1536,18 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
         }
     }
     println!(
-        "dmesh_uart_watch_timeout direct_records={direct_records} transport_packets={transport_packets}"
+        "dmesh_uart_watch_timeout received_bytes={received_bytes} direct_records={direct_records} transport_packets={transport_packets}"
     );
+    // A passive watch may legitimately see nothing.  A watch that explicitly
+    // performed the reset cannot: no byte at all means the ROM/Stage2/Main
+    // serial path was not observed, so returning success would hide the exact
+    // boot regression this diagnostic mode exists to expose.
+    if reset_after_open && received_bytes == 0 {
+        return Err(format!(
+            "UART reset capture received no bytes target={path} baud={}; ROM, Stage2, or Main serial output was not observed",
+            baud.map_or("driver-default".to_owned(), |value| value.to_string())
+        ));
+    }
     Ok(())
 }
 

@@ -2979,6 +2979,43 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.max_ack_delay_ms
     }
 
+    /// Return the next transport-owned wake deadline for a sparse bearer.
+    ///
+    /// The bearer supplies time in the same monotonic domain as
+    /// [`Self::set_time`], then blocks until this instant instead of running a
+    /// housekeeping tick.  The result covers a pending delayed ACK and the
+    /// earliest retained packet's PTO.  It deliberately exposes only a
+    /// deadline, never a packet: the normal owner must still call
+    /// [`Self::poll_transmit`] or [`Self::retransmit_due`] after the timer
+    /// fires, preserving one packet/ledger owner across UART, UDP6, and NOW.
+    pub fn next_bearer_deadline(&self, pto: u64) -> Option<u64> {
+        let immediate_control = self.control_pending
+            || self.pending_ack_frequency.is_some()
+            || (self.ack_pending && self.ack_packets >= self.ack_frequency);
+        let ack_deadline = self
+            .ack_pending
+            .then_some(if immediate_control {
+                self.send_clock
+            } else {
+                self.largest_received_at
+                    .saturating_add(self.max_ack_delay_ms)
+            });
+        let earliest_sent = self
+            .sent_packets
+            .iter()
+            .flatten()
+            .filter(|packet| !packet.lost)
+            .map(|packet| packet.sent_at)
+            .min();
+        let pto_deadline = earliest_sent.map(|sent_at| {
+            let interval = pto.saturating_mul(1u64 << self.pto_backoff.min(5));
+            self.last_pto_probe_at
+                .map(|last| last.saturating_add(interval))
+                .unwrap_or_else(|| sent_at.saturating_add(interval))
+        });
+        ack_deadline.into_iter().chain(pto_deadline).min()
+    }
+
     /// Request the peer's ACK policy using the QUIC ACK_FREQUENCY extension.
     /// `packet_threshold=1` is RFC 9000's every-other-ack-eliciting-packet
     /// default; delay is carried in microseconds by the extension.

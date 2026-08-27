@@ -426,7 +426,7 @@ impl RawWifiIperfRequest {
             && self.packet_size >= 4
             && (self.packet_size as usize) <= quic_lite::DEFAULT_MAX_DATAGRAM_SIZE
             && self.timeout_ms >= 1_000
-            && self.timeout_ms <= 60_000
+            && self.timeout_ms <= crate::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS
     }
 }
 
@@ -774,6 +774,20 @@ pub struct RawWifiSnapshot {
     /// Last common QUIC-lite error observed by an active raw service client.
     /// Its numeric value is the stable `raw_transport::receive_error_code`.
     pub last_raw_client_error: Option<u32>,
+    /// Last portable raw-service server error.  This is separate from the
+    /// initiating client error because a packet-at-a-time peer can accept an
+    /// OPEN_ACK before its server rejects the following request.
+    pub last_raw_service_error: Option<u32>,
+    /// Low 32 bits of the server receive CID installed by the active/recent
+    /// NOW client. This is connection metadata only, used to diagnose delayed
+    /// action frames on targets without lock-free 64-bit atomics.
+    pub raw_client_expected_server_cid: Option<u32>,
+    /// Low 32 bits of the DCID from the last valid NOW packet rejected by
+    /// that client's demultiplexer. It is absent until such a packet occurs.
+    pub raw_client_last_other_dcid: Option<u32>,
+    /// Low 24 bits of the peer MAC from the last action frame rejected before
+    /// QUIC demultiplexing because it was not the selected NOW peer.
+    pub raw_client_last_other_peer_suffix: Option<u32>,
     /// MAC currently owned by the STA interface.  This is a link identity,
     /// not an inferred IPv6 address; APSTA tests must not assume it equals
     /// the AP MAC.
@@ -908,6 +922,10 @@ pub fn encode_raw_wifi_snapshot(
         + usize::from(snapshot.raw_service_active.is_some())
         + usize::from(snapshot.last_tx_error.is_some())
         + usize::from(snapshot.last_raw_client_error.is_some())
+        + usize::from(snapshot.last_raw_service_error.is_some())
+        + usize::from(snapshot.raw_client_expected_server_cid.is_some())
+        + usize::from(snapshot.raw_client_last_other_dcid.is_some())
+        + usize::from(snapshot.raw_client_last_other_peer_suffix.is_some())
         + usize::from(snapshot.sta_mac.is_some())
         + usize::from(snapshot.ap_mac.is_some())
         + usize::from(snapshot.action_destination_broadcast.is_some())
@@ -993,6 +1011,22 @@ pub fn encode_raw_wifi_snapshot(
     }
     if let Some(value) = snapshot.last_raw_client_error {
         e.uint(34)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.last_raw_service_error {
+        e.uint(105)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.raw_client_expected_server_cid {
+        e.uint(102)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.raw_client_last_other_dcid {
+        e.uint(103)?;
+        e.uint(u64::from(value))?;
+    }
+    if let Some(value) = snapshot.raw_client_last_other_peer_suffix {
+        e.uint(104)?;
         e.uint(u64::from(value))?;
     }
     if let Some(value) = snapshot.sta_mac {
@@ -1227,6 +1261,30 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                 snapshot.last_raw_client_error = Some(
                     u32::try_from(decoder.uint().ok_or("radio client error")?)
                         .map_err(|_| "radio client error")?,
+                )
+            }
+            105 => {
+                snapshot.last_raw_service_error = Some(
+                    u32::try_from(decoder.uint().ok_or("radio service error")?)
+                        .map_err(|_| "radio service error")?,
+                )
+            }
+            102 => {
+                snapshot.raw_client_expected_server_cid = Some(
+                    u32::try_from(decoder.uint().ok_or("radio client expected CID")?)
+                        .map_err(|_| "radio client expected CID")?,
+                )
+            }
+            103 => {
+                snapshot.raw_client_last_other_dcid = Some(
+                    u32::try_from(decoder.uint().ok_or("radio client other DCID")?)
+                        .map_err(|_| "radio client other DCID")?,
+                )
+            }
+            104 => {
+                snapshot.raw_client_last_other_peer_suffix = Some(
+                    u32::try_from(decoder.uint().ok_or("radio client other peer")?)
+                        .map_err(|_| "radio client other peer")?,
                 )
             }
             35 => {

@@ -47,7 +47,8 @@ firmware command grammar.
 radio profile: `2:ssid` (STA target), `5:raw_tx_rate`, `6:sta_driver_tx`,
 `7:sta_bssid_check_disabled`, `8:sta_ampdu_enabled`, `9:sta_11b_rates_disabled`,
 `10:sta_raw_rx_enabled`, `13:espnow_capture`, `14:nan_dw_interval`, `15:now`,
-`16:ap`, optional `17:sta_passphrase` (8..63 bytes, volatile WPA2
+`16:ap`, optional `17:sta_passphrase` (8..63 bytes, volatile WPA2 override;
+absent selects the fixed DMesh WPA2 key),
 credential). Omitted fields use the current profile defaults only while this
 new epoch is constructed; they cannot be patched afterward. A later start is
 the only way to replace a selected radio setup. `ssid` is session data, not an
@@ -182,15 +183,16 @@ over raw PPP and the registered hardware stream service.
 | `promiscuous` | 10 | bool | explicit raw monitor state |
 | `dw_policy` | 11 | enum | `normal`, `disabled`, `manual` |
 | `rx_filter` | 12 | enum | `management`, `management_data` |
-| `ap_mode` | 13 | enum | `disabled` or ephemeral open APSTA owner |
+| `ap_mode` | 13 | enum | `disabled` or ephemeral fixed-WPA2 APSTA owner |
 | `ap_beacon_tu` | 14 | `u16` | AP beacon interval, 100..60000 TU; supplied with `ap_mode=open` |
 | `raw_sta_mode` | 15 | enum | `main_style`: Main's idempotent idle-STA start, unassociated and prom off |
 | `mac_ack` | 16 | bool | request driver MAC ACK for raw action TX; disabled by default so QUIC-lite owns loss recovery |
 | `action_destination_broadcast` | 20 | bool | send NOW-like action Address-1 as broadcast; an explicit non-promiscuous ROC/filter experiment |
 | `roc_listen_ms` | 25 | `u16` | request one 10..1000 ms same-channel ESP-IDF remain-on-channel action listener; rejected when the driver cannot accept the requested ROC mode |
 
-`ap_mode=open` starts a channel-selected open APSTA radio owner with a
-deterministic `DIRECT-XXXXXX-dmesh` SSID derived from the AP MAC. It creates
+`ap_mode=open` retains its legacy method name but starts a channel-selected
+WPA2 APSTA radio owner with Android's fixed `DIRECT-dmesh` SSID and
+`untrusted-open-mode` PSK. It creates
 no `esp_netif`, DHCP server, or lwIP data plane and never changes NVS. This is
 shared by Recovery and Main specifically to test NOW/NAN action reception when
 unassociated or associated with an ESP AP.

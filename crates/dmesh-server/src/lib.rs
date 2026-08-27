@@ -23,11 +23,22 @@ pub mod direct_iperf;
 /// Shared, bearer- and ESP-independent Recovery/Main bootstrap profile.
 pub mod firmware_profile;
 pub mod iperf;
+/// Portable state, event, effect, and redacted diagnostic contract for the
+/// Main firmware runtime. ESP adapters enqueue these events but do not own the
+/// state machine.
+pub mod main_runtime_state;
+/// Common CBOR contract for platform-observed local interfaces and addresses.
+/// Adapters report available fields; common routing/discovery consumes it.
+pub mod local_networks;
 /// Small no-std network-address helpers used by bearer adapters. This module
 /// has no socket runtime or ESP-IDF dependency.
 pub mod net;
 /// Privileged host/Android A-to-B probe request and result contract.
 pub mod probe;
+/// Common, bearer-independent platform power and memory observation contract.
+/// Android, Linux, and ESP adapters report facts; server policy consumes this
+/// state without depending on framework callback types.
+pub mod power;
 /// Bearer-neutral raw-command decoding and handler dispatch. Firmware and
 /// hosts supply handlers; neither UART nor Wi-Fi participates in this layer.
 pub mod raw_dispatch;
@@ -49,6 +60,9 @@ pub mod sta_selection;
 pub mod stream_server;
 /// Bounded borrowed tagged-CBOR envelope shared with host mesh control.
 pub mod tagged;
+/// Common ingress provenance and policy-driven egress selection shared by
+/// QUIC-lite, direct messages, radio adapters, and future relay paths.
+pub mod transport_path;
 /// UART framing shared by host and firmware bearer adapters.
 pub mod uart;
 

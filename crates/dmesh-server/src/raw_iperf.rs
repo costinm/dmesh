@@ -5,6 +5,7 @@
 //! has no socket, task, ESP-IDF, or peer-address dependency.
 
 use alloc::{boxed::Box, vec::Vec};
+use core::mem::MaybeUninit;
 
 pub use quic_lite::Error;
 use quic_lite::{
@@ -56,7 +57,12 @@ pub struct RawActionIperfRequest {
 }
 
 pub const RAW_ACTION_IPERF_DEFAULT_TIMEOUT_MS: u32 = 10_000;
-pub const RAW_ACTION_IPERF_MAX_TIMEOUT_MS: u32 = 60_000;
+/// A 256 KiB action transfer at the conservative one-packet NOW profile can
+/// legitimately take longer than one minute.  Keep the operation bounded,
+/// but allow the controller to request enough time to distinguish that normal
+/// airtime from a stalled client.  The one-shot deadline remains dormant
+/// between packets; this is not a longer polling interval.
+pub const RAW_ACTION_IPERF_MAX_TIMEOUT_MS: u32 = 180_000;
 
 /// Decode the bytes after the `espnow-iperf:` hardware-service prefix.
 ///
@@ -164,6 +170,11 @@ impl RawAssociationProfile {
 /// and can allocate a separate server instance when it admits more peers.
 pub struct RawIperfServer<const HISTORY: usize, const PACKET: usize> {
     local_cid: ConnectionId,
+    /// Counts replacements of a live association.  The initial server CID is
+    /// stable for compatibility, but a later client OPEN receives a fresh
+    /// server CID so delayed action frames from the previous association
+    /// cannot be admitted by the replacement endpoint.
+    association_epoch: u32,
     local_limits: ConnectionLimits,
     // This ledger contains the bounded receive history and ordered-stream
     // state. Keep it off the Wi-Fi ingress task's stack: a raw bearer starts
@@ -191,6 +202,19 @@ pub struct RawIperfServer<const HISTORY: usize, const PACKET: usize> {
 pub struct RawIngressPath {
     pub transport_id: u8,
     pub peer: [u8; 6],
+}
+
+impl From<RawIngressPath> for crate::transport_path::PacketPath {
+    fn from(path: RawIngressPath) -> Self {
+        Self {
+            ingress: crate::transport_path::TransportId(path.transport_id),
+            peer: path.peer,
+            // Raw QUIC-lite predates platform link hints. ESP preserves its
+            // STA/AP hint in its adapter queue; portable raw tests correctly
+            // report this as unknown.
+            link_hint: 0,
+        }
+    }
 }
 
 /// Bounded wire-state evidence shared by host and firmware diagnostics.  It
@@ -226,6 +250,12 @@ pub struct RawServiceCounters {
 /// without changing adapter callbacks or service handlers.
 pub struct RawIperfDispatcher<const HISTORY: usize, const PACKET: usize> {
     server_cid: ConnectionId,
+    /// Monotonic discriminator for server CIDs across closed associations.
+    /// `server` itself is intentionally released on CLOSE to recover its
+    /// bounded ledger, so this small dispatcher-owned value must outlive it.
+    /// Otherwise the next OPEN would reuse the retired server CID and delayed
+    /// raw-action packets could select the new endpoint.
+    server_cid_epoch: u32,
     limits: ConnectionLimits,
     association: RawAssociationProfile,
     // The dispatcher is long-lived firmware state.  Its server metadata is
@@ -244,11 +274,30 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
     ) -> Self {
         Self {
             server_cid,
+            server_cid_epoch: 0,
             limits,
             association,
             server: None,
             reply_path: None,
         }
+    }
+
+    /// Give the next fresh association a receive CID which cannot be selected
+    /// by a delayed packet for the one just retired. This is a pure
+    /// dispatcher-state transition: it retains no payload, queue, or endpoint
+    /// allocation, and is invoked only on CLOSE/profile replacement.
+    fn rotate_server_cid(&mut self, retired_client_cid: Option<ConnectionId>) {
+        self.server_cid_epoch = self.server_cid_epoch.wrapping_add(1).max(1);
+        let mut value = self
+            .server_cid
+            .value()
+            .wrapping_add(0x9e37_79b9)
+            ^ u64::from(self.server_cid_epoch);
+        if retired_client_cid.is_some_and(|cid| cid.value() == value) || value == 0 {
+            value = value.wrapping_add(1).max(1);
+        }
+        // The arithmetic above cannot make zero after the explicit repair.
+        self.server_cid = ConnectionId::new(value).expect("rotated raw server CID is nonzero");
     }
 
     /// Feed a datagram from any registered bearer. An immediate response is
@@ -259,6 +308,24 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
         packet: &[u8],
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
+        // A broadcast action bearer hears every nearby DMesh device.  This
+        // initial bounded dispatcher admits exactly one peer, so any packet
+        // from a foreign path must not reach that live endpoint.  In
+        // particular a DCID-zero OPEN must not replace the peer between its
+        // bootstrap ACK and first stream request, while a delayed non-zero
+        // packet must not create a misleading WrongConnectionId diagnostic.
+        // Connectionless discovery is handled before this QUIC service; a
+        // future authenticated connection table can lift this path pinning
+        // per entry.
+        //
+        // The same peer remains free to send a new OPEN: that is the normal
+        // recovery/replacement path after a lost CLOSE or a fresh probe.
+        let _ = ShortHeader::decode(packet)?;
+        if self.reply_path.is_some_and(|active_path| active_path != path)
+            && self.server.as_ref().is_some_and(|server| server.connection.is_some())
+        {
+            return Ok(None);
+        }
         if self.server.is_none() {
             self.server = Some(RawIperfServer::new_with_association(
                 self.server_cid,
@@ -280,8 +347,13 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
         // radio restart. Release the bounded ledger now; any immediate CLOSE
         // ACK was already encoded in `response` and remains valid to send.
         if self.server.as_ref().is_some_and(RawIperfServer::is_closed) {
+            let retired_client_cid = self
+                .server
+                .as_ref()
+                .and_then(|server| server.open_client_cid);
             self.server = None;
             self.reply_path = None;
+            self.rotate_server_cid(retired_client_cid);
         }
         Ok(response)
     }
@@ -337,6 +409,34 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
         self.reply_path
     }
 
+    /// Whether `packet` is addressed to this dispatcher's live server
+    /// association on `path`.
+    ///
+    /// A board can be an action client and an action server for the same peer
+    /// at once: for example, the peer may start IPERF while this board is
+    /// still draining a completed discovery check. The adapter must then
+    /// demultiplex by QUIC-lite DCID, not by source MAC alone. A DCID-zero
+    /// OPEN is a server bootstrap and is admissible only on the current reply
+    /// path (or before one exists); a nonzero DCID must name the live endpoint
+    /// receive CID. This method retains no packet and performs no transport
+    /// work, so it is safe for the shared ingress owner to use as its routing
+    /// predicate.
+    pub fn owns_packet_for_path(&self, path: RawIngressPath, packet: &[u8]) -> bool {
+        let Ok((header, _)) = ShortHeader::decode(packet) else {
+            return false;
+        };
+        if header.dcid.value() == 0 {
+            return self.reply_path.map_or(true, |active| active == path);
+        }
+        self.reply_path == Some(path)
+            && self
+                .server
+                .as_ref()
+                .and_then(|server| server.connection.as_ref())
+                .and_then(|connection| connection.mux.endpoint.local_connection_id())
+                == Some(header.dcid)
+    }
+
     /// Maximum number of fresh stream packets the bearer may emit from one
     /// ingress callback.  The value comes from the association profile rather
     /// than the radio adapter, so host and firmware use the same burst policy.
@@ -354,6 +454,10 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
         self.association = association.clamp::<HISTORY>();
         self.server = None;
         self.reply_path = None;
+        // Profile replacement drops endpoint state just like CLOSE. Rotate
+        // the receive CID as well, so a delayed packet from the previous
+        // radio epoch cannot select the first new association.
+        self.rotate_server_cid(None);
     }
 
     /// Snapshot common QUIC counters for a bearer-neutral diagnostic report.
@@ -381,6 +485,16 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
             },
             None => None,
         }
+    }
+
+    /// Return the current association's transport-owned timer deadline.
+    /// `now` and `pto` remain caller supplied so UART, UDP6, and NOW can use
+    /// their native monotonic clock without giving the shared dispatcher a
+    /// task, timer, or bearer-specific service loop.
+    pub fn next_service_deadline(&self, pto: u64) -> Option<u64> {
+        self.server
+            .as_ref()
+            .and_then(|server| server.next_service_deadline(pto))
     }
 
     /// Return bounded ACK ranges and retained packet numbers for automated
@@ -752,6 +866,16 @@ impl<const HISTORY: usize, const PACKET: usize> RawCheckClient<HISTORY, PACKET> 
                 return Ok(None);
             }
         }
+        if self.complete {
+            // The server may repeat its final echo before it observes the
+            // terminal close. Re-send CLOSE without re-opening this service.
+            self.counters.other_packets = self.counters.other_packets.saturating_add(1);
+            return self
+                .endpoint
+                .as_mut()
+                .ok_or(Error::Invalid)?
+                .poll_close(output);
+        }
         let endpoint = self.endpoint.as_mut().ok_or(Error::Invalid)?;
         endpoint.set_time(now_ms);
         let TransportPacket::Stream { frame, .. } = endpoint.receive_datagram(input)? else {
@@ -781,6 +905,14 @@ impl<const HISTORY: usize, const PACKET: usize> RawCheckClient<HISTORY, PACKET> 
         self.response_len += frame.data.len();
         endpoint.stream_consumed(frame.id, frame.data.len())?;
         self.complete = frame.fin;
+        if self.complete {
+            // Checks are intentionally short-lived, but they still create a
+            // normal QUIC-lite association. Send CLOSE as the final response
+            // action so the shared one-association dispatcher can accept the
+            // following IPERF or control request without a radio restart.
+            endpoint.close(0);
+            return endpoint.poll_close(output);
+        }
         endpoint.poll_transmit(output)
     }
 
@@ -803,6 +935,39 @@ impl<const HISTORY: usize, const PACKET: usize> RawCheckClient<HISTORY, PACKET> 
         self.endpoint
             .as_mut()
             .map_or(Ok(None), |endpoint| endpoint.poll_transmit(output))
+    }
+
+    /// Advance the check endpoint's clock for a timer-driven ACK/PTO turn.
+    /// This is the check counterpart to `RawIperfClient::poll_transmit_at`.
+    pub fn poll_transmit_at(
+        &mut self,
+        now_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        let Some(endpoint) = self.endpoint.as_mut() else {
+            return Ok(None);
+        };
+        endpoint.set_time(now_ms);
+        endpoint.poll_transmit(output)
+    }
+
+    /// Return the endpoint-owned delayed-ACK or PTO deadline for this check.
+    pub fn next_service_deadline_ms(&self, pto_ms: u64) -> Option<u64> {
+        self.endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.next_bearer_deadline(pto_ms))
+    }
+
+    /// Re-emit the terminal CLOSE after a completed one-shot check.
+    ///
+    /// The caller uses this only during a short, timer-driven drain period
+    /// after the final echo.  It lets a lossy datagram bearer retire the
+    /// server-side association without reopening the service or retaining a
+    /// second packet queue.
+    pub fn poll_close(&mut self, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
+        self.endpoint
+            .as_mut()
+            .map_or(Ok(None), |endpoint| endpoint.poll_close(output))
     }
 
     /// Re-send the outstanding request through the endpoint's bounded ledger
@@ -875,6 +1040,58 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfClient<HISTORY, PACKET> 
             stream_packets: 0,
             other_packets: 0,
         })
+    }
+
+    /// Construct the client directly in caller-provided static storage.
+    ///
+    /// ESP radio command tasks have deliberately small stacks, while an
+    /// `Option<EndpointState<..>>` reserves the complete bounded ledger even
+    /// before the bootstrap reply arrives.  The usual return-by-value
+    /// constructor is ideal for host code, but it can transiently materialize
+    /// that ledger on an embedded command stack.  This variant writes every
+    /// field into the supplied destination and leaves allocation policy with
+    /// the adapter; it retains the same fixed HISTORY/PACKET bound as `new`.
+    pub fn new_in_place(
+        storage: &mut MaybeUninit<Self>,
+        client_cid: ConnectionId,
+        bytes: u64,
+        packet_size: u16,
+    ) -> Result<&mut Self, Error> {
+        if packet_size < 4 || usize::from(packet_size) > PACKET {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0u8; 31];
+        let request_len = crate::iperf::encode_iperf_service_request(
+            crate::iperf::IperfServiceRequest::new(bytes, packet_size),
+            &mut request,
+        )
+        .ok_or(Error::Invalid)?;
+        let plan = crate::iperf::decode_iperf_service_request(&request[..request_len])
+            .ok_or(Error::Invalid)?;
+        let plan = crate::iperf::IperfServicePlan::from_request(plan, PACKET.saturating_sub(32));
+        // Field-by-field writes deliberately avoid a whole `Self` temporary.
+        // See the method-level rationale above; this is called once per
+        // explicit device-originated run, never from packet ingress.
+        let client = storage.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*client).client_cid).write(client_cid);
+            core::ptr::addr_of_mut!((*client).server_cid).write(None);
+            core::ptr::addr_of_mut!((*client).endpoint).write(None);
+            core::ptr::addr_of_mut!((*client).request).write(request);
+            core::ptr::addr_of_mut!((*client).request_len).write(request_len);
+            core::ptr::addr_of_mut!((*client).run).write(IperfRun::new(
+                2,
+                plan.normal_streams,
+                plan.high_priority_bytes != 0,
+                plan.low_priority_bytes != 0,
+            ));
+            core::ptr::addr_of_mut!((*client).started).write(false);
+            core::ptr::addr_of_mut!((*client).complete).write(false);
+            core::ptr::addr_of_mut!((*client).bootstrap_acks).write(0);
+            core::ptr::addr_of_mut!((*client).stream_packets).write(0);
+            core::ptr::addr_of_mut!((*client).other_packets).write(0);
+            Ok(&mut *client)
+        }
     }
 
     /// Start bootstrap. Call once, then transmit the returned packet.
@@ -979,6 +1196,17 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfClient<HISTORY, PACKET> 
                 return Ok(None);
             }
         }
+        if self.complete {
+            // A final IPERF stream packet can be repeated before the server
+            // receives CLOSE. Re-send the terminal record while keeping the
+            // application complete and the one-association ledger bounded.
+            self.other_packets = self.other_packets.saturating_add(1);
+            return self
+                .endpoint
+                .as_mut()
+                .ok_or(Error::Invalid)?
+                .poll_close(output);
+        }
         let endpoint = self.endpoint.as_mut().ok_or(Error::Invalid)?;
         endpoint.set_time(now_ms);
         let packet = endpoint.receive_datagram(input)?;
@@ -990,6 +1218,16 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfClient<HISTORY, PACKET> 
                 .map_err(|_| Error::Invalid)?;
             endpoint.stream_consumed(frame.id, consumed)?;
             self.complete = complete;
+            if complete {
+                // Raw-action servers deliberately own one bounded association
+                // at a time. A one-shot IPERF client must therefore retire
+                // its CID on FIN; otherwise the next explicit check or
+                // transfer is a fresh OPEN competing with a stale ledger.
+                // The adapter sends this returned CLOSE on the same bearer
+                // and then drops the completed client state.
+                endpoint.close(0);
+                return endpoint.poll_close(output);
+            }
         } else {
             self.other_packets = self.other_packets.saturating_add(1);
         }
@@ -1010,6 +1248,27 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfClient<HISTORY, PACKET> 
         };
         endpoint.set_time(now_ms);
         endpoint.poll_transmit(output)
+    }
+
+    /// Return the next ACK/PTO deadline owned by this IPERF association.
+    /// It is a scalar scheduling hint only; packet production remains in the
+    /// shared ingress owner after that deadline fires.
+    pub fn next_service_deadline_ms(&self, pto_ms: u64) -> Option<u64> {
+        self.endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.next_bearer_deadline(pto_ms))
+    }
+
+    /// Re-emit the terminal CLOSE after a completed one-shot IPERF run.
+    ///
+    /// A raw action adapter calls this from its bounded close-drain deadline,
+    /// not from a polling loop.  Repeating only CLOSE gives the remote
+    /// one-association server a reliable retirement signal without restarting
+    /// the transfer or preserving stream payloads.
+    pub fn poll_close(&mut self, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
+        self.endpoint
+            .as_mut()
+            .map_or(Ok(None), |endpoint| endpoint.poll_close(output))
     }
 
     /// Drive one QUIC-lite PTO/loss retransmission for a sparse bearer. The
@@ -1087,6 +1346,7 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfServer<HISTORY, PACKET> 
     ) -> Self {
         Self {
             local_cid,
+            association_epoch: 0,
             local_limits,
             connection: None,
             open_client_cid: None,
@@ -1117,6 +1377,26 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfServer<HISTORY, PACKET> 
                     output,
                 )?;
                 return Ok(Some(used));
+            }
+            if self.connection.is_some() {
+                // A raw action bearer can redeliver frames long after a
+                // client has timed out.  Keeping a fixed server CID means a
+                // subsequent client's request has the same DCID as that
+                // stale endpoint, allowing old stream state to consume it.
+                // Mint one receive CID for the replacement association so
+                // delayed packets are rejected at the QUIC boundary instead
+                // of being mistaken for current bearer progress.
+                self.association_epoch = self.association_epoch.wrapping_add(1).max(1);
+                let mut value = self
+                    .local_cid
+                    .value()
+                    .wrapping_add(0x9e37_79b9)
+                    ^ open.client_receive_cid.value()
+                    ^ u64::from(self.association_epoch);
+                if value == 0 || value == open.client_receive_cid.value() {
+                    value = value.wrapping_add(1).max(1);
+                }
+                self.local_cid = ConnectionId::new(value).ok_or(Error::Invalid)?;
             }
             let (mut connection, ack) = StreamServerConnection::accept_open_boxed_with_limits(
                 packet,
@@ -1248,10 +1528,24 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfServer<HISTORY, PACKET> 
             return connection.poll_transmit(output);
         };
         let packet = sender.poll(&mut connection.mux.endpoint, output)?;
-        if sender.is_complete() {
-            self.sender = None;
-        }
+        // Retain a completed producer until this association observes CLOSE
+        // or a fresh OPEN replaces it. A connectionless bearer can lose the
+        // final server packet, so the client legitimately retransmits its
+        // original IPERF request. Dropping `sender` here made that duplicate
+        // start a second producer on the same endpoint, overrun the client's
+        // expected stream, and flood the shared ingress pool. A completed
+        // sender owns no packet queue or payload; it is just the bounded
+        // association marker that makes duplicate requests idempotent.
         Ok(packet.map(|(used, _)| used))
+    }
+
+    /// Return the next ACK/PTO deadline for the accepted raw association.
+    /// It is only a scheduling value: the common worker still owns packet
+    /// production after the timer fires.
+    pub fn next_service_deadline(&self, pto: u64) -> Option<u64> {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.mux.endpoint.next_bearer_deadline(pto))
     }
 
     /// Take one validated device-flash command. The platform handler owns the
@@ -1570,6 +1864,86 @@ mod tests {
     }
 
     #[test]
+    fn eight_packet_client_completes_a_64k_transfer() {
+        // Firmware's raw UDP6 client and service association both retain a
+        // bounded eight-packet history.  Exercise a transfer substantially
+        // larger than one flight so a future capacity mismatch cannot strand
+        // the client after its initial window while appearing to work for a
+        // 4 KiB smoke test.
+        let client_cid = ConnectionId::new(0x46).unwrap();
+        let server_cid = ConnectionId::new(0x56).unwrap();
+        let mut client = RawIperfClient::<8, 1200>::new(client_cid, 64 * 1024).unwrap();
+        let mut server = RawIperfServer::<8, 1200>::new(server_cid);
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack_len = server
+            .receive(&client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive(&server_out[..open_ack_len], &mut client_out)
+            .unwrap()
+            .unwrap();
+        let mut server_len = server
+            .receive(&client_out[..request_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+
+        for _ in 0..512 {
+            let client_len = client
+                .receive(&server_out[..server_len], &mut client_out)
+                .unwrap();
+            if client.is_complete() {
+                break;
+            }
+            let client_len = client_len.expect("IPERF stream packet must produce ACK");
+            server_len = server
+                .receive(&client_out[..client_len], &mut server_out)
+                .unwrap()
+                .unwrap();
+        }
+        assert!(client.is_complete());
+        assert_eq!(client.bytes(), 64 * 1024);
+        assert_eq!(client.callback_errors(), [0; 6]);
+    }
+
+    #[test]
+    fn in_place_client_has_the_same_wire_state_as_the_normal_constructor() {
+        // Firmware constructs the raw action client directly in its final
+        // heap allocation so a large bounded ledger is never copied through
+        // the shared packet-worker stack. Keep that memory-safety path under
+        // the exact same OPEN/request/server exchange as the usual host
+        // constructor; a partially initialized field would otherwise first
+        // appear as an unexplained on-air `Invalid` request.
+        let client_cid = ConnectionId::new(0x147).unwrap();
+        let server_cid = ConnectionId::new(0x247).unwrap();
+        let mut storage = MaybeUninit::<RawIperfClient<4, 1200>>::uninit();
+        let client = RawIperfClient::new_in_place(&mut storage, client_cid, 4 * 1024, 256)
+            .unwrap();
+        let mut server = RawIperfServer::<8, 1200>::new(server_cid);
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack_len = server
+            .receive(&client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive(&server_out[..open_ack_len], &mut client_out)
+            .unwrap()
+            .unwrap();
+        let first_stream_len = server
+            .receive(&client_out[..request_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        assert!(first_stream_len > 0);
+        unsafe { core::ptr::drop_in_place(client) };
+    }
+
+    #[test]
     fn raw_server_can_fill_the_configured_eight_packet_burst_before_ack() {
         let client_cid = ConnectionId::new(0x64).unwrap();
         let server_cid = ConnectionId::new(0x65).unwrap();
@@ -1711,6 +2085,40 @@ mod tests {
     }
 
     #[test]
+    fn completed_iperf_request_duplicate_does_not_start_another_stream() {
+        // A no-ACK action link can lose the final response and retransmit the
+        // original request after the bounded producer has emitted FIN. The
+        // association must remain idempotent until CLOSE/new OPEN, otherwise
+        // the duplicate creates a second server stream and overfills a small
+        // firmware ingress pool.
+        let client_cid = ConnectionId::new(0xd8).unwrap();
+        let server_cid = ConnectionId::new(0xe9).unwrap();
+        let mut client = RawIperfClient::<4, 1200>::new_with_packet_size(client_cid, 8, 8).unwrap();
+        let mut server = RawIperfServer::<4, 1200>::new(server_cid);
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack_len = server
+            .receive(&client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive(&server_out[..open_ack_len], &mut client_out)
+            .unwrap()
+            .unwrap();
+        assert!(server
+            .receive(&client_out[..request_len], &mut server_out)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            server
+                .receive(&client_out[..request_len], &mut server_out)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn check_client_ignores_a_retransmitted_bootstrap_ack() {
         let client_cid = ConnectionId::new(0xc6).unwrap();
         let server_cid = ConnectionId::new(0xd7).unwrap();
@@ -1745,6 +2153,60 @@ mod tests {
             .receive(&server_out[..response_len], &mut client_out)
             .unwrap();
         assert!(client.is_complete());
+        let close_len = client
+            .poll_close(&mut client_out)
+            .unwrap()
+            .expect("a completed raw check retains its terminal CLOSE");
+        assert!(close_len > 0);
+    }
+
+    #[test]
+    fn replacement_open_mints_a_new_server_cid_and_rejects_old_requests() {
+        let first_cid = ConnectionId::new(0xc8).unwrap();
+        let second_cid = ConnectionId::new(0xc9).unwrap();
+        let server_cid = ConnectionId::new(0xd9).unwrap();
+        let mut first = RawCheckClient::<4, 1200>::new(first_cid, 1);
+        let mut second = RawCheckClient::<4, 1200>::new(second_cid, 2);
+        let mut server = RawIperfServer::<4, 1200>::new(server_cid);
+        let mut first_out = [0u8; 1200];
+        let mut second_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let first_open = first.start(&mut first_out).unwrap();
+        let first_ack = server
+            .receive(&first_out[..first_open], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let (_, first_bootstrap) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..first_ack],
+            first_cid,
+        )
+        .unwrap();
+        let first_request = first
+            .receive(&server_out[..first_ack], &mut first_out)
+            .unwrap()
+            .unwrap();
+
+        let second_open = second.start(&mut second_out).unwrap();
+        let second_ack = server
+            .receive(&second_out[..second_open], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let (_, second_bootstrap) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..second_ack],
+            second_cid,
+        )
+        .unwrap();
+        assert_ne!(
+            first_bootstrap.server_receive_cid,
+            second_bootstrap.server_receive_cid,
+            "a replacement must not share the old association DCID"
+        );
+        assert_eq!(
+            server.receive(&first_out[..first_request], &mut server_out),
+            Err(Error::WrongConnectionId),
+            "a delayed request from the replaced client must not reach the new endpoint"
+        );
     }
 
     #[test]
@@ -1821,6 +2283,11 @@ mod tests {
             .receive(path, &client_out[..open_len], &mut server_out)
             .unwrap()
             .unwrap();
+        let (_, first_ack) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..open_ack_len],
+            first_cid,
+        )
+        .unwrap();
         let request_len = first
             .receive(&server_out[..open_ack_len], &mut client_out)
             .unwrap()
@@ -1844,12 +2311,74 @@ mod tests {
         );
 
         let new_open_len = second.start(&mut client_out).unwrap();
+        let new_ack_len = dispatcher
+            .receive(path, &client_out[..new_open_len], &mut server_out)
+            .unwrap()
+            .expect("fresh CID must bootstrap immediately after CLOSE");
+        let (_, second_ack) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..new_ack_len],
+            second_cid,
+        )
+        .unwrap();
+        assert_ne!(
+            first_ack.server_receive_cid, second_ack.server_receive_cid,
+            "a closed raw association must not reuse its receive CID"
+        );
+    }
+
+    #[test]
+    fn dispatcher_does_not_replace_live_action_peer_with_foreign_open() {
+        let mut dispatcher = RawIperfDispatcher::<8, 1200>::new(
+            ConnectionId::new(0x9910).unwrap(),
+            ConnectionLimits::default(),
+            RawAssociationProfile::conservative(),
+        );
+        let first_path = RawIngressPath {
+            transport_id: 2,
+            peer: [1; 6],
+        };
+        let foreign_path = RawIngressPath {
+            transport_id: 2,
+            peer: [2; 6],
+        };
+        let mut first = RawIperfClient::<8, 1200>::new(ConnectionId::new(0x9911).unwrap(), 64)
+            .unwrap();
+        let mut foreign =
+            RawIperfClient::<8, 1200>::new(ConnectionId::new(0x9912).unwrap(), 64).unwrap();
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let first_open = first.start(&mut client_out).unwrap();
+        let first_ack = dispatcher
+            .receive(first_path, &client_out[..first_open], &mut server_out)
+            .unwrap()
+            .expect("first peer OPEN_ACK");
+        let first_request = first
+            .receive(&server_out[..first_ack], &mut client_out)
+            .unwrap()
+            .expect("first peer request");
+        let mut first_request_packet = [0u8; 1200];
+        first_request_packet[..first_request].copy_from_slice(&client_out[..first_request]);
+
+        let foreign_open = foreign.start(&mut client_out).unwrap();
+        assert_eq!(
+            dispatcher
+                .receive(foreign_path, &client_out[..foreign_open], &mut server_out)
+                .unwrap(),
+            None,
+            "nearby broadcast peer must not replace a live action association"
+        );
+
         assert!(
             dispatcher
-                .receive(path, &client_out[..new_open_len], &mut server_out)
+                .receive(
+                    first_path,
+                    &first_request_packet[..first_request],
+                    &mut server_out,
+                )
                 .unwrap()
                 .is_some(),
-            "fresh CID must bootstrap immediately after CLOSE"
+            "selected peer continues after foreign OPEN"
         );
     }
 

@@ -293,10 +293,12 @@ mod tests {
         assert!(
             build_action_frame([0; 6], [1; 6], [0xff; 6], &[0; MAX_ACTION_PAYLOAD + 1]).is_err()
         );
-        assert!(parse_action_frame(
-            &[0xd0; IEEE80211_HEADER_LEN + ACTION_HEADER_LEN + VENDOR_IE_HEADER_LEN]
-        )
-        .is_none());
+        assert!(
+            parse_action_frame(
+                &[0xd0; IEEE80211_HEADER_LEN + ACTION_HEADER_LEN + VENDOR_IE_HEADER_LEN]
+            )
+            .is_none()
+        );
     }
 
     #[test]
