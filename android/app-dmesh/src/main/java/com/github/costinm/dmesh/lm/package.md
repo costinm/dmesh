@@ -25,4 +25,4 @@ Current Android-local commands include:
 - `messages read seq=N preview=N` for a bounded hex preview of one raw payload.
 
 Keep these commands available through the same message/mux path used by the
-ADB shell provider, SSH JSONL bridge, and web command bridge.
+ADB shell provider, SSH message bridge, and web command bridge.

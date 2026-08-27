@@ -1,0 +1,33 @@
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+android {
+    compileSdkVersion(providers.gradleProperty("COMPILE_SDK_VERSION").get())
+    namespace = "com.github.costinm.dmesh"
+
+
+    defaultConfig {
+        // DMesh APIs are compatible with the oldest Android release we test.
+        minSdk = providers.gradleProperty("MIN_SDK_VERSION_OLD").get().toInt()
+
+        testInstrumentationRunner = "android.support.test.runner.AndroidJUnitRunner"
+
+    }
+
+    lint {
+        abortOnError = false
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
+        }
+    }
+}
+
+dependencies {
+    // Only core SDK.
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
+}

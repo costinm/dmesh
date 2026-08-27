@@ -9,15 +9,15 @@ import android.content.Context;
 import android.os.SystemClock;
 import android.util.Log;
 
-import com.github.costinm.dmesh.lm3.LocalMesh;
-
 import static android.app.job.JobScheduler.RESULT_SUCCESS;
 
 /**
  *  LMJob runs avery 15min (min interval allowed).
- *  Will run an update cycle, possibly starting AP.
+ *  Will run an update cycle.
  *
- *  If the battery permissions/fg are not enabled this is the main discovery.
+ * If the battery permissions/fg are not enabled this is the main discovery
+ * interface: dmesh-service is foreground service, but doesn't hold wake 
+ * locks and device may doze.
  */
 public class LMJob extends JobService {
     private static final String TAG = "DMJob";
@@ -54,13 +54,8 @@ public class LMJob extends JobService {
         Runnable r = new Runnable() {
             @Override
             public void run() {
-                LocalMesh lm = LocalMesh.get(LMJob.this.getApplicationContext());
-                lm.update();
-                try {
-                    Thread.sleep(5000);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
+                // Reconciliation belongs to Rust's durable update path. This
+                // legacy job is intentionally inert until Rust exposes it.
                 Log.d(TAG, "LMJob " + params.getJobId());
                 jobFinished(params, false);
             }

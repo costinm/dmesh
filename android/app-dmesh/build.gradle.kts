@@ -78,6 +78,7 @@ android {
 dependencies {
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
     androidTestImplementation("androidx.test:runner:1.2.0")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 
     //implementation(libs.androidx.appcompat)
     //implementation(libs.androidx.cardview)
@@ -87,7 +88,10 @@ dependencies {
     //implementation("androidx.tracing:tracing:1.3.0")
     //implementation("androidx.core:core:1.17.0")
 
-    implementation(project(mapOf("path" to ":android:lib-util")))
+    implementation(project(mapOf("path" to ":android:lib-dmesh")))
+    // The Wi-Fi owner is shared with the standalone P2P/NAN qualifier. DMesh
+    // switches command handling to it during the next migration phase.
+    implementation(project(mapOf("path" to ":android:dmesh-wifi")))
 
     //implementation(libs.androidx.monitor)
 

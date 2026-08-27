@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- P2P and Aware are nearby-device APIs on API 33+. This reproducer
+         neither scans BSSs nor derives physical location. -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <uses-feature android:name="android.hardware.wifi" android:required="true" />
+    <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
+
+    <application android:allowBackup="false" tools:replace="android:allowBackup"
+        android:label="P2P NAN Repro"
+        android:theme="@style/ReproTheme">
+        <activity android:name=".ReproActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".TermActivity" android:exported="true"
+            android:windowSoftInputMode="stateVisible|adjustResize" />
+        <service android:name=".ReproForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <provider android:name=".ReproControlProvider"
+            android:authorities="com.github.costinm.dmesh.transport.control"
+            android:exported="true" />
+    </application>
+</manifest>

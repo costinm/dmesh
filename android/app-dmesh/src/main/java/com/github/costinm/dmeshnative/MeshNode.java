@@ -42,12 +42,12 @@ public class MeshNode implements AutoCloseable {
         return nativeExec(nativeHandle, connId, command);
     }
 
-    public MeshStream openStream(long connId, String host, int port) {
+    public MeshNativeStream openStream(long connId, String host, int port) {
         long streamHandle = nativeOpenStream(nativeHandle, connId, host, port);
         if (streamHandle == 0) {
             return null;
         }
-        return new MeshStream(streamHandle);
+        return new MeshNativeStream(streamHandle);
     }
 
     public String getPublicKey() {
@@ -84,12 +84,19 @@ public class MeshNode implements AutoCloseable {
         nativeStopTunFd(handle);
     }
 
-    public static boolean sendBridgeJson(long clientId, String line) {
-        return nativeSendBridgeMessage(clientId, line);
+    /** Sends one opaque, bounded message record to the SSH bridge. */
+    public static boolean sendBridgeMessage(long clientId, byte[] message) {
+        return nativeSendBridgeMessage(clientId, message == null ? new byte[0] : message);
     }
 
     public static byte[] radioMessage(String method, String args, byte[] data, int fd) {
         return nativeRadioMessage(method, args == null ? "" : args, data == null ? new byte[0] : data, fd);
+    }
+
+    /** Rust validates a shell command and returns the transport projection for Android. */
+    public static String shellTransportCommand(String line) {
+        return radioMessageText("radio.shell.command", "",
+                line == null ? new byte[0] : line.getBytes(StandardCharsets.UTF_8), -1);
     }
 
     public static byte[] buildBleServiceData(String event, byte[] deviceId, byte[] payload,
@@ -142,20 +149,31 @@ public class MeshNode implements AutoCloseable {
                 new byte[0], -1);
     }
 
-    /** Decode the shared CBOR transport.start declaration for the Android adapter. */
-    public static String decodeTransportStart(byte[] record) {
-        return radioMessageText("radio.control.transport_start", "", record, -1);
+    /**
+     * Probe a peer learned by UDP6 multicast through the shared QUIC-lite echo
+     * service. {@code scope} is the caller's local P2P interface index, not a
+     * property of the remote peer; link-local P2P traffic is invalid without
+     * it.
+     */
+    public static String probeUdp6Echo(String address, int scope, int port, String payload) {
+        return radioMessageText("radio.probe.udp6_echo",
+                "address=" + textArg(address)
+                        + " scope=" + scope
+                        + " port=" + port
+                        + " payload=" + textArg(payload),
+                new byte[0], -1);
     }
 
-    /** Build the same volatile transport.start CBOR carried by UART or NAN SD. */
-    public static byte[] buildTransportStart(String mode, String ssid, String passphrase,
-                                             String bssid, boolean ap, boolean ndp) {
-        return radioMessage("radio.control.build_transport_start",
-                "mode=" + textArg(mode) + " ssid=" + textArg(ssid)
-                        + " passphrase=" + textArg(passphrase)
-                        + " bssid=" + textArg(bssid)
-                        + " ap=" + (ap ? "1" : "0")
-                        + " ndp=" + (ndp ? "1" : "0"), new byte[0], -1);
+    /** Run the common bounded QUIC-lite IPERF service over a scoped P2P link. */
+    public static String probeUdp6Iperf(String address, int scope, int port,
+                                        int bytes, int packetSize) {
+        return radioMessageText("radio.probe.udp6_iperf",
+                "address=" + textArg(address)
+                        + " scope=" + scope
+                        + " port=" + port
+                        + " bytes=" + bytes
+                        + " packet_size=" + packetSize,
+                new byte[0], -1);
     }
 
     public static String parseNanServiceInfo(byte[] serviceInfo) {
@@ -175,6 +193,21 @@ public class MeshNode implements AutoCloseable {
     /** Rust-owned one-hour inventory across NAN, UDP multicast, and control-plane discovery. */
     public static String knownDevices() {
         return radioMessageText("radio.devices", "", new byte[0], -1);
+    }
+
+    /** Rust-owned platform snapshot used for routing and local multicast decisions. */
+    public static String localNetworks() {
+        return radioMessageText("radio.local_networks", "", new byte[0], -1);
+    }
+
+    /** Latest bounded Android power/memory telemetry retained by Rust. */
+    public static String powerState() {
+        return radioMessageText("radio.power.state", "", new byte[0], -1);
+    }
+
+    /** Small Rust-generated status snapshot for the Android status shell. */
+    public static String statusText() {
+        return radioMessageText("radio.status_text", "", new byte[0], -1);
     }
 
     /** @deprecated Use {@link #knownDevices()}; the inventory is not NAN-only. */
@@ -224,7 +257,13 @@ public class MeshNode implements AutoCloseable {
     }
 
     private static String radioMessageText(String method, String args, byte[] data, int fd) {
-        return new String(radioMessage(method, args, data, fd), StandardCharsets.UTF_8);
+        // Text control/probe callers need the Rust error verbatim enough to
+        // record a failed lifecycle or bearer stage.  Do not route this via
+        // radioMessage(): that byte-oriented JNI method deliberately returns
+        // an empty buffer on failure so a binary NAN/BLE frame can never be
+        // mistaken for a JSON error record.
+        return nativeRadioMessageText(method, args == null ? "" : args,
+                data == null ? new byte[0] : data, fd);
     }
 
     private static String hex(byte[] data) {
@@ -273,11 +312,13 @@ public class MeshNode implements AutoCloseable {
     }
 
     public interface MeshCallback {
-        void onSshConnection(long clientId, String user);
-        void onMessage(long clientId, String jsonLine);
-        void onStreamOpened(long clientId, String jsonLine);
-        void onStream(long clientId, String host, int port, long streamHandle);
-        void onForwardedTcpip(long connId, String host, int port, long streamHandle);
+        void onTransportConnection(long clientId, String peer);
+        /** Opaque message bytes; dmeshnative maps them to the Android Bundle API. */
+        void onMessage(long clientId, byte[] message);
+        /** The transport endpoint is gone; release its Android-side gateway state. */
+        void onMessageClosed(long clientId);
+        void onInboundStream(long clientId, String host, int port, long streamHandle);
+        void onForwardedStream(long connId, String host, int port, long streamHandle);
     }
 
     private static native long nativeStartMesh(String baseDir, int sshPort, int httpPort);
@@ -293,6 +334,7 @@ public class MeshNode implements AutoCloseable {
     private static native long nativeTestTunFd(int fd);
     private static native long nativeStartTunFd(int fd);
     private static native void nativeStopTunFd(long handle);
-    private static native boolean nativeSendBridgeMessage(long clientId, String line);
+    private static native boolean nativeSendBridgeMessage(long clientId, byte[] message);
     private static native byte[] nativeRadioMessage(String method, String args, byte[] data, int fd);
+    private static native String nativeRadioMessageText(String method, String args, byte[] data, int fd);
 }

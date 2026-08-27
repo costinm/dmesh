@@ -9,9 +9,11 @@ import android.os.Parcel;
 import android.os.RemoteException;
 import android.util.Log;
 
-import com.github.costinm.dmesh.android.msg.DirectBinder;
-import com.github.costinm.dmesh.android.msg.MsgFrame;
+import com.github.costinm.dmesh.DirectBinder;
 
+import org.json.JSONObject;
+
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 
@@ -19,25 +21,19 @@ public class ChatBridge {
     private static final String TAG = "DMeshChat";
     private static final Object LOCK = new Object();
     private static final ArrayDeque<String> EVENTS = new ArrayDeque<>();
-    private static final ArrayList<MsgFrame> PENDING = new ArrayList<>();
+    private static final ArrayList<byte[]> PENDING = new ArrayList<>();
     private static IBinder remote;
     private static ServiceConnection connection;
 
-    private static final DirectBinder CALLBACK = new DirectBinder(new DirectBinder.Receiver() {
-        @Override
-        public boolean onDirectMessage(int code, DirectBinder.DirectMessage msg, Parcel reply)
-                throws RemoteException {
-            if (msg.frame != null) {
-                enqueueEvent(msg.frame.toJsonLine());
-            }
-            return true;
-        }
+    private static final DirectBinder CALLBACK = new DirectBinder((code, msg, reply) -> {
+        enqueueEvent(new String(msg.payload, StandardCharsets.UTF_8));
+        return true;
     });
 
     public static void submitText(Context context, String text) {
         Log.d(TAG, "rust ui typed: " + text);
         Context app = context.getApplicationContext();
-        sendFrame(app, frameForText(text));
+        sendPayload(app, payloadForText(text));
     }
 
     public static String drainEvents() {
@@ -50,37 +46,40 @@ public class ChatBridge {
         return out.toString();
     }
 
-    private static MsgFrame frameForText(String text) {
+    private static byte[] payloadForText(String text) {
         String trimmed = text == null ? "" : text.trim();
+        String method;
+        String body = trimmed;
         if (trimmed.equals("/messages") || trimmed.startsWith("/messages ")) {
-            MsgFrame frame = new MsgFrame("messages.subscribe");
+            method = "messages.subscribe";
             String[] parts = trimmed.split("\\s+", 2);
-            frame.fields.put("keys", parts.length > 1 ? parts[1].trim() : "all");
-            frame.fields.put("from", "app-chat-ui");
-            return frame;
-        }
-        if (trimmed.startsWith("/")) {
+            body = parts.length > 1 ? parts[1].trim() : "all";
+        } else if (trimmed.startsWith("/")) {
             String[] parts = trimmed.split("\\s+", 2);
-            MsgFrame frame = new MsgFrame(parts[0].substring(1).replace('/', '.'));
-            frame.fields.put("from", "app-chat-ui");
-            if (parts.length > 1) {
-                frame.fields.put("text", parts[1]);
-            }
-            return frame;
+            method = parts[0].substring(1).replace('/', '.');
+            body = parts.length > 1 ? parts[1] : "";
+        } else {
+            method = "chat.message";
         }
-        MsgFrame frame = new MsgFrame("chat.message");
-        frame.fields.put("from", "app-chat-ui");
-        frame.fields.put("text", trimmed);
-        return frame;
+        try {
+            JSONObject data = new JSONObject();
+            data.put("from", "app-chat-ui");
+            data.put("text", body);
+            if ("messages.subscribe".equals(method)) data.put("keys", body);
+            return new JSONObject().put("method", method).put("data", data)
+                    .toString().getBytes(StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot encode chat request", e);
+        }
     }
 
-    private static void sendFrame(Context app, MsgFrame frame) {
+    private static void sendPayload(Context app, byte[] payload) {
         synchronized (LOCK) {
             if (remote != null) {
-                sendNow(frame);
+                sendNow(payload);
                 return;
             }
-            PENDING.add(frame);
+            PENDING.add(payload);
         }
         bind(app);
     }
@@ -99,14 +98,14 @@ public class ChatBridge {
         ServiceConnection sc = new ServiceConnection() {
             @Override
             public void onServiceConnected(ComponentName name, IBinder service) {
-                ArrayList<MsgFrame> copy;
+                ArrayList<byte[]> copy;
                 synchronized (LOCK) {
                     remote = service;
                     copy = new ArrayList<>(PENDING);
                     PENDING.clear();
                 }
-                for (MsgFrame frame : copy) {
-                    sendNow(frame);
+                for (byte[] payload : copy) {
+                    sendNow(payload);
                 }
             }
 
@@ -129,7 +128,7 @@ public class ChatBridge {
         }
     }
 
-    private static void sendNow(MsgFrame frame) {
+    private static void sendNow(byte[] payload) {
         IBinder binder;
         synchronized (LOCK) {
             binder = remote;
@@ -140,7 +139,9 @@ public class ChatBridge {
         boolean ok = DirectBinder.transact(
                 binder,
                 DirectBinder.TRANSACT_MESSAGE,
-                frame,
+                payload,
+                "json",
+                null,
                 CALLBACK,
                 null);
         if (!ok) {

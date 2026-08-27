@@ -3,31 +3,18 @@ package com.github.costinm.dmesh.lm;
 import android.Manifest;
 import android.app.ActionBar;
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Message;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.Window;
 import android.widget.TextView;
 
-import com.github.costinm.dmesh.android.msg.MessageHandler;
-import com.github.costinm.dmesh.android.msg.MsgConn;
-import com.github.costinm.dmesh.android.msg.MsgFrame;
-import com.github.costinm.dmesh.android.msg.MsgMux;
-import com.github.costinm.dmesh.android.util.DMeshCompanionPrefs;
-import com.github.costinm.dmesh.android.util.UiUtil;
-import com.github.costinm.dmesh.lm3.Device;
+import com.github.costinm.dmesh.wifi.DMeshCompanionManager;
 import com.github.costinm.dmeshnative.MeshNode;
-
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 import java.net.InterfaceAddress;
 import java.net.InetAddress;
@@ -38,13 +25,13 @@ import java.util.Enumeration;
 import java.util.List;
 
 /**
- * Lightweight platform-only status shell for app-dmesh.
+ * Lightweight platform-only status and permission handling for app-dmesh.
  *
  * The command UI lives in the ssh-mesh admin web surface. This Activity only starts
  * the foreground service, handles Android permission/VPN UI flows, shows concise
- * local status, and opens the isolated WebActivity.
+ * local status, and may open the isolated WebActivity.
  */
-public class MeshActivityLight extends Activity implements MessageHandler {
+public class MeshActivityLight extends Activity {
     private static final String TAG = "Mesh";
     public static final String ACTION_START_VPN = "com.github.costinm.dmesh.START_VPN";
     public static final String ACTION_REQUEST_PERMISSIONS =
@@ -53,17 +40,9 @@ public class MeshActivityLight extends Activity implements MessageHandler {
     public static final String EXTRA_PERMISSIONS = "permissions";
     private static final String ADMIN_URL = "http://127.0.0.1:18480/_m/adm/";
     private static final int MENU_OPEN_WEB = 1;
-    private static final int MENU_SHOW_STATUS = 2;
-    private static final int MENU_SHOW_NOTIFICATIONS = 3;
-    private static final int MENU_PAIR_COMPANION = 4;
-    private static final int MENU_CLEAR_COMPANION = 5;
-    private static final int MENU_COMPANION_ACTIVE = 6;
-    private static final int MENU_COMPANION_SLEEP = 7;
-    private static final int MENU_COMPANION_LORA_LISTEN = 8;
-    private static final int MENU_COMPANION_RAW_WIFI = 9;
+    private static final int MENU_PAIR_COMPANION = 2;
     public static final int A_REQUEST_LOCATION = 10;
     public static final int A_REQUEST_VPN = 9;
-    private static final int MAX_NOTIFICATIONS = 40;
     private static final byte[] DEFAULT_VPN_ADDRESS = new byte[] {
             (byte) 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1
     };
@@ -80,17 +59,9 @@ public class MeshActivityLight extends Activity implements MessageHandler {
             Manifest.permission.NEARBY_WIFI_DEVICES,
     };
 
-    private final ArrayList<String> notifications = new ArrayList<>();
-    private Handler handler;
-    private MsgMux mux;
     private TextView conText;
     private TextView ifText;
     private TextView msgText;
-    private Bundle lastStatus;
-    private Bundle lastMessage;
-    private String companionStatus = "none";
-    private String companionPullStatus = "";
-    private long companionLastSeenMs;
     private Intent pendingStartupIntent;
     private boolean pendingVpnStart;
 
@@ -108,7 +79,6 @@ public class MeshActivityLight extends Activity implements MessageHandler {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_ACTION_BAR_OVERLAY);
-        handler = new Handler(getMainLooper());
         setContentView(R.layout.main_activity);
 
         ActionBar actionBar = getActionBar();
@@ -120,19 +90,8 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         conText = findViewById(R.id.con_text);
         ifText = findViewById(R.id.if_text);
         msgText = findViewById(R.id.msg_text);
-        msgText.setOnClickListener(v -> showNotifications());
-        ifText.setOnClickListener(v -> showStatus());
-
-        mux = MsgMux.get(getApplicationContext());
-        mux.subscribe("net", this);
-        mux.subscribe("netif", this);
-        mux.subscribe("netip", this);
-        mux.subscribe("wifi", this);
-        mux.subscribe("BLE", this);
-        mux.subscribe("COMPANION", this);
-        mux.subscribe("N", this);
-        mux.subscribe("messages", this);
-        mux.subscribe("permission", this);
+        ifText.setOnClickListener(v -> updateInterfaces());
+        msgText.setText("Open Web for DMesh status and controls");
 
         List<String> missing = checkPermissions(getApplicationContext());
         if (!missing.isEmpty()) {
@@ -143,25 +102,8 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         }
 
         startDMeshService();
-        updateInterfaces();
-        appendNotification("Activity started");
+        refreshStatus();
         handleIntent(getIntent());
-    }
-
-    @Override
-    protected void onDestroy() {
-        if (mux != null) {
-            mux.unsubscribe("net", this);
-            mux.unsubscribe("netif", this);
-            mux.unsubscribe("netip", this);
-            mux.unsubscribe("wifi", this);
-            mux.unsubscribe("BLE", this);
-            mux.unsubscribe("COMPANION", this);
-            mux.unsubscribe("N", this);
-            mux.unsubscribe("messages", this);
-            mux.unsubscribe("permission", this);
-        }
-        super.onDestroy();
     }
 
     @Override
@@ -267,7 +209,7 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         Intent startupIntent = pendingStartupIntent;
         pendingStartupIntent = null;
         startDMeshService();
-        updateInterfaces();
+        refreshStatus();
         handleIntent(startupIntent != null ? startupIntent : getIntent());
     }
 
@@ -279,20 +221,14 @@ public class MeshActivityLight extends Activity implements MessageHandler {
             startService(new Intent(this, VpnService.class));
         } else if (DMeshCompanionManager.REQUEST_ASSOCIATE == requestCode) {
             DMeshCompanionManager.handleActivityResult(this, resultCode, data);
+            refreshStatus();
         }
     }
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
         menu.add(0, MENU_OPEN_WEB, 0, "Web").setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
-        menu.add(0, MENU_SHOW_STATUS, 1, "Status");
-        menu.add(0, MENU_SHOW_NOTIFICATIONS, 2, "Notifications");
-        menu.add(0, MENU_PAIR_COMPANION, 3, "Pair companion");
-        menu.add(0, MENU_CLEAR_COMPANION, 4, "Clear companion");
-        menu.add(0, MENU_COMPANION_ACTIVE, 5, "Companion active 1m");
-        menu.add(0, MENU_COMPANION_SLEEP, 6, "Companion sleep");
-        menu.add(0, MENU_COMPANION_LORA_LISTEN, 7, "LoRa listen in sleep");
-        menu.add(0, MENU_COMPANION_RAW_WIFI, 8, "Raw Wi-Fi listen");
+        menu.add(0, MENU_PAIR_COMPANION, 1, "Pair companion");
         return true;
     }
 
@@ -302,37 +238,8 @@ public class MeshActivityLight extends Activity implements MessageHandler {
             openWebAdmin();
             return true;
         }
-        if (item.getItemId() == MENU_SHOW_STATUS) {
-            showStatus();
-            return true;
-        }
-        if (item.getItemId() == MENU_SHOW_NOTIFICATIONS) {
-            showNotifications();
-            return true;
-        }
         if (item.getItemId() == MENU_PAIR_COMPANION) {
             DMeshCompanionManager.associate(this);
-            return true;
-        }
-        if (item.getItemId() == MENU_CLEAR_COMPANION) {
-            DMeshCompanionManager.clear(this);
-            setServiceStatus("Companion cleared");
-            return true;
-        }
-        if (item.getItemId() == MENU_COMPANION_ACTIVE) {
-            sendCompanionCommand("mode active=true ms=60000");
-            return true;
-        }
-        if (item.getItemId() == MENU_COMPANION_SLEEP) {
-            sendCompanionCommand("mode sleep=true");
-            return true;
-        }
-        if (item.getItemId() == MENU_COMPANION_LORA_LISTEN) {
-            sendCompanionCommand("mode lora_sleep_listen=true save=true");
-            return true;
-        }
-        if (item.getItemId() == MENU_COMPANION_RAW_WIFI) {
-            sendCompanionCommand("mode raw_wifi=true channel=6");
             return true;
         }
         return super.onOptionsItemSelected(item);
@@ -340,75 +247,10 @@ public class MeshActivityLight extends Activity implements MessageHandler {
 
     private void openWebAdmin() {
         Intent intent = new Intent(this, WebActivity.class);
-        intent.putExtra(WebUrls.EXTRA_URL, ADMIN_URL);
+        intent.putExtra(WebActivity.EXTRA_URL, ADMIN_URL);
         startActivity(intent);
     }
 
-    private void sendCompanionCommand(String command) {
-        String addr = DMeshCompanionPrefs.address(this);
-        if (addr == null || addr.trim().isEmpty()) {
-            setServiceStatus("No companion address");
-            return;
-        }
-        mux.publish("ble.cmd", "addr", addr.trim(), "text", command);
-        setServiceStatus("Companion command: " + command);
-    }
-
-    @Override
-    public void handleMessage(String topic, String msgType, Message message, MsgConn replyTo,
-                              String[] args) {
-        final MsgFrame frame = MsgFrame.fromMessage(message);
-        final Bundle data = message.getData();
-        handler.post(() -> {
-            lastMessage = new Bundle(data);
-            updateCompanion(frame);
-            appendNotification(formatFrame(frame));
-            if ("net".equals(topic) && args != null && args.length > 2
-                    && "status".equals(args[2])) {
-                updateStatus(data);
-                return;
-            }
-            if ("netif".equals(topic) || "netip".equals(topic) || "wifi".equals(topic)
-                    || "BLE".equals(topic) || "COMPANION".equals(topic) || "N".equals(topic)) {
-                updateInterfaces();
-            }
-            if ("messages".equals(topic) && "status".equals(msgType)) {
-                setServiceStatus("Messages: " + data.getString("events", "0") + " events");
-            }
-        });
-    }
-
-    private void updateStatus(Bundle data) {
-        lastStatus = new Bundle(data);
-        int scanCount = 0;
-        int nearbyDevices = 0;
-        Bundle nested = data.getBundle("data");
-        if (nested != null) {
-            ArrayList<Bundle> scan = nested.getParcelableArrayList("scan");
-            if (scan != null) {
-                scanCount = scan.size();
-                nearbyDevices = scan.size();
-            }
-        }
-        String visible = data.getString("visible", "0");
-        String ap = data.getString("ap", "");
-        String ssid = data.getString(Device.WIFISSID, data.getString("s", ""));
-        StringBuilder status = new StringBuilder();
-        status.append("Service active");
-        status.append("\nNearby radio devices: ").append(nearbyDevices);
-        status.append("\nVisible: ").append(visible);
-        status.append("\nScan entries: ").append(scanCount);
-        appendCompanionStatus(status);
-        if (!ap.isEmpty()) {
-            status.append("\nAP: ").append(ap);
-        }
-        if (!ssid.isEmpty()) {
-            status.append("\nSSID: ").append(ssid);
-        }
-        conText.setText(status);
-        conText.setBackgroundColor(nearbyDevices > 0 ? Color.rgb(209, 250, 229) : Color.TRANSPARENT);
-        updateInterfaces();
-    }
 
     private void updateInterfaces() {
         if (ifText == null) {
@@ -433,228 +275,22 @@ public class MeshActivityLight extends Activity implements MessageHandler {
         } catch (SocketException e) {
             sb.append("Interface error: ").append(e.getMessage()).append("\n");
         }
-        appendRustDiscoveredDevices(sb);
         ifText.setText(sb.length() == 0 ? "No active interfaces" : sb.toString());
     }
 
-    /** Render the native one-hour cross-bearer inventory, not Java's session-scoped NAN handles. */
-    private void appendRustDiscoveredDevices(StringBuilder sb) {
+    /** Render Rust's bounded cross-bearer status; Java does not interpret discovery state. */
+    private void refreshStatus() {
+        updateInterfaces();
         try {
-            JSONArray devices = new JSONObject(MeshNode.knownDevices()).optJSONArray("devices");
-            int count = devices == null ? 0 : devices.length();
-            sb.append("Discovered devices: ").append(count).append("\n");
-            for (int i = 0; devices != null && i < count; i++) {
-                JSONObject device = devices.optJSONObject(i);
-                if (device == null) {
-                    continue;
-                }
-                sb.append("  ").append(device.optString("id", "peer"));
-                String peer = device.optString("peer", "");
-                if (!peer.isEmpty()) {
-                    sb.append(" ").append(peer);
-                }
-                String source = device.optJSONObject("info") == null ? ""
-                        : device.optJSONObject("info").optString("source", "");
-                if (!source.isEmpty()) {
-                    sb.append(" via ").append(source);
-                }
-                sb.append("\n");
-            }
+            setServiceStatus(MeshNode.statusText());
         } catch (Exception ignored) {
-            // The native library can be unavailable while the service starts.
+            setServiceStatus("DMesh starting");
         }
     }
 
     private void setServiceStatus(String text) {
         if (conText != null) {
-            StringBuilder status = new StringBuilder(text);
-            appendCompanionStatus(status);
-            conText.setText(status);
+            conText.setText(text);
         }
-    }
-
-    private void appendCompanionStatus(StringBuilder status) {
-        status.append("\nCompanion advertising: ").append(companionStatus);
-        if (!companionPullStatus.isEmpty()) {
-            status.append("\nPull: ").append(companionPullStatus);
-        }
-    }
-
-    private void updateCompanion(MsgFrame frame) {
-        if (frame == null || frame.method == null) {
-            return;
-        }
-        if ("BLE.DISC".equals(frame.method) && "dmesh".equals(frame.fields.get("proto"))) {
-            String id = frame.fields.getOrDefault("id", frame.fields.getOrDefault("addr", ""));
-            String event = frame.fields.getOrDefault("event", "announce");
-            String pending = frame.fields.getOrDefault("pending", "");
-            String payloadLen = frame.fields.getOrDefault("payload_len", "");
-            String hash = frame.fields.getOrDefault("payload_hash", "");
-            String rssi = frame.fields.getOrDefault("rssi", "");
-            boolean advertising = isPositive(pending) || isPositive(payloadLen)
-                    || "payload_pending".equals(event) || "lora_rx".equals(event);
-            StringBuilder sb = new StringBuilder();
-            if (advertising) {
-                sb.append(id.isEmpty() ? "peer" : id);
-                sb.append(' ').append(event);
-                if (!pending.isEmpty() && !"0".equals(pending)) {
-                    sb.append(" pending=").append(pending);
-                }
-                if (!payloadLen.isEmpty() && !"0".equals(payloadLen)) {
-                    sb.append(' ').append(payloadLen).append("B");
-                }
-                if (!hash.isEmpty()) {
-                    sb.append(" hash=").append(hash);
-                }
-                if (!rssi.isEmpty()) {
-                    sb.append(" rssi=").append(rssi);
-                }
-            } else {
-                sb.append(id.isEmpty() ? "peer" : id).append(" idle");
-            }
-            companionStatus = sb.toString();
-            companionLastSeenMs = System.currentTimeMillis();
-            return;
-        }
-        if ("BLE.PENDING".equals(frame.method)) {
-            String id = frame.fields.getOrDefault("id", frame.fields.getOrDefault("addr", ""));
-            companionPullStatus = "pending from " + (id.isEmpty() ? "peer" : id)
-                    + " via " + frame.fields.getOrDefault("action", "probe");
-            return;
-        }
-        if ("BLE.PULL".equals(frame.method)) {
-            String addr = frame.fields.getOrDefault("addr", "");
-            String state = frame.fields.getOrDefault("state", "");
-            companionPullStatus = state + (addr.isEmpty() ? "" : " " + addr);
-            return;
-        }
-        if ("BLE.MSG".equals(frame.method)) {
-            String seq = frame.fields.getOrDefault("seq", "");
-            String len = frame.fields.getOrDefault("len", "");
-            companionPullStatus = "saved seq=" + seq + (len.isEmpty() ? "" : " " + len + "B");
-            return;
-        }
-        if (frame.method.startsWith("COMPANION.")) {
-            String state = frame.fields.getOrDefault("state", "");
-            String addr = frame.fields.getOrDefault("addr", "");
-            if ("COMPANION.CLEAR".equals(frame.method)) {
-                companionStatus = "none";
-                companionPullStatus = "";
-            } else {
-                companionStatus = state.isEmpty() ? frame.method : state
-                        + (addr.isEmpty() ? "" : " " + addr);
-            }
-        }
-    }
-
-    private boolean isPositive(String value) {
-        if (value == null || value.isEmpty()) {
-            return false;
-        }
-        try {
-            return Integer.parseInt(value) > 0;
-        } catch (NumberFormatException e) {
-            return false;
-        }
-    }
-
-    private String formatFrame(MsgFrame frame) {
-        if (frame == null || frame.method == null) {
-            return "";
-        }
-        if ("BLE.DISC".equals(frame.method) && "dmesh".equals(frame.fields.get("proto"))) {
-            String id = frame.fields.getOrDefault("id", frame.fields.getOrDefault("addr", ""));
-            String event = frame.fields.getOrDefault("event", "announce");
-            String len = frame.fields.getOrDefault("payload_len", "");
-            String pending = frame.fields.getOrDefault("pending", "");
-            String rssi = frame.fields.getOrDefault("rssi", "");
-            return "BLE " + compactId(id) + " " + event
-                    + fieldText("pending", pending)
-                    + fieldText("len", len)
-                    + fieldText("rssi", rssi);
-        }
-        if ("BLE.PENDING".equals(frame.method) || "BLE.PULL".equals(frame.method)) {
-            return frame.method + " "
-                    + frame.fields.getOrDefault("id", frame.fields.getOrDefault("addr", "peer"))
-                    + fieldText("state", frame.fields.get("state"))
-                    + fieldText("action", frame.fields.get("action"));
-        }
-        if ("BLE.MSG".equals(frame.method)) {
-            return "BLE message "
-                    + frame.fields.getOrDefault("seq", "")
-                    + fieldText("len", frame.fields.get("len"))
-                    + fieldText("hash", frame.fields.get("hash"));
-        }
-        if (frame.method.startsWith("COMPANION.")) {
-            return frame.method
-                    + fieldText("state", frame.fields.get("state"))
-                    + fieldText("addr", frame.fields.get("addr"))
-                    + fieldText("association", frame.fields.get("association"));
-        }
-        if ("net.status".equals(frame.method)) {
-            return "Network status visible=" + frame.fields.getOrDefault("visible", "0")
-                    + fieldText("ap", frame.fields.get("ap"))
-                    + fieldText("ssid", frame.fields.get("s"));
-        }
-        if ("wifi.BLE.DISC".equals(frame.method)) {
-            return "BLE companion " + frame.fields.getOrDefault("name", "peer");
-        }
-        if (frame.fields.isEmpty()) {
-            return frame.method;
-        }
-        return frame.method + " " + frame.fields.toString();
-    }
-
-    private String compactId(String id) {
-        if (id == null || id.length() <= 12) {
-            return id == null ? "" : id;
-        }
-        return id.substring(0, 12);
-    }
-
-    private String fieldText(String key, String value) {
-        if (value == null || value.isEmpty() || "0".equals(value)) {
-            return "";
-        }
-        return " " + key + "=" + value;
-    }
-
-    private void appendNotification(String text) {
-        notifications.add(0, text);
-        while (notifications.size() > MAX_NOTIFICATIONS) {
-            notifications.remove(notifications.size() - 1);
-        }
-        if (msgText != null) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("Notifications: ").append(notifications.size()).append("\n");
-            int shown = Math.min(8, notifications.size());
-            for (int i = 0; i < shown; i++) {
-                sb.append(notifications.get(i)).append("\n\n");
-            }
-            msgText.setText(sb.toString());
-        }
-    }
-
-    private void showStatus() {
-        new AlertDialog.Builder(this)
-                .setTitle("Status")
-                .setMessage(lastStatus == null ? ifText.getText() : UiUtil.toString(lastStatus, "\n"))
-                .setPositiveButton("OK", null)
-                .show();
-    }
-
-    private void showNotifications() {
-        StringBuilder sb = new StringBuilder();
-        for (String notification : notifications) {
-            sb.append(notification).append("\n\n");
-        }
-        if (lastMessage != null) {
-            sb.append("Last message\n").append(UiUtil.toString(lastMessage, "\n"));
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("Notifications")
-                .setMessage(sb.length() == 0 ? "No notifications" : sb.toString())
-                .setPositiveButton("OK", null)
-                .show();
     }
 }

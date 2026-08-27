@@ -28,9 +28,11 @@
             android:enabled="true"
             android:exported="true">
             <intent-filter>
+                <action android:name="mesh.direct" />
                 <action android:name="com.github.costinm.dmesh.web.OPEN_URL" />
                 <action android:name="com.github.costinm.dmesh.web.FORWARD_PORT" />
             </intent-filter>
         </service>
+
     </application>
 </manifest>

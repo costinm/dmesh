@@ -26,5 +26,5 @@ android {
 }
 
 dependencies {
-    implementation(project(mapOf("path" to ":android:lib-util")))
+    implementation(project(mapOf("path" to ":android:lib-dmesh")))
 }

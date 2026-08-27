@@ -1,49 +1,53 @@
 package com.github.costinm.dmesh.chat;
 
+import android.app.Service;
+import android.content.Intent;
+import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.util.Log;
 
-import com.github.costinm.dmesh.android.msg.BaseMsgService;
-import com.github.costinm.dmesh.android.msg.DirectBinder;
-import com.github.costinm.dmesh.android.msg.MsgConn;
-import com.github.costinm.dmesh.android.msg.MsgFrame;
-import com.github.costinm.dmesh.android.msg.MessageHandler;
+import com.github.costinm.dmesh.DirectBinder;
+
+import org.json.JSONObject;
+
+import java.nio.charset.StandardCharsets;
 
 /**
  * ChatService receives raw messages from the mesh.
  */
-public class ChatService extends BaseMsgService implements MessageHandler {
+public class ChatService extends Service {
     private static final String TAG = "DMeshChat";
+    private final DirectBinder directBinder = new DirectBinder(this::handleRawMessage);
 
     @Override
-    public void onCreate() {
-        super.onCreate();
-        mux.subscribe("chat", this);
+    public IBinder onBind(Intent intent) {
+        return intent != null && DirectBinder.ACTION_DIRECT.equals(intent.getAction()) ? directBinder : null;
     }
 
-    @Override
-    public void handleMessage(String topic, String msgType, android.os.Message m,
-                              MsgConn replyTo, String[] args) {
-        MsgFrame frame = MsgFrame.fromMessage(m);
-        String text = frame.fields.get("text");
-        if (text == null) {
-            text = frame.fields.get("txt");
+    private boolean handleRawMessage(int code, DirectBinder.DirectMessage message, Parcel reply)
+            throws RemoteException {
+        try {
+            JSONObject request = new JSONObject(new String(message.payload, StandardCharsets.UTF_8));
+            String method = request.optString("method", "");
+            JSONObject data = request.optJSONObject("data");
+            String text = data == null ? "" : data.optString("text", data.optString("txt", ""));
+            Log.d(TAG, "raw command " + method + " text=" + text);
+            if (message.callback != null) {
+                JSONObject response = new JSONObject();
+                response.put("method", "chat.message");
+                response.put("id", request.optString("id", ""));
+                JSONObject body = new JSONObject();
+                body.put("from", "app-chat");
+                body.put("text", text);
+                response.put("data", body);
+                DirectBinder.transact(message.callback, DirectBinder.TRANSACT_EVENT,
+                        response.toString().getBytes(StandardCharsets.UTF_8), "json", null, null, null);
+            }
+            return true;
+        } catch (Exception error) {
+            Log.w(TAG, "invalid raw message", error);
+            return false;
         }
-        Log.d(TAG, "chat command " + frame.method + " text=" + text);
-        if (replyTo != null) {
-            MsgFrame out = new MsgFrame("chat.message");
-            out.fields.put("from", "app-chat");
-            out.fields.put("text", text == null ? "" : text);
-            replyTo.sendFrame(out);
-        }
-    }
-
-    @Override
-    protected boolean handleDirectMessage(int code, DirectBinder.DirectMessage direct,
-                                          Parcel reply) throws RemoteException {
-        Log.d(TAG, "direct binder message " + code + " " +
-                (direct.frame == null ? "" : direct.frame.toJsonLine()));
-        return super.handleDirectMessage(code, direct, reply);
     }
 }

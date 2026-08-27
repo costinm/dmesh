@@ -14,6 +14,13 @@ import android.widget.Toast;
 
 public class WebActivity extends Activity {
     private static final String TAG = "DMeshWeb";
+    static final String EXTRA_URL = "url";
+    static final String EXTRA_HOST = "host";
+    static final String EXTRA_PORT = "port";
+    static final String EXTRA_LOCAL_PORT = "localPort";
+    static final String DEFAULT_ADMIN_URL = "http://127.0.0.1:18480/_m/adm";
+    static final String HOME_URL = "file:///android_asset/index.html";
+    private static final String APP_D_MESH_PACKAGE = "com.github.costinm.dmesh.lm";
 
     private WebView webView;
 
@@ -53,9 +60,9 @@ public class WebActivity extends Activity {
     }
 
     private void openFromIntent(Intent intent) {
-        String url = intent == null ? null : intent.getStringExtra(WebUrls.EXTRA_URL);
+        String url = intent == null ? null : intent.getStringExtra(EXTRA_URL);
         if (url == null || url.length() == 0) {
-            url = WebUrls.HOME_URL;
+            url = HOME_URL;
         }
         webView.loadUrl(url);
     }
@@ -66,7 +73,7 @@ public class WebActivity extends Activity {
         }
         if ("appweb".equals(uri.getScheme())) {
             if ("open-admin".equals(uri.getHost())) {
-                webView.loadUrl(WebUrls.DEFAULT_ADMIN_URL);
+                webView.loadUrl(DEFAULT_ADMIN_URL);
                 return true;
             }
             if ("open-dmesh".equals(uri.getHost())) {
@@ -83,8 +90,8 @@ public class WebActivity extends Activity {
 
     private void openDmeshUi() {
         Intent intent = new Intent();
-        intent.setComponent(new ComponentName(WebUrls.APP_D_MESH_PACKAGE,
-                WebUrls.APP_D_MESH_PACKAGE + ".MeshActivityLight"));
+        intent.setComponent(new ComponentName(APP_D_MESH_PACKAGE,
+                APP_D_MESH_PACKAGE + ".MeshActivityLight"));
         try {
             startActivity(intent);
         } catch (Exception e) {
@@ -94,11 +101,11 @@ public class WebActivity extends Activity {
     }
 
     private void requestForward(Uri uri) {
-        Intent intent = new Intent(WebUrls.FORWARD_PORT_ACTION);
+        Intent intent = new Intent(WebBridgeService.FORWARD_PORT_ACTION);
         intent.setComponent(new ComponentName(this, WebBridgeService.class));
-        intent.putExtra(WebUrls.EXTRA_HOST, valueOrDefault(uri.getQueryParameter(WebUrls.EXTRA_HOST), "127.0.0.1"));
-        intent.putExtra(WebUrls.EXTRA_PORT, valueOrDefault(uri.getQueryParameter(WebUrls.EXTRA_PORT), "22"));
-        intent.putExtra(WebUrls.EXTRA_LOCAL_PORT, valueOrDefault(uri.getQueryParameter(WebUrls.EXTRA_LOCAL_PORT), "10022"));
+        intent.putExtra(EXTRA_HOST, valueOrDefault(uri.getQueryParameter(EXTRA_HOST), "127.0.0.1"));
+        intent.putExtra(EXTRA_PORT, valueOrDefault(uri.getQueryParameter(EXTRA_PORT), "22"));
+        intent.putExtra(EXTRA_LOCAL_PORT, valueOrDefault(uri.getQueryParameter(EXTRA_LOCAL_PORT), "10022"));
         startService(intent);
         Toast.makeText(this, "Forward request sent to app-dmesh", Toast.LENGTH_SHORT).show();
     }

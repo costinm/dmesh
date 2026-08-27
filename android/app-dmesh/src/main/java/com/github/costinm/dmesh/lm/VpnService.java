@@ -23,6 +23,8 @@ import java.net.UnknownHostException;
 import static android.system.OsConstants.AF_INET;
 import static android.system.OsConstants.AF_INET6;
 
+// TODO: verify it with the rust passt.
+
 /**
  * Simple VPN service.
  *

@@ -10,13 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Message;
-
-
-import com.github.costinm.dmesh.android.msg.MessageHandler;
-import com.github.costinm.dmesh.android.msg.MsgConn;
-
-public class NotificationHandler implements MessageHandler {
+public class NotificationHandler {
     public static final String CHANNEL_STATUS = "dmesh";
     public static final String CHANNEL_WIFI = "dmwifi";
     public static final String CHANNEL_MSG = "dmmsg";
@@ -75,37 +69,6 @@ public class NotificationHandler implements MessageHandler {
         nc.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         nc2.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         nc3.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
-    }
-
-    @Override
-    public void handleMessage(String topic, String msgType, Message msg, MsgConn replyTo, String[] args) {
-        Bundle arg = msg.getData();
-
-        String type = arg.getString("type", "status");
-        switch (type) {
-            case "status": {
-                Notification n = getNotification(arg);
-                if (nm != null) {
-                    nm.notify(1, n);
-                }
-                break;
-            }
-            case "disc": {
-                Notification n = getNeighborNotification(arg);
-                if (nm != null) {
-                    nm.notify(2, n);
-                }
-                break;
-            }
-            case "msg": {
-                Notification n = getMsgNotification(arg);
-                if (nm != null) {
-                    nm.notify(3, n);
-                }
-                break;
-            }
-        }
-
     }
 
     /**

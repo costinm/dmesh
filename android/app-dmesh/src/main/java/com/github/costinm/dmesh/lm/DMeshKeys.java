@@ -12,6 +12,8 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
+// TODO: move to rust side.
+
 final class DMeshKeys {
     static final String KEY_DIR = "ssh-mesh";
     static final String AUTHORIZED_KEYS = "authorized_keys";

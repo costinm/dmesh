@@ -18,6 +18,8 @@ import android.webkit.WebViewClient;
  * HTTP/message interfaces exposed by the foreground service.
  */
 public class WebActivity extends Activity {
+    static final String EXTRA_URL = "url";
+    static final String DEFAULT_ADMIN_URL = "http://127.0.0.1:18480/_m/adm/";
     private static final int MENU_BACK = 1;
     private static final int MENU_RELOAD = 2;
     private WebView webView;
@@ -82,9 +84,9 @@ public class WebActivity extends Activity {
     }
 
     private void openFromIntent(Intent intent) {
-        String url = intent == null ? null : intent.getStringExtra(WebUrls.EXTRA_URL);
+        String url = intent == null ? null : intent.getStringExtra(EXTRA_URL);
         if (url == null || url.isEmpty()) {
-            url = WebUrls.DEFAULT_ADMIN_URL;
+            url = DEFAULT_ADMIN_URL;
         }
         webView.loadUrl(url);
     }
@@ -94,7 +96,7 @@ public class WebActivity extends Activity {
             return false;
         }
         if ("appweb".equals(uri.getScheme()) && "open-admin".equals(uri.getHost())) {
-            webView.loadUrl(WebUrls.DEFAULT_ADMIN_URL);
+            webView.loadUrl(DEFAULT_ADMIN_URL);
             return true;
         }
         return false;
