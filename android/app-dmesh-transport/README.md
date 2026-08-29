@@ -58,9 +58,10 @@ adb shell am instrument -w \
   com.github.costinm.dmesh.transport.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
-`p2p.start`, `p2p.start_advertised`, `p2p.stop`, `nan.start`, `nan.stop`,
-`lohs.start`, and `lohs.stop` remain available as low-level qualification
-primitives. They are intentionally all delegated to `dmesh-wifi`.
+`p2p.start`, `p2p.start_advertised`, `p2p.discover`, `p2p.stop`, `nan.start`,
+`nan.stop`, `lohs.start`, and `lohs.stop` remain available as low-level
+qualification primitives. They are intentionally all delegated to
+`dmesh-wifi`.
 
 The same shell is available in-app as a terminal:
 

@@ -28,6 +28,7 @@ import android.net.wifi.p2p.WifiP2pConfig;
 import android.net.wifi.p2p.WifiP2pGroup;
 import android.net.wifi.p2p.WifiP2pManager;
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo;
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest;
 import android.os.Build;
 import android.util.Base64;
 import android.os.Handler;
@@ -55,7 +56,10 @@ import java.util.concurrent.TimeUnit;
  * retain that ordering while the remaining DMesh Wi-Fi adapters migrate here.
  */
 public final class WifiController {
-    private static final String NAN_SERVICE = "p2pnanrepro";
+    // Wi-Fi Aware derives its six-byte service identifier from this name.
+    // Keep it aligned with dmesh_rawnan::DMESH_SERVICE_ID (SHA-256("dmesh")
+    // prefix) so Android, Linux raw-NAN, and ESP use one discovery service.
+    private static final String NAN_SERVICE = "dmesh";
     /** Shared fixed AP name. It satisfies the Android P2P DIRECT-xy rule. */
     private static final String P2P_SSID = "DIRECT-dmesh";
     /** Shared default WPA2 key; an absent transport.start PSK selects it. */
@@ -93,6 +97,7 @@ public final class WifiController {
     private final ArrayDeque<String> log = new ArrayDeque<>();
     private WifiP2pManager.Channel p2pChannel;
     private WifiP2pDnsSdServiceInfo localService;
+    private WifiP2pDnsSdServiceRequest serviceRequest;
     private boolean localServiceAdding;
     private WifiAwareSession awareSession;
     private PublishDiscoverySession publishSession;
@@ -101,6 +106,7 @@ public final class WifiController {
     private WifiManager.LocalOnlyHotspotReservation lohsReservation;
     private ConnectivityManager.NetworkCallback staAttachment;
     private Network staNetwork;
+    private String staSsid = "";
     private boolean p2pGroupRequested;
     private boolean advertiseAfterGroup;
     private Announce announce = Announce.empty();
@@ -260,8 +266,11 @@ public final class WifiController {
             if (subscribeSession != null) {
                 subscribeSession.close();
                 subscribeSession = null;
-                if (awareSession != null) subscribeNan();
             }
+            // A production baseline subscribes to the common service name
+            // without a service-info filter. Recreate after any update even
+            // if the prior baseline did not have a session yet.
+            if (awareSession != null) subscribeNan();
             done.complete("applied");
         });
     }
@@ -358,6 +367,7 @@ public final class WifiController {
         staAttachment = new ConnectivityManager.NetworkCallback() {
             @Override public void onAvailable(Network network) {
                 staNetwork = network;
+                staSsid = request.ssid;
                 note("sta.available ssid=" + request.ssid);
                 complete.countDown();
             }
@@ -368,7 +378,7 @@ public final class WifiController {
                 complete.countDown();
             }
             @Override public void onLost(Network network) {
-                if (network.equals(staNetwork)) staNetwork = null;
+                if (network.equals(staNetwork)) { staNetwork = null; staSsid = ""; }
                 synchronized (WifiController.this) { appliedTransportKey = ""; }
                 note("sta.lost ssid=" + request.ssid);
             }
@@ -393,8 +403,15 @@ public final class WifiController {
         }
         staAttachment = null;
         staNetwork = null;
+        staSsid = "";
         note("sta.released");
     }
+
+    /** Current DMesh-managed STA SSID, or empty when no STA attachment exists. */
+    public synchronized String currentStaSsid() { return staSsid; }
+
+    /** True when this adapter owns an AP/GO endpoint. */
+    public synchronized boolean apActive() { return p2pGroupRequested || lohsReservation != null; }
 
     public void startP2pGroup() {
         startP2pGroup(false);
@@ -445,6 +462,51 @@ public final class WifiController {
                         || event.startsWith("p2p.create_group failed=")
                         || event.startsWith("p2p.create_group exception="),
                 15_000, () -> startP2pGroup(true));
+    }
+
+    /** Issue the DMesh DNS-SD query through Android's public P2P API. */
+    public boolean discoverP2pServicesAndAwait() {
+        return runAndAwait(event -> event.equals("p2p.discover_services accepted")
+                        || event.startsWith("p2p.discover_services failed=")
+                        || event.startsWith("p2p.discover_services exception="),
+                15_000, () -> handler.post(this::discoverP2pServices));
+    }
+
+    private void discoverP2pServices() {
+        stopNanInternal();
+        if (!ensureP2pChannel()) return;
+        WifiP2pManager.Channel channel = p2pChannel;
+        p2p.setDnsSdResponseListeners(channel,
+                (instance, type, device) -> note("p2p.dnssd_service instance=" + instance
+                        + " type=" + type + " peer=" + device.deviceAddress),
+                (domain, record, device) -> note("p2p.dnssd_txt domain=" + domain
+                        + " peer=" + device.deviceAddress + " keys=" + record.keySet()));
+        try {
+            p2p.clearServiceRequests(channel, chain("p2p.clear_service_requests", () -> {
+                WifiP2pDnsSdServiceRequest request =
+                        WifiP2pDnsSdServiceRequest.newInstance("dmesh", "_dmesh._tcp");
+                try {
+                    p2p.addServiceRequest(channel, request, new WifiP2pManager.ActionListener() {
+                        @Override public void onSuccess() {
+                            serviceRequest = request;
+                            note("p2p.service_request active");
+                            try {
+                                p2p.discoverServices(channel, action("p2p.discover_services"));
+                            } catch (RuntimeException error) {
+                                note("p2p.discover_services exception=" + describe(error));
+                            }
+                        }
+                        @Override public void onFailure(int reason) {
+                            note("p2p.service_request failed=" + reason);
+                        }
+                    });
+                } catch (RuntimeException error) {
+                    note("p2p.service_request exception=" + describe(error));
+                }
+            }));
+        } catch (RuntimeException error) {
+            note("p2p.clear_service_requests exception=" + describe(error));
+        }
     }
 
     private void createP2pGroup() {
@@ -632,9 +694,13 @@ public final class WifiController {
 
     private void clearServiceRequests(WifiP2pManager.Channel channel, Runnable after) {
         try {
-            p2p.clearServiceRequests(channel, chain("p2p.clear_service_requests", after));
+            p2p.clearServiceRequests(channel, chain("p2p.clear_service_requests", () -> {
+                serviceRequest = null;
+                after.run();
+            }));
         } catch (RuntimeException e) {
             note("p2p.clear_service_requests exception=" + describe(e));
+            serviceRequest = null;
             after.run();
         }
     }
@@ -785,9 +851,19 @@ public final class WifiController {
     }
 
     private void subscribeNan() {
-        if (awareSession == null || discover.isEmpty()) return;
-        SubscribeConfig config = new SubscribeConfig.Builder().setServiceName(NAN_SERVICE)
-                .setServiceSpecificInfo(discover.payload).build();
+        if (awareSession == null) return;
+        SubscribeConfig.Builder builder = new SubscribeConfig.Builder().setServiceName(NAN_SERVICE);
+        // `Discover.options` is the platform-neutral projection used by the
+        // Android bridge. The default Subscribe type is passive on several
+        // Android releases, which creates a session but does not emit the
+        // over-the-air active-Subscribe request needed to wake/responding
+        // firmware.
+        if (discover.options.contains("active")) {
+            builder.setSubscribeType(SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE);
+        }
+        // Empty means "all DMesh services" rather than "do not subscribe".
+        if (!discover.isEmpty()) builder.setServiceSpecificInfo(discover.payload);
+        SubscribeConfig config = builder.build();
         awareSession.subscribe(config, new DiscoverySessionCallback() {
             @Override public void onSubscribeStarted(SubscribeDiscoverySession subscribe) {
                 subscribeSession = subscribe;

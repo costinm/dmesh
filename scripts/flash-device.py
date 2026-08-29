@@ -11,12 +11,14 @@ flashing remain future paths for devices without a UART connection.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -90,7 +92,32 @@ def direct_serial_port(role: str) -> str:
     return matches[0]
 
 
+def release_serial_modem_lines(port: str) -> None:
+    """Return a CP210x serial adapter to an explicit idle line state.
+
+    LoRa boards connect RTS to EN and DTR to GPIO0.  A previous serial owner
+    may close while either line is asserted; entering esptool from that stale
+    state can select the ROM downloader but leave its TX path unsynchronised.
+    Clear both lines before starting esptool, then let esptool perform its
+    normal reset/download handshake from a known state.  Native USB-JTAG C6
+    endpoints do not expose these modem ioctls, so failure is intentionally a
+    no-op rather than a reason to reject their direct provisioning path.
+    """
+    try:
+        fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return
+    try:
+        mask = termios.TIOCM_DTR | termios.TIOCM_RTS
+        fcntl.ioctl(fd, termios.TIOCMBIC, mask.to_bytes(4, sys.byteorder, signed=True))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def probe_direct(port: str, baud: int, connect_attempts: int = 7) -> DirectDevice | None:
+    release_serial_modem_lines(port)
     command = [
         esptool_python(), "-m", "esptool", "--port", port, "--baud", str(baud),
         "--connect-attempts", str(connect_attempts),
@@ -330,7 +357,9 @@ def nvs_boot_target_image(
     port: str, chip: str, role: str, boot_target: int | None, clear_boot_target: bool,
     uart_boot: int | None, mode: str | None,
     server: str, board_ip: str, server_port: int, flash_baud: int,
-    source_override: Path | None = None,
+    source_override: Path | None = None, sta_profile: Path | None = None,
+    sta_ssid: str | None = None, sta_server_ll: str | None = None,
+    sta_server_port: int = 3336,
 ) -> Path:
     """Preserve NVS contents while setting or removing the lab boot target."""
     output = ROOT / "target" / "nvs" / role
@@ -358,6 +387,13 @@ def nvs_boot_target_image(
         command.extend(("--uart-boot", str(uart_boot)))
     if mode is not None:
         command.extend(("--mode", mode))
+    if sta_profile is not None:
+        command.extend(("--sta-profile", str(sta_profile)))
+        if sta_ssid is not None:
+            command.extend(("--sta-ssid", sta_ssid))
+        if sta_server_ll is not None:
+            command.extend(("--sta-server-ll", sta_server_ll))
+        command.extend(("--sta-server-port", str(sta_server_port)))
     subprocess.run(
         command,
         cwd=ROOT,
@@ -377,22 +413,77 @@ def write_verified(port: str, chip: str, pairs: list[tuple[str, Path]], baud: in
     attempts.append((115200, "20m", True))
     last: BaseException | None = None
     for attempt_baud, frequency, no_stub in attempts:
-        command = [
+        release_serial_modem_lines(port)
+        write_command = [
             esptool_python(), "-m", "esptool", "--chip", chip, "--port", port,
             "--baud", str(attempt_baud), "--before", "default-reset",
-            # A direct port has no service owner to reclaim, so let esptool
-            # leave ROM through its normal hard reset.
-            "--after", "hard_reset" if reset_after else "no_reset",
+            # Keep ROM/stub ownership for the verify phase below.  A successful
+            # write-flash only reports transfer completion; it is not evidence
+            # that the target flash contains the requested image.
+            "--after", "no_reset",
         ]
         if no_stub:
-            command.append("--no-stub")
+            write_command.append("--no-stub")
         flash_size = "8MB" if chip == "esp32s3" else "4MB"
-        command += ["write-flash", "--flash_mode", "dio", "--flash_freq", frequency,
-                    "--flash_size", flash_size]
+        write_command += ["write-flash", "--flash_mode", "dio", "--flash_freq", frequency,
+                          "--flash_size", flash_size]
         for offset, image in pairs:
-            command.extend((offset, str(image)))
+            write_command.extend((offset, str(image)))
         try:
-            subprocess.run(command, cwd=FW_RUST, check=True)
+            subprocess.run(write_command, cwd=FW_RUST, check=True)
+            # `write-flash` performs an ESP-ROM MD5 verification after every
+            # changed range (the tool prints "Hash of data verified").  That
+            # is the default deployment proof: it finishes before a board's
+            # UART/USB reset and avoids holding a C6 or CP2102 in the loader
+            # for a second full-image read at 115200 baud.  The old mandatory
+            # host readback routinely exceeded the bounded device-operation
+            # window and could leave an otherwise verified board in ROM mode.
+            #
+            # A forensic byte-for-byte SHA-256 readback remains available for
+            # an explicitly requested incident investigation.  It is never a
+            # normal prerequisite for selecting or health-checking Main.
+            if os.environ.get("DMESH_FLASH_FULL_READBACK") == "1":
+                import hashlib
+                import tempfile
+
+                with tempfile.TemporaryDirectory(prefix="dmesh-flash-verify-") as temp_dir:
+                    for index, (offset, image) in enumerate(pairs):
+                        readback = Path(temp_dir) / f"{index}.bin"
+                        verify_command = [
+                            esptool_python(), "-m", "esptool", "--chip", chip,
+                            "--port", port, "--baud", str(attempt_baud),
+                            "--before", "default-reset",
+                            "--after", "hard_reset" if reset_after and index + 1 == len(pairs) else "no_reset",
+                        ]
+                        if no_stub:
+                            verify_command.append("--no-stub")
+                        verify_command.extend(("read-flash", offset, str(image.stat().st_size), str(readback)))
+                        subprocess.run(verify_command, cwd=FW_RUST, check=True)
+                        if hashlib.sha256(readback.read_bytes()).digest() != hashlib.sha256(image.read_bytes()).digest():
+                            raise RuntimeError(
+                                f"readback hash mismatch offset={offset} image={image} "
+                                f"baud={attempt_baud} no_stub={no_stub}"
+                            )
+            elif reset_after:
+                # `write-flash --after no_reset` kept the loader active for
+                # optional forensic readback above.  Reset only after its MD5
+                # verification has succeeded so Main boot is deterministic.
+                reset_command = [
+                    esptool_python(), "-m", "esptool", "--chip", chip,
+                    "--port", port, "--baud", str(attempt_baud),
+                    # The write may have detached its stub already, notably
+                    # on CP2102 classic ESP32 boards.  Re-enter ROM with the
+                    # normal RTS/DTR handshake before issuing the final hard
+                    # reset instead of assuming a live stub.
+                    "--before", "default-reset", "--after", "hard-reset", "chip-id",
+                ]
+                if no_stub:
+                    # `--no-stub` is a global esptool option. It must appear
+                    # before the subcommand; appending it after `chip-id`
+                    # makes the conservative fallback report success for the
+                    # write but fail to perform the required final reset.
+                    reset_command.insert(-1, "--no-stub")
+                subprocess.run(reset_command, cwd=FW_RUST, check=True)
             return
         except (subprocess.CalledProcessError, OSError) as error:
             last = error
@@ -428,6 +519,14 @@ def main() -> int:
                         help="with target=nvs: set Stage2 stg2:uart_boot (0 disables selector)")
     parser.add_argument("--nvs-source", type=Path,
                         help="with target=nvs: explicit preserved NVS source image")
+    parser.add_argument("--sta-profile", type=Path,
+                        help="with target=nvs: private infra-sta.toml input; credentials are never printed")
+    parser.add_argument("--sta-ssid",
+                        help="with target=nvs: select an SSID from --sta-profile")
+    parser.add_argument("--sta-server-ll",
+                        help="with target=nvs: Recovery server IPv6 link-local address without an interface scope")
+    parser.add_argument("--sta-server-port", type=int, default=3336,
+                        help="with target=nvs: Recovery server UDP port for --sta-profile")
     parser.add_argument("--mode", choices=("active", "sleepy", "sleepy-soft"),
                         help="with target=nvs: set dmesh:mode for next boot (sleepy-soft keeps the radio awake for transition tests)")
     args = parser.parse_args()
@@ -456,8 +555,12 @@ def main() -> int:
         return 0
     if args.boot_target is not None and args.clear_boot_target:
         parser.error("--boot-target and --clear-boot-target are mutually exclusive")
-    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.uart_boot is None and args.mode is None:
-        parser.error("target=nvs requires a Stage2 override")
+    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.uart_boot is None and args.mode is None and args.sta_profile is None:
+        parser.error("target=nvs requires a Stage2 override, mode, or --sta-profile")
+    if args.sta_ssid is not None and args.sta_profile is None:
+        parser.error("--sta-ssid requires --sta-profile")
+    if args.sta_server_ll is not None and args.sta_profile is None:
+        parser.error("--sta-server-ll requires --sta-profile")
 
     physical = direct_serial_port(args.role)
     if args.check:
@@ -486,7 +589,8 @@ def main() -> int:
             image = nvs_boot_target_image(
                 physical, chip, args.role, args.boot_target, args.clear_boot_target, args.uart_boot,
                 args.mode, args.server, args.board_ip, args.server_port, args.flash_baud,
-                args.nvs_source,
+                args.nvs_source, args.sta_profile, args.sta_ssid, args.sta_server_ll,
+                args.sta_server_port,
             )
             pairs = [("0x9000", image)]
         else:

@@ -264,6 +264,10 @@ public class DMService extends MeshService {
                     addTransport(row.transports, capabilities, NetworkCapabilities.TRANSPORT_CELLULAR, "cellular");
                     addTransport(row.transports, capabilities, NetworkCapabilities.TRANSPORT_VPN, "vpn");
                     addTransport(row.transports, capabilities, NetworkCapabilities.TRANSPORT_BLUETOOTH, "bluetooth");
+                    if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                            && transport != null && !transport.currentStaSsid().isEmpty()) {
+                        row.ssid = transport.currentStaSsid();
+                    }
                 }
                 for (LinkAddress address : properties.getLinkAddresses()) {
                     String text = address.getAddress().getHostAddress();
@@ -289,6 +293,24 @@ public class DMService extends MeshService {
             snapshot.putParcelableArrayList("networks", rows);
             MeshNode.radioMessage("radio.local_networks.update", "",
                     CborMessageCodec.encodeBundle(snapshot), -1);
+            // The common announce carries framework-observed UDP6 endpoints.
+            // Java reports facts only; Rust owns the announce and sender.
+            if (transport != null) {
+                String staLinkLocal = "";
+                String apLinkLocal = "";
+                for (LocalNetwork row : networks.values()) {
+                    if (!row.active) continue;
+                    String linkLocal = firstLinkLocal(row.addresses);
+                    if (linkLocal.isEmpty()) continue;
+                    if (row.ssid != null && !row.ssid.isEmpty()) staLinkLocal = linkLocal;
+                    else if (transport.apActive() && row.transports.contains("wifi")) apLinkLocal = linkLocal;
+                }
+                transport.updateLinkLocalAddresses(staLinkLocal, apLinkLocal);
+            }
+            // Trigger the independent UDP6 multicast announce immediately on
+            // each observed network change; the five-minute loop remains the
+            // passive refresh, not the only chance to become visible.
+            if (meshNode != null) meshNode.triggerAnnounce();
         } catch (Exception error) {
             Log.w(TAG, "Unable to snapshot local networks", error);
         }
@@ -329,6 +351,7 @@ public class DMService extends MeshService {
         boolean internet;
         boolean validated;
         boolean metered;
+        String ssid;
 
         LocalNetwork(String name) { this.name = name; }
 
@@ -345,8 +368,19 @@ public class DMService extends MeshService {
             row.putStringArrayList("dns_servers", dnsServers);
             row.putStringArrayList("gateways", gateways);
             row.putStringArrayList("transports", transports);
+            if (ssid != null && !ssid.isEmpty()) row.putString("ssid", ssid);
             return row;
         }
+    }
+
+    private static String firstLinkLocal(ArrayList<String> addresses) {
+        for (String address : addresses) {
+            if (address != null && address.startsWith("fe80:")) {
+                int zone = address.indexOf('%');
+                return zone < 0 ? address : address.substring(0, zone);
+            }
+        }
+        return "";
     }
 
     static DMService getActiveService() {
@@ -376,6 +410,10 @@ public class DMService extends MeshService {
             messageGateway = new MessageStreamGateway(this);
             node.setCallback(messageGateway);
             meshNode = node;
+            // The foreground service began the NAN lifecycle before Rust was
+            // ready. Now project Rust's stable public identity into the shared
+            // Android/Linux/ESP DMesh presence descriptor.
+            if (transport != null) transport.configureNanIdentity(node.getPublicKey());
             Log.d(TAG, "Rust mesh node started: ssh=" + RUST_SSH_PORT
                     + " http=" + RUST_HTTP_PORT
                     + " pubkey=" + meshNode.getPublicKey());

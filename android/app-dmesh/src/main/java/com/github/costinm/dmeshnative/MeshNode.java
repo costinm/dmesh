@@ -93,25 +93,14 @@ public class MeshNode implements AutoCloseable {
         return nativeRadioMessage(method, args == null ? "" : args, data == null ? new byte[0] : data, fd);
     }
 
-    /** Rust validates a shell command and returns the transport projection for Android. */
+    /**
+     * Legacy ADB-provider compatibility only. New callers must send the
+     * common tagged control schema through Rust rather than inventing text
+     * commands in Java.
+     */
     public static String shellTransportCommand(String line) {
         return radioMessageText("radio.shell.command", "",
                 line == null ? new byte[0] : line.getBytes(StandardCharsets.UTF_8), -1);
-    }
-
-    public static byte[] buildBleServiceData(String event, byte[] deviceId, byte[] payload,
-                                             int rssi, int snrQ4) {
-        return radioMessage("radio.ble.build_service_data",
-                "event=" + textArg(event)
-                        + " device_id=" + hex(deviceId)
-                        + " rssi=" + rssi
-                        + " snr_q4=" + snrQ4,
-                payload, -1);
-    }
-
-    public static String parseBleServiceData(byte[] serviceData, int scanRssi, String address) {
-        return radioMessageText("radio.ble.parse_service_data",
-                "scan_rssi=" + scanRssi + " address=" + textArg(address), serviceData, -1);
     }
 
     public static byte[] buildNanServiceInfo(String role, byte[] deviceId, int wakeCount) {
@@ -124,13 +113,19 @@ public class MeshNode implements AutoCloseable {
 
     /** Build the bounded CBOR boot/periodic presence Service Info record. */
     public static byte[] buildNanAnnounce(String kind, byte[] deviceId, long uptimeSecs,
-                                          int transportMode, long counters) {
+                                          int transportMode, long counters, String deviceName,
+                                          String networkName, String staLinkLocalV6,
+                                          String apLinkLocalV6) {
         return radioMessage("radio.nan.build_announce",
                 "kind=" + textArg(kind)
                         + " device_id=" + hex(deviceId)
                         + " uptime_secs=" + uptimeSecs
                         + " transport_mode=" + transportMode
-                        + " counters=" + counters,
+                        + " counters=" + counters
+                        + " device_name=" + textArg(deviceName)
+                        + " network_name=" + textArg(networkName)
+                        + " sta_link_local_v6=" + textArg(staLinkLocalV6)
+                        + " ap_link_local_v6=" + textArg(apLinkLocalV6),
                 new byte[0], -1);
     }
 
@@ -245,14 +240,6 @@ public class MeshNode implements AutoCloseable {
                 "radio.nan.inject_frame",
                 "rssi=" + rssi,
                 followup, -1);
-        return result != null && result.length > 0;
-    }
-
-    public static boolean injectBleFrame(byte[] serviceData, int rssi, String address) {
-        byte[] result = radioMessage(
-                "radio.ble.inject_frame",
-                "scan_rssi=" + rssi + " address=" + textArg(address),
-                serviceData, -1);
         return result != null && result.length > 0;
     }
 

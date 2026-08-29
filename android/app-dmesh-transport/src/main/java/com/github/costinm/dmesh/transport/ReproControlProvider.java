@@ -39,6 +39,9 @@ public final class ReproControlProvider extends ContentProvider {
         else if ("p2p.start_advertised".equals(command)) {
             terminalObserved = controller.startP2pGroupWithServiceAndAwait();
         }
+        else if ("p2p.discover".equals(command)) {
+            terminalObserved = controller.discoverP2pServicesAndAwait();
+        }
         else if ("p2p.stop".equals(command)) controller.stopP2p(() -> { });
         else if ("nan.start".equals(command)) terminalObserved = controller.startNanAfterP2pAndAwait();
         else if ("nan.stop".equals(command)) controller.stopNan();

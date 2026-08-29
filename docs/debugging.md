@@ -116,14 +116,6 @@ For local emulator testing, forward it to the host:
 adb forward tcp:11522 tcp:15022
 ```
 
-The build helper does the full setup, including APK install, service start,
-adb forwarding, temporary test CA generation, one JSONL command, and one human
-command:
-
-```sh
-./scripts/build-android.sh ssh-jsonl-smoke
-```
-
 For a USB device or emulator that already has `app-dmesh` installed, provision a
 host SSH public key into the app sandbox and verify authenticated SSH access:
 
@@ -138,8 +130,9 @@ The script writes the generated public key to:
 ```
 
 It restarts `DMService`, forwards host `localhost:11522` to device port `15022`,
-forwards host `localhost:18080` to device admin HTTP port `18480`, checks the SSH
-banner, checks `/_m/adm`, and sends one authenticated SSH direct-stream command.
+forwards host `localhost:18080` to device admin HTTP port `18480`, and checks the
+SSH banner and `/_m/adm`. The `dmesh-msg:1` direct stream is binary records, so a
+separate binary client smoke test owns message-routing verification.
 
 To test CA trust instead of a single public key:
 
@@ -150,11 +143,11 @@ To test CA trust instead of a single public key:
 Generated test keys are under:
 
 ```sh
-target/ssh-jsonl-smoke/ca_ecdsa
-target/ssh-jsonl-smoke/ca_ecdsa.pub
-target/ssh-jsonl-smoke/id_ecdsa
-target/ssh-jsonl-smoke/id_ecdsa.pub
-target/ssh-jsonl-smoke/id_ecdsa-cert.pub
+target/android-ssh/ca_ecdsa
+target/android-ssh/ca_ecdsa.pub
+target/android-ssh/id_ecdsa
+target/android-ssh/id_ecdsa.pub
+target/android-ssh/id_ecdsa-cert.pub
 ```
 
 The smoke script installs the CA public key into the app sandbox as:
@@ -172,72 +165,35 @@ adb shell am start-foreground-service \
   -n com.github.costinm.dmesh.lm/.DMService
 ```
 
-Rust owns the SSH direct stream parser. It accepts JSON Lines when the first
-character is `{`, otherwise it treats the line as a human command. Java receives
-generic message names plus Android routing metadata through JNI.
+`dmesh-msg:1` is a binary transport. Each record is a four-byte big-endian
+length followed by one bounded (currently 2 KiB) opaque message payload. SSH
+does not parse CBOR or shell text; it forwards record bytes. JNI also passes
+only `byte[]`. `dmeshnative` maps those bytes to/from `MeshStream` and the typed
+Bundle API before an Android service sees them.
 
-Manual JSONL test:
+Plain SSH exec is intentionally not a message ingress. Use the root-only
+`DMeshShellProvider` for local shell text, or an explicit message client for
+`dmesh-msg:1`.
 
-```sh
-printf '%s\n' \
-  '{"id":"manual-1","method":"wifi.scan","data":{"reason":"manual-ssh-jsonl"}}' |
-timeout 12 ssh \
-  -i target/ssh-jsonl-smoke/id_ecdsa \
-  -o CertificateFile=target/ssh-jsonl-smoke/id_ecdsa-cert.pub \
-  -p 11522 \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o ControlMaster=no \
-  -o ControlPath=none \
-  -o PreferredAuthentications=publickey \
-  -o PasswordAuthentication=no \
-  dmesh@127.0.0.1 \
-  -W dmesh-msg:1
-```
+## app-dmesh REST admin bridge
 
-Plain SSH exec and shell are also mapped to the same Android MsgMux command
-surface. These do not execute Android/Linux processes; they send commands into
-`app-dmesh` and return JSON frames:
+The Android web UI uses the embedded ssh-mesh REST admin server. It is bound
+to `127.0.0.1` on the configured HTTP port and dispatches directly to the
+Rust handler registry: it does not use the retired JSONL Java bridge or a
+host-style `/mesh/run/mesh/...` UDS path.
 
-```sh
-ssh -F /dev/null \
-  -i target/android-ssh/id_ed25519 \
-  -p 11522 \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  dmesh@127.0.0.1 \
-  'permission.status'
+The initial Android HTTP catalog is intentionally read-only:
 
-printf '%s\n' 'permission.status' 'wifi.scan reason=manual-shell' exit |
-ssh -F /dev/null -T \
-  -i target/android-ssh/id_ed25519 \
-  -p 11522 \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  dmesh@127.0.0.1
-```
+- `radio.status_text`
+- `radio.devices`
+- `radio.local_networks`
+- `radio.power.state`
 
-Use `exit` or `quit` to close the line shell from scripts.
-
-Expected output includes an acknowledgement line:
-
-```json
-{"id":"manual-1","ok":true,"method":"wifi.scan"}
-```
-
-The SSH direct stream remains open for additional commands until the client
-closes it, so `timeout` may end the command after the acknowledgement has
-already been printed. Asynchronous event streaming back to the SSH client is not
-currently wired.
-
-## app-dmesh web command bridge
-
-The Android web UI uses the embedded ssh-mesh admin HTTP server, but command
-execution must not connect to Linux-style JSONL UDS paths such as
-`/mesh/run/mesh/...`. `app-dmesh` registers an in-process generic proxy bridge
-from Rust to Java after `MeshNode.setCallback(...)`; web tool calls under
-`/_m/proxy/mcp/lmesh` are translated to the same `MsgMux` command names used by
-SSH and the debug shell.
+All four take no fields or opaque payload. Framework callbacks, NAN/BLE
+adapter events, probes, storage, and the legacy shell bridge are not HTTP
+methods. Mutating operations are added only after they have a common
+`dmesh-server` tagged schema and an Android adapter that reports its
+capability/result.
 
 If a defensive UDS fallback is ever needed on Android, JNI configures mesh paths
 under the app files tree:
@@ -248,72 +204,28 @@ under the app files tree:
 
 Do not add Android command paths that depend on host `/mesh` directories.
 
-Manual web command smoke test:
+Manual REST smoke test:
 
 ```sh
 adb -s SERIAL forward tcp:18480 tcp:18480
 
-curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/proxy/mcp/lmesh?tools=mesh/radio-tools.json' \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+curl -sS 'http://127.0.0.1:18480/_m/mesh/services'
+curl -sS 'http://127.0.0.1:18480/_m/mesh/services/android/tools'
 
 curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/proxy/mcp/lmesh?tools=mesh/radio-tools.json' \
+  'http://127.0.0.1:18480/_m/mesh/services/android/call/radio.status_text' \
   -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"messages.file","arguments":{}}}'
-
-curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/proxy/mcp/lmesh?tools=mesh/radio-tools.json' \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ble.scan","arguments":{"reason":"web-smoke"}}}'
+  -d '{"id":1}'
 ```
 
-Expected results are MCP JSON-RPC responses with `structuredContent`. Android
-message file responses should point under:
+If `SSH_MESH_HTTP_API_KEY` is configured, add `?apikey=...` to the first URL;
+the server validates it and issues the scoped `mesh_api_key` cookie for later
+calls. A missing record ID is one-way submission; the observation methods are
+normally called with an ID and return a correlated result.
 
-```text
-/data/user/0/com.github.costinm.dmesh.lm/files/radio/ble/messages.bin
-```
-
-Async commands such as `ble.scan` may return `{"ok":true,"status":"sent"}` when
-the Java handler emits events later instead of a synchronous reply.
-
-Human command form is also accepted when the line does not start with `{`:
-
-```sh
-printf '%s\n' 'wifi scan --id manual-2 --reason manual-ssh' |
-timeout 12 ssh \
-  -i target/ssh-jsonl-smoke/id_ecdsa \
-  -o CertificateFile=target/ssh-jsonl-smoke/id_ecdsa-cert.pub \
-  -p 11522 \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o ControlMaster=no \
-  -o ControlPath=none \
-  -o PreferredAuthentications=publickey \
-  -o PasswordAuthentication=no \
-  dmesh@127.0.0.1 \
-  -W dmesh-msg:1
-```
-
-Supported human forms include:
-
-```sh
-wifi.scan reason=manual
-wifi.scan --reason manual
-wifi.scan --reason=manual
-wifi.scan --id manual-3 --reason "manual ssh"
-```
-
-The smoke test also validates cross-app direct Binder routing to `app-chat`:
-
-```sh
-app.chat.send --id chat-1 --text hello
-```
-
-Expected output includes `app.forwarded` from app-dmesh and `chat.message`
-from app-chat.
+SSH exec text and JSON Lines are not command APIs. `dmesh-msg:1` accepts a
+four-byte big-endian record length followed by one bounded opaque message record;
+`dmeshnative` maps the record to/from the typed Android Bundle adapter.
 
 ## app-dmesh ADB shell commands
 
@@ -356,6 +268,18 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
   --method command --arg 'wifi.scan reason=manual-adb'"
 ```
 
+Send one bounded request to an explicitly named app service through
+DirectBinder. The Java shell adapter maps `id`, `to`, and typed `i:`/`l:`/
+`f:`/`d:`/boolean values into `MeshStream`/Bundle; the result contains the
+correlated response Bundle. No app receives shell text or raw CBOR.
+
+```sh
+adb shell am start-foreground-service -n com.github.costinm.dmesh.lm/.DMService
+adb shell 'content call --uri content://com.github.costinm.dmesh.lm.shell \
+  --method message --arg "/web/echo id=adb-shell typed=i:7 \
+  to=intent:#Intent;component=com.github.costinm.dmesh.web/.WebBridgeService;end"'
+```
+
 Subscribe to live message frames for a few seconds:
 
 ```sh
@@ -390,7 +314,7 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
    --method command --arg 'ble.unbond addr=84:0D:8E:07:41:72'"
 
 adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'wifi.nan.start reason=manual-debug'"
+  --method command --arg 'transport.start mode=nan'"
 
 sleep 6
 

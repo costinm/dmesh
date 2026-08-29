@@ -20,6 +20,7 @@ android/local.properties
 build
 notes
 /target/
+/nodes/
 /android/app-dmesh/src/main/jniLibs/
 *.so
 target

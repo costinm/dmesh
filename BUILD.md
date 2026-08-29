@@ -7,10 +7,13 @@ and protocol support, and `ssh-mesh` for SSH, HTTPS, SFTP, and forwarding.
 ## Local build environment
 
 The checked-in build scripts source `env.sh` before invoking Cargo, Nix,
-Android, or firmware tools. It keeps all mutable state under `target/`: Cargo,
+Android, or firmware tools. Source it yourself before any direct Android or
+device command too: it selects the repo-local SDK's `adb` and makes attached
+devices visible. It keeps all mutable state under `target/`: Cargo,
 Rustup, Gradle, Nix profiles, Android SDK/NDK, ESP-IDF, and the Rust ESP
 toolchain. It does not use a host home directory or host-installed build
-tools. Source `env.sh` manually only when using other repo tools.
+tools. Source `env.sh` manually before using other repo tools, especially
+`adb`.
 
 ```sh
 cd "$(git rev-parse --show-toplevel)"
@@ -176,6 +179,17 @@ scripts/build-android.sh build debug
 Android SDK/NDK contents are installed under `target/android-sdk`; generated
 native libraries and APKs remain under `target/`.
 
+For a direct device command or the standalone P2P/NAN qualifier, source the
+environment first and select a serial explicitly when more than one device is
+attached:
+
+```sh
+. ./env.sh
+adb devices -l
+adb -s <serial> install -r target/apk/debug/app-dmesh-transport-debug.apk
+adb -s <serial> shell am start -n com.github.costinm.dmesh.transport/.ReproActivity
+```
+
 ## ESP32 firmware
 
 Install ESP32 host tools into their dedicated profile and ESP-IDF/Rust ESP
@@ -261,7 +275,7 @@ Main/Recovery behavioral differences as bugs.
 For the lab host's Recovery network, install the separate
 `crates/lmesh-wifi/examples/mesh-init/lmesh-wifi.toml` mesh-init service and set its
 `LMESH_INTERFACES` value to the AP interface, for example `wlan0`.
-`lmesh-wifi` owns the open MAC-derived `Direct-XXXXXXXX-Dmesh-local` AP and the
+`lmesh-wifi` owns the fixed open `DIRECT-dmesh` AP and the
 shared raw-NAN monitor on `wlan0` at startup. Do not run a separate hostapd or
 WPA/NAN control daemon. Use `mesh lmesh-wifi wifi.rawnan.status` and
 `mesh lmesh-wifi wifi.rawnan.ping` for bounded host tests.

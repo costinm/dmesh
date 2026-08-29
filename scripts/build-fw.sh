@@ -126,8 +126,19 @@ build_one() {
     # Wi-Fi/heap configuration after a defaults-file change.
     local sdk_defaults_path="$FIRMWARE_DIR/$sdkconfig"
     local sdk_defaults_digest
+    # Native ESP-IDF components are outside Cargo's Rust dependency graph.
+    # Include their source/ABI inputs in the target cache key so a module
+    # loader fix cannot silently package the prior C object file.
     sdk_defaults_digest="$(sha256sum \
         "$sdk_defaults_path" "$partition_overlay" \
+        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/CMakeLists.txt" \
+        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_module_loader.c" \
+        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_hw_host.c" \
+        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/dmesh_module_weak_platform.c" \
+        "$DMESH_REPO/fw/modules/native/dmesh_module_loader/include/dmesh_module_loader.h" \
+        "$DMESH_REPO/fw/mod_lora/include/dmesh_lora_abi.h" \
+        "$DMESH_REPO/fw/main/native/dmesh_uart_log/CMakeLists.txt" \
+        "$DMESH_REPO/fw/main/native/dmesh_uart_log/dmesh_uart_log.c" \
         | sha256sum | awk '{print $1}')"
     local sdk_id="cache-v3:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${sdk_defaults_digest}"
     if [[ ! -f "$sdk_stamp" || "$(cat "$sdk_stamp")" != "$sdk_id" ]]; then

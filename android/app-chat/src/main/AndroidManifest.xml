@@ -19,8 +19,8 @@
             android:name="android.app.NativeActivity"
             android:label="DMesh Chat"
             android:exported="true"
-            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-            android:configChanges="orientation|keyboardHidden|screenSize">
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:windowSoftInputMode="stateVisible|adjustResize">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="dmeshui" />
@@ -34,8 +34,8 @@
             android:name=".RatatuiActivity"
             android:label="DMesh Ratatui"
             android:exported="true"
-            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-            android:configChanges="orientation|keyboardHidden|screenSize">
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:windowSoftInputMode="stateVisible|adjustResize">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="dmeshui" />

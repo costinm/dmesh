@@ -319,11 +319,13 @@ build_rust_native() {
 build_apps() {
     local build_type="${1:-debug}"
     local dmesh_task=":android:app-dmesh:assembleDebug"
+    local transport_task=":android:app-dmesh-transport:assembleDebug"
     local web_task=":android:app-web:assembleDebug"
     local chat_task=":android:app-chat:assembleDebug"
 
     if [ "$build_type" = "release" ]; then
         dmesh_task=":android:app-dmesh:assembleRelease"
+        transport_task=":android:app-dmesh-transport:assembleRelease"
         web_task=":android:app-web:assembleRelease"
         chat_task=":android:app-chat:assembleRelease"
     elif [ "$build_type" != "debug" ]; then
@@ -335,13 +337,32 @@ build_apps() {
     clean_app_dmesh_dmeshui
     rm -rf \
         "$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type" \
+        "$SCRIPT_DIR/android/app-dmesh-transport/build/outputs/apk/$build_type" \
         "$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type" \
         "$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type" \
         "$SCRIPT_DIR/target/apk/$build_type"
     echo ""
     echo "=== Building Android APKs ($build_type) ==="
-    gradle "$dmesh_task" "$web_task" "$chat_task"
+    gradle "$dmesh_task" "$transport_task" "$web_task" "$chat_task"
     stage_apks "$build_type"
+}
+
+# Intentionally does not build Rust or any DMesh application. This is the
+# standalone AOSP-facing P2P-to-NAN reproducer build path.
+build_dmesh_transport() {
+    local build_type="${1:-debug}"
+    local task=":android:app-dmesh-transport:assembleDebug"
+    if [ "$build_type" = "release" ]; then
+        task=":android:app-dmesh-transport:assembleRelease"
+    elif [ "$build_type" != "debug" ]; then
+        echo "Usage: $0 dmesh-transport [debug|release]"
+        exit 1
+    fi
+    echo "=== Building standalone DMesh transport qualifier ($build_type) ==="
+    gradle "$task"
+    mkdir -p "$SCRIPT_DIR/target/apk/$build_type"
+    cp -f "$SCRIPT_DIR/android/app-dmesh-transport/build/outputs/apk/$build_type/"*.apk \
+        "$SCRIPT_DIR/target/apk/$build_type/"
 }
 
 stage_apks() {
@@ -568,12 +589,31 @@ install_apps_on_device() {
     local web_apk="$3"
     local chat_apk="$4"
     echo "=== [$serial] Installing app-dmesh/app-web/app-chat ==="
-    # ADB installs may block forever after a USB transport reset.  Bound the
-    # operation so install-all can continue with other USB or Wi-Fi devices.
+    install_apk_with_signature_reinstall "$serial" "$APP_DMESH_PKG" "$dmesh_apk"
+    install_apk_with_signature_reinstall "$serial" "$APP_WEB_PKG" "$web_apk"
+    install_apk_with_signature_reinstall "$serial" "$APP_CHAT_PKG" "$chat_apk"
+}
+
+# Preserve app data for ordinary upgrades. Android rejects an upgrade signed
+# by a different key; only in that explicit case remove the old package and
+# retry, because uninstalling necessarily removes that package's app data.
+install_apk_with_signature_reinstall() {
+    local serial="$1"
+    local pkg="$2"
+    local apk="$3"
     local install_timeout="${DMESH_ADB_INSTALL_TIMEOUT:-120}"
-    timeout "$install_timeout" adb -s "$serial" install -r "$dmesh_apk"
-    timeout "$install_timeout" adb -s "$serial" install -r "$web_apk"
-    timeout "$install_timeout" adb -s "$serial" install -r "$chat_apk"
+    local output
+    if output="$(timeout "$install_timeout" adb -s "$serial" install -r "$apk" 2>&1)"; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+    printf '%s\n' "$output" >&2
+    if [[ "$output" != *"INSTALL_FAILED_UPDATE_INCOMPATIBLE"* ]]; then
+        return 1
+    fi
+    echo "=== [$serial] $pkg has a different signing certificate; reinstalling it and clearing only its app data ==="
+    adb -s "$serial" uninstall "$pkg"
+    timeout "$install_timeout" adb -s "$serial" install "$apk"
 }
 
 uninstall_apps_on_device() {
@@ -912,18 +952,6 @@ run_ssh_forward_smoke() {
     done < <(require_android_devices)
 }
 
-run_ssh_jsonl_smoke() {
-    build_apps debug
-    prepare_connected_devices
-    local serial index=0
-    while read -r serial; do
-        echo "=== [$serial] Checking SSH JSONL MsgMux bridge ==="
-        DMESH_ADB_SERIAL="$serial" DMESH_HOST_SSH_PORT="$((11522 + index))" \
-            "$SCRIPT_DIR/scripts/test_emulator_ssh_jsonl.sh"
-        index=$((index + 1))
-    done < <(require_android_devices)
-}
-
 open_web_admin() {
     start_emulator
     adb shell am start \
@@ -939,6 +967,8 @@ Usage: $0 [command] [debug|release]
 Commands:
   deps                    Install Nix build dependencies into target/nix/profile.
   build [debug|release]   Build Rust UI and Android apps. Default.
+  dmesh-transport [debug|release]
+                          Build only the standalone platform transport qualifier.
   emulator                Start a headless emulator and wait for boot.
   install [debug|release] Build and install all apps on selected physical devices.
   install-all [debug|release] Remove old DMesh apps, install all apps, and set permissions.
@@ -953,7 +983,6 @@ Commands:
   test                    Build and run JVM tests plus connected Android tests.
   native-health           Run the app-dmesh JNI health test on selected devices.
   ssh-forward-smoke       Build/install app-dmesh and verify every selected adb SSH forward.
-  ssh-jsonl-smoke         Verify JSONL MsgMux command stream over SSH.
   open-web-admin          Open app-web on the localhost ssh-mesh admin URL.
 
 Environment:
@@ -1001,6 +1030,10 @@ main() {
         debug|release)
             detect_android_env
             build_apps "$cmd"
+            ;;
+        dmesh-transport)
+            detect_android_env
+            build_dmesh_transport "${2:-debug}"
             ;;
         emulator)
             detect_android_env
@@ -1053,10 +1086,6 @@ main() {
         ssh-forward-smoke)
             detect_android_env
             run_ssh_forward_smoke
-            ;;
-        ssh-jsonl-smoke)
-            detect_android_env
-            run_ssh_jsonl_smoke
             ;;
         open-web-admin)
             detect_android_env

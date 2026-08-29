@@ -47,7 +47,9 @@ public final class Ble {
             if (data == null) data = new byte[0];
             String address = "";
             try { address = device == null ? "" : device.getAddress(); } catch (SecurityException ignored) { }
-            events.onBleDiscovery(address, result.getRssi(), data);
+            // BLE discovery and future pairing/CoC ownership remain inside
+            // dmesh-wifi. Do not project advertisement bytes as a mesh API:
+            // once paired, CoC presents the shared UART byte stream directly.
             emit("scan_result:rssi=" + result.getRssi() + ":addr=" + address, data);
         }
         @Override public void onScanFailed(int errorCode) { emit("scan_failed:code=" + errorCode, new byte[0]); }
