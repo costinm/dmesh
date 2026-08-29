@@ -6,6 +6,9 @@
 //! inferred from it. NAN public actions are received only during the bounded
 //! promiscuous discovery window in `wifi_nan_dw_capture_esp`.
 
+// This can be used in the 'active' mode, for the interval between DW for NAN.
+//
+
 use core::{
     ffi::c_void,
     mem::MaybeUninit,

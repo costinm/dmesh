@@ -93,6 +93,10 @@ const PENDING_FOLLOWUP_CAPACITY: usize = 4;
 /// at the point of DW-gated transmission.
 const ACTIVE_PUBLISH_MAX_LEN: usize = dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN;
 const ACTIVE_PUBLISH_REFRESH_MS: u32 = dmesh_rawnan::NAN_ACTIVE_PUBLISH_INTERVAL_MS as u32;
+/// A fresh announce must cross independently phased NAN discovery windows.
+/// Eight 512-TU windows reaches the next DW0/DW8 boundary without creating a
+/// polling path or reacting to every repeated active-Subscribe packet.
+const ACTIVE_PUBLISH_BURST_WINDOWS: u8 = 8;
 /// One externally requested active-Subscribe SDF waits for the next local
 /// NAN discovery window. Public-action transmission from a UART/raw-radio
 /// handler would usually miss the peer's bounded DW. This holds one complete
@@ -150,6 +154,7 @@ static ACTIVE_PUBLISH_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PUBLISH_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PUBLISH_LEN: AtomicU16 = AtomicU16::new(0);
 static ACTIVE_PUBLISH_LAST_SENT_MS: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_PUBLISH_REMAINING: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_PUBLISH_INFO: [AtomicU8; ACTIVE_PUBLISH_MAX_LEN] =
     [const { AtomicU8::new(0) }; ACTIVE_PUBLISH_MAX_LEN];
 static PENDING_SDF_READY: AtomicBool = AtomicBool::new(false);
@@ -188,6 +193,12 @@ static ACTIVE_SUBSCRIBE_PEER: [AtomicU8; 6] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];
+// A framework Subscribe is retransmitted in each discovery window.  Retain
+// only the last tagged discovery ping per source, so the common handler sends
+// one fresh announce/follow-up for that ping instead of one per RF retry.
+static LAST_DISCOVERY_PEER: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static LAST_DISCOVERY_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_DISCOVERY_VALID: AtomicBool = AtomicBool::new(false);
 /// Application-owned CBOR dispatcher. Wi-Fi owns the callback and packet copy;
 /// Recovery/Main only receives a copied Service Info payload on the common
 /// ingress worker.
@@ -198,6 +209,24 @@ static SERVICE_INFO_HANDLER: AtomicUsize = AtomicUsize::new(0);
 // intentionally scalar diagnostics: neither the Wi-Fi callback nor the
 // snapshot retains a driver-owned frame or CBOR payload.
 static SERVICE_INFO_MATCHED: AtomicU32 = AtomicU32::new(0);
+/// DMesh SDA records that advertise an active-Subscribe control value. This
+/// proves the radio saw a request independently of whether its SDEA layout
+/// exposes a bounded Service Info record to the common parser.
+static ACTIVE_SUBSCRIBE_DESCRIPTORS: AtomicU32 = AtomicU32::new(0);
+/// Active DMesh Subscribe SDAs for which the following SDEA could not be
+/// associated and decoded. No driver frame or payload is retained.
+static ACTIVE_SUBSCRIBE_SDEA_MISSES: AtomicU32 = AtomicU32::new(0);
+// Structural diagnostics for the most recent active-Subscribe SDEA. These
+// retain no Service Info: header packs body[0..3], and declared length is the
+// fixed u16 at body[5..7] when present.
+static ACTIVE_SUBSCRIBE_SDEA_HEADER: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_SUBSCRIBE_SDEA_INFO_LEN: AtomicU32 = AtomicU32::new(0);
+/// Address-3 from the latest DMesh active-Subscribe SDF. It permits a
+/// bounded request/response cluster comparison without retaining a frame.
+static ACTIVE_SUBSCRIBE_BSSID: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static LAST_SDF_SOURCE: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static LAST_SDF_SERVICE_ID: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static ACTIVE_SUBSCRIBES: AtomicU32 = AtomicU32::new(0);
 static SERVICE_INFO_ENQUEUED: AtomicU32 = AtomicU32::new(0);
 static SERVICE_INFO_DROPPED: AtomicU32 = AtomicU32::new(0);
 static FILTER_PENDING: AtomicBool = AtomicBool::new(false);
@@ -313,6 +342,27 @@ fn mark_active_subscribe(peer: [u8; 6]) {
         ACTIVE_SUBSCRIBE_PEER[index].store(*value, Ordering::Relaxed);
     }
     ACTIVE_SUBSCRIBE_PENDING.store(true, Ordering::Release);
+}
+
+fn duplicate_discovery_ping(peer: [u8; 6], payload: &[u8]) -> bool {
+    let Some(record) = dmesh_server::tagged::decode(payload) else { return false };
+    let (Some(dmesh_server::tagged::Name::Tag(1)),
+         Some(dmesh_server::tagged::Name::Tag(6)), Some(id)) =
+        (record.component, record.method, record.id)
+    else { return false };
+    let Ok(id) = u32::try_from(id) else { return false };
+    let same = LAST_DISCOVERY_VALID.load(Ordering::Acquire)
+        && LAST_DISCOVERY_ID.load(Ordering::Relaxed) == id
+        && LAST_DISCOVERY_PEER.iter().enumerate()
+            .all(|(index, value)| value.load(Ordering::Relaxed) == peer[index]);
+    if !same {
+        for (index, value) in peer.iter().enumerate() {
+            LAST_DISCOVERY_PEER[index].store(*value, Ordering::Relaxed);
+        }
+        LAST_DISCOVERY_ID.store(id, Ordering::Relaxed);
+        LAST_DISCOVERY_VALID.store(true, Ordering::Release);
+    }
+    same
 }
 
 /// Consume the active-subscribe marker associated with a copied Service Info
@@ -556,8 +606,15 @@ fn drain_active_publish() {
     }
     let now = now_ms();
     let pending = ACTIVE_PUBLISH_PENDING.load(Ordering::Acquire);
+    let burst_remaining = ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire);
     let last_sent = ACTIVE_PUBLISH_LAST_SENT_MS.load(Ordering::Acquire);
-    if !pending && now.wrapping_sub(last_sent) < ACTIVE_PUBLISH_REFRESH_MS {
+    if burst_remaining != 0
+        && last_sent != 0
+        && now.wrapping_sub(last_sent) < dw_period_ms()
+    {
+        return;
+    }
+    if !pending && burst_remaining == 0 && now.wrapping_sub(last_sent) < ACTIVE_PUBLISH_REFRESH_MS {
         return;
     }
     let len = usize::from(ACTIVE_PUBLISH_LEN.load(Ordering::Acquire)).min(ACTIVE_PUBLISH_MAX_LEN);
@@ -595,7 +652,11 @@ fn drain_active_publish() {
         &frame[24..],
     ) {
         ACTIVE_PUBLISH_LAST_SENT_MS.store(now, Ordering::Release);
-        ACTIVE_PUBLISH_PENDING.store(false, Ordering::Release);
+        let remaining = ACTIVE_PUBLISH_REMAINING
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_sub(1))
+            .map(|value| value - 1)
+            .unwrap_or(0);
+        ACTIVE_PUBLISH_PENDING.store(remaining != 0, Ordering::Release);
     }
 }
 
@@ -724,8 +785,20 @@ fn due(now: u32, deadline: u32) -> bool {
 }
 
 /// `(all_management_frames, bytes, NAN_beacons, NAN_SDFs, NAN_followups,
-/// DMesh_Service_Info_matches, copied_to_ingress, ingress_copy_failures)`.
-pub fn stats() -> (u32, u32, u32, u32, u32, u32, u32, u32) {
+/// DMesh_Service_Info_matches, active_Subscribe_SDAs, active_SDEA_misses,
+/// last_SDEA_header, last_SDEA_declared_info_len, decoded_active_Subscribes,
+/// copied_to_ingress, ingress_copy_failures)`.
+pub fn stats() -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, [u8; 6], [u8; 6], [u8; 6], u32, u32, u32) {
+    let mut active_subscribe_bssid = [0u8; 6];
+    for (index, byte) in active_subscribe_bssid.iter_mut().enumerate() {
+        *byte = ACTIVE_SUBSCRIBE_BSSID[index].load(Ordering::Relaxed);
+    }
+    let mut last_sdf_source = [0u8; 6];
+    let mut last_sdf_service_id = [0u8; 6];
+    for index in 0..6 {
+        last_sdf_source[index] = LAST_SDF_SOURCE[index].load(Ordering::Relaxed);
+        last_sdf_service_id[index] = LAST_SDF_SERVICE_ID[index].load(Ordering::Relaxed);
+    }
     (
         FRAMES.load(Ordering::Relaxed),
         BYTES.load(Ordering::Relaxed),
@@ -733,6 +806,14 @@ pub fn stats() -> (u32, u32, u32, u32, u32, u32, u32, u32) {
         SDFS.load(Ordering::Relaxed),
         FOLLOWUPS.load(Ordering::Relaxed),
         SERVICE_INFO_MATCHED.load(Ordering::Relaxed),
+        ACTIVE_SUBSCRIBE_DESCRIPTORS.load(Ordering::Relaxed),
+        ACTIVE_SUBSCRIBE_SDEA_MISSES.load(Ordering::Relaxed),
+        ACTIVE_SUBSCRIBE_SDEA_HEADER.load(Ordering::Relaxed),
+        ACTIVE_SUBSCRIBE_SDEA_INFO_LEN.load(Ordering::Relaxed),
+        active_subscribe_bssid,
+        last_sdf_source,
+        last_sdf_service_id,
+        ACTIVE_SUBSCRIBES.load(Ordering::Relaxed),
         SERVICE_INFO_ENQUEUED.load(Ordering::Relaxed),
         SERVICE_INFO_DROPPED.load(Ordering::Relaxed),
     )
@@ -753,7 +834,16 @@ pub fn configure_active_publish(enabled: bool, service_info: &[u8]) -> bool {
     ACTIVE_PUBLISH_LEN.store(service_info.len() as u16, Ordering::Release);
     ACTIVE_PUBLISH_LAST_SENT_MS.store(0, Ordering::Release);
     ACTIVE_PUBLISH_PENDING.store(enabled, Ordering::Release);
+    ACTIVE_PUBLISH_REMAINING.store(
+        if enabled { ACTIVE_PUBLISH_BURST_WINDOWS } else { 0 },
+        Ordering::Release,
+    );
     ACTIVE_PUBLISH_ENABLED.store(enabled, Ordering::Release);
+    // This can be called by the copied NAN ingress worker after Main has
+    // already armed its current wait. Wake that existing owner once so it
+    // recomputes the next DW deadline; it remains a one-shot deadline, not a
+    // publish timer or an additional worker.
+    crate::main_runtime::request_transport_service();
     true
 }
 
@@ -895,6 +985,15 @@ pub fn reset_stats() {
     BEACONS.store(0, Ordering::Release);
     SDFS.store(0, Ordering::Release);
     FOLLOWUPS.store(0, Ordering::Release);
+    SERVICE_INFO_MATCHED.store(0, Ordering::Release);
+    ACTIVE_SUBSCRIBE_DESCRIPTORS.store(0, Ordering::Release);
+    ACTIVE_SUBSCRIBE_SDEA_MISSES.store(0, Ordering::Release);
+    ACTIVE_SUBSCRIBE_SDEA_HEADER.store(0, Ordering::Release);
+    ACTIVE_SUBSCRIBE_SDEA_INFO_LEN.store(0, Ordering::Release);
+    ACTIVE_SUBSCRIBES.store(0, Ordering::Release);
+    LAST_DISCOVERY_VALID.store(false, Ordering::Release);
+    SERVICE_INFO_ENQUEUED.store(0, Ordering::Release);
+    SERVICE_INFO_DROPPED.store(0, Ordering::Release);
     FILTER_ARMS.store(0, Ordering::Release);
     FILTER_ERRORS.store(0, Ordering::Release);
 }
@@ -1207,7 +1306,6 @@ pub fn service_deadline() {
     if !STARTED.load(Ordering::Acquire) {
         return;
     }
-    crate::wifi_esp::poll_p2p_action_responses();
     if lab_dw_policy() != 0 {
         return;
     }
@@ -1339,12 +1437,13 @@ pub fn next_service_delay_ms() -> Option<u32> {
     if crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
         return None;
     }
-    // The active NOW receive owner is event-driven: it remains armed until a
-    // profile transition or ROC completion queues Main.  Returning no NAN
-    // deadline prevents an artificial capture tick while no radio action is
-    // due.
+    // The active NOW receive owner is normally event-driven. A fresh NAN
+    // announce is the one bounded exception: service it once per DW while
+    // its eight-window burst remains, then immediately return to `None`.
+    // This is a correlated discovery response, not an idle capture tick.
     if NOW_ACTIVE_RECEIVE.load(Ordering::Acquire) {
-        return None;
+        return (ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire) != 0)
+            .then_some(dw_period_ms());
     }
     // The active NOW client owns its own exact retry/PTO deadline in Main.
     // Returning `None` here prevents a second synthetic timer wake while the
@@ -1390,49 +1489,87 @@ unsafe extern "C" fn callback(
 fn receive_management_frame(frame: &[u8]) {
     FRAMES.fetch_add(1, Ordering::Relaxed);
     BYTES.fetch_add(frame.len().min(u32::MAX as usize) as u32, Ordering::Relaxed);
-    // P2P Probe Requests are answered by the AP driver from its configured
-    // vendor IE. The subsequent GAS action arrives in this bounded management
-    // capture; dispatch it to the Wi-Fi owner, which retains and transmits
-    // the reply from worker context.
-    crate::wifi_esp::observe_p2p_management_frame(frame);
-    // The private action dispatcher is useful when the driver admits a frame,
-    // but C6 does not continuously accept unsolicited peer actions through
-    // it. DW capture is the reliable, explicitly bounded fallback.
-    crate::wifi_espnow_esp::receive_promiscuous_action(frame);
-    match dmesh_rawnan::classify(frame) {
-        dmesh_rawnan::FrameKind::Beacon if dmesh_rawnan::is_nan_beacon(frame) => {
-            BEACONS.fetch_add(1, Ordering::Relaxed);
-            if let Some(bssid) = frame.get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6)
-            {
-                let selected = selected_bssid();
-                // Acquisition selects one cluster and keeps it until the
-                // state machine explicitly rediscovers. Re-anchoring from
-                // every visible cluster gave peers different DW phases.
-                if bssid_is_unset(selected) {
-                    for (index, byte) in bssid.iter().enumerate() {
-                        FILTER_BSSID[index].store(*byte, Ordering::Relaxed);
-                    }
-                }
-                if bssid_is_unset(selected) || bssid == selected {
-                    // Store the local receive point, not the beacon TSF. TSF
-                    // is cluster-wide but local receive time schedules this
-                    // adapter's radio window for the selected cluster.
-                    store_sync_anchor_us(now_us());
-                    SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
-                    FILTER_PENDING.store(true, Ordering::Release);
+    // Promiscuous capture is enabled only for the scheduled NAN DW and its
+    // time-sync beacon. Keep the existing bounded NOW fallback on this same
+    // ingress: C6's private `(127, 0)` callback is the continuous fast path,
+    // but its split header/payload ABI has not completed every unassociated
+    // exchange while a DW capture is active. Both paths enter the one NOW
+    // parser/pool, which handles the duplicate safely. Do not admit P2P here.
+    if dmesh_rawnan::is_action_frame(frame) {
+        crate::wifi_espnow_esp::receive_action_frame(frame);
+    }
+    if dmesh_rawnan::is_nan_beacon(frame) {
+        BEACONS.fetch_add(1, Ordering::Relaxed);
+        if let Some(bssid) = frame.get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6) {
+            let selected = selected_bssid();
+            // Acquisition selects one cluster and keeps it until the
+            // state machine explicitly rediscovers. Re-anchoring from
+            // every visible cluster gave peers different DW phases.
+            if bssid_is_unset(selected) {
+                for (index, byte) in bssid.iter().enumerate() {
+                    FILTER_BSSID[index].store(*byte, Ordering::Relaxed);
                 }
             }
+            if bssid_is_unset(selected) || bssid == selected {
+                // Store the local receive point, not the beacon TSF. TSF
+                // is cluster-wide but local receive time schedules this
+                // adapter's radio window for the selected cluster.
+                store_sync_anchor_us(now_us());
+                SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
+                FILTER_PENDING.store(true, Ordering::Release);
+            }
         }
+    }
+    if matches!(
+        dmesh_rawnan::classify(frame),
+        dmesh_rawnan::FrameKind::Sdf | dmesh_rawnan::FrameKind::Followup
+    ) {
+        receive_nan_action(frame);
+    }
+}
+
+fn receive_nan_action(frame: &[u8]) {
+    match dmesh_rawnan::classify(frame) {
         dmesh_rawnan::FrameKind::Sdf => {
             SDFS.fetch_add(1, Ordering::Relaxed);
-            let Some(source) = frame.get(10..16).and_then(|source| source.try_into().ok()) else {
+            let Some(source): Option<[u8; 6]> = frame.get(10..16).and_then(|source| source.try_into().ok()) else {
                 return;
             };
+            for (index, byte) in source.iter().enumerate() {
+                LAST_SDF_SOURCE[index].store(*byte, Ordering::Relaxed);
+            }
+            if frame.get(30) == Some(&0x03) {
+                if let Some(service_id) = frame.get(33..39) {
+                    for (index, byte) in service_id.iter().enumerate() {
+                        LAST_SDF_SERVICE_ID[index].store(*byte, Ordering::Relaxed);
+                    }
+                }
+            }
             // Active Subscribe puts its custom CBOR Service Info in SDEA;
             // active Publish puts it directly in the SDA. Both are delivered
             // through the same copied ingress record as UART/SD control.
+            let active_descriptor = dmesh_rawnan::service_descriptors(frame).into_iter().any(
+                |item| {
+                    item.service_id == dmesh_rawnan::DMESH_SERVICE_ID
+                        && matches!(item.descriptor.control, 0x10..=0x12)
+                },
+            );
             let active_subscribe =
                 dmesh_rawnan::active_subscribe_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID);
+            if active_descriptor {
+                if let Some(bssid) = frame.get(16..22) {
+                    for (index, byte) in bssid.iter().enumerate() {
+                        ACTIVE_SUBSCRIBE_BSSID[index].store(*byte, Ordering::Relaxed);
+                    }
+                }
+                ACTIVE_SUBSCRIBE_DESCRIPTORS.fetch_add(1, Ordering::Relaxed);
+                let (header, info_len) = active_subscribe_sdea_layout(frame);
+                ACTIVE_SUBSCRIBE_SDEA_HEADER.store(header, Ordering::Relaxed);
+                ACTIVE_SUBSCRIBE_SDEA_INFO_LEN.store(info_len, Ordering::Relaxed);
+                if active_subscribe.is_none() {
+                    ACTIVE_SUBSCRIBE_SDEA_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let payload = active_subscribe.map(|item| item.service_info).or_else(|| {
                 // Android can emit a legacy `DM` descriptor and a current
                 // CBOR descriptor with the same service ID. Select a direct
@@ -1449,7 +1586,19 @@ fn receive_management_frame(frame: &[u8]) {
             });
             if let Some(payload) = payload {
                 SERVICE_INFO_MATCHED.fetch_add(1, Ordering::Relaxed);
-                if active_subscribe.is_some() {
+                // The discovery operation, rather than one peer-specific
+                // SDEA byte layout, defines a discovery ping. This also
+                // accepts Android/host Subscribe variants whose SSI is
+                // exposed through the generic descriptor parser.
+                let discovery_ping = matches!(
+                    dmesh_server::control::decode_request(payload),
+                    Some(dmesh_server::control::Request::TransportDiscover { .. })
+                );
+                if discovery_ping {
+                    ACTIVE_SUBSCRIBES.fetch_add(1, Ordering::Relaxed);
+                    if duplicate_discovery_ping(source, payload) {
+                        return;
+                    }
                     mark_active_subscribe(source);
                 }
                 if crate::shared_ingress_esp::enqueue(
@@ -1475,4 +1624,42 @@ fn receive_management_frame(frame: &[u8]) {
         }
         _ => {}
     }
+}
+
+/// Read only the fixed SDEA structural prefix after an active DMesh SDA. It
+/// is a diagnostic of parser interoperability, never an application payload
+/// capture.
+fn active_subscribe_sdea_layout(frame: &[u8]) -> (u32, u32) {
+    let mut active = None;
+    let mut offset = dmesh_rawnan::NAN_ACTION_START;
+    while offset + 3 <= frame.len() {
+        let attribute = frame[offset];
+        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
+        let body_start = offset + 3;
+        let Some(body_end) = body_start.checked_add(len) else { return (0, 0) };
+        let Some(body) = frame.get(body_start..body_end) else { return (0, 0) };
+        if attribute == 0x03
+            && body.len() >= 9
+            && body[..6] == dmesh_rawnan::DMESH_SERVICE_ID
+            && matches!(body[8], 0x10..=0x12)
+        {
+            active = Some((body[6], body[7]));
+        } else if attribute == 0x0e
+            && active.is_some_and(|(instance, requestor)| {
+                body.len() >= 2 && body[0] == instance && body[1] == requestor
+            })
+        {
+            let header = body
+                .get(..4)
+                .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .unwrap_or(0);
+            let info_len = body
+                .get(5..7)
+                .map(|bytes| u32::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+                .unwrap_or(0);
+            return (header, info_len);
+        }
+        offset = body_end;
+    }
+    (0, 0)
 }

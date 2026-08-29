@@ -3,6 +3,10 @@ name = "dmesh-fw-modules"
 version = "0.1.0"
 edition = "2021"
 
+# The module bridge is an ESP firmware dependency, not a root host-workspace
+# member. Keep focused host decoder tests independent like the other fw crates.
+[workspace]
+
 [features]
 default = []
 

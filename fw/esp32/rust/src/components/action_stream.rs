@@ -692,7 +692,7 @@ fn receive_response(peer: [u8; 6], packet: &[u8], path: usize, uart: bool) -> Op
             } else if service == SERVICE_HARDWARE {
                 if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(body) {
                     let mut response = [0u8; 192];
-                    let used = dmesh_fw_transport::wifi_radio_lab_esp::handle_encoded(
+                    let used = dmesh_fw_transport::wifi_radio_control_esp::handle_encoded(
                         request,
                         &mut response,
                     )
@@ -997,7 +997,7 @@ pub fn dispatch_uart_raw_ingress(
     super::serial::activate_window_for(super::serial::DEFAULT_ACTIVE_MS);
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(record) {
         let mut response = [0u8; 192];
-        match dmesh_fw_transport::wifi_radio_lab_esp::handle_encoded(request, &mut response) {
+        match dmesh_fw_transport::wifi_radio_control_esp::handle_encoded(request, &mut response) {
             Ok(used) => {
                 let _ = super::serial::write_direct_record(&response[..used]);
             }
@@ -1016,7 +1016,7 @@ pub fn dispatch_uart_raw_ingress(
         return;
     }
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_tx(record) {
-        match dmesh_fw_transport::wifi_radio_lab_esp::transmit_raw_action(request) {
+        match dmesh_fw_transport::wifi_radio_inject_esp::transmit_raw_action(request) {
             Ok(bytes) => {
                 let _ = super::serial::write_direct_record(
                     format!("radio raw action sent bytes={bytes}").as_bytes(),

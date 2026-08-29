@@ -76,7 +76,7 @@ else
     -C llvm-args=--min-jump-table-entries=1000000
   )
 fi
-module_data_vma=0
+module_data_vma="$data_base"
 link_data_args=()
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then
   link_data_args=(-C "link-arg=-Wl,--defsym=MODULE_DATA_VMA=$module_data_vma")
@@ -128,7 +128,7 @@ DMOD_FLAGS=0
 if [ -n "${DMESH_MODULE_VMA:-}" ]; then DMOD_FLAGS=1; fi
 "$DMESH_PYTHON" "$ROOT/fw/mod_hello/pack.py" --service-tag "$SERVICE_TAG" \
   --slot-count "$SLOT_COUNT" --code-vma "$(( ${DMESH_MODULE_VMA:-0} - 64 ))" \
-  --data-vma "$module_data_vma" --stack-words 16384 \
+  --data-vma "$data_base" --stack-words 16384 \
   --entry-offset "$DMOD_ENTRY_OFFSET" --flags "$DMOD_FLAGS" "$RAW" "$IMAGE"
 printf 'module image: %s\n' "$IMAGE"
 build_elapsed_ms=$(( $(now_ms) - build_started_ms ))

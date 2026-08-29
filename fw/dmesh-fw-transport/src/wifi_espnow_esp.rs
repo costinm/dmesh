@@ -10,11 +10,12 @@
 //! of NAN discovery-window/ROC policy. Main's hardware BSSID filter remains
 //! an optional lower-level prefilter experiment.
 
+// TODO: as fallback for NAN, we can use periodic (4s) NOW sync with similar master election.
+// That works on host/esp32 - if Androids are present they can start a NAN cluster. 
+// Using only NOW action frames is simplest - no deps on the beacon/management frames in NAN.
+
 use core::{alloc::Layout, mem::MaybeUninit};
-use core::{
-    ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,27 +828,16 @@ pub fn start_iperf_client(
     true
 }
 
-/// Receive one action from the private non-promiscuous driver dispatcher.
-/// The callback supplies a 24-byte 802.11 header separately from the action
-/// body. Reconstitute only enough frame storage for the host-tested rawnan
-/// parser, then make the single shared-ingress copy. No allocation,
-/// promiscuous mode, or remain-on-channel operation is involved.
-pub(crate) unsafe extern "C" fn action_rx_callback(
-    _driver_context: *mut c_void,
+/// Feed the original ESP-IDF private-dispatcher spans into the proven NOW
+/// adapter. `wifi_esp` owns registration and classification; this module owns
+/// only ESP-NOW framing and bounded ingress.
+pub(crate) fn receive_registered_action_parts(
     header: *mut u8,
     payload: *mut u8,
-    payload_end: *mut u8,
-) -> i32 {
-    if !crate::wifi_esp::now_dispatcher_enabled() {
-        return 0;
-    }
+    len: usize,
+) {
     RX_DISPATCHER.fetch_add(1, Ordering::Relaxed);
-    let Some(len) = (payload_end as usize).checked_sub(payload as usize) else {
-        RX_DROPS.fetch_add(1, Ordering::Relaxed);
-        return 0;
-    };
     receive_action_parts(header, payload, len);
-    0
 }
 
 /// ESP-IDF's action-transmit request may receive a co-channel response during
@@ -892,14 +882,15 @@ pub(crate) fn receive_roc_action_parts(header: *mut u8, payload: *mut u8, len: u
     receive_action_parts(header, payload, len);
 }
 
-/// Feed a complete management frame seen during a bounded NAN discovery
-/// capture. The caller controls promiscuous lifetime; this helper only admits
-/// an ESP-NOW-compatible action into the same shared packet pool as the
-/// private dispatcher. It is deliberately not a continuous monitor path.
-pub fn receive_promiscuous_action(frame: &[u8]) {
+/// Feed one complete action frame into the shared NOW parser and bounded
+/// ingress pool. The continuous private dispatcher normally supplies spans,
+/// while the existing NAN DW capture supplies a complete management frame as
+/// the bounded fallback on C6.
+pub fn receive_action_frame(frame: &[u8]) {
     if !dmesh_rawnan::is_action_frame(frame) {
         return;
     }
+    RX_DISPATCHER.fetch_add(1, Ordering::Relaxed);
     if ACTION_PARSE_BUSY.swap(true, Ordering::AcqRel) {
         RX_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
@@ -922,7 +913,7 @@ fn receive_action_frame_unlocked(frame: &[u8]) {
     // ESP-IDF exposes a locally transmitted action to the private receive
     // dispatcher on C6. It is not ingress and must not consume one of the
     // device-wide packet slots or be confused with the peer's reply.
-    if crate::wifi_radio_lab_esp::is_local_action_source(source) {
+    if crate::wifi_radio_control_esp::is_local_action_source(source) {
         RX_SELF_ECHOES.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -1292,7 +1283,7 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     // from the 64 ms capture in each 512-TU DW, which is exactly the intended
     // coexistence test.
     let peer_is_broadcast = peer.mac == [0xff; 6];
-    let lab_forces_broadcast = crate::wifi_radio_lab_esp::action_destination_broadcast();
+    let lab_forces_broadcast = crate::wifi_radio_control_esp::action_destination_broadcast();
     let destination = if peer_is_broadcast || lab_forces_broadcast {
         [0xff; 6]
     } else {
@@ -1306,7 +1297,7 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     // factory STA MAC makes the packet reach the radio yet fail the client's
     // selected-peer check.  Keep explicit radio-control selections intact;
     // only resolve Auto to AP for this unambiguous AP-only personality.
-    let configured_interface = crate::wifi_radio_lab_esp::action_tx_interface();
+    let configured_interface = crate::wifi_radio_control_esp::action_tx_interface();
     let interface = match configured_interface {
         dmesh_server::raw_wifi::RawWifiInterface::Auto
             if crate::wifi_esp::lab_open_ap_active() && !crate::wifi_esp::sta_associated() =>

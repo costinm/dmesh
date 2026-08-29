@@ -788,6 +788,17 @@ pub fn send_debug_text(text: &[u8]) -> bool {
     enqueue_uart_payload(UART_EGRESS_TEXT, text)
 }
 
+/// C/ESP-IDF log bridge. It only queues an already-formatted diagnostic line;
+/// the dedicated UART writer remains the sole physical UART0 owner.
+#[no_mangle]
+pub unsafe extern "C" fn dmesh_uart_log_line(bytes: *const u8, len: usize) -> i32 {
+    if bytes.is_null() || len == 0 || len > 255 {
+        return -1;
+    }
+    let line = core::slice::from_raw_parts(bytes, len);
+    i32::from(send_debug_text(line))
+}
+
 #[cfg(target_arch = "riscv32")]
 fn write_usb(bytes: &[u8]) -> i32 {
     unsafe {

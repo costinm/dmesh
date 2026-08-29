@@ -19,7 +19,7 @@ esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
 embuild = "0.33.3"
 
 [[package.metadata.esp-idf-sys.extra_components]]
-component_dirs = ["../modules/native"]
+component_dirs = ["../modules/native", "native"]
 
 [profile.release]
 codegen-units = 1

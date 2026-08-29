@@ -1,4 +1,4 @@
-//! Shared ESP adapter for the host-tested `dmesh_server::raw_wifi` handlers.
+//! ESP adapter for the shared `dmesh_server::raw_wifi` control/status schema.
 //!
 //! It owns only ESP-IDF state transitions and counter sampling.  CBOR
 //! parsing, handler method IDs, snapshots, and delta semantics are in
@@ -10,7 +10,7 @@ use dmesh_server::raw_wifi::{
     RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS,
     RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiBearer, RawWifiControlRequest, RawWifiCounters,
     RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
-    RawWifiSnapshot, RawWifiStaMode, RawWifiStaState, RawWifiTxRequest,
+    RawWifiSnapshot, RawWifiStaMode, RawWifiStaState,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);
@@ -123,7 +123,7 @@ fn rate_value(value: RawWifiRate) -> u8 {
     }
 }
 
-fn channel() -> Option<u8> {
+pub(crate) fn channel() -> Option<u8> {
     crate::wifi_esp::current_channel().map(|(primary, _)| primary)
 }
 
@@ -205,6 +205,14 @@ pub fn snapshot() -> RawWifiSnapshot {
         sdfs,
         followups,
         service_info_matched,
+        active_subscribe_descriptors,
+        active_subscribe_sdea_misses,
+        active_subscribe_sdea_header,
+        active_subscribe_sdea_info_len,
+        active_subscribe_bssid,
+        last_sdf_source,
+        last_sdf_service_id,
+        active_subscribes,
         service_info_enqueued,
         service_info_dropped,
     ) = crate::wifi_nan_dw_capture_esp::stats();
@@ -232,13 +240,22 @@ pub fn snapshot() -> RawWifiSnapshot {
     ) = crate::wifi_raw_udp6_esp::diagnostics();
     let (udp6_tx_submit_calls, udp6_tx_submit_us_total, udp6_tx_submit_us_max) =
         crate::wifi_raw_udp6_esp::tx_submit_timing();
+    // Keep the wire snapshot stable while P2P SD/GAS is not implemented on
+    // ESP32-C6. The action-receive experiment showed the driver does not
+    // deliver those public actions outside NAN DW, where they are unusable.
     let (
         p2p_probe_requests,
         p2p_probe_responses,
         p2p_gas_requests,
         p2p_gas_responses,
         p2p_response_drops,
-    ) = crate::wifi_esp::p2p_action_stats();
+    ) = (0, 0, 0, 0, 0);
+    let (
+        registered_nan_actions,
+        registered_now_actions,
+        registered_p2p_actions,
+        registered_action_drops,
+    ) = crate::wifi_esp::action_dispatch_stats();
     RawWifiSnapshot {
         epoch: EPOCH.load(Ordering::Acquire),
         channel: channel(),
@@ -247,6 +264,10 @@ pub fn snapshot() -> RawWifiSnapshot {
         dw_capturing: Some(capturing),
         nan_dw_interval: Some(crate::wifi_nan_dw_capture_esp::interval()),
         comparator_bssid: (bssid != [0; 6]).then_some(bssid),
+        nan_active_subscribe_bssid: (active_subscribe_bssid != [0; 6])
+            .then_some(active_subscribe_bssid),
+        nan_last_sdf_source: (last_sdf_source != [0; 6]).then_some(last_sdf_source),
+        nan_last_sdf_service_id: (last_sdf_service_id != [0; 6]).then_some(last_sdf_service_id),
         comparator_armed: Some(armed),
         comparator_errors,
         tx_interface: interface_from(TX_INTERFACE.load(Ordering::Acquire)),
@@ -295,6 +316,11 @@ pub fn snapshot() -> RawWifiSnapshot {
             nan_sdfs: sdfs,
             nan_followups: followups,
             nan_service_info_matched: service_info_matched,
+            nan_active_subscribe_descriptors: active_subscribe_descriptors,
+            nan_active_subscribe_sdea_misses: active_subscribe_sdea_misses,
+            nan_active_subscribe_sdea_header: active_subscribe_sdea_header,
+            nan_active_subscribe_sdea_info_len: active_subscribe_sdea_info_len,
+            nan_active_subscribes: active_subscribes,
             nan_service_info_enqueued: service_info_enqueued,
             nan_service_info_dropped: service_info_dropped,
             tx_duration_us_total,
@@ -332,6 +358,10 @@ pub fn snapshot() -> RawWifiSnapshot {
             p2p_gas_requests,
             p2p_gas_responses,
             p2p_response_drops,
+            registered_nan_actions,
+            registered_now_actions,
+            registered_p2p_actions,
+            registered_action_drops,
         },
     }
 }
@@ -541,58 +571,4 @@ pub fn handle_encoded(request: RawWifiLabRequest, out: &mut [u8]) -> Result<usiz
     let snapshot = handle(request)?;
     dmesh_server::raw_wifi::encode_raw_wifi_snapshot(method, snapshot, out)
         .ok_or("radio snapshot buffer")
-}
-
-/// Send a caller-supplied public/vendor action frame through the common
-/// ESP-IDF action lane. This is intentionally a raw-radio diagnostic, not a
-/// QUIC service: direct PPP and stream adapters decode the same host-owned
-/// `RawWifiTxRequest` before calling here. Complete non-action injection
-/// remains platform-specific until its receive and sequence semantics are
-/// covered by the same matrix.
-pub fn transmit_raw_action(request: RawWifiTxRequest<'_>) -> Result<usize, &'static str> {
-    if request.frame.len() < 24 || request.frame[0] != 0xd0 || request.frame[1] != 0 {
-        return Err("raw action frame required");
-    }
-    if channel() != Some(request.channel) {
-        return Err("raw action channel mismatch");
-    }
-    // NAN Follow-ups are discovery-window control, never generic immediate
-    // action traffic. The DW owner validates the selected cluster and rejects
-    // a host probe outside its bounded capture/send interval.
-    if dmesh_rawnan::is_nan_followup(request.frame) {
-        return crate::wifi_nan_dw_capture_esp::send_followup_frame(request.frame);
-    }
-    // Active Subscribe Service Info is useful only while the peer is inside
-    // its DW. Let the NAN owner send it from the next local discovery window
-    // rather than attempting immediate off-channel transmission here.
-    if dmesh_rawnan::is_nan_sdf(request.frame) {
-        return crate::wifi_nan_dw_capture_esp::queue_sdf_frame(request.frame)
-            .then_some(request.frame.len())
-            .ok_or("NAN SDF queue rejected");
-    }
-    if request.rate != RawWifiRate::Auto
-        && !crate::wifi_esp::configure_raw_tx_rate(rate_value(request.rate))
-    {
-        return Err("raw action rate rejected");
-    }
-    let interface = match request.interface {
-        RawWifiInterface::Auto | RawWifiInterface::Sta => crate::wifi_esp::RadioInterface::Sta,
-        RawWifiInterface::Ap => crate::wifi_esp::RadioInterface::Ap,
-        RawWifiInterface::Nan => crate::wifi_esp::RadioInterface::Nan,
-    };
-    let destination = request.frame[4..10]
-        .try_into()
-        .map_err(|_| "raw action destination")?;
-    let bssid = request.frame[16..22]
-        .try_into()
-        .map_err(|_| "raw action BSSID")?;
-    if !crate::wifi_espnow_esp::transmit_public_action_on_interface(
-        interface,
-        destination,
-        bssid,
-        &request.frame[24..],
-    ) {
-        return Err("raw action driver rejected");
-    }
-    Ok(request.frame.len())
 }

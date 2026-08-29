@@ -10,6 +10,95 @@ extern "C" {
     fn nvs_close(handle: u32);
 }
 
+const NVS_READONLY: i32 = 0;
+
+/// Read one NUL-terminated NVS string into a fixed buffer.  NVS does not
+/// promise whether the reported length includes the terminator, so normalize
+/// on the first NUL rather than relying on a version-specific ABI detail.
+fn nvs_string(handle: u32, key: &[u8], output: &mut [u8]) -> Option<usize> {
+    let mut length = output.len();
+    let result = unsafe {
+        nvs_get_str(
+            handle,
+            key.as_ptr().cast(),
+            output.as_mut_ptr(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    Some(
+        output
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(length.min(output.len())),
+    )
+}
+
+fn parse_port(value: &[u8]) -> Option<u16> {
+    let mut port = 0u16;
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        port = port.checked_mul(10)?.checked_add(u16::from(*byte - b'0'))?;
+    }
+    (port != 0).then_some(port)
+}
+
+/// Load the persisted, private STA profile into Main's desired profile.  The
+/// reader is deliberately all-or-nothing: a partially written credential or
+/// endpoint must leave Main in its ordinary NAN/NOW boot personality instead
+/// of associating to a guessed network.  Link-local text has no host scope in
+/// firmware, so it is retained only as a validated future UDP endpoint input;
+/// the Wi-Fi adapter never derives an address from a BSSID.
+pub(crate) fn apply_sta_profile_from_nvs(profile: &mut crate::TransportProfile) -> bool {
+    let _ = unsafe { nvs_flash_init() };
+    let mut handle = 0_u32;
+    if unsafe { nvs_open(b"dmesh\0".as_ptr().cast(), NVS_READONLY, &mut handle) } != 0 {
+        return false;
+    }
+    let mut ssid = [0u8; 33];
+    let mut psk = [0u8; 64];
+    let mut security = [0u8; 10];
+    let mut server_ll = [0u8; 40];
+    let mut server_port = [0u8; 6];
+    let result = (|| {
+        let ssid_len = nvs_string(handle, b"sta_ssid\0", &mut ssid)?;
+        let psk_len = nvs_string(handle, b"sta_psk\0", &mut psk)?;
+        let security_len = nvs_string(handle, b"sta_security\0", &mut security)?;
+        let server_len = nvs_string(handle, b"sta_server_ll\0", &mut server_ll)?;
+        let port_len = nvs_string(handle, b"sta_server_port\0", &mut server_port)?;
+        if !dmesh_server::firmware_profile::valid_ssid(&ssid[..ssid_len])
+            || !(8..=63).contains(&psk_len)
+            || !server_ll[..server_len].starts_with(b"fe80:")
+            || server_ll[..server_len].contains(&b'%')
+            || parse_port(&server_port[..port_len]).is_none()
+        {
+            return None;
+        }
+        profile.ssid[..ssid_len].copy_from_slice(&ssid[..ssid_len]);
+        profile.ssid_len = ssid_len;
+        profile.sta_passphrase[..psk_len].copy_from_slice(&psk[..psk_len]);
+        profile.sta_passphrase_len = psk_len;
+        profile.sta_security = match &security[..security_len] {
+            b"wpa2-psk" => dmesh_server::firmware_profile::StaSecurity::Wpa2Psk,
+            b"wpa3-sae" => dmesh_server::firmware_profile::StaSecurity::Wpa3Sae,
+            _ => return None,
+        };
+        profile.requested_transport = Some(dmesh_server::control::TransportKind::Sta);
+        profile.now = 2;
+        profile.nan_dw_interval = 0;
+        profile.ap = 0;
+        profile.run_requested = true;
+        Some(())
+    })()
+    .is_some();
+    unsafe { nvs_close(handle) };
+    result
+}
+
 /// Complete Main-only boot power policy read from the product NVS namespace.
 /// It is read exactly once before the radio owner starts: `sleepy-soft` is a
 /// sleepy radio policy with physical light sleep suppressed for diagnostics.
@@ -68,6 +157,42 @@ pub(crate) fn boot_power_policy_from_nvs() -> BootPowerPolicy {
 /// Publish boot diagnostics over NOW after Main's unassociated radio is live.
 /// Called once during Main boot; it deliberately uses the same wire records
 /// as UART and UDP6, rather than creating a NOW-only discovery schema.
+/// Emit one received LoRa/FSK packet through every currently-live public
+/// bearer.  The record is deliberately connectionless: it contains the RF
+/// measurements and opaque packet but does not feed back into the local
+/// tagged dispatcher or create a new radio task.
+pub fn forward_lora_packet(payload: &[u8], rssi: i16, snr: i8) -> bool {
+    if payload.is_empty() || payload.len() > crate::TRANSPORT_MTU {
+        return false;
+    }
+    // {1:1002, 2:5(packet), 5:{1:rssi,2:snr}, 10:h'packet'}
+    let mut record = [0u8; crate::TRANSPORT_MTU];
+    let mut encoder = dmesh_server::cbor::Encoder::new(&mut record);
+    if encoder.map(4).is_none()
+        || encoder.uint(1).is_none()
+        || encoder.uint(1002).is_none()
+        || encoder.uint(2).is_none()
+        || encoder.uint(5).is_none()
+        || encoder.uint(5).is_none()
+        || encoder.map(2).is_none()
+        || encoder.uint(1).is_none()
+        || encoder.int(i64::from(rssi)).is_none()
+        || encoder.uint(2).is_none()
+        || encoder.int(i64::from(snr)).is_none()
+        || encoder.uint(10).is_none()
+        || encoder.bytes_value(payload).is_none()
+    {
+        return false;
+    }
+    let used = encoder.len();
+    drop(encoder);
+    let record = &record[..used];
+    let uart = crate::uart_esp::send_direct_record(record);
+    let now = crate::wifi_espnow_esp::broadcast_record(record);
+    let udp6 = crate::wifi_raw_udp6_esp::broadcast_announce(record);
+    uart || now || udp6
+}
+
 pub(crate) fn send_boot_records_on_now(boot_message: &[u8], role: u8, partition: u8) {
     if let Some(record) = dmesh_server::services::encode_status_text(boot_message) {
         let _ = crate::wifi_espnow_esp::broadcast_record(&record);
@@ -100,11 +225,9 @@ pub(crate) fn send_boot_announce_uart(role: u8, partition: u8) {
 
 /// Active Main devices refresh their passive presence every five minutes.
 ///
-/// This is intentionally a Main policy rather than the generic NAN Publish
-/// refresh interval: Android and host adapters may choose a much sparser
-/// battery policy, while an awake ESP32 Main must remain promptly visible to
-/// nearby control planes without an explicit probe.  The actual work runs on
-/// the existing DW one-shot deadline, never in a polling loop.
+/// The same five-minute cadence is used by Android and host adapters. The
+/// actual work runs on the existing DW one-shot deadline, never in a polling
+/// loop.
 const ACTIVE_DISCOVERY_INTERVAL_MS: u64 = 5 * 60 * 1_000;
 
 /// Check the active passive-discovery cadence after a queued owner event.
@@ -782,6 +905,17 @@ fn announce_record(
             | dmesh_server::probe::PROBE_CAP_AP
             | dmesh_server::probe::PROBE_CAP_UDP6,
     );
+    // ESP raw UDP6 uses the deterministic EUI-64 link-local address for its
+    // active netif.  Advertise both roles when APSTA is live so a controller
+    // can select the shared bearer without inventing an ESP-only endpoint API.
+    if crate::wifi_esp::sta_associated() {
+        announce.set_sta_link_local_v6(quic_lite::raw_udp6::link_local_from_mac(mac).octets());
+    }
+    if crate::wifi_esp::lab_open_ap_active()
+        && let Some(ap_mac) = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap)
+    {
+        announce.set_ap_link_local_v6(quic_lite::raw_udp6::link_local_from_mac(ap_mac).octets());
+    }
     let mut record = [0; 96];
     let used = dmesh_server::announce::encode(announce, &mut record)?;
     Some((record, used))
@@ -1278,7 +1412,7 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
     }
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(packet) {
         let mut raw_response = [0u8; dmesh_server::raw_wifi::RAW_WIFI_SNAPSHOT_MAX_BYTES];
-        match crate::wifi_radio_lab_esp::handle_encoded(request, &mut raw_response) {
+        match crate::wifi_radio_control_esp::handle_encoded(request, &mut raw_response) {
             Ok(used) => send_nan_direct_response(peer, &raw_response[..used]),
             Err(error) => send_nan_handler_error(peer, packet, error),
         }
@@ -1476,7 +1610,7 @@ pub(crate) fn receive_uart_raw_ingress(
     }
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_handler(packet) {
         let mut response = [0u8; dmesh_server::raw_wifi::RAW_WIFI_SNAPSHOT_MAX_BYTES];
-        match crate::wifi_radio_lab_esp::handle_encoded(request, &mut response) {
+        match crate::wifi_radio_control_esp::handle_encoded(request, &mut response) {
             Ok(used) => {
                 let _ = crate::commands::send_record(&response[..used]);
             }
@@ -1485,7 +1619,7 @@ pub(crate) fn receive_uart_raw_ingress(
         return;
     }
     if let Ok(request) = dmesh_server::raw_wifi::decode_raw_wifi_tx(packet) {
-        match crate::wifi_radio_lab_esp::transmit_raw_action(request) {
+        match crate::wifi_radio_inject_esp::transmit_raw_action(request) {
             Ok(bytes) => crate::commands::send_response(
                 alloc::format!("radio raw action sent bytes={bytes}").as_bytes(),
             ),
@@ -1750,8 +1884,9 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         return;
     }
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: uart-install\n\0".as_ptr().cast()) };
-    // The association target comes only from `transport.start`; accept UART
-    // or future NAN commands before considering any STA epoch.
+    // A complete private NVS profile is the only boot-time STA authority.
+    // In its absence Main retains the ordinary NAN/NOW startup and accepts a
+    // later volatile transport.start command.
     let boot_power_policy = crate::main_runtime::boot_power_policy_from_nvs();
     let sleepy_boot = service.role == 1 && boot_power_policy.sleepy;
     // PM is selected once from the boot policy, before the Wi-Fi owner starts.
@@ -1767,7 +1902,7 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             params.now = 2;
             params.ap = 0;
             params.uart = dmesh_server::firmware_profile::UART_OFF;
-        } else if service.role == 1 {
+        } else if service.role == 1 && !crate::main_runtime::apply_sta_profile_from_nvs(params) {
             // Main's active default is NAN+NOW only. An AP is an explicit
             // transport.start personality, not an unconditional boot side
             // effect: enabling its beacon/DTIM workload beside NAN can brown
@@ -1814,9 +1949,7 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // remains the one owner of QUIC-lite state and decides whether another
     // UART packet is ready. This preserves the one-record classic-ESP32
     // egress budget without a periodic poll or a private bulk queue.
-    crate::uart_esp::set_egress_notify(Some(
-        crate::core_runtime::schedule_uart_egress_ready,
-    ));
+    crate::uart_esp::set_egress_notify(Some(crate::core_runtime::schedule_uart_egress_ready));
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: uart-start\n\0".as_ptr().cast()) };
     // Register once before any bearer accepts traffic. The handler table is
     // fixed-size and shared by UDP6/QUIC and NOW action adapters; no per-bearer
@@ -1853,10 +1986,8 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     crate::commands::send_response(service.boot_message);
     crate::main_runtime::send_boot_identity(service.role, service.partition);
     crate::main_runtime::send_boot_announce_uart(service.role, service.partition);
-    // The active default is an unassociated AP+NAN+NOW epoch with DW1. It is
-    // started exactly once here so boot/discovery Service Info and directed
-    // NAN control are reachable; an explicit transport.start is the only
-    // operation that replaces the epoch.
+    // A valid NVS profile begins the Main STA canary directly; otherwise Main
+    // starts its active unassociated AP+NAN+NOW epoch with DW1.
     let initial_profile = crate::core_runtime::transport_profile_snapshot();
     if sleepy_boot {
         crate::core_runtime::apply_uart_profile(false);
@@ -1866,9 +1997,14 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         crate::profile_store::generation(),
         (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000,
     );
-    crate::core_runtime::prepare_espnow_association(&initial_profile);
-    state.nan_now_started =
-        crate::wifi_esp::init_nan_now(&initial_profile, crate::core_runtime::receive_espnow);
+    if crate::main_runtime::wants_sta(&initial_profile) {
+        state.wifi_started = true;
+        crate::wifi_esp::init_sta(&initial_profile);
+    } else {
+        crate::core_runtime::prepare_espnow_association(&initial_profile);
+        state.nan_now_started =
+            crate::wifi_esp::init_nan_now(&initial_profile, crate::core_runtime::receive_espnow);
+    }
     if state.nan_now_started {
         crate::wifi_espnow_esp::set_poll_handler(Some(crate::core_runtime::poll_espnow));
         crate::main_runtime::send_boot_records_on_now(
@@ -1882,12 +2018,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // generations; they never borrow or mutate it directly.
     let mut runtime_state = dmesh_server::main_runtime_state::MainRuntimeState::default();
     let _ = runtime_state.reduce(dmesh_server::main_runtime_state::MainEvent::Boot);
-    // `TransportProfile::new()` represents a stopped generic radio, while
-    // Main deliberately boots an unassociated NAN/NOW epoch. Record that
-    // Main policy explicitly, including the NVS sleepy default, before the
-    // first timer event can consider a sleep boundary.
+    // Record the actual requested boot personality before the first timer
+    // event can consider a sleep boundary.
     let _ = runtime_state.reduce(dmesh_server::main_runtime_state::MainEvent::BootProfile {
-        mode: dmesh_server::main_runtime_state::RequestedMode::NanNow,
+        mode: crate::main_runtime::requested_mode(&initial_profile),
         sleepy: sleepy_boot,
     });
     crate::main_runtime::record_power_completion(&mut runtime_state);
@@ -2023,7 +2157,7 @@ impl MainRuntime {
 pub fn run(mark_healthy: fn()) {
     MainRuntime::new(mark_healthy).run();
 }
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use dmesh_server::main_runtime_state::MainRuntimeSnapshot;
 

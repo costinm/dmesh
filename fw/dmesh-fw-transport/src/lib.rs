@@ -48,7 +48,8 @@ pub mod wifi_esp;
 pub mod wifi_espnow_esp;
 pub mod wifi_nan_dw_capture_esp;
 pub mod wifi_nonpromisc_probe_esp;
-pub mod wifi_radio_lab_esp;
+pub mod wifi_radio_control_esp;
+pub mod wifi_radio_inject_esp;
 pub mod wifi_raw_udp6_esp;
 
 /// The one packet payload limit used by every bearer. A bearer that cannot

@@ -151,6 +151,7 @@ static dmesh_module_header_t cached_header;
 static uint32_t cached_offset;
 static esp_partition_t cached_raw_partition;
 static const esp_partition_t *cached_partition;
+static bool loader_initialized;
 static bool cached_header_valid;
 static volatile bool cached_task_done;
 static volatile bool cached_task_running;
@@ -181,14 +182,20 @@ static char cached_task_name[16];
 static volatile uint16_t cached_task_service_tag;
 static portMUX_TYPE lora_command_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* Main-owned transient memory map for module calls. The arena is reset before
- * each entry invocation and after it returns; modules must not retain these
- * pointers across calls or task restarts. */
-static uint8_t module_arena[MODULE_ARENA_SIZE] __attribute__((aligned(16)));
+/* Main-owned transient memory map for module calls.  Do not reserve this at
+ * boot: the module loader is linked into small classic ESP32 images, but an
+ * inactive module must not reduce the heap available for ESP-IDF's Main task.
+ * Allocate only when a running module actually asks the host ABI for memory;
+ * release it as soon as that invocation/task exits. */
+static uint8_t *module_arena;
+static uint8_t *module_arena_raw;
 static size_t module_arena_used;
 
 static void module_arena_reset(void)
 {
+    free(module_arena_raw);
+    module_arena = NULL;
+    module_arena_raw = NULL;
     module_arena_used = 0;
 }
 
@@ -196,6 +203,11 @@ static void *module_alloc(void *user, size_t size, size_t align)
 {
     (void)user;
     if (size == 0 || align == 0 || (align & (align - 1u)) != 0) return NULL;
+    if (module_arena == NULL) {
+        module_arena_raw = malloc(MODULE_ARENA_SIZE + 15u);
+        if (module_arena_raw == NULL) return NULL;
+        module_arena = (uint8_t *)(((uintptr_t)module_arena_raw + 15u) & ~(uintptr_t)15u);
+    }
     uintptr_t base = (uintptr_t)module_arena;
     uintptr_t current = base + module_arena_used;
     uintptr_t aligned = (current + align - 1u) & ~(align - 1u);
@@ -227,6 +239,12 @@ static dmesh_lora_config_v1 lora_config = {
     .spi_host = 2,
     .chip = DMESH_LORA_CHIP_SX127X, .reset_pin = 14, .cs_pin = 18,
     .irq_pin = 26, .busy_pin = -1, .sck_pin = 5, .miso_pin = 19, .mosi_pin = 27,
+    /* These are the established TLORA/SX127x defaults from the retired Main
+     * adapter.  Zero is a valid-looking ABI value but not a usable radio
+     * configuration, so keep a board capable of probe/RX/TX before a
+     * controller supplies an explicit tagged configuration. */
+    .frequency_hz = 913125000, .bandwidth_hz = 250000,
+    .spreading_factor = 10, .sync_word = 0x2b, .tx_power = 17,
     .board_power_pin = -1, .board_power_level = 1,
     .sx1262_dio2_rf_switch = 0, .sx1262_tcxo_mv = 0,
     .sx1262_pa_duty = 4, .sx1262_pa_hp = 7,
@@ -244,8 +262,9 @@ static spi_host_device_t lora_spi_host_device(void)
     return lora_config.spi_host == 1 ? SPI2_HOST : SPI3_HOST;
 #endif
 }
-static uint8_t lora_command_args[LORA_COMMAND_MAX];
-static uint8_t lora_command_payload[DMESH_LORA_MAX_PACKET];
+/* Command buffers belong to the active LoRa task, not the boot image. */
+static uint8_t *lora_command_args;
+static uint8_t *lora_command_payload;
 static size_t lora_command_args_len;
 static size_t lora_command_payload_len;
 static bool lora_command_pending;
@@ -439,6 +458,8 @@ extern int dmesh_module_set_setting(const uint8_t *key, size_t key_len,
                                     const uint8_t *value, size_t value_len);
 extern int dmesh_module_emit_event(uint16_t event_id, uint8_t value_type, uint8_t flags,
                                    const uint8_t *payload, size_t payload_len);
+extern int dmesh_module_lora_receive(const uint8_t *payload, size_t payload_len,
+                                     int16_t rssi, int8_t snr);
 
 static int get_setting(void *user, const uint8_t *key, size_t key_len,
                        uint8_t *value, size_t value_capacity, size_t *value_len)
@@ -597,17 +618,14 @@ static int lora_emit_packet(void *user, const uint8_t *data, size_t len, int16_t
 {
     (void)user;
     if (data == NULL || len == 0 || len > DMESH_LORA_MAX_PACKET) return -1;
-    char args[64];
-    int args_len = snprintf(args, sizeof(args), "op=lora_rx rssi=%d snr=%d", rssi, snr);
-    if (args_len <= 0 || (size_t)args_len >= sizeof(args)) return -1;
-    (void)args;
-    return dmesh_module_call_service(101u, data, len, NULL, 0, NULL, 50);
+    return dmesh_module_lora_receive(data, len, rssi, snr);
 }
 static int lora_poll_command(void *user, uint8_t *args, size_t *args_len,
                              uint8_t *payload, size_t *payload_len)
 {
     (void)user;
-    if (args == NULL || args_len == NULL || payload == NULL || payload_len == NULL) return -1;
+    if (args == NULL || args_len == NULL || payload == NULL || payload_len == NULL ||
+        lora_command_args == NULL || lora_command_payload == NULL) return -1;
     portENTER_CRITICAL(&lora_command_mux);
     if (!lora_command_pending) {
         portEXIT_CRITICAL(&lora_command_mux);
@@ -765,6 +783,7 @@ static const esp_partition_t *resolve_module_partition(void)
 
 void dmesh_module_loader_init(void)
 {
+    if (loader_initialized) return;
     ESP_LOGI(TAG, "startup init enter");
     dmesh_hw_host_set_spi(lora_spi_transfer);
     dmesh_hw_host_reset();
@@ -791,6 +810,7 @@ void dmesh_module_loader_init(void)
     memset(cached_task_name, 0, sizeof(cached_task_name));
     cached_task_service_tag = 0;
     cached_partition = resolve_module_partition();
+    loader_initialized = true;
     if (cached_partition == NULL || cached_partition->size < DMESH_MODULE_HEADER_SIZE) {
         ESP_LOGW(TAG, "module header unavailable partition=%p", (void *)cached_partition);
         return;
@@ -821,6 +841,8 @@ void dmesh_module_loader_init(void)
              (unsigned long)cached_header.entry_offset,
              (unsigned long)cached_header.image_size);
 }
+
+bool dmesh_module_loader_is_initialized(void) { return loader_initialized; }
 
 bool dmesh_module_loader_refresh_header(void)
 {
@@ -925,6 +947,10 @@ int dmesh_module_lora_command(const uint8_t *args, size_t args_len,
         payload_len > DMESH_LORA_MAX_PACKET || (payload_len != 0 && payload == NULL)) return -1;
     if (!service_running(43u)) return -21;
     portENTER_CRITICAL(&lora_command_mux);
+    if (lora_command_args == NULL || lora_command_payload == NULL) {
+        portEXIT_CRITICAL(&lora_command_mux);
+        return -21;
+    }
     if (lora_command_pending) {
         portEXIT_CRITICAL(&lora_command_mux);
         return -20;
@@ -938,6 +964,8 @@ int dmesh_module_lora_command(const uint8_t *args, size_t args_len,
     return 0;
 }
 
+bool dmesh_module_lora_running(void) { return service_running(43u); }
+
 bool dmesh_module_loader_prepare_flash(uint32_t timeout_ms)
 {
     if (!cached_task_running) return true;
@@ -948,6 +976,10 @@ bool dmesh_module_loader_prepare_flash(uint32_t timeout_ms)
      * from this same raw data region. Replace any queued radio command with a
      * bounded stop request before the TCP worker can touch the partition. */
     portENTER_CRITICAL(&lora_command_mux);
+    if (lora_command_args == NULL || lora_command_payload == NULL) {
+        portEXIT_CRITICAL(&lora_command_mux);
+        return false;
+    }
     memcpy(lora_command_args, stop, sizeof(stop) - 1);
     lora_command_args_len = sizeof(stop) - 1;
     lora_command_payload_len = 0;
@@ -1289,6 +1321,15 @@ static void module_task(void *arg)
     cached_task_stage = 8;
     service_set_running(job->service_tag, false);
     if (job->service_tag == 43u) dmesh_lora_irq_set_task(NULL);
+    if (job->service_tag == 43u) {
+        free(lora_command_args);
+        free(lora_command_payload);
+        lora_command_args = NULL;
+        lora_command_payload = NULL;
+        lora_command_args_len = 0;
+        lora_command_payload_len = 0;
+        lora_command_pending = false;
+    }
     cached_task_handle = NULL;
     memset(cached_task_name, 0, sizeof(cached_task_name));
     cached_task_service_tag = 0;
@@ -1333,6 +1374,23 @@ int dmesh_module_start_service(uint16_t service_tag, uint32_t offset, uint32_t s
     cached_task_done = false;
     cached_last_result = -999;
     cached_task_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (service_tag == 43u) {
+        lora_command_args = malloc(LORA_COMMAND_MAX);
+        lora_command_payload = malloc(DMESH_LORA_MAX_PACKET);
+        if (lora_command_args == NULL || lora_command_payload == NULL) {
+            free(lora_command_args);
+            free(lora_command_payload);
+            lora_command_args = NULL;
+            lora_command_payload = NULL;
+            free(job);
+            service_set_running(service_tag, false);
+            cached_task_done = true;
+            return -2;
+        }
+        lora_command_args_len = 0;
+        lora_command_payload_len = 0;
+        lora_command_pending = false;
+    }
     service_set_running(service_tag, true);
     cached_task_service_tag = service_tag;
     snprintf(cached_task_name, sizeof(cached_task_name), "tag-%u", (unsigned)service_tag);
@@ -1347,6 +1405,12 @@ int dmesh_module_start_service(uint16_t service_tag, uint32_t offset, uint32_t s
         service_set_running(service_tag, false);
         cached_task_done = true;
         cached_task_handle = NULL;
+        if (service_tag == 43u) {
+            free(lora_command_args);
+            free(lora_command_payload);
+            lora_command_args = NULL;
+            lora_command_payload = NULL;
+        }
         free(job);
         return -3;
     }

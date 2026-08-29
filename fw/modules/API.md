@@ -22,12 +22,25 @@ in field `6` as `{1: ok, 2: loader_result_abs}`.
 | 1000 | module | 2 | Initialize the native module loader. |
 | 1000 | module | 3 | Request a bounded loader stop before flash work. |
 | 1001 | hello | 4 | Start module service tag 46. |
-| 1002 | lora | 4 | Start module service tag 43. |
+| 1002 | lora | 4 | Configure and start/command module service tag 43. |
 | 1003 | hardware | 4 | Start module service tag 45. |
 
 For `RUN` (method 4), field `10` is passed unchanged as the bounded module
 payload. The loader derives flash placement from its service tag and validates
 the DMOD header; callers never supply a flash offset.
+
+For component `1002` only, field `4` is the required one-item CBOR array
+`[operation]`. Supported operations are `probe`, `probe127`, `probe126`,
+`rx`, `tx`, `stop`, `reconfigure`, `fsk`, and `stats`. Field `10` is the
+opaque `tx`/`fsk` packet, never a command string. Optional field `5` is a
+numeric configuration map. Its IDs follow `dmesh_lora_config_v1` after the
+ABI header: `1..14` are chip/frequency/bandwidth/SF/SPI/sync/power and the
+seven board pins; `15..24` are board-power and SX126x settings; `25..30` are
+coding rate, preamble, CRC, CAD mode, CAD interval, and CAD RX duration. An
+omitted map uses the established SX127x TLORA profile (913.125 MHz, 250 kHz,
+SF10, CR5, sync word 0x2b). This makes legacy LoRa boards usable without
+reintroducing the retired text-command dispatcher; SX1262 boards must provide
+their wiring/configuration map.
 
 ## Ownership and limits
 

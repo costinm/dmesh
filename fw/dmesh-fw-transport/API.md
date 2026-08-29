@@ -81,7 +81,7 @@ with the request id and record elapsed time for sleepy -> active-STA -> sleepy
 When NAN DW capture is enabled, firmware also keeps that same current CBOR
 announce as its active Publish Service Info. It is emitted only after the
 Wi-Fi owner has opened a confirmed discovery window, once after boot/update
-and then on the approximately 15-minute announce cadence. `nan_dw_interval=0`
+and then on the five-minute announce cadence. `nan_dw_interval=0`
 therefore keeps the descriptor pending rather than creating continuous
 promiscuous RX or an out-of-window NAN action. The publish state is replaced
 atomically with each boot/periodic record; it never retains an ESP-IDF frame

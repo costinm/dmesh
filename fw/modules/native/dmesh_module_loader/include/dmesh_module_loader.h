@@ -8,6 +8,7 @@
 
 bool dmesh_module_flash_supported(void);
 void dmesh_module_loader_init(void);
+bool dmesh_module_loader_is_initialized(void);
 /* Re-read the DMOD header after Main has replaced the module bytes. This is
  * safe only while no module task is running and enables hot module updates
  * without rebooting Main. */
@@ -23,6 +24,7 @@ int dmesh_module_lora_configure(const dmesh_lora_config_v1 *config);
 int dmesh_module_lora_update_config(const dmesh_lora_config_v1 *config);
 int dmesh_module_lora_command(const uint8_t *args, size_t args_len,
                               const uint8_t *payload, size_t payload_len);
+bool dmesh_module_lora_running(void);
 /* Stop an executing module before the flash transport erases its raw data
  * region. Returns false if the task does not quiesce within timeout_ms. */
 bool dmesh_module_loader_prepare_flash(uint32_t timeout_ms);
