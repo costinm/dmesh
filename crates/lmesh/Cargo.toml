@@ -20,8 +20,10 @@ p256 = { version = "=0.14.0-rc.7", features = ["pem", "ecdsa"] }
 rand = "0.10"
 anyhow = "1.0"
 async-trait = "0.1"
+axum = "0.7"
 libc = "0.2"
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
+ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
 minicbor = "2.2"
 
 [lib]

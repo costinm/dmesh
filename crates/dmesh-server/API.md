@@ -4,6 +4,12 @@
 no ESP-IDF, FreeRTOS, socket, UART, or Wi-Fi-driver dependency.  Firmware,
 `dmesh-cli`, and privileged host radio adapters use the same typed decoder.
 
+Platform integrations are adapters, not command owners. Android and Linux may
+report bounded network and power observations, then implement common control
+requests with explicit capability results. Framework-specific callbacks,
+permissions, and handles do not appear in this schema or in public method
+names; they stay behind the adapter that supplies those facts.
+
 ## Common tagged envelope
 
 New APIs use one root CBOR map.  Component and method are keys `1` and `2`;

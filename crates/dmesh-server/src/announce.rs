@@ -47,9 +47,24 @@ pub const DEVICE_CLASS_ANDROID: u8 = 3;
 pub const FIELD_PUBLIC_KEY: u64 = 5;
 /// Optional fixed-width raw signature over [`signing_bytes`].
 pub const FIELD_SIGNATURE: u64 = 6;
+/// Optional short human-facing display name. It is not an identity claim;
+/// certificates will later supply a verified FQDN.
+pub const FIELD_DEVICE_NAME: u64 = 9;
+/// Optional current STA network name. This is discovery routing metadata, not
+/// an identity or trust assertion. It lets two peers explicitly select their
+/// common UDP6 bearer instead of guessing from a NAN observation.
+pub const FIELD_NETWORK_NAME: u64 = 10;
+/// Optional IPv6 link-local endpoint for the active STA bearer.  This is
+/// routing metadata only; a scoped interface is still required by the local
+/// sender when it uses the address.
+pub const FIELD_STA_LINK_LOCAL_V6: u64 = 11;
+/// Optional IPv6 link-local endpoint for an active AP/GO bearer.
+pub const FIELD_AP_LINK_LOCAL_V6: u64 = 12;
 const MAX_DEVICE_ID: usize = 16;
 pub const MAX_PUBLIC_KEY: usize = 128;
 pub const SIGNATURE_LEN: usize = 64;
+pub const MAX_DEVICE_NAME: usize = 8;
+pub const MAX_NETWORK_NAME: usize = 32;
 
 /// Bounded presence information common to every radio bearer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +88,17 @@ pub struct Announce {
     /// omitted. `signature_len == 0` is the explicitly unsigned device form.
     pub signature: [u8; SIGNATURE_LEN],
     pub signature_len: u8,
+    /// Optional UTF-8 label for discovery UI only.
+    pub device_name: [u8; MAX_DEVICE_NAME],
+    pub device_name_len: u8,
+    /// Optional current STA SSID (or another local-link name).
+    pub network_name: [u8; MAX_NETWORK_NAME],
+    pub network_name_len: u8,
+    /// Optional IPv6 link-local endpoints, in network byte order.
+    pub sta_link_local_v6: [u8; 16],
+    pub sta_link_local_v6_present: bool,
+    pub ap_link_local_v6: [u8; 16],
+    pub ap_link_local_v6_present: bool,
 }
 
 /// Typed entry in a local announce-observation cache.
@@ -121,6 +147,14 @@ impl Announce {
             public_key_len: 0,
             signature: [0; SIGNATURE_LEN],
             signature_len: 0,
+            device_name: [0; MAX_DEVICE_NAME],
+            device_name_len: 0,
+            network_name: [0; MAX_NETWORK_NAME],
+            network_name_len: 0,
+            sta_link_local_v6: [0; 16],
+            sta_link_local_v6_present: false,
+            ap_link_local_v6: [0; 16],
+            ap_link_local_v6_present: false,
         }
     }
 
@@ -144,6 +178,14 @@ impl Announce {
             public_key_len: 0,
             signature: [0; SIGNATURE_LEN],
             signature_len: 0,
+            device_name: [0; MAX_DEVICE_NAME],
+            device_name_len: 0,
+            network_name: [0; MAX_NETWORK_NAME],
+            network_name_len: 0,
+            sta_link_local_v6: [0; 16],
+            sta_link_local_v6_present: false,
+            ap_link_local_v6: [0; 16],
+            ap_link_local_v6_present: false,
         }
     }
 
@@ -157,6 +199,40 @@ impl Announce {
 
     pub fn signature(&self) -> &[u8] {
         &self.signature[..usize::from(self.signature_len).min(SIGNATURE_LEN)]
+    }
+
+    pub fn device_name(&self) -> Option<&str> {
+        core::str::from_utf8(
+            &self.device_name[..usize::from(self.device_name_len).min(MAX_DEVICE_NAME)],
+        )
+        .ok()
+        .filter(|name| !name.is_empty())
+    }
+
+    pub fn network_name(&self) -> Option<&str> {
+        core::str::from_utf8(
+            &self.network_name[..usize::from(self.network_name_len).min(MAX_NETWORK_NAME)],
+        )
+        .ok()
+        .filter(|name| !name.is_empty())
+    }
+
+    pub fn sta_link_local_v6(&self) -> Option<[u8; 16]> {
+        self.sta_link_local_v6_present.then_some(self.sta_link_local_v6)
+    }
+
+    pub fn ap_link_local_v6(&self) -> Option<[u8; 16]> {
+        self.ap_link_local_v6_present.then_some(self.ap_link_local_v6)
+    }
+
+    pub fn set_sta_link_local_v6(&mut self, address: [u8; 16]) {
+        self.sta_link_local_v6 = address;
+        self.sta_link_local_v6_present = true;
+    }
+
+    pub fn set_ap_link_local_v6(&mut self, address: [u8; 16]) {
+        self.ap_link_local_v6 = address;
+        self.ap_link_local_v6_present = true;
     }
 
     pub fn has_identity(&self) -> bool {
@@ -190,6 +266,30 @@ impl Announce {
         self.signature_len = SIGNATURE_LEN as u8;
         true
     }
+
+    /// Set bounded UI metadata. It must never be used for authorization or
+    /// peer identity.
+    pub fn set_device_name(&mut self, name: &str) -> bool {
+        if name.is_empty() || name.len() > MAX_DEVICE_NAME {
+            return false;
+        }
+        self.device_name.fill(0);
+        self.device_name[..name.len()].copy_from_slice(name.as_bytes());
+        self.device_name_len = name.len() as u8;
+        true
+    }
+
+    /// Set current local-link routing metadata. This may be omitted whenever
+    /// the platform cannot establish a STA attachment or reveal its SSID.
+    pub fn set_network_name(&mut self, name: &str) -> bool {
+        if name.is_empty() || name.len() > MAX_NETWORK_NAME {
+            return false;
+        }
+        self.network_name.fill(0);
+        self.network_name[..name.len()].copy_from_slice(name.as_bytes());
+        self.network_name_len = name.len() as u8;
+        true
+    }
 }
 
 /// Encode one announce into the common direct-record envelope.
@@ -214,6 +314,10 @@ fn encode_inner(announce: Announce, include_signature: bool, out: &mut [u8]) -> 
     }
     let has_key = !announce.public_key().is_empty();
     let supplied_signature = !announce.signature().is_empty();
+    let has_name = announce.device_name().is_some();
+    let has_network_name = announce.network_name().is_some();
+    let has_sta_link_local_v6 = announce.sta_link_local_v6_present;
+    let has_ap_link_local_v6 = announce.ap_link_local_v6_present;
     // Canonical signing bytes deliberately omit field 6 even after a
     // signature has been attached. Only the full wire form requires key and
     // signature to appear together; otherwise verification of a decoded
@@ -233,7 +337,7 @@ fn encode_inner(announce: Announce, include_signature: bool, out: &mut [u8]) -> 
     e.uint(5)?;
     let has_descriptor =
         announce.device_class != DEVICE_CLASS_UNKNOWN || announce.probe_capabilities != 0;
-    e.map(4 + u64::from(has_key) + u64::from(has_signature) + 2 * u64::from(has_descriptor))?;
+    e.map(4 + u64::from(has_key) + u64::from(has_signature) + 2 * u64::from(has_descriptor) + u64::from(has_name) + u64::from(has_network_name) + u64::from(has_sta_link_local_v6) + u64::from(has_ap_link_local_v6))?;
     e.uint(FIELD_DEVICE_ID)?;
     e.bytes_value(id)?;
     e.uint(FIELD_UPTIME_SECS)?;
@@ -255,6 +359,22 @@ fn encode_inner(announce: Announce, include_signature: bool, out: &mut [u8]) -> 
     if has_signature {
         e.uint(FIELD_SIGNATURE)?;
         e.bytes_value(announce.signature())?;
+    }
+    if has_name {
+        e.uint(FIELD_DEVICE_NAME)?;
+        e.bytes_value(announce.device_name().expect("checked above").as_bytes())?;
+    }
+    if has_network_name {
+        e.uint(FIELD_NETWORK_NAME)?;
+        e.bytes_value(announce.network_name().expect("checked above").as_bytes())?;
+    }
+    if has_sta_link_local_v6 {
+        e.uint(FIELD_STA_LINK_LOCAL_V6)?;
+        e.bytes_value(&announce.sta_link_local_v6)?;
+    }
+    if has_ap_link_local_v6 {
+        e.uint(FIELD_AP_LINK_LOCAL_V6)?;
+        e.bytes_value(&announce.ap_link_local_v6)?;
     }
     Some(e.len())
 }
@@ -419,6 +539,14 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
         public_key_len: 0,
         signature: [0; SIGNATURE_LEN],
         signature_len: 0,
+        device_name: [0; MAX_DEVICE_NAME],
+        device_name_len: 0,
+        network_name: [0; MAX_NETWORK_NAME],
+        network_name_len: 0,
+        sta_link_local_v6: [0; 16],
+        sta_link_local_v6_present: false,
+        ap_link_local_v6: [0; 16],
+        ap_link_local_v6_present: false,
     };
     for _ in 0..count {
         match d.uint()? {
@@ -454,6 +582,40 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
                 announce.signature.copy_from_slice(signature);
                 announce.signature_len = SIGNATURE_LEN as u8;
             }
+            FIELD_DEVICE_NAME => {
+                let name = d.bytes_ref()?;
+                if name.is_empty()
+                    || name.len() > MAX_DEVICE_NAME
+                    || core::str::from_utf8(name).is_err()
+                    || announce.device_name().is_some()
+                {
+                    return None;
+                }
+                announce.device_name[..name.len()].copy_from_slice(name);
+                announce.device_name_len = name.len() as u8;
+            }
+            FIELD_NETWORK_NAME => {
+                let name = d.bytes_ref()?;
+                if name.is_empty()
+                    || name.len() > MAX_NETWORK_NAME
+                    || core::str::from_utf8(name).is_err()
+                    || announce.network_name().is_some()
+                {
+                    return None;
+                }
+                announce.network_name[..name.len()].copy_from_slice(name);
+                announce.network_name_len = name.len() as u8;
+            }
+            FIELD_STA_LINK_LOCAL_V6 => {
+                let address: [u8; 16] = d.bytes_ref()?.try_into().ok()?;
+                if announce.sta_link_local_v6_present { return None; }
+                announce.set_sta_link_local_v6(address);
+            }
+            FIELD_AP_LINK_LOCAL_V6 => {
+                let address: [u8; 16] = d.bytes_ref()?.try_into().ok()?;
+                if announce.ap_link_local_v6_present { return None; }
+                announce.set_ap_link_local_v6(address);
+            }
             _ => d.skip()?,
         }
     }
@@ -473,6 +635,8 @@ mod tests {
         id[..6].copy_from_slice(b"e6-c6!");
         let mut announce = Announce::discovery(id, 6, 900, 1, 17);
         announce.set_probe_descriptor(DEVICE_CLASS_ESP, 0x1f);
+        assert!(announce.set_device_name("lora-3"));
+        assert!(announce.set_network_name("mesh-test"));
         let mut wire = [0; 96];
         let used = encode(announce, &mut wire).unwrap();
         assert_eq!(decode_announce(&wire[..used]), Some(announce));

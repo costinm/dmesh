@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::{
@@ -457,12 +457,26 @@ pub struct RadioService {
     rawnan_subscribers: Arc<Mutex<HashMap<String, usize>>>,
     rawnan_state: Arc<Mutex<NanState>>,
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
+    pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
     pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     wpa_supplicants: Arc<Mutex<BTreeMap<String, lmesh_wpa::WpaSupplicant>>>,
     ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
     object_udp_started: Arc<AtomicBool>,
     transport_control: Arc<dmesh_server::udp::TransportControl>,
+}
+
+/// One caller-requested active NAN Subscribe. It retains only portable
+/// Service Info; the monitor builds a fresh frame at each confirmed DW using
+/// the current local MAC and cluster BSSID. Repeating through the next DW0 or
+/// DW8 lets sleepy peers see the same correlation ID without a timer or a
+/// second radio owner.
+#[derive(Clone, Debug)]
+struct PendingNanActiveSubscribe {
+    service_info: Vec<u8>,
+    request_id: u64,
+    sent_windows: u8,
+    last_slot: Option<u64>,
 }
 
 impl Default for RadioService {
@@ -713,6 +727,15 @@ impl DiscoveredDeviceRegistry {
                 "counters": announce.counters,
                 "device_class": announce.device_class,
                 "probe_capabilities": announce.probe_capabilities,
+                "device_name": announce.device_name(),
+                // Preserve common announce routing metadata for the generic
+                // inventory/UI.  It is advisory (never identity or auth),
+                // but lets a controller select a mutually attached UDP6
+                // bearer instead of guessing from Android's platform type.
+                "network_name": announce.network_name(),
+                "sta_link_local_v6": announce.sta_link_local_v6().map(Ipv6Addr::from).map(|address| address.to_string()),
+                "ap_link_local_v6": announce.ap_link_local_v6().map(Ipv6Addr::from).map(|address| address.to_string()),
+                "public_key": (!announce.public_key().is_empty()).then(|| hex_bytes(announce.public_key())),
             }),
             observations: BTreeMap::new(),
         });
@@ -1189,6 +1212,7 @@ impl RadioService {
             active_nan_publish: Arc::new(Mutex::new(NanActivePublish::new(
                 NAN_ACTIVE_PUBLISH_INSTANCE,
             ))),
+            pending_nan_active_subscribe: Arc::new(Mutex::new(None)),
             pending_nan_followups: Arc::new(Mutex::new(dmesh_rawnan::NanFollowupQueue::new(
                 MAX_PENDING_NAN_FOLLOWUPS,
             ))),
@@ -1547,39 +1571,35 @@ impl RadioService {
                 },
             };
             let mut wire = [0u8; 96];
-            let Some(used) = dmesh_server::control::encode_request(request, None, &mut wire) else {
+            // One discovery operation keeps one correlation ID across its
+            // DW retransmissions. Receivers use it to suppress duplicate
+            // replies from Android/host framework Subscribe repetition.
+            let Some(used) =
+                dmesh_server::control::encode_request(request, Some(started_at), &mut wire)
+            else {
                 return json!({"ok": false, "iface": iface, "error": "encode transport.discover"});
             };
-            let bssid = self
-                .rawnan_state
+            // Do not emit this immediately: sleepy firmware only receives in
+            // DW0/DW8. The existing beacon-driven monitor sends once in every
+            // confirmed DW and stops after the next DW0 or DW8 boundary.
+            *self
+                .pending_nan_active_subscribe
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .cluster()
-                .map(|cluster| cluster.0)
-                .ok_or_else(|| anyhow::anyhow!("active NAN discovery requires a selected cluster"));
-            let tx = raw_wifi_source(None, &iface)
-                .and_then(|source| bssid.map(|bssid| (source, bssid)))
-                .map(|(source, bssid)| {
-                    dmesh_rawnan::build_nan_usd_sdf_with_bssid(
-                        dmesh_rawnan::NAN_DISCOVERY_MAC,
-                        source,
-                        bssid,
-                        dmesh_rawnan::DMESH_SERVICE_ID,
-                        9,
-                        0x11,
-                        &wire[..used],
-                    )
-                })
-                .and_then(|frame| send_monitor_frame(&iface, channel, &frame, Some(6)));
-            result["nan_active_subscribe"] = match tx {
-                Ok(monitor) => {
-                    json!({"ok": true, "backend": "linux_af_packet_monitor", "monitor": monitor, "control_len": used})
-                }
-                Err(error) => {
-                    json!({"ok": false, "backend": "linux_af_packet_monitor", "error": format!("{error:#}")})
-                }
-            };
-            result["ok"] = json!(result["nan_active_subscribe"]["ok"] == true);
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(PendingNanActiveSubscribe {
+                    service_info: wire[..used].to_vec(),
+                request_id: started_at,
+                sent_windows: 0,
+                last_slot: None,
+                });
+            result["nan_active_subscribe"] = json!({
+                "ok": true,
+                "backend": "linux_af_packet_monitor",
+                "queued": true,
+                "control_len": used,
+                "request_id": started_at,
+                "stop_after_dw": "0_or_8",
+            });
         }
         if wait_ms != 0 {
             std::thread::sleep(Duration::from_millis(wait_ms));
@@ -2001,11 +2021,28 @@ impl RadioService {
 
     /// Fan out a discovery ping request to the selected media and record the intent.
     pub fn discovery_ping(&self, medium: Option<String>) -> Value {
-        self.ping(
-            Some(medium_to_radio(medium.as_deref().unwrap_or("all"))),
-            None,
-            None,
-        )
+        // An omitted medium means every currently registered, enabled radio.
+        // It must not manufacture errors for optional LoRa/STA adapters that
+        // are absent from this service instance.
+        let all_available = medium.is_none();
+        let radio = medium_to_radio(medium.as_deref().unwrap_or("all"));
+        let mut result = self.ping(Some(radio.clone()), None, None);
+        if all_available {
+            result["requested"] = json!("all_available");
+            result["unavailable"] = json!([]);
+        }
+        // A NAN discovery ping is an active `transport.discover` request, not
+        // merely a local history entry. Android and other common adapters
+        // recognize the tagged-CBOR request in the NAN SDEA and immediately
+        // re-publish their current presence descriptor.
+        if matches!(radio.as_str(), "all" | "nan" | "best") {
+            let active =
+                self.transport_discover(None, None, true, true, true, false, false, Some(1_000));
+            let active_ok = active["nan_active_subscribe"]["ok"] == true;
+            result["nan_active_discover"] = active;
+            result["ok"] = json!(result["ok"] == true && active_ok);
+        }
+        result
     }
 
     /// Ping/discover peers over one radio or all radios.
@@ -2509,6 +2546,7 @@ impl RadioService {
                 let discovered_devices = self.discovered_devices.clone();
                 let rawnan_state = self.rawnan_state.clone();
                 let active_nan_publish = self.active_nan_publish.clone();
+                let pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
                 let pending_nan_followups = self.pending_nan_followups.clone();
                 let ap_no_ht_stations = self.ap_no_ht_stations.clone();
                 let stop = Arc::new(AtomicBool::new(false));
@@ -2523,6 +2561,7 @@ impl RadioService {
                         discovered_devices,
                         rawnan_state,
                         active_nan_publish,
+                        pending_nan_active_subscribe,
                         pending_nan_followups,
                         ap_no_ht_stations,
                         channel,
@@ -3089,10 +3128,10 @@ impl RadioService {
         // field is never credentials input: only a matching private profile
         // may select WPA, and that profile supplies the password.
         let passphrase_ignored = passphrase.is_some();
-        let passphrase = match load_default_infrastructure_credentials() {
+        let credentials = match load_default_infrastructure_credentials() {
             Ok(Some(credentials)) => credentials
                 .find_by_ssid(&ssid)
-                .map(|profile| profile.password().to_owned()),
+                .map(|profile| (profile.password().to_owned(), profile.security())),
             Ok(_) => None,
             Err(error) => {
                 return json!({
@@ -3142,7 +3181,7 @@ impl RadioService {
         if anchor_up.get("ok").and_then(Value::as_bool) != Some(true) {
             return json!({"ok": false, "backend": "rtnetlink", "iface": sta_iface, "anchor_iface": iface, "cleanup": cleanup, "anchor_up": anchor_up, "failure_cleanup": self.clean_transport_state(&iface), "error": "failed to bring STA anchor up through rtnetlink"});
         }
-        let Some(passphrase) = passphrase else {
+        let Some((passphrase, security)) = credentials else {
             let mut result = self.wifi_sta_join_open(Some(sta_iface.clone()), ssid, bssid, channel);
             result["anchor_iface"] = json!(iface);
             result["cleanup"] = cleanup;
@@ -3182,17 +3221,23 @@ impl RadioService {
                 return json!({"ok": false, "backend": "wpa_supplicant", "iface": sta_iface, "anchor_iface": iface, "cleanup": cleanup, "anchor_up": anchor_up, "link_up": link_up, "failure_cleanup": self.clean_transport_state(&iface), "error": format!("{error:#}")});
             }
         };
-        if let Err(error) =
-            supplicant.connect_wpa2(ssid.as_bytes(), &passphrase, Duration::from_secs(20))
-        {
+        let association = match security {
+            crate::infra_credentials::InfrastructureSecurity::Wpa2Psk => {
+                supplicant.connect_wpa2(ssid.as_bytes(), &passphrase, Duration::from_secs(20))
+            }
+            crate::infra_credentials::InfrastructureSecurity::Wpa3Sae => {
+                supplicant.connect_wpa3_sae(ssid.as_bytes(), &passphrase, Duration::from_secs(20))
+            }
+        };
+        if let Err(error) = association {
             drop(supplicant);
-            return json!({"ok": false, "backend": "wpa_supplicant", "iface": sta_iface, "anchor_iface": iface, "auth": "wpa2-psk", "cleanup": cleanup, "anchor_up": anchor_up, "link_up": link_up, "failure_cleanup": self.clean_transport_state(&iface), "error": format!("{error:#}")});
+            return json!({"ok": false, "backend": "wpa_supplicant", "iface": sta_iface, "anchor_iface": iface, "auth": security.as_str(), "cleanup": cleanup, "anchor_up": anchor_up, "link_up": link_up, "failure_cleanup": self.clean_transport_state(&iface), "error": format!("{error:#}")});
         }
         let frequency = match supplicant.connected_frequency(Duration::from_secs(2)) {
             Ok(frequency) => frequency,
             Err(error) => {
                 drop(supplicant);
-                return json!({"ok": false, "backend": "wpa_supplicant", "iface": sta_iface, "anchor_iface": iface, "auth": "wpa2-psk", "cleanup": cleanup, "anchor_up": anchor_up, "link_up": link_up, "failure_cleanup": self.clean_transport_state(&iface), "error": format!("{error:#}")});
+                return json!({"ok": false, "backend": "wpa_supplicant", "iface": sta_iface, "anchor_iface": iface, "auth": security.as_str(), "cleanup": cleanup, "anchor_up": anchor_up, "link_up": link_up, "failure_cleanup": self.clean_transport_state(&iface), "error": format!("{error:#}")});
             }
         };
         self.wpa_supplicants
@@ -3237,7 +3282,7 @@ impl RadioService {
             "iface": sta_iface,
             "anchor_iface": iface,
             "ssid": ssid,
-            "auth": "wpa2-psk",
+            "auth": security.as_str(),
             "frequency_mhz": frequency,
             "cleanup": cleanup,
             "passphrase_ignored": passphrase_ignored,
@@ -3777,6 +3822,7 @@ impl RadioService {
                 let listener_key_for_thread = listener_key.clone();
                 let rawnan_state = self.rawnan_state.clone();
                 let active_nan_publish = self.active_nan_publish.clone();
+                let pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
                 let pending_nan_followups = self.pending_nan_followups.clone();
                 let raw_action_dispatcher = self.raw_action_dispatcher.clone();
                 let stop_flag = Arc::new(AtomicBool::new(false));
@@ -3793,6 +3839,7 @@ impl RadioService {
                         discovered_devices,
                         rawnan_state,
                         active_nan_publish,
+                        pending_nan_active_subscribe,
                         pending_nan_followups,
                         raw_action_dispatcher,
                         stop_flag,
@@ -8782,6 +8829,7 @@ fn ap_mgmt_receive_loop(
     discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
     rawnan_state: Arc<Mutex<NanState>>,
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
+    pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
     pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
     ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
     channel: u8,
@@ -8816,6 +8864,16 @@ fn ap_mgmt_receive_loop(
                         &rawnan_state,
                         &active_nan_publish,
                         |publish| send_monitor_frame(iface, channel, publish, Some(6)).map(|_| ()),
+                    );
+                    drain_pending_nan_active_subscribe(
+                        iface,
+                        iface,
+                        &history,
+                        &rawnan_state,
+                        &pending_nan_active_subscribe,
+                        |subscribe| {
+                            send_monitor_frame(iface, channel, subscribe, Some(6)).map(|_| ())
+                        },
                     );
                     drain_pending_nan_followups(
                         iface,
@@ -8974,6 +9032,105 @@ fn ap_mgmt_receive_loop(
             }
         }
     }
+}
+
+/// Send the active discovery Subscribe in every confirmed DW until the next
+/// DW0/DW8 boundary. This is deliberately beacon-driven: it gives always-awake
+/// peers the first window and guarantees the sleepy DW0/DW8 profile gets one
+/// chance, without an unsynchronised retry timer.
+fn drain_pending_nan_active_subscribe<F>(
+    iface: &str,
+    event_source: &str,
+    history: &Arc<Mutex<VecDeque<RadioEvent>>>,
+    rawnan_state: &Arc<Mutex<NanState>>,
+    pending: &Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
+    mut send_subscribe: F,
+) where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    let now_us = now_micros_u64();
+    let Some((last_beacon_us, tsf_us, period_us)) = rawnan_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .nan_sync_timing()
+    else {
+        return;
+    };
+    let dwell_age_us = now_us.saturating_sub(last_beacon_us);
+    if !dmesh_rawnan::beacon_dwell_open(dwell_age_us) {
+        return;
+    }
+    let Some(slot) = dmesh_rawnan::beacon_slot(tsf_us, period_us) else {
+        return;
+    };
+    let bssid = rawnan_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sync_bssid()
+        .map(|mac| mac.0);
+    let Ok(local) = iface_mac(iface) else {
+        return;
+    };
+    let Some(bssid) = bssid else {
+        return;
+    };
+    let Some(item) = ({
+        let guard = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .as_ref()
+            .filter(|item| item.last_slot != Some(slot))
+            .cloned()
+    }) else {
+        return;
+    };
+    let result = (|| {
+        let frame = dmesh_rawnan::build_nan_usd_sdf_with_bssid(
+            dmesh_rawnan::NAN_DISCOVERY_MAC,
+            local,
+            bssid,
+            dmesh_rawnan::DMESH_SERVICE_ID,
+            9,
+            0x11,
+            &item.service_info,
+        );
+        send_subscribe(&frame)
+    })();
+    let terminal_window = slot % 8 == 0;
+    let mut guard = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard
+        .as_ref()
+        .is_some_and(|current| current.request_id == item.request_id)
+    {
+        if terminal_window {
+            *guard = None;
+        } else if let Some(current) = guard.as_mut() {
+            current.last_slot = Some(slot);
+            current.sent_windows = current.sent_windows.saturating_add(1);
+        }
+    }
+    push_radio_event(
+        history,
+        RadioEvent {
+            ts_millis: now_millis(),
+            key: "wifi.rawnan.active_subscribe_tx".to_string(),
+            source: event_source.to_string(),
+            value: json!({
+                "ok": result.is_ok(),
+                "request_id": item.request_id,
+                "control_len": item.service_info.len(),
+                "slot": slot,
+                "terminal_dw0_or_dw8": terminal_window,
+                "sent_windows_before": item.sent_windows,
+                "dwell_age_us": dwell_age_us,
+                "error": result.err().map(|error| format!("{error:#}")),
+            }),
+            message: None,
+        },
+    );
 }
 
 /// Queue a bounded NAN payload until a beacon confirms that the selected DW
@@ -9734,6 +9891,7 @@ fn monitor_receive_loop(
     discovered_devices: Arc<Mutex<DiscoveredDeviceRegistry>>,
     rawnan_state: Arc<Mutex<NanState>>,
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
+    pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
     pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
     raw_action_dispatcher: Arc<
         Mutex<
@@ -9888,6 +10046,24 @@ fn monitor_receive_loop(
                                     (written == packet.len())
                                         .then_some(())
                                         .ok_or_else(|| anyhow::anyhow!("short NAN Publish write"))
+                                })
+                            },
+                        );
+                        drain_pending_nan_active_subscribe(
+                            iface,
+                            monitor_iface,
+                            &history,
+                            &rawnan_state,
+                            &pending_nan_active_subscribe,
+                            |subscribe| {
+                                let packet = build_radiotap_packet_at_rate(subscribe, Some(6))?;
+                                let socket = tx_socket.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!("monitor TX socket unavailable")
+                                })?;
+                                socket.send(&packet).and_then(|written| {
+                                    (written == packet.len())
+                                        .then_some(())
+                                        .ok_or_else(|| anyhow::anyhow!("short NAN Subscribe write"))
                                 })
                             },
                         );

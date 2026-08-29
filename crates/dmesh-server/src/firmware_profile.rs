@@ -27,6 +27,15 @@ pub const UART_115200: u8 = 1;
 /// this selector: it is a debug/JTAG path, not a controllable UART peripheral.
 pub const UART_OFF: u8 = 8;
 
+/// Authentication selected by a persisted STA profile.  Keep WPA3-SAE
+/// separate from WPA2-PSK: the ESP adapter must require PMF and never silently
+/// turn an SAE profile into a WPA2 or open association.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaSecurity {
+    Wpa2Psk,
+    Wpa3Sae,
+}
+
 /// Normalize a public UART selector before storing it in a profile.
 /// `0` requests the 115200 default; malformed selectors are rejected by the
 /// wire decoder before they reach this helper.
@@ -47,6 +56,10 @@ pub struct TransportProfile {
     /// explicitly selected for this transient radio epoch.
     pub sta_passphrase: [u8; 64],
     pub sta_passphrase_len: usize,
+    /// Security mode for a persisted/Main bootstrap profile. Volatile
+    /// `transport.start` continues to default to WPA2 unless a later control
+    /// schema explicitly gains a security field.
+    pub sta_security: StaSecurity,
     /// Optional exact AP identity supplied with the transient STA start.
     pub sta_bssid: [u8; 6],
     pub sta_bssid_set: bool,
@@ -123,6 +136,7 @@ impl TransportProfile {
             ssid_len: 0,
             sta_passphrase: [0; 64],
             sta_passphrase_len: 0,
+            sta_security: StaSecurity::Wpa2Psk,
             sta_bssid: [0; 6],
             sta_bssid_set: false,
             sta_channel: 0,

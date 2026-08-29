@@ -41,7 +41,10 @@ impl WpaEventMonitor {
     pub fn recv(&self, timeout: Duration) -> Result<String> {
         self.socket.set_read_timeout(Some(timeout)).ok();
         let mut response = vec![0u8; 8192];
-        let len = self.socket.recv(&mut response).context("receive WPA event")?;
+        let len = self
+            .socket
+            .recv(&mut response)
+            .context("receive WPA event")?;
         Ok(String::from_utf8_lossy(&response[..len]).trim().to_owned())
     }
 }
@@ -80,7 +83,9 @@ impl WpaClient {
         socket.set_read_timeout(Some(timeout)).ok();
         socket.send(b"ATTACH").context("attach WPA event socket")?;
         let mut response = [0u8; 64];
-        let len = socket.recv(&mut response).context("receive WPA ATTACH response")?;
+        let len = socket
+            .recv(&mut response)
+            .context("receive WPA ATTACH response")?;
         if String::from_utf8_lossy(&response[..len]).trim() != "OK" {
             let _ = fs::remove_file(&local_path);
             bail!("wpa_supplicant rejected ATTACH");
@@ -123,6 +128,7 @@ pub struct WpaSupplicant {
     control: WpaClient,
     control_dir: PathBuf,
     iface: String,
+    diagnostics: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl WpaSupplicant {
@@ -194,6 +200,7 @@ impl WpaSupplicant {
             control,
             control_dir,
             iface: iface.to_owned(),
+            diagnostics,
         })
     }
 
@@ -205,23 +212,83 @@ impl WpaSupplicant {
         {
             bail!("invalid WPA profile");
         }
-        let network = self.command_ok("ADD_NETWORK", timeout)?;
-        let id = network.parse::<u32>().context("parse WPA network id")?;
-        self.command_ok(&format!("SET_NETWORK {id} ssid {}", hex(ssid)), timeout)?;
-        self.command_ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK"), timeout)?;
+        let network = self
+            .command_ok("ADD_NETWORK", timeout)
+            .context("WPA2 ADD_NETWORK")?;
+        let id = network.parse::<u32>().context("parse WPA2 network id")?;
+        self.command_ok(&format!("SET_NETWORK {id} ssid {}", hex(ssid)), timeout)
+            .context("WPA2 SET_NETWORK ssid")?;
+        self.command_ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK"), timeout)
+            .context("WPA2 SET_NETWORK key_mgmt")?;
         self.command_ok(
             &format!("SET_NETWORK {id} psk \"{}\"", escape_wpa(passphrase)),
             timeout,
-        )?;
-        self.command_ok(&format!("SELECT_NETWORK {id}"), timeout)?;
+        )
+        .context("WPA2 SET_NETWORK credential")?;
+        self.command_ok(&format!("SELECT_NETWORK {id}"), timeout)
+            .context("WPA2 SELECT_NETWORK")?;
         let deadline = Instant::now() + timeout;
         loop {
-            let status = self.control.command("STATUS", Duration::from_secs(1))?;
+            let status = self
+                .control
+                .command("STATUS", Duration::from_secs(1))
+                .context("WPA2 STATUS")?;
             if status.lines().any(|line| line == "wpa_state=COMPLETED") {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 bail!("timed out waiting for WPA association");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Connect to a WPA3-Personal SAE network.  SAE is deliberately separate
+    /// from WPA2-PSK: PMF is required and callers get an explicit command
+    /// failure instead of a security downgrade.
+    pub fn connect_wpa3_sae(
+        &self,
+        ssid: &[u8],
+        passphrase: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        if ssid.is_empty()
+            || ssid.len() > 32
+            || !(8..=63).contains(&passphrase.len())
+            || passphrase.contains('\0')
+        {
+            bail!("invalid WPA3 SAE profile");
+        }
+        let network = self
+            .command_ok("ADD_NETWORK", timeout)
+            .context("WPA3 ADD_NETWORK")?;
+        let id = network.parse::<u32>().context("parse WPA3 network id")?;
+        self.command_ok(&format!("SET_NETWORK {id} ssid {}", hex(ssid)), timeout)
+            .context("WPA3 SET_NETWORK ssid")?;
+        self.command_ok(&format!("SET_NETWORK {id} key_mgmt SAE"), timeout)
+            .context("WPA3 SET_NETWORK key_mgmt")?;
+        self.command_ok(&format!("SET_NETWORK {id} ieee80211w 2"), timeout)
+            .context("WPA3 SET_NETWORK PMF")?;
+        self.command_ok(&format!("SET_NETWORK {id} sae_pwe 2"), timeout)
+            .context("WPA3 SET_NETWORK SAE PWE")?;
+        self.command_ok(
+            &format!("SET_NETWORK {id} psk \"{}\"", escape_wpa(passphrase)),
+            timeout,
+        )
+        .context("WPA3 SET_NETWORK credential")?;
+        self.command_ok(&format!("SELECT_NETWORK {id}"), timeout)
+            .context("WPA3 SELECT_NETWORK")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self
+                .control
+                .command("STATUS", Duration::from_secs(1))
+                .context("WPA3 STATUS")?;
+            if status.lines().any(|line| line == "wpa_state=COMPLETED") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for WPA3 SAE association");
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -327,12 +394,42 @@ impl WpaSupplicant {
     }
 
     fn command_ok(&self, command: &str, timeout: Duration) -> Result<String> {
-        let response = self.control.command(command, timeout)?;
+        let response = self.control.command(command, timeout).map_err(|error| {
+            // The command text can contain a PSK. Never render it here; the
+            // caller adds a fixed, non-secret phase label instead.
+            let output = self
+                .diagnostics
+                .lock()
+                .ok()
+                .map(|text| redact_child_output(&text))
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "no child output".to_owned());
+            anyhow::anyhow!("{error}; wpa_supplicant output={output:?}")
+        })?;
         if response == "FAIL" {
             bail!("wpa_supplicant rejected command");
         }
         Ok(response)
     }
+}
+
+fn redact_child_output(value: &str) -> String {
+    let mut safe = String::new();
+    for line in value.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("psk")
+            || lower.contains("password")
+            || lower.contains("passphrase")
+            || lower.contains("sae_password")
+        {
+            continue;
+        }
+        if !safe.is_empty() {
+            safe.push('\n');
+        }
+        safe.push_str(line);
+    }
+    safe
 }
 
 /// Previous lmesh releases could leave a P2P device child after the parent
@@ -368,9 +465,7 @@ fn wait_for_p2p_group(events: &WpaEventMonitor, timeout: Duration) -> Result<P2p
         if let Some(group) = parse_p2p_group_started(&event) {
             return Ok(group);
         }
-        if event.contains("P2P-GROUP-FORMATION-FAILURE")
-            || event.contains("P2P-GO-NEG-FAILURE")
-        {
+        if event.contains("P2P-GROUP-FORMATION-FAILURE") || event.contains("P2P-GO-NEG-FAILURE") {
             bail!("P2P group formation failed: {event}");
         }
     }
@@ -403,7 +498,10 @@ fn parse_p2p_group_started(event: &str) -> Option<P2pGroup> {
 }
 
 fn validate_hex(value: &str, name: &str) -> Result<()> {
-    if value.is_empty() || value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.is_empty()
+        || value.len() % 2 != 0
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         bail!("invalid {name}");
     }
     Ok(())

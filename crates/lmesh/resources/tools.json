@@ -273,14 +273,13 @@
     "title": "Steer Link"
   },
   {
-    "description": "Queue a discovery ping intent for one medium or all configured media.",
+    "description": "Request fresh presence on one medium. With medium omitted, fan out across every currently enabled radio; NAN sends active transport.discover and UDP multicast sends the signed host announce.",
     "group": "Discovery",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "medium": {
-          "default": "all",
-          "description": "Radio medium to ping, or all.",
+          "description": "Optional radio medium. Omit for all currently enabled radios.",
           "title": "Medium",
           "type": "string"
         }
@@ -491,6 +490,11 @@
           "title": "Destination MAC",
           "type": "string"
         },
+        "expected_peer": {
+          "description": "Optional MAC expected to answer the IPERF exchange.",
+          "title": "Expected responder MAC",
+          "type": "string"
+        },
         "iface": {
           "default": "wlan1",
           "title": "Interface",
@@ -552,7 +556,7 @@
       "type": "object"
     },
     "name": "wifi.raw.iperf",
-    "title": "Raw Action IPERF"
+    "title": "Perf (raw radio fallback)"
   },
   {
     "description": "Send a small custom raw-action probe.",

@@ -105,9 +105,7 @@ impl WifiService {
         };
         if ap {
             let backend = if open { "open" } else { "p2p" };
-            return self
-                .radio
-                .wifi_p2p_transport_start(Some(iface), &backend);
+            return self.radio.wifi_p2p_transport_start(Some(iface), &backend);
         }
         let bssid = match parse_bssid(bssid.as_deref()) {
             Ok(bssid) => bssid,
@@ -164,7 +162,9 @@ impl WifiService {
         } else {
             serde_json::json!({"ok": false, "state": "not_started", "reason": "monitor setup failed"})
         };
-        let beacon_listener = if monitor.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let beacon_listener = if monitor.get("ok").and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
             self.radio.wifi_nan_beacon_listen(Some(iface.clone()))
         } else {
             serde_json::json!({"ok": false, "state": "not_started", "reason": "monitor setup failed"})

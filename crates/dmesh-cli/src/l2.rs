@@ -6,6 +6,8 @@
 //! use driver backpressure instead: assigning them a nominal baud rate would
 //! create an artificial transport bottleneck.
 
+// TODO: move to uart-code crate, specific to uart.
+
 use std::collections::VecDeque;
 
 pub struct UartEgressPacer {

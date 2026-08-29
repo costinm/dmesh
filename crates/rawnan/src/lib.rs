@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use alloc::{vec, vec::Vec};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 pub mod espnow;
 pub use espnow::{
     action_header as espnow_action_header, build_action_frame as build_espnow_action_frame,
@@ -28,13 +28,13 @@ pub use channel_observation::{ChannelObservation, ChannelObservationSummary};
 
 pub mod service;
 pub use service::{
-    ActiveSubscribeServiceInfo, DmeshNanFollowup, DmeshServiceInfo, NAN_ACTIVE_PUBLISH_INTERVAL_MS,
-    NAN_ACTIVE_PUBLISH_MAX_LEN, NanActivePublish, NanFollowupEnqueue, NanFollowupIntent,
-    NanFollowupQueue, active_ack_for_service, active_subscribe_service_info,
-    build_dmesh_followup_payload, build_dmesh_service_info, build_nan_followup_sdf,
-    build_nan_publish_sdf, build_nan_publish_sdf_with_sdea, build_nan_service_extension,
-    build_nan_usd_sdf, build_nan_usd_sdf_with_bssid, is_dmesh_service_info,
-    parse_dmesh_nan_followup, parse_dmesh_service_info, wake_request_for_service,
+    active_ack_for_service, active_subscribe_service_info, build_dmesh_followup_payload,
+    build_dmesh_service_info, build_nan_followup_sdf, build_nan_publish_sdf,
+    build_nan_publish_sdf_with_sdea, build_nan_service_extension, build_nan_usd_sdf,
+    build_nan_usd_sdf_with_bssid, is_dmesh_service_info, parse_dmesh_nan_followup,
+    parse_dmesh_service_info, wake_request_for_service, ActiveSubscribeServiceInfo,
+    DmeshNanFollowup, DmeshServiceInfo, NanActivePublish, NanFollowupEnqueue, NanFollowupIntent,
+    NanFollowupQueue, NAN_ACTIVE_PUBLISH_INTERVAL_MS, NAN_ACTIVE_PUBLISH_MAX_LEN,
 };
 
 pub const FRAME_DST: usize = 4;
@@ -238,7 +238,7 @@ pub mod metrics {
         )
     }
 
-    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
     pub static NAN_RX_MGMT: AtomicU32 = AtomicU32::new(0);
     pub static NAN_RX_ACTION: AtomicU32 = AtomicU32::new(0);
@@ -365,7 +365,11 @@ pub mod metrics {
     }
 
     fn min_or_zero(value: u32) -> u32 {
-        if value == u32::MAX { 0 } else { value }
+        if value == u32::MAX {
+            0
+        } else {
+            value
+        }
     }
 
     /// Snapshot the shared atomics without taking an adapter-specific lock.
@@ -943,11 +947,9 @@ mod tests {
         assert_eq!(&publish[4..10], &destination);
         assert_eq!(&publish[10..16], &source);
         assert_eq!(&publish[16..22], &cluster);
-        assert!(
-            publish
-                .windows(7)
-                .any(|window| window == [0x0e, 0x04, 0x00, 1, 0, 2, 3])
-        );
+        assert!(publish
+            .windows(7)
+            .any(|window| window == [0x0e, 0x04, 0x00, 1, 0, 2, 3]));
         // Active publish SDF carries opaque Service Info verbatim. Firmware
         // dispatches these bytes as a direct CBOR command only after copying
         // them out of the Wi-Fi callback into the shared ingress pool.
@@ -1031,9 +1033,7 @@ mod tests {
         assert_eq!(&two_second[12..14], &one_second[12..14]);
         assert_eq!(
             build_nan_device_capability_attribute(4).unwrap(),
-            [
-                0x0f, 0x09, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00
-            ]
+            [0x0f, 0x09, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00]
         );
         assert!(build_nan_device_capability_attribute(3).is_err());
         assert_eq!(
@@ -1522,6 +1522,11 @@ impl NanState {
                 return Action::ArmA3(a3);
             }
             if self.cluster == Some(a3) {
+                // Each selected NAN beacon advances the common DW slot.
+                // Retaining the first TSF made host DW work reuse a stale
+                // slot indefinitely even while its local receive time moved.
+                self.last_beacon_tsf_us = beacon_tsf_us(frame.bytes).unwrap_or(0);
+                self.beacon_interval_tu = beacon_interval_tu(frame.bytes).unwrap_or(0);
                 self.last_beacon_us = frame.timestamp_us;
                 return Action::None;
             }

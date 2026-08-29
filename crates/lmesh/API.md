@@ -23,6 +23,41 @@ update the owning component API instead of duplicating method documentation.
 
 ## Reviewed tagged-CBOR core
 
+## Local REST admin bridge
+
+Set `LMESH_HTTP_PORT` to a non-zero port to enable the generic ssh-mesh admin
+REST bridge on `127.0.0.1`. It registers this lmesh instance through its
+existing UDS socket; it does not start another lmesh process or own radios.
+Set upstream `SSH_MESH_HTTP_API_KEY` to require the matching `apikey` query
+parameter. A valid parameter is returned as the `mesh_api_key` cookie, which
+subsequent REST calls use automatically.
+
+The initial schema-free record endpoint is:
+
+```text
+POST /_m/mesh/services/lmesh/records?mode=request|oneway
+Content-Type: application/json | application/cbor
+```
+
+JSON requests use the tagged-record envelope (`component`, `method`, optional
+`id`, `env`, `to`, and `data`). Decimal JSON keys in `env`, such as
+`{"1":4}`, encode as CBOR integer keys. `application/cbor` sends the tagged
+record through unchanged. A missing `id` is the existing one-way message form;
+`mode=oneway` validates that choice, while `mode=request` requires an ID. A
+`to` field is forwarded by lmesh rather than executed locally.
+
+`GET /_m/mesh/services` lists registered services and
+`GET /_m/mesh/services/lmesh/tools` returns the combined lmesh/lmesh-wifi
+catalog used by the browser and named clients.
+
+The embedded admin UI is at `/_m/adm/`. Its `dashboard.html` page is a
+catalog-driven operational view: it displays the available status and device
+inventories, offers an on-demand discovery ping where `discovery.ping` is
+published, and renders the bounded Perf form when a compatible performance
+method is advertised. `wifi.raw.iperf` remains the raw-radio fallback; it
+labels local submission and the handler result separately;
+a transmit result with zero received packets is not peer completion.
+
 The following small discovery core is the first reviewed `lmesh` tagged-CBOR
 surface. Its component index is 4. The remaining legacy commands stay in the
 catalog without numeric IDs and therefore use the explicit JSON-RPC gateway;

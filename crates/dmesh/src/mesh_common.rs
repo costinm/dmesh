@@ -4,6 +4,8 @@
 //! mesh logic. JNI-specific marshalling stays in the wrapper module.
 
 use dmesh_store::StoreService;
+use mesh::{tagged::TaggedRecord, wire::TaggedRecordHandler};
+use serde_json::json;
 #[cfg(target_os = "android")]
 use sha2::{Digest, Sha256};
 use ssh_mesh::sshc::SshClientManager;
@@ -32,7 +34,7 @@ pub struct MeshHandle {
     pub udp_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub announce_server_handle: Option<tokio::task::JoinHandle<()>>,
     /// Platform network transitions request an immediate announce without
-    /// changing the fifteen-minute periodic cadence.
+    /// changing the five-minute periodic cadence.
     pub announce_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
@@ -40,6 +42,30 @@ pub struct MeshHandle {
 pub struct MeshStreamHandle {
     pub stream: DuplexStream,
     pub runtime_handle: tokio::runtime::Handle,
+}
+
+/// DMesh's Android-specific registration for the generic ssh-mesh service
+/// registry.  This is an in-process adapter only: request execution is a
+/// direct Rust call into the established Android control dispatcher.
+struct AndroidControlHandler;
+
+fn android_http_catalog() -> serde_json::Value {
+    // Deliberately small until each mutating platform action implements the
+    // common dmesh-server tagged control schema and reports capabilities.
+    json!({"tools": [
+        {"name":"radio.status_text","description":"Read the Rust-owned mesh status summary.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"radio.devices","description":"Read the bounded cross-bearer device inventory.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"radio.local_networks","description":"Read platform-observed local network facts.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"radio.perf.udp6","description":"Run the common bounded perf service over a discovered peer's shared STA UDP6 path. Both peers must announce the same current SSID and the peer must have a fresh UDP multicast address.","inputSchema":{"type":"object","properties":{"target_id":{"type":"string","description":"Discovered device ID."},"bytes":{"type":"integer","minimum":1,"maximum":262144,"default":32768},"packet_size":{"type":"integer","minimum":64,"maximum":1100,"default":1100}},"required":["target_id"],"additionalProperties":false}},
+        {"name":"radio.power.state","description":"Read bounded power and memory observations.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}
+    ]})
+}
+
+#[async_trait::async_trait]
+impl TaggedRecordHandler for AndroidControlHandler {
+    async fn handle_record(&self, record: TaggedRecord) -> anyhow::Result<Option<TaggedRecord>> {
+        crate::mesh_jni::handle_tagged_control_record(record)
+    }
 }
 
 /// Create and start a mesh node.
@@ -109,14 +135,25 @@ pub fn start_mesh(
     // Spawn HTTP server if port configured
     let mut http_server_handle = None;
     if let Some(h_port) = node.http_port() {
+        let mesh_services = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
+        mesh_services.register(
+            "android",
+            ssh_mesh::mesh_rest::MeshService {
+                backend: ssh_mesh::mesh_rest::MeshServiceBackend::Direct(Arc::new(
+                    AndroidControlHandler,
+                )),
+                catalog: Some(android_http_catalog()),
+            },
+        );
         let app_state = ssh_mesh::AppState {
             ssh_server: node.clone(),
             target_http_address: None,
             ssh_client_manager: client_manager.clone(),
+            mesh_services,
         };
         let app = ssh_mesh::handlers::app(app_state);
         http_server_handle = Some(runtime.spawn(async move {
-            let addr = format!("0.0.0.0:{}", h_port);
+            let addr = format!("127.0.0.1:{}", h_port);
             match tokio::net::TcpListener::bind(&addr).await {
                 Ok(listener) => {
                     if let Err(e) = axum::serve(listener, app.into_make_service()).await {
@@ -233,7 +270,7 @@ async fn android_announce_loop(
     id.copy_from_slice(&digest[..16]);
     let take = id.len();
     let started = tokio::time::Instant::now();
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     let mut receive = [0u8; 256];
     let mut boot_pending = true;
     let mut joined_interfaces = BTreeSet::new();
@@ -294,6 +331,13 @@ async fn send_android_announce(
             0,
         )
     };
+    let mut announce = announce;
+    // Android's multicast sender enumerates the live kernel interfaces, so
+    // this is an observed endpoint rather than a guessed MAC-derived value.
+    // A peer still needs its own local scope when using this link-local route.
+    if let Some(address) = first_link_local_v6() {
+        announce.set_sta_link_local_v6(address.octets());
+    }
     let mut wire = [0u8; 96];
     let Some(used) = dmesh_server::announce::encode(announce, &mut wire) else {
         return false;
@@ -357,6 +401,33 @@ fn multicast_interface_indices() -> Vec<u32> {
         libc::freeifaddrs(head);
     }
     interfaces.into_iter().collect()
+}
+
+/// First active non-loopback IPv6 link-local address available to the Android
+/// mesh process.  It is attached to the common announce so peers can identify
+/// a real UDP6 endpoint; interface scope remains a local sender property.
+#[cfg(target_os = "android")]
+fn first_link_local_v6() -> Option<Ipv6Addr> {
+    unsafe {
+        let mut head = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 { return None; }
+        let mut current = head;
+        let mut result = None;
+        while !current.is_null() {
+            let entry = &*current;
+            let enabled = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
+            let loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
+            if enabled && !loopback && !entry.ifa_addr.is_null()
+                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
+            {
+                let address = Ipv6Addr::from((*(entry.ifa_addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr);
+                if address.is_unicast_link_local() { result = Some(address); break; }
+            }
+            current = entry.ifa_next;
+        }
+        libc::freeifaddrs(head);
+        result
+    }
 }
 
 /// Connect to a remote SSH server.

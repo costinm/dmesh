@@ -5,6 +5,8 @@
 //! `dmesh-cli`, `lmesh-wifi`, and `lmesh` can therefore make identical target
 //! choices without recreating the retired forwarding configuration.
 
+// TODO: move to dmesh-server, make sure it doesn't duplicate the core discovery info and persisted devices.
+
 use serde::Deserialize;
 use std::{
     fs,

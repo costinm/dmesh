@@ -22,6 +22,8 @@ struct CredentialsToml {
     #[serde(default)]
     password: Option<String>,
     #[serde(default)]
+    security: Option<String>,
+    #[serde(default)]
     networks: Vec<NetworkToml>,
 }
 
@@ -30,6 +32,8 @@ struct CredentialsToml {
 struct NetworkToml {
     ssid: String,
     password: String,
+    #[serde(default)]
+    security: Option<String>,
     #[serde(default)]
     default_gateway: Option<String>,
     #[serde(default)]
@@ -56,12 +60,28 @@ pub struct InfrastructureCredentials {
 pub struct InfrastructureProfile {
     ssid: String,
     password: String,
+    security: InfrastructureSecurity,
     default_gateway: Option<std::net::IpAddr>,
     ipv4_address: Option<std::net::Ipv4Addr>,
     ipv4_prefix: Option<u8>,
     ipv6_address: Option<std::net::Ipv6Addr>,
     ipv6_prefix: Option<u8>,
     ipv6_gateway: Option<std::net::Ipv6Addr>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InfrastructureSecurity {
+    Wpa2Psk,
+    Wpa3Sae,
+}
+
+impl InfrastructureSecurity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wpa2Psk => "wpa2-psk",
+            Self::Wpa3Sae => "wpa3-sae",
+        }
+    }
 }
 
 impl InfrastructureCredentials {
@@ -90,10 +110,15 @@ impl InfrastructureProfile {
         &self.password
     }
 
+    pub const fn security(&self) -> InfrastructureSecurity {
+        self.security
+    }
+
     fn redacted_status(&self) -> Value {
         json!({
             "ssid": self.ssid,
             "password_present": true,
+            "security": self.security.as_str(),
             "default_gateway": self.default_gateway.is_some(),
             "ipv4_static": self.ipv4_address.is_some(),
             "ipv6_static": self.ipv6_address.is_some(),
@@ -144,6 +169,7 @@ pub fn load_infrastructure_credentials(
                     path.display()
                 )
             })?,
+            security: credentials.security,
             default_gateway: None,
             ipv4_address: None,
             ipv4_netmask: None,
@@ -180,6 +206,11 @@ pub fn load_infrastructure_credentials(
                 path.display()
             );
         }
+        let security = match network.security.as_deref().unwrap_or("wpa2-psk") {
+            "wpa2-psk" => InfrastructureSecurity::Wpa2Psk,
+            "wpa3-sae" => InfrastructureSecurity::Wpa3Sae,
+            _ => bail!("infrastructure credential file {} has unsupported security", path.display()),
+        };
         if network.ipv4_netmask.is_some() && network.ipv4_prefix.is_some() {
             bail!(
                 "infrastructure credential file {} configures both ipv4_netmask and ipv4_prefix",
@@ -221,6 +252,7 @@ pub fn load_infrastructure_credentials(
         profiles.push(InfrastructureProfile {
             ssid: network.ssid,
             password: network.password,
+            security,
             default_gateway,
             ipv4_address,
             ipv4_prefix,

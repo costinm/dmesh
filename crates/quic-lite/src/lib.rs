@@ -2992,14 +2992,12 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         let immediate_control = self.control_pending
             || self.pending_ack_frequency.is_some()
             || (self.ack_pending && self.ack_packets >= self.ack_frequency);
-        let ack_deadline = self
-            .ack_pending
-            .then_some(if immediate_control {
-                self.send_clock
-            } else {
-                self.largest_received_at
-                    .saturating_add(self.max_ack_delay_ms)
-            });
+        let ack_deadline = self.ack_pending.then_some(if immediate_control {
+            self.send_clock
+        } else {
+            self.largest_received_at
+                .saturating_add(self.max_ack_delay_ms)
+        });
         let earliest_sent = self
             .sent_packets
             .iter()

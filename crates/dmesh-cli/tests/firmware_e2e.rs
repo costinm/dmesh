@@ -4059,6 +4059,96 @@ fn firmware_e6_transport_start_open_ap() {
     e6.assert_healthy().unwrap();
 }
 
+/// Probe the private registered-action path with an AP-advertised P2P peer.
+/// DW=0 keeps promiscuous capture off, so any Android GAS request observed by
+/// the firmware must have reached the registered callback.
+#[test]
+#[ignore = "requires e6 Main UART and an Android P2P service query"]
+fn firmware_e6_registered_action_ap_no_dw() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(1),
+                nan_dw_interval: Some(0),
+                ap: Some(1),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_5032_5047,
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.channel == Some(6)
+            && radio.ap_active == Some(true)
+            && radio.promiscuous == Some(false)
+            && radio.nan_dw_interval == Some(0)
+        {
+            eprintln!(
+                "firmware-e2e row=e6-registered-action-ap-no-dw {}",
+                snapshot_summary(&radio)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 did not reach AP registered-action state: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    e6.assert_healthy().unwrap();
+}
+
+/// Keep e6 awake and unassociated on channel 6 with neither an AP nor NAN-DW
+/// promiscuous capture. This isolates whether an independently advertised P2P
+/// peer causes Android traffic that the registered ESP action callback sees.
+#[test]
+#[ignore = "requires e6 Main UART and an independent channel-6 P2P advertiser"]
+fn firmware_e6_registered_action_no_ap_no_dw() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    control_request(
+        &mut e6,
+        ControlRequest::TransportStart {
+            kind: TransportKind::Nan,
+            config: dmesh_server::control::TransportConfig {
+                channel: Some(6),
+                now: Some(1),
+                nan_dw_interval: Some(0),
+                ap: Some(0),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        },
+        0xE6_5032_5030,
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let radio = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if radio.channel == Some(6)
+            && radio.ap_active == Some(false)
+            && radio.promiscuous == Some(false)
+            && radio.nan_dw_interval == Some(0)
+        {
+            eprintln!(
+                "firmware-e2e row=e6-registered-action-no-ap-no-dw {}",
+                snapshot_summary(&radio)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "e6 did not reach no-AP registered-action state: {}",
+            snapshot_summary(&radio)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    e6.assert_healthy().unwrap();
+}
+
 /// Run the infrastructure-independent AP/STA row for any two ESP32 Main
 /// descriptors that provide a local USB connection. The source board owns its
 /// selected AP (WPA2-PSK by default, or explicit `open=1`); the target
@@ -5291,7 +5381,12 @@ fn configure_sta_for_wlan0_with_now(
     );
 }
 
-fn configure_nan_for_channel(session: &mut DeviceSession, channel: u8, id: u64) {
+fn configure_nan_for_channel_with_dw(
+    session: &mut DeviceSession,
+    channel: u8,
+    dw_interval: u8,
+    id: u64,
+) {
     control_request(
         session,
         ControlRequest::TransportStart {
@@ -5299,11 +5394,8 @@ fn configure_nan_for_channel(session: &mut DeviceSession, channel: u8, id: u64) 
             config: dmesh_server::control::TransportConfig {
                 channel: Some(channel),
                 now: Some(0),
-                // Active NAN/NOW is the normal discovery/control-plane
-                // personality. DW=0 is reserved for low-level lab tests;
-                // the shared prober must leave the endpoint discoverable
-                // while it measures the NOW bearer.
-                nan_dw_interval: Some(1),
+                ap: Some(0),
+                nan_dw_interval: Some(dw_interval),
                 ..dmesh_server::control::TransportConfig::default()
             },
         },
@@ -5316,6 +5408,12 @@ fn configure_nan_for_channel(session: &mut DeviceSession, channel: u8, id: u64) 
     session
         .poll(Duration::from_millis(750))
         .unwrap_or_else(|error| panic!("{} NAN/NOW transition: {error}", session.path()));
+}
+
+fn configure_nan_for_channel(session: &mut DeviceSession, channel: u8, id: u64) {
+    // Active NAN/NOW is the normal discovery/control-plane personality. DW=0
+    // is reserved for registered-action experiments.
+    configure_nan_for_channel_with_dw(session, channel, 1, id);
 }
 
 /// Put e6 in the NAN+NOW receiver state used before an Android active-Publish
@@ -5335,6 +5433,7 @@ fn firmware_e6_nan_sd_transport_receiver() {
                 channel: Some(6),
                 now: Some(0),
                 nan_dw_interval: Some(1),
+                ap: Some(0),
                 ..dmesh_server::control::TransportConfig::default()
             },
         },
@@ -6931,7 +7030,12 @@ fn android_nan_sd_sta_declaration_associates_e6_wlan0() {
 /// returns a bounded local status record.  Waiting for that record proves the
 /// request entered the firmware before a later snapshot is used to judge
 /// on-air delivery.
-fn send_raw_action(session: &mut DeviceSession, frame: &[u8], interface: RawWifiInterface) {
+fn raw_action_status_with_dw_override(
+    session: &mut DeviceSession,
+    frame: &[u8],
+    interface: RawWifiInterface,
+    _outside_dw: bool,
+) -> Vec<u8> {
     let mut wire = [0u8; 1600];
     let used = encode_raw_wifi_tx_request(
         RawWifiTxRequest {
@@ -6954,19 +7058,32 @@ fn send_raw_action(session: &mut DeviceSession, frame: &[u8], interface: RawWifi
         })
         .unwrap_or_else(|error| panic!("{} raw action request: {error}", session.path()));
     assert!(matched, "{} raw action status timeout", session.path());
-    let status = session
+    session
         .recent_events()
         .filter_map(|event| match event {
             DeviceSessionEvent::DirectRecord(record) => decode_status_text(record),
             _ => None,
         })
         .last()
-        .expect("raw action status record");
+        .expect("raw action status record")
+        .to_vec()
+}
+
+fn raw_action_status(
+    session: &mut DeviceSession,
+    frame: &[u8],
+    interface: RawWifiInterface,
+) -> Vec<u8> {
+    raw_action_status_with_dw_override(session, frame, interface, false)
+}
+
+fn send_raw_action(session: &mut DeviceSession, frame: &[u8], interface: RawWifiInterface) {
+    let status = raw_action_status(session, frame, interface);
     assert!(
         status.starts_with(b"radio raw action sent bytes="),
         "{} rejected raw NAN SDF: {}",
         session.path(),
-        String::from_utf8_lossy(status)
+        String::from_utf8_lossy(&status)
     );
 }
 
@@ -7340,7 +7457,7 @@ fn hex(bytes: &[u8]) -> String {
 fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> String {
     let service_bps = raw_service_bps(snapshot);
     format!(
-        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} dw={:?}/{:?} ap={:?} active={:?} raw_rx={:?} assoc_phase_ms={:?} disconnect_reason={:?} tx={}/{} rx_dispatch={} parsed={} udp6={}/{}/{}/txfail={}/txresult={} nan={}/{}/{} service_info={}/{}/{} bootstrap={} stream={} other={} client_errors={} client_cid={:?}/{:?} peer_suffix={:?} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}/{:?}",
+        "ch={:?} sta={:?} rssi_dbm={:?} prom={:?} dw={:?}/{:?} ap={:?} active={:?} raw_rx={:?} assoc_phase_ms={:?} disconnect_reason={:?} tx={}/{} rx_dispatch={} parsed={} registered={}/{}/{}/drop={} p2p_gas={}/{} udp6={}/{}/{}/txfail={}/txresult={} nan={}/{}/{} service_info={}/{}/{} bootstrap={} stream={} other={} client_errors={} client_cid={:?}/{:?} peer_suffix={:?} raw_bytes={:?} raw_elapsed_us={:?} raw_bps={service_bps:?} roc={}/{}/{} last_error={:?}/{:?}",
         snapshot.channel,
         snapshot.sta_associated,
         snapshot.sta_ap_rssi_dbm,
@@ -7356,6 +7473,12 @@ fn snapshot_summary(snapshot: &dmesh_server::raw_wifi::RawWifiSnapshot) -> Strin
         snapshot.counters.tx_attempted,
         snapshot.counters.rx_driver_dispatch,
         snapshot.counters.rx_parser_accepted,
+        snapshot.counters.registered_nan_actions,
+        snapshot.counters.registered_now_actions,
+        snapshot.counters.registered_p2p_actions,
+        snapshot.counters.registered_action_drops,
+        snapshot.counters.p2p_gas_requests,
+        snapshot.counters.p2p_gas_responses,
         snapshot.counters.udp6_rx_frames,
         snapshot.counters.udp6_rx_invalid,
         snapshot.counters.udp6_udp_delivered,
@@ -7810,6 +7933,325 @@ fn complete_action_check(
         diagnostics(initiator),
         diagnostics(responder),
     );
+}
+
+/// Infrastructure-independent NOW regression gate. Both ESPs remain awake,
+/// unassociated, and pinned to channel 6; the only RF bearer under test is the
+/// registered ESP-NOW-compatible vendor action path.
+#[test]
+#[ignore = "requires flashed e6/e7 Main firmware and exclusive UART ownership"]
+fn firmware_unassociated_now_e6_e7() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(4_096);
+    e7.set_history_limit(4_096);
+
+    configure_nan_for_channel(&mut e6, 6, 0xE6_6D00);
+    configure_nan_for_channel(&mut e7, 6, 0xE7_6D00);
+
+    let (e6_source, e7_client) = complete_action_check(
+        &mut e7,
+        &mut e6,
+        E6_MAC,
+        0xE6_6D01,
+        "unassociated NOW e7->e6",
+    );
+    assert!(e6_source.counters.rx_parser_accepted > 0);
+    assert!(
+        e6_source.counters.registered_now_actions > 0,
+        "e7->e6 NOW must use e6's second `(127, 0)` registration"
+    );
+    assert!(e7_client.counters.raw_client_stream_packets > 0);
+
+    let (e7_source, e6_client) = complete_action_check(
+        &mut e6,
+        &mut e7,
+        E7_MAC,
+        0xE6_6D02,
+        "unassociated NOW e6->e7",
+    );
+    assert!(e7_source.counters.rx_parser_accepted > 0);
+    assert!(e6_client.counters.raw_client_stream_packets > 0);
+}
+
+/// Registration-order experiment, phase two. e6 has no NAN DW capture, so a
+/// NAN Follow-up can affect its `registered_nan_actions` counter only through
+/// the first `(4, 9)` private action registration. The current C6 result is
+/// deliberately negative: e7 can transmit the same frame that DW capture
+/// receives, but it is not delivered to the registered action callback.
+#[test]
+#[ignore = "historical C6 NAN-first callback probe; requires the temporary experiment firmware"]
+fn firmware_nan_first_registered_followup_without_receiver_dw_is_not_delivered() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(1_024);
+    e7.set_history_limit(1_024);
+
+    configure_nan_for_channel_with_dw(&mut e6, 6, 0, 0xE6_4E_4600);
+    configure_nan_for_channel_with_dw(&mut e7, 6, 1, 0xE7_4E_4600);
+    let before = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    let sender = snapshot(&mut e7, RAW_WIFI_METHOD_SNAPSHOT);
+    assert_eq!(before.nan_dw_interval, Some(0));
+    assert_eq!(before.promiscuous, Some(false));
+    let cluster_bssid = sender
+        .comparator_bssid
+        .expect("e7 NAN sender must select a cluster BSSID before Follow-up TX");
+    eprintln!(
+        "firmware-e2e NAN registered-callback address probe: e6_cluster={:?} e7_cluster={:?} destination={:02x?}",
+        before.comparator_bssid,
+        cluster_bssid,
+        E6_MAC,
+    );
+
+    let payload = dmesh_rawnan::build_dmesh_followup_payload(
+        0x7e,
+        0x4601,
+        E7_MAC,
+        E6_MAC,
+        b"nan-first-registered-callback",
+    )
+    .expect("bounded follow-up payload");
+    let frame = dmesh_rawnan::build_nan_followup_sdf(
+        E6_MAC,
+        E7_MAC,
+        cluster_bssid,
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        1,
+        &payload,
+    );
+
+    let send_deadline = Instant::now() + Duration::from_secs(8);
+    let mut sent = false;
+    let mut last_status = Vec::new();
+    while Instant::now() < send_deadline {
+        let status = raw_action_status(&mut e7, &frame, RawWifiInterface::Sta);
+        if status.starts_with(b"radio raw action sent bytes=") {
+            sent = true;
+            break;
+        }
+        last_status = status;
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        sent,
+        "e7 did not submit a Follow-up during its DW: {}",
+        String::from_utf8_lossy(&last_status)
+    );
+
+    let receive_deadline = Instant::now() + Duration::from_secs(3);
+    let after = loop {
+        let observed = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if Instant::now() >= receive_deadline {
+            break observed;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(after.nan_dw_interval, Some(0));
+    assert_eq!(after.promiscuous, Some(false));
+    assert_eq!(
+        after.counters.registered_nan_actions,
+        before.counters.registered_nan_actions,
+        "NAN Follow-up reached the registered `(4, 9)` callback with DW=0; replace this negative probe with parsed callback coverage"
+    );
+    assert_eq!(
+        after.counters.nan_followups,
+        before.counters.nan_followups,
+        "the receive proof must not come from DW capture"
+    );
+}
+
+/// A3-only follow-up experiment. The raw-lab sender bypasses only its own
+/// DW transmit gate so it can retain e6's selected cluster address in A3;
+/// e6 remains DW=0. A reception here would identify cluster-BSSID filtering,
+/// rather than action-registration order, as the missing condition above.
+#[test]
+#[ignore = "historical C6 A3 probe; requires the temporary raw-TX experiment firmware"]
+fn firmware_nan_registered_followup_receiver_cluster_a3() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(1_024);
+    e7.set_history_limit(1_024);
+
+    configure_nan_for_channel_with_dw(&mut e6, 6, 0, 0xE6_4E_4800);
+    configure_nan_for_channel_with_dw(&mut e7, 6, 0, 0xE7_4E_4800);
+    let before = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    assert_eq!(before.nan_dw_interval, Some(0));
+    assert_eq!(before.promiscuous, Some(false));
+    let receiver_cluster = before
+        .comparator_bssid
+        .expect("e6 must expose its selected NAN cluster BSSID");
+    let payload = dmesh_rawnan::build_dmesh_followup_payload(
+        0x7e,
+        0x4801,
+        E7_MAC,
+        E6_MAC,
+        b"nan-receiver-a3",
+    )
+    .expect("bounded follow-up payload");
+    let frame = dmesh_rawnan::build_nan_followup_sdf(
+        E6_MAC,
+        E7_MAC,
+        receiver_cluster,
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        1,
+        &payload,
+    );
+    let status = raw_action_status_with_dw_override(&mut e7, &frame, RawWifiInterface::Sta, true);
+    assert!(
+        status.starts_with(b"radio raw action sent bytes="),
+        "e7 A3 diagnostic TX rejected: {}",
+        String::from_utf8_lossy(&status)
+    );
+
+    let receive_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let observed = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if observed.counters.registered_nan_actions > before.counters.registered_nan_actions {
+            assert_eq!(observed.nan_dw_interval, Some(0));
+            assert_eq!(observed.promiscuous, Some(false));
+            return;
+        }
+        assert!(
+            Instant::now() < receive_deadline,
+            "e6 did not receive the A3=receiver-cluster NAN Follow-up via the first registered callback; receiver_cluster={receiver_cluster:02x?} before={} after={}",
+            snapshot_summary(&before),
+            snapshot_summary(&observed)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A1-only follow-up experiment. It retains e6's A3 cluster address from the
+/// preceding test but broadcasts A1, matching the delivery shape that works
+/// for NOW. This is a receive-filter diagnostic, not a valid directed NAN
+/// session operation.
+#[test]
+#[ignore = "historical C6 broadcast-A1 probe; requires the temporary raw-TX experiment firmware"]
+fn firmware_nan_registered_followup_broadcast_a1() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(1_024);
+    e7.set_history_limit(1_024);
+
+    configure_nan_for_channel_with_dw(&mut e6, 6, 0, 0xE6_4E_4900);
+    configure_nan_for_channel_with_dw(&mut e7, 6, 0, 0xE7_4E_4900);
+    let before = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    assert_eq!(before.nan_dw_interval, Some(0));
+    assert_eq!(before.promiscuous, Some(false));
+    let receiver_cluster = before
+        .comparator_bssid
+        .expect("e6 must expose its selected NAN cluster BSSID");
+    let payload = dmesh_rawnan::build_dmesh_followup_payload(
+        0x7e,
+        0x4901,
+        E7_MAC,
+        E6_MAC,
+        b"nan-broadcast-a1",
+    )
+    .expect("bounded follow-up payload");
+    let frame = dmesh_rawnan::build_nan_followup_sdf(
+        receiver_cluster,
+        E7_MAC,
+        [0xff; 6],
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        1,
+        &payload,
+    );
+    let status = raw_action_status_with_dw_override(&mut e7, &frame, RawWifiInterface::Sta, true);
+    assert!(
+        status.starts_with(b"radio raw action sent bytes="),
+        "e7 broadcast-A1 diagnostic TX rejected: {}",
+        String::from_utf8_lossy(&status)
+    );
+
+    let receive_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let observed = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if observed.counters.registered_nan_actions > before.counters.registered_nan_actions {
+            assert_eq!(observed.nan_dw_interval, Some(0));
+            assert_eq!(observed.promiscuous, Some(false));
+            return;
+        }
+        assert!(
+            Instant::now() < receive_deadline,
+            "e6 did not receive the broadcast-A1 NAN Follow-up via the first registered callback; A3={receiver_cluster:02x?} before={} after={}",
+            snapshot_summary(&before),
+            snapshot_summary(&observed)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Control for the DW=0 registration experiment above. This uses the same
+/// source, address fields, and sender DW-gated transmit, but permits e6's
+/// normal NAN capture to receive it. A pass proves the sender actually put
+/// the frame on the common channel before we consider A3/BSSID variations.
+#[test]
+#[ignore = "requires flashed e6/e7 Main firmware and exclusive UART ownership"]
+fn firmware_nan_followup_dw_capture_control() {
+    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
+    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
+    e6.set_history_limit(1_024);
+    e7.set_history_limit(1_024);
+
+    configure_nan_for_channel_with_dw(&mut e6, 6, 1, 0xE6_4E_4700);
+    configure_nan_for_channel_with_dw(&mut e7, 6, 1, 0xE7_4E_4700);
+    let before = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+    let sender = snapshot(&mut e7, RAW_WIFI_METHOD_SNAPSHOT);
+    assert_eq!(before.nan_dw_interval, Some(1));
+    let cluster_bssid = sender
+        .comparator_bssid
+        .expect("e7 NAN sender must select a cluster BSSID before Follow-up TX");
+    let payload = dmesh_rawnan::build_dmesh_followup_payload(
+        0x7e,
+        0x4701,
+        E7_MAC,
+        E6_MAC,
+        b"nan-dw-capture-control",
+    )
+    .expect("bounded follow-up payload");
+    let frame = dmesh_rawnan::build_nan_followup_sdf(
+        E6_MAC,
+        E7_MAC,
+        cluster_bssid,
+        dmesh_rawnan::DMESH_SERVICE_ID,
+        1,
+        &payload,
+    );
+
+    let send_deadline = Instant::now() + Duration::from_secs(8);
+    let mut sent = false;
+    let mut last_status = Vec::new();
+    while Instant::now() < send_deadline {
+        let status = raw_action_status(&mut e7, &frame, RawWifiInterface::Sta);
+        if status.starts_with(b"radio raw action sent bytes=") {
+            sent = true;
+            break;
+        }
+        last_status = status;
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        sent,
+        "e7 did not submit a Follow-up during its DW: {}",
+        String::from_utf8_lossy(&last_status)
+    );
+
+    let receive_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let observed = snapshot(&mut e6, RAW_WIFI_METHOD_SNAPSHOT);
+        if observed.counters.nan_followups > before.counters.nan_followups {
+            assert_eq!(observed.nan_dw_interval, Some(1));
+            return;
+        }
+        assert!(
+            Instant::now() < receive_deadline,
+            "e6 DW=1 did not capture the e7 NAN Follow-up; before={} after={}",
+            snapshot_summary(&before),
+            snapshot_summary(&observed)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Focused STA+NOW gate for the default transport profile. Both devices use a

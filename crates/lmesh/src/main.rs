@@ -7,14 +7,17 @@ use std::{
 use anyhow::{Context, Result};
 use lmesh::{LmeshService, LocalDiscovery};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::{TcpListener, UnixStream};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
 
-const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
+/// Keep host multicast presence aligned with NAN/NOW/ESP refreshes. Operators
+/// may still override this through `LMESH_ANNOUNCE_INTERVAL_SECS`.
+const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 5 * 60;
 const DEFAULT_STANDALONE_SOCKET: &str = "lmesh/mesh.sock";
 const ANNOUNCE_INTERVAL_ENV: &str = "LMESH_ANNOUNCE_INTERVAL_SECS";
 const CONTROL_SOCKET_ENV: &str = "LMESH_CONTROL_SOCKET";
+const HTTP_PORT_ENV: &str = "LMESH_HTTP_PORT";
 const WIFI_DISCOVERY_SOCKET_ENV: &str = "LMESH_WIFI_CONTROL_SOCKET";
 const DEFAULT_WIFI_DISCOVERY_SOCKET: &str = "/run/mesh/lmesh-wifi/mesh.sock";
 const RAWNAN_AUTOSTART_ENV: &str = "LMESH_RAWNAN_AUTOSTART";
@@ -27,6 +30,11 @@ const DEFAULT_LMESH_AP_BEACON_INTERVAL_TU: u16 = 500;
 /// Generated public catalog. Only reviewed entries carry numeric tags, so the
 /// CBOR path cannot accidentally expose or number a legacy control method.
 static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(|| {
+    mesh::tagged::TaggedCatalog::from_tools_json(&public_tools_json())
+        .expect("lmesh tools.json must be a valid tagged catalog")
+});
+
+fn public_tools_json() -> serde_json::Value {
     let mut tools =
         serde_json::from_str::<serde_json::Value>(include_str!("../resources/tools.json"))
             .expect("lmesh tools.json must be valid JSON");
@@ -44,9 +52,8 @@ static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(||
                 .iter()
                 .cloned(),
         );
-    mesh::tagged::TaggedCatalog::from_tools_json(&tools)
-        .expect("lmesh tools.json must be a valid tagged catalog")
-});
+    tools
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -119,13 +126,13 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
             }
         }
     });
-    // NAN uses a much lower presence cadence than UDP multicast. Updating the
-    // descriptor itself makes it pending for the next DW; it does not send
-    // from this timer or change the permanent monitor fixture.
+    // Keep NAN publish aligned with UDP multicast. Updating the descriptor
+    // makes it pending for the next DW; it does not send from this timer or
+    // change the permanent monitor fixture.
     let active_publish_service = service.clone();
     tokio::spawn(async move {
         loop {
-            sleep(Duration::from_secs(15 * 60)).await;
+            sleep(Duration::from_secs(DEFAULT_ANNOUNCE_INTERVAL_SECS)).await;
             let uptime_secs = active_publish_started.elapsed().as_secs();
             if let Err(error) = active_publish_service.refresh_active_nan_publish(uptime_secs) {
                 warn!(%error, "rawnan_active_publish_refresh_failed");
@@ -135,6 +142,7 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
 
     let listen_path = standalone_listen_path()?;
     let listen_path = listen_path.to_string_lossy().into_owned();
+    start_http_admin(&listen_path).await?;
     let mut listener = mesh::server::MeshListener::new("lmesh", Some(&listen_path))
         .map_err(|e| anyhow::anyhow!("lmesh listener error: {}", e))?;
     let mcp = Arc::new(mesh::jsonl::McpRegistry::new("lmesh"));
@@ -153,6 +161,50 @@ async fn run_server(trace_buffer: mesh::local_trace::LogBuffer) -> Result<()> {
         });
     }
 
+    Ok(())
+}
+
+/// Start the generic ssh-mesh admin REST server only when explicitly enabled.
+/// It talks to this supervised lmesh instance through the existing UDS instead
+/// of constructing another service or taking ownership of any radio.
+async fn start_http_admin(socket: &str) -> Result<()> {
+    let Some(port) = std::env::var(HTTP_PORT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+    else {
+        return Ok(());
+    };
+    let node = Arc::new(ssh_mesh::MeshNode::new(None, None));
+    let manager = Arc::new(ssh_mesh::sshc::SshClientManager::new(
+        node.private_key().clone(),
+        (*node.ca_keys).clone(),
+        None,
+        None,
+    ));
+    let registry = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
+    registry.register(
+        "lmesh",
+        ssh_mesh::mesh_rest::MeshService {
+            backend: ssh_mesh::mesh_rest::MeshServiceBackend::Uds(PathBuf::from(socket)),
+            catalog: Some(public_tools_json()),
+        },
+    );
+    let app = ssh_mesh::handlers::app(ssh_mesh::AppState {
+        ssh_server: node,
+        target_http_address: None,
+        ssh_client_manager: manager,
+        mesh_services: registry,
+    });
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .with_context(|| format!("bind lmesh HTTP admin port {port}"))?;
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app.into_make_service()).await {
+            error!(%error, "lmesh_http_admin_terminated");
+        }
+    });
+    debug!(port, "lmesh_http_admin_started");
     Ok(())
 }
 

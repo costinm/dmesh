@@ -288,11 +288,8 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
     /// allocation, and is invoked only on CLOSE/profile replacement.
     fn rotate_server_cid(&mut self, retired_client_cid: Option<ConnectionId>) {
         self.server_cid_epoch = self.server_cid_epoch.wrapping_add(1).max(1);
-        let mut value = self
-            .server_cid
-            .value()
-            .wrapping_add(0x9e37_79b9)
-            ^ u64::from(self.server_cid_epoch);
+        let mut value =
+            self.server_cid.value().wrapping_add(0x9e37_79b9) ^ u64::from(self.server_cid_epoch);
         if retired_client_cid.is_some_and(|cid| cid.value() == value) || value == 0 {
             value = value.wrapping_add(1).max(1);
         }
@@ -321,8 +318,13 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
         // The same peer remains free to send a new OPEN: that is the normal
         // recovery/replacement path after a lost CLOSE or a fresh probe.
         let _ = ShortHeader::decode(packet)?;
-        if self.reply_path.is_some_and(|active_path| active_path != path)
-            && self.server.as_ref().is_some_and(|server| server.connection.is_some())
+        if self
+            .reply_path
+            .is_some_and(|active_path| active_path != path)
+            && self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.connection.is_some())
         {
             return Ok(None);
         }
@@ -1387,10 +1389,7 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfServer<HISTORY, PACKET> 
                 // delayed packets are rejected at the QUIC boundary instead
                 // of being mistaken for current bearer progress.
                 self.association_epoch = self.association_epoch.wrapping_add(1).max(1);
-                let mut value = self
-                    .local_cid
-                    .value()
-                    .wrapping_add(0x9e37_79b9)
+                let mut value = self.local_cid.value().wrapping_add(0x9e37_79b9)
                     ^ open.client_receive_cid.value()
                     ^ u64::from(self.association_epoch);
                 if value == 0 || value == open.client_receive_cid.value() {
@@ -1920,8 +1919,7 @@ mod tests {
         let client_cid = ConnectionId::new(0x147).unwrap();
         let server_cid = ConnectionId::new(0x247).unwrap();
         let mut storage = MaybeUninit::<RawIperfClient<4, 1200>>::uninit();
-        let client = RawIperfClient::new_in_place(&mut storage, client_cid, 4 * 1024, 256)
-            .unwrap();
+        let client = RawIperfClient::new_in_place(&mut storage, client_cid, 4 * 1024, 256).unwrap();
         let mut server = RawIperfServer::<8, 1200>::new(server_cid);
         let mut client_out = [0u8; 1200];
         let mut server_out = [0u8; 1200];
@@ -2106,10 +2104,12 @@ mod tests {
             .receive(&server_out[..open_ack_len], &mut client_out)
             .unwrap()
             .unwrap();
-        assert!(server
-            .receive(&client_out[..request_len], &mut server_out)
-            .unwrap()
-            .is_some());
+        assert!(
+            server
+                .receive(&client_out[..request_len], &mut server_out)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             server
                 .receive(&client_out[..request_len], &mut server_out)
@@ -2198,8 +2198,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            first_bootstrap.server_receive_cid,
-            second_bootstrap.server_receive_cid,
+            first_bootstrap.server_receive_cid, second_bootstrap.server_receive_cid,
             "a replacement must not share the old association DCID"
         );
         assert_eq!(
@@ -2341,8 +2340,8 @@ mod tests {
             transport_id: 2,
             peer: [2; 6],
         };
-        let mut first = RawIperfClient::<8, 1200>::new(ConnectionId::new(0x9911).unwrap(), 64)
-            .unwrap();
+        let mut first =
+            RawIperfClient::<8, 1200>::new(ConnectionId::new(0x9911).unwrap(), 64).unwrap();
         let mut foreign =
             RawIperfClient::<8, 1200>::new(ConnectionId::new(0x9912).unwrap(), 64).unwrap();
         let mut client_out = [0u8; 1200];

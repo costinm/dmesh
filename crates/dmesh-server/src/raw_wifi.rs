@@ -1,7 +1,10 @@
-//! CBOR schema for bounded raw 802.11 hardware experiments.
+//! CBOR schema for bounded raw 802.11 control and action injection.
 //!
-//! This is deliberately host- and ESP-independent. Adapters apply the typed
-//! request to their radio APIs; the request never implies a socket API.
+//! This is deliberately platform-independent. Adapters expose only the
+//! operations their hardware/API can perform: ESP and Linux may implement raw
+//! action injection, while Android must return unsupported for it. Control,
+//! snapshot, check, and IPERF are separate operations with the same rule; a
+//! shared wire schema never claims platform support.
 
 use crate::{
     cbor::{Decoder, Encoder},
@@ -19,9 +22,14 @@ pub const RAW_WIFI_OP_RESET_COUNTERS: u64 = 4;
 pub const RAW_WIFI_OP_CHECK: u64 = 5;
 /// Start a bounded bulk raw service client on the selected action bearer.
 pub const RAW_WIFI_OP_IPERF: u64 = 6;
-/// Registered CBOR method identifiers for the independently callable radio
-/// control, snapshot, and counter-reset handlers.
+/// Registered CBOR method identifier for raw 802.11 action injection. This is
+/// a hardware capability: unsupported adapters must reject it explicitly.
 pub const RAW_WIFI_METHOD_TX: u64 = 71;
+/// Clear name for [`RAW_WIFI_METHOD_TX`]. The numeric wire value is retained.
+pub const RAW_WIFI_METHOD_ACTION_INJECT: u64 = RAW_WIFI_METHOD_TX;
+/// Registered CBOR method identifiers for independently callable radio
+/// control, snapshot, and counter-reset operations. Each is independently
+/// capability-gated by the concrete adapter.
 pub const RAW_WIFI_METHOD_CONTROL: u64 = 72;
 pub const RAW_WIFI_METHOD_SNAPSHOT: u64 = 73;
 pub const RAW_WIFI_METHOD_RESET_COUNTERS: u64 = 74;
@@ -43,9 +51,10 @@ pub const RAW_WIFI_MAX_FRAME: usize = 1500;
 /// remains deliberately below the common 1100-byte bearer MTU.
 pub const RAW_WIFI_SNAPSHOT_MAX_BYTES: usize = 384;
 
-/// Encode a complete tagged raw-frame injection request. The frame stays a
+/// Encode a complete tagged raw-action-injection request. The frame stays a
 /// borrowed byte string at the decoder boundary; this constructor does not
-/// fragment, copy into a transport queue, or imply a particular Wi-Fi API.
+/// fragment, copy into a transport queue, or imply that the selected adapter
+/// supports raw injection.
 pub fn encode_raw_wifi_tx_request(request: RawWifiTxRequest<'_>, out: &mut [u8]) -> Option<usize> {
     if !(24..=RAW_WIFI_MAX_FRAME).contains(&request.frame.len())
         || !(1..=13).contains(&request.channel)
@@ -73,6 +82,14 @@ pub fn encode_raw_wifi_tx_request(request: RawWifiTxRequest<'_>, out: &mut [u8])
     encoder.uint(6)?;
     encoder.boolean(request.disable_11b)?;
     Some(encoder.len())
+}
+
+/// Clear-name alias for [`encode_raw_wifi_tx_request`].
+pub fn encode_raw_wifi_action_inject_request(
+    request: RawWifiActionInjectRequest<'_>,
+    out: &mut [u8],
+) -> Option<usize> {
+    encode_raw_wifi_tx_request(request, out)
 }
 
 /// Encode an empty-payload registered snapshot/reset request.  This is shared
@@ -461,6 +478,18 @@ pub struct RawWifiCounters {
     pub nan_followups: u32,
     /// DMesh Service Info records recognized inside NAN SDFs.
     pub nan_service_info_matched: u32,
+    /// DMesh SDA records carrying an active-Subscribe control value.
+    pub nan_active_subscribe_descriptors: u32,
+    /// Active DMesh Subscribe SDAs whose SDEA did not yield a bounded Service
+    /// Info record. This distinguishes RF receipt from parser compatibility.
+    pub nan_active_subscribe_sdea_misses: u32,
+    /// Fixed four-byte SDEA header seen with the latest active Subscribe.
+    /// It contains structural metadata only, never Service Info bytes.
+    pub nan_active_subscribe_sdea_header: u32,
+    /// Declared Service Info length from that SDEA's fixed prefix.
+    pub nan_active_subscribe_sdea_info_len: u32,
+    /// Active NAN Subscribe SDFs carrying DMesh Service Info in their SDEA.
+    pub nan_active_subscribes: u32,
     /// Recognized Service Info records copied from the Wi-Fi callback to the
     /// shared ingress worker.
     pub nan_service_info_enqueued: u32,
@@ -519,6 +548,14 @@ pub struct RawWifiCounters {
     pub p2p_gas_responses: u32,
     /// P2P response intents dropped before a successful driver submission.
     pub p2p_response_drops: u32,
+    /// Frames delivered by the continuously registered action callback and
+    /// classified as NAN, NOW, or P2P before semantic parsing.
+    pub registered_nan_actions: u32,
+    pub registered_now_actions: u32,
+    pub registered_p2p_actions: u32,
+    /// Registered action callbacks dropped because the bounded scratch was
+    /// invalid, oversized, or already in use.
+    pub registered_action_drops: u32,
 }
 
 /// Version of the cross-platform per-peer Wi-Fi metrics record.
@@ -641,6 +678,17 @@ impl RawWifiCounters {
             nan_service_info_matched: self
                 .nan_service_info_matched
                 .saturating_sub(before.nan_service_info_matched),
+            nan_active_subscribe_descriptors: self
+                .nan_active_subscribe_descriptors
+                .saturating_sub(before.nan_active_subscribe_descriptors),
+            nan_active_subscribe_sdea_misses: self
+                .nan_active_subscribe_sdea_misses
+                .saturating_sub(before.nan_active_subscribe_sdea_misses),
+            nan_active_subscribe_sdea_header: self.nan_active_subscribe_sdea_header,
+            nan_active_subscribe_sdea_info_len: self.nan_active_subscribe_sdea_info_len,
+            nan_active_subscribes: self
+                .nan_active_subscribes
+                .saturating_sub(before.nan_active_subscribes),
             nan_service_info_enqueued: self
                 .nan_service_info_enqueued
                 .saturating_sub(before.nan_service_info_enqueued),
@@ -740,6 +788,18 @@ impl RawWifiCounters {
             p2p_response_drops: self
                 .p2p_response_drops
                 .saturating_sub(before.p2p_response_drops),
+            registered_nan_actions: self
+                .registered_nan_actions
+                .saturating_sub(before.registered_nan_actions),
+            registered_now_actions: self
+                .registered_now_actions
+                .saturating_sub(before.registered_now_actions),
+            registered_p2p_actions: self
+                .registered_p2p_actions
+                .saturating_sub(before.registered_p2p_actions),
+            registered_action_drops: self
+                .registered_action_drops
+                .saturating_sub(before.registered_action_drops),
         }
     }
 }
@@ -759,6 +819,13 @@ pub struct RawWifiSnapshot {
     /// between the bounded capture windows.
     pub nan_dw_interval: Option<u8>,
     pub comparator_bssid: Option<[u8; 6]>,
+    /// Address-3 from the latest DMesh active-Subscribe SDF. This is NAN
+    /// cluster metadata only; no Service Info or frame bytes are retained.
+    pub nan_active_subscribe_bssid: Option<[u8; 6]>,
+    /// Source and service ID from the latest complete NAN Service Descriptor.
+    /// These are protocol routing identifiers only, never Service Info bytes.
+    pub nan_last_sdf_source: Option<[u8; 6]>,
+    pub nan_last_sdf_service_id: Option<[u8; 6]>,
     pub comparator_armed: Option<bool>,
     pub comparator_errors: u32,
     pub tx_interface: Option<RawWifiInterface>,
@@ -914,6 +981,9 @@ pub fn encode_raw_wifi_snapshot(
         + usize::from(snapshot.dw_capturing.is_some())
         + usize::from(snapshot.nan_dw_interval.is_some())
         + usize::from(snapshot.comparator_bssid.is_some())
+        + usize::from(snapshot.nan_active_subscribe_bssid.is_some())
+        + usize::from(snapshot.nan_last_sdf_source.is_some())
+        + usize::from(snapshot.nan_last_sdf_service_id.is_some())
         + usize::from(snapshot.comparator_armed.is_some())
         + usize::from(snapshot.tx_interface.is_some())
         + usize::from(snapshot.tx_rate.is_some())
@@ -952,7 +1022,7 @@ pub fn encode_raw_wifi_snapshot(
     e.uint(6)?;
     // Epoch, comparator errors, and monotonic counters are always
     // present, letting the host calculate deltas without retaining FW state.
-    e.map((51 + optional) as u64)?;
+    e.map((60 + optional) as u64)?;
     e.uint(20)?;
     e.uint(u64::from(snapshot.epoch))?;
     if let Some(channel) = snapshot.channel {
@@ -978,6 +1048,18 @@ pub fn encode_raw_wifi_snapshot(
     if let Some(bssid) = snapshot.comparator_bssid {
         e.uint(25)?;
         e.bytes_value(&bssid)?;
+    }
+    if let Some(bssid) = snapshot.nan_active_subscribe_bssid {
+        e.uint(115)?;
+        e.bytes_value(&bssid)?;
+    }
+    if let Some(value) = snapshot.nan_last_sdf_source {
+        e.uint(116)?;
+        e.bytes_value(&value)?;
+    }
+    if let Some(value) = snapshot.nan_last_sdf_service_id {
+        e.uint(117)?;
+        e.bytes_value(&value)?;
     }
     if let Some(value) = snapshot.comparator_armed {
         e.uint(26)?;
@@ -1147,6 +1229,15 @@ pub fn encode_raw_wifi_snapshot(
         (98, snapshot.counters.p2p_gas_requests),
         (99, snapshot.counters.p2p_gas_responses),
         (100, snapshot.counters.p2p_response_drops),
+        (106, snapshot.counters.registered_nan_actions),
+        (107, snapshot.counters.registered_now_actions),
+        (108, snapshot.counters.registered_p2p_actions),
+        (109, snapshot.counters.registered_action_drops),
+        (110, snapshot.counters.nan_active_subscribes),
+        (111, snapshot.counters.nan_active_subscribe_descriptors),
+        (112, snapshot.counters.nan_active_subscribe_sdea_misses),
+        (113, snapshot.counters.nan_active_subscribe_sdea_header),
+        (114, snapshot.counters.nan_active_subscribe_sdea_info_len),
     ] {
         e.uint(key)?;
         e.uint(u64::from(value))?;
@@ -1229,12 +1320,50 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                     u32::try_from(decoder.uint().ok_or("radio P2P response drops")?)
                         .map_err(|_| "radio P2P response drops")?
             }
+            106 => {
+                snapshot.counters.registered_nan_actions =
+                    u32::try_from(decoder.uint().ok_or("registered NAN actions")?)
+                        .map_err(|_| "registered NAN actions")?
+            }
+            107 => {
+                snapshot.counters.registered_now_actions =
+                    u32::try_from(decoder.uint().ok_or("registered NOW actions")?)
+                        .map_err(|_| "registered NOW actions")?
+            }
+            108 => {
+                snapshot.counters.registered_p2p_actions =
+                    u32::try_from(decoder.uint().ok_or("registered P2P actions")?)
+                        .map_err(|_| "registered P2P actions")?
+            }
+            109 => {
+                snapshot.counters.registered_action_drops =
+                    u32::try_from(decoder.uint().ok_or("registered action drops")?)
+                        .map_err(|_| "registered action drops")?
+            }
             25 => {
                 snapshot.comparator_bssid = Some(
                     decoder
                         .bytes_ref()
                         .and_then(|v| v.try_into().ok())
                         .ok_or("radio comparator BSSID")?,
+                )
+            }
+            115 => {
+                snapshot.nan_active_subscribe_bssid = Some(
+                    decoder
+                        .bytes_ref()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("radio NAN active Subscribe BSSID")?,
+                )
+            }
+            116 => {
+                snapshot.nan_last_sdf_source = Some(
+                    decoder.bytes_ref().and_then(|v| v.try_into().ok()).ok_or("radio NAN SDF source")?,
+                )
+            }
+            117 => {
+                snapshot.nan_last_sdf_service_id = Some(
+                    decoder.bytes_ref().and_then(|v| v.try_into().ok()).ok_or("radio NAN SDF service")?,
                 )
             }
             26 => snapshot.comparator_armed = Some(decoder.boolean().ok_or("radio comparator")?),
@@ -1430,6 +1559,33 @@ pub fn decode_raw_wifi_snapshot(data: &[u8]) -> Result<(u64, RawWifiSnapshot), &
                     u32::try_from(decoder.uint().ok_or("radio NAN Service Info match")?)
                         .map_err(|_| "radio counter")?
             }
+            110 => {
+                snapshot.counters.nan_active_subscribes =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Subscribe")?)
+                        .map_err(|_| "radio counter")?
+            }
+            111 => {
+                snapshot.counters.nan_active_subscribe_descriptors =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Subscribe SDA")?)
+                        .map_err(|_| "radio counter")?
+            }
+            112 => {
+                snapshot.counters.nan_active_subscribe_sdea_misses = u32::try_from(
+                    decoder.uint().ok_or("radio NAN active Subscribe SDEA miss")?,
+                )
+                .map_err(|_| "radio counter")?
+            }
+            113 => {
+                snapshot.counters.nan_active_subscribe_sdea_header =
+                    u32::try_from(decoder.uint().ok_or("radio NAN active Subscribe SDEA header")?)
+                        .map_err(|_| "radio counter")?
+            }
+            114 => {
+                snapshot.counters.nan_active_subscribe_sdea_info_len = u32::try_from(
+                    decoder.uint().ok_or("radio NAN active Subscribe SDEA info length")?,
+                )
+                .map_err(|_| "radio counter")?
+            }
             93 => {
                 snapshot.counters.nan_service_info_enqueued =
                     u32::try_from(decoder.uint().ok_or("radio NAN Service Info ingress")?)
@@ -1609,6 +1765,18 @@ pub struct RawWifiTxRequest<'a> {
     pub frame: &'a [u8],
 }
 
+/// Clear-name alias for the raw 802.11 action-injection request schema.
+///
+/// `RawWifiTxRequest` remains the compatibility spelling for existing host,
+/// firmware, and CLI callers; it does not imply that every adapter has an
+/// 802.11 injection API.
+pub type RawWifiActionInjectRequest<'a> = RawWifiTxRequest<'a>;
+
+/// Clear-name alias for the control/snapshot/check/IPERF operation schema.
+/// The older `RawWifiLabRequest` spelling remains because it is source-facing
+/// in existing test and CLI code, while its CBOR wire values remain unchanged.
+pub type RawWifiControlOperation = RawWifiLabRequest;
+
 fn decode_interface(value: u64) -> Result<RawWifiInterface, &'static str> {
     match value {
         0 => Ok(RawWifiInterface::Auto),
@@ -1676,6 +1844,13 @@ pub fn decode_raw_wifi_tx(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static 
         return Err("raw wifi handler");
     }
     decode_raw_wifi_tx_fields(record.fields.ok_or("raw wifi fields")?)
+}
+
+/// Clear-name alias for [`decode_raw_wifi_tx`].
+pub fn decode_raw_wifi_action_inject(
+    data: &[u8],
+) -> Result<RawWifiActionInjectRequest<'_>, &'static str> {
+    decode_raw_wifi_tx(data)
 }
 
 fn decode_raw_wifi_tx_fields(data: &[u8]) -> Result<RawWifiTxRequest<'_>, &'static str> {
@@ -2375,6 +2550,7 @@ mod tests {
             counters: RawWifiCounters {
                 rx_parser_accepted: 7,
                 nan_beacons: 3,
+                nan_active_subscribes: 5,
                 tx_duration_le_750us: 2,
                 vendor_beacon_ies: 4,
                 vendor_nan_beacon_ies: 2,
@@ -2382,6 +2558,10 @@ mod tests {
                 roc_espnow_actions: 3,
                 roc_nan_actions: 4,
                 roc_other_actions: 5,
+                registered_nan_actions: 6,
+                registered_now_actions: 7,
+                registered_p2p_actions: 8,
+                registered_action_drops: 9,
                 udp6_rx_frames: 7,
                 udp6_rx_queue_drops: 2,
                 udp6_rx_invalid: 6,

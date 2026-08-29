@@ -201,6 +201,7 @@ fn run_ratatui_with_options(options: eframe::NativeOptions) -> eframe::Result {
 struct ChatApp {
     messages: Vec<ChatMessage>,
     input_value: String,
+    focus_input: bool,
 }
 
 struct ChatMessage {
@@ -218,6 +219,7 @@ impl ChatApp {
                     .to_owned(),
             }],
             input_value: String::new(),
+            focus_input: true,
         }
     }
 
@@ -232,6 +234,7 @@ impl ChatApp {
 
         self.messages.push(ChatMessage { author: "me", text });
         self.input_value.clear();
+        self.focus_input = true;
     }
 
     fn drain_events(&mut self) {
@@ -261,6 +264,10 @@ impl eframe::App for ChatApp {
                     egui::TextEdit::singleline(&mut self.input_value)
                         .hint_text("Type a message or /logs"),
                 );
+                if self.focus_input {
+                    input.request_focus();
+                    self.focus_input = false;
+                }
 
                 let send_clicked = ui
                     .add_sized([64.0, 38.0], egui::Button::new("Send"))
@@ -303,6 +310,7 @@ impl eframe::App for ChatApp {
 struct RatatuiPreviewApp {
     model: UiModel,
     client: MemoryMeshClient,
+    focus_input: bool,
 }
 
 impl RatatuiPreviewApp {
@@ -314,12 +322,14 @@ impl RatatuiPreviewApp {
         Self {
             model,
             client: MemoryMeshClient::default(),
+            focus_input: true,
         }
     }
 
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     fn submit(&mut self) {
         self.model.submit_current(&mut self.client);
+        self.focus_input = true;
     }
 }
 
@@ -351,6 +361,10 @@ impl eframe::App for RatatuiPreviewApp {
                 egui::TextEdit::singleline(&mut self.model.input)
                     .hint_text("mesh method, e.g. messages.snapshot"),
             );
+            if self.focus_input {
+                input.request_focus();
+                self.focus_input = false;
+            }
             let send = ui
                 .add_sized([68.0, 40.0], egui::Button::new("Send"))
                 .clicked();

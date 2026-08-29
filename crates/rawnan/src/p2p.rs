@@ -4,6 +4,11 @@
 //! capability by carrying a P2P vendor IE in its probe response.  It does not
 //! send probe, GAS, Service Discovery, GO-negotiation, or WPS traffic on its
 //! own. Those are controller-triggered Phase-2 operations.
+//! ESP32-C6 currently retains only the passive beacon/probe IE: its private
+//! action receive hook does not deliver P2P public actions. Keep the GAS and
+//! DNS-SD codec for Linux/Android interoperability for now; remove it later
+//! if those consumers no longer need it rather than reviving an ESP action
+//! path without a working management-RX primitive.
 
 /// IEEE 802.11 vendor-specific information element.
 pub const VENDOR_IE: u8 = 221;
@@ -566,11 +571,9 @@ mod tests {
         .unwrap();
         assert_eq!(&response[..3], &[4, GAS_INITIAL_RESPONSE, 0x6c]);
         assert!(response[..used].windows(5).any(|part| part == b"dmesh"));
-        assert!(
-            response[..used]
-                .windows(presence_len)
-                .any(|part| part == &presence[..presence_len])
-        );
+        assert!(response[..used]
+            .windows(presence_len)
+            .any(|part| part == &presence[..presence_len]));
         for end in crate::FRAME_DATA..request.len() {
             assert!(!is_dmesh_dns_sd_request(&request[..end]));
             assert_eq!(

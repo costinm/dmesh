@@ -303,46 +303,16 @@ fn parse_legacy_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> 
 }
 
 pub fn build_nan_service_info(role: &str, device_id: &[u8], wake_count: u32) -> Result<Vec<u8>> {
-    let device_id = checked_device_id(device_id)?;
-    let role = match role {
-        "android" | "android_publisher" => NAN_ROLE_ANDROID_PUBLISHER,
-        "firmware" | "firmware_publisher" => NAN_ROLE_FIRMWARE_PUBLISHER,
-        _ => NAN_ROLE_ANDROID_PUBLISHER,
-    };
-    let mut out = rawnan::build_dmesh_service_info(
-        device_id.try_into().expect("checked device id length"),
-        role,
-        None,
-    )
-    .to_vec();
-    out[11..15].copy_from_slice(&wake_count.to_le_bytes());
-    Ok(out)
+    let device_id: [u8; 6] = checked_device_id(device_id)?.try_into().expect("checked id");
+    let role = match role { "firmware" | "firmware_publisher" => NAN_ROLE_FIRMWARE_PUBLISHER, _ => NAN_ROLE_ANDROID_PUBLISHER };
+    let mut info = rawnan::build_dmesh_service_info(device_id, role, None).to_vec();
+    info[11..15].copy_from_slice(&wake_count.to_le_bytes());
+    Ok(info)
 }
 
 pub fn parse_nan_service_info(data: &[u8]) -> Result<Value> {
-    if data.len() < 21 {
-        bail!("DMesh NAN service info too short: {}", data.len());
-    }
-    if data[0..2] != DMESH_MAGIC || data[2] != DMESH_VERSION {
-        bail!("not a DMesh NAN v1 service info payload");
-    }
-    let mut device_id = [0_u8; 6];
-    device_id.copy_from_slice(&data[5..11]);
-    let wake_count = u32::from_le_bytes([data[11], data[12], data[13], data[14]]);
-    let last_len = u16::from_le_bytes([data[15], data[16]]);
-    let last_hash = u32::from_le_bytes([data[17], data[18], data[19], data[20]]);
-    Ok(json!({
-        "protocol": "dmesh_nan_service",
-        "version": DMESH_VERSION,
-        "role": nan_role_name(data[3]),
-        "role_code": data[3],
-        "flags": data[4],
-        "device_id": hex_bytes(&device_id),
-        "wake_count": wake_count,
-        "last_len": last_len,
-        "last_hash": format!("0x{last_hash:08x}"),
-        "last_hash_u32": last_hash,
-    }))
+    let info = rawnan::parse_dmesh_service_info(data).ok_or_else(|| anyhow::anyhow!("not a DMesh NAN service info payload"))?;
+    Ok(json!({"protocol":"dmesh_nan_service","role":nan_role_name(info.role),"role_code":info.role,"flags":info.flags,"device_id":hex_bytes(&info.device_id),"wake_count":info.wake_target,"last_len":info.wake_duration_ms}))
 }
 
 pub fn build_nan_followup(
@@ -351,64 +321,14 @@ pub fn build_nan_followup(
     target_id: &[u8],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    let device_id = checked_device_id(device_id)?;
-    let target_id = checked_device_id(target_id)?;
-    let msg_type = nan_msg_type(msg_type);
-    let payload_len = payload.len().min(231);
-    let seq = next_nan_seq();
-    rawnan::build_dmesh_followup_payload(
-        msg_type,
-        seq,
-        device_id.try_into().expect("checked device id length"),
-        target_id.try_into().expect("checked target id length"),
-        &payload[..payload_len],
-    )
+    let source: [u8; 6] = checked_device_id(device_id)?.try_into().expect("checked id");
+    let target: [u8; 6] = checked_device_id(target_id)?.try_into().expect("checked id");
+    rawnan::build_dmesh_followup_payload(nan_msg_type(msg_type), next_nan_seq(), source, target, &payload[..payload.len().min(231)])
 }
 
 pub fn parse_nan_followup(data: &[u8]) -> Result<Value> {
-    if data.len() < 24 {
-        bail!("DMesh NAN follow-up too short: {}", data.len());
-    }
-    if data[0..2] != DMESH_MAGIC || data[2] != DMESH_VERSION {
-        bail!("not a DMesh NAN v1 follow-up payload");
-    }
-    let msg_type = data[3];
-    let seq = u16::from_le_bytes([data[4], data[5]]);
-    let mut device_id = [0_u8; 6];
-    device_id.copy_from_slice(&data[6..12]);
-    let mut target_id = [0_u8; 6];
-    target_id.copy_from_slice(&data[12..18]);
-    let payload_len = u16::from_le_bytes([data[18], data[19]]) as usize;
-    let payload_hash = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-    let payload_end = 24 + payload_len.min(data.len().saturating_sub(24));
-    let payload = &data[24..payload_end];
-    let key = format!(
-        "{}:{}:{}:{}",
-        hex_bytes(&device_id),
-        seq,
-        msg_type,
-        payload_hash
-    );
-    let duplicate = NAN_DEDUPE
-        .get_or_init(|| Mutex::new(Dedupe::default()))
-        .lock()
-        .map(|mut dedupe| dedupe.check(key, NAN_DEDUPE_TTL))
-        .unwrap_or(false);
-    Ok(json!({
-        "protocol": "dmesh_nan_followup",
-        "version": DMESH_VERSION,
-        "msg_type": nan_msg_name(msg_type),
-        "msg_type_code": msg_type,
-        "seq": seq,
-        "device_id": hex_bytes(&device_id),
-        "target_id": hex_bytes(&target_id),
-        "payload_len": payload_len,
-        "payload_hash": format!("0x{payload_hash:08x}"),
-        "payload_hash_u32": payload_hash,
-        "payload": hex_bytes(payload),
-        "payload_text": String::from_utf8_lossy(payload),
-        "duplicate": duplicate,
-    }))
+    let followup = rawnan::parse_dmesh_nan_followup(data).ok_or_else(|| anyhow::anyhow!("not a DMesh NAN follow-up payload"))?;
+    Ok(json!({"protocol":"dmesh_nan_followup","msg_type":nan_msg_name(followup.msg_type),"msg_type_code":followup.msg_type,"seq":followup.seq,"device_id":hex_bytes(&followup.device_id),"target_id":hex_bytes(&followup.target_id),"payload_len":followup.payload.len(),"payload":hex_bytes(followup.payload),"payload_text":String::from_utf8_lossy(followup.payload)}))
 }
 
 fn checked_device_id(value: &[u8]) -> Result<&[u8]> {

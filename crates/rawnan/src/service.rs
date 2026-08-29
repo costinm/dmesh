@@ -8,18 +8,19 @@
 //! frames and exposes bounded service receipts.
 
 use crate::{
-    DMESH_MAGIC, DMESH_NAN_FOLLOWUP_HEADER_LEN, DMESH_VERSION, NAN_COMMAND_MAX_LEN,
+    fnv1a32, DMESH_MAGIC, DMESH_NAN_FOLLOWUP_HEADER_LEN, DMESH_VERSION, NAN_COMMAND_MAX_LEN,
     NAN_SDEA_SERVICE_UPDATE_CONTROL, NAN_SERVICE_FLAG_ACTIVE_ACK, NAN_SERVICE_FLAG_BLE_WAKE,
-    NAN_SERVICE_FLAG_UART_WAKE, NAN_SERVICE_INFO_LEN, fnv1a32,
+    NAN_SERVICE_FLAG_UART_WAKE, NAN_SERVICE_INFO_LEN,
 };
 use alloc::{collections::VecDeque, vec::Vec};
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 /// Maximum Service Info carried by a NAN Publish service descriptor.
 pub const NAN_ACTIVE_PUBLISH_MAX_LEN: usize = 255;
-/// Presence should refresh slowly; a new configuration is sent at the next
-/// confirmed DW, while steady state uses this cadence.
-pub const NAN_ACTIVE_PUBLISH_INTERVAL_MS: u64 = 15 * 60 * 1_000;
+/// Common passive-presence cadence. A new configuration is still sent at the
+/// next confirmed DW; steady-state refreshes use this five-minute interval on
+/// every bearer so host, Android, and ESP inventories converge promptly.
+pub const NAN_ACTIVE_PUBLISH_INTERVAL_MS: u64 = 5 * 60 * 1_000;
 
 /// Driver-independent state for an active NAN Publish descriptor.
 ///
@@ -272,8 +273,11 @@ pub struct ActiveSubscribeServiceInfo<'a> {
 
 /// Recover the bounded custom Service Info from an active Subscribe SDF.
 ///
-/// The parser accepts only a matching service ID, control `0x11`, and a SDEA
-/// with the same instance. Malformed or unrelated attributes are ignored.
+/// The parser accepts only a matching service ID, an active-Subscribe control
+/// value, and a SDEA with the same instance. Android framework implementations
+/// use different values in the active `0x10..=0x12` control range, and may add
+/// descriptor bytes after the mandatory nine-byte prefix. Malformed or
+/// unrelated attributes are ignored.
 pub fn active_subscribe_service_info<'a>(
     frame: &'a [u8],
     service_id: [u8; 6],
@@ -289,24 +293,46 @@ pub fn active_subscribe_service_info<'a>(
         let body_start = offset + 3;
         let body_end = body_start.checked_add(len)?;
         let body = frame.get(body_start..body_end)?;
-        if attr_id == 0x03 && body.len() == 9 && body[..6] == service_id && body[8] == 0x11 {
+        if attr_id == 0x03
+            && body.len() >= 9
+            && body[..6] == service_id
+            && matches!(body[8], 0x10..=0x12)
+        {
             subscribe = Some((body[6], body[7]));
         } else if attr_id == 0x0e {
             if let Some((instance, requestor_instance)) = subscribe {
                 // Attribute body emitted by `build_nan_usd_sdf`:
                 // instance, requestor, control(3), info_len(2), OUI/type(4), SI.
-                if body.len() >= 11 && body[0] == instance && body[1] == requestor_instance {
+                if body.len() >= 7 && body[0] == instance && body[1] == requestor_instance {
                     // The SDEA Service Info length includes its four-byte
                     // WFA OUI/type prefix; the returned SSI excludes it.
-                    let info_len =
-                        (u16::from_le_bytes([body[5], body[6]]) as usize).checked_sub(4)?;
-                    let info_start = 11usize;
-                    let info_end = info_start.checked_add(info_len)?;
-                    if body.get(7..11) == Some(&[0x50, 0x6f, 0x9a, 0x00]) {
+                    let declared_info_len = u16::from_le_bytes([body[5], body[6]]) as usize;
+                    if let Some(info_len) = declared_info_len.checked_sub(4) {
+                        let info_start = 11usize;
+                        let info_end = info_start.checked_add(info_len)?;
+                        if body.len() >= info_end
+                            && body.get(7..11) == Some(&[0x50, 0x6f, 0x9a, 0x00])
+                        {
+                            return Some(ActiveSubscribeServiceInfo {
+                                instance,
+                                requestor_instance,
+                                service_info: body.get(info_start..info_end)?,
+                            });
+                        }
+                    }
+                    // Android Wi-Fi Aware exposes Service Specific Info as
+                    // raw NAN Service Info: it has the same instance pair
+                    // and declared bounded length, but no WFA OUI/type
+                    // wrapper. Keep the wrapped form above for host/ESP
+                    // interoperability and accept this standard framework
+                    // spelling only when the attribute length is exact.
+                    let raw_info_start = 7usize;
+                    let raw_info_end = raw_info_start.checked_add(declared_info_len)?;
+                    if raw_info_end == body.len() {
                         return Some(ActiveSubscribeServiceInfo {
                             instance,
                             requestor_instance,
-                            service_info: body.get(info_start..info_end)?,
+                            service_info: body.get(raw_info_start..raw_info_end)?,
                         });
                     }
                 }
@@ -632,6 +658,65 @@ mod tests {
         let descriptor = crate::service_descriptor(&frame, service_id).unwrap();
         assert_eq!(descriptor.control, 0x11);
         assert!(descriptor.payload.is_empty());
+        assert_eq!(
+            active_subscribe_service_info(&frame, service_id),
+            Some(ActiveSubscribeServiceInfo {
+                instance: 9,
+                requestor_instance: 0,
+                service_info: &custom,
+            })
+        );
+    }
+
+    #[test]
+    fn active_subscribe_accepts_android_control_variants() {
+        let service_id = [7, 8, 9, 10, 11, 12];
+        let custom = [0xa1, 0x01, 0x01];
+        let frame = build_nan_usd_sdf_with_bssid(
+            crate::NAN_DISCOVERY_MAC,
+            [1, 2, 3, 4, 5, 6],
+            [0x50, 0x6f, 0x9a, 0x01, 0x8f, 0xf8],
+            service_id,
+            9,
+            0x10,
+            &custom,
+        );
+        // Android's `0x10` control value still associates the SDEA using the
+        // same instance/requestor pair.
+        let sda_len = crate::NAN_ACTION_START + 1;
+        assert_eq!(frame[sda_len], 9);
+        assert_eq!(
+            active_subscribe_service_info(&frame, service_id),
+            Some(ActiveSubscribeServiceInfo {
+                instance: 9,
+                requestor_instance: 0,
+                service_info: &custom,
+            })
+        );
+    }
+
+    #[test]
+    fn active_subscribe_accepts_raw_android_service_info() {
+        let service_id = [7, 8, 9, 10, 11, 12];
+        let custom = [0xa1, 0x01, 0x01];
+        let mut frame = build_nan_usd_sdf_with_bssid(
+            crate::NAN_DISCOVERY_MAC,
+            [1, 2, 3, 4, 5, 6],
+            [0x50, 0x6f, 0x9a, 0x01, 0x8f, 0xf8],
+            service_id,
+            9,
+            0x10,
+            &custom,
+        );
+        // Replace the WFA-wrapped SDEA with Android's raw Service Info form.
+        let sdea = crate::NAN_ACTION_START + 12;
+        assert_eq!(frame[sdea], 0x0e);
+        let body_start = sdea + 3;
+        frame[sdea + 1..sdea + 3].copy_from_slice(&((7 + custom.len()) as u16).to_le_bytes());
+        frame[body_start + 5..body_start + 7]
+            .copy_from_slice(&(custom.len() as u16).to_le_bytes());
+        frame.copy_within(body_start + 11..body_start + 11 + custom.len(), body_start + 7);
+        frame.truncate(body_start + 7 + custom.len());
         assert_eq!(
             active_subscribe_service_info(&frame, service_id),
             Some(ActiveSubscribeServiceInfo {

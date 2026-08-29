@@ -617,4 +617,3 @@ pub struct WifiRawnanListenRequest {
 /// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WifiRawnanListenResponse;
-

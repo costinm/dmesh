@@ -15,7 +15,8 @@ use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePub
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
@@ -47,6 +48,19 @@ fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// Optional discovery-only host label. Stable key material remains the
+/// identity; this short presentation value will later be superseded by a
+/// certificate-backed FQDN.
+fn discovery_device_name() -> Option<String> {
+    let name = std::env::var("HOSTNAME").ok()?;
+    let compact = name
+        .chars()
+        .filter(|character| character.is_ascii_graphic())
+        .take(dmesh_server::announce::MAX_DEVICE_NAME)
+        .collect::<String>();
+    (!compact.is_empty()).then_some(compact)
+}
+
 // The Wi-Fi crate owns the radio implementation. Re-export the wire protocol
 // here so existing Android/JNI callers keep the established lmesh path.
 pub use lmesh_wifi::radio_protocol;
@@ -61,6 +75,32 @@ const NAN_UDP_PORT: u16 = 15009;
 const NAN_UDP_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 250);
 const NAN_UDP_HEADER_LEN: usize = 12;
 const NAN_UDP_FRAME_MAX: usize = 512;
+
+/// IPv6 link-local multicast needs a concrete interface scope.  Index `0`
+/// does not mean "every interface" for `ff02::/16`, so discover each live
+/// non-loopback IPv6 link and join/send on all of them.
+fn multicast_v6_interface_indices() -> Vec<u32> {
+    let mut result = BTreeSet::new();
+    unsafe {
+        let mut head = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 { return Vec::new(); }
+        let mut current = head;
+        while !current.is_null() {
+            let entry = &*current;
+            let up = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
+            let loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
+            if up && !loopback && !entry.ifa_addr.is_null()
+                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
+            {
+                let index = libc::if_nametoindex(CStr::from_ptr(entry.ifa_name).as_ptr());
+                if index != 0 { result.insert(index); }
+            }
+            current = entry.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    result.into_iter().collect()
+}
 
 /// NAN supplies discovery/bootstrap only. It is deliberately not a
 /// QUIC-lite data bearer and must not be used to model object transfer.
@@ -345,10 +385,15 @@ impl LocalDiscovery {
         .await
         .context("Failed to bind IPv6 socket")?;
 
-        // Join multicast group on all interfaces (interface index 0)
-        socket
-            .join_multicast_v6(&MULTICAST_IPV6, 0)
-            .context("Failed to join IPv6 multicast group")?;
+        let interfaces = multicast_v6_interface_indices();
+        if interfaces.is_empty() {
+            anyhow::bail!("no active IPv6 multicast interface");
+        }
+        for index in interfaces {
+            socket
+                .join_multicast_v6(&MULTICAST_IPV6, index)
+                .with_context(|| format!("Failed to join IPv6 multicast group on interface {index}"))?;
+        }
 
         Ok(socket)
     }
@@ -584,6 +629,9 @@ impl LocalDiscovery {
             0,
             0,
         );
+        if let Some(name) = discovery_device_name() {
+            let _ = announce.set_device_name(&name);
+        }
         // This is the stable host control-plane identity.  It advertises its
         // measured radio capabilities so a pair probe may select it as an
         // endpoint, while the executor still promises never to reconfigure
@@ -637,6 +685,9 @@ impl LocalDiscovery {
         device_id.copy_from_slice(&digest[..16]);
         let mut announce =
             dmesh_server::announce::Announce::discovery(device_id, device_id.len() as u8, 0, 0, 0);
+        if let Some(name) = discovery_device_name() {
+            let _ = announce.set_device_name(&name);
+        }
         if !announce.set_public_key(&self.public_key) {
             anyhow::bail!("local public key exceeds announce bound");
         }
@@ -670,11 +721,15 @@ impl LocalDiscovery {
 
         // Send to IPv6 multicast
         if let Some(socket) = &self.socket_v6 {
-            let addr = SocketAddr::new(IpAddr::V6(MULTICAST_IPV6), MULTICAST_PORT);
-            socket
-                .send_to(&wire[..used], addr)
-                .await
-                .context("Failed to send IPv6 announcement")?;
+            for index in multicast_v6_interface_indices() {
+                let addr = SocketAddr::V6(std::net::SocketAddrV6::new(
+                    MULTICAST_IPV6, MULTICAST_PORT, 0, index,
+                ));
+                socket
+                    .send_to(&wire[..used], addr)
+                    .await
+                    .with_context(|| format!("Failed to send IPv6 announcement on interface {index}"))?;
+            }
         }
 
         Ok(())
@@ -1010,6 +1065,11 @@ pub enum Request {
         /// `nl80211`. It is independent from the selected TX lane.
         #[serde(default)]
         rx_variant: Option<String>,
+        /// Optional MAC expected to answer the raw-action IPERF exchange.
+        /// This keeps peer validation on the lmesh service path rather than
+        /// relying on a CLI-only prober invocation.
+        #[serde(default)]
+        expected_peer: Option<String>,
     },
     /// Run one shared QUIC-lite status/check exchange over a raw
     /// ESP-NOW-compatible action frame. This uses the same host/firmware
@@ -1563,7 +1623,19 @@ impl LmeshService {
                 reason,
             } => mesh::protocol::Response::ok_with_data(self.radio.link_steer(node, radio, reason)),
             Request::DiscoveryPing { medium } => {
-                mesh::protocol::Response::ok_with_data(self.radio.discovery_ping(medium))
+                let all_available = medium.is_none();
+                let wants_multicast = all_available
+                    || matches!(medium.as_deref(), Some("all" | "mcast" | "udp" | "udp6"));
+                let mut result = self.radio.discovery_ping(medium);
+                if wants_multicast {
+                    result["udp_multicast"] = match self.discovery.announce().await {
+                        Ok(()) => serde_json::json!({"ok": true, "accepted": true}),
+                        Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+                    };
+                    result["ok"] = serde_json::json!(result["ok"] == true
+                        && result["udp_multicast"]["ok"] == true);
+                }
+                mesh::protocol::Response::ok_with_data(result)
             }
             Request::MessagesHistory { keys, limit } => {
                 mesh::protocol::Response::ok_with_data(self.radio.history(keys, limit))
@@ -1646,6 +1718,7 @@ impl LmeshService {
                 tx_rate_mbps,
                 tx_variant,
                 rx_variant,
+                expected_peer,
             } => mesh::protocol::Response::ok_with_data(self.radio.raw_espnow_iperf(
                 iface,
                 channel,
@@ -1656,7 +1729,7 @@ impl LmeshService {
                 tx_rate_mbps.map(u64::from),
                 tx_variant,
                 rx_variant,
-                None,
+                expected_peer,
             )),
             Request::WifiRawCheck {
                 iface,

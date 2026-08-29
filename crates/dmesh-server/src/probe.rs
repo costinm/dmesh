@@ -259,13 +259,15 @@ pub struct PairProbeRequest {
     pub discovery: ProbePairDiscoverySequence,
 }
 
-/// Build the complete ESP pair characterization matrix.
+/// Build the complete discovered-pair characterization matrix.
 ///
 /// The control plane calls this once for its main integration operation.  Each
 /// returned request is a complete mode replacement for both endpoints, so a
 /// failed row cannot inherit state from the preceding row.  Narrow development
 /// operations use one of these requests (or a caller-supplied request) rather
-/// than growing pair-name-specific test functions.
+/// than growing pair-name-specific test functions.  The matrix is bearer
+/// neutral: an executor may control ESP, Android, or Host endpoints through
+/// their local adapters, but may schedule only the rows advertised by both.
 ///
 /// Rows are omitted when the descriptors do not jointly support their radio
 /// features. NAN remains requested in every scheduled row where it is a

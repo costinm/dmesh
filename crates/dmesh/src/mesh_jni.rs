@@ -14,15 +14,19 @@ use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
+use mesh::{
+    tagged::{NameOrTag, TaggedRecord},
+    wire::response_ok,
+};
 use serde_json::{Value, json};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(target_os = "android")]
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::io;
 #[cfg(target_os = "android")]
 use std::io::Write;
-use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 #[cfg(target_os = "android")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -40,7 +44,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::mesh_common::{MeshHandle, MeshStreamHandle};
-use lmesh::radio_protocol::{self, BleEvent};
+use lmesh::radio_protocol;
 
 const BRIDGE_HOST: &str = "dmesh-msg";
 const BRIDGE_PORT: u16 = 1;
@@ -56,7 +60,8 @@ static DISCOVERED_DEVICES: OnceLock<Mutex<BTreeMap<String, DiscoveredDevice>>> =
 /// Rust owns this table so routing and multicast discovery make the same
 /// decision on Android and Linux.  It is a replacement snapshot, not a Java
 /// policy cache.
-static LOCAL_NETWORKS: OnceLock<Mutex<BTreeMap<String, dmesh_server::local_networks::LocalNetwork>>> = OnceLock::new();
+static LOCAL_NETWORKS: OnceLock<Mutex<dmesh_server::local_networks::LocalNetworkTable>> =
+    OnceLock::new();
 /// Latest Android platform power/memory telemetry. This is an input to Rust
 /// scheduling; Java reports facts and does not decide admission policy.
 static POWER_STATE: OnceLock<Mutex<dmesh_server::power::PowerState>> = OnceLock::new();
@@ -72,14 +77,13 @@ static NAN_EVENTS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
 const DISCOVERED_DEVICE_TTL_MS: i64 = 60 * 60 * 1000;
 const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
 const NAN_EVENT_HISTORY_LEN: usize = 64;
-const MAX_LOCAL_NETWORK_TEXT: usize = 256;
-const MAX_POWER_TELEMETRY_BYTES: usize = 2 * 1024;
 
 #[derive(Clone)]
 struct DiscoveredDevice {
     last_seen_ms: i64,
     peer: String,
     info: Value,
+    transports: BTreeMap<String, String>,
 }
 
 fn nan_followups() -> &'static Mutex<VecDeque<FrameRecord>> {
@@ -141,137 +145,34 @@ fn discovered_devices() -> &'static Mutex<BTreeMap<String, DiscoveredDevice>> {
     DISCOVERED_DEVICES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn local_networks() -> &'static Mutex<BTreeMap<String, dmesh_server::local_networks::LocalNetwork>> {
-    LOCAL_NETWORKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn local_networks() -> &'static Mutex<dmesh_server::local_networks::LocalNetworkTable> {
+    LOCAL_NETWORKS.get_or_init(|| Mutex::new(dmesh_server::local_networks::LocalNetworkTable::default()))
 }
 
 fn power_state() -> &'static Mutex<dmesh_server::power::PowerState> {
     POWER_STATE.get_or_init(|| Mutex::new(dmesh_server::power::PowerState::default()))
 }
 
-fn power_state_json(state: dmesh_server::power::PowerState) -> Value {
-    json!({
-        "battery_percent": state.battery_percent,
-        "charging": state.charging,
-        "power_save": state.power_save,
-        "idle": state.idle,
-        "idle_ms": state.idle_ms,
-        "total_idle_ms": state.total_idle_ms,
-        "charging_ms": state.charging_ms,
-        "memory_available_bytes": state.memory_available_bytes,
-        "memory_low": state.memory_low,
-        "memory_threshold_bytes": state.memory_threshold_bytes,
-        "trim_level": state.trim_level,
-    })
-}
-
-fn power_u64(update: &serde_json::Map<String, Value>, key: &str) -> anyhow::Result<Option<u64>> {
-    update.get(key).map_or(Ok(None), |value| {
-        value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("power telemetry {key} must be unsigned"))
-    })
-}
-
-fn power_bool(update: &serde_json::Map<String, Value>, key: &str) -> anyhow::Result<Option<bool>> {
-    update.get(key).map_or(Ok(None), |value| {
-        value
-            .as_bool()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("power telemetry {key} must be boolean"))
-    })
-}
-
 fn update_power_state(payload: &[u8]) -> anyhow::Result<Value> {
-    if payload.len() > MAX_POWER_TELEMETRY_BYTES {
-        anyhow::bail!("power telemetry exceeds byte bound");
-    }
-    let update: Value = serde_json::from_slice(payload)
-        .map_err(|error| anyhow::anyhow!("invalid power telemetry: {error}"))?;
-    let update = update
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("power telemetry must be an object"))?;
-    let allowed = [
-        "source", "event", "battery_percent", "charging", "status", "plugged", "power_save", "idle",
-        "idle_ms", "total_idle_ms", "charging_ms", "memory_available_bytes",
-        "memory_low", "memory_threshold_bytes", "trim_level",
-    ];
-    if update.keys().any(|key| !allowed.contains(&key.as_str())) {
-        anyhow::bail!("power telemetry contains unsupported field");
-    }
-    for key in ["source", "event"] {
-        if let Some(value) = update.get(key)
-            && value
-                .as_str()
-                .map(|text| text.len() <= MAX_LOCAL_NETWORK_TEXT)
-                .unwrap_or(false)
-        {
-            continue;
-        } else if update.contains_key(key) {
-            anyhow::bail!("power telemetry {key} must be bounded text");
-        }
-    }
-    let battery_percent = power_u64(update, "battery_percent")?
-        .map(|value| u8::try_from(value).map_err(|_| anyhow::anyhow!("battery percentage exceeds 100")))
-        .transpose()?
-        .filter(|value| *value <= 100);
-    if update.contains_key("battery_percent") && battery_percent.is_none() {
-        anyhow::bail!("battery percentage must be 0..100");
-    }
-    let _status = power_u64(update, "status")?;
-    let _plugged = power_u64(update, "plugged")?;
-    let observation = dmesh_server::power::PowerObservation {
-        battery_percent,
-        charging: power_bool(update, "charging")?,
-        power_save: power_bool(update, "power_save")?,
-        idle: power_bool(update, "idle")?,
-        idle_ms: power_u64(update, "idle_ms")?,
-        total_idle_ms: power_u64(update, "total_idle_ms")?,
-        charging_ms: power_u64(update, "charging_ms")?,
-        memory_available_bytes: power_u64(update, "memory_available_bytes")?,
-        memory_low: power_bool(update, "memory_low")?,
-        memory_threshold_bytes: power_u64(update, "memory_threshold_bytes")?,
-        trim_level: power_u64(update, "trim_level")?
-            .map(|value| u32::try_from(value).map_err(|_| anyhow::anyhow!("trim level exceeds u32")))
-            .transpose()?,
-    };
-    let mut state = power_state().lock().map_err(|_| anyhow::anyhow!("power state poisoned"))?;
+    let observation = dmesh_server::power::decode_json_observation(payload)
+        .map_err(anyhow::Error::msg)?;
+    let mut state = power_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("power state poisoned"))?;
     state.apply(observation);
-    Ok(power_state_json(*state))
+    Ok(dmesh_server::power::json_status(*state))
 }
 
 fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
     let snapshot = dmesh_server::local_networks::decode_snapshot(payload)
         .ok_or_else(|| anyhow::anyhow!("invalid local-networks CBOR snapshot"))?;
-    let mut replacement = BTreeMap::new();
-    for row in snapshot.networks {
-        if replacement.insert(row.interface.clone(), row).is_some() {
-            anyhow::bail!("local-networks snapshot has duplicate interface");
-        }
-    }
-    let len = replacement.len();
     let mut current = local_networks()
         .lock()
         .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?;
-    *current = replacement;
-    Ok(len)
-}
-
-fn local_network_json(network: &dmesh_server::local_networks::LocalNetwork) -> Value {
-    json!({
-        "interface": network.interface,
-        "up": network.up,
-        "multicast": network.multicast,
-        "active": network.active,
-        "internet": network.internet,
-        "validated": network.validated,
-        "metered": network.metered,
-        "addresses": network.addresses,
-        "dns_servers": network.dns_servers,
-        "gateways": network.gateways,
-        "transports": network.transports,
-    })
+    current
+        .replace(snapshot)
+        .ok_or_else(|| anyhow::anyhow!("local-networks snapshot has duplicate interface"))?;
+    Ok(current.networks.len())
 }
 
 fn prune_discovered_devices(devices: &mut BTreeMap<String, DiscoveredDevice>, now_ms: i64) {
@@ -293,12 +194,19 @@ pub(crate) fn observe_announce(
         return;
     };
     prune_discovered_devices(&mut devices, now_ms);
-    devices.insert(
-        bytes_to_hex(announce.device_id()),
-        DiscoveredDevice {
-            last_seen_ms: now_ms,
-            peer,
-            info: json!({
+    let id = bytes_to_hex(announce.device_id());
+    let device = devices.entry(id).or_insert_with(|| DiscoveredDevice {
+        last_seen_ms: now_ms,
+        peer: String::new(),
+        info: Value::Null,
+        transports: BTreeMap::new(),
+    });
+    device.last_seen_ms = now_ms;
+    if !peer.is_empty() {
+        device.transports.insert(source.to_owned(), peer.clone());
+        device.peer = peer;
+    }
+    device.info = json!({
                 "protocol": "dmesh_announce",
                 "source": source,
                 "kind": announce.kind,
@@ -307,9 +215,12 @@ pub(crate) fn observe_announce(
                 "counters": announce.counters,
                 "device_class": announce.device_class,
                 "probe_capabilities": announce.probe_capabilities,
-            }),
-        },
-    );
+                "device_name": announce.device_name(),
+                "network_name": announce.network_name(),
+                "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+                "ap_link_local_v6": announce.ap_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+                "public_key": (!announce.public_key().is_empty()).then(|| bytes_to_hex(announce.public_key())),
+            });
 }
 
 #[cfg(target_os = "android")]
@@ -521,30 +432,6 @@ struct BridgeCommand {
 fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::Result<Vec<u8>> {
     let cmd = parse_bridge_human(&format!("{} {}", method, args.trim()))?;
     let response = match cmd.method.as_str() {
-        "radio.ble.build_service_data" => {
-            let event = cmd
-                .data
-                .get("event")
-                .map(String::as_str)
-                .unwrap_or("generic");
-            let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
-            let rssi = parse_i32(&cmd, "rssi", 0)?;
-            let snr_q4 = parse_i32(&cmd, "snr_q4", 0)?;
-            radio_protocol::build_ble_service_data(
-                BleEvent::parse(event),
-                &device_id,
-                payload,
-                rssi,
-                snr_q4,
-            )?
-        }
-        "radio.ble.parse_service_data" => {
-            let scan_rssi = parse_i32(&cmd, "scan_rssi", 0)?;
-            let address = cmd.data.get("address").map(String::as_str).unwrap_or("");
-            radio_protocol::parse_ble_service_data(payload, scan_rssi, address)?
-                .to_string()
-                .into_bytes()
-        }
         "radio.nan.build_service_info" => {
             let role = cmd
                 .data
@@ -599,6 +486,30 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     | dmesh_server::probe::PROBE_CAP_AP
                     | dmesh_server::probe::PROBE_CAP_UDP6,
             );
+            if let Some(name) = cmd.data.get("device_name").filter(|name| !name.is_empty())
+                && !announce.set_device_name(name)
+            {
+                anyhow::bail!("device_name must be valid UTF-8 and at most 8 bytes");
+            }
+            if let Some(name) = cmd.data.get("network_name").filter(|name| !name.is_empty())
+                && !announce.set_network_name(name)
+            {
+                anyhow::bail!("network_name must be valid UTF-8 and at most 32 bytes");
+            }
+            if let Some(address) = cmd.data.get("sta_link_local_v6").filter(|value| !value.is_empty()) {
+                let address = address
+                    .parse::<Ipv6Addr>()
+                    .map_err(|_| anyhow::anyhow!("sta_link_local_v6 must be IPv6"))?;
+                if !address.is_unicast_link_local() { anyhow::bail!("sta_link_local_v6 must be link-local"); }
+                announce.set_sta_link_local_v6(address.octets());
+            }
+            if let Some(address) = cmd.data.get("ap_link_local_v6").filter(|value| !value.is_empty()) {
+                let address = address
+                    .parse::<Ipv6Addr>()
+                    .map_err(|_| anyhow::anyhow!("ap_link_local_v6 must be IPv6"))?;
+                if !address.is_unicast_link_local() { anyhow::bail!("ap_link_local_v6 must be link-local"); }
+                announce.set_ap_link_local_v6(address.octets());
+            }
             let mut out = [0; 96];
             let used = dmesh_server::announce::encode(announce, &mut out)
                 .ok_or_else(|| anyhow::anyhow!("announce encoding exceeded bound"))?;
@@ -622,6 +533,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     "uptime_secs": announce.uptime_secs,
                     "transport_mode": announce.transport_mode,
                     "counters": announce.counters,
+                    "device_name": announce.device_name(),
+                    "network_name": announce.network_name(),
+                    "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+                    "ap_link_local_v6": announce.ap_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+                    "public_key": (!announce.public_key().is_empty()).then(|| bytes_to_hex(announce.public_key())),
                 })
             } else {
                 radio_protocol::parse_nan_service_info(payload)?
@@ -642,8 +558,9 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     device_id.to_ascii_lowercase(),
                     DiscoveredDevice {
                         last_seen_ms: now_ms,
-                        peer,
+                        peer: peer.clone(),
                         info: parsed.clone(),
+                        transports: BTreeMap::from([("nan_service_info".to_owned(), peer.clone())]),
                     },
                 );
             }
@@ -651,19 +568,22 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         }
         "radio.local_networks.update" => {
             let count = update_local_networks(payload)?;
-            json!({"ok": true, "interfaces": count}).to_string().into_bytes()
+            json!({"ok": true, "interfaces": count})
+                .to_string()
+                .into_bytes()
         }
         "radio.local_networks" => {
             let networks = local_networks()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?
+                .networks
                 .values()
-                .map(local_network_json)
+                .map(dmesh_server::local_networks::json_network)
                 .collect::<Vec<_>>();
             json!({"networks": networks}).to_string().into_bytes()
         }
         "radio.power.status" => update_power_state(payload)?.to_string().into_bytes(),
-        "radio.power.state" => power_state_json(
+        "radio.power.state" => dmesh_server::power::json_status(
             *power_state()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("power state poisoned"))?,
@@ -684,6 +604,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                         "last_seen_ms": device.last_seen_ms,
                         "peer": device.peer,
                         "info": device.info,
+                        "transports": device.transports,
                     })
                 })
                 .collect();
@@ -698,11 +619,18 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let networks = local_networks()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?;
-            let internet = networks.values().any(|network| network.validated && network.internet);
+            let internet = networks
+                .networks
+                .values()
+                .any(|network| network.validated && network.internet);
             let mut text = format!(
                 "DMesh\nLocal networks: {}{}\nDiscovered devices: {}",
-                networks.len(),
-                if internet { " (validated internet)" } else { "" },
+                networks.networks.len(),
+                if internet {
+                    " (validated internet)"
+                } else {
+                    ""
+                },
                 devices.len()
             );
             if let Ok(power) = power_state().lock() {
@@ -1108,22 +1036,35 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             }
             json!({"status": "ok"}).to_string().into_bytes()
         }
+        // Kept only for the root/ADB ContentProvider compatibility path. It
+        // will be removed once that provider submits common tagged control
+        // records directly; HTTP and embedded mesh dispatch never use it.
         "radio.shell.command" => {
             let line = std::str::from_utf8(payload)?.trim();
-            let schema = mesh::schema::ResourceSchema::from_embedded(include_str!("../../lmesh/resources/firmware-schema.json"))?;
+            let schema = mesh::schema::ResourceSchema::from_embedded(include_str!(
+                "../../lmesh/resources/firmware-schema.json"
+            ))?;
             let request = schema.parse_shell(line)?;
             let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
             let params = request.get("params").and_then(Value::as_object);
-            let mode_nan = method == "transport.start" && params
-                .and_then(|params| params.get("mode")).and_then(Value::as_str)
-                .is_some_and(|mode| mode == "nan" || mode == "aware");
-            let p2p_go = params.and_then(|params| params.get("ap"))
-                .and_then(Value::as_str).is_some_and(|value| value == "1")
-                || params.and_then(|params| params.get("p2p_go"))
-                    .and_then(Value::as_str).is_some_and(|value| value == "1");
-            let sta = method == "transport.start" && params
-                .and_then(|params| params.get("mode")).and_then(Value::as_str)
-                .is_some_and(|mode| mode == "sta");
+            let mode_nan = method == "transport.start"
+                && params
+                    .and_then(|params| params.get("mode"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|mode| mode == "nan" || mode == "aware");
+            let p2p_go = params
+                .and_then(|params| params.get("ap"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "1")
+                || params
+                    .and_then(|params| params.get("p2p_go"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == "1");
+            let sta = method == "transport.start"
+                && params
+                    .and_then(|params| params.get("mode"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|mode| mode == "sta");
             let operation = if method == "transport.stop" {
                 "stop"
             } else if sta {
@@ -1135,7 +1076,9 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             } else {
                 anyhow::bail!("no Android backend for schema command: {method}");
             };
-            json!({"status": "accepted", "operation": operation, "request": request}).to_string().into_bytes()
+            json!({"status": "accepted", "operation": operation, "request": request})
+                .to_string()
+                .into_bytes()
         }
         "radio.nan.build_followup" => {
             let msg_type = cmd
@@ -1199,61 +1142,6 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             }
             json!({"status": "ok"}).to_string().into_bytes()
         }
-        "radio.ble.inject_frame" => {
-            let parsed = radio_protocol::parse_ble_service_data(
-                payload,
-                parse_i32(&cmd, "scan_rssi", 0)?,
-                cmd.data.get("address").map(String::as_str).unwrap_or(""),
-            )?;
-            let src_hex = parsed.get("src_hex").and_then(|v| v.as_str()).unwrap_or("");
-            let packet_id = parsed
-                .get("packet_id")
-                .and_then(|v| v.as_u64())
-                .map(|s| s as u16);
-            let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            let payload_hash = parsed
-                .get("packet_id")
-                .and_then(|v| v.as_u64())
-                .map(|h| h as u32)
-                .unwrap_or(0);
-            let frame = FrameRecord {
-                protocol: "dmesh_ble".to_string(),
-                payload_hash,
-                src_device: src_hex.to_string(),
-                target_device: None,
-                seq: packet_id,
-                msg_type: if event.is_empty() {
-                    None
-                } else {
-                    Some(event.to_string())
-                },
-                payload: payload.to_vec(),
-                rssi: parsed
-                    .get("scan_rssi")
-                    .and_then(|v| v.as_i64())
-                    .map(|r| r as i32),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            if !src_hex.is_empty() {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let mut devices = discovered_devices()
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
-                prune_discovered_devices(&mut devices, now_ms);
-                devices.insert(
-                    src_hex.to_ascii_lowercase(),
-                    DiscoveredDevice {
-                        last_seen_ms: now_ms,
-                        peer: cmd.data.get("address").cloned().unwrap_or_default(),
-                        info: parsed.clone(),
-                    },
-                );
-            }
-            if let Some(sender) = store_sender() {
-                let _ = sender.send(StoreCommand::InsertFrame(frame));
-            }
-            json!({"status": "ok"}).to_string().into_bytes()
-        }
         "radio.coc.store_frame" => {
             let src_device = required_data(&cmd, "src_device")?;
             let seq = parse_i32(&cmd, "seq", -1)?;
@@ -1292,6 +1180,115 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         _ => anyhow::bail!("unknown radio method: {}", cmd.method),
     };
     Ok(response)
+}
+
+/// Execute an embedded tagged-record request through the existing Rust-owned
+/// Android control dispatcher.  This deliberately stays below JNI: the HTTP
+/// bridge calls it directly and never creates a socket, CBOR session, or Java
+/// command parser.  Android exposes named methods until it publishes a tagged
+/// catalog; numeric identities are rejected rather than guessed.
+pub(crate) fn handle_tagged_control_record(
+    record: TaggedRecord,
+) -> anyhow::Result<Option<TaggedRecord>> {
+    let component = match &record.component {
+        NameOrTag::Name(component) => component,
+        NameOrTag::Tag(tag) => {
+            anyhow::bail!("Android control has no catalog mapping for numeric component @{tag}")
+        }
+    };
+    let method = match &record.method {
+        NameOrTag::Name(method) => method,
+        NameOrTag::Tag(tag) => {
+            anyhow::bail!("Android control has no catalog mapping for numeric method @{tag}")
+        }
+    };
+    if method.is_empty() {
+        anyhow::bail!("tagged control record is missing a method")
+    }
+    // This handler is registered with the localhost HTTP service. Framework
+    // callbacks still enter through their dedicated JNI functions. The one
+    // mutating operation below is a bounded common UDP6 perf service selected
+    // from shared discovery facts, not an Android-private radio command.
+    if component != "radio"
+        || !matches!(method.as_str(), "status_text" | "devices" | "local_networks" | "power.state" | "perf.udp6")
+    {
+        anyhow::bail!("method is not exposed by the Android mesh HTTP service")
+    }
+    if !record.params.is_empty() {
+        anyhow::bail!("Android tagged control does not support positional parameters")
+    }
+    if record.data.is_some() {
+        anyhow::bail!("Android HTTP control methods do not accept opaque data")
+    }
+    if method != "perf.udp6" && !record.env.is_empty() {
+        anyhow::bail!("Android HTTP observation methods do not accept fields or data")
+    }
+
+    let mut args = String::new();
+    if method == "perf.udp6" {
+        let field = |name: &str| {
+            record.env.iter().find_map(|(key, value)| match key {
+                NameOrTag::Name(key) if key == name => Some(value),
+                _ => None,
+            })
+        };
+        let target_id = field("target_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("perf.udp6 requires target_id"))?;
+        let bytes = field("bytes").and_then(Value::as_u64).unwrap_or(32 * 1024);
+        let packet_size = field("packet_size").and_then(Value::as_u64).unwrap_or(1_100);
+        if !(1..=256 * 1024).contains(&bytes) || !(64..=1_100).contains(&packet_size) {
+            anyhow::bail!("perf.udp6 bytes or packet_size is outside the published bounds")
+        }
+        let device = discovered_devices()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown discovered target_id"))?;
+        let network_name = device.info.get("network_name").and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("target has not announced a current STA SSID"))?;
+        let local_matches = local_networks()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?
+            .networks
+            .values()
+            .any(|network| network.ssid.as_deref() == Some(network_name));
+        if !local_matches {
+            anyhow::bail!("target STA SSID does not match a local active STA attachment")
+        }
+        let peer = device.transports.get("udp_multicast")
+            .ok_or_else(|| anyhow::anyhow!("target has no UDP multicast transport observation"))?
+            .parse::<SocketAddr>()
+            .map_err(|_| anyhow::anyhow!("target UDP multicast address is invalid"))?;
+        let SocketAddr::V6(peer) = peer else {
+            anyhow::bail!("target UDP multicast address is not IPv6")
+        };
+        if !peer.ip().is_unicast_link_local() || peer.scope_id() == 0 {
+            anyhow::bail!("target UDP multicast address lacks a scoped IPv6 link-local route")
+        }
+        args = format!(
+            "address={} scope={} port={} bytes={} packet_size={}",
+            peer.ip(), peer.scope_id(), peer.port(), bytes, packet_size
+        );
+    }
+
+    let full_method = if component.is_empty() {
+        method.clone()
+    } else {
+        format!("{component}.{method}")
+    };
+    let full_method = if method == "perf.udp6" { "radio.probe.udp6_iperf".to_owned() } else { full_method };
+    let output = radio_message(&full_method, &args, &[], -1)?;
+    let Some(id) = record.id else {
+        return Ok(None);
+    };
+    let result = serde_json::from_slice(&output)
+        .or_else(|_| std::str::from_utf8(&output).map(|text| Value::String(text.to_owned())))
+        .unwrap_or_else(|_| Value::Array(output.into_iter().map(Value::from).collect()));
+    Ok(Some(response_ok(id, result)))
 }
 
 fn required_data<'a>(cmd: &'a BridgeCommand, key: &str) -> anyhow::Result<&'a str> {
@@ -1711,7 +1708,11 @@ fn take_bridge_record(pending: &mut Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> 
     }
     let size = u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
     if size == 0 || size > MAX_BRIDGE_MESSAGE_BYTES {
-        anyhow::bail!("message size {} is outside 1..={}", size, MAX_BRIDGE_MESSAGE_BYTES);
+        anyhow::bail!(
+            "message size {} is outside 1..={}",
+            size,
+            MAX_BRIDGE_MESSAGE_BYTES
+        );
     }
     if pending.len() < size + 4 {
         return Ok(None);
@@ -1723,9 +1724,14 @@ fn take_bridge_record(pending: &mut Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> 
 
 async fn write_bridge_record(stream: &mut DuplexStream, record: &[u8]) -> io::Result<()> {
     if record.is_empty() || record.len() > MAX_BRIDGE_MESSAGE_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid bridge message size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid bridge message size",
+        ));
     }
-    stream.write_all(&(record.len() as u32).to_be_bytes()).await?;
+    stream
+        .write_all(&(record.len() as u32).to_be_bytes())
+        .await?;
     stream.write_all(record).await
 }
 
@@ -2360,7 +2366,10 @@ mod tests {
         let mut pending = vec![0, 0, 0, 3, 1];
         assert!(take_bridge_record(&mut pending).unwrap().is_none());
         pending.extend_from_slice(&[2, 3, 0, 0, 0, 1, 4]);
-        assert_eq!(take_bridge_record(&mut pending).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(
+            take_bridge_record(&mut pending).unwrap(),
+            Some(vec![1, 2, 3])
+        );
         assert_eq!(take_bridge_record(&mut pending).unwrap(), Some(vec![4]));
         assert!(pending.is_empty());
     }
@@ -2369,79 +2378,63 @@ mod tests {
     fn bridge_record_rejects_empty_and_oversized_messages() {
         let mut empty = vec![0, 0, 0, 0];
         assert!(take_bridge_record(&mut empty).is_err());
-        let mut oversized = ((MAX_BRIDGE_MESSAGE_BYTES + 1) as u32).to_be_bytes().to_vec();
+        let mut oversized = ((MAX_BRIDGE_MESSAGE_BYTES + 1) as u32)
+            .to_be_bytes()
+            .to_vec();
         assert!(take_bridge_record(&mut oversized).is_err());
     }
 
     #[test]
-    fn radio_message_builds_and_parses_ble_service_data() {
-        let device_id = "010203040506";
-        let payload = b"abcdef";
-        let built = radio_message(
-            "radio.ble.build_service_data",
-            &format!("event=lora_rx device_id={device_id} rssi=-70 snr_q4=6"),
-            payload,
-            -1,
-        )
-        .unwrap();
-        // Current ESP32 advertisements begin with the DMesh BLE UUID16; the
-        // legacy `DM\x01` header remains accepted only by the parser.
-        assert_eq!(
-            u16::from_le_bytes([built[0], built[1]]),
-            lmesh::radio_protocol::DMESH_BLE_SERVICE_UUID16
-        );
-
-        let parsed = radio_message(
-            "radio.ble.parse_service_data",
-            "scan_rssi=-62 address=aa:bb",
-            &built,
-            -1,
-        )
-        .unwrap();
-        let parsed = String::from_utf8(parsed).unwrap();
-        assert!(parsed.contains(r#""layout":"esp32_service_data""#));
-        assert!(parsed.contains(r#""event":"lora_rx""#));
-        assert!(parsed.contains(r#""src_hex":"0x04030201""#));
-    }
-
-    #[test]
     fn local_network_snapshot_is_bounded_and_rust_owned() {
-        local_networks().lock().unwrap().clear();
+        local_networks().lock().unwrap().networks.clear();
         let mut snapshot = [0u8; 512];
         let mut cbor = dmesh_server::cbor::Encoder::new(&mut snapshot);
         cbor.map(1).unwrap();
         cbor.text_value(b"networks").unwrap();
         cbor.array(1).unwrap();
         cbor.map(11).unwrap();
-        cbor.text_value(b"interface").unwrap(); cbor.text_value(b"wlan0").unwrap();
-        for key in [b"up".as_slice(), b"multicast", b"active", b"internet", b"validated"] {
-            cbor.text_value(key).unwrap(); cbor.boolean(true).unwrap();
+        cbor.text_value(b"interface").unwrap();
+        cbor.text_value(b"wlan0").unwrap();
+        for key in [
+            b"up".as_slice(),
+            b"multicast",
+            b"active",
+            b"internet",
+            b"validated",
+        ] {
+            cbor.text_value(key).unwrap();
+            cbor.boolean(true).unwrap();
         }
-        cbor.text_value(b"metered").unwrap(); cbor.boolean(false).unwrap();
+        cbor.text_value(b"metered").unwrap();
+        cbor.boolean(false).unwrap();
         for (key, values) in [
-            (b"addresses".as_slice(), &[b"192.0.2.10".as_slice(), b"fe80::10%wlan0".as_slice()][..]),
+            (
+                b"addresses".as_slice(),
+                &[b"192.0.2.10".as_slice(), b"fe80::10%wlan0".as_slice()][..],
+            ),
             (b"dns_servers".as_slice(), &[b"192.0.2.53".as_slice()][..]),
             (b"gateways".as_slice(), &[b"192.0.2.1".as_slice()][..]),
             (b"transports".as_slice(), &[b"wifi".as_slice()][..]),
         ] {
-            cbor.text_value(key).unwrap(); cbor.array(values.len() as u64).unwrap();
-            for value in values { cbor.text_value(value).unwrap(); }
+            cbor.text_value(key).unwrap();
+            cbor.array(values.len() as u64).unwrap();
+            for value in values {
+                cbor.text_value(value).unwrap();
+            }
         }
         let length = cbor.len();
-        let update = radio_message(
-            "radio.local_networks.update",
-            "",
-            &snapshot[..length],
-            -1,
-        )
-        .unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&update).unwrap()["interfaces"], 1);
+        let update =
+            radio_message("radio.local_networks.update", "", &snapshot[..length], -1).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&update).unwrap()["interfaces"],
+            1
+        );
         let table = radio_message("radio.local_networks", "", &[], -1).unwrap();
         let table: Value = serde_json::from_slice(&table).unwrap();
         assert_eq!(table["networks"][0]["interface"], "wlan0");
         assert_eq!(table["networks"][0]["validated"], true);
-        let status = String::from_utf8(radio_message("radio.status_text", "", &[], -1).unwrap())
-            .unwrap();
+        let status =
+            String::from_utf8(radio_message("radio.status_text", "", &[], -1).unwrap()).unwrap();
         assert!(status.contains("Local networks: 1 (validated internet)"));
     }
 
@@ -2455,47 +2448,12 @@ mod tests {
             -1,
         )
         .unwrap();
-        let state: Value = serde_json::from_slice(
-            &radio_message("radio.power.state", "", &[], -1).unwrap(),
-        )
-        .unwrap();
+        let state: Value =
+            serde_json::from_slice(&radio_message("radio.power.state", "", &[], -1).unwrap())
+                .unwrap();
         assert_eq!(state["battery_percent"], 67);
         assert_eq!(state["power_save"], true);
         assert!(radio_message("radio.power.status", "", br#"{"unexpected":1}"#, -1).is_err());
-    }
-
-    #[test]
-    fn android_ble_discovery_updates_rust_inventory_and_status_text() {
-        discovered_devices().lock().unwrap().clear();
-        let advertisement = radio_message(
-            "radio.ble.build_service_data",
-            "event=lora_rx device_id=010203040506 rssi=-70 snr_q4=6",
-            b"payload",
-            -1,
-        )
-        .unwrap();
-        radio_message(
-            "radio.ble.inject_frame",
-            "scan_rssi=-62 address=aa:bb:cc:dd:ee:ff",
-            &advertisement,
-            -1,
-        )
-        .unwrap();
-
-        let devices = radio_message("radio.devices", "", &[], -1).unwrap();
-        let devices: Value = serde_json::from_slice(&devices).unwrap();
-        let entry = devices["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|device| device["id"] == "0x04030201")
-            .unwrap();
-        assert_eq!(entry["peer"], "aa:bb:cc:dd:ee:ff");
-
-        let status = radio_message("radio.status_text", "", &[], -1).unwrap();
-        let status = String::from_utf8(status).unwrap();
-        assert!(status.contains("Discovered devices: 1"));
-        assert!(status.contains("0x04030201 aa:bb:cc:dd:ee:ff"));
     }
 
     #[test]
@@ -2583,5 +2541,78 @@ mod tests {
             .unwrap();
         assert_eq!(udp["info"]["source"], "udp_multicast");
         assert_eq!(nan["info"]["source"], "nan_sd");
+    }
+
+    #[test]
+    fn android_nan_announce_retains_sta_network_name() {
+        let wire = radio_message(
+            "radio.nan.build_announce",
+            "kind=discovery device_id=616e64726f69642d31 uptime_secs=13 transport_mode=1 counters=4 device_name=Pixel network_name=costin sta_link_local_v6=fe80::1234 ap_link_local_v6=fe80::5678",
+            &[],
+            -1,
+        )
+        .unwrap();
+        let announce = dmesh_server::announce::decode_announce(&wire)
+            .expect("Android presence must decode as a common announce");
+        assert_eq!(announce.device_name(), Some("Pixel"));
+        assert_eq!(announce.network_name(), Some("costin"));
+        assert_eq!(announce.sta_link_local_v6(), Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets()));
+        assert_eq!(announce.ap_link_local_v6(), Some("fe80::5678".parse::<Ipv6Addr>().unwrap().octets()));
+        assert_eq!(announce.transport_mode, 1);
+    }
+
+    #[test]
+    fn tagged_control_dispatch_is_in_process_and_preserves_request_id() {
+        let response = handle_tagged_control_record(TaggedRecord {
+            component: NameOrTag::Name("radio".to_owned()),
+            method: NameOrTag::Name("status_text".to_owned()),
+            id: Some(json!(17)),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.id, Some(json!(17)));
+        assert!(
+            response
+                .result
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .is_some_and(|text| text.starts_with("DMesh"))
+        );
+    }
+
+    #[test]
+    fn tagged_control_without_id_is_oneway() {
+        let response = handle_tagged_control_record(TaggedRecord {
+            component: NameOrTag::Name("radio".to_owned()),
+            method: NameOrTag::Name("status_text".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn tagged_http_control_rejects_unreviewed_radio_actions() {
+        let error = handle_tagged_control_record(TaggedRecord {
+            component: NameOrTag::Name("radio".to_owned()),
+            method: NameOrTag::Name("nan.event".to_owned()),
+            id: Some(json!(18)),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("not exposed"));
+    }
+
+    #[test]
+    fn tagged_http_observations_reject_untyped_inputs() {
+        let error = handle_tagged_control_record(TaggedRecord {
+            component: NameOrTag::Name("radio".to_owned()),
+            method: NameOrTag::Name("devices".to_owned()),
+            id: Some(json!(19)),
+            env: BTreeMap::from([(NameOrTag::Name("limit".to_owned()), json!(10))]),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("do not accept"));
     }
 }

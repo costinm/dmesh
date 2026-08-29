@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+// TODO: move common (device free) to ssh-mesh, evaluate the rest.
+
 // The canonical schema is compiled in. `SCHEMA_DIR` supplies every
 // optional schema that dmesh-cli should translate at runtime.
 const CORE_SCHEMA: &str = include_str!("../../lmesh/resources/firmware-schema.json");

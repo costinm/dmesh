@@ -119,8 +119,8 @@ mod tests {
             link_hint: 0,
         };
         let policy = EgressPolicy::reply(path);
-        let available = TransportMask::only(TransportId::NOW)
-            .union(TransportMask::only(TransportId::UART));
+        let available =
+            TransportMask::only(TransportId::NOW).union(TransportMask::only(TransportId::UART));
         assert_eq!(policy.select(available), Some(TransportId::NOW));
     }
 

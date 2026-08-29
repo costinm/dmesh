@@ -104,7 +104,7 @@ pub fn discovery_pair_plan(
         long_bytes,
     );
     if rows.is_empty() {
-        anyhow::bail!("selected devices share no NAN-capable pair-probe row");
+        anyhow::bail!("selected devices share no compatible pair-probe row");
     }
     Ok(json!({
         "ok": true,

@@ -6,6 +6,9 @@
 //! evaluators therefore consume the same descriptor file without embedding
 //! board names or serial paths in their probe logic.
 
+
+// TODO: move parts to dmesh-server ( generic code ), integrate into android/fw/lmesh-wifi as core handler/feature
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
