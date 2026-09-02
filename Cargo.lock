@@ -1546,15 +1546,16 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "dmesh-rawnan",
  "dmesh-server",
  "dmesh-store",
  "hyper-util",
  "jni 0.21.1",
  "libc",
- "lmesh",
  "log",
  "mesh",
  "mesh-tun",
+ "p256",
  "quic-lite",
  "serde_json",
  "serial_test",
@@ -1574,12 +1575,14 @@ dependencies = [
  "anyhow",
  "dmesh-rawnan",
  "dmesh-server",
+ "glob",
  "libc",
  "lmesh",
  "lmesh-wifi",
  "mesh",
  "minicbor",
  "quic-lite",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3380,6 +3383,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
@@ -3388,9 +3392,11 @@ dependencies = [
  "minicbor",
  "p256",
  "quic-lite",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ssh-mesh",
  "tempfile",
  "tokio",
  "toml",
@@ -3501,7 +3507,6 @@ dependencies = [
 [[package]]
 name = "mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#e8b0b38edb66545d1251c67d678c48778c6a1676"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5666,7 +5671,6 @@ dependencies = [
 [[package]]
 name = "sftp-server"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#e8b0b38edb66545d1251c67d678c48778c6a1676"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6191,7 +6195,6 @@ dependencies = [
 [[package]]
 name = "ssh-config"
 version = "0.57.0"
-source = "git+https://github.com/costinm/ssh-mesh#e8b0b38edb66545d1251c67d678c48778c6a1676"
 dependencies = [
  "futures",
  "glob",
@@ -6254,7 +6257,6 @@ dependencies = [
 [[package]]
 name = "ssh-mesh"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#e8b0b38edb66545d1251c67d678c48778c6a1676"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8110,7 +8112,6 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "ws"
 version = "0.1.0"
-source = "git+https://github.com/costinm/ssh-mesh#e8b0b38edb66545d1251c67d678c48778c6a1676"
 dependencies = [
  "async-trait",
  "axum",

@@ -185,8 +185,8 @@ host-style `/mesh/run/mesh/...` UDS path.
 The initial Android HTTP catalog is intentionally read-only:
 
 - `radio.status_text`
-- `radio.devices`
-- `radio.local_networks`
+- `discovery.nodes`
+- `discovery.status`
 - `radio.power.state`
 
 All four take no fields or opaque payload. Framework callbacks, NAN/BLE
@@ -314,7 +314,7 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
    --method command --arg 'ble.unbond addr=84:0D:8E:07:41:72'"
 
 adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'transport.start mode=nan'"
+  --method command --arg 'transport.set mode=nan'"
 
 sleep 6
 

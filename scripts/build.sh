@@ -94,16 +94,16 @@ check_lmesh_api() {
         if [ -f ./env.sh ]; then
             . ./env.sh
         fi
+        local generated normalized
+        generated="$(mktemp)"
+        normalized="$(mktemp)"
         cargo run -p mesh-api-gen -- \
-            --api "$DMESH_REPO/crates/lmesh/API.md" \
-            --base-tools "$DMESH_REPO/crates/lmesh/resources/tools.json" \
-            --out-tools "$DMESH_REPO/crates/lmesh/resources/tools.json" \
-            --check
-        cargo run -p mesh-api-gen -- \
-            --api "$DMESH_REPO/crates/lmesh-wifi/API.md" \
-            --out-tools "$DMESH_REPO/crates/lmesh-wifi/resources/tools.json" \
-            --out-rust "$DMESH_REPO/crates/lmesh-wifi/src/api.rs" \
-            --check
+            --api "$DMESH_REPO/crates/dmesh-server/API.md" \
+            --out-tools "$generated"
+        jq 'map(if (.name | startswith("telemetry.")) then .name |= sub("^telemetry\\."; "") else . end)' \
+            "$generated" > "$normalized"
+        cmp "$normalized" "$DMESH_REPO/crates/lmesh/resources/tools.json"
+        rm -f "$generated" "$normalized"
     )
 }
 
@@ -128,10 +128,14 @@ lmesh_api_generate() {
         cd "$ssh_mesh_dir"
         unset CARGO_TARGET_DIR
         if [ -f ./env.sh ]; then . ./env.sh; fi
+        local generated
+        generated="$(mktemp)"
         cargo run -p mesh-api-gen -- \
-            --api "$DMESH_REPO/crates/lmesh-wifi/API.md" \
-            --out-tools "$DMESH_REPO/crates/lmesh-wifi/resources/tools.json" \
-            --out-rust "$DMESH_REPO/crates/lmesh-wifi/src/api.rs"
+            --api "$DMESH_REPO/crates/dmesh-server/API.md" \
+            --out-tools "$generated"
+        jq 'map(if (.name | startswith("telemetry.")) then .name |= sub("^telemetry\\."; "") else . end)' \
+            "$generated" > "$DMESH_REPO/crates/lmesh/resources/tools.json"
+        rm -f "$generated"
     )
 }
 

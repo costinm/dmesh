@@ -6,6 +6,12 @@ current flashing path for every target, including Main. It opens only the
 selected physical port through the repository's verified wrapper and never
 starts, stops, or restores a managed serial forward. ESP-NOW/action and Wi-Fi
 flashing remain future paths for devices without a UART connection.
+
+Before replacing a running Main image, the wrapper makes one bounded
+best-effort `transport.set mode=nan now=1` request through dmesh-cli and
+waits one second for Main's queued radio owner to stop STA before USB reset.
+The preflight never prevents a repair flash when the current firmware is
+crashed or UART is unavailable.
 """
 
 from __future__ import annotations
@@ -20,41 +26,16 @@ import subprocess
 import sys
 import termios
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FW_RUST = ROOT / "fw" / "esp32" / "rust"
 sys.path.insert(0, str(ROOT))
+DEFAULT_DEVICE_CATALOG = ROOT / "crates" / "dmesh-cli" / "examples" / "device-catalog.toml"
 
-# Direct USB inventory used only by esptool provisioning. This intentionally
-# has no lmesh-uart config or control-socket dependency. A lab override may
-# set DMESH_SERIAL_<ROLE>, for example DMESH_SERIAL_LORA1=/dev/ttyUSB0.
-BOARD_SERIAL_GLOBS = {
-    "e5": "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-E5-*-if00-port0",
-    "e6": "usb-Espressif_USB_JTAG_serial_debug_unit_14:C1:9F:E5:98:00-if00",
-    "e7": "usb-Espressif_USB_JTAG_serial_debug_unit_14:C1:9F:E4:5D:48-if00",
-    "lora1": "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA1-*-if00-port0",
-    "lora2": "usb-Silicon_Labs_CP2104_USB_to_UART_Bridge_Controller_01DC99BB-if00-port0",
-    "lora3": "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA3-*-if00-port0",
-    "lora4": "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_DMESH-LORA4-*-if00-port0",
-    "s3-1": "usb-1a86_USB_Single_Serial_5C82104982-if00",
-}
-
-# The builtin USB-JTAG adapter exposes the eFuse MAC as its OpenOCD serial.
-# Unlike ``direct_serial_port``, OpenOCD otherwise selects the first matching
-# ESP USB-JTAG device; that is unsafe while both e6 and e7 are attached.
-JTAG_ADAPTER_SERIAL = {
-    "e6": "14:C1:9F:E5:98:00",
-    "e7": "14:C1:9F:E4:5D:48",
-}
-# The builtin JTAG driver's serial-string query can fail after a C6 reset even
-# while the physical USB device is present. These lab boards have dedicated
-# hub ports, so OpenOCD's topology selector is the reliable disambiguator when
-# both are attached. Keep the serial inventory above for human diagnostics.
-JTAG_ADAPTER_LOCATION = {
-    "e6": "1-2.3",
-    "e7": "1-5",
-}
+# Direct USB/JTAG identities are resolved from the same TOML catalog as the
+# CLI and hardware E2E. A literal /dev path remains an explicit override.
 # Recovery rescue values integrity over JTAG throughput. The builtin adapter
 # defaults to 24 MHz; a wedged board on a long/noisy hub path is more reliable
 # at this conservative debug-clock rate.
@@ -77,19 +58,83 @@ def esptool_python() -> str:
     return str(local_envs[-1]) if local_envs else sys.executable
 
 
-def direct_serial_port(role: str) -> str:
+def catalog_device(catalog: Path | None, role: str) -> dict:
+    if catalog is None:
+        raise RuntimeError(
+            f"{role}: device catalog not selected"
+        )
+    if not catalog.is_file():
+        raise RuntimeError(f"device catalog not found: {catalog}")
+    with catalog.open("rb") as stream:
+        document = tomllib.load(stream)
+    devices = document.get("devices")
+    if not isinstance(devices, list):
+        raise RuntimeError("device catalog has no [[devices]] entries")
+    matches = [device for device in devices if isinstance(device, dict) and device.get("name") == role]
+    if len(matches) != 1:
+        raise RuntimeError(f"device catalog must contain exactly one device named {role!r}")
+    return matches[0]
+
+
+def direct_serial_port(role: str, catalog: Path | None) -> str:
     if role.startswith("/dev/"):
         return role
     override = os.environ.get(f"DMESH_SERIAL_{role.upper().replace('-', '_')}")
     if override:
         return override
-    pattern = BOARD_SERIAL_GLOBS.get(role)
-    if pattern is None:
-        raise RuntimeError(f"{role}: no direct USB inventory entry; set DMESH_SERIAL_<ROLE>")
+    device = catalog_device(catalog, role)
+    pattern = device.get("serial_glob") or device.get("serial")
+    if not isinstance(pattern, str) or not pattern:
+        raise RuntimeError(f"{role}: catalog has no serial or serial_glob; set DMESH_SERIAL_<ROLE>")
+    if pattern.startswith("/dev/"):
+        return pattern
     matches = sorted(glob.glob(f"/dev/serial/by-id/{pattern}"))
     if len(matches) != 1:
         raise RuntimeError(f"{role}: expected one direct USB port for {pattern}, found {matches}")
     return matches[0]
+
+
+def preflash_sta_off(role: str, target: str) -> None:
+    """Best-effort, observable Main STA teardown before USB flashing.
+
+    Keep this outside the esptool path: entering the ROM loader first would
+    make a correct control-plane request impossible.  The direct diagnostic
+    client owns UART framing and is deliberately used instead of reintroducing
+    a forwarding service.  A preflight failure is diagnostic evidence only;
+    flashing is the recovery path for precisely that class of failure.
+    """
+    if target not in ("main", "oldmain", "module") or role.startswith("/dev/"):
+        return
+    cli = ROOT / "target" / "debug" / "dmesh-cli"
+    if not cli.is_file():
+        print(f"{role}: STA-off preflight skipped (dmesh-cli is not built)", flush=True)
+        return
+    command = [str(cli), role, "--command", "transport.set mode=nan now=1"]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"{role}: STA-off preflight unavailable: {error}", flush=True)
+        return
+    if completed.returncode:
+        print(f"{role}: STA-off preflight failed (continuing to flash): {completed.stdout.strip()}", flush=True)
+        return
+    if "method=transport.set" not in completed.stdout:
+        print(f"{role}: STA-off preflight response was not correlated (continuing to flash)", flush=True)
+        return
+    # The command only changes desired state; Main serializes physical STA
+    # teardown on its event owner. One second is ample for that bounded
+    # transition and avoids asking the flash wrapper to become a Wi-Fi scan
+    # or association-status verifier.
+    time.sleep(1)
+    print(f"{role}: STA-off preflight accepted; waited 1s for STA teardown", flush=True)
 
 
 def release_serial_modem_lines(port: str) -> None:
@@ -116,13 +161,18 @@ def release_serial_modem_lines(port: str) -> None:
         os.close(fd)
 
 
-def probe_direct(port: str, baud: int, connect_attempts: int = 7) -> DirectDevice | None:
+def probe_direct(
+    port: str, baud: int, connect_attempts: int = 7, no_stub: bool = True
+) -> DirectDevice | None:
     release_serial_modem_lines(port)
     command = [
         esptool_python(), "-m", "esptool", "--port", port, "--baud", str(baud),
         "--connect-attempts", str(connect_attempts),
-        "--before", "default-reset", "--after", "no_reset", "--no-stub", "chip_id",
+        "--before", "default-reset", "--after", "no_reset",
     ]
+    if no_stub:
+        command.append("--no-stub")
+    command.append("chip_id")
     completed = subprocess.run(command, cwd=FW_RUST, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if completed.returncode:
         print(f"direct probe failed for {port}:\n{completed.stdout}", flush=True)
@@ -145,9 +195,23 @@ def probe_direct_until(port: str, baud: int, timeout_s: float) -> DirectDevice |
     while True:
         # One short esptool sync attempt per iteration has no long blind gap,
         # so an operator-issued JTAG reset can be caught during ROM startup.
-        device = probe_direct(port, baud, connect_attempts=1)
-        if device is not None or time.monotonic() >= deadline:
-            return device
+        # Keep chip identification as conservative as the later write path.
+        # A CP210x may enter ROM at its normal fast baud yet only exchange a
+        # reliable sync at 115200; the old one-shot probe aborted before the
+        # write ladder could reach that fallback.  Do not drop the no-stub
+        # variant: it is required by the CP2104 fleet board.
+        attempts = [(baud, True)]
+        if (baud, True) != (115200, True):
+            attempts.append((115200, True))
+        attempts.append((115200, False))
+        for attempt_baud, no_stub in attempts:
+            device = probe_direct(
+                port, attempt_baud, connect_attempts=1, no_stub=no_stub
+            )
+            if device is not None:
+                return device
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.25)
 
 
@@ -192,7 +256,7 @@ def openocd_binary_and_scripts() -> tuple[Path, Path]:
     return binary, scripts
 
 
-def jtag_adapter_location(role: str) -> str:
+def jtag_adapter_location(role: str, catalog: Path | None) -> str:
     """Return the exact USB topology of this board's builtin JTAG adapter.
 
     OpenOCD's serial-string selection is unreliable immediately after a C6
@@ -205,7 +269,7 @@ def jtag_adapter_location(role: str) -> str:
     fallback for a board whose serial interface is temporarily absent.
     """
     try:
-        port = Path(direct_serial_port(role)).resolve()
+        port = Path(direct_serial_port(role, catalog)).resolve()
         interface = (Path("/sys/class/tty") / port.name / "device").resolve()
         usb_device = interface.parent
         bus = (usb_device / "busnum").read_text().strip()
@@ -214,10 +278,13 @@ def jtag_adapter_location(role: str) -> str:
             return f"{bus}-{devpath}"
     except (OSError, RuntimeError):
         pass
-    return JTAG_ADAPTER_LOCATION[role]
+    location = catalog_device(catalog, role).get("jtag_adapter_location")
+    if not isinstance(location, str) or not location:
+        raise RuntimeError(f"{role}: catalog has no jtag_adapter_location")
+    return location
 
 
-def jtag_write_partition(role: str, image: Path, offset: str) -> None:
+def jtag_write_partition(role: str, image: Path, offset: str, catalog: Path | None) -> None:
     """Write one verified C6 application partition through USB-JTAG.
 
     This is deliberately narrower than the normal serial path: only the
@@ -229,7 +296,7 @@ def jtag_write_partition(role: str, image: Path, offset: str) -> None:
     if not image.is_file():
         raise RuntimeError(f"missing Recovery image: {image}")
     openocd, scripts = openocd_binary_and_scripts()
-    adapter_location = jtag_adapter_location(role)
+    adapter_location = jtag_adapter_location(role, catalog)
     # `program_esp ... reset exit` leaves this C6 builtin-JTAG target halted
     # at the reset vector. Keep the programming command separate so the final
     # reset has explicit `run` semantics before OpenOCD releases the adapter.
@@ -355,11 +422,11 @@ def read_flash_with_fallback(port: str, chip: str, offset: str, size: str, outpu
 
 def nvs_boot_target_image(
     port: str, chip: str, role: str, boot_target: int | None, clear_boot_target: bool,
-    uart_boot: int | None, mode: str | None,
+    uart_boot: int | None, mode: str | None, clear_sta_profile: bool,
     server: str, board_ip: str, server_port: int, flash_baud: int,
     source_override: Path | None = None, sta_profile: Path | None = None,
     sta_ssid: str | None = None, sta_server_ll: str | None = None,
-    sta_server_port: int = 3336,
+    sta_server_port: int = 3336, device_catalog: Path | None = None,
 ) -> Path:
     """Preserve NVS contents while setting or removing the lab boot target."""
     output = ROOT / "target" / "nvs" / role
@@ -387,6 +454,8 @@ def nvs_boot_target_image(
         command.extend(("--uart-boot", str(uart_boot)))
     if mode is not None:
         command.extend(("--mode", mode))
+    if clear_sta_profile:
+        command.append("--clear-sta-profile")
     if sta_profile is not None:
         command.extend(("--sta-profile", str(sta_profile)))
         if sta_ssid is not None:
@@ -394,6 +463,8 @@ def nvs_boot_target_image(
         if sta_server_ll is not None:
             command.extend(("--sta-server-ll", sta_server_ll))
         command.extend(("--sta-server-port", str(sta_server_port)))
+    if device_catalog is not None:
+        command.extend(("--device-catalog", str(device_catalog), "--device-role", role))
     subprocess.run(
         command,
         cwd=ROOT,
@@ -529,7 +600,14 @@ def main() -> int:
                         help="with target=nvs: Recovery server UDP port for --sta-profile")
     parser.add_argument("--mode", choices=("active", "sleepy", "sleepy-soft"),
                         help="with target=nvs: set dmesh:mode for next boot (sleepy-soft keeps the radio awake for transition tests)")
+    parser.add_argument("--clear-sta-profile", action="store_true",
+                        help="with target=nvs: remove only persisted STA selector/credential keys")
+    parser.add_argument("--device-catalog", type=Path,
+                        default=os.environ.get("DMESH_DEVICE_CATALOG", DEFAULT_DEVICE_CATALOG),
+                        help="shared device/E2E catalog; defaults to the checked-in test catalog")
     args = parser.parse_args()
+    if args.device_catalog is not None:
+        args.device_catalog = Path(args.device_catalog)
     try:
         args.transport = deployment_transport(args.target, args.transport)
     except ValueError as error:
@@ -541,8 +619,8 @@ def main() -> int:
         action_flash(args.role)
         return 0
     if args.transport == "jtag":
-        if args.check or args.role not in JTAG_ADAPTER_SERIAL or args.target not in ("recovery", "main"):
-            parser.error("--transport jtag is restricted to `flash-device.py <e6|e7> <recovery|main>`")
+        if args.check or args.role.startswith("/dev/") or args.target not in ("recovery", "main"):
+            parser.error("--transport jtag is restricted to a mapped C6 <main|recovery> target")
         _, pairs = artifacts(DirectDevice("esp32c6"), args.target, args.module)
         # This authority accepts exactly one checked app partition; retain the
         # partition-table offsets here so JTAG cannot overwrite Stage2 or NVS.
@@ -550,19 +628,18 @@ def main() -> int:
         if len(pairs) != 1 or pairs[0][0] != expected_offset:
             raise RuntimeError(f"unexpected {args.role} {args.target} JTAG artifact: {pairs}")
         print(f"{args.role}: JTAG {args.target} write {pairs[0][1]}", flush=True)
-        jtag_write_partition(args.role, pairs[0][1], expected_offset)
+        jtag_write_partition(args.role, pairs[0][1], expected_offset, args.device_catalog)
         print(f"{args.role}: JTAG verified {args.target} and reset", flush=True)
         return 0
     if args.boot_target is not None and args.clear_boot_target:
         parser.error("--boot-target and --clear-boot-target are mutually exclusive")
-    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.uart_boot is None and args.mode is None and args.sta_profile is None:
-        parser.error("target=nvs requires a Stage2 override, mode, or --sta-profile")
+    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.uart_boot is None and args.mode is None and not args.clear_sta_profile and args.sta_profile is None and args.device_catalog is None:
+        parser.error("target=nvs requires a Stage2 override, mode, --sta-profile, or --device-catalog")
     if args.sta_ssid is not None and args.sta_profile is None:
         parser.error("--sta-ssid requires --sta-profile")
     if args.sta_server_ll is not None and args.sta_profile is None:
         parser.error("--sta-server-ll requires --sta-profile")
-
-    physical = direct_serial_port(args.role)
+    physical = direct_serial_port(args.role, args.device_catalog)
     if args.check:
         device = probe_direct_until(physical, args.flash_baud, args.probe_timeout)
         if device is None:
@@ -576,6 +653,7 @@ def main() -> int:
     # be disabled merely because the module name is `flash`.
     provisioning_started = time.monotonic()
     print(f"{args.role}: direct USB provisioning on {physical}", flush=True)
+    preflash_sta_off(args.role, args.target)
     write_succeeded = False
     chip: str | None = None
     try:
@@ -588,9 +666,9 @@ def main() -> int:
             )
             image = nvs_boot_target_image(
                 physical, chip, args.role, args.boot_target, args.clear_boot_target, args.uart_boot,
-                args.mode, args.server, args.board_ip, args.server_port, args.flash_baud,
+                args.mode, args.clear_sta_profile, args.server, args.board_ip, args.server_port, args.flash_baud,
                 args.nvs_source, args.sta_profile, args.sta_ssid, args.sta_server_ll,
-                args.sta_server_port,
+                args.sta_server_port, args.device_catalog,
             )
             pairs = [("0x9000", image)]
         else:
