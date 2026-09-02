@@ -187,12 +187,12 @@ public class MeshNode implements AutoCloseable {
 
     /** Rust-owned one-hour inventory across NAN, UDP multicast, and control-plane discovery. */
     public static String knownDevices() {
-        return radioMessageText("radio.devices", "", new byte[0], -1);
+        return radioMessageText("discovery.nodes", "", new byte[0], -1);
     }
 
     /** Rust-owned platform snapshot used for routing and local multicast decisions. */
     public static String localNetworks() {
-        return radioMessageText("radio.local_networks", "", new byte[0], -1);
+        return radioMessageText("discovery.status", "", new byte[0], -1);
     }
 
     /** Latest bounded Android power/memory telemetry retained by Rust. */
@@ -241,6 +241,12 @@ public class MeshNode implements AutoCloseable {
                 "rssi=" + rssi,
                 followup, -1);
         return result != null && result.length > 0;
+    }
+
+    /** Record a packet delivered by the public Wi-Fi Aware message callback. */
+    public static String observeNanPacket(String peer, byte[] packet, int rssi) {
+        return radioMessageText("radio.nan.observe_packet",
+                "peer=" + textArg(peer) + " rssi=" + rssi, packet, -1);
     }
 
     private static String radioMessageText(String method, String args, byte[] data, int fd) {

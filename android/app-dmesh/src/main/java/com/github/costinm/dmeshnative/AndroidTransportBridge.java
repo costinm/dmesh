@@ -65,6 +65,23 @@ public final class AndroidTransportBridge {
             @Override public void onDiscovered(WifiDiscovery discovery) {
                 MeshNode.observeNanServiceInfo(discovery.peer, discovery.payload);
             }
+
+            @Override public void onReceived(String transport, String peer, byte[] payload,
+                                             int rssiDbm) {
+                // A directed NAN response is a normal received packet. Rust
+                // retains the packet fact and, when it is a DMesh follow-up,
+                // adds it to the same bounded discovery inventory used by
+                // Linux and ESP adapters.
+                if ("nan".equals(transport)) {
+                    String result = MeshNode.observeNanPacket(peer, payload, rssiDbm);
+                    // Keep the framework callback and Rust admission distinct:
+                    // delivery proves the Android session matched, while the
+                    // Rust result proves the bounded DMesh envelope parsed.
+                    // This diagnostic contains no payload bytes.
+                    MeshNode.recordNanEvent("aware.message_ingress", peer,
+                            result.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
         });
         ble = new Ble(context, new Handler(Looper.getMainLooper()), new TransportEventSink() {
             @Override public void onTransportEvent(String transport, String event, byte[] payload) {

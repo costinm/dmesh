@@ -879,6 +879,17 @@ public final class WifiController {
                     respondToActiveDiscover(peer);
                 }
             }
+            @Override public void onMessageReceived(PeerHandle peer, byte[] message) {
+                byte[] payload = message == null ? new byte[0] : message;
+                note("aware.on_message_received bytes=" + payload.length);
+                WifiEventSink sink = eventSink;
+                if (sink != null) {
+                    // WifiAware does not expose per-message RSSI through this
+                    // public callback. Keep -1 as an explicit unavailable
+                    // value; the common observation record must not invent it.
+                    sink.onReceived("nan", String.valueOf(peer), payload, -1);
+                }
+            }
             @Override public void onSessionConfigFailed() { note("aware.on_subscribe_config_failed"); }
             @Override public void onSessionTerminated() { note("aware.on_subscribe_terminated"); }
         }, handler);
