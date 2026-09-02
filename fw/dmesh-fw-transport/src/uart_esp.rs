@@ -756,18 +756,23 @@ pub fn send_transport_packet(packet: &[u8]) -> bool {
     accepted
 }
 
-/// Write one opaque non-transport PPP record. The UART adapter does not
-/// inspect CBOR, text, service tags, or command responses: those are
-/// dispatcher responsibilities.
+/// Write one DCID-zero direct record through the physical PPP bearer. The
+/// adapter does not inspect CBOR, text, service tags, or command responses;
+/// it only gives bounded UART control the same QUIC-lite short header used by
+/// UDP. Bare CBOR remains receive-only compatibility for Stage2/Recovery.
 pub fn send_direct_record(record: &[u8]) -> bool {
     #[cfg(not(target_arch = "riscv32"))]
     if !is_active() {
         return false;
     }
-    if record.is_empty() || record.len() > UART_MAX_PACKET {
+    if record.is_empty() || record.len() > UART_MAX_PACKET.saturating_sub(6) {
         return false;
     }
-    enqueue_uart_payload(UART_EGRESS_PPP, record)
+    let mut packet = [0u8; UART_MAX_PACKET];
+    let Ok(used) = quic_lite::encode_direct_packet(0, record, &mut packet) else {
+        return false;
+    };
+    enqueue_uart_payload(UART_EGRESS_PPP, &packet[..used])
 }
 
 /// Queue one raw ASCII diagnostic line for the sole physical UART writer.

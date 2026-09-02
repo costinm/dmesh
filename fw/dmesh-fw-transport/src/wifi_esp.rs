@@ -7,11 +7,11 @@
 //! bootstrap, datagram receive/send, and QUIC-lite scheduling. The
 //! flashing module sees only ordered application stream callbacks.
 
-use crate::{commands as uart, TransportProfile};
+use crate::{TransportProfile, commands as uart};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
 };
 
 // Recovery-only PHY policy. It is deliberately not an NVS setting: normal
@@ -71,11 +71,37 @@ impl RadioMode {
 }
 
 static RADIO_MODE: AtomicU8 = AtomicU8::new(RadioMode::Idle as u8);
+static LAST_SCAN_LEN: AtomicU8 = AtomicU8::new(0);
+static LAST_SCAN_TOTAL: AtomicU16 = AtomicU16::new(0);
+static LAST_SCAN_DMESH_TOTAL: AtomicU16 = AtomicU16::new(0);
+static LAST_SCAN_AT_MS: AtomicU32 = AtomicU32::new(0);
+/// `u8::MAX` means the configured STA SSID was not present in the most recent
+/// completed scan. Other values are ESP-IDF `wifi_auth_mode_t` discriminants.
+static LAST_SCAN_CONFIGURED_STA_AUTH: AtomicU8 = AtomicU8::new(u8::MAX);
+static mut LAST_SCAN: [dmesh_server::raw_wifi::RawWifiScanEntry;
+    dmesh_server::raw_wifi::RAW_WIFI_SCAN_MAX_RECORDS] =
+    [dmesh_server::raw_wifi::RawWifiScanEntry {
+        ssid: [0; 32],
+        ssid_len: 0,
+        bssid: [0; 6],
+        channel: 0,
+        signal_dbm: 0,
+    }; dmesh_server::raw_wifi::RAW_WIFI_SCAN_MAX_RECORDS];
 // ESP-IDF's `esp_wifi_get_channel` can return an error while an unassociated
 // STA has already accepted `esp_wifi_set_channel`. Retain only a channel that
 // this Wi-Fi owner successfully applied, so connectionless NOW TX has the
 // same concrete channel as the idle receiver.
 static APPLIED_CHANNEL: AtomicU8 = AtomicU8::new(0);
+
+/// Return the channel selected by the Wi-Fi owner without calling ESP-IDF.
+///
+/// Receive callbacks may use this as a bounded capture fact.  It is not a
+/// substitute for `current_channel()` in worker-context status reporting,
+/// where the driver query remains authoritative for an associated STA.
+pub fn selected_channel() -> Option<u8> {
+    let channel = APPLIED_CHANNEL.load(Ordering::Acquire);
+    (1..=13).contains(&channel).then_some(channel)
+}
 
 /// Claim the radio for exactly one named mode.  Returning false is an
 /// explicit mode conflict, never a best-effort change to global ESP-IDF
@@ -328,6 +354,10 @@ static STA_RECONNECT_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 static STA_EVENT_HANDLER_REGISTERED: AtomicBool = AtomicBool::new(false);
 static STA_ASSOCIATED_EVENT: AtomicBool = AtomicBool::new(false);
 static STA_LAST_DISCONNECT_REASON: AtomicU8 = AtomicU8::new(0);
+// ESP-IDF `WIFI_REASON_STA_LEAVING`: emitted after our own
+// `esp_wifi_disconnect` during an intentional radio-epoch replacement.  It
+// is not an association failure and must not arm Main's periodic STA retry.
+const WIFI_REASON_STA_LEAVING: u8 = 36;
 static STA_CONNECT_STARTED_MS: AtomicU32 = AtomicU32::new(0);
 static STA_CONNECT_TO_ASSOCIATED_MS: AtomicU32 = AtomicU32::new(0);
 /// Observe loss frequently enough to notice an AP restart promptly, but do
@@ -379,14 +409,23 @@ struct ScannedStaCandidate {
     ssid_len: usize,
     bssid: [u8; 6],
     channel: u8,
+    authmode: esp_idf_sys::wifi_auth_mode_t,
     preferred: bool,
 }
 
 /// Apply one scan-selected AP to the already-started STA driver. The caller
 /// owns scan timing and subsequent connection; this keeps ESP-IDF setup in
 /// the Wi-Fi owner for both initial association and reconnect.
-unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate) -> bool {
-    let mut sta = esp_idf_sys::wifi_sta_config_t::default();
+unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate, allow_open: bool) -> bool {
+    // Keep the credential installed by the epoch owner.  Rebuilding this from
+    // `default()` erased the passphrase while selecting a BSSID from a scan.
+    let mut wifi = esp_idf_sys::wifi_config_t::default();
+    if esp_idf_sys::esp_wifi_get_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut wifi)
+        != esp_idf_sys::ESP_OK
+    {
+        return false;
+    }
+    let sta = unsafe { &mut wifi.sta };
     for (dst, src) in sta
         .ssid
         .iter_mut()
@@ -397,7 +436,32 @@ unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate) -> bool {
     sta.bssid_set = true;
     sta.bssid.copy_from_slice(&selection.bssid);
     sta.channel = selection.channel;
-    let mut wifi = esp_idf_sys::wifi_config_t { sta };
+    match selection.authmode {
+        mode if mode == esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN => {
+            if !allow_open {
+                return false;
+            }
+            sta.threshold.authmode = mode;
+            sta.pmf_cfg.capable = false;
+            sta.pmf_cfg.required = false;
+        }
+        mode if mode == esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK => {
+            sta.threshold.authmode = mode;
+            sta.pmf_cfg.capable = true;
+            sta.pmf_cfg.required = false;
+        }
+        mode if mode == esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA3_PSK => {
+            sta.threshold.authmode = mode;
+            sta.pmf_cfg.capable = true;
+            sta.pmf_cfg.required = true;
+        }
+        mode if mode == esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_WPA3_PSK => {
+            sta.threshold.authmode = mode;
+            sta.pmf_cfg.capable = true;
+            sta.pmf_cfg.required = false;
+        }
+        _ => return false,
+    }
     esp_idf_sys::esp_wifi_set_config(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, &mut wifi)
         == esp_idf_sys::ESP_OK
 }
@@ -463,10 +527,12 @@ unsafe extern "C" fn sta_event_handler(
         } else {
             unsafe { (*(event_data.cast::<esp_idf_sys::wifi_event_sta_disconnected_t>())).reason }
         };
-        STA_LAST_DISCONNECT_REASON.store(reason, Ordering::Release);
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
         STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
-        notify_sta_lifecycle(false, reason);
+        if reason != WIFI_REASON_STA_LEAVING {
+            STA_LAST_DISCONNECT_REASON.store(reason, Ordering::Release);
+            notify_sta_lifecycle(false, reason);
+        }
     }
 }
 
@@ -678,9 +744,9 @@ pub fn init_sta(params: &TransportProfile) {
         for (dst, src) in sta.ssid.iter_mut().zip(ssid.iter().copied()) {
             *dst = src;
         }
-        // WPA2 is the volatile control default. A persisted WPA3-SAE profile
-        // selects ESP-IDF's SAE mode with mandatory PMF; neither form may
-        // silently downgrade to an open association.
+        // The selected BSSID's scan record decides the actual RSN mode below.
+        // This initial configuration only starts the driver to perform that
+        // scan while retaining the supplied credential for the selected AP.
         let passphrase = if params.sta_passphrase_len != 0 {
             &params.sta_passphrase[..params.sta_passphrase_len]
         } else {
@@ -691,29 +757,9 @@ pub fn init_sta(params: &TransportProfile) {
                 *dst = src;
             }
         }
-        sta.threshold.authmode = if params.open {
-            esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN
-        } else if matches!(
-            params.sta_security,
-            dmesh_server::firmware_profile::StaSecurity::Wpa3Sae
-        ) {
-            esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA3_PSK
-        } else {
-            esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
-        };
-        // PMF belongs to protected associations. Leaving it disabled for an
-        // explicit open epoch avoids presenting WPA capabilities to an AP
-        // which must accept unauthenticated association.
-        sta.pmf_cfg.capable = !params.open;
-        sta.pmf_cfg.required = matches!(
-            params.sta_security,
-            dmesh_server::firmware_profile::StaSecurity::Wpa3Sae
-        );
-        if params.sta_bssid_set {
-            sta.bssid_set = true;
-            sta.bssid.copy_from_slice(&params.sta_bssid);
-        }
-        sta.channel = params.sta_channel;
+        sta.threshold.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
+        sta.pmf_cfg.capable = false;
+        sta.pmf_cfg.required = false;
         let mut config = esp_idf_sys::wifi_config_t { sta };
         // `transport.start { mode=sta, ap=1 }` is a complete APSTA epoch,
         // not an after-the-fact lab toggle.  Configure both personalities
@@ -801,26 +847,41 @@ pub fn init_sta(params: &TransportProfile) {
         }
         uart::send_stat(b"wifi raw sta started_ms=", elapsed_ms(init_started_us));
         let _ = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-        // A caller that supplied a BSSID has already selected the AP. Do not
-        // scan first: that delays association and can replace the requested
-        // identity with a nearby AP sharing the SSID. SSID-only starts retain
-        // bounded scan selection to avoid a stale driver fast-scan cache.
-        if !params.sta_bssid_set {
-            if let Some(selection) = scan_dmesh_sta_candidate(&params.ssid[..params.ssid_len]) {
-                if apply_sta_candidate(&selection) {
-                    uart::send_response(if selection.preferred {
-                        b"wifi initial preferred candidate"
-                    } else {
-                        b"wifi initial fallback candidate"
-                    });
+        let mut association_candidate_ready = false;
+        if let Some(selection) = scan_dmesh_sta_candidate(
+            &params.ssid[..params.ssid_len],
+            params.sta_bssid_set.then_some(params.sta_bssid),
+        ) {
+            if apply_sta_candidate(&selection, params.open) {
+                association_candidate_ready = true;
+                uart::send_response(if selection.preferred {
+                    b"wifi initial preferred candidate"
                 } else {
-                    uart::send_response(b"wifi initial candidate config failed");
-                }
+                    b"wifi initial fallback candidate"
+                });
             } else {
-                uart::send_response(b"wifi initial scan no eligible AP");
+                uart::send_response(b"wifi initial candidate config failed");
             }
+        } else {
+            uart::send_response(b"wifi initial scan no eligible AP");
+        }
+        if !association_candidate_ready {
+            // Do not enter ESP-IDF's indefinite connecting state when the
+            // selected STA is not even visible. Main will restore its normal
+            // unassociated NAN+NOW epoch and schedule the next bounded scan.
+            uart::send_response(b"wifi STA association skipped no candidate");
+            // ESP-IDF emits no disconnect callback when Main deliberately
+            // declines to call `esp_wifi_connect`.  Queue the same lifecycle
+            // completion so Main restores NAN/NOW and schedules the bounded
+            // periodic retry instead of remaining in a half-started STA epoch.
+            notify_sta_lifecycle(false, 0);
+            return;
         }
         STA_CONNECT_TO_ASSOCIATED_MS.store(0, Ordering::Release);
+        // Do not present the intentional disconnect used to replace the
+        // prior radio epoch as this attempt's failure reason. A subsequent
+        // non-`STA_LEAVING` driver callback supplies the useful diagnostic.
+        STA_LAST_DISCONNECT_REASON.store(0, Ordering::Release);
         STA_CONNECT_STARTED_MS.store(
             (esp_idf_sys::esp_timer_get_time().max(0) as u64 / 1_000) as u32,
             Ordering::Release,
@@ -1348,10 +1409,10 @@ pub fn install_action_ingress(handler: crate::wifi_espnow_esp::EspNowHandler) ->
     installed
 }
 
-/// Start the associated STA+UDP6+NAN+NOW radio mode. The initial
-/// implementation enables the NOW callback only when `nan_dw_interval` is
-/// zero. Nonzero intervals enable NAN/DW capture every `interval * 512 ms`,
-/// without changing this public transport-mode name.
+/// Start the associated STA+UDP6+NOW extension, optionally with NAN DW
+/// capture on channel 6. `nan_dw_interval` is forced to zero by Main for a
+/// STA on any other channel; NOW then remains available co-channel and UDP6
+/// remains the normal shared-network bearer.
 /// Wi-Fi owns the callback, ingress-pool, and radio lifecycle in either case.
 pub fn start_sta_extensions(
     handler: crate::wifi_espnow_esp::EspNowHandler,
@@ -1417,7 +1478,7 @@ pub fn start_sta_extensions(
     // it stops/reinitializes the ESP-IDF driver.
     RADIO_MODE.store(RadioMode::StaRawUdp6Extensions as u8, Ordering::Release);
     uart::send_response(if nan_dw_interval == 0 {
-        b"wifi STA/NAN/NOW NOW-only started"
+        b"wifi STA/NOW-only started"
     } else {
         b"wifi STA/NAN/NOW with DW started"
     });
@@ -1547,6 +1608,14 @@ pub fn sta_ap_rssi_dbm() -> Option<i8> {
     let mut ap = esp_idf_sys::wifi_ap_record_t::default();
     (unsafe { esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) } == esp_idf_sys::ESP_OK)
         .then_some(ap.rssi)
+}
+
+/// ESP-IDF's currently applied maximum Wi-Fi TX power in quarter-dBm units.
+/// It is local configuration telemetry, not peer-visible RF evidence.
+pub fn max_tx_power_qdbm() -> Option<i8> {
+    let mut power = 0i8;
+    (unsafe { esp_idf_sys::esp_wifi_get_max_tx_power(&mut power) } == esp_idf_sys::ESP_OK)
+        .then_some(power)
 }
 
 /// Whether the current STA-driver epoch suppresses 802.11b rates.
@@ -1870,8 +1939,8 @@ unsafe extern "C" fn sta_reconnect_task(argument: *mut c_void) {
             }
         } else {
             uart::send_stat(b"wifi reconnect scan_ms=", elapsed_ms(reconnect_started_us));
-            if let Some(selection) = scan_dmesh_sta_candidate(preferred_ssid) {
-                if apply_sta_candidate(&selection) {
+            if let Some(selection) = scan_dmesh_sta_candidate(preferred_ssid, None) {
+                if apply_sta_candidate(&selection, false) {
                     // A reset of the association state is necessary after a host
                     // AP restart; a bare connect can otherwise retain the old
                     // BSSID/channel in ESP-IDF's fast-scan cache.
@@ -1903,7 +1972,10 @@ unsafe extern "C" fn sta_reconnect_task(argument: *mut c_void) {
 /// comes from the management-frame beacon itself; it is therefore both the
 /// AP association target and the MAC from which raw UDP6 derives the host LL
 /// endpoint.  No duplicate IPv6 setting or vendor IE is required.
-unsafe fn scan_dmesh_sta_candidate(preferred_ssid: &[u8]) -> Option<ScannedStaCandidate> {
+unsafe fn scan_dmesh_sta_candidate(
+    preferred_ssid: &[u8],
+    required_bssid: Option<[u8; 6]>,
+) -> Option<ScannedStaCandidate> {
     let scan = esp_idf_sys::esp_wifi_scan_start(core::ptr::null(), true);
     if scan != esp_idf_sys::ESP_OK {
         uart::send_stat(b"wifi reconnect scan_result=", scan as u32 as u64);
@@ -1936,9 +2008,14 @@ unsafe fn scan_dmesh_sta_candidate(preferred_ssid: &[u8]) -> Option<ScannedStaCa
         return None;
     }
     records.truncate(usize::from(returned));
+    store_scan_observations(&records, total, preferred_ssid);
 
     let mut candidates = Vec::with_capacity(records.len());
-    for record in &records {
+    for record in records.iter().filter(|record| {
+        required_bssid
+            .map(|bssid| record.bssid == bssid)
+            .unwrap_or(true)
+    }) {
         let len = record
             .ssid
             .iter()
@@ -1967,6 +2044,143 @@ unsafe fn scan_dmesh_sta_candidate(preferred_ssid: &[u8]) -> Option<ScannedStaCa
         ssid_len: selection.candidate.ssid.len(),
         bssid: selection.candidate.bssid,
         channel: selection.candidate.channel,
+        authmode: records
+            .iter()
+            .find(|record| record.bssid == selection.candidate.bssid)
+            .map(|record| record.authmode)?,
         preferred: selection.preferred,
     })
+}
+
+fn scan_now_ms() -> u32 {
+    (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32
+}
+
+fn dmesh_ssid(record: &esp_idf_sys::wifi_ap_record_t) -> bool {
+    record.ssid.starts_with(b"dmesh")
+}
+
+fn store_scan_observations(
+    records: &[esp_idf_sys::wifi_ap_record_t],
+    total: u16,
+    configured_sta_ssid: &[u8],
+) {
+    let direct_dmesh_total = records.iter().filter(|record| dmesh_ssid(record)).count() as u16;
+    let count =
+        direct_dmesh_total.min(dmesh_server::raw_wifi::RAW_WIFI_SCAN_MAX_RECORDS as u16) as usize;
+    unsafe {
+        for (index, record) in records
+            .iter()
+            .filter(|record| dmesh_ssid(record))
+            .take(count)
+            .enumerate()
+        {
+            let ssid_len = record
+                .ssid
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(record.ssid.len())
+                .min(32);
+            let mut entry = dmesh_server::raw_wifi::RawWifiScanEntry::default();
+            entry.ssid[..ssid_len].copy_from_slice(&record.ssid[..ssid_len]);
+            entry.ssid_len = ssid_len as u8;
+            entry.bssid = record.bssid;
+            entry.channel = record.primary;
+            entry.signal_dbm = record.rssi;
+            LAST_SCAN[index] = entry;
+        }
+    }
+    LAST_SCAN_LEN.store(count as u8, Ordering::Release);
+    LAST_SCAN_TOTAL.store(total, Ordering::Release);
+    LAST_SCAN_DMESH_TOTAL.store(direct_dmesh_total, Ordering::Release);
+    let configured_auth = records
+        .iter()
+        .find(|record| {
+            let length = record
+                .ssid
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(record.ssid.len());
+            configured_sta_ssid == &record.ssid[..length]
+        })
+        .map(|record| record.authmode as u8)
+        .unwrap_or(u8::MAX);
+    LAST_SCAN_CONFIGURED_STA_AUTH.store(configured_auth, Ordering::Release);
+    LAST_SCAN_AT_MS.store(scan_now_ms(), Ordering::Release);
+}
+
+fn cached_scan_observations(
+    out: &mut [dmesh_server::raw_wifi::RawWifiScanEntry],
+) -> dmesh_server::raw_wifi::RawWifiScanResponse {
+    let count = usize::from(LAST_SCAN_LEN.load(Ordering::Acquire)).min(out.len());
+    unsafe {
+        out[..count].copy_from_slice(&LAST_SCAN[..count]);
+    }
+    let now = scan_now_ms();
+    let mut configured_sta_ssid = [0u8; 32];
+    let configured_sta_ssid_len =
+        crate::main_runtime::read_setting(b"sta_ssid", &mut configured_sta_ssid)
+            .unwrap_or(0)
+            .min(configured_sta_ssid.len());
+    dmesh_server::raw_wifi::RawWifiScanResponse {
+        entries: count,
+        total_aps: LAST_SCAN_TOTAL.load(Ordering::Acquire),
+        direct_dmesh_aps: LAST_SCAN_DMESH_TOTAL.load(Ordering::Acquire),
+        age_ms: now.wrapping_sub(LAST_SCAN_AT_MS.load(Ordering::Acquire)),
+        fresh: false,
+        configured_sta_ssid,
+        configured_sta_ssid_len: configured_sta_ssid_len as u8,
+        configured_sta_auth_mode: match LAST_SCAN_CONFIGURED_STA_AUTH.load(Ordering::Acquire) {
+            u8::MAX => None,
+            auth_mode => Some(auth_mode),
+        },
+    }
+}
+
+/// Return bounded AP observations for `wifi.scan` without changing association.
+pub fn scan_observations(
+    request: dmesh_server::raw_wifi::RawWifiScanRequest,
+    out: &mut [dmesh_server::raw_wifi::RawWifiScanEntry],
+) -> Result<dmesh_server::raw_wifi::RawWifiScanResponse, &'static str> {
+    const CACHE_MAX_AGE_MS: u32 = 30_000;
+    let cached = cached_scan_observations(out);
+    if cached.total_aps != 0
+        && (request.last_results || (!request.fresh && cached.age_ms <= CACHE_MAX_AGE_MS))
+    {
+        return Ok(cached);
+    }
+    let profile = crate::profile_store::snapshot();
+    let configured_sta_ssid = &profile.ssid[..profile.ssid_len];
+    unsafe {
+        if esp_idf_sys::esp_wifi_scan_start(core::ptr::null(), true) != esp_idf_sys::ESP_OK {
+            return (cached.total_aps != 0)
+                .then_some(cached)
+                .ok_or("wifi scan start");
+        }
+        let mut total = 0u16;
+        if esp_idf_sys::esp_wifi_scan_get_ap_num(&mut total) != esp_idf_sys::ESP_OK {
+            return Err("wifi scan count");
+        }
+        let count = usize::from(total).min(out.len());
+        if count == 0 {
+            store_scan_observations(&[], total, configured_sta_ssid);
+            return Ok(cached_scan_observations(out));
+        }
+        let mut records = Vec::with_capacity(count);
+        records.resize(count, esp_idf_sys::wifi_ap_record_t::default());
+        let mut returned = count as u16;
+        if esp_idf_sys::esp_wifi_scan_get_ap_records(&mut returned, records.as_mut_ptr())
+            != esp_idf_sys::ESP_OK
+        {
+            return Err("wifi scan records");
+        }
+        store_scan_observations(
+            &records[..usize::from(returned)],
+            total,
+            configured_sta_ssid,
+        );
+        let mut response = cached_scan_observations(out);
+        response.fresh = true;
+        Ok(response)
+    }
 }

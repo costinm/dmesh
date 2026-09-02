@@ -59,7 +59,10 @@ pub fn roc_in_flight() -> bool {
 /// Main boot before ROC can be requested; it is not a per-window operation.
 /// The adapter remains usable by Recovery without this optional product hook.
 pub fn set_completion_handler(handler: Option<RocCompletionHandler>) {
-    ROC_COMPLETION_HANDLER.store(handler.map(|handler| handler as usize).unwrap_or(0), Ordering::Release);
+    ROC_COMPLETION_HANDLER.store(
+        handler.map(|handler| handler as usize).unwrap_or(0),
+        Ordering::Release,
+    );
 }
 
 fn notify_completion() {
@@ -145,8 +148,7 @@ pub fn listen_for_actions(channel: u8, duration_ms: u32) -> bool {
     // do not replace this with a local `wifi_roc_req_t`. The driver owns the
     // completed request until `roc_done_callback` clears `ROC_IN_FLIGHT`.
     let request = unsafe {
-        let request = core::ptr::addr_of_mut!(ROC_REQUEST)
-            .cast::<esp_idf_sys::wifi_roc_req_t>();
+        let request = core::ptr::addr_of_mut!(ROC_REQUEST).cast::<esp_idf_sys::wifi_roc_req_t>();
         request.write(core::mem::zeroed());
         (*request).ifx = crate::wifi_esp::radio_interface_id(crate::wifi_esp::RadioInterface::Sta);
         (*request).type_ = esp_idf_sys::wifi_roc_t_WIFI_ROC_REQ;
@@ -238,9 +240,8 @@ pub fn service_deadline() {
     // 400-ms lease plus the 64-ms DW and C6's 50-ms completion guard fits in
     // one 512-TU cadence; a nominal 512-ms lease does not.  Defer rather than
     // ask the driver to race the two receive modes.
-    if crate::wifi_nan_dw_capture_esp::roc_conflicts(
-        duration.saturating_add(ROC_REISSUE_GUARD_MS),
-    ) {
+    if crate::wifi_nan_dw_capture_esp::roc_conflicts(duration.saturating_add(ROC_REISSUE_GUARD_MS))
+    {
         ROC_LOOP_NEXT_US.store(now.wrapping_add(10_000), Ordering::Release);
         return;
     }

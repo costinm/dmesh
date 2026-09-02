@@ -47,6 +47,7 @@ pub fn sta_driver_tx_enabled() -> bool {
 /// Peer identity supplied to a bearer-neutral QUIC-lite handler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawUdp6Peer {
+    pub link: crate::shared_ingress_esp::IngressLink,
     pub mac: [u8; 6],
     pub ip: [u8; 16],
     pub port: u16,
@@ -136,8 +137,7 @@ struct AnnouncePeerSlot {
     source_mac_low: AtomicU32,
     source_mac_high: AtomicU32,
     uptime_secs: AtomicU32,
-    counters: AtomicU32,
-    kind_and_mode: AtomicU32,
+    kind: AtomicU32,
     last_seen_ms: AtomicU32,
 }
 
@@ -159,8 +159,7 @@ impl AnnouncePeerSlot {
             source_mac_low: AtomicU32::new(0),
             source_mac_high: AtomicU32::new(0),
             uptime_secs: AtomicU32::new(0),
-            counters: AtomicU32::new(0),
-            kind_and_mode: AtomicU32::new(0),
+            kind: AtomicU32::new(0),
             last_seen_ms: AtomicU32::new(0),
         }
     }
@@ -180,9 +179,7 @@ pub struct AnnouncePeerSnapshot {
     pub source_ip: [u8; 16],
     pub source_mac: [u8; 6],
     pub uptime_secs: u32,
-    pub counters: u32,
     pub kind: u8,
-    pub transport_mode: u8,
     pub last_seen_ms: u32,
 }
 
@@ -207,15 +204,12 @@ pub fn announce_peers(out: &mut [Option<AnnouncePeerSnapshot>; ANNOUNCE_PEER_CAP
         }
         let low = slot.source_mac_low.load(Ordering::Relaxed).to_le_bytes();
         let high = slot.source_mac_high.load(Ordering::Relaxed).to_le_bytes();
-        let kind_and_mode = slot.kind_and_mode.load(Ordering::Relaxed);
         out[index] = Some(AnnouncePeerSnapshot {
             device_id,
             source_ip,
             source_mac: [low[0], low[1], low[2], low[3], high[0], high[1]],
             uptime_secs: slot.uptime_secs.load(Ordering::Relaxed),
-            counters: slot.counters.load(Ordering::Relaxed),
-            kind: kind_and_mode as u8,
-            transport_mode: (kind_and_mode >> 8) as u8,
+            kind: slot.kind.load(Ordering::Relaxed) as u8,
             last_seen_ms,
         });
     }
@@ -320,7 +314,11 @@ pub fn next_raw_client_delay_ms() -> Option<u32> {
     }
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
     let remaining = due_ms.wrapping_sub(now_ms);
-    Some(if remaining > 0x8000_0000 { 1 } else { remaining.clamp(1, 1_000) })
+    Some(if remaining > 0x8000_0000 {
+        1
+    } else {
+        remaining.clamp(1, 1_000)
+    })
 }
 
 /// Publish the active client's next genuine QUIC-lite deadline and wake Main
@@ -348,10 +346,7 @@ fn publish_raw_client_deadline() {
                 .map(|deadline_ms| deadline_ms.saturating_mul(1_000))
                 .unwrap_or(state.deadline_us.max(0) as u64)
         } else {
-            state
-                .next_bootstrap_retry_us
-                .min(state.deadline_us)
-                .max(0) as u64
+            state.next_bootstrap_retry_us.min(state.deadline_us).max(0) as u64
         };
         let due_ms = due_us.max(now_us.saturating_sub(1)) / 1_000;
         RAW_CLIENT_NEXT_DUE_MS.store(due_ms as u32, Ordering::Release);
@@ -417,7 +412,9 @@ pub fn start_iperf_client(
         // client is currently allocation-free, but dropping here keeps this
         // lifecycle correct if the bounded QUIC state later owns a resource.
         unsafe {
-            core::ptr::drop_in_place(core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>());
+            core::ptr::drop_in_place(
+                core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>(),
+            );
         }
     }
     let client = match dmesh_server::raw_transport::RawClient::new_in_place(
@@ -442,6 +439,7 @@ pub fn start_iperf_client(
         }
     };
     let peer = RawUdp6Peer {
+        link: crate::shared_ingress_esp::IngressLink::WifiSta,
         mac: peer_mac,
         ip: link_local_from_mac(peer_mac),
         port: RAW_UDP6_PORT,
@@ -930,11 +928,14 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
         }
         return;
     }
-    // Presence is a separate multicast service, never a QUIC-lite datagram.
-    // Parse it before the unicast bearer so a valid announcement cannot inflate
-    // raw UDP6 error counters or reach a connection handler.
+    // Presence is multicast application data in a DCID-zero direct record,
+    // not a connection datagram. Parse it before the unicast bearer so a
+    // valid announcement cannot inflate raw UDP6 error counters or reach a
+    // connection handler.
     if let Ok(packet) = parse_udp6_for_destination(frame, ANNOUNCE_IPV6, ANNOUNCE_UDP6_PORT) {
-        if let Some(announce) = dmesh_server::announce::decode_announce(packet.payload) {
+        let payload = quic_lite::decode_direct_packet(packet.payload)
+            .map_or(packet.payload, |(_, payload)| payload);
+        if let Some(announce) = dmesh_server::announce::decode_announce(payload) {
             record_announce_peer(announce, packet.source_mac, packet.source_ip);
         } else {
             ANNOUNCE_INVALID.fetch_add(1, Ordering::Relaxed);
@@ -967,6 +968,7 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     // skip the bounded poller in that case: it owns the next queued stream
     // packet for raw UDP6 and raw action alike.
     let peer = RawUdp6Peer {
+        link: item.link(),
         mac: packet.source_mac,
         ip: packet.source_ip,
         port: packet.source_port,
@@ -997,9 +999,23 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     if result.sent != 0 {
         UDP_DELIVERED.fetch_add(1, Ordering::Relaxed);
         TX_FRAMES.fetch_add(result.sent as u32, Ordering::Relaxed);
+        // Keep a small physical-path breadcrumb for the host->STA direct
+        // responder. A client timeout alone cannot distinguish a handler
+        // that produced nothing from a Wi-Fi submit or AP-forwarding loss.
+        if UDP_DELIVERED.load(Ordering::Relaxed) <= 2 {
+            crate::commands::send_stat(b"raw udp6 egress sent=", result.sent as u64);
+            crate::commands::send_stat(
+                b"raw udp6 egress tx result=",
+                LAST_TX_RESULT.load(Ordering::Relaxed) as u64,
+            );
+        }
     }
     if result.invalid_length || result.submit_failed {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        crate::commands::send_stat(
+            b"raw udp6 egress submit_failed=",
+            u64::from(result.submit_failed),
+        );
     }
     if result.sent != 0 {
         schedule_paced_poll(item.link(), peer);
@@ -1031,11 +1047,7 @@ fn dispatch_raw_client(
             return true;
         }
         let response = &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER);
-        let outbound = match client.receive_at(
-            payload,
-            (now.max(0) as u64) / 1_000,
-            response,
-        ) {
+        let outbound = match client.receive_at(payload, (now.max(0) as u64) / 1_000, response) {
             Ok(packet) => {
                 RAW_CLIENT_RECEIVE_OK.fetch_add(1, Ordering::Relaxed);
                 packet
@@ -1203,12 +1215,7 @@ fn record_announce_peer(
     );
     slot.uptime_secs
         .store(announce.uptime_secs, Ordering::Relaxed);
-    slot.counters.store(announce.counters, Ordering::Relaxed);
-    slot.kind_and_mode.store(
-        // `decode_announce` accepts only the two small published method tags.
-        announce.kind as u32 | (u32::from(announce.transport_mode) << 8),
-        Ordering::Relaxed,
-    );
+    slot.kind.store(announce.kind as u32, Ordering::Relaxed);
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000).max(1) as u32;
     slot.last_seen_ms.store(now_ms, Ordering::Release);
     ANNOUNCE_RECEIVED.fetch_add(1, Ordering::Relaxed);
@@ -1307,13 +1314,14 @@ fn load_paced_peer() -> RawUdp6Peer {
         ip[index * 4..index * 4 + 4].copy_from_slice(&slot.load(Ordering::Acquire).to_be_bytes());
     }
     RawUdp6Peer {
+        link: crate::shared_ingress_esp::IngressLink::WifiSta,
         mac: [low[0], low[1], low[2], low[3], high[0], high[1]],
         ip,
         port: PACED_PEER_PORT.load(Ordering::Acquire) as u16,
     }
 }
 
-fn transmit_udp6(
+pub(crate) fn transmit_udp6(
     link: crate::shared_ingress_esp::IngressLink,
     peer: RawUdp6Peer,
     source_port: u16,
@@ -1354,14 +1362,42 @@ fn transmit_udp6(
     transmit_ipv6(link, peer.mac, local_mac, &ethernet[..frame_len])
 }
 
-/// Send one bounded unsigned presence record once STA/raw-UDP6 is live.
-/// This is intentionally outside the QUIC-lite listener port: multicast
-/// discovery must not be misparsed as a connection datagram.
+/// Send one bounded unsigned presence record over every live UDP6 Wi-Fi link.
+/// STA and AP have distinct ESP-IDF Ethernet egress, so APSTA must submit one
+/// multicast datagram through each rather than silently favouring STA.  The
+/// common payload may advertise both deterministic link-local endpoints;
+/// each Ethernet frame uses the source MAC/IP of its own egress link.
+/// This is intentionally outside the QUIC-lite listener port, but the payload
+/// still uses the DCID-zero direct-record envelope. Multicast discovery must
+/// not be misparsed as a connection datagram.
 pub fn broadcast_announce(payload: &[u8]) -> bool {
-    if payload.is_empty() || payload.len() > crate::TRANSPORT_MTU {
+    if payload.is_empty() || payload.len() > crate::TRANSPORT_MTU.saturating_sub(6) {
         return false;
     }
-    let link = crate::shared_ingress_esp::IngressLink::WifiSta;
+    let mut direct = [0u8; crate::TRANSPORT_MTU];
+    let Ok(used) = quic_lite::encode_direct_packet(0, payload, &mut direct) else {
+        return false;
+    };
+    let mut sent = false;
+    if crate::wifi_esp::sta_associated() {
+        sent |= broadcast_announce_on_link(
+            crate::shared_ingress_esp::IngressLink::WifiSta,
+            &direct[..used],
+        );
+    }
+    if crate::wifi_esp::lab_open_ap_active() {
+        sent |= broadcast_announce_on_link(
+            crate::shared_ingress_esp::IngressLink::WifiAp,
+            &direct[..used],
+        );
+    }
+    sent
+}
+
+fn broadcast_announce_on_link(
+    link: crate::shared_ingress_esp::IngressLink,
+    payload: &[u8],
+) -> bool {
     let local_mac = local_mac_for(link);
     let local_ip = link_local_from_mac(local_mac);
     let ethernet = unsafe { &mut *core::ptr::addr_of_mut!(TX_FRAME) };

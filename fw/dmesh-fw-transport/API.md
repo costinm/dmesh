@@ -68,6 +68,34 @@ whether UDP6 multicast, NOW, or NAN SD delivered them; only provenance differs.
 A host records received NAN Service Info announcements as
 `wifi.rawnan.discovery`.
 
+The same direct tagged-CBOR announce component provides the bounded common
+device-list request/response (`method=9`). It is the ESP projection of
+`radio.devices`: each entry carries first/last receive time, total and
+active-Publish/active-Subscribe/follow-up counts, last kind, bounded payload
+length/hash, `available_fields`, and `unavailable_fields`. ESP keeps the raw peer MAC only for local
+reply correlation; it sets the peer-correlation availability bit but does not
+return that platform-specific handle in the presentation response. ESP sets
+only facts it actually receives (peer correlation, cluster BSSID when known,
+the Wi-Fi-owner channel at capture time, and payload fingerprint); it leaves
+RSSI unavailable rather than substituting zero. The channel is a local receive
+fact, not an advertised peer setting. Semantic DMesh identity is empty for a raw NAN peer until a
+decoded announce has linked it.
+
+NAN Service Discovery is fixed to channel 6. A STA on another channel does
+not keep a NAN DW or NAN Service Info active; it continues to emit the same
+bounded announce over co-channel NOW and UDP6 multicast. The announce carries
+the current Wi-Fi channel and the STA UDP6 endpoint/network metadata so a
+receiver can choose the normal shared-network UDP6 path.
+
+The normal radio snapshot separates active-Publish `attempted`, locally
+driver-accepted `sent`, and locally rejected `dropped` counters. These are
+submission diagnostics only: `radio.devices` observations on a different
+device remain the required receipt evidence.
+
+When a platform exposes it, the same snapshot includes
+`max_tx_power_qdbm`, the local maximum transmit power in quarter-dBm. It is
+configuration telemetry, not evidence that a peer received a frame.
+
 Mode replacement emits additional announce methods using the same schema:
 `5=transition-begin`, `6=sleep-pending`, `7=transition-complete`, and
 `8=wake`. Each marker is sent before/after the radio owner changes state on
@@ -81,7 +109,11 @@ with the request id and record elapsed time for sleepy -> active-STA -> sleepy
 When NAN DW capture is enabled, firmware also keeps that same current CBOR
 announce as its active Publish Service Info. It is emitted only after the
 Wi-Fi owner has opened a confirmed discovery window, once after boot/update
-and then on the five-minute announce cadence. `nan_dw_interval=0`
+and then on the five-minute announce cadence. The ESP opens capture shortly
+before the selected cluster beacon and retains it for 100 ms: the normal NAN
+interoperability target remains the 64 ms discovery window after that beacon,
+and the extra bounded margin records host scheduling skew rather than creating
+an independent receive cadence. `nan_dw_interval=0`
 therefore keeps the descriptor pending rather than creating continuous
 promiscuous RX or an out-of-window NAN action. The publish state is replaced
 atomically with each boot/periodic record; it never retains an ESP-IDF frame
@@ -121,10 +153,11 @@ DMesh NAN Follow-up containing the correlated CBOR response, using the
 already-open discovery window and the current STA/AP action lane. An accepted
 Publish SI retains the NOW broadcast response path. Rejected payloads are
 reported only as bounded diagnostics.
-ESP32 records are intentionally unsigned discovery metadata. A record that
-does include a public key must include a valid signature before a receiver
-treats that key as an identity; Android will use the same optional form when
-its platform key adapter is wired to this record.
+ESP32 Main creates a persistent P-256 key on first boot, stores its private
+scalar as binary NVS data, and emits the same signed compressed-key record on
+NAN, NOW, UDP6, and UART. A receiver treats a public key as identity only when
+the common fixed-width signature verifies. Private key bytes never cross the
+settings, discovery, or diagnostics surfaces.
 
 `nvs get ssid` and `nvs set ssid` are not transport commands. Historical
 `recovery.*` aliases are not a transport configuration surface.
@@ -140,20 +173,20 @@ end-to-end test.
 
 Neither `mode=infra` nor `mode=sleepy` starts STA from NVS at boot. A UART
 `transport.start` record starts the shared STA/raw UDP6 bearer from its
-ephemeral SSID; future NAN Service Info uses exactly the same command. The
+ephemeral SSID; active NAN Service Info uses exactly the same command. The
 initial session deadline is 3 seconds for sleepy mode. A tracked DMesh
 stream keeps it live; after the final tracked stream completes, Main applies a
 200-ms command grace and then stops STA. Ordinary UDP/action packets which do
 not create a tracked stream do not extend the session.
 
-The current NAN wake message is not yet a transport command: it does not carry
-or validate SSID, BSSID, a distinct IPv6 endpoint, RSSI-selected channel or
-rate, or other association parameters. The future packet is an **active
-subscribe** NAN service descriptor whose **Service Info** bytes are a bounded
-CBOR command. It is decoded by the same command handler as UART; it
-must not introduce a parallel SD-info schema or use a NAN follow-up.
-`request_ephemeral_nan_session` exists to consume the resulting validated,
-memory-only radio setup later, but no current NAN ingress applies that command.
+The implemented NAN wake is an **active subscribe** NAN service descriptor
+whose Service Info bytes are a bounded common CBOR command. It can switch the
+unassociated NAN profile between sleepy (`nan_dw_interval=8`, `now=2`) and
+awake (`nan_dw_interval=1`, `now=1`) without provisioning STA credentials.
+It deliberately does not infer or accept an SSID, BSSID, RSSI-selected channel,
+or rate from discovery metadata: an STA transition still needs its explicit
+ephemeral profile. The response is correlated through a NAN follow-up and the
+committed profile is applied later by Main, outside the Wi-Fi callback.
 Discovery data must never write device Wi-Fi NVS.
 
 The physical choice is `control.transport.start {mode: Sta}` (associate with an
@@ -181,11 +214,11 @@ resetting the association, NOW callback, or NAN capture state.
 | `transport.start.ssid`, `sta_bssid`, `sta_channel` | unset | Ephemeral association target, queried from the managed AP owner by Rust e2e and sent over UART. `sta_bssid` and `sta_channel` select the intended AP without an application-owned discovery scan; all three values stay in RAM and never change NVS. A future optional IPv6 field is only needed when the peer is not the BSSID-derived link-local endpoint. |
 | `sta_passphrase` | fixed DMesh key | Optional 8..63-byte WPA2-PSK override for an Android P2P or other protected STA target. It is accepted only in `transport.start`, copied into RAM for the selected epoch, and never written to NVS. Its absence selects the fixed `DIRECT-dmesh`/`untrusted-open-mode` WPA2 key; it never means open authentication or reuse of an old override. WPA2 PMF is capable but not required for Android compatibility. |
 | Main `mode=infra` | n/a | Keeps the infrastructure policy active but does not associate from NVS. |
-| Main `mode=sleepy` | n/a | Keeps STA off until UART or future NAN Service Info; uses the bounded session lifecycle. |
+| Main `mode=sleepy` | n/a | Keeps STA off in the NAN DW8 sleepy profile. A directed NAN Service Info `transport.start {mode: Nan, nan_dw_interval: 1, now: 1}` wakes it into active NAN+NOW; a later DW8/`now:2` start restores sleepy policy. |
 | `control.transport.start {mode: Sta, ssid: ...}` | n/a | Required ephemeral STA target and full associated STA/raw-UDP6 setup. It replaces the boot setup. |
 | boot default / `control.transport.start {mode: Nan}` | n/a | Unassociated NOW setup. When AP is selected, it starts APSTA on channel 6 using Android's fixed `DIRECT-dmesh`/`untrusted-open-mode` WPA2 credentials; an explicit later Nan start deliberately replaces the current setup. |
-| `now` | `0` | Private action callback: `0` default/on, `1` explicit on, `2` explicit off. A future `udp6` setting will be independent. |
-| `nan_dw_interval` | `0` | NAN promiscuous capture cadence in 512 ms DWs: `0` off, `1` each DW, `8` four seconds, `16` eight seconds. Requires NOW enabled (`now != 2`). |
+| `now` | `0` | Private action callback: `0` default/on, `1` explicit on, `2` windowed/off. The `mode=Nan`, DW8, `now=2`, `ap=0`, UART-off combination is the sleepy profile; DW1 with `now=1` is the awake NAN+NOW profile. UDP6 remains independent. |
+| `nan_dw_interval` | `1` | NAN promiscuous capture cadence in 512 ms DWs: `0` explicitly off, `1` each DW, `8` four seconds, `16` eight seconds. DW8 plus `now=2` is intentionally windowed; it is not an always-listening NOW receiver. |
 | `ndp` | `0` | Common NAN Data Path policy: `0` off, `1` on. Android currently implements NDP; ESP retains this requested common profile until an NDP adapter is added. |
 | `ap` | `1` at boot | Local AP: `0` off, `1` on. Every ESP-owned AP is WPA2-PSK with Android's fixed `DIRECT-dmesh`/`untrusted-open-mode` credentials. The unassociated start configures APSTA before its one Wi-Fi start, so the AP holds channel 6. STA+AP is not part of this first test path. |
 | `espnow_capture` | `false` | Legacy volatile setting; do not use it to select staged Main coexistence. |
@@ -335,6 +368,18 @@ conversion attaches marked UART and direct CBOR to that same registry, then
 removes the legacy `transports` dispatch functions and their callers.
 
 ### Main relay connection storage
+
+Main's direct `relay.apply` handler activates a NOW forwarding route as part of
+the same idempotent reconciliation. It converts the portable transport-tagged
+MAC handle into its bounded local `EspNowPeer` binding before installing the
+DCID entry. Forwarding itself remains DCID-only and never inspects the source
+peer, ingress bearer, or tagged payload. Unsupported handle classes are
+rejected rather than left as apparently active rules.
+
+`relay.pair` binds its return handle to the exact UDP6 request ingress,
+including the host link-local address and stable source port, then reconciles
+the reverse and forward rules transactionally. A failure restores the previous
+DCID registry so bootstrap never starts with only one direction installed.
 
 Main distinguishes a passive association from an active QUIC-lite connection.
 A passive record holds only peer identity, DCID, and recency; it never

@@ -208,6 +208,17 @@ static int boot_cbor_selector(const uint8_t *data, size_t length)
            partition == DMESH_BOOT_PARTITION_MAIN ? 2 : 0;
 }
 
+/* DCID-zero direct records use the normal QUIC-lite short header: fixed bit,
+ * four-byte packet number, and the one-byte zero connection ID. Stage2 has no
+ * connection state, so it only strips this exact six-byte envelope before
+ * decoding its bounded selector. This keeps boot control consistent with the
+ * direct-record plane without importing the full Rust transport into C. */
+static int boot_direct_selector(const uint8_t *data, size_t length)
+{
+    if (length < 7 || data[0] != 0x43 || data[1] != 0x00) return 0;
+    return boot_cbor_selector(data + 6, length - 6);
+}
+
 /* Emit this before partition selection, including a persisted Recovery
  * target, so a failed NVS read cannot be inferred only from a later Main
  * boot. The values after stage2_version are configured and target. */
@@ -247,7 +258,7 @@ static int uart_boot_requested(void)
      * tiny rolling window as well: a forward which has already consumed or
      * normalized delimiters must not make the exact, self-delimiting selector
      * disappear during the short boot handoff. */
-    uint8_t raw_selector[10] = {0};
+    uint8_t raw_selector[16] = {0};
     size_t raw_selector_len = 0;
     for (uint32_t poll = 0; poll < polls; ++poll) {
         if ((poll & 0x3ffu) == 0) {
@@ -262,12 +273,16 @@ static int uart_boot_requested(void)
                 raw_selector[sizeof(raw_selector) - 1] = byte;
             }
             if (raw_selector_len == sizeof(raw_selector)) {
-                int selector = boot_cbor_selector(raw_selector, sizeof(raw_selector));
+                int selector = boot_direct_selector(raw_selector, sizeof(raw_selector));
                 if (selector != 0) return selector;
             }
             if (byte == DMESH_BOOT_WIRE_FLAG) {
                 if (in_frame && !escaped) {
-                    int selector = boot_cbor_selector(frame, frame_len);
+                    int selector = boot_direct_selector(frame, frame_len);
+                    /* Compatibility only for existing lab tools which still
+                     * send bare CBOR-over-PPP. New senders must use the
+                     * DCID-zero direct envelope above. */
+                    if (selector == 0) selector = boot_cbor_selector(frame, frame_len);
                     if (selector != 0) return selector;
                 }
                 in_frame = true; escaped = false; frame_len = 0;

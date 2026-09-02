@@ -7,10 +7,16 @@ meaning and compatibility rules live here.
 ## UART transport
 
 UART carries PPP/HDLC frames: `0x7e` delimits a packet and `0x7d` escapes the
-following byte with XOR `0x20`. There is no DMB1 packet and no plaintext
-selector. Stage2 emits `boot.identity` when `stg2:uart_boot` is enabled
-and accepts the definite CBOR selector `{0:60010,6:[partition]}`. Partition
+following byte with XOR `0x20`. There is no DMB1 packet or unframed selector
+for new senders. Stage2 emits `boot.identity` when `stg2:uart_boot` is enabled
+and accepts the definite CBOR selector `{0:60010,6:[partition]}` inside a
+QUIC-lite DCID-zero direct record (short-header byte `0x43`, zero CID, and a
+four-byte packet number). Partition
 `1` selects Main and partition `2` selects Recovery.
+
+Stage2 temporarily accepts the old bare-CBOR selector only for existing lab
+tools. That receive-only compatibility path must not be used by new code and
+will be removed once the in-tree callers have moved.
 
 For bounded lab diagnostics, binary NVS `u32` `stg2:boot_target` overrides
 normal selection before the UART window: `1` always boots Main and `2` always

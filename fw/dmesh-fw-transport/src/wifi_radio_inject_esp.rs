@@ -5,16 +5,12 @@
 //! injection is a hardware capability, not a normal transport service. Linux
 //! and ESP adapters may implement it; Android must reject it as unsupported.
 
-use dmesh_server::raw_wifi::{
-    RawWifiActionInjectRequest, RawWifiInterface, RawWifiRate,
-};
+use dmesh_server::raw_wifi::{RawWifiActionInjectRequest, RawWifiInterface, RawWifiRate};
 
 /// Submit a caller-supplied action management frame through the common ESP-IDF
 /// action lane. Complete non-action injection remains platform-specific until
 /// its receive and sequence semantics are covered by the same matrix.
-pub fn transmit_raw_action(
-    request: RawWifiActionInjectRequest<'_>,
-) -> Result<usize, &'static str> {
+pub fn transmit_raw_action(request: RawWifiActionInjectRequest<'_>) -> Result<usize, &'static str> {
     if request.frame.len() < 24 || request.frame[0] != 0xd0 || request.frame[1] != 0 {
         return Err("raw action frame required");
     }

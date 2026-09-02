@@ -7,6 +7,10 @@
 //! request to the Recovery-owned parameter image. UART, UDP, and future L2
 //! bearers call this handler without inheriting USB, PPP, or FreeRTOS code.
 
+extern crate alloc;
+
+use alloc::format;
+
 use dmesh_server::{
     connection::{self, ConnectionManager, ConnectionPolicy},
     control::{self, Handler, TransportConfig, TransportKind},
@@ -46,6 +50,7 @@ pub fn send_stat(prefix: &[u8], value: u64) {
 pub enum ProfileControlError {
     Unsupported,
     InvalidSetting,
+    Settings,
 }
 
 /// ESP application of common typed operations. It owns neither CBOR decoding
@@ -75,15 +80,57 @@ pub struct ControlApplyResult {
 impl Handler for ProfileControl<'_> {
     type Error = ProfileControlError;
 
-    fn settings_get(&mut self, _key: &[u8]) -> Result<(), Self::Error> {
+    fn settings_get(&mut self, key: &[u8]) -> Result<(), Self::Error> {
+        if key.starts_with(b"sec:") {
+            return Err(ProfileControlError::Unsupported);
+        }
+        let mut value = [0u8; 64];
+        let Some(used) = crate::main_runtime::read_setting(key, &mut value) else {
+            return Err(ProfileControlError::InvalidSetting);
+        };
+        let key = core::str::from_utf8(key).map_err(|_| ProfileControlError::InvalidSetting)?;
+        let value =
+            core::str::from_utf8(&value[..used]).map_err(|_| ProfileControlError::Settings)?;
+        send_response(format!("settings {key}={value}").as_bytes());
         Ok(())
     }
 
-    fn settings_set(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), Self::Error> {
-        Err(ProfileControlError::Unsupported)
+    fn settings_set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        if crate::main_runtime::write_binary_setting(key, value) {
+            send_response(b"binary setting updated; applies on next boot");
+            return Ok(());
+        }
+        if let Some(secret_key) = key.strip_prefix(b"sec:") {
+            if !crate::main_runtime::write_secret_setting(secret_key, value) {
+                return Err(ProfileControlError::InvalidSetting);
+            }
+            send_response(b"settings updated; applies on next boot");
+            return Ok(());
+        }
+        if !crate::main_runtime::write_setting(key, value) {
+            return Err(ProfileControlError::InvalidSetting);
+        }
+        send_response(b"settings updated; applies on next boot");
+        Ok(())
     }
 
     fn settings_list(&mut self) -> Result<(), Self::Error> {
+        let mut value = [0u8; 64];
+        for key in crate::main_runtime::setting_keys() {
+            let Some(used) = crate::main_runtime::read_setting(key, &mut value) else {
+                continue;
+            };
+            let key = core::str::from_utf8(key).map_err(|_| ProfileControlError::Settings)?;
+            let value =
+                core::str::from_utf8(&value[..used]).map_err(|_| ProfileControlError::Settings)?;
+            send_response(format!("settings {key}={value}").as_bytes());
+        }
+        for key in crate::main_runtime::secret_setting_keys() {
+            if crate::main_runtime::secret_setting_exists(key) {
+                let key = core::str::from_utf8(key).map_err(|_| ProfileControlError::Settings)?;
+                send_response(format!("settings sec:{key}=<redacted>").as_bytes());
+            }
+        }
         Ok(())
     }
 
@@ -97,7 +144,14 @@ impl Handler for ProfileControl<'_> {
                 // One start selects one complete, ephemeral radio profile.
                 // Do not persist it: UART and NAN Service Info must take the
                 // same command path and replace the previous radio epoch.
-                if config.ssid.is_none() && config.bssid.is_none() {
+                let configured_profile = config.ssid.is_none() && config.bssid.is_none();
+                // A configured STA profile is a legitimate on-demand target:
+                // `transport.start {mode: sta}` must be able to return from
+                // NAN/NOW without repeating a protected credential over the
+                // control bearer.  An entirely empty profile remains invalid
+                // so an unauthenticated request cannot make the adapter try
+                // an unspecified network.
+                if configured_profile && !self.profile.has_flash_profile() {
                     return Err(ProfileControlError::InvalidSetting);
                 }
                 let mut candidate = *self.profile;
@@ -106,12 +160,14 @@ impl Handler for ProfileControl<'_> {
                         return Err(ProfileControlError::InvalidSetting);
                     }
                 }
-                // A transport.start replaces the radio epoch. In particular,
-                // an omitted-PSK start selects the fixed DMesh WPA2 key and
-                // must not accidentally reuse a prior Android P2P secret.
-                // Clear the fixed buffer as well as its visible length so the
-                // volatile override is not retained in the shared profile.
-                clear_sta_passphrase(&mut candidate);
+                // An explicit target replaces the radio epoch: an omitted
+                // PSK then selects the fixed DMesh WPA2 key and must not
+                // accidentally reuse a prior Android P2P secret.  By
+                // contrast, target-less `mode=sta` selects the provisioned
+                // profile and deliberately retains its protected PSK.
+                if !configured_profile {
+                    clear_sta_passphrase(&mut candidate);
+                }
                 apply_transport_config(config, &mut candidate);
                 candidate.requested_transport = Some(kind);
                 candidate.run_requested = true;
@@ -146,13 +202,10 @@ impl Handler for ProfileControl<'_> {
     }
 
     fn transport_stop(&mut self, kind: TransportKind) -> Result<(), Self::Error> {
-        if self.profile.requested_transport == Some(kind) {
-            self.profile.requested_transport = None;
-            self.profile.run_requested = false;
-            Ok(())
-        } else {
-            Err(ProfileControlError::Unsupported)
-        }
+        let _ = kind;
+        // `transport.start mode=nan` is the complete declarative STA-off
+        // profile. A partial stop must not mutate radio state.
+        Err(ProfileControlError::Unsupported)
     }
 }
 
@@ -351,6 +404,7 @@ impl ProfileControlError {
         match self {
             Self::Unsupported => b"unsupported",
             Self::InvalidSetting => b"invalid_setting",
+            Self::Settings => b"settings",
         }
     }
 }
@@ -399,6 +453,8 @@ mod command_tests {
     fn transport_lifecycle_is_independent_from_connection_policy() {
         let mut params = TransportProfile::new();
         assert!(super::set_ssid(b"DIRECT-test", &mut params));
+        params.sta_passphrase[..8].copy_from_slice(b"test-psk");
+        params.sta_passphrase_len = 8;
         // {1: control, 2: transport.start, 5: {1: sta}}
         let start_sta = [0xa3, 1, 1, 2, 4, 5, 0xa1, 1, 1];
         assert_eq!(apply_control_record(&start_sta, &mut params), Some(true));
@@ -407,6 +463,10 @@ mod command_tests {
             Some(dmesh_server::control::TransportKind::Sta)
         );
         assert_eq!(params.ack_frequency, 0);
+        assert_eq!(
+            &params.sta_passphrase[..params.sta_passphrase_len],
+            b"test-psk"
+        );
 
         // {1: control, 2: transport.stop, 5: {1: sta}}
         let stop_sta = [0xa3, 1, 1, 2, 5, 5, 0xa1, 1, 1];

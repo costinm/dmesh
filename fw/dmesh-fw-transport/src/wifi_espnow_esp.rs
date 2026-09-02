@@ -11,12 +11,12 @@
 //! an optional lower-level prefilter experiment.
 
 // TODO: as fallback for NAN, we can use periodic (4s) NOW sync with similar master election.
-// That works on host/esp32 - if Androids are present they can start a NAN cluster. 
+// That works on host/esp32 - if Androids are present they can start a NAN cluster.
 // Using only NOW action frames is simplest - no deps on the beacon/management frames in NAN.
 
-use core::{alloc::Layout, mem::MaybeUninit};
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::{alloc::Layout, mem::MaybeUninit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EspNowPeer {
@@ -336,12 +336,18 @@ static mut RAW_CLIENT: MaybeUninit<RawClientState> = MaybeUninit::uninit();
 /// contiguous block after a radio epoch replacement; admission must then fail
 /// visibly instead of rebooting the board.  The allocation is reclaimed by
 /// [`finish_raw_client`] and never forms a packet queue.
-fn try_allocate_iperf_client_storage() -> Option<Box<MaybeUninit<
-    dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
->>> {
-    let layout = Layout::new::<MaybeUninit<
-        dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
-    >>();
+fn try_allocate_iperf_client_storage() -> Option<
+    Box<
+        MaybeUninit<
+            dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
+        >,
+    >,
+> {
+    let layout = Layout::new::<
+        MaybeUninit<
+            dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
+        >,
+    >();
     let storage = unsafe { alloc::alloc::alloc(layout) };
     (!storage.is_null()).then(|| unsafe { Box::from_raw(storage.cast()) })
 }
@@ -545,7 +551,11 @@ pub fn next_raw_client_delay_ms() -> Option<u32> {
     }
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
     let remaining = due_ms.wrapping_sub(now_ms);
-    Some(if remaining > 0x8000_0000 { 1 } else { remaining.clamp(1, 1_000) })
+    Some(if remaining > 0x8000_0000 {
+        1
+    } else {
+        remaining.clamp(1, 1_000)
+    })
 }
 
 /// Recompute Main's next one-shot wake after a shared-worker client change.
@@ -718,7 +728,12 @@ pub fn start_check_client(peer: EspNowPeer, nonce: u64, timeout_ms: u32) -> bool
         }));
         RAW_CLIENT_INITIALIZED.store(true, Ordering::Release);
         let response = &*core::ptr::addr_of!(RESPONSE);
-        if !transmit_client_from_worker(peer, &response[..used]) {
+        // A radio check is commonly initiated by a UART control record, not
+        // by the shared ingress worker.  The action request scratch and its
+        // in-band RX callback have one owner, so enqueue this first OPEN
+        // exactly like the timer-driven retransmits instead of writing that
+        // scratch from the UART service context.
+        if !transmit(peer, &response[..used]) {
             finish_raw_client();
             return false;
         }
@@ -735,12 +750,7 @@ pub fn start_check_client(peer: EspNowPeer, nonce: u64, timeout_ms: u32) -> bool
 /// arrive through NAN Service Discovery, a QUIC stream, or UART; all paths
 /// enter this one client and therefore get identical packet, timeout, and
 /// completion accounting.
-pub fn start_iperf_client(
-    peer: EspNowPeer,
-    bytes: u64,
-    packet_size: u16,
-    timeout_ms: u32,
-) -> bool {
+pub fn start_iperf_client(peer: EspNowPeer, bytes: u64, packet_size: u16, timeout_ms: u32) -> bool {
     if RAW_CLIENT_ACTIVE.swap(true, Ordering::AcqRel) {
         return false;
     }
@@ -772,10 +782,9 @@ pub fn start_iperf_client(
             return false;
         }
     };
-    let mut client: Box<dmesh_server::raw_transport::RawClient<
-        4,
-        { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-    >> = match dmesh_server::raw_transport::RawClient::new_in_place(
+    let mut client: Box<
+        dmesh_server::raw_transport::RawClient<4, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
+    > = match dmesh_server::raw_transport::RawClient::new_in_place(
         &mut client_storage,
         cid,
         bytes,
@@ -817,7 +826,10 @@ pub fn start_iperf_client(
         }));
         RAW_CLIENT_INITIALIZED.store(true, Ordering::Release);
         let response = &*core::ptr::addr_of!(RESPONSE);
-        if !transmit_client_from_worker(peer, &response[..used]) {
+        // See the check-client OPEN above: this control-path start can run
+        // from UART, while the action request itself is owned by the common
+        // egress worker.
+        if !transmit(peer, &response[..used]) {
             finish_raw_client();
             return false;
         }
@@ -831,11 +843,7 @@ pub fn start_iperf_client(
 /// Feed the original ESP-IDF private-dispatcher spans into the proven NOW
 /// adapter. `wifi_esp` owns registration and classification; this module owns
 /// only ESP-NOW framing and bounded ingress.
-pub(crate) fn receive_registered_action_parts(
-    header: *mut u8,
-    payload: *mut u8,
-    len: usize,
-) {
+pub(crate) fn receive_registered_action_parts(header: *mut u8, payload: *mut u8, len: usize) {
     RX_DISPATCHER.fetch_add(1, Ordering::Relaxed);
     receive_action_parts(header, payload, len);
 }
@@ -944,8 +952,8 @@ fn recently_seen_action(source: [u8; 6], payload: &[u8]) -> bool {
     let now_ms = ((unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000) as u32;
     let previous_hash = LAST_ACTION_FINGERPRINT.load(Ordering::Acquire);
     let previous_ms = LAST_ACTION_MS.load(Ordering::Acquire);
-    let duplicate = previous_hash == hash
-        && now_ms.wrapping_sub(previous_ms) <= DUPLICATE_ACTION_WINDOW_MS;
+    let duplicate =
+        previous_hash == hash && now_ms.wrapping_sub(previous_ms) <= DUPLICATE_ACTION_WINDOW_MS;
     LAST_ACTION_FINGERPRINT.store(hash, Ordering::Release);
     LAST_ACTION_MS.store(now_ms, Ordering::Release);
     duplicate
@@ -1122,8 +1130,7 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
                     }
                 }
                 if let Some(server_cid) = state.client.server_cid() {
-                        CLIENT_EXPECTED_SERVER_CID
-                            .store(server_cid.value() as u32, Ordering::Release);
+                    CLIENT_EXPECTED_SERVER_CID.store(server_cid.value() as u32, Ordering::Release);
                 }
                 if RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
                     schedule_raw_client_service();
@@ -1151,12 +1158,8 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
                     // did not select the client or shared server.
                     if let Ok((header, _)) = quic_lite::ShortHeader::decode(payload) {
                         CLIENT_OTHER_PACKETS.fetch_add(1, Ordering::Relaxed);
-                        CLIENT_LAST_OTHER_DCID
-                            .store(header.dcid.value() as u32, Ordering::Release);
-                        crate::commands::send_stat(
-                            b"espnow unexpected_dcid=",
-                            header.dcid.value(),
-                        );
+                        CLIENT_LAST_OTHER_DCID.store(header.dcid.value() as u32, Ordering::Release);
+                        crate::commands::send_stat(b"espnow unexpected_dcid=", header.dcid.value());
                     }
                     // It is a delayed association or unrelated service. The
                     // one-entry shared dispatcher must not let it disturb the
@@ -1168,7 +1171,9 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
                 CLIENT_PEER_MISMATCHES.fetch_add(1, Ordering::Relaxed);
                 let source = item.source();
                 CLIENT_LAST_OTHER_PEER_SUFFIX.store(
-                    (u32::from(source[3]) << 16) | (u32::from(source[4]) << 8) | u32::from(source[5]),
+                    (u32::from(source[3]) << 16)
+                        | (u32::from(source[4]) << 8)
+                        | u32::from(source[5]),
                     Ordering::Release,
                 );
                 // Surface an unexpected sender through the same bounded
@@ -1218,10 +1223,7 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
 /// This is called once per [`IngressKind::EspNowTx`] queue item, not from a
 /// periodic service tick.  The sender owns no packet history: QUIC-lite keeps
 /// retransmission state and re-enqueues only a due complete datagram.
-pub(crate) fn dispatch_egress(
-    item: crate::shared_ingress_esp::IngressPacket,
-    payload: &[u8],
-) {
+pub(crate) fn dispatch_egress(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
     // A packet-at-a-time raw association sends one stream frame, then waits
     // for the peer's ACK before the next frame may leave the QUIC-lite
     // ledger.  Keep the existing NAN capture owner available for that reply

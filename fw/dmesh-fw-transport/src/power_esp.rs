@@ -50,9 +50,8 @@ pub fn configure(sleepy: bool) -> bool {
         light_sleep_enable: sleepy,
     };
     unsafe {
-        esp_idf_sys::esp_pm_configure(
-            (&config as *const esp_idf_sys::esp_pm_config_t).cast(),
-        ) == esp_idf_sys::ESP_OK
+        esp_idf_sys::esp_pm_configure((&config as *const esp_idf_sys::esp_pm_config_t).cast())
+            == esp_idf_sys::ESP_OK
     }
 }
 
@@ -67,8 +66,12 @@ pub fn status() -> PowerStatus {
     };
     PowerStatus {
         cpu_mhz: (unsafe { esp_clk_cpu_freq() } / 1_000_000).min(u32::from(u16::MAX)) as u16,
-        min_mhz: configured.then_some(config.min_freq_mhz.max(0) as u16).unwrap_or(0),
-        max_mhz: configured.then_some(config.max_freq_mhz.max(0) as u16).unwrap_or(0),
+        min_mhz: configured
+            .then_some(config.min_freq_mhz.max(0) as u16)
+            .unwrap_or(0),
+        max_mhz: configured
+            .then_some(config.max_freq_mhz.max(0) as u16)
+            .unwrap_or(0),
         automatic_light_sleep: configured && config.light_sleep_enable,
         configured,
         light_sleep_attempts: LIGHT_SLEEP_ATTEMPTS.load(Ordering::Relaxed),

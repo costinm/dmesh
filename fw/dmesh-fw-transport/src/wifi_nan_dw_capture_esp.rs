@@ -7,10 +7,18 @@
 //! window are handed to the same shared action ingress as the private driver
 //! hook; outside the window there is no promiscuous capture.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 const NAN_DW_PERIOD_MS: u32 = 512 * 1_024 / 1_000;
-const NAN_DW_CAPTURE_MS: u32 = 64;
+/// Open a little before the selected cluster's beacon. The ESP timestamp is
+/// local receive time, so this absorbs bounded callback/worker jitter without
+/// changing the common DW phase.
+const NAN_DW_PRE_BEACON_US: u64 = 8_000;
+/// Keep receiving through the standard 64 ms DW and a measured tolerance for
+/// host scheduling. Android remains the interoperability boundary: it should
+/// arrive in the normal window, while this 100 ms adapter lease gives us a
+/// bounded diagnostic margin rather than an unsynchronised receive cadence.
+const NAN_DW_CAPTURE_MS: u32 = 100;
 /// Infra startup must keep receiving until it has a realistic chance to see
 /// an Android/host NAN beacon and establish a cluster/TSF.  A 1.5-second
 /// acquisition raced Android's active-publish setup; after that it sampled a
@@ -83,6 +91,12 @@ static FOLLOWUP_SEQUENCE: AtomicU16 = AtomicU16::new(1);
 /// data only after the Wi-Fi callback has classified the frame; it never
 /// retains a driver buffer or adds an ingress queue.
 pub const FOLLOWUP_HISTORY_CAPACITY: usize = 10;
+/// Device observations are semantic receive facts, separate from the small
+/// directed follow-up history. This is the ESP projection of the common
+/// `radio.devices` contract: fixed-capacity, no allocations, and no retained
+/// driver frame. A peer without a decoded DMesh announce remains provisional
+/// by its NAN MAC address.
+pub const NAN_DEVICE_OBSERVATION_CAPACITY: usize = 10;
 /// Active Subscribe control handling runs on the copied ingress worker and
 /// can finish just after the narrow receive capture closes. Retain a few
 /// response *intents* until the next captured DW; never retain ESP-IDF frame
@@ -116,6 +130,69 @@ struct FollowupSlot {
     last_seen_ms: AtomicU32,
 }
 
+const OBSERVATION_EMPTY: u8 = 0;
+const OBSERVATION_WRITING: u8 = 1;
+const OBSERVATION_READY: u8 = 2;
+pub const NAN_OBSERVATION_OTHER: u8 = 0;
+pub const NAN_OBSERVATION_ACTIVE_PUBLISH: u8 = 1;
+pub const NAN_OBSERVATION_ACTIVE_SUBSCRIBE: u8 = 2;
+pub const NAN_OBSERVATION_FOLLOWUP: u8 = 3;
+
+struct NanDeviceObservationSlot {
+    state: AtomicU8,
+    peer: [AtomicU8; 6],
+    bssid: [AtomicU8; 6],
+    first_seen_ms: AtomicU32,
+    last_seen_ms: AtomicU32,
+    packets: AtomicU32,
+    active_publish_rx: AtomicU32,
+    active_subscribe_rx: AtomicU32,
+    followup_rx: AtomicU32,
+    last_kind: AtomicU8,
+    last_channel: AtomicU8,
+    last_payload_len: AtomicU16,
+    last_payload_hash: AtomicU32,
+}
+
+impl NanDeviceObservationSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(OBSERVATION_EMPTY),
+            peer: [const { AtomicU8::new(0) }; 6],
+            bssid: [const { AtomicU8::new(0) }; 6],
+            first_seen_ms: AtomicU32::new(0),
+            last_seen_ms: AtomicU32::new(0),
+            packets: AtomicU32::new(0),
+            active_publish_rx: AtomicU32::new(0),
+            active_subscribe_rx: AtomicU32::new(0),
+            followup_rx: AtomicU32::new(0),
+            last_kind: AtomicU8::new(NAN_OBSERVATION_OTHER),
+            last_channel: AtomicU8::new(0),
+            last_payload_len: AtomicU16::new(0),
+            last_payload_hash: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Copied device-list facts for a single observed NAN peer.
+#[derive(Clone, Copy)]
+pub struct NanDeviceObservationSnapshot {
+    pub peer: [u8; 6],
+    pub bssid: [u8; 6],
+    pub first_seen_ms: u32,
+    pub last_seen_ms: u32,
+    pub packets: u32,
+    pub active_publish_rx: u32,
+    pub active_subscribe_rx: u32,
+    pub followup_rx: u32,
+    pub last_kind: u8,
+    /// Receiver radio channel at capture time, or zero when the owner had no
+    /// selected channel fact. This is not a channel advertised by the peer.
+    pub last_channel: u8,
+    pub last_payload_len: u16,
+    pub last_payload_hash: u32,
+}
+
 impl FollowupSlot {
     const fn new() -> Self {
         Self {
@@ -146,6 +223,8 @@ pub struct FollowupSnapshot {
 static FOLLOWUP_HISTORY: [FollowupSlot; FOLLOWUP_HISTORY_CAPACITY] =
     [const { FollowupSlot::new() }; FOLLOWUP_HISTORY_CAPACITY];
 static FOLLOWUP_HISTORY_NEXT: AtomicUsize = AtomicUsize::new(0);
+static NAN_DEVICE_OBSERVATIONS: [NanDeviceObservationSlot; NAN_DEVICE_OBSERVATION_CAPACITY] =
+    [const { NanDeviceObservationSlot::new() }; NAN_DEVICE_OBSERVATION_CAPACITY];
 static PENDING_FOLLOWUP_NEXT: AtomicUsize = AtomicUsize::new(0);
 static PENDING_FOLLOWUP_QUEUED: AtomicU32 = AtomicU32::new(0);
 static PENDING_FOLLOWUP_SENT: AtomicU32 = AtomicU32::new(0);
@@ -155,6 +234,9 @@ static ACTIVE_PUBLISH_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PUBLISH_LEN: AtomicU16 = AtomicU16::new(0);
 static ACTIVE_PUBLISH_LAST_SENT_MS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_PUBLISH_REMAINING: AtomicU8 = AtomicU8::new(0);
+static ACTIVE_PUBLISH_ATTEMPTED: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_PUBLISH_SENT: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_PUBLISH_DROPPED: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_PUBLISH_INFO: [AtomicU8; ACTIVE_PUBLISH_MAX_LEN] =
     [const { AtomicU8::new(0) }; ACTIVE_PUBLISH_MAX_LEN];
 static PENDING_SDF_READY: AtomicBool = AtomicBool::new(false);
@@ -165,6 +247,10 @@ static PENDING_SDF: [AtomicU8; PENDING_SDF_MAX_LEN] =
 struct PendingFollowup {
     state: AtomicU8,
     peer: [AtomicU8; 6],
+    /// The receiver's Subscribe transaction identifiers.  A NAN Follow-up
+    /// must target that instance, not this device's Publish instance.
+    instance: AtomicU8,
+    requestor_instance: AtomicU8,
     payload_len: AtomicU16,
     payload: [AtomicU8; dmesh_rawnan::NAN_COMMAND_MAX_LEN],
     queued_ms: AtomicU32,
@@ -175,6 +261,8 @@ impl PendingFollowup {
         Self {
             state: AtomicU8::new(PENDING_EMPTY),
             peer: [const { AtomicU8::new(0) }; 6],
+            instance: AtomicU8::new(0),
+            requestor_instance: AtomicU8::new(0),
             payload_len: AtomicU16::new(0),
             payload: [const { AtomicU8::new(0) }; dmesh_rawnan::NAN_COMMAND_MAX_LEN],
             queued_ms: AtomicU32::new(0),
@@ -193,6 +281,8 @@ static ACTIVE_SUBSCRIBE_PEER: [AtomicU8; 6] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];
+static ACTIVE_SUBSCRIBE_INSTANCE: AtomicU8 = AtomicU8::new(0);
+static ACTIVE_SUBSCRIBE_REQUESTOR_INSTANCE: AtomicU8 = AtomicU8::new(0);
 // A framework Subscribe is retransmitted in each discovery window.  Retain
 // only the last tagged discovery ping per source, so the common handler sends
 // one fresh announce/follow-up for that ping instead of one per RF retry.
@@ -226,9 +316,16 @@ static ACTIVE_SUBSCRIBE_SDEA_INFO_LEN: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SUBSCRIBE_BSSID: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
 static LAST_SDF_SOURCE: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
 static LAST_SDF_SERVICE_ID: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+/// Local elapsed time from the most recent selected NAN beacon to the last
+/// SDF. It records timing only, never service information or frame bytes.
+static LAST_SDF_AFTER_BEACON_US: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SUBSCRIBES: AtomicU32 = AtomicU32::new(0);
 static SERVICE_INFO_ENQUEUED: AtomicU32 = AtomicU32::new(0);
 static SERVICE_INFO_DROPPED: AtomicU32 = AtomicU32::new(0);
+// The shared worker has actually invoked the Main/Recovery handler.  This is
+// deliberately separate from `SERVICE_INFO_ENQUEUED`: a copied frame proves
+// callback admission, whereas this proves that normal runtime control saw it.
+static SERVICE_INFO_DISPATCHED: AtomicU32 = AtomicU32::new(0);
 static FILTER_PENDING: AtomicBool = AtomicBool::new(false);
 static FILTER_ARMED: AtomicBool = AtomicBool::new(false);
 static FILTER_ARMS: AtomicU32 = AtomicU32::new(0);
@@ -253,8 +350,151 @@ fn selected_bssid() -> [u8; 6] {
     bssid
 }
 
+/// Change the NAN cluster used for DW synchronization and transmitted A3.
+/// This is receive-side state only: it must never alter the STA/AP BSSID.
+fn select_cluster_bssid(bssid: &[u8]) {
+    if bssid.len() != 6 {
+        return;
+    }
+    for (index, byte) in bssid.iter().enumerate() {
+        FILTER_BSSID[index].store(*byte, Ordering::Relaxed);
+    }
+}
+
 fn bssid_is_unset(bssid: [u8; 6]) -> bool {
     bssid == [0; 6]
+}
+
+fn observation_peer_matches(slot: &NanDeviceObservationSlot, peer: [u8; 6]) -> bool {
+    slot.state.load(Ordering::Acquire) == OBSERVATION_READY
+        && slot
+            .peer
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| byte.load(Ordering::Relaxed) == peer[index])
+}
+
+fn record_nan_device_observation(
+    peer: [u8; 6],
+    bssid: [u8; 6],
+    kind: u8,
+    payload: &[u8],
+) {
+    let now = now_ms();
+    let slot = NAN_DEVICE_OBSERVATIONS
+        .iter()
+        .find(|slot| observation_peer_matches(slot, peer))
+        .or_else(|| {
+            NAN_DEVICE_OBSERVATIONS.iter().find(|slot| {
+                slot.state
+                    .compare_exchange(
+                        OBSERVATION_EMPTY,
+                        OBSERVATION_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            })
+        })
+        .or_else(|| {
+            NAN_DEVICE_OBSERVATIONS
+                .iter()
+                .filter(|slot| slot.state.load(Ordering::Acquire) == OBSERVATION_READY)
+                .min_by_key(|slot| slot.last_seen_ms.load(Ordering::Relaxed))
+                .filter(|slot| {
+                    slot.state
+                        .compare_exchange(
+                            OBSERVATION_READY,
+                            OBSERVATION_WRITING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                })
+        });
+    let Some(slot) = slot else {
+        return;
+    };
+    let replacing = slot.state.load(Ordering::Acquire) == OBSERVATION_WRITING;
+    if replacing {
+        for (index, byte) in peer.iter().enumerate() {
+            slot.peer[index].store(*byte, Ordering::Relaxed);
+        }
+        slot.first_seen_ms.store(now, Ordering::Relaxed);
+        slot.packets.store(0, Ordering::Relaxed);
+        slot.active_publish_rx.store(0, Ordering::Relaxed);
+        slot.active_subscribe_rx.store(0, Ordering::Relaxed);
+        slot.followup_rx.store(0, Ordering::Relaxed);
+    }
+    for (index, byte) in bssid.iter().enumerate() {
+        slot.bssid[index].store(*byte, Ordering::Relaxed);
+    }
+    slot.last_seen_ms.store(now, Ordering::Relaxed);
+    slot.packets.fetch_add(1, Ordering::Relaxed);
+    match kind {
+        NAN_OBSERVATION_ACTIVE_PUBLISH => {
+            slot.active_publish_rx.fetch_add(1, Ordering::Relaxed);
+        }
+        NAN_OBSERVATION_ACTIVE_SUBSCRIBE => {
+            slot.active_subscribe_rx.fetch_add(1, Ordering::Relaxed);
+        }
+        NAN_OBSERVATION_FOLLOWUP => {
+            slot.followup_rx.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    slot.last_kind.store(kind, Ordering::Relaxed);
+    // This callback cannot query ESP-IDF. The Wi-Fi owner records its last
+    // successfully applied channel atomically, which is the channel on which
+    // this management frame was captured.
+    slot.last_channel.store(
+        crate::wifi_esp::selected_channel().unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    slot.last_payload_len
+        .store(payload.len().min(u16::MAX as usize) as u16, Ordering::Relaxed);
+    slot.last_payload_hash.store(
+        dmesh_server::discovery::payload_hash(payload),
+        Ordering::Relaxed,
+    );
+    slot.state.store(OBSERVATION_READY, Ordering::Release);
+}
+
+/// Copy the bounded NAN device observations for the shared device-list
+/// projection. ESP has no public RSSI fact on this receive path. The channel
+/// is the Wi-Fi owner's receiver channel captured with the frame, not a peer
+///-advertised channel.
+pub fn nan_device_observations(
+    out: &mut [Option<NanDeviceObservationSnapshot>; NAN_DEVICE_OBSERVATION_CAPACITY],
+) {
+    for (index, slot) in NAN_DEVICE_OBSERVATIONS.iter().enumerate() {
+        if slot.state.load(Ordering::Acquire) != OBSERVATION_READY {
+            out[index] = None;
+            continue;
+        }
+        let mut peer = [0; 6];
+        let mut bssid = [0; 6];
+        for (index, byte) in peer.iter_mut().enumerate() {
+            *byte = slot.peer[index].load(Ordering::Relaxed);
+        }
+        for (index, byte) in bssid.iter_mut().enumerate() {
+            *byte = slot.bssid[index].load(Ordering::Relaxed);
+        }
+        out[index] = Some(NanDeviceObservationSnapshot {
+            peer,
+            bssid,
+            first_seen_ms: slot.first_seen_ms.load(Ordering::Relaxed),
+            last_seen_ms: slot.last_seen_ms.load(Ordering::Relaxed),
+            packets: slot.packets.load(Ordering::Relaxed),
+            active_publish_rx: slot.active_publish_rx.load(Ordering::Relaxed),
+            active_subscribe_rx: slot.active_subscribe_rx.load(Ordering::Relaxed),
+            followup_rx: slot.followup_rx.load(Ordering::Relaxed),
+            last_kind: slot.last_kind.load(Ordering::Relaxed),
+            last_channel: slot.last_channel.load(Ordering::Relaxed),
+            last_payload_len: slot.last_payload_len.load(Ordering::Relaxed),
+            last_payload_hash: slot.last_payload_hash.load(Ordering::Relaxed),
+        });
+    }
 }
 
 fn record_followup(followup: dmesh_rawnan::DmeshNanFollowup<'_>) {
@@ -337,23 +577,35 @@ pub fn pending_followup_stats() -> (u32, u32, u32, u8) {
     )
 }
 
-fn mark_active_subscribe(peer: [u8; 6]) {
+fn mark_active_subscribe(peer: [u8; 6], instance: u8, requestor_instance: u8) {
     for (index, value) in peer.iter().enumerate() {
         ACTIVE_SUBSCRIBE_PEER[index].store(*value, Ordering::Relaxed);
     }
+    ACTIVE_SUBSCRIBE_INSTANCE.store(instance, Ordering::Relaxed);
+    ACTIVE_SUBSCRIBE_REQUESTOR_INSTANCE.store(requestor_instance, Ordering::Relaxed);
     ACTIVE_SUBSCRIBE_PENDING.store(true, Ordering::Release);
 }
 
 fn duplicate_discovery_ping(peer: [u8; 6], payload: &[u8]) -> bool {
-    let Some(record) = dmesh_server::tagged::decode(payload) else { return false };
-    let (Some(dmesh_server::tagged::Name::Tag(1)),
-         Some(dmesh_server::tagged::Name::Tag(6)), Some(id)) =
-        (record.component, record.method, record.id)
-    else { return false };
-    let Ok(id) = u32::try_from(id) else { return false };
+    let Some(record) = dmesh_server::tagged::decode(payload) else {
+        return false;
+    };
+    let (
+        Some(dmesh_server::tagged::Name::Tag(1)),
+        Some(dmesh_server::tagged::Name::Tag(6)),
+        Some(id),
+    ) = (record.component, record.method, record.id)
+    else {
+        return false;
+    };
+    let Ok(id) = u32::try_from(id) else {
+        return false;
+    };
     let same = LAST_DISCOVERY_VALID.load(Ordering::Acquire)
         && LAST_DISCOVERY_ID.load(Ordering::Relaxed) == id
-        && LAST_DISCOVERY_PEER.iter().enumerate()
+        && LAST_DISCOVERY_PEER
+            .iter()
+            .enumerate()
             .all(|(index, value)| value.load(Ordering::Relaxed) == peer[index]);
     if !same {
         for (index, value) in peer.iter().enumerate() {
@@ -369,21 +621,30 @@ fn duplicate_discovery_ping(peer: [u8; 6], payload: &[u8]) -> bool {
 /// record. The common ingress worker is single-consumer, so this ties a
 /// response to the current request without passing Wi-Fi driver buffers or
 /// callback state outside this owner.
-pub fn take_active_subscribe(peer: [u8; 6]) -> bool {
+pub fn take_active_subscribe(peer: [u8; 6]) -> Option<(u8, u8)> {
     if !ACTIVE_SUBSCRIBE_PENDING.load(Ordering::Acquire) {
-        return false;
+        return None;
     }
     let matches = ACTIVE_SUBSCRIBE_PEER
         .iter()
         .enumerate()
         .all(|(index, value)| value.load(Ordering::Relaxed) == peer[index]);
     if matches {
+        let instance = ACTIVE_SUBSCRIBE_INSTANCE.load(Ordering::Relaxed);
+        let requestor_instance = ACTIVE_SUBSCRIBE_REQUESTOR_INSTANCE.load(Ordering::Relaxed);
         ACTIVE_SUBSCRIBE_PENDING.store(false, Ordering::Release);
+        Some((instance, requestor_instance))
+    } else {
+        None
     }
-    matches
 }
 
-fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
+fn queue_followup_response(
+    peer: [u8; 6],
+    instance: u8,
+    requestor_instance: u8,
+    response: &[u8],
+) -> bool {
     if response.len() > dmesh_rawnan::NAN_COMMAND_MAX_LEN {
         return false;
     }
@@ -407,6 +668,8 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
                 let payload_len = usize::from(slot.payload_len.load(Ordering::Relaxed))
                     .min(dmesh_rawnan::NAN_COMMAND_MAX_LEN);
                 let identical = payload_len == response.len()
+                    && slot.instance.load(Ordering::Relaxed) == instance
+                    && slot.requestor_instance.load(Ordering::Relaxed) == requestor_instance
                     && slot
                         .peer
                         .iter()
@@ -431,6 +694,9 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
         for (index, byte) in peer.iter().enumerate() {
             slot.peer[index].store(*byte, Ordering::Relaxed);
         }
+        slot.instance.store(instance, Ordering::Relaxed);
+        slot.requestor_instance
+            .store(requestor_instance, Ordering::Relaxed);
         for (index, byte) in response.iter().enumerate() {
             slot.payload[index].store(*byte, Ordering::Relaxed);
         }
@@ -458,6 +724,9 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
             for (index, byte) in peer.iter().enumerate() {
                 slot.peer[index].store(*byte, Ordering::Relaxed);
             }
+            slot.instance.store(instance, Ordering::Relaxed);
+            slot.requestor_instance
+                .store(requestor_instance, Ordering::Relaxed);
             for (index, byte) in response.iter().enumerate() {
                 slot.payload[index].store(*byte, Ordering::Relaxed);
             }
@@ -474,7 +743,12 @@ fn queue_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
     false
 }
 
-fn transmit_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
+fn transmit_followup_response(
+    peer: [u8; 6],
+    subscriber_instance: u8,
+    _subscribe_requestor_instance: u8,
+    response: &[u8],
+) -> bool {
     if response.len() > dmesh_rawnan::NAN_COMMAND_MAX_LEN {
         return false;
     }
@@ -497,20 +771,21 @@ fn transmit_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
     ) else {
         return false;
     };
-    let frame = dmesh_rawnan::build_nan_followup_sdf(
+    // A follow-up is emitted by our Publish instance (1).  The matching
+    // Android Subscribe supplied its own instance in the received SDA; that
+    // value becomes the requestor instance ID in the response.  Reversing
+    // these fields makes the framework silently discard an otherwise valid
+    // unicast NAN action.
+    let frame = dmesh_rawnan::build_nan_followup_sdf_for_requestor(
         peer,
         local,
         bssid,
         dmesh_rawnan::DMESH_SERVICE_ID,
         1,
+        subscriber_instance,
         &payload,
     );
-    transmit_public_action_from_dw(
-        interface,
-        peer,
-        bssid,
-        &frame[24..],
-    )
+    transmit_public_action_from_dw(interface, peer, bssid, &frame[24..])
 }
 
 /// Submit one NAN public action inside a DW without leaving ESP-IDF in
@@ -526,12 +801,14 @@ fn transmit_public_action_from_dw(
     bssid: [u8; 6],
     body: &[u8],
 ) -> bool {
-    yield_capture_for_action_tx(|| crate::wifi_espnow_esp::transmit_public_action_on_interface(
-        interface,
-        destination,
-        bssid,
-        body,
-    ))
+    yield_capture_for_action_tx(|| {
+        crate::wifi_espnow_esp::transmit_public_action_on_interface(
+            interface,
+            destination,
+            bssid,
+            body,
+        )
+    })
 }
 
 /// Yield the capture owner for one ESP-IDF action submission, then restore it.
@@ -541,7 +818,13 @@ fn transmit_public_action_from_dw(
 /// radio; this provides the same short, explicit handoff for NAN and NOW.
 /// It is not a receive loop and never retains a packet.
 pub(crate) fn yield_capture_for_action_tx(send: impl FnOnce() -> bool) -> bool {
-    yield_capture_for_action_tx_result(|| if send() { esp_idf_sys::ESP_OK } else { esp_idf_sys::ESP_FAIL }) == esp_idf_sys::ESP_OK
+    yield_capture_for_action_tx_result(|| {
+        if send() {
+            esp_idf_sys::ESP_OK
+        } else {
+            esp_idf_sys::ESP_FAIL
+        }
+    }) == esp_idf_sys::ESP_OK
 }
 
 /// Integer-result counterpart for raw action TX, which preserves the ESP-IDF
@@ -582,13 +865,15 @@ fn drain_pending_followup_responses() {
         for (index, byte) in peer.iter_mut().enumerate() {
             *byte = slot.peer[index].load(Ordering::Relaxed);
         }
+        let instance = slot.instance.load(Ordering::Relaxed);
+        let requestor_instance = slot.requestor_instance.load(Ordering::Relaxed);
         let payload_len = usize::from(slot.payload_len.load(Ordering::Acquire))
             .min(dmesh_rawnan::NAN_COMMAND_MAX_LEN);
         for (index, byte) in payload[..payload_len].iter_mut().enumerate() {
             *byte = slot.payload[index].load(Ordering::Relaxed);
         }
         slot.state.store(PENDING_EMPTY, Ordering::Release);
-        if transmit_followup_response(peer, &payload[..payload_len]) {
+        if transmit_followup_response(peer, instance, requestor_instance, &payload[..payload_len]) {
             PENDING_FOLLOWUP_SENT.fetch_add(1, Ordering::Relaxed);
         } else {
             PENDING_FOLLOWUP_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -608,10 +893,7 @@ fn drain_active_publish() {
     let pending = ACTIVE_PUBLISH_PENDING.load(Ordering::Acquire);
     let burst_remaining = ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire);
     let last_sent = ACTIVE_PUBLISH_LAST_SENT_MS.load(Ordering::Acquire);
-    if burst_remaining != 0
-        && last_sent != 0
-        && now.wrapping_sub(last_sent) < dw_period_ms()
-    {
+    if burst_remaining != 0 && last_sent != 0 && now.wrapping_sub(last_sent) < dw_period_ms() {
         return;
     }
     if !pending && burst_remaining == 0 && now.wrapping_sub(last_sent) < ACTIVE_PUBLISH_REFRESH_MS {
@@ -645,18 +927,24 @@ fn drain_active_publish() {
         1,
         &service_info[..len],
     );
+    ACTIVE_PUBLISH_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
     if transmit_public_action_from_dw(
         interface,
         dmesh_rawnan::NAN_DISCOVERY_MAC,
         bssid,
         &frame[24..],
     ) {
+        ACTIVE_PUBLISH_SENT.fetch_add(1, Ordering::Relaxed);
         ACTIVE_PUBLISH_LAST_SENT_MS.store(now, Ordering::Release);
         let remaining = ACTIVE_PUBLISH_REMAINING
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_sub(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
             .map(|value| value - 1)
             .unwrap_or(0);
         ACTIVE_PUBLISH_PENDING.store(remaining != 0, Ordering::Release);
+    } else {
+        ACTIVE_PUBLISH_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -707,11 +995,22 @@ fn drain_pending_sdf() {
 /// that window, in which case this queues the response for the next DW.
 /// This module owns scheduling/context; `wifi_espnow_esp` remains the sole
 /// ESP-IDF public-action submitter.
-pub fn send_followup_response(peer: [u8; 6], response: &[u8]) -> bool {
+pub fn send_followup_response(
+    peer: [u8; 6],
+    instance: u8,
+    requestor_instance: u8,
+    response: &[u8],
+) -> bool {
     if CAPTURING.load(Ordering::Acquire) {
-        transmit_followup_response(peer, response)
+        let sent = transmit_followup_response(peer, instance, requestor_instance, response);
+        if sent {
+            PENDING_FOLLOWUP_SENT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PENDING_FOLLOWUP_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        sent
     } else {
-        queue_followup_response(peer, response)
+        queue_followup_response(peer, instance, requestor_instance, response)
     }
 }
 
@@ -736,14 +1035,9 @@ pub fn send_followup_frame(frame: &[u8]) -> Result<usize, &'static str> {
     } else {
         crate::wifi_esp::RadioInterface::Ap
     };
-    transmit_public_action_from_dw(
-        interface,
-        destination,
-        bssid,
-        &frame[24..],
-    )
-    .then_some(frame.len())
-    .ok_or("NAN follow-up driver rejected")
+    transmit_public_action_from_dw(interface, destination, bssid, &frame[24..])
+        .then_some(frame.len())
+        .ok_or("NAN follow-up driver rejected")
 }
 
 fn now_ms() -> u32 {
@@ -787,8 +1081,27 @@ fn due(now: u32, deadline: u32) -> bool {
 /// `(all_management_frames, bytes, NAN_beacons, NAN_SDFs, NAN_followups,
 /// DMesh_Service_Info_matches, active_Subscribe_SDAs, active_SDEA_misses,
 /// last_SDEA_header, last_SDEA_declared_info_len, decoded_active_Subscribes,
-/// copied_to_ingress, ingress_copy_failures)`.
-pub fn stats() -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, [u8; 6], [u8; 6], [u8; 6], u32, u32, u32) {
+/// copied_to_ingress, ingress_copy_failures, worker_handler_invocations)`.
+pub fn stats() -> (
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    [u8; 6],
+    [u8; 6],
+    [u8; 6],
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+) {
     let mut active_subscribe_bssid = [0u8; 6];
     for (index, byte) in active_subscribe_bssid.iter_mut().enumerate() {
         *byte = ACTIVE_SUBSCRIBE_BSSID[index].load(Ordering::Relaxed);
@@ -816,6 +1129,8 @@ pub fn stats() -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, [u8; 6], [u
         ACTIVE_SUBSCRIBES.load(Ordering::Relaxed),
         SERVICE_INFO_ENQUEUED.load(Ordering::Relaxed),
         SERVICE_INFO_DROPPED.load(Ordering::Relaxed),
+        SERVICE_INFO_DISPATCHED.load(Ordering::Relaxed),
+        LAST_SDF_AFTER_BEACON_US.load(Ordering::Relaxed),
     )
 }
 
@@ -835,7 +1150,11 @@ pub fn configure_active_publish(enabled: bool, service_info: &[u8]) -> bool {
     ACTIVE_PUBLISH_LAST_SENT_MS.store(0, Ordering::Release);
     ACTIVE_PUBLISH_PENDING.store(enabled, Ordering::Release);
     ACTIVE_PUBLISH_REMAINING.store(
-        if enabled { ACTIVE_PUBLISH_BURST_WINDOWS } else { 0 },
+        if enabled {
+            ACTIVE_PUBLISH_BURST_WINDOWS
+        } else {
+            0
+        },
         Ordering::Release,
     );
     ACTIVE_PUBLISH_ENABLED.store(enabled, Ordering::Release);
@@ -855,6 +1174,24 @@ pub fn active_publish_status() -> (bool, bool, u16, u32) {
         ACTIVE_PUBLISH_PENDING.load(Ordering::Acquire),
         ACTIVE_PUBLISH_LEN.load(Ordering::Acquire),
         ACTIVE_PUBLISH_LAST_SENT_MS.load(Ordering::Acquire),
+    )
+}
+
+/// True only while the NAN DW receiver is active on NAN's fixed channel 6.
+/// Associated STA on another channel keeps NOW and UDP6 but must not publish
+/// NAN Service Info as if it were reachable there.
+pub fn active_on_nan_channel() -> bool {
+    STARTED.load(Ordering::Acquire) && crate::wifi_esp::selected_channel() == Some(6)
+}
+
+/// Monotonic local active-Publish TX evidence. `sent` means the ESP action
+/// submitter accepted it; a peer-side NAN observation is still required to
+/// prove RF delivery.
+pub fn active_publish_stats() -> (u32, u32, u32) {
+    (
+        ACTIVE_PUBLISH_ATTEMPTED.load(Ordering::Relaxed),
+        ACTIVE_PUBLISH_SENT.load(Ordering::Relaxed),
+        ACTIVE_PUBLISH_DROPPED.load(Ordering::Relaxed),
     )
 }
 
@@ -878,8 +1215,7 @@ pub fn queue_sdf_frame(frame: &[u8]) -> bool {
         || frame.len() > PENDING_SDF_MAX_LEN
         || frame.len() < dmesh_rawnan::FRAME_BSSID + 6
         || bssid_is_unset(selected_bssid())
-        || frame[dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6]
-            != selected_bssid()
+        || frame[dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6] != selected_bssid()
     {
         return false;
     }
@@ -902,6 +1238,7 @@ pub fn queue_sdf_frame(frame: &[u8]) -> bool {
 fn dispatch_service_info(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
     let handler = SERVICE_INFO_HANDLER.load(Ordering::Acquire);
     if handler != 0 {
+        SERVICE_INFO_DISPATCHED.fetch_add(1, Ordering::Relaxed);
         let handler: NanServiceInfoHandler = unsafe { core::mem::transmute(handler) };
         handler(item.source(), payload);
     }
@@ -991,9 +1328,14 @@ pub fn reset_stats() {
     ACTIVE_SUBSCRIBE_SDEA_HEADER.store(0, Ordering::Release);
     ACTIVE_SUBSCRIBE_SDEA_INFO_LEN.store(0, Ordering::Release);
     ACTIVE_SUBSCRIBES.store(0, Ordering::Release);
+    LAST_SDF_AFTER_BEACON_US.store(0, Ordering::Release);
     LAST_DISCOVERY_VALID.store(false, Ordering::Release);
     SERVICE_INFO_ENQUEUED.store(0, Ordering::Release);
     SERVICE_INFO_DROPPED.store(0, Ordering::Release);
+    SERVICE_INFO_DISPATCHED.store(0, Ordering::Release);
+    ACTIVE_PUBLISH_ATTEMPTED.store(0, Ordering::Release);
+    ACTIVE_PUBLISH_SENT.store(0, Ordering::Release);
+    ACTIVE_PUBLISH_DROPPED.store(0, Ordering::Release);
     FILTER_ARMS.store(0, Ordering::Release);
     FILTER_ERRORS.store(0, Ordering::Release);
 }
@@ -1040,7 +1382,10 @@ pub fn request_permissive_capture(duration_ms: u16) -> bool {
     }
     // Resume ordinary DW scheduling only after this bounded observation
     // closes; do not alter the configured cadence.
-    NEXT_MS.store(requested_until.wrapping_add(dw_period_ms()), Ordering::Release);
+    NEXT_MS.store(
+        requested_until.wrapping_add(dw_period_ms()),
+        Ordering::Release,
+    );
     true
 }
 
@@ -1383,7 +1728,11 @@ pub fn service_deadline() {
     // local time. This aligns independent devices to the same cluster beacon
     // instead of preserving their arbitrary boot-time phase.
     if let Some(anchor_us) = take_sync_anchor_us() {
-        let next_us = dmesh_rawnan::next_nan_dw_start_us(anchor_us, now_us());
+        let next_us = dmesh_rawnan::next_nan_dw_start_us(
+            anchor_us,
+            now_us().saturating_add(NAN_DW_PRE_BEACON_US),
+        )
+        .saturating_sub(NAN_DW_PRE_BEACON_US);
         NEXT_MS.store(
             (next_us / 1_000).min(u64::from(u32::MAX)) as u32,
             Ordering::Release,
@@ -1442,8 +1791,7 @@ pub fn next_service_delay_ms() -> Option<u32> {
     // its eight-window burst remains, then immediately return to `None`.
     // This is a correlated discovery response, not an idle capture tick.
     if NOW_ACTIVE_RECEIVE.load(Ordering::Acquire) {
-        return (ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire) != 0)
-            .then_some(dw_period_ms());
+        return (ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire) != 0).then_some(dw_period_ms());
     }
     // The active NOW client owns its own exact retry/PTO deadline in Main.
     // Returning `None` here prevents a second synthetic timer wake while the
@@ -1455,7 +1803,11 @@ pub fn next_service_delay_ms() -> Option<u32> {
     let service_until = NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire);
     if service_until != 0 {
         let remaining = service_until.wrapping_sub(now);
-        return Some(if remaining > 0x8000_0000 { 1 } else { remaining.max(1) });
+        return Some(if remaining > 0x8000_0000 {
+            1
+        } else {
+            remaining.max(1)
+        });
     }
     let deadline = if CAPTURING.load(Ordering::Acquire) {
         UNTIL_MS.load(Ordering::Acquire)
@@ -1463,7 +1815,11 @@ pub fn next_service_delay_ms() -> Option<u32> {
         NEXT_MS.load(Ordering::Acquire)
     };
     let remaining = deadline.wrapping_sub(now);
-    Some(if remaining > 0x8000_0000 { 0 } else { remaining.max(1) })
+    Some(if remaining > 0x8000_0000 {
+        0
+    } else {
+        remaining.max(1)
+    })
 }
 
 fn dw_period_ms() -> u32 {
@@ -1502,19 +1858,36 @@ fn receive_management_frame(frame: &[u8]) {
         BEACONS.fetch_add(1, Ordering::Relaxed);
         if let Some(bssid) = frame.get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6) {
             let selected = selected_bssid();
-            // Acquisition selects one cluster and keeps it until the
-            // state machine explicitly rediscovers. Re-anchoring from
-            // every visible cluster gave peers different DW phases.
-            if bssid_is_unset(selected) {
-                for (index, byte) in bssid.iter().enumerate() {
-                    FILTER_BSSID[index].store(*byte, Ordering::Relaxed);
-                }
+            let received_us = now_us();
+            let last_selected_us = {
+                let high = SYNC_ANCHOR_HI.load(Ordering::Acquire);
+                let low = SYNC_ANCHOR_LO.load(Ordering::Relaxed);
+                (u64::from(high) << 32) | u64::from(low)
+            };
+            // Keep one live cluster so peers retain a common DW phase. If it
+            // disappears, a foreign NAN beacon may replace it after the same
+            // three-DW guard as rawnan::NanState. This avoids a permanently
+            // stale first-acquired BSSID while avoiding per-beacon flapping.
+            // TODO(NAN cluster convergence): ESP cannot transmit NAN sync
+            // beacons, so it cannot take part in normal cluster merging. If
+            // two isolated clusters later become visible through an ESP in
+            // the middle, select the stronger beacon; when their RSSI values
+            // are too close to distinguish, choose the lexicographically
+            // smallest BSSID. Keep the stale-only handover for now: that
+            // split-cluster case is uncommon and needs measured RSSI/hysteresis
+            // before it can safely replace a live common DW phase.
+            let replace_stale_cluster = !bssid_is_unset(selected)
+                && bssid != selected
+                && received_us.saturating_sub(last_selected_us)
+                    >= dmesh_rawnan::NAN_CLUSTER_RESELECT_AFTER_US;
+            if bssid_is_unset(selected) || replace_stale_cluster {
+                select_cluster_bssid(bssid);
             }
-            if bssid_is_unset(selected) || bssid == selected {
+            if bssid_is_unset(selected) || bssid == selected || replace_stale_cluster {
                 // Store the local receive point, not the beacon TSF. TSF
                 // is cluster-wide but local receive time schedules this
                 // adapter's radio window for the selected cluster.
-                store_sync_anchor_us(now_us());
+                store_sync_anchor_us(received_us);
                 SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
                 FILTER_PENDING.store(true, Ordering::Release);
             }
@@ -1532,9 +1905,25 @@ fn receive_nan_action(frame: &[u8]) {
     match dmesh_rawnan::classify(frame) {
         dmesh_rawnan::FrameKind::Sdf => {
             SDFS.fetch_add(1, Ordering::Relaxed);
-            let Some(source): Option<[u8; 6]> = frame.get(10..16).and_then(|source| source.try_into().ok()) else {
+            let last_beacon_us = {
+                let high = SYNC_ANCHOR_HI.load(Ordering::Acquire);
+                let low = SYNC_ANCHOR_LO.load(Ordering::Relaxed);
+                (u64::from(high) << 32) | u64::from(low)
+            };
+            let after_beacon_us = now_us().saturating_sub(last_beacon_us);
+            LAST_SDF_AFTER_BEACON_US.store(
+                after_beacon_us.min(u64::from(u32::MAX)) as u32,
+                Ordering::Relaxed,
+            );
+            let Some(source): Option<[u8; 6]> =
+                frame.get(10..16).and_then(|source| source.try_into().ok())
+            else {
                 return;
             };
+            let bssid: [u8; 6] = frame
+                .get(16..22)
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or([0; 6]);
             for (index, byte) in source.iter().enumerate() {
                 LAST_SDF_SOURCE[index].store(*byte, Ordering::Relaxed);
             }
@@ -1548,12 +1937,25 @@ fn receive_nan_action(frame: &[u8]) {
             // Active Subscribe puts its custom CBOR Service Info in SDEA;
             // active Publish puts it directly in the SDA. Both are delivered
             // through the same copied ingress record as UART/SD control.
-            let active_descriptor = dmesh_rawnan::service_descriptors(frame).into_iter().any(
-                |item| {
-                    item.service_id == dmesh_rawnan::DMESH_SERVICE_ID
-                        && matches!(item.descriptor.control, 0x10..=0x12)
-                },
-            );
+            let active_descriptor =
+                dmesh_rawnan::service_descriptors(frame)
+                    .into_iter()
+                    .any(|item| {
+                        item.service_id == dmesh_rawnan::DMESH_SERVICE_ID
+                            && matches!(item.descriptor.control, 0x10..=0x12)
+                    });
+            for descriptor in dmesh_rawnan::service_descriptors(frame) {
+                if descriptor.service_id != dmesh_rawnan::DMESH_SERVICE_ID {
+                    continue;
+                }
+                let kind = match descriptor.descriptor.control & 0x03 {
+                    0 => NAN_OBSERVATION_ACTIVE_PUBLISH,
+                    1 => NAN_OBSERVATION_ACTIVE_SUBSCRIBE,
+                    2 => NAN_OBSERVATION_FOLLOWUP,
+                    _ => NAN_OBSERVATION_OTHER,
+                };
+                record_nan_device_observation(source, bssid, kind, descriptor.descriptor.payload);
+            }
             let active_subscribe =
                 dmesh_rawnan::active_subscribe_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID);
             if active_descriptor {
@@ -1599,7 +2001,13 @@ fn receive_nan_action(frame: &[u8]) {
                     if duplicate_discovery_ping(source, payload) {
                         return;
                     }
-                    mark_active_subscribe(source);
+                    let (instance, requestor_instance) = active_subscribe
+                        .map(|item| (item.instance, item.requestor_instance))
+                        // Legacy descriptor fallback does not expose a
+                        // Subscribe transaction; preserve the historical
+                        // compatibility pair only for that form.
+                        .unwrap_or((1, 0));
+                    mark_active_subscribe(source, instance, requestor_instance);
                 }
                 if crate::shared_ingress_esp::enqueue(
                     crate::shared_ingress_esp::IngressKind::NanServiceInfo,
@@ -1614,9 +2022,18 @@ fn receive_nan_action(frame: &[u8]) {
         }
         dmesh_rawnan::FrameKind::Followup => {
             FOLLOWUPS.fetch_add(1, Ordering::Relaxed);
+            let source: Option<[u8; 6]> =
+                frame.get(10..16).and_then(|value| value.try_into().ok());
+            let bssid: [u8; 6] = frame
+                .get(16..22)
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or([0; 6]);
             if let Some(payload) =
-                dmesh_rawnan::service_descriptor_payload(frame, dmesh_rawnan::DMESH_SERVICE_ID)
+                dmesh_rawnan::followup_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID)
             {
+                if let Some(source) = source {
+                    record_nan_device_observation(source, bssid, NAN_OBSERVATION_FOLLOWUP, payload);
+                }
                 if let Some(followup) = dmesh_rawnan::parse_dmesh_nan_followup(payload) {
                     record_followup(followup);
                 }
@@ -1636,8 +2053,12 @@ fn active_subscribe_sdea_layout(frame: &[u8]) -> (u32, u32) {
         let attribute = frame[offset];
         let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
         let body_start = offset + 3;
-        let Some(body_end) = body_start.checked_add(len) else { return (0, 0) };
-        let Some(body) = frame.get(body_start..body_end) else { return (0, 0) };
+        let Some(body_end) = body_start.checked_add(len) else {
+            return (0, 0);
+        };
+        let Some(body) = frame.get(body_start..body_end) else {
+            return (0, 0);
+        };
         if attribute == 0x03
             && body.len() >= 9
             && body[..6] == dmesh_rawnan::DMESH_SERVICE_ID

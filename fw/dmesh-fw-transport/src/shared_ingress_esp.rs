@@ -203,7 +203,11 @@ pub fn memory_stats() -> IngressMemoryStats {
 }
 
 fn zero_if_unset(value: u32) -> u32 {
-    if value == u32::MAX { 0 } else { value }
+    if value == u32::MAX {
+        0
+    } else {
+        value
+    }
 }
 
 fn record_lowest(slot: &AtomicU32, value: u32) {
@@ -559,7 +563,10 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
                 core::ptr::addr_of_mut!(TASK_PACKET).cast(),
                 esp_idf_sys::TickType_t::MAX,
             )
-        } != 1 { continue; }
+        } != 1
+        {
+            continue;
+        }
         let item = unsafe { *core::ptr::addr_of!(TASK_PACKET).cast::<IngressPacket>() };
         if item.kind == IngressKind::Work {
             let work = WORK_HANDLER.swap(0, Ordering::AcqRel);
@@ -615,10 +622,9 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
         let _ = PACKETS.release(item.slot);
         // This is the worker's own task context, so FreeRTOS can report the
         // real remaining-stack watermark without synchronizing with a caller.
-        record_lowest(
-            &WORKER_STACK_MIN_FREE_WORDS,
-            unsafe { esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) as u32 },
-        );
+        record_lowest(&WORKER_STACK_MIN_FREE_WORDS, unsafe {
+            esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) as u32
+        });
     }
 }
 

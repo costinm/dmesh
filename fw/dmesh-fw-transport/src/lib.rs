@@ -24,10 +24,10 @@ pub mod profile_store;
 // and quic-lite. Main and Recovery select concrete entry points, not Cargo
 // product-role features.
 pub mod commands;
-pub mod crypto_esp;
-pub mod flash;
 /// Shared transport engine used by the Main and Recovery policy wrappers.
 pub mod core_runtime;
+pub mod crypto_esp;
+pub mod flash;
 /// Main-specific policy entry point. The implementation is intentionally
 /// separate from the shared engine so Main can evolve without making the
 /// frozen Recovery lane link or execute its policy.
@@ -37,6 +37,9 @@ pub mod power_esp;
 /// Recovery-specific policy entry point. This remains a thin compatibility
 /// shell until Recovery is reduced to open-STA UDP6 flashing.
 pub mod recovery_runtime;
+/// Main-only bounded DCID forwarding state. Recovery intentionally does not
+/// register this handler or accept transit rules.
+pub mod relay_main;
 pub mod state;
 pub mod task_esp;
 pub mod uart_esp;

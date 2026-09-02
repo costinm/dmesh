@@ -5,12 +5,12 @@
 //! durable ESP erase/write operations.
 
 use alloc::{
-    alloc::{Layout, alloc_zeroed},
+    alloc::{alloc_zeroed, Layout},
     boxed::Box,
     vec::Vec,
 };
 use core::ffi::c_void;
-use dmesh_server::protocol::{BLOCK_SIZE, ImageSink};
+use dmesh_server::protocol::{ImageSink, BLOCK_SIZE};
 
 const PENDING_FLASH_BLOCKS: usize = 8;
 const FLASH_WRITE_BLOCKS: usize = 2;

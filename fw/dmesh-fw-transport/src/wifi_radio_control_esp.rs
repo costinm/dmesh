@@ -4,13 +4,13 @@
 //! parsing, handler method IDs, snapshots, and delta semantics are in
 //! `dmesh-server`, so direct PPP and QUIC stream callers use identical bytes.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use dmesh_server::raw_wifi::{
-    RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS,
-    RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiBearer, RawWifiControlRequest, RawWifiCounters,
-    RawWifiDwPolicy, RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter,
-    RawWifiSnapshot, RawWifiStaMode, RawWifiStaState,
+    RawWifiApMode, RawWifiBearer, RawWifiControlRequest, RawWifiCounters, RawWifiDwPolicy,
+    RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter, RawWifiSnapshot,
+    RawWifiStaMode, RawWifiStaState, RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL,
+    RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);
@@ -82,6 +82,7 @@ pub const fn response_method(request: RawWifiLabRequest) -> Option<u64> {
         RawWifiLabRequest::ResetCounters => Some(RAW_WIFI_METHOD_RESET_COUNTERS),
         RawWifiLabRequest::Check(_) => Some(RAW_WIFI_METHOD_CHECK),
         RawWifiLabRequest::Iperf(_) => Some(dmesh_server::raw_wifi::RAW_WIFI_METHOD_IPERF),
+        RawWifiLabRequest::Scan(_) => Some(dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN),
     }
 }
 
@@ -183,8 +184,7 @@ pub fn snapshot() -> RawWifiSnapshot {
         raw_client_expected_server_cid,
         raw_client_last_other_dcid,
         raw_client_last_other_peer_suffix,
-    ) =
-        crate::wifi_espnow_esp::raw_client_cid_diagnostics();
+    ) = crate::wifi_espnow_esp::raw_client_cid_diagnostics();
     let (udp6_service_bytes, _udp6_service_errors, udp6_service_elapsed_us) =
         crate::wifi_raw_udp6_esp::raw_client_result();
     // One raw service is admitted at a time by the probe executor. Select
@@ -215,7 +215,13 @@ pub fn snapshot() -> RawWifiSnapshot {
         active_subscribes,
         service_info_enqueued,
         service_info_dropped,
+        service_info_dispatched,
+        last_sdf_after_beacon_us,
     ) = crate::wifi_nan_dw_capture_esp::stats();
+    let (nan_followup_queued, nan_followup_sent, nan_followup_dropped, nan_followup_pending) =
+        crate::wifi_nan_dw_capture_esp::pending_followup_stats();
+    let (nan_active_publish_attempted, nan_active_publish_sent, nan_active_publish_dropped) =
+        crate::wifi_nan_dw_capture_esp::active_publish_stats();
     let (vendor_beacon_ies, vendor_nan_beacon_ies, vendor_other_ies) =
         crate::wifi_nonpromisc_probe_esp::stats();
     let (roc_frames, _roc_bytes, roc_requests, roc_failures, roc_espnow, roc_nan, roc_other) =
@@ -268,6 +274,8 @@ pub fn snapshot() -> RawWifiSnapshot {
             .then_some(active_subscribe_bssid),
         nan_last_sdf_source: (last_sdf_source != [0; 6]).then_some(last_sdf_source),
         nan_last_sdf_service_id: (last_sdf_service_id != [0; 6]).then_some(last_sdf_service_id),
+        nan_last_sdf_after_beacon_us: (last_sdf_after_beacon_us != 0)
+            .then_some(last_sdf_after_beacon_us),
         comparator_armed: Some(armed),
         comparator_errors,
         tx_interface: interface_from(TX_INTERFACE.load(Ordering::Acquire)),
@@ -299,6 +307,7 @@ pub fn snapshot() -> RawWifiSnapshot {
         sta_connect_to_associated_ms: crate::wifi_esp::sta_connect_to_associated_ms(),
         sta_last_disconnect_reason: Some(crate::wifi_esp::sta_last_disconnect_reason()),
         sta_ap_rssi_dbm: crate::wifi_esp::sta_ap_rssi_dbm(),
+        max_tx_power_qdbm: crate::wifi_esp::max_tx_power_qdbm(),
         udp6_tx_burst_packets: Some(crate::wifi_raw_udp6_esp::tx_burst_packets()),
         udp6_tx_submit_calls: Some(udp6_tx_submit_calls),
         udp6_tx_submit_us_total: Some(udp6_tx_submit_us_total),
@@ -315,6 +324,13 @@ pub fn snapshot() -> RawWifiSnapshot {
             nan_beacons: beacons,
             nan_sdfs: sdfs,
             nan_followups: followups,
+            nan_followup_queued,
+            nan_followup_sent,
+            nan_followup_dropped,
+            nan_followup_pending: u32::from(nan_followup_pending),
+            nan_active_publish_attempted,
+            nan_active_publish_sent,
+            nan_active_publish_dropped,
             nan_service_info_matched: service_info_matched,
             nan_active_subscribe_descriptors: active_subscribe_descriptors,
             nan_active_subscribe_sdea_misses: active_subscribe_sdea_misses,
@@ -323,6 +339,7 @@ pub fn snapshot() -> RawWifiSnapshot {
             nan_active_subscribes: active_subscribes,
             nan_service_info_enqueued: service_info_enqueued,
             nan_service_info_dropped: service_info_dropped,
+            nan_service_info_dispatched: service_info_dispatched,
             tx_duration_us_total,
             tx_duration_us_max,
             tx_duration_le_250us,
@@ -559,6 +576,7 @@ pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static st
                 crate::wifi_espnow_esp::schedule_raw_client_service();
             }
         }
+        RawWifiLabRequest::Scan(_) => {}
     }
     Ok(snapshot())
 }
@@ -567,6 +585,17 @@ pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static st
 /// caller-owned bounded buffer.  UART direct PPP and QUIC stream adapters use
 /// this exact function; neither owns a second radio response schema.
 pub fn handle_encoded(request: RawWifiLabRequest, out: &mut [u8]) -> Result<usize, &'static str> {
+    if let RawWifiLabRequest::Scan(request) = request {
+        let mut entries = [dmesh_server::raw_wifi::RawWifiScanEntry::default();
+            dmesh_server::raw_wifi::RAW_WIFI_SCAN_MAX_RECORDS];
+        let response = crate::wifi_esp::scan_observations(request, &mut entries)?;
+        return dmesh_server::raw_wifi::encode_raw_wifi_scan_response(
+            &entries[..response.entries],
+            response,
+            out,
+        )
+        .ok_or("wifi scan response");
+    }
     let method = response_method(request).ok_or("unsupported radio lab request")?;
     let snapshot = handle(request)?;
     dmesh_server::raw_wifi::encode_raw_wifi_snapshot(method, snapshot, out)
