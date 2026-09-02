@@ -288,12 +288,10 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
     /// allocation, and is invoked only on CLOSE/profile replacement.
     fn rotate_server_cid(&mut self, retired_client_cid: Option<ConnectionId>) {
         self.server_cid_epoch = self.server_cid_epoch.wrapping_add(1).max(1);
-        let mut value =
-            self.server_cid.value().wrapping_add(0x9e37_79b9) ^ u64::from(self.server_cid_epoch);
-        if retired_client_cid.is_some_and(|cid| cid.value() == value) || value == 0 {
+        let mut value = self.server_cid.value().wrapping_add(1).max(1);
+        if retired_client_cid.is_some_and(|cid| cid.value() == value) {
             value = value.wrapping_add(1).max(1);
         }
-        // The arithmetic above cannot make zero after the explicit repair.
         self.server_cid = ConnectionId::new(value).expect("rotated raw server CID is nonzero");
     }
 
@@ -371,6 +369,13 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfDispatcher<HISTORY, PACK
         {
             connection.mux.endpoint.set_time(now);
         }
+    }
+
+    /// Active endpoint receive CID, if bootstrap has created an association.
+    pub fn expected_receive_cid(&self) -> Option<ConnectionId> {
+        self.server
+            .as_ref()
+            .and_then(RawIperfServer::expected_receive_cid)
     }
 
     /// Poll delayed control only for the path that last made valid service
@@ -577,6 +582,24 @@ pub struct RawCheckClient<const HISTORY: usize, const PACKET: usize> {
     counters: RawServiceCounters,
 }
 
+/// Bounded tagged-CBOR request/response client for a complete-datagram
+/// bearer.  It uses the same QUIC-lite association and ACK ownership as the
+/// compact echo check, but carries one whole tagged record without inserting a
+/// legacy service byte.  The application response is retained in the same
+/// packet-sized bound, so a raw adapter never grows a private queue.
+pub struct RawTaggedClient<const HISTORY: usize, const PACKET: usize> {
+    client_cid: ConnectionId,
+    server_cid: Option<ConnectionId>,
+    endpoint: Option<EndpointState<8, HISTORY, PACKET>>,
+    request: [u8; PACKET],
+    request_len: usize,
+    started: bool,
+    complete: bool,
+    response: [u8; PACKET],
+    response_len: usize,
+    counters: RawServiceCounters,
+}
+
 /// Bearer-neutral, incremental signed-object GET client.
 ///
 /// It retains only the bounded QUIC-lite ledger and the small GET request.
@@ -751,6 +774,174 @@ impl<const HISTORY: usize, const PACKET: usize> RawObjectClient<HISTORY, PACKET>
     }
     pub const fn counters(&self) -> RawServiceCounters {
         self.counters
+    }
+}
+
+impl<const HISTORY: usize, const PACKET: usize> RawTaggedClient<HISTORY, PACKET> {
+    /// `record` is a complete tagged-CBOR envelope.  It is deliberately not
+    /// prefixed by a legacy service selector: the server dispatches component
+    /// and method from the envelope itself on every bearer.
+    pub fn new(client_cid: ConnectionId, record: &[u8]) -> Result<Self, Error> {
+        if record.is_empty() || record.len() > PACKET {
+            return Err(Error::BufferTooSmall);
+        }
+        let mut request = [0u8; PACKET];
+        request[..record.len()].copy_from_slice(record);
+        Ok(Self {
+            client_cid,
+            server_cid: None,
+            endpoint: None,
+            request,
+            request_len: record.len(),
+            started: false,
+            complete: false,
+            response: [0; PACKET],
+            response_len: 0,
+            counters: RawServiceCounters::default(),
+        })
+    }
+
+    pub fn start(&mut self, output: &mut [u8; PACKET]) -> Result<usize, Error> {
+        if self.started {
+            return Err(Error::Invalid);
+        }
+        self.started = true;
+        quic_lite::encode_bootstrap_open_packet_with_profile(
+            self.client_cid,
+            0,
+            ConnectionLimits::default(),
+            0,
+            output,
+        )
+    }
+
+    pub fn accepts(&self, input: &[u8]) -> bool {
+        ShortHeader::decode(input).is_ok_and(|(header, _)| header.dcid == self.client_cid)
+    }
+
+    pub fn retry_bootstrap(&self, output: &mut [u8; PACKET]) -> Result<usize, Error> {
+        if !self.started || self.server_cid.is_some() || self.complete {
+            return Err(Error::Invalid);
+        }
+        quic_lite::encode_bootstrap_open_packet_with_profile(
+            self.client_cid,
+            0,
+            ConnectionLimits::default(),
+            0,
+            output,
+        )
+    }
+
+    pub fn receive_at(
+        &mut self,
+        input: &[u8],
+        now_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        if self.endpoint.is_none() {
+            let (_, ack) =
+                quic_lite::decode_bootstrap_open_ack_packet_with_limits(input, self.client_cid)?;
+            let mut endpoint =
+                EndpointState::new(Role::Client, ConnectionLimits::default(), PACKET as u64);
+            endpoint.set_time(now_ms);
+            endpoint.install_connection_ids(self.client_cid, ack.server_receive_cid)?;
+            endpoint.set_initial_peer_credit(ack.max_data, ack.max_stream_data)?;
+            endpoint.continue_packet_numbers_from(1)?;
+            endpoint.open_send_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                quic_lite::INITIAL_MAX_STREAM_DATA,
+            )?;
+            let (used, _) = endpoint.encode_stream_packet(
+                ack.server_receive_cid,
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                0,
+                true,
+                &self.request[..self.request_len],
+                output,
+            )?;
+            self.server_cid = Some(ack.server_receive_cid);
+            self.endpoint = Some(endpoint);
+            self.counters.bootstrap_acks = self.counters.bootstrap_acks.saturating_add(1);
+            return Ok(Some(used));
+        }
+        if let Ok((_, ack)) =
+            quic_lite::decode_bootstrap_open_ack_packet_with_limits(input, self.client_cid)
+            && self.server_cid == Some(ack.server_receive_cid)
+        {
+            self.counters.bootstrap_acks = self.counters.bootstrap_acks.saturating_add(1);
+            return Ok(None);
+        }
+        if self.complete {
+            self.counters.other_packets = self.counters.other_packets.saturating_add(1);
+            return self
+                .endpoint
+                .as_mut()
+                .ok_or(Error::Invalid)?
+                .poll_close(output);
+        }
+        let endpoint = self.endpoint.as_mut().ok_or(Error::Invalid)?;
+        endpoint.set_time(now_ms);
+        let TransportPacket::Stream { frame, .. } = endpoint.receive_datagram(input)? else {
+            self.counters.other_packets = self.counters.other_packets.saturating_add(1);
+            return endpoint.poll_transmit(output);
+        };
+        if frame.id == quic_lite::FIRST_SERVER_BIDI_STREAM_ID
+            && frame.offset.saturating_add(frame.data.len() as u64) <= self.response_len as u64
+        {
+            self.counters.other_packets = self.counters.other_packets.saturating_add(1);
+            return endpoint.poll_transmit(output);
+        }
+        self.counters.stream_packets = self.counters.stream_packets.saturating_add(1);
+        if frame.id != quic_lite::FIRST_SERVER_BIDI_STREAM_ID
+            || frame.offset != self.response_len as u64
+            || self.response_len.saturating_add(frame.data.len()) > self.response.len()
+        {
+            return Err(Error::Invalid);
+        }
+        self.response[self.response_len..self.response_len + frame.data.len()]
+            .copy_from_slice(frame.data);
+        self.response_len += frame.data.len();
+        endpoint.stream_consumed(frame.id, frame.data.len())?;
+        self.complete = frame.fin;
+        if self.complete {
+            endpoint.close(0);
+            return endpoint.poll_close(output);
+        }
+        endpoint.poll_transmit(output)
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+    pub const fn bytes(&self) -> u64 {
+        self.response_len as u64
+    }
+    pub const fn server_cid(&self) -> Option<ConnectionId> {
+        self.server_cid
+    }
+    pub const fn counters(&self) -> RawServiceCounters {
+        self.counters
+    }
+    pub fn response(&self) -> Option<&[u8]> {
+        self.complete.then_some(&self.response[..self.response_len])
+    }
+    pub fn poll_transmit(&mut self, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
+        self.endpoint
+            .as_mut()
+            .map_or(Ok(None), |endpoint| endpoint.poll_transmit(output))
+    }
+    pub fn poll_retransmit(
+        &mut self,
+        now_us: u64,
+        pto_us: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        let Some(endpoint) = self.endpoint.as_mut() else {
+            return Ok(None);
+        };
+        Ok(endpoint
+            .retransmit_due(now_us, pto_us, output)?
+            .map(|(used, _)| used))
     }
 }
 
@@ -1359,6 +1550,14 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfServer<HISTORY, PACKET> 
         }
     }
 
+    /// Receive CID installed in the live QUIC endpoint. This diagnostic view
+    /// distinguishes a bad relay rewrite from receiver-side state drift.
+    pub fn expected_receive_cid(&self) -> Option<ConnectionId> {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.mux.endpoint.local_connection_id())
+    }
+
     /// Consume one complete datagram and write at most one immediate response.
     /// `Ok(None)` is normal transport backpressure or an ACK that created no
     /// immediate packet. The caller supplies future input/timer polls.
@@ -1389,10 +1588,8 @@ impl<const HISTORY: usize, const PACKET: usize> RawIperfServer<HISTORY, PACKET> 
                 // delayed packets are rejected at the QUIC boundary instead
                 // of being mistaken for current bearer progress.
                 self.association_epoch = self.association_epoch.wrapping_add(1).max(1);
-                let mut value = self.local_cid.value().wrapping_add(0x9e37_79b9)
-                    ^ open.client_receive_cid.value()
-                    ^ u64::from(self.association_epoch);
-                if value == 0 || value == open.client_receive_cid.value() {
+                let mut value = self.local_cid.value().wrapping_add(1).max(1);
+                if value == open.client_receive_cid.value() {
                     value = value.wrapping_add(1).max(1);
                 }
                 self.local_cid = ConnectionId::new(value).ok_or(Error::Invalid)?;
@@ -1589,6 +1786,10 @@ mod tests {
     use quic_lite::{
         ConnectionLimits, EndpointState, Role, encode_bootstrap_open_packet_with_profile,
     };
+
+    fn raw_tagged_test_handler(_record: crate::tagged::Record<'_>) -> Option<Vec<u8>> {
+        Some(b"tagged-response".to_vec())
+    }
 
     #[test]
     fn receive_error_codes_are_stable_for_firmware_diagnostics() {
@@ -2015,6 +2216,44 @@ mod tests {
                 .is_some_and(|response| !response.is_empty())
         );
         assert_eq!(client.bytes(), client.response().unwrap().len() as u64);
+    }
+
+    #[test]
+    fn tagged_client_round_trips_a_direct_record_over_raw_bearer() {
+        const COMPONENT: u64 = 60_001;
+        assert!(crate::services::register_tagged_component(
+            COMPONENT,
+            raw_tagged_test_handler
+        ));
+        // {1: component, 2: method, 3: request id}; no legacy service byte.
+        let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x61, 2, 1, 3, 7];
+        let client_cid = ConnectionId::new(0x166).unwrap();
+        let server_cid = ConnectionId::new(0x177).unwrap();
+        let mut client = RawTaggedClient::<4, 1200>::new(client_cid, &request).unwrap();
+        let mut server = RawIperfServer::<4, 1200>::new(server_cid);
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack_len = server
+            .receive(&client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive_at(&server_out[..open_ack_len], 1, &mut client_out)
+            .unwrap()
+            .unwrap();
+        let response_len = server
+            .receive(&client_out[..request_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let _ = client
+            .receive_at(&server_out[..response_len], 2, &mut client_out)
+            .unwrap();
+
+        assert!(client.is_complete());
+        assert_eq!(client.response(), Some(b"tagged-response".as_slice()));
+        assert_eq!(client.counters().stream_packets, 1);
     }
 
     #[test]

@@ -33,10 +33,15 @@ pub mod path_bridge;
 pub mod path_router;
 pub mod ram_budget;
 pub mod raw_udp6;
+pub mod relay;
 
 pub use path_router::{
     ConnectionTable, ConnectionTableError, DcidRouter, DcidRouterError, PathCapacity, PathPolicy,
     PathState,
+};
+pub use relay::{
+    DcidDatagram, DcidDatagramError, DcidIngress, DcidRegistry, DcidRegistryError, DcidTarget,
+    ForwardRule, dispatch_datagram,
 };
 
 #[cfg(any(feature = "std", test))]
@@ -534,8 +539,10 @@ pub trait DatagramBearer {
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
+    pub const MAX_VALUE: u64 = (1u64 << 61) - 1;
+
     pub const fn new(value: u64) -> Option<Self> {
-        if value < (1u64 << 62) {
+        if value <= Self::MAX_VALUE {
             Some(Self(value))
         } else {
             None
@@ -546,13 +553,15 @@ impl ConnectionId {
         self.0
     }
 
-    /// The first two bits of the first CID byte encode total length.
+    /// CID byte 0 has a dedicated length class: `0` is a one-byte CID;
+    /// `100`, `101`, and `110` select 2, 4, and 8 bytes respectively.
+    /// `111` is reserved and rejected by the decoder.
     pub const fn encoded_len(self) -> usize {
-        if self.0 <= 0x3f {
+        if self.0 <= 0x7f {
             1
-        } else if self.0 <= 0x3fff {
+        } else if self.0 <= 0x1fff {
             2
-        } else if self.0 <= 0x3fff_ffff {
+        } else if self.0 <= 0x1fff_ffff {
             4
         } else {
             8
@@ -566,14 +575,14 @@ impl ConnectionId {
         }
         let tag = match n {
             1 => 0,
-            2 => 1,
-            4 => 2,
-            _ => 3,
-        } << 6;
+            2 => 0b100,
+            4 => 0b101,
+            _ => 0b110,
+        } << 5;
         for i in 0..n {
             out[i] = (self.0 >> (8 * (n - i - 1))) as u8;
         }
-        out[0] = (out[0] & 0x3f) | tag;
+        out[0] = (out[0] & if n == 1 { 0x7f } else { 0x1f }) | tag;
         Ok(n)
     }
 
@@ -581,20 +590,59 @@ impl ConnectionId {
         if input.is_empty() {
             return Err(Error::Truncated);
         }
-        let n = match input[0] >> 6 {
-            0 => 1,
-            1 => 2,
-            2 => 4,
-            _ => 8,
+        let (n, value_mask) = if input[0] & 0x80 == 0 {
+            (1, 0x7f)
+        } else {
+            match (input[0] >> 5) & 0x03 {
+                0 => (2, 0x1f),
+                1 => (4, 0x1f),
+                2 => (8, 0x1f),
+                _ => return Err(Error::Invalid),
+            }
         };
         if input.len() < n {
             return Err(Error::Truncated);
         }
-        let mut value = (input[0] & 0x3f) as u64;
+        let mut value = (input[0] & value_mask) as u64;
         for &b in &input[1..n] {
             value = (value << 8) | b as u64;
         }
-        Ok((Self(value), n))
+        let cid = Self(value);
+        if cid.encoded_len() != n {
+            return Err(Error::Invalid);
+        }
+        Ok((cid, n))
+    }
+
+    /// Build a relay-local CID from the node-local label and 1-based distance
+    /// from the source. Labels 0 and 1 are reserved for bootstrap and control
+    /// allocation respectively.
+    pub const fn relay_local(label: u64, position: u8) -> Option<Self> {
+        if label < 2 || position == 0 {
+            return None;
+        }
+        if position <= 4 && label <= 0x1f {
+            return Self::new((label << 2) | (position - 1) as u64);
+        }
+        if position <= 16 && label <= ((1u64 << 57) - 1) {
+            return Self::new((label << 4) | (position - 1) as u64);
+        }
+        None
+    }
+
+    /// Return the node-local label and 1-based source distance encoded by a
+    /// non-zero relay-local CID. Callers enforce whether an endpoint CID is
+    /// being used as a relay label for a particular direction.
+    pub const fn relay_parts(self) -> Option<(u64, u8)> {
+        if self.0 == 0 {
+            return None;
+        }
+        let hop_bits = if self.encoded_len() == 1 { 2 } else { 4 };
+        let hop_mask = (1u64 << hop_bits) - 1;
+        Some((
+            self.0 >> hop_bits,
+            ((self.0 & hop_mask) as u8).saturating_add(1),
+        ))
     }
 }
 
@@ -658,7 +706,11 @@ pub fn decode_envelope(input: &[u8]) -> Result<(PeerKey, u8, &[u8]), EnvelopeErr
     if !matches!(cid_len, 1 | 2 | 4 | 8) || input.len() < 13 + cid_len {
         return Err(EnvelopeError::Truncated);
     }
-    let (dcid, _) = ConnectionId::decode(&input[13..]).map_err(|_| EnvelopeError::Invalid)?;
+    let (dcid, decoded_len) =
+        ConnectionId::decode(&input[13..]).map_err(|_| EnvelopeError::Invalid)?;
+    if decoded_len != cid_len {
+        return Err(EnvelopeError::Invalid);
+    }
     let mut wifi_mac = [0u8; 6];
     wifi_mac.copy_from_slice(&input[6..12]);
     Ok((PeerKey { wifi_mac, dcid }, input[5], &input[13 + cid_len..]))
@@ -677,6 +729,146 @@ pub enum Error {
     BootstrapInvalid,
     HistoryFull,
     RetransmissionTooLarge,
+}
+
+/// Encode one bounded direct message.  Direct messages use the normal
+/// QUIC-lite short header and packet number, but their body is raw application
+/// bytes rather than QUIC frames: there is no stream ordering, ACK, flow
+/// credit, retransmission, or endpoint state.  DCID zero selects this
+/// direct-message plane at the final receiver.
+pub fn encode_direct_packet(
+    packet_number: u32,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    encode_one_way_packet(
+        ConnectionId::new(0).ok_or(Error::Invalid)?,
+        packet_number,
+        payload,
+        out,
+    )
+}
+
+/// Encode an opaque one-way message for either a relay-local label or the
+/// final DCID-zero direct-message destination. The body is not a QUIC frame;
+/// forwarding nodes use [`rewrite_dcid`] and never inspect it.
+pub fn encode_one_way_packet(
+    dcid: ConnectionId,
+    packet_number: u32,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if payload.is_empty() {
+        return Err(Error::Invalid);
+    }
+    let header_len = ShortHeader {
+        flags: FLAG_FIXED,
+        dcid,
+        // Four bytes make the direct packet number self-contained: unlike a
+        // QUIC connection it has no expected receive number to reconstruct.
+        packet_number,
+        packet_number_len: 4,
+    }
+    .encode(out)?;
+    if out.len() < header_len + payload.len() {
+        return Err(Error::BufferTooSmall);
+    }
+    out[header_len..header_len + payload.len()].copy_from_slice(payload);
+    Ok(header_len + payload.len())
+}
+
+/// Decode a bounded DCID-zero direct message.  The returned header retains
+/// the complete packet number and the payload is deliberately opaque to the
+/// transport; DMesh's shared tagged-CBOR handler validates it.
+pub fn decode_direct_packet(input: &[u8]) -> Result<(ShortHeader, &[u8]), Error> {
+    let (header, header_len) = ShortHeader::decode(input)?;
+    if header.dcid.value() != 0 || header.packet_number_len != 4 || input.len() == header_len {
+        return Err(Error::Invalid);
+    }
+    Ok((header, &input[header_len..]))
+}
+
+/// Rewrite only the DCID of an opaque short-header datagram into separate
+/// caller-owned storage.  Flags, truncated packet-number bytes, and all body
+/// bytes are copied exactly.  The caller checks its selected bearer's MTU
+/// before enqueueing `used` bytes.
+pub fn rewrite_dcid(
+    input: &[u8],
+    outbound_dcid: ConnectionId,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let prefix = ShortHeader::decode_prefix(input)?;
+    let inbound_len = prefix.dcid.encoded_len();
+    let outbound_len = outbound_dcid.encoded_len();
+    let used = input
+        .len()
+        .checked_sub(inbound_len)
+        .and_then(|len| len.checked_add(outbound_len))
+        .ok_or(Error::Invalid)?;
+    if out.len() < used {
+        return Err(Error::BufferTooSmall);
+    }
+    out[0] = input[0];
+    outbound_dcid.encode(&mut out[1..])?;
+    let input_tail = 1 + inbound_len;
+    let output_tail = 1 + outbound_len;
+    out[output_tail..used].copy_from_slice(&input[input_tail..]);
+    Ok(used)
+}
+
+/// Rewrite the only bootstrap field a relay is allowed to interpret.
+///
+/// A normal relay is deliberately opaque and should use [`rewrite_dcid`].
+/// Relay-open is the one exception: the first OPEN names the CID to which the
+/// server will send OPEN_ACK.  In a three-party path that address must be the
+/// relay's *return alias*, not the client's private receive CID.  The relay
+/// therefore substitutes `relay_receive_cid` in the OPEN body while changing
+/// the outer DCID to `outbound_dcid` (normally zero for the final service).
+/// Its independently installed reverse rule later rewrites that alias back to
+/// the client CID before UDP delivery.  No later QUIC-lite packet is decoded
+/// or changed by this helper.
+pub fn rewrite_relay_open(
+    input: &[u8],
+    outbound_dcid: ConnectionId,
+    relay_receive_cid: ConnectionId,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if relay_receive_cid.value() == 0 {
+        return Err(Error::BootstrapInvalid);
+    }
+    // OPEN itself is specified only for DCID zero.  First make a bounded
+    // scratch representation with that destination, then use the normal
+    // bootstrap decoder rather than duplicating its frame validation here.
+    let mut direct = [0u8; DEFAULT_MAX_DATAGRAM_SIZE];
+    let direct_len = rewrite_dcid(
+        input,
+        ConnectionId::new(0).ok_or(Error::BootstrapInvalid)?,
+        &mut direct,
+    )?;
+    let (header, open) = decode_bootstrap_open_packet_with_limits(&direct[..direct_len])?;
+    let mut body = [0u8; 32];
+    let body_len = BootstrapOpen {
+        client_receive_cid: relay_receive_cid,
+        max_data: open.max_data,
+        max_stream_data: open.max_stream_data,
+        max_in_flight_packets: open.max_in_flight_packets,
+    }
+    .encode(&mut body)?;
+    let header_len = ShortHeader {
+        flags: header.flags,
+        dcid: outbound_dcid,
+        packet_number: header.packet_number,
+        packet_number_len: header.packet_number_len,
+    }
+    .encode(out)?;
+    let frame_len = Frame::Stream(StreamFrame {
+        id: CONTROL_STREAM_ID,
+        offset: 0,
+        fin: true,
+        data: &body[..body_len],
+    })
+    .encode(&mut out[header_len..])?;
+    Ok(header_len + frame_len)
 }
 
 /// Result metadata for a bearer datagram after transport processing. The
@@ -4242,13 +4434,13 @@ mod tests {
     fn connection_id_lengths_round_trip() {
         for value in [
             0,
-            0x3f,
-            0x40,
-            0x3fff,
-            0x4000,
-            0x3fff_ffff,
-            0x4000_0000,
-            (1u64 << 62) - 1,
+            0x7f,
+            0x80,
+            0x1fff,
+            0x2000,
+            0x1fff_ffff,
+            0x2000_0000,
+            (1u64 << 61) - 1,
         ] {
             let id = ConnectionId::new(value).unwrap();
             let mut b = [0; 8];
@@ -4256,6 +4448,75 @@ mod tests {
             assert_eq!(n, id.encoded_len());
             assert_eq!(ConnectionId::decode(&b[..n]).unwrap(), (id, n));
         }
+        assert!(ConnectionId::new(1u64 << 61).is_none());
+    }
+
+    #[test]
+    fn connection_id_uses_structured_length_classes() {
+        let cases = [
+            (0x7f, &[0x7f][..]),
+            (0x80, &[0x80, 0x80][..]),
+            (0x1fff, &[0x9f, 0xff][..]),
+            (0x2000, &[0xa0, 0x00, 0x20, 0x00][..]),
+            (0x1fff_ffff, &[0xbf, 0xff, 0xff, 0xff][..]),
+            (
+                0x2000_0000,
+                &[0xc0, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00][..],
+            ),
+        ];
+        for (value, expected) in cases {
+            let mut encoded = [0u8; 8];
+            let used = ConnectionId::new(value)
+                .unwrap()
+                .encode(&mut encoded)
+                .unwrap();
+            assert_eq!(&encoded[..used], expected);
+        }
+    }
+
+    #[test]
+    fn connection_id_rejects_reserved_and_noncanonical_classes() {
+        assert_eq!(
+            ConnectionId::decode(&[0xe0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Invalid)
+        );
+        assert_eq!(ConnectionId::decode(&[0x80, 0x01]), Err(Error::Invalid));
+        assert_eq!(
+            ConnectionId::decode(&[0xa0, 0, 0, 0x7f]),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            ConnectionId::decode(&[0xc0, 0, 0, 0, 0, 0, 0, 0x80]),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn relay_local_cids_encode_class_dependent_hop_positions() {
+        let nearby = ConnectionId::relay_local(2, 1).unwrap();
+        assert_eq!(nearby.value(), 8);
+        assert_eq!(nearby.encoded_len(), 1);
+        assert_eq!(nearby.relay_parts(), Some((2, 1)));
+
+        let nearby_last = ConnectionId::relay_local(31, 4).unwrap();
+        assert_eq!(nearby_last.value(), 0x7f);
+        assert_eq!(nearby_last.encoded_len(), 1);
+        assert_eq!(nearby_last.relay_parts(), Some((31, 4)));
+
+        let long = ConnectionId::relay_local(32, 1).unwrap();
+        assert_eq!(long.value(), 0x200);
+        assert_eq!(long.encoded_len(), 2);
+        assert_eq!(long.relay_parts(), Some((32, 1)));
+
+        let long_last = ConnectionId::relay_local(511, 16).unwrap();
+        assert_eq!(long_last.value(), 0x1fff);
+        assert_eq!(long_last.encoded_len(), 2);
+        assert_eq!(long_last.relay_parts(), Some((511, 16)));
+
+        assert!(ConnectionId::relay_local(1, 1).is_none());
+        assert!(ConnectionId::relay_local(2, 0).is_none());
+        assert!(ConnectionId::relay_local(2, 17).is_none());
+        assert_eq!(ConnectionId::new(0).unwrap().relay_parts(), None);
     }
 
     #[test]
@@ -4677,7 +4938,7 @@ mod tests {
         );
 
         let largest = BootstrapOpen {
-            client_receive_cid: ConnectionId::new((1u64 << 62) - 1).unwrap(),
+            client_receive_cid: ConnectionId::new(ConnectionId::MAX_VALUE).unwrap(),
             max_data: 64,
             max_stream_data: 64,
             max_in_flight_packets: 0,
@@ -4686,7 +4947,7 @@ mod tests {
         assert_eq!(
             &encoded[..used],
             &[
-                0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x05, 0x40, 0x40, 0x40,
+                0x00, 0x00, 0xdf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x05, 0x40, 0x40, 0x40,
                 0x40, 0x00
             ]
         );
@@ -4704,7 +4965,7 @@ mod tests {
         );
 
         let largest_ack = BootstrapOpenAck {
-            server_receive_cid: ConnectionId::new((1u64 << 62) - 1).unwrap(),
+            server_receive_cid: ConnectionId::new(ConnectionId::MAX_VALUE).unwrap(),
             max_data: 64,
             max_stream_data: 64,
             max_in_flight_packets: 0,
@@ -4713,7 +4974,7 @@ mod tests {
         assert_eq!(
             &encoded[..used],
             &[
-                0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x05, 0x40, 0x40, 0x40,
+                0x01, 0x00, 0xdf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x05, 0x40, 0x40, 0x40,
                 0x40, 0x00
             ]
         );
@@ -6441,6 +6702,18 @@ mod tests {
     }
 
     #[test]
+    fn bearer_envelope_rejects_a_declared_cid_length_that_disagrees_with_class() {
+        let key = PeerKey {
+            wifi_mac: [1, 2, 3, 4, 5, 6],
+            dcid: ConnectionId::new(1).unwrap(),
+        };
+        let mut out = [0u8; 64];
+        let used = encode_envelope(key, 9, b"payload", &mut out).unwrap();
+        out[12] = 2;
+        assert_eq!(decode_envelope(&out[..used]), Err(EnvelopeError::Invalid));
+    }
+
+    #[test]
     fn newreno_congestion_window_uses_rfc_initial_and_loss_rules() {
         let mut c = CongestionController::new(1200);
         assert_eq!(c.congestion_window, 12_000);
@@ -6792,5 +7065,38 @@ mod tests {
             header_len: 0,
         };
         assert_eq!(prefix.reconstruct(0), Err(Error::PacketNumberExhausted));
+    }
+
+    #[test]
+    fn direct_packet_uses_dcid_zero_without_quic_frames() {
+        let mut packet = [0u8; 32];
+        let used = encode_direct_packet(0x0102_0304, &[0xa2, 1, 2], &mut packet).unwrap();
+        let (header, payload) = decode_direct_packet(&packet[..used]).unwrap();
+        assert_eq!(header.dcid, ConnectionId::new(0).unwrap());
+        assert_eq!(header.packet_number, 0x0102_0304);
+        assert_eq!(header.packet_number_len, 4);
+        assert_eq!(payload, &[0xa2, 1, 2]);
+        assert!(decode_bootstrap_open_packet(&packet[..used]).is_err());
+    }
+
+    #[test]
+    fn dcid_rewrite_preserves_direct_packet_number_and_cbor() {
+        let inbound = ConnectionId::relay_local(2, 1).unwrap();
+        let outbound = ConnectionId::new(0).unwrap();
+        let mut packet = [0u8; 32];
+        let header_len = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: inbound,
+            packet_number: 0x0102_0304,
+            packet_number_len: 4,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        packet[header_len..header_len + 3].copy_from_slice(&[0xa1, 1, 2]);
+        let mut rewritten = [0u8; 32];
+        let used = rewrite_dcid(&packet[..header_len + 3], outbound, &mut rewritten).unwrap();
+        let (header, payload) = decode_direct_packet(&rewritten[..used]).unwrap();
+        assert_eq!(header.packet_number, 0x0102_0304);
+        assert_eq!(payload, &[0xa1, 1, 2]);
     }
 }

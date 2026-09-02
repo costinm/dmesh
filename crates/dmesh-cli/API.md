@@ -15,19 +15,24 @@ rendered through the same schema used by diagnostics.
 
 ## Device inventory
 
-The shared inventory root is `/home/lmesh/etc/lmesh/devices`. Each device has
-one directory and a `device.toml` file, for example
-[`examples/devices/e6/device.toml`](examples/devices/e6/device.toml). The
-library accepts an explicit `/dev/...` serial path, `udp://IP:PORT` / IP
-literal, or a directory name such as `e6`. `LMESH_DEVICE_DIR` overrides the
-root for tests and isolated deployments.
+The shared inventory is one TOML catalog. Its checked-in test default is
+[`examples/device-catalog.toml`](examples/device-catalog.toml); deployment
+sets `DMESH_DEVICE_CATALOG` to its protected replacement. The library accepts
+an explicit `/dev/...` serial path, a scoped `udp://[IPv6%iface]:PORT` / IP
+literal, or a catalog name such as `e8`.
 
 `static_ipv4`, `ipv6_link_local`, `serial_id`, and `auth_secret_ref` are
 inventory fields. The secret field is a reference only: authentication and
 encryption are a future end-to-end layer across every untrusted bearer.
-Current UDP sessions prefer `static_ipv4`; a serial-only profile resolves to
-its `/dev/serial/by-id/<serial_id>` path. IPv6 link-local is recorded now but
-needs a caller-selected interface scope before it becomes a UDP path.
+Current UDP sessions prefer `ipv4`; a serial-only profile resolves to its
+configured serial path. IPv6 link-local is recorded now but needs a
+caller-selected interface scope before it becomes a UDP path.
+
+Direct UDP diagnostics, direct control, and QUIC service clients bind local
+UDP port `3338` for both address families. This stable source port lets an ESP
+relay retain a reverse UDP6 next hop across sequential dmesh-cli invocations.
+Concurrent UDP commands must share a session instead of competing for that
+single operator port.
 
 The `dmesh-cli` binary is a foreground shell, not a managed UART protocol
 daemon. It takes the session target directly and has no default control socket

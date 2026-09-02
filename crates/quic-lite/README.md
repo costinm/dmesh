@@ -22,6 +22,20 @@ The forwarding paths should be optimized to reduce transmit power/air time - not
 if a packet can go trough 2-3 foreign hops at high speed/low power wifi - instead of one slow hop on same-owner
 device - the first choice is preferred, falling back and avoiding unreliable forwarders.
 
+## Direct messages and forwarding labels
+
+The normal short header is also the bounded one-way control envelope. DCID `0`
+with a four-byte packet number carries raw tagged-CBOR rather than QUIC frames:
+it has no stream, ACK, retransmission, flow-control, or endpoint state. This is
+used for small idempotent control records and their separately routed replies;
+the QUIC OPEN bootstrap is one distinct DCID-zero message kind.
+
+Every nonzero local DCID has exactly one unified target at a node: either a
+local endpoint or an opaque forwarding rule. A forwarding rule replaces only
+the DCID in caller-supplied output storage and sends the unchanged packet
+number and body to an adapter-owned next-hop handle. It does not parse CBOR or
+QUIC frames, and it does not rely on source address, bearer, or ingress peer.
+
 ## Differences from QUIC
 
 - no encryption
@@ -44,4 +58,4 @@ UDP and IPv6 link local. The bug was fixed long ago - the IP is still the same A
 it is far better to use a subset of a standard. 
 
 Almost the entire code in this package is LLM-generated - already implemented QUIC and H2 once, no fun to
-do it again. 
+do it again.

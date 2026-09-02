@@ -303,16 +303,24 @@ fn parse_legacy_ble_service_data(data: &[u8], scan_rssi: i32, address: &str) -> 
 }
 
 pub fn build_nan_service_info(role: &str, device_id: &[u8], wake_count: u32) -> Result<Vec<u8>> {
-    let device_id: [u8; 6] = checked_device_id(device_id)?.try_into().expect("checked id");
-    let role = match role { "firmware" | "firmware_publisher" => NAN_ROLE_FIRMWARE_PUBLISHER, _ => NAN_ROLE_ANDROID_PUBLISHER };
+    let device_id: [u8; 6] = checked_device_id(device_id)?
+        .try_into()
+        .expect("checked id");
+    let role = match role {
+        "firmware" | "firmware_publisher" => NAN_ROLE_FIRMWARE_PUBLISHER,
+        _ => NAN_ROLE_ANDROID_PUBLISHER,
+    };
     let mut info = rawnan::build_dmesh_service_info(device_id, role, None).to_vec();
     info[11..15].copy_from_slice(&wake_count.to_le_bytes());
     Ok(info)
 }
 
 pub fn parse_nan_service_info(data: &[u8]) -> Result<Value> {
-    let info = rawnan::parse_dmesh_service_info(data).ok_or_else(|| anyhow::anyhow!("not a DMesh NAN service info payload"))?;
-    Ok(json!({"protocol":"dmesh_nan_service","role":nan_role_name(info.role),"role_code":info.role,"flags":info.flags,"device_id":hex_bytes(&info.device_id),"wake_count":info.wake_target,"last_len":info.wake_duration_ms}))
+    let info = rawnan::parse_dmesh_service_info(data)
+        .ok_or_else(|| anyhow::anyhow!("not a DMesh NAN service info payload"))?;
+    Ok(
+        json!({"protocol":"dmesh_nan_service","role":nan_role_name(info.role),"role_code":info.role,"flags":info.flags,"device_id":hex_bytes(&info.device_id),"wake_count":info.wake_target,"last_len":info.wake_duration_ms}),
+    )
 }
 
 pub fn build_nan_followup(
@@ -321,14 +329,27 @@ pub fn build_nan_followup(
     target_id: &[u8],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
-    let source: [u8; 6] = checked_device_id(device_id)?.try_into().expect("checked id");
-    let target: [u8; 6] = checked_device_id(target_id)?.try_into().expect("checked id");
-    rawnan::build_dmesh_followup_payload(nan_msg_type(msg_type), next_nan_seq(), source, target, &payload[..payload.len().min(231)])
+    let source: [u8; 6] = checked_device_id(device_id)?
+        .try_into()
+        .expect("checked id");
+    let target: [u8; 6] = checked_device_id(target_id)?
+        .try_into()
+        .expect("checked id");
+    rawnan::build_dmesh_followup_payload(
+        nan_msg_type(msg_type),
+        next_nan_seq(),
+        source,
+        target,
+        &payload[..payload.len().min(231)],
+    )
 }
 
 pub fn parse_nan_followup(data: &[u8]) -> Result<Value> {
-    let followup = rawnan::parse_dmesh_nan_followup(data).ok_or_else(|| anyhow::anyhow!("not a DMesh NAN follow-up payload"))?;
-    Ok(json!({"protocol":"dmesh_nan_followup","msg_type":nan_msg_name(followup.msg_type),"msg_type_code":followup.msg_type,"seq":followup.seq,"device_id":hex_bytes(&followup.device_id),"target_id":hex_bytes(&followup.target_id),"payload_len":followup.payload.len(),"payload":hex_bytes(followup.payload),"payload_text":String::from_utf8_lossy(followup.payload)}))
+    let followup = rawnan::parse_dmesh_nan_followup(data)
+        .ok_or_else(|| anyhow::anyhow!("not a DMesh NAN follow-up payload"))?;
+    Ok(
+        json!({"protocol":"dmesh_nan_followup","msg_type":nan_msg_name(followup.msg_type),"msg_type_code":followup.msg_type,"seq":followup.seq,"device_id":hex_bytes(&followup.device_id),"target_id":hex_bytes(&followup.target_id),"payload_len":followup.payload.len(),"payload":hex_bytes(followup.payload),"payload_text":String::from_utf8_lossy(followup.payload)}),
+    )
 }
 
 fn checked_device_id(value: &[u8]) -> Result<&[u8]> {

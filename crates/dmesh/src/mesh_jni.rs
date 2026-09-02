@@ -8,6 +8,10 @@
 //! See also:
 //! - Java wrapper: `android/app-dmesh/src/main/java/...`
 
+use dmesh_server::discovery::{
+    DiscoveryObservation, DiscoveryPacketKind, OBSERVATION_PAYLOAD_FINGERPRINT, OBSERVATION_PEER,
+    OBSERVATION_RSSI,
+};
 use dmesh_store::{FrameRecord, StoreCommand};
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 #[cfg(target_os = "android")]
@@ -43,8 +47,10 @@ use tracing_subscriber::layer::SubscriberExt;
 #[cfg(target_os = "android")]
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::mesh_common::{MeshHandle, MeshStreamHandle};
-use lmesh::radio_protocol;
+use crate::{
+    android_nan_protocol as radio_protocol,
+    mesh_common::{MeshHandle, MeshStreamHandle},
+};
 
 const BRIDGE_HOST: &str = "dmesh-msg";
 const BRIDGE_PORT: u16 = 1;
@@ -83,7 +89,12 @@ struct DiscoveredDevice {
     last_seen_ms: i64,
     peer: String,
     info: Value,
+    /// Compatibility projection: newest peer identity per bearer.
     transports: BTreeMap<String, String>,
+    /// Bounded packet facts per bearer.  Discovery UI and E2E use these
+    /// receiver-side facts rather than inferring reachability from a local
+    /// transmit submission.
+    observations: BTreeMap<String, DiscoveryObservation>,
 }
 
 fn nan_followups() -> &'static Mutex<VecDeque<FrameRecord>> {
@@ -146,7 +157,8 @@ fn discovered_devices() -> &'static Mutex<BTreeMap<String, DiscoveredDevice>> {
 }
 
 fn local_networks() -> &'static Mutex<dmesh_server::local_networks::LocalNetworkTable> {
-    LOCAL_NETWORKS.get_or_init(|| Mutex::new(dmesh_server::local_networks::LocalNetworkTable::default()))
+    LOCAL_NETWORKS
+        .get_or_init(|| Mutex::new(dmesh_server::local_networks::LocalNetworkTable::default()))
 }
 
 fn power_state() -> &'static Mutex<dmesh_server::power::PowerState> {
@@ -154,8 +166,8 @@ fn power_state() -> &'static Mutex<dmesh_server::power::PowerState> {
 }
 
 fn update_power_state(payload: &[u8]) -> anyhow::Result<Value> {
-    let observation = dmesh_server::power::decode_json_observation(payload)
-        .map_err(anyhow::Error::msg)?;
+    let observation =
+        dmesh_server::power::decode_json_observation(payload).map_err(anyhow::Error::msg)?;
     let mut state = power_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("power state poisoned"))?;
@@ -180,6 +192,151 @@ fn prune_discovered_devices(devices: &mut BTreeMap<String, DiscoveredDevice>, no
         .retain(|_, device| now_ms.saturating_sub(device.last_seen_ms) <= DISCOVERED_DEVICE_TTL_MS);
 }
 
+fn observe_packet(
+    device: &mut DiscoveredDevice,
+    bearer: &str,
+    kind: &str,
+    peer: &str,
+    payload: &[u8],
+    rssi_dbm: Option<i32>,
+    now_ms: i64,
+) {
+    let kind = match kind {
+        "active_publish" => DiscoveryPacketKind::ActivePublish,
+        "active_subscribe" => DiscoveryPacketKind::ActiveSubscribe,
+        "followup" => DiscoveryPacketKind::Followup,
+        _ => DiscoveryPacketKind::Other,
+    };
+    let available_fields = OBSERVATION_PEER
+        | OBSERVATION_PAYLOAD_FINGERPRINT
+        | if rssi_dbm.is_some() {
+            OBSERVATION_RSSI
+        } else {
+            0
+        };
+    let observation = device
+        .observations
+        .entry(bearer.to_owned())
+        .or_insert_with(|| DiscoveryObservation::new(now_ms, available_fields));
+    // A framework RSSI callback is an actual available fact; leave the bit
+    // clear when Android did not supply one rather than displaying a made-up
+    // zero. Keep earlier capability facts if a later callback omits RSSI.
+    observation.available_fields |= available_fields;
+    observation.observe(
+        now_ms,
+        kind,
+        peer,
+        None,
+        None,
+        rssi_dbm.and_then(|value| i16::try_from(value).ok()),
+        payload,
+    );
+    device.last_seen_ms = now_ms;
+    if !peer.is_empty() {
+        device.peer = peer.to_owned();
+        device.transports.insert(bearer.to_owned(), peer.to_owned());
+    }
+}
+
+/// Admit one received NAN directed message into the common device inventory.
+/// The frame remains an observation until the portable follow-up parser has
+/// validated it; no Android-only command or follow-up protocol is introduced.
+fn observe_nan_followup_packet(
+    peer: &str,
+    payload: &[u8],
+    rssi_dbm: Option<i32>,
+) -> anyhow::Result<Value> {
+    // Android's public Wi-Fi Aware callback may retain the SDEA Generic
+    // protocol OUI/type before the Service Specific Info. ESP/Linux adapters
+    // already pass SSI itself. Normalize only this standard transport wrapper
+    // so all three reach the one DMesh follow-up parser with identical bytes.
+    let payload = payload
+        .strip_prefix(&[0x50, 0x6f, 0x9a, 0x02])
+        .unwrap_or(payload);
+    let parsed = match radio_protocol::parse_nan_followup(payload) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            // Android framework delivery is meaningful evidence even when a
+            // peer has not used the DMesh follow-up envelope. Keep that fact
+            // bounded and payload-free so the caller can distinguish a
+            // framework/session mismatch from a portable framing mismatch.
+            return Ok(json!({
+                "ok": false,
+                "error": error.to_string(),
+                "payload_len": payload.len(),
+                "payload_hash": dmesh_server::discovery::payload_hash(payload),
+                "prefix_hex": bytes_to_hex(&payload[..payload.len().min(4)]),
+            }));
+        }
+    };
+    let src_device = parsed
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let target_device = parsed
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let seq = parsed.get("seq").and_then(|v| v.as_u64()).map(|s| s as u16);
+    let msg_type = parsed
+        .get("msg_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let packet_hash = parsed
+        .get("payload_hash_u32")
+        .and_then(|v| v.as_u64())
+        .map(|h| h as u32)
+        .unwrap_or_else(|| dmesh_server::discovery::payload_hash(payload));
+    let frame = FrameRecord {
+        protocol: "dmesh_nan_followup".to_string(),
+        payload_hash: packet_hash,
+        src_device: src_device.to_string(),
+        target_device: (!target_device.is_empty()).then(|| target_device.to_string()),
+        seq,
+        msg_type: (!msg_type.is_empty()).then(|| msg_type.to_string()),
+        payload: payload.to_vec(),
+        rssi: rssi_dbm,
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
+    record_nan_followup(frame.clone());
+    if let Some(sender) = store_sender() {
+        let _ = sender.send(StoreCommand::InsertFrame(frame));
+    }
+    // A directed Follow-up carries the same tagged-CBOR announce bytes as
+    // NAN Service Info and UDP discovery. Promote that semantic record through
+    // the one inventory ingress before retaining a provisional radio address;
+    // otherwise a host P2P group MAC becomes a second, Android-only device.
+    if let Some(followup) = dmesh_rawnan::parse_dmesh_nan_followup(payload)
+        && let Some(announce) = dmesh_server::announce::decode_announce(followup.payload)
+    {
+        let semantic_id = bytes_to_hex(announce.device_id());
+        observe_announce(announce, peer.to_owned(), "nan_followup", followup.payload);
+        return Ok(json!({
+            "status": "ok",
+            "packet_kind": "followup",
+            "source": src_device,
+            "semantic_id": semantic_id,
+        }));
+    }
+    if !src_device.is_empty() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Ok(mut devices) = discovered_devices().lock() {
+            prune_discovered_devices(&mut devices, now_ms);
+            let device = devices
+                .entry(src_device.to_ascii_lowercase())
+                .or_insert_with(|| DiscoveredDevice {
+                    last_seen_ms: now_ms,
+                    peer: String::new(),
+                    info: json!({"protocol": "dmesh_nan_followup"}),
+                    transports: BTreeMap::new(),
+                    observations: BTreeMap::new(),
+                });
+            observe_packet(device, "nan", "followup", peer, payload, rssi_dbm, now_ms);
+        }
+    }
+    Ok(json!({"status": "ok", "packet_kind": "followup", "source": src_device}))
+}
+
 /// Record a validated common announce from any Android discovery bearer.
 /// `source` is provenance only: boot and periodic presence records update one
 /// Rust-owned inventory whether UDP multicast, NAN Service Info, or a future
@@ -188,6 +345,7 @@ pub(crate) fn observe_announce(
     announce: dmesh_server::announce::Announce,
     peer: String,
     source: &str,
+    payload: &[u8],
 ) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let Ok(mut devices) = discovered_devices().lock() else {
@@ -200,27 +358,32 @@ pub(crate) fn observe_announce(
         peer: String::new(),
         info: Value::Null,
         transports: BTreeMap::new(),
+        observations: BTreeMap::new(),
     });
-    device.last_seen_ms = now_ms;
-    if !peer.is_empty() {
-        device.transports.insert(source.to_owned(), peer.clone());
-        device.peer = peer;
-    }
+    let bearer = if source.starts_with("nan") {
+        "nan"
+    } else {
+        source
+    };
+    let kind = match source {
+        "nan_followup" => "followup",
+        _ if bearer == "nan" => "active_publish",
+        _ => "announce",
+    };
+    observe_packet(device, bearer, kind, &peer, payload, None, now_ms);
     device.info = json!({
-                "protocol": "dmesh_announce",
-                "source": source,
-                "kind": announce.kind,
-                "uptime_secs": announce.uptime_secs,
-                "transport_mode": announce.transport_mode,
-                "counters": announce.counters,
-                "device_class": announce.device_class,
-                "probe_capabilities": announce.probe_capabilities,
-                "device_name": announce.device_name(),
-                "network_name": announce.network_name(),
-                "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-                "ap_link_local_v6": announce.ap_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-                "public_key": (!announce.public_key().is_empty()).then(|| bytes_to_hex(announce.public_key())),
-            });
+        "protocol": "dmesh_announce",
+        "kind": announce.kind,
+        "uptime_secs": announce.uptime_secs,
+        "device_class": announce.device_class,
+        "probe_capabilities": announce.probe_capabilities,
+        "device_name": announce.device_name(),
+        "network_name": announce.network_name(),
+        "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+        "vip6": dmesh_server::announce::virtual_ip6(announce.public_key())
+            .or_else(|| dmesh_server::announce::virtual_ip6_from_identity_hint(announce.device_id()))
+            .map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
+    });
 }
 
 #[cfg(target_os = "android")]
@@ -445,8 +608,6 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "radio.nan.build_announce" => {
             let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
             let uptime_secs = parse_u32(&cmd, "uptime_secs", 0)?;
-            let transport_mode = parse_u32(&cmd, "transport_mode", 0)? as u8;
-            let counters = parse_u32(&cmd, "counters", 0)?;
             let kind = match cmd.data.get("kind").map(String::as_str) {
                 Some("boot") => dmesh_server::announce::ANNOUNCE_BOOT,
                 _ => dmesh_server::announce::ANNOUNCE_DISCOVERY,
@@ -457,22 +618,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             }
             id[..device_id.len()].copy_from_slice(&device_id);
             let announce = if kind == dmesh_server::announce::ANNOUNCE_BOOT {
-                let mut boot = dmesh_server::announce::Announce::boot(
-                    id,
-                    device_id.len() as u8,
-                    transport_mode,
-                );
+                let mut boot = dmesh_server::announce::Announce::boot(id, device_id.len() as u8);
                 boot.uptime_secs = uptime_secs;
-                boot.counters = counters;
                 boot
             } else {
-                dmesh_server::announce::Announce::discovery(
-                    id,
-                    device_id.len() as u8,
-                    uptime_secs,
-                    transport_mode,
-                    counters,
-                )
+                dmesh_server::announce::Announce::discovery(id, device_id.len() as u8, uptime_secs)
             };
             // Android emits the same descriptor used by Linux and ESP.  The
             // advertised subset avoids scheduling ESP-NOW rows for phones;
@@ -496,19 +646,18 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             {
                 anyhow::bail!("network_name must be valid UTF-8 and at most 32 bytes");
             }
-            if let Some(address) = cmd.data.get("sta_link_local_v6").filter(|value| !value.is_empty()) {
+            if let Some(address) = cmd
+                .data
+                .get("sta_link_local_v6")
+                .filter(|value| !value.is_empty())
+            {
                 let address = address
                     .parse::<Ipv6Addr>()
                     .map_err(|_| anyhow::anyhow!("sta_link_local_v6 must be IPv6"))?;
-                if !address.is_unicast_link_local() { anyhow::bail!("sta_link_local_v6 must be link-local"); }
+                if !address.is_unicast_link_local() {
+                    anyhow::bail!("sta_link_local_v6 must be link-local");
+                }
                 announce.set_sta_link_local_v6(address.octets());
-            }
-            if let Some(address) = cmd.data.get("ap_link_local_v6").filter(|value| !value.is_empty()) {
-                let address = address
-                    .parse::<Ipv6Addr>()
-                    .map_err(|_| anyhow::anyhow!("ap_link_local_v6 must be IPv6"))?;
-                if !address.is_unicast_link_local() { anyhow::bail!("ap_link_local_v6 must be link-local"); }
-                announce.set_ap_link_local_v6(address.octets());
             }
             let mut out = [0; 96];
             let used = dmesh_server::announce::encode(announce, &mut out)
@@ -524,20 +673,17 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let parsed = if let Some(announce) = announce {
                 // This is exactly the same presence ingress as UDP multicast,
                 // not a NAN-specific device cache.
-                observe_announce(announce, peer.clone(), "nan_sd");
+                observe_announce(announce, peer.clone(), "nan_sd", payload);
                 json!({
                     "protocol": "dmesh_announce",
                     "source": "nan_sd",
                     "device_id": bytes_to_hex(announce.device_id()),
                     "kind": announce.kind,
                     "uptime_secs": announce.uptime_secs,
-                    "transport_mode": announce.transport_mode,
-                    "counters": announce.counters,
                     "device_name": announce.device_name(),
                     "network_name": announce.network_name(),
                     "sta_link_local_v6": announce.sta_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-                    "ap_link_local_v6": announce.ap_link_local_v6().map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
-                    "public_key": (!announce.public_key().is_empty()).then(|| bytes_to_hex(announce.public_key())),
+                    "vip6": dmesh_server::announce::virtual_ip6(announce.public_key()).map(std::net::Ipv6Addr::from).map(|address| address.to_string()),
                 })
             } else {
                 radio_protocol::parse_nan_service_info(payload)?
@@ -554,15 +700,25 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     .lock()
                     .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?;
                 prune_discovered_devices(&mut devices, now_ms);
-                devices.insert(
-                    device_id.to_ascii_lowercase(),
-                    DiscoveredDevice {
+                let device = devices
+                    .entry(device_id.to_ascii_lowercase())
+                    .or_insert_with(|| DiscoveredDevice {
                         last_seen_ms: now_ms,
-                        peer: peer.clone(),
-                        info: parsed.clone(),
-                        transports: BTreeMap::from([("nan_service_info".to_owned(), peer.clone())]),
-                    },
+                        peer: String::new(),
+                        info: Value::Null,
+                        transports: BTreeMap::new(),
+                        observations: BTreeMap::new(),
+                    });
+                observe_packet(
+                    device,
+                    "nan",
+                    "active_publish",
+                    &peer,
+                    payload,
+                    None,
+                    now_ms,
                 );
+                device.info = parsed.clone();
             }
             parsed.to_string().into_bytes()
         }
@@ -572,7 +728,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .to_string()
                 .into_bytes()
         }
-        "radio.local_networks" => {
+        "discovery.status" => {
             let networks = local_networks()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?
@@ -580,7 +736,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .values()
                 .map(dmesh_server::local_networks::json_network)
                 .collect::<Vec<_>>();
-            json!({"networks": networks}).to_string().into_bytes()
+            json!({"networks": networks, "local_networks": networks, "stats": {"devices": discovered_devices().lock().map(|devices| devices.len()).unwrap_or(0)}}).to_string().into_bytes()
         }
         "radio.power.status" => update_power_state(payload)?.to_string().into_bytes(),
         "radio.power.state" => dmesh_server::power::json_status(
@@ -590,7 +746,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         )
         .to_string()
         .into_bytes(),
-        "radio.devices" | "radio.nan.known_devices" => {
+        "discovery.nodes" | "radio.nan.known_devices" => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let mut devices = discovered_devices()
                 .lock()
@@ -598,14 +754,40 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             prune_discovered_devices(&mut devices, now_ms);
             let devices: Vec<Value> = devices
                 .iter()
-                .map(|(id, device)| {
-                    json!({
-                        "id": id,
+                .map(|(_, device)| {
+                    let identity = device
+                        .info
+                        .get("device_name")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| device.info.get("vip6").and_then(Value::as_str));
+                    let mut value = json!({
+                        "identity_state": "semantic",
                         "last_seen_ms": device.last_seen_ms,
-                        "peer": device.peer,
-                        "info": device.info,
-                        "transports": device.transports,
-                    })
+                        "announce": device.info,
+                        "observations": device.observations.iter().map(|(bearer, observation)| {
+                            (bearer.clone(), json!({
+                                "first_seen_ms": observation.first_seen_ms,
+                                "last_seen_ms": observation.last_seen_ms,
+                                "available_fields": observation.available_fields,
+                                "unavailable_fields": observation.unavailable_fields(),
+                                "packets": observation.packets,
+                                "active_publish_rx": observation.active_publish_rx,
+                                "active_subscribe_rx": observation.active_subscribe_rx,
+                                "followup_rx": observation.followup_rx,
+                                "last_kind": observation.last_kind.as_str(),
+                                "last_bssid": observation.last_bssid,
+                                "last_channel": observation.last_channel,
+                                "last_rssi_dbm": observation.last_rssi_dbm,
+                                "last_payload_len": observation.last_payload_len,
+                                "last_payload_hash": observation.last_payload_hash,
+                            }))
+                        }).collect::<serde_json::Map<_, _>>(),
+                    });
+                    if let Some(identity) = identity {
+                        value["identity"] = Value::String(identity.to_owned());
+                    }
+                    value
                 })
                 .collect();
             json!({"devices": devices}).to_string().into_bytes()
@@ -744,7 +926,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             // Android controller's own NAN, AP, or STA state.
             let discovered = devices
                 .iter()
-                .filter_map(|(id, device)| {
+                .filter_map(|(_, device)| {
                     let class = device.info.get("device_class")?.as_u64()? as u8;
                     let kind = match class {
                         dmesh_server::announce::DEVICE_CLASS_ESP => "esp",
@@ -753,11 +935,20 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                         _ => return None,
                     };
                     let capabilities = device.info.get("probe_capabilities")?.as_u64()?;
-                    Some(json!({
-                        "id": id,
+                    let identity = device
+                        .info
+                        .get("device_name")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| device.info.get("vip6").and_then(Value::as_str));
+                    let mut value = json!({
                         "kind": kind,
                         "capabilities": capabilities,
-                    }))
+                    });
+                    if let Some(identity) = identity {
+                        value["identity"] = Value::String(identity.to_owned());
+                    }
+                    Some(value)
                 })
                 .collect::<Vec<_>>();
             json!({
@@ -997,6 +1188,33 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .collect::<Vec<_>>();
             json!({"events": entries}).to_string().into_bytes()
         }
+        "nan.status" => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let events = nan_events()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("NAN event cache poisoned"))?;
+            let active = events.iter().any(|entry| {
+                now_ms.saturating_sub(entry.timestamp) <= 10 * 60 * 1_000
+                    && entry.msg_type.as_deref() == Some("attached")
+            });
+            json!({
+                "active": active,
+            })
+            .to_string()
+            .into_bytes()
+        }
+        "now.metrics" | "udp6.metrics" | "wifi.link.metrics" => b"{}".to_vec(),
+        "nan.metrics" => {
+            let followups = nan_followups()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("NAN follow-up cache poisoned"))?;
+            let events = nan_events()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("NAN event cache poisoned"))?;
+            json!({"events": events.len(), "followups": followups.len()})
+                .to_string()
+                .into_bytes()
+        }
         "radio.nan.event" => {
             let event = cmd.data.get("event").cloned().unwrap_or_default();
             let peer = cmd.data.get("peer").cloned().unwrap_or_default();
@@ -1045,8 +1263,29 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 "../../lmesh/resources/firmware-schema.json"
             ))?;
             let request = schema.parse_shell(line)?;
-            let method = request.get("method").and_then(Value::as_str).unwrap_or_default();
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let params = request.get("params").and_then(Value::as_object);
+            // The root/ADB compatibility provider must expose the same
+            // bounded inventory as the app UI and Linux/ESP diagnostics.
+            // This is a read-only projection of the existing JNI command;
+            // it does not create a provider-specific discovery cache.
+            if matches!(
+                method,
+                "discovery.nodes"
+                    | "nan.status"
+                    | "now.metrics"
+                    | "nan.metrics"
+                    | "udp6.metrics"
+                    | "wifi.link.metrics"
+                    | "radio.nan.followups"
+                    | "radio.nan.events"
+                    | "discovery.status"
+            ) {
+                return radio_message(method, "", &[], -1);
+            }
             let mode_nan = method == "transport.start"
                 && params
                     .and_then(|params| params.get("mode"))
@@ -1093,54 +1332,12 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "radio.nan.parse_followup" => radio_protocol::parse_nan_followup(payload)?
             .to_string()
             .into_bytes(),
-        "radio.nan.inject_frame" => {
-            let parsed = radio_protocol::parse_nan_followup(payload)?;
-            let src_device = parsed
-                .get("device_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let target_device = parsed
-                .get("target_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let seq = parsed.get("seq").and_then(|v| v.as_u64()).map(|s| s as u16);
-            let msg_type = parsed
-                .get("msg_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let payload_hash = parsed
-                .get("payload_hash_u32")
-                .and_then(|v| v.as_u64())
-                .map(|h| h as u32)
-                .unwrap_or(0);
-            let frame = FrameRecord {
-                protocol: "dmesh_nan_followup".to_string(),
-                payload_hash,
-                src_device: src_device.to_string(),
-                target_device: if target_device.is_empty() {
-                    None
-                } else {
-                    Some(target_device.to_string())
-                },
-                seq,
-                msg_type: if msg_type.is_empty() {
-                    None
-                } else {
-                    Some(msg_type.to_string())
-                },
-                payload: payload.to_vec(),
-                rssi: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            // The framework callback has supplied an actual directed
-            // follow-up. Retain it in the Rust-owned bounded receipt view;
-            // generic NAN lifecycle events use the separate `nan.events`
-            // cache above and must not pollute this protocol-level list.
-            record_nan_followup(frame.clone());
-            if let Some(sender) = store_sender() {
-                let _ = sender.send(StoreCommand::InsertFrame(frame));
-            }
-            json!({"status": "ok"}).to_string().into_bytes()
+        "radio.nan.inject_frame" | "radio.nan.observe_packet" => {
+            let peer = cmd.data.get("peer").map(String::as_str).unwrap_or("");
+            let rssi = parse_i32(&cmd, "rssi", -1)?;
+            observe_nan_followup_packet(peer, payload, (rssi != -1).then_some(rssi))?
+                .to_string()
+                .into_bytes()
         }
         "radio.coc.store_frame" => {
             let src_device = required_data(&cmd, "src_device")?;
@@ -1209,9 +1406,22 @@ pub(crate) fn handle_tagged_control_record(
     // callbacks still enter through their dedicated JNI functions. The one
     // mutating operation below is a bounded common UDP6 perf service selected
     // from shared discovery facts, not an Android-private radio command.
-    if component != "radio"
-        || !matches!(method.as_str(), "status_text" | "devices" | "local_networks" | "power.state" | "perf.udp6")
-    {
+    let supported = matches!(
+        (component.as_str(), method.as_str()),
+        ("discovery", "devices" | "status")
+            | ("nan", "status")
+            | (
+                "radio",
+                "status_text"
+                    | "devices"
+                    | "nan.followups"
+                    | "nan.events"
+                    | "local_networks"
+                    | "power.state"
+                    | "perf.udp6"
+            )
+    );
+    if !supported {
         anyhow::bail!("method is not exposed by the Android mesh HTTP service")
     }
     if !record.params.is_empty() {
@@ -1220,12 +1430,12 @@ pub(crate) fn handle_tagged_control_record(
     if record.data.is_some() {
         anyhow::bail!("Android HTTP control methods do not accept opaque data")
     }
-    if method != "perf.udp6" && !record.env.is_empty() {
+    if !(component == "radio" && method == "perf.udp6") && !record.env.is_empty() {
         anyhow::bail!("Android HTTP observation methods do not accept fields or data")
     }
 
     let mut args = String::new();
-    if method == "perf.udp6" {
+    if component == "radio" && method == "perf.udp6" {
         let field = |name: &str| {
             record.env.iter().find_map(|(key, value)| match key {
                 NameOrTag::Name(key) if key == name => Some(value),
@@ -1237,7 +1447,9 @@ pub(crate) fn handle_tagged_control_record(
             .filter(|id| !id.is_empty())
             .ok_or_else(|| anyhow::anyhow!("perf.udp6 requires target_id"))?;
         let bytes = field("bytes").and_then(Value::as_u64).unwrap_or(32 * 1024);
-        let packet_size = field("packet_size").and_then(Value::as_u64).unwrap_or(1_100);
+        let packet_size = field("packet_size")
+            .and_then(Value::as_u64)
+            .unwrap_or(1_100);
         if !(1..=256 * 1024).contains(&bytes) || !(64..=1_100).contains(&packet_size) {
             anyhow::bail!("perf.udp6 bytes or packet_size is outside the published bounds")
         }
@@ -1247,7 +1459,10 @@ pub(crate) fn handle_tagged_control_record(
             .get(target_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown discovered target_id"))?;
-        let network_name = device.info.get("network_name").and_then(Value::as_str)
+        let network_name = device
+            .info
+            .get("network_name")
+            .and_then(Value::as_str)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| anyhow::anyhow!("target has not announced a current STA SSID"))?;
         let local_matches = local_networks()
@@ -1259,7 +1474,9 @@ pub(crate) fn handle_tagged_control_record(
         if !local_matches {
             anyhow::bail!("target STA SSID does not match a local active STA attachment")
         }
-        let peer = device.transports.get("udp_multicast")
+        let peer = device
+            .transports
+            .get("udp_multicast")
             .ok_or_else(|| anyhow::anyhow!("target has no UDP multicast transport observation"))?
             .parse::<SocketAddr>()
             .map_err(|_| anyhow::anyhow!("target UDP multicast address is invalid"))?;
@@ -1271,7 +1488,11 @@ pub(crate) fn handle_tagged_control_record(
         }
         args = format!(
             "address={} scope={} port={} bytes={} packet_size={}",
-            peer.ip(), peer.scope_id(), peer.port(), bytes, packet_size
+            peer.ip(),
+            peer.scope_id(),
+            peer.port(),
+            bytes,
+            packet_size
         );
     }
 
@@ -1280,7 +1501,11 @@ pub(crate) fn handle_tagged_control_record(
     } else {
         format!("{component}.{method}")
     };
-    let full_method = if method == "perf.udp6" { "radio.probe.udp6_iperf".to_owned() } else { full_method };
+    let full_method = if component == "radio" && method == "perf.udp6" {
+        "radio.probe.udp6_iperf".to_owned()
+    } else {
+        full_method
+    };
     let output = radio_message(&full_method, &args, &[], -1)?;
     let Some(id) = record.id else {
         return Ok(None);
@@ -2361,6 +2586,10 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStopTu
 mod tests {
     use super::*;
 
+    // The JNI adapter deliberately owns process-wide bounded radio caches.
+    // Tests which clear/inject those caches must not run concurrently.
+    static RADIO_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn bridge_record_accepts_fragmented_bounded_messages() {
         let mut pending = vec![0, 0, 0, 3, 1];
@@ -2429,7 +2658,7 @@ mod tests {
             serde_json::from_slice::<Value>(&update).unwrap()["interfaces"],
             1
         );
-        let table = radio_message("radio.local_networks", "", &[], -1).unwrap();
+        let table = radio_message("discovery.status", "", &[], -1).unwrap();
         let table: Value = serde_json::from_slice(&table).unwrap();
         assert_eq!(table["networks"][0]["interface"], "wlan0");
         assert_eq!(table["networks"][0]["validated"], true);
@@ -2475,6 +2704,7 @@ mod tests {
 
     #[test]
     fn android_nan_followup_receipts_are_bounded_rust_state() {
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
         nan_followups().lock().unwrap().clear();
         nan_events().lock().unwrap().clear();
         radio_message("radio.nan.event", "event=attached peer=framework", &[], -1).unwrap();
@@ -2485,7 +2715,15 @@ mod tests {
             -1,
         )
         .unwrap();
-        radio_message("radio.nan.inject_frame", "rssi=-55", &followup, -1).unwrap();
+        let mut android_sdea_message = vec![0x50, 0x6f, 0x9a, 0x02];
+        android_sdea_message.extend_from_slice(&followup);
+        radio_message(
+            "radio.nan.inject_frame",
+            "rssi=-55",
+            &android_sdea_message,
+            -1,
+        )
+        .unwrap();
         let receipts = radio_message("radio.nan.followups", "", &[], -1).unwrap();
         let receipts: Value = serde_json::from_slice(&receipts).unwrap();
         assert_eq!(receipts["followups"].as_array().unwrap().len(), 1);
@@ -2497,18 +2735,65 @@ mod tests {
     }
 
     #[test]
+    fn android_nan_followup_promotes_embedded_announce_identity() {
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
+        discovered_devices().lock().unwrap().clear();
+        nan_followups().lock().unwrap().clear();
+        let mut id = [0_u8; 16];
+        id.copy_from_slice(b"host-followup-id");
+        let announce = dmesh_server::announce::Announce::discovery(id, 16, 9);
+        let mut announce_wire = [0_u8; 96];
+        let announce_len = dmesh_server::announce::encode(announce, &mut announce_wire).unwrap();
+        let followup = radio_message(
+            "radio.nan.build_followup",
+            "msg_type=command_cbor device_id=7219f817de65 target_id=020102030405",
+            &announce_wire[..announce_len],
+            -1,
+        )
+        .unwrap();
+        let mut android_sdea_message = vec![0x50, 0x6f, 0x9a, 0x02];
+        android_sdea_message.extend_from_slice(&followup);
+        radio_message(
+            "radio.nan.inject_frame",
+            "peer=android-peer rssi=-55",
+            &android_sdea_message,
+            -1,
+        )
+        .unwrap();
+        let devices = radio_message("discovery.nodes", "", &[], -1).unwrap();
+        let devices: Value = serde_json::from_slice(&devices).unwrap();
+        let host = devices["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["observations"]["nan"]["last_kind"] == "followup")
+            .expect("embedded announce must replace the P2P group-MAC placeholder");
+        assert_eq!(host["observations"]["nan"]["last_kind"], "followup");
+        assert_eq!(host["observations"]["nan"]["followup_rx"], 1);
+        assert!(
+            devices["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.get("id").is_none())
+        );
+    }
+
+    #[test]
     fn android_device_inventory_unifies_udp_and_nan_discovery() {
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
         discovered_devices().lock().unwrap().clear();
         let mut id = [0_u8; 16];
         id[..6].copy_from_slice(b"udp-a1");
         observe_announce(
-            dmesh_server::announce::Announce::discovery(id, 6, 12, 1, 3),
+            dmesh_server::announce::Announce::discovery(id, 6, 12),
             "[fe80::1]:5227".to_string(),
             "udp_multicast",
+            b"udp-announce",
         );
         let service_info = radio_message(
             "radio.nan.build_announce",
-            "kind=discovery device_id=6e616e2d6232 uptime_secs=13 transport_mode=0 counters=4",
+            "kind=discovery device_id=6e616e2d6232 uptime_secs=13",
             &[],
             -1,
         )
@@ -2520,34 +2805,37 @@ mod tests {
             -1,
         )
         .unwrap();
-        let devices = radio_message("radio.devices", "", &[], -1).unwrap();
+        let devices = radio_message("discovery.nodes", "", &[], -1).unwrap();
         let devices: Value = serde_json::from_slice(&devices).unwrap();
-        let ids = devices["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|entry| entry["id"].as_str())
-            .collect::<Vec<_>>();
-        assert!(ids.contains(&"7564702d6131"));
-        assert!(ids.contains(&"6e616e2d6232"));
         let entries = devices["devices"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.get("id").is_none()));
         let udp = entries
             .iter()
-            .find(|device| device["id"] == "7564702d6131")
+            .find(|device| device["observations"].get("udp_multicast").is_some())
             .unwrap();
         let nan = entries
             .iter()
-            .find(|device| device["id"] == "6e616e2d6232")
+            .find(|device| device["observations"].get("nan").is_some())
             .unwrap();
-        assert_eq!(udp["info"]["source"], "udp_multicast");
-        assert_eq!(nan["info"]["source"], "nan_sd");
+        assert_eq!(udp["observations"]["udp_multicast"]["last_kind"], "other");
+        assert_eq!(nan["observations"]["nan"]["last_kind"], "active_publish");
+        assert_eq!(
+            nan["observations"]["nan"]["last_payload_len"],
+            service_info.len()
+        );
+        assert_ne!(
+            nan["observations"]["nan"]["last_payload_hash"],
+            0x811c_9dc5u32
+        );
+        assert_eq!(nan["observations"]["nan"]["unavailable_fields"], 14);
     }
 
     #[test]
     fn android_nan_announce_retains_sta_network_name() {
         let wire = radio_message(
             "radio.nan.build_announce",
-            "kind=discovery device_id=616e64726f69642d31 uptime_secs=13 transport_mode=1 counters=4 device_name=Pixel network_name=costin sta_link_local_v6=fe80::1234 ap_link_local_v6=fe80::5678",
+            "kind=discovery device_id=616e64726f69642d31 uptime_secs=13 device_name=Pixel network_name=costin sta_link_local_v6=fe80::1234",
             &[],
             -1,
         )
@@ -2556,9 +2844,10 @@ mod tests {
             .expect("Android presence must decode as a common announce");
         assert_eq!(announce.device_name(), Some("Pixel"));
         assert_eq!(announce.network_name(), Some("costin"));
-        assert_eq!(announce.sta_link_local_v6(), Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets()));
-        assert_eq!(announce.ap_link_local_v6(), Some("fe80::5678".parse::<Ipv6Addr>().unwrap().octets()));
-        assert_eq!(announce.transport_mode, 1);
+        assert_eq!(
+            announce.sta_link_local_v6(),
+            Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets())
+        );
     }
 
     #[test]

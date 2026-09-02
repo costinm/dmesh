@@ -47,7 +47,10 @@ impl LocalNetworkTable {
     pub fn replace(&mut self, snapshot: LocalNetworks) -> Option<()> {
         let mut replacement = alloc::collections::BTreeMap::new();
         for network in snapshot.networks {
-            if replacement.insert(network.interface.clone(), network).is_some() {
+            if replacement
+                .insert(network.interface.clone(), network)
+                .is_some()
+            {
                 return None;
             }
         }
@@ -196,27 +199,31 @@ mod tests {
     #[test]
     fn replacement_table_rejects_duplicate_interfaces() {
         let mut table = LocalNetworkTable::default();
-        assert!(table
-            .replace(LocalNetworks {
-                networks: vec![LocalNetwork {
-                    interface: "wlan0".into(),
-                    ..LocalNetwork::default()
-                }],
-            })
-            .is_some());
-        assert!(table
-            .replace(LocalNetworks {
-                networks: vec![
-                    LocalNetwork {
+        assert!(
+            table
+                .replace(LocalNetworks {
+                    networks: vec![LocalNetwork {
                         interface: "wlan0".into(),
                         ..LocalNetwork::default()
-                    },
-                    LocalNetwork {
-                        interface: "wlan0".into(),
-                        ..LocalNetwork::default()
-                    },
-                ],
-            })
-            .is_none());
+                    }],
+                })
+                .is_some()
+        );
+        assert!(
+            table
+                .replace(LocalNetworks {
+                    networks: vec![
+                        LocalNetwork {
+                            interface: "wlan0".into(),
+                            ..LocalNetwork::default()
+                        },
+                        LocalNetwork {
+                            interface: "wlan0".into(),
+                            ..LocalNetwork::default()
+                        },
+                    ],
+                })
+                .is_none()
+        );
     }
 }

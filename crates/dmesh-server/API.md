@@ -10,6 +10,101 @@ requests with explicit capability results. Framework-specific callbacks,
 permissions, and handles do not appear in this schema or in public method
 names; they stay behind the adapter that supplies those facts.
 
+## Device-list observations
+
+`discovery.nodes` is the bounded, cross-platform discovery inventory. Its
+device identity, decoded announce metadata, bearer name, and receiver-side
+observation fields are presentation-safe. A radio adapter's native peer handle
+is only an opaque correlation fact: Android `PeerHandle` values, Linux MAC
+addresses, and firmware MAC addresses are not interchangeable identities and
+must not be rendered as a user-facing device name.
+
+Each observation supplies `available_fields` and `unavailable_fields` bitsets:
+`1=peer correlation`, `2=BSSID`, `4=channel`, `8=RSSI`, and `16=payload
+fingerprint`. `peer correlation` says that the local adapter has a native
+return path; its value is deliberately absent from the presentation list
+because Android `PeerHandle`, Linux MAC, and ESP MAC are incomparable. An
+unavailable fact is a platform limit, not zero or a failed discovery. UI
+surfaces render it as unavailable and keep adapter-specific diagnostics in
+their native status snapshot rather than adding platform-only device-list
+columns. All adapters report packet counters (`packets`, active Publish,
+active Subscribe, and Follow-up), last packet kind, timestamps, and bounded
+payload length/hash with the same meaning. `channel`, when available, is the
+receiver's channel at capture time: it determines whether NOW/NAN can be
+expected to work between the observed radios, but does not claim that a peer
+is permanently configured for that channel. When two STA/AP devices share an
+IP network, UDP6 is the normal data path regardless of whether channel-bound
+NAN/NOW discovery is also available.
+
+```mesh-api
+id = "discovery.nodes"
+component = "discovery"
+method = "nodes"
+component-index = 6
+method-index = 9
+ui-visibility = "default"
+summary = "Return the bounded cross-bearer observed-device inventory"
+```
+
+## Local NAN status and transport metrics
+
+Component `7` reports local runtime health. It never duplicates the peer
+inventory above and it never exposes Linux interface/process controls.
+Unavailable platform facts and counters are omitted. Metrics are split by the
+runtime that owns the counter so an ESP and a host can report the same facts
+without an ambiguous aggregate `wifi.raw.metrics` response.
+
+`nan.status` fields are `1:active`, `2:cluster_id` bytes, `3:sync_id` bytes,
+`4:publishing`, and `5:publish_pending`. Metric responses are bounded maps
+whose stable numeric key identifies a counter within that method. Per-peer
+signal/rate/retry observations continue to use `raw_wifi::WifiLinkMetrics`.
+
+```mesh-api
+id = "nan.status"
+component = "telemetry"
+method = "nan.status"
+component-index = 7
+method-index = 1
+ui-visibility = "default"
+summary = "Return local NAN attach, cluster, synchronization, and publish state"
+```
+
+```mesh-api
+id = "now.metrics"
+component = "telemetry"
+method = "now.metrics"
+component-index = 7
+method-index = 2
+summary = "Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters"
+```
+
+```mesh-api
+id = "nan.metrics"
+component = "telemetry"
+method = "nan.metrics"
+component-index = 7
+method-index = 3
+summary = "Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters"
+```
+
+```mesh-api
+id = "udp6.metrics"
+component = "telemetry"
+method = "udp6.metrics"
+component-index = 7
+method-index = 4
+summary = "Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters"
+```
+
+```mesh-api
+id = "wifi.link.metrics"
+component = "telemetry"
+method = "wifi.link.metrics"
+component-index = 7
+method-index = 5
+summary = "Return common optional per-peer Wi-Fi link observations"
+```
+
 ## Common tagged envelope
 
 New APIs use one root CBOR map.  Component and method are keys `1` and `2`;
@@ -42,27 +137,57 @@ firmware command grammar.
 
 | Method | Name | Fields | Result / adapter responsibility |
 | ---: | --- | --- | --- |
-| 1 | `settings.get` | `1:key` text | Return the current value, or a typed not-found error. |
-| 2 | `settings.set` | `1:key`, `2:value` text | Validate and persist a deployment setting through its adapter. SSID is not a setting: STA receives it only in `transport.start`. |
-| 3 | `settings.list` | none | Return bounded known settings and current values. |
-| 4 | `transport.start` | `1:kind` enum plus the complete volatile radio profile | Stop any previous radio epoch cleanly, then start one explicit bearer personality. |
-| 5 | `transport.stop` | `1:kind` enum | Stop the selected bearer. |
+| 1 | `settings.get` | `1:key` text | Return one non-secret current value, or a typed not-found error. `sec:*` values are write-only. |
+| 2 | `settings.set` | `1:key`, `2:value` text | Validate and persist a deployment setting through its adapter. `sec:*` is accepted for first-use provisioning but is never echoed. |
+| 3 | `settings.list` | none | Return bounded known settings and current non-secret values; present `sec:*` keys are reported as `<redacted>`. |
+| 4 | `transport.set` | `1:kind` enum plus the complete volatile radio profile | Replace the complete radio profile; an all-off profile replaces stop. |
 
-`transport.start.kind` is `1=sta`, `5=uart`, or `6=nan`. Values `2`, `3`, and
-`4` are retired and rejected. A start record holds one immutable, volatile
+```mesh-api
+id = "transport.set"
+component = "transport"
+method = "set"
+component-index = 1
+method-index = 4
+ui-visibility = "default"
+summary = "Replace a node's complete volatile physical transport profile"
+[request]
+fields = [
+  { name = "kind", index = 1, type = "u8", required = true },
+  { name = "ssid", index = 2, type = "string" },
+  { name = "bssid", index = 3, type = "string" },
+  { name = "channel", index = 4, type = "u8" },
+  { name = "nan_dw_interval", index = 14, type = "u8" },
+  { name = "now", index = 15, type = "u8" },
+  { name = "ap", index = 16, type = "u8" },
+  { name = "passphrase", index = 17, type = "string" },
+  { name = "ndp", index = 19, type = "u8" },
+  { name = "open", index = 24, type = "bool" },
+]
+```
+
+`transport.set.kind` is `1=sta`, `5=uart`, or `6=nan`. Values `2`, `3`, and
+`4` are retired and rejected. A set record holds one immutable, volatile
 radio profile: `2:ssid` (STA target), `5:raw_tx_rate`, `6:sta_driver_tx`,
 `7:sta_bssid_check_disabled`, `8:sta_ampdu_enabled`, `9:sta_11b_rates_disabled`,
 `10:sta_raw_rx_enabled`, `13:espnow_capture`, `14:nan_dw_interval`, `15:now`,
 `16:ap`, optional `17:sta_passphrase` (8..63 bytes, volatile WPA2 override;
 absent selects the fixed DMesh WPA2 key),
 credential). Omitted fields use the current profile defaults only while this
-new epoch is constructed; they cannot be patched afterward. A later start is
+new epoch is constructed; they cannot be patched afterward. A later set is
 the only way to replace a selected radio setup. `ssid` is session data, not an
 NVS write, so UART and future NAN Service Info use identical CBOR. Replaying
-the same complete start (as an active NAN Publish/Subscribe may do in several
+the same complete set (as an active NAN Publish/Subscribe may do in several
 discovery windows) is an acknowledgement-only no-op: it must not stop Wi-Fi,
 reset NOW, or begin another association. A different complete profile is the
-only start that replaces the current epoch. `19:ndp` is the common NAN Data
+only set that replaces the current epoch.
+
+A provisioned NVS STA profile is applied at boot through this same complete
+`transport.set(kind=sta)` path, with its configured NOW/NAN extension. If
+association fails, the adapter keeps that STA profile as the desired next
+epoch while it returns to NOW+NAN; it makes one new STA attempt immediately
+before the next periodic advertisement. The same fallback/retry rule applies
+to a later volatile `transport.set(kind=sta)`.
+`19:ndp` is the common NAN Data
 Path policy (`0` off, `1` on). Android implements it today; adapters without
 NDP retain the requested profile and report unsupported capability rather than
 interpreting it as a different bearer.
@@ -86,7 +211,7 @@ association, stream, RPC, or forward.
 `probe::ProbeRequest` and `probe::ProbeResponse` are the common host/Android
 control-plane contract for deciding whether two nodes can form a mesh-chain
 link. A probe is not sent to an ESP as a new handler. Instead, the signed
-control plane applies the existing `transport.start` records to endpoint A and
+control plane applies the existing `transport.set` records to endpoint A and
 endpoint B, sends the normal NAN SD/follow-up, NOW, and UDP6 low-level checks,
 then returns one structured response.
 
@@ -125,6 +250,134 @@ On the current raw firmware bearer, a changed policy retires the active raw
 association so the next QUIC-lite OPEN receives one coherent profile. It does
 not restart STA, change channel, or reconfigure radio callbacks. Path policy
 and timeout remain connection-manager settings and are not radio controls.
+
+## Direct messages and DCID forwarding setup
+
+DCID `0` is the bounded direct-message destination. A direct message carries a
+normal QUIC-lite short header with a four-byte packet number followed directly
+by one tagged-CBOR record: it does not carry a QUIC frame, create endpoint
+state, consume stream credit, ACK, retransmit, or use flow control. Direct
+messages are appropriate for idempotent desired-state commands and small
+responses; a record with key `3` (`id`) requests a correlated response on a
+separately routed direct message. QUIC-lite bootstrap remains one DCID-zero
+message kind, but is no longer the only use of that value.
+
+Component `5` configures independent one-way forwarding rules. It is accepted
+through the same direct-message or stream handler surface; the first portable
+implementation supplies the codec and a bounded unified DCID registry, while
+platform adapters still own next-hop resolution and egress.
+
+| Method | Name | Fields |
+| ---: | --- | --- |
+| 1 | `relay.apply` | `1:allocation`, `6:revision`, `7:present`; when present, optional `2:proposed_dcid` plus `3:next_hop`, `4:outbound_dcid`, `5:position` |
+| 2 | `relay.pair` | one forward rule plus `11..16` reverse allocation/DCID/next-hop/outbound/position/revision fields |
+
+`next_hop` is a device-local opaque route handle. It is neither an overlay
+identity nor source-path metadata and it is never put in a forwarded packet.
+The initial portable NOW handle is `transport_id << 56 | mac48`, with the
+reserved byte at bits 48--55 equal to zero. Main validates that representation
+and binds it to a directed `EspNowPeer` while handling `relay.apply`; invalid,
+zero, broadcast, and unsupported bearer handles fail closed. UDP6 uses a
+transport-tagged controller token because a link-local IPv6 address and UDP
+port do not fit in this compact value. During `relay.pair`, Main binds that
+token to the complete request-ingress tuple. The two rules are transactionally
+reconciled locally but remain independent directional DCID entries.
+The relay accepts a proposed local DCID or later returns a locally allocated
+one. `outbound_dcid=0` means the final next hop receives a direct message;
+nonzero values select another relay rule or a QUIC endpoint. A forward and its
+return path remain separate setup records. Repeating an equal allocation with
+the same request `id` is an idempotent retry: it returns the current result and
+does not consume another rule slot; a different target for the same local DCID
+is rejected.
+
+### Relay-open CID ownership
+
+`relay.pair` is the only bootstrap exception to otherwise opaque DCID
+forwarding. It does **not** make the relay a QUIC endpoint: the client and
+server still each choose their own receive CID. It gives the relay two local
+aliases, one for each direction, and binds the reverse bearer route to the
+client's stable UDP tuple.
+
+```
+ client (CID C)                 relay (aliases F, R)                  server (CID S)
+ ──────────────                 ────────────────────                  ──────────────
+ relay.pair(F?, R?, client=C) ───────────────────────────────────────►
+                         ◄──── observed pair(F, R); F/R may differ from F?/R?
+
+ OPEN: outer DCID=F, body client_receive_cid=C ───────────────────────►
+                         relay-open: outer DCID -> 0; body CID C -> R ─► OPEN
+                                                                    ◄── ACK: DCID=R, server CID=S
+                         reverse rule: DCID R -> C ────────────────────► ACK: DCID=C, server CID=S
+
+ later client packet: outer DCID=F ─► forward rule: F -> S ───────────►
+ later server packet: outer DCID=R ◄─ reverse rule: R -> C ◄───────────
+```
+
+The client must first generate its own nonzero receive CID `C`, request a
+pair, and use the **observed** forward alias `F` returned by the relay—not its
+proposal—for relay-open. The relay changes the plaintext bootstrap OPEN once:
+it substitutes `R` for `C` in `client_receive_cid` and forwards the outer
+packet with DCID zero. The server consequently sends its OPEN_ACK to `R`; the
+normal reverse rule rewrites that outer DCID to `C` before delivery to the
+client. After ACK, the server's independently chosen CID `S` is installed as
+the forward rule's outbound DCID. All subsequent packets are opaque DCID
+rewrites. A client retry uses the same `C` and UDP source port; the desired
+state response makes the relay aliases stable unless a collision caused a
+different observed pair.
+
+The aliases are intentionally hop-local.  They are not a single circuit label
+that every relay can correlate.  In the forward direction, each relay replaces
+the alias by the one meaningful to its next hop; only the final relay replaces
+its last-hop alias by the server-selected receive CID `S`.  The reverse path is
+independent and ends at the client-selected receive CID `C`:
+
+```text
+ client       relay A          relay B          egress          server
+   ── F0 ──► [F0 -> F1] ──► [F1 -> F2] ──► [F2 -> S] ───────► CID S
+
+ client       relay A          relay B          ingress         server
+ CID C ◄──── [R1 -> C] ◄──── [R2 -> R1] ◄──── [R3 -> R2] ◄──── R3
+```
+
+Thus the first relay knows only `F0` and `F1`, a middle relay knows only its two
+adjacent aliases, and the last relay alone learns `S`.  With independently
+allocated reverse aliases, a foreign middle relay cannot learn either endpoint
+CID or the complete circuit from forwarding state.  This is the required
+privacy property when the mesh owner controls the first and last relays but
+intermediate relays are untrusted.
+
+Circuit construction belongs to `dmesh-server`, above individual L2 adapters
+and outside the QUIC endpoint. It selects an adjacent next hop and returns the
+local alias for that leg. UDP6, UART, NOW, FSK, and BLE-CoC adapters only
+deliver bounded packets to that adjacent peer and apply the installed
+alias-to-alias forwarding rule.
+
+AEAD does not prevent this translation.  The sending endpoint protects the
+packet using the header that the receiving endpoint will see: in the forward
+direction that header contains `S`.  After packet protection, the first-hop
+adapter substitutes `F0`; relays translate only that fixed-width field; and the
+egress restores `S` before the server removes header protection or verifies
+AEAD.  The ciphertext and every other authenticated header byte remain
+unchanged, so both endpoints authenticate the same canonical header even
+though intermediate links carried hop-local aliases.  The reverse direction
+works identically with `C` as its canonical destination CID.
+
+This encoding also preserves the privacy property: no plaintext copy of the
+canonical packet or final CID accompanies the alias.  A simple outer alias in
+front of an otherwise visible QUIC packet would expose `S` to every relay and
+is therefore not an acceptable replacement.  Long-header support still needs
+separate design and tests for its explicit CID lengths, exposed source CID,
+Initial-key derivation, and bootstrap sequencing; it does not require changing
+the established short-header alias model.
+
+`relay::install_symmetric_chain` is the CP-side handler for the initial
+`[source, relay..., destination]` form. Each `ChainNode` supplies the transport
+used to reach that node and either a six-byte MAC (`NOW`) or an IPv6 link-local
+address (`UDP6`). The adapter resolves that description at the relay being
+configured, exchanges the direct setup request, and must verify its matching
+response ID before advancing. It creates forward and return labels over the
+same relay sequence; the transports may differ by direction because each
+next-hop description is resolved locally.
 
 ## Signed objects and flash
 

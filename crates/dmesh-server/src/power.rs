@@ -72,7 +72,9 @@ pub fn decode_json_observation(input: &[u8]) -> Result<PowerObservation, &'stati
         return Err("power observation exceeds byte bound");
     }
     let value: Value = serde_json::from_slice(input).map_err(|_| "invalid power observation")?;
-    let values = value.as_object().ok_or("power observation must be an object")?;
+    let values = value
+        .as_object()
+        .ok_or("power observation must be an object")?;
     const FIELDS: &[&str] = &[
         "source",
         "event",
@@ -130,13 +132,29 @@ pub fn decode_json_observation(input: &[u8]) -> Result<PowerObservation, &'stati
 }
 
 #[cfg(feature = "std")]
-fn uint(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<Option<u64>, &'static str> {
-    values.get(key).map_or(Ok(None), |value| value.as_u64().map(Some).ok_or("power observation integer must be unsigned"))
+fn uint(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<u64>, &'static str> {
+    values.get(key).map_or(Ok(None), |value| {
+        value
+            .as_u64()
+            .map(Some)
+            .ok_or("power observation integer must be unsigned")
+    })
 }
 
 #[cfg(feature = "std")]
-fn boolean(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<Option<bool>, &'static str> {
-    values.get(key).map_or(Ok(None), |value| value.as_bool().map(Some).ok_or("power observation boolean must be boolean"))
+fn boolean(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<bool>, &'static str> {
+    values.get(key).map_or(Ok(None), |value| {
+        value
+            .as_bool()
+            .map(Some)
+            .ok_or("power observation boolean must be boolean")
+    })
 }
 
 /// JSON status projection for generic HTTP and text adapters.  It has no

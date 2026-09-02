@@ -227,7 +227,32 @@ impl FirmwareSchema {
     /// Decode a firmware compact-CBOR payload into a schema-labelled value.
     /// Unknown method and field IDs remain numeric, so diagnostics stay
     /// structured and lossless when a host has not yet installed a schema.
+    ///
+    /// Direct firmware controls use the common tagged record envelope
+    /// (`component`, `method`, `id`, `fields`/`result`), not the older compact
+    /// `{0: method, 6: payload}` diagnostic map.  Project that canonical form
+    /// into the compact renderer's input shape first, so `wifi.scan` renders
+    /// exactly like `transport.set`.
     pub fn decode_packet(&self, payload: &[u8]) -> Result<Value> {
+        if let Some(record) = dmesh_server::tagged::decode(payload) {
+            if let (Some(dmesh_server::tagged::Name::Tag(method)), Some(id), Some(body)) =
+                (record.method, record.id, record.result.or(record.error))
+            {
+                let mut compact = Vec::with_capacity(payload.len());
+                dmesh_server::cbor::encode::map(3, &mut compact);
+                dmesh_server::cbor::encode::uint(0, &mut compact);
+                dmesh_server::cbor::encode::uint(method, &mut compact);
+                dmesh_server::cbor::encode::uint(1, &mut compact);
+                dmesh_server::cbor::encode::uint(id, &mut compact);
+                dmesh_server::cbor::encode::uint(
+                    if record.result.is_some() { 6 } else { 5 },
+                    &mut compact,
+                );
+                compact.extend_from_slice(body);
+                let value = mesh::cbor::decode_json(&compact, &self.catalog)?;
+                return Ok(self.rename_decoded(value));
+            }
+        }
         let value = mesh::cbor::decode_json(payload, &self.catalog)?;
         Ok(self.rename_decoded(value))
     }
@@ -365,6 +390,26 @@ impl FirmwareSchema {
 /// require numeric component and method tags; an unreviewed schema entry must
 /// use the explicit JSON-RPC compatibility path instead of unnamed CBOR.
 pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
+    encode_direct_command_with_id(command, 0)
+}
+
+/// Encode one correlated direct command. Callers that cross a bearer must
+/// supply a fresh nonzero ID so request and result use the common envelope.
+pub fn encode_direct_command_with_id(command: &str, id: u64) -> Result<Vec<u8>> {
+    if command
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|method| method == "relay.apply")
+    {
+        return encode_relay_apply_command(command, id);
+    }
+    if command
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|method| method == "relay.pair")
+    {
+        return encode_relay_pair_command(command, id);
+    }
     let schema = FirmwareSchema::load();
     let mut value = command_json(command, &schema)?;
     let method = value
@@ -402,11 +447,13 @@ pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
     if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u16
         && fields.is_empty()
         && (u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT
-            || u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS)
+            || u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_RESET_COUNTERS
+            || u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN)
     {
-        let mut wire = [0u8; 16];
-        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request(
+        let mut wire = [0u8; 24];
+        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request_with_id(
             u64::from(entry.id),
+            id,
             &mut wire,
         )
         .context("raw radio snapshot request")?;
@@ -415,6 +462,7 @@ pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
     let mut record = TaggedRecord {
         component: NameOrTag::Tag(u32::from(component)),
         method: NameOrTag::Tag(u32::from(entry.id)),
+        id: Some(Value::from(id)),
         ..TaggedRecord::default()
     };
     for (name, field_value) in fields {
@@ -431,6 +479,140 @@ pub fn encode_direct_command(command: &str) -> Result<Vec<u8>> {
             .insert(NameOrTag::Tag(u32::from(id)), field_value.clone());
     }
     mesh::cbor::encode_record(&record)
+}
+
+fn encode_relay_apply_command(command: &str, id: u64) -> Result<Vec<u8>> {
+    let mut allocation = None;
+    let mut revision = None;
+    let mut inbound_dcid = None;
+    let mut outbound_dcid = None;
+    let mut position = None;
+    let mut next_mac = None;
+    for word in command.split_ascii_whitespace().skip(1) {
+        let (key, value) = word
+            .split_once('=')
+            .with_context(|| format!("relay.apply argument must be key=value: {word}"))?;
+        match key {
+            "allocation" => allocation = Some(value.parse::<u64>().context("allocation")?),
+            "revision" => revision = Some(value.parse::<u64>().context("revision")?),
+            "inbound_dcid" => inbound_dcid = Some(value.parse::<u64>().context("inbound_dcid")?),
+            "outbound_dcid" => outbound_dcid = Some(value.parse::<u64>().context("outbound_dcid")?),
+            "position" => position = Some(value.parse::<u8>().context("position")?),
+            "next_mac" => {
+                let compact: String = value
+                    .chars()
+                    .filter(|character| *character != ':')
+                    .collect();
+                anyhow::ensure!(compact.len() == 12, "next_mac must contain six bytes");
+                let mut mac = [0u8; 6];
+                for (index, byte) in mac.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16)
+                        .context("next_mac must be hexadecimal")?;
+                }
+                next_mac = Some(mac);
+            }
+            _ => anyhow::bail!("unknown relay.apply field {key}"),
+        }
+    }
+    let request = dmesh_server::relay::Request {
+        allocation: allocation.context("relay.apply requires allocation")?,
+        revision: revision.context("relay.apply requires revision")?,
+        rule: Some(dmesh_server::relay::DesiredRule {
+            proposed_dcid: Some(
+                quic_lite::ConnectionId::new(
+                    inbound_dcid.context("relay.apply requires inbound_dcid")?,
+                )
+                .context("inbound_dcid exceeds QUIC-lite bounds")?,
+            ),
+            route: dmesh_server::relay::RelayRoute {
+                next_hop: dmesh_server::relay::now_next_hop_handle(
+                    next_mac.context("relay.apply requires next_mac")?,
+                )
+                .context("next_mac must be a directed unicast address")?,
+                outbound_dcid: quic_lite::ConnectionId::new(
+                    outbound_dcid.context("relay.apply requires outbound_dcid")?,
+                )
+                .context("outbound_dcid exceeds QUIC-lite bounds")?,
+            },
+            position: position.context("relay.apply requires position")?,
+        }),
+    };
+    let mut wire = [0u8; 128];
+    let used = dmesh_server::relay::encode_request(request, Some(id), &mut wire)
+        .context("encode relay.apply")?;
+    Ok(wire[..used].to_vec())
+}
+
+fn encode_relay_pair_command(command: &str, id: u64) -> Result<Vec<u8>> {
+    let mut values = BTreeMap::new();
+    for word in command.split_ascii_whitespace().skip(1) {
+        let (key, value) = word
+            .split_once('=')
+            .with_context(|| format!("relay.pair argument must be key=value: {word}"))?;
+        values.insert(key, value);
+    }
+    let number = |key: &str| -> Result<u64> {
+        values
+            .get(key)
+            .with_context(|| format!("relay.pair requires {key}"))?
+            .parse::<u64>()
+            .with_context(|| format!("relay.pair {key} must be integer"))
+    };
+    let compact: String = values
+        .get("next_mac")
+        .context("relay.pair requires next_mac")?
+        .chars()
+        .filter(|character| *character != ':')
+        .collect();
+    anyhow::ensure!(compact.len() == 12, "next_mac must contain six bytes");
+    let mut mac = [0u8; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16)
+            .context("next_mac must be hexadecimal")?;
+    }
+    let revision = number("revision")?;
+    let forward_dcid = quic_lite::ConnectionId::new(number("forward_dcid")?)
+        .context("forward_dcid exceeds QUIC-lite bounds")?;
+    let reverse_dcid = quic_lite::ConnectionId::new(number("reverse_dcid")?)
+        .context("reverse_dcid exceeds QUIC-lite bounds")?;
+    let client_dcid = quic_lite::ConnectionId::new(number("client_dcid")?)
+        .context("client_dcid exceeds QUIC-lite bounds")?;
+    let position = u8::try_from(number("position")?).context("position exceeds u8")?;
+    let request = dmesh_server::relay::PairRequest {
+        forward: dmesh_server::relay::Request {
+            allocation: number("forward_allocation")?,
+            revision,
+            rule: Some(dmesh_server::relay::DesiredRule {
+                proposed_dcid: Some(forward_dcid),
+                route: dmesh_server::relay::RelayRoute {
+                    next_hop: dmesh_server::relay::now_next_hop_handle(mac)
+                        .context("next_mac must be a directed unicast address")?,
+                    outbound_dcid: quic_lite::ConnectionId::new(0).unwrap(),
+                },
+                position,
+            }),
+        },
+        reverse: dmesh_server::relay::Request {
+            allocation: number("reverse_allocation")?,
+            revision,
+            rule: Some(dmesh_server::relay::DesiredRule {
+                proposed_dcid: Some(reverse_dcid),
+                route: dmesh_server::relay::RelayRoute {
+                    next_hop: dmesh_server::relay::udp6_next_hop_handle(number("return_token")?)
+                        .context("return_token must fit in 48 bits and be nonzero")?,
+                    // `reverse_dcid` is relay-owned. relay.open replaces the
+                    // OPEN return CID with it; this reverse rule restores the
+                    // separately chosen client receive CID on UDP egress.
+                    outbound_dcid: client_dcid,
+                },
+                position,
+            }),
+        },
+    };
+    let mut wire = [0u8; 192];
+    let used = dmesh_server::relay::encode_pair_request(request, Some(id), &mut wire)
+        .context("encode relay.pair")?;
+    Ok(wire[..used].to_vec())
 }
 
 /// Compact logfmt renderer shared by the session CLI and the remaining
@@ -569,7 +751,9 @@ fn resolve_schema_directory(path: PathBuf) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FirmwareSchema, encode_direct_command, render_device_record};
+    use super::{
+        FirmwareSchema, encode_direct_command, encode_direct_command_with_id, render_device_record,
+    };
     use minicbor::Encoder;
     use serde_json::json;
 
@@ -659,6 +843,76 @@ mod tests {
     }
 
     #[test]
+    fn relay_apply_command_uses_typed_now_handle() {
+        let wire = encode_direct_command_with_id(
+            "relay.apply allocation=7 revision=1 inbound_dcid=8 outbound_dcid=0 position=1 next_mac=84:0d:8e:07:41:70",
+            19,
+        )
+        .unwrap();
+        let request = dmesh_server::relay::decode_request(&wire).unwrap();
+        assert_eq!(request.allocation, 7);
+        assert_eq!(request.revision, 1);
+        let rule = request.rule.unwrap();
+        assert_eq!(rule.proposed_dcid.unwrap().value(), 8);
+        assert_eq!(rule.route.outbound_dcid.value(), 0);
+        assert_eq!(
+            dmesh_server::relay::now_next_hop_mac(rule.route.next_hop),
+            Some([0x84, 0x0d, 0x8e, 0x07, 0x41, 0x70])
+        );
+    }
+
+    #[test]
+    fn relay_pair_command_installs_independent_directional_dcids() {
+        let wire = encode_direct_command_with_id(
+            "relay.pair forward_allocation=7 reverse_allocation=8 revision=1 forward_dcid=8 reverse_dcid=12 client_dcid=77 position=1 return_token=99 next_mac=84:0d:8e:07:41:70",
+            20,
+        )
+        .unwrap();
+        let pair = dmesh_server::relay::decode_pair_request(&wire).unwrap();
+        assert_eq!(pair.forward.rule.unwrap().proposed_dcid.unwrap().value(), 8);
+        assert_eq!(
+            pair.reverse.rule.unwrap().proposed_dcid.unwrap().value(),
+            12
+        );
+        assert_eq!(
+            dmesh_server::relay::udp6_next_hop_token(pair.reverse.rule.unwrap().route.next_hop),
+            Some(99)
+        );
+        assert_eq!(pair.reverse.rule.unwrap().route.outbound_dcid.value(), 77);
+    }
+
+    #[test]
+    fn direct_transport_set_uses_the_cli_catalog_and_common_envelope() {
+        let command = encode_direct_command("transport.set mode=nan now=1").unwrap();
+        let envelope = dmesh_server::tagged::decode(&command).expect("tagged direct envelope");
+        assert_eq!(envelope.component, Some(dmesh_server::tagged::Name::Tag(1)));
+        assert_eq!(envelope.method, Some(dmesh_server::tagged::Name::Tag(4)));
+        assert_eq!(envelope.id, Some(0));
+        assert_eq!(
+            dmesh_server::control::decode_request(&command),
+            Some(dmesh_server::control::Request::TransportStart {
+                kind: dmesh_server::control::TransportKind::Nan,
+                config: dmesh_server::control::TransportConfig {
+                    now: Some(1),
+                    ..dmesh_server::control::TransportConfig::default()
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn direct_settings_set_uses_the_common_control_envelope() {
+        let command = encode_direct_command("settings.set key=sta_ssid value=costin").unwrap();
+        assert_eq!(
+            dmesh_server::control::decode_request(&command),
+            Some(dmesh_server::control::Request::SettingsSet {
+                key: b"sta_ssid",
+                value: b"costin",
+            })
+        );
+    }
+
+    #[test]
     fn radio_control_command_uses_schema_types_and_direct_handler_envelope() {
         let command = encode_direct_command(
             "radio.control channel=6 sta_state=disconnect_hold comparator_bssid=50:6f:9a:01:34:4a comparator_enabled=true promiscuous=false dw_policy=disabled",
@@ -694,8 +948,9 @@ mod tests {
     fn direct_radio_snapshot_keeps_the_required_empty_fields_map() {
         let encoded = encode_direct_command("radio.snapshot").unwrap();
         let mut expected = [0u8; 16];
-        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request(
+        let used = dmesh_server::raw_wifi::encode_raw_wifi_snapshot_request_with_id(
             dmesh_server::raw_wifi::RAW_WIFI_METHOD_SNAPSHOT,
+            0,
             &mut expected,
         )
         .unwrap();
@@ -704,5 +959,34 @@ mod tests {
             dmesh_server::raw_wifi::decode_raw_wifi_handler(&encoded),
             Ok(dmesh_server::raw_wifi::RawWifiLabRequest::Snapshot)
         );
+    }
+
+    #[test]
+    fn tagged_wifi_scan_result_uses_the_common_control_renderer() {
+        let schema = FirmwareSchema::load();
+        let result = [0xa5, 1, 0x80, 2, 4, 3, 0, 4, 0, 5, 0xf5];
+        let mut wire = [0u8; 64];
+        let used = dmesh_server::tagged::encode_numeric_response(4, 77, 91, &result, &mut wire)
+            .expect("bounded scan response");
+        let rendered = render_device_record(&schema, &wire[..used]);
+        assert!(rendered.contains("method=wifi.scan"), "{rendered}");
+        assert!(rendered.contains("id=91"), "{rendered}");
+        assert!(rendered.contains("payload.2=4"), "{rendered}");
+    }
+
+    #[test]
+    fn tagged_transport_error_keeps_its_method_and_request_id() {
+        let schema = FirmwareSchema::load();
+        let mut wire = [0u8; 64];
+        let used =
+            dmesh_server::tagged::encode_numeric_error(1, 4, 92, b"invalid_setting", &mut wire)
+                .expect("bounded transport error");
+        let rendered = render_device_record(&schema, &wire[..used]);
+        assert!(
+            rendered.contains("\"method\":\"transport.set\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"id\":92"), "{rendered}");
+        assert!(rendered.contains("invalid_setting"), "{rendered}");
     }
 }

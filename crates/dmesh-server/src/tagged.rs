@@ -146,6 +146,28 @@ pub fn encode_numeric_response(
     Some(encoder.len())
 }
 
+/// Encode a numeric tagged request with no parameters or fields.
+///
+/// This is useful for common observation methods such as `discovery.nodes` on
+/// a normal QUIC stream. Mutating requests use their component-specific typed
+/// encoders so the field map remains explicit.
+pub fn encode_numeric_empty_request(
+    component: u64,
+    method: u64,
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut encoder = Encoder::new(out);
+    encoder.map(3)?;
+    encoder.uint(1)?;
+    encoder.uint(component)?;
+    encoder.uint(2)?;
+    encoder.uint(method)?;
+    encoder.uint(3)?;
+    encoder.uint(id)?;
+    Some(encoder.len())
+}
+
 /// Encode a correlated handler failure. Keeping the request id and method in
 /// the same envelope lets UART, NAN Follow-up, and QUIC callers report a
 /// rejected request without falling back to an uncorrelated text message.
@@ -171,7 +193,7 @@ pub fn encode_numeric_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{Name, decode, destination, encode_numeric_response};
+    use super::{Name, decode, destination, encode_numeric_empty_request, encode_numeric_response};
     #[test]
     fn destination_and_binary_payload_stay_borrowed() {
         let wire = [
@@ -211,6 +233,17 @@ mod tests {
         assert_eq!(record.method, Some(Name::Tag(2)));
         assert_eq!(record.id, Some(9));
         assert_eq!(record.result, Some(&[0xa0][..]));
+    }
+
+    #[test]
+    fn empty_numeric_request_preserves_method_and_id() {
+        let mut wire = [0; 32];
+        let used = encode_numeric_empty_request(6, 9, 17, &mut wire).unwrap();
+        let record = decode(&wire[..used]).unwrap();
+        assert_eq!(record.component, Some(Name::Tag(6)));
+        assert_eq!(record.method, Some(Name::Tag(9)));
+        assert_eq!(record.id, Some(17));
+        assert!(record.fields.is_none());
     }
 
     #[test]

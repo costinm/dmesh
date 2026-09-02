@@ -27,8 +27,10 @@ use std::boxed::Box;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::eprintln;
 use std::format;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::string::String;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +44,53 @@ const MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
 pub const STABLE_WIFI_UDP_PORT: u16 = 3336;
 /// Development `lmesh`/wlan1 listener.  It must not collide with wlan0.
 pub const DEVELOPMENT_WIFI_UDP_PORT: u16 = 3337;
+
+/// Application-owned tagged-CBOR dispatch for a normal QUIC stream.
+///
+/// This is intentionally distinct from the DCID-zero direct-message hook:
+/// callers receive a complete stream request only after the QUIC association
+/// has been established. It lets host applications expose the same async
+/// catalog handler over HTTP and every QUIC bearer without turning a bearer
+/// address into a control API.
+pub trait TaggedStreamHandler: Send + Sync {
+    fn handle<'a>(
+        &'a self,
+        context: TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Transport facts for a normal tagged QUIC stream request.  The request
+/// payload deliberately remains bearer-neutral, but a relay control handler
+/// needs the authenticated adjacent peer when it binds a reverse route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaggedStreamContext {
+    pub peer: SocketAddr,
+}
+
+/// Outcome of a relay-forwarding lookup on a UDP listener.  This shares one
+/// socket with ordinary QUIC endpoints: a matching DCID is rewritten and sent
+/// to the configured adjacent peer before endpoint-connection lookup.
+pub enum RelayDatagramOutcome {
+    NotHandled,
+    Forward { peer: SocketAddr, used: usize },
+    Drop,
+}
+
+/// Optional owner of relay forwarding state for a UDP listener.
+///
+/// The handler sees only bounded packets and an adjacent ingress tuple.  It
+/// must not parse stream payloads; tagged relay administration is performed by
+/// [`TaggedStreamHandler`] after QUIC termination.
+pub trait RelayDatagramHandler: Send + Sync {
+    fn handle(
+        &self,
+        ingress: SocketAddr,
+        packet: &[u8],
+        out: &mut [u8],
+    ) -> RelayDatagramOutcome;
+}
+
 /// Reserved local port for `dmesh-cli` session/driver endpoints.
 pub const DMESH_CLI_UDP_PORT: u16 = 3338;
 /// Raw IPv6 firmware bearer port (outside host UDP listener ownership).
@@ -615,7 +664,7 @@ impl PendingObjectTransfer {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct UdpConfig {
     pub bind: SocketAddr,
     pub artifact_root: PathBuf,
@@ -654,6 +703,18 @@ pub struct UdpConfig {
     /// Optional opaque Recovery command/log mailbox. Normal object serving
     /// leaves it unset; host hardware tests can install it on a third port.
     pub control: Option<Arc<TransportControl>>,
+    /// Optional tagged direct-message handler. Direct control retains the
+    /// DCID-zero wire shape, but only a valid tagged-CBOR record is offered
+    /// here. QUIC bootstrap OPEN also has DCID zero and must always bypass
+    /// this handler into endpoint setup.
+    pub direct_handler: Option<Arc<dyn crate::relay::DirectHandler>>,
+    /// Optional async tagged-CBOR handler for normal QUIC streams. When it
+    /// declines a record, the bounded static component registry remains the
+    /// fallback for firmware and compatibility services.
+    pub tagged_handler: Option<Arc<dyn TaggedStreamHandler>>,
+    /// Optional bounded DCID forwarding lookup sharing this listener with
+    /// ordinary QUIC endpoints and normal tagged stream control.
+    pub relay_handler: Option<Arc<dyn RelayDatagramHandler>>,
 }
 
 impl Default for UdpConfig {
@@ -674,6 +735,9 @@ impl Default for UdpConfig {
             iperf_burst_delay: Duration::ZERO,
             ip_tos: None,
             control: None,
+            direct_handler: None,
+            tagged_handler: None,
+            relay_handler: None,
         }
     }
 }
@@ -764,6 +828,10 @@ pub struct UdpClient {
     peer: SocketAddr,
     endpoint: EndpointState<8, 512>,
     local_cid: quic_lite::ConnectionId,
+    /// Optional adjacent-link wire label. QUIC-lite still creates packets for
+    /// the authenticated end-to-end peer CID; the UDP path adapter replaces
+    /// only the visible outer DCID before sending to `peer`.
+    quic_lite_wire_dcid: Option<quic_lite::ConnectionId>,
     deferred_receive_credit: bool,
 }
 
@@ -779,6 +847,9 @@ pub struct ReceivedStream {
 }
 
 impl UdpClient {
+    pub fn peer_connection_id(&self) -> Option<quic_lite::ConnectionId> {
+        self.endpoint.peer_connection_id()
+    }
     /// Snapshot endpoint-owned loss, retransmission, ACK, and ordering
     /// counters for a completed diagnostic transfer. The socket adapter does
     /// not infer these from packet timing; QUIC-lite remains the authority.
@@ -798,7 +869,7 @@ impl UdpClient {
             .poll_close(&mut packet)
             .map_err(|error| anyhow::anyhow!("UDP close: {error:?}"))?
         {
-            self.socket.send_to(&packet[..used], self.peer).await?;
+            self.send_endpoint_packet(&packet[..used]).await?;
         }
         Ok(())
     }
@@ -833,6 +904,36 @@ impl UdpClient {
         Self::connect_with_history_capacity(bind, peer, local_cid, 512).await
     }
 
+    /// Establish a normal QUIC-lite connection on a caller-owned socket.
+    ///
+    /// A circuit session keeps one UDP source tuple stable while it first
+    /// controls a relay and later opens adjacent relay legs. The session owner,
+    /// rather than this single-connection helper, decides when the socket can
+    /// be reused for another connection.
+    pub async fn connect_with_socket(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        local_cid: quic_lite::ConnectionId,
+    ) -> Result<Self> {
+        configure_host_udp_buffers(&socket)?;
+        Self::connect_with_socket_via(
+            socket,
+            peer,
+            local_cid,
+            512,
+            ConnectionLimits::default(),
+            None,
+        )
+        .await
+    }
+
+    /// Return the owned socket when this one-connection helper is no longer
+    /// needed. The higher-level circuit session is responsible for preserving
+    /// the socket's source tuple and for multiplexing retained connections.
+    pub fn into_socket(self) -> UdpSocket {
+        self.socket
+    }
+
     pub async fn connect_with_history_capacity(
         bind: SocketAddr,
         peer: SocketAddr,
@@ -858,6 +959,61 @@ impl UdpClient {
         history_capacity: usize,
         limits: ConnectionLimits,
     ) -> Result<Self> {
+        Self::connect_with_limits_via(bind, peer, local_cid, history_capacity, limits, None).await
+    }
+
+    /// Establish over an adjacent UDP link whose on-wire DCID differs from
+    /// QUIC's end-to-end destination CID. This is path adaptation, not relay
+    /// control: callers obtain `wire_dcid` from the bearer-neutral circuit
+    /// builder, and this adapter never parses or installs relay rules.
+    pub async fn connect_with_quic_lite_wire_dcid(
+        bind: SocketAddr,
+        peer: SocketAddr,
+        local_cid: quic_lite::ConnectionId,
+        wire_dcid: quic_lite::ConnectionId,
+    ) -> Result<Self> {
+        Self::connect_with_limits_via(
+            bind,
+            peer,
+            local_cid,
+            512,
+            ConnectionLimits::default(),
+            Some(wire_dcid),
+        )
+        .await
+    }
+
+    /// Continue on a caller-owned UDP socket with an adjacent-link wire CID.
+    /// Circuit construction may have exchanged setup records on this same
+    /// bearer first; UDP only preserves its peer/port and applies the returned
+    /// wire label. The same circuit output can drive UART, NOW, FSK, or BLE-CoC
+    /// adapters without involving this type.
+    pub async fn connect_with_socket_and_quic_lite_wire_dcid(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        local_cid: quic_lite::ConnectionId,
+        wire_dcid: quic_lite::ConnectionId,
+    ) -> Result<Self> {
+        configure_host_udp_buffers(&socket)?;
+        Self::connect_with_socket_via(
+            socket,
+            peer,
+            local_cid,
+            512,
+            ConnectionLimits::default(),
+            Some(wire_dcid),
+        )
+        .await
+    }
+
+    async fn connect_with_limits_via(
+        bind: SocketAddr,
+        peer: SocketAddr,
+        local_cid: quic_lite::ConnectionId,
+        history_capacity: usize,
+        limits: ConnectionLimits,
+        quic_lite_wire_dcid: Option<quic_lite::ConnectionId>,
+    ) -> Result<Self> {
         if local_cid.value() == 0 {
             bail!("bootstrap local CID must be non-zero");
         }
@@ -866,6 +1022,25 @@ impl UdpClient {
         }
         let socket = UdpSocket::bind(bind).await?;
         configure_host_udp_buffers(&socket)?;
+        Self::connect_with_socket_via(
+            socket,
+            peer,
+            local_cid,
+            history_capacity,
+            limits,
+            quic_lite_wire_dcid,
+        )
+        .await
+    }
+
+    async fn connect_with_socket_via(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        local_cid: quic_lite::ConnectionId,
+        history_capacity: usize,
+        limits: ConnectionLimits,
+        quic_lite_wire_dcid: Option<quic_lite::ConnectionId>,
+    ) -> Result<Self> {
         let mut client = Self {
             socket,
             peer,
@@ -876,6 +1051,7 @@ impl UdpClient {
                 history_capacity,
             ),
             local_cid: local_cid,
+            quic_lite_wire_dcid,
             deferred_receive_credit: false,
         };
         let mut response = [0u8; MTU];
@@ -893,7 +1069,17 @@ impl UdpClient {
                 &mut open,
             )
             .map_err(|error| anyhow::anyhow!("bootstrap OPEN: {error:?}"))?;
-            client.socket.send_to(&open[..used], client.peer).await?;
+            if let Some(wire_dcid) = quic_lite_wire_dcid {
+                let mut relayed = [0u8; MTU];
+                let relayed_used = quic_lite::rewrite_dcid(&open[..used], wire_dcid, &mut relayed)
+                    .map_err(|error| anyhow::anyhow!("relay bootstrap DCID: {error:?}"))?;
+                client
+                    .socket
+                    .send_to(&relayed[..relayed_used], client.peer)
+                    .await?;
+            } else {
+                client.socket.send_to(&open[..used], client.peer).await?;
+            }
             let received = timeout(ACK_TIMEOUT, client.socket.recv_from(&mut response)).await;
             let Ok(Ok((len, response_peer))) = received else {
                 continue;
@@ -945,6 +1131,50 @@ impl UdpClient {
         bail!("UDP bootstrap timeout after {BOOTSTRAP_ATTEMPTS} attempts (no response)")
     }
 
+    async fn send_endpoint_packet(&self, packet: &[u8]) -> Result<()> {
+        if let Some(wire_dcid) = self.quic_lite_wire_dcid {
+            let mut relayed = [0u8; MTU];
+            let used = quic_lite::rewrite_dcid(packet, wire_dcid, &mut relayed)
+                .map_err(|error| anyhow::anyhow!("adjacent-link wire DCID: {error:?}"))?;
+            self.socket.send_to(&relayed[..used], self.peer).await?;
+        } else {
+            self.socket.send_to(packet, self.peer).await?;
+        }
+        Ok(())
+    }
+
+    /// Exchange one DCID-zero setup/update while retaining this client's
+    /// stable UDP tuple. Non-direct connection traffic is ignored until the
+    /// correlated direct response arrives.
+    pub async fn exchange_direct(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        Self::exchange_direct_on_socket(&self.socket, self.peer, packet).await
+    }
+
+    /// Exchange one direct record on a socket that will subsequently become a
+    /// relay client. This preserves the reverse-path UDP tuple across pair
+    /// setup, relay-open, and later service traffic.
+    pub async fn exchange_direct_on_socket(
+        socket: &UdpSocket,
+        peer: SocketAddr,
+        packet: &[u8],
+    ) -> Result<Vec<u8>> {
+        socket.send_to(packet, peer).await?;
+        let mut response = [0u8; MTU];
+        for _ in 0..BOOTSTRAP_ATTEMPTS {
+            let Ok(Ok((used, response_peer))) =
+                timeout(ACK_TIMEOUT, socket.recv_from(&mut response)).await
+            else {
+                continue;
+            };
+            if response_peer != peer || quic_lite::decode_direct_packet(&response[..used]).is_err()
+            {
+                continue;
+            }
+            return Ok(response[..used].to_vec());
+        }
+        bail!("UDP direct exchange timeout after {BOOTSTRAP_ATTEMPTS} attempts")
+    }
+
     /// Send one complete application request stream and wait for its
     /// transport control response. The caller chooses the service tag/schema.
     pub async fn send_stream(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<()> {
@@ -963,7 +1193,7 @@ impl UdpClient {
                 &mut packet,
             )
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
-        self.socket.send_to(&packet[..used], self.peer).await?;
+        self.send_endpoint_packet(&packet[..used]).await?;
         let mut response = [0u8; MTU];
         let (len, peer) = timeout(ACK_TIMEOUT, self.socket.recv_from(&mut response))
             .await
@@ -1018,7 +1248,7 @@ impl UdpClient {
                 &mut packet,
             )
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
-        self.socket.send_to(&packet[..used], self.peer).await?;
+        self.send_endpoint_packet(&packet[..used]).await?;
         let started = Instant::now();
         for attempt in 0..STREAM_ATTEMPTS {
             let deadline = Instant::now() + ACK_TIMEOUT;
@@ -1035,11 +1265,26 @@ impl UdpClient {
                 if peer != self.peer {
                     bail!("UDP client peer changed");
                 }
-                match self
-                    .endpoint
-                    .receive_datagram(&incoming[..len])
-                    .map_err(|error| anyhow::anyhow!("client transport input: {error:?}"))?
-                {
+                // The CLI intentionally uses one fixed diagnostic source
+                // port. A delayed response from a retired association can
+                // therefore arrive while a new request is active. Correlate
+                // it by destination CID before asking EndpointState to parse
+                // it; an unrelated (including DCID=0) packet is not a fatal
+                // error for the current request.
+                let Ok((header, _)) = quic_lite::ShortHeader::decode(&incoming[..len]) else {
+                    continue;
+                };
+                if header.dcid != self.local_cid {
+                    continue;
+                }
+                let received = match self.endpoint.receive_datagram(&incoming[..len]) {
+                    Ok(packet) => packet,
+                    Err(quic_lite::Error::Invalid | quic_lite::Error::WrongConnectionId) => {
+                        continue;
+                    }
+                    Err(error) => bail!("client transport input: {error:?}"),
+                };
+                match received {
                     quic_lite::TransportPacket::Control => continue,
                     quic_lite::TransportPacket::Stream { frame, .. } => {
                         let response = ReceivedStream {
@@ -1064,7 +1309,7 @@ impl UdpClient {
                             .poll_transmit(&mut ack)
                             .map_err(|error| anyhow::anyhow!("client response ACK: {error:?}"))?
                         {
-                            self.socket.send_to(&ack[..ack_len], self.peer).await?;
+                            self.send_endpoint_packet(&ack[..ack_len]).await?;
                         }
                         return Ok(response);
                     }
@@ -1084,7 +1329,7 @@ impl UdpClient {
             let Some((retry_len, _packet_number)) = retransmission else {
                 continue;
             };
-            self.socket.send_to(&retry[..retry_len], self.peer).await?;
+            self.send_endpoint_packet(&retry[..retry_len]).await?;
         }
         bail!("UDP stream request timeout after {STREAM_ATTEMPTS} attempts")
     }
@@ -1193,7 +1438,7 @@ impl UdpClient {
                 .poll_transmit(&mut control)
                 .map_err(|error| anyhow::anyhow!("client ACK: {error:?}"))?
             {
-                self.socket.send_to(&control[..used], self.peer).await?;
+                self.send_endpoint_packet(&control[..used]).await?;
             }
             return Ok(ReceivedStream {
                 id: stream.id,
@@ -1303,6 +1548,15 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 Err(_) => continue,
             };
         let packet = datagram[..len].to_vec();
+        // This bounded bearer diagnostic is a DCID-zero direct record. Check
+        // it before treating the same DCID as endpoint bootstrap.
+        let mut probe_response = [0u8; MTU];
+        if let Some(used) =
+            quic_lite::bearer_probe::udp_bearer_probe_response(&packet, &mut probe_response)
+        {
+            socket.send_to(&probe_response[..used], peer).await?;
+            continue;
+        }
         let (header, _) = match quic_lite::ShortHeader::decode(&packet) {
             Ok(value) => value,
             Err(error) => {
@@ -1311,6 +1565,24 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             }
         };
         if header.dcid.value() == 0 {
+            if let (Some(handler), Ok((direct_header, payload))) = (
+                config.direct_handler.as_ref(),
+                quic_lite::decode_direct_packet(&packet),
+            ) && crate::tagged::decode(payload).is_some() {
+                let mut response = [0u8; MTU];
+                match handler.handle_direct(direct_header.packet_number, payload, &mut response) {
+                    crate::relay::DirectOutcome::NotHandled => {}
+                    crate::relay::DirectOutcome::Handled => continue,
+                    crate::relay::DirectOutcome::Response(used) if used <= response.len() => {
+                        socket.send_to(&response[..used], peer).await?;
+                        continue;
+                    }
+                    crate::relay::DirectOutcome::Response(_) => {
+                        tracing::warn!(%peer, "udp_direct_handler_oversize_response");
+                        continue;
+                    }
+                }
+            }
             let Ok((_, open)) = quic_lite::decode_bootstrap_open_packet_with_limits(&packet) else {
                 tracing::warn!(%peer, "udp_transport_invalid_bootstrap");
                 continue;
@@ -1351,6 +1623,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 let registry_for_connection = registry.clone();
                 let server_for_connection = server.clone();
                 let control_for_connection = config.control.clone();
+                let tagged_handler_for_connection = config.tagged_handler.clone();
                 let closed_routes_for_connection = closed_routes.clone();
                 tokio::spawn(async move {
                     let result = serve_persistent_peer_with_ids(
@@ -1376,6 +1649,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         config.iperf_burst_packets,
                         config.iperf_burst_delay,
                         control_for_connection,
+                        tagged_handler_for_connection,
                     )
                     .await;
                     if let Ok(mut closed) = closed_routes_for_connection.lock() {
@@ -1416,6 +1690,24 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             continue;
         }
         let key = header.dcid.value();
+        if let Some(handler) = config.relay_handler.as_deref() {
+            let mut forwarded = [0u8; MTU];
+            match handler.handle(peer, &packet, &mut forwarded) {
+                RelayDatagramOutcome::NotHandled => {}
+                RelayDatagramOutcome::Forward {
+                    peer: next_hop,
+                    used,
+                } if used <= forwarded.len() => {
+                    socket.send_to(&forwarded[..used], next_hop).await?;
+                    continue;
+                }
+                RelayDatagramOutcome::Forward { .. } => {
+                    tracing::warn!(%peer, "udp_relay_handler_oversize_forward");
+                    continue;
+                }
+                RelayDatagramOutcome::Drop => continue,
+            }
+        }
         if let Some(sender) = connections.get(&key) {
             if connection_peers.get(&key) != Some(&peer) {
                 tracing::warn!(
@@ -1477,6 +1769,7 @@ async fn serve_persistent_peer_with_ids(
     iperf_burst_packets: usize,
     iperf_burst_delay: Duration,
     control: Option<Arc<TransportControl>>,
+    tagged_handler: Option<Arc<dyn TaggedStreamHandler>>,
 ) -> Result<()> {
     let mut mux = Box::new(StreamMux::<8, 512>::new_with_history_capacity(
         Role::Server,
@@ -1535,6 +1828,7 @@ async fn serve_persistent_peer_with_ids(
             iperf_burst_packets,
             iperf_burst_delay,
             control.as_deref(),
+            tagged_handler.as_deref(),
         )
         .await
         .context("initial persistent packet")?;
@@ -1604,6 +1898,7 @@ async fn serve_persistent_peer_with_ids(
                     iperf_burst_packets,
                     iperf_burst_delay,
                     control.as_deref(),
+                    tagged_handler.as_deref(),
                 )
                 .await
                 {
@@ -1761,7 +2056,8 @@ fn allocate_server_cid(
     avoid: quic_lite::ConnectionId,
 ) -> Result<quic_lite::ConnectionId> {
     for _ in 0..1024 {
-        let value = NEXT_SERVER_CID.fetch_add(1, Ordering::Relaxed) & ((1u64 << 62) - 1);
+        let value =
+            NEXT_SERVER_CID.fetch_add(1, Ordering::Relaxed) & quic_lite::ConnectionId::MAX_VALUE;
         if value != 0 && value != avoid.value() && !connections.contains_key(&value) {
             return quic_lite::ConnectionId::new(value)
                 .ok_or_else(|| anyhow::anyhow!("CID allocation overflow"));
@@ -1838,6 +2134,7 @@ async fn process_persistent_packet<const H: usize>(
     iperf_burst_packets: usize,
     iperf_burst_delay: Duration,
     control: Option<&TransportControl>,
+    tagged_handler: Option<&dyn TaggedStreamHandler>,
 ) -> Result<()> {
     mux.endpoint.set_time(started.elapsed().as_millis() as u64);
     let mut packet = [0u8; MTU];
@@ -1848,7 +2145,16 @@ async fn process_persistent_packet<const H: usize>(
         // Tagged-CBOR is the normal stream request envelope. It carries the
         // component/method itself, so no service byte is consumed from the
         // stream. The branches below are compatibility for legacy clients.
-        if let Some(response) = dispatch_tagged_stream(&request.data) {
+        if let Some(response) = match tagged_handler {
+            Some(handler) => {
+                handler
+                    .handle(TaggedStreamContext { peer }, request.data.clone())
+                    .await
+            }
+            None => None,
+        }
+        .or_else(|| dispatch_tagged_stream(&request.data))
+        {
             mux.complete_request(request.stream_id, request.data.len())
                 .map_err(|error| anyhow::anyhow!("tagged request accounting: {error:?}"))?;
             let (used, _) = mux
@@ -2419,6 +2725,101 @@ mod tests {
     use super::*;
     use quic_lite::CommittedStreamDisposition;
 
+    #[derive(Debug)]
+    struct EchoDirect;
+
+    impl crate::relay::DirectHandler for EchoDirect {
+        fn handle_direct(
+            &self,
+            packet_number: u32,
+            payload: &[u8],
+            response: &mut [u8],
+        ) -> crate::relay::DirectOutcome {
+            if crate::tagged::decode(payload).is_none() {
+                return crate::relay::DirectOutcome::NotHandled;
+            }
+            match quic_lite::encode_direct_packet(packet_number + 1, payload, response) {
+                Ok(used) => crate::relay::DirectOutcome::Response(used),
+                Err(_) => crate::relay::DirectOutcome::Handled,
+            }
+        }
+    }
+
+    /// Deliberately accepts every payload it is offered. The listener must
+    /// still let a bootstrap OPEN through, because only tagged records are
+    /// eligible for direct-control dispatch.
+    #[derive(Debug)]
+    struct GreedyDirect;
+
+    impl crate::relay::DirectHandler for GreedyDirect {
+        fn handle_direct(
+            &self,
+            _packet_number: u32,
+            _payload: &[u8],
+            _response: &mut [u8],
+        ) -> crate::relay::DirectOutcome {
+            crate::relay::DirectOutcome::Handled
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_listener_dispatches_direct_message_before_quic_bootstrap() {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server = tokio::spawn(run(UdpConfig {
+            bind,
+            direct_handler: Some(Arc::new(EchoDirect)),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut request_payload = [0u8; 32];
+        let request_payload_len =
+            crate::tagged::encode_numeric_empty_request(1, 1, 7, &mut request_payload).unwrap();
+        let mut request = [0u8; 32];
+        let request_len = quic_lite::encode_direct_packet(
+            7,
+            &request_payload[..request_payload_len],
+            &mut request,
+        )
+        .unwrap();
+        client.send_to(&request[..request_len], bind).await.unwrap();
+        let mut response = [0u8; 32];
+        let (response_len, peer) =
+            timeout(Duration::from_millis(100), client.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(peer, bind);
+        let (header, payload) = quic_lite::decode_direct_packet(&response[..response_len]).unwrap();
+        assert_eq!(header.packet_number, 8);
+        assert_eq!(payload, &request_payload[..request_payload_len]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_bootstrap_bypasses_even_a_greedy_direct_handler() {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server = tokio::spawn(run(UdpConfig {
+            bind,
+            direct_handler: Some(Arc::new(GreedyDirect)),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            quic_lite::ConnectionId::new(17).unwrap(),
+        )
+        .await
+        .expect("bootstrap must bypass direct handler");
+        assert!(client.peer_connection_id().is_some_and(|cid| cid.value() != 0));
+        server.abort();
+    }
+
     #[test]
     fn active_object_scheduler_never_waits_the_idle_50ms_tick() {
         assert_eq!(
@@ -2714,7 +3115,7 @@ mod tests {
     fn server_cid_allocator_skips_client_receive_cid() {
         let connections = HashMap::new();
         let next = NEXT_SERVER_CID.load(Ordering::Relaxed);
-        let avoid = ConnectionId::new(next & ((1u64 << 62) - 1)).unwrap();
+        let avoid = ConnectionId::new(next & ConnectionId::MAX_VALUE).unwrap();
         let allocated = allocate_server_cid(&connections, avoid).unwrap();
         assert_ne!(allocated, avoid);
         assert_ne!(allocated.value(), 0);
@@ -2823,6 +3224,7 @@ mod tests {
             peer: server_addr,
             endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
             local_cid: local,
+            quic_lite_wire_dcid: None,
             deferred_receive_credit: false,
         };
         client.endpoint.install_connection_ids(local, peer).unwrap();
@@ -2856,6 +3258,7 @@ mod tests {
             peer: server_addr,
             endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
             local_cid: local,
+            quic_lite_wire_dcid: None,
             deferred_receive_credit: false,
         };
         client.endpoint.install_connection_ids(local, peer).unwrap();
@@ -4750,5 +5153,49 @@ mod tests {
         assert_eq!(ack, 4);
         assert_eq!(get, &configured[2..]);
         assert!(crate::protocol::decode_get(get).is_some());
+    }
+
+    #[derive(Debug)]
+    struct AsyncTaggedEcho;
+
+    impl TaggedStreamHandler for AsyncTaggedEcho {
+        fn handle<'a>(
+            &'a self,
+            _context: TaggedStreamContext,
+            request: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move { request.starts_with(b"tagged:").then_some(request) })
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_quic_stream_uses_async_tagged_handler() {
+        let root = tempdir().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            tagged_handler: Some(Arc::new(AsyncTaggedEcho)),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0x5a5).unwrap(),
+        )
+        .await
+        .unwrap();
+        let request = b"tagged:normal-quic-stream";
+        let (stream, response, fin) = client
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, request, true)
+            .await
+            .unwrap();
+        assert_eq!(stream, quic_lite::FIRST_SERVER_BIDI_STREAM_ID);
+        assert!(fin);
+        assert_eq!(response, request);
+        server_task.abort();
     }
 }

@@ -4,7 +4,18 @@
 //! mesh logic. JNI-specific marshalling stays in the wrapper module.
 
 use dmesh_store::StoreService;
-use mesh::{tagged::TaggedRecord, wire::TaggedRecordHandler};
+use mesh::{
+    tagged::{NameOrTag, TaggedRecord},
+    wire::TaggedRecordHandler,
+};
+#[cfg(target_os = "android")]
+use p256::SecretKey;
+#[cfg(target_os = "android")]
+use p256::ecdsa::signature::Signer;
+#[cfg(target_os = "android")]
+use p256::ecdsa::{Signature, SigningKey};
+#[cfg(target_os = "android")]
+use p256::elliptic_curve::sec1::ToSec1Point;
 use serde_json::json;
 #[cfg(target_os = "android")]
 use sha2::{Digest, Sha256};
@@ -49,15 +60,93 @@ pub struct MeshStreamHandle {
 /// direct Rust call into the established Android control dispatcher.
 struct AndroidControlHandler;
 
+/// The public discovery numeric identities are shared with lmesh. Android's
+/// handwritten catalog still advertises names, so normalize just the reviewed
+/// common aliases at the QUIC terminal before invoking that dispatcher.
+/// Unknown numeric records remain rejected by `handle_tagged_control_record`.
+fn normalize_android_tagged_record(mut record: TaggedRecord) -> TaggedRecord {
+    match (&record.component, &record.method) {
+        (NameOrTag::Tag(6), NameOrTag::Tag(1)) => {
+            record.component = NameOrTag::Name("discovery".to_owned());
+            record.method = NameOrTag::Name("devices".to_owned());
+        }
+        (NameOrTag::Tag(6), NameOrTag::Tag(2)) => {
+            record.component = NameOrTag::Name("discovery".to_owned());
+            record.method = NameOrTag::Name("status".to_owned());
+        }
+        _ => {}
+    }
+    record
+}
+
+/// Identity material used only to produce a signed, authenticated discovery
+/// record. QUIC endpoint authentication remains independent of this presence
+/// signature; the public-key DER is the stable `to` selector used by the
+/// discovery-to-QUIC bridge.
+#[cfg(target_os = "android")]
+struct AndroidAnnounceIdentity {
+    public_key: Vec<u8>,
+    signing_key: SigningKey,
+}
+
+/// Android terminates normal QUIC streams in the same Rust catalog dispatcher
+/// as its local HTTP service. This keeps `to` forwarding bearer-neutral: the
+/// caller chooses a discovered identity, then the target executes locally.
+struct AndroidUdpTaggedHandler;
+
+impl dmesh_server::udp::TaggedStreamHandler for AndroidUdpTaggedHandler {
+    fn handle<'a>(
+        &'a self,
+        _context: dmesh_server::udp::TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let record = match mesh::cbor::decode_record(&request) {
+                Ok(record) => normalize_android_tagged_record(record),
+                Err(error) => {
+                    log::warn!("Android QUIC tagged request decode failed: {error}");
+                    return None;
+                }
+            };
+            let request_id = record.id.clone()?;
+            let response = match crate::mesh_jni::handle_tagged_control_record(record) {
+                Ok(Some(response)) => response,
+                Ok(None) => return None,
+                Err(error) => {
+                    log::warn!("Android QUIC tagged request rejected: {error}");
+                    mesh::wire::response_error(
+                        request_id,
+                        serde_json::json!({"error": error.to_string()}),
+                    )
+                }
+            };
+            match mesh::cbor::encode_record(&response) {
+                Ok(wire) => Some(wire),
+                Err(error) => {
+                    log::warn!("Android QUIC tagged response encoding failed: {error}");
+                    None
+                }
+            }
+        })
+    }
+}
+
 fn android_http_catalog() -> serde_json::Value {
     // Deliberately small until each mutating platform action implements the
     // common dmesh-server tagged control schema and reports capabilities.
     json!({"tools": [
-        {"name":"radio.status_text","description":"Read the Rust-owned mesh status summary.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"radio.devices","description":"Read the bounded cross-bearer device inventory.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"radio.local_networks","description":"Read platform-observed local network facts.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"radio.perf.udp6","description":"Run the common bounded perf service over a discovered peer's shared STA UDP6 path. Both peers must announce the same current SSID and the peer must have a fresh UDP multicast address.","inputSchema":{"type":"object","properties":{"target_id":{"type":"string","description":"Discovered device ID."},"bytes":{"type":"integer","minimum":1,"maximum":262144,"default":32768},"packet_size":{"type":"integer","minimum":64,"maximum":1100,"default":1100}},"required":["target_id"],"additionalProperties":false}},
-        {"name":"radio.power.state","description":"Read bounded power and memory observations.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}
+        {"name":"radio.status_text","description":"Read the Rust-owned mesh status summary.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"discovery.nodes","title":"Nodes","description":"Read the bounded cross-bearer node inventory, including physical devices and future control-plane nodes.","x-ui-visibility":"default","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"discovery.status","title":"This node","description":"Read this node's currently announced local network and capability facts.","x-ui-visibility":"default","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"nan.status","description":"Read local Wi-Fi Aware attach and publish state; peer inventory is in discovery.nodes.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"now.metrics","description":"Read local ESP-NOW runtime counters when supported.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"nan.metrics","description":"Read local Wi-Fi Aware event and Follow-up counters.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"udp6.metrics","description":"Read local raw IPv6, UDP, and NDP counters when supported.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"wifi.link.metrics","description":"Read common optional per-peer Wi-Fi link observations when supported.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"radio.nan.followups","description":"Read bounded receiver-proven NAN follow-up receipts.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"radio.nan.events","description":"Read bounded Android Wi-Fi Aware callback events.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"radio.perf.udp6","description":"Run the common bounded perf service over a discovered peer's shared STA UDP6 path. Both peers must announce the same current SSID and the peer must have a fresh UDP multicast address.","x-ui-visibility":"default","inputSchema":{"type":"object","properties":{"target_id":{"type":"string","description":"Discovered node ID."},"bytes":{"type":"integer","minimum":1,"maximum":262144,"default":32768},"packet_size":{"type":"integer","minimum":64,"maximum":1100,"default":1100}},"required":["target_id"],"additionalProperties":false}},
+        {"name":"radio.power.state","description":"Read bounded power and memory observations.","x-ui-visibility":"masked","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}
     ]})
 }
 
@@ -150,6 +239,7 @@ pub fn start_mesh(
             target_http_address: None,
             ssh_client_manager: client_manager.clone(),
             mesh_services,
+            web_root: std::env::var_os("DMESH_HTTP_WEB_DIR").map(std::path::PathBuf::from),
         };
         let app = ssh_mesh::handlers::app(app_state);
         http_server_handle = Some(runtime.spawn(async move {
@@ -179,6 +269,7 @@ pub fn start_mesh(
                 dmesh_server::udp::STABLE_WIFI_UDP_PORT,
             )),
             artifact_root: base_path.clone(),
+            tagged_handler: Some(Arc::new(AndroidUdpTaggedHandler)),
             ..dmesh_server::udp::UdpConfig::default()
         };
         Some(runtime.spawn(async move {
@@ -192,14 +283,24 @@ pub fn start_mesh(
 
     #[cfg(target_os = "android")]
     let (announce_server_handle, announce_trigger) = {
-        let public_key = node
+        let ecdsa_key = node
             .private_key()
+            .key_data()
+            .ecdsa()
+            .ok_or_else(|| anyhow::anyhow!("Android mesh identity is not ECDSA P-256"))?;
+        let secret_key = SecretKey::from_slice(ecdsa_key.private_key_bytes())?;
+        let public_key = secret_key
             .public_key()
-            .to_openssh()
-            .unwrap_or_default();
+            .to_sec1_point(true)
+            .as_bytes()
+            .to_vec();
+        let identity = AndroidAnnounceIdentity {
+            public_key,
+            signing_key: SigningKey::from(secret_key),
+        };
         let (trigger, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
-            Some(runtime.spawn(android_announce_loop(public_key, receiver))),
+            Some(runtime.spawn(android_announce_loop(identity, receiver))),
             Some(trigger),
         )
     };
@@ -249,7 +350,7 @@ pub fn stop_mesh(handle: MeshHandle) {
 /// while the QUIC UDP listener remains unicast-only.
 #[cfg(target_os = "android")]
 async fn android_announce_loop(
-    public_key: String,
+    identity: AndroidAnnounceIdentity,
     mut trigger: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) {
     const PORT: u16 = 5227;
@@ -261,11 +362,7 @@ async fn android_announce_loop(
             return;
         }
     };
-    // OpenSSH public-key text begins with the same algorithm label on every
-    // device (for example `ecdsa-sha2-nistp...`). Hash the complete stable
-    // public identity instead of copying that common prefix into every
-    // announce record.
-    let digest = Sha256::digest(public_key.as_bytes());
+    let digest = Sha256::digest(&identity.public_key);
     let mut id = [0; 16];
     id.copy_from_slice(&digest[..16]);
     let take = id.len();
@@ -278,7 +375,7 @@ async fn android_announce_loop(
         tokio::select! {
             _ = interval.tick() => {
                 let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
-                    id, take as u8, started.elapsed().as_secs(), boot_pending).await;
+                    id, take as u8, started.elapsed().as_secs(), boot_pending, &identity).await;
                 if sent { boot_pending = false; }
             }
             Some(()) = trigger.recv() => {
@@ -286,18 +383,21 @@ async fn android_announce_loop(
                 // scoped multicast interface and emit the same bounded record
                 // now, rather than waiting for the periodic interval.
                 let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
-                    id, take as u8, started.elapsed().as_secs(), boot_pending).await;
+                    id, take as u8, started.elapsed().as_secs(), boot_pending, &identity).await;
                 if sent { boot_pending = false; }
             }
             received = socket.recv_from(&mut receive) => match received {
                 Ok((len, sender)) => {
-                    if let Some(announce) = dmesh_server::announce::decode_announce(&receive[..len])
+                    let payload = quic_lite::decode_direct_packet(&receive[..len])
+                        .map_or(&receive[..len], |(_, payload)| payload);
+                    if let Some(announce) = dmesh_server::announce::decode_announce(payload)
                         && announce.device_id() != &id[..take]
                     {
                         crate::mesh_jni::observe_announce(
                             announce,
                             sender.to_string(),
                             "udp_multicast",
+                            &receive[..len],
                         );
                     }
                 }
@@ -319,46 +419,100 @@ async fn send_android_announce(
     id_len: u8,
     uptime_secs: u64,
     boot: bool,
+    identity: &AndroidAnnounceIdentity,
 ) -> bool {
-    let announce = if boot {
-        dmesh_server::announce::Announce::boot(id, id_len, 0)
+    let mut announce = if boot {
+        dmesh_server::announce::Announce::boot(id, id_len)
     } else {
         dmesh_server::announce::Announce::discovery(
             id,
             id_len,
             u32::try_from(uptime_secs).unwrap_or(u32::MAX),
-            0,
-            0,
         )
     };
-    let mut announce = announce;
-    // Android's multicast sender enumerates the live kernel interfaces, so
-    // this is an observed endpoint rather than a guessed MAC-derived value.
-    // A peer still needs its own local scope when using this link-local route.
-    if let Some(address) = first_link_local_v6() {
-        announce.set_sta_link_local_v6(address.octets());
+    if let Ok(domain) = std::env::var("DMESH_DISCOVERY_DOMAIN") {
+        let domain = domain.trim();
+        if !domain.is_empty() && domain.len() <= dmesh_server::announce::MAX_DEVICE_DOMAIN {
+            let _ = announce.set_device_domain(domain);
+        }
     }
-    let mut wire = [0u8; 96];
-    let Some(used) = dmesh_server::announce::encode(announce, &mut wire) else {
-        return false;
-    };
-    let interfaces = multicast_interface_indices();
-    for interface_index in &interfaces {
-        if joined_interfaces.insert(*interface_index)
-            && let Err(error) = socket.join_multicast_v6(&group, *interface_index)
+    let interfaces = multicast_interfaces();
+    for interface in &interfaces {
+        if joined_interfaces.insert(interface.index)
+            && let Err(error) = socket.join_multicast_v6(&group, interface.index)
         {
             log::warn!(
-                "Android announce multicast join failed on interface {interface_index}: {error}"
+                "Android announce multicast join failed on {} ({}): {error}",
+                interface.name,
+                interface.index,
             );
         }
     }
     let mut sent = false;
-    for interface_index in interfaces {
-        let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, interface_index));
+    for interface in interfaces {
+        // One bounded common record is sent on each live multicast interface.
+        // Its advertised UDP6 endpoint must be the link-local address for the
+        // exact interface carrying this datagram; a peer supplies its own
+        // scope when replying. Do not leak a first/random interface address.
+        let mut per_interface = announce;
+        if let Some(address) = interface.link_local {
+            per_interface.set_sta_link_local_v6(address.octets());
+            // Advertise only the device-local UDP6 address and listener port.
+            // The receiving node retains the ingress interface/scope; an
+            // Android sender must not serialize its interface name or SSID.
+            per_interface.set_udp_port(dmesh_server::udp::STABLE_WIFI_UDP_PORT);
+            per_interface.set_udp_link_local_v6(address.octets());
+        }
+        if !per_interface.set_public_key(&identity.public_key) {
+            log::error!("Android announce public key exceeds common bound");
+            continue;
+        }
+        let mut signing_wire = [0u8; 384];
+        let Some(signing_used) =
+            dmesh_server::announce::signing_bytes(per_interface, &mut signing_wire)
+        else {
+            log::error!("Android announce signing record exceeded bound");
+            continue;
+        };
+        let signature: Signature = identity.signing_key.sign(&signing_wire[..signing_used]);
+        if !per_interface.set_signature(signature.to_bytes().as_ref()) {
+            log::error!("Android announce signature has invalid length");
+            continue;
+        }
+        let mut announce_wire = [0u8; 384];
+        let Some(announce_used) = dmesh_server::announce::encode(per_interface, &mut announce_wire)
+        else {
+            log::warn!(
+                "Android announce encoding exceeded bound on {}",
+                interface.name
+            );
+            continue;
+        };
+        let mut wire = [0u8; 448];
+        let Some(used) =
+            quic_lite::encode_direct_packet(0, &announce_wire[..announce_used], &mut wire).ok()
+        else {
+            log::warn!(
+                "Android announce direct envelope exceeded bound on {}",
+                interface.name
+            );
+            continue;
+        };
+        let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, interface.index));
         match socket.send_to(&wire[..used], destination).await {
-            Ok(_) => sent = true,
+            Ok(_) => {
+                sent = true;
+                log::debug!(
+                    "Android announce UDP6 submitted on {} ({}) addr={:?}",
+                    interface.name,
+                    interface.index,
+                    interface.link_local,
+                );
+            }
             Err(error) => log::warn!(
-                "Android announce multicast send failed on interface {interface_index}: {error}"
+                "Android announce multicast send failed on {} ({}): {error}",
+                interface.name,
+                interface.index,
             ),
         }
     }
@@ -370,8 +524,15 @@ async fn send_android_announce(
 /// Wi-Fi and would make a service-start boot announce disappear before a
 /// network becomes available.
 #[cfg(target_os = "android")]
-fn multicast_interface_indices() -> Vec<u32> {
-    let mut interfaces = BTreeSet::new();
+struct MulticastInterface {
+    index: u32,
+    name: String,
+    link_local: Option<Ipv6Addr>,
+}
+
+#[cfg(target_os = "android")]
+fn multicast_interfaces() -> Vec<MulticastInterface> {
+    let mut interfaces = std::collections::BTreeMap::<u32, MulticastInterface>::new();
     unsafe {
         let mut head = std::ptr::null_mut();
         if libc::getifaddrs(&mut head) != 0 {
@@ -386,48 +547,40 @@ fn multicast_interface_indices() -> Vec<u32> {
             let entry = &*current;
             let enabled = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
             let loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
+            let multicast = entry.ifa_flags & (libc::IFF_MULTICAST as u32) != 0;
             if enabled
                 && !loopback
+                && multicast
                 && !entry.ifa_addr.is_null()
                 && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
             {
                 let index = libc::if_nametoindex(CStr::from_ptr(entry.ifa_name).as_ptr());
                 if index != 0 {
-                    interfaces.insert(index);
+                    let name = CStr::from_ptr(entry.ifa_name)
+                        .to_string_lossy()
+                        .into_owned();
+                    let address = Ipv6Addr::from(
+                        (*(entry.ifa_addr as *const libc::sockaddr_in6))
+                            .sin6_addr
+                            .s6_addr,
+                    );
+                    let interface = interfaces
+                        .entry(index)
+                        .or_insert_with(|| MulticastInterface {
+                            index,
+                            name,
+                            link_local: None,
+                        });
+                    if address.is_unicast_link_local() {
+                        interface.link_local = Some(address);
+                    }
                 }
             }
             current = entry.ifa_next;
         }
         libc::freeifaddrs(head);
     }
-    interfaces.into_iter().collect()
-}
-
-/// First active non-loopback IPv6 link-local address available to the Android
-/// mesh process.  It is attached to the common announce so peers can identify
-/// a real UDP6 endpoint; interface scope remains a local sender property.
-#[cfg(target_os = "android")]
-fn first_link_local_v6() -> Option<Ipv6Addr> {
-    unsafe {
-        let mut head = std::ptr::null_mut();
-        if libc::getifaddrs(&mut head) != 0 { return None; }
-        let mut current = head;
-        let mut result = None;
-        while !current.is_null() {
-            let entry = &*current;
-            let enabled = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
-            let loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
-            if enabled && !loopback && !entry.ifa_addr.is_null()
-                && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
-            {
-                let address = Ipv6Addr::from((*(entry.ifa_addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr);
-                if address.is_unicast_link_local() { result = Some(address); break; }
-            }
-            current = entry.ifa_next;
-        }
-        libc::freeifaddrs(head);
-        result
-    }
+    interfaces.into_values().collect()
 }
 
 /// Connect to a remote SSH server.
@@ -539,4 +692,50 @@ pub fn stream_close(handle: &mut MeshStreamHandle) -> Result<(), anyhow::Error> 
         let _ = handle.stream.shutdown().await;
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn android_quic_normalizes_public_discovery_numeric_tags() {
+        let record = TaggedRecord {
+            component: NameOrTag::Tag(6),
+            method: NameOrTag::Tag(2),
+            id: Some(json!("request-1")),
+            ..TaggedRecord::default()
+        };
+
+        let normalized = normalize_android_tagged_record(record);
+        assert_eq!(
+            normalized.component,
+            NameOrTag::Name("discovery".to_owned())
+        );
+        assert_eq!(normalized.method, NameOrTag::Name("status".to_owned()));
+        assert_eq!(normalized.id, Some(json!("request-1")));
+    }
+
+    #[test]
+    fn android_quic_terminal_returns_a_correlated_discovery_response() {
+        let request = TaggedRecord {
+            component: NameOrTag::Tag(6),
+            method: NameOrTag::Tag(2),
+            id: Some(json!("request-2")),
+            ..TaggedRecord::default()
+        };
+        let wire = mesh::cbor::encode_record(&request).expect("encode request");
+        let response_wire = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(dmesh_server::udp::TaggedStreamHandler::handle(
+                &AndroidUdpTaggedHandler,
+                wire,
+            ))
+            .expect("terminal response");
+        let response = mesh::cbor::decode_record(&response_wire).expect("decode response");
+
+        assert_eq!(response.id, Some(json!("request-2")));
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
 }

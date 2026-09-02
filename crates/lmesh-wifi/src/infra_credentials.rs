@@ -209,7 +209,10 @@ pub fn load_infrastructure_credentials(
         let security = match network.security.as_deref().unwrap_or("wpa2-psk") {
             "wpa2-psk" => InfrastructureSecurity::Wpa2Psk,
             "wpa3-sae" => InfrastructureSecurity::Wpa3Sae,
-            _ => bail!("infrastructure credential file {} has unsupported security", path.display()),
+            _ => bail!(
+                "infrastructure credential file {} has unsupported security",
+                path.display()
+            ),
         };
         if network.ipv4_netmask.is_some() && network.ipv4_prefix.is_some() {
             bail!(

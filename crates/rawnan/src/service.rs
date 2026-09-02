@@ -116,7 +116,14 @@ impl NanActivePublish {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NanFollowupIntent {
     pub destination: [u8; 6],
+    /// Local Service Descriptor instance that owns this Follow-up.
     pub instance: u8,
+    /// Remote Subscribe instance to which this Follow-up is directed.
+    ///
+    /// A generic application Follow-up has no preceding Subscribe transaction
+    /// and retains the compatibility value zero. A response to an active
+    /// Subscribe retains the parsed value while it waits for the next DW.
+    pub requestor_instance: u8,
     pub payload: Vec<u8>,
     pub queued_at_us: u64,
 }
@@ -179,6 +186,7 @@ impl NanFollowupQueue {
         if self.intents.iter().any(|item| {
             item.destination == intent.destination
                 && item.instance == intent.instance
+                && item.requestor_instance == intent.requestor_instance
                 && item.payload == intent.payload
         }) {
             return NanFollowupEnqueue::Duplicate;
@@ -285,6 +293,27 @@ pub fn active_subscribe_service_info<'a>(
     if !crate::is_nan_sdf(frame) {
         return None;
     }
+
+    // Android may coalesce its unsolicited Publish and active Subscribe for
+    // the same service into one SDF. In the captured framework form the
+    // Publish is control 0x10 and carries the announce, while the following
+    // Subscribe is control 0x11 and carries its Service Info directly in the
+    // SDA. Prefer that explicit Subscribe descriptor before considering an
+    // SDEA: selecting the first matching service ID would otherwise consume
+    // the peer's announce and silently lose `transport.discover`.
+    for descriptor in crate::service_descriptors(frame) {
+        if descriptor.service_id == service_id
+            && matches!(descriptor.descriptor.control, 0x11 | 0x12)
+            && !descriptor.descriptor.payload.is_empty()
+        {
+            return Some(ActiveSubscribeServiceInfo {
+                instance: descriptor.descriptor.instance,
+                requestor_instance: descriptor.descriptor.requestor_instance,
+                service_info: descriptor.descriptor.payload,
+            });
+        }
+    }
+
     let mut subscribe = None;
     let mut offset = crate::NAN_ACTION_START;
     while offset + 3 <= frame.len() {
@@ -462,19 +491,89 @@ pub fn build_nan_followup_sdf(
     instance_id: u8,
     payload: &[u8],
 ) -> Vec<u8> {
+    build_nan_followup_sdf_for_requestor(
+        destination,
+        source,
+        cluster_bssid,
+        service_id,
+        instance_id,
+        0,
+        payload,
+    )
+}
+
+/// Build a NAN follow-up directed at the subscribing service instance.
+///
+/// The requestor instance is part of the wire transaction, not radio policy:
+/// adapters must echo the values parsed from the received active Subscribe.
+/// The compatibility wrapper above retains the historically emitted zero
+/// requestor instance for callers that have no Subscribe transaction.
+pub fn build_nan_followup_sdf_for_requestor(
+    destination: [u8; 6],
+    source: [u8; 6],
+    cluster_bssid: [u8; 6],
+    service_id: [u8; 6],
+    instance_id: u8,
+    requestor_instance_id: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     let len = payload.len().min(255);
-    let mut frame = Vec::with_capacity(30 + 3 + 10 + len);
+    // Follow-up SSI belongs in its SDEA, not inline after the SDA control
+    // byte. Android's NAN engine follows this layout: the SDA is the fixed
+    // nine-byte service descriptor and the matching SDEA contains Generic
+    // protocol Service Info. Some raw peers accepted the old inline spelling,
+    // but Android did not deliver it to `onMessageReceived`.
+    let sdea_len = 9 + len; // instance + control + SSI length + OUI/type + SSI
+    let mut frame = Vec::with_capacity(30 + 3 + 9 + 3 + sdea_len);
     frame.extend_from_slice(&[0xd0, 0x00, 0x00, 0x00]);
     frame.extend_from_slice(&destination);
     frame.extend_from_slice(&source);
     frame.extend_from_slice(&cluster_bssid);
     frame.extend_from_slice(&[0x00, 0x00, 0x04, 0x09, 0x50, 0x6f, 0x9a, 0x13]);
     frame.push(0x03);
-    frame.extend_from_slice(&((10 + len) as u16).to_le_bytes());
+    frame.extend_from_slice(&9_u16.to_le_bytes());
     frame.extend_from_slice(&service_id);
-    frame.extend_from_slice(&[instance_id, 0, 0x12, len as u8]);
+    frame.extend_from_slice(&[instance_id, requestor_instance_id, 0x02]);
+    frame.push(0x0e);
+    frame.extend_from_slice(&(sdea_len as u16).to_le_bytes());
+    frame.push(instance_id);
+    frame.extend_from_slice(&0_u16.to_le_bytes());
+    frame.extend_from_slice(&((4 + len) as u16).to_le_bytes());
+    frame.extend_from_slice(&[0x50, 0x6f, 0x9a, 0x02]);
     frame.extend_from_slice(&payload[..len]);
     frame
+}
+
+/// Return the Generic-protocol Service Info from a directed NAN Follow-up.
+/// The standard form uses the fixed-length SDA followed by an SDEA whose
+/// instance matches the SDA. The narrow inline fallback is retained only for
+/// already-captured legacy peers; local encoders always emit the SDEA form.
+pub fn followup_service_info<'a>(frame: &'a [u8], service_id: [u8; 6]) -> Option<&'a [u8]> {
+    let descriptor = crate::service_descriptor(frame, service_id)?;
+    if descriptor.control & 0x03 != 0x02 {
+        return None;
+    }
+    if !descriptor.payload.is_empty() {
+        return Some(descriptor.payload);
+    }
+    let mut offset = crate::NAN_ACTION_START;
+    while offset + 3 <= frame.len() {
+        let attr_id = frame[offset];
+        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
+        let start = offset + 3;
+        let end = start.checked_add(len)?;
+        let body = frame.get(start..end)?;
+        if attr_id == 0x0e && body.len() >= 9 && body[0] == descriptor.instance {
+            let declared = u16::from_le_bytes([body[3], body[4]]) as usize;
+            let payload_len = declared.checked_sub(4)?;
+            let payload_end = 9usize.checked_add(payload_len)?;
+            if body.get(5..9) == Some(&[0x50, 0x6f, 0x9a, 0x02]) && payload_end == body.len() {
+                return body.get(9..payload_end);
+            }
+        }
+        offset = end;
+    }
+    None
 }
 
 pub fn parse_dmesh_nan_followup(data: &[u8]) -> Option<DmeshNanFollowup<'_>> {
@@ -713,9 +812,11 @@ mod tests {
         assert_eq!(frame[sdea], 0x0e);
         let body_start = sdea + 3;
         frame[sdea + 1..sdea + 3].copy_from_slice(&((7 + custom.len()) as u16).to_le_bytes());
-        frame[body_start + 5..body_start + 7]
-            .copy_from_slice(&(custom.len() as u16).to_le_bytes());
-        frame.copy_within(body_start + 11..body_start + 11 + custom.len(), body_start + 7);
+        frame[body_start + 5..body_start + 7].copy_from_slice(&(custom.len() as u16).to_le_bytes());
+        frame.copy_within(
+            body_start + 11..body_start + 11 + custom.len(),
+            body_start + 7,
+        );
         frame.truncate(body_start + 7 + custom.len());
         assert_eq!(
             active_subscribe_service_info(&frame, service_id),
@@ -728,11 +829,50 @@ mod tests {
     }
 
     #[test]
+    fn active_subscribe_prefers_android_control_after_coalesced_publish() {
+        // Pixel 3a capture: one SDF contains its active Publish announce
+        // (control 0x10) followed by the active Subscribe control record
+        // (control 0x11). The latter is direct SDA Service Info rather than
+        // the SDEA spelling used by our synthetic builder.
+        let frame = decode_hex(concat!(
+            "d0000000516f9a01000002e23e7e4875506f9a010000a05f",
+            "0409506f9a130f090000090014010000140003560075943193eac9",
+            "0100104ca30106020205a9015001b6872f5796a581dd40a5c85052f226",
+            "021a0000038403010400070308181d0948506978656c2033610a46636f",
+            "7374696e0b50fe800000000000001c0322fffe4d4f150e04000100020103",
+            "190075943193eac98000110fa401010206031ab43aaddf05a116f50e0400",
+            "800002010f0900000900140100001400121b0043010016001a10180004fe",
+            "ffff3f3151ff07008020000f8001000f"
+        ));
+        let expected = decode_hex("a401010206031ab43aaddf05a116f5");
+        assert_eq!(
+            active_subscribe_service_info(&frame, crate::DMESH_SERVICE_ID),
+            Some(ActiveSubscribeServiceInfo {
+                instance: 0x80,
+                requestor_instance: 0,
+                service_info: expected.as_slice(),
+            })
+        );
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        let raw = value.as_bytes();
+        for pair in raw.chunks_exact(2) {
+            let high = (pair[0] as char).to_digit(16).unwrap() as u8;
+            let low = (pair[1] as char).to_digit(16).unwrap() as u8;
+            bytes.push((high << 4) | low);
+        }
+        bytes
+    }
+
+    #[test]
     fn followup_queue_deduplicates_and_replaces_oldest_at_its_bound() {
         let mut queue = NanFollowupQueue::new(2);
         let first = NanFollowupIntent {
             destination: [1; 6],
             instance: 1,
+            requestor_instance: 0,
             payload: vec![1],
             queued_at_us: 10,
         };
@@ -742,6 +882,7 @@ mod tests {
             queue.enqueue(NanFollowupIntent {
                 destination: [2; 6],
                 instance: 1,
+                requestor_instance: 0,
                 payload: vec![2],
                 queued_at_us: 20,
             }),
@@ -751,6 +892,7 @@ mod tests {
             queue.enqueue(NanFollowupIntent {
                 destination: [3; 6],
                 instance: 1,
+                requestor_instance: 0,
                 payload: vec![3],
                 queued_at_us: 30,
             }),

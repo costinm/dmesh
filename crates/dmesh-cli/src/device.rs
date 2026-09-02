@@ -1,50 +1,35 @@
-//! Shared host inventory for one device per directory.
+//! Shared host inventory resolved from the common E2E/device catalog.
 //!
 //! This module contains names and stable bearer addresses only. It does not
 //! create a transport connection, open a serial adapter, or read credentials.
-//! `dmesh-cli`, `lmesh-wifi`, and `lmesh` can therefore make identical target
-//! choices without recreating the retired forwarding configuration.
+//! `dmesh-cli`, the flasher, and E2E can therefore make identical target
+//! choices without recreating a per-tool forwarding inventory.
 
-// TODO: move to dmesh-server, make sure it doesn't duplicate the core discovery info and persisted devices.
-
-use serde::Deserialize;
+use crate::prober::{DEFAULT_DEVICE_CATALOG, E2eConfig};
 use std::{
-    fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
-/// The default shared inventory. Tests and isolated deployments may override
-/// it with `LMESH_DEVICE_DIR`; production intentionally converges on the
-/// common lmesh home rather than a per-daemon forwarding file.
-pub const DEFAULT_DEVICE_DIRECTORY: &str = "/home/lmesh/etc/lmesh/devices";
+/// Optional override for the one shared inventory location.
+pub const DEVICE_CATALOG_ENV: &str = "DMESH_DEVICE_CATALOG";
 pub const DEFAULT_UDP_PORT: u16 = 3337;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceProfile {
     /// Optional redundant guard against placing the wrong file in a directory.
-    #[serde(default)]
     pub name: Option<String>,
     /// Static STA address, preferred for the current host UDP bearer.
-    #[serde(default)]
     pub static_ipv4: Option<Ipv4Addr>,
     /// Inventory only for now. A link-local route also requires an interface
     /// scope, which belongs to the caller's bearer configuration.
-    #[serde(default)]
     pub ipv6_link_local: Option<Ipv6Addr>,
     /// `/dev/serial/by-id` basename or an explicit absolute serial path.
-    #[serde(default)]
     pub serial_id: Option<String>,
     /// Reserved for the future end-to-end authentication layer. This is a
     /// reference/name, never secret bytes read or logged by this module.
-    #[serde(default)]
     pub auth_secret_ref: Option<String>,
-    #[serde(default = "default_udp_port")]
     pub udp_port: u16,
-}
-
-fn default_udp_port() -> u16 {
-    DEFAULT_UDP_PORT
 }
 
 impl DeviceProfile {
@@ -53,44 +38,69 @@ impl DeviceProfile {
             .map(|ip| SocketAddr::new(IpAddr::V4(ip), self.udp_port))
     }
 
-    pub fn serial_path(&self) -> Option<PathBuf> {
-        self.serial_id.as_deref().map(|id| {
-            let path = Path::new(id);
-            if path.is_absolute() {
-                path.to_owned()
-            } else {
-                Path::new("/dev/serial/by-id").join(path)
-            }
-        })
+    pub fn serial_path(&self) -> Result<Option<PathBuf>, String> {
+        let Some(id) = self.serial_id.as_deref() else {
+            return Ok(None);
+        };
+        let path = Path::new(id);
+        let candidate = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            Path::new("/dev/serial/by-id").join(path)
+        };
+        if !id.contains('*') && !id.contains('?') && !id.contains('[') {
+            return Ok(Some(candidate));
+        }
+        let pattern = candidate.to_string_lossy();
+        let matches = glob::glob(&pattern)
+            .map_err(|error| format!("invalid serial_glob {id:?}: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("expand serial_glob {id:?}: {error}"))?;
+        match matches.as_slice() {
+            [single] => Ok(Some(single.clone())),
+            [] => Err(format!("serial_glob {id:?} matched no device")),
+            _ => Err(format!(
+                "serial_glob {id:?} matched multiple devices: {matches:?}"
+            )),
+        }
     }
 }
 
-pub fn device_directory() -> PathBuf {
-    std::env::var_os("LMESH_DEVICE_DIR")
+pub fn device_catalog_path() -> PathBuf {
+    std::env::var_os(DEVICE_CATALOG_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DEVICE_DIRECTORY))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DEVICE_CATALOG))
 }
 
-/// Load `/home/lmesh/etc/lmesh/devices/<name>/device.toml`. Device names are
-/// path components, not arbitrary paths.
+/// Load a named device from the shared E2E/device catalog. The parser never
+/// reads or exposes the catalog's secret fields.
 pub fn load_device(name: &str) -> Result<DeviceProfile, String> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(format!("invalid device name {name:?}"));
     }
-    let path = device_directory().join(name).join("device.toml");
-    let contents =
-        fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let profile: DeviceProfile =
-        toml::from_str(&contents).map_err(|error| format!("parse {}: {error}", path.display()))?;
-    if let Some(declared) = &profile.name
-        && declared != name
-    {
-        return Err(format!(
-            "device profile {} declares name {declared:?}",
-            path.display()
-        ));
-    }
-    Ok(profile)
+    let path = device_catalog_path();
+    let catalog = E2eConfig::from_path(&path)?;
+    let device = catalog.require_device(name)?;
+    let static_ipv4 = device
+        .ipv4
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error| format!("catalog device {name:?} has invalid ipv4: {error}"))?;
+    let ipv6_link_local = device
+        .ipv6_link_local
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error| format!("catalog device {name:?} has invalid ipv6_link_local: {error}"))?;
+    Ok(DeviceProfile {
+        name: Some(device.name.clone()),
+        static_ipv4,
+        ipv6_link_local,
+        serial_id: device.serial.clone().or_else(|| device.serial_glob.clone()),
+        auth_secret_ref: device.auth_secret_ref.clone(),
+        udp_port: device.udp_port,
+    })
 }
 
 /// Resolve an explicit `udp://IP:PORT`, `IP[:PORT]`, or an inventory name to
@@ -121,7 +131,10 @@ pub fn resolve_udp_peer(target: &str) -> Result<Option<SocketAddr>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_UDP_PORT, DeviceProfile, resolve_udp_peer};
+    use super::{
+        DEFAULT_UDP_PORT, DeviceProfile, device_catalog_path, load_device, resolve_udp_peer,
+    };
+    use crate::prober::DEFAULT_DEVICE_CATALOG;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -136,7 +149,7 @@ mod tests {
         };
         assert_eq!(profile.udp_peer().unwrap().to_string(), "192.0.2.6:3337");
         assert_eq!(
-            profile.serial_path().unwrap().to_string_lossy(),
+            profile.serial_path().unwrap().unwrap().to_string_lossy(),
             "/dev/serial/by-id/usb-e6"
         );
     }
@@ -148,5 +161,29 @@ mod tests {
             "192.0.2.9:3337"
         );
         assert!(resolve_udp_peer("fe80::9").is_err());
+    }
+
+    #[test]
+    fn default_catalog_is_a_tracked_source_fixture() {
+        assert!(DEFAULT_DEVICE_CATALOG.ends_with("examples/device-catalog.toml"));
+        if std::env::var_os("DMESH_DEVICE_CATALOG").is_none() {
+            assert_eq!(
+                device_catalog_path().to_string_lossy(),
+                DEFAULT_DEVICE_CATALOG
+            );
+        }
+    }
+
+    #[test]
+    fn default_catalog_keeps_current_c6_role_selection() {
+        if std::env::var_os("DMESH_DEVICE_CATALOG").is_none() {
+            let profile = load_device("e8").unwrap();
+            assert!(
+                profile
+                    .serial_id
+                    .as_deref()
+                    .is_some_and(|serial| serial.contains("10:BD:A3:AC:5A:20"))
+            );
+        }
     }
 }

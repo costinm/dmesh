@@ -246,12 +246,7 @@ impl WpaSupplicant {
     /// Connect to a WPA3-Personal SAE network.  SAE is deliberately separate
     /// from WPA2-PSK: PMF is required and callers get an explicit command
     /// failure instead of a security downgrade.
-    pub fn connect_wpa3_sae(
-        &self,
-        ssid: &[u8],
-        passphrase: &str,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub fn connect_wpa3_sae(&self, ssid: &[u8], passphrase: &str, timeout: Duration) -> Result<()> {
         if ssid.is_empty()
             || ssid.len() > 32
             || !(8..=63).contains(&passphrase.len())

@@ -16,6 +16,34 @@
     {"id": 0, "name": "event", "fields": [
       {"id": 32, "name": "message", "kind": "text"}
     ]},
+    {"id": 1, "name": "settings.get", "component": 1, "direct_control": true, "fields": [
+      {"id": 1, "name": "key", "kind": "text"}
+    ]},
+    {"id": 2, "name": "settings.set", "component": 1, "direct_control": true, "fields": [
+      {"id": 1, "name": "key", "kind": "text"}, {"id": 2, "name": "value", "kind": "text"}
+    ]},
+    {"id": 3, "name": "settings.list", "component": 1, "direct_control": true},
+    {"id": 4, "name": "transport.set", "component": 1, "direct_control": true, "fields": [
+      {"id": 1, "name": "mode", "kind": "enum", "values": {"sta": 1, "uart": 5, "nan": 6}},
+      {"id": 2, "name": "ssid", "kind": "text"},
+      {"id": 3, "name": "bssid", "kind": "mac"},
+      {"id": 4, "name": "channel", "kind": "u8"},
+      {"id": 5, "name": "raw_tx_rate", "kind": "u8"},
+      {"id": 6, "name": "sta_driver_tx", "kind": "bool"},
+      {"id": 14, "name": "nan_dw_interval", "kind": "u8"},
+      {"id": 15, "name": "now", "kind": "u8"},
+      {"id": 16, "name": "ap", "kind": "u8"},
+      {"id": 17, "name": "passphrase", "kind": "text"},
+      {"id": 24, "name": "open", "kind": "bool"}
+    ]},
+    {"id": 6, "name": "transport.discover", "component": 1, "direct_control": true, "fields": [
+      {"id": 2, "name": "ssid", "kind": "text"},
+      {"id": 4, "name": "channel", "kind": "u8"},
+      {"id": 20, "name": "active_scan", "kind": "bool"},
+      {"id": 21, "name": "passive_scan", "kind": "bool"},
+      {"id": 22, "name": "nan", "kind": "bool"},
+      {"id": 23, "name": "dns_sd", "kind": "bool"}
+    ]},
     {"id": 33, "name": "status"},
     {"id": 34, "name": "xstatus"},
     {"id": 35, "name": "stats"},
@@ -94,6 +122,11 @@
     ]},
     {"id": 73, "name": "radio.snapshot", "component": 4, "direct_control": true, "fields": [
       {"id": 20, "name": "epoch", "kind": "u32"}, {"id": 21, "name": "applied_channel", "kind": "u8"}, {"id": 22, "name": "sta_associated", "kind": "bool"}, {"id": 23, "name": "applied_promiscuous", "kind": "bool"}, {"id": 24, "name": "dw_capturing", "kind": "bool"}, {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"}, {"id": 26, "name": "comparator_armed", "kind": "bool"}, {"id": 27, "name": "comparator_errors", "kind": "u32"}, {"id": 28, "name": "applied_tx_interface", "kind": "enum"}, {"id": 29, "name": "applied_tx_rate", "kind": "enum"}, {"id": 30, "name": "ap_active", "kind": "bool"}, {"id": 31, "name": "mac_ack", "kind": "bool"}, {"id": 40, "name": "tx_attempted", "kind": "u32"}, {"id": 41, "name": "tx_driver_accepted", "kind": "u32"}, {"id": 42, "name": "tx_driver_failed", "kind": "u32"}, {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"}, {"id": 44, "name": "rx_parser_accepted", "kind": "u32"}, {"id": 45, "name": "rx_parser_rejected", "kind": "u32"}, {"id": 46, "name": "rx_self_echo", "kind": "u32"}, {"id": 47, "name": "rx_dropped", "kind": "u32"}, {"id": 48, "name": "nan_beacons", "kind": "u32"}, {"id": 49, "name": "nan_sdfs", "kind": "u32"}, {"id": 50, "name": "nan_followups", "kind": "u32"}, {"id": 51, "name": "tx_duration_us_total", "kind": "u32"}, {"id": 52, "name": "tx_duration_us_max", "kind": "u32"}, {"id": 53, "name": "tx_duration_le_250us", "kind": "u32"}, {"id": 54, "name": "tx_duration_le_750us", "kind": "u32"}, {"id": 55, "name": "tx_duration_le_2ms", "kind": "u32"}, {"id": 56, "name": "tx_duration_gt_2ms", "kind": "u32"}
+    ]},
+    {"id": 77, "name": "wifi.scan", "component": 4, "direct_control": true, "fields": [
+      {"id": 30, "name": "fresh", "kind": "bool"}, {"id": 31, "name": "last_results", "kind": "bool"},
+      {"id": 6, "name": "configured_sta_auth_mode", "kind": "u8"},
+      {"id": 7, "name": "configured_sta_ssid", "kind": "text"}
     ]},
     {"id": 74, "name": "radio.reset_counters", "component": 4, "direct_control": true, "fields": [
       {"id": 20, "name": "epoch", "kind": "u32"}, {"id": 21, "name": "applied_channel", "kind": "u8"}, {"id": 22, "name": "sta_associated", "kind": "bool"}, {"id": 23, "name": "applied_promiscuous", "kind": "bool"}, {"id": 24, "name": "dw_capturing", "kind": "bool"}, {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"}, {"id": 26, "name": "comparator_armed", "kind": "bool"}, {"id": 27, "name": "comparator_errors", "kind": "u32"}, {"id": 28, "name": "applied_tx_interface", "kind": "enum"}, {"id": 29, "name": "applied_tx_rate", "kind": "enum"}, {"id": 30, "name": "ap_active", "kind": "bool"}, {"id": 40, "name": "tx_attempted", "kind": "u32"}, {"id": 41, "name": "tx_driver_accepted", "kind": "u32"}, {"id": 42, "name": "tx_driver_failed", "kind": "u32"}, {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"}, {"id": 44, "name": "rx_parser_accepted", "kind": "u32"}, {"id": 45, "name": "rx_parser_rejected", "kind": "u32"}, {"id": 46, "name": "rx_self_echo", "kind": "u32"}, {"id": 47, "name": "rx_dropped", "kind": "u32"}, {"id": 48, "name": "nan_beacons", "kind": "u32"}, {"id": 49, "name": "nan_sdfs", "kind": "u32"}, {"id": 50, "name": "nan_followups", "kind": "u32"}

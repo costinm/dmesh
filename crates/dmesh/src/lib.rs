@@ -7,12 +7,14 @@
 //!
 //! The Python wrapper lives in the upstream ssh-mesh checkout.
 
-// Re-export workspace crates
-pub use lmesh;
+// Re-export reusable upstream crates.
 pub use mesh_tun;
 pub use ssh_mesh;
 
 pub mod mesh_common;
+
+#[cfg(feature = "jni-wrapper")]
+mod android_nan_protocol;
 
 #[cfg(feature = "jni-wrapper")]
 pub mod mesh_jni;

@@ -8,35 +8,18 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[path = "api.rs"]
-mod api_generated;
-pub mod dispatch;
 mod infra_credentials;
-/// Generated API structs plus stable compatibility aliases used by the
-/// reviewed service adapters. The generated artifact itself remains untouched.
-pub mod api {
-    pub use super::api_generated::*;
-    pub type ApStatusRequest = WifiApStatusRequest;
-    pub type StaStatusRequest = WifiStaStatusRequest;
-    pub type RawNanStatusRequest = WifiRawnanStatusRequest;
-    pub type ProbePlanRequest = WifiProbePlanRequest;
-    pub type InterfaceStatusRequest = WifiInterfaceStatusRequest;
-    pub type ApStationsRequest = WifiApStationsRequest;
-    pub type RawMetricsRequest = WifiRawMetricsRequest;
-    pub type RawStopRequest = WifiRawStopRequest;
-    pub type RawListenRequest = WifiRawListenRequest;
-    pub type RawCheckRequest = WifiRawCheckRequest;
-    pub type RawIperfRequest = WifiRawIperfRequest;
-    pub type RawSendRequest = WifiRawSendRequest;
-    pub type RawNanPingRequest = WifiRawnanPingRequest;
-    pub type RawNanListenRequest = WifiRawnanListenRequest;
-}
-mod ndp;
 mod radio;
 /// Host-side JSON/compatibility conversion for raw NAN and legacy BLE commands.
 /// The byte/state core remains in `dmesh-rawnan`.
 pub mod radio_protocol;
-pub mod reviewed;
+pub mod recovery;
+
+// The shared Linux mesh discovery/routing core. `lmesh` re-exports this
+// module and contributes only its BLE launcher integration.
+extern crate self as lmesh_wifi;
+pub mod mesh_core;
+pub mod mesh_runtime;
 
 pub use infra_credentials::{
     INFRA_STA_CREDENTIALS_PATH, InfrastructureCredentials, load_default_infrastructure_credentials,
@@ -104,8 +87,15 @@ impl WifiService {
             Err(error) => return serde_json::json!({"ok": false, "error": error.to_string()}),
         };
         if ap {
+            if open && passphrase.as_deref().is_some_and(|value| !value.is_empty()) {
+                return serde_json::json!({"ok": false, "iface": iface, "error": "open AP cannot accept a passphrase"});
+            }
             let backend = if open { "open" } else { "p2p" };
-            return self.radio.wifi_p2p_transport_start(Some(iface), &backend);
+            return self.radio.wifi_p2p_transport_start(
+                Some(iface),
+                &backend,
+                passphrase.as_deref().filter(|value| !value.is_empty()),
+            );
         }
         let bssid = match parse_bssid(bssid.as_deref()) {
             Ok(bssid) => bssid,
@@ -141,7 +131,7 @@ impl WifiService {
         };
         let transport = self
             .radio
-            .wifi_p2p_transport_start(Some(iface.clone()), "p2p");
+            .wifi_p2p_transport_start(Some(iface.clone()), "p2p", None);
         if transport.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return serde_json::json!({
                 "ok": false,

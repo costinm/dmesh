@@ -20,6 +20,9 @@ pub mod control;
 /// Bearer-neutral direct IPERF request/result records. This contains no
 /// Recovery-specific command envelope or firmware dependency.
 pub mod direct_iperf;
+/// Shared receiver-side facts exposed by every platform's discovered-device
+/// list. Radio callbacks and retention remain adapter-owned.
+pub mod discovery;
 /// Shared, bearer- and ESP-independent Recovery/Main bootstrap profile.
 pub mod firmware_profile;
 pub mod iperf;
@@ -47,6 +50,8 @@ pub mod raw_iperf;
 pub mod raw_transport;
 /// CBOR-decoded, socket-free raw 802.11 hardware request schema.
 pub mod raw_wifi;
+/// Tagged-CBOR setup records for one-way DCID forwarding.
+pub mod relay;
 /// Predefined common stream services and schemas.  This is deliberately
 /// above `quic-lite`: transport provides ordered streams, while this module
 /// owns service tags, CBOR/object operations, diagnostics, and log watching.
@@ -60,6 +65,8 @@ pub mod sta_selection;
 pub mod stream_server;
 /// Bounded borrowed tagged-CBOR envelope shared with host mesh control.
 pub mod tagged;
+/// Portable local discovery status and transport-owned metric views.
+pub mod telemetry;
 /// Common ingress provenance and policy-driven egress selection shared by
 /// QUIC-lite, direct messages, radio adapters, and future relay paths.
 pub mod transport_path;

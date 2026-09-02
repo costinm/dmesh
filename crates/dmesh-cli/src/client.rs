@@ -8,7 +8,9 @@
 use crate::{
     device::{load_device, resolve_udp_peer},
     l2::UartEgressPacer,
-    schema::{FirmwareSchema, encode_direct_command, render_device_record},
+    schema::{
+        FirmwareSchema, encode_direct_command, encode_direct_command_with_id, render_device_record,
+    },
 };
 use dmesh_server::{
     direct_iperf::{IperfRequest, decode_iperf_result, encode_iperf_request},
@@ -30,12 +32,12 @@ use std::{
     os::fd::AsRawFd,
     os::unix::{
         fs::{FileTypeExt, OpenOptionsExt},
-        net::UnixListener,
+        net::{UnixListener, UnixStream},
     },
     path::Path,
     sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uart_codec::codec::{Decoder, encode_payload};
 
@@ -176,13 +178,18 @@ impl DeviceSession {
         })
     }
 
-    /// Send an unmarked, PPP-framed direct record such as a CBOR raw command.
+    /// Send a PPP-framed DCID-zero direct record. The UART PPP layer remains
+    /// physical framing only; control receives the same short header used by
+    /// the UDP direct-record plane.
     pub fn send_direct_record(&mut self, record: &[u8]) -> Result<(), String> {
-        if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1 {
+        if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_DATAGRAM_SIZE - 6 {
             return Err("direct record is empty or exceeds the UART MTU".into());
         }
         self.assert_healthy()?;
-        send_ppp(&mut self.serial, record)
+        let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let used = quic_lite::encode_direct_packet(0, record, &mut packet)
+            .map_err(|error| format!("UART direct record: {error:?}"))?;
+        send_ppp(&mut self.serial, &packet[..used])
     }
 
     /// Poll the one UART owner and append all received observations to its
@@ -351,7 +358,7 @@ impl ClientPathPolicy {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--command TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--command TEXT | --direct-hex HEX | --iperf-bytes N] [--parallel-streams 1..4] [--high-priority-bytes N] [--low-priority-bytes N] [--target-bps N] [--timeout-secs N]\n       dmesh-cli udp://HOST:PORT|IP|DEVICE --udp-probe\n       dmesh-cli udp://HOST:PORT|IP|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N] [--socket PATH]"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--command TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli SERIAL|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N]\n       dmesh-cli uds:///run/mesh/lmesh[-wifi]/mesh.sock|lmesh://lmesh[-wifi] --method METHOD [--data JSON] [--to NODE]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--command TEXT | --direct-hex HEX | --iperf-bytes N] [--parallel-streams 1..4] [--high-priority-bytes N] [--low-priority-bytes N] [--target-bps N] [--timeout-secs N]\n       dmesh-cli udp://HOST:PORT|IP|DEVICE --udp-probe\n       dmesh-cli udp://HOST:PORT|IP|DEVICE [--services | --service status|metrics|events|services|log-watch|control | --service-tag 0..255] [--body-hex HEX] [--log-records 1..64] [--iperf-bytes N] [--socket PATH]"
     );
     std::process::exit(2)
 }
@@ -468,6 +475,12 @@ pub fn run_dmesh_cli() -> Result<(), String> {
 pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut arguments: Vec<String> = args.into_iter().collect();
     if arguments
+        .first()
+        .is_some_and(|target| proxy_socket_target(target).is_some())
+    {
+        return run_lmesh_proxy_client(&arguments);
+    }
+    if arguments
         .get(1)
         .is_some_and(|argument| argument == "--reset")
     {
@@ -478,7 +491,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         if !target.starts_with('/') {
             let profile = load_device(&target)?;
             let serial = profile
-                .serial_path()
+                .serial_path()?
                 .ok_or_else(|| format!("device {target:?} has no serial_id for --reset"))?;
             arguments[0] = serial.display().to_string();
         }
@@ -499,31 +512,34 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             }
             let profile = load_device(&target)?;
             let serial = profile
-                .serial_path()
+                .serial_path()?
                 .ok_or_else(|| format!("device {target:?} has no serial_id for --watch"))?;
             arguments[0] = serial.display().to_string();
         }
         return run_serial_watch(&arguments);
     }
     // Raw records are an intentional, bounded physical-bearer lane for
-    // schema-defined bootstrap/control and diagnostics. Resolve a named
-    // device to its serial identity *before* normal UDP preference: a profile
-    // may describe both bearers, but `--command` must never silently become a
-    // UDP request.
+    // schema-defined bootstrap/control and diagnostics.  An explicit UDP URI
+    // selects the companion's DCID-zero control lane; a named profile remains
+    // serial-first so a routine local command cannot silently use the radio.
     if arguments
         .get(1)
         .is_some_and(|argument| matches!(argument.as_str(), "--direct-hex" | "--command"))
     {
         let target = arguments.first().cloned().unwrap_or_else(|| usage());
+        if target.starts_with("udp://") {
+            return run_udp_direct_record(&arguments);
+        }
         if !target.starts_with('/') {
-            if target.starts_with("udp://") || target.contains(':') {
+            if target.contains(':') {
                 return Err(
-                    "--command requires a serial path or device profile, not a UDP target".into(),
+                    "--command requires an explicit udp:// target, serial path, or device profile"
+                        .into(),
                 );
             }
             let profile = load_device(&target)?;
             let serial = profile
-                .serial_path()
+                .serial_path()?
                 .ok_or_else(|| format!("device {target:?} has no serial_id for --command"))?;
             arguments[0] = serial.display().to_string();
         }
@@ -545,7 +561,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             // replacing its name with the resolved `/dev/serial/by-id` path.
             Err(_) if !target.starts_with('/') && !target.contains(':') => {
                 let profile = load_device(&target)?;
-                let serial = profile.serial_path().ok_or_else(|| {
+                let serial = profile.serial_path()?.ok_or_else(|| {
                     format!("device {target:?} has neither static_ipv4 nor serial_id")
                 })?;
                 arguments[0] = serial.display().to_string();
@@ -688,7 +704,7 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
             } else {
                 bootstrap.port()
             };
-            let run_id = run_id();
+            let run_id = fresh_request_id() as u32;
             let mut request = IperfRequest::uart(port, bytes, run_id);
             request.parallel_streams = parallel_streams;
             request.high_priority_bytes = high_priority_bytes;
@@ -917,6 +933,98 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
     Err("UART L2 bridge timed out".into())
 }
 
+/// Resolve a supervised host-radio control endpoint.  This is intentionally a
+/// control-plane client, not a serial forwarder: `lmesh-wifi` or `lmesh` owns
+/// NOW/NAN selection and returns its receiver-side counters in the response.
+fn proxy_socket_target(target: &str) -> Option<&str> {
+    match target {
+        "lmesh://lmesh-wifi" => Some("/run/mesh/lmesh-wifi/mesh.sock"),
+        "lmesh://lmesh" => Some("/run/mesh/lmesh/mesh.sock"),
+        _ => target.strip_prefix("uds://"),
+    }
+}
+
+fn proxy_request(
+    method: &str,
+    data: serde_json::Value,
+    to: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut data = data;
+    if !data.is_object() {
+        return Err("--data must be a JSON object".into());
+    }
+    let object = data.as_object_mut().expect("checked object");
+    object.insert(
+        "id".into(),
+        serde_json::json!(format!("dmesh-cli-{}", fresh_request_id())),
+    );
+    object.insert(
+        "method".into(),
+        serde_json::Value::String(method.to_owned()),
+    );
+    if let Some(to) = to {
+        object.insert("to".into(), serde_json::Value::String(to));
+    }
+    Ok(data)
+}
+
+/// Invoke one existing reviewed lmesh method over its JSONL UDS.  The CLI does
+/// not interpret a successful host TX as peer success; it prints the service's
+/// complete result, including NOW response/counter fields where applicable.
+fn run_lmesh_proxy_client(arguments: &[String]) -> Result<(), String> {
+    let target = arguments.first().ok_or("missing proxy target")?;
+    let socket = proxy_socket_target(target).ok_or("invalid proxy target")?;
+    let mut method = None;
+    let mut to = None;
+    let mut data = serde_json::json!({});
+    let mut index = 1;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--method" => {
+                index += 1;
+                method = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --method value")?
+                        .clone(),
+                );
+            }
+            "--data" => {
+                index += 1;
+                data = serde_json::from_str(arguments.get(index).ok_or("missing --data value")?)
+                    .map_err(|error| format!("invalid --data JSON: {error}"))?;
+            }
+            "--to" => {
+                index += 1;
+                to = Some(arguments.get(index).ok_or("missing --to value")?.clone());
+            }
+            unknown => return Err(format!("unknown proxy argument {unknown}")),
+        }
+        index += 1;
+    }
+    let method = method.ok_or("proxy requests require --method METHOD")?;
+    let request = proxy_request(&method, data, to)?;
+    let mut stream =
+        UnixStream::connect(socket).map_err(|error| format!("connect {socket}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| error.to_string())?;
+    writeln!(stream, "{request}").map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .map_err(|error| error.to_string())?;
+    if response.trim().is_empty() {
+        return Err(format!("proxy {socket} returned no response for {method}"));
+    }
+    println!(
+        "dmesh_cli_proxy_response endpoint={socket} method={method} {}",
+        response.trim()
+    );
+    Ok(())
+}
+
 /// Direct physical reset for the client that owns the serial port.  This is
 /// intentionally outside any retired forwarding service.
 fn reset_serial(path: &str) -> Result<(), String> {
@@ -969,9 +1077,10 @@ fn send_uart_transport(serial: &mut File, packet: &[u8]) -> Result<(), String> {
 /// The UART session is the sole serial owner. Direct records are never used
 /// as services, but retaining them here makes the narrowly permitted
 /// UART-QUIC diagnostic line visible when transport setup itself fails.
-fn report_uart_direct_record(path: &str, record: &[u8]) {
+fn report_uart_direct_record(path: &str, record: &[u8], filter: &mut WatchTextFilter) {
     match core::str::from_utf8(record) {
-        Ok(text) => eprintln!("dmesh_uart_diagnostic target={path} {text}"),
+        Ok(text) if filter.retain(text) => eprintln!("dmesh_uart_diagnostic target={path} {text}"),
+        Ok(_) => {}
         Err(_) => eprintln!(
             "dmesh_uart_diagnostic target={path} nontext_record_bytes={} hex={}",
             record.len(),
@@ -992,6 +1101,28 @@ fn report_uart_direct_record(path: &str, record: &[u8]) {
 #[derive(Default)]
 struct RawTextTap {
     line: Vec<u8>,
+}
+
+/// The ESP-IDF sniffer teardown diagnostic may repeat at a fixed cadence while
+/// the radio settles.  Keep the first line for diagnosis but avoid drowning a
+/// bounded boot watch in identical text.
+#[derive(Default)]
+struct WatchTextFilter {
+    seen_disable_sniffer: bool,
+    suppressed_disable_sniffer: u64,
+}
+
+impl WatchTextFilter {
+    fn retain(&mut self, line: &str) -> bool {
+        if line.contains("ic_disable_sniffer") {
+            if self.seen_disable_sniffer {
+                self.suppressed_disable_sniffer = self.suppressed_disable_sniffer.saturating_add(1);
+                return false;
+            }
+            self.seen_disable_sniffer = true;
+        }
+        true
+    }
 }
 
 impl RawTextTap {
@@ -1060,6 +1191,7 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
     let path = arguments.first().ok_or("missing serial path")?;
     let mut index = 1;
     let mut timeout = Duration::from_secs(2);
+    let mut baud = None;
     let record = match arguments.get(index).map(String::as_str) {
         Some("--direct-hex") => {
             index += 1;
@@ -1067,8 +1199,11 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
         }
         Some("--command") => {
             index += 1;
-            encode_direct_command(arguments.get(index).ok_or("missing --command value")?)
-                .map_err(|error| error.to_string())?
+            encode_direct_command_with_id(
+                arguments.get(index).ok_or("missing --command value")?,
+                fresh_request_id(),
+            )
+            .map_err(|error| error.to_string())?
         }
         _ => usage(),
     };
@@ -1085,18 +1220,28 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
                         .map_err(|error| error.to_string())?,
                 );
             }
+            "--baud" => {
+                index += 1;
+                baud = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --baud value")?
+                        .parse::<u32>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
             argument => return Err(format!("raw record does not support {argument}")),
         }
         index += 1;
     }
-    if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1 {
+    if record.is_empty() || record.len() > quic_lite::DEFAULT_MAX_DATAGRAM_SIZE - 6 {
         return Err("raw record is empty or exceeds the UART MTU".into());
     }
     let mut serial = open_serial(path)?;
-    // Direct PPP records use the platform's normal serial speed. Baud-rate
-    // selection is a stream-session option and intentionally is not part of
-    // this one-record diagnostic path.
-    configure_serial(&serial, None)?;
+    // CP210x boards expose a physical 8N1 UART while C6 USB-JTAG uses its
+    // packetized driver cadence. Keep the former opt-in exactly as stream
+    // requests do; direct schema-backed diagnostics must work on both.
+    configure_serial(&serial, baud)?;
     // USB-JTAG retains diagnostic records across short-lived CLI owners. Do
     // not mistake that old backlog for the reply to the record below.
     let mut stale = [0u8; 256];
@@ -1108,7 +1253,10 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-    send_ppp(&mut serial, &record)?;
+    let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    let used = quic_lite::encode_direct_packet(0, &record, &mut packet)
+        .map_err(|error| format!("UART direct record: {error:?}"))?;
+    send_ppp(&mut serial, &packet[..used])?;
     println!("dmesh_cli_raw_sent target={path} bytes={}", record.len());
 
     let schema = FirmwareSchema::load();
@@ -1116,6 +1264,10 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
     let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
     let deadline = Instant::now() + timeout;
     let mut replies = 0u32;
+    // Raw schema commands share the ESP console with stream requests. Keep
+    // the repeated NAN sniffer teardown line from burying a bounded direct
+    // response just as the service path does.
+    let mut text_filter = WatchTextFilter::default();
     while Instant::now() < deadline {
         match serial.read(&mut buffer) {
             Ok(used) if used != 0 => {
@@ -1124,11 +1276,10 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
                     .map_err(|error| error.to_string())?
                 {
                     if let Ok(UartIngress::DirectRecord(record)) = classify_uart_payload(&frame) {
-                        println!(
-                            "dmesh_cli_raw_reply bytes={} {}",
-                            record.len(),
-                            render_device_record(&schema, record)
-                        );
+                        let rendered = render_device_record(&schema, record);
+                        if text_filter.retain(&rendered) {
+                            println!("dmesh_cli_raw_reply bytes={} {rendered}", record.len());
+                        }
                         replies = replies.saturating_add(1);
                     }
                 }
@@ -1145,6 +1296,12 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
     if replies == 0 {
         Err("raw record response timeout".into())
     } else {
+        if text_filter.suppressed_disable_sniffer != 0 {
+            println!(
+                "dmesh_cli_raw_suppressed text=ic_disable_sniffer count={}",
+                text_filter.suppressed_disable_sniffer
+            );
+        }
         Ok(())
     }
 }
@@ -1158,8 +1315,11 @@ fn run_serial_service_request(
     service: u8,
     body: &[u8],
 ) -> Result<(), String> {
-    let cid = quic_lite::ConnectionId::new(u64::from(run_id()))
-        .ok_or("could not allocate UART client CID")?;
+    // Service requests can overlap normal ESP-IDF radio diagnostics. Apply
+    // the same bounded sniffer-teardown filter as `--watch`, otherwise a
+    // useful service response is buried under the identical idle line.
+    let mut text_filter = WatchTextFilter::default();
+    let cid = fresh_connection_id()?;
     let limits = ConnectionLimits::default();
     let mut open = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
     let open_used = quic_lite::encode_bootstrap_open_packet_with_limits(cid, 0, limits, &mut open)
@@ -1182,7 +1342,7 @@ fn run_serial_service_request(
                     let packet = match classify_uart_payload(&record) {
                         Ok(UartIngress::Transport(packet)) => packet,
                         Ok(UartIngress::DirectRecord(record)) => {
-                            report_uart_direct_record(path, record);
+                            report_uart_direct_record(path, record, &mut text_filter);
                             continue;
                         }
                         Err(_) => continue,
@@ -1273,7 +1433,7 @@ fn run_serial_service_request(
                     let packet = match classify_uart_payload(&record) {
                         Ok(UartIngress::Transport(packet)) => packet,
                         Ok(UartIngress::DirectRecord(record)) => {
-                            report_uart_direct_record(path, record);
+                            report_uart_direct_record(path, record, &mut text_filter);
                             continue;
                         }
                         Err(_) => continue,
@@ -1450,6 +1610,7 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
     let schema = FirmwareSchema::load();
     let mut decoder = Decoder::with_max(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1);
     let mut raw_text = RawTextTap::default();
+    let mut text_filter = WatchTextFilter::default();
     let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
     let mut direct_records = 0u64;
     let mut transport_packets = 0u64;
@@ -1491,10 +1652,12 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
             Ok(used) if used != 0 => {
                 received_bytes = received_bytes.saturating_add(used as u64);
                 for line in raw_text.push(&buffer[..used]) {
-                    println!(
-                        "dmesh_uart_watch_text {}",
-                        serde_json::to_string(&line).unwrap()
-                    );
+                    if text_filter.retain(&line) {
+                        println!(
+                            "dmesh_uart_watch_text {}",
+                            serde_json::to_string(&line).unwrap()
+                        );
+                    }
                 }
                 for record in decoder
                     .push(&buffer[..used])
@@ -1538,6 +1701,12 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
     println!(
         "dmesh_uart_watch_timeout received_bytes={received_bytes} direct_records={direct_records} transport_packets={transport_packets}"
     );
+    if text_filter.suppressed_disable_sniffer != 0 {
+        println!(
+            "dmesh_uart_watch_suppressed text=ic_disable_sniffer count={}",
+            text_filter.suppressed_disable_sniffer
+        );
+    }
     // A passive watch may legitimately see nothing.  A watch that explicitly
     // performed the reset cannot: no byte at all means the ROM/Stage2/Main
     // serial path was not observed, so returning success would hide the exact
@@ -1775,6 +1944,10 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     let mut target_bps = None;
     let mut log_records = None;
     let mut session_socket = None;
+    let mut relay_forward_dcid = None;
+    let mut relay_reverse_dcid = None;
+    let mut relay_next_mac = None;
+    let mut relay_allocation = 1u64;
     let mut index = 1;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -1878,6 +2051,43 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
                         .clone(),
                 );
             }
+            "--relay-forward-dcid" => {
+                index += 1;
+                relay_forward_dcid = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --relay-forward-dcid value")?
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "--relay-reverse-dcid" => {
+                index += 1;
+                relay_reverse_dcid = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --relay-reverse-dcid value")?
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "--relay-next-mac" => {
+                index += 1;
+                relay_next_mac = Some(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --relay-next-mac value")?
+                        .clone(),
+                );
+            }
+            "--relay-allocation" => {
+                index += 1;
+                relay_allocation = arguments
+                    .get(index)
+                    .ok_or("missing --relay-allocation value")?
+                    .parse::<u64>()
+                    .map_err(|error| error.to_string())?;
+            }
             _ => return Err(format!("unknown UDP client argument {}", arguments[index])),
         }
         index += 1;
@@ -1912,18 +2122,121 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     let mut request = Vec::with_capacity(1 + body.len());
     request.push(service);
     request.extend_from_slice(&body);
-    let cid = quic_lite::ConnectionId::new(u64::from(run_id()))
-        .ok_or("could not allocate UDP client CID")?;
+    let relay = match (relay_forward_dcid, relay_reverse_dcid, relay_next_mac) {
+        (None, None, None) => None,
+        (Some(forward), Some(reverse), Some(next_mac)) => Some((
+            quic_lite::ConnectionId::new(forward).ok_or("invalid relay forward DCID")?,
+            quic_lite::ConnectionId::new(reverse).ok_or("invalid relay reverse DCID")?,
+            next_mac,
+        )),
+        _ => return Err("relay mode requires forward DCID, reverse DCID, and next MAC".into()),
+    };
+    // This CID is owned by dmesh-cli and remains stable across relay alias
+    // allocation. It is never a relay allocation.
+    let cid = fresh_connection_id()?;
+    let relay_pair = if let Some((forward, reverse, next_mac)) = relay.as_ref() {
+        let revision = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_micros()
+            .min(u128::from(u64::MAX - 1)) as u64;
+        let reverse_allocation = relay_allocation
+            .checked_add(1)
+            .ok_or("relay reverse allocation overflow")?;
+        let pair = format!(
+            "relay.pair forward_allocation={relay_allocation} reverse_allocation={reverse_allocation} revision={revision} forward_dcid={} reverse_dcid={} client_dcid={} position=1 return_token={relay_allocation} next_mac={next_mac}",
+            forward.value(),
+            reverse.value(),
+            cid.value(),
+        );
+        let request = encode_direct_command_with_id(&pair, fresh_request_id())
+            .map_err(|error| error.to_string())?;
+        let response = exchange_udp_direct_record(peer, &request)?;
+        let (_, response) = quic_lite::decode_direct_packet(&response)
+            .map_err(|error| format!("relay pair response packet: {error:?}"))?;
+        let response = dmesh_server::tagged::decode(response)
+            .ok_or("relay pair response is not tagged CBOR")?;
+        if response.error.is_some() {
+            return Err("relay pair returned an error".into());
+        }
+        let observed = dmesh_server::relay::decode_observed_pair(
+            response.result.ok_or("relay pair response has no result")?,
+        )
+        .ok_or("relay pair response has invalid aliases")?;
+        eprintln!(
+            "dmesh_udp_relay_pair requested_forward={} requested_reverse={} forward_dcid={} reverse_dcid={} client_dcid={}",
+            forward.value(),
+            reverse.value(),
+            observed.forward.local_dcid.unwrap().value(),
+            observed.reverse.local_dcid.unwrap().value(),
+            cid.value(),
+        );
+        Some((revision, observed))
+    } else {
+        None
+    };
     let schema = FirmwareSchema::load();
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
-        let mut client = dmesh_server::udp::UdpClient::connect(
-            udp_bind_for_peer(peer),
-            peer,
-            cid,
-        )
-        .await
+        let mut client = if let Some((_, observed)) = relay_pair {
+            dmesh_server::udp::UdpClient::connect_with_quic_lite_wire_dcid(
+                udp_bind_for_peer(peer),
+                peer,
+                cid,
+                observed.forward.local_dcid.unwrap(),
+            )
+            .await
+        } else {
+            dmesh_server::udp::UdpClient::connect(udp_bind_for_peer(peer), peer, cid).await
+        }
         .map_err(|error| error.to_string())?;
+        if let Some((pair_revision, observed)) = relay_pair {
+            let (_, _, next_mac) = relay.as_ref().expect("relay pair has relay options");
+            let forward = observed.forward.local_dcid.unwrap();
+            let reverse = observed.reverse.local_dcid.unwrap();
+            let server_cid = client
+                .peer_connection_id()
+                .ok_or("relayed bootstrap did not install server CID")?;
+            eprintln!(
+                "dmesh_udp_relay_bootstrap forward_dcid={} reverse_dcid={} server_dcid={}",
+                forward.value(),
+                reverse.value(),
+                server_cid.value()
+            );
+            let revision = pair_revision
+                .checked_add(1)
+                .ok_or("missing relay pair revision")?;
+            let update = encode_direct_command_with_id(
+                &format!(
+                    "relay.apply allocation={relay_allocation} revision={revision} inbound_dcid={} outbound_dcid={} position=1 next_mac={next_mac}",
+                    forward.value(),
+                    server_cid.value()
+                ),
+                fresh_request_id(),
+            )
+            .map_err(|error| error.to_string())?;
+            let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+            let used = quic_lite::encode_direct_packet(fresh_packet_number(), &update, &mut packet)
+                .map_err(|error| format!("relay update packet: {error:?}"))?;
+            let update_response = client
+                .exchange_direct(&packet[..used])
+                .await
+                .map_err(|error| error.to_string())?;
+            let update_record = dmesh_server::tagged::decode(
+                quic_lite::decode_direct_packet(&update_response)
+                    .map_err(|error| format!("relay update response packet: {error:?}"))?
+                    .1,
+            )
+            .ok_or("relay update response is not tagged CBOR")?;
+            if update_record.error.is_some() {
+                return Err("relay update returned an error".into());
+            }
+            eprintln!(
+                "dmesh_udp_relay_updated forward_dcid={} outbound_dcid={}",
+                forward.value(),
+                server_cid.value()
+            );
+        }
         if service == quic_lite::SERVICE_IPERF {
             client.set_deferred_receive_credit(true);
             let started = Instant::now();
@@ -2060,20 +2373,20 @@ fn run_udp_bearer_probe(peer: SocketAddr) -> Result<(), String> {
     // IPv4 wildcard first makes the diagnostic fail before it exercises the
     // bearer at all, even though the normal UDP client selects the family
     // from its peer through `udp_bind_for_peer`.
-    let bind = match peer {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => "[::]:0",
-    };
-    let socket = UdpSocket::bind(bind).map_err(|error| error.to_string())?;
+    let socket = UdpSocket::bind(udp_bind_for_peer(peer)).map_err(|error| error.to_string())?;
     socket.connect(peer).map_err(|error| error.to_string())?;
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| error.to_string())?;
-    let nonce = u64::from(run_id());
-    let request = quic_lite::bearer_probe::encode_udp_bearer_probe(nonce);
+    let nonce = fresh_request_id();
+    let packet_number = fresh_packet_number();
+    let mut request = [0u8; 64];
+    let request_len =
+        quic_lite::bearer_probe::encode_udp_bearer_probe(packet_number, nonce, &mut request)
+            .ok_or("encode UDP bearer probe")?;
     let started = Instant::now();
     loop {
-        match socket.send(&request) {
+        match socket.send(&request[..request_len]) {
             Ok(_) => break,
             Err(error)
                 if error.kind() == ErrorKind::WouldBlock
@@ -2084,7 +2397,7 @@ fn run_udp_bearer_probe(peer: SocketAddr) -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-    let mut response = [0u8; quic_lite::bearer_probe::UDP_BEARER_PROBE_LEN];
+    let mut response = [0u8; 64];
     let used = loop {
         match socket.recv(&mut response) {
             Ok(used) => break used,
@@ -2104,10 +2417,100 @@ fn run_udp_bearer_probe(peer: SocketAddr) -> Result<(), String> {
         return Err("UDP bearer probe received an invalid response".into());
     }
     println!(
-        "dmesh_udp_probe target={peer} nonce={nonce} elapsed_us={}",
+        "dmesh_udp_probe target={peer} request_id={nonce} packet_number={packet_number} elapsed_us={}",
         started.elapsed().as_micros()
     );
     Ok(())
+}
+
+/// Send one schema-backed DCID-zero control record to an explicit UDP
+/// companion.  This is deliberately separate from a QUIC-lite service stream:
+/// it is used to request radio actions such as active discovery before a
+/// relay/DCID route exists.
+fn run_udp_direct_record(arguments: &[String]) -> Result<(), String> {
+    let target = arguments.first().ok_or("missing UDP target")?;
+    let peer = target
+        .strip_prefix("udp://")
+        .ok_or("UDP target must use udp://HOST:PORT")?;
+    let peer = parse_udp_peer(peer)?;
+    let mut index = 1;
+    let record = match arguments.get(index).map(String::as_str) {
+        Some("--direct-hex") => {
+            index += 1;
+            hex(arguments.get(index).ok_or("missing --direct-hex value")?)?
+        }
+        Some("--command") => {
+            index += 1;
+            encode_direct_command_with_id(
+                arguments.get(index).ok_or("missing --command value")?,
+                fresh_request_id(),
+            )
+            .map_err(|error| error.to_string())?
+        }
+        _ => usage(),
+    };
+    index += 1;
+    let mut timeout = Duration::from_secs(2);
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--timeout-secs" => {
+                index += 1;
+                timeout = Duration::from_secs(
+                    arguments
+                        .get(index)
+                        .ok_or("missing --timeout-secs value")?
+                        .parse::<u64>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            argument => return Err(format!("UDP direct record does not support {argument}")),
+        }
+        index += 1;
+    }
+    let response = exchange_udp_direct_record_with_timeout(peer, &record, timeout)?;
+    let (_, response_record) = quic_lite::decode_direct_packet(&response)
+        .map_err(|_| "UDP direct record received a non-direct response".to_owned())?;
+    let schema = FirmwareSchema::load();
+    println!(
+        "dmesh_udp_direct_reply target={peer} {}",
+        render_device_record(&schema, response_record)
+    );
+    Ok(())
+}
+
+/// Exchange one direct record from the fixed dmesh-cli UDP source port.
+/// Keeping this tuple stable is deliberate: relay.pair binds its reverse path
+/// to it, while independent dmesh-cli invocations can reuse that binding.
+fn exchange_udp_direct_record(peer: SocketAddr, record: &[u8]) -> Result<Vec<u8>, String> {
+    exchange_udp_direct_record_with_timeout(peer, record, Duration::from_secs(2))
+}
+
+fn exchange_udp_direct_record_with_timeout(
+    peer: SocketAddr,
+    record: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    let packet_number = fresh_packet_number();
+    let used = quic_lite::encode_direct_packet(packet_number, record, &mut packet)
+        .map_err(|error| format!("encode UDP direct packet: {error:?}"))?;
+    let socket = UdpSocket::bind(udp_bind_for_peer(peer)).map_err(|error| error.to_string())?;
+    socket.connect(peer).map_err(|error| error.to_string())?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    socket
+        .send(&packet[..used])
+        .map_err(|error| error.to_string())?;
+    let mut response = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    let response_len = socket.recv(&mut response).map_err(|error| {
+        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+            "UDP direct record timeout (no reply)".to_owned()
+        } else {
+            error.to_string()
+        }
+    })?;
+    Ok(response[..response_len].to_vec())
 }
 
 #[derive(Deserialize)]
@@ -2288,8 +2691,7 @@ pub fn serve_udp_session_socket(peer: SocketAddr, socket_path: &Path) -> Result<
     listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
-    let cid = quic_lite::ConnectionId::new(u64::from(run_id()))
-        .ok_or("could not allocate UDP session CID")?;
+    let cid = fresh_connection_id()?;
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     let mut client = runtime
         .block_on(dmesh_server::udp::UdpClient::connect(
@@ -2316,7 +2718,7 @@ pub fn serve_udp_session_socket(peer: SocketAddr, socket_path: &Path) -> Result<
                         .service_tag
                         .or_else(|| request.service.as_deref().and_then(service_tag))
                     {
-                        None => serde_json::json!({"success": false, "error": "unknown service"}),
+                        None => serde_json::json!({"error": "unknown service"}),
                         Some(service) => {
                             let body = request.body_hex.as_deref().map(hex).transpose();
                             match body {
@@ -2333,21 +2735,23 @@ pub fn serve_udp_session_socket(peer: SocketAddr, socket_path: &Path) -> Result<
                                         .block_on(client.request_stream(stream_id, &packet, true))
                                     {
                                         Ok((stream_id, record, fin)) => serde_json::json!({
-                                            "success": true, "stream": stream_id, "fin": fin,
-                                            "record": render_device_record(&schema, &record),
-                                            "record_hex": hex_encode(&record),
+                                            "response": {
+                                                "stream": stream_id, "fin": fin,
+                                                "record": render_device_record(&schema, &record),
+                                                "record_hex": hex_encode(&record),
+                                            }
                                         }),
                                         Err(error) => {
-                                            serde_json::json!({"success": false, "error": error.to_string()})
+                                            serde_json::json!({"error": error.to_string()})
                                         }
                                     }
                                 }
-                                Err(error) => serde_json::json!({"success": false, "error": error}),
+                                Err(error) => serde_json::json!({"error": error}),
                             }
                         }
                     },
                     Err(error) => {
-                        serde_json::json!({"success": false, "error": format!("invalid JSON request: {error}")})
+                        serde_json::json!({"error": format!("invalid JSON request: {error}")})
                     }
                 };
                 writeln!(stream, "{response}").map_err(|error| error.to_string())?;
@@ -2370,17 +2774,429 @@ fn bearer_name(path_policy: ClientPathPolicy) -> &'static str {
     }
 }
 
-fn run_id() -> u32 {
-    let value = Instant::now().elapsed().as_nanos() as u32 ^ std::process::id();
-    value.max(1)
+/// Fresh caller identity for correlation across independent CLI invocations.
+///
+/// Never derive this from process ID or a newly-created `Instant`: both made
+/// consecutive dmesh-cli runs reuse the same connection ID and let a delayed
+/// datagram be misattributed to the next request.
+fn fresh_request_id() -> u64 {
+    loop {
+        let value = rand::random::<u64>();
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+fn fresh_connection_id() -> Result<quic_lite::ConnectionId, String> {
+    let value = (fresh_request_id() & quic_lite::ConnectionId::MAX_VALUE).max(1);
+    quic_lite::ConnectionId::new(value).ok_or("could not allocate random client CID".to_owned())
+}
+
+fn fresh_packet_number() -> u32 {
+    // Keep below the full-width boundary so the bootstrap and its retries can
+    // advance without wrapping, while still avoiding the fixed packet zero.
+    (rand::random::<u32>() & 0x3fff_ffff).max(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientPathPolicy, RawTextTap, is_fatal_diagnostic, parse_udp_peer, render_binary_events,
-        render_handler_list,
+        ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic, parse_udp_peer,
+        proxy_request, proxy_socket_target, render_binary_events, render_handler_list,
     };
+    use dmesh_server::relay::{
+        DesiredRule, PairRequest, RelayRoute, RelayState, Request, decode_pair_request,
+        decode_request, encode_observed_pair, encode_observed_rule, encode_pair_request,
+        encode_request, now_next_hop_handle, udp6_next_hop_handle,
+    };
+    use dmesh_server::udp::{
+        RelayDatagramHandler, RelayDatagramOutcome, TaggedStreamContext, TaggedStreamHandler,
+        UdpClient, UdpConfig,
+    };
+    use quic_lite::{
+        ConnectionId, DcidDatagram, dispatch_datagram,
+    };
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UdpSocket;
+
+    #[derive(Clone)]
+    struct RelayHarness {
+        state: Arc<Mutex<RelayState<SocketAddr, 2>>>,
+        server_addr: SocketAddr,
+        forward_count: Arc<AtomicUsize>,
+        reverse_count: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct DirectRelayAdminSentinel(AtomicUsize);
+
+    impl dmesh_server::relay::DirectHandler for DirectRelayAdminSentinel {
+        fn handle_direct(
+            &self,
+            _packet_number: u32,
+            payload: &[u8],
+            _out: &mut [u8],
+        ) -> dmesh_server::relay::DirectOutcome {
+            if decode_pair_request(payload).is_some() || decode_request(payload).is_some() {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            dmesh_server::relay::DirectOutcome::NotHandled
+        }
+    }
+
+    impl TaggedStreamHandler for RelayHarness {
+        fn handle<'a>(
+            &'a self,
+            context: TaggedStreamContext,
+            request: Vec<u8>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move {
+                let record = dmesh_server::tagged::decode(&request)?;
+                let id = record.id?;
+                let mut response = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+                let used = if let Some(pair) = decode_pair_request(&request) {
+                    let (forward, reverse) = self
+                        .state
+                        .lock()
+                        .ok()?
+                        .reconcile_pair(pair, |handle| {
+                            if now_next_hop_handle([2, 0, 0, 0, 0, 1]) == Some(handle) {
+                                Some(self.server_addr)
+                            } else if udp6_next_hop_handle(1) == Some(handle) {
+                                Some(context.peer)
+                            } else {
+                                None
+                            }
+                        })
+                        .ok()?;
+                    let mut fields = [0u8; 64];
+                    let fields_len = encode_observed_pair(forward, reverse, &mut fields)?;
+                    dmesh_server::tagged::encode_numeric_response(
+                        dmesh_server::relay::RELAY_COMPONENT,
+                        dmesh_server::relay::RELAY_APPLY_PAIR,
+                        id,
+                        &fields[..fields_len],
+                        &mut response,
+                    )?
+                } else if let Some(request) = decode_request(&request) {
+                    let observed = self
+                        .state
+                        .lock()
+                        .ok()?
+                        .reconcile(request, |handle| {
+                            (now_next_hop_handle([2, 0, 0, 0, 0, 1]) == Some(handle))
+                                .then_some(self.server_addr)
+                        })
+                        .ok()?;
+                    let mut fields = [0u8; 64];
+                    let fields_len = encode_observed_rule(observed, &mut fields)?;
+                    dmesh_server::tagged::encode_numeric_response(
+                        dmesh_server::relay::RELAY_COMPONENT,
+                        dmesh_server::relay::RELAY_APPLY,
+                        id,
+                        &fields[..fields_len],
+                        &mut response,
+                    )?
+                } else if record.component == Some(dmesh_server::tagged::Name::Tag(6))
+                    && record.method == Some(dmesh_server::tagged::Name::Tag(9))
+                {
+                    // `curl -sS -X POST http://127.0.0.1:18981/_m/mesh \
+                    //   -H 'content-type: application/json' \
+                    //   --data '{"id":31,"method":"discovery.nodes"}'`
+                    // exercises the same catalog method through HTTP.
+                    dmesh_server::tagged::encode_numeric_response(6, 9, id, &[0x81, 0x65, b'r', b'e', b'l', b'a', b'y'], &mut response)?
+                } else {
+                    return None;
+                };
+                Some(response[..used].to_vec())
+            })
+        }
+    }
+
+    impl RelayDatagramHandler for RelayHarness {
+        fn handle(
+            &self,
+            ingress: SocketAddr,
+            packet: &[u8],
+            out: &mut [u8],
+        ) -> RelayDatagramOutcome {
+            let Ok(state) = self.state.lock() else {
+                return RelayDatagramOutcome::Drop;
+            };
+            let Ok(datagram) = dispatch_datagram(state.registry(), packet, out) else {
+                return RelayDatagramOutcome::NotHandled;
+            };
+            let DcidDatagram::Forward { rule, used } = datagram else {
+                return RelayDatagramOutcome::NotHandled;
+            };
+            if ingress == self.server_addr {
+                self.reverse_count.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.forward_count.fetch_add(1, Ordering::Relaxed);
+            }
+            let used = if rule.outbound_dcid.value() == 0 && ingress != self.server_addr {
+                let Ok((header, _)) = quic_lite::ShortHeader::decode(packet) else {
+                    return RelayDatagramOutcome::Drop;
+                };
+                let Some(reverse) = state.relay_open_return_dcid(header.dcid) else {
+                    return RelayDatagramOutcome::Drop;
+                };
+                let Ok(used) = quic_lite::rewrite_relay_open(
+                    packet,
+                    rule.outbound_dcid,
+                    reverse,
+                    out,
+                ) else {
+                    return RelayDatagramOutcome::Drop;
+                };
+                used
+            } else {
+                used
+            };
+            RelayDatagramOutcome::Forward {
+                peer: rule.next_hop,
+                used,
+            }
+        }
+    }
+
+    /// CLIENT, RELAY, and SERVER share actual UDP listeners. Relay
+    /// administration is sent on normal QUIC streams; only the current
+    /// QUIC-lite relay-open bootstrap uses DCID zero.
+    #[tokio::test]
+    async fn udp_relay_pair_rewrites_bootstrap_and_status_both_directions() {
+        let root = std::env::temp_dir().join(format!(
+            "dmesh-cli-relay-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        drop(server_socket);
+        let server_task = tokio::spawn(dmesh_server::udp::run(UdpConfig {
+            bind: server_addr,
+            artifact_root: root.clone(),
+            ..UdpConfig::default()
+        }));
+
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        drop(relay_socket);
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forward_count = Arc::new(AtomicUsize::new(0));
+        let reverse_count = Arc::new(AtomicUsize::new(0));
+        let relay = Arc::new(RelayHarness {
+            state: Arc::new(Mutex::new(RelayState::new())),
+            server_addr,
+            forward_count: forward_count.clone(),
+            reverse_count: reverse_count.clone(),
+        });
+        let direct_relay_admin = Arc::new(DirectRelayAdminSentinel(AtomicUsize::new(0)));
+        let relay_task = tokio::spawn(dmesh_server::udp::run(UdpConfig {
+            bind: relay_addr,
+            artifact_root: root.clone(),
+            tagged_handler: Some(relay.clone()),
+            relay_handler: Some(relay),
+            direct_handler: Some(direct_relay_admin.clone()),
+            ..UdpConfig::default()
+        }));
+
+        // The first control connection uses the same stable client UDP tuple
+        // that Step 2 will reuse for relay-open. `relay.pair` itself travels
+        // on a normal tagged QUIC stream, never through the direct handler.
+        let mut control = UdpClient::connect_with_socket(
+            client_socket,
+            relay_addr,
+            ConnectionId::new(71).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut discovery = [0u8; 32];
+        // HTTP-equivalent discovery request used by the dashboard before it
+        // offers a relay-local neighbor:
+        // curl -sS -X POST http://127.0.0.1:18982/_m/mesh/services/lmesh/call/discovery.nodes \
+        //   -H 'content-type: application/json' --data '{"id":31}'
+        let discovery_len = dmesh_server::tagged::encode_numeric_empty_request(
+            6,
+            9,
+            31,
+            &mut discovery,
+        )
+        .unwrap();
+        let (_, discovery_response, discovery_fin) = control
+            .request_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                &discovery[..discovery_len],
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(discovery_fin);
+        let discovery_response = dmesh_server::tagged::decode(&discovery_response).unwrap();
+        assert_eq!(discovery_response.id, Some(31));
+        assert_eq!(discovery_response.result, Some(&[0x81, 0x65, b'r', b'e', b'l', b'a', b'y'][..]));
+
+        let pair = PairRequest {
+            forward: Request {
+                allocation: 1,
+                revision: 1,
+                rule: Some(DesiredRule {
+                    proposed_dcid: Some(ConnectionId::new(8).unwrap()),
+                    route: RelayRoute {
+                        next_hop: now_next_hop_handle([2, 0, 0, 0, 0, 1]).unwrap(),
+                        outbound_dcid: ConnectionId::new(0).unwrap(),
+                    },
+                    position: 1,
+                }),
+            },
+            reverse: Request {
+                allocation: 2,
+                revision: 1,
+                rule: Some(DesiredRule {
+                    proposed_dcid: Some(ConnectionId::new(12).unwrap()),
+                    route: RelayRoute {
+                        next_hop: udp6_next_hop_handle(1).unwrap(),
+                        outbound_dcid: ConnectionId::new(77).unwrap(),
+                    },
+                    position: 1,
+                }),
+            },
+        };
+        // Step-1 HTTP driver:
+        // curl -sS -X POST http://127.0.0.1:18981/_m/mesh/services/lmesh/call/relay.connect \
+        //   -H 'content-type: application/json' \
+        //   --data '{"id":41,"relay_endpoint":"udp://[fe80::226e:f1ff:fe13:b170]:3339","next_hop_mac":"10:bd:a3:ac:5a:20"}'
+        // performs this stream-side discovery + relay.pair sequence. Android
+        // uses the same JSON at `/services/android/call/relay.connect`.
+        let mut record = [0u8; 192];
+        let record_len = encode_pair_request(pair, Some(41), &mut record).unwrap();
+        let (_, response, response_fin) = control
+            .request_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4,
+                &record[..record_len],
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(response_fin);
+        let response_record = dmesh_server::tagged::decode(&response).unwrap();
+        assert_eq!(
+            response_record.method,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::relay::RELAY_APPLY_PAIR
+            ))
+        );
+        assert!(response_record.error.is_none());
+        let observed =
+            dmesh_server::relay::decode_observed_pair(response_record.result.unwrap()).unwrap();
+        assert_eq!(observed.forward.local_dcid.unwrap().value(), 8);
+        assert_eq!(observed.reverse.local_dcid.unwrap().value(), 12);
+        assert_eq!(
+            direct_relay_admin.0.load(Ordering::Relaxed),
+            0,
+            "relay.pair must be administered through a normal QUIC stream"
+        );
+        let client_socket = control.into_socket();
+
+        let mut client = UdpClient::connect_with_socket_and_quic_lite_wire_dcid(
+            client_socket,
+            relay_addr,
+            ConnectionId::new(77).unwrap(),
+            ConnectionId::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+        let server_cid = client.peer_connection_id().unwrap();
+        assert_ne!(server_cid.value(), 0);
+        let update = Request {
+            allocation: 1,
+            revision: 2,
+            rule: Some(DesiredRule {
+                proposed_dcid: Some(ConnectionId::new(8).unwrap()),
+                route: RelayRoute {
+                    next_hop: now_next_hop_handle([2, 0, 0, 0, 0, 1]).unwrap(),
+                    outbound_dcid: server_cid,
+                },
+                position: 1,
+            }),
+        };
+        let mut update_record = [0u8; 128];
+        let update_record_len = encode_request(update, Some(42), &mut update_record).unwrap();
+        // The current one-connection UDP helper gives its socket to the
+        // relayed endpoint above. A later shared client-session mux will keep
+        // this original control connection alive. Until then, verify that the
+        // reconciliation is still a normal QUIC stream, not a direct packet.
+        let mut update_control = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            relay_addr,
+            ConnectionId::new(72).unwrap(),
+        )
+        .await
+        .unwrap();
+        // `relay.apply` is an internal Step-2 reconciliation record, not a
+        // public HTTP method. The future HTTP driver remains `relay.connect`;
+        // it owns the retained session and performs this update after OPEN_ACK.
+        let (_, update_response, update_fin) = update_control
+            .request_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                &update_record[..update_record_len],
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(update_fin);
+        assert!(
+            dmesh_server::tagged::decode(&update_response)
+                .unwrap()
+                .error
+                .is_none()
+        );
+
+        let (_, status, fin) = client
+            .request_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                &[quic_lite::SERVICE_STATUS],
+                true,
+            )
+            .await
+            .unwrap();
+        let status = String::from_utf8(status).unwrap();
+        assert!(fin);
+        assert!(
+            status.contains("connection_dcid="),
+            "status handler response: {status}"
+        );
+        assert!(
+            forward_count.load(Ordering::Relaxed) >= 2,
+            "bootstrap plus status must traverse forward route"
+        );
+        assert!(
+            reverse_count.load(Ordering::Relaxed) >= 2,
+            "bootstrap ACK plus status must traverse reverse route"
+        );
+        assert_eq!(
+            direct_relay_admin.0.load(Ordering::Relaxed),
+            0,
+            "relay.apply must be administered through a normal QUIC stream"
+        );
+        eprintln!(
+            "dmesh-cli relay-e2e server_dcid={} forward_packets={} reverse_packets={}",
+            server_cid.value(),
+            forward_count.load(Ordering::Relaxed),
+            reverse_count.load(Ordering::Relaxed)
+        );
+        relay_task.abort();
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn path_policy_aliases_and_firmware_values_are_stable() {
@@ -2428,6 +3244,38 @@ mod tests {
         assert_eq!(tap.push(b"uart\r\n"), vec!["boot step=uart"]);
         assert!(tap.push(&[0x7e, b'a', 0, b'\n', 0x7e]).is_empty());
         assert_eq!(tap.push(b"panic=none\n"), vec!["panic=none"]);
+    }
+
+    #[test]
+    fn proxy_targets_and_requests_use_existing_jsonl_contract() {
+        assert_eq!(
+            proxy_socket_target("lmesh://lmesh-wifi"),
+            Some("/run/mesh/lmesh-wifi/mesh.sock")
+        );
+        assert_eq!(
+            proxy_socket_target("uds:///tmp/lmesh.sock"),
+            Some("/tmp/lmesh.sock")
+        );
+        let request = proxy_request(
+            "wifi.raw.check",
+            serde_json::json!({"destination":"14:c1:9f:e4:5d:48"}),
+            Some("14c19fe45d48".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(request["method"], "wifi.raw.check");
+        assert_eq!(request["destination"], "14:c1:9f:e4:5d:48");
+        assert_eq!(request["to"], "14c19fe45d48");
+        assert!(request["id"].as_str().unwrap().starts_with("dmesh-cli-"));
+        assert!(proxy_request("wifi.raw.check", serde_json::json!([]), None).is_err());
+    }
+
+    #[test]
+    fn watch_filter_keeps_first_sniffer_diagnostic() {
+        let mut filter = WatchTextFilter::default();
+        assert!(filter.retain("I (1) wifi:ic_disable_sniffer"));
+        assert!(!filter.retain("I (2) wifi:ic_disable_sniffer"));
+        assert!(filter.retain("DMESH main: radio ready"));
+        assert_eq!(filter.suppressed_disable_sniffer, 1);
     }
 
     #[test]

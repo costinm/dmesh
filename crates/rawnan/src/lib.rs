@@ -29,12 +29,13 @@ pub use channel_observation::{ChannelObservation, ChannelObservationSummary};
 pub mod service;
 pub use service::{
     active_ack_for_service, active_subscribe_service_info, build_dmesh_followup_payload,
-    build_dmesh_service_info, build_nan_followup_sdf, build_nan_publish_sdf,
-    build_nan_publish_sdf_with_sdea, build_nan_service_extension, build_nan_usd_sdf,
-    build_nan_usd_sdf_with_bssid, is_dmesh_service_info, parse_dmesh_nan_followup,
-    parse_dmesh_service_info, wake_request_for_service, ActiveSubscribeServiceInfo,
-    DmeshNanFollowup, DmeshServiceInfo, NanActivePublish, NanFollowupEnqueue, NanFollowupIntent,
-    NanFollowupQueue, NAN_ACTIVE_PUBLISH_INTERVAL_MS, NAN_ACTIVE_PUBLISH_MAX_LEN,
+    build_dmesh_service_info, build_nan_followup_sdf, build_nan_followup_sdf_for_requestor,
+    build_nan_publish_sdf, build_nan_publish_sdf_with_sdea, build_nan_service_extension,
+    build_nan_usd_sdf, build_nan_usd_sdf_with_bssid, followup_service_info, is_dmesh_service_info,
+    parse_dmesh_nan_followup, parse_dmesh_service_info, wake_request_for_service,
+    ActiveSubscribeServiceInfo, DmeshNanFollowup, DmeshServiceInfo, NanActivePublish,
+    NanFollowupEnqueue, NanFollowupIntent, NanFollowupQueue, NAN_ACTIVE_PUBLISH_INTERVAL_MS,
+    NAN_ACTIVE_PUBLISH_MAX_LEN,
 };
 
 pub const FRAME_DST: usize = 4;
@@ -55,6 +56,11 @@ pub const NAN_DW_DONE: u8 = 1 << 1;
 pub const NAN_DW_UNITS_SHIFT: u8 = 2;
 pub const NAN_RX_FRAME_MAX: usize = 1536;
 pub const NAN_CLUSTER_RESELECT_AFTER_US: u64 = 3 * 512 * 1024;
+/// Forget a NAN cluster entirely when no selected-cluster beacon has arrived
+/// for this long.  Adapters may continue to hear unrelated beacons while the
+/// selected cluster disappears, so this is deliberately separate from the
+/// shorter foreign-cluster reselection guard above.
+pub const NAN_CLUSTER_STALE_AFTER_US: u64 = 5_000_000;
 pub const NAN_DISCOVERY_PERIOD_US: u64 = 512 * 1024;
 /// One IEEE 802.11 time unit in microseconds.
 pub const NAN_TU_US: u32 = 1024;
@@ -909,6 +915,43 @@ mod tests {
     }
 
     #[test]
+    fn nan_state_reselects_when_the_selected_cluster_stops_beaconing() {
+        let first = [0x50, 0x6f, 0x9a, 1, 6, 1];
+        let replacement = [0x50, 0x6f, 0x9a, 1, 6, 2];
+        let mut state = NanState::default();
+        assert_eq!(
+            state.observe(RxFrame {
+                bytes: &nan_beacon(first, 100, 512),
+                rssi_dbm: -20,
+                timestamp_us: 1_000,
+            }),
+            Action::ArmA3(MacAddr(first))
+        );
+
+        // The first foreign beacon is ignored while the selected cluster is
+        // still live. Once its three-DW guard expires, the replacement
+        // cluster becomes the timing and A3 source immediately.
+        assert_eq!(
+            state.observe(RxFrame {
+                bytes: &nan_beacon(replacement, 200, 512),
+                rssi_dbm: -30,
+                timestamp_us: 1_001,
+            }),
+            Action::DropForeign
+        );
+        assert_eq!(
+            state.observe(RxFrame {
+                bytes: &nan_beacon(replacement, 300, 512),
+                rssi_dbm: -30,
+                timestamp_us: 1_000 + NAN_CLUSTER_RESELECT_AFTER_US,
+            }),
+            Action::ArmA3(MacAddr(replacement))
+        );
+        assert_eq!(state.cluster(), Some(MacAddr(replacement)));
+        assert_eq!(state.sync_bssid(), Some(MacAddr(replacement)));
+    }
+
+    #[test]
     fn shared_beacon_wait_and_slot_policy_is_deterministic() {
         assert!(!beacon_seen_since(7, 7));
         assert!(beacon_seen_since(7, 8));
@@ -960,8 +1003,30 @@ mod tests {
 
         let followup = build_nan_followup_sdf(destination, source, cluster, service, 1, b"hello");
         assert_eq!(&followup[4..10], &destination);
-        assert_eq!(followup[41], 0x12);
-        assert_eq!(&followup[43..48], b"hello");
+        assert_eq!(followup[41], 0x02);
+        assert_eq!(followup[42], 0x0e);
+        assert_eq!(&followup[50..54], &[0x50, 0x6f, 0x9a, 0x02]);
+        assert_eq!(&followup[54..59], b"hello");
+        assert_eq!(
+            followup_service_info(&followup, service),
+            Some(&b"hello"[..])
+        );
+
+        let requestor = build_nan_followup_sdf_for_requestor(
+            destination,
+            source,
+            cluster,
+            service,
+            1,
+            0x80,
+            b"hello",
+        );
+        assert_eq!(requestor[39], 1);
+        assert_eq!(requestor[40], 0x80);
+        assert_eq!(
+            followup_service_info(&requestor, service),
+            Some(&b"hello"[..])
+        );
     }
 
     #[test]
@@ -1565,6 +1630,6 @@ impl NanState {
 
 impl Default for NanState {
     fn default() -> Self {
-        Self::new(5_000_000)
+        Self::new(NAN_CLUSTER_STALE_AFTER_US)
     }
 }

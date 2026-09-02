@@ -9,26 +9,36 @@
 //! least 20 seconds; the suite never flashes, resets, or starts/stops host
 //! Wi-Fi interfaces.
 //!
+//! # Non-negotiable hardware-selection rule
+//!
+//! **Never hardcode a lab board name, serial path, MAC, BSSID, or pair in an
+//! E2E test name or body.** Those are mutable lab inventory, not protocol
+//! behavior. Every generic hardware row loads `DMESH_DEVICE_CATALOG`, selects
+//! its source/target descriptors, and derive every identity from those
+//! descriptors. If a board is removed from `e2e-matrix`, no generic test may
+//! still be able to open or transmit to it. Board-specific incident
+//! experiments belong outside this generic matrix and must not be invoked by
+//! the normal E2E runner.
+//!
 //! ```sh
-//! DMESH_E2E_CONFIG=target/e2e-devices.toml \
+//! DMESH_DEVICE_CATALOG=target/e2e-devices.toml \
 //! scripts/build.sh firmware-e2e
 //! ```
 
-use dmesh_cli::prober::{E2eConfig, E2eDeviceConfig, E2ePairConfig};
+use dmesh_cli::prober::{DEFAULT_E2E_MATRIX, E2eConfig, E2eDeviceConfig, E2ePairConfig};
 use dmesh_cli::{DeviceSession, DeviceSessionEvent};
 use dmesh_server::probe::{
     PROBE_CAP_AP, PROBE_CAP_NAN, PROBE_CAP_NOW, PROBE_CAP_STA, PROBE_CAP_UDP6, PairProbeRequest,
     ProbeActivation, ProbeApResult, ProbeDeviceDescriptor, ProbeEndpoint, ProbeEndpointKind,
-    ProbeMeasurement, ProbeMode, ProbeModeResult, ProbePairDiscoverySequence, ProbeRequest, ProbeResponse, ProbeScanResult,
-    ProbeUdp6AssociationResult, full_pair_probe_requests,
+    ProbeMeasurement, ProbeMode, ProbeModeResult, ProbePairDiscoverySequence, ProbeRequest,
+    ProbeResponse, ProbeScanResult, ProbeUdp6AssociationResult, full_pair_probe_requests,
 };
 use dmesh_server::raw_wifi::{
     RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT, RawWifiApMode, RawWifiBearer,
     RawWifiCheckRequest, RawWifiControlRequest, RawWifiDwPolicy, RawWifiInterface,
     RawWifiIperfRequest, RawWifiRate, RawWifiStaMode, RawWifiStaState, RawWifiTxRequest,
-    decode_raw_wifi_snapshot,
-    encode_raw_wifi_check_request, encode_raw_wifi_control_request, encode_raw_wifi_iperf_request,
-    encode_raw_wifi_snapshot_request, encode_raw_wifi_tx_request,
+    decode_raw_wifi_snapshot, encode_raw_wifi_check_request, encode_raw_wifi_control_request,
+    encode_raw_wifi_iperf_request, encode_raw_wifi_snapshot_request, encode_raw_wifi_tx_request,
 };
 use dmesh_server::{
     announce::{
@@ -88,7 +98,9 @@ struct NodeIdentity {
 }
 
 fn load_e2e_config() -> Option<E2eConfig> {
-    let requested = std::path::PathBuf::from(std::env::var_os("DMESH_E2E_CONFIG")?);
+    let requested = std::env::var_os("DMESH_DEVICE_CATALOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(dmesh_cli::prober::DEFAULT_DEVICE_CATALOG));
     // Cargo runs integration tests from the package directory. Operators use
     // repository-relative descriptors through scripts/build.sh, so resolve a
     // relative path against the environment's checkout root when it is not
@@ -100,7 +112,17 @@ fn load_e2e_config() -> Option<E2eConfig> {
     } else {
         requested
     };
-    Some(E2eConfig::from_path(&path).unwrap_or_else(|error| panic!("{error}")))
+    let matrix = std::env::var_os("DMESH_E2E_MATRIX")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_E2E_MATRIX));
+    let matrix = if matrix.is_absolute() || matrix.exists() {
+        matrix
+    } else if let Some(root) = std::env::var_os("DMESH_REPO") {
+        std::path::PathBuf::from(root).join(matrix)
+    } else {
+        matrix
+    };
+    Some(E2eConfig::from_catalog_and_matrix(&path, &matrix).unwrap_or_else(|error| panic!("{error}")))
 }
 
 fn configured_device<'a>(config: &'a E2eConfig, name: &str) -> &'a E2eDeviceConfig {
@@ -332,18 +354,8 @@ fn usb_activate_pair(
         .target
         .discard_startup_backlog(Duration::from_millis(1_500))
         .map_err(|error| format!("settle {} USB: {error}", target.name))?;
-    configure_probe_endpoint(
-        &mut sessions.source,
-        mode_for(source),
-        "",
-        0x4D50_5550_0001,
-    );
-    configure_probe_endpoint(
-        &mut sessions.target,
-        mode_for(target),
-        "",
-        0x4D50_5550_0002,
-    );
+    configure_probe_endpoint(&mut sessions.source, mode_for(source), "", 0x4D50_5550_0001);
+    configure_probe_endpoint(&mut sessions.target, mode_for(target), "", 0x4D50_5550_0002);
     Ok(sessions)
 }
 
@@ -459,13 +471,17 @@ fn host_nan_send(frame: &[u8]) {
     );
 }
 
-/// Both supervised host controllers preserve the same raw-NAN payload but
-/// use their established JSON-RPC envelopes (`data` for lmesh-wifi, `result`
-/// for lmesh). Keep that difference at this outer test adapter boundary.
+/// Both supervised host controllers expose the operation object directly:
+/// tagged-CBOR uses `result` and flat JSONL uses `response`.  Test code keeps
+/// that transport spelling at this outer adapter boundary.
 fn controller_data(response: &serde_json::Value) -> &serde_json::Value {
     response
-        .get("data")
+        .get("response")
         .or_else(|| response.get("result"))
+        // The supervised UDS JSONL endpoint returns its successful handler
+        // value under `data`, while JSON-RPC uses `result`.  E2E must accept
+        // both existing control envelopes before inspecting NAN state.
+        .or_else(|| response.get("data"))
         .unwrap_or(response)
 }
 
@@ -822,7 +838,7 @@ fn configured_android_udp_target() -> (String, String) {
                 .to_owned()
         } else {
             std::env::var("DMESH_E2E_ANDROID_DEVICE").expect(
-                "DMESH_E2E_ANDROID_DEVICE or DMESH_E2E_PAIR is required with DMESH_E2E_CONFIG",
+                "DMESH_E2E_ANDROID_DEVICE or DMESH_E2E_PAIR is required with DMESH_DEVICE_CATALOG",
             )
         };
         let device = configured_device(&config, &device_name);
@@ -842,9 +858,9 @@ fn configured_android_udp_target() -> (String, String) {
     }
     (
         std::env::var("DMESH_E2E_ANDROID_SERIAL")
-            .expect("DMESH_E2E_ANDROID_SERIAL is required without DMESH_E2E_CONFIG"),
+            .expect("DMESH_E2E_ANDROID_SERIAL is required without DMESH_DEVICE_CATALOG"),
         std::env::var("DMESH_E2E_ANDROID_IPV4")
-            .expect("DMESH_E2E_ANDROID_IPV4 is required without DMESH_E2E_CONFIG"),
+            .expect("DMESH_E2E_ANDROID_IPV4 is required without DMESH_DEVICE_CATALOG"),
     )
 }
 
@@ -1122,7 +1138,7 @@ fn android_known_devices(serial: &str, request_id: &str) -> String {
         serial,
         serde_json::json!({
             "id": request_id,
-            "method": "radio.devices",
+            "method": "discovery.nodes",
         }),
     )
 }
@@ -2178,9 +2194,10 @@ fn e2e_now_iperf_timeout_ms(bytes: u64) -> u64 {
         .saturating_mul(8_000)
         .saturating_div(MIN_ACTION_GOODPUT_BPS)
         .saturating_add(SETUP_ALLOWANCE_MS);
-    e2e_now_timeout_ms()
-        .max(scaled)
-        .clamp(1_000, u64::from(dmesh_server::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS))
+    e2e_now_timeout_ms().max(scaled).clamp(
+        1_000,
+        u64::from(dmesh_server::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS),
+    )
 }
 
 fn e2e_now_packet_size() -> u64 {
@@ -2906,13 +2923,13 @@ fn read_json_rpc_response(
     Ok(response.get("result").cloned().unwrap_or(response))
 }
 
-/// Reviewed CBOR replies retain a `data` wrapper, while legacy JSON-RPC
-/// replies return their `result` directly. History is intentionally available
-/// through both during the migration, so E2E must inspect the semantic events
-/// rather than mistake that envelope difference for missing RF delivery.
+/// History is returned as the operation object on both reviewed CBOR and
+/// JSON-RPC paths. E2E inspects semantic events rather than treating the
+/// response envelope as delivery evidence.
 fn history_events(response: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     response
-        .get("data")
+        .get("response")
+        .or_else(|| response.get("result"))
         .unwrap_or(response)
         .get("events")
         .and_then(serde_json::Value::as_array)
@@ -2990,7 +3007,7 @@ fn host_control_cbor_request_and_response_use_framed_numeric_records() {
         );
         let response = mesh::wire::response_ok(
             record.id.expect("request id"),
-            serde_json::json!({"success": true, "data": {"codec": "cbor"}}),
+            serde_json::json!({"codec": "cbor"}),
         );
         let frame = encode_stream_frame(&encode_record(&response).expect("encode response"))
             .expect("frame response");
@@ -3005,7 +3022,7 @@ fn host_control_cbor_request_and_response_use_framed_numeric_records() {
         },
         path.to_str().expect("UTF-8 socket path"),
     );
-    assert_eq!(response["data"]["codec"], "cbor");
+    assert_eq!(response["codec"], "cbor");
     server.join().expect("CBOR test server panicked");
     std::fs::remove_file(path).expect("remove CBOR test socket");
 }
@@ -3031,7 +3048,7 @@ fn host_control_unreviewed_inspection_request_and_response_use_json_rpc() {
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request["id"].clone(),
-                "result": {"success": true, "data": {"codec": "json-rpc"}},
+                "result": {"codec": "json-rpc"},
             })
         )
         .expect("write JSON-RPC response");
@@ -3043,7 +3060,7 @@ fn host_control_unreviewed_inspection_request_and_response_use_json_rpc() {
         serde_json::json!({"iface": "wlan0"}),
         path.to_str().expect("UTF-8 socket path"),
     );
-    assert_eq!(response["data"]["codec"], "json-rpc");
+    assert_eq!(response["codec"], "json-rpc");
     server.join().expect("JSON-RPC test server panicked");
     std::fs::remove_file(path).expect("remove JSON-RPC test socket");
 }
@@ -4156,12 +4173,12 @@ fn firmware_e6_registered_action_no_ap_no_dw() {
 /// raw UDP6 and NAN Service Info without using wlan0, lmesh, or an external
 /// AP. USB is only the local control/modem bearer, never the bearer under
 /// test. This makes the method reproducible for an arbitrary compatible pair
-/// selected by `DMESH_E2E_CONFIG`, `DMESH_E2E_SOURCE`, and
+/// selected by `DMESH_DEVICE_CATALOG`, `DMESH_E2E_SOURCE`, and
 /// `DMESH_E2E_TARGET`.
 #[test]
 #[ignore = "requires two configured ESP Main USB descriptors and exclusive USB ownership"]
 fn firmware_usb_esp_pair_ap_sta_udp6_and_nan() {
-    let config = load_e2e_config().expect("set DMESH_E2E_CONFIG for the USB ESP pair suite");
+    let config = load_e2e_config().expect("load DMESH_DEVICE_CATALOG for the USB ESP pair suite");
     let source_name = std::env::var("DMESH_E2E_SOURCE").ok();
     let target_name = std::env::var("DMESH_E2E_TARGET").ok();
     let (source, target) = config
@@ -4638,7 +4655,7 @@ fn e2e_sta_driver_tx() -> bool {
 /// explicit comparison requested by an operator; it is never inferred from a
 /// missing passphrase, so production callers cannot silently downgrade WPA2.
 fn e2e_pair_open_mode() -> bool {
-    match std::env::var("DMESH_E2E_OPEN") .as_deref() {
+    match std::env::var("DMESH_E2E_OPEN").as_deref() {
         Err(_) | Ok("0" | "off") => false,
         Ok("1" | "on") => true,
         Ok(value) => panic!("DMESH_E2E_OPEN must be 0, 1, off, or on, got {value:?}"),
@@ -4820,7 +4837,10 @@ fn complete_action_iperf_bytes(
     snapshot(source, RAW_WIFI_METHOD_RESET_COUNTERS);
     let timeout_ms = u32::try_from(e2e_now_iperf_timeout_ms(bytes))
         .expect("NOW timeout fits firmware u32")
-        .clamp(1_000, dmesh_server::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS);
+        .clamp(
+            1_000,
+            dmesh_server::raw_iperf::RAW_ACTION_IPERF_MAX_TIMEOUT_MS,
+        );
     let request = RawWifiIperfRequest {
         peer,
         bytes,
@@ -4858,9 +4878,9 @@ fn complete_action_iperf_bytes(
                             .and_then(|text| core::str::from_utf8(text).ok())
                             .filter(|text| text.contains("raw service") || text.contains("espnow"))
                             .map(str::to_owned),
-                        DeviceSessionEvent::Diagnostic(text) => text
-                            .contains("raw service")
-                            .then(|| text.clone()),
+                        DeviceSessionEvent::Diagnostic(text) => {
+                            text.contains("raw service").then(|| text.clone())
+                        }
                         DeviceSessionEvent::TransportPacket(_) => None,
                     })
                     .take(32)
@@ -5863,7 +5883,7 @@ fn android_ap_capability_probe() {
 ///   --arg '{"id":"p3-p2p","method":"wifi.p2p.connect","data":{}}'
 /// adb -s "$DMESH_E2E_ANDROID_P7" shell content call \
 ///   --uri content://com.github.costinm.dmesh.lm.shell --method command \
-///   --arg '{"id":"p7-devices","method":"radio.devices"}'
+///   --arg '{"id":"p7-devices","method":"discovery.nodes"}'
 /// ```
 #[test]
 #[ignore = "requires Pixel 7 and Pixel 3a DMesh services; no host WLAN changes"]
@@ -7570,7 +7590,7 @@ fn set_action_mac_ack(
 fn wait_for_associated_channel_6(
     session: &mut DeviceSession,
 ) -> dmesh_server::raw_wifi::RawWifiSnapshot {
-    wait_for_associated_channel_6_matching(session, None)
+    wait_for_associated_channel_matching(session, 6, None)
 }
 
 /// A transport start replaces an asynchronous radio epoch. Association and
@@ -7580,11 +7600,12 @@ fn wait_for_associated_channel_6_with_driver_tx(
     session: &mut DeviceSession,
     sta_driver_tx: bool,
 ) -> dmesh_server::raw_wifi::RawWifiSnapshot {
-    wait_for_associated_channel_6_matching(session, Some(sta_driver_tx))
+    wait_for_associated_channel_matching(session, 6, Some(sta_driver_tx))
 }
 
-fn wait_for_associated_channel_6_matching(
+fn wait_for_associated_channel_matching(
     session: &mut DeviceSession,
+    expected_channel: u8,
     expected_sta_driver_tx: Option<bool>,
 ) -> dmesh_server::raw_wifi::RawWifiSnapshot {
     // `wifi_esp::init_sta` uses a bounded 50-second association window. A
@@ -7594,7 +7615,7 @@ fn wait_for_associated_channel_6_matching(
     let deadline = association_started + Duration::from_secs(65);
     let mut observed = snapshot(session, RAW_WIFI_METHOD_SNAPSHOT);
     while !(observed.sta_associated == Some(true)
-        && observed.channel == Some(6)
+        && observed.channel == Some(expected_channel)
         && expected_sta_driver_tx.is_none_or(|expected| observed.sta_driver_tx == Some(expected)))
         && Instant::now() < deadline
     {
@@ -7635,8 +7656,8 @@ fn wait_for_associated_channel_6_matching(
     );
     assert_eq!(
         observed.channel,
-        Some(6),
-        "{} did not return to lab channel 6 before the action matrix: {observed:?}",
+        Some(expected_channel),
+        "{} did not settle on expected channel {expected_channel} before the action matrix: {observed:?}",
         session.path()
     );
     if let Some(expected) = expected_sta_driver_tx {
@@ -7919,9 +7940,9 @@ fn complete_action_check(
                     .ok()
                     .filter(|text| text.contains("espnow") || text.contains("raw service"))
                     .map(str::to_owned),
-                DeviceSessionEvent::Diagnostic(text) => (text.contains("espnow")
-                    || text.contains("raw service"))
-                    .then(|| text.clone()),
+                DeviceSessionEvent::Diagnostic(text) => {
+                    (text.contains("espnow") || text.contains("raw service")).then(|| text.clone())
+                }
                 DeviceSessionEvent::TransportPacket(_) => None,
             })
             .take(32)
@@ -7998,9 +8019,7 @@ fn firmware_nan_first_registered_followup_without_receiver_dw_is_not_delivered()
         .expect("e7 NAN sender must select a cluster BSSID before Follow-up TX");
     eprintln!(
         "firmware-e2e NAN registered-callback address probe: e6_cluster={:?} e7_cluster={:?} destination={:02x?}",
-        before.comparator_bssid,
-        cluster_bssid,
-        E6_MAC,
+        before.comparator_bssid, cluster_bssid, E6_MAC,
     );
 
     let payload = dmesh_rawnan::build_dmesh_followup_payload(
@@ -8049,13 +8068,11 @@ fn firmware_nan_first_registered_followup_without_receiver_dw_is_not_delivered()
     assert_eq!(after.nan_dw_interval, Some(0));
     assert_eq!(after.promiscuous, Some(false));
     assert_eq!(
-        after.counters.registered_nan_actions,
-        before.counters.registered_nan_actions,
+        after.counters.registered_nan_actions, before.counters.registered_nan_actions,
         "NAN Follow-up reached the registered `(4, 9)` callback with DW=0; replace this negative probe with parsed callback coverage"
     );
     assert_eq!(
-        after.counters.nan_followups,
-        before.counters.nan_followups,
+        after.counters.nan_followups, before.counters.nan_followups,
         "the receive proof must not come from DW capture"
     );
 }
@@ -8254,23 +8271,46 @@ fn firmware_nan_followup_dw_capture_control() {
     }
 }
 
-/// Focused STA+NOW gate for the default transport profile. Both devices use a
-/// plain STA start; NAN DW capture remains off. This proves that e6 accepts
-/// and originates an action-bearer exchange without special NOW setup.
+/// Focused configured-pair STA+NOW gate for the default transport profile.
+/// Both devices use a plain STA start; NAN DW capture remains off.
 #[test]
-#[ignore = "requires flashed e6/e7 firmware, the supervised wlan0 AP, and exclusive UART ownership"]
-fn firmware_sta_now_e6_e7() {
-    let mut e6 = DeviceSession::open(serial_from_env("DMESH_E2E_E6"), None).unwrap();
-    let mut e7 = DeviceSession::open(serial_from_env("DMESH_E2E_E7"), None).unwrap();
-    e6.set_history_limit(4_096);
-    e7.set_history_limit(4_096);
+#[ignore = "requires a configured flashed ESP pair, the supervised wlan0 AP, and exclusive UART ownership"]
+fn firmware_sta_now_configured_pair() {
+    let config = load_e2e_config().expect("load DMESH_DEVICE_CATALOG for the STA+NOW pair");
+    let source_name = std::env::var("DMESH_E2E_SOURCE").ok();
+    let target_name = std::env::var("DMESH_E2E_TARGET").ok();
+    let (source, target) = config
+        .select_esp_pair_by_name(source_name.as_deref(), target_name.as_deref())
+        .unwrap_or_else(|error| panic!("STA+NOW pair selection: {error}"));
+    assert!(
+        source.supports_sta && source.supports_now,
+        "{} must support STA and NOW for this row",
+        source.name
+    );
+    assert!(
+        target.supports_sta && target.supports_now,
+        "{} must support STA and NOW for this row",
+        target.name
+    );
+    let source_mac = configured_mac(source);
+    let target_mac = configured_mac(target);
+    let mut source_session = open_configured_usb_session(source).unwrap();
+    let mut target_session = open_configured_usb_session(target).unwrap();
+    source_session.set_history_limit(4_096);
+    target_session.set_history_limit(4_096);
 
     let ssid = wlan0_ssid();
-    configure_sta_for_wlan0(&mut e6, &ssid, 0xE6_6E00);
-    configure_sta_for_wlan0(&mut e7, &ssid, 0xE7_6E00);
-    let e6_mode = wait_for_associated_channel_6(&mut e6);
-    let e7_mode = wait_for_associated_channel_6(&mut e7);
-    for (name, mode) in [("e6", e6_mode), ("e7", e7_mode)] {
+    let (_, expected_channel) = wlan0_bssid_channel();
+    configure_sta_for_wlan0(&mut source_session, &ssid, 0x4D50_6E00);
+    configure_sta_for_wlan0(&mut target_session, &ssid, 0x4D50_6E10);
+    let source_mode =
+        wait_for_associated_channel_matching(&mut source_session, expected_channel, None);
+    let target_mode =
+        wait_for_associated_channel_matching(&mut target_session, expected_channel, None);
+    for (name, mode) in [
+        (source.name.as_str(), source_mode),
+        (target.name.as_str(), target_mode),
+    ] {
         assert_eq!(mode.sta_associated, Some(true), "{name} STA association");
         assert_eq!(
             mode.promiscuous,
@@ -8280,37 +8320,183 @@ fn firmware_sta_now_e6_e7() {
         assert_eq!(mode.dw_capturing, Some(false), "{name} NAN DW must be off");
     }
 
-    let (e6_source, e7_client) =
-        complete_action_check(&mut e7, &mut e6, E6_MAC, 0xE6_6E01, "STA+NOW e7->e6");
-    assert!(
-        e6_source.counters.rx_driver_dispatch > 0,
-        "e6 did not dispatch NOW"
+    let (source_after, target_client) = complete_action_check(
+        &mut target_session,
+        &mut source_session,
+        source_mac,
+        0x4D50_6E01,
+        &format!("STA+NOW {} -> {}", target.name, source.name),
     );
     assert!(
-        e6_source.counters.rx_parser_accepted > 0,
-        "e6 did not parse NOW"
+        source_after.counters.rx_driver_dispatch > 0,
+        "{} did not dispatch NOW",
+        source.name
     );
     assert!(
-        e7_client.counters.raw_client_stream_packets > 0,
-        "e7 did not receive the e6 response"
+        source_after.counters.rx_parser_accepted > 0,
+        "{} did not parse NOW",
+        source.name
     );
-    assert_eq!(e7_client.counters.raw_client_receive_errors, 0);
+    assert!(
+        target_client.counters.raw_client_stream_packets > 0,
+        "{} did not receive {} response",
+        target.name,
+        source.name
+    );
+    assert_eq!(target_client.counters.raw_client_receive_errors, 0);
 
-    let (e7_source, e6_client) =
-        complete_action_check(&mut e6, &mut e7, E7_MAC, 0xE6_6E02, "STA+NOW e6->e7");
-    assert!(
-        e7_source.counters.rx_driver_dispatch > 0,
-        "e7 did not dispatch NOW"
+    let (target_after, source_client) = complete_action_check(
+        &mut source_session,
+        &mut target_session,
+        target_mac,
+        0x4D50_6E02,
+        &format!("STA+NOW {} -> {}", source.name, target.name),
     );
     assert!(
-        e7_source.counters.rx_parser_accepted > 0,
-        "e7 did not parse NOW"
+        target_after.counters.rx_driver_dispatch > 0,
+        "{} did not dispatch NOW",
+        target.name
     );
     assert!(
-        e6_client.counters.raw_client_stream_packets > 0,
-        "e6 did not receive the e7 response"
+        target_after.counters.rx_parser_accepted > 0,
+        "{} did not parse NOW",
+        target.name
     );
-    assert_eq!(e6_client.counters.raw_client_receive_errors, 0);
+    assert!(
+        source_client.counters.raw_client_stream_packets > 0,
+        "{} did not receive {} response",
+        source.name,
+        target.name
+    );
+    assert_eq!(source_client.counters.raw_client_receive_errors, 0);
+}
+
+/// Exercise every enabled, locally controlled ESP descriptor which declares
+/// both NAN and NOW.  This is deliberately pairwise and bidirectional: each
+/// device must receive and reply to several NOW pings from every other
+/// configured participant.  `e2e_enabled=false` is the sole opt-out for a
+/// quarantined board; never add a board-name exception here.
+#[test]
+#[ignore = "requires DMESH_DEVICE_CATALOG, every enabled NAN+NOW ESP, wlan0 AP, and exclusive UART ownership"]
+fn firmware_configured_nan_now_mesh() {
+    let config = load_e2e_config().expect("load DMESH_DEVICE_CATALOG for the NAN+NOW mesh");
+    let participants = config
+        .devices
+        .iter()
+        .filter(|device| {
+            device.kind == "esp" && device.e2e_enabled && device.supports_nan && device.supports_now
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        participants.len() >= 2,
+        "need at least two enabled ESP descriptors with NAN and NOW"
+    );
+    for device in &participants {
+        assert!(
+            device.serial.is_some(),
+            "enabled NAN+NOW device {} needs a local serial adapter",
+            device.name
+        );
+    }
+    let repeats = std::env::var("DMESH_E2E_NOW_PINGS")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(3)
+        .clamp(2, 8);
+    let ssid = wlan0_ssid();
+    let (_, expected_channel) = wlan0_bssid_channel();
+    let mut request_id = 0x4D50_4E4F_0000_u64;
+
+    for source_index in 0..participants.len() {
+        for target_index in source_index + 1..participants.len() {
+            let source = participants[source_index];
+            let target = participants[target_index];
+            let source_mac = configured_mac(source);
+            let target_mac = configured_mac(target);
+            let mut source_session = open_configured_usb_session(source).unwrap();
+            let mut target_session = open_configured_usb_session(target).unwrap();
+            source_session.set_history_limit(4_096);
+            target_session.set_history_limit(4_096);
+
+            configure_sta_for_wlan0_with_now(&mut source_session, &ssid, true, true, request_id);
+            request_id = request_id.saturating_add(1);
+            configure_sta_for_wlan0_with_now(&mut target_session, &ssid, true, true, request_id);
+            request_id = request_id.saturating_add(1);
+            for (name, state) in [
+                (
+                    source.name.as_str(),
+                    wait_for_associated_channel_matching(
+                        &mut source_session,
+                        expected_channel,
+                        None,
+                    ),
+                ),
+                (
+                    target.name.as_str(),
+                    wait_for_associated_channel_matching(
+                        &mut target_session,
+                        expected_channel,
+                        None,
+                    ),
+                ),
+            ] {
+                assert_eq!(state.sta_associated, Some(true), "{name} STA association");
+                assert_eq!(state.dw_capturing, Some(false), "{name} NOW row DW state");
+            }
+
+            for sample in 0..repeats {
+                let (source_after, target_client) = complete_action_check(
+                    &mut target_session,
+                    &mut source_session,
+                    source_mac,
+                    request_id,
+                    &format!(
+                        "configured NAN+NOW {} -> {} sample={sample}",
+                        target.name, source.name
+                    ),
+                );
+                request_id = request_id.saturating_add(1);
+                assert!(
+                    source_after.counters.rx_parser_accepted > 0,
+                    "{} did not parse NOW from {} sample={sample}",
+                    source.name,
+                    target.name
+                );
+                assert!(
+                    target_client.counters.raw_client_stream_packets > 0,
+                    "{} did not receive NOW response from {} sample={sample}",
+                    target.name,
+                    source.name
+                );
+                assert_eq!(target_client.counters.raw_client_receive_errors, 0);
+
+                let (target_after, source_client) = complete_action_check(
+                    &mut source_session,
+                    &mut target_session,
+                    target_mac,
+                    request_id,
+                    &format!(
+                        "configured NAN+NOW {} -> {} sample={sample}",
+                        source.name, target.name
+                    ),
+                );
+                request_id = request_id.saturating_add(1);
+                assert!(
+                    target_after.counters.rx_parser_accepted > 0,
+                    "{} did not parse NOW from {} sample={sample}",
+                    target.name,
+                    source.name
+                );
+                assert!(
+                    source_client.counters.raw_client_stream_packets > 0,
+                    "{} did not receive NOW response from {} sample={sample}",
+                    source.name,
+                    target.name
+                );
+                assert_eq!(source_client.counters.raw_client_receive_errors, 0);
+            }
+        }
+    }
 }
 
 /// Host-to-e6 action-bearer IPERF using the same raw QUIC-lite client as the
@@ -8477,9 +8663,9 @@ fn firmware_e7_nan_now_sta_transition_cycles() {
 /// Run the configured pair list. This is the name-independent matrix entry
 /// point; legacy device-specific rows remain available for focused bring-up.
 #[test]
-#[ignore = "requires DMESH_E2E_CONFIG, the configured radio lab, and exclusive UART ownership"]
+#[ignore = "requires DMESH_DEVICE_CATALOG, the configured radio lab, and exclusive UART ownership"]
 fn firmware_configured_pairs() {
-    let config = load_e2e_config().expect("set DMESH_E2E_CONFIG for the configured matrix");
+    let config = load_e2e_config().expect("load DMESH_DEVICE_CATALOG for the configured matrix");
     let selected = std::env::var("DMESH_E2E_PAIRS").ok().map(|value| {
         value
             .split(',')
@@ -8617,7 +8803,7 @@ fn firmware_configured_pairs() {
     }
 }
 
-/// Discovery-selected two-device prober. `DMESH_E2E_CONFIG` supplies only
+/// Discovery-selected two-device prober. `DMESH_DEVICE_CATALOG` supplies only
 /// local adapter details such as optional serial diagnostics; endpoint choice
 /// is by advertised NAN identity, never a board nickname. Set both
 /// `DMESH_E2E_SOURCE` and `DMESH_E2E_TARGET` select two descriptor names.
@@ -8634,14 +8820,14 @@ fn firmware_configured_pairs() {
 /// cluster, and can be diagnostically extended with
 /// `DMESH_E2E_NAN_WAKE_TIMEOUT_SECS=40`.
 #[test]
-#[ignore = "requires DMESH_E2E_CONFIG, optional discovery IDs, host wlan0 NAN, and remote UDP6"]
+#[ignore = "requires DMESH_DEVICE_CATALOG, optional discovery IDs, host wlan0 NAN, and remote UDP6"]
 fn firmware_pair_prober() {
     let Some(config) = load_e2e_config() else {
         // `scripts/build.sh firmware-e2e` compiles this ignored hardware
         // target on ordinary developer hosts.  A missing lab descriptor is a
         // skipped live run, not a source failure; an explicitly supplied
         // descriptor still fails strictly if its selection is invalid.
-        eprintln!("firmware-e2e skipped: set DMESH_E2E_CONFIG for the pair prober");
+        eprintln!("firmware-e2e skipped: set DMESH_DEVICE_CATALOG for the pair prober");
         return;
     };
     let source_name = std::env::var("DMESH_E2E_SOURCE").ok();

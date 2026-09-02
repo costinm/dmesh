@@ -37,8 +37,12 @@ pub const fn is_dmesh_direct_ssid(ssid: &[u8]) -> bool {
     false
 }
 
-/// Prefer the configured SSID when it is usable, otherwise choose the
-/// strongest eligible DMesh AP.
+/// Prefer the configured infrastructure SSID when it is usable, otherwise
+/// choose the strongest eligible DMesh AP.
+///
+/// The `DIRECT-...-dmesh` naming restriction protects only the fallback
+/// selection.  Applying it before the exact preferred-SSID match made a
+/// normal provisioned network such as `costin` permanently ineligible.
 pub fn select_sta_candidate<'a>(
     candidates: &'a [StaCandidate<'a>],
     preferred_ssid: &[u8],
@@ -46,7 +50,7 @@ pub fn select_sta_candidate<'a>(
 ) -> Option<StaSelection<'a>> {
     let mut strongest = None;
     for candidate in candidates {
-        if !is_dmesh_direct_ssid(candidate.ssid) || candidate.rssi_dbm < minimum_rssi_dbm {
+        if candidate.rssi_dbm < minimum_rssi_dbm {
             continue;
         }
         if candidate.ssid == preferred_ssid {
@@ -55,6 +59,9 @@ pub fn select_sta_candidate<'a>(
                 preferred: true,
                 server_link_local: quic_lite::raw_udp6::link_local_from_mac(candidate.bssid),
             });
+        }
+        if !is_dmesh_direct_ssid(candidate.ssid) {
+            continue;
         }
         if strongest.is_none_or(|current: StaCandidate<'a>| candidate.rssi_dbm > current.rssi_dbm) {
             strongest = Some(*candidate);
@@ -155,6 +162,27 @@ mod tests {
                 .unwrap()
                 .preferred
         );
+    }
+
+    #[test]
+    fn configured_infrastructure_ssid_is_eligible() {
+        let candidates = [
+            StaCandidate {
+                ssid: b"DIRECT-near-dmesh",
+                bssid: [1; 6],
+                rssi_dbm: -35,
+                channel: 6,
+            },
+            StaCandidate {
+                ssid: b"costin",
+                bssid: [2; 6],
+                rssi_dbm: -60,
+                channel: 11,
+            },
+        ];
+        let selected = select_sta_candidate(&candidates, b"costin", -70).unwrap();
+        assert!(selected.preferred);
+        assert_eq!(selected.candidate.ssid, b"costin");
     }
 
     #[test]

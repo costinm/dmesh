@@ -17,7 +17,14 @@ pub const CONTROL_COMPONENT: u64 = 1;
 pub const SETTINGS_GET: u64 = 1;
 pub const SETTINGS_SET: u64 = 2;
 pub const SETTINGS_LIST: u64 = 3;
-pub const TRANSPORT_START: u64 = 4;
+/// Complete declarative volatile transport profile. An all-off profile is the
+/// sole stop representation; callers must not model lifecycle as imperative
+/// start/stop commands.
+pub const TRANSPORT_SET: u64 = 4;
+/// Temporary source compatibility while callers migrate to [`TRANSPORT_SET`].
+/// The wire tag is unchanged and this alias must be removed with the legacy
+/// `transport.start` spelling.
+pub const TRANSPORT_START: u64 = TRANSPORT_SET;
 pub const TRANSPORT_STOP: u64 = 5;
 /// Discover bearer candidates without changing the selected transport epoch.
 /// Platform adapters may implement one or more requested discovery mechanisms.
@@ -396,7 +403,14 @@ fn field_bytes<'a>(encoded: &'a [u8], wanted: u64) -> Option<&'a [u8]> {
     for _ in 0..count {
         let key = d.uint()?;
         if key == wanted {
-            result = Some(d.text_ref().or_else(|| d.bytes_ref())?);
+            // `text_ref` consumes the CBOR head before discovering a byte
+            // string, so rewind before trying the binary form. Settings keys
+            // remain text while settings values may now be arbitrary bytes.
+            let saved = d.position();
+            result = Some(d.text_ref().or_else(|| {
+                d.set_position(saved);
+                d.bytes_ref()
+            })?);
         } else {
             d.skip()?;
         }
@@ -461,7 +475,10 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
             e.uint(FIELD_KEY)?;
             e.text_value(key)?;
             e.uint(FIELD_VALUE)?;
-            e.text_value(value)?;
+            // Settings values are opaque bytes. Text settings retain their
+            // UTF-8 validation in the receiving store, while NVS blobs such
+            // as the control-plane key need no base64 transport workaround.
+            e.bytes_value(value)?;
         }
         Request::SettingsList => {}
         Request::TransportStart { kind, config } => {
@@ -677,6 +694,34 @@ mod tests {
             Some(Request::TransportStart {
                 kind: TransportKind::Nan,
                 config: TransportConfig::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn settings_set_encodes_binary_value_as_cbor_bytes() {
+        let mut wire = [0u8; 96];
+        let used = encode_request(
+            Request::SettingsSet {
+                key: b"cp",
+                value: &[0, 0xff, 1],
+            },
+            None,
+            &mut wire,
+        )
+        .unwrap();
+        // The raw 0x43 bytes header makes this unambiguously a CBOR byte
+        // string, not a text string which would reject the 0xff byte.
+        assert!(
+            wire[..used]
+                .windows(4)
+                .any(|window| window == [0x43, 0, 0xff, 1])
+        );
+        assert_eq!(
+            decode_request(&wire[..used]),
+            Some(Request::SettingsSet {
+                key: b"cp",
+                value: &[0, 0xff, 1]
             })
         );
     }

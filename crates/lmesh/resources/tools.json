@@ -1,1141 +1,241 @@
 [
   {
-    "description": "List currently discovered local mesh nodes",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "lmesh.nodes",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 1
-  },
-  {
-    "description": "Return one discovered node by public key",
+    "description": "Open a retained QUIC control connection to a relay and install its first directed NOW relay leg",
     "inputSchema": {
       "properties": {
-        "public_key": {
+        "next_hop_mac": {
           "type": "string",
-          "x-cli-position": 1,
+          "x-protobuf-index": 2,
+          "x-protobuf-type": "string"
+        },
+        "relay_endpoint": {
+          "type": "string",
           "x-protobuf-index": 1,
           "x-protobuf-type": "string"
         }
       },
-      "required": [
-        "public_key"
-      ],
+      "required": ["relay_endpoint", "next_hop_mac"],
       "type": "object"
     },
-    "name": "lmesh.get_node",
+    "name": "relay.connect",
+    "outputSchema": {"properties": {}, "required": [], "type": "object"},
+    "x-component-index": 9,
+    "x-method-index": 1,
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Return retained first-relay QUIC control sessions and their observed aliases",
+    "inputSchema": {"properties": {}, "required": [], "type": "object"},
+    "name": "relay.status",
+    "outputSchema": {"properties": {}, "required": [], "type": "object"},
+    "x-component-index": 9,
+    "x-method-index": 2,
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Open the selected endpoint through an installed relay leg, reconcile its forward CID, and verify discovery.nodes over QUIC",
+    "inputSchema": {
+      "properties": {
+        "relay_endpoint": {
+          "type": "string",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "string"
+        }
+      },
+      "required": ["relay_endpoint"],
+      "type": "object"
+    },
+    "name": "relay.open",
+    "outputSchema": {"properties": {}, "required": [], "type": "object"},
+    "x-component-index": 9,
+    "x-method-index": 3,
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Return the bounded cross-bearer observed-device inventory",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "discovery.nodes",
     "outputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "x-component-index": 4,
+    "x-component-index": 6,
+    "x-method-index": 9,
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Return local NAN attach, cluster, synchronization, and publish state",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "nan.status",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
+    "x-method-index": 1,
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "now.metrics",
+    "outputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "x-component-index": 7,
     "x-method-index": 2
   },
   {
-    "description": "Send a multicast local mesh announcement",
+    "description": "Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters",
     "inputSchema": {
-      "properties": {
-        "metadata": {
-          "type": "object",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "object"
-        }
-      },
+      "properties": {},
       "required": [],
       "type": "object"
     },
-    "name": "lmesh.announce",
+    "name": "nan.metrics",
     "outputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "x-component-index": 4,
+    "x-component-index": 7,
     "x-method-index": 3
   },
   {
-    "description": "Return local discovery and radio status",
+    "description": "Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters",
     "inputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "name": "lmesh.status",
+    "name": "udp6.metrics",
     "outputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "x-component-index": 4,
+    "x-component-index": 7,
     "x-method-index": 4
   },
   {
-    "description": "Return configured local radio adapters",
+    "description": "Return common optional per-peer Wi-Fi link observations",
     "inputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "name": "lmesh.radios.list",
+    "name": "wifi.link.metrics",
     "outputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "x-component-index": 4,
-    "x-method-index": 9
-  },
-  {
-    "description": "Return recently observed neighbors",
-    "inputSchema": {
-      "properties": {
-        "seen_within_sec": {
-          "type": "integer",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "u64"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "lmesh.neighbors",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
+    "x-component-index": 7,
     "x-method-index": 5
   },
   {
-    "description": "Return local link observations and selected paths",
+    "description": "Replace a node's complete volatile physical transport profile",
     "inputSchema": {
       "properties": {
-        "seen_within_sec": {
+        "ap": {
           "type": "integer",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "u64"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "lmesh.links.list",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 6
-  },
-  {
-    "description": "Discover peers over one radio or all radios",
-    "inputSchema": {
-      "properties": {
-        "nonce": {
-          "type": "string",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "string"
-        },
-        "radio": {
-          "type": "string",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "string"
-        },
-        "wait_ms": {
-          "type": "integer",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "u64"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "lmesh.ping",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 7
-  },
-  {
-    "description": "Alias for ping.",
-    "group": "Discovery",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "nonce": {
-          "title": "Nonce",
-          "type": "string"
-        },
-        "radio": {
-          "default": "all",
-          "enum": [
-            "all",
-            "wifiraw",
-            "lora",
-            "ble",
-            "serial",
-            "sta"
-          ],
-          "title": "Radio",
-          "type": "string"
-        },
-        "wait_ms": {
-          "default": 900,
-          "minimum": 50,
-          "title": "Wait milliseconds",
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "name": "disc",
-    "title": "Discover"
-  },
-  {
-    "description": "Send a mesh payload over the selected radio",
-    "inputSchema": {
-      "properties": {
-        "destination": {
-          "type": "string",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "string"
-        },
-        "payload": {
-          "type": "string",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "string"
-        },
-        "radio": {
-          "type": "string",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "string"
-        }
-      },
-      "required": [
-        "payload"
-      ],
-      "type": "object"
-    },
-    "name": "lmesh.send",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 8
-  },
-  {
-    "description": "Record a steering hint for a peer and preferred radio.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "node": {
-          "title": "Node",
-          "type": "string"
-        },
-        "radio": {
-          "default": "best",
-          "enum": [
-            "best",
-            "wifiraw",
-            "lora",
-            "ble",
-            "serial",
-            "sta"
-          ],
-          "title": "Radio",
-          "type": "string"
-        },
-        "reason": {
-          "title": "Reason",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "link.steer",
-    "title": "Steer Link"
-  },
-  {
-    "description": "Request fresh presence on one medium. With medium omitted, fan out across every currently enabled radio; NAN sends active transport.discover and UDP multicast sends the signed host announce.",
-    "group": "Discovery",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "medium": {
-          "description": "Optional radio medium. Omit for all currently enabled radios.",
-          "title": "Medium",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "discovery.ping",
-    "title": "Ping All Media"
-  },
-  {
-    "description": "Return recent radio and backend message history",
-    "inputSchema": {
-      "properties": {
-        "keys": {
-          "type": "string",
-          "x-protobuf-index": 1,
-          "x-protobuf-type": "string"
-        },
-        "limit": {
-          "type": "integer",
-          "x-protobuf-index": 2,
-          "x-protobuf-type": "u64"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "lmesh.messages.history",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 10
-  },
-  {
-    "description": "Calculate QUIC-shaped NAN stream framing and rates without opening a socket.",
-    "group": "Transport",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "image_size": {
-          "minimum": 1,
-          "type": "integer"
-        },
-        "mtu": {
-          "default": 1200,
-          "maximum": 2304,
-          "minimum": 256,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "image_size"
-      ],
-      "type": "object"
-    },
-    "name": "object.nan.dry_run",
-    "title": "Dry-run NAN Object Transfer"
-  },
-  {
-    "description": "Listen for the custom raw vendor-action bulk transport during NAN-synchronized active windows.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "channel": {
-          "default": 6,
-          "maximum": 13,
-          "minimum": 1,
-          "title": "Channel",
-          "type": "integer"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "listen_sec": {
-          "default": 60,
-          "minimum": 1,
-          "title": "Listen seconds",
-          "type": "integer"
-        },
-        "rx_variant": {
-          "default": "nl80211",
-          "description": "Receive backend to use.",
-          "enum": [
-            "nl80211",
-            "monitor",
-            "monitor_active"
-          ],
-          "title": "RX variant",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.raw.listen",
-    "title": "Listen Raw Wi-Fi"
-  },
-  {
-    "description": "Send custom raw vendor-action bulk traffic using the stable DMesh marker rather than the ESP-NOW API.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "channel": {
-          "default": 6,
-          "maximum": 13,
-          "minimum": 1,
-          "title": "Channel",
-          "type": "integer"
-        },
-        "destination": {
-          "description": "Optional destination MAC. Defaults to broadcast.",
-          "title": "Destination MAC",
-          "type": "string"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "listen_sec": {
-          "default": 60,
-          "minimum": 1,
-          "title": "Listen seconds",
-          "type": "integer"
-        },
-        "payload": {
-          "description": "Command or payload bytes encoded as UTF-8 text.",
-          "title": "Payload",
-          "type": "string"
-        },
-        "source": {
-          "description": "Optional spoofed 802.11 source MAC for raw Wi-Fi TX experiments. Defaults to the interface MAC.",
-          "title": "Source MAC",
-          "type": "string"
-        },
-        "tx_duration_ms": {
-          "description": "Optional nl80211 frame wait/off-channel duration. Defaults to listen_sec * 1000.",
-          "minimum": 0,
-          "title": "TX duration milliseconds",
-          "type": "integer"
-        },
-        "tx_variant": {
-          "default": "standard",
-          "description": "nl80211 FRAME request shape to try. Monitor variants are explicit debug/data-frame paths and are not used by defaults.",
-          "enum": [
-            "standard",
-            "zero_duration",
-            "no_duration",
-            "no_offchannel",
-            "minimal",
-            "dont_wait_ack",
-            "dont_wait_no_duration",
-            "dont_wait_minimal",
-            "onchannel",
-            "onchannel_noack",
-            "dont_wait_no_cck",
-            "no_cck",
-            "no_freq",
-            "monitor",
-            "monitor_active",
-            "multicast_data",
-            "multicast_data_active",
-            "sta_multicast_llc",
-            "sta_multicast_llc_active",
-            "sta_direct_llc",
-            "sta_direct_llc_active",
-            "roc",
-            "pyroute2"
-          ],
-          "title": "TX variant",
-          "type": "string"
-        }
-      },
-      "required": [
-        "payload"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.raw.send",
-    "title": "Send Raw Wi-Fi"
-  },
-  {
-    "description": "Run the shared QUIC-lite IPERF client over raw ESP-NOW-compatible action frames.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "bytes": {
-          "default": 8192,
-          "minimum": 1,
-          "title": "Payload bytes",
-          "type": "integer"
-        },
-        "channel": {
-          "default": 6,
-          "maximum": 13,
-          "minimum": 1,
-          "title": "Channel",
-          "type": "integer"
-        },
-        "destination": {
-          "title": "Destination MAC",
-          "type": "string"
-        },
-        "expected_peer": {
-          "description": "Optional MAC expected to answer the IPERF exchange.",
-          "title": "Expected responder MAC",
-          "type": "string"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "packet_size": {
-          "default": 1200,
-          "maximum": 1200,
-          "minimum": 4,
-          "title": "Payload bytes per packet",
-          "type": "integer"
-        },
-        "rx_variant": {
-          "default": "monitor",
-          "description": "Select independently from TX so host action replies can be captured on the same driver path.",
-          "enum": [
-            "monitor",
-            "nl80211"
-          ],
-          "title": "Host RX path",
-          "type": "string"
-        },
-        "timeout_ms": {
-          "default": 20000,
-          "maximum": 60000,
-          "minimum": 1000,
-          "title": "Timeout milliseconds",
-          "type": "integer"
-        },
-        "tx_rate_mbps": {
-          "default": 6,
-          "enum": [
-            6,
-            9,
-            12,
-            18,
-            24,
-            36,
-            48,
-            54
-          ],
-          "title": "Fixed TX rate Mbps",
-          "type": "integer"
-        },
-        "tx_variant": {
-          "default": "monitor",
-          "description": "monitor uses the proven AF_PACKET/radiotap injector; nl80211 is a driver-path experiment.",
-          "enum": [
-            "monitor",
-            "nl80211"
-          ],
-          "title": "Host TX path",
-          "type": "string"
-        }
-      },
-      "required": [
-        "destination"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.raw.iperf",
-    "title": "Perf (raw radio fallback)"
-  },
-  {
-    "description": "Send a small custom raw-action probe.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "channel": {
-          "default": 6,
-          "maximum": 13,
-          "minimum": 1,
-          "title": "Channel",
-          "type": "integer"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "listen_sec": {
-          "default": 60,
-          "minimum": 1,
-          "title": "Listen seconds",
-          "type": "integer"
-        },
-        "nonce": {
-          "description": "Optional ping nonce. Defaults to a process/time value.",
-          "title": "Nonce",
-          "type": "string"
-        },
-        "wait_ms": {
-          "default": 900,
-          "minimum": 50,
-          "title": "Wait milliseconds",
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.raw.ping",
-    "title": "Ping Raw Wi-Fi"
-  },
-  {
-    "description": "Listen for DMesh Ethernet frames on the normal AP/STA netdev path and request packet multicast membership for the DMesh receive addresses.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "listen_sec": {
-          "default": 60,
-          "minimum": 1,
-          "title": "Listen seconds",
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.data.listen",
-    "title": "Listen Wi-Fi Data"
-  },
-  {
-    "description": "Send a DMesh Ethernet frame with EtherType 0x88b5 on the normal AP/STA netdev path.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "destination": {
-          "description": "Optional destination MAC. Defaults to the DMesh IPv6 multicast MAC.",
-          "title": "Destination MAC",
-          "type": "string"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "payload": {
-          "description": "Payload bytes encoded as UTF-8 text.",
-          "title": "Payload",
-          "type": "string"
-        }
-      },
-      "required": [
-        "payload"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.data.send",
-    "title": "Send Wi-Fi Data"
-  },
-  {
-    "description": "Capture a bounded host management-frame sample",
-    "inputSchema": {
-      "properties": {
-        "active": {
-          "type": "boolean",
-          "x-protobuf-index": 5,
-          "x-protobuf-type": "bool"
-        },
-        "capture_ms": {
-          "type": "integer",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "u64"
-        },
-        "channel": {
-          "type": "integer",
-          "x-protobuf-index": 2,
+          "x-protobuf-index": 16,
           "x-protobuf-type": "u8"
         },
-        "iface": {
+        "bssid": {
           "type": "string",
-          "x-protobuf-index": 1,
+          "x-protobuf-index": 3,
           "x-protobuf-type": "string"
         },
-        "max_frames": {
-          "type": "integer",
-          "x-protobuf-index": 4,
-          "x-protobuf-type": "u64"
-        }
-      },
-      "required": [],
-      "type": "object"
-    },
-    "name": "wifi.mgmt.capture",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 5,
-    "x-method-index": 13
-  },
-  {
-    "description": "Start a password-less open AP on channel 6. Default SSID is the fixed DIRECT-dmesh. Records AP SME auth/assoc/probe/deauth frames as wifi.ap.mgmt while running.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "beacon_interval_tu": {
-          "default": 100,
-          "maximum": 1000,
-          "minimum": 10,
-          "title": "Beacon interval (TU)",
-          "type": "integer"
-        },
-        "channel": {
-          "default": 6,
-          "maximum": 13,
-          "minimum": 1,
-          "title": "2.4 GHz channel",
-          "type": "integer"
-        },
-        "ht40": {
-          "default": false,
-          "title": "Use 40 MHz HT",
-          "type": "boolean"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "ssid": {
-          "title": "SSID",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.ap.start_open",
-    "title": "Start Open AP"
-  },
-  {
-    "description": "Stop AP operation on an interface.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.ap.stop",
-    "title": "Stop AP"
-  },
-  {
-    "description": "Return open AP defaults and station metrics where available.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.ap.status",
-    "title": "AP Status"
-  },
-  {
-    "description": "Dump associated station metrics through nl80211.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.ap.stations",
-    "title": "AP Stations"
-  },
-  {
-    "description": "Experimental: add a station entry by MAC without a normal auth/assoc exchange.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "aid": {
-          "default": 1,
-          "maximum": 2007,
-          "minimum": 1,
-          "title": "Association ID",
-          "type": "integer"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "mac": {
-          "title": "Station MAC",
-          "type": "string"
-        }
-      },
-      "required": [
-        "mac"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.ap.station.add",
-    "title": "Add Station"
-  },
-  {
-    "description": "Disconnect one associated station without stopping the AP.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "type": "string"
-        },
-        "mac": {
-          "title": "Station MAC",
-          "type": "string"
-        }
-      },
-      "required": [
-        "mac"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.ap.station.remove",
-    "title": "Remove AP Station"
-  },
-  {
-    "description": "Disconnect all associated stations without stopping the AP.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.ap.station.remove_all",
-    "title": "Remove All AP Stations"
-  },
-  {
-    "description": "Join a password-less open AP on channel 6.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "ssid": {
-          "title": "SSID",
-          "type": "string"
-        }
-      },
-      "required": [
-        "ssid"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.sta.join_open",
-    "title": "Join Open AP"
-  },
-  {
-    "description": "Return station-mode AP peer metrics from nl80211.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.sta.status",
-    "title": "Station Status"
-  },
-  {
-    "description": "Configure a static IPv4 address through the managed lmesh process.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "address": {
-          "title": "IPv4 address",
-          "type": "string"
-        },
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "prefix": {
-          "default": 24,
-          "maximum": 32,
-          "minimum": 0,
-          "title": "Prefix length",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "address"
-      ],
-      "type": "object"
-    },
-    "name": "wifi.sta.configure_ipv4",
-    "title": "Configure Station IPv4"
-  },
-  {
-    "description": "Scan for nearby Wi-Fi BSS entries through the lmesh radio process.",
-    "group": "Wi-Fi",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "iface": {
-          "default": "wlan1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "ssid": {
-          "title": "SSID filter",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.scan",
-    "title": "Wi-Fi Scan"
-  },
-  {
-    "description": "Enable or disable Wi-Fi service advertisement through the local adapter.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "on": {
-          "default": true,
-          "title": "On",
-          "type": "boolean"
-        },
-        "p2p": {
-          "default": false,
-          "title": "P2P",
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.adv",
-    "title": "Wi-Fi Advertise"
-  },
-  {
-    "description": "Start Wi-Fi Direct/service discovery through the local adapter.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "sd": {
-          "default": true,
-          "title": "Service discovery",
-          "type": "boolean"
-        },
-        "wait": {
-          "default": 0,
-          "minimum": 0,
-          "title": "Wait seconds",
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "name": "wifi.con.start",
-    "title": "Start Wi-Fi Discovery"
-  },
-  {
-    "description": "Stop Wi-Fi Direct/service discovery through the local adapter.",
-    "group": "Radio",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {},
-      "type": "object"
-    },
-    "name": "wifi.con.stop",
-    "title": "Stop Wi-Fi Discovery"
-  },
-  {
-    "description": "Request a BLE scan through the local adapter.",
-    "group": "BLE",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "dev_id": {
-          "default": 0,
-          "minimum": 0,
-          "title": "HCI device id",
-          "type": "integer"
-        },
-        "reason": {
-          "default": "web",
-          "title": "Reason",
-          "type": "string"
-        },
-        "scan_ms": {
-          "default": 1500,
-          "maximum": 30000,
-          "minimum": 100,
-          "title": "Scan window (ms)",
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "name": "ble.scan",
-    "title": "BLE Scan"
-  },
-  {
-    "description": "Enable or disable DMesh BLE service-data advertisements through raw Linux HCI sockets.",
-    "group": "BLE",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "dev_id": {
-          "default": 0,
-          "minimum": 0,
-          "title": "HCI device id",
-          "type": "integer"
-        },
-        "on": {
-          "default": true,
-          "title": "On",
-          "type": "boolean"
-        },
-        "payload": {
-          "default": "lmesh",
-          "title": "Payload",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "ble.adv",
-    "title": "BLE Advertise"
-  },
-  {
-    "description": "List observed bearer-neutral announces",
-    "inputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "name": "lmesh.announces",
-    "outputSchema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    },
-    "x-component-index": 4,
-    "x-method-index": 11
-  },
-  {
-    "description": "Run a NAN-first peer health probe and select a bearer",
-    "inputSchema": {
-      "properties": {
         "channel": {
           "type": "integer",
           "x-protobuf-index": 4,
           "x-protobuf-type": "u8"
         },
-        "iface": {
-          "type": "string",
-          "x-protobuf-index": 3,
-          "x-protobuf-type": "string"
+        "kind": {
+          "type": "integer",
+          "x-protobuf-index": 1,
+          "x-protobuf-type": "u8"
         },
-        "nan": {
-          "type": "boolean",
-          "x-protobuf-index": 5,
-          "x-protobuf-type": "bool"
+        "nan_dw_interval": {
+          "type": "integer",
+          "x-protobuf-index": 14,
+          "x-protobuf-type": "u8"
+        },
+        "ndp": {
+          "type": "integer",
+          "x-protobuf-index": 19,
+          "x-protobuf-type": "u8"
         },
         "now": {
+          "type": "integer",
+          "x-protobuf-index": 15,
+          "x-protobuf-type": "u8"
+        },
+        "open": {
           "type": "boolean",
-          "x-protobuf-index": 6,
+          "x-protobuf-index": 24,
           "x-protobuf-type": "bool"
         },
-        "source": {
+        "passphrase": {
           "type": "string",
-          "x-protobuf-index": 1,
+          "x-protobuf-index": 17,
           "x-protobuf-type": "string"
         },
-        "target": {
+        "ssid": {
           "type": "string",
           "x-protobuf-index": 2,
           "x-protobuf-type": "string"
-        },
-        "timeout_ms": {
-          "type": "integer",
-          "x-protobuf-index": 8,
-          "x-protobuf-type": "u64"
-        },
-        "udp6": {
-          "type": "boolean",
-          "x-protobuf-index": 7,
-          "x-protobuf-type": "bool"
         }
       },
       "required": [
-        "source",
-        "target"
+        "kind"
       ],
       "type": "object"
     },
-    "name": "lmesh.probe",
+    "name": "transport.start",
     "outputSchema": {
       "properties": {},
       "required": [],
       "type": "object"
     },
-    "x-component-index": 4,
-    "x-method-index": 12
+    "x-component-index": 1,
+    "x-method-index": 4,
+    "x-ui-visibility": "default"
+  },
+  {
+    "description": "Actively request fresh discovery from this node without replacing its transport profile",
+    "inputSchema": {
+      "properties": {
+        "active_scan": {"type": "boolean", "x-protobuf-index": 20, "x-protobuf-type": "bool"},
+        "channel": {"type": "integer", "x-protobuf-index": 4, "x-protobuf-type": "u8"},
+        "dns_sd": {"type": "boolean", "x-protobuf-index": 23, "x-protobuf-type": "bool"},
+        "nan": {"type": "boolean", "x-protobuf-index": 22, "x-protobuf-type": "bool"},
+        "passive_scan": {"type": "boolean", "x-protobuf-index": 21, "x-protobuf-type": "bool"}
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "transport.discover",
+    "outputSchema": {"properties": {}, "required": [], "type": "object"},
+    "x-component-index": 1,
+    "x-method-index": 6,
+    "x-ui-visibility": "default"
   }
 ]

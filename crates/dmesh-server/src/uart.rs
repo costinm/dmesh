@@ -32,6 +32,11 @@ pub fn encode_uart_datagram(packet: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 /// Classify one PPP payload. Empty frames are invalid, not heartbeats.
+///
+/// New direct records carry the normal DCID-zero QUIC-lite short header, so
+/// control has the same framing over UART and UDP. Bare CBOR is accepted only
+/// as a Stage2/Recovery compatibility input; callers receive its payload in
+/// the same `DirectRecord` variant and must not emit it for new requests.
 pub fn classify_uart_payload(payload: &[u8]) -> Result<UartIngress<'_>, UartIngressError> {
     let Some((&first, rest)) = payload.split_first() else {
         return Err(UartIngressError::Empty);
@@ -47,7 +52,10 @@ pub fn classify_uart_payload(payload: &[u8]) -> Result<UartIngress<'_>, UartIngr
     } else if payload.len() > DEFAULT_MAX_DATAGRAM_SIZE {
         Err(UartIngressError::Oversize)
     } else {
-        Ok(UartIngress::DirectRecord(payload))
+        match quic_lite::decode_direct_packet(payload) {
+            Ok((_, record)) => Ok(UartIngress::DirectRecord(record)),
+            Err(_) => Ok(UartIngress::DirectRecord(payload)),
+        }
     }
 }
 
@@ -65,6 +73,16 @@ mod tests {
             Ok(UartIngress::DirectRecord(&[0xa1, 1]))
         );
         assert_eq!(classify_uart_payload(&[]), Err(UartIngressError::Empty));
+    }
+
+    #[test]
+    fn direct_packet_is_unwrapped_for_the_shared_handler() {
+        let mut packet = [0u8; 32];
+        let used = quic_lite::encode_direct_packet(7, &[0xa1, 1], &mut packet).unwrap();
+        assert_eq!(
+            classify_uart_payload(&packet[..used]),
+            Ok(UartIngress::DirectRecord(&[0xa1, 1]))
+        );
     }
     #[test]
     fn egress_uses_the_shared_mtu_and_marker() {
