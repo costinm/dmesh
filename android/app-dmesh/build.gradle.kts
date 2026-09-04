@@ -43,8 +43,10 @@ android {
         minSdk = providers.gradleProperty("MIN_SDK_VERSION").get().toInt()
         targetSdk = providers.gradleProperty("TARGET_SDK_VERSION").get().toInt()
         // 30 - Android 11, 2020
-        versionCode = 30
-        versionName = "1.4"
+        // Bump whenever a deployed manifest changes: Android can otherwise
+        // retain an older component registry for an identical version code.
+        versionCode = 31
+        versionName = "1.5"
         multiDexEnabled = false
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

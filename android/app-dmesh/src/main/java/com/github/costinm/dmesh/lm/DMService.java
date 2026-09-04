@@ -170,10 +170,6 @@ public class DMService extends MeshService {
         batteryMonitor = new BatteryMonitor(this);
         submitMemoryTelemetry(0);
         transport = AndroidTransportBridge.get(this.getApplicationContext());
-        // NAN is a continuous discovery/control plane, just like the native
-        // UDP listener started below. Do not wait for a UI command or the
-        // periodic repair job to join/publish the cluster.
-        transport.startBaseline();
 
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         connectivityManager = cm;
@@ -406,14 +402,18 @@ public class DMService extends MeshService {
                 return;
             }
             MeshNode node = new MeshNode(baseDir.getAbsolutePath());
-            node.start(RUST_SSH_PORT, RUST_HTTP_PORT);
+            node.start(getApplicationContext(), RUST_SSH_PORT, RUST_HTTP_PORT);
             messageGateway = new MessageStreamGateway(this);
             node.setCallback(messageGateway);
             meshNode = node;
-            // The foreground service began the NAN lifecycle before Rust was
-            // ready. Now project Rust's stable public identity into the shared
-            // Android/Linux/ESP DMesh presence descriptor.
-            if (transport != null) transport.configureNanIdentity(node.getPublicKey());
+            // Start Aware only after the native event sink exists. Starting
+            // it in onCreate races attach/publish/subscribe callbacks against
+            // nativeStartMesh and makes a live Android NAN session look
+            // inactive to the shared Rust telemetry handler.
+            if (transport != null) {
+                transport.configureNanIdentity(node.getPublicKey());
+                transport.startBaseline();
+            }
             Log.d(TAG, "Rust mesh node started: ssh=" + RUST_SSH_PORT
                     + " http=" + RUST_HTTP_PORT
                     + " pubkey=" + meshNode.getPublicKey());

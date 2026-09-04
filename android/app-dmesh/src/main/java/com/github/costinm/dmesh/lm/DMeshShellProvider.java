@@ -11,6 +11,7 @@ import com.github.costinm.dmesh.DirectBinder;
 import com.github.costinm.dmesh.MeshStream;
 import com.github.costinm.dmeshnative.MeshNode;
 
+// TODO: retire after the https mesh provisioning (TOFU/initial setup) is implemented, don't expect/use adb except for port forward
 
 /**
  * ADB/root-only command surface for local testing and provisioning.
@@ -80,6 +81,18 @@ public class DMeshShellProvider extends ContentProvider {
         Bundle out = new Bundle();
         if (service == null || service.shellMeshNode() == null) {
             out.putString("status", "rust_unavailable");
+            return out;
+        }
+        if ("provision-device-secret".equals(method)) {
+            byte[] secret = extras == null ? null : extras.getByteArray("secret");
+            if (secret == null || !service.shellMeshNode().provisionDeviceSecret(secret)) {
+                out.putString("status", "device_secret_rejected");
+                return out;
+            }
+            // The active UDP dispatcher intentionally retains its current
+            // derived branch. Restart through the normal service lifecycle to
+            // install the newly provisioned root; no secret bytes are echoed.
+            out.putString("status", "device_secret_stored_restart_required");
             return out;
         }
         String projection = MeshNode.shellTransportCommand(line);

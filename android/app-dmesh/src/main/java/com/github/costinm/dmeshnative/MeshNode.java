@@ -1,5 +1,16 @@
 package com.github.costinm.dmeshnative;
 
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.os.ParcelFileDescriptor;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.StandardProtocolFamily;
+import java.nio.channels.DatagramChannel;
 import java.nio.charset.StandardCharsets;
 
 public class MeshNode implements AutoCloseable {
@@ -16,10 +27,83 @@ public class MeshNode implements AutoCloseable {
     }
 
     public void start(int sshPort, int httpPort) {
-        nativeHandle = nativeStartMesh(baseDir, sshPort, httpPort);
+        start(null, sshPort, httpPort);
+    }
+
+    /**
+     * Start the common Rust mesh with an Android-network-bound UDP FD.
+     *
+     * Android selects routes by a per-socket network mark. A socket opened by
+     * Rust alone has no mark and may receive an IPv6 datagram but be unable to
+     * route its reply. Java performs only that platform-specific socket setup;
+     * Rust owns the QUIC listener and every packet/handler decision after the
+     * FD handoff.
+     */
+    public void start(Context context, int sshPort, int httpPort) {
+        int udpFd = -1;
+        if (context != null) {
+            try {
+                udpFd = openNetworkUdpSocket(context, 3336);
+            } catch (IOException error) {
+                throw new RuntimeException("Failed to open Android mesh UDP socket", error);
+            }
+        }
+        nativeHandle = nativeStartMesh(baseDir, sshPort, httpPort, udpFd);
         if (nativeHandle == 0) {
+            if (udpFd >= 0) {
+                try { ParcelFileDescriptor.adoptFd(udpFd).close(); } catch (IOException ignored) { }
+            }
             throw new RuntimeException("Failed to start MeshNode");
         }
+    }
+
+    /**
+     * Store provisioned DMesh root material in this app's Rust data directory.
+     * The native side validates and writes it atomically; it never exposes the
+     * bytes through settings or a handler. Restart the mesh service afterwards
+     * so its QUIC association owner derives the new reset-key branch.
+     */
+    public boolean provisionDeviceSecret(byte[] secret) {
+        return nativeProvisionDeviceSecret(baseDir, secret);
+    }
+
+    private static int openNetworkUdpSocket(Context context, int port) throws IOException {
+        DatagramChannel channel = DatagramChannel.open(StandardProtocolFamily.INET6);
+        try {
+            channel.configureBlocking(false);
+            java.net.DatagramSocket socket = channel.socket();
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress(InetAddress.getByName("::"), port));
+            ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
+            Network network = activeWifiNetwork(manager);
+            if (network != null) network.bindSocket(socket);
+            ParcelFileDescriptor descriptor = ParcelFileDescriptor.fromDatagramSocket(socket);
+            return descriptor.detachFd();
+        } finally {
+            channel.close();
+        }
+    }
+
+    /**
+     * Link-local DMesh UDP must use the Wi-Fi network that owns the received
+     * address. `getActiveNetwork()` may be cellular even while Wi-Fi Aware or
+     * STA is carrying the packet; binding an IPv6 socket to that default lets
+     * it receive a datagram but routes its OPEN_ACK onto the wrong network.
+     *
+     * This is Android's platform-only route selection. Rust still owns the
+     * socket after handoff, all QUIC association state, and every handler.
+     */
+    private static Network activeWifiNetwork(ConnectivityManager manager) {
+        if (manager == null) return null;
+        Network fallback = manager.getActiveNetwork();
+        for (Network candidate : manager.getAllNetworks()) {
+            NetworkCapabilities capabilities = manager.getNetworkCapabilities(candidate);
+            if (capabilities != null
+                    && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                return candidate;
+            }
+        }
+        return fallback;
     }
 
     public void stop() {
@@ -111,14 +195,13 @@ public class MeshNode implements AutoCloseable {
                 new byte[0], -1);
     }
 
-    /** Build the bounded CBOR boot/periodic presence Service Info record. */
-    public static byte[] buildNanAnnounce(String kind, byte[] deviceId, long uptimeSecs,
+    /** Build the bounded CBOR discovery presence Service Info record. */
+    public static byte[] buildNanAnnounce(byte[] deviceId, long uptimeSecs,
                                           int transportMode, long counters, String deviceName,
                                           String networkName, String staLinkLocalV6,
                                           String apLinkLocalV6) {
         return radioMessage("radio.nan.build_announce",
-                "kind=" + textArg(kind)
-                        + " device_id=" + hex(deviceId)
+                "device_id=" + hex(deviceId)
                         + " uptime_secs=" + uptimeSecs
                         + " transport_mode=" + transportMode
                         + " counters=" + counters
@@ -136,38 +219,11 @@ public class MeshNode implements AutoCloseable {
      */
     public static String planProbePair(String sourceId, String targetId,
                                        int shortBytes, int longBytes) {
-        return radioMessageText("radio.probe.plan",
+        return radioMessageText("probe.plan",
                 "source_id=" + textArg(sourceId)
                         + " target_id=" + textArg(targetId)
                         + " short_bytes=" + shortBytes
                         + " long_bytes=" + longBytes,
-                new byte[0], -1);
-    }
-
-    /**
-     * Probe a peer learned by UDP6 multicast through the shared QUIC-lite echo
-     * service. {@code scope} is the caller's local P2P interface index, not a
-     * property of the remote peer; link-local P2P traffic is invalid without
-     * it.
-     */
-    public static String probeUdp6Echo(String address, int scope, int port, String payload) {
-        return radioMessageText("radio.probe.udp6_echo",
-                "address=" + textArg(address)
-                        + " scope=" + scope
-                        + " port=" + port
-                        + " payload=" + textArg(payload),
-                new byte[0], -1);
-    }
-
-    /** Run the common bounded QUIC-lite IPERF service over a scoped P2P link. */
-    public static String probeUdp6Iperf(String address, int scope, int port,
-                                        int bytes, int packetSize) {
-        return radioMessageText("radio.probe.udp6_iperf",
-                "address=" + textArg(address)
-                        + " scope=" + scope
-                        + " port=" + port
-                        + " bytes=" + bytes
-                        + " packet_size=" + packetSize,
                 new byte[0], -1);
     }
 
@@ -314,7 +370,8 @@ public class MeshNode implements AutoCloseable {
         void onForwardedStream(long connId, String host, int port, long streamHandle);
     }
 
-    private static native long nativeStartMesh(String baseDir, int sshPort, int httpPort);
+    private static native long nativeStartMesh(String baseDir, int sshPort, int httpPort, int udpFd);
+    private static native boolean nativeProvisionDeviceSecret(String baseDir, byte[] secret);
     private native void nativeStop(long handle);
     private native long nativeConnect(long handle, String host, int port, String user, String serverKey);
     private native String nativeExec(long handle, long connId, String command);

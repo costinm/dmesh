@@ -875,7 +875,7 @@ public final class WifiController {
                 if (sink != null) sink.onDiscovered(new WifiDiscovery("nan", String.valueOf(peer),
                         info, -1, SystemClock.elapsedRealtime()));
                 note("aware.on_service_discovered bytes=" + (info == null ? 0 : info.length));
-                if (DmeshControl.isTransportDiscover(info)) {
+                if (DmeshControl.isDiscoveryRequest(info)) {
                     respondToActiveDiscover(peer);
                 }
             }
@@ -916,13 +916,13 @@ public final class WifiController {
                 note("aware.discover_response exception=" + describe(error));
             }
         }
-        // Recreate the publish session so nearby passive peers receive the
-        // presence record now instead of waiting for the platform cadence.
-        if (publishSession != null) {
-            publishSession.close();
-            publishSession = null;
-            publishNan();
-        }
+        // The directed reply above is the immediate presence response. Keep
+        // the long-lived publish session intact: closing and recreating it
+        // for every active discovery request races Android's session
+        // callbacks, briefly removes the advertised service, and leaves the
+        // common NAN status falsely inactive. Announce updates themselves
+        // still recreate publication through setAnnounce(), where changing
+        // Service Info is actually required.
     }
 
     private static String hex(byte[] value) {

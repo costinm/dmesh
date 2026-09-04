@@ -46,7 +46,7 @@ public final class AndroidTransportBridge {
     private long nanDiscoveryRequestId;
     private final Runnable refreshNanPresence = new Runnable() {
         @Override public void run() {
-            publishNanPresence(false);
+            publishNanPresence();
             presenceHandler.postDelayed(this, NAN_PRESENCE_REFRESH_MS);
         }
     };
@@ -59,7 +59,11 @@ public final class AndroidTransportBridge {
         wifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
         wifi = WifiController.create(context, new WifiEventSink() {
             @Override public void onEvent(String event) {
-                MeshNode.recordNanEvent("framework", "", event.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                // Keep the framework lifecycle name as the Rust event name.
+                // The shared telemetry handler derives attach/publish/subscribe
+                // state from this bounded chronology; collapsing every callback
+                // to `framework` made a live Aware session look inactive.
+                MeshNode.recordNanEvent(event, "", event.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
 
             @Override public void onDiscovered(WifiDiscovery discovery) {
@@ -107,12 +111,9 @@ public final class AndroidTransportBridge {
             nanStartedElapsedMs = android.os.SystemClock.elapsedRealtime();
             nanDiscoveryRequestId = nanStartedElapsedMs & 0xffff_ffffL;
             presenceHandler.removeCallbacks(refreshNanPresence);
-            // Keep the boot descriptor published long enough for a nearby raw
-            // NAN observer to receive it before replacing it with periodic
-            // discovery descriptors.
-            publishNanPresence(true);
+            publishNanPresence();
             presenceHandler.postDelayed(refreshNanPresence, NAN_PRESENCE_REFRESH_MS);
-            // A NAN Subscribe carries the same tagged `transport.discover`
+            // A NAN Subscribe carries the same directed `announce.discovery`
             // record as Linux and ESP.  Keep this ID stable for the whole
             // Subscribe session: Android repeats the SDF, and a sleepy peer
             // must answer once per discovery ping, not once per repeated RF
@@ -124,13 +125,13 @@ public final class AndroidTransportBridge {
             // the foreground service merely because a provider is unavailable.
         }
     }
-    private void publishNanPresence(boolean boot) {
+    private void publishNanPresence() {
         byte[] deviceId = nanDeviceId;
         if (deviceId == null) return;
         long uptimeSecs = Math.max(0, (android.os.SystemClock.elapsedRealtime()
                 - nanStartedElapsedMs) / 1000);
         String staSsid = currentStaSsid();
-        byte[] announce = MeshNode.buildNanAnnounce(boot ? "boot" : "discovery", deviceId,
+        byte[] announce = MeshNode.buildNanAnnounce(deviceId,
                 uptimeSecs, staSsid.isEmpty() ? 0 : 1, 0, shortDeviceName(), staSsid,
                 staLinkLocalV6, apLinkLocalV6);
         if (announce.length == 0) return;
@@ -138,19 +139,19 @@ public final class AndroidTransportBridge {
                 ignored -> { });
     }
 
-    /** Canonical CBOR: {1: control, 2: transport.discover, 3: id,
-     * 5: {nan: true}}.  Java projects the shared fixed wire form; Rust still
+    /** Canonical CBOR: {1: announce, 2: discovery, 3: id, 5: {}}.
+     * Java projects the shared fixed wire form; Rust still
      * owns its meaning and all response validation. */
     private byte[] nanDiscoverRecord() {
         long id = nanDiscoveryRequestId;
         return new byte[] {
-                (byte) 0xa4, 0x01, 0x01, 0x02, 0x06, 0x03, 0x1a,
+                (byte) 0xa4, 0x01, 0x06, 0x02, 0x02, 0x03, 0x1a,
                 (byte) (id >>> 24), (byte) (id >>> 16), (byte) (id >>> 8), (byte) id,
-                0x05, (byte) 0xa1, 0x16, (byte) 0xf5
+                0x05, (byte) 0xa0
         };
     }
     /** Network callbacks use this to publish a changed STA mode/SSID promptly. */
-    public void refreshNanPresence() { publishNanPresence(false); }
+    public void refreshNanPresence() { publishNanPresence(); }
 
     /** Update shared observed IPv6 endpoints before publishing presence. */
     public void updateLinkLocalAddresses(String sta, String ap) {
@@ -207,7 +208,11 @@ public final class AndroidTransportBridge {
             if ("nan".equals(operation)) return "nan=" + wifi.startNanAfterP2pAndAwait();
             if ("p2p_go".equals(operation)) return "p2p_go=" + wifi.startP2pGroupWithServiceAndAwait();
             if ("sta".equals(operation)) return startSta(projection);
-            if ("stop".equals(operation)) { wifi.stopP2p(() -> { }); return "stop=accepted"; }
+            if ("stop".equals(operation)) {
+                wifi.stopNan();
+                wifi.stopP2p(() -> { });
+                return "stop=accepted";
+            }
             return "rejected=" + operation;
         } catch (Exception e) { return "invalid_projection=" + e; }
     }
