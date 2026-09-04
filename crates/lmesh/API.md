@@ -1,7 +1,7 @@
 # lmesh service bridge
 
 `lmesh` is a launcher and generic local REST/tagged-record bridge; it is not a
-portable API owner. Reviewed discovery, transport, probe, IPERF, raw-radio,
+portable API owner. Reviewed discovery, transport, probe, raw-radio,
 status, and metrics contracts live beside their structs/codecs in
 [`dmesh-server/API.md`](../dmesh-server/API.md). Linux Wi-Fi implementation
 details live in `lmesh-wifi` and are not public mesh methods.

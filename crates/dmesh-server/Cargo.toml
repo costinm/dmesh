@@ -12,6 +12,8 @@ serde_json = { version = "1", optional = true }
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time", "sync", "fs"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+axum = { version = "0.7", optional = true }
+ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh", optional = true }
 
 [features]
 default = ["std", "udp"]
@@ -25,6 +27,7 @@ std = [
     "dep:tracing-subscriber",
 ]
 udp = ["std", "dep:libc", "quic-lite/std"]
+http = ["std", "dep:axum", "dep:ssh-mesh"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -33,7 +36,7 @@ tempfile = "3"
 name = "dmesh_server"
 
 [[example]]
-name = "recovery-iperf-server"
+name = "recovery-probe-server"
 required-features = ["udp"]
 test = true
 

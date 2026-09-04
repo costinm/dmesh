@@ -31,7 +31,7 @@ use std::ffi::{CString, c_char, c_int, c_void};
 use std::io;
 #[cfg(target_os = "android")]
 use std::io::Write;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::Ipv6Addr;
 #[cfg(target_os = "android")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -116,11 +116,47 @@ fn record_nan_followup(frame: FrameRecord) {
 
 fn record_nan_event(frame: FrameRecord) {
     if let Ok(mut history) = nan_events().lock() {
+        // Lifecycle callbacks describe the state used by `telemetry.nan_status`.
+        // Routine discovery callbacks can be arbitrarily frequent, so they must
+        // not evict the last attach/publish/subscribe transition and make a live
+        // Android Aware session look inactive.
         if history.len() == NAN_EVENT_HISTORY_LEN {
-            history.pop_front();
+            if let Some(index) = history
+                .iter()
+                .position(|entry| !nan_event_is_lifecycle(entry.msg_type.as_deref()))
+            {
+                history.remove(index);
+            } else if nan_event_is_lifecycle(frame.msg_type.as_deref()) {
+                // A lifecycle-only history is exceptionally small; retain the
+                // latest transition rather than rejecting it.
+                history.pop_front();
+            } else {
+                // Keep the lifecycle state intact. The raw persistent frame
+                // store still receives this diagnostic callback below.
+                return;
+            }
         }
         history.push_back(frame);
     }
+}
+
+fn nan_event_is_lifecycle(event: Option<&str>) -> bool {
+    matches!(
+        event,
+        Some(
+            "attached"
+                | "aware.on_attached"
+                | "aware.on_session_terminated"
+                | "aware.on_attach_failed"
+                | "aware.session_close"
+                | "aware.on_publish_started"
+                | "aware.on_publish_terminated"
+                | "aware.publish_close"
+                | "aware.on_subscribe_started"
+                | "aware.on_subscribe_terminated"
+                | "aware.subscribe_close"
+        )
+    )
 }
 #[cfg(target_os = "android")]
 static ANDROID_LOGGER: AndroidLog = AndroidLog;
@@ -608,22 +644,13 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "radio.nan.build_announce" => {
             let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
             let uptime_secs = parse_u32(&cmd, "uptime_secs", 0)?;
-            let kind = match cmd.data.get("kind").map(String::as_str) {
-                Some("boot") => dmesh_server::announce::ANNOUNCE_BOOT,
-                _ => dmesh_server::announce::ANNOUNCE_DISCOVERY,
-            };
             let mut id = [0; 16];
             if device_id.is_empty() || device_id.len() > id.len() {
                 anyhow::bail!("announce device id must be 1..16 bytes");
             }
             id[..device_id.len()].copy_from_slice(&device_id);
-            let announce = if kind == dmesh_server::announce::ANNOUNCE_BOOT {
-                let mut boot = dmesh_server::announce::Announce::boot(id, device_id.len() as u8);
-                boot.uptime_secs = uptime_secs;
-                boot
-            } else {
-                dmesh_server::announce::Announce::discovery(id, device_id.len() as u8, uptime_secs)
-            };
+            let announce =
+                dmesh_server::announce::Announce::discovery(id, device_id.len() as u8, uptime_secs);
             // Android emits the same descriptor used by Linux and ESP.  The
             // advertised subset avoids scheduling ESP-NOW rows for phones;
             // Android-specific NAN data-path capability remains a separate
@@ -658,6 +685,12 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     anyhow::bail!("sta_link_local_v6 must be link-local");
                 }
                 announce.set_sta_link_local_v6(address.octets());
+                // NAN is discovery/activation, not a separate data bearer.
+                // A peer that learns Android's link-local endpoint over NAN
+                // must use the same normal QUIC UDP listener as multicast and
+                // directed discovery, not an Android-only port convention.
+                announce.set_udp_link_local_v6(address.octets());
+                announce.set_udp_port(dmesh_server::udp::STABLE_WIFI_UDP_PORT);
             }
             let mut out = [0; 96];
             let used = dmesh_server::announce::encode(announce, &mut out)
@@ -841,7 +874,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             }
             text.into_bytes()
         }
-        "radio.probe.plan" => {
+        "probe.plan" => {
             let source_id = required_data(&cmd, "source_id")?;
             let target_id = required_data(&cmd, "target_id")?;
             if source_id == target_id {
@@ -963,192 +996,6 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             .to_string()
             .into_bytes()
         }
-        "radio.probe.udp6_echo" => {
-            // The controller supplies the address learned from the shared
-            // multicast announce and the *local* P2P interface index. A
-            // link-local address without that scope is not a usable P2P
-            // destination, so reject it here rather than silently using an
-            // unrelated default Wi-Fi route.
-            let address = required_data(&cmd, "address")?
-                .parse::<Ipv6Addr>()
-                .map_err(|_| anyhow::anyhow!("udp6 echo address must be IPv6"))?;
-            if !address.is_unicast_link_local() {
-                anyhow::bail!("udp6 echo requires an IPv6 link-local address");
-            }
-            let scope = parse_u32(&cmd, "scope", 0)?;
-            if scope == 0 {
-                anyhow::bail!("udp6 echo requires a nonzero local interface scope");
-            }
-            let port = u16::try_from(parse_u32(
-                &cmd,
-                "port",
-                u32::from(dmesh_server::udp::STABLE_WIFI_UDP_PORT),
-            )?)
-            .map_err(|_| anyhow::anyhow!("udp6 echo port is outside u16"))?;
-            let body = cmd
-                .data
-                .get("payload")
-                .map(String::as_bytes)
-                .unwrap_or(b"dmesh-p2p-probe");
-            if body.is_empty() || body.len() > 256 {
-                anyhow::bail!("udp6 echo payload must be 1..=256 bytes");
-            }
-            let peer = SocketAddr::V6(SocketAddrV6::new(address, port, 0, scope));
-            let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| anyhow::anyhow!("udp6 echo runtime: {error}"))?;
-            let started = std::time::Instant::now();
-            let payload = body.to_vec();
-            let payload_len = payload.len();
-            let result = runtime.block_on(async move {
-                let cid_value = (chrono::Utc::now().timestamp_micros() as u64) | 1;
-                let cid = quic_lite::ConnectionId::new(cid_value)
-                    .ok_or_else(|| anyhow::anyhow!("udp6 echo CID"))?;
-                let mut client = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    dmesh_server::udp::UdpClient::connect(bind, peer, cid),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("udp6 echo bootstrap timeout"))??;
-                let mut request = Vec::with_capacity(1 + payload.len());
-                request.push(quic_lite::SERVICE_ECHO);
-                request.extend_from_slice(&payload);
-                let (_, echoed, _) = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    client.request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, &request, true),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("udp6 echo response timeout"))??;
-                let _ = client.close(0).await;
-                if echoed != payload {
-                    anyhow::bail!("udp6 echo payload mismatch");
-                }
-                Ok::<_, anyhow::Error>(client.transport_stats())
-            })?;
-            json!({
-                "ok": true,
-                "peer": peer.to_string(),
-                "bytes": payload_len,
-                "elapsed_us": started.elapsed().as_micros(),
-                "packets_tx": result.sent_datagrams,
-                "packets_rx": result.received_datagrams,
-            })
-            .to_string()
-            .into_bytes()
-        }
-        "radio.probe.udp6_iperf" => {
-            // This is the same scoped-P2P UDP bearer and common SERVICE_IPERF
-            // schema used by host/firmware tests. Java only marshals the
-            // request; stream reassembly and transport accounting stay Rust.
-            let address = required_data(&cmd, "address")?
-                .parse::<Ipv6Addr>()
-                .map_err(|_| anyhow::anyhow!("udp6 iperf address must be IPv6"))?;
-            if !address.is_unicast_link_local() {
-                anyhow::bail!("udp6 iperf requires an IPv6 link-local address");
-            }
-            let scope = parse_u32(&cmd, "scope", 0)?;
-            if scope == 0 {
-                anyhow::bail!("udp6 iperf requires a nonzero local interface scope");
-            }
-            let port = u16::try_from(parse_u32(
-                &cmd,
-                "port",
-                u32::from(dmesh_server::udp::STABLE_WIFI_UDP_PORT),
-            )?)
-            .map_err(|_| anyhow::anyhow!("udp6 iperf port is outside u16"))?;
-            let bytes = u64::from(parse_u32(&cmd, "bytes", 32 * 1024)?);
-            if !(1..=256 * 1024).contains(&bytes) {
-                anyhow::bail!("udp6 iperf bytes must be 1..=262144");
-            }
-            let packet_size = u16::try_from(parse_u32(&cmd, "packet_size", 1_100)?)
-                .map_err(|_| anyhow::anyhow!("udp6 iperf packet size is outside u16"))?;
-            if !(64..=1_100).contains(&packet_size) {
-                anyhow::bail!("udp6 iperf packet size must be 64..=1100");
-            }
-            let peer = SocketAddr::V6(SocketAddrV6::new(address, port, 0, scope));
-            let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| anyhow::anyhow!("udp6 iperf runtime: {error}"))?;
-            let started = std::time::Instant::now();
-            let result = runtime.block_on(async move {
-                let cid_value = (chrono::Utc::now().timestamp_micros() as u64) | 1;
-                let cid = quic_lite::ConnectionId::new(cid_value)
-                    .ok_or_else(|| anyhow::anyhow!("udp6 iperf CID"))?;
-                let mut client = tokio::time::timeout(
-                    std::time::Duration::from_secs(4),
-                    dmesh_server::udp::UdpClient::connect(bind, peer, cid),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("udp6 iperf bootstrap timeout"))??;
-                let mut request = [0u8; 64];
-                let request_len = dmesh_server::iperf::encode_iperf_service_request(
-                    dmesh_server::iperf::IperfServiceRequest::new(bytes, packet_size),
-                    &mut request,
-                )
-                .ok_or_else(|| anyhow::anyhow!("udp6 iperf request encoding"))?;
-                // IPERF is an asymmetric service: the client opens the
-                // request stream, while the server schedules its payload on
-                // a server-initiated response stream (normally ID 1). Do
-                // not use `request_stream_all`, which correctly enforces
-                // same-stream request/response semantics for RPC services
-                // but would reject this IPERF response as `1 expected 4`.
-                let expected =
-                    usize::try_from(bytes).map_err(|_| anyhow::anyhow!("udp6 iperf size"))?;
-                let (response_stream, first, mut finished) = tokio::time::timeout(
-                    std::time::Duration::from_secs(12),
-                    client.request_stream(
-                        quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                        &request[..request_len],
-                        true,
-                    ),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("udp6 iperf first response timeout"))??;
-                let mut received = first;
-                while !finished {
-                    let (stream, chunk, fin) = tokio::time::timeout(
-                        std::time::Duration::from_secs(12),
-                        client.recv_stream(),
-                    )
-                    .await
-                    .map_err(|_| anyhow::anyhow!("udp6 iperf transfer timeout"))??;
-                    if stream != response_stream {
-                        anyhow::bail!(
-                            "udp6 iperf response stream {stream} expected {response_stream}"
-                        );
-                    }
-                    if received.len().saturating_add(chunk.len()) > expected {
-                        anyhow::bail!("udp6 iperf response exceeds requested {bytes} bytes");
-                    }
-                    received.extend_from_slice(&chunk);
-                    finished = fin;
-                }
-                if received.len() != usize::try_from(bytes).unwrap_or(usize::MAX) {
-                    anyhow::bail!("udp6 iperf received {} expected {bytes}", received.len());
-                }
-                let stats = client.transport_stats();
-                let _ = client.close(0).await;
-                Ok::<_, anyhow::Error>(stats)
-            })?;
-            let elapsed_us = started.elapsed().as_micros().max(1) as u64;
-            json!({
-                "ok": true,
-                "peer": peer.to_string(),
-                "bytes": bytes,
-                "packet_size": packet_size,
-                "elapsed_us": elapsed_us,
-                "bps": bytes.saturating_mul(8_000_000) / elapsed_us,
-                "packets_tx": result.sent_datagrams,
-                "packets_rx": result.received_datagrams,
-                "retransmitted": result.retransmitted_datagrams,
-            })
-            .to_string()
-            .into_bytes()
-        }
         "radio.nan.followups" => {
             let history = nan_followups()
                 .lock()
@@ -1188,23 +1035,70 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .collect::<Vec<_>>();
             json!({"events": entries}).to_string().into_bytes()
         }
-        "nan.status" => {
+        "telemetry.nan_status" => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let events = nan_events()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("NAN event cache poisoned"))?;
-            let active = events.iter().any(|entry| {
-                now_ms.saturating_sub(entry.timestamp) <= 10 * 60 * 1_000
-                    && entry.msg_type.as_deref() == Some("attached")
-            });
+            // Android's public Wi-Fi Aware callbacks are the authority for
+            // local session state. Preserve their ordering: a terminated
+            // callback must win over an older successful attach, while a new
+            // attach can make the session active again. Discovery receipt
+            // records are peer facts and intentionally do not imply that the
+            // local Aware session remains attached.
+            let mut active = false;
+            let mut publish_active = false;
+            let mut subscribe_active = false;
+            let mut last_event = None;
+            for entry in events
+                .iter()
+                .filter(|entry| now_ms.saturating_sub(entry.timestamp) <= 10 * 60 * 1_000)
+            {
+                let Some(event) = entry.msg_type.as_deref() else {
+                    continue;
+                };
+                last_event = Some(event);
+                match event {
+                    "attached" | "aware.on_attached" => active = true,
+                    "aware.on_session_terminated"
+                    | "aware.on_attach_failed"
+                    | "aware.session_close" => {
+                        active = false;
+                        publish_active = false;
+                        subscribe_active = false;
+                    }
+                    "aware.on_publish_started" if active => publish_active = true,
+                    "aware.on_publish_terminated" | "aware.publish_close" => {
+                        publish_active = false;
+                    }
+                    "aware.on_subscribe_started" if active => subscribe_active = true,
+                    "aware.on_subscribe_terminated" | "aware.subscribe_close" => {
+                        subscribe_active = false;
+                    }
+                    _ => {}
+                }
+            }
             json!({
                 "active": active,
+                "publish_active": publish_active,
+                "subscribe_active": subscribe_active,
+                "last_event": last_event,
             })
             .to_string()
             .into_bytes()
         }
-        "now.metrics" | "udp6.metrics" | "wifi.link.metrics" => b"{}".to_vec(),
-        "nan.metrics" => {
+        // Connection packet counters are supplied by the shared QUIC server;
+        // this platform handler contributes only Android's bounded endpoint
+        // identity.  Keeping the bare service name here makes numeric
+        // component 9/status work through the same catalog projection as
+        // Linux and ESP instead of growing an Android-only alias.
+        "status" => json!({"status_version": 1, "platform": "android"})
+            .to_string()
+            .into_bytes(),
+        "telemetry.now_metrics" | "telemetry.udp6_metrics" | "telemetry.wifi_link_metrics" => {
+            b"{}".to_vec()
+        }
+        "telemetry.nan_metrics" => {
             let followups = nan_followups()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("NAN follow-up cache poisoned"))?;
@@ -1275,22 +1169,26 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             if matches!(
                 method,
                 "discovery.nodes"
-                    | "nan.status"
-                    | "now.metrics"
-                    | "nan.metrics"
-                    | "udp6.metrics"
-                    | "wifi.link.metrics"
+                    | "telemetry.nan_status"
+                    | "telemetry.now_metrics"
+                    | "telemetry.nan_metrics"
+                    | "telemetry.udp6_metrics"
+                    | "telemetry.wifi_link_metrics"
                     | "radio.nan.followups"
                     | "radio.nan.events"
                     | "discovery.status"
             ) {
                 return radio_message(method, "", &[], -1);
             }
-            let mode_nan = method == "transport.start"
-                && params
-                    .and_then(|params| params.get("mode"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|mode| mode == "nan" || mode == "aware");
+            // Schema enum fields are represented by their stable numeric tag
+            // at this adapter boundary. Accept the text form as well for an
+            // older local caller, but project both forms through the one
+            // `transport.set` Android operation.
+            let transport_mode = params.and_then(|params| params.get("mode"));
+            let mode_nan = method == "transport.set"
+                && transport_mode.is_some_and(|mode| {
+                    matches!(mode.as_str(), Some("nan" | "aware")) || mode.as_u64() == Some(6)
+                });
             let p2p_go = params
                 .and_then(|params| params.get("ap"))
                 .and_then(Value::as_str)
@@ -1299,12 +1197,19 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     .and_then(|params| params.get("p2p_go"))
                     .and_then(Value::as_str)
                     .is_some_and(|value| value == "1");
-            let sta = method == "transport.start"
-                && params
-                    .and_then(|params| params.get("mode"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|mode| mode == "sta");
-            let operation = if method == "transport.stop" {
+            let sta = method == "transport.set"
+                && transport_mode.is_some_and(|mode| {
+                    mode.as_str() == Some("sta") || mode.as_u64() == Some(1)
+                });
+            // `uart` is the portable all-radio-off profile.  Android has no
+            // UART bearer, so its projection only tears down the Android
+            // Wi-Fi personalities; it does not invent a separate
+            // `wifi.nan.stop` command surface.
+            let radio_off = method == "transport.set"
+                && transport_mode.is_some_and(|mode| {
+                    mode.as_str() == Some("uart") || mode.as_u64() == Some(5)
+                });
+            let operation = if radio_off {
                 "stop"
             } else if sta {
                 "sta"
@@ -1403,13 +1308,15 @@ pub(crate) fn handle_tagged_control_record(
         anyhow::bail!("tagged control record is missing a method")
     }
     // This handler is registered with the localhost HTTP service. Framework
-    // callbacks still enter through their dedicated JNI functions. The one
-    // mutating operation below is a bounded common UDP6 perf service selected
-    // from shared discovery facts, not an Android-private radio command.
+    // callbacks still enter through their dedicated JNI functions.
     let supported = matches!(
         (component.as_str(), method.as_str()),
-        ("discovery", "devices" | "status")
-            | ("nan", "status")
+        ("", "status")
+            | ("discovery", "devices" | "nodes" | "status")
+            | (
+                "telemetry",
+                "nan_status" | "now_metrics" | "nan_metrics" | "udp6_metrics" | "wifi_link_metrics"
+            )
             | (
                 "radio",
                 "status_text"
@@ -1418,7 +1325,6 @@ pub(crate) fn handle_tagged_control_record(
                     | "nan.events"
                     | "local_networks"
                     | "power.state"
-                    | "perf.udp6"
             )
     );
     if !supported {
@@ -1430,83 +1336,19 @@ pub(crate) fn handle_tagged_control_record(
     if record.data.is_some() {
         anyhow::bail!("Android HTTP control methods do not accept opaque data")
     }
-    if !(component == "radio" && method == "perf.udp6") && !record.env.is_empty() {
+    if !record.env.is_empty() {
         anyhow::bail!("Android HTTP observation methods do not accept fields or data")
     }
 
-    let mut args = String::new();
-    if component == "radio" && method == "perf.udp6" {
-        let field = |name: &str| {
-            record.env.iter().find_map(|(key, value)| match key {
-                NameOrTag::Name(key) if key == name => Some(value),
-                _ => None,
-            })
-        };
-        let target_id = field("target_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("perf.udp6 requires target_id"))?;
-        let bytes = field("bytes").and_then(Value::as_u64).unwrap_or(32 * 1024);
-        let packet_size = field("packet_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(1_100);
-        if !(1..=256 * 1024).contains(&bytes) || !(64..=1_100).contains(&packet_size) {
-            anyhow::bail!("perf.udp6 bytes or packet_size is outside the published bounds")
-        }
-        let device = discovered_devices()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("discovered-device cache poisoned"))?
-            .get(target_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown discovered target_id"))?;
-        let network_name = device
-            .info
-            .get("network_name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("target has not announced a current STA SSID"))?;
-        let local_matches = local_networks()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("local-networks table poisoned"))?
-            .networks
-            .values()
-            .any(|network| network.ssid.as_deref() == Some(network_name));
-        if !local_matches {
-            anyhow::bail!("target STA SSID does not match a local active STA attachment")
-        }
-        let peer = device
-            .transports
-            .get("udp_multicast")
-            .ok_or_else(|| anyhow::anyhow!("target has no UDP multicast transport observation"))?
-            .parse::<SocketAddr>()
-            .map_err(|_| anyhow::anyhow!("target UDP multicast address is invalid"))?;
-        let SocketAddr::V6(peer) = peer else {
-            anyhow::bail!("target UDP multicast address is not IPv6")
-        };
-        if !peer.ip().is_unicast_link_local() || peer.scope_id() == 0 {
-            anyhow::bail!("target UDP multicast address lacks a scoped IPv6 link-local route")
-        }
-        args = format!(
-            "address={} scope={} port={} bytes={} packet_size={}",
-            peer.ip(),
-            peer.scope_id(),
-            peer.port(),
-            bytes,
-            packet_size
-        );
-    }
-
-    let full_method = if component.is_empty() {
-        method.clone()
-    } else {
-        format!("{component}.{method}")
+    let full_method = match (component.as_str(), method.as_str()) {
+        // The common tagged name is discovery.nodes while Android's internal
+        // callback predates the catalog and exposes it as discovery/devices.
+        // Keep this translation here, at the platform boundary.
+        ("discovery", "devices" | "nodes") => "discovery.nodes".to_owned(),
+        _ if component.is_empty() => method.clone(),
+        _ => format!("{component}.{method}"),
     };
-    let full_method = if component == "radio" && method == "perf.udp6" {
-        "radio.probe.udp6_iperf".to_owned()
-    } else {
-        full_method
-    };
-    let output = radio_message(&full_method, &args, &[], -1)?;
+    let output = radio_message(&full_method, "", &[], -1)?;
     let Some(id) = record.id else {
         return Ok(None);
     };
@@ -2097,6 +1939,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
     base_dir: JString,
     ssh_port: jint,
     http_port: jint,
+    udp_fd: jint,
 ) -> jlong {
     #[cfg(target_os = "android")]
     init_android_logging();
@@ -2108,11 +1951,50 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
     #[cfg(target_os = "android")]
     configure_android_mesh_paths(&base_dir_str);
 
-    match crate::mesh_common::start_mesh(&base_dir_str, ssh_port, http_port) {
+    match crate::mesh_common::start_mesh(
+        &base_dir_str,
+        ssh_port,
+        http_port,
+        (udp_fd >= 0).then_some(udp_fd),
+    ) {
         Ok(handle) => Box::into_raw(Box::new(handle)) as jlong,
         Err(e) => {
             log::error!("Failed to start mesh: {}", e);
             0
+        }
+    }
+}
+
+/// Provision the private device/control-plane root before the next mesh
+/// start. Java only supplies Android's app-private base directory and opaque
+/// bytes; the shared Rust settings helper owns validation and the atomic
+/// mode-0600 write. The secret is never returned through JNI, settings, HTTP,
+/// SSH, or a QUIC handler.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeProvisionDeviceSecret(
+    mut env: JNIEnv,
+    _class: JClass,
+    base_dir: JString,
+    secret: JByteArray,
+) -> jboolean {
+    let base_dir: String = match env.get_string(&base_dir) {
+        Ok(value) => value.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    let secret = match env.convert_byte_array(&secret) {
+        Ok(secret) => secret,
+        Err(_) => return JNI_FALSE,
+    };
+    match dmesh_server::settings::write_private_device_secret_file(
+        std::path::Path::new(&base_dir).join("device-secret.bin"),
+        &secret,
+    ) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            // Deliberately log only the operation error, never length or
+            // contents of provisioning material.
+            log::warn!("Android device-secret provisioning rejected: {error}");
+            JNI_FALSE
         }
     }
 }
@@ -2735,6 +2617,86 @@ mod tests {
     }
 
     #[test]
+    fn android_nan_status_follows_framework_lifecycle_order() {
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
+        nan_events().lock().unwrap().clear();
+        radio_message(
+            "radio.nan.event",
+            "event=aware.on_attached peer=framework",
+            &[],
+            -1,
+        )
+        .unwrap();
+        radio_message(
+            "radio.nan.event",
+            "event=aware.on_publish_started peer=framework",
+            &[],
+            -1,
+        )
+        .unwrap();
+        radio_message(
+            "radio.nan.event",
+            "event=aware.on_subscribe_started peer=framework",
+            &[],
+            -1,
+        )
+        .unwrap();
+        let status = radio_message("telemetry.nan_status", "", &[], -1).unwrap();
+        let status: Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["active"], true);
+        assert_eq!(status["publish_active"], true);
+        assert_eq!(status["subscribe_active"], true);
+        assert_eq!(status["last_event"], "aware.on_subscribe_started");
+
+        radio_message(
+            "radio.nan.event",
+            "event=aware.on_session_terminated peer=framework",
+            &[],
+            -1,
+        )
+        .unwrap();
+        let status = radio_message("telemetry.nan_status", "", &[], -1).unwrap();
+        let status: Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["active"], false);
+        assert_eq!(status["publish_active"], false);
+        assert_eq!(status["subscribe_active"], false);
+    }
+
+    #[test]
+    fn android_nan_status_survives_routine_discovery_history_pressure() {
+        let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
+        nan_events().lock().unwrap().clear();
+        for event in [
+            "aware.on_attached",
+            "aware.on_publish_started",
+            "aware.on_subscribe_started",
+        ] {
+            radio_message(
+                "radio.nan.event",
+                &format!("event={event} peer=framework"),
+                &[],
+                -1,
+            )
+            .unwrap();
+        }
+        for _ in 0..(NAN_EVENT_HISTORY_LEN * 2) {
+            radio_message(
+                "radio.nan.event",
+                "event=aware.on_service_discovered peer=peer",
+                &[],
+                -1,
+            )
+            .unwrap();
+        }
+
+        let status = radio_message("telemetry.nan_status", "", &[], -1).unwrap();
+        let status: Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["active"], true);
+        assert_eq!(status["publish_active"], true);
+        assert_eq!(status["subscribe_active"], true);
+    }
+
+    #[test]
     fn android_nan_followup_promotes_embedded_announce_identity() {
         let _guard = RADIO_STATE_TEST_LOCK.lock().unwrap();
         discovered_devices().lock().unwrap().clear();
@@ -2848,6 +2810,11 @@ mod tests {
             announce.sta_link_local_v6(),
             Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets())
         );
+        assert_eq!(
+            announce.udp_link_local_v6(),
+            Some("fe80::1234".parse::<Ipv6Addr>().unwrap().octets())
+        );
+        assert_eq!(announce.udp_port, dmesh_server::udp::STABLE_WIFI_UDP_PORT);
     }
 
     #[test]
@@ -2867,6 +2834,36 @@ mod tests {
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .is_some_and(|text| text.starts_with("DMesh"))
         );
+    }
+
+    #[test]
+    fn android_shell_projects_numeric_transport_set_nan_to_the_nan_adapter() {
+        let projection = radio_message(
+            "radio.shell.command",
+            "",
+            b"transport.set mode=nan",
+            -1,
+        )
+        .unwrap();
+        let projection: Value = serde_json::from_slice(&projection).unwrap();
+        assert_eq!(projection["status"], "accepted");
+        assert_eq!(projection["operation"], "nan");
+        assert_eq!(projection["request"]["params"]["mode"], 6);
+    }
+
+    #[test]
+    fn android_shell_projects_uart_transport_set_to_the_all_radio_off_adapter() {
+        let projection = radio_message(
+            "radio.shell.command",
+            "",
+            b"transport.set mode=uart",
+            -1,
+        )
+        .unwrap();
+        let projection: Value = serde_json::from_slice(&projection).unwrap();
+        assert_eq!(projection["status"], "accepted");
+        assert_eq!(projection["operation"], "stop");
+        assert_eq!(projection["request"]["params"]["mode"], 5);
     }
 
     #[test]

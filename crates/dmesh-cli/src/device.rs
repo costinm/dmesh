@@ -26,6 +26,11 @@ pub struct DeviceProfile {
     pub ipv6_link_local: Option<Ipv6Addr>,
     /// `/dev/serial/by-id` basename or an explicit absolute serial path.
     pub serial_id: Option<String>,
+    /// Physical speed for a real UART bridge.  Packetized USB/JTAG endpoints
+    /// leave this unset; callers must carry the profile value through to the
+    /// common serial framing adapter instead of treating every named device as
+    /// USB-JTAG.
+    pub uart_baud: Option<u32>,
     /// Reserved for the future end-to-end authentication layer. This is a
     /// reference/name, never secret bytes read or logged by this module.
     pub auth_secret_ref: Option<String>,
@@ -98,6 +103,7 @@ pub fn load_device(name: &str) -> Result<DeviceProfile, String> {
         static_ipv4,
         ipv6_link_local,
         serial_id: device.serial.clone().or_else(|| device.serial_glob.clone()),
+        uart_baud: device.uart_baud,
         auth_secret_ref: device.auth_secret_ref.clone(),
         udp_port: device.udp_port,
     })
@@ -144,6 +150,7 @@ mod tests {
             static_ipv4: Some("192.0.2.6".parse::<Ipv4Addr>().unwrap()),
             ipv6_link_local: Some("fe80::6".parse::<Ipv6Addr>().unwrap()),
             serial_id: Some("usb-e6".into()),
+            uart_baud: None,
             auth_secret_ref: Some("reserved".into()),
             udp_port: DEFAULT_UDP_PORT,
         };

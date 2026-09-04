@@ -300,7 +300,7 @@ pub fn active_subscribe_service_info<'a>(
     // Subscribe is control 0x11 and carries its Service Info directly in the
     // SDA. Prefer that explicit Subscribe descriptor before considering an
     // SDEA: selecting the first matching service ID would otherwise consume
-    // the peer's announce and silently lose `transport.discover`.
+    // the peer's announce and silently lose directed `announce.discovery`.
     for descriptor in crate::service_descriptors(frame) {
         if descriptor.service_id == service_id
             && matches!(descriptor.descriptor.control, 0x11 | 0x12)

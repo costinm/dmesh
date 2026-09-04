@@ -1,19 +1,13 @@
 //! Bearer-neutral stream services used by UDP, NAN, fake links, and devices.
 //!
 //! This module deliberately has no socket or bearer code. A bearer decodes a
-//! stream packet, passes the service tag/body to [`handle_stream`], and sends
-//! the returned response on its own transport.
+//! stream packet and passes the complete request to the shared tagged
+//! dispatcher. Bearers do not select application handlers.
 
 use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use quic_lite::{
-    ConnectionId, EndpointState, PathPolicy, SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS,
-    SERVICE_IPERF, SERVICE_LOG_WATCH, SERVICE_METRICS, SERVICE_OBJECT, SERVICE_STATUS,
-    SERVICE_STREAM,
-};
-
-pub use quic_lite::{StreamHandler, StreamRegistry};
+use quic_lite::{ConnectionId, EndpointState};
 
 const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
 /// A retained binary event must fit in one bounded direct-record response.
@@ -21,10 +15,75 @@ const MAX_EVENT_RESPONSE_BYTES: usize = 1200;
 /// limit would still allow one producer to retain an arbitrary allocation.
 pub const MAX_BINARY_EVENT_PAYLOAD_BYTES: usize = 1024;
 pub const LOG_WATCH_MAX_RECORDS: usize = 64;
-/// Control-stream subtype for selecting a bearer-neutral egress policy.
-pub const CONTROL_PATH_POLICY: u8 = 3;
-/// First byte in a compact control-handler response.
-pub const CONTROL_RESPONSE: u8 = 2;
+
+/// Common read-only connection diagnostics. These are application handlers,
+/// not QUIC service numbers; every request uses the normal tagged envelope.
+pub const DIAGNOSTIC_COMPONENT: u64 = 9;
+pub const DIAGNOSTIC_STATUS_METHOD: u64 = 1;
+pub const DIAGNOSTIC_SERVICES_METHOD: u64 = 2;
+pub const DIAGNOSTIC_METRICS_METHOD: u64 = 3;
+pub const DIAGNOSTIC_EVENTS_METHOD: u64 = 4;
+pub const DIAGNOSTIC_LOG_WATCH_METHOD: u64 = 5;
+
+const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
+    (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_STATUS_METHOD, b"status"),
+    (
+        DIAGNOSTIC_COMPONENT,
+        DIAGNOSTIC_SERVICES_METHOD,
+        b"services",
+    ),
+    (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_METRICS_METHOD, b"metrics"),
+    (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_EVENTS_METHOD, b"events"),
+    (
+        DIAGNOSTIC_COMPONENT,
+        DIAGNOSTIC_LOG_WATCH_METHOD,
+        b"log-watch",
+    ),
+    (
+        crate::probe::PROBE_COMPONENT,
+        crate::probe::PROBE_RUN,
+        b"probe",
+    ),
+    (
+        crate::protocol::OBJECT_COMPONENT,
+        crate::protocol::OBJECT_GET_METHOD,
+        b"object.get",
+    ),
+    (
+        crate::protocol::OBJECT_COMPONENT,
+        crate::protocol::OBJECT_FLASH_METHOD,
+        b"object.flash",
+    ),
+];
+
+/// Encode the built-in tagged QUIC handler catalog as
+/// `[[component, method, "service"], ...]`.
+///
+/// Compatibility stream selectors are intentionally excluded: they are
+/// framing for object transfer and connection migration, not application
+/// handler identities.
+pub fn encode_tagged_service_catalog() -> Vec<u8> {
+    let mut output = alloc::vec![0; 192];
+    let mut encoder = crate::cbor::Encoder::new(&mut output);
+    encoder
+        .array(BUILTIN_TAGGED_SERVICES.len() as u64)
+        .expect("fixed service catalog capacity");
+    for (component, method, name) in BUILTIN_TAGGED_SERVICES {
+        encoder.array(3).expect("fixed service catalog capacity");
+        encoder
+            .uint(*component)
+            .expect("fixed service catalog capacity");
+        encoder
+            .uint(*method)
+            .expect("fixed service catalog capacity");
+        encoder
+            .text_value(name)
+            .expect("fixed service catalog capacity");
+    }
+    let used = encoder.len();
+    output.truncate(used);
+    output
+}
 
 /// Platform extension for tagged-CBOR requests carried directly in an
 /// application stream. Component IDs remain `u64` inside the envelope, so
@@ -74,18 +133,16 @@ pub fn register_tagged_component(component: u64, handler: TaggedComponentHandler
 
 /// Dispatch a complete tagged-CBOR stream request.
 ///
-/// This is deliberately attempted before decoding the historical service
-/// byte. A stream is an HTTP-like request channel, not a handler identity:
-/// each stream may carry any component and multiple streams may concurrently
-/// call the same component. Service-byte framing remains a compatibility
-/// adapter for the existing echo/iperf/object endpoints.
+/// A stream is an HTTP-like request channel, not a handler identity: each
+/// stream may carry any component and multiple streams may concurrently call
+/// the same component.
 pub fn dispatch_tagged_stream(data: &[u8]) -> Option<Vec<u8>> {
     dispatch_tagged_record(crate::tagged::decode(data)?)
 }
 
-/// Dispatch an already-decoded tagged record. UDP/QUIC stream adapters use
-/// [`dispatch_tagged_stream`], while small firmware handlers can avoid a
-/// second decode when their ingress has already inspected the envelope.
+/// Dispatch an already-decoded tagged record from a canonical stream handler.
+/// This registry is deliberately not a direct-message allowlist: connectionless
+/// ingress must apply its explicit policy before invoking any operation.
 pub fn dispatch_tagged_record(record: crate::tagged::Record<'_>) -> Option<Vec<u8>> {
     let crate::tagged::Name::Tag(component) = record.component? else {
         return None;
@@ -102,73 +159,136 @@ pub fn dispatch_tagged_record(record: crate::tagged::Record<'_>) -> Option<Vec<u
     None
 }
 
-/// Common diagnostic/control handler set that does not require an object
-/// receiver. ESP-NOW, UART, and UDP endpoints use it until their object sink
-/// is explicitly attached, so discovery never advertises `object` early.
-pub fn diagnostic_stream_registry() -> StreamRegistry {
-    let mut registry = StreamRegistry::empty();
-    for (tag, name) in [
-        (SERVICE_ECHO, b"echo".as_slice()),
-        (SERVICE_STATUS, b"status".as_slice()),
-        (SERVICE_STREAM, b"handlers".as_slice()),
-        (SERVICE_IPERF, b"iperf".as_slice()),
-        (SERVICE_METRICS, b"metrics".as_slice()),
-        (SERVICE_EVENTS, b"events".as_slice()),
-        (SERVICE_CONTROL, b"control".as_slice()),
-        (SERVICE_LOG_WATCH, b"log-watch".as_slice()),
-    ] {
-        // This is a required mutation, not merely a debug-time invariant.
-        // The same registry is used by release firmware and host adapters.
-        // A static duplicate is a debug-time source error, never a runtime
-        // reason to panic an embedded server.
-        let _registered = registry.register(tag, name);
-        debug_assert!(_registered);
+/// Dispatch connection-aware diagnostic tagged requests.
+///
+/// Unlike static application components, these results need the live QUIC
+/// endpoint state and event ring. The connection owner supplies that context after a
+/// complete stream request has been admitted; bearer adapters never do.
+pub fn dispatch_diagnostic_tagged_stream<const N: usize, const H: usize, const P: usize>(
+    endpoint: &EndpointState<N, H, P>,
+    events: Option<&EventRing>,
+    connection_cid: ConnectionId,
+    stream_id: u64,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let record = crate::tagged::decode(data)?;
+    if record.component != Some(crate::tagged::Name::Tag(DIAGNOSTIC_COMPONENT))
+        || record.to.is_some()
+        || record.params.is_some()
+        || record.data.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+    {
+        return None;
     }
-    registry
-}
-
-/// Standard server surface when an object receiver/sender has been attached.
-/// Bearer adapters use this rather than copying a service-name list: the
-/// numeric registry is the dispatch authority and names remain diagnostics.
-pub fn object_stream_registry() -> StreamRegistry {
-    StreamRegistry::default()
-}
-
-/// Decode the compact policy body used after `CONTROL_PATH_POLICY`.
-/// `[0]` selects the highest measured available path, `[1, path]` compares on
-/// one explicit path, `[2, primary]` prefers the low-airtime path until its
-/// adapter reports full, and `[3]` aggregates all available paths. Physical
-/// bearer names never appear on the wire.
-pub fn decode_path_policy(data: &[u8]) -> Option<PathPolicy> {
-    match data {
-        [0] => Some(PathPolicy::HighestMeasuredSpeed),
-        [1, path] => Some(PathPolicy::Explicit(*path as usize)),
-        [2, primary] => Some(PathPolicy::AirtimeFirst {
-            primary: *primary as usize,
-        }),
-        [3] => Some(PathPolicy::Aggregate),
-        _ => None,
-    }
-}
-
-/// Acknowledge a policy change using the same compact body on every bearer.
-pub fn encode_path_policy_response(policy: PathPolicy) -> Vec<u8> {
-    let mut response = Vec::with_capacity(3);
-    response.push(CONTROL_RESPONSE);
-    match policy {
-        PathPolicy::HighestMeasuredSpeed => response.push(0),
-        PathPolicy::Explicit(path) if path <= u8::MAX as usize => {
-            response.extend_from_slice(&[1, path as u8])
+    let crate::tagged::Name::Tag(method) = record.method? else {
+        return None;
+    };
+    let id = record.id?;
+    let fields = diagnostic_fields(record.fields)?;
+    if method == DIAGNOSTIC_SERVICES_METHOD {
+        if fields != (None, None) {
+            return None;
         }
-        PathPolicy::AirtimeFirst { primary } if primary <= u8::MAX as usize => {
-            response.extend_from_slice(&[2, primary as u8])
-        }
-        PathPolicy::Aggregate => response.push(3),
-        // `PathPolicy` is internally unconstrained; no ESP adapter has more
-        // than 255 paths. Preserve a valid response rather than panicking.
-        _ => response.push(0),
+        let result = encode_tagged_service_catalog();
+        let mut response = alloc::vec![0; result.len().checked_add(64)?];
+        let used = crate::tagged::encode_numeric_response(
+            DIAGNOSTIC_COMPONENT,
+            method,
+            id,
+            &result,
+            &mut response,
+        )?;
+        response.truncate(used);
+        return Some(response);
     }
-    response
+    let result = match method {
+        DIAGNOSTIC_STATUS_METHOD => {
+            if fields != (None, None) {
+                return None;
+            }
+            tagged_connection_status(endpoint, connection_cid, stream_id)
+        }
+        DIAGNOSTIC_METRICS_METHOD => {
+            if fields != (None, None) {
+                return None;
+            }
+            metrics_status(endpoint, connection_cid, stream_id)
+        }
+        DIAGNOSTIC_EVENTS_METHOD => {
+            if fields.1.is_some() {
+                return None;
+            }
+            events_status(
+                endpoint,
+                events,
+                connection_cid,
+                stream_id,
+                format!("since={}", fields.0.unwrap_or(0)).as_bytes(),
+            )
+        }
+        DIAGNOSTIC_LOG_WATCH_METHOD => {
+            let since = fields.0.unwrap_or(0);
+            let records = fields.1.unwrap_or(1);
+            if records == 0 || records > LOG_WATCH_MAX_RECORDS as u64 {
+                return None;
+            }
+            format!(
+                "log_watch_version=1;next_sequence={};since={since};requested={records};logs=0",
+                events.map_or(0, EventRing::next_sequence)
+            )
+            .into_bytes()
+        }
+        _ => return None,
+    };
+    let mut response = alloc::vec![0; result.len().checked_add(64)?];
+    let used = crate::tagged::encode_numeric_data_response(
+        DIAGNOSTIC_COMPONENT,
+        method,
+        id,
+        &result,
+        true,
+        &mut response,
+    )?;
+    response.truncate(used);
+    Some(response)
+}
+
+/// Decode `{1: since?, 2: records?}` without allowing unknown or duplicate
+/// fields. An omitted fields map is the same as an empty map.
+fn diagnostic_fields(fields: Option<&[u8]>) -> Option<(Option<u64>, Option<u64>)> {
+    let Some(fields) = fields else {
+        return Some((None, None));
+    };
+    let mut decoder = crate::cbor::Decoder::new(fields);
+    let (major, count) = decoder.head()?;
+    if major != 5 || count == u64::MAX {
+        return None;
+    }
+    let mut since = None;
+    let mut records = None;
+    for _ in 0..count {
+        match decoder.uint()? {
+            1 if since.is_none() => since = Some(decoder.uint()?),
+            2 if records.is_none() => records = Some(decoder.uint()?),
+            _ => return None,
+        }
+    }
+    decoder.is_finished().then_some((since, records))
+}
+
+fn tagged_connection_status<const N: usize, const H: usize, const P: usize>(
+    endpoint: &EndpointState<N, H, P>,
+    cid: ConnectionId,
+    stream_id: u64,
+) -> Vec<u8> {
+    format!(
+        "status_version=1;connection_dcid={};stream_id={stream_id};received_packets={};largest_received={:?};next_packet_number={};bytes_in_flight={};congestion_window={};history={}/{}",
+        cid.value(), endpoint.received_packet_count(), endpoint.largest_received(),
+        endpoint.next_packet_number, endpoint.bytes_in_flight(), endpoint.congestion.congestion_window,
+        endpoint.history_len(), endpoint.history_capacity(),
+    )
+    .into_bytes()
 }
 
 /// Bounded subscription request shared by every server adapter. The request
@@ -418,131 +538,6 @@ impl EventRing {
     }
 }
 
-/// Handle one complete application stream request. `data` excludes the
-/// service tag. Object handling remains in the object-store adapter because it
-/// needs its application server; all diagnostic/test services are here.
-pub fn handle_stream<const N: usize, const H: usize, const P: usize>(
-    endpoint: &EndpointState<N, H, P>,
-    connection_cid: ConnectionId,
-    stream_id: u64,
-    registry: &StreamRegistry,
-    service: u8,
-    data: &[u8],
-) -> Result<Vec<u8>, &'static str> {
-    handle_stream_with_events(
-        endpoint,
-        None,
-        connection_cid,
-        stream_id,
-        registry,
-        service,
-        data,
-    )
-}
-
-pub fn handle_stream_with_events<const N: usize, const H: usize, const P: usize>(
-    endpoint: &EndpointState<N, H, P>,
-    events: Option<&EventRing>,
-    connection_cid: ConnectionId,
-    stream_id: u64,
-    registry: &StreamRegistry,
-    service: u8,
-    data: &[u8],
-) -> Result<Vec<u8>, &'static str> {
-    if !registry.contains(service) {
-        return Err("unknown stream service");
-    }
-    match service {
-        // Echo is the compact bearer-neutral liveness primitive. In
-        // particular, raw 802.11 action probes must not turn a small nonce
-        // into a verbose status report requiring multiple vendor IEs.
-        SERVICE_ECHO => Ok(data.to_vec()),
-        SERVICE_STATUS => Ok(connection_status(
-            endpoint,
-            connection_cid,
-            stream_id,
-            service,
-            data,
-        )),
-        SERVICE_IPERF => Ok(iperf_status(endpoint, connection_cid, stream_id, data)),
-        SERVICE_METRICS => Ok(metrics_status(endpoint, connection_cid, stream_id)),
-        SERVICE_EVENTS => Ok(events_status(
-            endpoint,
-            events,
-            connection_cid,
-            stream_id,
-            data,
-        )),
-        SERVICE_STREAM => Ok(registry.encode_handler_list()),
-        // The historical control byte remains a harmless acknowledgement.
-        // New tagged-CBOR handlers are dispatched from the entire stream by
-        // [`dispatch_tagged_stream`], before this legacy service decoding.
-        SERVICE_CONTROL => Ok(Vec::new()),
-        // Log retention and authentication are server policy.  This compact
-        // baseline acknowledges the stream without making command or object
-        // streams wait for an unavailable log consumer.
-        SERVICE_LOG_WATCH => Ok(log_watch_status(events, data)),
-        SERVICE_OBJECT => Err("object service belongs to object-store adapter"),
-        _ => Err("unknown stream service"),
-    }
-}
-
-fn log_watch_status(events: Option<&EventRing>, data: &[u8]) -> Vec<u8> {
-    let requested = decode_log_watch_request(data)
-        .map(|request| request.records)
-        .unwrap_or(0);
-    let since = core::str::from_utf8(data)
-        .ok()
-        .and_then(|value| value.strip_prefix("since=")?.parse::<u64>().ok())
-        .unwrap_or(0);
-    let next_sequence = events.map_or(0, EventRing::next_sequence);
-    format!("log_watch_version=1;next_sequence={next_sequence};since={since};requested={requested};logs=0").into_bytes()
-}
-
-fn connection_status<const N: usize, const H: usize, const P: usize>(
-    endpoint: &EndpointState<N, H, P>,
-    cid: ConnectionId,
-    stream_id: u64,
-    service: u8,
-    data: &[u8],
-) -> Vec<u8> {
-    format!(
-        "service={service};connection_dcid={};stream_id={stream_id};received_packets={};largest_received={:?};next_packet_number={};bytes_in_flight={};congestion_window={};history={}/{};request_bytes={}",
-        cid.value(), endpoint.received_packet_count(), endpoint.largest_received(),
-        endpoint.next_packet_number, endpoint.bytes_in_flight(), endpoint.congestion.congestion_window,
-        endpoint.history_len(), endpoint.history_capacity(), data.len(),
-    ).into_bytes()
-}
-
-fn iperf_status<const N: usize, const H: usize, const P: usize>(
-    endpoint: &EndpointState<N, H, P>,
-    _cid: ConnectionId,
-    _stream_id: u64,
-    data: &[u8],
-) -> Vec<u8> {
-    let requested = data
-        .get(..8)
-        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
-        .unwrap_or(data.len() as u64);
-    let received = data.len().saturating_sub(8) as u64;
-    // Fixed binary response: version, requested, received, packet number,
-    // in-flight bytes, congestion window, and history occupancy.  A benchmark
-    // must not depend on text formatting or a parser on either endpoint.
-    let mut response = Vec::with_capacity(1 + 6 * 8);
-    response.push(1);
-    for value in [
-        requested,
-        received,
-        endpoint.next_packet_number as u64,
-        endpoint.bytes_in_flight(),
-        endpoint.congestion.congestion_window,
-        endpoint.history_len() as u64,
-    ] {
-        response.extend_from_slice(&value.to_be_bytes());
-    }
-    response
-}
-
 fn metrics_status<const N: usize, const H: usize, const P: usize>(
     endpoint: &EndpointState<N, H, P>,
     cid: ConnectionId,
@@ -661,6 +656,43 @@ mod tests {
             .then(|| b"module-response".to_vec())
     }
 
+    fn diagnostic_request(method: u64, id: u64, since: Option<u64>) -> Vec<u8> {
+        let mut request = vec![0; 64];
+        let used = if let Some(since) = since {
+            let mut encoder = crate::cbor::Encoder::new(&mut request);
+            encoder.map(4).unwrap();
+            encoder.uint(1).unwrap();
+            encoder.uint(DIAGNOSTIC_COMPONENT).unwrap();
+            encoder.uint(2).unwrap();
+            encoder.uint(method).unwrap();
+            encoder.uint(3).unwrap();
+            encoder.uint(id).unwrap();
+            encoder.uint(5).unwrap();
+            encoder.map(1).unwrap();
+            encoder.uint(1).unwrap();
+            encoder.uint(since).unwrap();
+            encoder.len()
+        } else {
+            crate::tagged::encode_numeric_empty_request(
+                DIAGNOSTIC_COMPONENT,
+                method,
+                id,
+                &mut request,
+            )
+            .unwrap()
+        };
+        request.truncate(used);
+        request
+    }
+
+    fn tagged_result_text(response: &[u8]) -> &str {
+        let record = crate::tagged::decode(response).unwrap();
+        let mut result = crate::cbor::Decoder::new(record.result.unwrap());
+        let text = core::str::from_utf8(result.text_ref().unwrap()).unwrap();
+        assert!(result.is_finished());
+        text
+    }
+
     #[test]
     fn tagged_stream_dispatch_uses_component_not_stream_or_service_id() {
         // {1: 1999, 2: 1}; there is intentionally no leading service byte.
@@ -671,6 +703,57 @@ mod tests {
             Some(b"module-response".to_vec())
         );
         assert!(!register_tagged_component(1999, tagged_test_handler));
+    }
+
+    #[test]
+    fn connection_diagnostics_are_correlated_tagged_handlers() {
+        let local = ConnectionId::new(41).unwrap();
+        let peer = ConnectionId::new(42).unwrap();
+        let mut endpoint =
+            EndpointState::<8, 4>::new(Role::Server, ConnectionLimits::default(), 1200);
+        endpoint.install_connection_ids(local, peer).unwrap();
+        let mut request = [0u8; 32];
+        let used = crate::tagged::encode_numeric_empty_request(
+            DIAGNOSTIC_COMPONENT,
+            DIAGNOSTIC_STATUS_METHOD,
+            77,
+            &mut request,
+        )
+        .unwrap();
+        let response =
+            dispatch_diagnostic_tagged_stream(&endpoint, None, local, 4, &request[..used]).unwrap();
+        let record = crate::tagged::decode(&response).unwrap();
+        assert_eq!(record.id, Some(77));
+        let mut result = crate::cbor::Decoder::new(record.result.unwrap());
+        let status = result.text_ref().unwrap();
+        assert!(result.is_finished());
+        assert!(status.starts_with(b"status_version="));
+
+        let mut ring = EventRing::new(4);
+        ring.push(7, 8, 9, 10);
+        let mut request = [0u8; 64];
+        let mut encoder = crate::cbor::Encoder::new(&mut request);
+        encoder.map(4).unwrap();
+        encoder.uint(1).unwrap();
+        encoder.uint(DIAGNOSTIC_COMPONENT).unwrap();
+        encoder.uint(2).unwrap();
+        encoder.uint(DIAGNOSTIC_EVENTS_METHOD).unwrap();
+        encoder.uint(3).unwrap();
+        encoder.uint(78).unwrap();
+        encoder.uint(5).unwrap();
+        encoder.map(1).unwrap();
+        encoder.uint(1).unwrap();
+        encoder.uint(0).unwrap();
+        let used = encoder.len();
+        let response =
+            dispatch_diagnostic_tagged_stream(&endpoint, Some(&ring), local, 8, &request[..used])
+                .unwrap();
+        let record = crate::tagged::decode(&response).unwrap();
+        assert_eq!(record.id, Some(78));
+        let mut result = crate::cbor::Decoder::new(record.result.unwrap());
+        let events = result.text_ref().unwrap();
+        assert!(result.is_finished());
+        assert!(events.starts_with(b"events_version=2;next_sequence=1;events=1;"));
     }
 
     #[test]
@@ -745,55 +828,21 @@ mod tests {
     }
 
     #[test]
-    fn registry_resolves_only_numeric_tag_without_bearer_state() {
-        let registry = StreamRegistry::default();
-        assert_eq!(
-            registry.resolve_tag(&[SERVICE_LOG_WATCH, 0xa0]),
-            Some((SERVICE_LOG_WATCH, &[0xa0][..]))
-        );
-        assert_eq!(
-            registry.resolve_tag(&[0x64, b'e', b'c', b'h', b'o', 1, 2]),
-            None
-        );
-        assert_eq!(registry.resolve_tag(&[0x0a]), None);
-    }
-
-    #[test]
-    fn diagnostic_registry_never_advertises_an_unattached_object_sink() {
-        let registry = diagnostic_stream_registry();
-        assert!(!registry.contains(SERVICE_OBJECT));
-        assert!(registry.contains(SERVICE_LOG_WATCH));
-        assert_eq!(
-            registry.resolve_tag(&[SERVICE_STREAM]),
-            Some((SERVICE_STREAM, &[][..]))
-        );
-    }
-
-    #[test]
     fn event_handler_returns_ring_records() {
-        let registry = StreamRegistry::default();
         let endpoint = EndpointState::<4, 4>::new(Role::Server, ConnectionLimits::default(), 1200);
         let cid = ConnectionId::new(22).unwrap();
         let mut ring = EventRing::new(4);
         ring.push(9, 4, 3, 100);
-        let response = handle_stream_with_events(
-            &endpoint,
-            Some(&ring),
-            cid,
-            8,
-            &registry,
-            SERVICE_EVENTS,
-            b"since=0",
-        )
-        .unwrap();
-        let text = core::str::from_utf8(&response).unwrap();
+        let request = diagnostic_request(DIAGNOSTIC_EVENTS_METHOD, 81, Some(0));
+        let response =
+            dispatch_diagnostic_tagged_stream(&endpoint, Some(&ring), cid, 8, &request).unwrap();
+        let text = tagged_result_text(&response);
         assert!(text.contains("events_version=2;next_sequence=1;events=1"));
         assert!(text.contains("event_kind=9;stream_id=4;packet_number=3;value=100"));
     }
 
     #[test]
     fn event_handler_bounds_large_history_to_one_datagram() {
-        let registry = StreamRegistry::default();
         let endpoint =
             EndpointState::<4, 4, 512>::new(Role::Server, ConnectionLimits::default(), 512);
         let cid = ConnectionId::new(22).unwrap();
@@ -801,25 +850,17 @@ mod tests {
         for sequence in 0..64 {
             ring.push(9, sequence, sequence, sequence * 100);
         }
-        let response = handle_stream_with_events(
-            &endpoint,
-            Some(&ring),
-            cid,
-            8,
-            &registry,
-            SERVICE_EVENTS,
-            b"since=0",
-        )
-        .unwrap();
-        assert!(response.len() <= 512 - 64);
-        let text = core::str::from_utf8(&response).unwrap();
+        let request = diagnostic_request(DIAGNOSTIC_EVENTS_METHOD, 82, Some(0));
+        let response =
+            dispatch_diagnostic_tagged_stream(&endpoint, Some(&ring), cid, 8, &request).unwrap();
+        let text = tagged_result_text(&response);
+        assert!(text.len() <= 512 - 64);
         assert!(text.starts_with("events_version=2;next_sequence=64;events="));
         assert!(text.contains("event_seq=0;"));
     }
 
     #[test]
     fn fake_stream_transport_injects_loss_and_latency_while_driving_handlers() {
-        let registry = StreamRegistry::default();
         let mut client =
             EndpointState::<8, 4>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut server =
@@ -834,22 +875,14 @@ mod tests {
             .unwrap();
         let mut now = 0u64;
         let mut delivered = 0usize;
-        for (packet_number, (stream_id, service)) in [
-            (4, SERVICE_METRICS),
-            (8, SERVICE_EVENTS),
-            (12, SERVICE_IPERF),
+        for (packet_number, (stream_id, method)) in [
+            (4, DIAGNOSTIC_METRICS_METHOD),
+            (8, DIAGNOSTIC_EVENTS_METHOD),
         ]
         .into_iter()
         .enumerate()
         {
-            let mut body = Vec::from([service]);
-            if service == SERVICE_EVENTS {
-                body.extend_from_slice(b"since=0");
-            }
-            if service == SERVICE_IPERF {
-                body.extend_from_slice(&32u64.to_be_bytes());
-                body.extend_from_slice(&[0xa5; 32]);
-            }
+            let body = diagnostic_request(method, stream_id, None);
             client.open_send_stream(stream_id, 64 * 1024).unwrap();
             let mut packet = [0u8; 1200];
             let (used, _) = client
@@ -865,24 +898,22 @@ mod tests {
             else {
                 panic!("expected stream");
             };
-            let response = handle_stream(
+            let response = dispatch_diagnostic_tagged_stream(
                 &server,
+                None,
                 server_cid,
                 stream_id,
-                &registry,
-                service,
-                &frame.data[1..],
+                &frame.data,
             )
             .unwrap();
-            assert!(!response.is_empty());
+            assert!(!tagged_result_text(&response).is_empty());
             delivered += 1;
         }
-        assert_eq!(delivered, 2);
+        assert_eq!(delivered, 1);
     }
 
     #[test]
     fn fake_bearer_drives_multiple_stream_operations_under_faults() {
-        let registry = StreamRegistry::default();
         let mut client =
             EndpointState::<8, 8>::new(Role::Client, ConnectionLimits::default(), 1200);
         let mut server =
@@ -903,16 +934,14 @@ mod tests {
             mtu: 1200,
         });
         let operations = [
-            (4, SERVICE_ECHO, b"status".as_slice()),
-            (8, SERVICE_IPERF, b"payload".as_slice()),
-            (12, SERVICE_METRICS, b"".as_slice()),
-            (16, SERVICE_EVENTS, b"since=0".as_slice()),
-            (20, SERVICE_STREAM, b"".as_slice()),
+            (4, DIAGNOSTIC_STATUS_METHOD),
+            (12, DIAGNOSTIC_METRICS_METHOD),
+            (16, DIAGNOSTIC_EVENTS_METHOD),
+            (20, DIAGNOSTIC_SERVICES_METHOD),
         ];
-        for (stream_id, service, body) in operations {
+        for (stream_id, method) in operations {
             client.open_send_stream(stream_id, 64 * 1024).unwrap();
-            let mut request = Vec::from([service]);
-            request.extend_from_slice(body);
+            let request = diagnostic_request(method, stream_id, None);
             let mut packet = [0u8; 1200];
             let (used, _) = client
                 .encode_stream_packet(server_cid, stream_id, 0, true, &request, &mut packet)
@@ -924,14 +953,12 @@ mod tests {
             if let Ok(quic_lite::TransportPacket::Stream { frame, .. }) =
                 server.receive_datagram(&packet)
             {
-                let service = frame.data[0];
-                let response = handle_stream(
+                let response = dispatch_diagnostic_tagged_stream(
                     &server,
+                    None,
                     server_cid,
                     frame.id,
-                    &registry,
-                    service,
-                    &frame.data[1..],
+                    &frame.data,
                 )
                 .unwrap();
                 assert!(!response.is_empty());
@@ -940,30 +967,6 @@ mod tests {
         }
         assert!(link.dropped() >= 1);
         assert!(delivered >= 2);
-        assert!(link.sent() >= 5);
-    }
-
-    #[test]
-    fn path_policy_control_is_compact_and_bearer_neutral() {
-        assert_eq!(
-            decode_path_policy(&[0]),
-            Some(quic_lite::PathPolicy::HighestMeasuredSpeed)
-        );
-        assert_eq!(
-            decode_path_policy(&[1, 2]),
-            Some(quic_lite::PathPolicy::Explicit(2))
-        );
-        assert_eq!(
-            decode_path_policy(&[2, 1]),
-            Some(quic_lite::PathPolicy::AirtimeFirst { primary: 1 })
-        );
-        assert_eq!(
-            decode_path_policy(&[3]),
-            Some(quic_lite::PathPolicy::Aggregate)
-        );
-        assert_eq!(
-            encode_path_policy_response(quic_lite::PathPolicy::Explicit(2)),
-            vec![CONTROL_RESPONSE, 1, 2]
-        );
+        assert!(link.sent() >= 4);
     }
 }

@@ -1,12 +1,18 @@
 //! Shared host Wi-Fi ownership and netd policy.
 //!
 //! The full `lmesh` service and the Wi-Fi-only `lmesh-wifi` service use this
-//! crate. Linux Wi-Fi, host NAN transport, discovery, and AP/STA operations
+//! crate. Linux Wi-Fi, host NAN discovery/activation, and AP/STA operations
 //! live here; direct UART sessions are owned by `dmesh-cli`, not this service.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 mod infra_credentials;
 mod radio;
@@ -37,11 +43,16 @@ pub use radio::RadioService;
 pub struct WifiService {
     netd: WifiNetd,
     radio: RadioService,
+    wifi_was_absent: Arc<AtomicBool>,
 }
 
 impl WifiService {
     pub fn new(netd: WifiNetd, radio: RadioService) -> Self {
-        Self { netd, radio }
+        Self {
+            netd,
+            radio,
+            wifi_was_absent: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn from_environment() -> Self {
@@ -90,7 +101,10 @@ impl WifiService {
             if open && passphrase.as_deref().is_some_and(|value| !value.is_empty()) {
                 return serde_json::json!({"ok": false, "iface": iface, "error": "open AP cannot accept a passphrase"});
             }
-            let backend = if open { "open" } else { "p2p" };
+            // A normal AP is the safe default for clients. P2P-GO remains a
+            // service-startup diagnostic personality, not the implicit
+            // meaning of an AP request.
+            let backend = if open { "open" } else { "wpa2-ap" };
             return self.radio.wifi_p2p_transport_start(
                 Some(iface),
                 &backend,
@@ -107,19 +121,12 @@ impl WifiService {
             .wifi_sta_transport_start(Some(iface), ssid, passphrase, bssid, channel)
     }
 
-    /// End the owned STA transport epoch through the same shared cleanup path
-    /// used before every replacement `transport.start`.
-    pub fn transport_stop(&self, iface: Option<String>) -> serde_json::Value {
-        match self.owned_sta_iface(iface) {
-            Ok(iface) => self.radio.wifi_sta_transport_stop(Some(iface)),
-            Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
-        }
-    }
-
-    /// Start the default channel-6 P2P Group Owner and then attach the same
-    /// long-lived NAN/NOW monitor fixture used beside an ordinary AP.  The
-    /// P2P transition owns replacement cleanup; monitor setup is deliberately
-    /// subsequent so it follows the actual settled radio channel.
+    /// Start the configured channel-6 AP personality and then attach the
+    /// long-lived NAN/NOW monitor fixture. `wpa2-ap` is a conventional WPA2
+    /// infrastructure AP, `open` uses the native diagnostic AP path, and
+    /// `p2p` retains the P2P-GO compatibility backend.
+    /// Transport replacement owns cleanup, so monitor setup deliberately
+    /// follows the actual settled radio channel.
     pub fn start_p2p_go_with_rawnan(
         &self,
         iface: Option<String>,
@@ -129,9 +136,15 @@ impl WifiService {
             Ok(iface) => iface,
             Err(error) => return serde_json::json!({"ok": false, "error": error.to_string()}),
         };
+        let backend = match std::env::var("LMESH_AP_BACKEND").as_deref() {
+            Ok("open") => "open",
+            Ok("p2p") => "p2p",
+            Ok("wpa2-ap") | Err(_) => "wpa2-ap",
+            Ok(_) => "wpa2-ap",
+        };
         let transport = self
             .radio
-            .wifi_p2p_transport_start(Some(iface.clone()), "p2p", None);
+            .wifi_p2p_transport_start(Some(iface.clone()), backend, None);
         if transport.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return serde_json::json!({
                 "ok": false,
@@ -164,6 +177,7 @@ impl WifiService {
                 && monitor.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
                 && listener.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
             "iface": iface,
+            "ap_backend": backend,
             "transport": transport,
             "monitor": monitor,
             "listener": listener,
@@ -182,8 +196,8 @@ impl WifiService {
     }
 
     /// Apply the common startup policy used by the stable service. The stable
-    /// AP-equivalent is a WPA2-PSK P2P Group Owner; the legacy raw open AP is
-    /// an explicitly enabled diagnostic backend only.
+    /// The stable AP is a WPA2-PSK infrastructure AP; P2P-GO and native open
+    /// AP are explicitly selected diagnostic backends.
     pub fn start_stable(&self) -> Vec<serde_json::Value> {
         let mut results = self
             .radio
@@ -201,10 +215,9 @@ impl WifiService {
         results
     }
 
-    /// Bounded stable-service recovery.  It is intentionally limited to this
-    /// service's owned AP fixture: a lost/down adapter is rebuilt through the
-    /// same startup sequence, never by
-    /// manipulating another service's radio.
+    /// Observe whether the owned base adapter exists. Startup is rerun only
+    /// after a confirmed absent-to-present transition; this never reacts to
+    /// carrier, AP, P2P, or monitor state.
     pub fn reconcile_stable_health(&self) -> serde_json::Value {
         let Some(iface) = self.netd.owned_interfaces().names().first().cloned() else {
             return serde_json::json!({"ok": true, "state": "no_owned_interface"});
@@ -213,19 +226,17 @@ impl WifiService {
             return serde_json::json!({"ok": true, "state": "not_an_ap_owner", "iface": iface});
         }
         let link = self.radio.wifi_interface_status(Some(iface.clone()));
-        let flags = link
-            .pointer("/link/flags")
-            .and_then(serde_json::Value::as_u64);
-        let up_and_running = flags.is_some_and(|flags| {
-            flags & libc::IFF_UP as u64 != 0 && flags & libc::IFF_RUNNING as u64 != 0
-        });
-        if up_and_running {
-            return serde_json::json!({"ok": true, "state": "healthy", "iface": iface, "link": link});
+        if link.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            self.wifi_was_absent.store(true, Ordering::Release);
+            return serde_json::json!({"ok": true, "state": "absent", "iface": iface, "link": link});
+        }
+        if !self.wifi_was_absent.swap(false, Ordering::AcqRel) {
+            return serde_json::json!({"ok": true, "state": "present", "iface": iface, "link": link});
         }
         let recovery = self.start_stable();
         serde_json::json!({
             "ok": recovery.iter().any(|result| result.get("ok").and_then(serde_json::Value::as_bool) == Some(true)),
-            "state": "reconciled",
+            "state": "reappeared_reinitialized",
             "iface": iface,
             "prior_link": link,
             "recovery": recovery,

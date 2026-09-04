@@ -23,6 +23,9 @@ pub const RECORD_BLOB: u8 = 2;
 pub const RECORD_DONE: u8 = 3;
 pub const MAX_RECORD: usize = 16 * 1024 * 1024;
 pub const REQUEST_MAX: usize = 1024;
+pub const OBJECT_COMPONENT: u64 = 10;
+pub const OBJECT_GET_METHOD: u64 = 1;
+pub const OBJECT_FLASH_METHOD: u64 = 2;
 
 /// Credit return after one verified object record. This policy is independent
 /// of UDP/UART/radio: a persistent sink returns blob credit only when it has
@@ -61,6 +64,46 @@ pub fn encode_get(out: &mut [u8], name: Option<&[u8]>, cpu: u8, target: u8) -> O
     encoder.uint(2)?;
     encoder.uint(target as u64)?;
     Some(encoder.len())
+}
+
+/// Encode a correlated object GET handler request for a normal QUIC stream.
+pub fn encode_get_request(
+    out: &mut [u8],
+    id: u64,
+    name: Option<&[u8]>,
+    cpu: u8,
+    target: u8,
+) -> Option<usize> {
+    let mut fields = [0u8; REQUEST_MAX];
+    let fields_len = encode_get(&mut fields, name, cpu, target)?;
+    let mut encoder = super::cbor::Encoder::new(out);
+    encoder.map(4)?;
+    encoder.uint(1)?;
+    encoder.uint(OBJECT_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(OBJECT_GET_METHOD)?;
+    encoder.uint(3)?;
+    encoder.uint(id)?;
+    encoder.uint(5)?;
+    encoder.encoded_value(&fields[..fields_len])?;
+    Some(encoder.len())
+}
+
+/// Decode a complete tagged object GET request. Routing must be resolved
+/// before the local object store is invoked.
+pub fn decode_get_request(input: &[u8]) -> Option<(u64, GetRequest<'_>)> {
+    let record = super::tagged::decode(input)?;
+    if record.component != Some(super::tagged::Name::Tag(OBJECT_COMPONENT))
+        || record.method != Some(super::tagged::Name::Tag(OBJECT_GET_METHOD))
+        || record.to.is_some()
+        || record.params.is_some()
+        || record.data.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+    {
+        return None;
+    }
+    Some((record.id?, decode_get(record.fields?)?))
 }
 
 /// One contiguous chunk in the ordered object-response stream.
@@ -376,6 +419,42 @@ pub fn encode_flash_request(request: FlashRequest<'_>, out: &mut [u8]) -> Option
     encoder.uint(5)?;
     encoder.boolean(request.dry_run)?;
     Some(encoder.len())
+}
+
+/// Encode a correlated flash handler request on the normal QUIC stream plane.
+pub fn encode_flash_handler_request(
+    request: FlashRequest<'_>,
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut fields = [0u8; REQUEST_MAX];
+    let fields_len = encode_flash_request(request, &mut fields)?;
+    let mut encoder = super::cbor::Encoder::new(out);
+    encoder.map(4)?;
+    encoder.uint(1)?;
+    encoder.uint(OBJECT_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(OBJECT_FLASH_METHOD)?;
+    encoder.uint(3)?;
+    encoder.uint(id)?;
+    encoder.uint(5)?;
+    encoder.encoded_value(&fields[..fields_len])?;
+    Some(encoder.len())
+}
+
+pub fn decode_flash_handler_request(input: &[u8]) -> Option<(u64, FlashRequest<'_>)> {
+    let record = super::tagged::decode(input)?;
+    if record.component != Some(super::tagged::Name::Tag(OBJECT_COMPONENT))
+        || record.method != Some(super::tagged::Name::Tag(OBJECT_FLASH_METHOD))
+        || record.to.is_some()
+        || record.params.is_some()
+        || record.data.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+    {
+        return None;
+    }
+    Some((record.id?, decode_flash_request(record.fields?)?))
 }
 
 /// Decode a complete canonical `flash` handler body. Duplicate, unknown, or
@@ -1515,6 +1594,40 @@ mod tests {
         assert_eq!(request.name, Some(&b"main"[..]));
         assert_eq!(request.cpu, 13);
         assert_eq!(request.target, 6);
+    }
+
+    #[test]
+    fn object_handlers_use_correlated_tagged_stream_requests() {
+        let mut get = [0u8; 128];
+        let get_len = encode_get_request(&mut get, 41, Some(b"main"), 13, 6).unwrap();
+        assert_eq!(
+            decode_get_request(&get[..get_len]),
+            Some((
+                41,
+                GetRequest {
+                    name: Some(b"main"),
+                    cpu: 13,
+                    target: 6,
+                }
+            ))
+        );
+
+        let flash = FlashRequest {
+            object: GetRequest {
+                name: None,
+                cpu: 13,
+                target: 6,
+            },
+            address: None,
+            transport: 0,
+            dry_run: true,
+        };
+        let mut wire = [0u8; 160];
+        let used = encode_flash_handler_request(flash, 42, &mut wire).unwrap();
+        assert_eq!(decode_flash_handler_request(&wire[..used]), Some((42, flash)));
+
+        // A raw fields map is no longer a callable stream request.
+        assert!(decode_get_request(&[0xa2, 0x01, 0x0d, 0x02, 0x06]).is_none());
     }
 
     #[test]

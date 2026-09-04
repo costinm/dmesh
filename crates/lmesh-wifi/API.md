@@ -8,9 +8,10 @@ and numeric identities live beside their structs and codecs in
 `LMESH_INTERFACES` is the comma-separated allowlist of interfaces owned by the
 process. Linux-only AP, station, monitor, injection, and `iw` diagnostics are
 internal adapter/test functions. They are intentionally absent from public
-tool catalogs. Bearer lifecycle uses common `transport.start`; discovery uses
+tool catalogs. Bearer lifecycle uses common `transport.set`; discovery uses
 `discovery.nodes`; local NAN health uses
-`nan.status`; probing and IPERF use the common `dmesh-server` schemas.
+`telemetry.nan_status`; probing uses the bearer-neutral `probe` QUIC stream
+service from the common `dmesh-server` schema.
 
 The shared NAN frame/state implementation is documented in
 [`dmesh-rawnan/API.md`](../rawnan/API.md). Direct UART sessions remain owned by

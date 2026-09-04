@@ -73,7 +73,7 @@ impl SleepBlockers {
     pub const NONE: Self = Self(0);
     pub const RADIO_TRANSITION: Self = Self(1 << 0);
     pub const CORRELATED_RESPONSE: Self = Self(1 << 1);
-    pub const RAW_SERVICE_DEADLINE: Self = Self(1 << 2);
+    pub const CONNECTION_DEADLINE: Self = Self(1 << 2);
     pub const NAN_DEADLINE: Self = Self(1 << 3);
 
     pub const fn is_empty(self) -> bool {

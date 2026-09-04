@@ -10,15 +10,12 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+pub use quic_lite::ClientStreamConnection as StreamClientConnection;
+use quic_lite::{ConnectionId, ConnectionLimits, Error, ServerStreamConnection};
 #[cfg(test)]
-use quic_lite::encode_bootstrap_open_ack_packet;
-use quic_lite::mux::MuxRequest;
-use quic_lite::mux::StreamMux;
 use quic_lite::{
-    BootstrapClient, ConnectionId, ConnectionLimits, Error, FIRST_CLIENT_BIDI_STREAM_ID,
-    FIRST_SERVER_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA, PathPolicy, Role, ShortHeader,
-    StreamRegistry, decode_bootstrap_open_packet_with_limits,
-    encode_bootstrap_open_ack_packet_with_limits,
+    FIRST_CLIENT_BIDI_STREAM_ID, FIRST_SERVER_BIDI_STREAM_ID,
+    decode_bootstrap_open_packet_with_limits, encode_bootstrap_open_ack_packet,
 };
 
 use crate::services::{EventRing, MAX_BINARY_EVENT_PAYLOAD_BYTES};
@@ -154,31 +151,42 @@ pub struct StreamServerConnection<
     const HISTORY: usize,
     const PACKET: usize = { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
 > {
-    /// Four normal IPERF streams plus high/low diagnostic lanes. This is a
-    /// server-wide handler capacity, shared by host and firmware adapters;
-    /// it must not be smaller than `IperfServicePlan` can advertise.
-    pub mux: StreamMux<6, HISTORY, PACKET>,
-    pub registry: StreamRegistry,
+    core: ServerStreamConnection<{ quic_lite::DEFAULT_STREAM_STATE_SLOTS }, HISTORY, PACKET>,
     pub events: EventRing,
-    path_policy: PathPolicy,
-    next_response_stream: u64,
+}
+
+impl<const HISTORY: usize, const PACKET: usize> core::ops::Deref
+    for StreamServerConnection<HISTORY, PACKET>
+{
+    type Target =
+        ServerStreamConnection<{ quic_lite::DEFAULT_STREAM_STATE_SLOTS }, HISTORY, PACKET>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl<const HISTORY: usize, const PACKET: usize> core::ops::DerefMut
+    for StreamServerConnection<HISTORY, PACKET>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
 }
 
 impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, PACKET> {
-    /// Accept one complete DCID-zero OPEN and encode its OPEN_ACK.
+    /// Accept one complete custom-version Initial OPEN and encode its OPEN_ACK.
     ///
     /// The caller chooses the local DCID after its own fixed-capacity
     /// admission check. The returned ACK is a complete bearer datagram.
     pub fn accept_open(
         packet: &[u8],
         server_cid: ConnectionId,
-        registry: StreamRegistry,
         event_capacity: usize,
     ) -> Result<(Self, Vec<u8>), Error> {
         Self::accept_open_with_limits(
             packet,
             server_cid,
-            registry,
             event_capacity,
             ConnectionLimits::default(),
         )
@@ -190,42 +198,17 @@ impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, 
     pub fn accept_open_with_limits(
         packet: &[u8],
         server_cid: ConnectionId,
-        registry: StreamRegistry,
         event_capacity: usize,
         local_limits: ConnectionLimits,
     ) -> Result<(Self, Vec<u8>), Error> {
-        let (bootstrap_header, open) = decode_bootstrap_open_packet_with_limits(packet)?;
-        let client_cid = open.client_receive_cid;
-        let mut mux = StreamMux::new(Role::Server, local_limits, PACKET as u64, 1, 4, 4096);
-        mux.install_connection_ids(server_cid, client_cid)?;
-        // OPEN and OPEN_ACK are bearer-owned packets. Persist the negotiated
-        // receive budget and packet-number boundary before processing streams,
-        // otherwise the first response can be mistaken for ACK packet zero.
-        mux.endpoint.set_initial_peer_budget(
-            open.max_data,
-            open.max_stream_data,
-            open.max_in_flight_packets,
-        )?;
-        mux.endpoint
-            .continue_packet_numbers_from(bootstrap_header.packet_number.saturating_add(1))?;
-
-        let mut ack = [0u8; PACKET];
-        let used = encode_bootstrap_open_ack_packet_with_limits(
-            client_cid,
-            server_cid,
-            0,
-            local_limits,
-            &mut ack,
-        )?;
+        let (core, ack) =
+            ServerStreamConnection::accept_open_with_limits(packet, server_cid, local_limits)?;
         Ok((
             Self {
-                mux,
-                registry,
+                core,
                 events: EventRing::new(event_capacity),
-                path_policy: PathPolicy::HighestMeasuredSpeed,
-                next_response_stream: FIRST_SERVER_BIDI_STREAM_ID,
             },
-            ack[..used].to_vec(),
+            ack,
         ))
     }
 
@@ -240,168 +223,43 @@ impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, 
     pub fn accept_open_boxed_with_limits(
         packet: &[u8],
         server_cid: ConnectionId,
-        registry: StreamRegistry,
         event_capacity: usize,
         local_limits: ConnectionLimits,
     ) -> Result<(Box<Self>, Vec<u8>), Error> {
-        let (bootstrap_header, open) = decode_bootstrap_open_packet_with_limits(packet)?;
-        let client_cid = open.client_receive_cid;
-
-        let mut ack = [0u8; PACKET];
-        let used = encode_bootstrap_open_ack_packet_with_limits(
-            client_cid,
+        Self::accept_open_boxed_with_limits_and_reset_token(
+            packet,
             server_cid,
-            0,
+            event_capacity,
             local_limits,
-            &mut ack,
-        )?;
+            None,
+        )
+    }
 
-        // `Box::new_uninit` gives `StreamMux::new` its final return place,
-        // avoiding a full endpoint ledger in the caller's stack frame.
+    /// In-place firmware accept that advertises the token derived by
+    /// quic-lite from the device's provisioned control-plane secret.
+    pub fn accept_open_boxed_with_limits_and_reset_token(
+        packet: &[u8],
+        server_cid: ConnectionId,
+        event_capacity: usize,
+        local_limits: ConnectionLimits,
+        stateless_reset_token: Option<quic_lite::StatelessResetToken>,
+    ) -> Result<(Box<Self>, Vec<u8>), Error> {
+        // Initialize the generic connection core directly in its final outer
+        // allocation, then add only DMesh event state around it.
         let mut connection = Box::<Self>::new_uninit();
         let pointer = connection.as_mut_ptr().cast::<Self>();
         unsafe {
-            StreamMux::init_in_place(
-                core::ptr::addr_of_mut!((*pointer).mux),
-                Role::Server,
+            let ack = ServerStreamConnection::accept_open_in_place_with_config_and_reset_token(
+                core::ptr::addr_of_mut!((*pointer).core),
+                packet,
+                server_cid,
                 local_limits,
-                PACKET as u64,
-                4,
-                4096,
-            );
-            core::ptr::addr_of_mut!((*pointer).registry).write(registry);
-            core::ptr::addr_of_mut!((*pointer).events).write(EventRing::new(event_capacity));
-            core::ptr::addr_of_mut!((*pointer).path_policy).write(PathPolicy::HighestMeasuredSpeed);
-            core::ptr::addr_of_mut!((*pointer).next_response_stream)
-                .write(FIRST_SERVER_BIDI_STREAM_ID);
-            let mut connection = connection.assume_init();
-            connection
-                .mux
-                .install_connection_ids(server_cid, client_cid)?;
-            connection.mux.endpoint.set_initial_peer_budget(
-                open.max_data,
-                open.max_stream_data,
-                open.max_in_flight_packets,
+                quic_lite::ServerStreamConfig::default(),
+                stateless_reset_token,
             )?;
-            connection
-                .mux
-                .endpoint
-                .continue_packet_numbers_from(bootstrap_header.packet_number.saturating_add(1))?;
-            Ok((connection, ack[..used].to_vec()))
+            core::ptr::addr_of_mut!((*pointer).events).write(EventRing::new(event_capacity));
+            Ok((connection.assume_init(), ack))
         }
-    }
-
-    pub fn path_policy(&self) -> PathPolicy {
-        self.path_policy
-    }
-
-    pub fn set_path_policy(&mut self, policy: PathPolicy) {
-        self.path_policy = policy;
-    }
-
-    /// Reserve the next server-initiated bidirectional stream ID for a
-    /// multi-packet producer. The producer still uses `mux.endpoint` for
-    /// every packet, so packet numbers, ACK/loss state, and peer flow credit
-    /// remain in the shared QUIC-lite endpoint.
-    pub fn reserve_response_stream(&mut self) -> u64 {
-        let stream = self.next_response_stream;
-        self.next_response_stream = self.next_response_stream.saturating_add(4);
-        stream
-    }
-
-    pub fn receive_request(&mut self, packet: &[u8]) -> Result<Option<MuxRequest>, Error> {
-        self.mux.receive_request(packet)
-    }
-
-    /// Encode a final service response on the next server bidi stream.
-    pub fn encode_response(&mut self, body: &[u8], out: &mut [u8]) -> Result<(usize, u32), Error> {
-        let stream = self.reserve_response_stream();
-        self.mux.encode_response(stream, body, true, out)
-    }
-
-    pub fn poll_transmit(&mut self, out: &mut [u8]) -> Result<Option<usize>, Error> {
-        self.mux.endpoint.poll_transmit(out)
-    }
-}
-
-/// Bearer-neutral locally initiated connection state. A bearer chooses the
-/// peer and sends the returned complete datagrams; it never owns bootstrap
-/// credit, connection IDs, or the first request stream.
-pub struct StreamClientConnection<
-    const HISTORY: usize,
-    const PACKET: usize = { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-> {
-    mux: StreamMux<4, HISTORY, PACKET>,
-    bootstrap: Option<BootstrapClient>,
-    pending_request: Option<Vec<u8>>,
-}
-
-impl<const HISTORY: usize, const PACKET: usize> StreamClientConnection<HISTORY, PACKET> {
-    pub fn new(
-        local_cid: ConnectionId,
-        retry_timeout_us: u64,
-        max_attempts: u8,
-        request: Option<Vec<u8>>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            mux: StreamMux::new(
-                Role::Client,
-                ConnectionLimits::default(),
-                PACKET as u64,
-                1,
-                4,
-                4096,
-            ),
-            bootstrap: Some(BootstrapClient::new(
-                local_cid,
-                retry_timeout_us,
-                max_attempts,
-            )?),
-            pending_request: request,
-        })
-    }
-
-    pub fn start_open(&mut self, now_us: u64, out: &mut [u8]) -> Result<usize, Error> {
-        self.bootstrap
-            .as_mut()
-            .ok_or(Error::BootstrapInvalid)?
-            .start_open(now_us, out)
-    }
-
-    /// Apply a complete OPEN_ACK and, when one was queued, encode its request
-    /// stream. The response uses the peer's advertised credit and a fresh
-    /// packet number; packet zero remains reserved for OPEN_ACK.
-    pub fn receive_open_ack_and_request(
-        &mut self,
-        packet: &[u8],
-        out: &mut [u8],
-    ) -> Result<Option<usize>, Error> {
-        let (ack_header, _) = ShortHeader::decode(packet)?;
-        let bootstrap = self.bootstrap.as_mut().ok_or(Error::BootstrapInvalid)?;
-        let peer = bootstrap.on_open_ack(packet)?;
-        self.mux
-            .install_connection_ids(bootstrap.local_cid(), peer)?;
-        // OPEN_ACK is bearer-owned packet zero. The first persistent request
-        // must start after it or the peer's duplicate detector discards it.
-        self.mux
-            .endpoint
-            .continue_packet_numbers_from(ack_header.packet_number.saturating_add(1))?;
-        self.bootstrap = None;
-        let Some(request) = self.pending_request.take() else {
-            return Ok(None);
-        };
-        self.mux
-            .endpoint
-            .open_send_stream(FIRST_CLIENT_BIDI_STREAM_ID, INITIAL_MAX_STREAM_DATA)?;
-        let (used, _) = self.mux.endpoint.encode_stream_packet(
-            peer,
-            FIRST_CLIENT_BIDI_STREAM_ID,
-            0,
-            true,
-            &request,
-            out,
-        )?;
-        Ok(Some(used))
     }
 }
 
@@ -409,8 +267,8 @@ impl<const HISTORY: usize, const PACKET: usize> StreamClientConnection<HISTORY, 
 mod tests {
     use super::*;
     use quic_lite::{
-        BootstrapClient, Frame, ShortHeader, StreamRegistry,
-        decode_bootstrap_open_ack_packet_with_limits, decode_frame,
+        BootstrapClient, Frame, ShortHeader, decode_bootstrap_open_ack_packet_with_limits,
+        decode_frame,
     };
 
     #[test]
@@ -420,13 +278,8 @@ mod tests {
         let mut bootstrap = BootstrapClient::new(client, 500_000, 4).unwrap();
         let mut open = [0u8; 1200];
         let open_len = bootstrap.start_open(0, &mut open).unwrap();
-        let (mut connection, ack) = StreamServerConnection::<1>::accept_open(
-            &open[..open_len],
-            server,
-            StreamRegistry::empty(),
-            2,
-        )
-        .unwrap();
+        let (mut connection, ack) =
+            StreamServerConnection::<1>::accept_open(&open[..open_len], server, 2).unwrap();
         let (_, parsed_ack) = decode_bootstrap_open_ack_packet_with_limits(&ack, client).unwrap();
         assert_eq!(parsed_ack.server_receive_cid, server);
         assert_eq!(connection.mux.endpoint.local_connection_id(), Some(server));
@@ -450,13 +303,8 @@ mod tests {
         let mut bootstrap = BootstrapClient::new(client, 500_000, 4).unwrap();
         let mut open = [0u8; 1200];
         let open_len = bootstrap.start_open(0, &mut open).unwrap();
-        let (mut connection, _) = StreamServerConnection::<2>::accept_open(
-            &open[..open_len],
-            server,
-            StreamRegistry::empty(),
-            0,
-        )
-        .unwrap();
+        let (mut connection, _) =
+            StreamServerConnection::<2>::accept_open(&open[..open_len], server, 0).unwrap();
         let mut output = [0u8; 1200];
         let first = connection.encode_response(b"one", &mut output).unwrap().0;
         let (_, first_header_len) = ShortHeader::decode(&output[..first]).unwrap();
@@ -515,13 +363,9 @@ mod tests {
     fn client_bootstrap_uses_peer_credit_and_first_client_stream() {
         let client = ConnectionId::new(40).unwrap();
         let server = ConnectionId::new(41).unwrap();
-        let mut connection = StreamClientConnection::<2>::new(
-            client,
-            500_000,
-            4,
-            Some(vec![quic_lite::SERVICE_ECHO, b'o', b'k']),
-        )
-        .unwrap();
+        let mut connection =
+            StreamClientConnection::<2>::new(client, 500_000, 4, Some(vec![2, b'o', b'k']))
+                .unwrap();
         let mut open = [0u8; 1200];
         let open_len = connection.start_open(0, &mut open).unwrap();
         let (_, received_open) =
@@ -540,6 +384,6 @@ mod tests {
             panic!("client stream")
         };
         assert_eq!(stream.id, FIRST_CLIENT_BIDI_STREAM_ID);
-        assert_eq!(stream.data, &[quic_lite::SERVICE_ECHO, b'o', b'k']);
+        assert_eq!(stream.data, &[2, b'o', b'k']);
     }
 }

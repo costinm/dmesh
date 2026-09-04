@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 
 /// Tagged component reserved for one-way presence records.
 pub const ANNOUNCE_COMPONENT: u64 = 6;
-pub const ANNOUNCE_BOOT: u64 = 1;
 pub const ANNOUNCE_DISCOVERY: u64 = 2;
 /// Local request/response for bounded observation caches, not a broadcast.
 pub const ANNOUNCE_OBSERVED: u64 = 3;
@@ -262,33 +261,6 @@ pub struct ObservedDevice<'a> {
 }
 
 impl Announce {
-    pub const fn boot(device_id: [u8; MAX_DEVICE_ID], device_id_len: u8) -> Self {
-        Self {
-            kind: ANNOUNCE_BOOT,
-            device_id,
-            device_id_len,
-            uptime_secs: 0,
-            device_class: DEVICE_CLASS_UNKNOWN,
-            probe_capabilities: 0,
-            public_key: [0; MAX_PUBLIC_KEY],
-            public_key_len: 0,
-            signature: [0; SIGNATURE_LEN],
-            signature_len: 0,
-            device_name: [0; MAX_DEVICE_NAME],
-            device_name_len: 0,
-            device_domain: [0; MAX_DEVICE_DOMAIN],
-            device_domain_len: 0,
-            network_name: [0; MAX_NETWORK_NAME],
-            network_name_len: 0,
-            wifi_channel: 0,
-            sta_link_local_v6: [0; 16],
-            sta_link_local_v6_present: false,
-            udp_port: 0,
-            udp_link_local_v6: [0; 16],
-            udp_link_local_v6_present: false,
-        }
-    }
-
     pub const fn discovery(
         device_id: [u8; MAX_DEVICE_ID],
         device_id_len: u8,
@@ -551,7 +523,10 @@ fn encode_inner(
     let has_sta_link_local_v6 = announce.sta_link_local_v6_present;
     let has_udp_port = announce.udp_port != 0;
     let has_udp_link_local_v6 = announce.udp_link_local_v6_present;
-    if has_udp_port != has_udp_link_local_v6 {
+    // A port is an override, not a prerequisite for advertising a UDP path.
+    // The receiver knows the default service port for the announced device
+    // class; requiring it here made every default-port ESP path invisible.
+    if has_udp_port && !has_udp_link_local_v6 {
         return None;
     }
     // Canonical signing bytes deliberately omit field 6 even after a
@@ -837,8 +812,7 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
     }
     let kind = match record.method? {
         Name::Tag(
-            value @ (ANNOUNCE_BOOT
-            | ANNOUNCE_DISCOVERY
+            value @ (ANNOUNCE_DISCOVERY
             | ANNOUNCE_TRANSITION_BEGIN
             | ANNOUNCE_SLEEP_PENDING
             | ANNOUNCE_TRANSITION_COMPLETE
@@ -982,7 +956,7 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
     }
     (announce.device_id_len != 0
         && (announce.public_key_len == 0) == (announce.signature_len == 0)
-        && (announce.udp_port == 0) == !announce.udp_link_local_v6_present
+        && (announce.udp_port == 0 || announce.udp_link_local_v6_present)
         && d.is_finished())
     .then_some(announce)
 }
@@ -1026,9 +1000,6 @@ mod tests {
         let record = decode(&response[..response_len]).unwrap();
         assert_eq!(record.id, Some(71));
         assert_eq!(decode_announce(&response[..response_len]), Some(announce));
-
-        let boot = Announce::boot(id, 6);
-        assert!(encode_discovery_response(boot, 71, &mut response).is_none());
     }
 
     #[test]
@@ -1043,7 +1014,7 @@ mod tests {
             source_mac: [1, 2, 3, 4, 5, 6],
             source_ip: &[0; 16],
             uptime_secs: 20,
-            kind: ANNOUNCE_BOOT as u8,
+            kind: ANNOUNCE_DISCOVERY as u8,
             last_seen_ms: 500,
         }];
         let mut response = [0; 192];

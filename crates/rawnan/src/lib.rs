@@ -1329,45 +1329,6 @@ pub fn service_descriptor_payload<'a>(frame: &'a [u8], service_id: [u8; 6]) -> O
     service_descriptor(frame, service_id).map(|descriptor| descriptor.payload)
 }
 
-/// Return the first Service Descriptor payload for `service_id` accepted by
-/// `predicate`, without allocating.  An Android peer may include both its
-/// legacy `DM` service-state descriptor and a CBOR control/announce descriptor
-/// under the same service ID in one SDF; radio callbacks must select the
-/// useful record without retaining or heap-allocating the driver frame.
-pub fn service_descriptor_payload_matching<'a, F>(
-    frame: &'a [u8],
-    service_id: [u8; 6],
-    mut predicate: F,
-) -> Option<&'a [u8]>
-where
-    F: FnMut(&[u8]) -> bool,
-{
-    if !is_nan_sdf(frame) {
-        return None;
-    }
-    let mut offset = NAN_ACTION_START;
-    while offset + 3 <= frame.len() {
-        let attr_id = frame[offset];
-        let len = u16::from_le_bytes([frame[offset + 1], frame[offset + 2]]) as usize;
-        let start = offset + 3;
-        let Some(end) = start.checked_add(len) else {
-            break;
-        };
-        let Some(body) = frame.get(start..end) else {
-            break;
-        };
-        if attr_id == 0x03 {
-            if let Some(descriptor) = service_descriptor_body(body, service_id) {
-                if predicate(descriptor.payload) {
-                    return Some(descriptor.payload);
-                }
-            }
-        }
-        offset = end;
-    }
-    None
-}
-
 /// Return every complete Service Descriptor Attribute carried by an SDF.
 ///
 /// Malformed trailing attributes are ignored, while a malformed outer frame

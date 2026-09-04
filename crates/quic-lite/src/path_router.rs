@@ -153,6 +153,10 @@ impl<T, const CONNECTIONS: usize, const PATHS: usize> ConnectionTable<T, CONNECT
         self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
+    pub fn contains(&self, dcid: ConnectionId) -> bool {
+        self.router.routes.iter().any(|route| *route == Some(dcid))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
         self.entries
             .iter()

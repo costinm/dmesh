@@ -5,7 +5,10 @@
     {"id": 1, "name": "main", "api": "fw/esp32/rust/docs/README.md"},
     {"id": 2, "name": "recovery", "api": "fw/recovery-rust/README.md"},
     {"id": 3, "name": "stage2", "api": "fw/boot/API.md"},
-    {"id": 4, "name": "mod_lora", "api": "fw/mod_lora/API.md"}
+    {"id": 4, "name": "mod_lora", "api": "fw/mod_lora/API.md"},
+    {"id": 101, "name": "runtime", "api": "fw/dmesh-fw-transport/API.md"},
+    {"id": 102, "name": "power", "api": "fw/dmesh-fw-transport/API.md"},
+    {"id": 103, "name": "memory", "api": "fw/dmesh-fw-transport/API.md"}
   ],
   "events": [
     {"id": 60000, "name": "boot.identity", "owner": "stage2/recovery/main"},
@@ -16,14 +19,14 @@
     {"id": 0, "name": "event", "fields": [
       {"id": 32, "name": "message", "kind": "text"}
     ]},
-    {"id": 1, "name": "settings.get", "component": 1, "direct_control": true, "fields": [
+    {"id": 1, "name": "settings.get", "component": 1, "x-check-all": {"key": "name"}, "x-check-all-platforms": ["esp32", "android"], "fields": [
       {"id": 1, "name": "key", "kind": "text"}
     ]},
-    {"id": 2, "name": "settings.set", "component": 1, "direct_control": true, "fields": [
+    {"id": 2, "name": "settings.set", "component": 1, "fields": [
       {"id": 1, "name": "key", "kind": "text"}, {"id": 2, "name": "value", "kind": "text"}
     ]},
-    {"id": 3, "name": "settings.list", "component": 1, "direct_control": true},
-    {"id": 4, "name": "transport.set", "component": 1, "direct_control": true, "fields": [
+    {"id": 3, "name": "settings.list", "component": 1, "x-check-all": {}, "x-check-all-platforms": ["esp32", "android"]},
+    {"id": 4, "name": "transport.set", "component": 1, "x-ui-visibility": "default", "fields": [
       {"id": 1, "name": "mode", "kind": "enum", "values": {"sta": 1, "uart": 5, "nan": 6}},
       {"id": 2, "name": "ssid", "kind": "text"},
       {"id": 3, "name": "bssid", "kind": "mac"},
@@ -36,15 +39,44 @@
       {"id": 17, "name": "passphrase", "kind": "text"},
       {"id": 24, "name": "open", "kind": "bool"}
     ]},
-    {"id": 6, "name": "transport.discover", "component": 1, "direct_control": true, "fields": [
-      {"id": 2, "name": "ssid", "kind": "text"},
-      {"id": 4, "name": "channel", "kind": "u8"},
-      {"id": 20, "name": "active_scan", "kind": "bool"},
-      {"id": 21, "name": "passive_scan", "kind": "bool"},
-      {"id": 22, "name": "nan", "kind": "bool"},
-      {"id": 23, "name": "dns_sd", "kind": "bool"}
+    {"id": 3, "name": "relay.list", "component": 5, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
+    {"id": 9, "name": "discovery.nodes", "component": 6, "x-ui-visibility": "default", "x-check-all": {}, "x-check-all-platforms": ["esp32", "host", "android"]},
+    {"id": 1, "name": "telemetry.nan_status", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
+    {"id": 2, "name": "telemetry.now_metrics", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
+    {"id": 3, "name": "telemetry.nan_metrics", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
+    {"id": 4, "name": "telemetry.udp6_metrics", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
+    {"id": 5, "name": "telemetry.wifi_link_metrics", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
+    {"id": 1, "name": "runtime.snapshot", "component": 101, "x-check-all": {}, "x-check-all-platforms": ["esp32"], "fields": [
+      {"id": 0, "name": "desired_mode", "kind": "u32"}, {"id": 1, "name": "desired_generation", "kind": "u32"}, {"id": 2, "name": "request_id", "kind": "u32"}, {"id": 3, "name": "sleepy", "kind": "bool"}, {"id": 4, "name": "radio_lifecycle", "kind": "u32"}, {"id": 5, "name": "applied_generation", "kind": "u32"}, {"id": 6, "name": "power_lifecycle", "kind": "u32"}, {"id": 7, "name": "sleep_blockers", "kind": "u32"}, {"id": 8, "name": "last_error", "kind": "u32"}, {"id": 9, "name": "stale_completion_count", "kind": "u32"}, {"id": 10, "name": "queue_overflow_count", "kind": "u32"}, {"id": 11, "name": "wake_cause", "kind": "u32"}, {"id": 12, "name": "cpu_mhz", "kind": "u32"}, {"id": 13, "name": "pm_min_mhz", "kind": "u32"}, {"id": 14, "name": "pm_max_mhz", "kind": "u32"}, {"id": 15, "name": "pm_automatic_light_sleep", "kind": "bool"}, {"id": 16, "name": "pm_configured", "kind": "bool"}, {"id": 17, "name": "light_sleep_attempts", "kind": "u32"}, {"id": 18, "name": "light_sleep_entries", "kind": "u32"}, {"id": 19, "name": "light_sleep_skipped", "kind": "u32"}, {"id": 20, "name": "last_sleep_requested_us", "kind": "u32"}, {"id": 21, "name": "last_sleep_duration_us", "kind": "u32"}
     ]},
-    {"id": 33, "name": "status"},
+    {"id": 1, "name": "power.snapshot", "component": 102, "x-check-all": {}, "x-check-all-platforms": ["esp32"], "fields": [
+      {"id": 0, "name": "cpu_mhz", "kind": "u32"}, {"id": 1, "name": "min_mhz", "kind": "u32"}, {"id": 2, "name": "max_mhz", "kind": "u32"}, {"id": 3, "name": "automatic_light_sleep", "kind": "bool"}, {"id": 4, "name": "configured", "kind": "bool"}, {"id": 5, "name": "light_sleep_attempts", "kind": "u32"}, {"id": 6, "name": "light_sleep_entries", "kind": "u32"}, {"id": 7, "name": "light_sleep_skipped", "kind": "u32"}, {"id": 8, "name": "last_sleep_requested_us", "kind": "u32"}, {"id": 9, "name": "last_sleep_duration_us", "kind": "u32"}
+    ]},
+    {"id": 1, "name": "memory.snapshot", "component": 103, "x-check-all": {}, "x-check-all-platforms": ["esp32"], "fields": [
+      {"id": 0, "name": "packet_slots", "kind": "u32"}, {"id": 1, "name": "packet_slots_available", "kind": "u32"}, {"id": 2, "name": "packet_drops", "kind": "u32"}, {"id": 3, "name": "worker_stack_bytes", "kind": "u32"}, {"id": 4, "name": "worker_running", "kind": "bool"}, {"id": 5, "name": "worker_starts", "kind": "u32"}, {"id": 6, "name": "worker_create_failures", "kind": "u32"}, {"id": 7, "name": "worker_stack_min_free_words", "kind": "u32"}, {"id": 8, "name": "free_internal_bytes", "kind": "u32"}, {"id": 9, "name": "min_free_internal_bytes", "kind": "u32"}, {"id": 10, "name": "largest_internal_block_bytes", "kind": "u32"}
+    ]},
+    {"id": 1, "name": "probe", "component": 8, "x-check-all": {"bytes": 65536, "packet_size": 1024, "parallel_streams": 1}, "x-check-all-platforms": ["esp32", "host", "android"], "fields": [
+      {"id": 1, "name": "bytes", "kind": "u64"},
+      {"id": 2, "name": "packet_size", "kind": "u16"},
+      {"id": 3, "name": "pace_us", "kind": "u32"},
+      {"id": 4, "name": "burst_packets", "kind": "u8"},
+      {"id": 5, "name": "burst_delay_us", "kind": "u32"},
+      {"id": 6, "name": "ack_frequency", "kind": "u8"},
+      {"id": 7, "name": "ack_delay_ms", "kind": "u8"},
+      {"id": 8, "name": "low_priority_bytes", "kind": "u32"},
+      {"id": 9, "name": "high_priority_bytes", "kind": "u32"},
+      {"id": 10, "name": "parallel_streams", "kind": "u8"}
+    ]},
+    {"id": 1, "name": "status", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32", "android"]},
+    {"id": 2, "name": "services", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
+    {"id": 3, "name": "metrics", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
+    {"id": 4, "name": "events", "component": 9, "x-check-all": {"since": 0}, "x-check-all-platforms": ["esp32", "host"], "fields": [
+      {"id": 1, "name": "since", "kind": "u64"}
+    ]},
+    {"id": 5, "name": "log-watch", "component": 9, "x-check-all": {"since": 0, "records": 1}, "x-check-all-platforms": ["esp32", "host"], "fields": [
+      {"id": 1, "name": "since", "kind": "u64"},
+      {"id": 2, "name": "records", "kind": "u8"}
+    ]},
     {"id": 34, "name": "xstatus"},
     {"id": 35, "name": "stats"},
     {"id": 36, "name": "logs"},
@@ -79,11 +111,11 @@
     {"id": 65, "name": "button"},
     {"id": 66, "name": "nvs"},
     {"id": 67, "name": "radio"},
-    {"id": 68, "name": "recovery", "direct_control": true},
+    {"id": 68, "name": "recovery"},
     {"id": 69, "name": "reset"},
     {"id": 70, "name": "module"},
     {"id": 71, "name": "hello"},
-    {"id": 72, "name": "radio.control", "component": 4, "direct_control": true, "fields": [
+    {"id": 72, "name": "radio.control", "component": 4, "fields": [
       {"id": 2, "name": "channel", "kind": "u8"},
       {"id": 3, "name": "interface", "kind": "enum", "values": {"auto": 0, "sta": 1, "ap": 2, "nan": 3}},
       {"id": 5, "name": "rate", "kind": "enum", "values": {"auto": 0, "6": 6, "9": 9, "12": 12, "18": 18, "24": 24, "36": 36, "48": 48, "54": 54}},
@@ -97,7 +129,7 @@
       {"id": 13, "name": "ap_mode", "kind": "enum", "values": {"disabled": 0, "open": 1}},
       {"id": 14, "name": "ap_beacon_tu", "kind": "u16"},
       {"id": 15, "name": "raw_sta_mode", "kind": "enum", "values": {"main_style": 1}},
-      {"id": 20, "name": "epoch", "kind": "u32"},
+      {"id": 20, "name": "action_destination_broadcast", "kind": "bool"},
       {"id": 21, "name": "applied_channel", "kind": "u8"},
       {"id": 22, "name": "sta_associated", "kind": "bool"},
       {"id": 23, "name": "applied_promiscuous", "kind": "bool"},
@@ -120,15 +152,15 @@
       {"id": 49, "name": "nan_sdfs", "kind": "u32"},
       {"id": 50, "name": "nan_followups", "kind": "u32"}
     ]},
-    {"id": 73, "name": "radio.snapshot", "component": 4, "direct_control": true, "fields": [
+    {"id": 73, "name": "radio.snapshot", "component": 4, "x-check-all": {}, "x-check-all-platforms": ["esp32"], "fields": [
       {"id": 20, "name": "epoch", "kind": "u32"}, {"id": 21, "name": "applied_channel", "kind": "u8"}, {"id": 22, "name": "sta_associated", "kind": "bool"}, {"id": 23, "name": "applied_promiscuous", "kind": "bool"}, {"id": 24, "name": "dw_capturing", "kind": "bool"}, {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"}, {"id": 26, "name": "comparator_armed", "kind": "bool"}, {"id": 27, "name": "comparator_errors", "kind": "u32"}, {"id": 28, "name": "applied_tx_interface", "kind": "enum"}, {"id": 29, "name": "applied_tx_rate", "kind": "enum"}, {"id": 30, "name": "ap_active", "kind": "bool"}, {"id": 31, "name": "mac_ack", "kind": "bool"}, {"id": 40, "name": "tx_attempted", "kind": "u32"}, {"id": 41, "name": "tx_driver_accepted", "kind": "u32"}, {"id": 42, "name": "tx_driver_failed", "kind": "u32"}, {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"}, {"id": 44, "name": "rx_parser_accepted", "kind": "u32"}, {"id": 45, "name": "rx_parser_rejected", "kind": "u32"}, {"id": 46, "name": "rx_self_echo", "kind": "u32"}, {"id": 47, "name": "rx_dropped", "kind": "u32"}, {"id": 48, "name": "nan_beacons", "kind": "u32"}, {"id": 49, "name": "nan_sdfs", "kind": "u32"}, {"id": 50, "name": "nan_followups", "kind": "u32"}, {"id": 51, "name": "tx_duration_us_total", "kind": "u32"}, {"id": 52, "name": "tx_duration_us_max", "kind": "u32"}, {"id": 53, "name": "tx_duration_le_250us", "kind": "u32"}, {"id": 54, "name": "tx_duration_le_750us", "kind": "u32"}, {"id": 55, "name": "tx_duration_le_2ms", "kind": "u32"}, {"id": 56, "name": "tx_duration_gt_2ms", "kind": "u32"}
     ]},
-    {"id": 77, "name": "wifi.scan", "component": 4, "direct_control": true, "fields": [
+    {"id": 77, "name": "wifi.scan", "component": 4, "x-check-all": {"last_results": true}, "x-check-all-platforms": ["esp32", "host"], "fields": [
       {"id": 30, "name": "fresh", "kind": "bool"}, {"id": 31, "name": "last_results", "kind": "bool"},
       {"id": 6, "name": "configured_sta_auth_mode", "kind": "u8"},
       {"id": 7, "name": "configured_sta_ssid", "kind": "text"}
     ]},
-    {"id": 74, "name": "radio.reset_counters", "component": 4, "direct_control": true, "fields": [
+    {"id": 74, "name": "radio.reset_counters", "component": 4, "fields": [
       {"id": 20, "name": "epoch", "kind": "u32"}, {"id": 21, "name": "applied_channel", "kind": "u8"}, {"id": 22, "name": "sta_associated", "kind": "bool"}, {"id": 23, "name": "applied_promiscuous", "kind": "bool"}, {"id": 24, "name": "dw_capturing", "kind": "bool"}, {"id": 25, "name": "applied_comparator_bssid", "kind": "mac"}, {"id": 26, "name": "comparator_armed", "kind": "bool"}, {"id": 27, "name": "comparator_errors", "kind": "u32"}, {"id": 28, "name": "applied_tx_interface", "kind": "enum"}, {"id": 29, "name": "applied_tx_rate", "kind": "enum"}, {"id": 30, "name": "ap_active", "kind": "bool"}, {"id": 40, "name": "tx_attempted", "kind": "u32"}, {"id": 41, "name": "tx_driver_accepted", "kind": "u32"}, {"id": 42, "name": "tx_driver_failed", "kind": "u32"}, {"id": 43, "name": "rx_driver_dispatch", "kind": "u32"}, {"id": 44, "name": "rx_parser_accepted", "kind": "u32"}, {"id": 45, "name": "rx_parser_rejected", "kind": "u32"}, {"id": 46, "name": "rx_self_echo", "kind": "u32"}, {"id": 47, "name": "rx_dropped", "kind": "u32"}, {"id": 48, "name": "nan_beacons", "kind": "u32"}, {"id": 49, "name": "nan_sdfs", "kind": "u32"}, {"id": 50, "name": "nan_followups", "kind": "u32"}
     ]}
   ],

@@ -29,6 +29,16 @@ pub mod now_metric {
     pub const RX_DROPPED: u16 = 8;
     pub const REGISTERED_ACTIONS: u16 = 9;
     pub const REGISTERED_DROPS: u16 = 10;
+    /// First four bytes of the last ROC action body, in network byte order.
+    /// This is framing evidence, not application payload retention.
+    pub const LAST_ROC_BODY_PREFIX: u16 = 11;
+    /// Bounded byte length of the last ROC action body.
+    pub const LAST_ROC_BODY_LEN: u16 = 12;
+    pub const RX_INVALID_DROPS: u16 = 13;
+    pub const RX_BUSY_DROPS: u16 = 14;
+    pub const RX_SHARED_INGRESS_DROPS: u16 = 15;
+    pub const LAST_REGISTERED_BODY_PREFIX: u16 = 16;
+    pub const LAST_REGISTERED_BODY_LEN: u16 = 17;
 }
 
 pub mod nan_metric {
@@ -110,7 +120,19 @@ pub fn encode_request(method: u64, id: u64, out: &mut [u8]) -> Option<usize> {
 /// Decode and validate an empty telemetry read request.
 pub fn decode_request(packet: &[u8]) -> Option<(u64, u64)> {
     let record = decode(packet)?;
-    if record.component != Some(Name::Tag(TELEMETRY_COMPONENT)) || record.params.is_some() {
+    decode_request_record(record)
+}
+
+/// Decode a telemetry request which has already been framed by a tagged QUIC
+/// stream handler. This keeps direct and stream adapters on one validator.
+pub fn decode_request_record(record: crate::tagged::Record<'_>) -> Option<(u64, u64)> {
+    if record.to.is_some()
+        || record.component != Some(Name::Tag(TELEMETRY_COMPONENT))
+        || record.params.is_some()
+        || record.data.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+    {
         return None;
     }
     let method = match record.method? {
@@ -128,10 +150,14 @@ pub fn decode_request(packet: &[u8]) -> Option<(u64, u64)> {
         }
         _ => return None,
     };
-    let fields = record.fields?;
-    let mut d = Decoder::new(fields);
-    let (major, count) = d.head()?;
-    (major == 5 && count == 0 && d.is_finished()).then_some((method, record.id?))
+    if let Some(fields) = record.fields {
+        let mut d = Decoder::new(fields);
+        let (major, count) = d.head()?;
+        if major != 5 || count != 0 || !d.is_finished() {
+            return None;
+        }
+    }
+    Some((method, record.id?))
 }
 
 pub fn encode_nan_status(status: NanStatus<'_>, out: &mut [u8]) -> Option<usize> {

@@ -221,14 +221,24 @@ pub fn parse_action_frame_into(frame: &[u8], output: &mut [u8]) -> Option<([u8; 
     {
         return None;
     }
-    if frame.get(IEEE80211_HEADER_LEN..IEEE80211_HEADER_LEN + 4)? != ACTION_PREFIX {
+    let source = frame.get(10..16)?.try_into().ok()?;
+    let used = parse_action_body_into(frame.get(IEEE80211_HEADER_LEN..)?, output)?;
+    Some((source, used))
+}
+
+/// Parse the action body supplied by a native receive callback.  A full raw
+/// frame is not always available: C6 ROC delivers the 802.11 header and body
+/// separately, while its private vendor dispatcher already reassembles the
+/// vendor-IE bodies.  Keeping the body parser portable makes those adapters
+/// framing-only and preserves the exact same v2 IE validation.
+pub fn parse_action_body_into(action: &[u8], output: &mut [u8]) -> Option<usize> {
+    if action.get(..4)? != ACTION_PREFIX {
         return None;
     }
-    let source = frame.get(10..16)?.try_into().ok()?;
-    let mut ie_offset: usize = IEEE80211_HEADER_LEN + ACTION_HEADER_LEN;
+    let mut ie_offset: usize = ACTION_HEADER_LEN;
     let mut written: usize = 0;
     loop {
-        let ie = frame.get(ie_offset..)?;
+        let ie = action.get(ie_offset..)?;
         let element_len = ie.get(1).copied()? as usize;
         let end = 2usize.checked_add(element_len)?;
         let element = ie.get(..end)?;
@@ -253,20 +263,20 @@ pub fn parse_action_frame_into(frame: &[u8], output: &mut [u8]) -> Option<([u8; 
             // The one-IE-plus-tail form is an RX-filter experiment. It is
             // still a single frame and lets both raw adapters validate the
             // same QUIC bytes without pretending to be ESP-IDF ESP-NOW.
-            let tail = frame.get(ie_offset..).unwrap_or_default();
+            let tail = action.get(ie_offset..).unwrap_or_default();
             // ESP promiscuous metadata may retain the 802.11 FCS. A complete
             // v2 IE sequence has no tail, except for that four-byte checksum;
             // do not turn it into four bogus QUIC bytes. Any other tail is
             // the explicit one-IE-plus-tail lab layout.
             if tail.len() == 4 {
-                return Some((source, written));
+                return Some(written);
             }
             let next = written.checked_add(tail.len())?;
             if next > output.len() {
                 return None;
             }
             output[written..next].copy_from_slice(tail);
-            return Some((source, next));
+            return Some(next);
         }
     }
 }
@@ -286,6 +296,25 @@ mod tests {
             parse_action_frame(&frame),
             Some((source, payload.as_slice()))
         );
+    }
+
+    #[test]
+    fn action_body_callback_reassembles_the_original_quic_datagram() {
+        // ESP's generic STA/AP action callback supplies the 802.11 header and
+        // action body separately.  Keep its body-only form covered here so
+        // the firmware adapter cannot accidentally pass the radio envelope to
+        // QUIC-lite as if it were a QUIC packet.
+        let destination = [1, 2, 3, 4, 5, 6];
+        let source = [6, 5, 4, 3, 2, 1];
+        let payload = [0x40, 0x01, 0x02, 0x03];
+        let frame = build_action_frame(destination, source, [0xff; 6], &payload).unwrap();
+        let mut output = [0; 4];
+
+        assert_eq!(
+            parse_action_body_into(&frame[IEEE80211_HEADER_LEN..], &mut output),
+            Some(payload.len())
+        );
+        assert_eq!(output, payload);
     }
 
     #[test]

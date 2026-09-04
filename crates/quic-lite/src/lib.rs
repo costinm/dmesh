@@ -9,6 +9,7 @@
 //! bearer/security layer.
 
 extern crate alloc;
+#[cfg(any(feature = "std", test))]
 use alloc::vec::Vec;
 #[cfg(not(any(feature = "std", test)))]
 use alloc::{
@@ -19,10 +20,8 @@ use alloc::{
 #[cfg(all(feature = "std", not(test)))]
 extern crate std;
 
-pub mod bearer_probe;
 pub mod callback;
 pub mod connection;
-pub mod iperf;
 pub mod ledger;
 
 pub mod mux;
@@ -35,13 +34,22 @@ pub mod ram_budget;
 pub mod raw_udp6;
 pub mod relay;
 
+pub use connection::{
+    AssociationProfile, ClientAssociation, ClientBootstrapIngress, ClientConnection,
+    ClientStreamConnection, ConnectionCounters, ConnectionDebugState, ConnectionIdDiagnostic,
+    ConnectionManager, ConnectionPolicy, DatagramClient, DatagramClientDriver, PathConnection,
+    PathId, ServerAssociationTable, ServerConnection, ServerConnectionIngress, ServerDatagram, ServerPacket,
+    ServerStreamConfig, ServerStreamConnection, classify_server_datagram,
+    classify_server_packet, receive_error_code,
+};
+
 pub use path_router::{
     ConnectionTable, ConnectionTableError, DcidRouter, DcidRouterError, PathCapacity, PathPolicy,
     PathState,
 };
 pub use relay::{
-    DcidDatagram, DcidDatagramError, DcidIngress, DcidRegistry, DcidRegistryError, DcidTarget,
-    ForwardRule, dispatch_datagram,
+    DcidDatagram, DcidDatagramError, DcidRegistry, DcidRegistryError, DcidTarget,
+    ForwardDestination, ForwardRule, dispatch_datagram,
 };
 
 #[cfg(any(feature = "std", test))]
@@ -51,261 +59,157 @@ pub mod fake;
 extern crate std;
 
 use core::cmp::{max, min};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 pub const FLAG_FIXED: u8 = 0x40;
 pub const FLAG_SPIN: u8 = 0x20;
 pub const FLAG_RESERVED: u8 = 0x18;
 pub const FLAG_KEY_PHASE: u8 = 0x04;
 
-/// Shared benchmark stream envelope used by the host and ESP32 test paths.
-/// It is intentionally separate from the production object-store protocol so
-/// an iperf-like run can vary bearer parameters without changing semantics.
-pub const BENCH_MAGIC: [u8; 4] = *b"DMTB";
-pub const BENCH_CONNECTION_ID: u64 = 0x1234;
-pub const BENCH_STREAM_ID: u64 = 0;
-
-/// Application stream service tags shared by all bearers.
-pub const SERVICE_OBJECT: u8 = 1;
-pub const SERVICE_ECHO: u8 = 2;
-pub const SERVICE_STATUS: u8 = 3;
-pub const SERVICE_STREAM: u8 = 4;
-/// Enumerate every registered application stream handler.  The response is a
-/// compact CBOR array of `[tag, name]` pairs. `STREAM` is retained as the
-/// numeric wire tag while the handler name makes its purpose explicit to
-/// interactive clients.
-pub const SERVICE_HANDLERS: u8 = SERVICE_STREAM;
-pub const SERVICE_IPERF: u8 = 5;
-pub const SERVICE_METRICS: u8 = 6;
-pub const SERVICE_EVENTS: u8 = 7;
-/// Recovery command/log exchange. Payloads are compact CBOR records owned by
-/// Recovery; transport only carries the stream and never interprets them.
-pub const SERVICE_CONTROL: u8 = 8;
-/// Subscribe to bounded diagnostic log records exposed by a server.  The
-/// transport only carries this tag; log schemas and retention are server
-/// policy.
-pub const SERVICE_LOG_WATCH: u8 = 9;
-/// Ask a device to fetch one signed object and install it through its local
-/// flash sink. The device, not the command sender, opens the object GET.
-pub const SERVICE_FLASH: u8 = 10;
-
-/// A small CBOR selector used at the beginning of a stream command.  This is
-/// intentionally not a CBOR dependency or a general decoder: transport only
-/// recognizes one definite integer service tag and leaves the body opaque.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CborSelector {
-    Tag(u64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CborSelectorError {
-    Truncated,
-    Unsupported,
-}
-
-/// One application handler advertised by a QUIC-lite endpoint.
+/// QUIC requires a stateless-reset token to be indistinguishable from random
+/// bytes to an off-path observer.  The issuer derives it from a secret that
+/// survives association-table eviction (and, in production, process/device
+/// restart) plus the CID it issued to the peer.
 ///
-/// This deliberately describes dispatch only.  It contains neither a CBOR
-/// schema nor a function pointer: the application owning a stream reads its
-/// own payload after QUIC-lite has selected it.
+/// This is deliberately a quic-lite primitive: bearers neither construct a
+/// reset packet nor inspect its token.  They only write the opaque datagram
+/// selected by an association owner.
+pub const STATELESS_RESET_TOKEN_LEN: usize = 16;
+const STATELESS_RESET_MIN_PACKET_LEN: usize = 21;
+
+// PSP-inspired key-schedule boundary: every protocol purpose gets a stable,
+// versioned label below the device/control-plane root.  Stateless reset is the
+// first consumer because it needs restart recovery before packet encryption is
+// deployed.  Future authenticated receive/traffic keys must add their own
+// labels here rather than deriving from the reset key or reusing reset tokens.
+// This is deliberately only a DMesh key-separation model; it is not a claim
+// of PSP message or wire-format compatibility.
+const DEVICE_SECRET_RESET_KEY_LABEL: &[u8] = b"dmesh/quic-lite/reset-key/v1";
+const STATELESS_RESET_TOKEN_LABEL: &[u8] = b"dmesh/quic-lite/stateless-reset/v1";
+const STATELESS_RESET_PREFIX_LABEL: &[u8] = b"dmesh/quic-lite/stateless-reset/prefix/v1";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StreamHandler {
-    pub tag: u8,
-    pub name: &'static [u8],
-}
+pub struct StatelessResetKey([u8; 32]);
 
-/// Shared stream-handler registry for every QUIC-lite bearer.
-///
-/// The registry is in the transport crate so UART, UDP, ESP-NOW, and host
-/// tests advertise the exact same tag/name surface.  It remains no_std and
-/// only uses `alloc`; CBOR is limited to the small selector helper below.
-#[derive(Clone, Debug)]
-pub struct StreamRegistry {
-    handlers: Vec<StreamHandler>,
-}
-
-impl Default for StreamRegistry {
-    fn default() -> Self {
-        let mut registry = Self {
-            handlers: Vec::new(),
-        };
-        for handler in [
-            StreamHandler {
-                tag: SERVICE_OBJECT,
-                name: b"object",
-            },
-            StreamHandler {
-                tag: SERVICE_ECHO,
-                name: b"echo",
-            },
-            StreamHandler {
-                tag: SERVICE_STATUS,
-                name: b"status",
-            },
-            StreamHandler {
-                tag: SERVICE_HANDLERS,
-                name: b"handlers",
-            },
-            StreamHandler {
-                tag: SERVICE_IPERF,
-                name: b"iperf",
-            },
-            StreamHandler {
-                tag: SERVICE_METRICS,
-                name: b"metrics",
-            },
-            StreamHandler {
-                tag: SERVICE_EVENTS,
-                name: b"events",
-            },
-            StreamHandler {
-                tag: SERVICE_CONTROL,
-                name: b"control",
-            },
-            StreamHandler {
-                tag: SERVICE_LOG_WATCH,
-                name: b"log-watch",
-            },
-        ] {
-            // Registration mutates the advertised surface.  Do not place it
-            // inside `debug_assert!`: release firmware would otherwise build
-            // an empty registry and reject every valid stream service.  The
-            // canonical static list is trusted in production; debug builds
-            // still check it contains no duplicate tag or name.
-            let _registered = registry.register(handler.tag, handler.name);
-            debug_assert!(_registered);
+impl StatelessResetKey {
+    /// Derive the reset-key branch from the provisioned device/control-plane
+    /// secret. This is the narrow PSP-style schedule boundary for DMesh:
+    /// reset and future receive-encryption keys intentionally use separate
+    /// labels, so exposing a reset token never reuses traffic-key material.
+    /// The root itself remains in NVS or the platform's private equivalent and
+    /// never enters a packet or settings response. This reserves compatible
+    /// key-separation semantics; it does not claim PSP wire compatibility.
+    pub fn from_device_secret(secret: &[u8]) -> Result<Self, Error> {
+        if secret.len() < 16 {
+            return Err(Error::Invalid);
         }
-        registry
-    }
-}
-
-impl StreamRegistry {
-    /// Start with no advertised handlers. Bearer adapters use this when their
-    /// available service surface is intentionally narrower than the common
-    /// host/server baseline.
-    pub fn empty() -> Self {
-        Self {
-            handlers: Vec::new(),
-        }
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts secret bytes");
+        mac.update(DEVICE_SECRET_RESET_KEY_LABEL);
+        let digest = mac.finalize().into_bytes();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&digest);
+        Ok(Self(key))
     }
 
-    /// Register one stable service tag and human-readable name.  A duplicate
-    /// tag or name is rejected so discovery cannot advertise an ambiguous
-    /// handler.
-    pub fn register(&mut self, tag: u8, name: &'static [u8]) -> bool {
-        if name.is_empty()
-            || self
-                .handlers
-                .iter()
-                .any(|handler| handler.tag == tag || handler.name == name)
+    /// Derive the reset token advertised for one locally-issued receive CID.
+    /// A host/service supplies stable key material; a random boot-only key
+    /// would not let a restarted endpoint reset associations from before the
+    /// restart and therefore does not satisfy the recovery contract.
+    pub fn token_for(self, cid: ConnectionId) -> StatelessResetToken {
+        let mut cid_bytes = [0u8; 8];
+        let cid_len = cid
+            .encode(&mut cid_bytes)
+            .expect("CID buffer is fixed-size");
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC accepts 32-byte key");
+        mac.update(STATELESS_RESET_TOKEN_LABEL);
+        mac.update(&cid_bytes[..cid_len]);
+        let digest = mac.finalize().into_bytes();
+        let mut token = [0u8; STATELESS_RESET_TOKEN_LEN];
+        token.copy_from_slice(&digest[..STATELESS_RESET_TOKEN_LEN]);
+        StatelessResetToken(token)
+    }
+
+    /// Form an RFC 9000-style opaque stateless reset for an unknown
+    /// short-header CID.  The triggering datagram length is retained to avoid
+    /// becoming a packet-size oracle.  The HMAC-generated prefix is opaque;
+    /// the final bytes are the receiver-recognized token.
+    pub fn encode_for_unknown_packet(
+        self,
+        triggering_packet: &[u8],
+        out: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        let (header, _) = ShortHeader::decode(triggering_packet)?;
+        self.encode_for_unknown_cid(triggering_packet, header.dcid, out)
+    }
+
+    /// Internal reset formatter after QUIC-lite has decoded the unknown
+    /// destination. Bearers must use [`Self::encode_for_unknown_packet`] so
+    /// they never inspect a QUIC header merely to obtain a CID.
+    fn encode_for_unknown_cid(
+        self,
+        triggering_packet: &[u8],
+        unknown_dcid: ConnectionId,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        if triggering_packet.len() < STATELESS_RESET_MIN_PACKET_LEN
+            || triggering_packet
+                .first()
+                .is_none_or(|first| first & 0x80 != 0)
         {
+            return Ok(None);
+        }
+        let used = triggering_packet.len().min(out.len());
+        if used < STATELESS_RESET_MIN_PACKET_LEN {
+            return Err(Error::BufferTooSmall);
+        }
+        let token = self.token_for(unknown_dcid);
+        let mut cid_bytes = [0u8; 8];
+        let cid_len = unknown_dcid.encode(&mut cid_bytes)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC accepts 32-byte key");
+        mac.update(STATELESS_RESET_PREFIX_LABEL);
+        mac.update(&cid_bytes[..cid_len]);
+        mac.update(&(used as u64).to_be_bytes());
+        let digest = mac.finalize().into_bytes();
+        for (index, byte) in out[..used - STATELESS_RESET_TOKEN_LEN]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = digest[index % digest.len()] ^ (index as u8).wrapping_mul(0x9d);
+        }
+        // This implementation has no packet protection yet.  Make the
+        // opaque reset fail the local pre-protection header parser so a
+        // shared listener can offer it to candidate associations by ingress
+        // path; quic-lite then performs the token comparison.  Full QUIC
+        // packet protection naturally supplies this indistinguishability.
+        out[0] &= 0x3f;
+        out[used - STATELESS_RESET_TOKEN_LEN..used].copy_from_slice(&token.0);
+        Ok(Some(used))
+    }
+}
+
+/// Opaque state retained by an association after the peer issued its CID.
+/// It is intentionally not serializable and has no public byte accessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatelessResetToken([u8; STATELESS_RESET_TOKEN_LEN]);
+
+impl StatelessResetToken {
+    /// Recognize a reset only after normal association parsing has failed.
+    /// A valid packet can end in the same bytes by chance, so calling this
+    /// before normal packet authentication/parsing would be unsafe.
+    pub fn matches_packet(self, input: &[u8]) -> bool {
+        if input.len() < STATELESS_RESET_MIN_PACKET_LEN {
             return false;
         }
-        self.handlers.push(StreamHandler { tag, name });
-        true
-    }
-
-    pub fn handlers(&self) -> &[StreamHandler] {
-        &self.handlers
-    }
-
-    pub fn contains(&self, tag: u8) -> bool {
-        self.handlers.iter().any(|handler| handler.tag == tag)
-    }
-
-    /// Encode handler discovery as canonical compact CBOR:
-    /// `[[tag, "name"], ...]`. This small self-contained encoder keeps
-    /// QUIC-lite free of a CBOR crate and is not a handler payload schema.
-    pub fn encode_handler_list(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(1 + self.handlers.len() * 12);
-        encode_cbor_head(&mut output, 4, self.handlers.len() as u64);
-        for handler in &self.handlers {
-            encode_cbor_head(&mut output, 4, 2);
-            encode_cbor_head(&mut output, 0, u64::from(handler.tag));
-            encode_cbor_head(&mut output, 3, handler.name.len() as u64);
-            output.extend_from_slice(handler.name);
+        let suffix = &input[input.len() - STATELESS_RESET_TOKEN_LEN..];
+        let mut different = 0u8;
+        for (received, expected) in suffix.iter().zip(self.0.iter()) {
+            different |= received ^ expected;
         }
-        output
-    }
-
-    /// Resolve a compact numeric service tag at the beginning of a stream
-    /// body. Names are deliberately discovery-only metadata and never select
-    /// a handler or command.
-    pub fn resolve_tag<'a>(&self, input: &'a [u8]) -> Option<(u8, &'a [u8])> {
-        let (selector, used) = decode_cbor_selector(input).ok()?;
-        let CborSelector::Tag(tag) = selector;
-        let handler = self
-            .handlers
-            .iter()
-            .find(|handler| u64::from(handler.tag) == tag)?;
-        Some((handler.tag, &input[used..]))
+        different == 0
     }
 }
 
-fn encode_cbor_head(output: &mut Vec<u8>, major: u8, value: u64) {
-    debug_assert!(major < 8);
-    let prefix = major << 5;
-    match value {
-        0..=23 => output.push(prefix | value as u8),
-        24..=255 => output.extend_from_slice(&[prefix | 24, value as u8]),
-        256..=65_535 => {
-            output.push(prefix | 25);
-            output.extend_from_slice(&(value as u16).to_be_bytes());
-        }
-        65_536..=4_294_967_295 => {
-            output.push(prefix | 26);
-            output.extend_from_slice(&(value as u32).to_be_bytes());
-        }
-        _ => {
-            output.push(prefix | 27);
-            output.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
-
-/// Decode a definite CBOR unsigned-integer service tag at `input[0]`.
-/// Names are discovery metadata only and are rejected here. The returned
-/// offset begins the handler-owned payload.
-pub fn decode_cbor_selector(input: &[u8]) -> Result<(CborSelector, usize), CborSelectorError> {
-    let Some(&head) = input.first() else {
-        return Err(CborSelectorError::Truncated);
-    };
-    let major = head >> 5;
-    let additional = head & 0x1f;
-    let (value, header_len) = match additional {
-        value @ 0..=23 => (u64::from(value), 1),
-        24 => (*input.get(1).ok_or(CborSelectorError::Truncated)? as u64, 2),
-        25 => {
-            let bytes: [u8; 2] = input
-                .get(1..3)
-                .ok_or(CborSelectorError::Truncated)?
-                .try_into()
-                .map_err(|_| CborSelectorError::Truncated)?;
-            (u64::from(u16::from_be_bytes(bytes)), 3)
-        }
-        26 => {
-            let bytes: [u8; 4] = input
-                .get(1..5)
-                .ok_or(CborSelectorError::Truncated)?
-                .try_into()
-                .map_err(|_| CborSelectorError::Truncated)?;
-            (u64::from(u32::from_be_bytes(bytes)), 5)
-        }
-        27 => {
-            let bytes: [u8; 8] = input
-                .get(1..9)
-                .ok_or(CborSelectorError::Truncated)?
-                .try_into()
-                .map_err(|_| CborSelectorError::Truncated)?;
-            (u64::from_be_bytes(bytes), 9)
-        }
-        _ => return Err(CborSelectorError::Unsupported),
-    };
-    if major == 0 {
-        Ok((CborSelector::Tag(value), header_len))
-    } else {
-        Err(CborSelectorError::Unsupported)
-    }
-}
 pub const CONTROL_STREAM_ID: u64 = 0;
 pub const FIRST_CLIENT_BIDI_STREAM_ID: u64 = 4;
 pub const FIRST_SERVER_BIDI_STREAM_ID: u64 = 1;
@@ -320,6 +224,18 @@ pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1100;
 /// stream-frame overhead. Commands using this bound never rely on L2
 /// fragmentation, even when CID/varint widths grow.
 pub const DEFAULT_MAX_STREAM_PAYLOAD: usize = DEFAULT_MAX_DATAGRAM_SIZE - 64;
+/// A retained association keeps a bounded ledger for both directions of each
+/// application RPC.  The current tagged RPC binding uses one client-initiated
+/// request stream and one server-initiated response stream, so 32 slots admit
+/// a complete 16-service catalog pass without reconnecting.  This is an
+/// association bound, not a bearer property: UART, UDP, and NOW all use the
+/// same ledger.
+pub const DEFAULT_STREAM_STATE_SLOTS: usize = 32;
+/// Per-direction peer stream credit paired with
+/// [`DEFAULT_STREAM_STATE_SLOTS`].  QUIC stream IDs are never reused, so a
+/// later idle-close/reopen is the explicit lifetime boundary once this bounded
+/// association budget is consumed.
+pub const DEFAULT_MAX_BIDI_STREAMS: u64 = 16;
 /// Fixed histogram shape for bearer inter-packet gaps.  Keeping this in the
 /// transport lets every bearer report comparable pacing evidence without
 /// coupling the measurements to sockets, Wi-Fi, or a server schema.
@@ -473,51 +389,6 @@ mod recovery_profile_tests {
         assert_eq!(timing.total_gap_us, 10_500);
         assert_eq!(timing.max_gap_us, 10_000);
         assert_eq!(timing.gap_buckets, [1, 0, 0, 1, 0, 0]);
-    }
-
-    #[test]
-    fn stream_selector_accepts_compact_tag_only() {
-        assert_eq!(
-            decode_cbor_selector(&[8, 0xa0]),
-            Ok((CborSelector::Tag(8), 1))
-        );
-        assert_eq!(
-            decode_cbor_selector(&[0x69, b'l', b'o', b'g', b'-', b'w', b'a', b't', b'c', b'h']),
-            Err(CborSelectorError::Unsupported)
-        );
-        assert_eq!(
-            decode_cbor_selector(&[0xa1]),
-            Err(CborSelectorError::Unsupported)
-        );
-        assert_eq!(
-            decode_cbor_selector(&[0x78]),
-            Err(CborSelectorError::Truncated)
-        );
-    }
-
-    #[test]
-    fn shared_handler_registry_advertises_tag_and_name_once() {
-        let mut registry = StreamRegistry::default();
-        assert!(registry.contains(SERVICE_HANDLERS));
-        assert_eq!(
-            registry.resolve_tag(&[SERVICE_HANDLERS, 1]),
-            Some((SERVICE_HANDLERS, &[1][..]))
-        );
-        assert_eq!(
-            registry.resolve_tag(&[0x68, b'h', b'a', b'n', b'd', b'l', b'e', b'r', b's']),
-            None
-        );
-        assert_eq!(
-            registry.encode_handler_list().get(..11),
-            Some(
-                &[
-                    0x89, 0x82, 1, 0x66, b'o', b'b', b'j', b'e', b'c', b't', 0x82
-                ][..]
-            )
-        );
-        assert!(!registry.register(SERVICE_HANDLERS, b"different-name"));
-        assert!(!registry.register(42, b"handlers"));
-        assert!(registry.register(42, b"custom"));
     }
 }
 
@@ -726,39 +597,189 @@ pub enum Error {
     StreamLimit,
     PacketNumberExhausted,
     WrongConnectionId,
+    /// An opaque inbound packet matched the reset token issued by the peer
+    /// for this association.  The association is no longer usable; its
+    /// manager must create a fresh one before sending another stream.
+    PeerRestarted,
     BootstrapInvalid,
     HistoryFull,
     RetransmissionTooLarge,
 }
 
-/// Encode one bounded direct message.  Direct messages use the normal
-/// QUIC-lite short header and packet number, but their body is raw application
-/// bytes rather than QUIC frames: there is no stream ordering, ACK, flow
-/// credit, retransmission, or endpoint state.  DCID zero selects this
-/// direct-message plane at the final receiver.
-pub fn encode_direct_packet(
+/// Embedded callers use this enum directly. Host association managers can
+/// preserve the exact variant through an error chain; in particular,
+/// `PeerRestarted` is a token-verified state change rather than an ambiguous
+/// timeout, so it must not be reduced to a bearer-specific string.
+impl core::fmt::Display for Error {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
+/// Version assigned to the DMesh long-header extension. It deliberately does
+/// not claim QUIC version 1: the header layout and CID roles follow RFC 9000,
+/// while Initial protection and transport-parameter negotiation are not yet
+/// implemented.
+pub const DMESH_LONG_HEADER_VERSION: u32 = 0x444d_0001;
+pub const LONG_PACKET_INITIAL: u8 = 0;
+pub const LONG_PACKET_DIRECT: u8 = 1;
+
+/// Parsed subset of the RFC 9000 long header used before a connection has an
+/// established short-header destination CID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LongHeader {
+    packet_type: u8,
+    version: u32,
+    dcid: Option<ConnectionId>,
+    scid: Option<ConnectionId>,
+    packet_number: u32,
+    packet_number_len: u8,
+}
+
+fn encode_long_packet(
+    packet_type: u8,
+    dcid: Option<ConnectionId>,
+    scid: Option<ConnectionId>,
+    packet_number: u32,
+    packet_number_len: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if packet_type > 3 || !matches!(packet_number_len, 1..=4) || payload.is_empty() {
+        return Err(Error::Invalid);
+    }
+    let mut at = 0usize;
+    let need = 1 + 4 + 1 + dcid.map_or(0, ConnectionId::encoded_len) + 1
+        + scid.map_or(0, ConnectionId::encoded_len)
+        + usize::from(packet_type == LONG_PACKET_INITIAL) // zero-length Initial token
+        + 8 // maximum varint length for packet length
+        + usize::from(packet_number_len)
+        + payload.len();
+    if out.len() < need {
+        return Err(Error::BufferTooSmall);
+    }
+    out[at] = 0xc0 | (packet_type << 4) | (packet_number_len - 1);
+    at += 1;
+    out[at..at + 4].copy_from_slice(&DMESH_LONG_HEADER_VERSION.to_be_bytes());
+    at += 4;
+    for cid in [dcid, scid] {
+        let len = cid.map_or(0, ConnectionId::encoded_len);
+        out[at] = len as u8;
+        at += 1;
+        if let Some(cid) = cid {
+            cid.encode(&mut out[at..at + len])?;
+            at += len;
+        }
+    }
+    if packet_type == LONG_PACKET_INITIAL {
+        // Preserve the standard Initial token-length position. Retry/token
+        // validation is not implemented yet, so the token is empty.
+        out[at] = 0;
+        at += 1;
+    }
+    let body_len = u64::from(packet_number_len) + payload.len() as u64;
+    let length_len = put_varint(body_len, &mut out[at..])?;
+    at += length_len;
+    let pn = packet_number.to_be_bytes();
+    out[at..at + usize::from(packet_number_len)]
+        .copy_from_slice(&pn[4 - usize::from(packet_number_len)..]);
+    at += usize::from(packet_number_len);
+    out[at..at + payload.len()].copy_from_slice(payload);
+    Ok(at + payload.len())
+}
+
+fn decode_long_packet(input: &[u8]) -> Result<(LongHeader, usize, usize), Error> {
+    if input.len() < 9 || input[0] & 0xc0 != 0xc0 {
+        return Err(Error::Invalid);
+    }
+    let version = u32::from_be_bytes(input[1..5].try_into().map_err(|_| Error::Truncated)?);
+    if version != DMESH_LONG_HEADER_VERSION {
+        return Err(Error::Invalid);
+    }
+    let packet_type = (input[0] >> 4) & 0x03;
+    let packet_number_len = (input[0] & 0x03) + 1;
+    let mut at = 5usize;
+    let mut cids = [None, None];
+    for slot in &mut cids {
+        let len = *input.get(at).ok_or(Error::Truncated)? as usize;
+        at += 1;
+        if len != 0 {
+            if !matches!(len, 1 | 2 | 4 | 8) || input.len() < at + len {
+                return Err(Error::Invalid);
+            }
+            let (cid, used) = ConnectionId::decode(&input[at..at + len])?;
+            if used != len {
+                return Err(Error::Invalid);
+            }
+            *slot = Some(cid);
+            at += len;
+        }
+    }
+    if packet_type == LONG_PACKET_INITIAL {
+        let (token_len, used) = get_varint(input.get(at..).ok_or(Error::Truncated)?)?;
+        at += used;
+        let token_len = usize::try_from(token_len).map_err(|_| Error::Invalid)?;
+        at = at.checked_add(token_len).ok_or(Error::Invalid)?;
+        if input.len() < at {
+            return Err(Error::Truncated);
+        }
+    }
+    let (body_len, used) = get_varint(&input[at..])?;
+    at += used;
+    let body_len = usize::try_from(body_len).map_err(|_| Error::Invalid)?;
+    if body_len < usize::from(packet_number_len) || input.len() != at + body_len {
+        return Err(Error::Invalid);
+    }
+    let mut pn = [0u8; 4];
+    let pn_len = usize::from(packet_number_len);
+    pn[4 - pn_len..].copy_from_slice(&input[at..at + pn_len]);
+    at += pn_len;
+    Ok((
+        LongHeader {
+            packet_type,
+            version,
+            dcid: cids[0],
+            scid: cids[1],
+            packet_number: u32::from_be_bytes(pn),
+            packet_number_len,
+        },
+        at,
+        body_len - pn_len,
+    ))
+}
+
+/// Encode one bounded connectionless direct message in the custom-version
+/// QUIC long header. The 0-RTT type bits are version-defined as the DMesh
+/// direct plane; empty CID fields make clear that no connection is asserted.
+fn encode_direct_packet(
     packet_number: u32,
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize, Error> {
-    encode_one_way_packet(
-        ConnectionId::new(0).ok_or(Error::Invalid)?,
+    encode_long_packet(
+        LONG_PACKET_DIRECT,
+        None,
+        None,
         packet_number,
+        4,
         payload,
         out,
     )
 }
 
-/// Encode an opaque one-way message for either a relay-local label or the
-/// final DCID-zero direct-message destination. The body is not a QUIC frame;
-/// forwarding nodes use [`rewrite_dcid`] and never inspect it.
+/// Encode an opaque one-way message addressed to an established relay-local
+/// label. Connectionless direct messages use [`encode_direct_packet`] and its
+/// custom-version long header instead.
 pub fn encode_one_way_packet(
     dcid: ConnectionId,
     packet_number: u32,
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize, Error> {
-    if payload.is_empty() {
+    if payload.is_empty() || dcid.value() == 0 {
         return Err(Error::Invalid);
     }
     let header_len = ShortHeader {
@@ -777,15 +798,236 @@ pub fn encode_one_way_packet(
     Ok(header_len + payload.len())
 }
 
-/// Decode a bounded DCID-zero direct message.  The returned header retains
-/// the complete packet number and the payload is deliberately opaque to the
-/// transport; DMesh's shared tagged-CBOR handler validates it.
-pub fn decode_direct_packet(input: &[u8]) -> Result<(ShortHeader, &[u8]), Error> {
-    let (header, header_len) = ShortHeader::decode(input)?;
-    if header.dcid.value() != 0 || header.packet_number_len != 4 || input.len() == header_len {
+/// Decode a bounded connectionless direct message. A compatibility
+/// [`ShortHeader`] view is returned to existing application policy; the wire
+/// itself is long-header and never uses DCID zero as a discriminator.
+fn decode_direct_packet(input: &[u8]) -> Result<(ShortHeader, &[u8]), Error> {
+    let (long, header_len, payload_len) = decode_long_packet(input)?;
+    if long.packet_type != LONG_PACKET_DIRECT
+        // A terminating direct packet has empty CID fields. An opaque relay
+        // may install a local routing label in DCID, but that label is never
+        // exposed to the direct application handler and does not assert a
+        // connection.
+        || long.scid.is_some()
+        || long.packet_number_len != 4
+        || payload_len == 0
+    {
         return Err(Error::Invalid);
     }
-    Ok((header, &input[header_len..]))
+    Ok((
+        ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(0).ok_or(Error::Invalid)?,
+            packet_number: long.packet_number,
+            packet_number_len: long.packet_number_len,
+        },
+        &input[header_len..],
+    ))
+}
+
+/// Result of offering a connectionless direct request to an application.
+///
+/// Direct is deliberately a small request/response form of the normal
+/// handler contract.  The application sees only its tagged payload, never a
+/// packet header, DCID, or packet number.  QUIC-lite owns versioned long
+/// header parsing, correlation packet numbers, and response framing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectMessageDisposition {
+    /// This application does not expose the payload as a direct operation.
+    NotHandled,
+    /// The request was consumed and intentionally has no response body.
+    Handled,
+    /// The response payload copied into the supplied output buffer.
+    Response(usize),
+}
+
+/// Payload-only endpoint for bounded connectionless direct requests.
+///
+/// This is the only public direct-message API.  Bearer adapters provide and
+/// receive complete packet bytes, while registered handlers receive and emit
+/// only application payloads.  The custom long-header format is private to
+/// QUIC-lite so a bearer cannot grow a competing direct framing convention.
+#[derive(Clone, Debug)]
+struct DirectMessageEndpoint {
+    next_packet_number: u32,
+}
+
+/// One accepted direct request.  Its correlation state is intentionally
+/// private: applications may read only [`Self::payload`], then ask the same
+/// endpoint to form a response.  This keeps long-header mechanics outside
+/// the handler API.
+/// Opaque correlation token for a received direct request.
+///
+/// Applications may inspect only [`Self::payload`]. Passing the token back to
+/// [`encode_direct_message_response`] retains the private long-header packet
+/// number without exposing it to a bearer or handler.
+pub struct DirectMessageRequest<'a> {
+    payload: &'a [u8],
+    packet_number: u32,
+}
+
+impl<'a> DirectMessageRequest<'a> {
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+impl Default for DirectMessageEndpoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectMessageEndpoint {
+    pub const fn new() -> Self {
+        Self {
+            next_packet_number: 1,
+        }
+    }
+
+    /// Return whether `input` is the private direct long-header packet type.
+    /// Callers use this only to select endpoint ingress; CID values and other
+    /// framing details remain private to QUIC-lite.
+    pub fn is_packet(input: &[u8]) -> bool {
+        decode_long_packet(input)
+            .is_ok_and(|(header, _, _)| header.packet_type == LONG_PACKET_DIRECT)
+    }
+
+    /// Encapsulate one short application request.  Packet-number allocation
+    /// is internal; correlation belongs in the request payload (for example a
+    /// tagged-CBOR request ID), not in bearer-visible frame state.
+    pub fn send(&mut self, payload: &[u8], output: &mut [u8]) -> Result<usize, Error> {
+        let packet_number = self.next_packet_number;
+        self.next_packet_number = self.next_packet_number.wrapping_add(1).max(1);
+        encode_direct_packet(packet_number, payload, output)
+    }
+
+    /// Admit one private direct packet and expose only its application body.
+    pub fn receive_request<'a>(
+        &mut self,
+        input: &'a [u8],
+    ) -> Result<DirectMessageRequest<'a>, Error> {
+        let (header, payload) = decode_direct_packet(input)?;
+        Ok(DirectMessageRequest {
+            payload,
+            packet_number: header.packet_number,
+        })
+    }
+
+    /// Encode a response for an accepted request without exposing its packet
+    /// number or long-header representation to the application.
+    pub fn respond(
+        &mut self,
+        request: DirectMessageRequest<'_>,
+        payload: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        encode_direct_packet(request.packet_number.wrapping_add(1), payload, output)
+    }
+
+    /// Offer an incoming direct request to a payload-only canonical handler.
+    /// If it returns a response payload, QUIC-lite emits the correlated long
+    /// header response.  No caller can construct or inspect direct headers.
+    pub fn receive<F>(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        handler: F,
+    ) -> Result<DirectMessageDisposition, Error>
+    where
+        F: FnOnce(&[u8], &mut [u8]) -> DirectMessageDisposition,
+    {
+        let request = self.receive_request(input)?;
+        let mut response_payload = [0u8; DEFAULT_MAX_DATAGRAM_SIZE];
+        match handler(request.payload(), &mut response_payload) {
+            DirectMessageDisposition::Response(used) if used <= response_payload.len() => {
+                let used = self.respond(request, &response_payload[..used], output)?;
+                Ok(DirectMessageDisposition::Response(used))
+            }
+            DirectMessageDisposition::Response(_) => Err(Error::BufferTooSmall),
+            disposition => Ok(disposition),
+        }
+    }
+
+    /// Decode one direct response into its payload-only representation.
+    pub fn receive_response<'a>(&mut self, input: &'a [u8]) -> Result<&'a [u8], Error> {
+        let (_, payload) = decode_direct_packet(input)?;
+        Ok(payload)
+    }
+}
+
+/// Return whether `input` is a private custom-version direct long-header
+/// packet. The result carries no CID or frame information.
+pub fn is_direct_message_packet(input: &[u8]) -> bool {
+    DirectMessageEndpoint::is_packet(input)
+}
+
+/// Encapsulate one bounded direct application payload.
+///
+/// Packet-number allocation and the custom long header remain private to
+/// QUIC-lite. This helper is for the terminating direct exception only; a
+/// normal operation must use an association stream instead.
+pub fn encode_direct_message(payload: &[u8], output: &mut [u8]) -> Result<usize, Error> {
+    DirectMessageEndpoint::new().send(payload, output)
+}
+
+/// Decode only the application payload of a direct response.
+pub fn decode_direct_message_response(input: &[u8]) -> Result<&[u8], Error> {
+    DirectMessageEndpoint::new().receive_response(input)
+}
+
+/// Admit a direct request and expose only its application payload plus an
+/// opaque response-correlation token.
+pub fn receive_direct_message_request(input: &[u8]) -> Result<DirectMessageRequest<'_>, Error> {
+    DirectMessageEndpoint::new().receive_request(input)
+}
+
+/// Correlate a direct response without exposing any packet-header detail.
+pub fn encode_direct_message_response(
+    request: DirectMessageRequest<'_>,
+    payload: &[u8],
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    DirectMessageEndpoint::new().respond(request, payload, output)
+}
+
+/// Decode, dispatch, and correlate a bounded direct application record.
+///
+/// This is the synchronous form used by no-std adapters. Async host
+/// dispatchers can retain the opaque token from
+/// [`receive_direct_message_request`] until their canonical handler returns.
+pub fn handle_direct_message<F>(
+    input: &[u8],
+    output: &mut [u8],
+    handler: F,
+) -> Result<DirectMessageDisposition, Error>
+where
+    F: FnOnce(&[u8], &mut [u8]) -> DirectMessageDisposition,
+{
+    DirectMessageEndpoint::new().receive(input, output, handler)
+}
+
+/// Decode only the destination needed by endpoint/relay routing. Long-header
+/// packets with an empty destination are represented by the reserved local
+/// zero value internally; zero is never serialized as their DCID.
+/// Internal relay routing decode. Shared listeners use
+/// [`crate::classify_server_datagram`] instead; exposing this would let a
+/// bearer grow its own header-peeking path.
+pub(crate) fn decode_routing_prefix(input: &[u8]) -> Result<ShortHeaderPrefix, Error> {
+    if input.first().is_some_and(|flags| flags & 0x80 != 0) {
+        let (header, header_len, _) = decode_long_packet(input)?;
+        Ok(ShortHeaderPrefix {
+            flags: input[0],
+            dcid: header
+                .dcid
+                .unwrap_or(ConnectionId::new(0).ok_or(Error::Invalid)?),
+            truncated_packet_number: header.packet_number,
+            packet_number_len: header.packet_number_len,
+            header_len,
+        })
+    } else {
+        ShortHeader::decode_prefix(input)
+    }
 }
 
 /// Rewrite only the DCID of an opaque short-header datagram into separate
@@ -797,6 +1039,45 @@ pub fn rewrite_dcid(
     outbound_dcid: ConnectionId,
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    if outbound_dcid.value() == 0 {
+        return Err(Error::Invalid);
+    }
+    // A connectionless direct record has an intentionally empty long-header
+    // destination. It terminates at the adjacent QUIC-lite endpoint and is
+    // never an established or relayed route. Allowing this public helper to
+    // add a DCID would turn a private direct envelope into a synthetic
+    // connection packet and let bearer/relay code recreate the retired
+    // DCID-zero convention.
+    if input.first().is_some_and(|flags| flags & 0x80 != 0)
+        && decode_long_packet(input)?.0.packet_type == LONG_PACKET_DIRECT
+    {
+        return Err(Error::Invalid);
+    }
+    rewrite_destination(input, Some(outbound_dcid), out)
+}
+
+/// Rewrite a routing destination without representing an empty long-header
+/// destination as a synthetic `ConnectionId(0)`. The bootstrap-only form is
+/// private to QUIC-lite relay dispatch; all public established-route callers
+/// use [`rewrite_dcid`].
+fn rewrite_destination(
+    input: &[u8],
+    outbound_dcid: Option<ConnectionId>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if input.first().is_some_and(|flags| flags & 0x80 != 0) {
+        let (header, payload_at, payload_len) = decode_long_packet(input)?;
+        return encode_long_packet(
+            header.packet_type,
+            outbound_dcid,
+            header.scid,
+            header.packet_number,
+            header.packet_number_len,
+            &input[payload_at..payload_at + payload_len],
+            out,
+        );
+    }
+    let outbound_dcid = outbound_dcid.ok_or(Error::Invalid)?;
     let prefix = ShortHeader::decode_prefix(input)?;
     let inbound_len = prefix.dcid.encoded_len();
     let outbound_len = outbound_dcid.encoded_len();
@@ -816,59 +1097,46 @@ pub fn rewrite_dcid(
     Ok(used)
 }
 
-/// Rewrite the only bootstrap field a relay is allowed to interpret.
+pub(crate) fn rewrite_bootstrap_destination(input: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    rewrite_destination(input, None, out)
+}
+
+/// Rewrite the only bootstrap header field a relay is allowed to interpret.
 ///
 /// A normal relay is deliberately opaque and should use [`rewrite_dcid`].
 /// Relay-open is the one exception: the first OPEN names the CID to which the
 /// server will send OPEN_ACK.  In a three-party path that address must be the
-/// relay's *return alias*, not the client's private receive CID.  The relay
-/// therefore substitutes `relay_receive_cid` in the OPEN body while changing
-/// the outer DCID to `outbound_dcid` (normally zero for the final service).
+/// relay's *return alias*, not the client's private receive CID. The relay
+/// therefore substitutes `relay_receive_cid` in the Initial SCID while changing
+/// the DCID to `outbound_dcid` (normally empty at the final service).
 /// Its independently installed reverse rule later rewrites that alias back to
 /// the client CID before UDP delivery.  No later QUIC-lite packet is decoded
 /// or changed by this helper.
 pub fn rewrite_relay_open(
     input: &[u8],
-    outbound_dcid: ConnectionId,
+    outbound_dcid: Option<ConnectionId>,
     relay_receive_cid: ConnectionId,
     out: &mut [u8],
 ) -> Result<usize, Error> {
     if relay_receive_cid.value() == 0 {
         return Err(Error::BootstrapInvalid);
     }
-    // OPEN itself is specified only for DCID zero.  First make a bounded
-    // scratch representation with that destination, then use the normal
-    // bootstrap decoder rather than duplicating its frame validation here.
+    // First remove the adjacent forwarding DCID and validate the resulting
+    // Initial before changing its source CID. The setup body contains only
+    // transport limits; relays never rewrite application/control payload.
     let mut direct = [0u8; DEFAULT_MAX_DATAGRAM_SIZE];
-    let direct_len = rewrite_dcid(
-        input,
-        ConnectionId::new(0).ok_or(Error::BootstrapInvalid)?,
-        &mut direct,
-    )?;
-    let (header, open) = decode_bootstrap_open_packet_with_limits(&direct[..direct_len])?;
-    let mut body = [0u8; 32];
-    let body_len = BootstrapOpen {
-        client_receive_cid: relay_receive_cid,
-        max_data: open.max_data,
-        max_stream_data: open.max_stream_data,
-        max_in_flight_packets: open.max_in_flight_packets,
-    }
-    .encode(&mut body)?;
-    let header_len = ShortHeader {
-        flags: header.flags,
-        dcid: outbound_dcid,
-        packet_number: header.packet_number,
-        packet_number_len: header.packet_number_len,
-    }
-    .encode(out)?;
-    let frame_len = Frame::Stream(StreamFrame {
-        id: CONTROL_STREAM_ID,
-        offset: 0,
-        fin: true,
-        data: &body[..body_len],
-    })
-    .encode(&mut out[header_len..])?;
-    Ok(header_len + frame_len)
+    let direct_len = rewrite_bootstrap_destination(input, &mut direct)?;
+    decode_bootstrap_open_packet_with_limits(&direct[..direct_len])?;
+    let (header, payload_at, payload_len) = decode_long_packet(&direct[..direct_len])?;
+    encode_long_packet(
+        LONG_PACKET_INITIAL,
+        outbound_dcid,
+        Some(relay_receive_cid),
+        header.packet_number,
+        header.packet_number_len,
+        &direct[payload_at..payload_at + payload_len],
+        out,
+    )
 }
 
 /// Result metadata for a bearer datagram after transport processing. The
@@ -939,6 +1207,29 @@ pub struct TransportStats {
     pub receive_interpacket_max: u64,
 }
 
+/// Stream lifecycle counts for one endpoint direction.
+///
+/// `total` is the number of stream IDs opened since this association was
+/// created. `active` excludes a locally-sent or peer-received FIN. These are
+/// association facts: a UART, UDP, or NOW adapter must never infer them from
+/// frame bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamDirectionStats {
+    pub active: u64,
+    pub total: u64,
+}
+
+/// Stream lifecycle counts for both directions of one QUIC association.
+///
+/// A peer may open normal bidirectional streams at any time. “Locally
+/// initiated” and “peer initiated” describe stream-ID ownership, not the
+/// bearer that happened to carry the packet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectionStreamStats {
+    pub locally_initiated: StreamDirectionStats,
+    pub peer_initiated: StreamDirectionStats,
+}
+
 /// Version-0 connection bootstrap carried as complete data on stream 0.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootstrapOpen {
@@ -959,6 +1250,10 @@ pub struct BootstrapOpenAck {
     pub max_stream_data: u64,
     /// See [`BootstrapOpen::max_in_flight_packets`].
     pub max_in_flight_packets: u16,
+    /// Token that proves an opaque datagram is the peer's stateless-reset
+    /// signal for this association. Version-0 peers omit it; recovery then
+    /// falls back to the bounded PTO/idle transition.
+    pub stateless_reset_token: Option<StatelessResetToken>,
 }
 
 impl BootstrapOpen {
@@ -1033,7 +1328,7 @@ impl BootstrapOpen {
 impl BootstrapOpenAck {
     pub const VERSION: u64 = 0;
     pub fn encode(self, out: &mut [u8]) -> Result<usize, Error> {
-        if self.server_receive_cid.value() == 0 {
+        if self.server_receive_cid.value() == 0 || self.stateless_reset_token.is_some() {
             return Err(Error::BootstrapInvalid);
         }
         if out.len() < 3 {
@@ -1095,8 +1390,86 @@ impl BootstrapOpenAck {
             max_data,
             max_stream_data,
             max_in_flight_packets,
+            stateless_reset_token: None,
         })
     }
+}
+
+fn encode_bootstrap_profile(
+    kind: u8,
+    limits: ConnectionLimits,
+    max_in_flight_packets: u16,
+    stateless_reset_token: Option<StatelessResetToken>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if out.len() < 3 || kind > 1 {
+        return Err(Error::BufferTooSmall);
+    }
+    out[0] = kind;
+    let mut at = 1;
+    at += put_varint(u64::from(stateless_reset_token.is_some()), &mut out[at..])?;
+    let mut parameters = [0u8; 64];
+    let mut used = 0;
+    used += put_varint(limits.max_data, &mut parameters[used..])?;
+    used += put_varint(limits.max_stream_data, &mut parameters[used..])?;
+    used += put_varint(u64::from(max_in_flight_packets), &mut parameters[used..])?;
+    if let Some(token) = stateless_reset_token {
+        parameters[used..used + STATELESS_RESET_TOKEN_LEN].copy_from_slice(&token.0);
+        used += STATELESS_RESET_TOKEN_LEN;
+    }
+    at += put_varint(used as u64, &mut out[at..])?;
+    if out.len() < at + used {
+        return Err(Error::BufferTooSmall);
+    }
+    out[at..at + used].copy_from_slice(&parameters[..used]);
+    Ok(at + used)
+}
+
+fn decode_bootstrap_profile(
+    input: &[u8],
+    expected_kind: u8,
+) -> Result<(ConnectionLimits, u16, Option<StatelessResetToken>), Error> {
+    if input.first().copied() != Some(expected_kind) {
+        return Err(Error::BootstrapInvalid);
+    }
+    let (version, version_len) = get_varint(&input[1..])?;
+    if version > 1 {
+        return Err(Error::BootstrapInvalid);
+    }
+    let (length, length_len) = get_varint(&input[1 + version_len..])?;
+    let parameters = &input[1 + version_len + length_len..];
+    if parameters.len() != length as usize {
+        return Err(Error::BootstrapInvalid);
+    }
+    let (max_data, data_len) = get_varint(parameters)?;
+    let (max_stream_data, stream_len) = get_varint(&parameters[data_len..])?;
+    let (packets, packets_len) = get_varint(&parameters[data_len + stream_len..])?;
+    let values_len = data_len + stream_len + packets_len;
+    let reset_token = match version {
+        0 if values_len == parameters.len() => None,
+        1 if values_len + STATELESS_RESET_TOKEN_LEN == parameters.len() => {
+            let mut token = [0u8; STATELESS_RESET_TOKEN_LEN];
+            token.copy_from_slice(&parameters[values_len..]);
+            Some(StatelessResetToken(token))
+        }
+        _ => return Err(Error::BootstrapInvalid),
+    };
+    if values_len > parameters.len()
+        || max_data == 0
+        || max_stream_data == 0
+        || packets > u16::MAX as u64
+    {
+        return Err(Error::BootstrapInvalid);
+    }
+    Ok((
+        ConnectionLimits {
+            max_data,
+            max_stream_data,
+            ..ConnectionLimits::default()
+        },
+        packets as u16,
+        reset_token,
+    ))
 }
 
 /// Shared no-std client-side version-0 bootstrap state machine. Bearers own
@@ -1293,7 +1666,7 @@ impl BootstrapClient {
     }
 }
 
-/// Encode a complete stream-0/DCID-0 version-0 OPEN datagram.
+/// Encode a complete stream-0 OPEN in a custom-version QUIC Initial header.
 pub fn encode_bootstrap_open_packet(
     client_cid: ConnectionId,
     packet_number: u32,
@@ -1329,32 +1702,31 @@ pub fn encode_bootstrap_open_packet_with_profile(
     max_in_flight_packets: u16,
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    if client_cid.value() == 0 {
+        return Err(Error::BootstrapInvalid);
+    }
     let mut body = [0u8; 32];
-    let body_len = BootstrapOpen {
-        client_receive_cid: client_cid,
-        max_data: limits.max_data,
-        max_stream_data: limits.max_stream_data,
-        max_in_flight_packets,
-    }
-    .encode(&mut body)?;
-    let header_len = ShortHeader {
-        flags: FLAG_FIXED,
-        dcid: ConnectionId::new(0).ok_or(Error::BootstrapInvalid)?,
-        packet_number,
-        packet_number_len: 1,
-    }
-    .encode(out)?;
+    let body_len = encode_bootstrap_profile(0, limits, max_in_flight_packets, None, &mut body)?;
+    let mut frame = [0u8; 64];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,
         offset: 0,
         fin: true,
         data: &body[..body_len],
     })
-    .encode(&mut out[header_len..])?;
-    Ok(header_len + frame_len)
+    .encode(&mut frame)?;
+    encode_long_packet(
+        LONG_PACKET_INITIAL,
+        None,
+        Some(client_cid),
+        packet_number,
+        1,
+        &frame[..frame_len],
+        out,
+    )
 }
 
-/// Decode a complete stream-0/DCID-0 version-0 OPEN datagram.
+/// Decode a complete custom-version Initial OPEN datagram.
 pub fn decode_bootstrap_open_packet(input: &[u8]) -> Result<(ShortHeader, ConnectionId), Error> {
     let (header, open) = decode_bootstrap_open_packet_with_limits(input)?;
     Ok((header, open.client_receive_cid))
@@ -1364,8 +1736,48 @@ pub fn decode_bootstrap_open_packet(input: &[u8]) -> Result<(ShortHeader, Connec
 pub fn decode_bootstrap_open_packet_with_limits(
     input: &[u8],
 ) -> Result<(ShortHeader, BootstrapOpen), Error> {
-    let (header, header_len) = ShortHeader::decode_with_expected(input, 0)?;
-    if header.dcid.value() != 0 {
+    let (long, header_len, _) = decode_long_packet(input)?;
+    if long.packet_type != LONG_PACKET_INITIAL || long.dcid.is_some() {
+        return Err(Error::BootstrapInvalid);
+    }
+    let source_cid = long.scid.ok_or(Error::BootstrapInvalid)?;
+    let (frame, used) = decode_frame(&input[header_len..])?;
+    if header_len + used != input.len() {
+        return Err(Error::BootstrapInvalid);
+    }
+    let Frame::Stream(stream) = frame else {
+        return Err(Error::BootstrapInvalid);
+    };
+    if stream.id != CONTROL_STREAM_ID || stream.offset != 0 || !stream.fin {
+        return Err(Error::BootstrapInvalid);
+    }
+    let (limits, max_in_flight_packets, reset_token) = decode_bootstrap_profile(stream.data, 0)?;
+    if reset_token.is_some() {
+        return Err(Error::BootstrapInvalid);
+    }
+    let open = BootstrapOpen {
+        client_receive_cid: source_cid,
+        max_data: limits.max_data,
+        max_stream_data: limits.max_stream_data,
+        max_in_flight_packets,
+    };
+    Ok((
+        ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(0).ok_or(Error::BootstrapInvalid)?,
+            packet_number: long.packet_number,
+            packet_number_len: long.packet_number_len,
+        },
+        open,
+    ))
+}
+
+/// Return the encoded OPEN control body for duplicate/conflict detection.
+/// Connection managers may compare it byte-for-byte without parsing either
+/// the long header or stream frame in a bearer adapter.
+pub fn bootstrap_open_payload(input: &[u8]) -> Result<&[u8], Error> {
+    let (long, header_len, _) = decode_long_packet(input)?;
+    if long.packet_type != LONG_PACKET_INITIAL || long.dcid.is_some() || long.scid.is_none() {
         return Err(Error::BootstrapInvalid);
     }
     let (frame, used) = decode_frame(&input[header_len..])?;
@@ -1378,11 +1790,11 @@ pub fn decode_bootstrap_open_packet_with_limits(
     if stream.id != CONTROL_STREAM_ID || stream.offset != 0 || !stream.fin {
         return Err(Error::BootstrapInvalid);
     }
-    Ok((header, BootstrapOpen::decode(stream.data)?))
+    Ok(stream.data)
 }
 
-/// Encode a complete stream-0 version-0 OPEN_ACK addressed to the client's
-/// receive CID.
+/// Encode OPEN_ACK in a custom-version Initial header. The standard DCID and
+/// SCID fields carry the client and server receive CIDs respectively.
 pub fn encode_bootstrap_open_ack_packet(
     client_cid: ConnectionId,
     server_cid: ConnectionId,
@@ -1406,35 +1818,53 @@ pub fn encode_bootstrap_open_ack_packet_with_limits(
     limits: ConnectionLimits,
     out: &mut [u8],
 ) -> Result<usize, Error> {
-    if client_cid == server_cid {
+    encode_bootstrap_open_ack_packet_with_limits_and_reset_token(
+        client_cid,
+        server_cid,
+        packet_number,
+        limits,
+        None,
+        out,
+    )
+}
+
+/// Encode OPEN_ACK while advertising the server CID's stateless-reset token.
+/// Callers that retain a persistent [`StatelessResetKey`] derive this token
+/// once per allocated server CID.  A client receiving it can recover a server
+/// restart without waiting for a PTO timeout.
+pub fn encode_bootstrap_open_ack_packet_with_limits_and_reset_token(
+    client_cid: ConnectionId,
+    server_cid: ConnectionId,
+    packet_number: u32,
+    limits: ConnectionLimits,
+    stateless_reset_token: Option<StatelessResetToken>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if client_cid.value() == 0 || server_cid.value() == 0 || client_cid == server_cid {
         return Err(Error::BootstrapInvalid);
     }
-    let mut body = [0u8; 32];
-    let body_len = BootstrapOpenAck {
-        server_receive_cid: server_cid,
-        max_data: limits.max_data,
-        max_stream_data: limits.max_stream_data,
-        max_in_flight_packets: 0,
-    }
-    .encode(&mut body)?;
-    let header_len = ShortHeader {
-        flags: FLAG_FIXED,
-        dcid: client_cid,
-        packet_number,
-        packet_number_len: 1,
-    }
-    .encode(out)?;
+    let mut body = [0u8; 64];
+    let body_len = encode_bootstrap_profile(1, limits, 0, stateless_reset_token, &mut body)?;
+    let mut frame = [0u8; 64];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,
         offset: 0,
         fin: true,
         data: &body[..body_len],
     })
-    .encode(&mut out[header_len..])?;
-    Ok(header_len + frame_len)
+    .encode(&mut frame)?;
+    encode_long_packet(
+        LONG_PACKET_INITIAL,
+        Some(client_cid),
+        Some(server_cid),
+        packet_number,
+        1,
+        &frame[..frame_len],
+        out,
+    )
 }
 
-/// Decode a complete stream-0 version-0 OPEN_ACK.
+/// Decode a complete custom-version Initial OPEN_ACK.
 pub fn decode_bootstrap_open_ack_packet(
     input: &[u8],
     expected_client_cid: ConnectionId,
@@ -1448,8 +1878,8 @@ pub fn decode_bootstrap_open_ack_packet_with_limits(
     input: &[u8],
     expected_client_cid: ConnectionId,
 ) -> Result<(ShortHeader, BootstrapOpenAck), Error> {
-    let (header, header_len) = ShortHeader::decode(input)?;
-    if header.dcid != expected_client_cid {
+    let (long, header_len, _) = decode_long_packet(input)?;
+    if long.packet_type != LONG_PACKET_INITIAL || long.dcid != Some(expected_client_cid) {
         return Err(Error::WrongConnectionId);
     }
     let (frame, used) = decode_frame(&input[header_len..])?;
@@ -1462,12 +1892,28 @@ pub fn decode_bootstrap_open_ack_packet_with_limits(
     if stream.id != CONTROL_STREAM_ID || stream.offset != 0 || !stream.fin {
         return Err(Error::BootstrapInvalid);
     }
-    let ack = BootstrapOpenAck::decode(stream.data)?;
-    let server_cid = ack.server_receive_cid;
+    let server_cid = long.scid.ok_or(Error::BootstrapInvalid)?;
     if server_cid == expected_client_cid {
         return Err(Error::BootstrapInvalid);
     }
-    Ok((header, ack))
+    let (limits, max_in_flight_packets, stateless_reset_token) =
+        decode_bootstrap_profile(stream.data, 1)?;
+    let ack = BootstrapOpenAck {
+        server_receive_cid: server_cid,
+        max_data: limits.max_data,
+        max_stream_data: limits.max_stream_data,
+        max_in_flight_packets,
+        stateless_reset_token,
+    };
+    Ok((
+        ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: expected_client_cid,
+            packet_number: long.packet_number,
+            packet_number_len: long.packet_number_len,
+        },
+        ack,
+    ))
 }
 
 pub fn put_varint(value: u64, out: &mut [u8]) -> Result<usize, Error> {
@@ -1582,7 +2028,7 @@ impl ShortHeader {
         Ok(1 + n + pn_len)
     }
 
-    pub fn decode_prefix(input: &[u8]) -> Result<ShortHeaderPrefix, Error> {
+    pub(crate) fn decode_prefix(input: &[u8]) -> Result<ShortHeaderPrefix, Error> {
         if input.is_empty() {
             return Err(Error::Truncated);
         }
@@ -1684,53 +2130,33 @@ pub enum TransportPacket<'a> {
     Control,
 }
 
-/// Encode one bounded benchmark datagram (magic, short header, stream frame).
-pub fn encode_bench_stream(
-    packet_number: u32,
-    offset: u64,
-    fin: bool,
-    data: &[u8],
-    out: &mut [u8],
-) -> Result<usize, Error> {
-    if out.len() < BENCH_MAGIC.len() {
-        return Err(Error::BufferTooSmall);
-    }
-    out[..BENCH_MAGIC.len()].copy_from_slice(&BENCH_MAGIC);
-    let header = ShortHeader {
-        flags: FLAG_FIXED,
-        dcid: ConnectionId::new(BENCH_CONNECTION_ID).ok_or(Error::Invalid)?,
-        packet_number,
-        packet_number_len: 2,
-    };
-    let header_len = header.encode(&mut out[BENCH_MAGIC.len()..])?;
-    let frame = Frame::Stream(StreamFrame {
-        id: BENCH_STREAM_ID,
-        offset,
-        fin,
-        data,
-    });
-    let frame_len = frame.encode(&mut out[BENCH_MAGIC.len() + header_len..])?;
-    Ok(BENCH_MAGIC.len() + header_len + frame_len)
+/// All application stream frames admitted from one complete QUIC datagram.
+///
+/// A packet can legitimately carry a transport ACK together with one or more
+/// independent STREAM frames.  Returning only the first frame is sufficient
+/// for a one-shot client but loses correlation for a shared association with
+/// several in-flight streams.  This fixed-size view keeps the packet parser
+/// and stream admission in QUIC-lite while letting a connection owner route
+/// every accepted frame to its pending request.  Bearer adapters never decode
+/// this structure themselves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportDatagram<'a> {
+    pub header: ShortHeader,
+    streams: [Option<StreamFrame<'a>>; 8],
+    stream_count: usize,
+    pub duplicate: bool,
 }
 
-/// Decode and validate one benchmark datagram, returning the stream frame and
-/// the number of consumed bytes (excluding any optional monitor trailer).
-pub fn decode_bench_stream(input: &[u8]) -> Result<(ShortHeader, StreamFrame<'_>, usize), Error> {
-    if input.len() < BENCH_MAGIC.len() || input[..BENCH_MAGIC.len()] != BENCH_MAGIC {
-        return Err(Error::Invalid);
+impl<'a> TransportDatagram<'a> {
+    /// Ordered STREAM frames from this packet. Empty for a control-only or
+    /// duplicate packet.
+    pub fn streams(&self) -> impl Iterator<Item = StreamFrame<'a>> + '_ {
+        self.streams[..self.stream_count].iter().flatten().copied()
     }
-    let (header, header_len) = ShortHeader::decode(&input[BENCH_MAGIC.len()..])?;
-    if header.dcid.value() != BENCH_CONNECTION_ID {
-        return Err(Error::Invalid);
+
+    pub const fn has_streams(&self) -> bool {
+        self.stream_count != 0
     }
-    let (frame, frame_len) = decode_frame(&input[BENCH_MAGIC.len() + header_len..])?;
-    let Frame::Stream(stream) = frame else {
-        return Err(Error::Invalid);
-    };
-    if stream.id != BENCH_STREAM_ID {
-        return Err(Error::Invalid);
-    }
-    Ok((header, stream, BENCH_MAGIC.len() + header_len + frame_len))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2140,6 +2566,7 @@ pub struct SendStreamCredit {
     pub id: u64,
     pub max_data: u64,
     pub sent: u64,
+    finished: bool,
 }
 
 /// Peer-advertised connection and stream credit for a sender.  Retransmits do
@@ -2179,6 +2606,7 @@ impl<const N: usize> SendFlowControl<N> {
             id,
             max_data: min(max_data, self.initial_stream_max_data),
             sent: 0,
+            finished: false,
         });
         Ok(())
     }
@@ -2228,6 +2656,12 @@ impl<const N: usize> SendFlowControl<N> {
         let end = offset.saturating_add(len as u64);
         let new_bytes = end.saturating_sub(stream.sent);
         stream.sent = max(stream.sent, end);
+        // Preserve existing tolerant send semantics while exposing lifecycle
+        // diagnostics: a newly appended range after an earlier FIN makes the
+        // send half active again. Exact retransmissions do not call reserve.
+        if new_bytes != 0 {
+            stream.finished = false;
+        }
         self.sent_data = self.sent_data.saturating_add(new_bytes);
         Ok(())
     }
@@ -2245,6 +2679,38 @@ impl<const N: usize> SendFlowControl<N> {
             .ok_or(Error::Invalid)?;
         stream.max_data = max(stream.max_data, max_data);
         Ok(())
+    }
+
+    /// Record the final locally-sent stream frame after it has entered the
+    /// endpoint retransmission ledger. Retransmission uses that ledger and
+    /// therefore does not re-open a stream in this accounting.
+    pub fn finish_stream(&mut self, id: u64) -> Result<(), Error> {
+        let stream = self
+            .streams
+            .iter_mut()
+            .flatten()
+            .find(|stream| stream.id == id)
+            .ok_or(Error::Invalid)?;
+        stream.finished = true;
+        Ok(())
+    }
+
+    fn stream_stats(&self, role: Role) -> ConnectionStreamStats {
+        let mut result = ConnectionStreamStats::default();
+        for stream in self.streams.iter().flatten() {
+            let server_initiated = stream.id & 1 != 0;
+            let local = server_initiated == matches!(role, Role::Server);
+            let direction = if local {
+                &mut result.locally_initiated
+            } else {
+                &mut result.peer_initiated
+            };
+            direction.total = direction.total.saturating_add(1);
+            if !stream.finished {
+                direction.active = direction.active.saturating_add(1);
+            }
+        }
+        result
     }
 
     pub fn stream_credit(&self, id: u64) -> Option<u64> {
@@ -2484,7 +2950,7 @@ impl Default for ConnectionLimits {
         Self {
             max_data: INITIAL_MAX_DATA,
             max_stream_data: INITIAL_MAX_STREAM_DATA,
-            max_streams_bidi: 8,
+            max_streams_bidi: DEFAULT_MAX_BIDI_STREAMS,
             max_streams_uni: 4,
         }
     }
@@ -2636,6 +3102,24 @@ impl<const N: usize> ConnectionState<N> {
             .ok_or(Error::StreamLimit)?;
         self.streams[i] = Some(StreamState::new(id, self.limits.max_stream_data));
         Ok(self.streams[i].as_mut().unwrap())
+    }
+
+    fn stream_stats(&self) -> ConnectionStreamStats {
+        let mut result = ConnectionStreamStats::default();
+        for stream in self.streams.iter().flatten() {
+            let (server_initiated, _) = Self::stream_kind(stream.id);
+            let local = server_initiated == matches!(self.role, Role::Server);
+            let direction = if local {
+                &mut result.locally_initiated
+            } else {
+                &mut result.peer_initiated
+            };
+            direction.total = direction.total.saturating_add(1);
+            if !stream.finished {
+                direction.active = direction.active.saturating_add(1);
+            }
+        }
+        result
     }
 }
 
@@ -2809,7 +3293,19 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             #[cfg(any(feature = "std", test))]
             core::ptr::addr_of_mut!((*out).sent_packets).write(alloc::vec![None; history_capacity]);
             #[cfg(not(any(feature = "std", test)))]
-            core::ptr::addr_of_mut!((*out).sent_packets).write([None; H]);
+            {
+                // Do not write `[None; H]` as one value here.  A
+                // `SentPacket<P>` carries a complete bounded datagram, so
+                // that innocent-looking array expression would materialize
+                // the entire retransmission ledger on the packet-ingress
+                // task stack before copying it into the boxed association.
+                // Initialize each final slot in place instead.
+                let slots =
+                    core::ptr::addr_of_mut!((*out).sent_packets).cast::<Option<SentPacket<P>>>();
+                for index in 0..H {
+                    slots.add(index).write(None);
+                }
+            }
             core::ptr::addr_of_mut!((*out).local_cid).write(None);
             core::ptr::addr_of_mut!((*out).peer_cid).write(None);
             core::ptr::addr_of_mut!((*out).control_pending).write(false);
@@ -3294,6 +3790,31 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.close_code.is_some()
     }
 
+    /// Snapshot stream ownership/lifecycle without exposing a transport
+    /// packet or bearer address. This is the source for connection-status
+    /// handlers on firmware, Linux, and Android.
+    pub fn stream_stats(&self) -> ConnectionStreamStats {
+        let mut result = self.send.stream_stats(self.receive.role);
+        let received = self.receive.stream_stats();
+        result.locally_initiated.total = result
+            .locally_initiated
+            .total
+            .saturating_add(received.locally_initiated.total);
+        result.locally_initiated.active = result
+            .locally_initiated
+            .active
+            .saturating_add(received.locally_initiated.active);
+        result.peer_initiated.total = result
+            .peer_initiated
+            .total
+            .saturating_add(received.peer_initiated.total);
+        result.peer_initiated.active = result
+            .peer_initiated
+            .active
+            .saturating_add(received.peer_initiated.active);
+        result
+    }
+
     pub const fn close_code(&self) -> Option<u64> {
         self.close_code
     }
@@ -3363,10 +3884,14 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         Ok((header, stream))
     }
 
-    /// Hand one complete bearer datagram to the transport. ACKs and flow
-    /// control are consumed here; only application STREAM frames are returned
-    /// to the bearer adapter.
-    pub fn receive_datagram<'a>(&mut self, input: &'a [u8]) -> Result<TransportPacket<'a>, Error> {
+    /// Hand one complete bearer datagram to the transport and return every
+    /// admitted application STREAM frame. ACKs and flow control are consumed
+    /// here; a shared association owner uses this result to correlate several
+    /// in-flight streams without asking a bearer to inspect frames.
+    pub fn receive_datagram_batch<'a>(
+        &mut self,
+        input: &'a [u8],
+    ) -> Result<TransportDatagram<'a>, Error> {
         if self.is_closed() {
             return Err(Error::Invalid);
         }
@@ -3385,8 +3910,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         }
         // Decode the complete frame list before mutating endpoint state. This
         // keeps a malformed trailing frame from partially applying an ACK or
-        // stream credit update. Version 0 exposes at most one application
-        // stream frame per datagram; ACK/control frames may accompany it.
+        // stream credit update. ACK/control frames may accompany multiple
+        // application streams in one datagram.
         let mut offset = header_len;
         if offset == input.len() {
             return Err(Error::Truncated);
@@ -3473,9 +3998,14 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             self.ack_pending = true;
             self.stats.duplicate_datagrams += 1;
             self.stats.control_datagrams += 1;
-            return Ok(TransportPacket::Control);
+            return Ok(TransportDatagram {
+                header,
+                streams: [None; 8],
+                stream_count: 0,
+                duplicate: true,
+            });
         }
-        let Some(stream) = streams[0] else {
+        let Some(_) = streams[0] else {
             // ACK/control packets still consume receive packet numbers.
             // PING, ACK_FREQUENCY, and CLOSE are ack-eliciting. Pure ACK and
             // flow-control packets are only acknowledged when otherwise due.
@@ -3485,7 +4015,12 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                 self.ack_pending = true;
                 self.ack_packets = self.ack_packets.saturating_add(1);
             }
-            return Ok(TransportPacket::Control);
+            return Ok(TransportDatagram {
+                header,
+                streams,
+                stream_count: 0,
+                duplicate: false,
+            });
         };
         for stream in streams[..stream_count].iter().flatten() {
             self.receive
@@ -3512,12 +4047,31 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.observe_packet(header.packet_number);
         self.ack_pending = true;
         self.ack_packets = self.ack_packets.saturating_add(1);
-        self.queue_stream_credit(stream.id);
+        for stream in streams[..stream_count].iter().flatten() {
+            self.queue_stream_credit(stream.id);
+        }
         self.stats.stream_datagrams += 1;
-        Ok(TransportPacket::Stream {
+        Ok(TransportDatagram {
             header,
-            frame: stream,
+            streams,
+            stream_count,
+            duplicate: false,
         })
+    }
+
+    /// Compatibility view for a one-stream-at-a-time consumer. New shared
+    /// association owners should use [`Self::receive_datagram_batch`] so a
+    /// coalesced response cannot strand another in-flight request.
+    pub fn receive_datagram<'a>(&mut self, input: &'a [u8]) -> Result<TransportPacket<'a>, Error> {
+        let packet = self.receive_datagram_batch(input)?;
+        if let Some(frame) = packet.streams().next() {
+            Ok(TransportPacket::Stream {
+                header: packet.header,
+                frame,
+            })
+        } else {
+            Ok(TransportPacket::Control)
+        }
     }
 
     /// Process one bearer datagram and emit any transport responses through a
@@ -3535,8 +4089,6 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         S: FnMut(StreamFrame<'_>) -> Result<usize, Error>,
         O: FnMut(&[u8]),
     {
-        let (header, _) = ShortHeader::decode_with_expected(input, self.expected_packet_number())?;
-        let duplicate = self.has_received_packet(header.packet_number);
         // Stream delivery can apply bounded application backpressure. Do not
         // let a rejection consume packet numbers, ACK ranges, or flow credit.
         // The embedded endpoint contains a fixed packet ledger larger than
@@ -3556,9 +4108,10 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
                 Box::from_raw(raw)
             }
         };
-        let packet = self.receive_datagram(input)?;
+        let packet = self.receive_datagram_batch(input)?;
+        let duplicate = packet.duplicate;
         let mut stream = false;
-        if let TransportPacket::Stream { frame, .. } = packet {
+        for frame in packet.streams() {
             stream = true;
             let consumed = match on_stream(frame) {
                 Ok(consumed) => consumed,
@@ -3643,11 +4196,10 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     where
         S: FnMut(StreamFrame<'_>) -> Result<CommittedStreamDisposition, Error>,
     {
-        let (header, _) = ShortHeader::decode_with_expected(input, self.expected_packet_number())?;
-        let duplicate = self.has_received_packet(header.packet_number);
-        let packet = self.receive_datagram(input)?;
+        let packet = self.receive_datagram_batch(input)?;
+        let duplicate = packet.duplicate;
         let mut stream = false;
-        if let TransportPacket::Stream { frame, .. } = packet {
+        for frame in packet.streams() {
             stream = true;
             match on_stream(frame)? {
                 CommittedStreamDisposition::Consumed(consumed) => {
@@ -4060,6 +4612,9 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             sent_at: self.send_clock,
             lost: false,
         });
+        if fin {
+            self.send.finish_stream(stream_id)?;
+        }
         self.stats.sent_datagrams += 1;
         self.stats.sent_stream_datagrams += 1;
         Ok((p, packet_number))
@@ -4909,6 +5464,7 @@ mod tests {
             max_data: 4096,
             max_stream_data: 2048,
             max_in_flight_packets: 0,
+            stateless_reset_token: None,
         };
         let used = server.encode(&mut encoded).unwrap();
         assert_eq!(BootstrapOpenAck::decode(&encoded[..used]).unwrap(), server);
@@ -4957,6 +5513,7 @@ mod tests {
             max_data: 64,
             max_stream_data: 64,
             max_in_flight_packets: 0,
+            stateless_reset_token: None,
         };
         let used = smallest_ack.encode(&mut encoded).unwrap();
         assert_eq!(
@@ -4969,6 +5526,7 @@ mod tests {
             max_data: 64,
             max_stream_data: 64,
             max_in_flight_packets: 0,
+            stateless_reset_token: None,
         };
         let used = largest_ack.encode(&mut encoded).unwrap();
         assert_eq!(
@@ -4988,8 +5546,15 @@ mod tests {
         let mut open = [0u8; 128];
         let used = client.start_open(0, &mut open).unwrap();
         assert_eq!(client.state(), BootstrapClientState::Opening);
+        let (long_open, _, _) = decode_long_packet(&open[..used]).unwrap();
+        assert_eq!(long_open.packet_type, LONG_PACKET_INITIAL);
+        assert_eq!(long_open.dcid, None);
+        assert_eq!(long_open.scid, Some(client_cid));
         assert_eq!(
-            ShortHeader::decode(&open[..used]).unwrap().0.packet_number,
+            decode_bootstrap_open_packet(&open[..used])
+                .unwrap()
+                .0
+                .packet_number,
             0
         );
 
@@ -4997,7 +5562,10 @@ mod tests {
         assert!(retry.is_none());
         let retry = client.poll_timeout(10, &mut open).unwrap().unwrap();
         assert_eq!(
-            ShortHeader::decode(&open[..retry]).unwrap().0.packet_number,
+            decode_bootstrap_open_packet(&open[..retry])
+                .unwrap()
+                .0
+                .packet_number,
             1
         );
         assert_eq!(client.attempts(), 2);
@@ -5005,6 +5573,10 @@ mod tests {
         let mut ack = [0u8; 128];
         let ack_len =
             encode_bootstrap_open_ack_packet(client_cid, server_cid, 0, &mut ack).unwrap();
+        let (long_ack, _, _) = decode_long_packet(&ack[..ack_len]).unwrap();
+        assert_eq!(long_ack.packet_type, LONG_PACKET_INITIAL);
+        assert_eq!(long_ack.dcid, Some(client_cid));
+        assert_eq!(long_ack.scid, Some(server_cid));
         assert_eq!(client.on_open_ack(&ack[..ack_len]).unwrap(), server_cid);
         assert_eq!(client.state(), BootstrapClientState::Established);
         // A duplicate ACK is harmless; a different server CID is not.
@@ -5175,12 +5747,20 @@ mod tests {
         })
         .encode(&mut combined[ack_len..])
         .unwrap();
-        let total = ack_len + stream_len;
-        let packet = client.receive_datagram(&combined[..total]).unwrap();
-        let TransportPacket::Stream { frame, .. } = packet else {
-            panic!("combined packet lost stream frame");
-        };
-        assert_eq!(frame.data, b"response");
+        let second_stream_len = Frame::Stream(StreamFrame {
+            id: 5,
+            offset: 0,
+            fin: true,
+            data: b"second response",
+        })
+        .encode(&mut combined[ack_len + stream_len..])
+        .unwrap();
+        let total = ack_len + stream_len + second_stream_len;
+        let packet = client.receive_datagram_batch(&combined[..total]).unwrap();
+        assert_eq!(
+            packet.streams().map(|frame| frame.data).collect::<Vec<_>>(),
+            vec![b"response".as_slice(), b"second response".as_slice()]
+        );
         assert_eq!(client.history_len(), 0);
         assert!(EndpointState::<4, 4>::validate_datagram(&combined[..total]).is_ok());
 
@@ -5713,6 +6293,51 @@ mod tests {
             "fresh-number retransmission must be re-ACKed promptly"
         );
         assert_eq!(receiver.stats().ack_immediate_datagrams, 1);
+    }
+
+    #[test]
+    fn committed_callbacks_deliver_every_coalesced_stream() {
+        let local = ConnectionId::new(0x81).unwrap();
+        let peer = ConnectionId::new(0x82).unwrap();
+        let mut sender =
+            EndpointState::<4, 8, 256>::new(Role::Client, ConnectionLimits::default(), 1200);
+        let mut receiver =
+            EndpointState::<4, 8, 256>::new(Role::Server, ConnectionLimits::default(), 1200);
+        sender.install_connection_ids(local, peer).unwrap();
+        receiver.install_connection_ids(peer, local).unwrap();
+        sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
+        sender.open_send_stream(8, INITIAL_MAX_STREAM_DATA).unwrap();
+
+        let mut packet = [0u8; 256];
+        let (first_used, _) = sender
+            .encode_stream_packet(peer, 4, 0, true, b"first", &mut packet)
+            .unwrap();
+        let second_used = Frame::Stream(StreamFrame {
+            id: 8,
+            offset: 0,
+            fin: true,
+            data: b"second",
+        })
+        .encode(&mut packet[first_used..])
+        .unwrap();
+        let mut output = [0u8; 256];
+        let mut received = Vec::new();
+        let info = receiver
+            .receive_with_committed_callbacks(
+                &packet[..first_used + second_used],
+                &mut output,
+                |_| {},
+                |frame| {
+                    received.push((frame.id, frame.data.to_vec()));
+                    Ok(frame.data.len())
+                },
+            )
+            .unwrap();
+        assert!(info.stream);
+        assert_eq!(
+            received,
+            vec![(4, b"first".to_vec()), (8, b"second".to_vec())]
+        );
     }
 
     #[test]
@@ -6278,7 +6903,7 @@ mod tests {
         sender.install_connection_ids(local, peer).unwrap();
         receiver.install_connection_ids(peer, local).unwrap();
         sender.open_send_stream(4, INITIAL_MAX_STREAM_DATA).unwrap();
-        let object_record = [SERVICE_OBJECT, 0, 0, 0, 3, 0xa1, 0x01, 0x02];
+        let object_record = [1, 0, 0, 0, 3, 0xa1, 0x01, 0x02];
         let mut link = crate::fake::FakeDatagramLink::new(crate::fake::FaultConfig {
             latency_ticks: 7,
             drop_every: Some(2),
@@ -7068,9 +7693,108 @@ mod tests {
     }
 
     #[test]
-    fn direct_packet_uses_dcid_zero_without_quic_frames() {
+    fn stateless_reset_is_opaque_and_recognized_only_by_its_issued_token() {
+        let key = StatelessResetKey::from_device_secret(&[0x5a; 32]).unwrap();
+        let stale = ConnectionId::new(0x1_2345).unwrap();
+        let other = ConnectionId::new(0x1_2346).unwrap();
+        let mut triggering = [0u8; 48];
+        ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: stale,
+            packet_number: 7,
+            packet_number_len: 1,
+        }
+        .encode(&mut triggering)
+        .unwrap();
+        let mut reset = [0u8; 48];
+        let used = key
+            .encode_for_unknown_cid(&triggering, stale, &mut reset)
+            .unwrap()
+            .unwrap();
+        assert_eq!(used, triggering.len());
+        assert!(key.token_for(stale).matches_packet(&reset[..used]));
+        assert!(!key.token_for(other).matches_packet(&reset[..used]));
+        assert_ne!(&reset[..used - STATELESS_RESET_TOKEN_LEN], &[0; 32]);
+        assert!(
+            key.encode_for_unknown_cid(&[0xc0; 48], stale, &mut reset)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            key.encode_for_unknown_cid(&triggering[..20], stale, &mut reset)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn established_dcid_rewrite_rejects_the_retired_zero_sentinel() {
+        let mut packet = [0u8; 16];
+        let used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(7).unwrap(),
+            packet_number: 1,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        let mut output = [0u8; 16];
+        assert_eq!(
+            rewrite_dcid(&packet[..used], ConnectionId::new(0).unwrap(), &mut output),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn reset_key_is_a_labeled_derivation_of_the_device_secret() {
+        let secret = [0x44; 32];
+        let derived = StatelessResetKey::from_device_secret(&secret).unwrap();
+        let different = StatelessResetKey::from_device_secret(&[0x45; 32]).unwrap();
+        let cid = ConnectionId::new(0x111).unwrap();
+        assert_ne!(derived.token_for(cid), different.token_for(cid));
+        assert_eq!(
+            derived.token_for(cid),
+            StatelessResetKey::from_device_secret(&secret)
+                .unwrap()
+                .token_for(cid)
+        );
+        assert_eq!(
+            StatelessResetKey::from_device_secret(&secret[..15]),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn bootstrap_ack_carries_optional_peer_reset_token() {
+        let key = StatelessResetKey::from_device_secret(&[0x91; 32]).unwrap();
+        let client = ConnectionId::new(0x1234).unwrap();
+        let server = ConnectionId::new(0x5678).unwrap();
+        let token = key.token_for(server);
+        let mut packet = [0u8; 128];
+        let used = encode_bootstrap_open_ack_packet_with_limits_and_reset_token(
+            client,
+            server,
+            0,
+            ConnectionLimits::default(),
+            Some(token),
+            &mut packet,
+        )
+        .unwrap();
+        let (_, ack) =
+            decode_bootstrap_open_ack_packet_with_limits(&packet[..used], client).unwrap();
+        assert_eq!(ack.server_receive_cid, server);
+        assert_eq!(ack.stateless_reset_token, Some(token));
+    }
+
+    #[test]
+    fn direct_packet_uses_custom_long_header_without_connection_cids() {
         let mut packet = [0u8; 32];
         let used = encode_direct_packet(0x0102_0304, &[0xa2, 1, 2], &mut packet).unwrap();
+        let (long, _, _) = decode_long_packet(&packet[..used]).unwrap();
+        assert_eq!(long.version, DMESH_LONG_HEADER_VERSION);
+        assert_eq!(long.packet_type, LONG_PACKET_DIRECT);
+        assert_eq!(long.dcid, None);
+        assert_eq!(long.scid, None);
         let (header, payload) = decode_direct_packet(&packet[..used]).unwrap();
         assert_eq!(header.dcid, ConnectionId::new(0).unwrap());
         assert_eq!(header.packet_number, 0x0102_0304);
@@ -7080,23 +7804,17 @@ mod tests {
     }
 
     #[test]
-    fn dcid_rewrite_preserves_direct_packet_number_and_cbor() {
+    fn established_dcid_rewrite_cannot_recreate_connectionless_direct_packet() {
         let inbound = ConnectionId::relay_local(2, 1).unwrap();
-        let outbound = ConnectionId::new(0).unwrap();
-        let mut packet = [0u8; 32];
-        let header_len = ShortHeader {
-            flags: FLAG_FIXED,
-            dcid: inbound,
-            packet_number: 0x0102_0304,
-            packet_number_len: 4,
-        }
-        .encode(&mut packet)
-        .unwrap();
-        packet[header_len..header_len + 3].copy_from_slice(&[0xa1, 1, 2]);
-        let mut rewritten = [0u8; 32];
-        let used = rewrite_dcid(&packet[..header_len + 3], outbound, &mut rewritten).unwrap();
-        let (header, payload) = decode_direct_packet(&rewritten[..used]).unwrap();
-        assert_eq!(header.packet_number, 0x0102_0304);
-        assert_eq!(payload, &[0xa1, 1, 2]);
+        let mut direct = [0u8; 64];
+        let direct_len = encode_direct_packet(0x0102_0304, &[0xa1, 1, 2], &mut direct).unwrap();
+        let mut packet = [0u8; 64];
+        // Connectionless direct packets never enter a relayed established
+        // route. `rewrite_dcid` rejects them before a caller can manufacture
+        // an adjacent relay DCID.
+        assert_eq!(
+            rewrite_dcid(&direct[..direct_len], inbound, &mut packet),
+            Err(Error::Invalid)
+        );
     }
 }

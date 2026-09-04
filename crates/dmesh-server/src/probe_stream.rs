@@ -1,9 +1,9 @@
-//! Ordered IPERF diagnostic stream validation, independent of any bearer.
+//! Ordered throughput-probe stream implementation, independent of any bearer.
 
 use alloc::{sync::Arc, vec::Vec};
 
-use crate::{
-    EndpointState, Error, INITIAL_MAX_STREAM_DATA, RECOVERY_REORDER_CAPACITY_BYTES, StreamFrame,
+use quic_lite::{
+    Error, RECOVERY_REORDER_CAPACITY_BYTES, StreamFrame,
     callback::{CallbackError, CallbackStreams, CopyingError, CopyingStreamEvents},
 };
 
@@ -14,7 +14,7 @@ use crate::{
 /// its selected L2 path can accept another datagram. `None` means normal
 /// congestion/flow-control backpressure, not an error and not a reason to
 /// block a firmware task.
-pub struct IperfSender {
+pub struct ProbeSender {
     stream_id: u64,
     remaining: usize,
     chunk_size: usize,
@@ -22,7 +22,7 @@ pub struct IperfSender {
     packet_id: u32,
 }
 
-impl IperfSender {
+impl ProbeSender {
     pub fn new(stream_id: u64, bytes: usize, chunk_size: usize) -> Option<Self> {
         if bytes == 0 || chunk_size < 4 {
             return None;
@@ -44,26 +44,17 @@ impl IperfSender {
         self.offset
     }
 
-    /// Encode at most one new stream packet. The return value is the packet
-    /// length and FIN flag. It never allocates and it leaves state untouched
-    /// when peer credit or the endpoint's congestion ledger is full.
-    pub fn poll<const N: usize, const H: usize, const P: usize>(
+    /// Produce at most one new fragment through the association-owned encoder.
+    /// The return value is the packet length and FIN flag.  This producer
+    /// deliberately never receives an endpoint: flow control, CIDs, and
+    /// packet framing belong to QUIC-lite.
+    pub fn poll<const P: usize>(
         &mut self,
-        endpoint: &mut EndpointState<N, H, P>,
         output: &mut [u8; P],
+        mut encode: impl FnMut(u64, u64, bool, &[u8], &mut [u8; P]) -> Result<usize, Error>,
     ) -> Result<Option<(usize, bool)>, Error> {
         if self.remaining == 0 {
             return Ok(None);
-        }
-        let peer = endpoint
-            .peer_connection_id()
-            .ok_or(Error::WrongConnectionId)?;
-        if endpoint
-            .open_send_stream(self.stream_id, INITIAL_MAX_STREAM_DATA)
-            .is_err()
-        {
-            // The stream was normally opened by the first call. It is also
-            // valid for a bearer to have opened it while reserving IDs.
         }
         let payload_len = self.remaining.min(self.chunk_size).min(P);
         if payload_len < 4 {
@@ -75,15 +66,14 @@ impl IperfSender {
             *byte = self.offset.wrapping_add(4 + index as u64) as u8;
         }
         let fin = payload_len == self.remaining;
-        let (used, _) = match endpoint.encode_stream_packet(
-            peer,
+        let used = match encode(
             self.stream_id,
             self.offset,
             fin,
             &payload[..payload_len],
             output,
         ) {
-            Ok(packet) => packet,
+            Ok(used) => used,
             Err(Error::FlowControl | Error::Invalid | Error::HistoryFull) => return Ok(None),
             Err(error) => return Err(error),
         };
@@ -137,8 +127,8 @@ impl CopyingStreamEvents for Sink<'_> {
     }
 }
 
-/// Bounded in-order receiver for the diagnostic IPERF stream.
-pub struct IperfReceiver {
+/// Bounded in-order receiver for the diagnostic PROBE stream.
+pub struct ProbeReceiver {
     ordered: CallbackStreams<Arc<Vec<u8>>>,
     validation: u8,
     bytes: u64,
@@ -147,16 +137,16 @@ pub struct IperfReceiver {
     callback_errors: [u64; 6],
 }
 
-/// Bounded multi-stream IPERF run.
+/// Bounded multi-stream PROBE run.
 ///
 /// Stream placement, priority-stream completion, ordered validation, and byte
 /// accounting are transport-test semantics rather than ESP, UDP, or socket
 /// behavior.  Bearers feed committed stream frames here and use the returned
 /// byte count to advance QUIC-lite flow control.
-pub struct IperfRun<const NORMAL: usize> {
-    normal: [IperfReceiver; NORMAL],
-    high: IperfReceiver,
-    low: IperfReceiver,
+pub struct ProbeRun<const NORMAL: usize> {
+    normal: [ProbeReceiver; NORMAL],
+    high: ProbeReceiver,
+    low: ProbeReceiver,
     normal_complete: [bool; NORMAL],
     high_complete: bool,
     low_complete: bool,
@@ -165,7 +155,7 @@ pub struct IperfRun<const NORMAL: usize> {
     low_enabled: bool,
 }
 
-impl<const NORMAL: usize> IperfRun<NORMAL> {
+impl<const NORMAL: usize> ProbeRun<NORMAL> {
     pub fn new(
         validation: u8,
         normal_streams: usize,
@@ -174,9 +164,9 @@ impl<const NORMAL: usize> IperfRun<NORMAL> {
     ) -> Self {
         let normal_streams = normal_streams.clamp(1, NORMAL);
         Self {
-            normal: core::array::from_fn(|_| IperfReceiver::new(validation)),
-            high: IperfReceiver::new(validation),
-            low: IperfReceiver::new(validation),
+            normal: core::array::from_fn(|_| ProbeReceiver::new(validation)),
+            high: ProbeReceiver::new(validation),
+            low: ProbeReceiver::new(validation),
             normal_complete: [false; NORMAL],
             high_complete: !high_enabled,
             low_complete: !low_enabled,
@@ -237,7 +227,7 @@ impl<const NORMAL: usize> IperfRun<NORMAL> {
     pub fn normal_bytes(&self) -> u64 {
         self.normal[..self.normal_streams]
             .iter()
-            .map(IperfReceiver::bytes)
+            .map(ProbeReceiver::bytes)
             .sum()
     }
 
@@ -268,7 +258,7 @@ impl<const NORMAL: usize> IperfRun<NORMAL> {
     }
 }
 
-impl IperfReceiver {
+impl ProbeReceiver {
     pub fn new(validation: u8) -> Self {
         Self {
             ordered: CallbackStreams::new(1, RECOVERY_REORDER_CAPACITY_BYTES),
@@ -320,14 +310,14 @@ impl IperfReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::{IperfReceiver, IperfRun, IperfSender};
-    use crate::{
+    use super::{ProbeReceiver, ProbeRun, ProbeSender};
+    use quic_lite::{
         ConnectionId, ConnectionLimits, EndpointState, Role, StreamFrame, TransportPacket,
     };
 
     #[test]
     fn validates_and_counts_one_complete_packet() {
-        let mut receiver = IperfReceiver::new(2);
+        let mut receiver = ProbeReceiver::new(2);
         let packet = [0, 0, 0, 0, 4, 5, 6];
         assert_eq!(
             receiver.handle(StreamFrame {
@@ -343,7 +333,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_packet_sequence() {
-        let mut receiver = IperfReceiver::new(1);
+        let mut receiver = ProbeReceiver::new(1);
         assert!(
             receiver
                 .handle(StreamFrame {
@@ -359,7 +349,7 @@ mod tests {
 
     #[test]
     fn multi_stream_run_owns_priority_stream_mapping_and_completion() {
-        let mut run = IperfRun::<4>::new(0, 2, true, true);
+        let mut run = ProbeRun::<4>::new(0, 2, true, true);
         for id in [3, 7, 11, 15] {
             assert_eq!(
                 run.handle(
@@ -387,7 +377,7 @@ mod tests {
         let mut sender_endpoint = EndpointState::<4, 8>::new(
             Role::Server,
             ConnectionLimits::default(),
-            crate::DEFAULT_MAX_DATAGRAM_SIZE as u64,
+            quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64,
         );
         sender_endpoint
             .install_connection_ids(server, client)
@@ -398,16 +388,21 @@ mod tests {
         let mut receiver_endpoint = EndpointState::<4, 8>::new(
             Role::Client,
             ConnectionLimits::default(),
-            crate::DEFAULT_MAX_DATAGRAM_SIZE as u64,
+            quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64,
         );
         receiver_endpoint
             .install_connection_ids(client, server)
             .unwrap();
-        let mut sender = IperfSender::new(3, 12, 8).unwrap();
-        let mut wire = [0u8; crate::DEFAULT_MAX_DATAGRAM_SIZE];
-        let mut receiver = IperfReceiver::new(2);
+        let mut sender = ProbeSender::new(3, 12, 8).unwrap();
+        let mut wire = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let mut receiver = ProbeReceiver::new(2);
         let (first, first_fin) = sender
-            .poll(&mut sender_endpoint, &mut wire)
+            .poll(&mut wire, |stream, offset, fin, payload, out| {
+                let _ = sender_endpoint.open_send_stream(stream, quic_lite::INITIAL_MAX_STREAM_DATA);
+                sender_endpoint
+                    .encode_stream_packet(client, stream, offset, fin, payload, out)
+                    .map(|(used, _)| used)
+            })
             .unwrap()
             .unwrap();
         assert!(!first_fin);
@@ -419,7 +414,12 @@ mod tests {
         assert_eq!(receiver.handle(frame), Ok((false, 8)));
         receiver_endpoint.stream_consumed(3, 8).unwrap();
         let (second, second_fin) = sender
-            .poll(&mut sender_endpoint, &mut wire)
+            .poll(&mut wire, |stream, offset, fin, payload, out| {
+                let _ = sender_endpoint.open_send_stream(stream, quic_lite::INITIAL_MAX_STREAM_DATA);
+                sender_endpoint
+                    .encode_stream_packet(client, stream, offset, fin, payload, out)
+                    .map(|(used, _)| used)
+            })
             .unwrap()
             .unwrap();
         assert!(second_fin);

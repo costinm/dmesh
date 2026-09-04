@@ -54,15 +54,15 @@ Unavailable platform facts and counters are omitted. Metrics are split by the
 runtime that owns the counter so an ESP and a host can report the same facts
 without an ambiguous aggregate `wifi.raw.metrics` response.
 
-`nan.status` fields are `1:active`, `2:cluster_id` bytes, `3:sync_id` bytes,
+`telemetry.nan_status` fields are `1:active`, `2:cluster_id` bytes, `3:sync_id` bytes,
 `4:publishing`, and `5:publish_pending`. Metric responses are bounded maps
 whose stable numeric key identifies a counter within that method. Per-peer
 signal/rate/retry observations continue to use `raw_wifi::WifiLinkMetrics`.
 
 ```mesh-api
-id = "nan.status"
+id = "telemetry.nan_status"
 component = "telemetry"
-method = "nan.status"
+method = "nan_status"
 component-index = 7
 method-index = 1
 ui-visibility = "default"
@@ -70,36 +70,36 @@ summary = "Return local NAN attach, cluster, synchronization, and publish state"
 ```
 
 ```mesh-api
-id = "now.metrics"
+id = "telemetry.now_metrics"
 component = "telemetry"
-method = "now.metrics"
+method = "now_metrics"
 component-index = 7
 method-index = 2
 summary = "Return local ESP-NOW submission, receive, admission, dispatch, drop, and error counters"
 ```
 
 ```mesh-api
-id = "nan.metrics"
+id = "telemetry.nan_metrics"
 component = "telemetry"
-method = "nan.metrics"
+method = "nan_metrics"
 component-index = 7
 method-index = 3
 summary = "Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters"
 ```
 
 ```mesh-api
-id = "udp6.metrics"
+id = "telemetry.udp6_metrics"
 component = "telemetry"
-method = "udp6.metrics"
+method = "udp6_metrics"
 component-index = 7
 method-index = 4
 summary = "Return local raw IPv6 validation, UDP delivery, NDP, transmit, and failure counters"
 ```
 
 ```mesh-api
-id = "wifi.link.metrics"
+id = "telemetry.wifi_link_metrics"
 component = "telemetry"
-method = "wifi.link.metrics"
+method = "wifi_link_metrics"
 component-index = 7
 method-index = 5
 summary = "Return common optional per-peer Wi-Fi link observations"
@@ -253,17 +253,18 @@ and timeout remain connection-manager settings and are not radio controls.
 
 ## Direct messages and DCID forwarding setup
 
-DCID `0` is the bounded direct-message destination. A direct message carries a
-normal QUIC-lite short header with a four-byte packet number followed directly
-by one tagged-CBOR record: it does not carry a QUIC frame, create endpoint
+A direct message carries the DMesh custom-version QUIC long header with empty
+DCID/SCID fields and a four-byte packet number, followed directly by one
+tagged-CBOR record. Its version-specific packet type distinguishes it from
+connection setup; it does not carry a QUIC frame, create endpoint
 state, consume stream credit, ACK, retransmit, or use flow control. Direct
 messages are appropriate for idempotent desired-state commands and small
 responses; a record with key `3` (`id`) requests a correlated response on a
-separately routed direct message. QUIC-lite bootstrap remains one DCID-zero
-message kind, but is no longer the only use of that value.
+separately routed direct message. Connection setup uses the Initial-shaped long
+header and its official source/destination CID fields.
 
 Component `5` configures independent one-way forwarding rules. It is accepted
-through the same direct-message or stream handler surface; the first portable
+through the stream handler surface; the first portable
 implementation supplies the codec and a bounded unified DCID registry, while
 platform adapters still own next-hop resolution and egress.
 
@@ -271,6 +272,8 @@ platform adapters still own next-hop resolution and egress.
 | ---: | --- | --- |
 | 1 | `relay.apply` | `1:allocation`, `6:revision`, `7:present`; when present, optional `2:proposed_dcid` plus `3:next_hop`, `4:outbound_dcid`, `5:position` |
 | 2 | `relay.pair` | one forward rule plus `11..16` reverse allocation/DCID/next-hop/outbound/position/revision fields |
+| 3 | `relay.list` | empty request; returns active mappings, capacity, and active QUIC association snapshots |
+| 4 | `relay.rm` | `21:dcid`, `22:revision`; removes the paired entries for that local DCID |
 
 `next_hop` is a device-local opaque route handle. It is neither an overlay
 identity nor source-path metadata and it is never put in a forwarded packet.
@@ -289,6 +292,31 @@ return path remain separate setup records. Repeating an equal allocation with
 the same request `id` is an idempotent retry: it returns the current result and
 does not consume another rule slot; a different target for the same local DCID
 is rejected.
+
+`relay.list` is read-only and is served on a normal QUIC stream. Its result is
+`{1: active, 2: capacity, 3: rules, 4: connections, 5: last_close_monotonic}`.
+`last_close_monotonic` is `0` until a peer has completed a QUIC CLOSE and is
+retained after that association is released. Each rule contains its
+local DCID, outbound DCID, current revision, resolved device-local next-hop,
+and (when an association is active) field `5`, that endpoint's receive CID.
+The compact CBOR next-hop value is typed as `{1: transport_id, 2:
+address_bytes, 3: udp_port?}`: NOW carries its MAC and UDP6 carries its real
+IPv6 address and port. The opaque UDP6 token is never returned; the HTTP
+control plane renders the typed result as, for example, `udp://[fe80::...]:3339`.
+
+Each `connections` entry is association state from `quic-lite`, not a
+per-bearer cache: `{1: receive_cid, 2: peer_cid, 3: streams, 4: active_path?,
+5: valid_paths, 6: last_close_monotonic?, 7: packet_stats}`. `streams` has
+locally initiated (`1`) and peer initiated (`2`) directions, each `{1: active,
+2: total}`. A valid packet received on a new UART, UDP, or NOW path changes
+only `active_path`; the CIDs and stream totals remain on the same association.
+
+`relay.rm` is an authenticated stream operation. Its revision guards the
+named local mapping (the forward mapping can legitimately have a newer
+revision after relay-open updates its outbound DCID). If that mapping is still
+current, the relay removes it, its paired reverse mapping, relay-open metadata,
+and any no-longer-used local route binding. Missing DCIDs return `false`; a
+stale revision is rejected.
 
 ### Relay-open CID ownership
 
@@ -420,15 +448,14 @@ rewrite handler fields.
 | 72 | `radio.control` | Apply an explicit partial radio-state update, then return the applied snapshot. |
 | 73 | `radio.snapshot` | Return one counter/state snapshot without changing radio state. |
 | 74 | `radio.reset_counters` | Advance the metric epoch, reset lab counters, and return the reset snapshot. |
-| 75 | `radio.check` | Start a bounded raw action-bearer `SERVICE_ECHO` check, then return the current snapshot. |
 
 `radio.control` fields are optional: omitted means unchanged.  They are
 command-scoped and must never modify NVS or influence a subsequent reboot.
 
-`radio.check` uses canonical CBOR body `{0:5,17:peer-mac,18:nonce,19:timeout-ms}`.
-The service framing and check response live in `dmesh-server`; host and ESP
-adapters only provide packet-at-a-time action I/O.  The same method is valid
-over raw PPP and the registered hardware stream service.
+Reachability checks are not radio laboratory operations. `check` sends a
+directed `announce.discovery` request and expects the normal signed announce;
+throughput uses the bearer-neutral `probe` QUIC stream. There is no
+`radio.check`, raw-bearer echo, or Wi-Fi-specific probe handler.
 
 | Field | CBOR key | Type | Meaning |
 | --- | ---: | --- | --- |
@@ -473,22 +500,19 @@ firmware must not periodically emit snapshots while a lab case is executing.
 When the adapter exposes them, the snapshot also contains the actual STA and
 AP MACs.  E2E callers must use the selected interface's reported MAC as the
 raw-action peer identity; they must not infer an AP MAC from a STA MAC.
-It also returns the raw service client's delivered bytes and device-monotonic
+It also returns the QUIC probe client's delivered bytes and device-monotonic
 elapsed microseconds. A caller may derive goodput from those two fields; its
 own completion latency remains a separately reported host-observation metric.
 
-## Raw-bearer service check
+## Reachability and probe services
 
-`RawCheckClient` is a bounded liveness check for the raw bearer. It
-opens a normal raw QUIC-lite association and requests `SERVICE_ECHO` with an
-eight-byte caller nonce. The standard status response proves OPEN, stream
-request, response, and ACK/credit delivery without allocating a bulk sender
-or reserving a response buffer. Bearer adapters report their own RSSI and
-driver-counter sample next to the status result: those radio-specific values
-do not belong in this portable service response.
+Reachability is bearer-independent. The operator-facing `check` operation
+sends a directed `announce.discovery` request and expects the peer's signed
+announce; there is no `wifi.raw.check` or raw-bearer echo operation.
+Throughput and loss measurements use the normal QUIC `probe` stream service.
+Radio snapshots remain separate observations and do not initiate a connection.
 
 The machine-readable schema is
 [`schemas/radio-lab.schema.json`](schemas/radio-lab.schema.json).  The
 `dmesh-cli` firmware schema catalog imports its method/field tags and types so
-the same records can be emitted with `--command` in direct PPP mode or sent as
-a QUIC hardware-service body.
+the same records are sent through the normal QUIC hardware-service stream.

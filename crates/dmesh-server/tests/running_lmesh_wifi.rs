@@ -3,9 +3,9 @@
 //! Run explicitly with the service already running:
 //! `cargo test -p quic-lite --features udp --test running_lmesh_wifi -- --ignored --nocapture`
 
-use dmesh_server::protocol::{RECORD_MANIFEST, encode_get};
+use dmesh_server::protocol::{RECORD_MANIFEST, encode_get_request};
 use dmesh_server::udp::UdpClient;
-use quic_lite::{FIRST_CLIENT_BIDI_STREAM_ID, SERVICE_OBJECT};
+use quic_lite::FIRST_CLIENT_BIDI_STREAM_ID;
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};
 
@@ -13,8 +13,7 @@ use tokio::time::{Duration, timeout};
 #[ignore = "requires the managed lmesh-wifi service and its AP"]
 async fn running_lmesh_wifi_returns_a_main_manifest() {
     let mut request = [0u8; 64];
-    request[0] = SERVICE_OBJECT;
-    let used = encode_get(&mut request[1..], None, 13, 6).expect("encode GET") + 1;
+    let used = encode_get_request(&mut request, 1, None, 13, 6).expect("encode GET");
     let mut client = UdpClient::connect(
         "0.0.0.0:0".parse().unwrap(),
         "127.0.0.1:3336".parse().unwrap(),
@@ -36,8 +35,7 @@ async fn running_lmesh_wifi_returns_a_main_manifest() {
 #[ignore = "requires the managed lmesh-wifi service and its AP"]
 async fn running_lmesh_wifi_transfers_complete_object_over_loopback() {
     let mut request = [0u8; 64];
-    request[0] = SERVICE_OBJECT;
-    let used = encode_get(&mut request[1..], None, 13, 6).expect("encode GET") + 1;
+    let used = encode_get_request(&mut request, 2, None, 13, 6).expect("encode GET");
     let mut client = UdpClient::connect(
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:3336".parse().unwrap(),

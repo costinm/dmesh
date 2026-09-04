@@ -1,11 +1,19 @@
-//! Privileged control-plane A-to-B probe contract.
+//! Regular mesh-stream throughput probe contract.
 //!
-//! A probe is executed by a host or Android control plane using existing
-//! signed low-level control and data requests. It is intentionally **not** a
-//! firmware handler: ESP endpoints only receive their normal `transport.start`
-//! and bearer commands. Keeping the plan and its result here gives host and
-//! Android one versioned record without coupling it to UART, UDP6, NAN, or
-//! ESP-NOW framing.
+//! `probe.run` is an ordinary registered DMesh stream service. A host or
+//! Android caller opens it through the Tokio-backed `mesh::MeshClient`; the selected client
+//! implementation may reuse or establish a QUIC association, or later use
+//! SSH/HTTP2, without exposing that detail to the probe. The payload plan and
+//! its result therefore stay independent of UART, UDP, NOW, NAN, and packet
+//! framing. ESP firmware uses `mesh_api` and `quic_lite`, not this host API.
+//! The pair-planning records below are local controller inputs, not
+//! a second peer transport protocol.
+
+pub use crate::probe_service::{
+    PROBE_COMPONENT, PROBE_MAX_BYTES, PROBE_MAX_NORMAL_STREAMS, PROBE_RUN, PROBE_RUN_REQUEST_MAX,
+    ProbeServicePlan, ProbeServiceRequest, decode_probe_run_record, encode_probe_run_request,
+};
+pub use crate::probe_stream::{ProbeReceiver, ProbeRun, ProbeSender};
 
 /// One endpoint's complete requested radio personality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +28,7 @@ pub struct ProbeMode {
     /// and 16 every 8 seconds.
     pub nan_dw_interval: u8,
     /// Requested NAN Data Path policy for the radio epoch. It maps directly
-    /// to `transport.start.ndp`; only Android implements NDP today.
+    /// to `transport.set.ndp`; only Android implements NDP today.
     pub ndp: bool,
     /// Start a colocated AP while this mode is active.
     pub ap: bool,
@@ -136,12 +144,12 @@ pub struct ProbeRequest {
     pub test_nan: bool,
     /// Request an Android-to-Android Wi-Fi Aware data path after discovery.
     /// This is distinct from NAN Service Discovery: it yields an IPv6 link
-    /// which can carry the ordinary UDP/IPERF service on supported phones.
+    /// which can carry the ordinary UDP/PROBE service on supported phones.
     pub test_nan_data: bool,
     pub test_now: bool,
     /// Establish the requested AP/P2P/STA topology, then prove the IPv6
     /// bearer in order: multicast discovery, one-way datagram, QUIC-lite,
-    /// and IPERF. This is deliberately distinct from an already-associated
+    /// and PROBE. This is deliberately distinct from an already-associated
     /// UDP6 throughput check.
     pub test_udp6_association: bool,
     pub test_udp6: bool,
@@ -392,7 +400,7 @@ pub struct ProbeMeasurement {
 }
 
 /// Evidence for a complete IPv6 local-link association probe.  Association is
-/// not inferred from a successful `transport.start`: the executor records the
+/// not inferred from a successful `transport.set`: the executor records the
 /// platform/radio completion, then requires multicast discovery before it can
 /// use an observed scoped address for directed traffic.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -404,7 +412,7 @@ pub struct ProbeUdp6AssociationResult {
     pub multicast: ProbeMeasurement,
     pub one_way: ProbeMeasurement,
     pub quic_lite: ProbeMeasurement,
-    pub iperf: ProbeMeasurement,
+    pub throughput: ProbeMeasurement,
 }
 
 impl ProbeUdp6AssociationResult {
@@ -418,7 +426,7 @@ impl ProbeUdp6AssociationResult {
             && self.multicast.succeeded
             && self.one_way.succeeded
             && self.quic_lite.succeeded
-            && self.iperf.succeeded
+            && self.throughput.succeeded
     }
 }
 
@@ -441,7 +449,7 @@ pub struct ProbeModeResult {
 }
 
 /// A bounded P2P Group Owner lifecycle result. Credentials are deliberately
-/// omitted: they remain in the correlated, privileged `transport.start` reply,
+/// omitted: they remain in the correlated, privileged `transport.set` reply,
 /// never in a persisted control-plane probe record.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "std", derive(serde::Deserialize, serde::Serialize))]
@@ -482,7 +490,7 @@ pub struct ProbeResponse {
     pub target_mode: ProbeModeResult,
     pub nan: ProbeMeasurement,
     /// Wi-Fi Aware data-path lifecycle and, when requested, the standard
-    /// UDP/IPERF measurement over that NDP IPv6 link.
+    /// UDP/PROBE measurement over that NDP IPv6 link.
     pub nan_data: ProbeMeasurement,
     pub now: ProbeMeasurement,
     /// Stage-by-stage outcome for a bearer brought up by this probe.
@@ -590,10 +598,10 @@ mod tests {
                 succeeded: true,
                 ..ProbeMeasurement::default()
             },
-            iperf: ProbeMeasurement::default(),
+            throughput: ProbeMeasurement::default(),
         };
         assert!(!result.completed());
-        result.iperf.succeeded = true;
+        result.throughput.succeeded = true;
         assert!(result.completed());
     }
 

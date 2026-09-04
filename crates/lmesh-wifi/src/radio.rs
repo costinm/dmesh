@@ -3,7 +3,6 @@ use mesh::message::{
     FIELD_IFACE, FIELD_LEN, FIELD_MEDIUM, FIELD_NETWORK, FIELD_NODE, FIELD_PAYLOAD, FIELD_RADIO_ID,
     FIELD_RSSI, FIELD_SNR, FIELD_STATUS, MeshMessage, MeshMessageCodec,
 };
-use minicbor::Encoder;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -17,9 +16,10 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::UdpSocket;
 
 use crate::load_default_infrastructure_credentials;
 use crate::radio_protocol;
@@ -64,6 +64,29 @@ const MAX_DISCOVERED_DEVICES: usize = 256;
 /// evidence for a new peer or a material change, but never turn periodic SDF
 /// receipt into an event-log/trace stream.
 const DISCOVERY_EVENT_MIN_INTERVAL_MS: u128 = 15 * 60 * 1_000;
+/// CIDs identify live QUIC associations, so wall-clock milliseconds are not
+/// sufficient: parallel HTTP calls can begin in the same tick and must never
+/// consume each other's Initial ACK. This allocator is process-local; the
+/// peer's normal Initial handling still makes CID collision/replacement an
+/// explicit QUIC event rather than a radio concern.
+/// Lazily seeded so a supervised lmesh-wifi restart does not reuse the same
+/// first client CID against a device that still retains its prior NOW
+/// association. Zero means unseeded; it is not a valid wire CID.
+static NEXT_ACTION_CLIENT_CID: AtomicU64 = AtomicU64::new(0);
+/// Keep the action-bearer Initial CID in the established four-byte wire
+/// range. Some already-deployed peers do not yet accept the full variable
+/// width compact CID range. Millisecond low bits still make the allocation
+/// range change across ordinary service restarts; a peer retains an idle
+/// association for seconds, not the 4.6-hour seed wrap interval.
+const ACTION_CLIENT_CID_SEED_BASE: u64 = 0x0100_0000;
+const ACTION_CLIENT_CID_SEED_MASK: u64 = 0x00ff_ffff;
+/// The smallest deployed ESP-NOW/action receive path has a bounded payload
+/// below a 256-byte QUIC STREAM packet once long-header/frame overhead is
+/// included. This is a path fact, not a probe personality: MeshClient will
+/// move it into QUIC-lite's negotiated Path metadata. Until then, preserve a
+/// portable 128-byte probe fragment on NOW rather than letting a user-facing
+/// 256-byte request turn into a peer reset on classic ESP32 firmware.
+const ACTION_PATH_MAX_PROBE_PACKET_SIZE: u16 = 128;
 /// Only a bounded tail is needed to restore the at-most-256 live inventory.
 /// This keeps a provisioned persistent change log from becoming an unbounded
 /// startup read after months of topology churn.
@@ -79,6 +102,78 @@ const ETHERNET_HEADER_LEN: usize = 14;
 const IEEE80211_LLC_SNAP_LEN: usize = 8;
 const PACKET_ADD_MEMBERSHIP: libc::c_int = 1;
 const PACKET_MR_MULTICAST: libc::c_ushort = 0;
+
+/// Map action-bearer metadata to the opaque handle retained by QUIC.
+/// Encoding and decoding remain in this adapter; the connection dispatcher
+/// only compares the handle and selects it for egress.
+fn action_path_id(peer: [u8; 6]) -> quic_lite::PathId {
+    let value = (2_u64 << 48)
+        | ((peer[0] as u64) << 40)
+        | ((peer[1] as u64) << 32)
+        | ((peer[2] as u64) << 24)
+        | ((peer[3] as u64) << 16)
+        | ((peer[4] as u64) << 8)
+        | peer[5] as u64;
+    quic_lite::PathId::new(value).expect("action path is nonzero")
+}
+
+/// Direct messages use QUIC-lite's private long-header extension.  Every
+/// other action payload is an opaque association packet and must reach the
+/// common connection dispatcher unchanged.  Keeping this classification in
+/// one small helper prevents a bearer from accidentally treating a normal
+/// short-header stream packet as a direct record.
+fn action_payload_is_direct(packet: &[u8]) -> bool {
+    dmesh_server::direct::ConnectionlessMessage::is_packet(packet)
+}
+
+fn next_action_client_cid() -> quic_lite::ConnectionId {
+    let mut current = NEXT_ACTION_CLIENT_CID.load(Ordering::Acquire);
+    if current == 0 {
+        // NOW peers can outlive this host process. A fixed process-start CID
+        // makes a fresh Initial indistinguishable from a delayed/replayed
+        // association after mesh-init restarts the radio owner. This is not
+        // identity or entropy for QUIC authentication; it is only a unique
+        // local CID allocation range. The wall-clock seed avoids the restart
+        // collision while preserving the established four-byte CID range.
+        let seed = ACTION_CLIENT_CID_SEED_BASE | (now_millis_u64() & ACTION_CLIENT_CID_SEED_MASK);
+        match NEXT_ACTION_CLIENT_CID.compare_exchange(
+            0,
+            seed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => current = seed,
+            Err(initialized) => current = initialized,
+        }
+    }
+    let raw = if current == 0 {
+        // `current` is only zero on an impossible atomic race with a caller
+        // outside this allocator; retain a valid non-zero fallback.
+        1
+    } else {
+        NEXT_ACTION_CLIENT_CID.fetch_add(1, Ordering::Relaxed)
+    };
+    // `ConnectionId` reserves the top three bits for its compact encoding.
+    // A practical process never reaches this wrap, but keep the value valid
+    // and non-zero if a long-running controller does.
+    let value = (raw % quic_lite::ConnectionId::MAX_VALUE).max(1);
+    quic_lite::ConnectionId::new(value).expect("bounded action client CID")
+}
+
+fn action_path_peer(path: quic_lite::PathId) -> Option<[u8; 6]> {
+    let value = path.value();
+    if (value >> 48) as u8 != 2 {
+        return None;
+    }
+    Some([
+        (value >> 40) as u8,
+        (value >> 32) as u8,
+        (value >> 24) as u8,
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ])
+}
 
 /// Process-local adapter state around the shared, allocation-free capture
 /// counters. Each lmesh/lmesh-wifi process has one radio owner, while the
@@ -105,37 +200,6 @@ fn discovery_event_gate() -> &'static Mutex<BTreeMap<String, (u128, String)>> {
     DISCOVERY_EVENT_GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Complete-datagram client contract shared by the bounded IPERF benchmark
-/// and the small production status check.  Raw 802.11 injection/capture stays
-/// below this boundary; service clients stay in `dmesh-server`.
-trait RawActionClient {
-    fn start(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<usize, quic_lite::Error>;
-    fn receive_at(
-        &mut self,
-        input: &[u8],
-        now_ms: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error>;
-    fn accepts(&self, input: &[u8]) -> bool;
-    fn is_complete(&self) -> bool;
-    /// Poll delayed ACK/window control.  Action bearers have no socket task
-    /// to drive the QUIC clock, so the adapter must explicitly service this
-    /// timer path between received frames.
-    fn poll_transmit(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error>;
-    fn poll_retransmit(
-        &mut self,
-        now_us: u64,
-        pto_us: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error>;
-}
-
 /// A monitor VIF receives every matching action frame, including delayed
 /// packets from a previous association and unrelated NAN/management traffic.
 /// These errors mean that a captured frame is not usable for this client. A
@@ -152,138 +216,8 @@ fn raw_action_receive_error_is_ambient(error: quic_lite::Error) -> bool {
     )
 }
 
-impl RawActionClient
-    for dmesh_server::raw_iperf::RawIperfClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>
-{
-    fn start(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<usize, quic_lite::Error> {
-        Self::start(self, output)
-    }
-
-    fn is_complete(&self) -> bool {
-        Self::is_complete(self)
-    }
-
-    fn receive_at(
-        &mut self,
-        input: &[u8],
-        now_ms: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        Self::receive_at(self, input, now_ms, output)
-    }
-
-    fn accepts(&self, input: &[u8]) -> bool {
-        Self::accepts(self, input)
-    }
-
-    fn poll_transmit(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        <dmesh_server::raw_iperf::RawIperfClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_transmit_at(self, now_millis_u64(), output)
-    }
-    fn poll_retransmit(
-        &mut self,
-        now_us: u64,
-        pto_us: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        <dmesh_server::raw_iperf::RawIperfClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_retransmit(self, now_us, pto_us, output)
-    }
-}
-
-impl RawActionClient
-    for dmesh_server::raw_iperf::RawCheckClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>
-{
-    fn start(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<usize, quic_lite::Error> {
-        Self::start(self, output)
-    }
-
-    fn is_complete(&self) -> bool {
-        Self::is_complete(self)
-    }
-
-    fn receive_at(
-        &mut self,
-        input: &[u8],
-        now_ms: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        Self::receive_at(self, input, now_ms, output)
-    }
-
-    fn accepts(&self, input: &[u8]) -> bool {
-        Self::accepts(self, input)
-    }
-
-    fn poll_transmit(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        <dmesh_server::raw_iperf::RawCheckClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_transmit(self, output)
-    }
-    fn poll_retransmit(
-        &mut self,
-        now_us: u64,
-        pto_us: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        <dmesh_server::raw_iperf::RawCheckClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>::poll_retransmit(self, now_us, pto_us, output)
-    }
-}
-
-impl RawActionClient
-    for dmesh_server::raw_iperf::RawTaggedClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>
-{
-    fn start(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<usize, quic_lite::Error> {
-        Self::start(self, output)
-    }
-
-    fn is_complete(&self) -> bool {
-        Self::is_complete(self)
-    }
-
-    fn receive_at(
-        &mut self,
-        input: &[u8],
-        now_ms: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        Self::receive_at(self, input, now_ms, output)
-    }
-
-    fn accepts(&self, input: &[u8]) -> bool {
-        Self::accepts(self, input)
-    }
-
-    fn poll_transmit(
-        &mut self,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        Self::poll_transmit(self, output)
-    }
-
-    fn poll_retransmit(
-        &mut self,
-        now_us: u64,
-        pto_us: u64,
-        output: &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        Self::poll_retransmit(self, now_us, pto_us, output)
-    }
-}
-
 #[derive(Debug)]
-struct RawActionRun {
+struct DatagramRun {
     elapsed_us: u128,
     tx_packets: u64,
     /// Driver/socket transmission failures. A successful local write is not
@@ -292,9 +226,12 @@ struct RawActionRun {
     /// Structured result of the most recent raw frame submission. This keeps
     /// adapter errors (for example nl80211 EINVAL) visible to automated tests
     /// without retaining packet bytes.
-    last_tx: Option<Value>,
     rx_packets: u64,
     retransmit_packets: u64,
+    /// Set only when QUIC-lite recognized the opaque token advertised by the
+    /// peer in its OPEN_ACK.  A timeout or radio injection failure is not a
+    /// restart signal and must not cause an implicit request replay.
+    peer_restarted: bool,
     error: Option<String>,
 }
 
@@ -505,11 +442,19 @@ const IEEE80211_LLC_SNAP_IPV6: [u8; IEEE80211_LLC_SNAP_LEN] =
 const RAWNAN_LLC_DEFAULT: [u8; IEEE80211_LLC_SNAP_LEN] =
     [0xaa, 0xaa, 0x03, 0xd0, 0x4d, 0x45, 0x53, 0x48];
 const RAW_ACTION_RESPONSE_REPETITIONS: usize = 1;
+/// A raw-action peer can reboot or leave/rejoin its NAN/NOW radio epoch
+/// without a host-visible CLOSE.  Keep a recently used association for normal
+/// multi-stream operation, but do not reuse its CIDs indefinitely: a later
+/// Initial is the safe recovery boundary for an otherwise silent peer.
+const NOW_ASSOCIATION_IDLE_RETIRE_MS: u64 = 5_000;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
 const IFF_UP: u32 = 0x1;
+
+type ActionConnectionRuntime =
+    dmesh_server::transport::SharedConnectionRuntime<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
 
 /// Linux radio backend used by the lmesh JSONL methods.
 #[derive(Clone)]
@@ -522,21 +467,19 @@ pub struct RadioService {
     // The host raw-action receiver uses the same bounded QUIC-lite service
     // dispatcher as firmware. It is created lazily only after the first
     // valid NOW packet, so normal AP/NAN operation reserves no transport RAM.
-    raw_action_dispatcher: Arc<
-        Mutex<
-            Option<
-                dmesh_server::raw_iperf::RawIperfDispatcher<
-                    16,
-                    { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-                >,
-            >,
-        >,
-    >,
+    connection_runtime: ActionConnectionRuntime,
     rawnan_subscribers: Arc<Mutex<HashMap<String, usize>>>,
     rawnan_state: Arc<Mutex<NanState>>,
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
     pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
     pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
+    /// Directed NOW discovery is connectionless, but it still has the common
+    /// tagged-CBOR request ID. Retain only a bounded one-shot waiter until
+    /// the raw action ingress admits the matching signed announce reply.
+    pending_now_discovery: Arc<Mutex<HashMap<u64, PendingNowDiscovery>>>,
+    retained_now_tagged_associations:
+        Arc<Mutex<HashMap<String, Arc<Mutex<RetainedNowTaggedAssociation>>>>>,
+    next_direct_discovery_id: Arc<AtomicU64>,
     wifi_ap_handles: Arc<Mutex<BTreeMap<String, ApRuntime>>>,
     wpa_supplicants: Arc<Mutex<BTreeMap<String, lmesh_wpa::WpaSupplicant>>>,
     // A P2P group has a driver-created VIF and a distinct device address.
@@ -546,6 +489,13 @@ pub struct RadioService {
     p2p_group_ifaces: Arc<Mutex<BTreeMap<String, String>>>,
     ap_no_ht_stations: Arc<Mutex<HashSet<[u8; 6]>>>,
     object_udp_started: Arc<AtomicBool>,
+    /// The sole UDP listener for this process. It is shared with multicast
+    /// discovery and retained client associations; no helper binds a private
+    /// check/probe socket.
+    object_udp_socket: Arc<Mutex<Option<Arc<UdpSocket>>>>,
+    /// CID ingress registration for outbound associations on the same normal
+    /// listener. `dmesh-server` remains the only packet reader.
+    object_udp_client_ingress: Arc<dmesh_server::udp::UdpClientIngress>,
     transport_control: Arc<dmesh_server::udp::TransportControl>,
 }
 
@@ -560,6 +510,51 @@ struct PendingNanActiveSubscribe {
     request_id: u64,
     sent_windows: u8,
     last_slot: Option<u64>,
+}
+
+struct PendingNowDiscovery {
+    peer: [u8; 6],
+    reply: std::sync::mpsc::Sender<Value>,
+}
+
+/// Retained normal tagged-stream association for one directed NOW peer.
+/// Frame I/O remains in the action adapter, while the CID and stream ledger
+/// stay with this association across operator requests.
+struct RetainedNowTaggedAssociation {
+    client:
+        Option<dmesh_server::transport::TaggedClient<16, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>>,
+    last_completed_ms: Option<u64>,
+}
+
+impl RetainedNowTaggedAssociation {
+    const fn new() -> Self {
+        Self {
+            client: None,
+            last_completed_ms: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.client = None;
+        self.last_completed_ms = None;
+    }
+
+    fn retire_if_idle(&mut self, now_ms: u64) {
+        if self.client.is_some()
+            && self
+                .last_completed_ms
+                .is_some_and(|last| now_ms.saturating_sub(last) >= NOW_ASSOCIATION_IDLE_RETIRE_MS)
+        {
+            // The remote may have rebooted or changed its radio epoch while
+            // there was no active stream. `ServerConnection` admits the fresh
+            // Initial as a replacement; do not send a stale stream CID first.
+            self.reset();
+        }
+    }
+
+    fn mark_completed(&mut self, now_ms: u64) {
+        self.last_completed_ms = Some(now_ms);
+    }
 }
 
 impl Default for RadioService {
@@ -746,7 +741,20 @@ impl DiscoveredDeviceRegistry {
             // Retain every recent bearer observation while using the newest
             // semantic announce as the active transport/capability state.
             entry.observations = previous.observations.clone();
+            // A directed discovery reply deliberately omits its sender-local
+            // UDP endpoint: the request's source tuple is the checked path
+            // and the responder cannot safely choose an egress interface.
+            // It must not erase the interface-specific endpoint advertised
+            // by the preceding unsolicited announce.  Preserve only absent
+            // route fields; a later complete announce still replaces them.
+            preserve_advertised_udp_route(&previous.announce, &mut entry.announce);
         }
+        // A cold receiver may first learn a node from its directed discovery
+        // reply rather than a multicast announce. The source tuple is then a
+        // verified, selected UDP path. Persist its IPv6 address and unicast
+        // port as endpoint facts, while keeping the scope in `last_peer` on
+        // the receive-side observation where it belongs.
+        hydrate_udp_route_from_observed_peer(&entry.source, &entry.peer, &mut entry.announce);
         let bssid = entry
             .bssid
             .as_deref()
@@ -1041,6 +1049,68 @@ impl DiscoveredDeviceRegistry {
     }
 }
 
+/// Retain an interface-specific endpoint across a sparse directed discovery
+/// reply. The reply is signed and fresh, but it intentionally has no local
+/// interface selector; accepting its `null` fields as a route withdrawal
+/// would make a successful check remove the route required for later streams.
+fn preserve_advertised_udp_route(previous: &Value, current: &mut Value) {
+    let (Some(previous), Some(current)) = (previous.as_object(), current.as_object_mut()) else {
+        return;
+    };
+    for field in ["udp_link_local_v6", "sta_link_local_v6", "udp_port"] {
+        if current.get(field).is_none_or(Value::is_null)
+            && let Some(value) = previous.get(field).filter(|value| !value.is_null())
+        {
+            current.insert(field.to_owned(), value.clone());
+        }
+    }
+}
+
+fn hydrate_udp_route_from_observed_peer(source: &str, peer: &str, announce: &mut Value) {
+    if source != "udp_multicast" {
+        return;
+    }
+    let Some((host, port)) = peer
+        .strip_prefix('[')
+        .and_then(|value| value.split_once("]:"))
+    else {
+        return;
+    };
+    let Some(address) = host
+        .split_once('%')
+        .map_or(host, |(address, _)| address)
+        .parse::<Ipv6Addr>()
+        .ok()
+    else {
+        return;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return;
+    };
+    // UDP 5227 is receive-only multicast discovery, never a QUIC endpoint.
+    if port == crate::mesh_core::DISCOVERY_MULTICAST_PORT {
+        return;
+    }
+    let Some(announce) = announce.as_object_mut() else {
+        return;
+    };
+    if announce
+        .get("udp_link_local_v6")
+        .is_none_or(Value::is_null)
+    {
+        announce.insert(
+            "udp_link_local_v6".to_owned(),
+            Value::String(address.to_string()),
+        );
+    }
+    if announce.get("udp_port").is_none_or(Value::is_null) {
+        announce.insert(
+            "udp_port".to_owned(),
+            Value::Number(u64::from(port).into()),
+        );
+    }
+}
+
 fn restored_observation(
     now_ms: u128,
     peer: &str,
@@ -1086,6 +1156,11 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
                     "active_subscribe_rx": observation.active_subscribe_rx,
                     "followup_rx": observation.followup_rx,
                     "last_kind": observation.last_kind.as_str(),
+                    // A bearer-scoped path identity.  For NOW this is the
+                    // sender MAC required for a directed check; it is kept
+                    // beside the bearer evidence so a later NAN/UDP update
+                    // cannot overwrite it with a different path.
+                    "last_peer": (!observation.last_peer.is_empty()).then_some(&observation.last_peer),
                     "last_bssid": observation.last_bssid.map(|value| colon_mac(&value)),
                     "last_channel": observation.last_channel,
                     "last_rssi_dbm": observation.last_rssi_dbm,
@@ -1456,7 +1531,12 @@ impl RadioService {
             radios: Arc::new(load_radio_adapters()),
             raw_wifi_listeners: Arc::new(Mutex::new(HashSet::new())),
             raw_wifi_stop_flags: Arc::new(Mutex::new(HashMap::new())),
-            raw_action_dispatcher: Arc::new(Mutex::new(None)),
+            connection_runtime: ActionConnectionRuntime::new(
+                quic_lite::ConnectionId::new(now_millis_u64().max(1))
+                    .expect("non-zero action server CID"),
+                quic_lite::ConnectionLimits::default(),
+                raw_action_association_profile(),
+            ),
             rawnan_subscribers: Arc::new(Mutex::new(HashMap::new())),
             rawnan_state: Arc::new(Mutex::new(NanState::new(
                 dmesh_rawnan::NAN_CLUSTER_STALE_AFTER_US,
@@ -1468,11 +1548,16 @@ impl RadioService {
             pending_nan_followups: Arc::new(Mutex::new(dmesh_rawnan::NanFollowupQueue::new(
                 MAX_PENDING_NAN_FOLLOWUPS,
             ))),
+            pending_now_discovery: Arc::new(Mutex::new(HashMap::new())),
+            retained_now_tagged_associations: Arc::new(Mutex::new(HashMap::new())),
+            next_direct_discovery_id: Arc::new(AtomicU64::new(now_millis_u64().max(1))),
             wifi_ap_handles: Arc::new(Mutex::new(BTreeMap::new())),
             wpa_supplicants: Arc::new(Mutex::new(BTreeMap::new())),
             p2p_group_ifaces: Arc::new(Mutex::new(BTreeMap::new())),
             ap_no_ht_stations: Arc::new(Mutex::new(ap_no_ht_stations())),
             object_udp_started: Arc::new(AtomicBool::new(false)),
+            object_udp_socket: Arc::new(Mutex::new(None)),
+            object_udp_client_ingress: dmesh_server::udp::UdpClientIngress::new(),
             transport_control: Arc::new(dmesh_server::udp::TransportControl::default()),
         };
         service
@@ -1487,18 +1572,19 @@ impl RadioService {
         port: Option<u16>,
         root: Option<String>,
     ) -> Value {
-        self.object_udp_start_with_tagged_handler(bind, port, root, None)
+        self.object_udp_start_with_tagged_handler(bind, port, root, None, None)
     }
 
     /// Start the normal QUIC listener with an optional application-owned
     /// tagged-CBOR stream handler.  The handler runs only after QUIC stream
-    /// framing; it is never a DCID-zero/direct-command escape hatch.
+    /// framing; it is never a legacy direct-command escape hatch.
     pub fn object_udp_start_with_tagged_handler(
         &self,
         bind: Option<String>,
         port: Option<u16>,
         root: Option<String>,
         tagged_handler: Option<Arc<dyn dmesh_server::udp::TaggedStreamHandler>>,
+        direct_handler: Option<Arc<dyn dmesh_server::udp::TaggedStreamHandler>>,
     ) -> Value {
         if self.object_udp_started.swap(true, Ordering::AcqRel) {
             return json!({"ok": true, "already_running": true, "bearer": "udp"});
@@ -1528,9 +1614,26 @@ impl RadioService {
                 return json!({"ok": false, "bearer": "udp", "error": format!("invalid bind address: {error}")});
             }
         };
-        if let Err(error) = std::net::UdpSocket::bind(address) {
+        let socket = match std::net::UdpSocket::bind(address) {
+            Ok(socket) => socket,
+            Err(error) => {
+                self.object_udp_started.store(false, Ordering::Release);
+                return json!({"ok": false, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "error": format!("UDP bind failed: {error}")});
+            }
+        };
+        if let Err(error) = socket.set_nonblocking(true) {
             self.object_udp_started.store(false, Ordering::Release);
-            return json!({"ok": false, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "error": format!("UDP bind failed: {error}")});
+            return json!({"ok": false, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "error": format!("UDP nonblocking setup failed: {error}")});
+        }
+        let socket = match UdpSocket::from_std(socket) {
+            Ok(socket) => Arc::new(socket),
+            Err(error) => {
+                self.object_udp_started.store(false, Ordering::Release);
+                return json!({"ok": false, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "error": format!("UDP async adoption failed: {error}")});
+            }
+        };
+        if let Ok(mut current) = self.object_udp_socket.lock() {
+            *current = Some(socket.clone());
         }
         let root = root
             .map(PathBuf::from)
@@ -1545,9 +1648,24 @@ impl RadioService {
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/flash")
             });
+        // The root is provisioned outside the common text settings surface:
+        // `DMESH_DEVICE_SECRET_FILE`, or `device-secret.bin` beside the
+        // configured settings file. It is shared with the control plane and
+        // only its quic-lite reset-key branch reaches this listener.
+        let stateless_reset_key =
+            match dmesh_server::settings::stateless_reset_key_from_environment() {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(%error, "object_udp_reset_secret_unavailable");
+                    None
+                }
+            };
         let started = self.object_udp_started.clone();
         let mut udp_config = dmesh_server::udp::UdpConfig {
             bind: address,
+            socket: Some(socket),
+            client_ingress: Some(self.object_udp_client_ingress.clone()),
+            stateless_reset_key,
             artifact_root: root,
             // The host retains the sender window. Recovery processes receive
             // callbacks immediately and does not mirror this payload ledger,
@@ -1568,6 +1686,7 @@ impl RadioService {
                 .unwrap_or(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE - 64),
             control: Some(self.transport_control.clone()),
             tagged_handler,
+            direct_handler,
             ..dmesh_server::udp::UdpConfig::default()
         };
         // Keep deployment tuning outside the transport implementation while
@@ -1585,7 +1704,23 @@ impl RadioService {
                 tracing::warn!(%error, "object_udp_stopped");
             }
         });
-        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "quic-lite", "object_store": "dmesh-server", "services": ["object", "echo", "status", "handlers", "iperf", "metrics", "events", "control", "log-watch"]})
+        json!({"ok": true, "bearer": "udp", "bind": address.ip().to_string(), "port": address.port(), "transport": "quic-lite", "object_store": "dmesh-server", "services": ["object.get", "object.flash", "status", "services", "probe", "metrics", "events", "log-watch"]})
+    }
+
+    /// The one process-owned UDP listener, available to discovery/association
+    /// glue for egress only. Its receive loop always remains in dmesh-server.
+    pub fn object_udp_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.object_udp_socket
+            .lock()
+            .ok()
+            .and_then(|socket| socket.clone())
+    }
+
+    /// Register a device association with the process UDP listener. The
+    /// caller never receives directly from the socket; dmesh-server routes
+    /// packets by DCID into this association's bounded ingress queue.
+    pub fn object_udp_client_ingress(&self) -> Arc<dmesh_server::udp::UdpClientIngress> {
+        self.object_udp_client_ingress.clone()
     }
 
     /// Transport-owned aggregates for the stable object listener.  This is
@@ -1632,7 +1767,7 @@ impl RadioService {
                 "mac": mac,
                 "link_local_v6": link_local_v6,
             },
-            "note": "compatibility host diagnostic; use discovery.status, nan.status, and discovery.nodes",
+            "note": "compatibility host diagnostic; use discovery.status, telemetry.nan_status, and discovery.nodes",
         })
     }
 
@@ -1658,6 +1793,21 @@ impl RadioService {
         {
             status.insert("publishing".to_owned(), Value::Bool(enabled));
         }
+        for (target, source) in [
+            ("beacons_received", "nan_beacons"),
+            ("service_discovery_received", "sdf_received"),
+        ] {
+            status.insert(
+                target.to_owned(),
+                raw.get(source).cloned().unwrap_or(Value::from(0)),
+            );
+        }
+        status.insert(
+            "active_cluster_ssid".to_owned(),
+            raw.get("active_cluster_ssid")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
         Value::Object(status)
     }
 
@@ -1774,6 +1924,10 @@ impl RadioService {
             })
             .take(32)
             .collect::<Vec<_>>();
+        let sdf_received = history
+            .iter()
+            .filter(|event| event.key == "wifi.rawnan.discovery")
+            .count() as u64;
         // Ordinary AP beacons arrive through the same passive monitor as NAN
         // timing. Keep a bounded, newest-per-BSSID view for STA selection;
         // this is observation only and must never trigger cfg80211 scanning.
@@ -1806,6 +1960,15 @@ impl RadioService {
             });
         }
         let observed_aps = observed_aps.into_values().collect::<Vec<_>>();
+        let active_cluster_ssid = state.sync_bssid().and_then(|sync_bssid| {
+            let sync_bssid = colon_mac(&sync_bssid.0);
+            observed_aps.iter().find_map(|ap| {
+                (ap.get("bssid").and_then(Value::as_str) == Some(sync_bssid.as_str()))
+                    .then(|| ap.get("ssid").cloned())
+                    .flatten()
+                    .filter(|ssid| !ssid.is_null())
+            })
+        });
         let (radio_bss, channel_discovery) = {
             let mut registry = self
                 .discovered_devices
@@ -1844,6 +2007,9 @@ impl RadioService {
             "sync_age_ms": (last_beacon_local_us != 0).then_some(sync_age_ms),
             "beacon_interval_tu": state.beacon_interval_tu(),
             "nan_events": events,
+            "nan_beacons": host_capture_counters().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).capture.nan_beacons,
+            "sdf_received": sdf_received,
+            "active_cluster_ssid": active_cluster_ssid,
             "discovered_devices": discovered_devices,
             "observed_announces": observed_announces,
             "followups": followups,
@@ -1881,10 +2047,10 @@ impl RadioService {
     }
 
     /// Request current DMesh presence without replacing the selected transport.
-    /// An active NAN request is a common `transport.discover` tagged-CBOR
-    /// record carried in an SDEA. Peers answer with a fresh announce instead
-    /// of waiting for their normal passive-discovery cadence.
-    pub fn transport_discover(
+    /// An active NAN request is the canonical directed `announce.discovery`
+    /// record carried in an SDEA. Peers answer with the same signed announce
+    /// used for unsolicited presence.
+    fn request_discovery(
         &self,
         iface: Option<String>,
         channel: Option<u8>,
@@ -1903,24 +2069,14 @@ impl RadioService {
             "active": active, "nan": nan, "passive_scan": passive_scan,
             "active_scan": active_scan, "dns_sd": dns_sd});
         if active && nan {
-            let request = dmesh_server::control::Request::TransportDiscover {
-                config: dmesh_server::control::TransportDiscoverConfig {
-                    channel: Some(channel),
-                    active_scan,
-                    passive_scan,
-                    nan,
-                    dns_sd,
-                    ..dmesh_server::control::TransportDiscoverConfig::default()
-                },
-            };
-            let mut wire = [0u8; 96];
+            let mut record = [0u8; 96];
             // One discovery operation keeps one correlation ID across its
             // DW retransmissions. Receivers use it to suppress duplicate
             // replies from Android/host framework Subscribe repetition.
             let Some(used) =
-                dmesh_server::control::encode_request(request, Some(started_at), &mut wire)
+                dmesh_server::announce::encode_discovery_request(started_at, &mut record)
             else {
-                return json!({"ok": false, "iface": iface, "error": "encode transport.discover"});
+                return json!({"ok": false, "iface": iface, "error": "encode announce.discovery"});
             };
             // Do not emit this immediately: sleepy firmware only receives in
             // DW0/DW8. The existing beacon-driven monitor sends once in every
@@ -1930,7 +2086,7 @@ impl RadioService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(PendingNanActiveSubscribe {
-                    service_info: wire[..used].to_vec(),
+                    service_info: record[..used].to_vec(),
                     request_id: started_at,
                     sent_windows: 0,
                     last_slot: None,
@@ -1941,6 +2097,7 @@ impl RadioService {
                 "queued": true,
                 "control_len": used,
                 "request_id": started_at,
+                "schedule": ["next_dw", "next_dw0_or_dw8"],
                 "stop_after_dw": "0_or_8",
             });
             // NOW is the always-awake companion to the DW-bound NAN
@@ -1948,6 +2105,17 @@ impl RadioService {
             // active P2P GO device address when one exists; the monitor VIF
             // remains only the injection lane. Sleepy peers are still served
             // by the NAN retry above.
+            // NAN is a discovery/activation medium, so its SDEA carries the
+            // tagged request directly. NOW is a QUIC bearer: direct messages
+            // on it use the same versioned long-header envelope as every
+            // other connectionless direct packet.
+            let mut direct_wire = [0u8; 128];
+            let Some(direct_used) = dmesh_server::direct::ConnectionlessMessage::encode(
+                &record[..used],
+                &mut direct_wire,
+            ) else {
+                return json!({"ok": false, "iface": iface, "error": "wrap announce.discovery"});
+            };
             let now = self.wifi_raw_send(
                 Some(iface.clone()),
                 Some(channel),
@@ -1958,7 +2126,7 @@ impl RadioService {
                 None,
                 Some("ff:ff:ff:ff:ff:ff".to_owned()),
                 None,
-                format!("hex:{}", hex_bytes(&wire[..used])),
+                format!("hex:{}", hex_bytes(&direct_wire[..direct_used])),
                 Some(6),
             );
             result["now_discovery"] = now;
@@ -1982,7 +2150,7 @@ impl RadioService {
             .collect::<Vec<_>>();
         result["fresh_events"] = json!(fresh);
         result["inventory"] = self.rawnan_status(Some(iface.clone()))["discovered_devices"].clone();
-        self.record("transport.discover", result.clone());
+        self.record("announce.discovery", result.clone());
         result
     }
 
@@ -1993,6 +2161,41 @@ impl RadioService {
         let iface = wifi_iface(iface);
         let link = interface_link_status(&iface);
         json!({ "ok": link.get("ok").and_then(Value::as_bool).unwrap_or(false), "iface": iface, "link": link })
+    }
+
+    /// Health facts for the stable P2P GO plus monitor topology.  The anchor
+    /// is intentionally allowed to be down while the group child owns the
+    /// radio, so callers must not use the anchor link state as the sole
+    /// recovery signal once this topology is active.
+    pub fn p2p_monitor_health(&self, iface: Option<String>) -> Value {
+        let iface = wifi_iface(iface);
+        let wpa_active = self
+            .wpa_supplicants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&iface);
+        let group_iface = self
+            .p2p_group_ifaces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&iface)
+            .cloned();
+        let monitor_iface = monitor_iface_name(&iface);
+        let monitor_listener = self
+            .raw_wifi_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&format!("{iface}:monitor"));
+        json!({
+            "iface": iface,
+            "wpa_active": wpa_active,
+            "anchor_link": interface_link_status(&iface),
+            "p2p_group_iface": group_iface.as_ref(),
+            "p2p_group_link": group_iface.as_deref().map(interface_link_status),
+            "monitor_iface": monitor_iface,
+            "monitor_link": interface_link_status(&monitor_iface),
+            "monitor_listener": monitor_listener,
+        })
     }
 
     /// Read the host's current netdev inventory through rtnetlink. This is a
@@ -2165,14 +2368,11 @@ impl RadioService {
     pub fn wifi_raw_stop(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
         let monitor = monitor_iface_name(&iface);
-        // The action dispatcher owns one association ledger for this radio
-        // service. Stopping its monitor listener is an explicit bearer
-        // lifecycle boundary, so discard that ledger as well; otherwise a
-        // later automated check/IPERF run can inherit an old CID and report
-        // misleading reverse-direction dispatch errors.
-        if let Ok(mut dispatcher) = self.raw_action_dispatcher.lock() {
-            *dispatcher = None;
-        }
+        // Stopping one physical path must not retire the logical QUIC
+        // association. A later valid packet can migrate the same connection
+        // to UDP, UART, or a restarted action adapter while preserving CIDs
+        // and stream state. Connection retirement belongs to CLOSE/timeout or
+        // explicit connection policy, never bearer teardown.
         self.raw_wifi_listeners
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2436,30 +2636,189 @@ impl RadioService {
         neighbors
     }
 
-    /// Fan out a discovery ping request to the selected media and record the intent.
-    pub fn discovery_ping(&self, medium: Option<String>) -> Value {
+    /// Fan out an active discovery request to the selected media.
+    pub fn discovery_active(&self, medium: Option<String>, to: Option<String>) -> Value {
         // An omitted medium means every currently registered, enabled radio.
         // It must not manufacture errors for optional LoRa/STA adapters that
         // are absent from this service instance.
         let all_available = medium.is_none();
         let radio = medium_to_radio(medium.as_deref().unwrap_or("all"));
-        let mut result = self.ping(Some(radio.clone()), None, None);
+        let mut result = json!({
+            "ok": true,
+            "record": "announce.discovery",
+            "mode": "broadcast",
+            "radio": radio,
+            "submissions": {},
+        });
+        if let Some(destination) = to {
+            // A directed check names the actual bearer address. It must not be
+            // silently replaced by a node lookup or a "best" path.
+            let mut record = [0u8; 96];
+            let request_id = now_millis_u64();
+            let Some(used) =
+                dmesh_server::announce::encode_discovery_request(request_id, &mut record)
+            else {
+                return json!({"ok": false, "error": "encode announce.discovery"});
+            };
+            let mut wire = [0u8; 128];
+            let sent = if parse_now_peer_address(&destination).is_some() {
+                let Some(used) =
+                    dmesh_server::direct::ConnectionlessMessage::encode(&record[..used], &mut wire)
+                else {
+                    return json!({"ok": false, "error": "wrap announce.discovery"});
+                };
+                self.wifi_raw_send(
+                    None,
+                    None,
+                    Some(1),
+                    Some(now_wire_destination(&destination)),
+                    None,
+                    Some("monitor".to_owned()),
+                    None,
+                    Some("ff:ff:ff:ff:ff:ff".to_owned()),
+                    None,
+                    format!("hex:{}", hex_bytes(&wire[..used])),
+                    Some(6),
+                )
+            } else {
+                json!({"ok": false, "error": "unsupported explicit discovery address", "to": destination})
+            };
+            return json!({
+                "ok": sent["ok"] == true,
+                "record": "announce.discovery",
+                "mode": "directed",
+                "to": destination,
+                "request_id": request_id,
+                "submission": sent,
+            });
+        }
         if all_available {
             result["requested"] = json!("all_available");
             result["unavailable"] = json!([]);
+            result["intended_sends"] = json!([
+                "nan_active_sd_next_dw",
+                "nan_active_sd_next_dw0_or_dw8",
+                "udp_multicast_all_scopes",
+                "now_broadcast"
+            ]);
         }
-        // A NAN discovery ping is an active `transport.discover` request, not
+        // A NAN discovery check is a directed `announce.discovery` request, not
         // merely a local history entry. Android and other common adapters
         // recognize the tagged-CBOR request in the NAN SDEA and immediately
         // re-publish their current presence descriptor.
         if matches!(radio.as_str(), "all" | "nan" | "best") {
             let active =
-                self.transport_discover(None, None, true, true, true, false, false, Some(1_000));
+                self.request_discovery(None, None, true, true, true, false, false, Some(1_000));
             let active_ok = active["nan_active_subscribe"]["ok"] == true;
-            result["nan_active_discover"] = active;
+            result["submissions"]["nan"] = active;
             result["ok"] = json!(result["ok"] == true && active_ok);
         }
         result
+    }
+
+    /// Send a directed NOW active-discovery request and wait for its signed,
+    /// correlated announce response. A successful frame injection alone is
+    /// not a check: it says nothing about peer reception or the return path.
+    pub async fn directed_now_discovery(
+        &self,
+        medium: Option<String>,
+        destination: String,
+    ) -> Result<Value> {
+        // The public `to` address is the peer's ordinary stable Wi-Fi MAC.
+        // The raw action frame uses the ESP receive alias (the locally
+        // administered bit is flipped) as address-1.  Keep that conversion
+        // inside this frame-I/O adapter: callers and the association ledger
+        // must continue to key the peer by its ordinary address, which is
+        // also the source address on the reply.
+        let Some(peer) = parse_now_peer_address(&destination) else {
+            bail!("unsupported explicit discovery address: {destination}");
+        };
+        let request_id = self
+            .next_direct_discovery_id
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1);
+        let (reply, receiver) = std::sync::mpsc::channel();
+        self.pending_now_discovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(request_id, PendingNowDiscovery { peer, reply });
+
+        let submission = self.send_directed_now_discovery(medium, &destination, request_id);
+        if submission["ok"] != true {
+            self.pending_now_discovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request_id);
+            bail!(
+                "directed NOW discovery was not submitted: {}",
+                submission["error"].as_str().unwrap_or("unknown send error")
+            );
+        }
+
+        let response =
+            tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(3)))
+                .await
+                .context("directed NOW discovery waiter stopped")?
+                .map_err(|error| anyhow::anyhow!("directed NOW discovery timed out: {error}"));
+        self.pending_now_discovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&request_id);
+        let response = response?;
+        Ok(json!({
+            "ok": true,
+            "record": "announce.discovery",
+            "mode": "directed",
+            "to": destination,
+            "request_id": request_id,
+            "submission": submission,
+            "response": response,
+        }))
+    }
+
+    fn send_directed_now_discovery(
+        &self,
+        _medium: Option<String>,
+        destination: &str,
+        request_id: u64,
+    ) -> Value {
+        let mut record = [0u8; 96];
+        let Some(record_used) =
+            dmesh_server::announce::encode_discovery_request(request_id, &mut record)
+        else {
+            return json!({"ok": false, "error": "encode announce.discovery"});
+        };
+        let mut wire = [0u8; 128];
+        let Some(used) =
+            dmesh_server::direct::ConnectionlessMessage::encode(&record[..record_used], &mut wire)
+        else {
+            return json!({"ok": false, "error": "wrap announce.discovery"});
+        };
+        let wire_destination = now_wire_destination(destination);
+        let iface = wifi_iface(None);
+        let source = match self.now_action_source(&iface) {
+            Ok(source) => colon_mac(&source),
+            Err(error) => {
+                return json!({"ok": false, "error": format!("NOW source MAC: {error:#}")});
+            }
+        };
+        self.wifi_raw_send(
+            None,
+            None,
+            Some(1),
+            Some(wire_destination),
+            Some(source),
+            Some("monitor".to_owned()),
+            None,
+            // ESP-NOW-compatible action traffic uses broadcast address-3
+            // even for a unicast receiver. This must match the firmware
+            // transmitter; using the selected peer as a BSSID makes C6 drop
+            // the action before the common direct dispatcher sees it.
+            Some("ff:ff:ff:ff:ff:ff".to_owned()),
+            None,
+            format!("hex:{}", hex_bytes(&wire[..used])),
+            Some(6),
+        )
     }
 
     /// Ping/discover peers over one radio or all radios.
@@ -3160,10 +3519,21 @@ impl RadioService {
         raw_wifi_source(None, anchor_iface).map(|mac| (mac, "interface_mac"))
     }
 
+    /// NOW is an independent packet bearer, not a NAN/P2P service action.
+    /// Its source must be the anchor radio identity that owns the monitor
+    /// injection path.  A P2P-GO child MAC is appropriate for NAN Service
+    /// Discovery, but some drivers do not put arbitrary vendor action frames
+    /// using that child address on air or deliver their replies to the anchor
+    /// monitor.  Keep this choice inside the frame adapter; the shared QUIC
+    /// association only receives the opaque NOW path.
+    fn now_action_source(&self, anchor_iface: &str) -> Result<[u8; 6]> {
+        raw_wifi_source(None, anchor_iface)
+    }
+
     /// Return basic AP defaults and station metrics where available.
     pub fn wifi_ap_status(&self, iface: Option<String>) -> Value {
         let iface = wifi_iface(iface);
-        let p2p_active = self
+        let wpa_active = self
             .wpa_supplicants
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3193,14 +3563,14 @@ impl RadioService {
             .unwrap_or(DEFAULT_RAW_WIFI_CHANNEL);
         let result = json!({
             "ok": true,
-            "backend": if p2p_active { "wpa_supplicant_p2p" } else { "linux_nl80211" },
+            "backend": if wpa_active { "wpa_supplicant" } else { "linux_nl80211" },
             "iface": iface,
-            "ssid_default": if p2p_active { DMESH_P2P_SSID.to_owned() } else { default_open_ap_ssid(&iface) },
+            "ssid_default": if wpa_active { DMESH_P2P_SSID.to_owned() } else { default_open_ap_ssid(&iface) },
             "channel": channel,
             "freq": channel_to_freq(channel),
             "bssid": mac.map(|mac| colon_mac(&mac)),
-            "auth": if p2p_active { "wpa2-psk" } else { "open" },
-            "p2p_active": p2p_active,
+            "auth": if wpa_active { "wpa2-psk" } else { "open" },
+            "p2p_active": p2p_group_iface.is_some(),
             "p2p_group_iface": p2p_group_iface,
             "p2p_group_mac": p2p_group_mac.map(|mac| colon_mac(&mac)),
             "stations": stations,
@@ -3377,7 +3747,7 @@ impl RadioService {
     /// request uses one bounded nl80211 scan on the selected 2.4 GHz channels;
     /// it does not start an AP, create a monitor VIF, or invoke a host command.
     /// The result keeps all BSS entries plus DMesh subsets so a probe can pick
-    /// a candidate and issue the separate `transport.start` transition.
+    /// a candidate and issue the separate `transport.set` transition.
     pub fn wifi_scan(
         &self,
         iface: Option<String>,
@@ -3563,7 +3933,7 @@ impl RadioService {
         result
     }
 
-    /// Execute one STA transition selected by the common `transport.start`
+    /// Execute one STA transition selected by the common `transport.set`
     /// profile.
     ///
     /// A transport transition is an ownership boundary.  Before creating its
@@ -3581,7 +3951,7 @@ impl RadioService {
     ) -> Value {
         let iface = wifi_iface(iface);
         // A supplied value is volatile session data from the common
-        // transport.start record; it is neither persisted nor included in the
+        // transport.set record; it is neither persisted nor included in the
         // result/history.  Without it, retain the deployment-profile lookup
         // and its open-network fallback.
         let supplied_passphrase = passphrase.filter(|value| !value.is_empty());
@@ -3592,7 +3962,7 @@ impl RadioService {
                     "backend": "validation",
                     "iface": iface,
                     "ssid": ssid,
-                    "error": "transport.start passphrase must contain 8 through 63 non-NUL bytes",
+                    "error": "transport.set passphrase must contain 8 through 63 non-NUL bytes",
                 });
             }
         }
@@ -3663,7 +4033,7 @@ impl RadioService {
             if result.get("ok").and_then(Value::as_bool) != Some(true) {
                 result["failure_cleanup"] = self.clean_transport_state(&iface);
             }
-            self.record("transport.start.sta", result.clone());
+            self.record("transport.set.sta", result.clone());
             return result;
         };
         if let Err(error) = set_link_state(&sta_iface, false) {
@@ -3762,24 +4132,7 @@ impl RadioService {
             "link_up": link_up,
             "ap_restoration": ap_restoration,
         });
-        self.record("transport.start.sta", result.clone());
-        result
-    }
-
-    /// End the current STA/AP transport epoch. This is intentionally the same
-    /// ownership boundary used before `transport.start`, so a caller can make
-    /// a clean, inspectable stop without immediately selecting a replacement.
-    pub fn wifi_sta_transport_stop(&self, iface: Option<String>) -> Value {
-        let iface = wifi_iface(iface);
-        let cleanup = self.clean_transport_state(&iface);
-        let result = json!({
-            "ok": cleanup.get("ok").and_then(Value::as_bool) == Some(true),
-            "backend": "linux_nl80211",
-            "iface": iface,
-            "state": "stopped",
-            "cleanup": cleanup,
-        });
-        self.record("transport.stop", result.clone());
+        self.record("transport.set.sta", result.clone());
         result
     }
 
@@ -3794,20 +4147,21 @@ impl RadioService {
     ) -> Value {
         let iface = wifi_iface(iface);
         let backend = backend.trim().to_ascii_lowercase();
-        if backend != "p2p" && backend != "open" {
+        if backend != "p2p" && backend != "open" && backend != "wpa2-ap" {
             return json!({
                 "ok": false,
                 "iface": iface,
-                "error": "transport AP backend must be p2p or open",
+                "error": "transport AP backend must be p2p, wpa2-ap, or open",
             });
         }
         let passphrase = passphrase.unwrap_or(DMESH_P2P_PASSPHRASE);
-        if backend == "p2p" && (!(8..=63).contains(&passphrase.len()) || passphrase.contains('\0'))
+        if (backend == "p2p" || backend == "wpa2-ap")
+            && (!(8..=63).contains(&passphrase.len()) || passphrase.contains('\0'))
         {
             return json!({
                 "ok": false,
                 "iface": iface,
-                "error": "transport.start passphrase must contain 8 through 63 non-NUL bytes",
+                "error": "transport.set passphrase must contain 8 through 63 non-NUL bytes",
             });
         }
         let cleanup = self.clean_transport_state(&iface);
@@ -3850,8 +4204,60 @@ impl RadioService {
                 "anchor_up": anchor_up,
                 "ap": open,
             });
-            self.record("transport.start.ap", result.clone());
+            self.record("transport.set.ap", result.clone());
             return result;
+        }
+
+        if backend == "wpa2-ap" {
+            let control_dir = wpa_runtime_dir();
+            let ap = (|| -> Result<()> {
+                let supplicant =
+                    lmesh_wpa::WpaSupplicant::start(&iface, control_dir, Duration::from_secs(5))?;
+                supplicant.start_wpa2_ap(
+                    DMESH_P2P_SSID.as_bytes(),
+                    passphrase,
+                    DMESH_P2P_FREQUENCY_MHZ,
+                    Duration::from_secs(15),
+                )?;
+                self.wpa_supplicants
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(iface.clone(), supplicant);
+                Ok(())
+            })();
+            return match ap {
+                Ok(()) => {
+                    let result = json!({
+                        "ok": true,
+                        "requested_backend": "wpa2-ap",
+                        "active_backend": "wpa2-ap",
+                        "backend": "wpa_supplicant",
+                        "iface": iface,
+                        "ssid": DMESH_P2P_SSID,
+                        "auth": "wpa2-psk",
+                        "frequency_mhz": DMESH_P2P_FREQUENCY_MHZ,
+                        "cleanup": cleanup,
+                        "anchor_up": anchor_up,
+                    });
+                    self.record("transport.set.ap", result.clone());
+                    result
+                }
+                Err(error) => {
+                    let failure_cleanup = self.clean_transport_state(&iface);
+                    let result = json!({
+                        "ok": false,
+                        "requested_backend": "wpa2-ap",
+                        "iface": iface,
+                        "ssid": DMESH_P2P_SSID,
+                        "cleanup": cleanup,
+                        "failure_cleanup": failure_cleanup,
+                        "anchor_up": anchor_up,
+                        "error": format!("WPA2 AP setup failed: {error:#}"),
+                    });
+                    self.record("transport.set.ap", result.clone());
+                    result
+                }
+            };
         }
 
         let control_dir = wpa_runtime_dir();
@@ -3893,7 +4299,7 @@ impl RadioService {
                     "cleanup": cleanup,
                     "anchor_up": anchor_up,
                 });
-                self.record("transport.start.ap", result.clone());
+                self.record("transport.set.ap", result.clone());
                 result
             }
             Err(error) => {
@@ -3911,7 +4317,7 @@ impl RadioService {
                     "anchor_up": anchor_up,
                     "error": "P2P/PSK group creation failed; open AP fallback is disabled",
                 });
-                self.record("transport.start.ap", result.clone());
+                self.record("transport.set.ap", result.clone());
                 result
             }
         }
@@ -4318,7 +4724,8 @@ impl RadioService {
                 let active_nan_publish = self.active_nan_publish.clone();
                 let pending_nan_active_subscribe = self.pending_nan_active_subscribe.clone();
                 let pending_nan_followups = self.pending_nan_followups.clone();
-                let raw_action_dispatcher = self.raw_action_dispatcher.clone();
+                let pending_now_discovery = self.pending_now_discovery.clone();
+                let connection_runtime = self.connection_runtime.clone();
                 let p2p_group_ifaces = self.p2p_group_ifaces.clone();
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 stop_flags
@@ -4336,7 +4743,8 @@ impl RadioService {
                         active_nan_publish,
                         pending_nan_active_subscribe,
                         pending_nan_followups,
-                        raw_action_dispatcher,
+                        pending_now_discovery,
+                        connection_runtime,
                         p2p_group_ifaces,
                         stop_flag,
                     );
@@ -5020,180 +5428,9 @@ impl RadioService {
         result
     }
 
-    /// Send a DMesh raw Wi-Fi ping and return replies observed by the nl80211 listener.
-    pub fn wifi_raw_ping(
-        &self,
-        iface: Option<String>,
-        channel: Option<u8>,
-        listen_sec: Option<u64>,
-        wait_ms: Option<u64>,
-        nonce: Option<String>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let channel = raw_wifi_channel(channel);
-        let listen_sec = listen_sec.unwrap_or(DEFAULT_RAW_WIFI_LISTEN_SECS).max(1);
-        let wait_ms = wait_ms.unwrap_or(900).clamp(50, 10_000);
-        let nonce = nonce.unwrap_or_else(|| format!("{}-{}", std::process::id(), now_millis()));
-        let payload = format!("dmesh.ping type=status source=lmesh nonce={nonce}");
-        let listen = self.wifi_raw_listen(
-            Some(iface.clone()),
-            Some(channel),
-            Some(listen_sec),
-            Some("nl80211".to_string()),
-        );
-        let sent_at = now_millis_u64();
-        let tx = self.wifi_raw_send(
-            Some(iface.clone()),
-            Some(channel),
-            Some(listen_sec),
-            None,
-            None,
-            Some("dont_wait_ack".to_string()),
-            None,
-            None,
-            None,
-            payload.clone(),
-            None,
-        );
-        std::thread::sleep(Duration::from_millis(wait_ms));
-        let replies = self.raw_wifi_ping_replies(sent_at, &iface);
-        let result = json!({
-            "ok": tx.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            "iface": iface,
-            "channel": channel,
-            "listen_sec": listen_sec,
-            "wait_ms": wait_ms,
-            "nonce": nonce,
-            "payload": payload,
-            "listen": listen,
-            "tx": tx,
-            "reply_count": replies.len(),
-            "replies": replies,
-        });
-        self.record("wifi.raw.ping", result.clone());
-        result
-    }
-
-    /// Host raw-NAN smoke path. This deliberately uses the existing
-    /// monitor TX/RX transport but runs every received frame through the
-    /// shared no_std NAN state machine, so host behavior is observable before
-    /// the ESP DMOD adapter is enabled.
-    pub fn rawnan_ping(
-        &self,
-        iface: Option<String>,
-        channel: Option<u8>,
-        destination: Option<String>,
-        bssid: Option<String>,
-        payload: String,
-        wait_ms: Option<u64>,
-    ) -> Value {
-        let iface_value = wifi_iface(iface);
-        let channel_value = raw_wifi_channel(channel);
-        let wait_ms = wait_ms.unwrap_or(1_000).clamp(50, 10_000);
-        let listen = self.wifi_raw_listen(
-            Some(iface_value.clone()),
-            Some(channel_value),
-            Some((wait_ms / 1_000 + 3).max(3)),
-            Some("monitor".to_string()),
-        );
-        let sent_at = now_millis_u64();
-        let destination_bytes = raw_wifi_destination(destination.as_deref(), "monitor");
-        let target = format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            destination_bytes[2], destination_bytes[3], destination_bytes[4], destination_bytes[5]
-        );
-        let payload_bytes = if payload.eq_ignore_ascii_case("ping") {
-            firmware_targeted_command_cbor_with_timeout(
-                "ping",
-                &target,
-                Some(wait_ms.min(u32::MAX as u64) as u32),
-            )
-            .unwrap_or_else(|_| payload.as_bytes().to_vec())
-        } else if let Some(hex) = payload.strip_prefix("hex:") {
-            decode_firmware_hex(hex).unwrap_or_else(|_| payload.as_bytes().to_vec())
-        } else {
-            payload.as_bytes().to_vec()
-        };
-        let bssid = bssid
-            .as_deref()
-            .and_then(|value| parse_mac(Some(value)))
-            .or_else(|| {
-                self.rawnan_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .cluster()
-                    .map(|mac| mac.0)
-            })
-            .unwrap_or(destination_bytes);
-        let tx = match raw_wifi_source(None, &iface_value)
-            .and_then(|source| {
-                build_dmesh_vendor_action_frame_with_bssid(
-                    destination_bytes,
-                    source,
-                    bssid,
-                    &payload_bytes,
-                )
-            })
-            .and_then(|frame| send_monitor_frame(&iface_value, channel_value, &frame, None))
-        {
-            Ok(value) => json!({
-                "ok": true,
-                "backend": "linux_af_packet_monitor",
-                "tx_variant": "monitor",
-                "iface": iface_value,
-                "channel": channel_value,
-                "payload_len": payload_bytes.len(),
-                "frame_len": value.get("packet_len").cloned().unwrap_or_else(|| json!(0)),
-                "monitor": value,
-            }),
-            Err(error) => json!({
-                "ok": false,
-                "backend": "linux_af_packet_monitor",
-                "tx_variant": "monitor",
-                "iface": iface_value,
-                "channel": channel_value,
-                "payload_len": payload_bytes.len(),
-                "error": format!("{error:#}"),
-            }),
-        };
-        std::thread::sleep(Duration::from_millis(wait_ms));
-        let events = self
-            .history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|event| event.key == "wifi.raw.rx" && event.ts_millis >= u128::from(sent_at))
-            .map(|event| event.value.clone())
-            .collect::<Vec<_>>();
-        let state = self
-            .rawnan_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cluster = state.cluster().map(|mac| colon_mac(&mac.0));
-        let rx_count = events.len();
-        let result = json!({
-            "ok": tx.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            "backend": "rawnan_host",
-            "iface": iface_value,
-            "channel": channel_value,
-            "payload_len": payload_bytes.len(),
-            "payload_mode": if payload.eq_ignore_ascii_case("ping") { "generated_cbor" } else if payload.starts_with("hex:") { "hex" } else { "text" },
-            "listen": listen,
-            "tx": tx,
-            "wait_ms": wait_ms,
-            "rx_events": events,
-            "rx_count": rx_count,
-            "filter_mode": match state.mode() {
-                dmesh_rawnan::FilterMode::Discovery => "discovery",
-                dmesh_rawnan::FilterMode::Cluster => "cluster_a3",
-            },
-            "cluster_bssid": cluster,
-        });
-        self.record("wifi.rawnan.ping", result.clone());
-        result
-    }
-
-    fn run_raw_action_client<C: RawActionClient>(
+    fn run_datagram_client_over_action<
+        C: quic_lite::DatagramClient<{ quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>,
+    >(
         &self,
         iface: &str,
         channel: u8,
@@ -5203,32 +5440,29 @@ impl RadioService {
         timeout_ms: u64,
         tx_rate_mbps: u8,
         tx_variant: &str,
+        initial_packet: Option<&[u8]>,
         client: &mut C,
-    ) -> RawActionRun {
-        let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-        // A bootstrap OPEN has no peer CID yet, so the normal QUIC PTO path
-        // cannot retransmit it. Keep a bounded copy for the NAN/DW window.
-        let mut bootstrap_packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-        let (mut pending, bootstrap_used) = match client.start(&mut packet) {
-            Ok(used) => {
-                bootstrap_packet[..used].copy_from_slice(&packet[..used]);
-                (Some(used), used)
-            }
+    ) -> DatagramRun {
+        let start_ms = now_millis_u64();
+        let driver_result = match initial_packet {
+            Some(packet) => quic_lite::DatagramClientDriver::from_packet(packet, start_ms),
+            None => quic_lite::DatagramClientDriver::start(client, start_ms),
+        };
+        let mut driver = match driver_result {
+            Ok(driver) => driver,
             Err(error) => {
-                return RawActionRun {
+                return DatagramRun {
                     elapsed_us: 0,
                     tx_packets: 0,
                     tx_errors: 0,
-                    last_tx: None,
                     rx_packets: 0,
                     retransmit_packets: 0,
+                    peer_restarted: false,
                     error: Some(format!("raw action OPEN: {error:?}")),
                 };
             }
         };
         let started = Instant::now();
-        let mut last_bootstrap_tx = started;
-        let start_ms = now_millis_u64();
         // The sender must not start the long-lived history listener on the
         // same monitor VIF: active monitor TX may need to recreate that VIF,
         // and the listener then races deletion/recreation while also making
@@ -5242,13 +5476,13 @@ impl RadioService {
             match require_existing_monitor_iface(&monitor_iface) {
                 Ok(setup) => Some(setup),
                 Err(error) => {
-                    return RawActionRun {
+                    return DatagramRun {
                         elapsed_us: started.elapsed().as_micros(),
                         tx_packets: 0,
                         tx_errors: 0,
-                        last_tx: None,
                         rx_packets: 0,
                         retransmit_packets: 0,
+                        peer_restarted: false,
                         error: Some(format!(
                             "raw action requires a pre-provisioned monitor {monitor_iface}: {error:#}"
                         )),
@@ -5277,16 +5511,17 @@ impl RadioService {
         let mut direct_buf = [0_u8; 4096];
         let mut direct_payload = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
         let mut seen = HashSet::new();
-        let mut tx_packets = 0u64;
         let mut tx_errors = 0u64;
-        let mut last_tx = None;
-        let mut rx_packets = 0u64;
-        let mut retransmit_packets = 0u64;
-        let mut bootstrap_pending = true;
+        let mut peer_restarted = false;
         let mut error = None;
         let local_source = colon_mac(&source);
         while started.elapsed() < Duration::from_millis(timeout_ms) {
-            if let Some(used) = pending.take() {
+            if let Some(packet) = driver.packet() {
+                // A completed tagged request queues one final QUIC CLOSE.
+                // Flush it on the same selected path before returning so the
+                // peer dispatcher releases its association for the next
+                // independent stream request.
+                let final_control = client.is_complete();
                 // This is the raw ESP-NOW-compatible QUIC bearer, not NAN
                 // service discovery.  `wifi_raw_send` deliberately builds a
                 // NAN public action for its generic host diagnostic API;
@@ -5301,7 +5536,7 @@ impl RadioService {
                     destination,
                     source,
                     [0xff; 6],
-                    &packet[..used],
+                    packet,
                 ) {
                     Ok(length) => length,
                     Err(frame_error) => {
@@ -5353,7 +5588,6 @@ impl RadioService {
                         Some(tx_rate_mbps),
                     )
                 };
-                last_tx = Some(sent.clone());
                 if !sent.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                     tx_errors = tx_errors.saturating_add(1);
                     error = Some(format!(
@@ -5364,9 +5598,9 @@ impl RadioService {
                     ));
                     break;
                 }
-                tx_packets = tx_packets.saturating_add(1);
-                if bootstrap_pending {
-                    last_bootstrap_tx = Instant::now();
+                driver.mark_sent(now_millis_u64());
+                if final_control {
+                    break;
                 }
             }
             if let Some(socket) = direct_rx.as_ref() {
@@ -5385,17 +5619,8 @@ impl RadioService {
                     // this client before invoking the QUIC decoder; a
                     // foreign/stale payload must not become a fatal
                     // `Truncated` codec error for the active request.
-                    if !client.accepts(&direct_payload[..payload_len]) {
-                        continue;
-                    }
-                    bootstrap_pending = false;
-                    rx_packets = rx_packets.saturating_add(1);
-                    match client.receive_at(
-                        &direct_payload[..payload_len],
-                        now_millis_u64(),
-                        &mut packet,
-                    ) {
-                        Ok(next) => pending = next,
+                    match driver.receive(client, &direct_payload[..payload_len], now_millis_u64()) {
+                        Ok(_) => {}
                         Err(receive_error) => {
                             // A monitor VIF can deliver a delayed response
                             // from the association that the preceding test
@@ -5403,6 +5628,11 @@ impl RadioService {
                             // ignore it and continue waiting for the current
                             // bearer rather than converting stale RF traffic
                             // into a test failure.
+                            if receive_error == quic_lite::Error::PeerRestarted {
+                                peer_restarted = true;
+                                error = Some("QUIC-lite direct RX: PeerRestarted".to_owned());
+                                break;
+                            }
                             if !raw_action_receive_error_is_ambient(receive_error) {
                                 error = Some(format!("QUIC-lite direct RX: {receive_error:?}"));
                                 break;
@@ -5411,41 +5641,21 @@ impl RadioService {
                     }
                 }
             }
-            // Delayed ACKs and flow-credit updates are not necessarily
-            // returned from `receive`; unlike UDP, this monitor bearer has no
-            // independent socket worker to poll the QUIC clock.  Queue the
-            // one returned control datagram through the same raw action TX
-            // path, preserving the no-owned-egress-queue invariant.
-            if pending.is_none()
-                && let Ok(Some(used)) = client.poll_transmit(&mut packet)
-            {
-                pending = Some(used);
+            // Connection-owned delayed control, retransmission, and OPEN
+            // replay are driven with the adapter's monotonic clock. The
+            // adapter only transmits the resulting complete frame.
+            if let Err(poll_error) = driver.poll(client, now_millis_u64(), 100, 400) {
+                error = Some(format!("QUIC-lite poll: {poll_error:?}"));
+                break;
             }
-            if pending.is_none()
-                // EndpointState clocks are absolute milliseconds (the same
-                // unit used by receive_at). Passing a run-relative clock here
-                // moves time backwards after the first response and silently
-                // disables client-side PTO recovery.
-                && let Ok(Some(used)) = client.poll_retransmit(
-                    now_millis_u64(),
-                    100,
-                    &mut packet,
-                )
-            {
-                pending = Some(used);
-                retransmit_packets = retransmit_packets.saturating_add(1);
-            }
-            // Before the server CID is learned, explicitly repeat the OPEN
-            // at a modest cadence. Once a response establishes the peer CID,
-            // normal QUIC retransmission and flow-control polling takes over.
-            if pending.is_none()
-                && bootstrap_used != 0
-                && bootstrap_pending
-                && last_bootstrap_tx.elapsed() >= Duration::from_millis(400)
-            {
-                packet[..bootstrap_used].copy_from_slice(&bootstrap_packet[..bootstrap_used]);
-                pending = Some(bootstrap_used);
-                retransmit_packets = retransmit_packets.saturating_add(1);
+            // A direct monitor receive is the normal fast path.  It does not
+            // pass through `history`, so completion must be checked here as
+            // well as in the history loop below.  In particular, retain the
+            // association client only after its final ACK/control packet has
+            // been injected; otherwise the next stream can race a still
+            // pending packet from the preceding stream.
+            if client.is_complete() && driver.packet().is_none() {
+                break;
             }
             let events = self
                 .history
@@ -5487,186 +5697,41 @@ impl RadioService {
                 // request's QUIC connection.  Filter by destination CID
                 // before decoding so stale or unrelated action payloads are
                 // ambient traffic rather than a bulk-transfer failure.
-                if !client.accepts(&payload) {
-                    continue;
-                }
-                bootstrap_pending = false;
-                rx_packets = rx_packets.saturating_add(1);
-                match client.receive_at(&payload, now_millis_u64(), &mut packet) {
-                    Ok(next) => pending = next,
+                match driver.receive(client, &payload, now_millis_u64()) {
+                    Ok(_) => {}
                     Err(receive_error) => {
+                        if receive_error == quic_lite::Error::PeerRestarted {
+                            peer_restarted = true;
+                            error = Some("QUIC-lite RX: PeerRestarted".to_owned());
+                            break;
+                        }
                         if !raw_action_receive_error_is_ambient(receive_error) {
                             error = Some(format!("QUIC-lite RX: {receive_error:?}"));
                             break;
                         }
                     }
                 }
-                if client.is_complete() {
+                // `receive_at` queues the close above.  Do not return until
+                // that packet was injected; otherwise a one-shot client
+                // leaves the peer dispatcher pinned to its old CID.
+                if client.is_complete() && driver.packet().is_none() {
                     break;
                 }
             }
-            if client.is_complete() || error.is_some() {
+            if error.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        RawActionRun {
+        DatagramRun {
             elapsed_us: started.elapsed().as_micros(),
-            tx_packets,
+            tx_packets: driver.tx_packets(),
             tx_errors,
-            last_tx,
-            rx_packets,
-            retransmit_packets,
+            rx_packets: driver.rx_packets(),
+            retransmit_packets: driver.retransmit_packets(),
+            peer_restarted,
             error,
         }
-    }
-
-    /// Run the standard QUIC-lite IPERF service through raw ESP-NOW-compatible
-    /// vendor action frames. The host owns monitor injection/capture only;
-    /// bootstrap, stream request, ACKs, and IPERF validation live in the
-    /// bearer-neutral `dmesh_server::raw_iperf::RawIperfClient`.
-    pub fn raw_espnow_iperf(
-        &self,
-        iface: Option<String>,
-        channel: Option<u8>,
-        destination: String,
-        bytes: u64,
-        packet_size: Option<u64>,
-        timeout_ms: Option<u64>,
-        tx_rate_mbps: Option<u64>,
-        tx_variant: Option<String>,
-        rx_variant: Option<String>,
-        expected_peer: Option<String>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let channel = raw_wifi_channel(channel);
-        let timeout_ms = timeout_ms.unwrap_or(20_000).clamp(1_000, 60_000);
-        let packet_size = packet_size
-            .unwrap_or(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64)
-            .clamp(4, quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64) as u16;
-        let tx_rate_mbps = match tx_rate_mbps {
-            None => 6,
-            Some(rate @ (1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54)) => rate as u8,
-            Some(_) => {
-                return json!({
-                    "ok": false,
-                    "error": "tx_rate_mbps must be one of 1,2,5,6,9,11,12,18,24,36,48,54"
-                });
-            }
-        };
-        // This is deliberately a runtime selection: the host's monitor
-        // injector is the historically proven on-air action path, whereas
-        // NL80211_CMD_FRAME is useful to test a driver-managed route but is
-        // rejected by some adapters. Neither choice changes QUIC-lite.
-        let tx_variant = match tx_variant.as_deref().unwrap_or("monitor") {
-            "monitor" | "monitor_active" => tx_variant.as_deref().unwrap_or("monitor"),
-            "action" | "nl80211" => "action",
-            other => {
-                return json!({
-                    "ok": false,
-                    "error": format!("tx_variant must be monitor, action, or nl80211, got {other:?}"),
-                });
-            }
-        };
-        let rx_variant = match rx_variant.as_deref().unwrap_or("monitor") {
-            "monitor" | "monitor_active" => rx_variant.as_deref().unwrap_or("monitor"),
-            "nl80211" => "nl80211",
-            other => {
-                return json!({
-                    "ok": false,
-                    "error": format!("rx_variant must be monitor, monitor_active, or nl80211, got {other:?}"),
-                });
-            }
-        };
-        let destination_mac = match parse_mac(Some(&destination)) {
-            Some(mac) => mac,
-            None => return json!({"ok": false, "error": "destination must be a MAC address"}),
-        };
-        let expected_peer_mac = match expected_peer.as_deref() {
-            Some(value) => match parse_mac(Some(value)) {
-                Some(mac) => Some(mac),
-                None => return json!({"ok": false, "error": "expected_peer must be a MAC address"}),
-            },
-            None => None,
-        };
-        let source = match raw_wifi_source(None, &iface) {
-            Ok(mac) => mac,
-            Err(error) => {
-                return json!({"ok": false, "iface": iface, "error": format!("source MAC: {error:#}")});
-            }
-        };
-        // `nl80211` frame events keep the AP's managed station association
-        // intact. Monitor-VIF creation is useful for passive NAN inspection
-        // but can sever an active Recovery STA on this chipset.
-        // The sender uses the bounded direct monitor socket prepared by
-        // `run_raw_action_client`; only the peer needs a history listener.
-        // Starting another listener here used to race active monitor TX.
-        let listen = json!({
-            "ok": true,
-            "backend": "linux_af_packet_monitor_direct",
-            "iface": iface,
-            "channel": channel,
-            "rx_variant": rx_variant,
-        });
-        let cid_value = now_millis_u64().max(1);
-        let client_cid = match quic_lite::ConnectionId::new(cid_value) {
-            Some(cid) => cid,
-            None => return json!({"ok": false, "error": "could not allocate client CID"}),
-        };
-        let mut client = match dmesh_server::raw_iperf::RawIperfClient::<
-            16,
-            { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-        >::new_with_packet_size(client_cid, bytes, packet_size)
-        {
-            Ok(client) => client,
-            Err(error) => return json!({"ok": false, "error": format!("IPERF client: {error:?}")}),
-        };
-        let run = self.run_raw_action_client(
-            &iface,
-            channel,
-            destination_mac,
-            expected_peer_mac,
-            source,
-            timeout_ms,
-            tx_rate_mbps,
-            tx_variant,
-            &mut client,
-        );
-        let elapsed_us = run.elapsed_us;
-        let complete = client.is_complete();
-        let transferred = client.bytes();
-        let bps = if elapsed_us == 0 {
-            0
-        } else {
-            transferred.saturating_mul(8).saturating_mul(1_000_000) / elapsed_us as u64
-        };
-        let result = json!({
-            "ok": complete,
-            "bearer": "espnow_raw_action",
-            "iface": iface,
-            "channel": channel,
-            "destination": destination,
-            "expected_peer": expected_peer,
-            "requested_bytes": bytes,
-            "packet_size": packet_size,
-            "tx_rate_mbps": tx_rate_mbps,
-            "tx_variant": tx_variant,
-            "rx_variant": rx_variant,
-            "bytes": transferred,
-            "elapsed_us": elapsed_us,
-            "bps": bps,
-            "tx_packets": run.tx_packets,
-            "tx_errors": run.tx_errors,
-            "last_tx": run.last_tx,
-            "rx_packets": run.rx_packets,
-            "retransmit_packets": run.retransmit_packets,
-            "callback_errors": client.callback_errors(),
-            "server_cid": client.server_cid().map(|cid| cid.value()),
-            "listen": listen,
-            "error": run.error,
-        });
-        self.record("wifi.raw.iperf", result.clone());
-        result
     }
 
     /// Forward one complete tagged-CBOR request over the raw NOW-like bearer.
@@ -5675,21 +5740,289 @@ impl RadioService {
     /// shared client owns bootstrap, ACK, retransmission, and its bounded
     /// response buffer; this method only selects the Linux action ingress and
     /// submits its returned complete datagrams.
-    pub fn forward_tagged_record_over_now(
+    pub(crate) fn forward_tagged_record_on_action_path(
         &self,
         destination: &str,
         record: &[u8],
     ) -> Result<Vec<u8>> {
-        let client_cid = quic_lite::ConnectionId::new(now_millis_u64().max(1))
-            .context("allocate NOW directed QUIC CID")?;
-        self.forward_tagged_record_over_now_with_cid(destination, record, client_cid)
+        // This adapter owns only complete action-frame I/O. A failed stream
+        // is semantically ambiguous, so retry policy belongs to the common
+        // schema-aware caller: it may replay reviewed reads after a peer
+        // restart, but must never silently replay a mutation on NOW.
+        self.forward_tagged_record_on_action_path_once(destination, record)
+    }
+
+    /// Discard the retained QUIC association for one NOW peer after the
+    /// bearer-neutral router has proven that its response belongs to a
+    /// different stream request.  This does not inspect a frame or an
+    /// application record: it only retires the peer's connection state so the
+    /// next safe request creates a fresh association.
+    pub(crate) fn reset_tagged_association_on_action_path(&self, destination: &str) -> Result<()> {
+        let peer_mac = parse_now_peer_address(destination)
+            .context("NOW association reset destination must be a MAC address")?;
+        let key = colon_mac(&peer_mac);
+        let association = self
+            .retained_now_tagged_associations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(association) = association {
+            association
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reset();
+        }
+        Ok(())
+    }
+
+    fn forward_tagged_record_on_action_path_once(
+        &self,
+        destination: &str,
+        record: &[u8],
+    ) -> Result<Vec<u8>> {
+        let iface = wifi_iface(None);
+        let channel = raw_wifi_channel(None);
+        let peer_mac = parse_now_peer_address(destination)
+            .context("NOW directed destination must be a MAC address")?;
+        // A1 is the selected peer's actual unicast radio address.  The old
+        // raw_receive-MAC convention flips its group bit (for example e7's
+        // `14:c1:...` into `15:c1:...`), which prevents strict ESP action
+        // receive from reaching the peer.  ESP-NOW's broadcast convention is
+        // A3 and is set by `encode_action_frame`, not by this path selector.
+        let destination_mac = directed_now_destination(peer_mac);
+        let source = self
+            .now_action_source(&iface)
+            .context("NOW directed source MAC")?;
+        // The retained association is keyed by the stable peer identity; the
+        // derived receive address is only an action-frame address-1 detail.
+        let key = colon_mac(&peer_mac);
+        let association = {
+            let mut associations = self
+                .retained_now_tagged_associations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            associations
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(RetainedNowTaggedAssociation::new())))
+                .clone()
+        };
+        let mut association = association
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        association.retire_if_idle(now_millis_u64());
+        let run = if association.client.is_none() {
+            let mut client = dmesh_server::transport::TaggedClient::<
+                16,
+                { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+            >::new(next_action_client_cid(), record)
+            .map_err(|error| anyhow::anyhow!("NOW tagged request: {error:?}"))?;
+            client.set_close_when_complete(false);
+            association.client = Some(client);
+            let run = self.run_datagram_client_over_action(
+                &iface,
+                channel,
+                destination_mac,
+                Some(peer_mac),
+                source,
+                5_000,
+                6,
+                "monitor",
+                None,
+                association.client.as_mut().expect("installed NOW client"),
+            );
+            run
+        } else {
+            let mut packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+            let client = association.client.as_mut().expect("retained NOW client");
+            let stream = client.allocate_client_bidi_stream()?;
+            let used = client
+                .begin_request(stream, record, &mut packet)
+                .map_err(|error| anyhow::anyhow!("encode retained NOW stream: {error:?}"))?;
+            let run = self.run_datagram_client_over_action(
+                &iface,
+                channel,
+                destination_mac,
+                Some(peer_mac),
+                source,
+                5_000,
+                6,
+                "monitor",
+                Some(&packet[..used]),
+                association.client.as_mut().expect("retained NOW client"),
+            );
+            run
+        };
+        let completed_response = association
+            .client
+            .as_ref()
+            .filter(|client| client.is_complete() && run.error.is_none())
+            .and_then(|client| client.response().map(Vec::from));
+        if let Some(response) = completed_response {
+            association.mark_completed(now_millis_u64());
+            return Ok(response);
+        }
+        let counters = association
+            .client
+            .as_ref()
+            .expect("NOW client remains installed")
+            .counters();
+        association.reset();
+        if run.peer_restarted {
+            return Err(anyhow::Error::new(quic_lite::Error::PeerRestarted));
+        }
+        // A bounded action-path retransmission exhaustion has the same
+        // association meaning as UDP's `AssociationStreamTimeout`: this
+        // client cannot safely continue on the retained CID.  Preserve the
+        // typed outcome so the device-keyed caller may make its one allowed
+        // fresh-association retry for catalogued reads.  Mutations never
+        // match that retry policy.
+        if run.tx_errors == 0 && run.error.as_deref().is_none_or(|error| error == "timeout") {
+            return Err(anyhow::Error::new(
+                dmesh_server::transport::AssociationStreamTimeout {
+                    attempts: u32::try_from(run.retransmit_packets.saturating_add(1))
+                        .unwrap_or(u32::MAX),
+                },
+            ));
+        }
+        anyhow::bail!(
+            "NOW directed stream incomplete: tx_packets={} tx_errors={} rx_packets={} retransmit_packets={} bootstrap_acks={} stream_packets={} other_packets={} error={}",
+            run.tx_packets,
+            run.tx_errors,
+            run.rx_packets,
+            run.retransmit_packets,
+            counters.bootstrap_acks,
+            counters.stream_packets,
+            counters.other_packets,
+            run.error.unwrap_or_else(|| "timeout".to_owned()),
+        )
+    }
+
+    /// Run the normal QUIC `probe` stream over the currently selected NOW
+    /// path. The public operation is bearer-neutral; this method is only the
+    /// frame adapter used when routing selected a MAC-addressed action path.
+    pub(crate) fn probe_on_action_path(
+        &self,
+        destination: &str,
+        request: dmesh_server::probe::ProbeServiceRequest,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let iface = wifi_iface(None);
+        let channel = raw_wifi_channel(None);
+        let peer_mac = parse_now_peer_address(destination)
+            .context("NOW probe destination must be a MAC address")?;
+        // See `forward_tagged_record_on_action_path_once`: directed QUIC
+        // traffic uses the advertised unicast MAC in A1; A3 remains broadcast.
+        let destination_mac = directed_now_destination(peer_mac);
+        let source = self
+            .now_action_source(&iface)
+            .context("NOW probe source MAC")?;
+        let requested_packet_size = request.packet_size;
+        let mut effective_request = request;
+        effective_request.packet_size = effective_request
+            .packet_size
+            .min(ACTION_PATH_MAX_PROBE_PACKET_SIZE);
+        let requested_bytes = dmesh_server::probe::ProbeServicePlan::from_request(
+            request,
+            quic_lite::DEFAULT_MAX_DATAGRAM_SIZE.saturating_sub(32),
+        )
+        .total_bytes();
+        let key = colon_mac(&peer_mac);
+        let association = {
+            let mut associations = self
+                .retained_now_tagged_associations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            associations
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(RetainedNowTaggedAssociation::new())))
+                .clone()
+        };
+        let mut association = association
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        association.retire_if_idle(now_millis_u64());
+        let mut initial = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let (mut client, initial_len) = if let Some(tagged) = association.client.take() {
+            tagged
+                .into_probe(effective_request, &mut initial)
+                .map_err(|error| anyhow::anyhow!("NOW probe stream: {error:?}"))?
+        } else {
+            let mut client = dmesh_server::transport::ProbeClient::<
+                16,
+                { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+            >::from_request(next_action_client_cid(), effective_request)
+            .map_err(|error| anyhow::anyhow!("NOW probe request: {error:?}"))?;
+            // The public probe is an ordinary MeshClient stream. Retain its
+            // first association just as a later tagged stream does; emitting
+            // CLOSE after the final probe fragment races the action peer's
+            // reset path and makes a cold probe look like a bearer failure.
+            client.set_close_when_complete(false);
+            (client, 0)
+        };
+        let run = self.run_datagram_client_over_action(
+            &iface,
+            channel,
+            destination_mac,
+            Some(peer_mac),
+            source,
+            timeout_ms.clamp(100, 120_000),
+            6,
+            "monitor",
+            (initial_len != 0).then_some(&initial[..initial_len]),
+            &mut client,
+        );
+        let completed = client.is_complete() && run.error.is_none();
+        let bytes = client.bytes();
+        let elapsed_us = u64::try_from(run.elapsed_us).unwrap_or(u64::MAX);
+        let bps = if elapsed_us == 0 {
+            0
+        } else {
+            bytes.saturating_mul(8).saturating_mul(1_000_000) / elapsed_us
+        };
+        let normal_bytes = client.normal_bytes();
+        let high_bytes = client.high_bytes();
+        let low_bytes = client.low_bytes();
+        if completed {
+            association.client = Some(client.into_tagged_client());
+            association.mark_completed(now_millis_u64());
+        } else {
+            association.reset();
+        }
+        // Keep restart recognition opaque to the frame adapter's caller.
+        // The verified token was parsed by QUIC-lite; return the typed result
+        // so MeshClient policy can discard this association and make its one
+        // allowed read-only retry without matching display text.
+        if run.peer_restarted {
+            return Err(anyhow::Error::new(quic_lite::Error::PeerRestarted));
+        }
+        Ok(json!({
+            "ok": completed,
+            "service": "probe",
+            "to": destination,
+            "path": {"kind": "now", "peer": colon_mac(&peer_mac)},
+            "requested_bytes": requested_bytes,
+            "requested_packet_size": requested_packet_size,
+            "effective_packet_size": effective_request.packet_size,
+            "bytes": bytes,
+            "normal_bytes": normal_bytes,
+            "high_bytes": high_bytes,
+            "low_bytes": low_bytes,
+            "elapsed_us": elapsed_us,
+            "bps": bps,
+            "tx_packets": run.tx_packets,
+            "tx_errors": run.tx_errors,
+            "rx_packets": run.rx_packets,
+            "retransmit_packets": run.retransmit_packets,
+            "error": run.error,
+        }))
     }
 
     /// Caller-selected CID variant used by circuit control. The relay's
     /// reverse alias must rewrite to the receive CID chosen by this QUIC
     /// endpoint, so circuit construction cannot leave CID allocation hidden
     /// inside a one-shot radio helper.
-    pub fn forward_tagged_record_over_now_with_cid(
+    pub(crate) fn forward_tagged_record_on_action_path_with_cid(
         &self,
         destination: &str,
         record: &[u8],
@@ -5697,23 +6030,29 @@ impl RadioService {
     ) -> Result<Vec<u8>> {
         let iface = wifi_iface(None);
         let channel = raw_wifi_channel(None);
-        let destination_mac = parse_mac(Some(destination))
+        let peer_mac = parse_now_peer_address(destination)
             .context("NOW directed destination must be a MAC address")?;
-        let source = raw_wifi_source(None, &iface).context("NOW directed source MAC")?;
-        let mut client = dmesh_server::raw_iperf::RawTaggedClient::<
+        // See `forward_tagged_record_on_action_path_once`: directed QUIC
+        // traffic uses the advertised unicast MAC in A1; A3 remains broadcast.
+        let destination_mac = directed_now_destination(peer_mac);
+        let source = self
+            .now_action_source(&iface)
+            .context("NOW directed source MAC")?;
+        let mut client = dmesh_server::transport::TaggedClient::<
             16,
             { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
         >::new(client_cid, record)
         .map_err(|error| anyhow::anyhow!("NOW tagged request: {error:?}"))?;
-        let run = self.run_raw_action_client(
+        let run = self.run_datagram_client_over_action(
             &iface,
             channel,
             destination_mac,
-            Some(destination_mac),
+            Some(peer_mac),
             source,
             5_000,
             6,
             "monitor",
+            None,
             &mut client,
         );
         let counters = client.counters();
@@ -5740,123 +6079,8 @@ impl RadioService {
     /// address.
     pub fn directed_now_source_mac(&self) -> Result<[u8; 6]> {
         let iface = wifi_iface(None);
-        raw_wifi_source(None, &iface).context("NOW directed source MAC")
-    }
-
-    /// Send one normal QUIC-lite status request through the raw NOW-like
-    /// bearer.  This is a production liveness/probe operation, not an IPERF
-    /// shortcut: the returned status bytes and shared transport counters are
-    /// useful to both host and firmware matrix runners.
-    pub fn raw_espnow_check(
-        &self,
-        iface: Option<String>,
-        channel: Option<u8>,
-        destination: String,
-        nonce: u64,
-        timeout_ms: Option<u64>,
-        tx_rate_mbps: Option<u64>,
-        tx_variant: Option<String>,
-        rx_variant: Option<String>,
-        expected_peer: Option<String>,
-    ) -> Value {
-        let iface = wifi_iface(iface);
-        let channel = raw_wifi_channel(channel);
-        let timeout_ms = timeout_ms.unwrap_or(5_000).clamp(1_000, 60_000);
-        let tx_rate_mbps = match tx_rate_mbps {
-            None => 6,
-            Some(rate @ (1 | 2 | 5 | 6 | 9 | 11 | 12 | 18 | 24 | 36 | 48 | 54)) => rate as u8,
-            Some(_) => {
-                return json!({"ok": false, "error": "tx_rate_mbps must be one of 1,2,5,6,9,11,12,18,24,36,48,54"});
-            }
-        };
-        let tx_variant = match tx_variant.as_deref().unwrap_or("monitor") {
-            "monitor" | "monitor_active" => tx_variant.as_deref().unwrap_or("monitor"),
-            "action" | "nl80211" => "action",
-            other => {
-                return json!({"ok": false, "error": format!("tx_variant must be monitor, action, or nl80211, got {other:?}")});
-            }
-        };
-        let rx_variant = match rx_variant.as_deref().unwrap_or("monitor") {
-            "monitor" | "monitor_active" => rx_variant.as_deref().unwrap_or("monitor"),
-            "nl80211" => "nl80211",
-            other => {
-                return json!({"ok": false, "error": format!("rx_variant must be monitor, monitor_active, or nl80211, got {other:?}")});
-            }
-        };
-        let Some(destination_mac) = parse_mac(Some(&destination)) else {
-            return json!({"ok": false, "error": "destination must be a MAC address"});
-        };
-        let expected_peer_mac = match expected_peer.as_deref() {
-            Some(value) => match parse_mac(Some(value)) {
-                Some(mac) => Some(mac),
-                None => return json!({"ok": false, "error": "expected_peer must be a MAC address"}),
-            },
-            None => None,
-        };
-        let source = match raw_wifi_source(None, &iface) {
-            Ok(mac) => mac,
-            Err(error) => {
-                return json!({"ok": false, "iface": iface, "error": format!("source MAC: {error:#}")});
-            }
-        };
-        // As with IPERF, do not create a second history listener on the
-        // sender's monitor VIF. The direct bounded socket is opened by the
-        // raw action loop and shares the same prepared VIF with TX.
-        let listen = json!({
-            "ok": true,
-            "backend": "linux_af_packet_monitor_direct",
-            "iface": iface,
-            "channel": channel,
-            "rx_variant": rx_variant,
-        });
-        let Some(client_cid) = quic_lite::ConnectionId::new(now_millis_u64().max(1)) else {
-            return json!({"ok": false, "error": "could not allocate client CID"});
-        };
-        let mut client = dmesh_server::raw_iperf::RawCheckClient::<
-            16,
-            { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-        >::new(client_cid, nonce);
-        let run = self.run_raw_action_client(
-            &iface,
-            channel,
-            destination_mac,
-            expected_peer_mac,
-            source,
-            timeout_ms,
-            tx_rate_mbps,
-            tx_variant,
-            &mut client,
-        );
-        let response_hex = client.response().map(hex_lower);
-        let counters = client.counters();
-        let result = json!({
-            "ok": client.is_complete() && run.error.is_none(),
-            "bearer": "espnow_raw_action",
-            "service": "status",
-            "iface": iface,
-            "channel": channel,
-            "destination": destination,
-            "expected_peer": expected_peer,
-            "nonce": nonce,
-            "tx_rate_mbps": tx_rate_mbps,
-            "tx_variant": tx_variant,
-            "rx_variant": rx_variant,
-            "elapsed_us": run.elapsed_us,
-            "tx_packets": run.tx_packets,
-            "tx_errors": run.tx_errors,
-            "last_tx": run.last_tx,
-            "rx_packets": run.rx_packets,
-            "counters": {
-                "bootstrap_acks": counters.bootstrap_acks,
-                "stream_packets": counters.stream_packets,
-                "other_packets": counters.other_packets,
-            },
-            "response_hex": response_hex,
-            "listen": listen,
-            "error": run.error,
-        });
-        self.record("wifi.raw.check", result.clone());
-        result
+        self.now_action_source(&iface)
+            .context("NOW directed source MAC")
     }
 
     /// Capture beacon and probe-response management frames through an AF_PACKET monitor socket.
@@ -5989,26 +6213,6 @@ impl RadioService {
         });
         self.record("wifi.mgmt.capture", result.clone());
         Ok(result)
-    }
-
-    fn raw_wifi_ping_replies(&self, since_ms: u64, iface: &str) -> Vec<Value> {
-        self.history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|event| event.ts_millis as u64 >= since_ms)
-            .filter(|event| event.key == "wifi.raw.rx")
-            .filter_map(|event| {
-                let payload = event.value.get("payload_text")?.as_str()?;
-                if !payload.starts_with("dmesh.ping ") || !payload.contains("reply=true") {
-                    return None;
-                }
-                if event.value.get("iface").and_then(Value::as_str) != Some(iface) {
-                    return None;
-                }
-                Some(event.value.clone())
-            })
-            .collect()
     }
 
     fn record(&self, key: &str, value: Value) {
@@ -6215,30 +6419,6 @@ fn decode_firmware_hex(value: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).map_err(Into::into))
         .collect()
-}
-
-/// Encode a one-hop raw-NAN ping request.  This remains a host radio helper:
-/// it never opens a UART and uses the documented firmware command envelope.
-fn firmware_targeted_command_cbor_with_timeout(
-    command: &str,
-    target: &str,
-    timeout_ms: Option<u32>,
-) -> Result<Vec<u8>> {
-    if !command.trim().eq_ignore_ascii_case("ping") {
-        bail!("raw Wi-Fi helper only supports the documented ping request");
-    }
-    let mut bytes = Vec::with_capacity(56);
-    let mut encoder = Encoder::new(&mut bytes);
-    let argument_count = 2 + usize::from(timeout_ms.is_some());
-    encoder.map(2)?;
-    encoder.u16(0)?.u16(49)?;
-    encoder.u16(6)?.map(argument_count as u64)?;
-    encoder.u16(190)?.str("true")?;
-    encoder.u16(331)?.str(target)?;
-    if let Some(timeout_ms) = timeout_ms {
-        encoder.u16(41)?.str(&timeout_ms.to_string())?;
-    }
-    Ok(bytes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -8589,7 +8769,7 @@ fn ensure_monitor_iface(
 }
 
 /// Test-facing monitor users may only consume the persistent fixture.  Radio
-/// setup is deliberately kept out of this helper so a listener/check/iperf
+/// setup is deliberately kept out of this helper so a listener/check/probe
 /// request cannot disturb a live AP or make a passive local loopback appear
 /// to be an RF result.
 fn require_existing_monitor_iface(monitor_iface: &str) -> Result<Value> {
@@ -10537,8 +10717,8 @@ fn raw_action_response_repetitions() -> usize {
 /// rebuilding either supervised service. The shared default remains the
 /// normal eight-packet profile; this is a diagnostic knob, not a retained
 /// one-packet stop-and-wait policy.
-fn raw_action_association_profile() -> dmesh_server::raw_iperf::RawAssociationProfile {
-    let mut profile = dmesh_server::raw_iperf::RawAssociationProfile::c6_default();
+fn raw_action_association_profile() -> quic_lite::AssociationProfile {
+    let mut profile = quic_lite::AssociationProfile::c6_default();
     if let Ok(value) = std::env::var("DMESH_RAW_ACTION_HISTORY") {
         if let Ok(value) = value.parse::<usize>() {
             profile.history_packets = value.clamp(1, 16);
@@ -10584,16 +10764,8 @@ fn monitor_receive_loop(
     active_nan_publish: Arc<Mutex<NanActivePublish>>,
     pending_nan_active_subscribe: Arc<Mutex<Option<PendingNanActiveSubscribe>>>,
     pending_nan_followups: Arc<Mutex<dmesh_rawnan::NanFollowupQueue>>,
-    raw_action_dispatcher: Arc<
-        Mutex<
-            Option<
-                dmesh_server::raw_iperf::RawIperfDispatcher<
-                    16,
-                    { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-                >,
-            >,
-        >,
-    >,
+    pending_now_discovery: Arc<Mutex<HashMap<u64, PendingNowDiscovery>>>,
+    connection_runtime: ActionConnectionRuntime,
     p2p_group_ifaces: Arc<Mutex<BTreeMap<String, String>>>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -10629,17 +10801,10 @@ fn monitor_receive_loop(
         // response was lost. AF_PACKET timeouts wake this loop without a
         // second queue or transport-owned packet buffer.
         let mut timer_response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-        let timer_path = raw_action_dispatcher
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .and_then(|dispatcher| dispatcher.reply_path());
+        let timer_path = connection_runtime.reply_path();
         if let Some(path) = timer_path
-            && let Ok(Some(used)) = raw_action_dispatcher
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_mut()
-                .expect("reply path implies dispatcher")
+            && let Some(peer) = action_path_peer(path)
+            && let Ok(Some(used)) = connection_runtime
                 // Raw QUIC endpoint clocks are milliseconds.  Keep PTO in the
                 // same unit as the dispatcher set_time call above.
                 .poll_retransmit_for(path, now_millis_u64(), 100, &mut timer_response)
@@ -10647,16 +10812,13 @@ fn monitor_receive_loop(
                 Some(socket) => send_raw_action_datagram_on_socket(
                     iface,
                     socket,
-                    path.peer,
+                    peer,
                     &timer_response[..used],
                     last_action_rate,
                 ),
-                None => send_raw_action_datagram(
-                    iface,
-                    path.peer,
-                    &timer_response[..used],
-                    last_action_rate,
-                ),
+                None => {
+                    send_raw_action_datagram(iface, peer, &timer_response[..used], last_action_rate)
+                }
             }
         {
             push_radio_event(
@@ -10668,7 +10830,7 @@ fn monitor_receive_loop(
                     value: json!({
                         "ok": false,
                         "timer_retransmit": true,
-                        "peer": colon_mac(&path.peer),
+                        "peer": colon_mac(&peer),
                         "error": format!("{error:#}"),
                     }),
                     message: None,
@@ -10840,7 +11002,14 @@ fn monitor_receive_loop(
                     // by the host's ordinary receive MAC.  Admit raw data
                     // payloads as well as the legacy IPv6/UDP diagnostic.
                     let nan_data = is_nan_data_frame(frame);
-                    if raw_wifi_receive_address_allowed(frame, &receive_addresses) || nan_data {
+                    // `local_action_addresses` includes the P2P-GO address
+                    // when the monitor is anchored on its parent interface.
+                    // A NOW peer replies to the source address it observed,
+                    // which is that GO address; filtering only the anchor
+                    // aliases here silently dropped the reply before the
+                    // bearer-neutral QUIC dispatcher could receive it.
+                    if raw_wifi_receive_address_allowed(frame, &local_action_addresses) || nan_data
+                    {
                         if let Some(mut value) =
                             parse_dmesh_wifi_frame(frame, iface, "linux_af_packet_monitor")
                         {
@@ -10904,19 +11073,68 @@ fn monitor_receive_loop(
                         if local_action_addresses.iter().any(|local| *local == peer) {
                             continue;
                         }
-                        let payload = &action_payload[..payload_len];
-                        // A NOW reply to `transport.discover` is the common
-                        // bounded announce record, not a QUIC-lite datagram.
+                        let packet = &action_payload[..payload_len];
+                        // A NOW reply to directed `announce.discovery` is a
+                        // connectionless QUIC long-header packet. NAN service
+                        // discovery is different: it carries its bounded CBOR
+                        // record inside SDEA and is not a data bearer.
+                        if action_payload_is_direct(packet) {
+                            let Some(payload) =
+                                dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                            else {
+                                continue;
+                            };
                         // Admit it before the raw endpoint so action-frame
                         // discovery updates the same registry as NAN SDF.
                         if let Some(announce) = dmesh_server::announce::decode_announce(payload)
                             && announce_identity_valid(announce)
                         {
                             let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
+                            let peer_text = colon_mac(&peer);
                             discovered_devices
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .observe_announce("now", colon_mac(&peer), bssid.clone(), announce);
+                                .observe_announce(
+                                    "now",
+                                    peer_text.clone(),
+                                    bssid.clone(),
+                                    announce,
+                                );
+                            // A directed check is complete only when this is
+                            // the signed announce carrying its request ID and
+                            // it arrived from the selected NOW peer. Ordinary
+                            // unsolicited announcements still update the
+                            // inventory above, but never satisfy a check.
+                            if let Some(request_id) =
+                                dmesh_server::tagged::decode(payload).and_then(|record| record.id)
+                            {
+                                let pending = pending_now_discovery
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .remove(&request_id);
+                                if let Some(waiter) = pending {
+                                    if waiter.peer == peer {
+                                        let _ = waiter.reply.send(json!({
+                                            "authenticated": true,
+                                            "source": peer_text,
+                                            "announce": {
+                                                "kind": announce.kind,
+                                                "device_id": hex_bytes(announce.device_id()),
+                                                "device_name": announce.device_name(),
+                                                "uptime_secs": announce.uptime_secs,
+                                                "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
+                                            },
+                                        }));
+                                    } else {
+                                        // Preserve the waiter when an attacker
+                                        // or an unrelated peer reuses an ID.
+                                        pending_now_discovery
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .insert(request_id, waiter);
+                                    }
+                                }
+                            }
                             push_radio_event(
                                 &history,
                                 RadioEvent {
@@ -10960,46 +11178,22 @@ fn monitor_receive_loop(
                             );
                             continue;
                         }
-                        if let Some((role, partition)) =
-                            dmesh_server::direct_iperf::decode_boot_identity_payload(payload)
-                        {
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.raw.boot".to_string(),
-                                    source: monitor_iface.to_string(),
-                                    value: json!({
-                                        "peer": colon_mac(&peer),
-                                        "role": role,
-                                        "partition": partition,
-                                    }),
-                                    message: None,
-                                },
-                            );
-                            continue;
+                        // A direct envelope has either updated presence above
+                        // or is a separately allowlisted connectionless
+                        // operation. It is never a normal association frame.
+                        // In particular, do not hand its inner tagged record
+                        // to the QUIC dispatcher, and do not make ordinary
+                        // short-header QUIC packets pass this direct decoder.
+                        continue;
                         }
                         let mut response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-                        let path = dmesh_server::raw_iperf::RawIngressPath {
-                            transport_id: 2,
-                            peer,
-                        };
-                        let dispatch_result = {
-                            let mut dispatcher = raw_action_dispatcher
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let dispatcher = dispatcher.get_or_insert_with(|| {
-                                let cid = quic_lite::ConnectionId::new(now_millis_u64().max(1))
-                                    .expect("non-zero raw action server CID");
-                                dmesh_server::raw_iperf::RawIperfDispatcher::new(
-                                    cid,
-                                    quic_lite::ConnectionLimits::default(),
-                                    raw_action_association_profile(),
-                                )
-                            });
-                            dispatcher.set_time(now_millis_u64());
-                            dispatcher.receive(path, payload, &mut response)
-                        };
+                        let path = action_path_id(peer);
+                        let dispatch_result = connection_runtime.receive_at(
+                            path,
+                            packet,
+                            now_millis_u64(),
+                            &mut response,
+                        );
                         match dispatch_result {
                             Ok(Some(used)) => {
                                 let sent = match tx_socket.as_ref() {
@@ -11017,11 +11211,8 @@ fn monitor_receive_loop(
                                         last_action_rate,
                                     ),
                                 };
-                                let transport = raw_action_dispatcher
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .as_ref()
-                                    .and_then(|dispatcher| dispatcher.transport_stats())
+                                let transport = connection_runtime
+                                    .transport_stats()
                                     .map(|stats| {
                                         json!({
                                             "received_datagrams": stats.received_datagrams,
@@ -11042,24 +11233,17 @@ fn monitor_receive_loop(
                                             "ack_frequency_sent": stats.ack_frequency_sent,
                                         })
                                     });
-                                let ack_state = raw_action_dispatcher
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .as_ref()
-                                    .and_then(|dispatcher| dispatcher.transport_ack_state())
-                                    .map(|(largest_acked, bytes_in_flight, congestion_window)| {
+                                let ack_state = connection_runtime.transport_ack_state().map(
+                                    |(largest_acked, bytes_in_flight, congestion_window)| {
                                         json!({
                                             "largest_acked_by_peer": largest_acked,
                                             "bytes_in_flight": bytes_in_flight,
                                             "congestion_window": congestion_window,
                                         })
-                                    });
-                                let debug_state = raw_action_dispatcher
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .as_ref()
-                                    .and_then(|dispatcher| dispatcher.transport_debug_state())
-                                    .map(|state| {
+                                    },
+                                );
+                                let debug_state =
+                                    connection_runtime.connection_debug_state().map(|state| {
                                         json!({
                                             "received_ranges": state.received_ranges,
                                             "peer_ack_ranges": state.peer_ack_ranges,
@@ -11091,13 +11275,7 @@ fn monitor_receive_loop(
                                 // active; no adapter-owned egress queue is
                                 // introduced and QUIC retains every packet in
                                 // its normal bounded ledger.
-                                let burst = raw_action_dispatcher
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .as_ref()
-                                    .map(|dispatcher| dispatcher.tx_burst_packets())
-                                    .unwrap_or(1)
-                                    .max(1);
+                                let burst = connection_runtime.tx_burst_packets().max(1);
                                 for _ in 1..burst {
                                     let mut burst_response =
                                         [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
@@ -11107,17 +11285,10 @@ fn monitor_receive_loop(
                                     std::thread::sleep(Duration::from_millis(
                                         raw_action_burst_gap_ms(),
                                     ));
-                                    let next = {
-                                        let mut dispatcher = raw_action_dispatcher
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                        dispatcher.as_mut().and_then(|dispatcher| {
-                                            dispatcher
-                                                .poll_for(path, &mut burst_response)
-                                                .ok()
-                                                .flatten()
-                                        })
-                                    };
+                                    let next = connection_runtime
+                                        .poll_for(path, &mut burst_response)
+                                        .ok()
+                                        .flatten();
                                     let Some(next) = next else { break };
                                     let burst_sent = match tx_socket.as_ref() {
                                         Some(socket) => send_raw_action_datagram_on_socket(
@@ -12494,7 +12665,7 @@ fn host_capture_metrics_json() -> Value {
 fn retain_discovery_event(event: &RadioEvent) -> bool {
     // A directed NAN follow-up is an application receipt, not a periodic
     // presence refresh. Retain it even when it immediately follows a discovery
-    // record for the same peer so `nan.status` cannot lose the completion.
+    // record for the same peer so `telemetry.nan_status` cannot lose the completion.
     if event
         .value
         .get("followup")
@@ -12745,6 +12916,14 @@ fn raw_wifi_source_mode(value: Option<&str>) -> &'static str {
 fn raw_receive_mac(mut mac: [u8; 6]) -> [u8; 6] {
     mac[0] ^= 0x01;
     mac
+}
+
+/// Directed NOW QUIC traffic uses the selected peer address unchanged in
+/// 802.11 address 1.  `raw_receive_mac` is retained only for legacy monitor
+/// filtering and discovery experiments; applying it to a directed sender
+/// turns a unicast address into a group address.
+fn directed_now_destination(peer: [u8; 6]) -> [u8; 6] {
+    peer
 }
 
 fn frame_type(frame: &[u8]) -> u8 {
@@ -13649,6 +13828,32 @@ fn parse_device_id(value: Option<&str>) -> Option<[u8; 6]> {
     Some(out)
 }
 
+/// Decode the stable peer address used by the directed NOW API.  `rx:` and
+/// `raw:` are accepted for diagnostics, but are framing details rather than a
+/// second peer identity: the reply source and association key remain the
+/// ordinary MAC supplied after the prefix.
+fn parse_now_peer_address(value: &str) -> Option<[u8; 6]> {
+    let stable = value
+        .strip_prefix("rx:")
+        .or_else(|| value.strip_prefix("raw:"))
+        .unwrap_or(value);
+    parse_device_id(Some(stable))
+}
+
+/// Return the action-frame address-1 for a public NOW peer address.
+///
+/// ESP raw action ingress listens on the derived receive address. Existing
+/// explicit `rx:`/`raw:` inputs retain their spelling so a packet-level test
+/// can request exactly one conversion, while ordinary callers simply pass a
+/// stable catalog/discovery MAC.
+fn now_wire_destination(destination: &str) -> String {
+    if destination.starts_with("rx:") || destination.starts_with("raw:") {
+        destination.to_owned()
+    } else {
+        format!("rx:{destination}")
+    }
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -13700,6 +13905,70 @@ mod tests {
     use p256::SecretKey;
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
+
+    #[test]
+    fn peer_restart_marker_does_not_match_an_ambiguous_bearer_error() {
+        assert!(dmesh_server::transport::is_peer_restarted_error(
+            &anyhow::Error::new(quic_lite::Error::PeerRestarted)
+        ));
+        assert!(!dmesh_server::transport::is_peer_restarted_error(
+            &anyhow::anyhow!("raw action timeout")
+        ));
+    }
+
+    #[test]
+    fn action_filter_admits_a_p2p_go_reply_address() {
+        let anchor = [0x9c, 0xef, 0xd5, 0xf6, 0x36, 0x47];
+        let group = [0x9a, 0xef, 0xd5, 0xf6, 0x36, 0x47];
+        let mut addresses = vec![anchor, raw_receive_mac(anchor), RAW_WIFI_MULTICAST];
+        addresses.push(group);
+        let mut frame = [0_u8; IEEE80211_BODY];
+        frame[IEEE80211_ADDR1..IEEE80211_ADDR1 + 6].copy_from_slice(&group);
+
+        assert!(raw_wifi_receive_address_allowed(&frame, &addresses));
+    }
+
+    #[test]
+    fn directed_now_quic_keeps_the_advertised_unicast_address() {
+        let peer = [0x14, 0xc1, 0x9f, 0xe4, 0x5d, 0x48];
+        assert_eq!(directed_now_destination(peer), peer);
+        assert_ne!(directed_now_destination(peer), raw_receive_mac(peer));
+    }
+
+    #[test]
+    fn action_ingress_keeps_normal_quic_packets_out_of_direct_decoder() {
+        let mut direct = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let direct_used = dmesh_server::direct::ConnectionlessMessage::encode(b"direct", &mut direct)
+            .expect("direct envelope");
+        assert!(action_payload_is_direct(&direct[..direct_used]));
+
+        let mut stream = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        let stream_used = quic_lite::encode_one_way_packet(
+            quic_lite::ConnectionId::new(7).unwrap(),
+            1,
+            b"stream",
+            &mut stream,
+        )
+        .expect("normal association packet");
+        assert!(!action_payload_is_direct(&stream[..stream_used]));
+    }
+
+    #[test]
+    fn retained_now_association_retires_only_after_idle_window() {
+        let mut association = RetainedNowTaggedAssociation::new();
+        association.client = Some(
+            dmesh_server::transport::TaggedClient::new(
+                quic_lite::ConnectionId::new(17).unwrap(),
+                &[0xa3, 1, 6, 2, 1, 3, 1],
+            )
+            .unwrap(),
+        );
+        association.mark_completed(100);
+        association.retire_if_idle(100 + NOW_ASSOCIATION_IDLE_RETIRE_MS - 1);
+        assert!(association.client.is_some());
+        association.retire_if_idle(100 + NOW_ASSOCIATION_IDLE_RETIRE_MS);
+        assert!(association.client.is_none());
+    }
 
     #[test]
     fn announce_identity_validation_accepts_unsigned_devices_and_rejects_fake_hosts() {
@@ -13779,7 +14048,67 @@ mod tests {
     }
 
     #[test]
+    fn directed_discovery_reply_does_not_erase_advertised_udp_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
+        let mut id = [0_u8; 16];
+        id[..10].copy_from_slice(b"android-p7");
+        let mut multicast = dmesh_server::announce::Announce::discovery(id, 10, 1);
+        multicast.set_udp_port(3336);
+        multicast.set_udp_link_local_v6("fe80::1234".parse::<Ipv6Addr>().unwrap().octets());
+        registry.observe_announce(
+            "udp_multicast",
+            "[fe80::1234%5]:5227".to_owned(),
+            None,
+            multicast,
+        );
+
+        // The generic directed reply has no sender-local endpoint because it
+        // cannot know which local interface carried the request.
+        let reply = dmesh_server::announce::Announce::discovery(id, 10, 2);
+        registry.observe_announce(
+            "udp_multicast",
+            "[fe80::1234%5]:3336".to_owned(),
+            None,
+            reply,
+        );
+
+        let entry = registry.devices.get(&hex_bytes(&id[..10])).unwrap();
+        assert_eq!(entry.announce["udp_link_local_v6"], "fe80::1234");
+        assert_eq!(entry.announce["udp_port"], 3336);
+        assert_eq!(entry.observations["udp_multicast"].last_peer, "[fe80::1234%5]:3336");
+    }
+
+    #[test]
+    fn directed_discovery_reply_seeds_cold_inventory_from_unicast_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
+        let mut id = [0_u8; 16];
+        id[..10].copy_from_slice(b"android-s2");
+        registry.observe_announce(
+            "udp_multicast",
+            "[fe80::5678%5]:3336".to_owned(),
+            None,
+            dmesh_server::announce::Announce::discovery(id, 10, 1),
+        );
+
+        let entry = registry.devices.get(&hex_bytes(&id[..10])).unwrap();
+        assert_eq!(entry.announce["udp_link_local_v6"], "fe80::5678");
+        assert_eq!(entry.announce["udp_port"], 3336);
+    }
+
+    #[test]
     fn discovery_presentation_hides_internal_route_and_key_material() {
+        let mut now = CommonDiscoveryObservation::new(1, OBSERVATION_PEER);
+        now.observe(
+            2,
+            DiscoveryPacketKind::Other,
+            "02:00:00:00:00:11",
+            None,
+            None,
+            None,
+            &[],
+        );
         let entry = DiscoveredDevice {
             device_id: "device".to_owned(),
             last_seen_ms: now_millis(),
@@ -13792,7 +14121,7 @@ mod tests {
                 "route_key": "internal-route",
                 "vip6": "fc00::11",
             }),
-            observations: BTreeMap::new(),
+            observations: BTreeMap::from([("now".to_owned(), now)]),
         };
         let value = discovered_device_json(&entry);
         assert!(value.get("id").is_none());
@@ -13802,6 +14131,10 @@ mod tests {
         assert!(value["announce"].get("device_id").is_none());
         assert!(value["announce"].get("public_key").is_none());
         assert!(value["announce"].get("route_key").is_none());
+        assert_eq!(
+            value["observations"]["now"]["last_peer"],
+            "02:00:00:00:00:11"
+        );
     }
 
     #[test]
@@ -14095,7 +14428,8 @@ mod tests {
         let dst = [0x14, 0xc1, 0x9f, 0xe5, 0x98, 0x00];
         let src = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
         let bssid = [0x50, 0x6f, 0x9a, 0x01, 0x54, 0x6c];
-        let frame = build_dmesh_vendor_action_frame_with_bssid(dst, src, bssid, b"DMTB").unwrap();
+        let frame =
+            build_dmesh_vendor_action_frame_with_bssid(dst, src, bssid, b"mesh-test").unwrap();
 
         assert_eq!(&frame[4..10], &dst); // A1: addressed device
         assert_eq!(&frame[10..16], &src); // A2: host Wi-Fi adapter
@@ -14224,7 +14558,7 @@ mod tests {
         let bssid = [0x50, 0x6f, 0x9a, 1, 2, 3];
         let src = [0x02, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
         let dst = RAW_WIFI_MULTICAST;
-        let payload = b"DMTB-test";
+        let payload = b"mesh-test";
         let frame = build_dmesh_nan_raw_data_frame(bssid, dst, src, &RAWNAN_LLC_DEFAULT, payload);
         assert_eq!(&frame[IEEE80211_ADDR1..IEEE80211_ADDR1 + 6], &dst);
         assert_eq!(&frame[IEEE80211_ADDR3..IEEE80211_ADDR3 + 6], &bssid);
@@ -14234,7 +14568,7 @@ mod tests {
         );
         let parsed = parse_dmesh_wifi_frame(&frame, "wlan1", "test").unwrap();
         assert_eq!(parsed["layout"], "nan_raw_data");
-        assert_eq!(parsed["payload_text"], "DMTB-test");
+        assert_eq!(parsed["payload_text"], "mesh-test");
     }
 
     #[test]
@@ -14432,6 +14766,25 @@ BSS 44:94:fc:e4:84:15(on wlan1)
     }
 
     #[test]
+    fn directed_now_keeps_peer_identity_but_uses_receive_alias_on_wire() {
+        let peer = [0x14, 0xc1, 0x9f, 0xe4, 0x5d, 0x48];
+        assert_eq!(parse_now_peer_address("14:c1:9f:e4:5d:48"), Some(peer));
+        assert_eq!(
+            now_wire_destination("14:c1:9f:e4:5d:48"),
+            "rx:14:c1:9f:e4:5d:48"
+        );
+        assert_eq!(
+            raw_wifi_destination(Some(&now_wire_destination("14:c1:9f:e4:5d:48")), "monitor"),
+            [0x15, 0xc1, 0x9f, 0xe4, 0x5d, 0x48]
+        );
+        assert_eq!(parse_now_peer_address("rx:14:c1:9f:e4:5d:48"), Some(peer));
+        assert_eq!(
+            now_wire_destination("rx:14:c1:9f:e4:5d:48"),
+            "rx:14:c1:9f:e4:5d:48"
+        );
+    }
+
+    #[test]
     fn transport_cleanup_releases_anchor_and_legacy_wpa_owners() {
         assert_eq!(
             wpa_owner_iface_names("wlan1", "wlan1sta"),
@@ -14470,5 +14823,14 @@ BSS 44:94:fc:e4:84:15(on wlan1)
         );
         assert_eq!(result["dmesh"].as_array().unwrap().len(), 1);
         assert_eq!(result["dmesh"][0]["bssid"], "02:00:00:00:00:06");
+    }
+
+    #[test]
+    fn concurrent_action_clients_never_share_a_timestamp_derived_cid() {
+        let first = next_action_client_cid();
+        let second = next_action_client_cid();
+        assert_ne!(first, second);
+        assert_ne!(first.value(), 0);
+        assert_ne!(second.value(), 0);
     }
 }

@@ -1,4 +1,4 @@
-//! Standalone current-build transport listener for host and firmware IPERF.
+//! Standalone current-build transport listener for host and firmware probes.
 //! It intentionally does not own or restart either managed Wi-Fi service.
 
 use dmesh_server::udp::{TransportControl, UdpConfig, run};
@@ -68,9 +68,9 @@ async fn main() -> anyhow::Result<()> {
         // Keep object records below the one shared QUIC-lite bearer MTU.
         // UdpConfig's default reserves the framing headroom required by all
         // bearers, including UART and extended vendor-action frames.
-        iperf_pace: Duration::from_micros(pace_us),
-        iperf_burst_packets: burst_packets,
-        iperf_burst_delay: Duration::from_micros(burst_delay_us),
+        probe_pace: Duration::from_micros(pace_us),
+        probe_burst_packets: burst_packets,
+        probe_burst_delay: Duration::from_micros(burst_delay_us),
         history_capacity,
         ip_tos,
         control: Some(control),

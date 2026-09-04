@@ -6,15 +6,21 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::mux::StreamMux;
-use crate::{
-    ConnectionId, ConnectionLimits, DatagramBearer, Error, Role, SERVICE_ECHO, SERVICE_EVENTS,
-    SERVICE_IPERF, SERVICE_METRICS, SERVICE_STREAM,
+use crate::{ConnectionId, ConnectionLimits, DatagramBearer, Error, Role};
+
+const TEST_SERVICE_ECHO: u8 = 2;
+const TEST_SERVICE_STREAM: u8 = 4;
+const TEST_SERVICE_METRICS: u8 = 6;
+const TEST_SERVICE_EVENTS: u8 = 7;
+#[cfg(test)]
+use self::{
+    TEST_SERVICE_ECHO as SERVICE_ECHO, TEST_SERVICE_EVENTS as SERVICE_EVENTS,
+    TEST_SERVICE_METRICS as SERVICE_METRICS, TEST_SERVICE_STREAM as SERVICE_STREAM,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamOperation {
     Echo,
-    Iperf,
     Metrics,
     Events,
     Registry,
@@ -23,18 +29,16 @@ pub enum StreamOperation {
 impl StreamOperation {
     fn service(self) -> u8 {
         match self {
-            Self::Echo => SERVICE_ECHO,
-            Self::Iperf => SERVICE_IPERF,
-            Self::Metrics => SERVICE_METRICS,
-            Self::Events => SERVICE_EVENTS,
-            Self::Registry => SERVICE_STREAM,
+            Self::Echo => TEST_SERVICE_ECHO,
+            Self::Metrics => TEST_SERVICE_METRICS,
+            Self::Events => TEST_SERVICE_EVENTS,
+            Self::Registry => TEST_SERVICE_STREAM,
         }
     }
 
     fn body(self) -> &'static [u8] {
         match self {
             Self::Echo | Self::Metrics | Self::Registry => b"",
-            Self::Iperf => b"\0\0\0\0\0\0\0\x20payload",
             Self::Events => b"since=0",
         }
     }
@@ -406,7 +410,6 @@ mod tests {
         let results = run_stream_operations(
             &[
                 StreamOperation::Echo,
-                StreamOperation::Iperf,
                 StreamOperation::Metrics,
                 StreamOperation::Events,
                 StreamOperation::Registry,
@@ -418,15 +421,14 @@ mod tests {
             },
         )
         .unwrap_or_else(|error| panic!("operation failed: {error:?}"));
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 4);
         assert_eq!(results[0].response, vec![SERVICE_ECHO]);
-        assert_eq!(results[1].response[0], SERVICE_IPERF);
-        assert_eq!(results[2].response, vec![SERVICE_METRICS]);
+        assert_eq!(results[1].response, vec![SERVICE_METRICS]);
         assert_eq!(
-            results[3].response,
+            results[2].response,
             vec![SERVICE_EVENTS, b's', b'i', b'n', b'c', b'e', b'=', b'0']
         );
-        assert_eq!(results[4].response, vec![SERVICE_STREAM]);
+        assert_eq!(results[3].response, vec![SERVICE_STREAM]);
     }
 
     #[test]
@@ -568,7 +570,6 @@ mod tests {
             StreamOperation::Echo,
             StreamOperation::Metrics,
             StreamOperation::Events,
-            StreamOperation::Iperf,
             StreamOperation::Registry,
         ];
         let faults = FaultConfig {

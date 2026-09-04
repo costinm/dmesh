@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 
 /// Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake
 /// mesh-api: summary = "Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake"
-/// mesh-api: id = "transport.start"
+/// mesh-api: id = "transport.set"
 /// mesh-api: component = "transport"
-/// mesh-api: method = "start"
+/// mesh-api: method = "set"
 /// mesh-api: visibility = "public"
 /// mesh-api: component-index = 1
 /// mesh-api: method-index = 4
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportStartRequest {
+pub struct TransportSetRequest {
     /// API field `kind`.
     /// mesh-api-field: index = 1
     /// mesh-api-field: required = true
@@ -65,38 +65,15 @@ pub struct TransportStartRequest {
 
 /// Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake
 /// mesh-api: summary = "Replace a node's volatile physical transport profile; NAN DW8 with NOW off is sleepy, while DW1 with NOW on is awake"
-/// mesh-api: id = "transport.start"
+/// mesh-api: id = "transport.set"
 /// mesh-api: component = "transport"
-/// mesh-api: method = "start"
+/// mesh-api: method = "set"
 /// mesh-api: visibility = "public"
 /// mesh-api: component-index = 1
 /// mesh-api: method-index = 4
 /// mesh-api: shape = "response"
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportStartResponse;
-
-/// Stop the selected local transport epoch
-/// mesh-api: summary = "Stop the selected local transport epoch"
-/// mesh-api: id = "transport.stop"
-/// mesh-api: component = "transport"
-/// mesh-api: method = "stop"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 5
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportStopRequest;
-
-/// Stop the selected local transport epoch
-/// mesh-api: summary = "Stop the selected local transport epoch"
-/// mesh-api: id = "transport.stop"
-/// mesh-api: component = "transport"
-/// mesh-api: method = "stop"
-/// mesh-api: visibility = "public"
-/// mesh-api: component-index = 1
-/// mesh-api: method-index = 5
-/// mesh-api: shape = "response"
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TransportStopResponse;
+pub struct TransportSetResponse;
 
 /// Send a mesh payload over the selected radio
 /// mesh-api: summary = "Send a mesh payload over the selected radio"

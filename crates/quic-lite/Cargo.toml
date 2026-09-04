@@ -8,6 +8,11 @@ publish = false
 default = []
 std = []
 
+[dependencies]
+hmac = { version = "0.13", default-features = false }
+mesh-api = { path = "../../../rust/ssh-mesh/crates/mesh-api" }
+sha2 = { version = "0.11", default-features = false }
+
 [lib]
 name = "quic_lite"
 path = "src/lib.rs"

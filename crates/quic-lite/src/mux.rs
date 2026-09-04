@@ -5,7 +5,7 @@
 //! radio, timer, and peer-address policy stays outside this module.
 
 use crate::callback::{CallbackStreams, CopyingError, CopyingStreamEvents};
-use crate::{ConnectionId, EndpointState, Error, Role, TransportPacket};
+use crate::{ConnectionId, EndpointState, Error, Role};
 use alloc::{sync::Arc, vec::Vec};
 
 #[derive(Default)]
@@ -208,9 +208,14 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             Ok(packet) => packet,
             Err(error) => return Err(error),
         };
-        let TransportPacket::Stream { .. } = packet else {
-            return Ok(None);
-        };
+        // EndpointState reports the first transport-class result for a
+        // complete datagram. A later request commonly piggybacks its STREAM
+        // frame with the ACK for the preceding server response, in which case
+        // that result is `Control` even though the validated frame list above
+        // contains a stream. The mux has already staged every STREAM frame;
+        // deliver those frames after any accepted packet rather than silently
+        // losing a valid stream behind an ACK.
+        let _ = packet;
         let mut first = None;
         for frame in parsed_streams {
             let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
@@ -291,6 +296,20 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         fin: bool,
         out: &mut [u8],
     ) -> Result<(usize, u32), Error> {
+        self.encode_response_at(stream_id, 0, data, fin, out)
+    }
+
+    /// Encode one contiguous response-stream fragment.  Application handlers
+    /// remain oblivious to bearer MTU: the QUIC terminal chooses fragments and
+    /// retains their shared stream offset for UDP, UART, NOW, and NAN alike.
+    pub fn encode_response_at(
+        &mut self,
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        out: &mut [u8],
+    ) -> Result<(usize, u32), Error> {
         if self
             .endpoint
             .open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)
@@ -303,16 +322,17 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             .peer_connection_id()
             .ok_or(Error::WrongConnectionId)?;
         self.endpoint
-            .encode_stream_packet(peer, stream_id, 0, fin, data, out)
+            .encode_stream_packet(peer, stream_id, offset, fin, data, out)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    const SERVICE_ECHO: u8 = 2;
+    const SERVICE_STATUS: u8 = 3;
+    const SERVICE_METRICS: u8 = 6;
     use super::*;
-    use crate::{
-        ConnectionId, ConnectionLimits, FIRST_CLIENT_BIDI_STREAM_ID, Role, SERVICE_METRICS,
-    };
+    use crate::{ConnectionId, ConnectionLimits, FIRST_CLIENT_BIDI_STREAM_ID, Role};
 
     #[test]
     fn persistent_mux_reassembles_multiple_streams_and_exposes_metrics() {
@@ -376,7 +396,7 @@ mod tests {
                 4,
                 0,
                 false,
-                &[crate::SERVICE_ECHO, b'b', b'a', b'd'],
+                &[SERVICE_ECHO, b'b', b'a', b'd'],
                 &mut packet,
             )
             .unwrap();
@@ -388,7 +408,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             response.data,
-            [crate::SERVICE_ECHO, b'b', b'a', b'd', b'i', b'c', b's']
+            [SERVICE_ECHO, b'b', b'a', b'd', b'i', b'c', b's']
         );
     }
 
@@ -421,7 +441,7 @@ mod tests {
                     stream,
                     0,
                     false,
-                    &[crate::SERVICE_ECHO, b'\x10' + stream as u8],
+                    &[SERVICE_ECHO, b'\x10' + stream as u8],
                     &mut packet,
                 )
                 .unwrap();
@@ -440,14 +460,7 @@ mod tests {
             assert_eq!(response.stream_id, stream);
             assert_eq!(
                 response.data,
-                [
-                    crate::SERVICE_ECHO,
-                    b'\x10' + stream as u8,
-                    b'd',
-                    b'o',
-                    b'n',
-                    b'e'
-                ]
+                [SERVICE_ECHO, b'\x10' + stream as u8, b'd', b'o', b'n', b'e']
             );
         }
         assert_eq!(server.pending_streams(), 0);
@@ -470,14 +483,7 @@ mod tests {
         let mut packet = [0u8; 256];
         let (first_len, _) = client
             .endpoint
-            .encode_stream_packet(
-                s,
-                4,
-                0,
-                false,
-                &[crate::SERVICE_ECHO, b'a', b'b'],
-                &mut packet,
-            )
+            .encode_stream_packet(s, 4, 0, false, &[SERVICE_ECHO, b'a', b'b'], &mut packet)
             .unwrap();
         assert!(
             server
@@ -520,7 +526,7 @@ mod tests {
         let mut packet = [0u8; 256];
         let (used, _) = client
             .endpoint
-            .encode_stream_packet(s, 4, 0, true, &[crate::SERVICE_METRICS], &mut packet)
+            .encode_stream_packet(s, 4, 0, true, &[SERVICE_METRICS], &mut packet)
             .unwrap();
         let first = server.receive_datagram(&packet[..used]).unwrap();
         assert!(first.is_some());
@@ -550,7 +556,7 @@ mod tests {
             id: 4,
             offset: 0,
             fin: true,
-            data: &[crate::SERVICE_METRICS],
+            data: &[SERVICE_METRICS],
         })
         .encode(&mut packet[used..])
         .unwrap();
@@ -558,7 +564,7 @@ mod tests {
             id: 8,
             offset: 0,
             fin: true,
-            data: &[crate::SERVICE_STATUS],
+            data: &[SERVICE_STATUS],
         })
         .encode(&mut packet[used..])
         .unwrap();
@@ -567,5 +573,39 @@ mod tests {
         let second = server.receive_datagram(&packet[..used]).unwrap().unwrap();
         assert_eq!(second.stream_id, 8);
         assert!(server.receive_datagram(&packet[..used]).unwrap().is_none());
+    }
+
+    #[test]
+    fn mux_delivers_a_stream_piggybacked_with_control() {
+        let client_cid = ConnectionId::new(41).unwrap();
+        let server_cid = ConnectionId::new(42).unwrap();
+        let mut server =
+            StreamMux::<8, 8>::new(Role::Server, ConnectionLimits::default(), 1200, 8, 8, 4096);
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        let mut packet = [0u8; 256];
+        let mut used = crate::ShortHeader {
+            flags: crate::FLAG_FIXED,
+            dcid: server_cid,
+            packet_number: 0,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        used += crate::Frame::MaxData(64 * 1024)
+            .encode(&mut packet[used..])
+            .unwrap();
+        used += crate::Frame::Stream(crate::StreamFrame {
+            id: FIRST_CLIENT_BIDI_STREAM_ID,
+            offset: 0,
+            fin: true,
+            data: &[SERVICE_STATUS],
+        })
+        .encode(&mut packet[used..])
+        .unwrap();
+        let request = server.receive_request(&packet[..used]).unwrap().unwrap();
+        assert_eq!(request.stream_id, FIRST_CLIENT_BIDI_STREAM_ID);
+        assert_eq!(request.data, [SERVICE_STATUS]);
     }
 }

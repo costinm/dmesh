@@ -146,6 +146,28 @@ pub fn encode_numeric_response(
     Some(encoder.len())
 }
 
+/// Encode a bounded byte/text diagnostic as a correlated tagged result.
+/// Diagnostics choose text only when their existing payload is valid UTF-8;
+/// binary handler inventories remain byte strings without a lossy projection.
+pub fn encode_numeric_data_response(
+    component: u64,
+    method: u64,
+    id: u64,
+    result: &[u8],
+    text: bool,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut value = alloc::vec![0; result.len().checked_add(9)?];
+    let mut encoder = Encoder::new(&mut value);
+    if text {
+        encoder.text_value(result)?;
+    } else {
+        encoder.bytes_value(result)?;
+    }
+    let value_len = encoder.len();
+    encode_numeric_response(component, method, id, &value[..value_len], out)
+}
+
 /// Encode a numeric tagged request with no parameters or fields.
 ///
 /// This is useful for common observation methods such as `discovery.nodes` on

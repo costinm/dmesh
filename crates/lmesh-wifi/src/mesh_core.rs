@@ -30,7 +30,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 use tracing::{debug, error, info, instrument, warn};
 
@@ -39,11 +39,25 @@ use tracing::{debug, error, info, instrument, warn};
 /// it into its inventory without coupling the multicast receive loop to a
 /// particular Wi-Fi implementation.
 type AnnounceObserver = Arc<dyn Fn(SocketAddr, dmesh_server::announce::Announce) + Send + Sync>;
+type DirectedDiscoveryWaiters = Arc<
+    std::sync::Mutex<HashMap<u64, oneshot::Sender<(SocketAddr, dmesh_server::announce::Announce)>>>,
+>;
 
 /// Optional discovery-only host label. Stable key material remains the
 /// identity; this short presentation value will later be superseded by a
 /// certificate-backed FQDN.
 fn discovery_device_name() -> Option<String> {
+    // A configured common setting wins over the machine hostname.  This keeps
+    // Linux's signed announce aligned with `settings.get key=name`, while the
+    // hostname remains a useful zero-config fallback.
+    if let Some(path) = std::env::var_os("DMESH_SETTINGS_FILE") {
+        let mut store = dmesh_server::settings::FileSettings::new(path, "linux");
+        if let Ok(name) = dmesh_server::settings::SettingsHandler::new(&mut store).get("name")
+            && !name.is_empty()
+        {
+            return Some(name);
+        }
+    }
     let name = std::env::var("HOSTNAME").ok()?;
     let compact = name
         .chars()
@@ -74,6 +88,41 @@ pub const DISCOVERY_MULTICAST_IPV6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0,
 /// than one local link. Example: `costin=wlan1,br-lan`.
 const UDP6_NETWORKS_ENV: &str = "LMESH_UDP6_NETWORKS";
 const MAX_STORED_ANNOUNCES: usize = 16;
+/// CIDs are process-wide, not service-specific: probe and tagged handlers
+/// may open different device associations through the same UDP listener.
+///
+/// A device keeps an idle association briefly after the host service restarts.
+/// Starting this counter at one on every process launch therefore reuses a
+/// still-live CID and makes the first post-restart stream look like a stale
+/// retransmission. Seed once per process, then allocate monotonically; CIDs
+/// are routing tokens rather than authentication material.
+static NEXT_DEVICE_ASSOCIATION_CID: AtomicU64 = AtomicU64::new(0);
+
+fn association_cid_seed(now_nanos: u128, process_id: u32) -> u64 {
+    let high = (now_nanos >> 64) as u64;
+    let low = now_nanos as u64;
+    (high ^ low ^ u64::from(process_id).rotate_left(32)).max(1)
+}
+
+fn next_device_association_cid() -> u64 {
+    let current = NEXT_DEVICE_ASSOCIATION_CID.load(Ordering::Acquire);
+    if current == 0 {
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(1);
+        let seed = association_cid_seed(now_nanos, std::process::id());
+        let _ = NEXT_DEVICE_ASSOCIATION_CID.compare_exchange(
+            0,
+            seed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+    NEXT_DEVICE_ASSOCIATION_CID
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1)
+}
 
 /// Bind an IPv4 multicast receiver so the independently supervised host
 /// services both receive each multicast datagram. `SO_REUSEADDR` is required
@@ -312,12 +361,60 @@ fn configured_udp6_scope_id() -> Option<u32> {
     })
 }
 
+/// Link-local IPv6 scope IDs are local kernel object IDs, not durable peer
+/// facts. A P2P group can disappear and be recreated with a new ID while a
+/// discovery observation is still within its TTL. Never offer or select the
+/// old ID as a usable QUIC path.
+fn udp6_peer_has_scope_in(
+    peer: &SocketAddr,
+    live_scope_ids: impl IntoIterator<Item = u32>,
+) -> bool {
+    match peer {
+        SocketAddr::V6(address) if address.ip().is_unicast_link_local() => {
+            address.scope_id() != 0
+                && live_scope_ids
+                    .into_iter()
+                    .any(|id| id == address.scope_id())
+        }
+        SocketAddr::V4(_) | SocketAddr::V6(_) => true,
+    }
+}
+
+fn udp6_peer_has_live_scope(peer: &SocketAddr) -> bool {
+    // Keep the decision separate from discovery state: only the local kernel
+    // can say whether a receiver-local scope is still usable.
+    udp6_peer_has_scope_in(
+        peer,
+        local_udp6_interfaces().into_iter().filter_map(|interface| {
+            interface
+                .get("interface_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+        }),
+    )
+}
+
+fn require_live_udp6_scope(peer: SocketAddr) -> Result<SocketAddr> {
+    if udp6_peer_has_live_scope(&peer) {
+        Ok(peer)
+    } else {
+        anyhow::bail!(
+            "IPv6 link-local scope {} is no longer an active receive interface",
+            match peer {
+                SocketAddr::V6(address) => address.scope_id(),
+                SocketAddr::V4(_) => 0,
+            }
+        );
+    }
+}
+
 /// Decode the explicit UDP form accepted by the explorer: `[IPv6]:port`,
-/// `IPv4:port`, or the same value prefixed with `udp://`.  Link-local scope
-/// remains receiver-local; use the configured mesh ingress for an unscoped
-/// link-local address.  A colon-separated MAC is deliberately recognized so
-/// the caller receives a precise NOW-not-yet-installed error instead of a
-/// misleading unknown-discovery-node result.
+/// `IPv4:port`, or the same forms without a port (which select the normal
+/// DMesh UDP port).  Link-local scope remains receiver-local; use the
+/// configured mesh ingress for an unscoped link-local address. A
+/// colon-separated MAC is deliberately recognized so the caller receives a
+/// precise NOW-not-yet-installed error instead of a misleading
+/// unknown-discovery-node result.
 fn explicit_udp_endpoint(destination: &str) -> Result<Option<SocketAddr>> {
     let value = destination.trim();
     if value.is_empty() {
@@ -333,7 +430,201 @@ fn explicit_udp_endpoint(destination: &str) -> Result<Option<SocketAddr>> {
         }
         return Ok(Some(endpoint));
     }
+    // A port is noise when the peer uses the normal DMesh UDP listener.
+    // Preserve the bracketed IPv6 spelling so a `%iface` scope can still be
+    // resolved below without ever serializing that local interface name.
+    if let Some(bracketed_address) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        let (address, scope) = bracketed_address
+            .rsplit_once('%')
+            .map_or((bracketed_address, None), |(address, scope)| {
+                (address, Some(scope))
+            });
+        if let Ok(address) = address.parse::<Ipv6Addr>() {
+            let scope_id = scope.map_or_else(
+                || configured_udp6_scope_id().unwrap_or(0),
+                |scope| {
+                    scope
+                        .parse::<u32>()
+                        .ok()
+                        .or_else(|| {
+                            std::fs::read_to_string(format!("/sys/class/net/{scope}/ifindex"))
+                                .ok()
+                                .and_then(|value| value.trim().parse::<u32>().ok())
+                        })
+                        .unwrap_or(0)
+                },
+            );
+            if scope.is_some() && scope_id == 0 {
+                anyhow::bail!("unknown IPv6 scope interface {:?}", scope.unwrap());
+            }
+            return Ok(Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                address,
+                dmesh_server::udp::STABLE_WIFI_UDP_PORT,
+                0,
+                scope_id,
+            ))));
+        }
+    }
+    if let Ok(address) = value.parse::<std::net::IpAddr>() {
+        return Ok(Some(SocketAddr::new(
+            address,
+            dmesh_server::udp::STABLE_WIFI_UDP_PORT,
+        )));
+    }
+    // Rust's SocketAddr parser deliberately does not accept the `%iface`
+    // spelling used for IPv6 link-local literals. The HTTP dashboard and
+    // dmesh-cli both need that spelling to select a directly reachable relay;
+    // resolve its scope locally and never put the interface name on the wire.
+    if let Some((bracketed_address, port)) = value.rsplit_once("]:")
+        && let Some(scoped_address) = bracketed_address.strip_prefix('[')
+        && let Some((address, scope)) = scoped_address.rsplit_once('%')
+        && let (Ok(address), Ok(port)) = (address.parse::<Ipv6Addr>(), port.parse::<u16>())
+    {
+        let scope_id = scope.parse::<u32>().ok().or_else(|| {
+            std::fs::read_to_string(format!("/sys/class/net/{scope}/ifindex"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
+        if let Some(scope_id) = scope_id {
+            return Ok(Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                address, port, 0, scope_id,
+            ))));
+        }
+        anyhow::bail!("unknown IPv6 scope interface {scope:?}");
+    }
     Ok(None)
+}
+
+/// Resolve a normal UDP path from the common semantic discovery inventory.
+///
+/// The inventory's `identity` is the configured device name (or stable VIP6
+/// fallback) and is therefore the public name accepted by the CLI and HTTP
+/// stream API.  The announced address is sender data, but the IPv6 scope is
+/// deliberately recovered from the local observation's `last_peer`: a sender
+/// must never serialize one receiver's interface name or index into its
+/// signed announce.
+///
+/// This is intentionally *not* used by directed `discovery.active`: a check
+/// is a test of one supplied address/path, never a best-path node lookup.
+fn semantic_inventory_udp_peer(
+    inventory: &serde_json::Value,
+    destination: &str,
+) -> Option<SocketAddr> {
+    // A semantic name can have more than one observation while NAN and UDP
+    // announcements converge.  NAN deliberately has no data path, so never
+    // let a NAN-only candidate hide a later UDP observation for the same
+    // name. Select candidates with a receiver-observed UDP6 path. Prefer the
+    // signed advertised address/port. A multicast observation supplies the
+    // receiver-local scope, but its port is not a normal-UDP fallback:
+    // 5227 is receive-only discovery ingress, never a QUIC stream endpoint.
+    inventory
+        .get("devices")?
+        .as_array()?
+        .iter()
+        .filter(|device| {
+            device.get("identity").and_then(serde_json::Value::as_str) == Some(destination)
+        })
+        .find_map(semantic_inventory_udp_peer_for_device)
+}
+
+/// Resolve one semantic inventory entry's receiver-reachable UDP path.
+/// Keeping this separate lets association lookup prove that an explicit
+/// address names the same device as its public discovery identity.
+fn semantic_inventory_udp_peer_for_device(device: &serde_json::Value) -> Option<SocketAddr> {
+    let ingress = device
+        .get("observations")?
+        .as_object()?
+        .values()
+        .filter_map(|observation| observation.get("last_peer")?.as_str())
+        .filter_map(|peer| explicit_udp_endpoint(peer).ok().flatten())
+        .find_map(|peer| match peer {
+            SocketAddr::V6(peer) if peer.ip().is_unicast_link_local() => Some(peer),
+            SocketAddr::V4(_) | SocketAddr::V6(_) => None,
+        })?;
+    let announce = device.get("announce");
+    let address = announce
+        .and_then(|announce| announce.get("udp_link_local_v6"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|address| address.parse::<Ipv6Addr>().ok())
+        .unwrap_or(*ingress.ip());
+    // A link-local address is usable only on the link that delivered the
+    // packet. A local service can see another local service's multicast
+    // announce through a different radio (for example an endpoint on br-lan
+    // observed on wlan0). Its advertised address is valid on the sender's
+    // link, but the receiving wlan0 scope cannot route it.
+    if address.is_unicast_link_local() && address != *ingress.ip() {
+        return None;
+    }
+    let port = announce
+        .and_then(|announce| announce.get("udp_port"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0 && *port != DISCOVERY_MULTICAST_PORT)
+        .unwrap_or(ingress.port());
+    if port == DISCOVERY_MULTICAST_PORT {
+        return None;
+    }
+    Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+        address,
+        port,
+        ingress.flowinfo(),
+        ingress.scope_id(),
+    )))
+}
+
+/// Return the one stable device key for either its public discovery name or
+/// a concrete receiver-reachable UDP address. An announce `route_key` is the
+/// authenticated public identity; configured names remain the stable fallback
+/// for devices that do not yet advertise one.
+fn semantic_inventory_device_key(
+    inventory: &serde_json::Value,
+    destination: &str,
+) -> Option<String> {
+    let explicit = explicit_udp_endpoint(destination).ok().flatten();
+    inventory.get("devices")?.as_array()?.iter().find_map(|device| {
+        let identity = device.get("identity")?.as_str()?;
+        let matches = identity == destination
+            || explicit.is_some_and(|peer| semantic_inventory_udp_peer_for_device(device) == Some(peer));
+        if !matches {
+            return None;
+        }
+        let route_key = device
+            .get("announce")
+            .and_then(|announce| announce.get("route_key"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty());
+        Some(format!("identity:{}", route_key.unwrap_or(identity)))
+    })
+}
+
+/// The dashboard and report use the same presentation inventory as routing.
+/// Hide a stale receiver-local UDP observation rather than turning it into a
+/// clickable address that fails with `Network unreachable`.  Other bearers
+/// (notably NOW and NAN observations) are not IPv6 routes and remain intact.
+fn presentation_radio_devices(radio: &lmesh_wifi::RadioService) -> serde_json::Value {
+    let mut inventory = radio.radio_devices();
+    let Some(devices) = inventory
+        .get_mut("devices")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return inventory;
+    };
+    for device in devices {
+        let Some(observations) = device
+            .get_mut("observations")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        observations.retain(|_, observation| {
+            observation
+                .get("last_peer")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|peer| explicit_udp_endpoint(peer).ok().flatten())
+                .is_none_or(|peer| udp6_peer_has_live_scope(&peer))
+        });
+    }
+    inventory
 }
 
 /// A directed NOW destination is an ordinary colon-separated hardware
@@ -415,6 +706,9 @@ pub struct ObservedAnnounce {
     pub device_id: String,
     pub kind: u64,
     pub uptime_secs: u32,
+    /// Sender class selects documented defaults such as the normal UDP/QUIC
+    /// listener when the signed announce intentionally omits a port override.
+    pub device_class: u8,
     /// Current sender Wi-Fi channel, or zero when the sender cannot report it.
     pub wifi_channel: u8,
     pub authenticated: bool,
@@ -444,6 +738,11 @@ pub struct LocalDiscovery {
     /// IPv6 UDP socket
     socket_v4: Option<Arc<UdpSocket>>,
     socket_v6: Option<Arc<UdpSocket>>,
+    /// The process's normal QUIC listener. lmesh wires this after starting
+    /// `dmesh-server::udp`; directed discovery and multicast sends use this
+    /// normal source port, while 5227 remains receive-only multicast ingress.
+    shared_udp_socket: Arc<std::sync::Mutex<Option<Arc<UdpSocket>>>>,
+    direct_waiters: DirectedDiscoveryWaiters,
     /// Optional semantic sink for signed/validated common CBOR announces.
     /// The node map remains the compatibility view; this lets the owning
     /// host radio expose one device inventory across UDP and NAN.
@@ -491,6 +790,8 @@ impl LocalDiscovery {
             node_store_dir: Arc::new(Self::default_node_store_dir()?),
             socket_v4: None,
             socket_v6: None,
+            shared_udp_socket: Arc::new(std::sync::Mutex::new(None)),
+            direct_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
             announce_observer: Arc::new(RwLock::new(None)),
             announce_network_name: None,
             announce_udp_port: 0,
@@ -513,6 +814,22 @@ impl LocalDiscovery {
     /// the ingress buffer before the bounded device registry is updated.
     pub async fn set_announce_observer(&self, observer: AnnounceObserver) {
         *self.announce_observer.write().await = Some(observer);
+    }
+
+    /// Attach the process-owned normal UDP listener. The listener's receive
+    /// loop performs QUIC/direct classification; discovery only uses this
+    /// clone to send multicast announces on the same local port.
+    pub fn set_shared_udp_socket(&self, socket: Arc<UdpSocket>) {
+        if let Ok(mut shared) = self.shared_udp_socket.lock() {
+            *shared = Some(socket);
+        }
+    }
+
+    fn shared_udp_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.shared_udp_socket
+            .lock()
+            .ok()
+            .and_then(|socket| socket.clone())
     }
 
     /// Load key from file or generate a new one
@@ -739,11 +1056,14 @@ impl LocalDiscovery {
             // New common presence wire. It deliberately shares the old
             // local-link multicast socket but not its JSON envelope, so
             // UART/NOW/NAN/UDP observe one bounded CBOR record.
-            // UDP discovery is a DCID-zero direct record. Accept bare CBOR
-            // only while older peers are still being upgraded; NAN SDF has
-            // its own bearer frame and continues to carry the inner record.
-            let announce_data =
-                quic_lite::decode_direct_packet(data).map_or(data, |(_, payload)| payload);
+            // UDP discovery is always a private QUIC-lite direct record. NAN Service
+            // Discovery has its own bearer frame and carries the inner tagged
+            // record directly; accepting that shape here would blur the
+            // bearer/connection boundary and preserve an obsolete alias.
+            let Some(announce_data) = dmesh_server::direct::ConnectionlessMessage::decode(data)
+            else {
+                continue;
+            };
             if let Some(announce) = dmesh_server::announce::decode_announce(announce_data) {
                 // A sender that supplies an identity must prove it: the key
                 // hash is its stable device id and the signature covers the
@@ -777,6 +1097,7 @@ impl LocalDiscovery {
                     device_id: hex_encode(announce.device_id()),
                     kind: announce.kind,
                     uptime_secs: announce.uptime_secs,
+                    device_class: announce.device_class,
                     wifi_channel: announce.wifi_channel,
                     authenticated: announce.has_identity(),
                     udp_port: announce.udp_port,
@@ -873,10 +1194,219 @@ impl LocalDiscovery {
         }
     }
 
+    /// Admit one common announce from the normal QUIC listener's direct
+    /// long-header branch.  The listener owns framing and socket I/O; this
+    /// method owns only signature validation and the semantic inventory.
+    async fn observe_signed_announce(
+        &self,
+        addr: SocketAddr,
+        announce: dmesh_server::announce::Announce,
+    ) -> bool {
+        let public_key = if announce.has_identity() {
+            let digest = Sha256::digest(announce.public_key());
+            let signature = Signature::from_slice(announce.signature()).ok();
+            let verifying_key = VerifyingKey::from_sec1_bytes(announce.public_key()).ok();
+            let mut signed = [0u8; 384];
+            let valid = signature.zip(verifying_key).and_then(|(signature, key)| {
+                dmesh_server::announce::signing_bytes(announce, &mut signed)
+                    .map(|used| key.verify(&signed[..used], &signature).is_ok())
+            }) == Some(true);
+            if !valid || announce.device_id() != &digest[..announce.device_id().len()] {
+                warn!(address = %addr, "dropping announce with invalid identity");
+                return false;
+            }
+            base64_url_encode(announce.public_key())
+        } else {
+            hex_encode(announce.device_id())
+        };
+        if public_key == self.public_key_b64 {
+            return false;
+        }
+        Self::notify_announce_observer(&self.announce_observer, addr, announce).await;
+        let announce_info = ObservedAnnounce {
+            device_id: hex_encode(announce.device_id()),
+            kind: announce.kind,
+            uptime_secs: announce.uptime_secs,
+            device_class: announce.device_class,
+            wifi_channel: announce.wifi_channel,
+            authenticated: announce.has_identity(),
+            udp_port: announce.udp_port,
+            udp_link_local_v6: announce.udp_link_local_v6(),
+        };
+        let node = Node {
+            public_key: public_key.clone(),
+            address: addr,
+            last_seen: std::time::Instant::now(),
+            metadata: None,
+            announce: Some(announce_info.clone()),
+        };
+        let is_new = {
+            let mut nodes = self.nodes.write().await;
+            let is_new = !nodes.contains_key(&public_key);
+            nodes.insert(public_key.clone(), node);
+            is_new
+        };
+        info!(public_key = %public_key, address = %addr, announce = ?announce_info,
+            event = if is_new { "node_seen" } else { "node_updated" }, "announce_rx");
+        true
+    }
+
+    fn complete_directed_discovery(
+        &self,
+        request_id: u64,
+        peer: SocketAddr,
+        announce: dmesh_server::announce::Announce,
+    ) {
+        if let Ok(mut waiters) = self.direct_waiters.lock()
+            && let Some(waiter) = waiters.remove(&request_id)
+        {
+            let _ = waiter.send((peer, announce));
+        }
+    }
+
     /// Send an announcement to the multicast group
     #[instrument(skip(self))]
     pub async fn announce(&self) -> Result<serde_json::Value> {
         self.announce_with_metadata(None).await
+    }
+
+    /// Actively ask every peer on every live UDP multicast scope to emit its
+    /// current signed `announce.discovery`. This uses the same tagged request
+    /// as directed `check`; multicast addressing is the only distinction.
+    pub async fn broadcast_request(&self) -> Result<serde_json::Value> {
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut record = [0u8; 96];
+        let record_len = dmesh_server::announce::encode_discovery_request(request_id, &mut record)
+            .context("Failed to encode broadcast announce.discovery request")?;
+        let mut wire = [0u8; 128];
+        let wire_len =
+            dmesh_server::direct::ConnectionlessMessage::encode(&record[..record_len], &mut wire)
+                .ok_or_else(|| anyhow::anyhow!("Failed to wrap discovery request"))?;
+        let mut transmissions = Vec::new();
+        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v4.clone()) {
+            let destination = SocketAddr::new(
+                IpAddr::V4(DISCOVERY_MULTICAST_IPV4),
+                DISCOVERY_MULTICAST_PORT,
+            );
+            socket.send_to(&wire[..wire_len], destination).await?;
+            transmissions.push(serde_json::json!({
+                "transport": "udp4_multicast_compat",
+                "destination": destination.to_string(),
+                "source": socket.local_addr().ok().map(|source| source.to_string()),
+                "bytes": wire_len,
+                "accepted": true,
+            }));
+        }
+        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v6.clone()) {
+            for interface_index in multicast_v6_interface_indices() {
+                let destination = SocketAddr::V6(std::net::SocketAddrV6::new(
+                    DISCOVERY_MULTICAST_IPV6,
+                    DISCOVERY_MULTICAST_PORT,
+                    0,
+                    interface_index,
+                ));
+                match socket.send_to(&wire[..wire_len], destination).await {
+                    Ok(_) => transmissions.push(serde_json::json!({
+                        "transport": "udp6_multicast",
+                        "destination": destination.to_string(),
+                        "source": socket.local_addr().ok().map(|source| source.to_string()),
+                        "interface_index": interface_index,
+                        "bytes": wire_len,
+                        "accepted": true,
+                    })),
+                    Err(error) => warn!(
+                        %error,
+                        interface_index,
+                        "udp6_multicast_discovery_request_skipped"
+                    ),
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "accepted": !transmissions.is_empty(),
+            "request_id": request_id,
+            "record": "announce.discovery",
+            "mode": "broadcast",
+            "transmissions": transmissions,
+        }))
+    }
+
+    /// Send active discovery to one explicit UDP address. The address is the
+    /// path under test; this function deliberately performs no node lookup or
+    /// alternate-path fallback.
+    pub async fn directed_request(&self, destination: &str) -> Result<serde_json::Value> {
+        let peer = explicit_udp_endpoint(destination)?
+            .ok_or_else(|| anyhow::anyhow!("directed UDP discovery needs udp://HOST"))?;
+        let peer = require_live_udp6_scope(peer)?;
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut record = [0u8; 96];
+        let record_len = dmesh_server::announce::encode_discovery_request(request_id, &mut record)
+            .context("Failed to encode directed announce.discovery request")?;
+        let mut wire = [0u8; 128];
+        let wire_len =
+            dmesh_server::direct::ConnectionlessMessage::encode(&record[..record_len], &mut wire)
+                .ok_or_else(|| anyhow::anyhow!("Failed to wrap discovery request"))?;
+        // Directed discovery shares the normal listener and its CID/direct
+        // ingress routing. Never create an ephemeral socket here: a reply
+        // must be received through the same fixed service port as every QUIC
+        // association and other direct discovery response.
+        let socket = self
+            .shared_udp_socket()
+            .ok_or_else(|| anyhow::anyhow!("normal UDP listener is not running"))?;
+        let (sender, receiver) = oneshot::channel();
+        self.direct_waiters
+            .lock()
+            .map_err(|_| anyhow::anyhow!("directed discovery waiters poisoned"))?
+            .insert(request_id, sender);
+        if let Err(error) = socket.send_to(&wire[..wire_len], peer).await {
+            if let Ok(mut waiters) = self.direct_waiters.lock() {
+                waiters.remove(&request_id);
+            }
+            return Err(error.into());
+        }
+        let (source, announce) =
+            match tokio::time::timeout(std::time::Duration::from_secs(3), receiver).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_)) => anyhow::bail!("directed discovery listener stopped"),
+                Err(_) => {
+                    if let Ok(mut waiters) = self.direct_waiters.lock() {
+                        waiters.remove(&request_id);
+                    }
+                    anyhow::bail!("directed discovery response timed out")
+                }
+            };
+        let signature = Signature::from_slice(announce.signature()).ok();
+        let verifying_key = VerifyingKey::from_sec1_bytes(announce.public_key()).ok();
+        let mut signed = [0u8; 384];
+        let valid = signature.zip(verifying_key).and_then(|(signature, key)| {
+            dmesh_server::announce::signing_bytes(announce, &mut signed)
+                .map(|used| key.verify(&signed[..used], &signature).is_ok())
+        }) == Some(true);
+        if !announce.has_identity() || !valid {
+            anyhow::bail!("discovery response is not signed by its announced identity");
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "record": "announce.discovery",
+            "mode": "directed",
+            "to": destination,
+            "source": source.to_string(),
+            "request_id": request_id,
+            "announce": {
+                "device_id": hex_encode(announce.device_id()),
+                "device_name": announce.device_name(),
+                "uptime_secs": announce.uptime_secs,
+                "udp_port": announce.udp_port,
+                "udp_link_local_v6": announce.udp_link_local_v6().map(Ipv6Addr::from).map(|address| address.to_string()),
+                "authenticated": true,
+            },
+        }))
     }
 
     /// Build the compact common presence record used as NAN Publish Service
@@ -950,12 +1480,13 @@ impl LocalDiscovery {
         Ok(wire[..used].to_vec())
     }
 
-    /// Send an announcement with optional metadata
-    #[instrument(skip(self, _metadata))]
-    pub async fn announce_with_metadata(
+    /// Build the current signed announce for unsolicited presence and for a
+    /// directed discovery reply.  The transport binding supplies neither
+    /// identities nor a second encoder.
+    pub fn signed_discovery_announce(
         &self,
-        _metadata: Option<HashMap<String, String>>,
-    ) -> Result<serde_json::Value> {
+        uptime_secs: u64,
+    ) -> Result<dmesh_server::announce::Announce> {
         // Keep the radio record identical across UDP/NOW/NAN/UART. Unlike an
         // ESP32 presence hint, a host carries its P-256 identity and signs the
         // canonical fields. Receivers accept unsigned records only when no
@@ -963,8 +1494,11 @@ impl LocalDiscovery {
         let digest = Sha256::digest(&self.public_key);
         let mut device_id = [0; 16];
         device_id.copy_from_slice(&digest[..16]);
-        let mut announce =
-            dmesh_server::announce::Announce::discovery(device_id, device_id.len() as u8, 0);
+        let mut announce = dmesh_server::announce::Announce::discovery(
+            device_id,
+            device_id.len() as u8,
+            uptime_secs.min(u64::from(u32::MAX)) as u32,
+        );
         if let Some(name) = discovery_device_name() {
             let _ = announce.set_device_name(&name);
         }
@@ -979,6 +1513,14 @@ impl LocalDiscovery {
                 }
             }
         }
+        announce.set_probe_descriptor(
+            dmesh_server::announce::DEVICE_CLASS_HOST,
+            dmesh_server::probe::PROBE_CAP_NAN
+                | dmesh_server::probe::PROBE_CAP_NOW
+                | dmesh_server::probe::PROBE_CAP_STA
+                | dmesh_server::probe::PROBE_CAP_AP
+                | dmesh_server::probe::PROBE_CAP_UDP6,
+        );
         if !announce.set_public_key(&self.public_key) {
             anyhow::bail!("local public key exceeds announce bound");
         }
@@ -997,19 +1539,30 @@ impl LocalDiscovery {
         if !announce.set_signature(signature.to_bytes().as_ref()) {
             anyhow::bail!("local announce signature has invalid length");
         }
+        Ok(announce)
+    }
+
+    /// Send an announcement with optional metadata
+    #[instrument(skip(self, _metadata))]
+    pub async fn announce_with_metadata(
+        &self,
+        _metadata: Option<HashMap<String, String>>,
+    ) -> Result<serde_json::Value> {
+        let announce = self.signed_discovery_announce(0)?;
         let mut announce_wire = [0; 384];
         let announce_used = dmesh_server::announce::encode(announce, &mut announce_wire)
             .context("Failed to encode local announce")?;
         let mut wire = [0; 512];
-        let used = quic_lite::encode_direct_packet(0, &announce_wire[..announce_used], &mut wire)
-            .map_err(|error| {
-            anyhow::anyhow!("Failed to wrap local announce in direct record: {error:?}")
-        })?;
+        let used = dmesh_server::direct::ConnectionlessMessage::encode(
+            &announce_wire[..announce_used],
+            &mut wire,
+        )
+        .ok_or_else(|| anyhow::anyhow!("Failed to wrap local announce in connectionless record"))?;
 
         let mut transmissions = Vec::new();
         // Best-effort compatibility for older IPv4-only local peers. IPv6
         // below is the explicit per-link discovery transport.
-        if let Some(socket) = &self.socket_v4 {
+        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v4.clone()) {
             let addr = SocketAddr::new(
                 IpAddr::V4(DISCOVERY_MULTICAST_IPV4),
                 DISCOVERY_MULTICAST_PORT,
@@ -1021,6 +1574,7 @@ impl LocalDiscovery {
             transmissions.push(serde_json::json!({
                 "transport": "udp4_multicast_compat",
                 "destination": addr.to_string(),
+                "source": socket.local_addr().ok().map(|source| source.to_string()),
                 "bytes": used,
                 "accepted": true,
                 "egress": "kernel_route",
@@ -1029,7 +1583,7 @@ impl LocalDiscovery {
         // Send on every active IPv6 link. Link-local multicast is scoped, so
         // this explicitly includes br-lan, associated STA/AP links, and P2P
         // links rather than relying on a single kernel-selected default route.
-        if let Some(socket) = &self.socket_v6 {
+        if let Some(socket) = self.shared_udp_socket().or_else(|| self.socket_v6.clone()) {
             for index in multicast_v6_interface_indices() {
                 let addr = SocketAddr::V6(std::net::SocketAddrV6::new(
                     DISCOVERY_MULTICAST_IPV6,
@@ -1053,6 +1607,7 @@ impl LocalDiscovery {
                 transmissions.push(serde_json::json!({
                     "transport": "udp6_multicast",
                     "destination": addr.to_string(),
+                    "source": socket.local_addr().ok().map(|source| source.to_string()),
                     "interface_index": index,
                     "interface": interface,
                     "bytes": used,
@@ -1250,6 +1805,23 @@ fn default_rate_profile() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum Request {
+    /// Run the normal QUIC probe service to a routed node. The destination
+    /// selects a connection path; callers never select a Wi-Fi-specific
+    /// probe implementation.
+    #[serde(rename = "probe")]
+    Probe {
+        to: String,
+        #[serde(default)]
+        bytes: Option<u64>,
+        #[serde(default)]
+        packet_size: Option<u16>,
+        /// Number of concurrent normal QUIC streams. This remains part of
+        /// the probe service request rather than a NOW/UDP adapter setting.
+        #[serde(default)]
+        parallel_streams: Option<u8>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     /// Open or replace one retained QUIC control connection to a directly
     /// reachable relay and install its first adjacent relay leg.  The next
     /// hop is a relay-local NOW peer for this initial promotion; the UI will
@@ -1266,6 +1838,14 @@ pub enum Request {
     /// status on the resulting QUIC connection.
     #[serde(rename = "relay.open")]
     RelayOpen { relay_endpoint: String },
+    /// Read the terminal endpoint's normal QUIC status stream through an
+    /// existing completed relay circuit.
+    #[serde(rename = "relay.endpoint.status")]
+    RelayEndpointStatus { relay_endpoint: String },
+    /// Tear down one retained controller circuit and request removal of its
+    /// relay-local pair before dropping the local endpoint connection.
+    #[serde(rename = "relay.close")]
+    RelayClose { relay_endpoint: String },
     /// Inspect retained first-leg control sessions without probing a peer.
     #[serde(rename = "relay.status")]
     RelayStatus,
@@ -1288,11 +1868,15 @@ pub enum Request {
         #[serde(default)]
         reason: Option<String>,
     },
-    /// Fan out a discovery ping over one medium or all configured media.
-    #[serde(rename = "discovery.ping")]
-    DiscoveryPing {
+    /// Send the canonical active discovery request. With no destination it is
+    /// broadcast on every enabled medium; `to` names one explicit bearer
+    /// address and never triggers best-path or node-name resolution.
+    #[serde(rename = "discovery.active")]
+    DiscoveryActive {
         #[serde(default)]
         medium: Option<String>,
+        #[serde(default)]
+        to: Option<String>,
     },
     /// Return recent radio/backend message history.
     #[serde(rename = "messages.history")]
@@ -1336,20 +1920,6 @@ pub enum Request {
         #[serde(default)]
         disable_80211b: bool,
     },
-    /// Send a raw Wi-Fi DMesh status ping and collect replies.
-    #[serde(rename = "wifi.raw.ping")]
-    WifiRawPing {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        channel: Option<u8>,
-        #[serde(default)]
-        listen_sec: Option<u64>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-        #[serde(default)]
-        nonce: Option<String>,
-    },
     /// Presentation-safe common discovery inventory. Native radio peers stay
     /// in adapter diagnostics; this response exposes only semantic IDs and
     /// shared observation facts.
@@ -1360,39 +1930,20 @@ pub enum Request {
     DiscoveryStatus,
     /// Common NAN cluster and counter projection. Device records are exposed
     /// only through `discovery.nodes`.
-    #[serde(rename = "nan.status")]
+    #[serde(rename = "telemetry.nan_status")]
     NanStatus,
     /// Local ESP-NOW/action transport counters. Missing facts are omitted.
-    #[serde(rename = "now.metrics")]
+    #[serde(rename = "telemetry.now_metrics")]
     NowMetrics,
     /// Local NAN capture and semantic dispatch counters.
-    #[serde(rename = "nan.metrics")]
+    #[serde(rename = "telemetry.nan_metrics")]
     NanMetrics,
     /// Local raw IPv6, UDP, and NDP counters.
-    #[serde(rename = "udp6.metrics")]
+    #[serde(rename = "telemetry.udp6_metrics")]
     Udp6Metrics,
     /// Common optional per-peer Wi-Fi link observations.
-    #[serde(rename = "wifi.link.metrics")]
+    #[serde(rename = "telemetry.wifi_link_metrics")]
     WifiLinkMetrics,
-    /// Request current passive inventory or an active NAN discovery response
-    /// without replacing the current transport epoch.
-    #[serde(rename = "transport.discover")]
-    TransportDiscover {
-        #[serde(default)]
-        iface: Option<String>,
-        #[serde(default)]
-        channel: Option<u8>,
-        #[serde(default)]
-        nan: Option<bool>,
-        #[serde(default)]
-        passive_scan: Option<bool>,
-        #[serde(default)]
-        active_scan: Option<bool>,
-        #[serde(default)]
-        dns_sd: Option<bool>,
-        #[serde(default)]
-        wait_ms: Option<u64>,
-    },
     /// Size a NAN object transfer without opening an IP socket or touching a
     /// device. The same envelope is used by data frames and action diagnostics.
     #[serde(rename = "object.nan.dry_run")]
@@ -1474,6 +2025,12 @@ pub enum Request {
         channel: Option<u8>,
         #[serde(default)]
         passive: Option<bool>,
+        /// Shared schema spelling for a bounded cached scan result.  Linux
+        /// implements that cache with its passive monitor observations; it
+        /// must not reinterpret this read-only request as an active nl80211
+        /// scan on an owned AP.
+        #[serde(default)]
+        last_results: Option<bool>,
     },
     /// Join an open AP on the shared DMesh channel.
     #[serde(rename = "wifi.sta.join_open")]
@@ -1485,11 +2042,11 @@ pub enum Request {
     /// Replace a local transport profile. Adapters apply the settings they
     /// support and ignore the rest; the resulting announced state reports
     /// what became active.
-    #[serde(rename = "transport.start")]
-    TransportStart {
+    #[serde(rename = "transport.set")]
+    TransportSet {
         /// Device-neutral bearer kind. Linux accepts `nan` with `ap=1` for
         /// the P2P AP-equivalent and retains `sta` for ordinary association.
-        #[serde(default)]
+        #[serde(default, rename = "mode", alias = "kind")]
         kind: Option<TransportKindRequest>,
         #[serde(default)]
         iface: Option<String>,
@@ -1507,19 +2064,13 @@ pub enum Request {
         /// NOW action receive policy: `0` default/on, `1` on, `2` off.
         #[serde(default)]
         now: Option<u8>,
-        /// `transport.start` AP-equivalent request.
+        /// `transport.set` AP-equivalent request.
         #[serde(default)]
         ap: Option<u8>,
         /// Select the ordinary raw open AP backend for Linux/ESP comparison.
         /// Omitted/zero selects the default P2P WPA2-PSK Group Owner.
         #[serde(default)]
         open: Option<TransportFlagRequest>,
-    },
-    /// End the current Linux Wi-Fi transport and remove service-created VIFs.
-    #[serde(rename = "transport.stop")]
-    TransportStop {
-        #[serde(default)]
-        iface: Option<String>,
     },
     /// Configure a static IPv4 address for a station test or bootstrap link.
     #[serde(rename = "wifi.sta.configure_ipv4")]
@@ -1569,12 +2120,45 @@ impl TransportFlagRequest {
     }
 }
 
+/// Semantic sink for unsolicited signed announcements received by the normal
+/// UDP listener. It deliberately has no packet/header access.
+struct UdpDiscoveryIngressHandler {
+    discovery: Arc<LocalDiscovery>,
+}
+
+impl dmesh_server::udp::TaggedStreamHandler for UdpDiscoveryIngressHandler {
+    fn handle<'a>(
+        &'a self,
+        context: dmesh_server::udp::TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            if dmesh_server::direct::classify(&request)
+                == Some(dmesh_server::direct::DirectMessageKind::Discovery)
+                && let Some(announce) = dmesh_server::announce::decode_announce(&request)
+            {
+                let request_id =
+                    dmesh_server::tagged::decode(&request).and_then(|record| record.id);
+                let accepted = self
+                    .discovery
+                    .observe_signed_announce(context.peer, announce)
+                    .await;
+                if accepted && let Some(request_id) = request_id {
+                    self.discovery
+                        .complete_directed_discovery(request_id, context.peer, announce);
+                }
+            }
+            None
+        })
+    }
+}
+
 pub struct LmeshService {
     discovery: Arc<LocalDiscovery>,
-    /// Embedded canary Wi-Fi instance.  It is constructed through the same
-    /// reusable library object as the standalone lmesh-wifi launcher; this
-    /// process owns the interfaces named by its own LMESH_INTERFACES (normally
-    /// wlan1), while lmesh-wifi remains an independent wlan0 instance.
+    /// Optional embedded Wi-Fi instance. It is constructed through the same
+    /// reusable library object as the standalone lmesh-wifi launcher, but an
+    /// empty `LMESH_INTERFACES` makes this process UDP-only. When non-empty,
+    /// this process owns only the explicitly named interfaces.
     wifi_service: lmesh_wifi::WifiService,
     radio: lmesh_wifi::RadioService,
     wifi: lmesh_wifi::WifiNetd,
@@ -1582,6 +2166,124 @@ pub struct LmeshService {
     /// reverse rule to the UDP tuple of this socket, so the socket must not
     /// be recreated between HTTP calls.
     relay_sessions: Arc<Mutex<HashMap<String, RelayControlSession>>>,
+    /// Temporary UDP-side association cache, keyed by stable discovery
+    /// identity rather than address. `to` selects the immediate UDP path.
+    ///
+    /// This must be folded together with the radio adapter's retained NOW
+    /// client into one device-keyed QUIC-lite multipath association. Until
+    /// then it deliberately does not claim to preserve CIDs or handshake
+    /// material across a UDP/NOW path change. Each mutex orders requests for
+    /// this one temporary driver; different devices remain independent.
+    device_udp_associations: Arc<Mutex<HashMap<String, Arc<Mutex<DeviceUdpAssociation>>>>>,
+}
+
+struct DeviceUdpAssociation {
+    client: Option<dmesh_server::udp::UdpClient>,
+}
+
+impl DeviceUdpAssociation {
+    const fn new() -> Self {
+        Self {
+            client: None,
+        }
+    }
+}
+
+/// A peer restart discards its connection-ID table while a host may still
+/// retain the device association.  Retrying a read on a fresh association is
+/// safe; replaying a mutation is not.  Keep this policy beside the shared
+/// numeric catalog rather than teaching a UDP adapter about service names.
+fn tagged_record_is_safe_stale_association_retry(record: &[u8]) -> bool {
+    // lmesh HTTP/SSH uses mesh's generic tagged-CBOR encoder. Prefer that
+    // representation here so the recovery rule sees exactly the bytes handed
+    // to `forward_tagged_record`; firmware's borrowed decoder below remains
+    // the no-std-compatible fallback for adapter tests and ESP-originated
+    // records.
+    if let Ok(record) = mesh::cbor::decode_record(record)
+    {
+        return match (record.component, record.method) {
+            (mesh::tagged::NameOrTag::Tag(component), mesh::tagged::NameOrTag::Tag(method)) => {
+                dmesh_server::service_catalog::is_read_only_stream_service(
+                    u64::from(component),
+                    u64::from(method),
+                )
+            }
+            (mesh::tagged::NameOrTag::Name(component), mesh::tagged::NameOrTag::Name(method)) => {
+                // Component-9 diagnostics such as `status` and `services`
+                // deliberately have bare catalog names.  They are normal
+                // read-only streams just like `settings.get`; do not make
+                // stale-association recovery depend on presentation syntax.
+                let name = if component.is_empty() {
+                    method
+                } else {
+                    let mut name = component;
+                    name.push('.');
+                    name.push_str(&method);
+                    name
+                };
+                dmesh_server::service_catalog::stream_service_by_name(&name)
+                    .is_some_and(|service| {
+                        dmesh_server::service_catalog::is_read_only_stream_service(
+                            service.component,
+                            service.method,
+                        )
+                    })
+            }
+            _ => false,
+        };
+    }
+    let Some(record) = dmesh_server::tagged::decode(record) else {
+        return false;
+    };
+    let (
+        Some(dmesh_server::tagged::Name::Tag(component)),
+        Some(dmesh_server::tagged::Name::Tag(method)),
+    ) = (record.component, record.method)
+    else {
+        return false;
+    };
+    dmesh_server::service_catalog::is_read_only_stream_service(component, method)
+}
+
+/// Convert the compact DMesh tagged response into the schema-neutral mesh
+/// response envelope used by HTTP, SSH, and Android's private Rust bridge.
+///
+/// A DMesh response retains numeric component and method fields so a bounded
+/// ESP/UART caller can correlate it without a catalog.  In the generic mesh
+/// envelope, responses intentionally have empty component/method fields; a
+/// result plus a method would instead be an invalid request.  This adapter is
+/// at the mesh API boundary, never in a bearer: UDP, NOW, and UART all receive
+/// the same DMesh response and use this one conversion before it reaches an
+/// HTTP/SSH caller.
+fn decode_stream_response(response: &[u8]) -> Result<mesh::tagged::TaggedRecord> {
+    if let Ok(record) = mesh::cbor::decode_record(response) {
+        return Ok(record);
+    }
+    let record = dmesh_server::tagged::decode(response)
+        .ok_or_else(|| anyhow::anyhow!("decode DMesh tagged stream response"))?;
+    let id = record
+        .id
+        .ok_or_else(|| anyhow::anyhow!("DMesh tagged stream response lacks id"))?;
+    let (key, value) = match (record.result, record.error) {
+        (Some(result), None) => (6, result),
+        (None, Some(error)) => (7, error),
+        _ => anyhow::bail!("DMesh tagged stream response lacks one terminal result or error"),
+    };
+    let mut wire = vec![0u8; response.len().saturating_add(24)];
+    let mut encoder = dmesh_server::cbor::Encoder::new(&mut wire);
+    encoder.map(4).ok_or_else(|| anyhow::anyhow!("encode mesh response map"))?;
+    encoder.uint(1).ok_or_else(|| anyhow::anyhow!("encode mesh response component"))?;
+    encoder.text_value(b"").ok_or_else(|| anyhow::anyhow!("encode empty mesh component"))?;
+    encoder.uint(2).ok_or_else(|| anyhow::anyhow!("encode mesh response method"))?;
+    encoder.text_value(b"").ok_or_else(|| anyhow::anyhow!("encode empty mesh method"))?;
+    encoder.uint(3).ok_or_else(|| anyhow::anyhow!("encode mesh response id"))?;
+    encoder.uint(id).ok_or_else(|| anyhow::anyhow!("encode mesh response id value"))?;
+    encoder.uint(key).ok_or_else(|| anyhow::anyhow!("encode mesh response terminal key"))?;
+    encoder.encoded_value(value).ok_or_else(|| anyhow::anyhow!("encode mesh response terminal value"))?;
+    let used = encoder.len();
+    drop(encoder);
+    mesh::cbor::decode_record(&wire[..used])
+        .context("decode normalized DMesh tagged stream response")
 }
 
 struct RelayControlSession {
@@ -1596,6 +2298,7 @@ struct RelayControlSession {
     forward_alias: quic_lite::ConnectionId,
     reverse_alias: quic_lite::ConnectionId,
     forward_allocation: u64,
+    forward_revision: u64,
     forward_next_hop: u64,
     endpoint_server_cid: Option<quic_lite::ConnectionId>,
 }
@@ -1609,7 +2312,7 @@ impl LmeshService {
         let radio = wifi_service.radio().clone();
         let wifi = wifi_service.netd().clone();
         // Construction is deliberately radio-neutral. A lmesh restart must
-        // not retune, create a monitor, or change link state on wlan1; each
+        // not retune, create a monitor, or change link state; each
         // transport/AP operation owns its own explicit transition.
         Self {
             discovery,
@@ -1617,6 +2320,7 @@ impl LmeshService {
             radio,
             wifi,
             relay_sessions: Arc::new(Mutex::new(HashMap::new())),
+            device_udp_associations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1641,7 +2345,7 @@ impl LmeshService {
     }
 
     /// Attach the experimental raw-NAN receiver to this service's permanent
-    /// monitor fixture (normally `wlan1mon`).
+    /// monitor fixture when this process owns a Wi-Fi interface.
     pub fn start_default_rawnan(&self) -> serde_json::Value {
         self.wifi_service.start_canary_rawnan(None)
     }
@@ -1698,13 +2402,6 @@ impl LmeshService {
         }
     }
 
-    /// End the current Wi-Fi transport epoch and prove that service-created
-    /// AP/monitor/legacy-STA children are gone while retaining the primary
-    /// interface as a down station VIF.
-    pub fn stop_wifi_transport(&self, iface: Option<String>) -> serde_json::Value {
-        self.wifi_service.transport_stop(iface)
-    }
-
     fn owned_wifi_iface(
         &self,
         iface: Option<String>,
@@ -1722,6 +2419,12 @@ impl LmeshService {
     /// Return the local public key used for announcements.
     pub fn public_key_b64(&self) -> &str {
         self.discovery.public_key_b64()
+    }
+
+    /// Clone the one process-owned QUIC UDP listener for discovery egress.
+    /// Receive ownership remains in `dmesh-server::udp::run`.
+    pub fn udp_listener_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.radio.object_udp_socket()
     }
 
     /// Merge an already validated multicast observation with the host radio's
@@ -1746,12 +2449,285 @@ impl LmeshService {
         port: u16,
         tagged_handler: Arc<dyn dmesh_server::udp::TaggedStreamHandler>,
     ) -> serde_json::Value {
+        let discovery = self.discovery.clone();
+        let started = std::time::Instant::now();
+        let discovery_handler: Arc<dyn dmesh_server::udp::TaggedStreamHandler> = Arc::new(
+            dmesh_server::direct::SignedDiscoveryResponder::new(Arc::new(move || {
+                discovery
+                    .signed_discovery_announce(started.elapsed().as_secs())
+                    .ok()
+            })),
+        );
+        let announce_ingress: Arc<dyn dmesh_server::udp::TaggedStreamHandler> =
+            Arc::new(UdpDiscoveryIngressHandler {
+                discovery: self.discovery.clone(),
+            });
+        let direct_discovery: Arc<dyn dmesh_server::udp::TaggedStreamHandler> =
+            Arc::new(dmesh_server::udp::FallbackTaggedStreamHandler::new(
+                discovery_handler,
+                announce_ingress,
+            ));
+        let shared_handler: Arc<dyn dmesh_server::udp::TaggedStreamHandler> = Arc::new(
+            dmesh_server::udp::FallbackTaggedStreamHandler::new(direct_discovery, tagged_handler),
+        );
         self.radio.object_udp_start_with_tagged_handler(
             None,
             Some(port),
             None,
-            Some(tagged_handler),
+            Some(shared_handler.clone()),
+            Some(shared_handler),
         )
+    }
+
+    async fn resolve_udp_peer(&self, destination: &str) -> Result<SocketAddr> {
+        if let Some(peer) = explicit_udp_endpoint(destination)? {
+            return require_live_udp6_scope(peer);
+        }
+        let node = if let Some(node) = self.discovery.get_node(destination).await {
+            node
+        } else if let Some(peer) =
+            semantic_inventory_udp_peer(&presentation_radio_devices(&self.radio), destination)
+        {
+            return Ok(peer);
+        } else {
+            anyhow::bail!("unsupported/no_quic_route: destination is not discovered");
+        };
+        let announce = node.announce.as_ref();
+        let port = announce
+            .map(|announce| announce.udp_port)
+            .filter(|port| *port != 0)
+            // A missing port is the receiver-selected default. ESP Main's
+            // raw UDP6 bearer uses 3339; host/Android listeners retain their
+            // configured service-port defaults. The sending device never
+            // carries an interface scope in its signed announce.
+            .or_else(|| {
+                announce
+                    .filter(|announce| {
+                        announce.device_class == dmesh_server::announce::DEVICE_CLASS_ESP
+                    })
+                    .map(|_| dmesh_server::udp::RAW_UDP6_PORT)
+            })
+            .or_else(|| {
+                std::env::var("LMESH_OBJECT_SERVER_PORT")
+                    .ok()
+                    .and_then(|value| value.parse::<u16>().ok())
+            })
+            .unwrap_or(dmesh_server::udp::DEVELOPMENT_WIFI_UDP_PORT);
+        let advertised_udp6 = announce
+            .as_ref()
+            .and_then(|announce| announce.udp_link_local_v6)
+            .map(Ipv6Addr::from);
+        require_live_udp6_scope(if let Some(ip) = advertised_udp6 {
+            let (flowinfo, scope_id) = match node.address {
+                SocketAddr::V6(address) => (address.flowinfo(), address.scope_id()),
+                SocketAddr::V4(_) => (0, configured_udp6_scope_id().unwrap_or(0)),
+            };
+            SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, flowinfo, scope_id))
+        } else {
+            match node.address {
+                SocketAddr::V4(address) => {
+                    SocketAddr::V4(std::net::SocketAddrV4::new(*address.ip(), port))
+                }
+                SocketAddr::V6(address) => SocketAddr::V6(std::net::SocketAddrV6::new(
+                    *address.ip(),
+                    port,
+                    address.flowinfo(),
+                    address.scope_id(),
+                )),
+            }
+        })
+    }
+
+    /// Resolve the stable device key for a retained UDP association. A named
+    /// signed-discovery route is already that key.  An explicit endpoint that
+    /// cannot be tied to discovery remains path-keyed because treating an
+    /// unauthenticated address as a device identity would let two devices
+    /// accidentally share a QUIC association.
+    async fn udp_association_key(&self, destination: &str) -> String {
+        if self.discovery.get_node(destination).await.is_some() {
+            return format!("identity:{destination}");
+        }
+        if let Some(key) = semantic_inventory_device_key(
+            &presentation_radio_devices(&self.radio),
+            destination,
+        ) {
+            return key;
+        }
+        format!("unverified-udp:{destination}")
+    }
+
+    async fn udp_association_for(&self, key: &str) -> Arc<Mutex<DeviceUdpAssociation>> {
+        let mut associations = self.device_udp_associations.lock().await;
+        associations
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(DeviceUdpAssociation::new())))
+            .clone()
+    }
+
+    /// Retire only the client state for a failed read-only UDP operation.
+    /// The association key remains device-oriented so the future multipath
+    /// owner can retain its validated path set instead of recreating an
+    /// address-keyed client here.
+    async fn reset_udp_association_for(&self, destination: &str) {
+        let key = self.udp_association_key(destination).await;
+        let association = self.udp_association_for(&key).await;
+        association.lock().await.client = None;
+    }
+
+    /// Retire the association selected for one idempotent retry.  This is
+    /// MeshClient recovery policy, not a radio policy: the selected adapter
+    /// merely releases its opaque frame-I/O handle while QUIC gets a new CID
+    /// and reopens the same service stream.
+    async fn retire_selected_association_for_retry(&self, destination: &str) -> Result<()> {
+        if is_now_mac(destination) {
+            self.radio
+                .reset_tagged_association_on_action_path(destination)
+        } else {
+            self.reset_udp_association_for(destination).await;
+            Ok(())
+        }
+    }
+
+    /// A UDP-only lmesh companion must not fall back to the historical
+    /// `wlan1` default for a NOW address. `lmesh-wifi` is the explicit radio
+    /// owner in that deployment; callers select its endpoint when they need
+    /// a NOW path. This keeps radio ownership out of the portable HTTP/QUIC
+    /// controller rather than turning a missing interface into a late raw
+    /// frame error.
+    fn require_owned_wifi_for_now(&self) -> Result<()> {
+        if self.wifi_owned_interfaces().names().is_empty() {
+            anyhow::bail!(
+                "unsupported/no_quic_route: lmesh is UDP-only; send NOW requests to lmesh-wifi"
+            );
+        }
+        Ok(())
+    }
+
+    /// Run the normal QUIC probe service over the route selected for a node.
+    /// MAC destinations currently resolve to the NOW frame adapter; discovered
+    /// or explicit IP destinations use UDP. The service contract and stream
+    /// receiver are identical on both paths.
+    async fn probe(
+        &self,
+        destination: &str,
+        request: dmesh_server::probe::ProbeServiceRequest,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
+        if is_now_mac(destination) {
+            self.require_owned_wifi_for_now()?;
+            // The action adapter does one opaque-frame attempt.  The common
+            // MeshClient retry loop below decides whether a typed peer restart
+            // may safely create a replacement association.
+            return self
+                .radio
+                .probe_on_action_path(destination, request, timeout_ms);
+        }
+
+        static NEXT_PROBE_REQUEST_ID: AtomicU64 = AtomicU64::new(0x2000);
+        let peer = self.resolve_udp_peer(destination).await?;
+        let key = self.udp_association_key(destination).await;
+        let association = self.udp_association_for(&key).await;
+        let mut association = association.lock().await;
+        if association.client.is_none() {
+            let cid = next_device_association_cid();
+            let cid = quic_lite::ConnectionId::new(cid)
+                .ok_or_else(|| anyhow::anyhow!("unable to allocate probe connection ID"))?;
+            let socket = self
+                .radio
+                .object_udp_socket()
+                .ok_or_else(|| anyhow::anyhow!("normal UDP listener is not running"))?;
+            association.client = Some(
+                dmesh_server::udp::UdpClient::connect_with_listener(
+                    socket,
+                    self.radio.object_udp_client_ingress(),
+                    peer,
+                    cid,
+                )
+                .await
+                .with_context(|| format!("open QUIC probe route to {destination}"))?,
+            );
+        }
+        let client = association
+            .client
+            .as_mut()
+            .expect("client is installed immediately above");
+        let stream = client.allocate_client_bidi_stream()?;
+        client
+            .select_udp_path(peer)
+            .with_context(|| format!("select UDP path {peer} for {key}"))?;
+        client.set_deferred_receive_credit(true);
+
+        let id = NEXT_PROBE_REQUEST_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut wire = [0u8; dmesh_server::probe::PROBE_RUN_REQUEST_MAX];
+        let used = dmesh_server::probe::encode_probe_run_request(request, id, &mut wire)
+            .context("encode probe request")?;
+        let plan = dmesh_server::probe::ProbeServicePlan::from_request(
+            request,
+            quic_lite::DEFAULT_MAX_DATAGRAM_SIZE.saturating_sub(32),
+        );
+        let mut receiver = dmesh_server::probe::ProbeRun::<
+            { dmesh_server::probe::PROBE_MAX_NORMAL_STREAMS },
+        >::new(
+            2,
+            plan.normal_streams,
+            plan.high_priority_bytes != 0,
+            plan.low_priority_bytes != 0,
+        );
+        let started = std::time::Instant::now();
+        let transfer = async {
+            // Response stream IDs are association-global. A previous tagged
+            // request may already have consumed stream 3/7/...; the first
+            // PROBE frame defines this run's normal-stream base rather than
+            // assuming a fresh association always starts at stream 3.
+            let mut first_response_stream = None;
+            let mut frame = client
+                .request_stream_frame(stream, &wire[..used], true)
+                .await?;
+            loop {
+                let stream = quic_lite::StreamFrame {
+                    id: frame.id,
+                    offset: frame.offset,
+                    fin: frame.fin,
+                    data: &frame.data,
+                };
+                let first_stream = *first_response_stream.get_or_insert(frame.id);
+                let (complete, _) = receiver
+                    .handle(first_stream, stream)
+                    .map_err(|_| anyhow::anyhow!("probe payload validation failed"))?;
+                if complete {
+                    return Result::<()>::Ok(());
+                }
+                frame = client.recv_stream_frame().await?;
+            }
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms.clamp(100, 120_000)),
+            transfer,
+        )
+        .await
+        .context("QUIC probe timed out")??;
+        client.set_deferred_receive_credit(false);
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let bytes = receiver.bytes();
+        let bps = if elapsed_us == 0 {
+            0
+        } else {
+            bytes.saturating_mul(8).saturating_mul(1_000_000) / elapsed_us
+        };
+        Ok(serde_json::json!({
+            "ok": true,
+            "service": "probe",
+            "to": destination,
+            "path": {"kind": "udp", "peer": peer.to_string()},
+            "requested_bytes": plan.total_bytes(),
+            "bytes": bytes,
+            "normal_bytes": receiver.normal_bytes(),
+            "high_bytes": receiver.high_bytes(),
+            "low_bytes": receiver.low_bytes(),
+            "elapsed_us": elapsed_us,
+            "bps": bps,
+            "callback_errors": receiver.callback_errors(),
+        }))
     }
 
     /// Send a complete tagged-CBOR request over a normal QUIC stream.  A
@@ -1765,78 +2741,142 @@ impl LmeshService {
         destination: &str,
         record: &[u8],
     ) -> Result<mesh::tagged::TaggedRecord> {
-        static NEXT_CID: AtomicU64 = AtomicU64::new(1);
         if is_now_mac(destination) {
-            let response = self
-                .radio
-                .forward_tagged_record_over_now(destination, record)
-                .with_context(|| {
-                    format!("send directed tagged request over NOW to {destination}")
-                })?;
-            return mesh::cbor::decode_record(&response)
-                .context("decode directed NOW tagged response");
-        }
-        let peer = if let Some(peer) = explicit_udp_endpoint(destination)? {
-            peer
-        } else {
-            let node = self.discovery.get_node(destination).await.ok_or_else(|| {
-                anyhow::anyhow!("unsupported/no_quic_route: destination is not discovered")
-            })?;
-            let port = node
-                .announce
-                .as_ref()
-                .map(|announce| announce.udp_port)
-                .filter(|port| *port != 0)
-                .or_else(|| {
-                    std::env::var("LMESH_OBJECT_SERVER_PORT")
-                        .ok()
-                        .and_then(|value| value.parse::<u16>().ok())
-                })
-                .unwrap_or(dmesh_server::udp::DEVELOPMENT_WIFI_UDP_PORT);
-            let advertised_udp6 = node
-                .announce
-                .as_ref()
-                .and_then(|announce| announce.udp_link_local_v6)
-                .map(Ipv6Addr::from);
-            if let Some(ip) = advertised_udp6 {
-                let (flowinfo, scope_id) = match node.address {
-                    SocketAddr::V6(address) => (address.flowinfo(), address.scope_id()),
-                    // A separate IPv4 multicast observation can refresh the same
-                    // signed node. Its lack of an IPv6 scope must not discard the
-                    // endpoint; choose this receiver's configured UDP6 ingress.
-                    SocketAddr::V4(_) => (0, configured_udp6_scope_id().unwrap_or(0)),
-                };
-                SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, flowinfo, scope_id))
-            } else {
-                match node.address {
-                    SocketAddr::V4(address) => {
-                        SocketAddr::V4(std::net::SocketAddrV4::new(*address.ip(), port))
+            self.require_owned_wifi_for_now()?;
+            let request_id = mesh::cbor::decode_record(record)
+                .context("decode directed NOW tagged request")?
+                .id;
+            let retryable = tagged_record_is_safe_stale_association_retry(record);
+            // A delayed stateless-reset packet can arrive just after the
+            // first fresh NOW open.  Permit two fresh associations for a
+            // reviewed read; mutations are never replayed.
+            let mut stale_association_retries = 0u8;
+            loop {
+                match self
+                    .radio
+                    .forward_tagged_record_on_action_path(destination, record)
+                {
+                    Ok(response) => {
+                        let response = decode_stream_response(&response)
+                            .context("decode directed NOW tagged response")?;
+                        if response.id == request_id {
+                            return Ok(response);
+                        }
+                        // A stale action-frame response belongs to a prior
+                        // stream on this peer association.  Association state
+                        // is common QUIC state, not a transport-specific
+                        // handler result: retire it before the bounded read
+                        // recovery. Mutations retain their ambiguity and are
+                        // never replayed.
+                        self.radio
+                            .reset_tagged_association_on_action_path(destination)?;
+                        if retryable && stale_association_retries < 2 {
+                            stale_association_retries += 1;
+                            continue;
+                        }
+                        anyhow::bail!("directed QUIC response ID mismatch");
                     }
-                    SocketAddr::V6(address) => SocketAddr::V6(std::net::SocketAddrV6::new(
-                        *address.ip(),
-                        port,
-                        address.flowinfo(),
-                        address.scope_id(),
-                    )),
+                    Err(_error)
+                        if retryable
+                            && stale_association_retries < 2 =>
+                    {
+                        // The raw action association was discarded by its
+                        // owner before this error reaches the service edge.
+                        // Whether the error was a token-verified reset, a
+                        // bounded timeout, or an action-window failure, a
+                        // retained CID cannot be reused. Repeat only a
+                        // reviewed read-only service with a bounded number
+                        // of fresh CIDs; mutations retain their ambiguous
+                        // outcome and are never replayed.
+                        // `forward_tagged_record_on_action_path` reports a
+                        // token-verified peer restart after decoding the
+                        // opaque QUIC packet, but it cannot know the HTTP
+                        // request's replay policy.  Retire the association
+                        // here before retrying; otherwise the next request
+                        // would send the same dead CID over the same NOW
+                        // path and fail identically.
+                        self.radio
+                            .reset_tagged_association_on_action_path(destination)?;
+                        stale_association_retries += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("send directed tagged request over NOW to {destination}")
+                        });
+                    }
                 }
             }
-        };
-        let bind = match peer {
-            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-            SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
-        };
-        let cid = NEXT_CID.fetch_add(1, Ordering::Relaxed).max(1);
-        let cid = quic_lite::ConnectionId::new(cid)
-            .ok_or_else(|| anyhow::anyhow!("unable to allocate QUIC connection ID"))?;
-        let mut client = dmesh_server::udp::UdpClient::connect(bind, peer, cid)
-            .await
-            .with_context(|| format!("open QUIC route to discovered node {destination}"))?;
-        let (_stream, response, _fin) = client
-            .request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, record, true)
-            .await
-            .context("send directed tagged request over QUIC")?;
-        let _ = client.close(0).await;
-        mesh::cbor::decode_record(&response).context("decode directed QUIC tagged response")
+        }
+        let peer = self.resolve_udp_peer(destination).await?;
+        let key = self.udp_association_key(destination).await;
+        let association = self.udp_association_for(&key).await;
+        let mut association = association.lock().await;
+        let retryable = tagged_record_is_safe_stale_association_retry(record);
+        let mut retried_stale_association = false;
+        loop {
+            // If this attempt reuses a live client and receives no response,
+            // the peer may have restarted and forgotten our CID.  Only
+            // catalogued reads receive one fresh-association retry below;
+            // mutations keep their uncertainty visible to the caller.
+            let reused_association = association.client.is_some();
+            if association.client.is_none() {
+                let cid = next_device_association_cid();
+                let cid = quic_lite::ConnectionId::new(cid)
+                    .ok_or_else(|| anyhow::anyhow!("unable to allocate QUIC connection ID"))?;
+                let socket = self
+                    .radio
+                    .object_udp_socket()
+                    .ok_or_else(|| anyhow::anyhow!("normal UDP listener is not running"))?;
+                association.client = Some(
+                    dmesh_server::udp::UdpClient::connect_with_listener(
+                        socket,
+                        self.radio.object_udp_client_ingress(),
+                        peer,
+                        cid,
+                    )
+                    .await
+                    .with_context(|| format!("open QUIC route to discovered node {destination}"))?,
+                );
+            }
+            let response = {
+                let client = association
+                    .client
+                    .as_mut()
+                    .expect("client is installed immediately above");
+                let stream = client.allocate_client_bidi_stream()?;
+                client
+                    .select_udp_path(peer)
+                    .with_context(|| format!("select UDP path {peer} for {key}"))?;
+                client
+                    .request_stream_all(stream, record, true, 256 * 1024)
+                    .await
+            };
+            match response {
+                Ok(response) => {
+                    return decode_stream_response(&response)
+                        .context("decode directed QUIC tagged response");
+                }
+                Err(error) => {
+                    // A failed stream can have outstanding packet history
+                    // and a peer-side half-open stream. Do not let a later
+                    // HTTP call inherit it. A reviewed read may make one
+                    // fresh-association retry after a token-verified reset
+                    // or an exhausted bounded stream timeout; mutations keep
+                    // their ambiguous result and are never replayed.
+                    association.client = None;
+                    if retryable
+                        && reused_association
+                        && !retried_stale_association
+                        && dmesh_server::transport::is_fresh_association_retry_error(&error)
+                    {
+                        retried_stale_association = true;
+                        continue;
+                    }
+                    return Err(error).context("send directed tagged request over QUIC");
+                }
+            }
+        }
     }
 
     /// Install the first relay leg through a retained normal QUIC control
@@ -1856,11 +2896,14 @@ impl LmeshService {
         let local_cid = next_relay_cid(&NEXT_CONTROL_CID, 0x434f_4e54_524f_4c00)
             .ok_or_else(|| anyhow::anyhow!("unable to allocate relay control CID"))?;
         let endpoint_cid = next_relay_cid(&NEXT_ENDPOINT_CID, 0x454e_4450_4f49_4e54)
-        .ok_or_else(|| anyhow::anyhow!("unable to allocate relay endpoint CID"))?;
+            .ok_or_else(|| anyhow::anyhow!("unable to allocate relay endpoint CID"))?;
         let udp_peer = explicit_udp_endpoint(&relay_endpoint)?;
-        let now_relay = (udp_peer.is_none() && is_now_mac(&relay_endpoint)).then_some(relay_endpoint.as_str());
+        let now_relay =
+            (udp_peer.is_none() && is_now_mac(&relay_endpoint)).then_some(relay_endpoint.as_str());
         if udp_peer.is_none() && now_relay.is_none() {
-            anyhow::bail!("relay_endpoint must be udp://HOST:PORT, [IPv6]:PORT, or a directed NOW MAC");
+            anyhow::bail!(
+                "relay_endpoint must be udp://HOST:PORT, [IPv6]:PORT, or a directed NOW MAC"
+            );
         }
 
         // `relay.pair` is a normal request on the authenticated control
@@ -1874,8 +2917,7 @@ impl LmeshService {
             dmesh_server::relay::now_next_hop_handle(self.radio.directed_now_source_mac()?)
                 .ok_or_else(|| anyhow::anyhow!("invalid directed NOW source MAC"))?
         } else {
-            dmesh_server::relay::udp6_next_hop_handle(allocation)
-                .expect("nonzero relay allocation")
+            dmesh_server::relay::udp6_next_hop_handle(allocation).expect("nonzero relay allocation")
         };
         let request = dmesh_server::relay::PairRequest {
             forward: dmesh_server::relay::Request {
@@ -1886,7 +2928,7 @@ impl LmeshService {
                     route: dmesh_server::relay::RelayRoute {
                         next_hop: dmesh_server::relay::now_next_hop_handle(mac)
                             .expect("validated directed NOW MAC"),
-                        outbound_dcid: quic_lite::ConnectionId::new(0).expect("zero bootstrap DCID"),
+                        destination: quic_lite::ForwardDestination::Bootstrap,
                     },
                     position: 1,
                 }),
@@ -1898,7 +2940,7 @@ impl LmeshService {
                     proposed_dcid: Some(reverse_alias),
                     route: dmesh_server::relay::RelayRoute {
                         next_hop: reverse_handle,
-                        outbound_dcid: endpoint_cid,
+                        destination: quic_lite::ForwardDestination::Connection(endpoint_cid),
                     },
                     position: 2,
                 }),
@@ -1925,8 +2967,13 @@ impl LmeshService {
             }
             (response, Some(client), "udp_quic")
         } else {
-            let response = self.radio
-                .forward_tagged_record_over_now_with_cid(now_relay.expect("validated NOW relay"), &wire[..used], local_cid)
+            let response = self
+                .radio
+                .forward_tagged_record_on_action_path_with_cid(
+                    now_relay.expect("validated NOW relay"),
+                    &wire[..used],
+                    local_cid,
+                )
                 .context("send relay.pair over NOW QUIC control")?;
             (response, None, "now_quic")
         };
@@ -1960,19 +3007,23 @@ impl LmeshService {
                 let _ = client.close(0).await;
             }
         }
-        sessions.insert(relay_endpoint.clone(), RelayControlSession {
-            client: retained_client,
-            peer: relay_endpoint.clone(),
-            udp_peer,
-            local_cid,
-            endpoint_cid,
-            forward_alias,
-            reverse_alias,
-            forward_allocation: allocation,
-            forward_next_hop: dmesh_server::relay::now_next_hop_handle(mac)
-                .expect("validated directed NOW MAC"),
-            endpoint_server_cid: None,
-        });
+        sessions.insert(
+            relay_endpoint.clone(),
+            RelayControlSession {
+                client: retained_client,
+                peer: relay_endpoint.clone(),
+                udp_peer,
+                local_cid,
+                endpoint_cid,
+                forward_alias,
+                reverse_alias,
+                forward_allocation: allocation,
+                forward_revision: 1,
+                forward_next_hop: dmesh_server::relay::now_next_hop_handle(mac)
+                    .expect("validated directed NOW MAC"),
+                endpoint_server_cid: None,
+            },
+        );
         Ok(serde_json::json!({
             "state": "leg_ready",
             "relay_endpoint": relay_endpoint,
@@ -1998,27 +3049,27 @@ impl LmeshService {
             .remove(&relay_endpoint)
             .ok_or_else(|| anyhow::anyhow!("relay.open requires an existing leg_ready session"))?;
         let result = async {
-            let peer = session
-                .udp_peer
-                .ok_or_else(|| anyhow::anyhow!("relay.open over NOW control is not implemented yet"))?;
-            let control = session
-                .client
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("relay.open session has no retained UDP control socket"))?;
+            let peer = session.udp_peer.ok_or_else(|| {
+                anyhow::anyhow!("relay.open over NOW control is not implemented yet")
+            })?;
+            let control = session.client.take().ok_or_else(|| {
+                anyhow::anyhow!("relay.open session has no retained UDP control socket")
+            })?;
 
             // This is the one current QUIC-lite relay-open exception: the
             // endpoint's bootstrap OPEN uses visible alias F on the adjacent
-            // e9 link. e9 rewrites it to DCID zero and substitutes R into the
+            // e9 link. e9 removes the relay-local label and substitutes R into the
             // plaintext receive-CID field before it reaches the endpoint.
-            let socket = control.into_socket();
-            let mut endpoint = dmesh_server::udp::UdpClient::connect_with_socket_and_quic_lite_wire_dcid(
-                socket,
-                peer,
-                session.endpoint_cid,
-                session.forward_alias,
-            )
-            .await
-            .context("relay.open endpoint bootstrap through observed forward alias")?;
+            let socket = control.into_socket()?;
+            let mut endpoint =
+                dmesh_server::udp::UdpClient::connect_with_socket_and_quic_lite_wire_dcid(
+                    socket,
+                    peer,
+                    session.endpoint_cid,
+                    session.forward_alias,
+                )
+                .await
+                .context("relay.open endpoint bootstrap through observed forward alias")?;
             let endpoint_server_cid = endpoint
                 .peer_connection_id()
                 .ok_or_else(|| anyhow::anyhow!("relay.open did not install endpoint server CID"))?;
@@ -2031,7 +3082,7 @@ impl LmeshService {
             // to the original, still-live endpoint socket above.
             static NEXT_UPDATE_CID: AtomicU64 = AtomicU64::new(0x5000);
             let update_cid = next_relay_cid(&NEXT_UPDATE_CID, 0x5550_4441_5445_0000)
-            .ok_or_else(|| anyhow::anyhow!("unable to allocate relay update CID"))?;
+                .ok_or_else(|| anyhow::anyhow!("unable to allocate relay update CID"))?;
             let bind = match peer {
                 SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
                 SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
@@ -2046,19 +3097,16 @@ impl LmeshService {
                     proposed_dcid: Some(session.forward_alias),
                     route: dmesh_server::relay::RelayRoute {
                         next_hop: session.forward_next_hop,
-                        outbound_dcid: endpoint_server_cid,
+                        destination: quic_lite::ForwardDestination::Connection(endpoint_server_cid),
                     },
                     position: 1,
                 }),
             };
             let mut update_wire = [0u8; 128];
             let update_id = session.forward_allocation.saturating_add(1);
-            let update_len = dmesh_server::relay::encode_request(
-                update,
-                Some(update_id),
-                &mut update_wire,
-            )
-            .ok_or_else(|| anyhow::anyhow!("encode relay.apply update"))?;
+            let update_len =
+                dmesh_server::relay::encode_request(update, Some(update_id), &mut update_wire)
+                    .ok_or_else(|| anyhow::anyhow!("encode relay.apply update"))?;
             let (_, update_response, update_fin) = update_control
                 .request_stream(
                     quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
@@ -2075,6 +3123,9 @@ impl LmeshService {
             if update_response.id != Some(update_id) || update_response.error.is_some() {
                 anyhow::bail!("relay.apply update rejected or returned a mismatched response");
             }
+            // Subsequent close requests must guard the mapping as it exists
+            // after OPEN reconciliation, not the original pair revision.
+            session.forward_revision = update.revision;
 
             // Require a correlated discovery response from the endpoint
             // before recording this leg as connected.  This is the same
@@ -2115,9 +3166,9 @@ impl LmeshService {
             {
                 anyhow::bail!("endpoint discovery.nodes response is not a matching QUIC result");
             } else {
-                endpoint_discovery
-                    .result
-                    .ok_or_else(|| anyhow::anyhow!("endpoint discovery.nodes response has no result"))?
+                endpoint_discovery.result.ok_or_else(|| {
+                    anyhow::anyhow!("endpoint discovery.nodes response has no result")
+                })?
             };
             session.client = Some(endpoint);
             session.endpoint_server_cid = Some(endpoint_server_cid);
@@ -2136,8 +3187,139 @@ impl LmeshService {
             }))
         }
         .await;
-        self.relay_sessions.lock().await.insert(relay_endpoint, session);
+        self.relay_sessions
+            .lock()
+            .await
+            .insert(relay_endpoint, session);
         result
+    }
+
+    /// Read endpoint status through the retained end-to-end QUIC connection.
+    /// This is deliberately distinct from `relay.status`, which describes the
+    /// controller's local circuit object and cannot prove endpoint service.
+    async fn relay_endpoint_status(&self, relay_endpoint: String) -> Result<serde_json::Value> {
+        let mut session = self
+            .relay_sessions
+            .lock()
+            .await
+            .remove(&relay_endpoint)
+            .ok_or_else(|| anyhow::anyhow!("relay.endpoint.status requires an existing circuit"))?;
+        let result = async {
+            let endpoint = session.client.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("relay.endpoint.status requires a completed UDP relay circuit")
+            })?;
+            // Each request owns a fresh client-initiated bidirectional
+            // stream. Reusing stream 8 made the first status check pass but
+            // left a later HTTP/UI refresh looking like a relay failure.
+            static NEXT_ENDPOINT_STATUS_STREAM: AtomicU64 =
+                AtomicU64::new(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4);
+            let stream_id = NEXT_ENDPOINT_STATUS_STREAM.fetch_add(4, Ordering::Relaxed);
+            let request_id = stream_id;
+            let mut request = [0u8; 32];
+            let used = dmesh_server::tagged::encode_numeric_empty_request(
+                dmesh_server::services::DIAGNOSTIC_COMPONENT,
+                dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
+                request_id,
+                &mut request,
+            )
+            .ok_or_else(|| anyhow::anyhow!("encode endpoint status request"))?;
+            let (_, response, fin) = endpoint
+                .request_stream(stream_id, &request[..used], true)
+                .await
+                .context("request endpoint status through relay")?;
+            if !fin {
+                anyhow::bail!("endpoint status did not finish its QUIC stream");
+            }
+            let response = dmesh_server::tagged::decode(&response)
+                .ok_or_else(|| anyhow::anyhow!("endpoint status is not tagged CBOR"))?;
+            if response.id != Some(request_id) || response.error.is_some() {
+                anyhow::bail!("endpoint status returned a mismatched or failed response");
+            }
+            let mut status = dmesh_server::cbor::Decoder::new(
+                response
+                    .result
+                    .ok_or_else(|| anyhow::anyhow!("endpoint status has no result"))?,
+            );
+            let status = core::str::from_utf8(
+                status
+                    .text_ref()
+                    .context("endpoint status result is not text")?,
+            )
+            .context("endpoint status is not UTF-8")?
+            .to_owned();
+            Ok(serde_json::json!({
+                "state": "next_connected",
+                "relay_endpoint": relay_endpoint,
+                "endpoint_server_cid": session.endpoint_server_cid.map(|cid| cid.value()),
+                "endpoint_status": status,
+            }))
+        }
+        .await;
+        self.relay_sessions
+            .lock()
+            .await
+            .insert(relay_endpoint, session);
+        result
+    }
+
+    /// Remove the retained controller session and its remote pair. A missing
+    /// pair is a successful idempotent cleanup; an unavailable relay leaves
+    /// the caller with an error rather than pretending the remote rule is gone.
+    async fn relay_close(&self, relay_endpoint: String) -> Result<serde_json::Value> {
+        let session = self
+            .relay_sessions
+            .lock()
+            .await
+            .remove(&relay_endpoint)
+            .ok_or_else(|| anyhow::anyhow!("relay.close requires an existing circuit"))?;
+        let peer = session.udp_peer.ok_or_else(|| {
+            anyhow::anyhow!("relay.close over NOW control is not implemented yet")
+        })?;
+        let bind = match peer {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+        };
+        static NEXT_CLOSE_CID: AtomicU64 = AtomicU64::new(0x7000);
+        let local_cid = next_relay_cid(&NEXT_CLOSE_CID, 0x434c_4f53_4500_0000)
+            .ok_or_else(|| anyhow::anyhow!("unable to allocate relay close CID"))?;
+        let mut control = dmesh_server::udp::UdpClient::connect(bind, peer, local_cid)
+            .await
+            .context("open relay close control connection")?;
+        let id = session.forward_allocation.saturating_add(3);
+        let mut request = [0u8; 64];
+        let used = dmesh_server::relay::encode_remove_request(
+            session.forward_alias,
+            session.forward_revision,
+            id,
+            &mut request,
+        )
+        .ok_or_else(|| anyhow::anyhow!("encode relay.rm"))?;
+        let (_, response, fin) = control
+            .request_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                &request[..used],
+                true,
+            )
+            .await
+            .context("send relay.rm")?;
+        if !fin {
+            anyhow::bail!("relay.rm did not finish its QUIC stream");
+        }
+        let response = dmesh_server::tagged::decode(&response)
+            .ok_or_else(|| anyhow::anyhow!("decode relay.rm tagged response"))?;
+        if response.id != Some(id) || response.error.is_some() {
+            anyhow::bail!("relay.rm rejected or returned a mismatched response");
+        }
+        let removed = response
+            .result
+            .and_then(|result| dmesh_server::cbor::Decoder::new(result).boolean())
+            .ok_or_else(|| anyhow::anyhow!("relay.rm response lacks boolean result"))?;
+        let _ = control.close(0).await;
+        Ok(serde_json::json!({
+            "state": "closed",
+            "relay_endpoint": relay_endpoint,
+            "removed": removed,
+        }))
     }
 
     async fn relay_status(&self) -> serde_json::Value {
@@ -2151,6 +3333,7 @@ impl LmeshService {
                     "local_cid": session.local_cid.value(),
                     "forward_alias": session.forward_alias.value(),
                     "reverse_alias": session.reverse_alias.value(),
+                    "forward_revision": session.forward_revision,
                     "endpoint_cid": session.endpoint_cid.value(),
                     "endpoint_server_cid": session.endpoint_server_cid.map(|cid| cid.value()),
                     "state": if session.endpoint_server_cid.is_some() { "next_connected" } else { "leg_ready" },
@@ -2163,7 +3346,62 @@ impl LmeshService {
     /// Handle a single JSON-lines request.
     pub async fn handle_request(&self, request: Request) -> mesh::protocol::Response {
         match request {
-            Request::RelayConnect { relay_endpoint, next_hop_mac } => match self.relay_connect(relay_endpoint, next_hop_mac).await {
+            Request::Probe {
+                to,
+                bytes,
+                packet_size,
+                parallel_streams,
+                timeout_ms,
+            } => {
+                let mut request = dmesh_server::probe::ProbeServiceRequest::new(
+                    bytes.unwrap_or(64 * 1024),
+                    packet_size.unwrap_or(1200),
+                );
+                request.parallel_streams = parallel_streams;
+                let timeout_ms = timeout_ms.unwrap_or(30_000);
+                // Probe is a normal read-only stream. A peer restart can
+                // invalidate a retained CID just after a service restart;
+                // discard the failed per-path client and allow the same two
+                // fresh-association attempts used by catalogued reads.
+                let mut result = self.probe(&to, request, timeout_ms).await;
+                for retry in 1_u64..=3 {
+                    if !result.as_ref().is_err_and(|error| {
+                        dmesh_server::transport::is_fresh_association_retry_error(error)
+                    }) {
+                        break;
+                    }
+                    if let Err(error) = self.retire_selected_association_for_retry(&to).await {
+                        result = Err(error);
+                        break;
+                    }
+                    // A peer has to schedule the replacement after emitting
+                    // its stateless reset. Replaying an idempotent read in
+                    // the same call stack can otherwise receive that prior
+                    // reset again. This is association recovery for every
+                    // QUIC path, not a NOW timing rule.
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * retry,
+                    ))
+                    .await;
+                    result = self.probe(&to, request, timeout_ms).await;
+                }
+                match result {
+                    Ok(value) if value["ok"] == true => {
+                        mesh::protocol::Response::ok_with_data(value)
+                    }
+                    Ok(value) => mesh::protocol::Response::err(
+                        value["error"]
+                            .as_str()
+                            .unwrap_or("probe did not complete")
+                            .to_owned(),
+                    ),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
+            Request::RelayConnect {
+                relay_endpoint,
+                next_hop_mac,
+            } => match self.relay_connect(relay_endpoint, next_hop_mac).await {
                 Ok(value) => mesh::protocol::Response::ok_with_data(value),
                 Err(error) => mesh::protocol::Response::err(error.to_string()),
             },
@@ -2171,7 +3409,21 @@ impl LmeshService {
                 Ok(value) => mesh::protocol::Response::ok_with_data(value),
                 Err(error) => mesh::protocol::Response::err(error.to_string()),
             },
-            Request::RelayStatus => mesh::protocol::Response::ok_with_data(self.relay_status().await),
+            Request::RelayEndpointStatus { relay_endpoint } => {
+                match self.relay_endpoint_status(relay_endpoint).await {
+                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
+            Request::RelayClose { relay_endpoint } => {
+                match self.relay_close(relay_endpoint).await {
+                    Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                    Err(error) => mesh::protocol::Response::err(error.to_string()),
+                }
+            }
+            Request::RelayStatus => {
+                mesh::protocol::Response::ok_with_data(self.relay_status().await)
+            }
             Request::Send {
                 radio,
                 destination,
@@ -2184,18 +3436,45 @@ impl LmeshService {
                 radio,
                 reason,
             } => mesh::protocol::Response::ok_with_data(self.radio.link_steer(node, radio, reason)),
-            Request::DiscoveryPing { medium } => {
+            Request::DiscoveryActive { medium, to } => {
+                if let Some(destination) = to {
+                    if destination.starts_with("udp://") {
+                        return match self.discovery.directed_request(&destination).await {
+                            Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                            Err(error) => mesh::protocol::Response::err(error.to_string()),
+                        };
+                    }
+                    return match self.radio.directed_now_discovery(medium, destination).await {
+                        Ok(value) => mesh::protocol::Response::ok_with_data(value),
+                        Err(error) => mesh::protocol::Response::err(error.to_string()),
+                    };
+                }
                 let all_available = medium.is_none();
                 let wants_multicast = all_available
                     || matches!(medium.as_deref(), Some("all" | "mcast" | "udp" | "udp6"));
-                let mut result = self.radio.discovery_ping(medium);
+                // A launcher with an empty ownership allow-list is the
+                // UDP-only companion personality.  It may still solicit
+                // discovery on the shared UDP socket, but it must never let
+                // the radio adapter choose a fallback interface.
+                let mut result = if self.wifi_owned_interfaces().names().is_empty() {
+                    serde_json::json!({
+                        "ok": true,
+                        "submissions": {"wifi": {"ok": true, "state": "not_owned"}}
+                    })
+                } else {
+                    self.radio.discovery_active(medium, None)
+                };
                 if wants_multicast {
-                    result["udp_multicast"] = match self.discovery.announce().await {
-                        Ok(report) => report,
-                        Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
-                    };
+                    result["submissions"]["udp_multicast"] =
+                        match self.discovery.broadcast_request().await {
+                            Ok(report) => report,
+                            Err(error) => {
+                                serde_json::json!({"ok": false, "error": error.to_string()})
+                            }
+                        };
                     result["ok"] = serde_json::json!(
-                        result["ok"] == true && result["udp_multicast"]["accepted"] == true
+                        result["ok"] == true
+                            && result["submissions"]["udp_multicast"]["accepted"] == true
                     );
                 }
                 mesh::protocol::Response::ok_with_data(result)
@@ -2246,62 +3525,36 @@ impl LmeshService {
                 )),
                 Err(error) => mesh::protocol::Response::err(error.to_string()),
             },
-            Request::WifiRawPing {
-                iface,
-                channel,
-                listen_sec,
-                wait_ms,
-                nonce,
-            } => mesh::protocol::Response::ok_with_data(
-                self.radio
-                    .wifi_raw_ping(iface, channel, listen_sec, wait_ms, nonce),
-            ),
             Request::RadioDevices => {
-                mesh::protocol::Response::ok_with_data(self.radio.radio_devices())
+                mesh::protocol::Response::ok_with_data(presentation_radio_devices(&self.radio))
             }
             Request::DiscoveryStatus => {
                 mesh::protocol::Response::ok_with_data(common_discovery_status(&self.radio))
             }
-            Request::NanStatus => {
-                mesh::protocol::Response::ok_with_data(self.radio.nan_status(None))
-            }
-            Request::NowMetrics => {
-                mesh::protocol::Response::ok_with_data(self.radio.now_metrics(None))
-            }
-            Request::NanMetrics => {
-                mesh::protocol::Response::ok_with_data(self.radio.nan_metrics(None))
-            }
+            Request::NanStatus => match self.owned_wifi_iface(None, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => {
+                    mesh::protocol::Response::ok_with_data(self.radio.nan_status(Some(iface)))
+                }
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
+            Request::NowMetrics => match self.owned_wifi_iface(None, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => {
+                    mesh::protocol::Response::ok_with_data(self.radio.now_metrics(Some(iface)))
+                }
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
+            Request::NanMetrics => match self.owned_wifi_iface(None, lmesh_wifi::Operation::Nan) {
+                Ok(iface) => {
+                    mesh::protocol::Response::ok_with_data(self.radio.nan_metrics(Some(iface)))
+                }
+                Err(error) => mesh::protocol::Response::err(error.to_string()),
+            },
             Request::Udp6Metrics => {
                 mesh::protocol::Response::ok_with_data(self.radio.udp6_metrics())
             }
             Request::WifiLinkMetrics => {
                 mesh::protocol::Response::ok_with_data(self.radio.wifi_link_metrics(None))
             }
-            Request::TransportDiscover {
-                iface,
-                channel,
-                nan,
-                passive_scan,
-                active_scan,
-                dns_sd,
-                wait_ms,
-            } => match self.owned_wifi_iface(iface, lmesh_wifi::Operation::Nan) {
-                Ok(iface) => mesh::protocol::Response::ok_with_data(self.radio.transport_discover(
-                    Some(iface),
-                    channel,
-                    // A `transport.discover` request is itself an active
-                    // query. `nan=false` explicitly suppresses NAN while
-                    // the other optional scan flags select additional
-                    // discovery media.
-                    nan.unwrap_or(true),
-                    nan.unwrap_or(true),
-                    passive_scan.unwrap_or(true),
-                    active_scan.unwrap_or(false),
-                    dns_sd.unwrap_or(false),
-                    wait_ms,
-                )),
-                Err(error) => mesh::protocol::Response::err(error.to_string()),
-            },
             Request::ObjectNanDryRun { image_size, mtu } => mesh::protocol::Response::ok_with_data(
                 nan_object_dry_run(image_size, mtu.unwrap_or(1_200)),
             ),
@@ -2379,16 +3632,17 @@ impl LmeshService {
                 ssid,
                 channel,
                 passive,
+                last_results,
             } => mesh::protocol::Response::ok_with_data(self.radio.wifi_scan(
                 iface,
                 ssid,
                 channel,
-                passive.unwrap_or(false),
+                passive.unwrap_or_else(|| last_results.unwrap_or(false)),
             )),
             Request::WifiStaJoinOpen { iface, ssid } => mesh::protocol::Response::ok_with_data(
                 self.radio.wifi_sta_join_open(iface, ssid, None, None),
             ),
-            Request::TransportStart {
+            Request::TransportSet {
                 kind,
                 iface,
                 ssid,
@@ -2410,7 +3664,7 @@ impl LmeshService {
                 };
                 if !kind_ok {
                     mesh::protocol::Response::err(
-                        "Linux transport.start expects kind=sta or kind=nan with ap=1",
+                        "Linux transport.set expects kind=sta or kind=nan with ap=1",
                     )
                 } else {
                     mesh::protocol::Response::ok_with_data(
@@ -2418,9 +3672,6 @@ impl LmeshService {
                             .transport_start(iface, ssid, passphrase, bssid, channel, ap, open),
                     )
                 }
-            }
-            Request::TransportStop { iface } => {
-                mesh::protocol::Response::ok_with_data(self.stop_wifi_transport(iface))
             }
             Request::WifiStaConfigureIpv4 {
                 iface,
@@ -2479,6 +3730,118 @@ mod tests {
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn stale_association_retry_is_limited_to_catalogued_reads() {
+        let mut read = [0u8; 64];
+        let read_len = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::control::CONTROL_COMPONENT,
+            dmesh_server::control::SETTINGS_GET,
+            1,
+            &mut read,
+        )
+        .unwrap();
+        assert!(tagged_record_is_safe_stale_association_retry(
+            &read[..read_len]
+        ));
+
+        let mut telemetry = [0u8; 64];
+        let telemetry_len = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::telemetry::TELEMETRY_COMPONENT,
+            dmesh_server::telemetry::NAN_METRICS_METHOD,
+            2,
+            &mut telemetry,
+        )
+        .unwrap();
+        assert!(tagged_record_is_safe_stale_association_retry(
+            &telemetry[..telemetry_len]
+        ));
+
+        let mesh_wire = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(
+                dmesh_server::telemetry::TELEMETRY_COMPONENT as u32,
+            ),
+            method: mesh::tagged::NameOrTag::Tag(
+                dmesh_server::telemetry::NAN_METRICS_METHOD as u32,
+            ),
+            id: Some(serde_json::json!(3)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(tagged_record_is_safe_stale_association_retry(&mesh_wire));
+
+        let named_mesh_wire = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Name("telemetry".to_owned()),
+            method: mesh::tagged::NameOrTag::Name("nan_metrics".to_owned()),
+            id: Some(serde_json::json!(4)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(tagged_record_is_safe_stale_association_retry(&named_mesh_wire));
+
+        let bare_status_wire = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Name(String::new()),
+            method: mesh::tagged::NameOrTag::Name("status".to_owned()),
+            id: Some(serde_json::json!(5)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(tagged_record_is_safe_stale_association_retry(&bare_status_wire));
+
+        let mut cached_scan = [0u8; 64];
+        let cached_scan_len = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::raw_wifi::RAW_WIFI_COMPONENT,
+            dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN,
+            6,
+            &mut cached_scan,
+        )
+        .unwrap();
+        assert!(tagged_record_is_safe_stale_association_retry(
+            &cached_scan[..cached_scan_len]
+        ));
+
+        let mut mutation = [0u8; 64];
+        let mutation_len = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::control::CONTROL_COMPONENT,
+            dmesh_server::control::SETTINGS_SET,
+            2,
+            &mut mutation,
+        )
+        .unwrap();
+        assert!(!tagged_record_is_safe_stale_association_retry(
+            &mutation[..mutation_len]
+        ));
+    }
+
+    #[test]
+    fn compact_dmesh_stream_response_normalizes_for_mesh_http_and_ssh() {
+        let mut response = [0u8; 64];
+        let used = dmesh_server::tagged::encode_numeric_response(
+            dmesh_server::telemetry::TELEMETRY_COMPONENT,
+            dmesh_server::telemetry::NOW_METRICS_METHOD,
+            42,
+            &[0xf5],
+            &mut response,
+        )
+        .unwrap();
+
+        let record = decode_stream_response(&response[..used]).unwrap();
+        assert_eq!(record.id, Some(serde_json::json!(42)));
+        assert_eq!(record.result, Some(serde_json::json!(true)));
+        assert!(record.error.is_none());
+        assert_eq!(record.kind().unwrap(), mesh::tagged::RecordKind::Response);
+    }
+
+    #[test]
+    fn association_cid_seed_is_nonzero_and_process_specific() {
+        let now = 1_726_000_000_123_456_789u128;
+        let first = association_cid_seed(now, 100);
+        let second = association_cid_seed(now, 101);
+
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn test_base64_url_encode() {
         let data = b"hello world";
         let encoded = base64_url_encode(data);
@@ -2497,8 +3860,8 @@ mod tests {
             "wifi.raw.listen",
             "wifi.raw.stop",
             "wifi.raw.send",
+            "wifi.raw.ping",
             "wifi.raw.check",
-            "wifi.raw.iperf",
             "wifi.raw.metrics",
             "wifi.nan.status",
             "wifi.nan.listen",
@@ -2517,6 +3880,81 @@ mod tests {
     }
 
     #[test]
+    fn probe_request_names_only_the_node_and_service_parameters() {
+        let request = serde_json::from_value::<Request>(serde_json::json!({
+            "method": "probe",
+            "to": "02:00:00:00:00:44",
+            "bytes": 4096,
+            "packet_size": 512,
+            "parallel_streams": 2,
+            "timeout_ms": 5000
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Probe {
+                to,
+                bytes: Some(4096),
+                packet_size: Some(512),
+                parallel_streams: Some(2),
+                timeout_ms: Some(5000),
+            } if to == "02:00:00:00:00:44"
+        ));
+    }
+
+    #[test]
+    fn active_discovery_distinguishes_broadcast_from_an_explicit_path() {
+        let broadcast = serde_json::from_value::<Request>(serde_json::json!({
+            "method": "discovery.active"
+        }))
+        .unwrap();
+        assert!(matches!(
+            broadcast,
+            Request::DiscoveryActive {
+                medium: None,
+                to: None
+            }
+        ));
+
+        let directed = serde_json::from_value::<Request>(serde_json::json!({
+            "method": "discovery.active",
+            "medium": "udp6",
+            "to": "udp://[fe80::7%3]:3339"
+        }))
+        .unwrap();
+        assert!(matches!(
+            directed,
+            Request::DiscoveryActive {
+                medium: Some(medium),
+                to: Some(to)
+            } if medium == "udp6" && to == "udp://[fe80::7%3]:3339"
+        ));
+        assert!(
+            serde_json::from_value::<Request>(serde_json::json!({
+                "method": "discovery.broadcast"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn wifi_scan_last_results_is_a_shared_read_only_request_field() {
+        let request = serde_json::from_value::<Request>(serde_json::json!({
+            "method": "wifi.scan",
+            "last_results": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::WifiScan {
+                passive: None,
+                last_results: Some(true),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn explicit_udp_target_and_now_mac_route_are_distinct() {
         assert_eq!(
             explicit_udp_endpoint("udp://[2001:db8::44]:3336")
@@ -2528,10 +3966,261 @@ mod tests {
             explicit_udp_endpoint("192.0.2.44:3336").unwrap().unwrap(),
             "192.0.2.44:3336".parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(
+            explicit_udp_endpoint("udp://[2001:db8::44]")
+                .unwrap()
+                .unwrap(),
+            "[2001:db8::44]:3336".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            explicit_udp_endpoint("192.0.2.44").unwrap().unwrap(),
+            "192.0.2.44:3336".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(explicit_udp_endpoint("02:00:00:00:00:44").unwrap(), None);
         assert!(is_now_mac("02:00:00:00:00:44"));
         assert!(!is_now_mac("02:00:00:00:00:444"));
         assert!(!is_now_mac("not-a-mac"));
+    }
+
+    #[test]
+    fn explicit_udp_target_accepts_numeric_link_local_scope() {
+        assert_eq!(
+            explicit_udp_endpoint("udp://[fe80::44%7]:3339")
+                .unwrap()
+                .unwrap(),
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::44".parse().unwrap(),
+                3339,
+                0,
+                7,
+            ))
+        );
+        assert_eq!(
+            explicit_udp_endpoint("udp://[fe80::44%7]")
+                .unwrap()
+                .unwrap(),
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::44".parse().unwrap(),
+                dmesh_server::udp::STABLE_WIFI_UDP_PORT,
+                0,
+                7,
+            ))
+        );
+    }
+
+    #[test]
+    fn stale_receiver_local_ipv6_scope_is_not_a_route() {
+        let live = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::44".parse().unwrap(),
+            3339,
+            0,
+            5,
+        ));
+        let stale = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::44".parse().unwrap(),
+            3339,
+            0,
+            588_879,
+        ));
+        assert!(udp6_peer_has_scope_in(&live, [5]));
+        assert!(!udp6_peer_has_scope_in(&stale, [5]));
+        assert!(!udp6_peer_has_scope_in(&live, []));
+    }
+
+    #[test]
+    fn semantic_inventory_routes_name_to_advertised_ipv6_on_observed_scope() {
+        let inventory = serde_json::json!({
+            "devices": [{
+                "identity": "e7",
+                "announce": {
+                    "udp_link_local_v6": "fe80::16c1:9fff:fee4:5d48",
+                    "udp_port": 3339,
+                },
+                "observations": {
+                    "udp_multicast": {
+                        "last_peer": "[fe80::16c1:9fff:fee4:5d48%5]:3339",
+                    },
+                },
+            }],
+        });
+        assert_eq!(
+            semantic_inventory_udp_peer(&inventory, "e7"),
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::16c1:9fff:fee4:5d48".parse().unwrap(),
+                3339,
+                0,
+                5,
+            )))
+        );
+        assert_eq!(semantic_inventory_udp_peer(&inventory, "unknown"), None);
+    }
+
+    #[test]
+    fn semantic_inventory_uses_one_association_key_for_name_and_udp_path() {
+        let inventory = serde_json::json!({
+            "devices": [{
+                "identity": "e7",
+                "announce": {
+                    "route_key": "stable-e7-key",
+                    "udp_link_local_v6": "fe80::16c1:9fff:fee4:5d48",
+                    "udp_port": 3339,
+                },
+                "observations": {
+                    "udp_multicast": {
+                        "last_peer": "[fe80::16c1:9fff:fee4:5d48%5]:3339",
+                    },
+                },
+            }],
+        });
+        assert_eq!(
+            semantic_inventory_device_key(&inventory, "e7").as_deref(),
+            Some("identity:stable-e7-key")
+        );
+        assert_eq!(
+            semantic_inventory_device_key(
+                &inventory,
+                "udp://[fe80::16c1:9fff:fee4:5d48%5]:3339",
+            )
+            .as_deref(),
+            Some("identity:stable-e7-key")
+        );
+    }
+
+    #[test]
+    fn semantic_inventory_uses_observed_ipv6_path_when_legacy_announce_omits_it() {
+        let inventory = serde_json::json!({
+            "devices": [{
+                "identity": "e9",
+                "announce": {},
+                "observations": {
+                    "udp_multicast": {
+                        "last_peer": "[fe80::226e:f1ff:fe13:b170%5]:3337",
+                    },
+                },
+            }],
+        });
+
+        assert_eq!(
+            semantic_inventory_udp_peer(&inventory, "e9"),
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::226e:f1ff:fe13:b170".parse().unwrap(),
+                3337,
+                0,
+                5,
+            )))
+        );
+    }
+
+    #[test]
+    fn semantic_inventory_never_uses_multicast_port_as_a_quic_path() {
+        let inventory = serde_json::json!({
+            "devices": [{
+                "identity": "legacy-discovery-only",
+                "announce": {},
+                "observations": {
+                    "udp_multicast": {
+                        "last_peer": "[fe80::44%5]:5227",
+                    },
+                },
+            }],
+        });
+
+        assert_eq!(
+            semantic_inventory_udp_peer(&inventory, "legacy-discovery-only"),
+            None,
+            "UDP multicast ingress is discovery-only, not a QUIC route"
+        );
+    }
+
+    #[test]
+    fn semantic_inventory_uses_announced_port_with_multicast_scope() {
+        let inventory = serde_json::json!({
+            "devices": [{
+                "identity": "legacy-with-normal-port",
+                "announce": {
+                    "udp_port": 3339,
+                },
+                "observations": {
+                    "udp_multicast": {
+                        "last_peer": "[fe80::44%5]:5227",
+                    },
+                },
+            }],
+        });
+
+        assert_eq!(
+            semantic_inventory_udp_peer(&inventory, "legacy-with-normal-port"),
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::44".parse().unwrap(),
+                3339,
+                0,
+                5,
+            )))
+        );
+    }
+
+    #[test]
+    fn semantic_inventory_rejects_link_local_endpoint_from_another_ingress_link() {
+        let inventory = serde_json::json!({
+            "devices": [{
+                "identity": "cross-link-host",
+                "announce": {
+                    "udp_link_local_v6": "fe80::2c41:eeff:fe44:bd03",
+                    "udp_port": 3336,
+                },
+                "observations": {
+                    "udp_multicast": {
+                        "last_peer": "[fe80::7619:f8ff:fe17:de65%5]:3336",
+                    },
+                },
+            }],
+        });
+
+        assert_eq!(
+            semantic_inventory_udp_peer(&inventory, "cross-link-host"),
+            None,
+            "an ingress scope cannot route another link's link-local endpoint"
+        );
+    }
+
+    #[test]
+    fn semantic_inventory_skips_nan_only_duplicate_before_scoped_udp_route() {
+        let inventory = serde_json::json!({
+            "devices": [
+                {
+                    "identity": "phone",
+                    "announce": {
+                        "udp_link_local_v6": "fe80::9b8e:1f1d:6a40:2304",
+                        "udp_port": 3336,
+                    },
+                    "observations": {
+                        "nan": { "last_peer": "5e:ec:ed:ae:cb:56" },
+                    },
+                },
+                {
+                    "identity": "phone",
+                    "announce": {
+                        "udp_link_local_v6": "fe80::9b8e:1f1d:6a40:2304",
+                        "udp_port": 3336,
+                    },
+                    "observations": {
+                        "udp_multicast": {
+                            "last_peer": "[fe80::9b8e:1f1d:6a40:2304%5]:3336",
+                        },
+                    },
+                },
+            ],
+        });
+
+        assert_eq!(
+            semantic_inventory_udp_peer(&inventory, "phone"),
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::9b8e:1f1d:6a40:2304".parse().unwrap(),
+                3336,
+                0,
+                5,
+            )))
+        );
     }
 
     #[test]

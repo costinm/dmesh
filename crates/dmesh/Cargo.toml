@@ -13,7 +13,7 @@ jni-wrapper = ["dep:jni"]
 ssh-mesh = { git = "https://github.com/costinm/ssh-mesh", package = "ssh-mesh" }
 mesh-tun = { path = "../tun", default-features = false }
 dmesh-store = { path = "../dmesh-store" }
-dmesh-server = { path = "../dmesh-server", features = ["udp"] }
+dmesh-server = { path = "../dmesh-server", features = ["udp", "http"] }
 dmesh-rawnan = { path = "../rawnan" }
 quic-lite = { path = "../quic-lite", features = ["std"] }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
@@ -22,7 +22,6 @@ anyhow = "1.0"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-axum = "0.7"
 log = "0.4"
 libc = "0.2"
 hyper-util = { version = "0.1", features = ["full"] }

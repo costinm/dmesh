@@ -21,14 +21,6 @@ pub const SETTINGS_LIST: u64 = 3;
 /// sole stop representation; callers must not model lifecycle as imperative
 /// start/stop commands.
 pub const TRANSPORT_SET: u64 = 4;
-/// Temporary source compatibility while callers migrate to [`TRANSPORT_SET`].
-/// The wire tag is unchanged and this alias must be removed with the legacy
-/// `transport.start` spelling.
-pub const TRANSPORT_START: u64 = TRANSPORT_SET;
-pub const TRANSPORT_STOP: u64 = 5;
-/// Discover bearer candidates without changing the selected transport epoch.
-/// Platform adapters may implement one or more requested discovery mechanisms.
-pub const TRANSPORT_DISCOVER: u64 = 6;
 
 const FIELD_KEY: u64 = 1;
 const FIELD_VALUE: u64 = 2;
@@ -72,14 +64,6 @@ const FIELD_UART: u64 = 18;
 /// it belongs in the common start record so peers can negotiate it without an
 /// Android-only control schema.
 const FIELD_NDP: u64 = 19;
-/// Discovery mechanism selectors.  SSID and channel reuse the bounded STA
-/// field representation above; these flags keep discovery independent from a
-/// transport replacement so probes can discover first and call
-/// `transport.start` only for their chosen candidate.
-const FIELD_DISCOVER_ACTIVE_SCAN: u64 = 20;
-const FIELD_DISCOVER_PASSIVE_SCAN: u64 = 21;
-const FIELD_DISCOVER_NAN: u64 = 22;
-const FIELD_DISCOVER_DNS_SD: u64 = 23;
 /// Select unauthenticated 802.11 only for this volatile AP/STA epoch. The
 /// default remains WPA2-PSK; `open=1` is an explicit interoperability and
 /// measurement choice, never an implicit fallback for a missing passphrase.
@@ -121,20 +105,6 @@ pub struct TransportConfig<'a> {
     pub uart: Option<u8>,
 }
 
-/// Device-neutral discovery request.  It is deliberately separate from
-/// [`TransportConfig`]: discovery must not create, stop, or replace the
-/// current radio epoch.  An adapter reports the mechanisms it actually
-/// supports; callers then select a result with `transport.start`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TransportDiscoverConfig<'a> {
-    pub ssid: Option<&'a [u8]>,
-    pub channel: Option<u8>,
-    pub active_scan: bool,
-    pub passive_scan: bool,
-    pub nan: bool,
-    pub dns_sd: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Request<'a> {
     SettingsGet {
@@ -145,15 +115,9 @@ pub enum Request<'a> {
         value: &'a [u8],
     },
     SettingsList,
-    TransportStart {
+    TransportSet {
         kind: TransportKind,
         config: TransportConfig<'a>,
-    },
-    TransportStop {
-        kind: TransportKind,
-    },
-    TransportDiscover {
-        config: TransportDiscoverConfig<'a>,
     },
 }
 
@@ -166,21 +130,11 @@ pub trait Handler {
     fn settings_get(&mut self, key: &[u8]) -> Result<(), Self::Error>;
     fn settings_set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error>;
     fn settings_list(&mut self) -> Result<(), Self::Error>;
-    fn transport_start(
+    fn transport_set(
         &mut self,
         kind: TransportKind,
         config: TransportConfig<'_>,
     ) -> Result<(), Self::Error>;
-    fn transport_stop(&mut self, kind: TransportKind) -> Result<(), Self::Error>;
-    /// Optional platform hook.  Existing adapters remain source-compatible
-    /// while they add discovery mechanisms; a request must never mutate an
-    /// active transport merely because discovery is unsupported.
-    fn transport_discover(
-        &mut self,
-        _config: TransportDiscoverConfig<'_>,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
 }
 
 /// Error returned by the shared tagged-control dispatcher.
@@ -205,9 +159,7 @@ pub fn dispatch_request<H: Handler>(request: Request<'_>, handler: &mut H) -> Re
         Request::SettingsGet { key } => handler.settings_get(key),
         Request::SettingsSet { key, value } => handler.settings_set(key, value),
         Request::SettingsList => handler.settings_list(),
-        Request::TransportStart { kind, config } => handler.transport_start(kind, config),
-        Request::TransportStop { kind } => handler.transport_stop(kind),
-        Request::TransportDiscover { config } => handler.transport_discover(config),
+        Request::TransportSet { kind, config } => handler.transport_set(kind, config),
     }
 }
 
@@ -228,26 +180,33 @@ pub fn decode_record(record: Record<'_>) -> Option<Request<'_>> {
     if record.component != Some(Name::Tag(CONTROL_COMPONENT)) {
         return None;
     }
-    let fields = record.fields?;
     match record.method? {
-        Name::Tag(SETTINGS_GET) => Some(Request::SettingsGet {
-            key: field_bytes(fields, FIELD_KEY)?,
+        Name::Tag(SETTINGS_GET) => {
+            let fields = record.fields?;
+            Some(Request::SettingsGet {
+                key: field_bytes(fields, FIELD_KEY)?,
+            })
+        }
+        Name::Tag(SETTINGS_SET) => {
+            let fields = record.fields?;
+            Some(Request::SettingsSet {
+                key: field_bytes(fields, FIELD_KEY)?,
+                value: field_bytes(fields, FIELD_VALUE)?,
+            })
+        }
+        // Schema adapters are allowed to omit an empty map.  Treat that as
+        // equivalent to the compact CBOR encoder's `{}` so `settings.list`
+        // is a normal tagged stream handler on every bearer.
+        Name::Tag(SETTINGS_LIST) => record.fields.map_or(Some(Request::SettingsList), |fields| {
+            map_is_empty(fields).then_some(Request::SettingsList)
         }),
-        Name::Tag(SETTINGS_SET) => Some(Request::SettingsSet {
-            key: field_bytes(fields, FIELD_KEY)?,
-            value: field_bytes(fields, FIELD_VALUE)?,
-        }),
-        Name::Tag(SETTINGS_LIST) => map_is_empty(fields).then_some(Request::SettingsList),
-        Name::Tag(TRANSPORT_START) => Some(Request::TransportStart {
-            kind: transport_kind(field_uint(fields, FIELD_MODE)?)?,
-            config: decode_transport_config(fields)?,
-        }),
-        Name::Tag(TRANSPORT_STOP) => Some(Request::TransportStop {
-            kind: transport_kind(field_uint(fields, FIELD_MODE)?)?,
-        }),
-        Name::Tag(TRANSPORT_DISCOVER) => Some(Request::TransportDiscover {
-            config: decode_transport_discover_config(fields)?,
-        }),
+        Name::Tag(TRANSPORT_SET) => {
+            let fields = record.fields?;
+            Some(Request::TransportSet {
+                kind: transport_kind(field_uint(fields, FIELD_MODE)?)?,
+                config: decode_transport_config(fields)?,
+            })
+        }
         _ => None,
     }
 }
@@ -352,42 +311,6 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
     d.is_finished().then_some(config)
 }
 
-fn decode_transport_discover_config(encoded: &[u8]) -> Option<TransportDiscoverConfig<'_>> {
-    let mut d = Decoder::new(encoded);
-    let (major, count) = d.head()?;
-    if major != 5 || count == u64::MAX {
-        return None;
-    }
-    let mut config = TransportDiscoverConfig::default();
-    for _ in 0..count {
-        match d.uint()? {
-            FIELD_STA_SSID => {
-                let ssid = d.text_ref().or_else(|| d.bytes_ref())?;
-                if ssid.is_empty() || ssid.len() > 32 || ssid.contains(&0) {
-                    return None;
-                }
-                config.ssid = Some(ssid);
-            }
-            FIELD_STA_CHANNEL => {
-                let channel = u8::try_from(d.uint()?).ok()?;
-                if !(1..=14).contains(&channel) {
-                    return None;
-                }
-                config.channel = Some(channel);
-            }
-            FIELD_DISCOVER_ACTIVE_SCAN => config.active_scan = d.boolean()?,
-            FIELD_DISCOVER_PASSIVE_SCAN => config.passive_scan = d.boolean()?,
-            FIELD_DISCOVER_NAN => config.nan = d.boolean()?,
-            FIELD_DISCOVER_DNS_SD => config.dns_sd = d.boolean()?,
-            _ => d.skip()?,
-        }
-    }
-    if !(config.active_scan || config.passive_scan || config.nan || config.dns_sd) {
-        return None;
-    }
-    Some(config)
-}
-
 fn map_is_empty(encoded: &[u8]) -> bool {
     let mut d = Decoder::new(encoded);
     matches!(d.head(), Some((5, 0))) && d.is_finished()
@@ -443,8 +366,7 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
     let field_count = match request {
         Request::SettingsSet { .. } => 2,
         Request::SettingsList => 0,
-        Request::TransportStart { config, .. } => 1 + transport_config_count(config),
-        Request::TransportDiscover { config } => transport_discover_config_count(config),
+        Request::TransportSet { config, .. } => 1 + transport_config_count(config),
         _ => 1,
     };
     let mut e = Encoder::new(out);
@@ -456,9 +378,7 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
         Request::SettingsGet { .. } => SETTINGS_GET,
         Request::SettingsSet { .. } => SETTINGS_SET,
         Request::SettingsList => SETTINGS_LIST,
-        Request::TransportStart { .. } => TRANSPORT_START,
-        Request::TransportStop { .. } => TRANSPORT_STOP,
-        Request::TransportDiscover { .. } => TRANSPORT_DISCOVER,
+        Request::TransportSet { .. } => TRANSPORT_SET,
     })?;
     if let Some(id) = id {
         e.uint(3)?;
@@ -481,7 +401,7 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
             e.bytes_value(value)?;
         }
         Request::SettingsList => {}
-        Request::TransportStart { kind, config } => {
+        Request::TransportSet { kind, config } => {
             e.uint(FIELD_MODE)?;
             e.uint(match kind {
                 TransportKind::Sta => 1,
@@ -490,31 +410,8 @@ pub fn encode_request(request: Request<'_>, id: Option<u64>, out: &mut [u8]) -> 
             })?;
             encode_config(config, &mut e)?;
         }
-        Request::TransportStop { kind } => {
-            e.uint(FIELD_MODE)?;
-            e.uint(match kind {
-                TransportKind::Sta => 1,
-                TransportKind::Uart => 5,
-                TransportKind::Nan => 6,
-            })?;
-        }
-        Request::TransportDiscover { config } => encode_discover_config(config, &mut e)?,
     }
     Some(e.len())
-}
-
-fn transport_discover_config_count(config: TransportDiscoverConfig<'_>) -> u64 {
-    [
-        config.ssid.is_some(),
-        config.channel.is_some(),
-        config.active_scan,
-        config.passive_scan,
-        config.nan,
-        config.dns_sd,
-    ]
-    .into_iter()
-    .filter(|present| *present)
-    .count() as u64
 }
 
 fn transport_config_count(config: TransportConfig<'_>) -> u64 {
@@ -626,38 +523,6 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
     Some(())
 }
 
-fn encode_discover_config(config: TransportDiscoverConfig<'_>, e: &mut Encoder<'_>) -> Option<()> {
-    if !(config.active_scan || config.passive_scan || config.nan || config.dns_sd) {
-        return None;
-    }
-    if let Some(ssid) = config.ssid {
-        if ssid.is_empty() || ssid.len() > 32 || ssid.contains(&0) {
-            return None;
-        }
-        e.uint(FIELD_STA_SSID)?;
-        e.text_value(ssid)?;
-    }
-    if let Some(channel) = config.channel {
-        if !(1..=14).contains(&channel) {
-            return None;
-        }
-        e.uint(FIELD_STA_CHANNEL)?;
-        e.uint(u64::from(channel))?;
-    }
-    for (field, value) in [
-        (FIELD_DISCOVER_ACTIVE_SCAN, config.active_scan),
-        (FIELD_DISCOVER_PASSIVE_SCAN, config.passive_scan),
-        (FIELD_DISCOVER_NAN, config.nan),
-        (FIELD_DISCOVER_DNS_SD, config.dns_sd),
-    ] {
-        if value {
-            e.uint(field)?;
-            e.boolean(true)?;
-        }
-    }
-    Some(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,7 +546,7 @@ mod tests {
             })
         );
         let used = encode_request(
-            Request::TransportStart {
+            Request::TransportSet {
                 kind: TransportKind::Nan,
                 config: TransportConfig::default(),
             },
@@ -691,7 +556,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             decode_request(&wire[..used]),
-            Some(Request::TransportStart {
+            Some(Request::TransportSet {
                 kind: TransportKind::Nan,
                 config: TransportConfig::default(),
             })
@@ -727,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_start_captures_one_complete_radio_profile() {
+    fn transport_set_captures_one_complete_radio_profile() {
         let mut wire = [0; 96];
         let config = TransportConfig {
             ssid: Some(b"Direct-test"),
@@ -740,7 +605,7 @@ mod tests {
             ..TransportConfig::default()
         };
         let used = encode_request(
-            Request::TransportStart {
+            Request::TransportSet {
                 kind: TransportKind::Sta,
                 config,
             },
@@ -750,11 +615,28 @@ mod tests {
         .unwrap();
         assert_eq!(
             decode_request(&wire[..used]),
-            Some(Request::TransportStart {
+            Some(Request::TransportSet {
                 kind: TransportKind::Sta,
                 config,
             })
         );
+    }
+
+    #[test]
+    fn settings_list_allows_schema_omitted_empty_fields() {
+        // The JSON/schema bridge does not need to materialize an empty
+        // fields map.  This must decode identically to `encode_request` so
+        // the stream handler is not formatter- or bearer-dependent.
+        let wire = [
+            0xa3,
+            1,
+            CONTROL_COMPONENT as u8,
+            2,
+            SETTINGS_LIST as u8,
+            3,
+            7,
+        ];
+        assert_eq!(decode_request(&wire), Some(Request::SettingsList));
     }
 
     #[test]
@@ -781,7 +663,7 @@ mod tests {
         fn settings_list(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn transport_start(
+        fn transport_set(
             &mut self,
             kind: TransportKind,
             config: TransportConfig<'_>,
@@ -790,26 +672,17 @@ mod tests {
             self.transport = Some(kind);
             Ok(())
         }
-        fn transport_stop(&mut self, _: TransportKind) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        fn transport_discover(
-            &mut self,
-            _: TransportDiscoverConfig<'_>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
     }
 
     #[test]
-    fn shared_dispatcher_reaches_the_start_owner_once() {
+    fn shared_dispatcher_reaches_the_set_owner_once() {
         let mut wire = [0; 96];
         let physical = TransportConfig {
             raw_tx_rate: Some(54),
             ..TransportConfig::default()
         };
         let used = encode_request(
-            Request::TransportStart {
+            Request::TransportSet {
                 kind: TransportKind::Sta,
                 config: physical,
             },
@@ -823,36 +696,9 @@ mod tests {
     }
 
     #[test]
-    fn transport_discover_round_trips_without_replacing_transport() {
+    fn transport_set_round_trips_explicit_open_mode() {
         let mut wire = [0; 96];
-        let request = Request::TransportDiscover {
-            config: TransportDiscoverConfig {
-                ssid: Some(b"DIRECT-test-dmesh"),
-                channel: Some(6),
-                active_scan: true,
-                nan: true,
-                ..TransportDiscoverConfig::default()
-            },
-        };
-        let used = encode_request(request, Some(9), &mut wire).unwrap();
-        assert_eq!(
-            decode_request(&wire[..used]),
-            Some(Request::TransportDiscover {
-                config: TransportDiscoverConfig {
-                    ssid: Some(b"DIRECT-test-dmesh"),
-                    channel: Some(6),
-                    active_scan: true,
-                    nan: true,
-                    ..TransportDiscoverConfig::default()
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn transport_start_round_trips_explicit_open_mode() {
-        let mut wire = [0; 96];
-        let request = Request::TransportStart {
+        let request = Request::TransportSet {
             kind: TransportKind::Sta,
             config: TransportConfig {
                 ssid: Some(b"DIRECT-dmesh"),

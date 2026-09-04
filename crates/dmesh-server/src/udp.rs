@@ -6,28 +6,31 @@
 //! currently installed here, while the same connection table is intended for
 //! additional host-test services on other stream IDs.
 
-use crate::services::{
-    CONTROL_PATH_POLICY, CONTROL_RESPONSE, decode_path_policy, dispatch_tagged_stream,
-    handle_stream_with_events,
-};
-pub use crate::services::{EventRing, StreamHandler, StreamRegistry};
+pub use crate::services::EventRing;
+use crate::services::{dispatch_diagnostic_tagged_stream, dispatch_tagged_stream};
 use crate::{ObjectServer, ServerConfig};
 use crate::{
-    iperf::{IperfServicePlan, IperfServiceRequest, decode_iperf_service_request},
-    protocol::ObjectRecordStream,
+    probe::{ProbeServicePlan, ProbeServiceRequest},
+    protocol::{GetRequest, ObjectRecordStream, decode_get_request},
 };
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use quic_lite::Role;
 use quic_lite::ledger::{
     LedgerCapacityController, LedgerMemoryPolicy, LedgerMemorySnapshot, select_capacity,
     system_memory_snapshot,
 };
 use quic_lite::mux::StreamMux;
-use quic_lite::{ConnectionLimits, EndpointState, INITIAL_MAX_STREAM_DATA, PathPolicy, Role};
+use quic_lite::{
+    ConnectionLimits, ConnectionTable, EndpointState, INITIAL_MAX_STREAM_DATA, PathState,
+    ServerStreamConfig, ServerStreamConnection,
+};
 use std::boxed::Box;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::eprintln;
 use std::format;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -36,18 +39,28 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 
 const MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
-/// Stable `lmesh-wifi`/wlan0 object and IPERF listener.
+
+/// Adapter-local opaque handle for a UDP peer tuple. The hash is never put on
+/// the wire or used as a device identity; it merely lets `quic-lite` retain
+/// path history without learning socket-address syntax.
+fn udp_path_id(peer: SocketAddr) -> quic_lite::PathId {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    peer.hash(&mut hasher);
+    let value = hasher.finish() | (1_u64 << 63);
+    quic_lite::PathId::new(value).expect("tagged UDP path ID is nonzero")
+}
+/// Stable `lmesh-wifi`/wlan0 object and PROBE listener.
 pub const STABLE_WIFI_UDP_PORT: u16 = 3336;
 /// Development `lmesh`/wlan1 listener.  It must not collide with wlan0.
 pub const DEVELOPMENT_WIFI_UDP_PORT: u16 = 3337;
 
 /// Application-owned tagged-CBOR dispatch for a normal QUIC stream.
 ///
-/// This is intentionally distinct from the DCID-zero direct-message hook:
+/// This is intentionally distinct from the private direct-message hook:
 /// callers receive a complete stream request only after the QUIC association
 /// has been established. It lets host applications expose the same async
 /// catalog handler over HTTP and every QUIC bearer without turning a bearer
@@ -58,6 +71,87 @@ pub trait TaggedStreamHandler: Send + Sync {
         context: TaggedStreamContext,
         request: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Invoke the first registered handler that returns a correlated tagged
+/// response.  The same composite is installed for normal streams and the
+/// connectionless direct exception, so a direct operation cannot acquire a
+/// second application implementation.
+pub struct FallbackTaggedStreamHandler {
+    primary: Arc<dyn TaggedStreamHandler>,
+    fallback: Arc<dyn TaggedStreamHandler>,
+}
+
+impl FallbackTaggedStreamHandler {
+    pub fn new(
+        primary: Arc<dyn TaggedStreamHandler>,
+        fallback: Arc<dyn TaggedStreamHandler>,
+    ) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl TaggedStreamHandler for FallbackTaggedStreamHandler {
+    fn handle<'a>(
+        &'a self,
+        context: TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(response) = self.primary.handle(context, request.clone()).await {
+                return Some(response);
+            }
+            self.fallback.handle(context, request).await
+        })
+    }
+}
+
+/// Application callback behind the shared canonical tagged-stream boundary.
+/// Implementations decode only their application schema; QUIC correlation
+/// and envelope admission are handled by [`CanonicalTaggedStreamHandler`].
+pub trait TaggedApplicationHandler: Send + Sync {
+    fn handle_tagged<'a>(
+        &'a self,
+        context: TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>;
+}
+
+/// Shared QUIC tagged-CBOR adapter used by Linux and Android.
+///
+/// It rejects malformed or uncorrelated requests before application dispatch
+/// and accepts only a terminal response carrying the same request ID. This
+/// prevents each platform wrapper from growing subtly different QUIC-facing
+/// decode, correlation, and response policy.
+pub struct CanonicalTaggedStreamHandler {
+    application: Arc<dyn TaggedApplicationHandler>,
+}
+
+impl CanonicalTaggedStreamHandler {
+    pub fn new(application: Arc<dyn TaggedApplicationHandler>) -> Self {
+        Self { application }
+    }
+}
+
+impl TaggedStreamHandler for CanonicalTaggedStreamHandler {
+    fn handle<'a>(
+        &'a self,
+        context: TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let request_id = crate::tagged::decode(&request)?.id?;
+            let response = self.application.handle_tagged(context, request).await?;
+            let record = crate::tagged::decode(&response)?;
+            if record.id != Some(request_id)
+                || record.to.is_some()
+                || (record.result.is_some() == record.error.is_some())
+            {
+                return None;
+            }
+            Some(response)
+        })
+    }
 }
 
 /// Transport facts for a normal tagged QUIC stream request.  The request
@@ -83,12 +177,7 @@ pub enum RelayDatagramOutcome {
 /// must not parse stream payloads; tagged relay administration is performed by
 /// [`TaggedStreamHandler`] after QUIC termination.
 pub trait RelayDatagramHandler: Send + Sync {
-    fn handle(
-        &self,
-        ingress: SocketAddr,
-        packet: &[u8],
-        out: &mut [u8],
-    ) -> RelayDatagramOutcome;
+    fn handle(&self, ingress: SocketAddr, packet: &[u8], out: &mut [u8]) -> RelayDatagramOutcome;
 }
 
 /// Reserved local port for `dmesh-cli` session/driver endpoints.
@@ -124,29 +213,22 @@ const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const BOOTSTRAP_ATTEMPTS: u32 = 4;
 const STREAM_ATTEMPTS: u32 = 4;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
-// A host IPERF receiver can acknowledge a full congestion window faster than
+// A host PROBE receiver can acknowledge a full congestion window faster than
 // the per-connection task observes it.  This remains bounded and is host-only
 // routing state; tearing down the route on a transient full queue loses the
 // ACK frontier and prevents PTO recovery entirely.
 const CONNECTION_DATAGRAM_QUEUE_CAPACITY: usize = 1024;
-/// Fixed bound shared with the no_std Recovery IPERF receiver.
-const MAX_IPERF_STREAMS: usize = 4;
-// Host UDP IPERF can refill a full host ledger in one scheduler pass. Device
+/// Fixed bound shared with the no_std Recovery PROBE receiver.
+const MAX_PROBE_STREAMS: usize = 4;
+// Host UDP PROBE can refill a full host ledger in one scheduler pass. Device
 // receivers still bound the effective burst through their advertised packet
 // flight limit, so this does not enlarge Recovery/ESP receive memory.
-const HOST_IPERF_NORMAL_REFILL_PACKETS: usize = 64;
+const HOST_PROBE_NORMAL_REFILL_PACKETS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_SERVER_CID: AtomicU64 = AtomicU64::new(0x100);
 
 /// First byte on an application stream selects the connection service.
 /// Remaining bytes belong to that service's schema.
-pub use quic_lite::{
-    SERVICE_CONTROL, SERVICE_ECHO, SERVICE_EVENTS, SERVICE_IPERF, SERVICE_METRICS, SERVICE_OBJECT,
-    SERVICE_STATUS, SERVICE_STREAM,
-};
-
-const CONTROL_LOG: u8 = 0;
-const CONTROL_POLL: u8 = 1;
 /// Object streaming is the normal Recovery workload. ACK=8 keeps reverse
 /// traffic sparse enough to preserve a useful forward burst, while the 5 ms
 /// cap repairs a short/cwnd-limited burst promptly.
@@ -154,51 +236,21 @@ const RECOVERY_OBJECT_ACK_FREQUENCY: u8 = 8;
 const RECOVERY_MAX_ACK_DELAY_US: u64 = 5_000;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 
-/// Decode the transport-service envelope for an object GET.  The CBOR bytes
-/// themselves remain the canonical object-store request; the optional byte
-/// before them is an association parameter selected for this connection.
-/// Older `[SERVICE_OBJECT, CBOR-GET...]` clients remain valid.
-fn object_request_envelope(request: &[u8]) -> Result<(u8, &[u8])> {
-    let Some((&service, body)) = request.split_first() else {
-        bail!("empty object request");
-    };
-    if service != SERVICE_OBJECT {
-        bail!("not an object request");
-    }
-    match body.first().copied() {
-        Some(1..=32) => Ok((body[0], &body[1..])),
-        Some(_) => Ok((RECOVERY_OBJECT_ACK_FREQUENCY, body)),
-        None => bail!("missing object GET"),
-    }
+fn object_request(request: &[u8]) -> Result<GetRequest<'_>> {
+    decode_get_request(request)
+        .map(|(_, request)| request)
+        .ok_or_else(|| anyhow::anyhow!("invalid tagged object GET"))
 }
 
-/// Bounded command/log bridge for a transport test scaffold or a future
-/// managed control service. Its contents are opaque compact CBOR records;
-/// only Recovery's shared command parser interprets commands.
+/// Local observability and path policy for a running UDP listener.
+///
+/// This object is not a wire command channel. Remote operations use tagged
+/// QUIC handlers; callers such as lmesh read these bounded snapshots locally.
 #[derive(Debug)]
 pub struct TransportControl {
-    commands: Mutex<VecDeque<Vec<u8>>>,
-    logs: Mutex<VecDeque<QueuedLogRecord>>,
-    log_dropped_full: AtomicU64,
     stats: Mutex<Option<ServerTransportStats>>,
     errors: Mutex<VecDeque<String>>,
     events: Mutex<VecDeque<String>>,
-    path_policy: Mutex<PathPolicy>,
-}
-
-/// Opaque log retention state.  It is intentionally a service-level metric:
-/// the QUIC-lite endpoint only sees stream bytes and credit, never log policy.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LogQueueStats {
-    pub queued_records: usize,
-    pub dropped_full: u64,
-    pub oldest_age_ms: u64,
-}
-
-#[derive(Debug)]
-struct QueuedLogRecord {
-    bytes: Vec<u8>,
-    received_at: Instant,
 }
 
 /// Opaque sender-side snapshot for a bearer status surface.  It deliberately
@@ -216,20 +268,10 @@ pub struct ServerTransportStats {
 }
 
 impl TransportControl {
-    /// The active policy is generic over UDP/UART/LoRa/action-frame paths.
-    /// Authentication/authorization belongs to the future end-to-end layer,
-    /// not to this untrusted bearer control codec.
-    pub fn path_policy(&self) -> PathPolicy {
-        *self.path_policy.lock().expect("path policy lock")
-    }
-
-    pub fn set_path_policy(&self, policy: PathPolicy) {
-        *self.path_policy.lock().expect("path policy lock") = policy;
-    }
     pub fn server_stats(&self) -> Option<ServerTransportStats> {
         *self.stats.lock().ok()?
     }
-    fn record_server_stats<const H: usize>(&self, endpoint: &EndpointState<8, H>) {
+    fn record_server_stats<const N: usize, const H: usize>(&self, endpoint: &EndpointState<N, H>) {
         if let Ok(mut stats) = self.stats.lock() {
             *stats = Some(ServerTransportStats {
                 history_len: endpoint.history_len(),
@@ -290,72 +332,14 @@ impl TransportControl {
             .cloned()
             .collect()
     }
-    pub fn queue_command(&self, record: Vec<u8>) {
-        let mut commands = self.commands.lock().expect("control commands lock");
-        if commands.len() == CONTROL_QUEUE_CAPACITY {
-            commands.pop_front();
-        }
-        commands.push_back(record);
-    }
-
-    pub fn take_log(&self) -> Option<Vec<u8>> {
-        self.logs
-            .lock()
-            .expect("control logs lock")
-            .pop_front()
-            .map(|record| record.bytes)
-    }
-
-    pub fn log_stats(&self) -> LogQueueStats {
-        let logs = self.logs.lock().expect("control logs lock");
-        LogQueueStats {
-            queued_records: logs.len(),
-            dropped_full: self.log_dropped_full.load(Ordering::Relaxed),
-            oldest_age_ms: logs
-                .front()
-                .map(|record| record.received_at.elapsed().as_millis() as u64)
-                .unwrap_or(0),
-        }
-    }
-
-    fn receive_log(&self, record: &[u8]) {
-        let mut logs = self.logs.lock().expect("control logs lock");
-        if logs.len() == CONTROL_QUEUE_CAPACITY {
-            logs.pop_front();
-            self.log_dropped_full.fetch_add(1, Ordering::Relaxed);
-        }
-        logs.push_back(QueuedLogRecord {
-            bytes: record.to_vec(),
-            received_at: Instant::now(),
-        });
-    }
-
-    fn next_response(&self) -> Vec<u8> {
-        let command = self
-            .commands
-            .lock()
-            .expect("control commands lock")
-            .pop_front();
-        let mut response = Vec::with_capacity(2 + command.as_ref().map_or(0, Vec::len));
-        response.push(SERVICE_CONTROL);
-        response.push(CONTROL_RESPONSE);
-        if let Some(command) = command {
-            response.extend_from_slice(&command);
-        }
-        response
-    }
 }
 
 impl Default for TransportControl {
     fn default() -> Self {
         Self {
-            commands: Mutex::new(VecDeque::new()),
-            logs: Mutex::new(VecDeque::new()),
-            log_dropped_full: AtomicU64::new(0),
             stats: Mutex::new(None),
             errors: Mutex::new(VecDeque::new()),
             events: Mutex::new(VecDeque::new()),
-            path_policy: Mutex::new(PathPolicy::HighestMeasuredSpeed),
         }
     }
 }
@@ -363,6 +347,22 @@ impl Default for TransportControl {
 struct ConnectionDatagram {
     peer: SocketAddr,
     bytes: Vec<u8>,
+}
+
+struct UdpConnectionRoute {
+    cid: quic_lite::ConnectionId,
+    peer: SocketAddr,
+    sender: mpsc::Sender<ConnectionDatagram>,
+    last_activity: Instant,
+}
+
+/// Listener-local route for an outbound association.  The tuple is not a
+/// QUIC identity; it is retained only so an opaque stateless reset can be
+/// offered to the bounded set of associations that received it from that
+/// adjacent peer.  Quic-lite performs the private reset-token comparison.
+struct UdpClientIngressRoute {
+    peer: SocketAddr,
+    sender: mpsc::Sender<ConnectionDatagram>,
 }
 
 /// Bootstrap shares the endpoint packet-number space until the first
@@ -382,7 +382,7 @@ struct PendingObjectTransfer {
     sent_datagrams: u64,
 }
 
-/// Transport-only response source for IPERF. It deliberately has no object
+/// Transport-only response source for PROBE. It deliberately has no object
 /// record header, manifest, store lookup, or flash semantics.
 struct PendingByteTransfer {
     stream_id: u64,
@@ -394,7 +394,7 @@ struct PendingByteTransfer {
     burst_packets: usize,
     burst_delay: Duration,
     pacer: AdaptivePacer,
-    /// Host-side scheduler evidence for one transport IPERF response.  This
+    /// Host-side scheduler evidence for one transport PROBE response.  This
     /// is deliberately aggregate-only: logging a datagram would itself
     /// perturb the Wi-Fi benchmark.
     first_send: Option<Instant>,
@@ -403,6 +403,15 @@ struct PendingByteTransfer {
     window_fills: u64,
     max_window_fill: u64,
     interpacket_gaps: [u64; 6],
+}
+
+/// One terminal tagged-CBOR response awaiting available QUIC packet-ledger
+/// capacity.  This is connection state, not a bearer queue: UART/NOW/NAN and
+/// UDP all resume the same response stream after an ACK or PTO edge.
+struct PendingTaggedResponse {
+    stream_id: u64,
+    bytes: Vec<u8>,
+    offset: usize,
 }
 
 /// Conservative feedback pacer shared by object and byte response streams.
@@ -510,11 +519,10 @@ fn interpacket_gap_bucket(gap: Duration) -> usize {
     quic_lite::interpacket_gap_bucket(gap.as_micros().try_into().unwrap_or(u64::MAX))
 }
 
-/// Read optional, request-scoped IPERF scheduling controls.  The fixed first
-/// 11 bytes remain the compatibility schema (`service`, byte count, packet
-/// size); absent trailing fields deliberately inherit the listener defaults.
-fn iperf_schedule(
-    request: IperfServiceRequest,
+/// Read optional, request-scoped PROBE scheduling controls from the canonical
+/// tagged request. Absent fields deliberately inherit listener defaults.
+fn probe_schedule(
+    request: ProbeServiceRequest,
     default_pace: Duration,
     default_burst_packets: usize,
     default_burst_delay: Duration,
@@ -537,7 +545,7 @@ fn iperf_schedule(
     // ACK_FREQUENCY encodes the threshold as `frequency - 1`; the endpoint
     // can retain at most ACK_RANGE_CAPACITY ranges. Clamp at the same bound
     // as Recovery's command parser so a malformed request cannot start an
-    // IPERF transfer while silently failing to install its advertised policy.
+    // PROBE transfer while silently failing to install its advertised policy.
     let ack_frequency = request
         .ack_frequency
         .unwrap_or(2)
@@ -584,9 +592,9 @@ impl PendingByteTransfer {
     }
 }
 
-fn report_byte_transfer<const H: usize>(
+fn report_byte_transfer<const N: usize, const H: usize>(
     transfer: &PendingByteTransfer,
-    endpoint: &EndpointState<8, H>,
+    endpoint: &EndpointState<N, H>,
 ) {
     let stats = endpoint.stats();
     let elapsed_us = transfer
@@ -594,7 +602,7 @@ fn report_byte_transfer<const H: usize>(
         .map(|first| first.elapsed().as_micros())
         .unwrap_or(0);
     eprintln!(
-        "iperf_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} history={}/{} peer_flight={} cwnd={} inflight={} fills={} max_fill={} pace_us={} pace_activations={} elapsed_us={} \
+        "probe_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} history={}/{} peer_flight={} cwnd={} inflight={} fills={} max_fill={} pace_us={} pace_activations={} elapsed_us={} \
          gaps=<1ms:{},1-5ms:{},5-10ms:{},10-25ms:{},25-50ms:{},>=50ms:{} \
          loss=gap:{} time:{} events:{} loss_retx:{} pto_retx:{}",
         transfer.stream_id,
@@ -667,6 +675,20 @@ impl PendingObjectTransfer {
 #[derive(Clone)]
 pub struct UdpConfig {
     pub bind: SocketAddr,
+    /// A pre-bound process listener. When supplied, `run` adopts this socket
+    /// instead of creating a second bind; discovery, client associations, and
+    /// normal streams consequently share one local UDP port.
+    pub socket: Option<Arc<UdpSocket>>,
+    /// Process-owned ingress router for outbound associations using `socket`.
+    /// The listener remains the only socket reader and dispatches packets by
+    /// the association's local CID.  Transport adapters never compete with
+    /// the listener through a second `recv_from` loop.
+    pub client_ingress: Option<Arc<UdpClientIngress>>,
+    /// Stable secret used by quic-lite to issue and later recognize
+    /// stateless-reset tokens.  It must be device/service-local persistent
+    /// material, not a boot-random value; leaving it unset retains PTO/idle
+    /// recovery but cannot notify peers of a restart immediately.
+    pub stateless_reset_key: Option<quic_lite::StatelessResetKey>,
     pub artifact_root: PathBuf,
     /// Active retransmission slots per server-side endpoint. Zero selects a
     /// capacity from the host memory policy; non-zero is an explicit override.
@@ -688,26 +710,25 @@ pub struct UdpConfig {
     /// the transport window: even small diagnostic records must still be sent
     /// in flight as a window, not as stop-and-wait packets.
     pub object_chunk: usize,
-    /// Optional host-only interval between transport IPERF response packets.
+    /// Optional host-only interval between transport PROBE response packets.
     /// Zero preserves flood behavior. This is a diagnostic knob, not a
     /// transport reliability mechanism.
-    pub iperf_pace: Duration,
-    /// Test-only maximum IPERF datagrams in one sender pass. Zero preserves
+    pub probe_pace: Duration,
+    /// Test-only maximum PROBE datagrams in one sender pass. Zero preserves
     /// the normal unlimited congestion-window fill.
-    pub iperf_burst_packets: usize,
-    /// Test-only wait after an IPERF burst. Zero preserves unpaced sending.
-    pub iperf_burst_delay: Duration,
+    pub probe_burst_packets: usize,
+    /// Test-only wait after an PROBE burst. Zero preserves unpaced sending.
+    pub probe_burst_delay: Duration,
     /// Optional IPv4 DSCP/TOS applied to this listener's outbound datagrams.
     /// It is a host-bearer diagnostic only; `None` preserves best-effort.
     pub ip_tos: Option<u8>,
     /// Optional opaque Recovery command/log mailbox. Normal object serving
     /// leaves it unset; host hardware tests can install it on a third port.
     pub control: Option<Arc<TransportControl>>,
-    /// Optional tagged direct-message handler. Direct control retains the
-    /// DCID-zero wire shape, but only a valid tagged-CBOR record is offered
-    /// here. QUIC bootstrap OPEN also has DCID zero and must always bypass
-    /// this handler into endpoint setup.
-    pub direct_handler: Option<Arc<dyn crate::relay::DirectHandler>>,
+    /// Normal tagged handler also exposed through the custom-version direct
+    /// long-header exception. QUIC-lite owns direct framing and only calls
+    /// this established stream-handler boundary with the tagged payload.
+    pub direct_handler: Option<Arc<dyn TaggedStreamHandler>>,
     /// Optional async tagged-CBOR handler for normal QUIC streams. When it
     /// declines a record, the bounded static component registry remains the
     /// fallback for firmware and compatibility services.
@@ -721,6 +742,9 @@ impl Default for UdpConfig {
     fn default() -> Self {
         Self {
             bind: SocketAddr::from(([0, 0, 0, 0], STABLE_WIFI_UDP_PORT)),
+            socket: None,
+            client_ingress: None,
+            stateless_reset_key: None,
             artifact_root: PathBuf::from("."),
             history_capacity: 0,
             ledger_memory_policy: LedgerMemoryPolicy::default(),
@@ -730,9 +754,9 @@ impl Default for UdpConfig {
             receive_timeout: Duration::from_secs(1),
             ledger_resize_interval: Duration::from_secs(5),
             object_chunk: OBJECT_CHUNK,
-            iperf_pace: Duration::ZERO,
-            iperf_burst_packets: 0,
-            iperf_burst_delay: Duration::ZERO,
+            probe_pace: Duration::ZERO,
+            probe_burst_packets: 0,
+            probe_burst_delay: Duration::ZERO,
             ip_tos: None,
             control: None,
             direct_handler: None,
@@ -820,14 +844,82 @@ fn socket_ipv4_tos(socket: &UdpSocket) -> Result<u8> {
     Ok(value as u8)
 }
 
-/// Minimal host client for the feature-gated UDP QUIC bearer. It owns one
-/// transport connection and exposes only datagram/stream operations; service
-/// schemas remain above this type.
-pub struct UdpClient {
-    socket: UdpSocket,
+struct UdpClientIngressRegistration {
+    cid: quic_lite::ConnectionId,
     peer: SocketAddr,
-    endpoint: EndpointState<8, 512>,
-    local_cid: quic_lite::ConnectionId,
+    sender: mpsc::Sender<ConnectionDatagram>,
+    ready: oneshot::Sender<Result<()>>,
+}
+
+/// Listener-owned registration point for outgoing QUIC associations.
+///
+/// The UDP listener owns the port and is the only consumer of inbound frames.
+/// A client association registers its non-zero local CID before transmitting
+/// an Initial; the listener then forwards matching OPEN_ACK and normal QUIC
+/// packets to that association.  This keeps one process port across incoming
+/// services and outgoing streams while preserving the core association's CID
+/// and path state.
+pub struct UdpClientIngress {
+    sender: mpsc::Sender<UdpClientIngressRegistration>,
+    receiver: Mutex<Option<mpsc::Receiver<UdpClientIngressRegistration>>>,
+}
+
+impl UdpClientIngress {
+    pub fn new() -> Arc<Self> {
+        let (sender, receiver) = mpsc::channel(CONNECTION_DATAGRAM_QUEUE_CAPACITY);
+        Arc::new(Self {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
+    fn take_receiver(&self) -> Option<mpsc::Receiver<UdpClientIngressRegistration>> {
+        self.receiver.lock().ok()?.take()
+    }
+
+    async fn register(
+        &self,
+        cid: quic_lite::ConnectionId,
+        peer: SocketAddr,
+    ) -> Result<mpsc::Receiver<ConnectionDatagram>> {
+        let (sender, receiver) = mpsc::channel(CONNECTION_DATAGRAM_QUEUE_CAPACITY);
+        let (ready, accepted) = oneshot::channel();
+        self.sender
+            .send(UdpClientIngressRegistration {
+                cid,
+                peer,
+                sender,
+                ready,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("UDP listener ingress router stopped"))?;
+        accepted
+            .await
+            .map_err(|_| anyhow::anyhow!("UDP listener ingress registration dropped"))??;
+        Ok(receiver)
+    }
+}
+
+/// Minimal host UDP frame adapter for one already-created QUIC association.
+///
+/// CID, endpoint, packet-number, and path state are all
+/// [`quic_lite::ClientAssociation`] state. This adapter uses either a private
+/// diagnostic socket or a listener-owned socket with CID ingress routing; it
+/// never creates a second reader for a shared socket. The device-keyed
+/// manager above it shares an association across concurrent streams and
+/// UART/NOW/UDP paths. Service schemas remain above both layers.
+pub struct UdpClient {
+    socket: Arc<UdpSocket>,
+    /// Present only when this association uses the process listener's shared
+    /// socket. The listener has already selected packets by local CID.
+    ingress: Option<mpsc::Receiver<ConnectionDatagram>>,
+    peer: SocketAddr,
+    /// The QUIC association is core state; this adapter holds only a socket
+    /// reference, peer tuple, and opaque UDP path handle. A higher-level
+    /// device manager may retain the same association while selecting another
+    /// UART/NOW/UDP path for a later request.
+    connection: quic_lite::ClientAssociation<512, MTU>,
+    path: quic_lite::PathId,
     /// Optional adjacent-link wire label. QUIC-lite still creates packets for
     /// the authenticated end-to-end peer CID; the UDP path adapter replaces
     /// only the visible outer DCID before sending to `peer`.
@@ -836,7 +928,7 @@ pub struct UdpClient {
 }
 
 /// One committed server-initiated stream frame. This keeps offset and FIN
-/// visible to diagnostic clients such as IPERF without exposing any socket or
+/// visible to diagnostic clients such as PROBE without exposing any socket or
 /// bearer-specific framing above `UdpClient`.
 #[derive(Debug)]
 pub struct ReceivedStream {
@@ -847,14 +939,84 @@ pub struct ReceivedStream {
 }
 
 impl UdpClient {
+    async fn recv_association_packet(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        if let Some(ingress) = self.ingress.as_mut() {
+            let datagram = ingress
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("UDP listener ingress router stopped"))?;
+            if datagram.bytes.len() > buffer.len() {
+                bail!("UDP listener ingress packet exceeds client buffer");
+            }
+            buffer[..datagram.bytes.len()].copy_from_slice(&datagram.bytes);
+            return Ok((datagram.bytes.len(), datagram.peer));
+        }
+        Ok(self.socket.recv_from(buffer).await?)
+    }
+
+    fn endpoint(&self) -> &EndpointState<{ quic_lite::DEFAULT_STREAM_STATE_SLOTS }, 512> {
+        self.connection
+            .connection()
+            .endpoint()
+            .expect("UDP client methods require an established connection")
+    }
+
+    fn endpoint_mut(
+        &mut self,
+    ) -> &mut EndpointState<{ quic_lite::DEFAULT_STREAM_STATE_SLOTS }, 512> {
+        self.connection
+            .connection_mut()
+            .endpoint_mut()
+            .expect("UDP client methods require an established connection")
+    }
+
     pub fn peer_connection_id(&self) -> Option<quic_lite::ConnectionId> {
-        self.endpoint.peer_connection_id()
+        self.connection.connection().peer_cid()
+    }
+
+    /// Allocate the next stream from the shared QUIC association.  A UDP
+    /// device manager must not retain a second stream-ID counter: when this
+    /// association later gains a NOW or UART path, all paths share this one
+    /// sequence.
+    pub fn allocate_client_bidi_stream(&mut self) -> Result<u64> {
+        self.connection
+            .allocate_client_bidi_stream()
+            .map_err(|error| anyhow::anyhow!("client stream ID: {error:?}"))
+    }
+
+    /// Select the UDP tuple used for the next datagram without replacing the
+    /// QUIC association.  A caller must have already established that the
+    /// tuple belongs to the same device identity: addresses are paths, not
+    /// connection keys.  A valid response on the selected path is recorded
+    /// by `ClientAssociation` alongside the previous paths.
+    ///
+    /// This deliberately does not open a socket or issue a new Initial.  The
+    /// association keeps its CIDs, stream state, and (eventually) handshake
+    /// material while a controller moves it between UDP paths.
+    pub fn select_udp_path(&mut self, peer: SocketAddr) -> Result<()> {
+        let local = self.socket.local_addr()?;
+        if local.is_ipv4() != peer.is_ipv4() {
+            bail!(
+                "cannot move one UDP socket between IPv4 and IPv6 paths; retain the association through a dual-family path adapter"
+            );
+        }
+        self.peer = peer;
+        self.path = udp_path_id(peer);
+        self.connection.select_path(self.path);
+        Ok(())
+    }
+
+    /// Association-level stream counters, independent of the selected UDP
+    /// path.  This is the same core diagnostic used by a future UART/NOW
+    /// adapter, not a socket-local estimate.
+    pub fn stream_stats(&self) -> quic_lite::ConnectionStreamStats {
+        self.endpoint().stream_stats()
     }
     /// Snapshot endpoint-owned loss, retransmission, ACK, and ordering
     /// counters for a completed diagnostic transfer. The socket adapter does
     /// not infer these from packet timing; QUIC-lite remains the authority.
-    pub const fn transport_stats(&self) -> quic_lite::TransportStats {
-        self.endpoint.stats()
+    pub fn transport_stats(&self) -> quic_lite::TransportStats {
+        self.endpoint().stats()
     }
 
     /// Explicitly retire this diagnostic association on its bearer.  Dropping
@@ -862,10 +1024,10 @@ impl UdpClient {
     /// callers that run repeated probes must send CLOSE so the peer can admit
     /// the next fresh connection without waiting for an idle timeout.
     pub async fn close(&mut self, code: u64) -> Result<()> {
-        self.endpoint.close(code);
+        self.endpoint_mut().close(code);
         let mut packet = [0u8; MTU];
-        if let Some(used) = self
-            .endpoint
+        if let Some((_path, used)) = self
+            .connection
             .poll_close(&mut packet)
             .map_err(|error| anyhow::anyhow!("UDP close: {error:?}"))?
         {
@@ -883,19 +1045,19 @@ impl UdpClient {
     /// Set the local delayed-ACK packet threshold for a diagnostic client.
     /// The wire ACK logic remains in `EndpointState`.
     pub fn set_ack_frequency(&mut self, frequency: u8) {
-        self.endpoint.set_ack_frequency(frequency);
+        self.endpoint_mut().set_ack_frequency(frequency);
     }
 
     /// Lower the active retransmission ledger for this side. The endpoint's
     /// static host profile remains the upper bound.
     pub fn set_history_capacity(&mut self, limit: usize) -> Result<()> {
-        self.endpoint
+        self.endpoint_mut()
             .set_history_capacity(limit)
             .map_err(|error| anyhow::anyhow!("UDP history capacity: {error:?}"))
     }
 
-    /// Establish a directional-CID connection using the version-0 short
-    /// header bootstrap on stream 0 and reserved `DCID=0`.
+    /// Establish a directional-CID connection using the custom-version QUIC
+    /// Initial header and the standard DCID/SCID roles.
     pub async fn connect(
         bind: SocketAddr,
         peer: SocketAddr,
@@ -917,11 +1079,12 @@ impl UdpClient {
     ) -> Result<Self> {
         configure_host_udp_buffers(&socket)?;
         Self::connect_with_socket_via(
-            socket,
+            Arc::new(socket),
             peer,
             local_cid,
             512,
             ConnectionLimits::default(),
+            None,
             None,
         )
         .await
@@ -930,8 +1093,9 @@ impl UdpClient {
     /// Return the owned socket when this one-connection helper is no longer
     /// needed. The higher-level circuit session is responsible for preserving
     /// the socket's source tuple and for multiplexing retained connections.
-    pub fn into_socket(self) -> UdpSocket {
-        self.socket
+    pub fn into_socket(self) -> Result<UdpSocket> {
+        Arc::try_unwrap(self.socket)
+            .map_err(|_| anyhow::anyhow!("UDP socket remains shared by a listener or association"))
     }
 
     pub async fn connect_with_history_capacity(
@@ -996,12 +1160,13 @@ impl UdpClient {
     ) -> Result<Self> {
         configure_host_udp_buffers(&socket)?;
         Self::connect_with_socket_via(
-            socket,
+            Arc::new(socket),
             peer,
             local_cid,
             512,
             ConnectionLimits::default(),
             Some(wire_dcid),
+            None,
         )
         .await
     }
@@ -1020,7 +1185,7 @@ impl UdpClient {
         if !(1..=512).contains(&history_capacity) {
             bail!("UDP history capacity must be in 1..=512");
         }
-        let socket = UdpSocket::bind(bind).await?;
+        let socket = Arc::new(UdpSocket::bind(bind).await?);
         configure_host_udp_buffers(&socket)?;
         Self::connect_with_socket_via(
             socket,
@@ -1029,31 +1194,52 @@ impl UdpClient {
             history_capacity,
             limits,
             quic_lite_wire_dcid,
+            None,
+        )
+        .await
+    }
+
+    /// Establish on the process listener's existing UDP socket. `ingress`
+    /// ensures the listener, rather than this association, remains the sole
+    /// reader of that socket and forwards only this CID's packets here.
+    pub async fn connect_with_listener(
+        socket: Arc<UdpSocket>,
+        ingress: Arc<UdpClientIngress>,
+        peer: SocketAddr,
+        local_cid: quic_lite::ConnectionId,
+    ) -> Result<Self> {
+        let receiver = ingress.register(local_cid, peer).await?;
+        Self::connect_with_socket_via(
+            socket,
+            peer,
+            local_cid,
+            512,
+            ConnectionLimits::default(),
+            None,
+            Some(receiver),
         )
         .await
     }
 
     async fn connect_with_socket_via(
-        socket: UdpSocket,
+        socket: Arc<UdpSocket>,
         peer: SocketAddr,
         local_cid: quic_lite::ConnectionId,
         history_capacity: usize,
         limits: ConnectionLimits,
         quic_lite_wire_dcid: Option<quic_lite::ConnectionId>,
+        ingress: Option<mpsc::Receiver<ConnectionDatagram>>,
     ) -> Result<Self> {
         let mut client = Self {
             socket,
+            ingress,
             peer,
-            endpoint: EndpointState::new_with_history_capacity(
-                Role::Client,
-                limits,
-                MTU as u64,
-                history_capacity,
-            ),
-            local_cid: local_cid,
+            connection: quic_lite::ClientAssociation::with_limits(local_cid, limits),
+            path: udp_path_id(peer),
             quic_lite_wire_dcid,
             deferred_receive_credit: false,
         };
+        client.connection.select_path(client.path);
         let mut response = [0u8; MTU];
         // A bootstrap timeout used to discard the only evidence of an L2
         // response.  Keep the client bearer-neutral but preserve a compact
@@ -1062,13 +1248,10 @@ impl UdpClient {
         let mut last_observation = None;
         for packet_number in 0..BOOTSTRAP_ATTEMPTS {
             let mut open = [0u8; MTU];
-            let used = quic_lite::encode_bootstrap_open_packet_with_limits(
-                local_cid,
-                packet_number,
-                limits,
-                &mut open,
-            )
-            .map_err(|error| anyhow::anyhow!("bootstrap OPEN: {error:?}"))?;
+            let (_path, used) = client
+                .connection
+                .encode_open_attempt(packet_number, &mut open)
+                .map_err(|error| anyhow::anyhow!("bootstrap OPEN: {error:?}"))?;
             if let Some(wire_dcid) = quic_lite_wire_dcid {
                 let mut relayed = [0u8; MTU];
                 let relayed_used = quic_lite::rewrite_dcid(&open[..used], wire_dcid, &mut relayed)
@@ -1080,50 +1263,52 @@ impl UdpClient {
             } else {
                 client.socket.send_to(&open[..used], client.peer).await?;
             }
-            let received = timeout(ACK_TIMEOUT, client.socket.recv_from(&mut response)).await;
-            let Ok(Ok((len, response_peer))) = received else {
-                continue;
-            };
-            if response_peer != client.peer {
-                last_observation = Some(format!(
-                    "reply_peer={} expected_peer={} bytes={len}",
-                    response_peer, client.peer
-                ));
-                continue;
-            }
-            let (header, ack) = match quic_lite::decode_bootstrap_open_ack_packet_with_limits(
-                &response[..len],
-                local_cid,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    last_observation = Some(format!("invalid_ack bytes={len} error={error:?}"));
+            // Discovery and direct control use the same UDP listener as a
+            // QUIC association. A connectionless record from the selected
+            // peer must not consume this OPEN attempt: keep receiving until
+            // the attempt deadline and admit only the matching long-header
+            // OPEN_ACK. The socket/bearer never decodes its payload.
+            let deadline = Instant::now() + ACK_TIMEOUT;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let received =
+                    timeout(remaining, client.recv_association_packet(&mut response)).await;
+                let Ok(Ok((len, response_peer))) = received else {
+                    break;
+                };
+                if response_peer != client.peer {
+                    last_observation = Some(format!(
+                        "reply_peer={} expected_peer={} bytes={len}",
+                        response_peer, client.peer
+                    ));
                     continue;
                 }
-            };
-            let server_cid = ack.server_receive_cid;
-            if header.dcid != local_cid || server_cid.value() == 0 {
-                last_observation = Some(format!(
-                    "invalid_ack_route dcid={} server_cid={} expected_dcid={}",
-                    header.dcid.value(),
-                    server_cid.value(),
-                    local_cid.value()
-                ));
-                continue;
+                // The association owns long-header validation, CID matching,
+                // reset recognition, and OPEN_ACK installation.  UDP merely
+                // injects a complete datagram on its selected opaque path;
+                // connectionless discovery and malformed traffic therefore
+                // cannot become a second bootstrap parser here.
+                let installed =
+                    client
+                        .connection
+                        .receive_open_ack(client.path, &response[..len], 0);
+                match installed {
+                    Ok(_) => {}
+                    Err(error) => {
+                        last_observation =
+                            Some(format!("rejected_bootstrap bytes={len} error={error:?}"));
+                        continue;
+                    }
+                }
+                client
+                    .endpoint_mut()
+                    .set_history_capacity(history_capacity)
+                    .map_err(|error| anyhow::anyhow!("UDP history capacity: {error:?}"))?;
+                return Ok(client);
             }
-            client
-                .endpoint
-                .install_connection_ids(local_cid, server_cid)
-                .map_err(|error| anyhow::anyhow!("install bootstrap CIDs: {error:?}"))?;
-            client
-                .endpoint
-                .set_initial_peer_credit(ack.max_data, ack.max_stream_data)
-                .map_err(|error| anyhow::anyhow!("bootstrap peer credit: {error:?}"))?;
-            client
-                .endpoint
-                .continue_packet_numbers_from(packet_number.saturating_add(1))
-                .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
-            return Ok(client);
         }
         if let Some(observation) = last_observation {
             bail!("UDP bootstrap timeout after {BOOTSTRAP_ATTEMPTS} attempts ({observation})")
@@ -1143,7 +1328,7 @@ impl UdpClient {
         Ok(())
     }
 
-    /// Exchange one DCID-zero setup/update while retaining this client's
+    /// Exchange one private direct setup/update while retaining this client's
     /// stable UDP tuple. Non-direct connection traffic is ignored until the
     /// correlated direct response arrives.
     pub async fn exchange_direct(&self, packet: &[u8]) -> Result<Vec<u8>> {
@@ -1166,7 +1351,8 @@ impl UdpClient {
             else {
                 continue;
             };
-            if response_peer != peer || quic_lite::decode_direct_packet(&response[..used]).is_err()
+            if response_peer != peer
+                || quic_lite::decode_direct_message_response(&response[..used]).is_err()
             {
                 continue;
             }
@@ -1178,20 +1364,10 @@ impl UdpClient {
     /// Send one complete application request stream and wait for its
     /// transport control response. The caller chooses the service tag/schema.
     pub async fn send_stream(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<()> {
-        self.endpoint
-            .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
-            .map_err(|error| anyhow::anyhow!("client stream: {error:?}"))?;
         let mut packet = [0u8; MTU];
-        let (used, _) = self
-            .endpoint
-            .encode_stream_packet(
-                self.endpoint.peer_connection_id().unwrap_or(self.local_cid),
-                stream_id,
-                0,
-                fin,
-                data,
-                &mut packet,
-            )
+        let (_path, used) = self
+            .connection
+            .encode_stream_payload(stream_id, data, fin, &mut packet)
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
         self.send_endpoint_packet(&packet[..used]).await?;
         let mut response = [0u8; MTU];
@@ -1201,15 +1377,14 @@ impl UdpClient {
         if peer != self.peer {
             bail!("UDP client peer changed");
         }
-        match self
-            .endpoint
-            .receive_datagram(&response[..len])
-            .map_err(|error| anyhow::anyhow!("client transport input: {error:?}"))?
-        {
-            quic_lite::TransportPacket::Control => Ok(()),
-            quic_lite::TransportPacket::Stream { .. } => {
-                bail!("unexpected stream while waiting for ACK")
-            }
+        let control = self
+            .connection
+            .receive_stream_payload(self.path, &response[..len])
+            .map_err(|error| anyhow::anyhow!("client transport input: {error:?}"))?;
+        if control.is_none() {
+            Ok(())
+        } else {
+            bail!("unexpected stream while waiting for ACK")
         }
     }
 
@@ -1233,20 +1408,13 @@ impl UdpClient {
         data: &[u8],
         fin: bool,
     ) -> Result<ReceivedStream> {
-        self.endpoint
-            .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
-            .map_err(|error| anyhow::anyhow!("client stream: {error:?}"))?;
+        if self.connection.has_active_server_response_stream() {
+            bail!("previous UDP response stream has not reached FIN");
+        }
         let mut packet = [0u8; MTU];
-        let (used, _) = self
-            .endpoint
-            .encode_stream_packet(
-                self.endpoint.peer_connection_id().unwrap_or(self.local_cid),
-                stream_id,
-                0,
-                fin,
-                data,
-                &mut packet,
-            )
+        let (_path, used) = self
+            .connection
+            .encode_stream_payload(stream_id, data, fin, &mut packet)
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
         self.send_endpoint_packet(&packet[..used]).await?;
         let started = Instant::now();
@@ -1258,7 +1426,8 @@ impl UdpClient {
                     break;
                 }
                 let mut incoming = [0u8; MTU];
-                let received = timeout(remaining, self.socket.recv_from(&mut incoming)).await;
+                let received =
+                    timeout(remaining, self.recv_association_packet(&mut incoming)).await;
                 let Ok(Ok((len, peer))) = received else {
                     break;
                 };
@@ -1269,15 +1438,20 @@ impl UdpClient {
                 // port. A delayed response from a retired association can
                 // therefore arrive while a new request is active. Correlate
                 // it by destination CID before asking EndpointState to parse
-                // it; an unrelated (including DCID=0) packet is not a fatal
+                // it; an unrelated packet is not a fatal
                 // error for the current request.
-                let Ok((header, _)) = quic_lite::ShortHeader::decode(&incoming[..len]) else {
-                    continue;
-                };
-                if header.dcid != self.local_cid {
-                    continue;
+                // A stateless reset is intentionally opaque, so it is not a
+                // valid short header. Ask the shared association before the
+                // normal delayed-packet filter; a peer restart then becomes
+                // an immediate recovery event instead of three PTO waits.
+                if self.connection.is_peer_stateless_reset(&incoming[..len]) {
+                    return Err(anyhow::Error::new(quic_lite::Error::PeerRestarted));
                 }
-                let received = match self.endpoint.receive_datagram(&incoming[..len]) {
+                let received = match self.connection.receive_serial_response_payload(
+                    self.path,
+                    &incoming[..len],
+                    self.deferred_receive_credit,
+                ) {
                     Ok(packet) => packet,
                     Err(quic_lite::Error::Invalid | quic_lite::Error::WrongConnectionId) => {
                         continue;
@@ -1285,27 +1459,17 @@ impl UdpClient {
                     Err(error) => bail!("client transport input: {error:?}"),
                 };
                 match received {
-                    quic_lite::TransportPacket::Control => continue,
-                    quic_lite::TransportPacket::Stream { frame, .. } => {
+                    None => continue,
+                    Some(payload) => {
                         let response = ReceivedStream {
-                            id: frame.id,
-                            offset: frame.offset,
-                            fin: frame.fin,
-                            data: frame.data.to_vec(),
+                            id: payload.stream_id,
+                            offset: payload.offset,
+                            fin: payload.fin,
+                            data: payload.data.to_vec(),
                         };
-                        if self.deferred_receive_credit {
-                            self.endpoint
-                                .stream_consumed_deferred(response.id, response.data.len())
-                        } else {
-                            self.endpoint
-                                .stream_consumed(response.id, response.data.len())
-                        }
-                        .map_err(|error| {
-                            anyhow::anyhow!("client response accounting: {error:?}")
-                        })?;
                         let mut ack = [0u8; MTU];
-                        if let Some(ack_len) = self
-                            .endpoint
+                        if let Some((_path, ack_len)) = self
+                            .connection
                             .poll_transmit(&mut ack)
                             .map_err(|error| anyhow::anyhow!("client response ACK: {error:?}"))?
                         {
@@ -1319,11 +1483,11 @@ impl UdpClient {
                 break;
             }
             let now = started.elapsed().as_millis() as u64;
-            self.endpoint.set_time(now);
+            self.endpoint_mut().set_time(now);
             let mut retry = [0u8; MTU];
-            let pto = self.endpoint.pto_timeout();
+            let pto = self.endpoint().pto_timeout();
             let retransmission = self
-                .endpoint
+                .endpoint_mut()
                 .retransmit_due(now, pto, &mut retry)
                 .map_err(|error| anyhow::anyhow!("client stream retransmission: {error:?}"))?;
             let Some((retry_len, _packet_number)) = retransmission else {
@@ -1331,12 +1495,16 @@ impl UdpClient {
             };
             self.send_endpoint_packet(&retry[..retry_len]).await?;
         }
-        bail!("UDP stream request timeout after {STREAM_ATTEMPTS} attempts")
+        Err(anyhow::Error::new(
+            crate::transport::AssociationStreamTimeout {
+                attempts: STREAM_ATTEMPTS,
+            },
+        ))
     }
 
     /// Send one request and collect its complete ordered response stream.
     ///
-    /// IPERF and object-like services may return many independently received
+    /// PROBE and object-like services may return many independently received
     /// frames.  Preserve offsets here so a bearer client does not mistake
     /// reordering or a retransmission for a successful byte-count transfer.
     /// `max_bytes` is an explicit caller-provided memory bound.
@@ -1348,9 +1516,10 @@ impl UdpClient {
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
         let first = self.request_stream_frame(stream_id, data, fin).await?;
-        if first.id != stream_id {
-            bail!("UDP stream response id {} expected {stream_id}", first.id);
-        }
+        // A terminal may allocate the server-initiated response stream rather
+        // than mirror the client request stream. Keep the first accepted
+        // response stream ID as the correlation target for its fragments.
+        let response_stream_id = first.id;
         let mut frames = BTreeMap::<u64, Vec<u8>>::new();
         let mut final_offset = None;
         let mut frame = first;
@@ -1395,8 +1564,11 @@ impl UdpClient {
                 return Ok(assembled);
             }
             frame = self.recv_stream_frame().await?;
-            if frame.id != stream_id {
-                bail!("UDP stream response id {} expected {stream_id}", frame.id);
+            if frame.id != response_stream_id {
+                bail!(
+                    "UDP stream response id {} expected {response_stream_id}",
+                    frame.id
+                );
             }
         }
     }
@@ -1413,41 +1585,47 @@ impl UdpClient {
     pub async fn recv_stream_frame(&mut self) -> Result<ReceivedStream> {
         loop {
             let mut packet = [0u8; MTU];
-            let (len, peer) = self.socket.recv_from(&mut packet).await?;
+            let (len, peer) = self.recv_association_packet(&mut packet).await?;
             if peer != self.peer {
                 bail!("UDP client peer changed");
             }
             let stream = match self
-                .endpoint
-                .receive_datagram(&packet[..len])
+                .connection
+                .receive_stream_payload(self.path, &packet[..len])
                 .map_err(|error| anyhow::anyhow!("client transport input: {error:?}"))?
             {
-                quic_lite::TransportPacket::Control => continue,
-                quic_lite::TransportPacket::Stream { frame, .. } => frame,
+                None => continue,
+                Some((id, offset, fin, data)) => ReceivedStream {
+                    id,
+                    offset,
+                    fin,
+                    data: data.to_vec(),
+                },
             };
-            if self.deferred_receive_credit {
-                self.endpoint
-                    .stream_consumed_deferred(stream.id, stream.data.len())
-            } else {
-                self.endpoint.stream_consumed(stream.id, stream.data.len())
-            }
-            .map_err(|error| anyhow::anyhow!("client stream accounting: {error:?}"))?;
+            self.connection
+                .stream_consumed(stream.id, stream.data.len(), self.deferred_receive_credit)
+                .map_err(|error| anyhow::anyhow!("client stream accounting: {error:?}"))?;
             let mut control = [0u8; MTU];
-            if let Some(used) = self
-                .endpoint
+            if let Some((_path, used)) = self
+                .connection
                 .poll_transmit(&mut control)
                 .map_err(|error| anyhow::anyhow!("client ACK: {error:?}"))?
             {
                 self.send_endpoint_packet(&control[..used]).await?;
             }
-            return Ok(ReceivedStream {
-                id: stream.id,
-                offset: stream.offset,
-                fin: stream.fin,
-                data: stream.data.to_vec(),
-            });
+            if self
+                .connection
+                .accept_server_response_stream(stream.id, stream.fin)
+                .map_err(|error| anyhow::anyhow!(
+                    "UDP stream response id {} is not the association response: {error:?}",
+                    stream.id
+                ))?
+            {
+                return Ok(stream);
+            }
         }
     }
+
 }
 
 /// Start the host-side UDP bearer used by Recovery and Main object transfers.
@@ -1493,7 +1671,17 @@ pub async fn run(config: UdpConfig) -> Result<()> {
     } else {
         Duration::ZERO
     };
-    let socket = Arc::new(UdpSocket::bind(config.bind).await?);
+    let socket = match config.socket.clone() {
+        Some(socket) => socket,
+        None => Arc::new(UdpSocket::bind(config.bind).await?),
+    };
+    let mut client_ingress = config
+        .client_ingress
+        .as_ref()
+        .and_then(|ingress| ingress.take_receiver());
+    if config.client_ingress.is_some() && client_ingress.is_none() {
+        bail!("UDP client ingress router already has a listener");
+    }
     configure_host_udp_buffers(&socket)?;
     if let Some(tos) = config.ip_tos {
         configure_ipv4_tos(&socket, tos)?;
@@ -1503,90 +1691,145 @@ pub async fn run(config: UdpConfig) -> Result<()> {
         artifact_root: config.artifact_root,
         ..ServerConfig::default()
     });
-    let registry = StreamRegistry::default();
     let mut datagram = [0u8; MTU];
-    let mut connections: HashMap<u64, mpsc::Sender<ConnectionDatagram>> = HashMap::new();
-    let mut connection_peers: HashMap<u64, SocketAddr> = HashMap::new();
+    let mut connections =
+        ConnectionTable::<UdpConnectionRoute, MAX_ACTIVE_CONNECTIONS, 1>::new([PathState::new()]);
+    connections
+        .set_path_available(0, true)
+        .map_err(|error| anyhow::anyhow!("UDP path registration: {error:?}"))?;
     let mut pending_opens: HashMap<(SocketAddr, u64), u64> = HashMap::new();
     let mut pending_open_bytes: HashMap<(SocketAddr, u64), Vec<u8>> = HashMap::new();
     let mut bootstrap_packet_numbers: HashMap<(SocketAddr, u64), Arc<BootstrapPacketNumbers>> =
         HashMap::new();
-    let mut last_activity: HashMap<u64, Instant> = HashMap::new();
+    let mut outbound_routes = HashMap::<u64, UdpClientIngressRoute>::new();
     let closed_routes = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     loop {
         if let Ok(mut closed) = closed_routes.lock() {
             for cid in closed.drain(..) {
-                connections.remove(&cid);
-                connection_peers.remove(&cid);
-                last_activity.remove(&cid);
+                if let Some(cid) = quic_lite::ConnectionId::new(cid) {
+                    let _ = connections.remove(cid);
+                }
             }
-            pending_opens.retain(|_, cid| connections.contains_key(cid));
+            pending_opens.retain(|_, cid| {
+                quic_lite::ConnectionId::new(*cid).is_some_and(|cid| connections.contains(cid))
+            });
             pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
             bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
         }
+        // Client receivers disappear when their association is closed or a
+        // failed request is discarded. Retire their CID routing entry without
+        // waiting for another packet on that stale association.
+        outbound_routes.retain(|_, route| !route.sender.is_closed());
         // Do this for every listener iteration, not only after an empty
         // recv timeout. A new benchmark can otherwise keep an old, stalled
         // route alive forever; its PTO retransmissions then contaminate the
         // otherwise independent next run on the same AP.
         let now = Instant::now();
-        let expired: Vec<u64> = last_activity
+        let expired: Vec<quic_lite::ConnectionId> = connections
             .iter()
-            .filter(|(_, when)| now.duration_since(**when) >= config.idle_timeout)
-            .map(|(cid, _)| *cid)
+            .filter(|(_, route)| now.duration_since(route.last_activity) >= config.idle_timeout)
+            .map(|(_, route)| route.cid)
             .collect();
         for cid in expired {
-            connections.remove(&cid);
-            connection_peers.remove(&cid);
-            last_activity.remove(&cid);
+            let _ = connections.remove(cid);
         }
-        pending_opens.retain(|_, cid| connections.contains_key(cid));
+        pending_opens.retain(|_, cid| {
+            quic_lite::ConnectionId::new(*cid).is_some_and(|cid| connections.contains(cid))
+        });
         pending_open_bytes.retain(|key, _| pending_opens.contains_key(key));
         bootstrap_packet_numbers.retain(|key, _| pending_opens.contains_key(key));
-        let (len, peer) =
-            match timeout(config.receive_timeout, socket.recv_from(&mut datagram)).await {
-                Ok(result) => result?,
-                Err(_) => continue,
-            };
+        let received = if let Some(ingress) = client_ingress.as_mut() {
+            tokio::select! {
+                registration = ingress.recv() => {
+                    if let Some(registration) = registration {
+                        let cid = registration.cid.value();
+                        if outbound_routes.contains_key(&cid) {
+                            let _ = registration.ready.send(Err(anyhow::anyhow!(
+                                "UDP client association CID is already registered"
+                            )));
+                        } else {
+                            outbound_routes.insert(
+                                cid,
+                                UdpClientIngressRoute {
+                                    peer: registration.peer,
+                                    sender: registration.sender,
+                                },
+                            );
+                            let _ = registration.ready.send(Ok(()));
+                        }
+                    }
+                    continue;
+                }
+                result = timeout(config.receive_timeout, socket.recv_from(&mut datagram)) => result,
+            }
+        } else {
+            timeout(config.receive_timeout, socket.recv_from(&mut datagram)).await
+        };
+        let (len, peer) = match received {
+            Ok(result) => result?,
+            Err(_) => continue,
+        };
         let packet = datagram[..len].to_vec();
-        // This bounded bearer diagnostic is a DCID-zero direct record. Check
-        // it before treating the same DCID as endpoint bootstrap.
-        let mut probe_response = [0u8; MTU];
-        if let Some(used) =
-            quic_lite::bearer_probe::udp_bearer_probe_response(&packet, &mut probe_response)
-        {
-            socket.send_to(&probe_response[..used], peer).await?;
-            continue;
-        }
-        let (header, _) = match quic_lite::ShortHeader::decode(&packet) {
+        let classified = match quic_lite::classify_server_datagram(&packet) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(%peer, error = ?error, "udp_transport_malformed_header");
+                // A stateless reset intentionally has no parseable routing
+                // header.  Offer it only to retained outbound associations
+                // for this adjacent tuple; each association privately checks
+                // its reset token, so no adapter derives a CID from it.
+                let mut delivered = false;
+                for route in outbound_routes.values() {
+                    if route.peer != peer {
+                        continue;
+                    }
+                    match route.sender.try_send(ConnectionDatagram {
+                        peer,
+                        bytes: packet.clone(),
+                    }) {
+                        Ok(()) => delivered = true,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!(%peer, "udp_client_reset_ingress_queue_full");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
+                if !delivered {
+                    tracing::warn!(%peer, error = ?error, "udp_transport_malformed_header");
+                }
                 continue;
             }
         };
-        if header.dcid.value() == 0 {
-            if let (Some(handler), Ok((direct_header, payload))) = (
-                config.direct_handler.as_ref(),
-                quic_lite::decode_direct_packet(&packet),
-            ) && crate::tagged::decode(payload).is_some() {
-                let mut response = [0u8; MTU];
-                match handler.handle_direct(direct_header.packet_number, payload, &mut response) {
-                    crate::relay::DirectOutcome::NotHandled => {}
-                    crate::relay::DirectOutcome::Handled => continue,
-                    crate::relay::DirectOutcome::Response(used) if used <= response.len() => {
-                        socket.send_to(&response[..used], peer).await?;
-                        continue;
-                    }
-                    crate::relay::DirectOutcome::Response(_) => {
-                        tracing::warn!(%peer, "udp_direct_handler_oversize_response");
-                        continue;
+        if matches!(classified, quic_lite::ServerDatagram::Direct) {
+            if let Some(handler) = config.direct_handler.as_ref() {
+                let request = match quic_lite::receive_direct_message_request(&packet) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                if crate::direct::classify(request.payload()).is_none() {
+                    continue;
+                }
+                tracing::debug!(%peer, bytes = request.payload().len(), "udp_direct_request");
+                if let Some(payload) = handler
+                    .handle(TaggedStreamContext { peer }, request.payload().to_vec())
+                    .await
+                {
+                    let mut response = [0u8; MTU];
+                    match quic_lite::encode_direct_message_response(request, &payload, &mut response) {
+                        Ok(used) => {
+                            socket.send_to(&response[..used], peer).await?;
+                            tracing::debug!(%peer, bytes = used, "udp_direct_response");
+                        }
+                        Err(_) => tracing::warn!(%peer, "udp_direct_handler_oversize_response"),
                     }
                 }
-            }
-            let Ok((_, open)) = quic_lite::decode_bootstrap_open_packet_with_limits(&packet) else {
-                tracing::warn!(%peer, "udp_transport_invalid_bootstrap");
                 continue;
-            };
+            }
+            // Direct is a complete, explicitly typed long-header plane. It
+            // is never reinterpreted as connection setup merely because a
+            // handler declined its payload.
+            continue;
+        }
+        if let quic_lite::ServerDatagram::Initial(open) = classified {
             let client_cid = open.client_receive_cid;
             let key = (peer, client_cid.value());
             if let Some(previous) = pending_open_bytes.get(&key) {
@@ -1616,11 +1859,18 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 });
                 bootstrap_packet_numbers.insert(key, bootstrap_numbers.clone());
                 let (sender, receiver) = mpsc::channel(CONNECTION_DATAGRAM_QUEUE_CAPACITY);
-                connections.insert(allocated.value(), sender);
-                connection_peers.insert(allocated.value(), peer);
-                last_activity.insert(allocated.value(), Instant::now());
+                connections
+                    .insert(
+                        allocated,
+                        UdpConnectionRoute {
+                            cid: allocated,
+                            peer,
+                            sender,
+                            last_activity: Instant::now(),
+                        },
+                    )
+                    .map_err(|error| anyhow::anyhow!("UDP connection route: {error:?}"))?;
                 let socket_for_connection = socket.clone();
-                let registry_for_connection = registry.clone();
                 let server_for_connection = server.clone();
                 let control_for_connection = config.control.clone();
                 let tagged_handler_for_connection = config.tagged_handler.clone();
@@ -1630,7 +1880,6 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         socket_for_connection,
                         server_for_connection,
                         peer,
-                        registry_for_connection,
                         receiver,
                         None,
                         allocated,
@@ -1645,9 +1894,9 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         config.ledger_memory,
                         ledger_resize_interval,
                         config.object_chunk,
-                        config.iperf_pace,
-                        config.iperf_burst_packets,
-                        config.iperf_burst_delay,
+                        config.probe_pace,
+                        config.probe_burst_packets,
+                        config.probe_burst_delay,
                         control_for_connection,
                         tagged_handler_for_connection,
                     )
@@ -1683,13 +1932,47 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 })
                 .map_err(|_| anyhow::anyhow!("bootstrap packet number exhausted"))?;
             let mut ack = [0u8; MTU];
-            let used = encode_bootstrap_ack(client_cid, packet_number, server_cid, &mut ack)?;
+            let used = encode_bootstrap_ack_with_reset_token(
+                client_cid,
+                packet_number,
+                server_cid,
+                config
+                    .stateless_reset_key
+                    .map(|key| key.token_for(server_cid)),
+                &mut ack,
+            )?;
             socket.send_to(&ack[..used], peer).await?;
             tracing::info!(%peer, client_cid = client_cid.value(), server_cid = server_cid.value(),
                 packet_number, "object_udp_bootstrap_ack");
             continue;
         }
-        let key = header.dcid.value();
+        let destination = match classified {
+            quic_lite::ServerDatagram::Established { destination }
+            | quic_lite::ServerDatagram::BootstrapAck { destination } => destination,
+            // Direct and Initial each continue above. Keeping this exhaustive
+            // match makes a new QUIC-lite ingress kind impossible to route by
+            // accident in the socket adapter.
+            quic_lite::ServerDatagram::Direct | quic_lite::ServerDatagram::Initial(_) => {
+                continue;
+            }
+        };
+        if let Some(route) = outbound_routes.get(&destination.value()) {
+            match route.sender.try_send(ConnectionDatagram {
+                peer,
+                bytes: packet.clone(),
+            }) {
+                Ok(()) => continue,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(%peer, dcid = destination.value(), "udp_client_ingress_queue_full");
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    outbound_routes.remove(&destination.value());
+                    continue;
+                }
+            }
+        }
+        let key = destination.value();
         if let Some(handler) = config.relay_handler.as_deref() {
             let mut forwarded = [0u8; MTU];
             match handler.handle(peer, &packet, &mut forwarded) {
@@ -1708,18 +1991,18 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 RelayDatagramOutcome::Drop => continue,
             }
         }
-        if let Some(sender) = connections.get(&key) {
-            if connection_peers.get(&key) != Some(&peer) {
+        if let Ok(route) = connections.route_mut(0, &packet) {
+            if route.peer != peer {
                 tracing::warn!(
                     %peer,
                     dcid = key,
-                    expected_peer = ?connection_peers.get(&key),
+                    expected_peer = ?route.peer,
                     "udp_transport_wrong_peer"
                 );
                 continue;
             }
-            last_activity.insert(key, Instant::now());
-            match sender.try_send(ConnectionDatagram {
+            route.last_activity = Instant::now();
+            let route_closed = match route.sender.try_send(ConnectionDatagram {
                 peer,
                 bytes: packet.clone(),
             }) {
@@ -1732,16 +2015,30 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                     tracing::warn!(%peer, dcid = key, "udp_transport_connection_queue_full");
                     continue;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    connections.remove(&key);
-                    connection_peers.remove(&key);
-                }
+                Err(mpsc::error::TrySendError::Closed(_)) => true,
+            };
+            if route_closed {
+                let _ = connections.remove(destination);
             }
         }
 
         // Non-zero CIDs are routable only after bootstrap allocated them.
         // Unknown labels are dropped instead of creating an implicit
         // symmetric-CID connection.
+        if let Some(reset_key) = config.stateless_reset_key {
+            let mut reset = [0u8; MTU];
+            match reset_key.encode_for_unknown_packet(&packet, &mut reset) {
+                Ok(Some(used)) => {
+                    socket.send_to(&reset[..used], peer).await?;
+                    tracing::debug!(%peer, dcid = key, "udp_transport_stateless_reset");
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%peer, dcid = key, error = ?error, "udp_transport_stateless_reset_error")
+                }
+            }
+        }
         tracing::warn!(%peer, dcid = key, "udp_transport_unknown_cid");
     }
 }
@@ -1750,7 +2047,6 @@ async fn serve_persistent_peer_with_ids(
     socket: Arc<UdpSocket>,
     server: ObjectServer,
     peer: SocketAddr,
-    registry: StreamRegistry,
     mut receiver: mpsc::Receiver<ConnectionDatagram>,
     first_packet: Option<Vec<u8>>,
     local_cid: quic_lite::ConnectionId,
@@ -1765,44 +2061,45 @@ async fn serve_persistent_peer_with_ids(
     ledger_memory: Option<LedgerMemorySnapshot>,
     ledger_resize_interval: Duration,
     object_chunk: usize,
-    iperf_pace: Duration,
-    iperf_burst_packets: usize,
-    iperf_burst_delay: Duration,
+    probe_pace: Duration,
+    probe_burst_packets: usize,
+    probe_burst_delay: Duration,
     control: Option<Arc<TransportControl>>,
     tagged_handler: Option<Arc<dyn TaggedStreamHandler>>,
 ) -> Result<()> {
-    let mut mux = Box::new(StreamMux::<8, 512>::new_with_history_capacity(
-        Role::Server,
-        ConnectionLimits::default(),
-        MTU as u64,
-        64,
-        8,
-        256 * 1024,
-        history_capacity,
-    ));
-    let mut events = EventRing::new(64);
-    mux.install_connection_ids(local_cid, peer_cid)
-        .map_err(|error| anyhow::anyhow!("persistent CIDs: {error:?}"))?;
-    mux.endpoint
-        .set_initial_peer_budget(
+    let mut connection = Box::new(
+        ServerStreamConnection::<8, 512>::established_with_config(
+            local_cid,
+            peer_cid,
+            ConnectionLimits::default(),
             peer_max_data,
             peer_max_stream_data,
             peer_max_in_flight_packets,
+            0,
+            history_capacity,
+            ServerStreamConfig {
+                max_pending_streams: 8,
+                max_stream_bytes: 256 * 1024,
+            },
         )
-        .map_err(|error| anyhow::anyhow!("bootstrap peer credit: {error:?}"))?;
-    let mut response_stream = quic_lite::FIRST_SERVER_BIDI_STREAM_ID;
+        .map_err(|error| anyhow::anyhow!("persistent connection: {error:?}"))?,
+    );
+    let mut events = EventRing::new(64);
     let mut object_transfer = None;
-    let mut byte_transfers: [Option<PendingByteTransfer>; MAX_IPERF_STREAMS] =
+    let mut byte_transfers: [Option<PendingByteTransfer>; MAX_PROBE_STREAMS] =
         core::array::from_fn(|_| None);
     let mut high_byte_transfer = None;
     let mut low_byte_transfer = None;
+    let mut tagged_response = None;
     let started = Instant::now();
     let mut ledger_controller = LedgerCapacityController::new(history_capacity, 2);
     let mut next_ledger_resize = Instant::now() + ledger_resize_interval;
     if let Some(first_packet) = first_packet {
         let next = bootstrap_packet_numbers.next.load(Ordering::Acquire);
-        if next > mux.endpoint.next_packet_number {
-            mux.endpoint
+        if next > connection.mux.endpoint.next_packet_number {
+            connection
+                .mux
+                .endpoint
                 .continue_packet_numbers_from(next)
                 .map_err(|error| anyhow::anyhow!("continue bootstrap packet numbers: {error:?}"))?;
         }
@@ -1814,31 +2111,30 @@ async fn serve_persistent_peer_with_ids(
             peer,
             &server,
             &first_packet,
-            &mut mux,
-            &registry,
+            &mut connection,
             &mut events,
-            &mut response_stream,
             &mut object_transfer,
             &mut byte_transfers,
             &mut high_byte_transfer,
             &mut low_byte_transfer,
+            &mut tagged_response,
             started,
             object_chunk,
-            iperf_pace,
-            iperf_burst_packets,
-            iperf_burst_delay,
+            probe_pace,
+            probe_burst_packets,
+            probe_burst_delay,
             control.as_deref(),
             tagged_handler.as_deref(),
         )
         .await
         .context("initial persistent packet")?;
-        if mux.is_closed() {
+        if connection.mux.is_closed() {
             return Ok(());
         }
     }
     loop {
         if let Some(control) = control.as_deref() {
-            control.record_server_stats(&mux.endpoint);
+            control.record_server_stats(&connection.mux.endpoint);
         }
         let object_next_send = object_transfer
             .as_ref()
@@ -1869,8 +2165,10 @@ async fn serve_persistent_peer_with_ids(
         match timeout(receive_wait, receiver.recv()).await {
             Ok(Some(datagram)) if datagram.peer == peer => {
                 let next = bootstrap_packet_numbers.next.load(Ordering::Acquire);
-                if next > mux.endpoint.next_packet_number {
-                    mux.endpoint
+                if next > connection.mux.endpoint.next_packet_number {
+                    connection
+                        .mux
+                        .endpoint
                         .continue_packet_numbers_from(next)
                         .map_err(|error| {
                             anyhow::anyhow!("continue bootstrap packet numbers: {error:?}")
@@ -1884,19 +2182,18 @@ async fn serve_persistent_peer_with_ids(
                     peer,
                     &server,
                     &datagram.bytes,
-                    &mut mux,
-                    &registry,
+                    &mut connection,
                     &mut events,
-                    &mut response_stream,
                     &mut object_transfer,
                     &mut byte_transfers,
                     &mut high_byte_transfer,
                     &mut low_byte_transfer,
+                    &mut tagged_response,
                     started,
                     object_chunk,
-                    iperf_pace,
-                    iperf_burst_packets,
-                    iperf_burst_delay,
+                    probe_pace,
+                    probe_burst_packets,
+                    probe_burst_delay,
                     control.as_deref(),
                     tagged_handler.as_deref(),
                 )
@@ -1921,7 +2218,7 @@ async fn serve_persistent_peer_with_ids(
                 }
                 if !ledger_resize_interval.is_zero() {
                     maybe_resize_ledger(
-                        &mut mux,
+                        &mut connection.mux,
                         &mut ledger_controller,
                         &mut next_ledger_resize,
                         ledger_resize_interval,
@@ -1930,9 +2227,18 @@ async fn serve_persistent_peer_with_ids(
                         ledger_memory,
                     );
                 }
-                if mux.is_closed() {
+                if connection.mux.is_closed() {
                     break;
                 }
+                let mut packet = [0u8; MTU];
+                let _ = send_next_tagged_response_fragment(
+                    &socket,
+                    peer,
+                    &mut connection.mux,
+                    &mut tagged_response,
+                    &mut packet,
+                )
+                .await?;
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
@@ -1953,13 +2259,20 @@ async fn serve_persistent_peer_with_ids(
                     // A marked-loss repair consumes one slot but must not
                     // turn this scheduler pass into stop-and-wait. Refill
                     // every remaining congestion/history slot immediately.
-                    let _ = retransmit_due_packet(&socket, peer, &mut mux, started).await?;
+                    let _ =
+                        retransmit_due_packet(&socket, peer, &mut connection.mux, started).await?;
                     let mut packet = [0u8; MTU];
-                    let filled =
-                        fill_object_window(&socket, peer, &mut mux, transfer, &mut packet).await?;
+                    let filled = fill_object_window(
+                        &socket,
+                        peer,
+                        &mut connection.mux,
+                        transfer,
+                        &mut packet,
+                    )
+                    .await?;
                     let sent = filled && transfer.stream.is_complete();
                     if sent {
-                        report_object_transfer(transfer, mux.endpoint.stats());
+                        report_object_transfer(transfer, connection.mux.endpoint.stats());
                         object_transfer = None;
                     }
                 } else if byte_transfers.iter().any(Option::is_some)
@@ -1967,10 +2280,10 @@ async fn serve_persistent_peer_with_ids(
                     || low_byte_transfer.is_some()
                 {
                     let mut packet = [0u8; MTU];
-                    schedule_iperf_transfers(
+                    schedule_probe_transfers(
                         &socket,
                         peer,
-                        &mut mux,
+                        &mut connection.mux,
                         &mut byte_transfers,
                         &mut high_byte_transfer,
                         &mut low_byte_transfer,
@@ -1979,11 +2292,21 @@ async fn serve_persistent_peer_with_ids(
                     )
                     .await?;
                 } else {
-                    let _ = retransmit_due_packet(&socket, peer, &mut mux, started).await?;
+                    let _ =
+                        retransmit_due_packet(&socket, peer, &mut connection.mux, started).await?;
                 }
+                let mut packet = [0u8; MTU];
+                let _ = send_next_tagged_response_fragment(
+                    &socket,
+                    peer,
+                    &mut connection.mux,
+                    &mut tagged_response,
+                    &mut packet,
+                )
+                .await?;
                 if !ledger_resize_interval.is_zero() {
                     maybe_resize_ledger(
-                        &mut mux,
+                        &mut connection.mux,
                         &mut ledger_controller,
                         &mut next_ledger_resize,
                         ledger_resize_interval,
@@ -2052,13 +2375,16 @@ fn maybe_resize_ledger<const H: usize>(
 }
 
 fn allocate_server_cid(
-    connections: &HashMap<u64, mpsc::Sender<ConnectionDatagram>>,
+    connections: &ConnectionTable<UdpConnectionRoute, MAX_ACTIVE_CONNECTIONS, 1>,
     avoid: quic_lite::ConnectionId,
 ) -> Result<quic_lite::ConnectionId> {
     for _ in 0..1024 {
         let value =
             NEXT_SERVER_CID.fetch_add(1, Ordering::Relaxed) & quic_lite::ConnectionId::MAX_VALUE;
-        if value != 0 && value != avoid.value() && !connections.contains_key(&value) {
+        if value != 0
+            && value != avoid.value()
+            && quic_lite::ConnectionId::new(value).is_some_and(|cid| !connections.contains(cid))
+        {
             return quic_lite::ConnectionId::new(value)
                 .ok_or_else(|| anyhow::anyhow!("CID allocation overflow"));
         }
@@ -2074,16 +2400,7 @@ fn decode_bootstrap_open(packet: &[u8]) -> Option<quic_lite::ConnectionId> {
 }
 
 fn decode_bootstrap_open_payload(packet: &[u8]) -> Option<&[u8]> {
-    let (_, header_len) = quic_lite::ShortHeader::decode(packet).ok()?;
-    let (frame, used) = quic_lite::decode_frame(&packet[header_len..]).ok()?;
-    if used != packet.len().saturating_sub(header_len) {
-        return None;
-    }
-    let quic_lite::Frame::Stream(stream) = frame else {
-        return None;
-    };
-    (stream.id == quic_lite::CONTROL_STREAM_ID && stream.fin && stream.offset == 0)
-        .then_some(stream.data)
+    quic_lite::bootstrap_open_payload(packet).ok()
 }
 
 #[cfg(test)]
@@ -2105,6 +2422,7 @@ fn decode_bootstrap_ack(
         .map_err(|error| anyhow::anyhow!("bootstrap ACK: {error:?}"))
 }
 
+#[cfg(test)]
 fn encode_bootstrap_ack(
     client_cid: quic_lite::ConnectionId,
     packet_number: u32,
@@ -2115,54 +2433,109 @@ fn encode_bootstrap_ack(
         .map_err(|error| anyhow::anyhow!("bootstrap ACK: {error:?}"))
 }
 
+fn encode_bootstrap_ack_with_reset_token(
+    client_cid: quic_lite::ConnectionId,
+    packet_number: u32,
+    server_cid: quic_lite::ConnectionId,
+    stateless_reset_token: Option<quic_lite::StatelessResetToken>,
+    out: &mut [u8],
+) -> Result<usize> {
+    quic_lite::encode_bootstrap_open_ack_packet_with_limits_and_reset_token(
+        client_cid,
+        server_cid,
+        packet_number,
+        ConnectionLimits::default(),
+        stateless_reset_token,
+        out,
+    )
+    .map_err(|error| anyhow::anyhow!("bootstrap ACK: {error:?}"))
+}
+
 async fn process_persistent_packet<const H: usize>(
     socket: &UdpSocket,
     peer: SocketAddr,
     server: &ObjectServer,
     bytes: &[u8],
-    mux: &mut StreamMux<8, H>,
-    registry: &StreamRegistry,
+    connection: &mut ServerStreamConnection<8, H>,
     events: &mut EventRing,
-    response_stream: &mut u64,
     object_transfer: &mut Option<PendingObjectTransfer>,
-    byte_transfers: &mut [Option<PendingByteTransfer>; MAX_IPERF_STREAMS],
+    byte_transfers: &mut [Option<PendingByteTransfer>; MAX_PROBE_STREAMS],
     high_byte_transfer: &mut Option<PendingByteTransfer>,
     low_byte_transfer: &mut Option<PendingByteTransfer>,
+    tagged_response: &mut Option<PendingTaggedResponse>,
     started: Instant,
     object_chunk: usize,
-    iperf_pace: Duration,
-    iperf_burst_packets: usize,
-    iperf_burst_delay: Duration,
+    probe_pace: Duration,
+    probe_burst_packets: usize,
+    probe_burst_delay: Duration,
     control: Option<&TransportControl>,
     tagged_handler: Option<&dyn TaggedStreamHandler>,
 ) -> Result<()> {
-    mux.endpoint.set_time(started.elapsed().as_millis() as u64);
+    connection
+        .mux
+        .endpoint
+        .set_time(started.elapsed().as_millis() as u64);
     let mut packet = [0u8; MTU];
-    let request = mux
+    let request = connection
+        .mux
         .receive_request(bytes)
         .map_err(|error| anyhow::anyhow!("persistent input: {error:?}"))?;
     if let Some(request) = request {
+        let tagged_probe = crate::tagged::decode(&request.data)
+            .and_then(crate::probe::decode_probe_run_record)
+            .map(|(_, request)| request);
         // Tagged-CBOR is the normal stream request envelope. It carries the
         // component/method itself, so no service byte is consumed from the
         // stream. The branches below are compatibility for legacy clients.
-        if let Some(response) = match tagged_handler {
-            Some(handler) => {
-                handler
-                    .handle(TaggedStreamContext { peer }, request.data.clone())
-                    .await
+        if tagged_probe.is_none() {
+            if let Some(response) = match tagged_handler {
+                Some(handler) => {
+                    handler
+                        .handle(TaggedStreamContext { peer }, request.data.clone())
+                        .await
+                }
+                None => None,
             }
-            None => None,
-        }
-        .or_else(|| dispatch_tagged_stream(&request.data))
-        {
-            mux.complete_request(request.stream_id, request.data.len())
-                .map_err(|error| anyhow::anyhow!("tagged request accounting: {error:?}"))?;
-            let (used, _) = mux
-                .encode_response(*response_stream, &response, true, &mut packet)
-                .map_err(|error| anyhow::anyhow!("tagged response: {error:?}"))?;
-            socket.send_to(&packet[..used], peer).await?;
-            *response_stream = response_stream.saturating_add(4);
-            return Ok(());
+            .or_else(|| {
+                connection
+                    .mux
+                    .endpoint
+                    .local_connection_id()
+                    .or_else(|| connection.mux.endpoint.peer_connection_id())
+                    .and_then(|connection_cid| {
+                        dispatch_diagnostic_tagged_stream(
+                            &connection.mux.endpoint,
+                            Some(events),
+                            connection_cid,
+                            request.stream_id,
+                            &request.data,
+                        )
+                    })
+            })
+            .or_else(|| dispatch_tagged_stream(&request.data))
+            {
+                connection
+                    .mux
+                    .complete_request(request.stream_id, request.data.len())
+                    .map_err(|error| anyhow::anyhow!("tagged request accounting: {error:?}"))?;
+                if tagged_response.is_some() {
+                    bail!("tagged response already active");
+                }
+                *tagged_response = Some(PendingTaggedResponse {
+                    stream_id: connection.reserve_response_stream(),
+                    bytes: response,
+                    offset: 0,
+                });
+                let _ = send_next_tagged_response_fragment(
+                    socket,
+                    peer,
+                    &mut connection.mux,
+                    tagged_response,
+                    &mut packet,
+                )
+                .await?;
+                return Ok(());
+            }
         }
         if let Some(control) = control {
             control.record_event(format!(
@@ -2172,44 +2545,10 @@ async fn process_persistent_packet<const H: usize>(
                 request.data.len(),
             ));
         }
-        if request.data.first() == Some(&SERVICE_CONTROL) {
-            let record = request.data.get(2..).unwrap_or_default();
-            match request.data.get(1).copied() {
-                Some(CONTROL_LOG) => {
-                    if let Some(control) = control {
-                        control.receive_log(record);
-                    }
-                }
-                Some(CONTROL_POLL) => {}
-                Some(CONTROL_PATH_POLICY) => {
-                    let policy = decode_path_policy(record)
-                        .ok_or_else(|| anyhow::anyhow!("invalid path policy"))?;
-                    if let Some(control) = control {
-                        control.set_path_policy(policy);
-                        control.record_event(format!("path_policy={policy:?}"));
-                    }
-                }
-                _ => bail!("invalid control record"),
-            }
-            mux.complete_request(request.stream_id, request.data.len())
-                .map_err(|error| anyhow::anyhow!("control request accounting: {error:?}"))?;
-            let response = control.map_or_else(
-                || Vec::from([SERVICE_CONTROL, CONTROL_RESPONSE]),
-                TransportControl::next_response,
-            );
-            let (used, _) = mux
-                .encode_response(*response_stream, &response, true, &mut packet)
-                .map_err(|error| anyhow::anyhow!("control response: {error:?}"))?;
-            socket.send_to(&packet[..used], peer).await?;
-            *response_stream = response_stream.saturating_add(4);
-            return Ok(());
-        } else if request.data.first() == Some(&SERVICE_OBJECT) {
+        if let Ok(get) = object_request(&request.data) {
             if object_transfer.is_some() {
                 bail!("object transfer already active");
             }
-            let (ack_frequency, get_bytes) = object_request_envelope(&request.data)?;
-            let get = crate::protocol::decode_get(get_bytes)
-                .ok_or_else(|| anyhow::anyhow!("invalid bootstrapped object GET"))?;
             if get.target == 0 || get.name.as_ref().is_some_and(|name| name.len() > 128) {
                 bail!("invalid bootstrapped object target");
             }
@@ -2223,137 +2562,117 @@ async fn process_persistent_packet<const H: usize>(
             tracing::info!(%peer, stream = request.stream_id, records = records.len(),
                 "object_udp_get_accepted");
             *object_transfer = Some(PendingObjectTransfer::with_chunk(records, object_chunk));
-            mux.complete_request(request.stream_id, request.data.len())
+            connection
+                .mux
+                .complete_request(request.stream_id, request.data.len())
                 .map_err(|error| anyhow::anyhow!("object request accounting: {error:?}"))?;
-            // Object and IPERF use the same bearer. Make the object policy
+            // Object and PROBE use the same bearer. Make the object policy
             // explicit too; otherwise a Recovery client silently remains at
             // its local default and host/device diagnostics disagree.
-            mux.endpoint
+            connection
+                .mux
+                .endpoint
                 .request_ack_frequency(
                     0,
-                    u64::from(ack_frequency - 1),
+                    u64::from(RECOVERY_OBJECT_ACK_FREQUENCY - 1),
                     RECOVERY_MAX_ACK_DELAY_US,
                     1,
                 )
                 .map_err(|error| anyhow::anyhow!("object ACK_FREQUENCY: {error:?}"))?;
-            if let Some(used) = mux
+            if let Some(used) = connection
+                .mux
                 .endpoint
                 .poll_transmit(&mut packet)
                 .map_err(|error| anyhow::anyhow!("object ACK_FREQUENCY send: {error:?}"))?
             {
                 socket.send_to(&packet[..used], peer).await?;
             }
-        } else if request.data.first() == Some(&SERVICE_IPERF) {
+        } else if let Some(probe_request) = tagged_probe {
             if byte_transfers.iter().any(Option::is_some)
                 || high_byte_transfer.is_some()
                 || low_byte_transfer.is_some()
             {
-                bail!("iperf transfer already active");
+                bail!("probe transfer already active");
             }
-            let iperf_request = decode_iperf_service_request(&request.data)
-                .ok_or_else(|| anyhow::anyhow!("invalid IPERF request"))?;
             // The no-std handler plan is also consumed by firmware. Keep
             // request clamping, stream expansion, and ACK policy identical
             // before this socket adapter adds host-only pacing.
-            let iperf_plan = IperfServicePlan::from_request(iperf_request, MAX_OBJECT_CHUNK);
+            let probe_plan = ProbeServicePlan::from_request(probe_request, MAX_OBJECT_CHUNK);
             // The optional fields are diagnostic-only, scoped to this
-            // IPERF request. Normal object transfers keep UdpConfig's
+            // PROBE request. Normal object transfers keep UdpConfig's
             // default unpaced scheduling, and an older Recovery request
             // (11 bytes) still uses the listener defaults.
-            let (request_pace, request_burst, request_burst_delay, _, _) = iperf_schedule(
-                iperf_request,
-                iperf_pace,
-                iperf_burst_packets,
-                iperf_burst_delay,
+            let (request_pace, request_burst, request_burst_delay, _, _) = probe_schedule(
+                probe_request,
+                probe_pace,
+                probe_burst_packets,
+                probe_burst_delay,
             );
-            mux.complete_request(request.stream_id, request.data.len())
-                .map_err(|error| anyhow::anyhow!("iperf request accounting: {error:?}"))?;
+            connection
+                .mux
+                .complete_request(request.stream_id, request.data.len())
+                .map_err(|error| anyhow::anyhow!("probe request accounting: {error:?}"))?;
             // Default to RFC 9000's every-other-ack-eliciting-packet policy.
             // The selected ratio is carried in ACK_FREQUENCY, rather than
             // relying on a local Recovery setting the host cannot observe.
-            mux.endpoint
+            connection
+                .mux
+                .endpoint
                 .request_ack_frequency(
                     0,
-                    u64::from(iperf_plan.ack_frequency.saturating_sub(1)),
-                    u64::from(iperf_plan.ack_delay_ms) * 1_000,
+                    u64::from(probe_plan.ack_frequency.saturating_sub(1)),
+                    u64::from(probe_plan.ack_delay_ms) * 1_000,
                     1,
                 )
-                .map_err(|error| anyhow::anyhow!("iperf ACK_FREQUENCY: {error:?}"))?;
-            if let Some(used) = mux
+                .map_err(|error| anyhow::anyhow!("probe ACK_FREQUENCY: {error:?}"))?;
+            if let Some(used) = connection
+                .mux
                 .endpoint
                 .poll_transmit(&mut packet)
-                .map_err(|error| anyhow::anyhow!("iperf ACK_FREQUENCY send: {error:?}"))?
+                .map_err(|error| anyhow::anyhow!("probe ACK_FREQUENCY send: {error:?}"))?
             {
                 socket.send_to(&packet[..used], peer).await?;
             }
             for (index, transfer) in byte_transfers
                 .iter_mut()
-                .take(iperf_plan.normal_streams)
+                .take(probe_plan.normal_streams)
                 .enumerate()
             {
-                let bytes = iperf_plan.normal_bytes[index];
+                let bytes = probe_plan.normal_bytes[index];
+                let response_stream = connection.reserve_response_stream();
                 *transfer = Some(PendingByteTransfer::new(
-                    *response_stream,
+                    response_stream,
                     bytes,
-                    iperf_plan.packet_size,
+                    probe_plan.packet_size,
                     request_pace,
                     request_burst,
                     request_burst_delay,
                 ));
-                *response_stream = response_stream.saturating_add(4);
             }
-            if iperf_plan.high_priority_bytes != 0 {
+            if probe_plan.high_priority_bytes != 0 {
+                let response_stream = connection.reserve_response_stream();
                 *high_byte_transfer = Some(PendingByteTransfer::new(
-                    *response_stream,
-                    iperf_plan.high_priority_bytes,
-                    iperf_plan.packet_size,
+                    response_stream,
+                    probe_plan.high_priority_bytes,
+                    probe_plan.packet_size,
                     request_pace,
                     request_burst,
                     request_burst_delay,
                 ));
-                *response_stream = response_stream.saturating_add(4);
             }
-            if iperf_plan.low_priority_bytes != 0 {
+            if probe_plan.low_priority_bytes != 0 {
+                let response_stream = connection.reserve_response_stream();
                 *low_byte_transfer = Some(PendingByteTransfer::new(
-                    *response_stream,
-                    iperf_plan.low_priority_bytes,
-                    iperf_plan.packet_size,
+                    response_stream,
+                    probe_plan.low_priority_bytes,
+                    probe_plan.packet_size,
                     request_pace,
                     request_burst,
                     request_burst_delay,
                 ));
-                *response_stream = response_stream.saturating_add(4);
             }
         } else {
-            let connection = mux
-                .endpoint
-                .local_connection_id()
-                .or_else(|| mux.endpoint.peer_connection_id())
-                .ok_or(quic_lite::Error::WrongConnectionId)
-                .map_err(|error| anyhow::anyhow!("service CID: {error:?}"))?;
-            let service = *request
-                .data
-                .first()
-                .ok_or(quic_lite::Error::Invalid)
-                .map_err(|error| anyhow::anyhow!("empty service: {error:?}"))?;
-            let response = handle_stream_with_events(
-                &mux.endpoint,
-                Some(events),
-                connection,
-                request.stream_id,
-                registry,
-                service,
-                &request.data[1..],
-            )
-            .map_err(|error| anyhow::anyhow!(error))?;
-            mux.complete_request(request.stream_id, request.data.len())
-                .map_err(|error| anyhow::anyhow!("service accounting: {error:?}"))?;
-            let (used, _) = mux
-                .encode_response(*response_stream, &response, true, &mut packet)
-                .map_err(|error| anyhow::anyhow!("persistent response: {error:?}"))?;
-            socket.send_to(&packet[..used], peer).await?;
-            *response_stream = response_stream.saturating_add(4);
-            return Ok(());
+            anyhow::bail!("untagged diagnostic stream request rejected");
         }
     }
     if let Some(transfer) = object_transfer.as_mut() {
@@ -2367,11 +2686,12 @@ async fn process_persistent_packet<const H: usize>(
         // A selective-ACK repair is ordered before new bytes, not instead of
         // them. This is the transport scheduler; object records do not form
         // an application pacing boundary.
-        let _ = retransmit_due_packet(socket, peer, mux, started).await?;
-        let filled = fill_object_window(socket, peer, mux, transfer, &mut packet).await?;
+        let _ = retransmit_due_packet(socket, peer, &mut connection.mux, started).await?;
+        let filled =
+            fill_object_window(socket, peer, &mut connection.mux, transfer, &mut packet).await?;
         if filled {
             if transfer.stream.is_complete() {
-                report_object_transfer(transfer, mux.endpoint.stats());
+                report_object_transfer(transfer, connection.mux.endpoint.stats());
                 *object_transfer = None;
             }
         }
@@ -2379,10 +2699,10 @@ async fn process_persistent_packet<const H: usize>(
         || high_byte_transfer.is_some()
         || low_byte_transfer.is_some()
     {
-        schedule_iperf_transfers(
+        schedule_probe_transfers(
             socket,
             peer,
-            mux,
+            &mut connection.mux,
             byte_transfers,
             high_byte_transfer,
             low_byte_transfer,
@@ -2390,7 +2710,8 @@ async fn process_persistent_packet<const H: usize>(
             started,
         )
         .await?;
-    } else if let Some(used) = mux
+    } else if let Some(used) = connection
+        .mux
         .endpoint
         .poll_transmit(&mut packet)
         .map_err(|error| anyhow::anyhow!("persistent ACK: {error:?}"))?
@@ -2400,15 +2721,67 @@ async fn process_persistent_packet<const H: usize>(
     Ok(())
 }
 
-/// Priority scheduler for one connection. High-priority application records
-/// consume up to four packet opportunities, normal IPERF streams share the
-/// host refill quantum, and the log-like low stream receives one opportunity.
-/// Every branch remains bounded by endpoint congestion and stream credit.
-async fn schedule_iperf_transfers<const H: usize>(
+/// Advance one pending tagged response when its QUIC packet ledger has room.
+/// A terminal result is fragmented only at the physical frame boundary, and
+/// each next fragment is driven by the same ACK/PTO loop as every other QUIC
+/// stream.  It is therefore not a UDP-only bulk path.
+async fn send_next_tagged_response_fragment<const H: usize>(
     socket: &UdpSocket,
     peer: SocketAddr,
     mux: &mut StreamMux<8, H>,
-    normal: &mut [Option<PendingByteTransfer>; MAX_IPERF_STREAMS],
+    pending: &mut Option<PendingTaggedResponse>,
+    packet: &mut [u8; MTU],
+) -> Result<bool> {
+    let Some(response) = pending.as_mut() else {
+        return Ok(false);
+    };
+    if mux.endpoint.history_len() >= mux.endpoint.history_capacity() {
+        return Ok(false);
+    }
+    if response.bytes.is_empty() {
+        let (used, _) = mux
+            .encode_response_at(response.stream_id, 0, &[], true, packet)
+            .map_err(|error| anyhow::anyhow!("empty tagged response: {error:?}"))?;
+        socket.send_to(&packet[..used], peer).await?;
+        *pending = None;
+        return Ok(true);
+    }
+    let offset = response.offset;
+    let mut end = response.bytes.len().min(offset.saturating_add(MTU));
+    let used = loop {
+        let fin = end == response.bytes.len();
+        match mux.encode_response_at(
+            response.stream_id,
+            offset as u64,
+            &response.bytes[offset..end],
+            fin,
+            packet,
+        ) {
+            Ok((used, _)) => break used,
+            Err(quic_lite::Error::BufferTooSmall) if end > offset + 1 => {
+                end = offset + (end - offset) / 2;
+            }
+            Err(quic_lite::Error::HistoryFull) => return Ok(false),
+            Err(error) => bail!("tagged response fragment: {error:?}"),
+        }
+    };
+    socket.send_to(&packet[..used], peer).await?;
+    response.offset = end;
+    if response.offset == response.bytes.len() {
+        *pending = None;
+    }
+    Ok(true)
+}
+
+/// Priority scheduler for one connection. High-priority application records
+/// consume up to four packet opportunities, normal PROBE streams share the
+/// host refill quantum, and the log-like low stream receives one opportunity.
+/// Every branch remains bounded by endpoint congestion and stream credit.
+async fn schedule_probe_transfers<const H: usize>(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    mux: &mut StreamMux<8, H>,
+    normal: &mut [Option<PendingByteTransfer>; MAX_PROBE_STREAMS],
     high: &mut Option<PendingByteTransfer>,
     low: &mut Option<PendingByteTransfer>,
     packet: &mut [u8; MTU],
@@ -2428,9 +2801,9 @@ async fn schedule_iperf_transfers<const H: usize>(
         .count()
         .max(1);
     let budget = if high.is_some() {
-        HOST_IPERF_NORMAL_REFILL_PACKETS.saturating_sub(4)
+        HOST_PROBE_NORMAL_REFILL_PACKETS.saturating_sub(4)
     } else {
-        HOST_IPERF_NORMAL_REFILL_PACKETS
+        HOST_PROBE_NORMAL_REFILL_PACKETS
     };
     for slot in normal.iter_mut() {
         let Some(transfer) = slot.as_mut() else {
@@ -2495,7 +2868,7 @@ async fn fill_byte_window<const H: usize>(
             mux.endpoint
                 .peer_connection_id()
                 .ok_or(quic_lite::Error::WrongConnectionId)
-                .map_err(|error| anyhow::anyhow!("iperf peer CID: {error:?}"))?,
+                .map_err(|error| anyhow::anyhow!("probe peer CID: {error:?}"))?,
             transfer.stream_id,
             transfer.offset,
             fin,
@@ -2512,7 +2885,7 @@ async fn fill_byte_window<const H: usize>(
             // benchmark consume 1200 bytes of cwnd per datagram and turned
             // a windowed sender into an unnecessarily tiny burst.
             Err(quic_lite::Error::Invalid) => break,
-            Err(error) => return Err(anyhow::anyhow!("iperf response packet: {error:?}")),
+            Err(error) => return Err(anyhow::anyhow!("probe response packet: {error:?}")),
             Ok(packet) => packet,
         };
         socket.send_to(&packet[..used], peer).await?;
@@ -2702,46 +3075,82 @@ async fn fill_object_window<const H: usize>(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn log_queue_drops_oldest_without_affecting_command_queue() {
-        let control = TransportControl::default();
-        control.queue_command(vec![0xa1]);
-        for value in 0..=CONTROL_QUEUE_CAPACITY {
-            control.receive_log(&[value as u8]);
-        }
-        let stats = control.log_stats();
-        assert_eq!(stats.queued_records, CONTROL_QUEUE_CAPACITY);
-        assert_eq!(stats.dropped_full, 1);
-        assert_eq!(control.take_log(), Some(vec![1]));
-        assert_eq!(
-            control.next_response(),
-            vec![SERVICE_CONTROL, CONTROL_RESPONSE, 0xa1]
-        );
-    }
-
     use std::collections::HashSet;
     use std::eprintln;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use quic_lite::CommittedStreamDisposition;
 
+    fn established_client_connection(
+        local: ConnectionId,
+        peer: ConnectionId,
+        path: quic_lite::PathId,
+    ) -> quic_lite::ClientAssociation<512, MTU> {
+        let mut connection = quic_lite::ClientAssociation::new(local);
+        let mut packet = [0u8; MTU];
+        connection.select_path(path);
+        connection.start(&mut packet).unwrap();
+        let used = quic_lite::encode_bootstrap_open_ack_packet_with_limits(
+            local,
+            peer,
+            0,
+            ConnectionLimits::default(),
+            &mut packet,
+        )
+        .unwrap();
+        connection
+            .receive(path, &packet[..used], |client| {
+                client.receive_open_ack(&packet[..used], 0)
+            })
+            .unwrap();
+        connection
+    }
+
+    fn diagnostic_request(method: u64, id: u64) -> Vec<u8> {
+        let mut request = [0u8; 48];
+        let used = crate::tagged::encode_numeric_empty_request(
+            crate::services::DIAGNOSTIC_COMPONENT,
+            method,
+            id,
+            &mut request,
+        )
+        .unwrap();
+        request[..used].to_vec()
+    }
+
+    fn diagnostic_text(response: &[u8]) -> String {
+        let record = crate::tagged::decode(response).unwrap();
+        let mut result = crate::cbor::Decoder::new(record.result.unwrap());
+        let text = String::from_utf8(result.text_ref().unwrap().to_vec()).unwrap();
+        assert!(result.is_finished());
+        text
+    }
+
+    async fn request_diagnostic_text(
+        client: &mut UdpClient,
+        stream_id: u64,
+        method: u64,
+    ) -> String {
+        let request = diagnostic_request(method, stream_id);
+        let (_, response, finished) = client
+            .request_stream(stream_id, &request, true)
+            .await
+            .unwrap();
+        assert!(finished);
+        diagnostic_text(&response)
+    }
+
     #[derive(Debug)]
     struct EchoDirect;
 
-    impl crate::relay::DirectHandler for EchoDirect {
-        fn handle_direct(
-            &self,
-            packet_number: u32,
-            payload: &[u8],
-            response: &mut [u8],
-        ) -> crate::relay::DirectOutcome {
-            if crate::tagged::decode(payload).is_none() {
-                return crate::relay::DirectOutcome::NotHandled;
-            }
-            match quic_lite::encode_direct_packet(packet_number + 1, payload, response) {
-                Ok(used) => crate::relay::DirectOutcome::Response(used),
-                Err(_) => crate::relay::DirectOutcome::Handled,
-            }
+    impl TaggedStreamHandler for EchoDirect {
+        fn handle<'a>(
+            &'a self,
+            _context: TaggedStreamContext,
+            payload: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move { crate::direct::classify(&payload).map(|_| payload) })
         }
     }
 
@@ -2751,14 +3160,29 @@ mod tests {
     #[derive(Debug)]
     struct GreedyDirect;
 
-    impl crate::relay::DirectHandler for GreedyDirect {
-        fn handle_direct(
-            &self,
-            _packet_number: u32,
-            _payload: &[u8],
-            _response: &mut [u8],
-        ) -> crate::relay::DirectOutcome {
-            crate::relay::DirectOutcome::Handled
+    impl TaggedStreamHandler for GreedyDirect {
+        fn handle<'a>(
+            &'a self,
+            _context: TaggedStreamContext,
+            _payload: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async { None })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingDirect(AtomicUsize);
+
+    impl TaggedStreamHandler for CountingDirect {
+        fn handle<'a>(
+            &'a self,
+            _context: TaggedStreamContext,
+            _payload: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                None
+            })
         }
     }
 
@@ -2776,10 +3200,9 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut request_payload = [0u8; 32];
         let request_payload_len =
-            crate::tagged::encode_numeric_empty_request(1, 1, 7, &mut request_payload).unwrap();
+            crate::announce::encode_discovery_request(7, &mut request_payload).unwrap();
         let mut request = [0u8; 32];
-        let request_len = quic_lite::encode_direct_packet(
-            7,
+        let request_len = crate::direct::ConnectionlessMessage::encode(
             &request_payload[..request_payload_len],
             &mut request,
         )
@@ -2792,10 +3215,89 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(peer, bind);
-        let (header, payload) = quic_lite::decode_direct_packet(&response[..response_len]).unwrap();
-        assert_eq!(header.packet_number, 8);
+        let payload = crate::direct::ConnectionlessMessage::decode(&response[..response_len])
+            .unwrap();
         assert_eq!(payload, &request_payload[..request_payload_len]);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_listener_returns_quic_lite_stateless_reset_for_unknown_short_cid() {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let reset_key = quic_lite::StatelessResetKey::from_device_secret(&[0x71; 32]).unwrap();
+        let server = tokio::spawn(run(UdpConfig {
+            bind,
+            stateless_reset_key: Some(reset_key),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let unknown = ConnectionId::new(0x1_2345).unwrap();
+        let mut request = [0u8; 48];
+        let header_len = quic_lite::ShortHeader {
+            flags: quic_lite::FLAG_FIXED,
+            dcid: unknown,
+            packet_number: 1,
+            packet_number_len: 1,
+        }
+        .encode(&mut request)
+        .unwrap();
+        request[header_len..].fill(0x44);
+        client.send_to(&request, bind).await.unwrap();
+        let mut response = [0u8; 64];
+        let (used, peer) = timeout(Duration::from_millis(100), client.recv_from(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer, bind);
+        assert_eq!(used, request.len());
+        assert!(
+            reset_key
+                .token_for(unknown)
+                .matches_packet(&response[..used])
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retained_client_recovers_peer_restart_without_waiting_for_pto() {
+        let root = tempdir().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let bind = socket.local_addr().unwrap();
+        let reset_key = quic_lite::StatelessResetKey::from_device_secret(&[0x92; 32]).unwrap();
+        let config = || UdpConfig {
+            bind,
+            socket: Some(socket.clone()),
+            artifact_root: root.path().to_path_buf(),
+            stateless_reset_key: Some(reset_key),
+            ..UdpConfig::default()
+        };
+        let first_server = tokio::spawn(run(config()));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0x6a6).unwrap(),
+        )
+        .await
+        .unwrap();
+        // Keep the UDP port but discard the connection table, exactly as a
+        // supervised peer restart does. The new listener derives the same
+        // token for the old server CID and immediately resets the retained
+        // client association.
+        first_server.abort();
+        let restarted_server = tokio::spawn(run(config()));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let started = Instant::now();
+        let error = client
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, b"after-restart", true)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < ACK_TIMEOUT);
+        assert!(crate::transport::is_peer_restarted_error(&error));
+        restarted_server.abort();
     }
 
     #[tokio::test]
@@ -2816,7 +3318,98 @@ mod tests {
         )
         .await
         .expect("bootstrap must bypass direct handler");
-        assert!(client.peer_connection_id().is_some_and(|cid| cid.value() != 0));
+        assert!(
+            client
+                .peer_connection_id()
+                .is_some_and(|cid| cid.value() != 0)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_bootstrap_keeps_waiting_after_connectionless_discovery() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = server_socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut inbound = [0u8; MTU];
+            let (received, client) = server_socket.recv_from(&mut inbound).await.unwrap();
+            let (_, open) =
+                quic_lite::decode_bootstrap_open_packet_with_limits(&inbound[..received]).unwrap();
+
+            let mut direct = [0u8; MTU];
+            let direct_len = crate::direct::ConnectionlessMessage::encode(b"discovery", &mut direct)
+                .unwrap();
+            server_socket
+                .send_to(&direct[..direct_len], client)
+                .await
+                .unwrap();
+
+            let mut ack = [0u8; MTU];
+            let ack_len = quic_lite::encode_bootstrap_open_ack_packet_with_limits(
+                open.client_receive_cid,
+                ConnectionId::new(0x7788).unwrap(),
+                0,
+                ConnectionLimits::default(),
+                &mut ack,
+            )
+            .unwrap();
+            server_socket
+                .send_to(&ack[..ack_len], client)
+                .await
+                .unwrap();
+        });
+
+        let local_cid = ConnectionId::new(0x6677).unwrap();
+        let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpClient::connect_with_socket_via(
+            client_socket,
+            peer,
+            local_cid,
+            512,
+            ConnectionLimits::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("connectionless discovery must not consume the OPEN ACK wait");
+        assert_eq!(
+            client.peer_connection_id(),
+            Some(ConnectionId::new(0x7788).unwrap())
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_rejects_stream_only_record_before_direct_handler() {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let direct = Arc::new(CountingDirect::default());
+        let server = tokio::spawn(run(UdpConfig {
+            bind,
+            direct_handler: Some(direct.clone()),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut payload = [0u8; 32];
+        let payload_len =
+            crate::tagged::encode_numeric_empty_request(7, 1, 9, &mut payload).unwrap();
+        let mut packet = [0u8; 64];
+        let packet_len = crate::direct::ConnectionlessMessage::encode(
+            &payload[..payload_len],
+            &mut packet,
+        )
+        .unwrap();
+        client.send_to(&packet[..packet_len], bind).await.unwrap();
+        let mut response = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(50), client.recv_from(&mut response))
+                .await
+                .is_err()
+        );
+        assert_eq!(direct.0.load(Ordering::Relaxed), 0);
         server.abort();
     }
 
@@ -2873,7 +3466,7 @@ mod tests {
     }
 
     #[test]
-    fn active_unpaced_iperf_never_falls_back_to_idle_50ms_tick() {
+    fn active_unpaced_probe_never_falls_back_to_idle_50ms_tick() {
         // `None` is the normal unpaced state: `next_send` is already due.
         // It must not become the listener's 50 ms idle wait.
         assert_eq!(
@@ -2887,12 +3480,11 @@ mod tests {
     }
 
     #[test]
-    fn iperf_request_schedule_is_scoped_and_backward_compatible() {
+    fn probe_request_schedule_is_scoped_to_the_tagged_request() {
         let defaults = (Duration::from_micros(17), 3, Duration::from_micros(29));
-        let legacy = [SERVICE_IPERF; 11];
         assert_eq!(
-            iperf_schedule(
-                decode_iperf_service_request(&legacy).unwrap(),
+            probe_schedule(
+                ProbeServiceRequest::new(1024, 1200),
                 defaults.0,
                 defaults.1,
                 defaults.2,
@@ -2906,20 +3498,14 @@ mod tests {
             )
         );
 
-        let mut request = [0u8; 22];
-        request[0] = SERVICE_IPERF;
-        request[11..15].copy_from_slice(&250u32.to_be_bytes());
-        request[15] = 4;
-        request[16..20].copy_from_slice(&1_000u32.to_be_bytes());
-        request[20] = 8;
-        request[21] = 1;
+        let mut request = ProbeServiceRequest::new(1024, 1200);
+        request.pace_us = Some(250);
+        request.burst_packets = Some(4);
+        request.burst_delay_us = Some(1_000);
+        request.ack_frequency = Some(8);
+        request.ack_delay_ms = Some(1);
         assert_eq!(
-            iperf_schedule(
-                decode_iperf_service_request(&request).unwrap(),
-                defaults.0,
-                defaults.1,
-                defaults.2,
-            ),
+            probe_schedule(request, defaults.0, defaults.1, defaults.2,),
             (
                 Duration::from_micros(250),
                 4,
@@ -2928,15 +3514,9 @@ mod tests {
                 1_000
             )
         );
-        request[20] = u8::MAX;
+        request.ack_frequency = Some(u8::MAX);
         assert_eq!(
-            iperf_schedule(
-                decode_iperf_service_request(&request).unwrap(),
-                defaults.0,
-                defaults.1,
-                defaults.2,
-            )
-            .3,
+            probe_schedule(request, defaults.0, defaults.1, defaults.2,).3,
             quic_lite::ACK_RANGE_CAPACITY as u8
         );
     }
@@ -2973,7 +3553,7 @@ mod tests {
     }
 
     #[test]
-    fn iperf_send_gap_bins_have_the_compact_numeric_order() {
+    fn probe_send_gap_bins_have_the_compact_numeric_order() {
         assert_eq!(interpacket_gap_bucket(Duration::from_micros(999)), 0);
         assert_eq!(interpacket_gap_bucket(Duration::from_micros(1_000)), 1);
         assert_eq!(interpacket_gap_bucket(Duration::from_micros(5_000)), 2);
@@ -2983,9 +3563,8 @@ mod tests {
     }
     use crate::protocol::{
         BLOCK_SIZE, ImageEvent, ImageManifest, ImageReceiver, ImageSink, RECORD_BLOB, RECORD_DONE,
-        RECORD_MANIFEST, RecordBuffer, encode_get,
+        RECORD_MANIFEST, RecordBuffer, encode_get_request,
     };
-    use crate::services::handle_stream;
     use quic_lite::callback::{CallbackStreams, CopyingStreamEvents};
     use quic_lite::{
         ConnectionId, EndpointState, FIRST_CLIENT_BIDI_STREAM_ID, FLAG_FIXED, Frame,
@@ -3004,14 +3583,6 @@ mod tests {
 
     #[test]
     fn two_connections_register_and_report_multiple_service_streams() {
-        let registry = StreamRegistry::default();
-        assert_eq!(registry.handlers().len(), 9);
-        assert!(
-            registry
-                .handlers()
-                .iter()
-                .any(|handler| handler.tag == SERVICE_IPERF)
-        );
         for (client_value, server_value) in [(11u64, 22u64), (33u64, 44u64)] {
             let client_cid = ConnectionId::new(client_value).unwrap();
             let server_cid = ConnectionId::new(server_value).unwrap();
@@ -3025,26 +3596,17 @@ mod tests {
             server
                 .install_connection_ids(server_cid, client_cid)
                 .unwrap();
-            for (stream_id, service) in [
-                (4u64, SERVICE_ECHO),
-                (8, SERVICE_STATUS),
-                (12, SERVICE_IPERF),
-                (16, SERVICE_METRICS),
-                (20, SERVICE_EVENTS),
+            for (stream_id, method) in [
+                (4u64, crate::services::DIAGNOSTIC_STATUS_METHOD),
+                (8, crate::services::DIAGNOSTIC_STATUS_METHOD),
+                (16, crate::services::DIAGNOSTIC_METRICS_METHOD),
+                (20, crate::services::DIAGNOSTIC_EVENTS_METHOD),
             ] {
                 client
                     .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
                     .unwrap();
                 let mut packet = [0u8; MTU];
-                let mut request = Vec::from([service]);
-                if service == SERVICE_IPERF {
-                    request.extend_from_slice(&128u64.to_be_bytes());
-                    request.extend_from_slice(&[0xa5; 32]);
-                } else if service == SERVICE_EVENTS {
-                    request.extend_from_slice(b"since=0");
-                } else {
-                    request.extend_from_slice(b"probe");
-                }
+                let request = diagnostic_request(method, stream_id);
                 let (used, _) = client
                     .encode_stream_packet(server_cid, stream_id, 0, true, &request, &mut packet)
                     .unwrap();
@@ -3053,36 +3615,21 @@ mod tests {
                 else {
                     panic!("expected service stream");
                 };
-                let body = &frame.data[1..];
-                let response = handle_stream(
+                let response = crate::services::dispatch_diagnostic_tagged_stream(
                     &server,
+                    None,
                     server.local_connection_id().unwrap(),
                     stream_id,
-                    &registry,
-                    service,
-                    body,
+                    &frame.data,
                 )
                 .unwrap();
-                if service == SERVICE_IPERF {
-                    assert_eq!(response.len(), 49);
-                    assert_eq!(response[0], 1);
-                    assert_eq!(u64::from_be_bytes(response[1..9].try_into().unwrap()), 128);
-                    assert_eq!(u64::from_be_bytes(response[9..17].try_into().unwrap()), 32);
-                    continue;
-                }
-                if service == SERVICE_ECHO {
-                    // Echo is deliberately payload-only so direct action
-                    // checks and a QUIC stream share one small response.
-                    assert_eq!(response, b"probe");
-                    continue;
-                }
-                let response_text = String::from_utf8(response).unwrap();
+                let response_text = diagnostic_text(&response);
                 assert!(response_text.contains(&format!("connection_dcid={server_value}")));
                 assert!(response_text.contains(&format!("stream_id={stream_id}")));
-                if service == SERVICE_METRICS {
+                if method == crate::services::DIAGNOSTIC_METRICS_METHOD {
                     assert!(response_text.contains("slow_start_threshold="));
                     assert!(response_text.contains("max_streams_bidi="));
-                } else if service == SERVICE_EVENTS {
+                } else if method == crate::services::DIAGNOSTIC_EVENTS_METHOD {
                     assert!(response_text.contains("event=transport_snapshot"));
                     assert!(response_text.contains("next_sequence="));
                 } else {
@@ -3113,7 +3660,9 @@ mod tests {
 
     #[test]
     fn server_cid_allocator_skips_client_receive_cid() {
-        let connections = HashMap::new();
+        let connections = ConnectionTable::<UdpConnectionRoute, MAX_ACTIVE_CONNECTIONS, 1>::new([
+            PathState::new(),
+        ]);
         let next = NEXT_SERVER_CID.load(Ordering::Relaxed);
         let avoid = ConnectionId::new(next & ConnectionId::MAX_VALUE).unwrap();
         let allocated = allocate_server_cid(&connections, avoid).unwrap();
@@ -3167,8 +3716,8 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
             let (first_len, source) = server.recv_from(&mut input).await.unwrap();
-            let (first_header, _) = ShortHeader::decode(&input[..first_len]).unwrap();
-            assert_eq!(first_header.dcid.value(), 0);
+            let first_client = decode_bootstrap_open(&input[..first_len]).unwrap();
+            assert_ne!(first_client.value(), 0);
             let (second_len, second_source) = server.recv_from(&mut input).await.unwrap();
             assert_eq!(second_source, source);
             let client_cid = decode_bootstrap_open(&input[..second_len]).unwrap();
@@ -3186,10 +3735,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            client.endpoint.peer_connection_id(),
+            client.endpoint().peer_connection_id(),
             Some(ConnectionId::new(0xe3).unwrap())
         );
         task.await.unwrap();
+    }
+
+    #[test]
+    fn udp_path_id_keeps_ipv6_link_local_scopes_distinct() {
+        let address: std::net::Ipv6Addr = "fe80::44".parse().unwrap();
+        let on_br_lan = SocketAddr::V6(std::net::SocketAddrV6::new(address, 3339, 0, 5));
+        let on_wlan = SocketAddr::V6(std::net::SocketAddrV6::new(address, 3339, 0, 7));
+
+        assert_ne!(udp_path_id(on_br_lan), udp_path_id(on_wlan));
     }
 
     #[test]
@@ -3219,15 +3777,16 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let local = ConnectionId::new(1).unwrap();
         let peer = ConnectionId::new(2).unwrap();
+        let path = udp_path_id(server_addr);
         let mut client = UdpClient {
-            socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            ingress: None,
             peer: server_addr,
-            endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
-            local_cid: local,
+            connection: established_client_connection(local, peer, path),
+            path,
             quic_lite_wire_dcid: None,
             deferred_receive_credit: false,
         };
-        client.endpoint.install_connection_ids(local, peer).unwrap();
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
             let (_, source) = server.recv_from(&mut input).await.unwrap();
@@ -3244,7 +3803,53 @@ mod tests {
             server.send_to(&output[..used], source).await.unwrap();
         });
         client.send_stream(4, b"probe", true).await.unwrap();
+        assert_eq!(client.connection.active_path(), Some(path));
+        assert_eq!(client.connection.known_paths()[0], Some(path));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_client_ignores_delayed_completed_response_before_next_call() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let local = ConnectionId::new(1).unwrap();
+        let peer = ConnectionId::new(2).unwrap();
+        let path = udp_path_id(server_addr);
+        let mut client = UdpClient {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            ingress: None,
+            peer: server_addr,
+            connection: established_client_connection(local, peer, path),
+            path,
+            quic_lite_wire_dcid: None,
+            deferred_receive_credit: false,
+        };
+        let first = ReceivedStream {
+            id: quic_lite::FIRST_SERVER_BIDI_STREAM_ID,
+            offset: 0,
+            fin: true,
+            data: vec![1],
+        };
+        assert!(client
+            .connection
+            .accept_server_response_stream(first.id, first.fin)
+            .unwrap());
+        // A peer may retransmit this final response after the client has
+        // already ACKed it. It is not the next request's result.
+        assert!(!client
+            .connection
+            .accept_server_response_stream(first.id, first.fin)
+            .unwrap());
+        let next = ReceivedStream {
+            id: quic_lite::FIRST_SERVER_BIDI_STREAM_ID + 4,
+            offset: 0,
+            fin: true,
+            data: vec![2],
+        };
+        assert!(client
+            .connection
+            .accept_server_response_stream(next.id, next.fin)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -3253,15 +3858,16 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let local = ConnectionId::new(1).unwrap();
         let peer = ConnectionId::new(2).unwrap();
+        let path = udp_path_id(server_addr);
         let mut client = UdpClient {
-            socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            ingress: None,
             peer: server_addr,
-            endpoint: EndpointState::new(Role::Client, ConnectionLimits::default(), MTU as u64),
-            local_cid: local,
+            connection: established_client_connection(local, peer, path),
+            path,
             quic_lite_wire_dcid: None,
             deferred_receive_credit: false,
         };
-        client.endpoint.install_connection_ids(local, peer).unwrap();
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
             let (_, source) = server.recv_from(&mut input).await.unwrap();
@@ -3314,11 +3920,9 @@ mod tests {
         let expected = (0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&artifact, &expected).unwrap();
 
-        let mut request_body = [0u8; 64];
+        let mut request_body = [0u8; 96];
         // Exercise the real Main-flash request path.
-        let encoded_len = encode_get(&mut request_body[1..], None, 13, 6).unwrap();
-        request_body[0] = SERVICE_OBJECT;
-        let request_len = encoded_len + 1;
+        let request_len = encode_get_request(&mut request_body, 1, None, 13, 6).unwrap();
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind = probe.local_addr().unwrap();
         drop(probe);
@@ -3687,14 +4291,8 @@ mod tests {
         let expected = (0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&artifact, &expected).unwrap();
 
-        let mut request_body = [0u8; 64];
-        let encoded_len = encode_get(&mut request_body[2..], None, 13, 6).unwrap();
-        request_body[0] = SERVICE_OBJECT;
-        // Match Recovery's transport-service envelope. The host must not
-        // silently select its listener default when this test requests a
-        // specific delayed-ACK profile.
-        request_body[1] = ack_frequency.clamp(1, quic_lite::ACK_RANGE_CAPACITY as u8);
-        let request_len = encoded_len + 2;
+        let mut request_body = [0u8; 96];
+        let request_len = encode_get_request(&mut request_body, 1, None, 13, 6).unwrap();
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind = probe.local_addr().unwrap();
         drop(probe);
@@ -4165,35 +4763,109 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(client.endpoint.local_connection_id().unwrap().value(), 0x55);
-        assert_eq!(client.endpoint.next_packet_number, 1);
-        let server_cid = client.endpoint.peer_connection_id().unwrap();
+        assert_eq!(
+            client.endpoint().local_connection_id().unwrap().value(),
+            0x55
+        );
+        assert_eq!(client.endpoint().next_packet_number, 1);
+        let server_cid = client.endpoint().peer_connection_id().unwrap();
         assert_ne!(server_cid.value(), 0);
-        assert_ne!(server_cid, client.endpoint.local_connection_id().unwrap());
-        let (_response_stream, response, fin) = client
+        assert_ne!(server_cid, client.endpoint().local_connection_id().unwrap());
+        let response = request_diagnostic_text(
+            &mut client,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(response.contains("metrics_version=1"));
+        assert!(response.contains("history_capacity=2"));
+        assert!(response.contains("next_packet_number=1"));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_listener_routes_outbound_association_on_its_own_socket() {
+        let root = tempdir().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let bind = socket.local_addr().unwrap();
+        let ingress = UdpClientIngress::new();
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            socket: Some(socket.clone()),
+            client_ingress: Some(ingress.clone()),
+            artifact_root: root.path().to_path_buf(),
+            history_capacity: 2,
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect_with_listener(
+            socket.clone(),
+            ingress,
+            bind,
+            ConnectionId::new(0x66).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.socket.local_addr().unwrap(), bind);
+        let response = request_diagnostic_text(
+            &mut client,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(response.contains("metrics_version=1"));
+
+        // A listener-owned socket must behave exactly like the private
+        // diagnostic socket: opening an ordinary tagged stream cannot leave
+        // the association unable to start a later normal probe stream.  This
+        // is the host regression for lmesh keeping one association per
+        // device while HTTP requests select different paths on it.
+        let mut probe_request = [0u8; crate::probe::PROBE_RUN_REQUEST_MAX];
+        let request_len = crate::probe::encode_probe_run_request(
+            ProbeServiceRequest::new(4096, 512),
+            2,
+            &mut probe_request,
+        )
+        .unwrap();
+        let (_, first, mut finished) = client
             .request_stream(
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &[SERVICE_METRICS],
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4,
+                &probe_request[..request_len],
                 true,
             )
             .await
             .unwrap();
-        assert!(fin);
-        assert!(
-            core::str::from_utf8(&response)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
-        assert!(
-            core::str::from_utf8(&response)
-                .unwrap()
-                .contains("history_capacity=2")
-        );
-        assert!(
-            core::str::from_utf8(&response)
-                .unwrap()
-                .contains("next_packet_number=1")
-        );
+        let mut bytes = first;
+        while !finished {
+            let (_, frame, frame_finished) = client.recv_stream().await.unwrap();
+            bytes.extend_from_slice(&frame);
+            finished = frame_finished;
+        }
+        assert_eq!(bytes.len(), 4096);
+
+        // Completion does not pin the one producer slot. A later probe has a
+        // new client stream but retains this association and listener socket.
+        let request_len = crate::probe::encode_probe_run_request(
+            ProbeServiceRequest::new(1024, 512),
+            3,
+            &mut probe_request,
+        )
+        .unwrap();
+        let (_, first, mut finished) = client
+            .request_stream(
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 8,
+                &probe_request[..request_len],
+                true,
+            )
+            .await
+            .unwrap();
+        let mut bytes = first;
+        while !finished {
+            let (_, frame, frame_finished) = client.recv_stream().await.unwrap();
+            bytes.extend_from_slice(&frame);
+            finished = frame_finished;
+        }
+        assert_eq!(bytes.len(), 1024);
         server_task.abort();
     }
 
@@ -4228,15 +4900,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_, metrics, _) = client
-            .request_stream(
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &[SERVICE_METRICS],
-                true,
-            )
-            .await
-            .unwrap();
-        let metrics = core::str::from_utf8(&metrics).unwrap();
+        let metrics = request_diagnostic_text(
+            &mut client,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
         assert!(metrics.contains("history_capacity=16"));
         assert!(metrics.contains("history_storage_slots=16"));
         server_task.abort();
@@ -4279,12 +4948,14 @@ mod tests {
         let mut final_metrics = String::new();
         for (index, stream_id) in [4_u64, 8, 12, 16].into_iter().enumerate() {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let (_, metrics, _) = client
-                .request_stream(stream_id, &[SERVICE_METRICS], true)
-                .await
-                .unwrap();
+            let metrics = request_diagnostic_text(
+                &mut client,
+                stream_id,
+                crate::services::DIAGNOSTIC_METRICS_METHOD,
+            )
+            .await;
             if index == 3 {
-                final_metrics = String::from_utf8(metrics).unwrap();
+                final_metrics = metrics;
             }
         }
         assert!(final_metrics.contains("history_capacity=16"));
@@ -4303,8 +4974,8 @@ mod tests {
             artifact_root: root.path().to_path_buf(),
             // Exercise a bounded diagnostic burst. The default (exercised
             // by the Recovery profile tests) remains unpaced/unlimited.
-            iperf_burst_packets: 2,
-            iperf_burst_delay: Duration::from_micros(100),
+            probe_burst_packets: 2,
+            probe_burst_delay: Duration::from_micros(100),
             ..UdpConfig::default()
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4322,66 +4993,50 @@ mod tests {
         }
         let mut server_cids = Vec::new();
         for (index, client) in clients.iter_mut().enumerate() {
-            server_cids.push(client.endpoint.peer_connection_id().unwrap());
+            server_cids.push(client.endpoint().peer_connection_id().unwrap());
             let stream = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + index as u64 * 4;
-            let (_, metrics, _) = client
-                .request_stream(stream, &[SERVICE_METRICS], true)
-                .await
-                .unwrap();
-            assert!(
-                core::str::from_utf8(&metrics)
-                    .unwrap()
-                    .contains("metrics_version=1")
-            );
+            let metrics =
+                request_diagnostic_text(client, stream, crate::services::DIAGNOSTIC_METRICS_METHOD)
+                    .await;
+            assert!(metrics.contains("metrics_version=1"));
             let event_stream = stream + 4;
-            let (_, events, _) = client
-                .request_stream(event_stream, &[SERVICE_EVENTS], true)
+            let events = request_diagnostic_text(
+                client,
+                event_stream,
+                crate::services::DIAGNOSTIC_EVENTS_METHOD,
+            )
+            .await;
+            assert!(events.contains("events_version="));
+            assert!(events.contains("events="));
+            let probe_stream = event_stream + 4;
+            let mut probe_request = [0u8; crate::probe::PROBE_RUN_REQUEST_MAX];
+            let probe_request_len = crate::probe::encode_probe_run_request(
+                ProbeServiceRequest::new(4096, 512),
+                1,
+                &mut probe_request,
+            )
+            .unwrap();
+            let (_, first, mut probe_finished) = client
+                .request_stream(probe_stream, &probe_request[..probe_request_len], true)
                 .await
                 .unwrap();
-            assert!(
-                core::str::from_utf8(&events)
-                    .unwrap()
-                    .contains("events_version=")
-            );
-            assert!(core::str::from_utf8(&events).unwrap().contains("events="));
-            let echo_stream = event_stream + 4;
-            let (_, echo, _) = client
-                .request_stream(
-                    echo_stream,
-                    &[SERVICE_ECHO, b'p', b'r', b'o', b'b', b'e'],
-                    true,
-                )
-                .await
-                .unwrap();
-            // Echo is a payload-preserving liveness primitive, not a
-            // connection-status formatter. Status/metrics are separate
-            // services and may be requested on adjacent streams.
-            assert_eq!(echo, b"probe");
-            let iperf_stream = echo_stream + 4;
-            let mut iperf_request = Vec::from([SERVICE_IPERF]);
-            iperf_request.extend_from_slice(&4096u64.to_be_bytes());
-            iperf_request.extend_from_slice(&512u16.to_be_bytes());
-            let (_, first, mut iperf_finished) = client
-                .request_stream(iperf_stream, &iperf_request, true)
-                .await
-                .unwrap();
-            let mut iperf = first;
-            while !iperf_finished {
+            let mut probe = first;
+            while !probe_finished {
                 let (_, bytes, finished) = client.recv_stream().await.unwrap();
-                iperf.extend_from_slice(&bytes);
-                iperf_finished = finished;
+                probe.extend_from_slice(&bytes);
+                probe_finished = finished;
             }
-            assert_eq!(iperf.len(), 4096);
+            assert_eq!(probe.len(), 4096);
             let mut offset = 0usize;
             let mut packet_id = 0u32;
-            while offset < iperf.len() {
-                let used = (iperf.len() - offset).min(512);
+            while offset < probe.len() {
+                let used = (probe.len() - offset).min(512);
                 assert_eq!(
-                    u32::from_be_bytes(iperf[offset..offset + 4].try_into().unwrap()),
+                    u32::from_be_bytes(probe[offset..offset + 4].try_into().unwrap()),
                     packet_id,
                 );
                 assert!(
-                    iperf[offset + 4..offset + used]
+                    probe[offset + 4..offset + used]
                         .iter()
                         .enumerate()
                         .all(|(index, byte)| { *byte == (offset + 4 + index) as u8 })
@@ -4389,14 +5044,18 @@ mod tests {
                 offset += used;
                 packet_id = packet_id.wrapping_add(1);
             }
-            let registry_stream = iperf_stream + 4;
-            let (_, registry, _) = client
-                .request_stream(registry_stream, &[SERVICE_STREAM], true)
+            let registry_stream = probe_stream + 4;
+            let registry_request =
+                diagnostic_request(crate::services::DIAGNOSTIC_SERVICES_METHOD, registry_stream);
+            let (_, registry_response, _) = client
+                .request_stream(registry_stream, &registry_request, true)
                 .await
                 .unwrap();
-            // `handlers` is compact CBOR `[[tag, name], ...]`, not a text
-            // command surface. The names remain discovery metadata only.
-            assert_eq!(registry.first(), Some(&0x89));
+            let registry_record = crate::tagged::decode(&registry_response).unwrap();
+            let registry = registry_record.result.unwrap();
+            // `services` is compact CBOR
+            // `[[component, method, name], ...]`, not a text command surface.
+            assert_eq!(registry.first(), Some(&0x88));
             assert!(
                 registry
                     .windows(b"metrics".len())
@@ -4437,15 +5096,13 @@ mod tests {
             UdpClient::connect(client_bind, bind, ConnectionId::new(0x1_0000_0001).unwrap())
                 .await
                 .unwrap();
-        let (_, first_metrics, _) = first
-            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
-            .await
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&first_metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        let first_metrics = request_diagnostic_text(
+            &mut first,
+            FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(first_metrics.contains("metrics_version=1"));
         drop(first);
 
         // This is the old Recovery behavior: CID=1 on every command. The
@@ -4461,20 +5118,18 @@ mod tests {
             UdpClient::connect(client_bind, bind, ConnectionId::new(0x1_0000_0002).unwrap())
                 .await
                 .unwrap();
-        let (_, second_metrics, _) = second
-            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &[SERVICE_METRICS], true)
-            .await
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&second_metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        let second_metrics = request_diagnostic_text(
+            &mut second,
+            FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(second_metrics.contains("metrics_version=1"));
         server_task.abort();
     }
 
     #[tokio::test]
-    async fn udp_iperf_honors_recovery_bootstrap_credit_before_first_ack() {
+    async fn udp_probe_honors_recovery_bootstrap_credit_before_first_ack() {
         let root = tempdir().unwrap();
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind = probe.local_addr().unwrap();
@@ -4500,10 +5155,17 @@ mod tests {
         .await
         .unwrap();
         client.set_ack_frequency(4);
-        let mut request = Vec::from([SERVICE_IPERF]);
-        request.extend_from_slice(&120_000u64.to_be_bytes());
-        request.extend_from_slice(&1200u16.to_be_bytes());
-        let (_, first, mut finished) = client.request_stream(4, &request, true).await.unwrap();
+        let mut request = [0u8; crate::probe::PROBE_RUN_REQUEST_MAX];
+        let request_len = crate::probe::encode_probe_run_request(
+            ProbeServiceRequest::new(120_000, 1200),
+            1,
+            &mut request,
+        )
+        .unwrap();
+        let (_, first, mut finished) = client
+            .request_stream(4, &request[..request_len], true)
+            .await
+            .unwrap();
         let mut received = first.len();
         while !finished {
             let (_, bytes, fin) = timeout(Duration::from_secs(2), client.recv_stream())
@@ -4514,63 +5176,6 @@ mod tests {
             finished = fin;
         }
         assert_eq!(received, 120_000);
-        server_task.abort();
-    }
-
-    #[test]
-    fn path_policy_control_is_bearer_neutral() {
-        let control = TransportControl::default();
-        assert_eq!(control.path_policy(), PathPolicy::HighestMeasuredSpeed);
-        let policy = decode_path_policy(&[1, 3]).unwrap();
-        control.set_path_policy(policy);
-        assert_eq!(control.path_policy(), PathPolicy::Explicit(3));
-        assert_eq!(
-            decode_path_policy(&[2, 1]),
-            Some(PathPolicy::AirtimeFirst { primary: 1 })
-        );
-        assert_eq!(decode_path_policy(&[9]), None);
-    }
-
-    #[tokio::test]
-    async fn transport_control_carries_opaque_log_and_queued_command() {
-        let root = tempdir().unwrap();
-        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let bind = probe.local_addr().unwrap();
-        drop(probe);
-        let control = Arc::new(TransportControl::default());
-        control.queue_command(vec![0xa1, 0x00, 0x18, 0x44]);
-        let server_task = tokio::spawn(run(UdpConfig {
-            bind,
-            artifact_root: root.path().to_path_buf(),
-            control: Some(control.clone()),
-            ..UdpConfig::default()
-        }));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let mut client = UdpClient::connect(
-            "127.0.0.1:0".parse().unwrap(),
-            bind,
-            ConnectionId::new(0x8c).unwrap(),
-        )
-        .await
-        .unwrap();
-        let log = [SERVICE_CONTROL, CONTROL_LOG, 0xa1, 0x04, 0x62, b'o', b'k'];
-        let (_, response, finished) = client
-            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &log, true)
-            .await
-            .unwrap();
-        assert!(finished);
-        assert_eq!(
-            response,
-            [SERVICE_CONTROL, CONTROL_RESPONSE, 0xa1, 0x00, 0x18, 0x44]
-        );
-        assert_eq!(control.take_log().as_deref(), Some(&log[2..]));
-        // The same opaque control handle used by a live Wi-Fi listener must
-        // expose a current sender snapshot without requiring a packet trace.
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        let stats = control.server_stats().expect("listener transport stats");
-        assert!(stats.transport.received_datagrams >= 1);
-        assert!(stats.transport.sent_datagrams >= 1);
-        assert!(stats.transport.sent_stream_datagrams >= 1);
         server_task.abort();
     }
 
@@ -4593,7 +5198,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let server_cid = legitimate.endpoint.peer_connection_id().unwrap();
+        let server_cid = legitimate.endpoint().peer_connection_id().unwrap();
 
         let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut endpoint =
@@ -4605,8 +5210,9 @@ mod tests {
             .open_send_stream(4, INITIAL_MAX_STREAM_DATA)
             .unwrap();
         let mut packet = [0u8; MTU];
+        let attacker_request = diagnostic_request(crate::services::DIAGNOSTIC_METRICS_METHOD, 4);
         let (used, _) = endpoint
-            .encode_stream_packet(server_cid, 4, 0, true, &[SERVICE_METRICS], &mut packet)
+            .encode_stream_packet(server_cid, 4, 0, true, &attacker_request, &mut packet)
             .unwrap();
         attacker.send_to(&packet[..used], bind).await.unwrap();
         let mut response = [0u8; MTU];
@@ -4619,19 +5225,13 @@ mod tests {
             .is_err()
         );
 
-        let (_, metrics, _) = legitimate
-            .request_stream(
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &[SERVICE_METRICS],
-                true,
-            )
-            .await
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        let metrics = request_diagnostic_text(
+            &mut legitimate,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(metrics.contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -4654,7 +5254,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let server_cid = client.endpoint.peer_connection_id().unwrap();
+        let server_cid = client.endpoint().peer_connection_id().unwrap();
         let mut malformed = [0u8; MTU];
         let header_len = ShortHeader {
             flags: FLAG_FIXED,
@@ -4672,19 +5272,13 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let (_, metrics, _) = client
-            .request_stream(
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &[SERVICE_METRICS],
-                true,
-            )
-            .await
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        let metrics = request_diagnostic_text(
+            &mut client,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(metrics.contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -4718,19 +5312,13 @@ mod tests {
                 .await
                 .is_err()
         );
-        let (_, metrics, _) = first
-            .request_stream(
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &[SERVICE_METRICS],
-                true,
-            )
-            .await
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        let metrics = request_diagnostic_text(
+            &mut first,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(metrics.contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -4827,19 +5415,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_, metrics, _) = surviving
-            .request_stream(
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &[SERVICE_METRICS],
-                true,
-            )
-            .await
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&metrics)
-                .unwrap()
-                .contains("metrics_version=1")
-        );
+        let metrics = request_diagnostic_text(
+            &mut surviving,
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            crate::services::DIAGNOSTIC_METRICS_METHOD,
+        )
+        .await;
+        assert!(metrics.contains("metrics_version=1"));
         server_task.abort();
     }
 
@@ -4918,10 +5500,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let server_cid = client.endpoint.peer_connection_id().unwrap();
-        client.endpoint.close(0x77);
+        let server_cid = client.endpoint().peer_connection_id().unwrap();
+        client.endpoint_mut().close(0x77);
         let mut close = [0u8; MTU];
-        let close_len = client.endpoint.poll_close(&mut close).unwrap().unwrap();
+        let close_len = client
+            .endpoint_mut()
+            .poll_close(&mut close)
+            .unwrap()
+            .unwrap();
         client
             .socket
             .send_to(&close[..close_len], bind)
@@ -5034,12 +5620,11 @@ mod tests {
         .await
         .unwrap();
         let mut request = [0u8; 128];
-        let get_len = encode_get(&mut request[1..], None, 13, 6).unwrap();
-        request[0] = SERVICE_OBJECT;
+        let get_len = encode_get_request(&mut request, 1, None, 13, 6).unwrap();
         let (stream_id, first, fin) = client
             .request_stream(
                 quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                &request[..get_len + 1],
+                &request[..get_len],
                 true,
             )
             .await
@@ -5067,20 +5652,20 @@ mod tests {
         server_task.abort();
     }
 
-    /// Repeatable host-to-host UDP IPERF measurement. It deliberately drives
+    /// Repeatable host-to-host UDP PROBE measurement. It deliberately drives
     /// the production `run` listener and `UdpClient` through localhost, so it
     /// catches scheduler, ACK, flow-credit, and socket regressions without a
     /// shell-launched service or a Wi-Fi device. Keep it ignored: throughput
     /// is host-load dependent, while the printed conditions are the fast
     /// iteration signal. It never starts or restarts lmesh/lmesh-wifi.
     #[tokio::test]
-    #[ignore = "explicit UDP IPERF throughput measurement"]
-    async fn udp_iperf_loopback_measurement() {
-        let bytes = std::env::var("DMESH_IPERF_BYTES")
+    #[ignore = "explicit UDP PROBE throughput measurement"]
+    async fn udp_probe_loopback_measurement() {
+        let bytes = std::env::var("DMESH_PROBE_BYTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(64 * 1024);
-        let packet_size = std::env::var("DMESH_IPERF_PACKET_SIZE")
+        let packet_size = std::env::var("DMESH_PROBE_PACKET_SIZE")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(MAX_OBJECT_CHUNK as u16);
@@ -5105,13 +5690,16 @@ mod tests {
         .await
         .unwrap();
         client.set_deferred_receive_credit(true);
-        let mut request = [0u8; 11];
-        request[0] = SERVICE_IPERF;
-        request[1..9].copy_from_slice(&bytes.to_be_bytes());
-        request[9..11].copy_from_slice(&packet_size.to_be_bytes());
+        let mut request = [0u8; crate::probe::PROBE_RUN_REQUEST_MAX];
+        let request_len = crate::probe::encode_probe_run_request(
+            ProbeServiceRequest::new(bytes, packet_size),
+            1,
+            &mut request,
+        )
+        .unwrap();
         let started = Instant::now();
         let (_, first, mut fin) = client
-            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &request, true)
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &request[..request_len], true)
             .await
             .unwrap();
         let first_response_us = started.elapsed().as_micros();
@@ -5123,7 +5711,7 @@ mod tests {
                 let errors = control.take_errors();
                 server_task.abort();
                 panic!(
-                    "UDP IPERF receive timeout bytes={received} server_stats={stats:?} errors={errors:?}"
+                    "UDP PROBE receive timeout bytes={received} server_stats={stats:?} errors={errors:?}"
                 );
             };
             received = received.saturating_add(frame.len() as u64);
@@ -5134,7 +5722,7 @@ mod tests {
             / elapsed.as_micros().max(1) as u64;
         let server_stats = control.server_stats();
         eprintln!(
-            "host-host udp-iperf bytes={received} elapsed_us={} first_response_us={first_response_us} bps={bps} history=512 packet={packet_size} deferred_receive_credit=true server_stats={server_stats:?}",
+            "host-host udp-probe bytes={received} elapsed_us={} first_response_us={first_response_us} bps={bps} history=512 packet={packet_size} deferred_receive_credit=true server_stats={server_stats:?}",
             elapsed.as_micros(),
         );
         assert_eq!(received, bytes);
@@ -5142,17 +5730,18 @@ mod tests {
     }
 
     #[test]
-    fn object_request_envelope_keeps_get_bytes_and_negotiates_ack_ratio() {
-        let legacy = [SERVICE_OBJECT, 0xa2, 0x01, 0x0d, 0x02, 0x06];
-        let (legacy_ack, legacy_get) = object_request_envelope(&legacy).unwrap();
-        assert_eq!(legacy_ack, RECOVERY_OBJECT_ACK_FREQUENCY);
-        assert_eq!(legacy_get, &legacy[1..]);
-
-        let configured = [SERVICE_OBJECT, 4, 0xa2, 0x01, 0x0d, 0x02, 0x06];
-        let (ack, get) = object_request_envelope(&configured).unwrap();
-        assert_eq!(ack, 4);
-        assert_eq!(get, &configured[2..]);
-        assert!(crate::protocol::decode_get(get).is_some());
+    fn object_request_is_a_correlated_tagged_handler() {
+        let mut encoded = [0u8; 96];
+        let used = encode_get_request(&mut encoded, 17, None, 13, 6).unwrap();
+        assert_eq!(
+            object_request(&encoded[..used]).unwrap(),
+            crate::protocol::GetRequest {
+                name: None,
+                cpu: 13,
+                target: 6,
+            }
+        );
+        assert!(object_request(&[1, 0xa2, 0x01, 0x0d, 0x02, 0x06]).is_err());
     }
 
     #[derive(Debug)]
@@ -5166,6 +5755,97 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
             Box::pin(async move { request.starts_with(b"tagged:").then_some(request) })
         }
+    }
+
+    #[derive(Debug)]
+    struct AsyncTaggedLarge;
+
+    impl TaggedStreamHandler for AsyncTaggedLarge {
+        fn handle<'a>(
+            &'a self,
+            _context: TaggedStreamContext,
+            request: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move {
+                request.starts_with(b"tagged:").then(|| {
+                    let mut response = Vec::with_capacity(MTU * 20);
+                    while response.len() < MTU * 20 {
+                        response.extend_from_slice(&request);
+                    }
+                    response.truncate(MTU * 20);
+                    response
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedTaggedApplication(Vec<u8>);
+
+    impl TaggedApplicationHandler for FixedTaggedApplication {
+        fn handle_tagged<'a>(
+            &'a self,
+            _context: TaggedStreamContext,
+            _request: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+            Box::pin(async move { Some(self.0.clone()) })
+        }
+    }
+
+    fn tagged_test_context() -> TaggedStreamContext {
+        TaggedStreamContext {
+            peer: "127.0.0.1:3339".parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_tagged_handler_requires_a_correlated_terminal_response() {
+        // {1: 1, 2: 2, 3: 7}
+        let request = vec![0xa3, 1, 1, 2, 2, 3, 7];
+
+        // {1: 1, 2: 2, 3: 7, 6: {}}
+        let response = vec![0xa4, 1, 1, 2, 2, 3, 7, 6, 0xa0];
+        let handler =
+            CanonicalTaggedStreamHandler::new(Arc::new(FixedTaggedApplication(response.clone())));
+        assert_eq!(
+            handler.handle(tagged_test_context(), request.clone()).await,
+            Some(response)
+        );
+
+        // A different id, routing destination, missing terminal value, or both
+        // result and error are never admitted as the stream's response.
+        for rejected in [
+            vec![0xa4, 1, 1, 2, 2, 3, 8, 6, 0xa0],
+            vec![0xa5, 1, 1, 2, 2, 3, 7, 6, 0xa0, 9, 0x62, b'e', b'7'],
+            vec![0xa3, 1, 1, 2, 2, 3, 7],
+            vec![0xa5, 1, 1, 2, 2, 3, 7, 6, 0xa0, 7, 0x61, b'x'],
+        ] {
+            let handler =
+                CanonicalTaggedStreamHandler::new(Arc::new(FixedTaggedApplication(rejected)));
+            assert_eq!(
+                handler.handle(tagged_test_context(), request.clone()).await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_tagged_handler_rejects_malformed_or_uncorrelated_requests() {
+        let response = vec![0xa4, 1, 1, 2, 2, 3, 7, 6, 0xa0];
+        let handler = CanonicalTaggedStreamHandler::new(Arc::new(FixedTaggedApplication(response)));
+        assert_eq!(
+            handler
+                .handle(tagged_test_context(), b"not-cbor".to_vec())
+                .await,
+            None
+        );
+        // {1: 1, 2: 2}: a valid tagged request, but without an id.
+        assert_eq!(
+            handler
+                .handle(tagged_test_context(), vec![0xa2, 1, 1, 2, 2])
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -5196,6 +5876,76 @@ mod tests {
         assert_eq!(stream, quic_lite::FIRST_SERVER_BIDI_STREAM_ID);
         assert!(fin);
         assert_eq!(response, request);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_quic_stream_reassembles_a_multi_datagram_tagged_response() {
+        let root = tempdir().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            tagged_handler: Some(Arc::new(AsyncTaggedLarge)),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0x5a6).unwrap(),
+        )
+        .await
+        .unwrap();
+        let request = b"tagged:large-terminal-response";
+        let response = client
+            .request_stream_all(FIRST_CLIENT_BIDI_STREAM_ID, request, true, MTU * 20)
+            .await
+            .unwrap();
+        assert_eq!(response.len(), MTU * 20);
+        assert_eq!(&response[..request.len()], request);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_quic_stream_dispatches_tagged_connection_status() {
+        let root = tempdir().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = probe.local_addr().unwrap();
+        drop(probe);
+        let server_task = tokio::spawn(run(UdpConfig {
+            bind,
+            artifact_root: root.path().to_path_buf(),
+            ..UdpConfig::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut client = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            bind,
+            ConnectionId::new(0x5b5).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut request = [0u8; 32];
+        let request_len = crate::tagged::encode_numeric_empty_request(
+            crate::services::DIAGNOSTIC_COMPONENT,
+            crate::services::DIAGNOSTIC_STATUS_METHOD,
+            81,
+            &mut request,
+        )
+        .unwrap();
+        let (_, response, fin) = client
+            .request_stream(FIRST_CLIENT_BIDI_STREAM_ID, &request[..request_len], true)
+            .await
+            .unwrap();
+        assert!(fin);
+        let record = crate::tagged::decode(&response).unwrap();
+        assert_eq!(record.id, Some(81));
+        let mut result = crate::cbor::Decoder::new(record.result.unwrap());
+        assert!(result.text_ref().unwrap().starts_with(b"status_version=1;"));
+        assert!(result.is_finished());
         server_task.abort();
     }
 }

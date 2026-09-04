@@ -9,7 +9,7 @@ use std::{
 use crate::mesh_core::{LmeshService, LocalDiscovery};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, warn};
 
@@ -57,9 +57,152 @@ static CONTROL_CATALOG: LazyLock<mesh::tagged::TaggedCatalog> = LazyLock::new(||
         .expect("lmesh tools.json must be a valid tagged catalog")
 });
 
+/// Project the canonical firmware method schema into ssh-mesh tool entries.
+/// This keeps CLI and HTTP names, component/method tags, and field tags on one
+/// source of truth without teaching the HTTP adapter about individual DMesh
+/// operations.
+fn firmware_stream_tools() -> Vec<serde_json::Value> {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../lmesh/resources/firmware-schema.json"))
+            .expect("firmware-schema.json must be valid JSON");
+    schema["methods"]
+        .as_array()
+        .expect("firmware schema methods must be an array")
+        .iter()
+        .filter_map(|method| {
+            let component = method["component"].as_u64()?;
+            let method_id = method["id"].as_u64()?;
+            let name = method["name"].as_str()?;
+            let mut properties = serde_json::Map::new();
+            for field in method["fields"].as_array().into_iter().flatten() {
+                let field_name = field["name"].as_str()?;
+                let field_id = field["id"].as_u64()?;
+                let value_type = match field["kind"].as_str() {
+                    Some("bool") => "boolean",
+                    Some("text" | "mac") => "string",
+                    _ => "integer",
+                };
+                properties.insert(
+                    field_name.to_owned(),
+                    serde_json::json!({
+                        "type": value_type,
+                        "x-protobuf-index": field_id,
+                    }),
+                );
+            }
+            Some(serde_json::json!({
+                "name": name,
+                "description": format!("Call the {name} QUIC stream handler"),
+                "inputSchema": {"type": "object", "properties": properties},
+                "outputSchema": {"type": "object"},
+                "x-component-index": component,
+                "x-method-index": method_id,
+                "x-ui-visibility": method
+                    .get("x-ui-visibility")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("advanced")),
+                // `x-check-all` is deliberately supplied by the versioned
+                // firmware schema.  It makes the fleet report a catalog
+                // consumer: only explicit, side-effect-free request shapes
+                // are run against every discovered address.
+                "x-check-all": method.get("x-check-all").cloned(),
+                "x-check-all-platforms": method.get("x-check-all-platforms").cloned(),
+            }))
+        })
+        .collect()
+}
+
 fn public_tools_json() -> serde_json::Value {
-    serde_json::from_str::<serde_json::Value>(include_str!("../../lmesh/resources/tools.json"))
-        .expect("shared tools.json must be valid JSON")
+    let mut tools =
+        serde_json::from_str::<serde_json::Value>(include_str!("../../lmesh/resources/tools.json"))
+            .expect("shared tools.json must be valid JSON");
+    // These controller methods terminate locally.  They deliberately have no
+    // numeric wire tags: their operations retain host-owned circuit state and
+    // use normal tagged QUIC streams for every remote relay or endpoint call.
+    // Advertising them here lets the HTTP/UI bridge use the same JSON request
+    // surface as the local UDS client without opening an unauthenticated
+    // direct-message path on any mesh node.
+    let local = serde_json::json!([
+        {
+            "name": "discovery.active",
+            "description": "Send an active broadcast or directed discovery check",
+            "inputSchema": {"type":"object", "properties": {
+                "to":{"type":"string"},
+                "timeout_ms":{"type":"integer", "minimum":100}
+            }},
+            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
+        },
+        {
+            "name": "probe",
+            "description": "Run the normal QUIC probe stream to a routed node",
+            "inputSchema": {"type":"object", "required":["to"], "properties": {
+                "to":{"type":"string"},
+                "bytes":{"type":"integer", "minimum":1},
+                "packet_size":{"type":"integer", "minimum":8},
+                "timeout_ms":{"type":"integer", "minimum":100}
+            }},
+            "outputSchema":{"type":"object"}, "x-ui-visibility":"advanced"
+        },
+        {
+            "name": "relay.connect",
+            "description": "Create the first relay leg through a directly reachable relay",
+            "inputSchema": {"type":"object", "required":["relay_endpoint", "next_hop_mac"], "properties": {
+                "relay_endpoint":{"type":"string"}, "next_hop_mac":{"type":"string"}
+            }},
+            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
+        },
+        {
+            "name": "relay.open",
+            "description": "Open and verify the endpoint QUIC connection through a retained relay leg",
+            "inputSchema": {"type":"object", "required":["relay_endpoint"], "properties": {
+                "relay_endpoint":{"type":"string"}
+            }},
+            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
+        },
+        {
+            "name": "relay.endpoint.status",
+            "description": "Read endpoint status through a completed relay circuit",
+            "inputSchema": {"type":"object", "required":["relay_endpoint"], "properties": {
+                "relay_endpoint":{"type":"string"}
+            }},
+            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
+        },
+        {
+            "name": "relay.close",
+            "description": "Remove one retained relay circuit and its relay pair",
+            "inputSchema": {"type":"object", "required":["relay_endpoint"], "properties": {
+                "relay_endpoint":{"type":"string"}
+            }},
+            "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
+        },
+        {
+            "name": "relay.status",
+            "description": "List retained local relay circuits",
+            "inputSchema":{"type":"object"}, "outputSchema":{"type":"object"}, "x-ui-visibility":"default"
+        }
+    ]);
+    let tools = tools
+        .as_array_mut()
+        .expect("shared tools.json must be an array");
+    let mut known = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    for tool in firmware_stream_tools().into_iter().chain(
+        local
+            .as_array()
+            .expect("local tool list must be an array")
+            .iter()
+            .cloned(),
+    ) {
+        let Some(name) = tool["name"].as_str() else {
+            continue;
+        };
+        if known.insert(name.to_owned()) {
+            tools.push(tool);
+        }
+    }
+    serde_json::Value::Array(tools.clone())
 }
 
 /// Run the shared Linux mesh control plane.
@@ -86,13 +229,17 @@ async fn run_server(
     // carries the resulting IPv6 address and this service's distinct UDP
     // port; a receiver records the ingress interface/scope itself.
     discovery.configure_announce_udp6("costin", defaults.udp_port);
+    // Multicast discovery is intentionally the separate shared 5227 socket.
+    // Normal QUIC and directed-check traffic starts below on the service port.
     discovery.start().await?;
     let discovery = Arc::new(discovery);
     let service = Arc::new(LmeshService::new(discovery.clone()));
-    // Use the shared owned-interface watcher for wlan1 as well as wlan0.  The
-    // callback receives only events whose interface passed this process's
-    // LMESH_INTERFACES allowlist, so a wlan0 reset cannot restart lmesh.
+    // Netlink is only an advisory hint. A base-device event waits for the USB
+    // driver to settle, then runs the same presence-edge check as the periodic
+    // fallback. AP, monitor, carrier, and P2P events are ignored.
     let owned_interfaces = service.wifi_owned_interfaces();
+    let owned_base_interfaces = owned_interfaces.names().to_vec();
+    let owns_wifi = !owned_base_interfaces.is_empty();
     let (link_events, mut link_event_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         lmesh_wifi::recovery::watch_link_events(owned_interfaces, link_events)
@@ -100,20 +247,52 @@ async fn run_server(
     let recovery_service = service.clone();
     tokio::spawn(async move {
         while let Some(event) = link_event_rx.recv().await {
-            sleep(Duration::from_millis(250)).await;
+            let is_base = event
+                .iface
+                .as_deref()
+                .is_some_and(|iface| owned_base_interfaces.iter().any(|owned| owned == iface));
+            if !is_base {
+                continue;
+            }
+            sleep(Duration::from_secs(30)).await;
             let result = recovery_service.reconcile_wifi_health();
-            if result.get("state").and_then(serde_json::Value::as_str) != Some("healthy") {
-                warn!(?event, ?result, "lmesh_wifi_link_reconcile");
+            if result.get("state").and_then(serde_json::Value::as_str)
+                == Some("reappeared_reinitialized")
+            {
+                warn!(?event, ?result, "lmesh_wifi_reappeared_reinitialized");
+            }
+        }
+    });
+    let presence_service = service.clone();
+    tokio::spawn(async move {
+        // Establish the initial presence state without disturbing an already
+        // initialized radio, then provide a five-minute fallback for missed
+        // USB/netlink events.
+        let _ = presence_service.reconcile_wifi_health();
+        loop {
+            sleep(Duration::from_secs(5 * 60)).await;
+            let result = presence_service.reconcile_wifi_health();
+            if result.get("state").and_then(serde_json::Value::as_str)
+                == Some("reappeared_reinitialized")
+            {
+                warn!(?result, "lmesh_wifi_periodic_reappeared_reinitialized");
             }
         }
     });
     let udp_started = service.start_udp_tagged_handler(
         defaults.udp_port,
-        Arc::new(LmeshUdpTaggedHandler {
-            service: service.clone(),
-        }),
+        Arc::new(dmesh_server::udp::CanonicalTaggedStreamHandler::new(
+            Arc::new(LmeshCborHandler {
+                service: service.clone(),
+            }),
+        )),
     );
     if udp_started.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        if let Some(socket) = service.udp_listener_socket() {
+            discovery.set_shared_udp_socket(socket);
+        } else {
+            warn!("normal UDP listener started without an outbound socket handle");
+        }
         debug!(?udp_started, "lmesh_development_quic_started");
     } else {
         warn!(?udp_started, "lmesh_development_quic_start_failed");
@@ -139,20 +318,22 @@ async fn run_server(
         .await;
     discovery.announce().await?;
     let active_publish_started = Instant::now();
-    match service.refresh_active_nan_publish(0) {
-        Ok(status) => debug!(?status, "rawnan_active_publish_configured"),
-        Err(error) => warn!(%error, "rawnan_active_publish_configure_failed"),
-    }
-    let channel = raw_wifi_channel();
-    // lmesh owns wlan1 as the experimental/default peer radio: boot a
-    // channel-6 P2P GO and then attach the same monitor receive/TX fixture
-    // used by the stable wlan0 AP. The P2P implementation has an explicit
-    // pure-Rust open-AP fallback when unsupported.
-    let p2p_started = service.start_default_p2p_go(channel);
-    if p2p_started.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        debug!(?p2p_started, channel, "lmesh_default_p2p_nan_started");
+    if owns_wifi {
+        match service.refresh_active_nan_publish(0) {
+            Ok(status) => debug!(?status, "rawnan_active_publish_configured"),
+            Err(error) => warn!(%error, "rawnan_active_publish_configure_failed"),
+        }
+        let channel = raw_wifi_channel();
+        // A Wi-Fi-owning launcher may opt into its local P2P/NAN fixture. The
+        // UDP-only lmesh companion never enters this branch.
+        let p2p_started = service.start_default_p2p_go(channel);
+        if p2p_started.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            debug!(?p2p_started, channel, "lmesh_default_p2p_nan_started");
+        } else {
+            warn!(?p2p_started, channel, "lmesh_default_p2p_nan_start_failed");
+        }
     } else {
-        warn!(?p2p_started, channel, "lmesh_default_p2p_nan_start_failed");
+        debug!("lmesh_udp_only_no_wifi_owner");
     }
     debug!(
         public_key = %service.public_key_b64(),
@@ -172,16 +353,18 @@ async fn run_server(
     // Keep NAN publish aligned with UDP multicast. Updating the descriptor
     // makes it pending for the next DW; it does not send from this timer or
     // change the permanent monitor fixture.
-    let active_publish_service = service.clone();
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(DEFAULT_ANNOUNCE_INTERVAL_SECS)).await;
-            let uptime_secs = active_publish_started.elapsed().as_secs();
-            if let Err(error) = active_publish_service.refresh_active_nan_publish(uptime_secs) {
-                warn!(%error, "rawnan_active_publish_refresh_failed");
+    if owns_wifi {
+        let active_publish_service = service.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(DEFAULT_ANNOUNCE_INTERVAL_SECS)).await;
+                let uptime_secs = active_publish_started.elapsed().as_secs();
+                if let Err(error) = active_publish_service.refresh_active_nan_publish(uptime_secs) {
+                    warn!(%error, "rawnan_active_publish_refresh_failed");
+                }
             }
-        }
-    });
+        });
+    }
 
     let listen_path = standalone_listen_path(defaults)?;
     let listen_path = listen_path.to_string_lossy().into_owned();
@@ -199,7 +382,10 @@ async fn run_server(
     tokio::spawn(async move {
         sleep(Duration::from_secs(1)).await;
         let response = boot_discovery_service
-            .handle_request(crate::mesh_core::Request::DiscoveryPing { medium: None })
+            .handle_request(crate::mesh_core::Request::DiscoveryActive {
+                medium: None,
+                to: None,
+            })
             .await;
         if response.success {
             debug!("lmesh_boot_discovery_submitted");
@@ -234,7 +420,7 @@ async fn dispatch_directed_jsonl(
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    if value.get("to").is_none() {
+    if value.get("to").is_none() || keeps_to_as_local_argument(&value) {
         return Ok(None);
     }
     let record = tagged_record_from_jsonl(&value)?;
@@ -243,6 +429,18 @@ async fn dispatch_directed_jsonl(
         .await?
         .context("directed UDS request produced no response")?;
     Ok(Some(CONTROL_CATALOG.to_jsonl(&response)))
+}
+
+/// Most `to` fields select a remote QUIC destination at the JSONL boundary.
+/// Active discovery and probe are deliberately different: their `to` selects
+/// the local association path under test, so `LmeshService` must execute the
+/// corresponding client operation rather than forward that controller method
+/// as a remote tagged record.
+fn keeps_to_as_local_argument(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("method").and_then(serde_json::Value::as_str),
+        Some("discovery.active" | "lmesh.discovery.active" | "probe" | "lmesh.probe")
+    )
 }
 
 fn tagged_record_from_jsonl(value: &serde_json::Value) -> Result<mesh::tagged::TaggedRecord> {
@@ -291,29 +489,19 @@ async fn start_http_admin(socket: &str, port: u16) -> Result<()> {
         None,
         None,
     ));
-    let registry = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
-    registry.register(
-        "lmesh",
-        ssh_mesh::mesh_rest::MeshService {
+    let config = dmesh_server::http::HttpConfig {
+        bind: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        node,
+        client_manager: manager,
+        service: dmesh_server::http::HttpService {
+            name: "lmesh".to_owned(),
             backend: ssh_mesh::mesh_rest::MeshServiceBackend::Uds(PathBuf::from(socket)),
             catalog: Some(public_tools_json()),
         },
-    );
-    let app = ssh_mesh::handlers::app(ssh_mesh::AppState {
-        ssh_server: node,
-        target_http_address: None,
-        ssh_client_manager: manager,
-        mesh_services: registry,
         web_root: http_web_root("LMESH_HTTP_WEB_DIR"),
-    });
-    let listener = match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            return Err(error).with_context(|| format!("bind lmesh HTTP admin port {port}"));
-        }
     };
     tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, app.into_make_service()).await {
+        if let Err(error) = dmesh_server::http::serve(config).await {
             error!(%error, "lmesh_http_admin_terminated");
         }
     });
@@ -566,30 +754,46 @@ struct LmeshCborHandler {
     service: Arc<LmeshService>,
 }
 
-/// Terminates a normal QUIC stream in the existing lmesh catalog handler.
-/// It deliberately has no bearer or destination logic: route selection is
-/// owned by the initiating `mesh.con`/forwarding side.
-struct LmeshUdpTaggedHandler {
-    service: Arc<LmeshService>,
-}
-
-impl dmesh_server::udp::TaggedStreamHandler for LmeshUdpTaggedHandler {
-    fn handle<'a>(
+impl dmesh_server::udp::TaggedApplicationHandler for LmeshCborHandler {
+    fn handle_tagged<'a>(
         &'a self,
         _context: dmesh_server::udp::TaggedStreamContext,
         request: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>> {
         Box::pin(async move {
             let record = mesh::cbor::decode_record(&request).ok()?;
-            let handler = LmeshCborHandler {
-                service: self.service.clone(),
-            };
-            let response = mesh::wire::TaggedRecordHandler::handle_record(&handler, record)
+            // Component 9 belongs to the connection owner.  In particular,
+            // its event history is per QUIC association, so projecting it
+            // through lmesh's process-local JSON request enum would both
+            // lose that context and shadow the shared diagnostic terminal.
+            // Declining here lets `dmesh_server::udp` call the common
+            // connection-aware handler after this application adapter.
+            if is_connection_diagnostic(&record) {
+                return None;
+            }
+            let response = mesh::wire::TaggedRecordHandler::handle_record(self, record)
                 .await
                 .ok()??;
             mesh::cbor::encode_record(&response).ok()
         })
     }
+}
+
+fn is_connection_diagnostic(record: &mesh::tagged::TaggedRecord) -> bool {
+    let (mesh::tagged::NameOrTag::Tag(component), mesh::tagged::NameOrTag::Tag(method)) =
+        (&record.component, &record.method)
+    else {
+        return false;
+    };
+    *component == dmesh_server::services::DIAGNOSTIC_COMPONENT as u32
+        && matches!(
+            *method as u64,
+            dmesh_server::services::DIAGNOSTIC_STATUS_METHOD
+                | dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD
+                | dmesh_server::services::DIAGNOSTIC_METRICS_METHOD
+                | dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD
+                | dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD
+        )
 }
 
 #[async_trait::async_trait]
@@ -623,6 +827,12 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         &self,
         mut record: mesh::tagged::TaggedRecord,
     ) -> Result<Option<mesh::tagged::TaggedRecord>> {
+        // `to` normally selects a remote QUIC destination.  For the active
+        // discovery service it instead identifies the exact local bearer
+        // path under test, so preserve it for `Request::DiscoveryActive`.
+        if record_keeps_to_as_local_argument(&record) {
+            return self.handle_record(record).await;
+        }
         let id = record
             .id
             .clone()
@@ -650,10 +860,21 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
             ))),
             Err(error) => Ok(Some(mesh::wire::response_error(
                 id,
-                serde_json::json!({"error": error.to_string(), "to": destination}),
+                // Preserve the frame-adapter cause (including its bounded
+                // transmit/receive and QUIC bootstrap counters) in the HTTP
+                // result.  The outer context alone cannot distinguish a
+                // handler problem from a path/connection failure.
+                serde_json::json!({"error": format!("{error:#}"), "to": destination}),
             ))),
         }
     }
+}
+
+fn record_keeps_to_as_local_argument(record: &mesh::tagged::TaggedRecord) -> bool {
+    matches!(
+        decode_lmesh_tagged_request(record),
+        Ok(crate::mesh_core::Request::DiscoveryActive { .. } | crate::mesh_core::Request::Probe { .. })
+    )
 }
 
 fn decode_lmesh_tagged_request(
@@ -687,12 +908,13 @@ fn decode_lmesh_tagged_request(
                 .map(|limit| limit.min(usize::MAX as u64) as usize),
         }),
         "discovery.nodes" => Ok(crate::mesh_core::Request::RadioDevices),
+        "discovery.active" => serde_json::from_value(value),
         "discovery.status" => Ok(crate::mesh_core::Request::DiscoveryStatus),
-        "nan.status" => Ok(crate::mesh_core::Request::NanStatus),
-        "now.metrics" => Ok(crate::mesh_core::Request::NowMetrics),
-        "nan.metrics" => Ok(crate::mesh_core::Request::NanMetrics),
-        "udp6.metrics" => Ok(crate::mesh_core::Request::Udp6Metrics),
-        "wifi.link.metrics" => Ok(crate::mesh_core::Request::WifiLinkMetrics),
+        "telemetry.nan_status" => Ok(crate::mesh_core::Request::NanStatus),
+        "telemetry.now_metrics" => Ok(crate::mesh_core::Request::NowMetrics),
+        "telemetry.nan_metrics" => Ok(crate::mesh_core::Request::NanMetrics),
+        "telemetry.udp6_metrics" => Ok(crate::mesh_core::Request::Udp6Metrics),
+        "telemetry.wifi_link_metrics" => Ok(crate::mesh_core::Request::WifiLinkMetrics),
         "wifi.mgmt.capture" => serde_json::from_value::<
             crate::mesh_core::api::WifiMgmtCaptureRequest,
         >(value)
@@ -800,8 +1022,8 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(visible.contains(&"discovery.nodes"));
-        assert!(visible.contains(&"transport.start"));
-        assert!(visible.contains(&"transport.discover"));
+        assert!(visible.contains(&"discovery.active"));
+        assert!(visible.contains(&"transport.set"));
         assert!(!visible.contains(&"wifi.raw.send"));
         assert!(!visible.contains(&"wifi.rawnan.status"));
         assert!(!visible.contains(&"lmesh.nodes"));
@@ -812,7 +1034,13 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"nan.status"));
+        assert!(names.contains(&"probe"));
+        assert!(names.contains(&"telemetry.nan_status"));
+        assert!(names.contains(&"settings.get"));
+        assert!(names.contains(&"settings.set"));
+        assert!(names.contains(&"settings.list"));
+        assert!(names.contains(&"radio.snapshot"));
+        assert!(names.contains(&"radio.control"));
         assert!(!names.contains(&"lmesh.nodes"));
         assert!(!names.contains(&"lmesh.neighbors"));
         for retired in [
@@ -825,10 +1053,9 @@ mod tests {
             "lmesh.ping",
             "wifi.rawnan.status",
             "wifi.raw.metrics",
-            "wifi.probe.plan",
             "wifi.raw.send",
+            "wifi.raw.ping",
             "wifi.raw.check",
-            "wifi.raw.iperf",
         ] {
             assert!(
                 !names.contains(&retired),
@@ -838,7 +1065,71 @@ mod tests {
     }
 
     #[test]
-    fn common_numeric_transport_start_decodes_for_local_or_directed_use() {
+    fn catalog_declares_the_safe_fleet_stream_matrix() {
+        let catalog = public_tools_json();
+        let selected = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool.get("x-check-all").is_some_and(serde_json::Value::is_object))
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let expected = [
+            "discovery.nodes",
+            "events",
+            "log-watch",
+            "memory.snapshot",
+            "metrics",
+            "power.snapshot",
+            "probe",
+            "radio.snapshot",
+            "relay.list",
+            "runtime.snapshot",
+            "services",
+            "settings.get",
+            "settings.list",
+            "status",
+            "telemetry.nan_metrics",
+            "telemetry.nan_status",
+            "telemetry.now_metrics",
+            "telemetry.udp6_metrics",
+            "telemetry.wifi_link_metrics",
+            "wifi.scan",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(selected, expected);
+        let probe = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "probe")
+            .expect("probe must be catalogued for fleet checks");
+        assert_eq!(
+            probe["x-check-all"],
+            serde_json::json!({"bytes": 65536, "packet_size": 1024, "parallel_streams": 1})
+        );
+        assert_eq!(
+            probe["x-check-all-platforms"],
+            serde_json::json!(["esp32", "host", "android"])
+        );
+        for tool in catalog.as_array().unwrap().iter().filter(|tool| {
+            tool.get("x-check-all")
+                .is_some_and(serde_json::Value::is_object)
+        }) {
+            assert!(
+                tool.get("x-check-all-platforms")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|platforms| !platforms.is_empty()),
+                "{} needs an explicit supported-platform list",
+                tool["name"].as_str().unwrap_or("unnamed")
+            );
+        }
+    }
+
+    #[test]
+    fn common_numeric_transport_set_decodes_for_local_or_directed_use() {
         let request = decode_lmesh_tagged_request(&mesh::tagged::TaggedRecord {
             component: mesh::tagged::NameOrTag::Tag(1),
             method: mesh::tagged::NameOrTag::Tag(4),
@@ -864,7 +1155,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             request,
-            crate::mesh_core::Request::TransportStart {
+            crate::mesh_core::Request::TransportSet {
                 kind: Some(crate::mesh_core::TransportKindRequest::Tag(1)),
                 ssid,
                 passphrase: Some(passphrase),
@@ -915,6 +1206,60 @@ mod tests {
     }
 
     #[test]
+    fn connection_diagnostics_bypass_the_lmesh_application_adapter() {
+        for method in [
+            dmesh_server::services::DIAGNOSTIC_STATUS_METHOD,
+            dmesh_server::services::DIAGNOSTIC_SERVICES_METHOD,
+            dmesh_server::services::DIAGNOSTIC_METRICS_METHOD,
+            dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD,
+            dmesh_server::services::DIAGNOSTIC_LOG_WATCH_METHOD,
+        ] {
+            assert!(is_connection_diagnostic(&mesh::tagged::TaggedRecord {
+                component: mesh::tagged::NameOrTag::Tag(
+                    dmesh_server::services::DIAGNOSTIC_COMPONENT as u32,
+                ),
+                method: mesh::tagged::NameOrTag::Tag(method as u32),
+                id: Some(serde_json::json!(7)),
+                ..Default::default()
+            }));
+        }
+        assert!(!is_connection_diagnostic(&mesh::tagged::TaggedRecord {
+            component: mesh::tagged::NameOrTag::Tag(7),
+            method: mesh::tagged::NameOrTag::Tag(3),
+            id: Some(serde_json::json!(7)),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn diagnostic_fields_use_the_shared_tagged_fields_map() {
+        let record = CONTROL_CATALOG
+            .record_from_value("events", &serde_json::json!({"since": 0}))
+            .unwrap();
+        let wire = mesh::cbor::encode_record(&record).unwrap();
+        let record = dmesh_server::tagged::decode(&wire).unwrap();
+        assert_eq!(
+            record.component,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::services::DIAGNOSTIC_COMPONENT
+            ))
+        );
+        assert_eq!(
+            record.method,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::services::DIAGNOSTIC_EVENTS_METHOD
+            ))
+        );
+        assert!(record.params.is_none());
+        let fields = record.fields.unwrap();
+        let mut decoder = dmesh_server::cbor::Decoder::new(fields);
+        assert_eq!(decoder.head(), Some((5, 1)));
+        assert_eq!(decoder.uint(), Some(1));
+        assert_eq!(decoder.uint(), Some(0));
+        assert!(decoder.is_finished());
+    }
+
+    #[test]
     fn unreviewed_lmesh_method_cannot_enter_cbor_dispatch() {
         let error = decode_lmesh_tagged_request(&mesh::tagged::TaggedRecord {
             component: mesh::tagged::NameOrTag::Name("lmesh".to_owned()),
@@ -928,5 +1273,33 @@ mod tests {
                 .to_string()
                 .contains("outside the reviewed lmesh catalog")
         );
+    }
+
+    #[test]
+    fn active_discovery_keeps_its_explicit_path_local() {
+        assert!(keeps_to_as_local_argument(&serde_json::json!({
+            "method": "discovery.active",
+            "to": "udp://[fe80::44]:3339"
+        })));
+        assert!(keeps_to_as_local_argument(&serde_json::json!({
+            "method": "lmesh.discovery.active",
+            "to": "02:00:00:00:00:44"
+        })));
+        assert!(keeps_to_as_local_argument(&serde_json::json!({
+            "method": "probe",
+            "to": "e7",
+            "bytes": 4096
+        })));
+        assert!(!keeps_to_as_local_argument(&serde_json::json!({
+            "method": "telemetry.nan_metrics",
+            "to": "udp://[fe80::44]:3339"
+        })));
+
+        let mut record = CONTROL_CATALOG
+            .record_from_value("discovery.active", &serde_json::json!({}))
+            .unwrap();
+        record.id = Some(serde_json::json!(1));
+        record.to = Some(serde_json::json!("udp://[fe80::44]:3339"));
+        assert!(record_keeps_to_as_local_argument(&record));
     }
 }

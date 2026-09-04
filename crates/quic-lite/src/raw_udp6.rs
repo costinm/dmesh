@@ -103,6 +103,18 @@ pub fn is_icmpv6_frame(frame: &[u8]) -> bool {
         && frame[ETHERNET_HEADER_LEN + 6] == IPPROTO_ICMPV6
 }
 
+/// Identify an Ethernet-II IPv6 UDP frame before applying a local address or
+/// port policy.  A raw bearer uses this only to avoid counting ordinary ARP,
+/// ICMPv6, and non-IPv6 traffic as malformed DMesh UDP.  Validation of the
+/// IPv6 and UDP lengths, destination, and checksum remains in
+/// [`parse_udp6_for_destination`].
+pub fn is_udp6_frame(frame: &[u8]) -> bool {
+    frame.len() >= ETHERNET_HEADER_LEN + IPV6_HEADER_LEN
+        && read_u16(&frame[12..14]) == ETHERTYPE_IPV6
+        && frame[ETHERNET_HEADER_LEN] >> 4 == 6
+        && frame[ETHERNET_HEADER_LEN + 6] == IPPROTO_UDP
+}
+
 /// Wire metadata for an Ethernet-II IPv6 ICMPv6 frame.
 ///
 /// This deliberately performs no NDP validation: callers use it to explain
@@ -707,7 +719,7 @@ mod tests {
             group,
             peer,
             5227,
-            5227,
+            3339,
             b"announce",
         )
         .unwrap();
@@ -717,6 +729,8 @@ mod tests {
         );
         let parsed = parse_udp6_for_destination(&frame[..used], group, 5227).unwrap();
         assert_eq!(parsed.payload, b"announce");
+        assert_eq!(parsed.source_port, 3339);
+        assert_eq!(parsed.destination_port, 5227);
     }
 
     #[test]
@@ -764,6 +778,9 @@ mod tests {
         frame[20] = IPPROTO_UDP;
         assert!(!is_icmpv6_frame(&frame));
         assert_eq!(icmpv6_frame_info(&frame), None);
+        assert!(is_udp6_frame(&frame));
+        frame[12] = 0;
+        assert!(!is_udp6_frame(&frame));
         assert_eq!(error_label(Error::Length), "length/option");
         assert_eq!(ndp_error_text(Error::Checksum), b"ndp rejected checksum");
         assert_eq!(udp6_error_text(Error::Port), b"udp6 rejected port");

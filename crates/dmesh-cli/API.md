@@ -46,12 +46,12 @@ The replacement client surface is a reusable QUIC-lite device session (also
 used by `dmesh-cli`). It opens a direct serial L2 together with its IP
 backend when explicitly requested, or a direct UDP session for an IP/device
 profile. It never revives byte-forward sockets. Direct records are rendered as
-text or schema-labelled compact CBOR. `--command TEXT` encodes the explicitly
+text or schema-labelled compact CBOR. `--msg TEXT` encodes the explicitly
 selected direct-CBOR diagnostic/boot record; normal operations remain service
 streams. `log-watch` currently performs the bounded server poll; framed
 long-lived log delivery is pending its server handler.
 
-`--command` and `--direct-hex` are explicitly serial operations. When their
+`--msg` and `--direct-hex` are explicitly serial operations. When their
 target is an inventory name with both UDP and serial addresses, `dmesh-cli`
 selects `serial_id`; it never silently changes a direct diagnostic into a UDP
 request. Use service-stream options for an intentional UDP operation.
@@ -61,24 +61,24 @@ raw boot/platform text and direct-CBOR exception records. It labels marked
 QUIC-lite frames as transport observations and does not attempt to render
 them as logs. Firmware-generated logs use the `log-watch` service stream.
 
-`dmesh-cli <device-or-ip> --services` opens the registered `handlers`
-stream and prints the stable service list. Its response schema is CBOR
-`[[tag, name], ...]`; names are discovery/debug metadata only and never
-dispatch a command. Each handler owns the compact payload fields after its
-numeric tag. The CLI continues to use its local firmware schema for direct
-CBOR records and handler-specific CBOR responses.
+`dmesh-cli NODE services` opens the registered handler inventory through a
+normal tagged QUIC stream and prints the stable service list. Its response schema is CBOR
+`[[component, method, name], ...]`; names are discovery/debug metadata only and
+never dispatch a command. The numeric component/method pair is the handler
+identity. The CLI continues to use its local firmware schema for direct CBOR
+records and handler-specific CBOR responses.
 
 `dmesh-cli udp://IP:PORT --socket PATH` owns one UDP QUIC-lite connection
-and creates a mode-0600 JSONL Unix socket. Each line such as
-`{"service":"status"}`, `{"service":"services"}`, or
-`{"service":"log-watch","body_hex":"04"}`
-opens the next stream on that owned connection and receives one JSON result.
+and creates a mode-0600 JSONL Unix socket. Each line uses the same schema name
+and JSON fields as CLI/HTTP, such as `{"service":"status"}`,
+`{"service":"services"}`, or `{"service":"log-watch","records":4}`.
+It opens the next tagged stream and receives one JSON result.
 It is intentionally a session socket, not TCP/serial byte forwarding.
 
 `dmesh-cli` is the authoritative host test and shell tool. It owns direct
 UART L2 sessions, UDP sessions, handler discovery, bounded `log-watch` polls,
 and the optional local session socket used to expose a selected device
-connection to other tools. For UART/multipath IPERF it starts the matching
+connection to other tools. For UART/multipath PROBE it starts the matching
 temporary UDP server itself; a standalone UDP-server subcommand is a planned
 extension. It does not depend on `lmesh-wifi`; that service is reserved for
 raw ESP-NOW/action-frame validation because it owns the required WLAN
@@ -89,7 +89,7 @@ capabilities.
 Integration tests import the same `dmesh_cli::client` library entry points
 rather than shelling out to `dmesh-cli`. Infra devices with recorded STA
 addresses are the normal test targets: a host test can issue a QUIC-lite
-IPERF handler request to one device, or request that one device's IPERF client
+PROBE handler request to one device, or request that one device's PROBE client
 target another device. This exercises handler dispatch and device-to-device
 paths without opening UART.
 

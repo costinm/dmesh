@@ -17,15 +17,13 @@ pub mod cbor;
 pub mod connection;
 /// Tagged-CBOR control handlers shared by direct records and streams.
 pub mod control;
-/// Bearer-neutral direct IPERF request/result records. This contains no
-/// Recovery-specific command envelope or firmware dependency.
-pub mod direct_iperf;
+/// Explicit connectionless application-message allowlist and replay support.
+pub mod direct;
 /// Shared receiver-side facts exposed by every platform's discovered-device
 /// list. Radio callbacks and retention remain adapter-owned.
 pub mod discovery;
 /// Shared, bearer- and ESP-independent Recovery/Main bootstrap profile.
 pub mod firmware_profile;
-pub mod iperf;
 /// Common CBOR contract for platform-observed local interfaces and addresses.
 /// Adapters report available fields; common routing/discovery consumes it.
 pub mod local_networks;
@@ -42,16 +40,18 @@ pub mod net;
 pub mod power;
 /// Privileged host/Android A-to-B probe request and result contract.
 pub mod probe;
+mod probe_service;
+mod probe_stream;
 /// Bearer-neutral raw-command decoding and handler dispatch. Firmware and
 /// hosts supply handlers; neither UART nor Wi-Fi participates in this layer.
 pub mod raw_dispatch;
-pub mod raw_iperf;
-/// Stable bearer-neutral API for the bounded raw-datagram service.
-pub mod raw_transport;
 /// CBOR-decoded, socket-free raw 802.11 hardware request schema.
 pub mod raw_wifi;
 /// Tagged-CBOR setup records for one-way DCID forwarding.
 pub mod relay;
+/// Canonical numeric tagged-CBOR identities shared by CLI, HTTP, Linux, and
+/// Android Rust adapters.
+pub mod service_catalog;
 /// Predefined common stream services and schemas.  This is deliberately
 /// above `quic-lite`: transport provides ordered streams, while this module
 /// owns service tags, CBOR/object operations, diagnostics, and log watching.
@@ -67,17 +67,17 @@ pub mod stream_server;
 pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
 pub mod telemetry;
+/// Shared QUIC connection/server/client glue above bearer frame I/O.
+pub mod transport;
 /// Common ingress provenance and policy-driven egress selection shared by
 /// QUIC-lite, direct messages, radio adapters, and future relay paths.
 pub mod transport_path;
 /// UART framing shared by host and firmware bearer adapters.
 pub mod uart;
 
-/// Socket-free ESP-NOW/vendor-action object bearer. `lmesh-wifi` supplies raw
-/// 802.11 send/receive; this module owns only the same QUIC-lite bootstrap,
-/// DCID routing, object GET, and stream scheduling used by the UDP adapter.
-#[cfg(feature = "std")]
-pub mod action;
+/// Shared Tokio HTTP/UI adapter used by Linux and Android host integrations.
+#[cfg(feature = "http")]
+pub mod http;
 
 /// Host UDP adapter and standalone test server. This is intentionally kept
 /// out of `quic-lite`: it owns sockets, Tokio scheduling, object-server

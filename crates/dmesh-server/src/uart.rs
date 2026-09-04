@@ -1,7 +1,8 @@
-//! UART PPP-information-field framing for direct records and QUIC-lite datagrams.
+//! UART PPP-information-field framing for opaque QUIC-lite packets.
 //!
-//! Serial I/O remains in host and ESP bearer adapters; this only distinguishes
-//! their direct records from complete transport datagrams.
+//! Serial I/O remains in host and ESP bearer adapters. This module recognizes
+//! only the UART transport marker; it does not decode QUIC headers, direct
+//! envelopes, CBOR, or service records.
 
 use quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
 
@@ -11,7 +12,10 @@ pub const UART_TRANSPORT_MARKER: u8 = 0xf7;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UartIngress<'a> {
     Transport(&'a [u8]),
-    DirectRecord(&'a [u8]),
+    /// An unmarked PPP information field. New senders use this only for a
+    /// complete private direct long-header packet. The shared connectionless
+    /// endpoint, not the UART adapter, decides whether it is admissible.
+    Unmarked(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,10 +37,10 @@ pub fn encode_uart_datagram(packet: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// Classify one PPP payload. Empty frames are invalid, not heartbeats.
 ///
-/// New direct records carry the normal DCID-zero QUIC-lite short header, so
-/// control has the same framing over UART and UDP. Bare CBOR is accepted only
-/// as a Stage2/Recovery compatibility input; callers receive its payload in
-/// the same `DirectRecord` variant and must not emit it for new requests.
+/// Direct records carry the custom-version QUIC-lite long header, so control
+/// has the same framing over UART and UDP. The unmarked branch deliberately
+/// preserves its completed bytes: bare CBOR is not a compatibility command
+/// path and is rejected by the shared direct endpoint.
 pub fn classify_uart_payload(payload: &[u8]) -> Result<UartIngress<'_>, UartIngressError> {
     let Some((&first, rest)) = payload.split_first() else {
         return Err(UartIngressError::Empty);
@@ -52,10 +56,7 @@ pub fn classify_uart_payload(payload: &[u8]) -> Result<UartIngress<'_>, UartIngr
     } else if payload.len() > DEFAULT_MAX_DATAGRAM_SIZE {
         Err(UartIngressError::Oversize)
     } else {
-        match quic_lite::decode_direct_packet(payload) {
-            Ok((_, record)) => Ok(UartIngress::DirectRecord(record)),
-            Err(_) => Ok(UartIngress::DirectRecord(payload)),
-        }
+        Ok(UartIngress::Unmarked(payload))
     }
 }
 
@@ -70,18 +71,18 @@ mod tests {
         );
         assert_eq!(
             classify_uart_payload(&[0xa1, 1]),
-            Ok(UartIngress::DirectRecord(&[0xa1, 1]))
+            Ok(UartIngress::Unmarked(&[0xa1, 1]))
         );
         assert_eq!(classify_uart_payload(&[]), Err(UartIngressError::Empty));
     }
 
     #[test]
-    fn direct_packet_is_unwrapped_for_the_shared_handler() {
+    fn direct_packet_remains_opaque_for_the_shared_handler() {
         let mut packet = [0u8; 32];
-        let used = quic_lite::encode_direct_packet(7, &[0xa1, 1], &mut packet).unwrap();
+        let used = crate::direct::ConnectionlessMessage::encode(&[0xa1, 1], &mut packet).unwrap();
         assert_eq!(
             classify_uart_payload(&packet[..used]),
-            Ok(UartIngress::DirectRecord(&[0xa1, 1]))
+            Ok(UartIngress::Unmarked(&packet[..used]))
         );
     }
     #[test]

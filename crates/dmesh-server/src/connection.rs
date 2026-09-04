@@ -14,8 +14,8 @@ use crate::{
 pub use quic_lite::{connection::ConnectionManager, connection::ConnectionPolicy};
 
 /// Component for QUIC-lite connection/stream/RPC/forwarding primitives.
-/// Component 2 is already assigned to direct iperf; keep connection lifecycle
-/// distinct instead of extending a benchmark component.
+/// Component 2 is assigned to the normal QUIC `probe` stream service; keep
+/// connection lifecycle distinct from that diagnostic application handler.
 pub const CONNECTION_COMPONENT: u64 = 3;
 pub const CONNECTION_CONFIGURE: u64 = 1;
 
@@ -25,9 +25,9 @@ const FIELD_TX_BURST_PACKETS: u64 = 4;
 const FIELD_PATH_POLICY: u64 = 11;
 const FIELD_TIMEOUT_MS: u64 = 12;
 
-/// Currently the only bounded direct connection operation. Stream open, RPC,
-/// and forward requests will be added here as their transport-independent
-/// managers are introduced; they are not radio operations.
+/// Connection policy operation carried by a normal QUIC stream. Stream open,
+/// RPC, and forwarding belong to their transport-independent managers; this
+/// record is never an implicit connectionless/direct-message registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Request {
     Configure(ConnectionPolicy),

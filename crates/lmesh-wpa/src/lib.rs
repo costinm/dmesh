@@ -380,6 +380,45 @@ impl WpaSupplicant {
         wait_for_p2p_group(&events, timeout)
     }
 
+    /// Start a conventional infrastructure AP with WPA2-PSK. This is AP mode
+    /// (`mode=2`), not a Wi-Fi Direct group; clients see an ordinary secured
+    /// SSID and do not need P2P negotiation.
+    pub fn start_wpa2_ap(
+        &self,
+        ssid: &[u8],
+        passphrase: &str,
+        frequency_mhz: u32,
+        timeout: Duration,
+    ) -> Result<()> {
+        if ssid.is_empty()
+            || ssid.len() > 32
+            || !(8..=63).contains(&passphrase.len())
+            || passphrase.contains('\0')
+            || frequency_mhz == 0
+        {
+            bail!("invalid WPA2 AP profile");
+        }
+        let events = self.control.attach_events(timeout)?;
+        let network = self.command_ok("ADD_NETWORK", timeout)?;
+        let id = network.parse::<u32>().context("parse WPA2 AP network id")?;
+        self.command_ok(&format!("SET_NETWORK {id} ssid {}", hex(ssid)), timeout)?;
+        self.command_ok(&format!("SET_NETWORK {id} mode 2"), timeout)?;
+        self.command_ok(&format!("SET_NETWORK {id} key_mgmt WPA-PSK"), timeout)?;
+        self.command_ok(&format!("SET_NETWORK {id} proto RSN"), timeout)?;
+        self.command_ok(&format!("SET_NETWORK {id} pairwise CCMP"), timeout)?;
+        self.command_ok(&format!("SET_NETWORK {id} group CCMP"), timeout)?;
+        self.command_ok(
+            &format!("SET_NETWORK {id} psk \"{}\"", escape_wpa(passphrase)),
+            timeout,
+        )?;
+        self.command_ok(
+            &format!("SET_NETWORK {id} frequency {frequency_mhz}"),
+            timeout,
+        )?;
+        self.command_ok(&format!("SELECT_NETWORK {id}"), timeout)?;
+        wait_for_ap_enabled(&events, timeout)
+    }
+
     pub fn p2p_group_remove(&self, iface: &str, timeout: Duration) -> Result<()> {
         if iface.is_empty() || iface.as_bytes().contains(&0) {
             bail!("invalid P2P group interface name");
@@ -462,6 +501,28 @@ fn wait_for_p2p_group(events: &WpaEventMonitor, timeout: Duration) -> Result<P2p
         }
         if event.contains("P2P-GROUP-FORMATION-FAILURE") || event.contains("P2P-GO-NEG-FAILURE") {
             bail!("P2P group formation failed: {event}");
+        }
+    }
+}
+
+fn wait_for_ap_enabled(events: &WpaEventMonitor, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("timed out waiting for AP-ENABLED"))?;
+        let event = events.recv(remaining)?;
+        let event = event.trim_start_matches(|character: char| {
+            character == '<' || character == '>' || character.is_ascii_digit()
+        });
+        if event.starts_with("AP-ENABLED") {
+            return Ok(());
+        }
+        // Network-added/selected control events precede AP-ENABLED and are
+        // expected while configuring a transient profile. Only an explicit
+        // AP disable means the AP state machine rejected the profile.
+        if event.starts_with("AP-DISABLED") {
+            bail!("WPA2 AP setup failed: {event}");
         }
     }
 }

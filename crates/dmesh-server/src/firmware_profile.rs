@@ -95,7 +95,7 @@ pub struct TransportProfile {
     pub ack_delay_ms: u8,
     /// Maximum raw-bearer packets emitted from one ingress turn. Zero keeps
     /// the transport's C6 default; a nonzero value is an association-scoped
-    /// pacing control, not an IPERF request field.
+    /// pacing control, not an PROBE request field.
     pub tx_burst_packets: u8,
     pub raw_tx_rate: u8,
     /// Associated-STA egress policy: true submits Ethernet through ESP-IDF's
@@ -322,9 +322,7 @@ fn control_method(request: control::Request<'_>) -> u64 {
         control::Request::SettingsGet { .. } => control::SETTINGS_GET,
         control::Request::SettingsSet { .. } => control::SETTINGS_SET,
         control::Request::SettingsList => control::SETTINGS_LIST,
-        control::Request::TransportStart { .. } => control::TRANSPORT_START,
-        control::Request::TransportStop { .. } => control::TRANSPORT_STOP,
-        control::Request::TransportDiscover { .. } => control::TRANSPORT_DISCOVER,
+        control::Request::TransportSet { .. } => control::TRANSPORT_SET,
     }
 }
 
@@ -351,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn open_requires_an_explicit_transport_start_field() {
+    fn open_requires_an_explicit_transport_set_field() {
         let mut profile = TransportProfile::new();
         assert!(!profile.open, "WPA2 is the safe boot default");
 

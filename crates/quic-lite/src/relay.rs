@@ -1,23 +1,34 @@
 //! Bounded DCID dispatch shared by endpoint and opaque-forwarding targets.
 //!
-//! DCID zero is the direct-message ingress.  Every other DCID occupies one
-//! entry in this registry, either an endpoint owner or an opaque forwarding
+//! Every serialized non-empty DCID occupies one entry in this registry, either
+//! an endpoint owner or an opaque forwarding
 //! rule.  A platform therefore performs one lookup before it chooses local
 //! endpoint processing or next-hop egress; it must not maintain a competing
 //! relay lookup table.
 
 use crate::{
-    ConnectionId, Error, ShortHeader, ShortHeaderPrefix, decode_direct_packet, rewrite_dcid,
+    ConnectionId, Error, ShortHeaderPrefix, decode_direct_packet,
+    decode_routing_prefix, rewrite_bootstrap_destination, rewrite_dcid,
 };
+
+/// Destination selected by an opaque relay rule.
+///
+/// `Bootstrap` means a QUIC long header with an empty destination CID. It is
+/// explicit protocol state, not a numeric sentinel. Only the initial
+/// OPEN is allowed to use it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardDestination {
+    Connection(ConnectionId),
+    Bootstrap,
+}
 
 /// Opaque forwarding action selected by a non-zero local DCID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForwardRule<NextHop> {
     /// Platform-owned adjacent-peer or egress handle.
     pub next_hop: NextHop,
-    /// DCID written before submitting the packet to `next_hop`.  Zero is the
-    /// direct-message destination and is valid for the final hop.
-    pub outbound_dcid: ConnectionId,
+    /// Destination written before submitting the packet to `next_hop`.
+    pub destination: ForwardDestination,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,7 +39,7 @@ pub enum DcidTarget<Endpoint, NextHop> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DcidRegistryError {
-    ZeroReserved,
+    InvalidConnectionId,
     Occupied,
     Full,
     Missing,
@@ -37,10 +48,7 @@ pub enum DcidRegistryError {
 
 /// Result of the first and only DCID lookup performed by an ingress adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DcidIngress<'a, Endpoint, NextHop> {
-    /// A DCID-zero direct message.  Its payload is decoded by the common
-    /// direct-message handler, never by a QUIC stream endpoint.
-    Direct(ShortHeaderPrefix),
+pub(crate) enum DcidIngress<'a, Endpoint, NextHop> {
     Endpoint(ShortHeaderPrefix, &'a Endpoint),
     Forward(ShortHeaderPrefix, &'a ForwardRule<NextHop>),
 }
@@ -52,11 +60,19 @@ pub enum DcidIngress<'a, Endpoint, NextHop> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DcidDatagram<'a, Endpoint, NextHop> {
     Direct {
-        header: ShortHeader,
         payload: &'a [u8],
     },
-    Endpoint(ShortHeaderPrefix, &'a Endpoint),
+    Endpoint {
+        /// DCID selected by this shared QUIC-lite router. Adapters may use it
+        /// only to locate their association; packet headers remain private.
+        received_dcid: ConnectionId,
+        endpoint: &'a Endpoint,
+    },
     Forward {
+        /// CID from the received packet.  Relay adapters may use this only
+        /// for relay-open bookkeeping and diagnostics; they must not parse
+        /// the bearer frame a second time.
+        received_dcid: ConnectionId,
         rule: &'a ForwardRule<NextHop>,
         used: usize,
     },
@@ -83,21 +99,33 @@ pub fn dispatch_datagram<'a, Endpoint, NextHop, const ENTRIES: usize>(
     input: &'a [u8],
     output: &mut [u8],
 ) -> Result<DcidDatagram<'a, Endpoint, NextHop>, DcidDatagramError> {
-    let prefix = ShortHeader::decode_prefix(input).map_err(DcidDatagramError::Header)?;
+    // Direct traffic is its own custom-version long-header form.  Classify it
+    // before DCID routing so neither this registry nor a bearer treats an
+    // empty Initial destination as a synthetic numeric CID.
+    if crate::DirectMessageEndpoint::is_packet(input) {
+        let (_, payload) = decode_direct_packet(input).map_err(DcidDatagramError::Header)?;
+        return Ok(DcidDatagram::Direct { payload });
+    }
+    let prefix = decode_routing_prefix(input).map_err(DcidDatagramError::Header)?;
     match registry
         .ingress(prefix)
         .map_err(DcidDatagramError::Registry)?
     {
-        DcidIngress::Direct(_) => {
-            let (header, payload) =
-                decode_direct_packet(input).map_err(DcidDatagramError::Header)?;
-            Ok(DcidDatagram::Direct { header, payload })
-        }
-        DcidIngress::Endpoint(prefix, endpoint) => Ok(DcidDatagram::Endpoint(prefix, endpoint)),
+        DcidIngress::Endpoint(prefix, endpoint) => Ok(DcidDatagram::Endpoint {
+            received_dcid: prefix.dcid,
+            endpoint,
+        }),
         DcidIngress::Forward(_, rule) => {
-            let used = rewrite_dcid(input, rule.outbound_dcid, output)
-                .map_err(DcidDatagramError::Rewrite)?;
-            Ok(DcidDatagram::Forward { rule, used })
+            let used = match rule.destination {
+                ForwardDestination::Connection(dcid) => rewrite_dcid(input, dcid, output),
+                ForwardDestination::Bootstrap => rewrite_bootstrap_destination(input, output),
+            }
+            .map_err(DcidDatagramError::Rewrite)?;
+            Ok(DcidDatagram::Forward {
+                received_dcid: prefix.dcid,
+                rule,
+                used,
+            })
         }
     }
 }
@@ -160,7 +188,7 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         NextHop: Eq,
     {
         if dcid.value() == 0 {
-            return Err(DcidRegistryError::ZeroReserved);
+            return Err(DcidRegistryError::InvalidConnectionId);
         }
         if let Some((_, target)) = self
             .entries
@@ -209,13 +237,10 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         entry.take().map(|(_, target)| target)
     }
 
-    pub fn ingress(
+    pub(crate) fn ingress(
         &self,
         prefix: ShortHeaderPrefix,
     ) -> Result<DcidIngress<'_, Endpoint, NextHop>, DcidRegistryError> {
-        if prefix.dcid.value() == 0 {
-            return Ok(DcidIngress::Direct(prefix));
-        }
         let (_, target) = self
             .entries
             .iter()
@@ -234,7 +259,7 @@ impl<Endpoint, NextHop, const ENTRIES: usize> DcidRegistry<Endpoint, NextHop, EN
         target: DcidTarget<Endpoint, NextHop>,
     ) -> Result<(), DcidRegistryError> {
         if dcid.value() == 0 {
-            return Err(DcidRegistryError::ZeroReserved);
+            return Err(DcidRegistryError::InvalidConnectionId);
         }
         if self
             .entries
@@ -269,7 +294,7 @@ mod tests {
                 relay,
                 ForwardRule {
                     next_hop: 9,
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: ForwardDestination::Bootstrap,
                 },
             )
             .unwrap();
@@ -316,7 +341,7 @@ mod tests {
                 relay,
                 ForwardRule {
                     next_hop: 9,
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: ForwardDestination::Connection(ConnectionId::new(5).unwrap()),
                 },
             )
             .unwrap();
@@ -326,8 +351,7 @@ mod tests {
         let mut output = [0; 32];
         assert!(matches!(
             dispatch_datagram(&registry, &direct[..direct_len], &mut output),
-            Ok(DcidDatagram::Direct { header, payload })
-                if header.packet_number == 3 && payload == [0xa0]
+            Ok(DcidDatagram::Direct { payload }) if payload == [0xa0]
         ));
 
         let mut endpoint_packet = [0; 16];
@@ -341,7 +365,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             dispatch_datagram(&registry, &endpoint_packet[..endpoint_len], &mut output),
-            Ok(DcidDatagram::Endpoint(_, 7))
+            Ok(DcidDatagram::Endpoint { received_dcid, endpoint: 7 })
+                if received_dcid == endpoint
         ));
 
         let mut relay_packet = [0; 16];
@@ -355,14 +380,72 @@ mod tests {
         .unwrap();
         let used =
             match dispatch_datagram(&registry, &relay_packet[..relay_len], &mut output).unwrap() {
-                DcidDatagram::Forward { rule, used } => {
+                DcidDatagram::Forward { rule, used, .. } => {
                     assert_eq!(rule.next_hop, 9);
                     used
                 }
                 _ => panic!("expected forward"),
             };
         let (rewritten, _) = ShortHeader::decode(&output[..used]).unwrap();
-        assert_eq!(rewritten.dcid.value(), 0);
+        assert_eq!(rewritten.dcid.value(), 5);
         assert_eq!(rewritten.packet_number, 2);
+    }
+
+    #[test]
+    fn bootstrap_forwarding_uses_an_empty_long_header_destination() {
+        let relay = ConnectionId::relay_local(2, 1).unwrap();
+        let source = ConnectionId::new(11).unwrap();
+        let mut registry = DcidRegistry::<(), u16, 1>::new();
+        registry
+            .install_forward(
+                relay,
+                ForwardRule {
+                    next_hop: 9,
+                    destination: ForwardDestination::Bootstrap,
+                },
+            )
+            .unwrap();
+        let mut packet = [0; 64];
+        let packet_len = crate::encode_long_packet(
+            crate::LONG_PACKET_INITIAL,
+            Some(relay),
+            Some(source),
+            1,
+            4,
+            &[0xa0],
+            &mut packet,
+        )
+        .unwrap();
+        let mut output = [0; 64];
+        let DcidDatagram::Forward { used, .. } =
+            dispatch_datagram(&registry, &packet[..packet_len], &mut output).unwrap()
+        else {
+            panic!("bootstrap packet must be forwarded")
+        };
+        let (header, _, _) = crate::decode_long_packet(&output[..used]).unwrap();
+        assert_eq!(header.dcid, None);
+        assert_eq!(header.scid, Some(source));
+    }
+
+    #[test]
+    fn an_initial_with_an_empty_destination_is_not_direct_traffic() {
+        let source = ConnectionId::new(11).unwrap();
+        let registry = DcidRegistry::<(), u16, 1>::new();
+        let mut packet = [0; 64];
+        let packet_len = crate::encode_long_packet(
+            crate::LONG_PACKET_INITIAL,
+            None,
+            Some(source),
+            1,
+            4,
+            &[0xa0],
+            &mut packet,
+        )
+        .unwrap();
+        let mut output = [0; 64];
+        assert!(matches!(
+            dispatch_datagram(&registry, &packet[..packet_len], &mut output),
+            Err(DcidDatagramError::Registry(DcidRegistryError::Missing))
+        ));
     }
 }

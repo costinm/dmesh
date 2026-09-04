@@ -305,9 +305,9 @@ impl E2eConfig {
                 if !matches!(
                     test.as_str(),
                     "now-short"
-                        | "now-iperf"
+                        | "now-probe"
                         | "udp6-association"
-                        | "udp6-iperf"
+                        | "udp6-probe"
                         | "nan"
                         | "scan"
                         | "android-handlers"

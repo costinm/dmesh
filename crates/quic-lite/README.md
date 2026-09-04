@@ -22,13 +22,19 @@ The forwarding paths should be optimized to reduce transmit power/air time - not
 if a packet can go trough 2-3 foreign hops at high speed/low power wifi - instead of one slow hop on same-owner
 device - the first choice is preferred, falling back and avoiding unreliable forwarders.
 
-## Direct messages and forwarding labels
+## Long headers, direct messages, and forwarding labels
 
-The normal short header is also the bounded one-way control envelope. DCID `0`
-with a four-byte packet number carries raw tagged-CBOR rather than QUIC frames:
-it has no stream, ACK, retransmission, flow-control, or endpoint state. This is
-used for small idempotent control records and their separately routed replies;
-the QUIC OPEN bootstrap is one distinct DCID-zero message kind.
+Pre-connection traffic uses the RFC 9000 long-header field layout with the
+DMesh extension version `0x444d0001`. An Initial-type packet carries connection
+setup: the request has an empty DCID and the client's receive CID in SCID; the
+response addresses that CID in DCID and advertises the server receive CID in
+SCID. Initial protection and full QUIC transport-parameter negotiation are not
+implemented yet, which is why this must not claim QUIC version 1.
+
+The custom-version 0-RTT type carries bounded connectionless tagged-CBOR. Both
+CID fields are empty and the four-byte packet number is self-contained; it has
+no stream, ACK, retransmission, flow-control, or endpoint state. Packet type,
+not a serialized zero DCID, distinguishes this exceptional direct plane.
 
 Every nonzero local DCID has exactly one unified target at a node: either a
 local endpoint or an opaque forwarding rule. A forwarding rule replaces only
@@ -41,7 +47,8 @@ QUIC frames, and it does not rely on source address, bearer, or ingress peer.
 - no encryption
 - out-of-band handshake - the association may be established by a NAN active sub packet, a LoRA message or by
 the control plane.
-- no long headers.
+- established packets use short headers; setup and connectionless extensions
+  use the custom-version long header described above.
 
 ## Future changes
 

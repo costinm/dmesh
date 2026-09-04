@@ -1,8 +1,8 @@
-//! Tagged-CBOR setup records for one-way DCID forwarding.
+//! Tagged-CBOR stream handlers for one-way DCID forwarding.
 //!
-//! These records are deliberately small enough for the direct-message plane.
-//! They configure one local rule at a time; pairing a forward and return path
-//! remains a CP operation, not a relay-side transaction.
+//! Relay administration uses authenticated QUIC streams. The forwarding
+//! table may carry Initial setup or approved direct application records,
+//! but their payload type never grants a second relay-configuration path.
 
 use crate::transport_path::TransportId;
 use crate::{
@@ -20,6 +20,13 @@ pub const RELAY_APPLY: u64 = 1;
 /// Install a forward rule plus its independently keyed return rule. The
 /// platform binds the return handle to the request's adjacent ingress path.
 pub const RELAY_APPLY_PAIR: u64 = 2;
+/// Return the active local forwarding mappings.  This is a read-only QUIC
+/// stream method; platform adapters project their resolved next-hop route
+/// rather than exposing the opaque handle used by the forwarding table.
+pub const RELAY_LIST: u64 = 3;
+/// Remove one paired mapping by either of its local DCIDs. The platform
+/// removes the associated reverse mapping and relay-open metadata together.
+pub const RELAY_REMOVE: u64 = 4;
 
 // A portable handle for an adjacent ESP-NOW peer. The forwarding registry
 // still keys only on DCID; this value exists solely in relay.apply desired
@@ -96,13 +103,17 @@ const FIELD_REVERSE_NEXT_HOP: u64 = 13;
 const FIELD_REVERSE_OUTBOUND_DCID: u64 = 14;
 const FIELD_REVERSE_POSITION: u64 = 15;
 const FIELD_REVERSE_REVISION: u64 = 16;
+const FIELD_REMOVE_DCID: u64 = 21;
+const FIELD_REMOVE_REVISION: u64 = 22;
 
 /// One opaque platform-local next-hop route. `next_hop` is not a mesh
 /// identity and does not appear in a forwarded packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RelayRoute {
     pub next_hop: u64,
-    pub outbound_dcid: ConnectionId,
+    /// The final bootstrap hop has no long-header destination CID. This is
+    /// explicit protocol state rather than a zero-valued connection ID.
+    pub destination: quic_lite::ForwardDestination,
 }
 
 /// Address used by a control-plane chain description. It is consumed only by
@@ -136,13 +147,13 @@ impl ChainNode {
 }
 
 /// Adapter used by the CP chain handler. It resolves a physical next-hop at
-/// the relay being configured and exchanges one bounded DCID-zero record with
-/// that relay. No socket, QUIC endpoint, or private queue is implied here.
+/// the relay being configured and exchanges one bounded tagged record over a
+/// normal QUIC stream. No socket or private queue is implied here.
 pub trait ChainHandler {
     type Error;
 
     fn resolve_next_hop(&mut self, relay: ChainNode, next: ChainNode) -> Result<u64, Self::Error>;
-    fn exchange_direct(
+    fn exchange_stream(
         &mut self,
         relay: ChainNode,
         request: &[u8],
@@ -198,10 +209,12 @@ pub fn install_symmetric_chain<H: ChainHandler>(
             let position = (step + 1) as u8;
             let label = 2 + if reverse { 32 } else { 0 } + u64::from(position);
             let inbound = ConnectionId::relay_local(label, position).ok_or(ChainError::Packet)?;
-            let outbound = if step + 1 == relays {
-                ConnectionId::new(0).ok_or(ChainError::Packet)?
+            let destination = if step + 1 == relays {
+                quic_lite::ForwardDestination::Bootstrap
             } else {
-                ConnectionId::relay_local(label + 1, position + 1).ok_or(ChainError::Packet)?
+                quic_lite::ForwardDestination::Connection(
+                    ConnectionId::relay_local(label + 1, position + 1).ok_or(ChainError::Packet)?,
+                )
             };
             let relay = nodes[relay_index];
             let next = nodes[next_index];
@@ -220,26 +233,21 @@ pub fn install_symmetric_chain<H: ChainHandler>(
                     proposed_dcid: Some(inbound),
                     route: RelayRoute {
                         next_hop,
-                        outbound_dcid: outbound,
+                        destination,
                     },
                     position,
                 }),
             };
-            let mut cbor = [0u8; 128];
-            let cbor_len =
-                encode_request(request, Some(request_id), &mut cbor).ok_or(ChainError::Packet)?;
-            let packet_len =
-                quic_lite::encode_direct_packet(request_id as u32, &cbor[..cbor_len], request_out)
-                    .map_err(|_| ChainError::Packet)?;
+            let request_len =
+                encode_request(request, Some(request_id), request_out).ok_or(ChainError::Packet)?;
             let response_len = handler
-                .exchange_direct(relay, &request_out[..packet_len], response_in)
+                .exchange_stream(relay, &request_out[..request_len], response_in)
                 .map_err(ChainError::Handler)?;
             if response_len > response_in.len() {
                 return Err(ChainError::Response);
             }
-            let (_, payload) = quic_lite::decode_direct_packet(&response_in[..response_len])
-                .map_err(|_| ChainError::Response)?;
-            let response = crate::tagged::decode(payload).ok_or(ChainError::Response)?;
+            let response =
+                crate::tagged::decode(&response_in[..response_len]).ok_or(ChainError::Response)?;
             if response.component != Some(Name::Tag(RELAY_COMPONENT))
                 || response.method != Some(Name::Tag(RELAY_APPLY))
                 || response.id != Some(request_id)
@@ -438,6 +446,112 @@ impl<NextHop: Copy + Eq, const ENTRIES: usize> RelayState<NextHop, ENTRIES> {
         &self.registry
     }
 
+    /// Number of active one-way forwarding entries. A paired circuit consumes
+    /// two entries, but the registry deliberately remains keyed by each local
+    /// DCID independently.
+    pub fn active_len(&self) -> usize {
+        self.allocations
+            .iter()
+            .flatten()
+            .filter(|rule| rule.local_dcid.is_some())
+            .count()
+    }
+
+    /// Visit the public forwarding facts for each active mapping. `next_hop`
+    /// is intentionally still the platform-local handle here: the platform
+    /// owns its resolution into a real MAC, UDP tuple, UART link, or similar
+    /// address before it encodes a `relay.list` response.
+    pub fn visit_active(
+        &self,
+        mut visit: impl FnMut(ConnectionId, u64, quic_lite::ForwardDestination, u64),
+    ) {
+        for stored in self.allocations.iter().flatten() {
+            let (Some(local_dcid), Some(rule)) = (stored.local_dcid, stored.request.rule) else {
+                continue;
+            };
+            visit(
+                local_dcid,
+                rule.route.next_hop,
+                rule.route.destination,
+                stored.request.revision,
+            );
+        }
+    }
+
+    /// Whether an active mapping still owns `handle`. Platform adapters use
+    /// this after removal to release a resolved UDP tuple or other bounded
+    /// bearer binding without disrupting a shared route.
+    pub fn uses_next_hop(&self, handle: u64) -> bool {
+        self.allocations.iter().flatten().any(|stored| {
+            stored.local_dcid.is_some()
+                && stored
+                    .request
+                    .rule
+                    .is_some_and(|rule| rule.route.next_hop == handle)
+        })
+    }
+
+    /// Remove a paired mapping using either local alias. The request revision
+    /// is compared before mutation, so a controller that retained an old
+    /// circuit record cannot remove a reused pair. Missing aliases are an
+    /// idempotent successful absence (`Ok(false)`).
+    pub fn remove_pair(
+        &mut self,
+        dcid: ConnectionId,
+        revision: u64,
+    ) -> Result<bool, ReconcileError> {
+        let Some(index) = self
+            .allocations
+            .iter()
+            .position(|entry| entry.is_some_and(|stored| stored.local_dcid == Some(dcid)))
+        else {
+            return Ok(false);
+        };
+        let current = self.allocations[index].expect("located populated relay rule");
+        if current.request.revision != revision {
+            return Err(ReconcileError::StaleRevision);
+        }
+
+        let pairing = self
+            .relay_open_returns
+            .iter()
+            .flatten()
+            .copied()
+            .find(|(forward, reverse)| *forward == current.request.allocation || *reverse == dcid);
+        let mut remove = [None; 2];
+        remove[0] = Some(index);
+        if let Some((forward_allocation, reverse_dcid)) = pairing {
+            let forward_index = self.allocations.iter().position(|entry| {
+                entry.is_some_and(|stored| stored.request.allocation == forward_allocation)
+            });
+            let reverse_index = self.allocations.iter().position(|entry| {
+                entry.is_some_and(|stored| stored.local_dcid == Some(reverse_dcid))
+            });
+            let (Some(forward_index), Some(reverse_index)) = (forward_index, reverse_index) else {
+                return Err(ReconcileError::Registry(
+                    quic_lite::DcidRegistryError::Missing,
+                ));
+            };
+            remove = [Some(forward_index), Some(reverse_index)];
+        }
+
+        for index in remove.into_iter().flatten() {
+            if let Some(stored) = self.allocations[index].take() {
+                if let Some(local_dcid) = stored.local_dcid {
+                    self.registry.remove(local_dcid);
+                }
+            }
+        }
+        if let Some((forward_allocation, _)) = pairing {
+            for entry in &mut self.relay_open_returns {
+                if entry.is_some_and(|(allocation, _)| allocation == forward_allocation) {
+                    *entry = None;
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Reconcile a forward/return pair transactionally within this relay.
     /// The rules remain independent DCID entries after installation; pairing
     /// only prevents bootstrap from starting with one direction missing.
@@ -588,7 +702,7 @@ impl<NextHop: Copy + Eq, const ENTRIES: usize> RelayState<NextHop, ENTRIES> {
                 dcid,
                 quic_lite::ForwardRule {
                     next_hop,
-                    outbound_dcid: rule.route.outbound_dcid,
+                    destination: rule.route.destination,
                 },
             )
             .map_err(ReconcileError::Registry)?;
@@ -638,130 +752,6 @@ fn observed(rule: StoredRule) -> ObservedRule {
 pub enum DispatchError<E> {
     MalformedOrDirected,
     Handler(E),
-}
-
-/// Result of offering a DCID-zero tagged-CBOR record to a platform's shared
-/// control dispatcher. `Response` is a complete caller-produced short packet,
-/// ready for the bearer to submit; this keeps packet-number ownership with the
-/// adapter instead of inventing a relay-specific counter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectOutcome {
-    NotHandled,
-    Handled,
-    Response(usize),
-}
-
-/// Common direct-message binding used by UDP6 first and by ESP bearer owners
-/// next. A QUIC stream and a direct message may call the same component
-/// dispatcher; this trait represents only the bounded direct envelope.
-pub trait DirectHandler: Send + Sync + core::fmt::Debug {
-    fn handle_direct(
-        &self,
-        packet_number: u32,
-        payload: &[u8],
-        response: &mut [u8],
-    ) -> DirectOutcome;
-}
-
-/// Fixed-capacity duplicate cache owned only by a *terminating* direct-message
-/// handler. A relay never uses this: it rewrites and forwards every matching
-/// packet, including duplicates, without inspecting the CBOR body. A
-/// tagged-record `id`, when present, is the retry key; otherwise the direct
-/// packet number is the key. The request fingerprint rejects accidental reuse
-/// of an ID for a different command. Cached complete responses let a terminal
-/// handler answer a lost reply without repeating its side effect.
-pub struct TerminatingDirectDedup<const ENTRIES: usize, const RESPONSE_CAPACITY: usize> {
-    entries: [Option<TerminatingDirectDedupEntry<RESPONSE_CAPACITY>>; ENTRIES],
-    next: usize,
-}
-
-#[derive(Clone, Copy)]
-struct TerminatingDirectDedupEntry<const RESPONSE_CAPACITY: usize> {
-    id: Option<u64>,
-    packet_number: u32,
-    fingerprint: u32,
-    response_len: usize,
-    response: [u8; RESPONSE_CAPACITY],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminatingDirectDedupResult {
-    New,
-    Replay(usize),
-    Conflict,
-}
-
-impl<const ENTRIES: usize, const RESPONSE_CAPACITY: usize>
-    TerminatingDirectDedup<ENTRIES, RESPONSE_CAPACITY>
-{
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; ENTRIES],
-            next: 0,
-        }
-    }
-
-    /// Copy a cached response into `output`, if this is a duplicate. A return
-    /// of [`TerminatingDirectDedupResult::Conflict`] means a caller reused the key with a
-    /// different payload and must not execute it.
-    pub fn check(
-        &self,
-        packet_number: u32,
-        payload: &[u8],
-        output: &mut [u8],
-    ) -> TerminatingDirectDedupResult {
-        let id = decode(payload).and_then(|record| record.id);
-        let fingerprint = direct_fingerprint(payload);
-        for entry in self.entries.iter().flatten() {
-            let same_key = match (id, entry.id) {
-                (Some(id), Some(existing)) => id == existing,
-                (None, None) => packet_number == entry.packet_number,
-                _ => false,
-            };
-            if !same_key {
-                continue;
-            }
-            if entry.fingerprint != fingerprint || entry.response_len > output.len() {
-                return TerminatingDirectDedupResult::Conflict;
-            }
-            output[..entry.response_len].copy_from_slice(&entry.response[..entry.response_len]);
-            return TerminatingDirectDedupResult::Replay(entry.response_len);
-        }
-        TerminatingDirectDedupResult::New
-    }
-
-    /// Remember the complete response after the side effect has succeeded.
-    /// This is an overwrite ring, not an unbounded request history.
-    pub fn store(&mut self, packet_number: u32, payload: &[u8], response: &[u8]) -> bool {
-        if ENTRIES == 0 || response.len() > RESPONSE_CAPACITY {
-            return false;
-        }
-        let mut cached = [0; RESPONSE_CAPACITY];
-        cached[..response.len()].copy_from_slice(response);
-        self.entries[self.next] = Some(TerminatingDirectDedupEntry {
-            id: decode(payload).and_then(|record| record.id),
-            packet_number,
-            fingerprint: direct_fingerprint(payload),
-            response_len: response.len(),
-            response: cached,
-        });
-        self.next = (self.next + 1) % ENTRIES;
-        true
-    }
-}
-
-impl<const ENTRIES: usize, const RESPONSE_CAPACITY: usize> Default
-    for TerminatingDirectDedup<ENTRIES, RESPONSE_CAPACITY>
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn direct_fingerprint(payload: &[u8]) -> u32 {
-    payload.iter().fold(0x811c_9dc5, |hash, byte| {
-        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
-    })
 }
 
 pub fn dispatch<H: Handler>(
@@ -844,7 +834,7 @@ pub fn decode_pair_record(record: Record<'_>) -> Option<PairRequest> {
                 proposed_dcid: Some(ConnectionId::new(dcid?)?),
                 route: RelayRoute {
                     next_hop: next_hop?,
-                    outbound_dcid: ConnectionId::new(outbound_dcid?)?,
+                    destination: relay_destination(outbound_dcid)?,
                 },
                 position,
             }),
@@ -868,6 +858,62 @@ pub fn decode_pair_record(record: Record<'_>) -> Option<PairRequest> {
             fields.reverse_position,
         )?,
     })
+}
+
+/// Return the request ID for a read-only `relay.list` stream request.
+pub fn decode_list_record(record: Record<'_>) -> Option<u64> {
+    (record.to.is_none()
+        && record.component == Some(Name::Tag(RELAY_COMPONENT))
+        && record.method == Some(Name::Tag(RELAY_LIST)))
+    .then_some(record.id?)
+}
+
+/// Decode `relay.rm { dcid, rev }` from an authenticated stream record.
+pub fn decode_remove_record(record: Record<'_>) -> Option<(ConnectionId, u64)> {
+    if record.to.is_some()
+        || record.component != Some(Name::Tag(RELAY_COMPONENT))
+        || record.method != Some(Name::Tag(RELAY_REMOVE))
+    {
+        return None;
+    }
+    let mut decoder = Decoder::new(record.fields?);
+    let (major, count) = decoder.head()?;
+    if major != 5 || count == u64::MAX {
+        return None;
+    }
+    let mut dcid = None;
+    let mut revision = None;
+    for _ in 0..count {
+        match decoder.uint()? {
+            FIELD_REMOVE_DCID => dcid = Some(ConnectionId::new(decoder.uint()?)?),
+            FIELD_REMOVE_REVISION => revision = Some(decoder.uint()?),
+            _ => decoder.skip()?,
+        }
+    }
+    decoder.is_finished().then_some((dcid?, revision?))
+}
+
+/// Encode a `relay.rm` stream request. The response uses the normal tagged
+/// envelope and a boolean result body (`true` removed, `false` already absent).
+pub fn encode_remove_request(
+    dcid: ConnectionId,
+    revision: u64,
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut encoder = Encoder::new(out);
+    encoder.map(4)?;
+    encoder.uint(1)?;
+    encoder.uint(RELAY_COMPONENT)?;
+    encoder.uint(2)?;
+    encoder.uint(RELAY_REMOVE)?;
+    encoder.uint(3)?;
+    encoder.uint(id)?;
+    encoder.uint(5)?;
+    encoder.map(2)?;
+    put_uint(&mut encoder, FIELD_REMOVE_DCID, dcid.value())?;
+    put_uint(&mut encoder, FIELD_REMOVE_REVISION, revision)?;
+    Some(encoder.len())
 }
 
 pub fn decode_record(record: Record<'_>) -> Option<Request> {
@@ -898,7 +944,7 @@ pub fn decode_record(record: Record<'_>) -> Option<Request> {
                     },
                     route: RelayRoute {
                         next_hop: fields.next_hop?,
-                        outbound_dcid: ConnectionId::new(fields.outbound_dcid?)?,
+                        destination: relay_destination(fields.outbound_dcid)?,
                     },
                     position,
                 })
@@ -915,6 +961,15 @@ pub fn decode_record(record: Record<'_>) -> Option<Request> {
 
 fn nonzero(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
+}
+
+fn relay_destination(value: Option<u64>) -> Option<quic_lite::ForwardDestination> {
+    match value {
+        None => Some(quic_lite::ForwardDestination::Bootstrap),
+        Some(value) => ConnectionId::new(value)
+            .filter(|cid| cid.value() != 0)
+            .map(quic_lite::ForwardDestination::Connection),
+    }
 }
 
 #[derive(Default)]
@@ -956,12 +1011,15 @@ fn decode_fields(encoded: &[u8]) -> Option<Fields> {
     decoder.is_finished().then_some(fields)
 }
 
-/// Encode a setup request for either a direct DCID-zero message or a normal
-/// stream handler. The outer transport selects the delivery semantics.
+/// Encode a relay setup request for its normal QUIC stream handler.
 pub fn encode_request(request: Request, id: Option<u64>, out: &mut [u8]) -> Option<usize> {
-    let field_count = 3 + request
-        .rule
-        .map_or(0, |rule| 3 + usize::from(rule.proposed_dcid.is_some()));
+    let field_count = 3 + request.rule.map_or(0, |rule| {
+        2 + usize::from(rule.proposed_dcid.is_some())
+            + usize::from(matches!(
+                rule.route.destination,
+                quic_lite::ForwardDestination::Connection(_)
+            ))
+    });
     let mut encoder = Encoder::new(out);
     encoder.map(if id.is_some() { 4 } else { 3 })?;
     encoder.uint(1)?;
@@ -986,11 +1044,9 @@ pub fn encode_request(request: Request, id: Option<u64>, out: &mut [u8]) -> Opti
             put_uint(&mut encoder, FIELD_PROPOSED_DCID, dcid.value())?;
         }
         put_uint(&mut encoder, FIELD_NEXT_HOP, rule.route.next_hop)?;
-        put_uint(
-            &mut encoder,
-            FIELD_OUTBOUND_DCID,
-            rule.route.outbound_dcid.value(),
-        )?;
+        if let quic_lite::ForwardDestination::Connection(dcid) = rule.route.destination {
+            put_uint(&mut encoder, FIELD_OUTBOUND_DCID, dcid.value())?;
+        }
         put_uint(&mut encoder, FIELD_POSITION, u64::from(rule.position))?;
     }
     Some(encoder.len())
@@ -1010,7 +1066,14 @@ pub fn encode_pair_request(request: PairRequest, id: Option<u64>, out: &mut [u8]
         encoder.uint(id)?;
     }
     encoder.uint(5)?;
-    encoder.map(12)?;
+    let pair_destination_fields = usize::from(matches!(
+        forward.route.destination,
+        quic_lite::ForwardDestination::Connection(_)
+    )) + usize::from(matches!(
+        reverse.route.destination,
+        quic_lite::ForwardDestination::Connection(_)
+    ));
+    encoder.map((10 + pair_destination_fields) as u64)?;
     put_uint(&mut encoder, FIELD_ALLOCATION, request.forward.allocation)?;
     put_uint(&mut encoder, FIELD_REVISION, request.forward.revision)?;
     put_uint(
@@ -1019,11 +1082,9 @@ pub fn encode_pair_request(request: PairRequest, id: Option<u64>, out: &mut [u8]
         forward.proposed_dcid?.value(),
     )?;
     put_uint(&mut encoder, FIELD_NEXT_HOP, forward.route.next_hop)?;
-    put_uint(
-        &mut encoder,
-        FIELD_OUTBOUND_DCID,
-        forward.route.outbound_dcid.value(),
-    )?;
+    if let quic_lite::ForwardDestination::Connection(dcid) = forward.route.destination {
+        put_uint(&mut encoder, FIELD_OUTBOUND_DCID, dcid.value())?;
+    }
     put_uint(&mut encoder, FIELD_POSITION, u64::from(forward.position))?;
     put_uint(
         &mut encoder,
@@ -1041,11 +1102,9 @@ pub fn encode_pair_request(request: PairRequest, id: Option<u64>, out: &mut [u8]
         reverse.proposed_dcid?.value(),
     )?;
     put_uint(&mut encoder, FIELD_REVERSE_NEXT_HOP, reverse.route.next_hop)?;
-    put_uint(
-        &mut encoder,
-        FIELD_REVERSE_OUTBOUND_DCID,
-        reverse.route.outbound_dcid.value(),
-    )?;
+    if let quic_lite::ForwardDestination::Connection(dcid) = reverse.route.destination {
+        put_uint(&mut encoder, FIELD_REVERSE_OUTBOUND_DCID, dcid.value())?;
+    }
     put_uint(
         &mut encoder,
         FIELD_REVERSE_POSITION,
@@ -1062,10 +1121,7 @@ fn put_uint(encoder: &mut Encoder<'_>, key: u64, value: u64) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quic_lite::{
-        DcidIngress, DcidRegistry, ForwardRule, ShortHeader, decode_direct_packet,
-        encode_direct_packet, encode_one_way_packet, rewrite_dcid,
-    };
+    use quic_lite::{DcidRegistry, ForwardRule, rewrite_dcid};
 
     #[test]
     fn now_next_hop_handle_round_trips_and_rejects_group_addresses() {
@@ -1079,6 +1135,49 @@ mod tests {
         let udp = udp6_next_hop_handle(0x1234).unwrap();
         assert_eq!(udp6_next_hop_token(udp), Some(0x1234));
         assert_eq!(udp6_next_hop_handle(0), None);
+    }
+
+    #[test]
+    fn relay_list_request_and_active_projection_hide_internal_storage() {
+        let mut wire = [0u8; 32];
+        let used =
+            crate::tagged::encode_numeric_empty_request(RELAY_COMPONENT, RELAY_LIST, 41, &mut wire)
+                .unwrap();
+        assert_eq!(decode_list_record(decode(&wire[..used]).unwrap()), Some(41));
+
+        let mut state = RelayState::<u64, 2>::new();
+        state
+            .reconcile(
+                Request {
+                    allocation: 7,
+                    revision: 3,
+                    rule: Some(DesiredRule {
+                        proposed_dcid: ConnectionId::new(82),
+                        route: RelayRoute {
+                            next_hop: 0x1234,
+                            destination: quic_lite::ForwardDestination::Connection(
+                                ConnectionId::new(16).unwrap(),
+                            ),
+                        },
+                        position: 1,
+                    }),
+                },
+                Some,
+            )
+            .unwrap();
+        assert_eq!(state.active_len(), 1);
+        let mut seen = None;
+        state
+            .visit_active(|dcid, handle, outbound, rev| seen = Some((dcid, handle, outbound, rev)));
+        assert_eq!(
+            seen,
+            Some((
+                ConnectionId::new(82).unwrap(),
+                0x1234,
+                quic_lite::ForwardDestination::Connection(ConnectionId::new(16).unwrap()),
+                3,
+            ))
+        );
     }
 
     #[derive(Default)]
@@ -1099,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_relay_setup_round_trips_without_quic_state() {
+    fn relay_setup_round_trips_as_a_tagged_stream_record() {
         let request = Request {
             allocation: 9,
             revision: 1,
@@ -1107,7 +1206,7 @@ mod tests {
                 proposed_dcid: Some(ConnectionId::relay_local(2, 1).unwrap()),
                 route: RelayRoute {
                     next_hop: 77,
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: quic_lite::ForwardDestination::Bootstrap,
                 },
                 position: 1,
             }),
@@ -1118,6 +1217,21 @@ mod tests {
         let mut handler = TestHandler::default();
         dispatch(&wire[..used], &mut handler).unwrap();
         assert_eq!(handler.0, Some(request));
+    }
+
+    #[test]
+    fn relay_destination_rejects_the_retired_numeric_zero_sentinel() {
+        assert_eq!(
+            relay_destination(None),
+            Some(quic_lite::ForwardDestination::Bootstrap)
+        );
+        assert_eq!(relay_destination(Some(0)), None);
+        assert_eq!(
+            relay_destination(Some(17)),
+            Some(quic_lite::ForwardDestination::Connection(
+                ConnectionId::new(17).unwrap()
+            ))
+        );
     }
 
     #[test]
@@ -1141,7 +1255,7 @@ mod tests {
                 proposed_dcid: None,
                 route: RelayRoute {
                     next_hop: 1,
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: quic_lite::ForwardDestination::Bootstrap,
                 },
                 position: 17,
             }),
@@ -1160,7 +1274,7 @@ mod tests {
                 proposed_dcid: None,
                 route: RelayRoute {
                     next_hop: 9,
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: quic_lite::ForwardDestination::Bootstrap,
                 },
                 position: 2,
             }),
@@ -1189,7 +1303,7 @@ mod tests {
                 proposed_dcid: None,
                 route: RelayRoute {
                     next_hop: 10,
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: quic_lite::ForwardDestination::Bootstrap,
                 },
                 position: 2,
             }),
@@ -1213,22 +1327,16 @@ mod tests {
 
     struct LocalNode {
         registry: DcidRegistry<(), usize, 4>,
-        next_response_packet: u32,
     }
 
     impl LocalNode {
         fn new() -> Self {
             Self {
                 registry: DcidRegistry::new(),
-                next_response_packet: 1,
             }
         }
 
-        /// Process a local DCID-zero relay setup packet and return its direct
-        /// correlated response. Replaying an identical request is accepted by
-        /// the unified registry without creating a second rule.
-        fn setup(&mut self, packet: &[u8]) -> Vec<u8> {
-            let (_, payload) = decode_direct_packet(packet).unwrap();
+        fn setup_stream(&mut self, payload: &[u8]) -> Vec<u8> {
             let record = crate::tagged::decode(payload).unwrap();
             let id = record.id.unwrap();
             let request = decode_request(payload).unwrap();
@@ -1245,12 +1353,12 @@ mod tests {
                     dcid,
                     ForwardRule {
                         next_hop: usize::try_from(route.next_hop).unwrap(),
-                        outbound_dcid: route.outbound_dcid,
+                        destination: route.destination,
                     },
                 )
                 .unwrap();
-            let mut response = [0; 32];
-            let response_len = crate::tagged::encode_numeric_response(
+            let mut response = vec![0; 32];
+            let used = crate::tagged::encode_numeric_response(
                 RELAY_COMPONENT,
                 RELAY_APPLY,
                 id,
@@ -1258,37 +1366,16 @@ mod tests {
                 &mut response,
             )
             .unwrap();
-            let mut direct = vec![0; 64];
-            let used = encode_direct_packet(
-                self.next_response_packet,
-                &response[..response_len],
-                &mut direct,
-            )
-            .unwrap();
-            self.next_response_packet += 1;
-            direct.truncate(used);
-            direct
-        }
-
-        fn forward(&self, packet: &[u8]) -> (usize, Vec<u8>) {
-            let prefix = ShortHeader::decode_prefix(packet).unwrap();
-            let DcidIngress::Forward(_, rule) = self.registry.ingress(prefix).unwrap() else {
-                panic!("test packet must select a forwarding rule")
-            };
-            let mut rewritten = vec![0; packet.len() + 8];
-            let used = rewrite_dcid(packet, rule.outbound_dcid, &mut rewritten).unwrap();
-            rewritten.truncate(used);
-            (rule.next_hop, rewritten)
+            response.truncate(used);
+            response
         }
     }
 
-    fn setup_packet(request: Request, id: u64) -> Vec<u8> {
-        let mut cbor = [0; 96];
-        let cbor_len = encode_request(request, Some(id), &mut cbor).unwrap();
-        let mut packet = vec![0; 128];
-        let used = encode_direct_packet(id as u32, &cbor[..cbor_len], &mut packet).unwrap();
-        packet.truncate(used);
-        packet
+    fn setup_record(request: Request, id: u64) -> Vec<u8> {
+        let mut record = vec![0; 96];
+        let used = encode_request(request, Some(id), &mut record).unwrap();
+        record.truncate(used);
+        record
     }
 
     #[test]
@@ -1300,7 +1387,7 @@ mod tests {
                 proposed_dcid: ConnectionId::new(17),
                 route: RelayRoute {
                     next_hop: now_next_hop_handle([2, 0, 0, 0, 0, 1]).unwrap(),
-                    outbound_dcid: ConnectionId::new(0).unwrap(),
+                    destination: quic_lite::ForwardDestination::Bootstrap,
                 },
                 position: 1,
             }),
@@ -1312,7 +1399,9 @@ mod tests {
                 proposed_dcid: ConnectionId::new(18),
                 route: RelayRoute {
                     next_hop: udp6_next_hop_handle(3339).unwrap(),
-                    outbound_dcid: ConnectionId::new(19).unwrap(),
+                    destination: quic_lite::ForwardDestination::Connection(
+                        ConnectionId::new(19).unwrap(),
+                    ),
                 },
                 position: 2,
             }),
@@ -1327,8 +1416,67 @@ mod tests {
         );
     }
 
-    fn assert_setup_response(packet: &[u8], expected_id: u64) {
-        let (_, payload) = decode_direct_packet(packet).unwrap();
+    #[test]
+    fn relay_remove_removes_both_pair_members_and_rejects_stale_reuse() {
+        let forward = Request {
+            allocation: 10,
+            revision: 4,
+            rule: Some(DesiredRule {
+                proposed_dcid: ConnectionId::new(82),
+                route: RelayRoute {
+                    next_hop: 1,
+                    destination: quic_lite::ForwardDestination::Bootstrap,
+                },
+                position: 1,
+            }),
+        };
+        let reverse = Request {
+            allocation: 11,
+            revision: 4,
+            rule: Some(DesiredRule {
+                proposed_dcid: ConnectionId::new(83),
+                route: RelayRoute {
+                    next_hop: 2,
+                    destination: quic_lite::ForwardDestination::Connection(
+                        ConnectionId::new(44).unwrap(),
+                    ),
+                },
+                position: 2,
+            }),
+        };
+        let mut state = RelayState::<u64, 2>::new();
+        state
+            .reconcile_pair(PairRequest { forward, reverse }, Some)
+            .unwrap();
+        assert!(state.uses_next_hop(1));
+        assert!(state.uses_next_hop(2));
+        assert_eq!(
+            state.remove_pair(ConnectionId::new(83).unwrap(), 3),
+            Err(ReconcileError::StaleRevision)
+        );
+        assert_eq!(
+            state.remove_pair(ConnectionId::new(83).unwrap(), 4),
+            Ok(true)
+        );
+        assert_eq!(state.active_len(), 0);
+        assert!(!state.uses_next_hop(1));
+        assert!(!state.uses_next_hop(2));
+        assert_eq!(
+            state.remove_pair(ConnectionId::new(82).unwrap(), 4),
+            Ok(false)
+        );
+
+        let mut wire = [0u8; 64];
+        let used = encode_remove_request(ConnectionId::new(82).unwrap(), 4, 51, &mut wire).unwrap();
+        let record = decode(&wire[..used]).unwrap();
+        assert_eq!(record.id, Some(51));
+        assert_eq!(
+            decode_remove_record(record),
+            Some((ConnectionId::new(82).unwrap(), 4))
+        );
+    }
+
+    fn assert_setup_response(payload: &[u8], expected_id: u64) {
         let record = crate::tagged::decode(payload).unwrap();
         assert_eq!(record.component, Some(Name::Tag(RELAY_COMPONENT)));
         assert_eq!(record.method, Some(Name::Tag(RELAY_APPLY)));
@@ -1337,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn four_local_nodes_install_retry_and_exchange_direct_messages_over_two_relays() {
+    fn four_local_nodes_install_relay_over_stream_and_reject_direct_messages() {
         // Node indexes are only local test egress handles: B=1, C=2, D=3.
         let mut b = LocalNode::new();
         let mut c = LocalNode::new();
@@ -1346,7 +1494,7 @@ mod tests {
         let c_return = ConnectionId::relay_local(3, 1).unwrap();
         let b_return = ConnectionId::relay_local(3, 2).unwrap();
 
-        let b_forward_setup = setup_packet(
+        let b_forward_setup = setup_record(
             Request {
                 allocation: 1,
                 revision: 1,
@@ -1354,20 +1502,20 @@ mod tests {
                     proposed_dcid: Some(b_forward),
                     route: RelayRoute {
                         next_hop: 2,
-                        outbound_dcid: c_forward,
+                        destination: quic_lite::ForwardDestination::Connection(c_forward),
                     },
                     position: 1,
                 }),
             },
             101,
         );
-        // A retry sees the same direct-message id and receives the same
+        // A retry sees the same stream request id and receives the same
         // correlated result without consuming a second B rule.
-        assert_setup_response(&b.setup(&b_forward_setup), 101);
-        assert_setup_response(&b.setup(&b_forward_setup), 101);
+        assert_setup_response(&b.setup_stream(&b_forward_setup), 101);
+        assert_setup_response(&b.setup_stream(&b_forward_setup), 101);
         assert_eq!(b.registry.len(), 1);
 
-        let c_forward_setup = setup_packet(
+        let c_forward_setup = setup_record(
             Request {
                 allocation: 2,
                 revision: 1,
@@ -1375,16 +1523,16 @@ mod tests {
                     proposed_dcid: Some(c_forward),
                     route: RelayRoute {
                         next_hop: 3,
-                        outbound_dcid: ConnectionId::new(0).unwrap(),
+                        destination: quic_lite::ForwardDestination::Bootstrap,
                     },
                     position: 2,
                 }),
             },
             102,
         );
-        assert_setup_response(&c.setup(&c_forward_setup), 102);
+        assert_setup_response(&c.setup_stream(&c_forward_setup), 102);
 
-        let c_return_setup = setup_packet(
+        let c_return_setup = setup_record(
             Request {
                 allocation: 3,
                 revision: 1,
@@ -1392,15 +1540,15 @@ mod tests {
                     proposed_dcid: Some(c_return),
                     route: RelayRoute {
                         next_hop: 1,
-                        outbound_dcid: b_return,
+                        destination: quic_lite::ForwardDestination::Connection(b_return),
                     },
                     position: 1,
                 }),
             },
             103,
         );
-        assert_setup_response(&c.setup(&c_return_setup), 103);
-        let b_return_setup = setup_packet(
+        assert_setup_response(&c.setup_stream(&c_return_setup), 103);
+        let b_return_setup = setup_record(
             Request {
                 allocation: 4,
                 revision: 1,
@@ -1408,46 +1556,33 @@ mod tests {
                     proposed_dcid: Some(b_return),
                     route: RelayRoute {
                         next_hop: 0,
-                        outbound_dcid: ConnectionId::new(0).unwrap(),
+                        destination: quic_lite::ForwardDestination::Bootstrap,
                     },
                     position: 2,
                 }),
             },
             104,
         );
-        assert_setup_response(&b.setup(&b_return_setup), 104);
+        assert_setup_response(&b.setup_stream(&b_return_setup), 104);
         assert_eq!(b.registry.len(), 2);
         assert_eq!(c.registry.len(), 2);
 
-        // A's ordinary bounded request enters B under B's local label. B and
-        // C only rewrite that label; D alone sees the final DCID-zero CBOR.
+        // Direct long-header messages are adjacent-only. A relay is installed
+        // over ordinary streams above, but it must not manufacture a DCID for
+        // a connectionless discovery/configuration record and forward it
+        // through B or C.
         let request = [0xa4, 1, 0x18, 99, 2, 1, 3, 0x18, 55, 5, 0xa0];
+        let mut direct_request = [0; 64];
+        let direct_request_len = crate::direct::ConnectionlessMessage::encode(
+            &request,
+            &mut direct_request,
+        )
+        .unwrap();
         let mut a_to_b = [0; 64];
-        let a_to_b_len = encode_one_way_packet(b_forward, 500, &request, &mut a_to_b).unwrap();
-        let (next, b_to_c) = b.forward(&a_to_b[..a_to_b_len]);
-        assert_eq!(next, 2);
-        let (next, c_to_d) = c.forward(&b_to_c);
-        assert_eq!(next, 3);
-        let (_, d_payload) = decode_direct_packet(&c_to_d).unwrap();
-        let d_request = crate::tagged::decode(d_payload).unwrap();
-        assert_eq!(d_request.id, Some(55));
-
-        // D's correlated direct response uses the independently installed
-        // return labels C -> B -> A.
-        let mut response = [0; 32];
-        let response_len =
-            crate::tagged::encode_numeric_response(99, 1, 55, &[0xf5], &mut response).unwrap();
-        let mut d_to_c = [0; 64];
-        let d_to_c_len =
-            encode_one_way_packet(c_return, 501, &response[..response_len], &mut d_to_c).unwrap();
-        let (next, c_to_b) = c.forward(&d_to_c[..d_to_c_len]);
-        assert_eq!(next, 1);
-        let (next, b_to_a) = b.forward(&c_to_b);
-        assert_eq!(next, 0);
-        let (_, a_payload) = decode_direct_packet(&b_to_a).unwrap();
-        let a_response = crate::tagged::decode(a_payload).unwrap();
-        assert_eq!(a_response.id, Some(55));
-        assert_eq!(a_response.result, Some(&[0xf5][..]));
+        assert_eq!(
+            rewrite_dcid(&direct_request[..direct_request_len], b_forward, &mut a_to_b),
+            Err(quic_lite::Error::Invalid)
+        );
     }
 
     struct LocalChainHandler {
@@ -1471,16 +1606,16 @@ mod tests {
             })
         }
 
-        fn exchange_direct(
+        fn exchange_stream(
             &mut self,
             relay: ChainNode,
             request: &[u8],
             response: &mut [u8],
         ) -> Result<usize, Self::Error> {
             let reply = if relay == self.b_node {
-                self.b.setup(request)
+                self.b.setup_stream(request)
             } else if relay == self.c_node {
-                self.c.setup(request)
+                self.c.setup_stream(request)
             } else {
                 return Err(());
             };
@@ -1532,32 +1667,5 @@ mod tests {
         );
         assert_eq!(handler.b.registry.len(), 2);
         assert_eq!(handler.c.registry.len(), 2);
-    }
-
-    #[test]
-    fn terminating_direct_dedup_replays_id_without_repeating_side_effect() {
-        // {1:5(component), 2:1(method), 3:77(id)}
-        let request = [0xa3, 1, 5, 2, 1, 3, 0x18, 77];
-        let mut cache = TerminatingDirectDedup::<2, 32>::new();
-        let mut response = [0; 32];
-        assert_eq!(
-            cache.check(10, &request, &mut response),
-            TerminatingDirectDedupResult::New
-        );
-        assert!(cache.store(10, &request, b"done"));
-
-        // A retry can have a fresh direct packet number but keeps its tagged
-        // record ID. Only a final handler uses the cached response.
-        assert_eq!(
-            cache.check(11, &request, &mut response),
-            TerminatingDirectDedupResult::Replay(4)
-        );
-        assert_eq!(&response[..4], b"done");
-
-        let conflicting = [0xa3, 1, 5, 2, 2, 3, 0x18, 77];
-        assert_eq!(
-            cache.check(12, &conflicting, &mut response),
-            TerminatingDirectDedupResult::Conflict
-        );
     }
 }
