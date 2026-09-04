@@ -24,3 +24,4 @@ notes
 /android/app-dmesh/src/main/jniLibs/
 *.so
 target
+3p

@@ -1544,7 +1544,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "chrono",
  "dmesh-rawnan",
  "dmesh-server",
@@ -1604,12 +1603,14 @@ name = "dmesh-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "hex",
  "libc",
  "quic-lite",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ssh-mesh",
  "tempfile",
  "tokio",
  "tracing",
@@ -3383,7 +3384,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "dmesh-rawnan",
  "dmesh-server",
  "libc",
@@ -3513,6 +3513,7 @@ dependencies = [
  "chrono",
  "clap",
  "libc",
+ "mesh-api",
  "minicbor",
  "nix 0.29.0",
  "parking_lot",
@@ -3524,6 +3525,13 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mesh-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -4770,6 +4778,11 @@ checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 [[package]]
 name = "quic-lite"
 version = "0.1.0"
+dependencies = [
+ "hmac 0.13.0",
+ "mesh-api",
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "quick-error"

@@ -79,7 +79,7 @@ tmux send-keys -t "$session":build 'source ./env.sh && scripts/build-fw.sh e6' E
 # Naming convention: build, DEVICE.uart, DEVICE.udp, and matrix.DESCRIPTION.
 # DEVICE.uart is interactive: it renders UART diagnostics and accepts commands
 # on stdin (status, services, log-watch 8, metrics, events, control,
-# iperf 65536, quit) without a second serial owner.
+# probe 65536, quit) without a second serial owner.
 tmux new-window -t "$session" -n e6.uart
 tmux send-keys -t "$session":e6.uart \
   'source ./env.sh && target/debug/dmesh-cli /dev/serial/by-id/<e6-serial> --watch --interactive --timeout-secs 300' Enter
@@ -277,8 +277,9 @@ For the lab host's Recovery network, install the separate
 `LMESH_INTERFACES` value to the AP interface, for example `wlan0`.
 `lmesh-wifi` owns the fixed open `DIRECT-dmesh` AP and the
 shared raw-NAN monitor on `wlan0` at startup. Do not run a separate hostapd or
-WPA/NAN control daemon. Use `mesh lmesh-wifi wifi.rawnan.status` and
-`mesh lmesh-wifi wifi.rawnan.ping` for bounded host tests.
+WPA/NAN control daemon. Use `mesh lmesh-wifi nan.status` for radio state and
+the bearer-neutral `mesh lmesh-wifi probe to=NODE` QUIC stream service for a
+bounded end-to-end test.
 
 The frequently rebuilt experimental `lmesh` service is separate: its
 `LMESH_INTERFACES` should be `wlan1`, and it starts the same raw-NAN monitor on
