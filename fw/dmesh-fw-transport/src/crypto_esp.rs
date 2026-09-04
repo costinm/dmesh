@@ -135,8 +135,7 @@ pub fn p256_sign(
                 .then_some(())?;
             let mut signature = [0u8; P256_SIGNATURE_LEN];
             (esp_idf_sys::mbedtls_mpi_write_binary(r, signature[..32].as_mut_ptr(), 32) == 0
-                && esp_idf_sys::mbedtls_mpi_write_binary(s, signature[32..].as_mut_ptr(), 32)
-                    == 0)
+                && esp_idf_sys::mbedtls_mpi_write_binary(s, signature[32..].as_mut_ptr(), 32) == 0)
                 .then_some(signature)
         })();
         esp_idf_sys::mbedtls_mpi_free(s);

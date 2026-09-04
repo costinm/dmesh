@@ -54,11 +54,8 @@ fn receive_raw_udp6(
     packet: &[u8],
     response: &mut [u8; dmesh_fw_transport::TRANSPORT_MTU],
 ) -> Option<usize> {
-    dmesh_fw_transport::recovery_runtime::receive_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: 1,
-            peer: peer.mac,
-        },
+    dmesh_fw_transport::recovery_runtime::receive_connection_frame(
+        dmesh_fw_transport::core_runtime::connection_path_id(1, peer.mac),
         packet,
         response,
     )
@@ -67,11 +64,8 @@ fn poll_raw_udp6(
     peer: dmesh_fw_transport::wifi_raw_udp6_esp::RawUdp6Peer,
     response: &mut [u8; dmesh_fw_transport::TRANSPORT_MTU],
 ) -> Option<usize> {
-    dmesh_fw_transport::recovery_runtime::poll_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: 1,
-            peer: peer.mac,
-        },
+    dmesh_fw_transport::recovery_runtime::poll_connection(
+        dmesh_fw_transport::core_runtime::connection_path_id(1, peer.mac),
         response,
     )
 }
@@ -80,24 +74,38 @@ fn receive_espnow(
     packet: &[u8],
     response: &mut [u8; dmesh_fw_transport::TRANSPORT_MTU],
 ) -> Option<usize> {
-    dmesh_fw_transport::recovery_runtime::receive_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: 2,
-            peer: peer.mac,
-        },
+    dmesh_fw_transport::recovery_runtime::receive_connection_frame(
+        dmesh_fw_transport::core_runtime::connection_path_id(2, peer.mac),
         packet,
         response,
     )
+}
+
+/// Inject one complete NOW-compatible action-frame payload into Main's shared
+/// QUIC connection. Monitor/NAN capture supplies only the adjacent peer fact;
+/// CID admission, bootstrap, stream dispatch, and active-path selection stay
+/// in `dmesh-fw-transport` with the UDP6 and UART paths.
+pub fn receive_espnow_frame(peer: [u8; 6], packet: &[u8]) -> bool {
+    let peer = dmesh_fw_transport::wifi_espnow_esp::EspNowPeer { mac: peer };
+    let mut response = [0u8; dmesh_fw_transport::TRANSPORT_MTU];
+    let ingress = dmesh_fw_transport::recovery_runtime::receive_connection_frame_ingress(
+        dmesh_fw_transport::core_runtime::connection_path_id(2, peer.mac),
+        packet,
+        &mut response,
+    );
+    if let Some(used) = ingress.response {
+        if used <= response.len() {
+            let _ = dmesh_fw_transport::wifi_espnow_esp::transmit(peer, &response[..used]);
+        }
+    }
+    ingress.accepted
 }
 fn poll_espnow(
     peer: dmesh_fw_transport::wifi_espnow_esp::EspNowPeer,
     response: &mut [u8; dmesh_fw_transport::TRANSPORT_MTU],
 ) -> Option<usize> {
-    dmesh_fw_transport::recovery_runtime::poll_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: 2,
-            peer: peer.mac,
-        },
+    dmesh_fw_transport::recovery_runtime::poll_connection(
+        dmesh_fw_transport::core_runtime::connection_path_id(2, peer.mac),
         response,
     )
 }

@@ -562,19 +562,12 @@ pub fn poll_callbacks(settings: &crate::components::settings::SharedSettings) {
             .ok()
             .and_then(|mut queue| queue.pop_front());
         let Some(event) = event else { break };
-        let published = super::action_stream::publish_module_event(
-            event.event_id,
-            event.value_type,
-            event.flags,
-            &event.payload,
-        );
         telemetry::record_log(format!(
-            "event type=module.structured_event id={} value_type={} flags={} payload_len={} published={}",
+            "event type=module.structured_event id={} value_type={} flags={} payload_len={}",
             event.event_id,
             event.value_type,
             event.flags,
-            event.payload.len(),
-            published
+            event.payload.len()
         ));
     }
 }

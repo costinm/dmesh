@@ -58,11 +58,16 @@ pub mod wifi_raw_udp6_esp;
 /// The one packet payload limit used by every bearer. A bearer that cannot
 /// carry this must reject it at bring-up; it must not fragment at this layer.
 pub const TRANSPORT_MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
-/// Static maximum for a raw bearer connection.  Both Recovery and Main use
-/// this same storage ceiling; the negotiated/request-scoped burst may lower
-/// active use, but no image gets a silently different transport profile.
-pub const RAW_SERVICE_HISTORY_CAPACITY: usize = 8;
-pub type RawService =
-    dmesh_server::raw_transport::RawService<RAW_SERVICE_HISTORY_CAPACITY, { TRANSPORT_MTU }>;
+/// Static maximum for one retained association's outstanding packet ledger.
+/// The negotiated/request-scoped burst may lower active use, but no image
+/// gets a silently different transport profile. Finished sequential streams
+/// release this ledger through normal bidirectional ACK traffic.
+pub const CONNECTION_HISTORY_CAPACITY: usize = 8;
+/// Maximum simultaneously live peer associations in Main.  Each entry owns
+/// its own bounded QUIC stream ledger; this is deliberately a firmware memory
+/// budget, not a bearer limit. UART, UDP6 and NOW all feed the same table.
+pub const MAX_QUIC_ASSOCIATIONS: usize = 4;
+pub type ConnectionServer =
+    dmesh_server::transport::ConnectionServer<CONNECTION_HISTORY_CAPACITY, { TRANSPORT_MTU }>;
 
 pub use profile::TransportProfile;

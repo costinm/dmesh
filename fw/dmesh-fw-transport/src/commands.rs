@@ -9,8 +9,6 @@
 
 extern crate alloc;
 
-use alloc::format;
-
 use dmesh_server::{
     connection::{self, ConnectionManager, ConnectionPolicy},
     control::{self, Handler, TransportConfig, TransportKind},
@@ -63,17 +61,13 @@ struct ProfileControl<'a> {
 
 /// Result of applying one control record to the fixed-size radio profile.
 ///
-/// A `transport.start` is a declaration of an immutable radio epoch, not an
+/// A `transport.set` is a declaration of an immutable radio epoch, not an
 /// imperative restart command.  Its Service Info may be repeated in multiple
 /// NAN DWs, so callers must replace Wi-Fi only when this result reports an
 /// actual profile change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlApplyResult {
-    pub transport_start: bool,
-    /// `transport.discover` is a one-shot presence request. It must not
-    /// replace the current radio epoch, but the Main owner uses this signal
-    /// to publish a fresh canonical announce on every live bearer.
-    pub transport_discover: bool,
+    pub transport_set: bool,
     pub changed: bool,
 }
 
@@ -88,29 +82,27 @@ impl Handler for ProfileControl<'_> {
         let Some(used) = crate::main_runtime::read_setting(key, &mut value) else {
             return Err(ProfileControlError::InvalidSetting);
         };
-        let key = core::str::from_utf8(key).map_err(|_| ProfileControlError::InvalidSetting)?;
-        let value =
-            core::str::from_utf8(&value[..used]).map_err(|_| ProfileControlError::Settings)?;
-        send_response(format!("settings {key}={value}").as_bytes());
+        // The correlated stream response is emitted by the tagged handler.
+        // Do not leak a second status record through UART/NOW merely because
+        // a setting happened to be read over a stream.
+        let _ = core::str::from_utf8(key).map_err(|_| ProfileControlError::InvalidSetting)?;
+        let _ = core::str::from_utf8(&value[..used]).map_err(|_| ProfileControlError::Settings)?;
         Ok(())
     }
 
     fn settings_set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
         if crate::main_runtime::write_binary_setting(key, value) {
-            send_response(b"binary setting updated; applies on next boot");
             return Ok(());
         }
         if let Some(secret_key) = key.strip_prefix(b"sec:") {
             if !crate::main_runtime::write_secret_setting(secret_key, value) {
                 return Err(ProfileControlError::InvalidSetting);
             }
-            send_response(b"settings updated; applies on next boot");
             return Ok(());
         }
         if !crate::main_runtime::write_setting(key, value) {
             return Err(ProfileControlError::InvalidSetting);
         }
-        send_response(b"settings updated; applies on next boot");
         Ok(())
     }
 
@@ -120,21 +112,19 @@ impl Handler for ProfileControl<'_> {
             let Some(used) = crate::main_runtime::read_setting(key, &mut value) else {
                 continue;
             };
-            let key = core::str::from_utf8(key).map_err(|_| ProfileControlError::Settings)?;
-            let value =
+            let _ = core::str::from_utf8(key).map_err(|_| ProfileControlError::Settings)?;
+            let _ =
                 core::str::from_utf8(&value[..used]).map_err(|_| ProfileControlError::Settings)?;
-            send_response(format!("settings {key}={value}").as_bytes());
         }
         for key in crate::main_runtime::secret_setting_keys() {
             if crate::main_runtime::secret_setting_exists(key) {
-                let key = core::str::from_utf8(key).map_err(|_| ProfileControlError::Settings)?;
-                send_response(format!("settings sec:{key}=<redacted>").as_bytes());
+                let _ = core::str::from_utf8(key).map_err(|_| ProfileControlError::Settings)?;
             }
         }
         Ok(())
     }
 
-    fn transport_start(
+    fn transport_set(
         &mut self,
         kind: TransportKind,
         config: TransportConfig<'_>,
@@ -200,13 +190,6 @@ impl Handler for ProfileControl<'_> {
             TransportKind::Uart => Err(ProfileControlError::Unsupported),
         }
     }
-
-    fn transport_stop(&mut self, kind: TransportKind) -> Result<(), Self::Error> {
-        let _ = kind;
-        // `transport.start mode=nan` is the complete declarative STA-off
-        // profile. A partial stop must not mutate radio state.
-        Err(ProfileControlError::Unsupported)
-    }
 }
 
 /// QUIC-lite owns this policy boundary, independently of bearer start/stop.
@@ -239,14 +222,12 @@ pub fn apply_control_record_result(
 ) -> Option<Result<ControlApplyResult, ProfileControlError>> {
     let request = control::decode_request(packet);
     if let Some(request) = request {
-        let transport_start = matches!(request, control::Request::TransportStart { .. });
-        let transport_discover = matches!(request, control::Request::TransportDiscover { .. });
+        let transport_set = matches!(request, control::Request::TransportSet { .. });
         let before = *params;
         return Some(
             control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
                 ControlApplyResult {
-                    transport_start,
-                    transport_discover,
+                    transport_set,
                     changed: *params != before,
                 }
             }),
@@ -256,9 +237,34 @@ pub fn apply_control_record_result(
     Some(
         connection::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
             ControlApplyResult {
-                transport_start: false,
-                transport_discover: false,
+                transport_set: false,
                 changed: false,
+            }
+        }),
+    )
+}
+
+/// Apply the sole mutable application-control record admitted on the direct
+/// plane.  Settings, stop/discover, connection policy, relay, and radio-lab
+/// records remain normal stream handlers even when their CBOR payload happens
+/// to fit in one datagram.
+///
+/// `TransportSet` is the Rust spelling for wire method `1/4` and the public
+/// contract and catalog call it `transport.set`.
+pub fn apply_direct_transport_set_record_result(
+    packet: &[u8],
+    params: &mut TransportProfile,
+) -> Option<Result<ControlApplyResult, ProfileControlError>> {
+    let request = control::decode_request(packet)?;
+    if !matches!(request, control::Request::TransportSet { .. }) {
+        return None;
+    }
+    let before = *params;
+    Some(
+        control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
+            ControlApplyResult {
+                transport_set: true,
+                changed: *params != before,
             }
         }),
     )
@@ -276,14 +282,12 @@ pub fn apply_control_record_decoded(
         return None;
     }
     if let Some(request) = control::decode_record(record) {
-        let transport_start = matches!(request, control::Request::TransportStart { .. });
-        let transport_discover = matches!(request, control::Request::TransportDiscover { .. });
+        let transport_set = matches!(request, control::Request::TransportSet { .. });
         let before = *params;
         return Some(
             control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
                 ControlApplyResult {
-                    transport_start,
-                    transport_discover,
+                    transport_set,
                     changed: *params != before,
                 }
             }),
@@ -293,8 +297,7 @@ pub fn apply_control_record_decoded(
     Some(
         connection::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
             ControlApplyResult {
-                transport_start: false,
-                transport_discover: false,
+                transport_set: false,
                 changed: false,
             }
         }),
@@ -336,6 +339,18 @@ pub fn encode_control_response_decoded(
 /// shared ingress worker through [`apply_control_record_result`].
 pub fn is_control_record(packet: &[u8]) -> bool {
     control::decode_request(packet).is_some() || connection::decode_request(packet).is_some()
+}
+
+/// True only for wire method `1/4`, published as `transport.set`.
+///
+/// This is the mutable application record admitted on the connectionless
+/// direct plane. The broader [`is_control_record`] remains for normal stream
+/// dispatch and must not be used by a direct bearer.
+pub fn is_direct_transport_set_record(packet: &[u8]) -> bool {
+    matches!(
+        control::decode_request(packet),
+        Some(control::Request::TransportSet { .. })
+    )
 }
 
 /// Response projection is shared with host tests; firmware only selects the
@@ -385,11 +400,7 @@ fn control_method(request: control::Request<'_>) -> u64 {
         control::Request::SettingsGet { .. } => control::SETTINGS_GET,
         control::Request::SettingsSet { .. } => control::SETTINGS_SET,
         control::Request::SettingsList => control::SETTINGS_LIST,
-        control::Request::TransportStart { .. } => control::TRANSPORT_START,
-        control::Request::TransportStop { .. } => control::TRANSPORT_STOP,
-        // Main currently leaves the discovery operation to the platform
-        // radio owner, but error responses must preserve its request method.
-        control::Request::TransportDiscover { .. } => control::TRANSPORT_DISCOVER,
+        control::Request::TransportSet { .. } => control::TRANSPORT_SET,
     }
 }
 
@@ -468,14 +479,11 @@ mod command_tests {
             b"test-psk"
         );
 
-        // {1: control, 2: transport.stop, 5: {1: sta}}
-        let stop_sta = [0xa3, 1, 1, 2, 5, 5, 0xa1, 1, 1];
-        assert_eq!(apply_control_record(&stop_sta, &mut params), Some(true));
         assert_eq!(params.requested_transport, None);
     }
 
     #[test]
-    fn repeated_nan_transport_start_is_an_idempotent_profile_declaration() {
+    fn repeated_nan_transport_set_is_an_idempotent_profile_declaration() {
         // {1: control, 2: transport.start, 5: {1: nan, 14: DW1}}
         // This is the same bounded CBOR payload that can arrive in more than
         // one active NAN Publish/Subscribe discovery window.
@@ -484,7 +492,7 @@ mod command_tests {
         assert_eq!(
             apply_control_record_result(&start_nan, &mut params),
             Some(Ok(ControlApplyResult {
-                transport_start: true,
+                transport_set: true,
                 changed: true,
             }))
         );
@@ -492,7 +500,7 @@ mod command_tests {
         assert_eq!(
             apply_control_record_result(&start_nan, &mut params),
             Some(Ok(ControlApplyResult {
-                transport_start: true,
+                transport_set: true,
                 changed: false,
             }))
         );
@@ -515,7 +523,7 @@ mod command_tests {
         assert_eq!(
             apply_control_record_result(&start_sta, &mut params),
             Some(Ok(ControlApplyResult {
-                transport_start: true,
+                transport_set: true,
                 changed: true,
             }))
         );
@@ -523,7 +531,7 @@ mod command_tests {
         assert_eq!(
             apply_control_record_result(&start_sta, &mut params),
             Some(Ok(ControlApplyResult {
-                transport_start: true,
+                transport_set: true,
                 changed: false,
             }))
         );

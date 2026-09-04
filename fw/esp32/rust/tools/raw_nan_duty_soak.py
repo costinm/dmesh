@@ -62,7 +62,7 @@ class DirectRadioClient:
                 str(ROOT / "scripts" / "with-env.sh"),
                 "dmesh-cli",
                 self.role,
-                "--command",
+                "--msg",
                 command,
                 "--timeout-secs",
                 str(limit),

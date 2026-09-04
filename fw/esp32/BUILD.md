@@ -70,13 +70,9 @@ and protocol path as it is extracted.
 
 Main and Recovery default to `wifi-raw-udp6` and `wifi-espnow`, using the same
 common transport code. There is no DMesh lwIP socket-transport feature;
-residual SDK linkage is acceptable. Diagnostic device-to-device clients remain
-lab-only so normal Main does not reserve their state:
-
-```bash
-DMESH_FW_FEATURES=e6-raw-udp6-iperf-lab scripts/build-fw.sh e6
-DMESH_FW_FEATURES=e6-espnow-iperf-lab scripts/build-fw.sh e6
-```
+residual SDK linkage is acceptable. Throughput diagnostics are provided by
+the ordinary QUIC `probe` stream handler, independent of the selected bearer;
+there are no raw-Wi-Fi throughput-service feature variants.
 
 Build the selected lab immediately before `scripts/flash-device.py e7 main`.
 The build wrapper tracks feature composition and invalidates incompatible

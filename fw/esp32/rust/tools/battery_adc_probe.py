@@ -25,7 +25,7 @@ def run_dmesh_cli_commands(port: str, commands: list[str], timeout: float) -> st
                 str(mesh),
                 "dmesh-cli",
                 port,
-                "--command",
+                "--msg",
                 command,
                 "--timeout-secs",
                 str(int(timeout)),

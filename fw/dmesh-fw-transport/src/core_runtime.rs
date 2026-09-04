@@ -10,8 +10,8 @@
 // private on purpose: Main selects *when* the profile takes effect, while this
 // module performs the paired association/dispatcher mutation atomically from
 // that single runtime task.
-static mut RAW_ASSOCIATION: dmesh_server::raw_transport::RawAssociation =
-    dmesh_server::raw_transport::RawAssociation::c6_default();
+static mut RAW_ASSOCIATION: quic_lite::AssociationProfile =
+    quic_lite::AssociationProfile::c6_default();
 
 /// Copy the committed profile for a Main policy effect. Called only by the
 /// Main event owner after it receives an explicit event; callbacks never keep
@@ -31,23 +31,21 @@ pub(crate) fn apply_uart_profile(enabled: bool) {
     #[cfg(not(target_arch = "riscv32"))]
     // Main's active personality promises a usable physical UART control
     // bearer. Keep its sole reader/writer enabled until an explicit
-    // `transport.start uart=off` profile replaces it; a short debug window
+    // `transport.set uart=off` profile replaces it; a short debug window
     // would leave boot waiting for an event that only UART could deliver.
     // C6 USB-JTAG deliberately takes the no-op branch above: it is a packet
     // transport/debug facility, not a power-gated UART bridge.
     crate::uart_esp::set_always_on(enabled);
 }
 
-fn raw_association(
-    profile: &crate::TransportProfile,
-) -> dmesh_server::raw_transport::RawAssociation {
-    let window = crate::RAW_SERVICE_HISTORY_CAPACITY;
+fn raw_association(profile: &crate::TransportProfile) -> quic_lite::AssociationProfile {
+    let window = crate::CONNECTION_HISTORY_CAPACITY;
     let tx_burst_packets = if profile.tx_burst_packets == 0 {
         window
     } else {
         usize::from(profile.tx_burst_packets)
     };
-    dmesh_server::raw_transport::RawAssociation {
+    quic_lite::AssociationProfile {
         history_packets: window,
         ack_frequency: if profile.ack_frequency == 0 {
             8
@@ -65,7 +63,7 @@ fn raw_association(
         // paced egress setting cannot deadlock OPEN/ACK progress.
         initial_window_packets: window,
     }
-    .clamp::<{ crate::RAW_SERVICE_HISTORY_CAPACITY }>()
+    .clamp::<{ crate::CONNECTION_HISTORY_CAPACITY }>()
 }
 
 /// Construct the association used by the packet-at-a-time action bearer.
@@ -78,126 +76,111 @@ fn raw_association(
 /// stream packet. It is an association admission limit, not a polling loop.
 ///
 /// Main calls this only at explicit NAN/NOW epoch boundaries. It changes no
-/// Wi-Fi callback or hardware state; it simply gives the shared raw service
+/// Wi-Fi callback or hardware state; it simply gives the shared connection
 /// the matching QUIC-lite contract before an action frame constructs it.
-pub fn espnow_association(
-    profile: &crate::TransportProfile,
-) -> dmesh_server::raw_transport::RawAssociation {
+pub fn espnow_association(profile: &crate::TransportProfile) -> quic_lite::AssociationProfile {
     // Keep one immediate ACK per packet, but admit the complete bounded C6
     // initial flight. This is set only at an explicit NAN/NOW epoch boundary,
     // before a new association is admitted; it creates neither a timer tick
     // nor an adapter-private egress queue.
-    let mut association = dmesh_server::raw_transport::RawAssociation::c6_default();
+    let mut association = quic_lite::AssociationProfile::c6_default();
     association.ack_frequency = 1;
     if profile.ack_delay_ms != 0 {
         association.ack_delay_ms = profile.ack_delay_ms;
     }
-    association.clamp::<{ crate::RAW_SERVICE_HISTORY_CAPACITY }>()
+    association.clamp::<{ crate::CONNECTION_HISTORY_CAPACITY }>()
 }
 
-type RawServiceDispatcher = dmesh_server::raw_transport::RawServiceDispatcher<
-    { crate::RAW_SERVICE_HISTORY_CAPACITY },
+type ConnectionDispatcher = dmesh_server::transport::ConnectionDispatcher<
+    { crate::CONNECTION_HISTORY_CAPACITY },
     { crate::TRANSPORT_MTU },
+    { crate::MAX_QUIC_ASSOCIATIONS },
 >;
+
+/// Allocate an opaque connection path handle from adapter-owned metadata.
+/// Only this ESP integration decodes the handle back to a bearer address;
+/// QUIC retains and compares `PathId` without knowing its representation.
+pub const fn connection_path_id(transport_id: u8, peer: [u8; 6]) -> quic_lite::PathId {
+    let value = ((transport_id as u64) << 48)
+        | ((peer[0] as u64) << 40)
+        | ((peer[1] as u64) << 32)
+        | ((peer[2] as u64) << 24)
+        | ((peer[3] as u64) << 16)
+        | ((peer[4] as u64) << 8)
+        | peer[5] as u64;
+    match quic_lite::PathId::new(value) {
+        Some(path) => path,
+        None => panic!("ESP connection path must be nonzero"),
+    }
+}
+
+/// Decode only this platform adapter's opaque path handle for diagnostic
+/// rendering. QUIC-lite keeps the handle opaque and never learns a MAC,
+/// UART port, or raw-UDP tuple.
+pub(crate) const fn connection_path_transport(path: quic_lite::PathId) -> u8 {
+    (path.value() >> 48) as u8
+}
+
+pub(crate) const fn connection_path_peer(path: quic_lite::PathId) -> [u8; 6] {
+    let value = path.value();
+    [
+        (value >> 40) as u8,
+        (value >> 32) as u8,
+        (value >> 24) as u8,
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ]
+}
 
 // The service endpoint is shared by UART, raw UDP6, and ESP-NOW. Its
 // dispatcher/server metadata is fixed-size, so reserve it statically instead
 // of entering the ESP heap on the first received radio frame. The potentially
 // large QUIC ledger remains allocated by the service only after a valid OPEN.
-static mut RAW_SERVICE: core::mem::MaybeUninit<RawServiceDispatcher> =
+static mut CONNECTION_DISPATCHER: core::mem::MaybeUninit<ConnectionDispatcher> =
     core::mem::MaybeUninit::uninit();
-static RAW_SERVICE_READY: core::sync::atomic::AtomicBool =
+static CONNECTION_DISPATCHER_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// Last server-side raw-QUIC parsing error. Client errors are already exposed
 /// by the action adapter; this scalar closes the diagnostic gap when a peer
 /// receives OPEN_ACK but the server rejects its following stream request.
 /// It stores the portable compact error code, not packet bytes or state.
-static RAW_SERVICE_LAST_ERROR: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static CONNECTION_LAST_ERROR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Read the bounded raw-service error diagnostic for the radio snapshot.
-pub(crate) fn raw_service_last_error() -> u32 {
-    RAW_SERVICE_LAST_ERROR.load(core::sync::atomic::Ordering::Acquire)
+/// Read the bounded connection error diagnostic for the radio snapshot.
+pub(crate) fn connection_last_error() -> u32 {
+    CONNECTION_LAST_ERROR.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Return whether a NOW datagram belongs to the currently live shared server
-/// association. The action adapter uses this only when a local one-shot
-/// client is also draining against the same peer; routing by source MAC alone
-/// would otherwise discard the peer's ACK for this server. The dispatcher
-/// checks the ingress path and QUIC DCID without retaining the packet.
-pub(crate) fn raw_service_owns_espnow_packet(
-    peer: crate::wifi_espnow_esp::EspNowPeer,
-    packet: &[u8],
-) -> bool {
-    unsafe {
-        raw_service_if_ready().is_some_and(|service| {
-            service.owns_packet_for_path(
-                dmesh_server::raw_transport::IngressPath {
-                    transport_id: dmesh_server::transport_path::TransportId::NOW.0,
-                    peer: peer.mac,
-                },
-                packet,
-            )
-        })
+unsafe fn connection_dispatcher_mut() -> &'static mut ConnectionDispatcher {
+    if !CONNECTION_DISPATCHER_READY.load(core::sync::atomic::Ordering::Acquire) {
+        let mut dispatcher = ConnectionDispatcher::new(
+            // An empty Initial DCID means this is a new association. The
+            // shared dispatcher allocates a local, nonzero server CID instead
+            // of deriving QUIC state from a radio MAC.
+            quic_lite::ConnectionId::new(1).expect("one is a valid CID"),
+            quic_lite::ConnectionLimits::default(),
+            *core::ptr::addr_of!(RAW_ASSOCIATION),
+        );
+        // The dispatcher owns CID/restart behavior for UART, NOW, and UDP6.
+        // Bearer adapters never see the NVS-derived branch or reset framing.
+        dispatcher.set_stateless_reset_key(crate::main_runtime::stateless_reset_key());
+        core::ptr::addr_of_mut!(CONNECTION_DISPATCHER)
+            .write(core::mem::MaybeUninit::new(dispatcher));
+        CONNECTION_DISPATCHER_READY.store(true, core::sync::atomic::Ordering::Release);
     }
+    &mut *core::ptr::addr_of_mut!(CONNECTION_DISPATCHER).cast::<ConnectionDispatcher>()
 }
 
-unsafe fn raw_service_mut() -> &'static mut RawServiceDispatcher {
-    if !RAW_SERVICE_READY.load(core::sync::atomic::Ordering::Acquire) {
-        core::ptr::addr_of_mut!(RAW_SERVICE).write(core::mem::MaybeUninit::new(
-            RawServiceDispatcher::new(
-                // DCID zero in the bootstrap OPEN means that the peer did
-                // not request a server CID. The shared dispatcher allocates
-                // a local, nonzero counter value instead of deriving QUIC
-                // state from a radio MAC.
-                quic_lite::ConnectionId::new(1).expect("one is a valid CID"),
-                quic_lite::ConnectionLimits::default(),
-                *core::ptr::addr_of!(RAW_ASSOCIATION),
-            ),
-        ));
-        RAW_SERVICE_READY.store(true, core::sync::atomic::Ordering::Release);
-    }
-    &mut *core::ptr::addr_of_mut!(RAW_SERVICE).cast::<RawServiceDispatcher>()
-}
-
-unsafe fn raw_service_if_ready() -> Option<&'static mut RawServiceDispatcher> {
-    RAW_SERVICE_READY
+unsafe fn connection_dispatcher_if_ready() -> Option<&'static mut ConnectionDispatcher> {
+    CONNECTION_DISPATCHER_READY
         .load(core::sync::atomic::Ordering::Acquire)
-        .then(|| &mut *core::ptr::addr_of_mut!(RAW_SERVICE).cast::<RawServiceDispatcher>())
+        .then(|| {
+            &mut *core::ptr::addr_of_mut!(CONNECTION_DISPATCHER).cast::<ConnectionDispatcher>()
+        })
 }
 
-/// End the current raw-radio association before replacing its profile.
-///
-/// A UART control that changes raw pacing or pre-association receive policy
-/// cannot leave a dispatcher carrying the old ACK/burst contract. The
-/// hardware callback has already been stopped at this point, and the shared
-/// ingress worker is its sole caller, so dropping here releases any old
-/// connection ledger before the next STA association constructs a fresh one.
-unsafe fn reset_raw_service_unchecked() {
-    // A live NOW responder owns a bounded management-receive lease while it
-    // waits for the peer's ACK. Profile replacement is an explicit terminal
-    // transition, so release that lease before discarding the dispatcher; it
-    // must never survive into UART, UDP6, or the next radio epoch.
-    crate::wifi_nan_dw_capture_esp::end_now_service_receive_lease();
-    if RAW_SERVICE_READY.swap(false, core::sync::atomic::Ordering::AcqRel) {
-        unsafe {
-            core::ptr::drop_in_place(
-                core::ptr::addr_of_mut!(RAW_SERVICE).cast::<RawServiceDispatcher>(),
-            );
-        }
-    }
-}
-
-/// Forget the bounded raw service before a radio epoch is replaced.
-///
-/// Called by Main only while handling a serialized profile/lifecycle event.
-/// It is not a periodic operation and cannot race a radio callback: callers
-/// stop the relevant bearer callback before invoking it.
-pub(crate) fn reset_raw_service() {
-    unsafe { reset_raw_service_unchecked() }
-}
-
-/// Install the association defaults that the next raw service will use.
+/// Install the association defaults that the next connection will use.
 ///
 /// Called once during a STA/raw-radio start transition, before the receive
 /// callback can construct a dispatcher.  Returning the burst limit keeps the
@@ -210,7 +193,7 @@ pub(crate) fn prepare_raw_association(profile: &crate::TransportProfile) -> usiz
 }
 
 /// Install the action-bearer association at an explicit NAN/NOW epoch
-/// boundary.  A previous raw service may have been reached over UART or
+/// boundary. A previous connection may have been reached over UART or
 /// UDP6, so replace it rather than letting an old eight-packet association
 /// survive into the packet-at-a-time action path. The physical bearer is not
 /// touched here; callers have already serialized the radio transition.
@@ -218,20 +201,20 @@ pub(crate) fn prepare_espnow_association(profile: &crate::TransportProfile) -> u
     unsafe {
         RAW_ASSOCIATION = espnow_association(profile);
         let association = RAW_ASSOCIATION;
-        // The raw-service dispatcher controls QUIC admission, whereas the
+        // The connection dispatcher controls QUIC admission, whereas the
         // action adapter controls how many already-admitted datagrams one
         // callback turn submits. Keep the two values synchronized here at
         // the epoch boundary; otherwise a stale adapter default can create a
         // radio burst that contradicts the selected association profile.
         crate::wifi_espnow_esp::set_tx_burst_packets(association.tx_burst_packets);
-        if let Some(service) = raw_service_if_ready() {
-            service.replace_association(association);
+        if let Some(service) = connection_dispatcher_if_ready() {
+            service.set_association_defaults(association);
         }
         association.tx_burst_packets
     }
 }
 
-/// Replace the live raw service's association defaults without changing radio
+/// Replace the live connection's association defaults without changing radio
 /// state.  Main calls this only for an explicit ACK/burst profile transition;
 /// the raw callback never invokes it.  A not-yet-created dispatcher simply
 /// picks up the prepared defaults on its first valid OPEN.
@@ -239,73 +222,125 @@ pub(crate) fn replace_raw_association(profile: &crate::TransportProfile) -> usiz
     unsafe {
         RAW_ASSOCIATION = raw_association(profile);
         let association = RAW_ASSOCIATION;
-        if let Some(service) = raw_service_if_ready() {
-            service.replace_association(association);
+        if let Some(service) = connection_dispatcher_if_ready() {
+            service.set_association_defaults(association);
         }
         association.tx_burst_packets
     }
 }
 // Exactly one device-initiated object transfer may be active for the current
-// one-association raw service. The state is allocated only after a validated
+// one-association connection. The state is allocated only after a validated
 // `flash` request; it is not a bearer queue and owns no copy of object data.
 static mut FLASH_DOWNLOAD: Option<(
-    dmesh_server::raw_transport::IngressPath,
+    quic_lite::PathId,
     alloc::boxed::Box<crate::flash::SignedObjectFlashDownload>,
 )> = None;
 // PPP needs a response buffer while its callback sends an immediate ACK. It
 // is allocated only after the first valid UART service packet; this is bearer
 // scratch, not a second QUIC ledger or egress queue.
 static mut UART_SERVICE_RESPONSE: Option<alloc::boxed::Box<[u8; crate::TRANSPORT_MTU]>> = None;
-/// Scratch for the typed raw-service deadline event. The shared ingress task
+/// Scratch for the typed connection deadline event. The shared ingress task
 /// is its only user, exactly like normal raw ingress, so this adds neither a
 /// bearer queue nor a second packet pool allocation.
-static mut RAW_SERVICE_TIMER_RESPONSE: [u8; crate::TRANSPORT_MTU] = [0; crate::TRANSPORT_MTU];
+static mut CONNECTION_TIMER_RESPONSE: [u8; crate::TRANSPORT_MTU] = [0; crate::TRANSPORT_MTU];
 
-pub fn receive_raw_service(
-    path: dmesh_server::raw_transport::IngressPath,
+/// Opaque result of injecting one complete bearer frame into the shared QUIC
+/// association owner.  A bearer may use `accepted` for local accounting, but
+/// it must not derive that fact by decoding a QUIC header itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionFrameIngress {
+    pub accepted: bool,
+    pub response: Option<usize>,
+}
+
+pub fn receive_connection_frame(
+    path: quic_lite::PathId,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
+    receive_connection_frame_ingress(path, packet, response).response
+}
+
+/// Submit a complete frame plus its opaque path handle to the single
+/// association owner.  This is the only firmware-facing API that reports
+/// admission; Wi-Fi/NOW/UART adapters must not parse or peek at QUIC framing
+/// to recreate the result.
+pub fn receive_connection_frame_ingress(
+    path: quic_lite::PathId,
+    packet: &[u8],
+    response: &mut [u8; crate::TRANSPORT_MTU],
+) -> ConnectionFrameIngress {
     unsafe {
         let download_slot = core::ptr::addr_of_mut!(FLASH_DOWNLOAD);
         if let Some((download_path, download)) = (*download_slot).as_mut() {
+            if *download_path == path && download.is_peer_stateless_reset(packet) {
+                // A peer restart invalidates the object server's CID/table.
+                // Flash is a mutation: discard this incomplete client rather
+                // than replaying it on a fresh association. The common
+                // quic-lite branch recognized the opaque token; UART/NOW/UDP
+                // ingress did not parse it.
+                *download_slot = None;
+                CONNECTION_LAST_ERROR.store(
+                    quic_lite::receive_error_code(quic_lite::Error::PeerRestarted) as u32,
+                    core::sync::atomic::Ordering::Release,
+                );
+                crate::commands::send_response(b"flash download aborted: peer restarted");
+                return ConnectionFrameIngress {
+                    accepted: true,
+                    response: None,
+                };
+            }
             if *download_path == path && download.accepts(packet) {
                 let response = download.receive(packet, response).ok().flatten();
                 finish_flash_download();
-                return response;
+                return ConnectionFrameIngress {
+                    accepted: true,
+                    response,
+                };
             }
         }
-        let service = raw_service_mut();
+        let service = connection_dispatcher_mut();
         service.set_time(esp_idf_sys::esp_timer_get_time().max(0) as u64);
-        let result = match service.receive(path, packet, response) {
+        // Component handlers execute synchronously inside `receive`. Give
+        // them a pre-dispatch association snapshot rather than allowing a
+        // diagnostic handler to re-enter this mutable shared owner.
+        let connection_status = service.active_connection_status();
+        let last_close_at = service.last_close_at();
+        let receive =
+            crate::relay_main::with_connection_status(connection_status, last_close_at, || {
+                service.receive(path, packet, response)
+            });
+        let (accepted, result) = match receive {
             Ok(value) => match service.take_flash_request() {
-                Some(request) => begin_flash_download(service, path, request, response, value),
-                None => value,
+                Some(request) => (
+                    true,
+                    begin_flash_download(service, path, request, response, value),
+                ),
+                None => (true, value),
             },
             Err(error) => {
-                RAW_SERVICE_LAST_ERROR.store(
-                    dmesh_server::raw_transport::receive_error_code(error) as u32,
+                CONNECTION_LAST_ERROR.store(
+                    quic_lite::receive_error_code(error) as u32,
                     core::sync::atomic::Ordering::Release,
                 );
-                // Preserve the offending wire DCID beside the compact error
-                // code.  This is essential when a relay learns the server
-                // CID during bootstrap and subsequently rewrites its forward
-                // rule: `WrongConnectionId` alone cannot distinguish a stale
-                // relay translation from a receiver-side association change.
-                if let Ok((header, _)) = quic_lite::ShortHeader::decode(packet) {
-                    crate::commands::send_stat(b"raw service dcid=", header.dcid.value());
+                // Preserve connection-owned CID context beside the compact
+                // error code. The frame adapter deliberately does not decode
+                // QUIC headers or derive association state.
+                let diagnostic = service.connection_id_diagnostic(packet);
+                if let Some(received) = diagnostic.received {
+                    crate::commands::send_stat(b"connection dcid=", received.value());
                 }
-                if let Some(expected) = service.expected_receive_cid() {
-                    crate::commands::send_stat(b"raw service expected_dcid=", expected.value());
+                if let Some(expected) = diagnostic.expected {
+                    crate::commands::send_stat(b"connection expected_dcid=", expected.value());
                 }
                 crate::commands::send_stat(
-                    b"raw service error=",
-                    dmesh_server::raw_transport::receive_error_code(error) as u64,
+                    b"connection error=",
+                    quic_lite::receive_error_code(error) as u64,
                 );
-                None
+                (false, None)
             }
         };
-        if path.transport_id == dmesh_server::transport_path::TransportId::NOW.0 {
+        if connection_path_transport(path) == dmesh_server::transport_path::TransportId::NOW.0 {
             if service.reply_path() == Some(path) {
                 // The C6 continuous private action dispatcher sees the
                 // bootstrap reliably but not every later ACK. Hold the
@@ -326,20 +361,23 @@ pub fn receive_raw_service(
         // (or no) deadline and miss the connection-owned PTO until an
         // unrelated NAN event occurs. This marker only wakes Main to
         // recompute its one-shot timer; it neither polls nor sends here.
-        if path.transport_id == dmesh_server::transport_path::TransportId::NOW.0 {
-            crate::main_runtime::request_raw_service_deadline_recheck();
+        if connection_path_transport(path) == dmesh_server::transport_path::TransportId::NOW.0 {
+            crate::main_runtime::request_connection_deadline_recheck();
         }
-        result
+        ConnectionFrameIngress {
+            accepted,
+            response: result,
+        }
     }
 }
 
 /// Flash setup is cold and may construct a large receiver. Keep it out of the
-/// raw packet service frame so a normal UDP/NOW/UART IPERF packet does not
+/// raw packet service frame so a normal UDP/NOW/UART PROBE packet does not
 /// reserve the flash constructor's stack footprint.
 #[inline(never)]
 unsafe fn begin_flash_download(
-    service: &mut RawServiceDispatcher,
-    path: dmesh_server::raw_transport::IngressPath,
+    service: &mut ConnectionDispatcher,
+    path: quic_lite::PathId,
     request: alloc::vec::Vec<u8>,
     response: &mut [u8; crate::TRANSPORT_MTU],
     fallback: Option<usize>,
@@ -373,7 +411,7 @@ unsafe fn begin_flash_download(
 }
 
 /// Complete the original `flash` request only after the sink has committed
-/// all accepted blocks. The next normal raw-service poll emits this response.
+/// all accepted blocks. The next normal connection poll emits this response.
 unsafe fn finish_flash_download() {
     let download_slot = core::ptr::addr_of_mut!(FLASH_DOWNLOAD);
     let complete = (*download_slot)
@@ -383,13 +421,13 @@ unsafe fn finish_flash_download() {
         return;
     }
     *download_slot = None;
-    if let Some(service) = raw_service_if_ready() {
+    if let Some(service) = connection_dispatcher_if_ready() {
         let _ = service.complete_flash(alloc::vec::Vec::from(&b"flash complete"[..]));
     }
 }
 
-pub fn poll_raw_service(
-    path: dmesh_server::raw_transport::IngressPath,
+pub fn poll_connection(
+    path: quic_lite::PathId,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
     unsafe {
@@ -408,7 +446,7 @@ pub fn poll_raw_service(
                 }
             }
         }
-        let service = raw_service_if_ready()?;
+        let service = connection_dispatcher_if_ready()?;
         let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
         service.set_time(now_us);
         // Prefer endpoint-owned loss recovery over a fresh ACK/control frame:
@@ -428,11 +466,11 @@ pub fn poll_raw_service(
 /// microsecond clock.  Main converts that one value into a blocking queue
 /// timeout; this does not create a periodic radio service tick and leaves
 /// idle, UART, and UDP6 services entirely ingress-driven.
-pub(crate) fn raw_service_now_delay_ms() -> Option<u32> {
+pub(crate) fn connection_now_delay_ms() -> Option<u32> {
     unsafe {
-        let service = raw_service_if_ready()?;
+        let service = connection_dispatcher_if_ready()?;
         let path = service.reply_path()?;
-        if path.transport_id != dmesh_server::transport_path::TransportId::NOW.0 {
+        if connection_path_transport(path) != dmesh_server::transport_path::TransportId::NOW.0 {
             return None;
         }
         let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
@@ -451,31 +489,33 @@ pub(crate) fn raw_service_now_delay_ms() -> Option<u32> {
 /// Called only after Main's one-shot deadline; it does not touch the service
 /// directly because UART, UDP6, and NOW ingress all serialize that state on
 /// the packet worker.
-pub(crate) fn schedule_raw_service_now_timer() {
-    let _ = crate::shared_ingress_esp::schedule_raw_service_timer(service_raw_service_timer);
+pub(crate) fn schedule_connection_now_timer() {
+    let _ = crate::shared_ingress_esp::schedule_connection_timer(service_connection_timer);
 }
 
 /// Perform one server-side NOW PTO turn on the packet worker. The reply path
-/// comes from the accepted raw service packet, not from an adapter-private
+/// comes from the accepted connection packet, not from an adapter-private
 /// queue, so future multipath policy can replace this final transport match.
-fn service_raw_service_timer() {
+fn service_connection_timer() {
     unsafe {
-        let Some(service) = raw_service_if_ready() else {
+        let Some(service) = connection_dispatcher_if_ready() else {
             return;
         };
         let Some(path) = service.reply_path() else {
             return;
         };
-        if path.transport_id != dmesh_server::transport_path::TransportId::NOW.0 {
+        if connection_path_transport(path) != dmesh_server::transport_path::TransportId::NOW.0 {
             return;
         }
-        let response = &mut *core::ptr::addr_of_mut!(RAW_SERVICE_TIMER_RESPONSE);
-        let Some(used) = poll_raw_service(path, response) else {
+        let response = &mut *core::ptr::addr_of_mut!(CONNECTION_TIMER_RESPONSE);
+        let Some(used) = poll_connection(path, response) else {
             return;
         };
         if used <= response.len() {
             let _ = crate::wifi_espnow_esp::transmit_from_worker(
-                crate::wifi_espnow_esp::EspNowPeer { mac: path.peer },
+                crate::wifi_espnow_esp::EspNowPeer {
+                    mac: connection_path_peer(path),
+                },
                 &response[..used],
             );
         }
@@ -484,20 +524,70 @@ fn service_raw_service_timer() {
 
 /// Recovery is only the first consumer of this generic raw bearer.  Its
 /// handler contains no flash, Wi-Fi, or address policy: those stay outside
-/// the host-tested raw service and ESP adapter respectively.
+/// the host-tested connection and ESP adapter respectively.
 pub(crate) fn receive_raw_udp6(
     peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    receive_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: dmesh_server::transport_path::TransportId::UDP6.0,
-            peer: peer.mac,
-        },
+    receive_connection_frame(
+        connection_path_id(dmesh_server::transport_path::TransportId::UDP6.0, peer.mac),
         packet,
         response,
     )
+}
+
+/// Construct a bounded connectionless application packet at the shared QUIC
+/// dispatcher boundary. Physical UART/NOW/UDP adapters receive the completed
+/// packet only; they must never select a QUIC header or packet number.
+pub(crate) fn encode_connectionless_message(payload: &[u8], output: &mut [u8]) -> Option<usize> {
+    dmesh_server::direct::ConnectionlessMessage::encode(payload, output)
+}
+
+/// Terminate one connectionless UDP record after the bearer has supplied only
+/// its immutable path facts. Envelope and application classification belong
+/// here, alongside the shared connection dispatcher, rather than in Wi-Fi.
+pub(crate) fn receive_udp6_connectionless(
+    peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
+    packet: &[u8],
+    response: &mut [u8; crate::TRANSPORT_MTU],
+) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
+    if !dmesh_server::direct::ConnectionlessMessage::is_packet(packet) {
+        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
+    }
+    match dmesh_server::direct::ConnectionlessMessage::receive(
+        packet,
+        response,
+        |payload, response| {
+            if let Some(announce) = dmesh_server::announce::decode_announce(payload) {
+                crate::wifi_raw_udp6_esp::record_announce_peer(announce, peer.mac, peer.ip);
+                return dmesh_server::direct::ConnectionlessDisposition::Handled;
+            }
+            let mut response_len = 0;
+            if crate::main_runtime::receive_direct_request(payload, |record| {
+                if record.len() <= response.len() {
+                    response[..record.len()].copy_from_slice(record);
+                    response_len = record.len();
+                }
+            }) {
+                if response_len == 0 {
+                    dmesh_server::direct::ConnectionlessDisposition::Handled
+                } else {
+                    dmesh_server::direct::ConnectionlessDisposition::Response(response_len)
+                }
+            } else {
+                dmesh_server::direct::ConnectionlessDisposition::NotHandled
+            }
+        },
+    ) {
+        dmesh_server::direct::ConnectionlessDisposition::Response(used) => {
+            crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(used)
+        }
+        dmesh_server::direct::ConnectionlessDisposition::Handled => {
+            crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Handled
+        }
+        _ => crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected,
+    }
 }
 
 /// Main-only raw UDP6 entry point. A matching forwarding DCID is submitted to
@@ -508,51 +598,15 @@ pub(crate) fn receive_main_raw_udp6(
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    // Keep the UDP bearer probe below the relay and endpoint layers.  It is a
-    // DCID-zero ingress/egress diagnostic, not a QUIC-lite connection or a
-    // relay setup record, so treating it as either only produces a silent
-    // service miss.  This matches the host UDP service and lets dmesh-cli
-    // distinguish the raw STA bearer from later connection dispatch.
-    if let Some(used) = quic_lite::bearer_probe::udp_bearer_probe_response(packet, response) {
-        return Some(used);
-    }
-    // Direct control uses the same tagged record as UART/NAN/NOW.  UDP carries
-    // it in a DCID-zero packet so the host can ask its STA companion to emit
-    // an active discovery without first opening a stream.  Keep the reply in
-    // that direct packet too; a discovery response is an announce, while
-    // other commands return their normal correlated control envelope.
-    if let Ok((header, payload)) = quic_lite::decode_direct_packet(packet) {
-        let mut control_response = [0u8; crate::TRANSPORT_MTU];
-        let mut control_response_len = 0;
-        if crate::main_runtime::receive_common_control_record(payload, |record| {
-            if record.len() <= control_response.len() {
-                control_response[..record.len()].copy_from_slice(record);
-                control_response_len = record.len();
-            }
-        }) {
-            return (control_response_len != 0)
-                .then(|| {
-                    quic_lite::encode_direct_packet(
-                        header.packet_number,
-                        &control_response[..control_response_len],
-                        response,
-                    )
-                    .ok()
-                })
-                .flatten();
-        }
-    }
-    match crate::relay_main::apply_direct(
-        packet,
-        response,
-        Some(crate::relay_main::NextHop::Udp6 {
-            link: peer.link,
-            peer,
-        }),
-    ) {
-        dmesh_server::relay::DirectOutcome::Response(used) => return Some(used),
-        dmesh_server::relay::DirectOutcome::Handled => return None,
-        dmesh_server::relay::DirectOutcome::NotHandled => {}
+    // The connectionless long-header type carries only the shared direct allowlist: a directed discovery
+    // request/reply or a complete `transport.set` profile. A bearer probe is
+    // deliberately not a second diagnostic protocol; use directed discovery.
+    if dmesh_server::direct::ConnectionlessMessage::is_packet(packet) {
+        return match receive_udp6_connectionless(peer, packet, response) {
+            crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(used) => Some(used),
+            crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Handled
+            | crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected => None,
+        };
     }
     if crate::relay_main::forward(packet, response, |next_hop, payload| match next_hop {
         crate::relay_main::NextHop::Now(peer) => {
@@ -584,43 +638,56 @@ pub(crate) fn poll_raw_udp6(
     peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    poll_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: dmesh_server::transport_path::TransportId::UDP6.0,
-            peer: peer.mac,
-        },
+    poll_connection(
+        connection_path_id(dmesh_server::transport_path::TransportId::UDP6.0, peer.mac),
         response,
     )
 }
 
-/// The action bearer has its own bounded DCID table so an ESP-NOW test cannot
-/// steal an active UDP6 diagnostic connection. The application protocol is
-/// otherwise identical and stays in the host-tested raw service.
+/// Feed one complete ESP-NOW frame into the same connection dispatcher used
+/// by UART and UDP6. The latest valid ingress path selects the reply without
+/// replacing the logical connection or creating bearer-local DCID state.
 pub(crate) fn receive_espnow(
     peer: crate::wifi_espnow_esp::EspNowPeer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    // Presence is one-way shared CBOR, not a QUIC-lite datagram. Retain it
-    // before the action bearer reaches connection dispatch so unassociated
-    // NAN+NOW nodes keep the same bounded discovery view as STA/UDP6 nodes.
-    if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
-        crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, peer.mac);
-        return None;
+    // Direct records use the same DMesh QUIC long-header envelope over NOW as
+    // they do over UART and UDP6.  The action adapter supplies only peer MAC;
+    // direct classification and response framing stay here with connection
+    // dispatch.  A bare tagged record is never a direct packet on this path.
+    if dmesh_server::direct::ConnectionlessMessage::is_packet(packet) {
+        return match dmesh_server::direct::ConnectionlessMessage::receive(
+            packet,
+            response,
+            |payload, response| {
+                if let Some(announce) = dmesh_server::announce::decode_announce(payload) {
+                    crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, peer.mac);
+                    return dmesh_server::direct::ConnectionlessDisposition::Handled;
+                }
+                let mut response_len = 0;
+                if crate::main_runtime::receive_direct_request(payload, |record| {
+                    if record.len() <= response.len() {
+                        response[..record.len()].copy_from_slice(record);
+                        response_len = record.len();
+                    }
+                }) {
+                    if response_len == 0 {
+                        dmesh_server::direct::ConnectionlessDisposition::Handled
+                    } else {
+                        dmesh_server::direct::ConnectionlessDisposition::Response(response_len)
+                    }
+                } else {
+                    dmesh_server::direct::ConnectionlessDisposition::NotHandled
+                }
+            },
+        ) {
+            dmesh_server::direct::ConnectionlessDisposition::Response(used) => Some(used),
+            _ => None,
+        };
     }
-    // NOW uses the same tagged discovery/control record as NAN Service
-    // Discovery. Keep policy and announce generation in Main; only this
-    // bearer-specific closure chooses the directed action-frame reply.
-    if crate::main_runtime::receive_common_control_record(packet, |reply| {
-        let _ = crate::wifi_espnow_esp::transmit(peer, reply);
-    }) {
-        return None;
-    }
-    receive_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: dmesh_server::transport_path::TransportId::NOW.0,
-            peer: peer.mac,
-        },
+    receive_connection_frame(
+        connection_path_id(dmesh_server::transport_path::TransportId::NOW.0, peer.mac),
         packet,
         response,
     )
@@ -634,15 +701,6 @@ pub(crate) fn receive_main_espnow(
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    match crate::relay_main::apply_direct(
-        packet,
-        response,
-        Some(crate::relay_main::NextHop::Now(peer)),
-    ) {
-        dmesh_server::relay::DirectOutcome::Response(used) => return Some(used),
-        dmesh_server::relay::DirectOutcome::Handled => return None,
-        dmesh_server::relay::DirectOutcome::NotHandled => {}
-    }
     if crate::relay_main::forward(packet, response, |next_hop, payload| match next_hop {
         crate::relay_main::NextHop::Now(peer) => {
             crate::wifi_espnow_esp::transmit_from_worker(peer, payload)
@@ -656,21 +714,17 @@ pub(crate) fn receive_main_espnow(
     }) {
         return None;
     }
-    crate::relay_main::with_stream_ingress(
-        crate::relay_main::NextHop::Now(peer),
-        || receive_espnow(peer, packet, response),
-    )
+    crate::relay_main::with_stream_ingress(crate::relay_main::NextHop::Now(peer), || {
+        receive_espnow(peer, packet, response)
+    })
 }
 
 pub(crate) fn poll_espnow(
     peer: crate::wifi_espnow_esp::EspNowPeer,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    poll_raw_service(
-        dmesh_server::raw_transport::IngressPath {
-            transport_id: dmesh_server::transport_path::TransportId::NOW.0,
-            peer: peer.mac,
-        },
+    poll_connection(
+        connection_path_id(dmesh_server::transport_path::TransportId::NOW.0, peer.mac),
         response,
     )
 }
@@ -690,11 +744,8 @@ pub(crate) fn receive_uart_ingress(_item: crate::shared_ingress_esp::IngressPack
         let Some(response) = (*slot).as_mut() else {
             return;
         };
-        let path = dmesh_server::raw_transport::IngressPath {
-            transport_id: dmesh_server::transport_path::TransportId::UART.0,
-            peer: [0; 6],
-        };
-        let immediate = receive_raw_service(path, packet, response);
+        let path = connection_path_id(dmesh_server::transport_path::TransportId::UART.0, [0; 6]);
+        let immediate = receive_connection_frame(path, packet, response);
         pump_uart_egress(path, response, immediate);
     }
 }
@@ -712,7 +763,7 @@ pub(crate) fn schedule_uart_egress_ready() {
 /// Continue a UART service only after its physical writer reports capacity.
 ///
 /// Called once for each coalesced dequeue edge, not periodically. It respects
-/// the actual queue vacancy before calling `poll_raw_service`: polling an
+/// the actual queue vacancy before calling `poll_connection`: polling an
 /// endpoint that cannot submit would otherwise consume a ledger packet and
 /// leave it waiting for a retransmission that no UART timer owns.
 fn service_uart_egress_ready() {
@@ -720,10 +771,7 @@ fn service_uart_egress_ready() {
         let Some(response) = (*core::ptr::addr_of_mut!(UART_SERVICE_RESPONSE)).as_mut() else {
             return;
         };
-        let path = dmesh_server::raw_transport::IngressPath {
-            transport_id: dmesh_server::transport_path::TransportId::UART.0,
-            peer: [0; 6],
-        };
+        let path = connection_path_id(dmesh_server::transport_path::TransportId::UART.0, [0; 6]);
         pump_uart_egress(path, response, None);
     }
 }
@@ -735,7 +783,7 @@ fn service_uart_egress_ready() {
 /// it produces a datagram, so capacity must be checked before polling rather
 /// than treating a failed enqueue as ordinary packet loss.
 fn pump_uart_egress(
-    path: dmesh_server::raw_transport::IngressPath,
+    path: quic_lite::PathId,
     response: &mut [u8; crate::TRANSPORT_MTU],
     immediate: Option<usize>,
 ) {
@@ -744,11 +792,11 @@ fn pump_uart_egress(
     if credit == 0 {
         return;
     }
-    let _ = dmesh_server::raw_transport::pump_egress(
+    let _ = dmesh_server::transport::pump_egress(
         response,
         credit,
         immediate,
-        |response| poll_raw_service(path, response),
+        |response| poll_connection(path, response),
         crate::uart_esp::send_transport_packet,
     );
 }

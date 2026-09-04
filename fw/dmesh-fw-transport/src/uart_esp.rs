@@ -198,8 +198,9 @@ pub unsafe fn start_l2_task() -> bool {
 }
 
 /// Start the common UART/USB pool, handlers and L2 task after
-/// `install_l2_driver`. Both marked QUIC-lite datagrams and unmarked raw
-/// records are admitted to the common pool; only application callbacks differ.
+/// `install_l2_driver`. Both marked QUIC-lite datagrams and unmarked opaque
+/// direct packets are admitted to the common pool; only dispatcher callbacks
+/// differ. The UART adapter does not decode either packet form.
 pub unsafe fn start_shared_l2(
     transport: crate::shared_ingress_esp::IngressHandler,
     raw: crate::shared_ingress_esp::IngressHandler,
@@ -756,10 +757,10 @@ pub fn send_transport_packet(packet: &[u8]) -> bool {
     accepted
 }
 
-/// Write one DCID-zero direct record through the physical PPP bearer. The
-/// adapter does not inspect CBOR, text, service tags, or command responses;
-/// it only gives bounded UART control the same QUIC-lite short header used by
-/// UDP. Bare CBOR remains receive-only compatibility for Stage2/Recovery.
+/// Write one private QUIC-lite direct payload through the physical PPP bearer.
+/// The adapter does not inspect CBOR, text, service tags, or command
+/// responses; it delegates the long-header envelope to the shared direct
+/// endpoint.
 pub fn send_direct_record(record: &[u8]) -> bool {
     #[cfg(not(target_arch = "riscv32"))]
     if !is_active() {
@@ -769,10 +770,24 @@ pub fn send_direct_record(record: &[u8]) -> bool {
         return false;
     }
     let mut packet = [0u8; UART_MAX_PACKET];
-    let Ok(used) = quic_lite::encode_direct_packet(0, record, &mut packet) else {
+    let Some(used) = crate::core_runtime::encode_connectionless_message(record, &mut packet) else {
         return false;
     };
     enqueue_uart_payload(UART_EGRESS_PPP, &packet[..used])
+}
+
+/// Write one already-encoded connectionless packet through PPP. This is the
+/// response half of the shared direct endpoint; UART remains a frame writer
+/// and must not create a second envelope around it.
+pub fn send_connectionless_packet(packet: &[u8]) -> bool {
+    #[cfg(not(target_arch = "riscv32"))]
+    if !is_active() {
+        return false;
+    }
+    if packet.is_empty() || packet.len() > UART_MAX_PACKET {
+        return false;
+    }
+    enqueue_uart_payload(UART_EGRESS_PPP, packet)
 }
 
 /// Queue one raw ASCII diagnostic line for the sole physical UART writer.
@@ -1153,12 +1168,11 @@ fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
         return;
     };
     for record in records {
-        // Stage2 and Recovery's direct maintenance controls remain
-        // CBOR-over-PPP. Transport-marked packets are deliberately not fed
-        // into that parser: their stream dispatch belongs to the shared
-        // transport runtime above this physical bearer.
+        // The marker selects normal QUIC frames. An unmarked frame is passed
+        // unchanged to the shared direct endpoint, which alone recognizes a
+        // valid long-header direct record; UART never parses CBOR here.
         match classify_uart_payload(&record) {
-            Ok(UartIngress::DirectRecord(record)) => {
+            Ok(UartIngress::Unmarked(record)) => {
                 if crate::shared_ingress_esp::enqueue(
                     crate::shared_ingress_esp::IngressKind::UartRaw,
                     [0; 6],

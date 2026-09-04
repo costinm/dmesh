@@ -7,7 +7,7 @@
 //! window are handed to the same shared action ingress as the private driver
 //! hook; outside the window there is no promiscuous capture.
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 const NAN_DW_PERIOD_MS: u32 = 512 * 1_024 / 1_000;
 /// Open a little before the selected cluster's beacon. The ESP timestamp is
@@ -283,12 +283,6 @@ static ACTIVE_SUBSCRIBE_PEER: [AtomicU8; 6] = [
 ];
 static ACTIVE_SUBSCRIBE_INSTANCE: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_SUBSCRIBE_REQUESTOR_INSTANCE: AtomicU8 = AtomicU8::new(0);
-// A framework Subscribe is retransmitted in each discovery window.  Retain
-// only the last tagged discovery ping per source, so the common handler sends
-// one fresh announce/follow-up for that ping instead of one per RF retry.
-static LAST_DISCOVERY_PEER: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
-static LAST_DISCOVERY_ID: AtomicU32 = AtomicU32::new(0);
-static LAST_DISCOVERY_VALID: AtomicBool = AtomicBool::new(false);
 /// Application-owned CBOR dispatcher. Wi-Fi owns the callback and packet copy;
 /// Recovery/Main only receives a copied Service Info payload on the common
 /// ingress worker.
@@ -374,12 +368,7 @@ fn observation_peer_matches(slot: &NanDeviceObservationSlot, peer: [u8; 6]) -> b
             .all(|(index, byte)| byte.load(Ordering::Relaxed) == peer[index])
 }
 
-fn record_nan_device_observation(
-    peer: [u8; 6],
-    bssid: [u8; 6],
-    kind: u8,
-    payload: &[u8],
-) {
+fn record_nan_device_observation(peer: [u8; 6], bssid: [u8; 6], kind: u8, payload: &[u8]) {
     let now = now_ms();
     let slot = NAN_DEVICE_OBSERVATIONS
         .iter()
@@ -451,8 +440,10 @@ fn record_nan_device_observation(
         crate::wifi_esp::selected_channel().unwrap_or(0),
         Ordering::Relaxed,
     );
-    slot.last_payload_len
-        .store(payload.len().min(u16::MAX as usize) as u16, Ordering::Relaxed);
+    slot.last_payload_len.store(
+        payload.len().min(u16::MAX as usize) as u16,
+        Ordering::Relaxed,
+    );
     slot.last_payload_hash.store(
         dmesh_server::discovery::payload_hash(payload),
         Ordering::Relaxed,
@@ -584,37 +575,6 @@ fn mark_active_subscribe(peer: [u8; 6], instance: u8, requestor_instance: u8) {
     ACTIVE_SUBSCRIBE_INSTANCE.store(instance, Ordering::Relaxed);
     ACTIVE_SUBSCRIBE_REQUESTOR_INSTANCE.store(requestor_instance, Ordering::Relaxed);
     ACTIVE_SUBSCRIBE_PENDING.store(true, Ordering::Release);
-}
-
-fn duplicate_discovery_ping(peer: [u8; 6], payload: &[u8]) -> bool {
-    let Some(record) = dmesh_server::tagged::decode(payload) else {
-        return false;
-    };
-    let (
-        Some(dmesh_server::tagged::Name::Tag(1)),
-        Some(dmesh_server::tagged::Name::Tag(6)),
-        Some(id),
-    ) = (record.component, record.method, record.id)
-    else {
-        return false;
-    };
-    let Ok(id) = u32::try_from(id) else {
-        return false;
-    };
-    let same = LAST_DISCOVERY_VALID.load(Ordering::Acquire)
-        && LAST_DISCOVERY_ID.load(Ordering::Relaxed) == id
-        && LAST_DISCOVERY_PEER
-            .iter()
-            .enumerate()
-            .all(|(index, value)| value.load(Ordering::Relaxed) == peer[index]);
-    if !same {
-        for (index, value) in peer.iter().enumerate() {
-            LAST_DISCOVERY_PEER[index].store(*value, Ordering::Relaxed);
-        }
-        LAST_DISCOVERY_ID.store(id, Ordering::Relaxed);
-        LAST_DISCOVERY_VALID.store(true, Ordering::Release);
-    }
-    same
 }
 
 /// Consume the active-subscribe marker associated with a copied Service Info
@@ -1162,7 +1122,7 @@ pub fn configure_active_publish(enabled: bool, service_info: &[u8]) -> bool {
     // already armed its current wait. Wake that existing owner once so it
     // recomputes the next DW deadline; it remains a one-shot deadline, not a
     // publish timer or an additional worker.
-    crate::main_runtime::request_transport_service();
+    crate::main_runtime::request_deadline_recheck();
     true
 }
 
@@ -1329,7 +1289,6 @@ pub fn reset_stats() {
     ACTIVE_SUBSCRIBE_SDEA_INFO_LEN.store(0, Ordering::Release);
     ACTIVE_SUBSCRIBES.store(0, Ordering::Release);
     LAST_SDF_AFTER_BEACON_US.store(0, Ordering::Release);
-    LAST_DISCOVERY_VALID.store(false, Ordering::Release);
     SERVICE_INFO_ENQUEUED.store(0, Ordering::Release);
     SERVICE_INFO_DROPPED.store(0, Ordering::Release);
     SERVICE_INFO_DISPATCHED.store(0, Ordering::Release);
@@ -1499,7 +1458,7 @@ pub fn end_now_receive_lease() {
     // once for this state transition so it recomputes the next timer; without
     // that notification a completed NOW session could leave NAN idle until
     // some unrelated control event happened to wake Main.
-    crate::main_runtime::request_transport_service();
+    crate::main_runtime::request_deadline_recheck();
 }
 
 /// Whether starting a ROC lease with `duration_ms` would overlap a normal NAN
@@ -1944,10 +1903,16 @@ fn receive_nan_action(frame: &[u8]) {
                         item.service_id == dmesh_rawnan::DMESH_SERVICE_ID
                             && matches!(item.descriptor.control, 0x10..=0x12)
                     });
+            let mut service_payload = None;
             for descriptor in dmesh_rawnan::service_descriptors(frame) {
                 if descriptor.service_id != dmesh_rawnan::DMESH_SERVICE_ID {
                     continue;
                 }
+                // Prefer the last current descriptor when a transitional peer
+                // emits more than one descriptor for the same service. This
+                // is NAN framing policy; payload classification stays above
+                // the adapter.
+                service_payload = Some(descriptor.descriptor.payload);
                 let kind = match descriptor.descriptor.control & 0x03 {
                     0 => NAN_OBSERVATION_ACTIVE_PUBLISH,
                     1 => NAN_OBSERVATION_ACTIVE_SUBSCRIBE,
@@ -1972,40 +1937,20 @@ fn receive_nan_action(frame: &[u8]) {
                     ACTIVE_SUBSCRIBE_SDEA_MISSES.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let payload = active_subscribe.map(|item| item.service_info).or_else(|| {
-                // Android can emit a legacy `DM` descriptor and a current
-                // CBOR descriptor with the same service ID. Select a direct
-                // record here, before the one allowed callback copy; legacy
-                // service state is discovery metadata, never a mode command.
-                dmesh_rawnan::service_descriptor_payload_matching(
-                    frame,
-                    dmesh_rawnan::DMESH_SERVICE_ID,
-                    |candidate| {
-                        dmesh_server::announce::decode_announce(candidate).is_some()
-                            || crate::commands::is_control_record(candidate)
-                    },
-                )
-            });
+            let payload = active_subscribe
+                .map(|item| item.service_info)
+                .or(service_payload);
             if let Some(payload) = payload {
                 SERVICE_INFO_MATCHED.fetch_add(1, Ordering::Relaxed);
-                // The discovery operation, rather than one peer-specific
-                // SDEA byte layout, defines a discovery ping. This also
-                // accepts Android/host Subscribe variants whose SSI is
-                // exposed through the generic descriptor parser.
-                let discovery_ping = matches!(
-                    dmesh_server::control::decode_request(payload),
-                    Some(dmesh_server::control::Request::TransportDiscover { .. })
-                );
-                if discovery_ping {
+                // Preserve only NAN transaction metadata here. Shared direct
+                // policy decides whether this payload is discovery,
+                // transport configuration, or rejected input.
+                if active_descriptor {
                     ACTIVE_SUBSCRIBES.fetch_add(1, Ordering::Relaxed);
-                    if duplicate_discovery_ping(source, payload) {
-                        return;
-                    }
                     let (instance, requestor_instance) = active_subscribe
                         .map(|item| (item.instance, item.requestor_instance))
-                        // Legacy descriptor fallback does not expose a
-                        // Subscribe transaction; preserve the historical
-                        // compatibility pair only for that form.
+                        // A descriptor without a decoded SDEA has no richer
+                        // transaction facts; retain only its framing defaults.
                         .unwrap_or((1, 0));
                     mark_active_subscribe(source, instance, requestor_instance);
                 }
@@ -2022,8 +1967,7 @@ fn receive_nan_action(frame: &[u8]) {
         }
         dmesh_rawnan::FrameKind::Followup => {
             FOLLOWUPS.fetch_add(1, Ordering::Relaxed);
-            let source: Option<[u8; 6]> =
-                frame.get(10..16).and_then(|value| value.try_into().ok());
+            let source: Option<[u8; 6]> = frame.get(10..16).and_then(|value| value.try_into().ok());
             let bssid: [u8; 6] = frame
                 .get(16..22)
                 .and_then(|value| value.try_into().ok())

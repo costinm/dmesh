@@ -571,7 +571,7 @@ pub fn observe_raw_action_payload(source: [u8; 6], payload: &[u8], rssi: i32) {
         payload.len()
     ));
     telemetry::record_packet("wifi", Direction::Rx, payload, "source=raw_action");
-    if super::action_stream::receive_espnow(source, payload) {
+    if super::transport_runtime::receive_espnow_frame(source, payload) {
         return;
     }
     // Only complete QUIC-lite action datagrams are accepted here. In
@@ -3039,7 +3039,7 @@ pub fn observe_promiscuous_frame(frame: &[u8], rssi: i32) {
             RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if !super::action_stream::receive_espnow(source, payload) {
+        if !super::transport_runtime::receive_espnow_frame(source, payload) {
             RAW_CMD_DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }

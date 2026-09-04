@@ -3428,7 +3428,7 @@ fn observe_promiscuous_frame_at(frame: &[u8], rssi: i32, received_local_us: u64)
                 NAN_OBJECT_ACTION_DISPATCH.fetch_add(1, Ordering::Relaxed);
                 telemetry::record_packet("wifi", Direction::Rx, payload, "source=espnow_raw");
                 let _ = rssi;
-                if super::action_stream::receive_espnow(source, payload) {
+                if super::transport_runtime::receive_espnow_frame(source, payload) {
                     NAN_OBJECT_ACTION_ACCEPTED.fetch_add(1, Ordering::Relaxed);
                 }
             } else if is_nan_sdf(frame) {

@@ -190,7 +190,7 @@ unsafe extern "C" {
     fn ieee80211_recv_action_register(
         category: u8,
         action: u8,
-        callback: Option<unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8, *mut u8) -> i32>,
+        callback: Option<unsafe extern "C" fn(*mut c_void, usize, *mut u8, *mut u8) -> i32>,
     ) -> i32;
 }
 
@@ -251,20 +251,16 @@ pub fn register_now_dispatcher() -> bool {
 }
 
 unsafe extern "C" fn action_rx_callback(
-    _driver_context: *mut c_void,
-    header: *mut u8,
-    payload: *mut u8,
-    payload_end: *mut u8,
+    peer_context: *mut c_void,
+    second: usize,
+    third: *mut u8,
+    fourth: *mut u8,
 ) -> i32 {
-    if !now_dispatcher_enabled() || header.is_null() || payload.is_null() {
+    if !now_dispatcher_enabled() || peer_context.is_null() || third.is_null() {
         return 0;
     }
-    let Some(payload_len) = (payload_end as usize).checked_sub(payload as usize) else {
-        ACTION_CALLBACK_DROPS.fetch_add(1, Ordering::Relaxed);
-        return 0;
-    };
     ACTION_CALLBACK_NOW.fetch_add(1, Ordering::Relaxed);
-    crate::wifi_espnow_esp::receive_registered_action_parts(header, payload, payload_len);
+    crate::wifi_espnow_esp::receive_registered_action_payload(peer_context, second, third, fourth);
     0
 }
 
@@ -1357,7 +1353,10 @@ pub fn remain_on_channel(request: *mut esp_idf_sys::wifi_roc_req_t) -> i32 {
 /// Attach a caller-owned QUIC-lite handler to the generic raw Ethernet
 /// adapter. The caller owns all DCID and application state; this module owns
 /// only STA lifecycle and ESP Wi-Fi registration.
-pub fn start_raw_udp6(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool {
+pub fn start_raw_udp6(
+    handler: crate::wifi_raw_udp6_esp::RawUdp6Handler,
+    connectionless_handler: crate::wifi_raw_udp6_esp::ConnectionlessUdp6Handler,
+) -> bool {
     let mut mac = [0u8; 6];
     let mut ap = esp_idf_sys::wifi_ap_record_t::default();
     let read = unsafe {
@@ -1371,13 +1370,16 @@ pub fn start_raw_udp6(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool
     {
         return false;
     }
-    crate::wifi_raw_udp6_esp::start(mac, ap.bssid, handler)
+    crate::wifi_raw_udp6_esp::start(mac, ap.bssid, handler, connectionless_handler)
 }
 
 /// Start raw UDP6 for an unassociated open-AP epoch.  This has no STA AP
 /// record by design, so it selects the AP Ethernet ingress directly.
-pub fn start_raw_udp6_ap(handler: crate::wifi_raw_udp6_esp::RawUdp6Handler) -> bool {
-    crate::wifi_raw_udp6_esp::start_ap(handler)
+pub fn start_raw_udp6_ap(
+    handler: crate::wifi_raw_udp6_esp::RawUdp6Handler,
+    connectionless_handler: crate::wifi_raw_udp6_esp::ConnectionlessUdp6Handler,
+) -> bool {
+    crate::wifi_raw_udp6_esp::start_ap(handler, connectionless_handler)
 }
 
 /// Bind the caller-owned QUIC-lite action handler to the shared radio ingress.

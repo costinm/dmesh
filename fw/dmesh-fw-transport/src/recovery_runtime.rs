@@ -12,10 +12,10 @@
 // - BSSID/IPv6 passed via RTC temp area - no commands.
 // - UART for logs, no commands.
 
-// Keep the old prototype's raw-service adapter imports compiling while it is
+// Keep the old prototype's connection-adapter imports compiling while it is
 // being retired. NAN, NOW, and tagged `transport.start` are intentionally not
 // part of this Recovery entry point.
-pub use crate::core_runtime::{espnow_association, poll_raw_service, receive_raw_service};
+pub use crate::core_runtime::{espnow_association, poll_connection, receive_connection_frame};
 
 /// Start the minimal Recovery runtime.
 ///
@@ -50,7 +50,12 @@ fn run_with_boot_identity() {
     let mut raw_started = false;
     loop {
         crate::wifi_nonpromisc_probe_esp::service_deadline();
-        if !raw_started && crate::wifi_esp::start_raw_udp6(crate::core_runtime::receive_raw_udp6) {
+        if !raw_started
+            && crate::wifi_esp::start_raw_udp6(
+                crate::core_runtime::receive_raw_udp6,
+                crate::core_runtime::receive_udp6_connectionless,
+            )
+        {
             crate::wifi_raw_udp6_esp::set_poll_handler(Some(crate::core_runtime::poll_raw_udp6));
             raw_started = true;
             crate::commands::send_response(b"recovery raw udp6 STA bearer started");

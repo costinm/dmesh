@@ -31,10 +31,10 @@ address, gateway, mask, server, or UDP port.
 
 UART, raw UDP6, and the current NOW/vendor-action bearer use one common
 transport datagram maximum: **1100 bytes** (`quic_lite::DEFAULT_MAX_DATAGRAM_SIZE`).
-All firmware buffers and the host raw-action client derive from that bound.
-Current control/IPERF callers must request at most 1100 bytes; there is no
-per-bearer MTU negotiation yet. This prevents a host action client from
-emitting a final packet that the e6 action ingress cannot complete.
+All firmware buffers and complete-datagram clients derive from that bound.
+Current control/probe callers must request at most 1100 bytes; there is no
+per-bearer MTU negotiation yet. This prevents a host client from emitting a
+final packet that a firmware ingress cannot complete.
 
 The DMesh NOW/vendor-action bearer always transmits with 802.11 MAC ACK
 disabled, for both broadcast and unicast Address-1. QUIC-lite acknowledgements
@@ -45,7 +45,7 @@ peer must not be required to acknowledge a management action at the MAC layer.
 Unsolicited events default to the stable `lmesh-wifi` UDP destination port
 3336. This runtime default is not persisted and is distinct from the fixed
 raw UDP6 bearer port (3339); a registered event handler may select a different
-destination. Service requests, including iperf, carry their own port.
+destination. Service requests, including `probe`, carry their own port.
 
 After the boot AP+NOW radio is live, firmware also broadcasts the same bounded
 CBOR boot status and boot-identity records over NOW that it first emits on
@@ -269,9 +269,12 @@ from the derived link-local peer, and association parameters selected or
 adjusted from NAN SD RSSI/policy.
 
 The common production rendezvous must be operable from `dmesh-cli` and covered
-by Rust end-to-end tests before the default changes. It must send the request
-in the next selected DW, retry in DW0 and DW8 when the first NOW/nearest-DW
-attempt receives no response, and make the resulting mode observable. While
+by Rust end-to-end tests before the default changes. Active broadcast discovery
+must fan out independently: UDP multicast on every usable scope, NOW broadcast,
+NAN active SD in the next selected DW, and NAN active SD again at the next
+synchronized DW0/DW8. The boundary send is scheduled even when the earlier
+NOW/nearest-DW attempt receives a response. The resulting submissions and
+responses must remain separately observable. While
 STA is live, UDP must be able to request a mode change. If `dmesh-server` has
 no active streams, the device should apply a short post-request timeout and
 return to NAN or NAN+NOW. None of that NAN-CBOR ingress, retry, CLI, e2e, or

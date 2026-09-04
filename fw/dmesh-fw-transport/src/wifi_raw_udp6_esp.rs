@@ -6,14 +6,13 @@
 
 use core::{
     ffi::c_void,
-    mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
 use quic_lite::raw_udp6::{
-    encode_neighbor_advertisement, encode_station_ipv6_data_frame, encode_station_udp6_data_frame,
-    encode_udp6, link_local_from_mac, parse_neighbor_solicitation, parse_udp6,
-    parse_udp6_for_destination,
+    Error, encode_neighbor_advertisement, encode_station_ipv6_data_frame,
+    encode_station_udp6_data_frame, encode_udp6, link_local_from_mac, parse_neighbor_solicitation,
+    parse_udp6, parse_udp6_for_destination,
 };
 
 pub const RAW_UDP6_PORT: u16 = 3339;
@@ -57,6 +56,21 @@ pub struct RawUdp6Peer {
 /// UDP payload and writes at most one response payload into `response`.
 pub type RawUdp6Handler =
     fn(RawUdp6Peer, &[u8], &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
+/// Consume one complete connectionless UDP payload with immutable source
+/// metadata. The adapter selects this callback by UDP destination only; it
+/// does not decode direct envelopes or application records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionlessUdp6Outcome {
+    Rejected,
+    Handled,
+    Response(usize),
+}
+
+pub type ConnectionlessUdp6Handler = fn(
+    RawUdp6Peer,
+    &[u8],
+    &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+) -> ConnectionlessUdp6Outcome;
 /// Produce a further already-authorized connection packet. This is not a
 /// bearer queue: the connection retains the packet ledger and the adapter
 /// immediately transmits each returned datagram.
@@ -64,6 +78,7 @@ pub type RawUdp6PollHandler =
     fn(RawUdp6Peer, &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
+static CONNECTIONLESS_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static POLL_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static TX_BURST_PACKETS: AtomicUsize = AtomicUsize::new(8);
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -221,43 +236,6 @@ static mut TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
 static mut IEEE80211_TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
 static mut RESPONSE_BUFFER: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
     [0; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-/// One device-originated raw UDP6 IPERF client. It shares the raw Ethernet
-/// ingress worker and its response scratch; the STA bearer never gains a
-/// second receive task or packet queue merely to originate a pair probe.
-struct RawUdp6ClientState {
-    peer: RawUdp6Peer,
-    started_at_us: i64,
-    deadline_us: i64,
-    next_bootstrap_retry_us: i64,
-}
-
-// The shared raw service advertises an eight-packet C6 association. The
-// client must retain the same bounded receive history: four slots happen to
-// finish a small transfer, but cannot acknowledge the next flight of a
-// 16 KiB+ run. Keep the sizeable fixed ledger in static storage rather than
-// constructing it on the radio command task's stack; it is reused by exactly
-// one explicit client run and never becomes a per-packet queue.
-type RawUdp6Client =
-    dmesh_server::raw_transport::RawClient<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
-
-static RAW_CLIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
-static RAW_CLIENT_GENERATION: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_BYTES: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_ERRORS: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_ELAPSED_US: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_RECEIVE_OK: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_RECEIVE_ERRORS: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_BOOTSTRAP_ACKS: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_STREAM_PACKETS: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_OTHER_PACKETS: AtomicU32 = AtomicU32::new(0);
-static RAW_CLIENT_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
-/// Earliest client-owned bootstrap/ACK/PTO/timeout wake in Main's millisecond
-/// clock. The owner reads only this scalar; client state remains exclusively
-/// on the shared ingress worker.
-static RAW_CLIENT_NEXT_DUE_MS: AtomicU32 = AtomicU32::new(0);
-static mut RAW_CLIENT: MaybeUninit<RawUdp6ClientState> = MaybeUninit::uninit();
-static RAW_CLIENT_INITIALIZED: AtomicBool = AtomicBool::new(false);
-static mut RAW_CLIENT_ENGINE: MaybeUninit<RawUdp6Client> = MaybeUninit::uninit();
 /// Snapshot counters for status/log adapters.  The counters are deliberately
 /// separate from the packet ingress path and remain meaningful across bearers.
 pub fn stats() -> (u32, u32, u32, u32, u32, u32) {
@@ -269,204 +247,6 @@ pub fn stats() -> (u32, u32, u32, u32, u32, u32) {
         TX_FRAMES.load(Ordering::Relaxed),
         TX_FAILURES.load(Ordering::Relaxed),
     )
-}
-
-/// True while the STA raw-UDP6 lane owns the single bounded client run.
-/// Sampled by the radio snapshot; it is an operation state, not a queue size.
-pub fn raw_client_active() -> bool {
-    RAW_CLIENT_ACTIVE.load(Ordering::Acquire)
-}
-
-/// Completion/progress evidence for a device-originated UDP6 IPERF request.
-/// It has the same meaning as the NOW client result so a control-plane probe
-/// can calculate goodput without inspecting serial logs.
-pub fn raw_client_result() -> (u32, u32, u32) {
-    (
-        RAW_CLIENT_BYTES.load(Ordering::Acquire),
-        RAW_CLIENT_ERRORS.load(Ordering::Acquire),
-        RAW_CLIENT_ELAPSED_US.load(Ordering::Acquire),
-    )
-}
-
-/// Counters follow the shared raw-action snapshot vocabulary. The bearer is
-/// different, but bootstrap, stream, and parser progress mean the same thing
-/// to a pair-probe controller.
-pub fn raw_client_diagnostics() -> (u32, u32, u32, u32, u32) {
-    (
-        RAW_CLIENT_RECEIVE_OK.load(Ordering::Acquire),
-        RAW_CLIENT_RECEIVE_ERRORS.load(Ordering::Acquire),
-        RAW_CLIENT_LAST_ERROR.load(Ordering::Acquire),
-        RAW_CLIENT_BOOTSTRAP_ACKS.load(Ordering::Acquire),
-        RAW_CLIENT_STREAM_PACKETS.load(Ordering::Acquire),
-    )
-}
-
-/// Return the exact next raw-UDP6 client deadline for Main's blocking event
-/// wait. This is active only during an explicit device-originated probe; it
-/// is not a UDP service tick and therefore adds no idle radio wakeups.
-pub fn next_raw_client_delay_ms() -> Option<u32> {
-    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
-        return None;
-    }
-    let due_ms = RAW_CLIENT_NEXT_DUE_MS.load(Ordering::Acquire);
-    if due_ms == 0 {
-        return None;
-    }
-    let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64 / 1_000) as u32;
-    let remaining = due_ms.wrapping_sub(now_ms);
-    Some(if remaining > 0x8000_0000 {
-        1
-    } else {
-        remaining.clamp(1, 1_000)
-    })
-}
-
-/// Publish the active client's next genuine QUIC-lite deadline and wake Main
-/// once to recompute its blocking timeout. Called after client creation or a
-/// received client packet, never from the Ethernet callback.
-fn schedule_raw_client_service() {
-    publish_raw_client_deadline();
-    crate::main_runtime::request_transport_service();
-}
-
-/// Recompute only the deadline scalar. A due timer worker calls this after it
-/// has advanced the ledger, avoiding a wake-loop while the client is idle.
-fn publish_raw_client_deadline() {
-    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
-        RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
-        return;
-    }
-    unsafe {
-        let state = &*core::ptr::addr_of!(RAW_CLIENT).cast::<RawUdp6ClientState>();
-        let client = &*core::ptr::addr_of!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>();
-        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
-        let due_us = if client.server_cid().is_some() {
-            client
-                .next_service_deadline_ms(600)
-                .map(|deadline_ms| deadline_ms.saturating_mul(1_000))
-                .unwrap_or(state.deadline_us.max(0) as u64)
-        } else {
-            state.next_bootstrap_retry_us.min(state.deadline_us).max(0) as u64
-        };
-        let due_ms = due_us.max(now_us.saturating_sub(1)) / 1_000;
-        RAW_CLIENT_NEXT_DUE_MS.store(due_ms as u32, Ordering::Release);
-    }
-}
-
-/// Start a bounded STA-to-peer raw UDP6 IPERF run. Called by the shared
-/// numeric radio handler after the pair probe has put this endpoint in STA
-/// mode; it returns promptly and all subsequent packets flow through
-/// `dispatch_ingress`, the existing single worker owner.
-pub fn start_iperf_client(
-    peer_mac: [u8; 6],
-    bytes: u64,
-    packet_size: u16,
-    timeout_ms: u32,
-) -> bool {
-    if !STARTED.load(Ordering::Acquire) {
-        return false;
-    }
-    let now = unsafe { esp_idf_sys::esp_timer_get_time() };
-    if RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
-        // No periodic polling task owns this client. A later explicit probe
-        // command retires a genuinely expired operation and starts a fresh
-        // one; a live transfer remains exclusively owned by its original
-        // request. This keeps timeout recovery event-driven rather than a
-        // permanent firmware service tick.
-        let deadline =
-            unsafe { (*core::ptr::addr_of!(RAW_CLIENT).cast::<RawUdp6ClientState>()).deadline_us };
-        if now < deadline {
-            return false;
-        }
-        RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
-        RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-    }
-    if RAW_CLIENT_ACTIVE.swap(true, Ordering::AcqRel) {
-        return false;
-    }
-    // A radio snapshot is sampled across independent probe requests.  Clear
-    // completion evidence only after this request has exclusively acquired
-    // the client slot, so `raw_service_bytes` always describes this run and
-    // cannot make a later failed IPERF request look complete.
-    RAW_CLIENT_BYTES.store(0, Ordering::Release);
-    RAW_CLIENT_ERRORS.store(0, Ordering::Release);
-    RAW_CLIENT_ELAPSED_US.store(0, Ordering::Release);
-    RAW_CLIENT_RECEIVE_OK.store(0, Ordering::Release);
-    RAW_CLIENT_RECEIVE_ERRORS.store(0, Ordering::Release);
-    RAW_CLIENT_BOOTSTRAP_ACKS.store(0, Ordering::Release);
-    RAW_CLIENT_STREAM_PACKETS.store(0, Ordering::Release);
-    RAW_CLIENT_OTHER_PACKETS.store(0, Ordering::Release);
-    RAW_CLIENT_LAST_ERROR.store(0, Ordering::Release);
-    let generation = RAW_CLIENT_GENERATION
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1);
-    let cid = match quic_lite::ConnectionId::new(0x5550_8000 | u64::from(generation.max(1))) {
-        Some(cid) => cid,
-        None => {
-            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-            return false;
-        }
-    };
-    if RAW_CLIENT_INITIALIZED.swap(false, Ordering::AcqRel) {
-        // A new explicit run replaces only an already-retired client. The
-        // client is currently allocation-free, but dropping here keeps this
-        // lifecycle correct if the bounded QUIC state later owns a resource.
-        unsafe {
-            core::ptr::drop_in_place(
-                core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>(),
-            );
-        }
-    }
-    let client = match dmesh_server::raw_transport::RawClient::new_in_place(
-        unsafe { &mut *core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE) },
-        cid,
-        bytes,
-        packet_size,
-    ) {
-        Ok(client) => client,
-        Err(_) => {
-            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-            return false;
-        }
-    };
-    RAW_CLIENT_INITIALIZED.store(true, Ordering::Release);
-    let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
-    let used = match client.start(response) {
-        Ok(used) => used,
-        Err(_) => {
-            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-            return false;
-        }
-    };
-    let peer = RawUdp6Peer {
-        link: crate::shared_ingress_esp::IngressLink::WifiSta,
-        mac: peer_mac,
-        ip: link_local_from_mac(peer_mac),
-        port: RAW_UDP6_PORT,
-    };
-    unsafe {
-        core::ptr::addr_of_mut!(RAW_CLIENT).write(MaybeUninit::new(RawUdp6ClientState {
-            peer,
-            started_at_us: now,
-            deadline_us: now + i64::from(timeout_ms.clamp(1_000, 60_000)) * 1_000,
-            next_bootstrap_retry_us: now + 400_000,
-        }));
-    }
-    if !transmit_udp6(
-        crate::shared_ingress_esp::IngressLink::WifiSta,
-        peer,
-        RAW_UDP6_PORT,
-        &response[..used],
-    ) {
-        RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-        RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
-        return false;
-    }
-    // The opening packet has been submitted. If its reply is lost, the Main
-    // owner now has the exact bootstrap retry deadline instead of waiting for
-    // an unrelated raw Ethernet frame to make the client progress.
-    schedule_raw_client_service();
-    true
 }
 
 pub fn start_status() -> u32 {
@@ -510,15 +290,6 @@ pub fn reset_diagnostics() {
     TX_SUBMIT_CALLS.store(0, Ordering::Relaxed);
     TX_SUBMIT_US_TOTAL.store(0, Ordering::Relaxed);
     TX_SUBMIT_US_MAX.store(0, Ordering::Relaxed);
-    RAW_CLIENT_BYTES.store(0, Ordering::Relaxed);
-    RAW_CLIENT_ERRORS.store(0, Ordering::Relaxed);
-    RAW_CLIENT_ELAPSED_US.store(0, Ordering::Relaxed);
-    RAW_CLIENT_RECEIVE_OK.store(0, Ordering::Relaxed);
-    RAW_CLIENT_RECEIVE_ERRORS.store(0, Ordering::Relaxed);
-    RAW_CLIENT_BOOTSTRAP_ACKS.store(0, Ordering::Relaxed);
-    RAW_CLIENT_STREAM_PACKETS.store(0, Ordering::Relaxed);
-    RAW_CLIENT_OTHER_PACKETS.store(0, Ordering::Relaxed);
-    RAW_CLIENT_LAST_ERROR.store(0, Ordering::Relaxed);
 }
 
 unsafe extern "C" fn raw_tx_done(info: *const esp_idf_sys::esp_80211_tx_info_t) {
@@ -540,8 +311,14 @@ unsafe extern "C" fn raw_tx_done(info: *const esp_idf_sys::esp_80211_tx_info_t) 
 /// action-frame receivers do *not* use this API: ESP's private action
 /// dispatcher is global (category/action/callback only), and therefore has
 /// no per-interface registration to duplicate.
-pub fn start(local_mac: [u8; 6], ap_bssid: [u8; 6], handler: RawUdp6Handler) -> bool {
+pub fn start(
+    local_mac: [u8; 6],
+    ap_bssid: [u8; 6],
+    handler: RawUdp6Handler,
+    connectionless_handler: ConnectionlessUdp6Handler,
+) -> bool {
     HANDLER.store(handler as usize, Ordering::Release);
+    CONNECTIONLESS_HANDLER.store(connectionless_handler as usize, Ordering::Release);
     store_local_mac(local_mac);
     store_ap_bssid(ap_bssid);
     if STARTED.swap(true, Ordering::AcqRel) {
@@ -580,12 +357,16 @@ pub fn start(local_mac: [u8; 6], ap_bssid: [u8; 6], handler: RawUdp6Handler) -> 
 /// exists.  AP mode has a distinct ESP-IDF Ethernet RX registration; it must
 /// not be gated on `esp_wifi_sta_get_ap_info()`.  The packet worker, handler,
 /// and response path remain shared with the STA bearer.
-pub fn start_ap(handler: RawUdp6Handler) -> bool {
+pub fn start_ap(
+    handler: RawUdp6Handler,
+    connectionless_handler: ConnectionlessUdp6Handler,
+) -> bool {
     let Some(ap_mac) = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap) else {
         crate::commands::send_response(b"raw udp6 AP mac failed");
         return false;
     };
     HANDLER.store(handler as usize, Ordering::Release);
+    CONNECTIONLESS_HANDLER.store(connectionless_handler as usize, Ordering::Release);
     store_local_mac(ap_mac);
     store_ap_bssid(ap_mac);
     if !STARTED.swap(true, Ordering::AcqRel)
@@ -713,7 +494,7 @@ pub fn set_poll_handler(handler: Option<RawUdp6PollHandler>) {
 /// Applies to the next association; the raw adapter keeps no packet queue.
 pub fn set_tx_burst_packets(packets: usize) {
     TX_BURST_PACKETS.store(
-        packets.clamp(1, crate::RAW_SERVICE_HISTORY_CAPACITY),
+        packets.clamp(1, crate::CONNECTION_HISTORY_CAPACITY),
         Ordering::Release,
     );
 }
@@ -879,71 +660,67 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
                     crate::commands::send_response(b"raw udp6 ndp encode failed");
                 }
             }
-            Err(error) => {
-                NDP_INVALID.fetch_add(1, Ordering::Relaxed);
-                crate::commands::send_stat(
-                    b"raw udp6 ndp parse error=",
-                    quic_lite::raw_udp6::error_code(error) as u64,
-                );
-                if let Some(info) = quic_lite::raw_udp6::icmpv6_frame_info(frame) {
-                    // ICMPv6 is broader than NDP: Linux can return an error
-                    // quoting a raw UDP6 packet, and routine control traffic
-                    // can be addressed elsewhere.  Preserve the actual type,
-                    // code, hop limit, and declared payload size so a UART
-                    // diagnostic identifies the rejected packet without a
-                    // privileged host packet capture or copying its payload.
-                    crate::commands::send_stat(
-                        b"raw udp6 ndp icmp type/code=",
-                        ((info.icmp_type as u64) << 8) | info.code as u64,
-                    );
-                    crate::commands::send_stat(
-                        b"raw udp6 ndp icmp hop/payload=",
-                        ((info.hop_limit as u64) << 16) | info.payload_length as u64,
-                    );
-                }
-                // An ICMPv6 frame can be a Neighbor Solicitation, a
-                // reachability probe, or unrelated control traffic.  Keep
-                // enough wire shape to distinguish an ESP RX truncation from
-                // an NDP parser rule without copying/logging the frame.
-                crate::commands::send_stat(b"raw udp6 ndp rx len=", frame.len() as u64);
-                if frame.len()
-                    >= quic_lite::raw_udp6::ETHERNET_HEADER_LEN
-                        + quic_lite::raw_udp6::IPV6_HEADER_LEN
-                {
-                    let ip = &frame[quic_lite::raw_udp6::ETHERNET_HEADER_LEN..];
-                    crate::commands::send_stat(
-                        b"raw udp6 ndp ip payload_len=",
-                        u16::from_be_bytes([ip[4], ip[5]]) as u64,
-                    );
-                    crate::commands::send_stat(
-                        b"raw udp6 ndp ip next_hop_type=",
-                        ((ip[6] as u64) << 16)
-                            | ((ip[7] as u64) << 8)
-                            | ip.get(quic_lite::raw_udp6::IPV6_HEADER_LEN)
-                                .copied()
-                                .unwrap_or(0) as u64,
-                    );
+            Err(_) => {
+                // Router solicitations/advertisements and NDP for another
+                // local address are routine L2 traffic.  They are neither a
+                // DMesh packet failure nor UART diagnostics.  Retain only a
+                // scalar count for malformed NS traffic aimed at this raw
+                // bearer; explicit debug can expose that counter later.
+                if quic_lite::raw_udp6::icmpv6_frame_info(frame).is_some_and(|info| {
+                    info.icmp_type == quic_lite::raw_udp6::ICMPV6_NEIGHBOR_SOLICITATION
+                }) {
+                    NDP_INVALID.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         return;
     }
-    // Presence is multicast application data in a DCID-zero direct record,
-    // not a connection datagram. Parse it before the unicast bearer so a
-    // valid announcement cannot inflate raw UDP6 error counters or reach a
-    // connection handler.
+    // The raw adapter receives all normal Ethernet traffic from the STA
+    // driver.  Only IPv6 UDP can be a DMesh UDP6 bearer packet; do not count
+    // unrelated L2/control traffic as a rejected DMesh datagram.
+    if !quic_lite::raw_udp6::is_udp6_frame(frame) {
+        return;
+    }
+    // Connectionless records have a distinct multicast UDP destination. The
+    // adapter passes the complete payload and source facts to shared policy;
+    // it does not inspect the direct envelope or tagged application record.
     if let Ok(packet) = parse_udp6_for_destination(frame, ANNOUNCE_IPV6, ANNOUNCE_UDP6_PORT) {
-        let payload = quic_lite::decode_direct_packet(packet.payload)
-            .map_or(packet.payload, |(_, payload)| payload);
-        if let Some(announce) = dmesh_server::announce::decode_announce(payload) {
-            record_announce_peer(announce, packet.source_mac, packet.source_ip);
-        } else {
+        let handler = CONNECTIONLESS_HANDLER.load(Ordering::Acquire);
+        let peer = RawUdp6Peer {
+            link: item.link(),
+            mac: packet.source_mac,
+            ip: packet.source_ip,
+            port: packet.source_port,
+        };
+        if handler == 0 {
             ANNOUNCE_INVALID.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let handler = unsafe { core::mem::transmute::<usize, ConnectionlessUdp6Handler>(handler) };
+        let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
+        match handler(peer, packet.payload, response) {
+            ConnectionlessUdp6Outcome::Rejected => {
+                ANNOUNCE_INVALID.fetch_add(1, Ordering::Relaxed);
+            }
+            ConnectionlessUdp6Outcome::Handled => {}
+            ConnectionlessUdp6Outcome::Response(used) if used <= response.len() => {
+                if !transmit_udp6(item.link(), peer, peer.port, &response[..used]) {
+                    TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            ConnectionlessUdp6Outcome::Response(_) => {
+                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
         }
         return;
     }
     let packet = match parse_udp6(frame, local_ip, RAW_UDP6_PORT) {
         Ok(packet) => packet,
+        // The Ethernet callback receives every normal UDP datagram delivered
+        // to the STA.  A packet for another IPv6 address or UDP service is
+        // not a malformed DMesh frame and must not poison the UDP6 health
+        // counter or its first-error diagnostic.
+        Err(Error::Destination | Error::Port) => return,
         Err(error) => {
             if RX_INVALID.fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::commands::send_stat(
@@ -973,13 +750,6 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
         ip: packet.source_ip,
         port: packet.source_port,
     };
-    // A device-originated pair run consumes only packets from its requested
-    // peer before the normal server dispatcher sees them. This mirrors the
-    // NOW client path and prevents a client ACK from being mistaken for a new
-    // server-side service request on the same bounded raw-UDP6 endpoint.
-    if dispatch_raw_client(item.link(), peer, packet.payload) {
-        return;
-    }
     let immediate = handler(peer, packet.payload, response);
     if immediate.is_none() && UDP_HANDLER_NO_RESPONSE.fetch_add(1, Ordering::Relaxed) == 0 {
         // This is expected for an ACK-only transport packet; retain one
@@ -989,7 +759,7 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     let poll = POLL_HANDLER.load(Ordering::Acquire);
     let poll: Option<RawUdp6PollHandler> =
         (poll != 0).then(|| unsafe { core::mem::transmute(poll) });
-    let result = dmesh_server::raw_transport::pump_egress(
+    let result = dmesh_server::transport::pump_egress(
         response,
         TX_BURST_PACKETS.load(Ordering::Acquire),
         immediate,
@@ -1022,145 +792,7 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     }
 }
 
-/// Deliver one received UDP6 datagram to the active device-originated client.
-/// Called by the shared ingress worker on each valid port-3339 packet; it does
-/// no allocation and immediately submits any resulting packet through the
-/// existing raw Ethernet sender.
-fn dispatch_raw_client(
-    link: crate::shared_ingress_esp::IngressLink,
-    peer: RawUdp6Peer,
-    payload: &[u8],
-) -> bool {
-    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
-        return false;
-    }
-    unsafe {
-        let state = &mut *core::ptr::addr_of_mut!(RAW_CLIENT).cast::<RawUdp6ClientState>();
-        let client = &mut *core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>();
-        if state.peer != peer || !client.accepts(payload) {
-            return false;
-        }
-        let now = esp_idf_sys::esp_timer_get_time();
-        if now >= state.deadline_us {
-            RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
-            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-            return true;
-        }
-        let response = &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER);
-        let outbound = match client.receive_at(payload, (now.max(0) as u64) / 1_000, response) {
-            Ok(packet) => {
-                RAW_CLIENT_RECEIVE_OK.fetch_add(1, Ordering::Relaxed);
-                packet
-            }
-            Err(error) => {
-                RAW_CLIENT_LAST_ERROR.store(
-                    u32::from(dmesh_server::raw_transport::receive_error_code(error)),
-                    Ordering::Release,
-                );
-                RAW_CLIENT_RECEIVE_ERRORS.fetch_add(1, Ordering::Relaxed);
-                RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
-                RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-                return true;
-            }
-        };
-        let counters = client.counters();
-        RAW_CLIENT_BOOTSTRAP_ACKS.store(counters.bootstrap_acks, Ordering::Release);
-        RAW_CLIENT_STREAM_PACKETS.store(counters.stream_packets, Ordering::Release);
-        RAW_CLIENT_OTHER_PACKETS.store(counters.other_packets, Ordering::Release);
-        let bytes = client.bytes();
-        RAW_CLIENT_BYTES.store(bytes.min(u64::from(u32::MAX)) as u32, Ordering::Release);
-        if client.is_complete() {
-            let elapsed_us = (now - state.started_at_us).max(1) as u64;
-            let errors: u64 = client.callback_errors().into_iter().sum();
-            RAW_CLIENT_ERRORS.store(errors.min(u64::from(u32::MAX)) as u32, Ordering::Release);
-            RAW_CLIENT_ELAPSED_US.store(
-                elapsed_us.min(u64::from(u32::MAX)) as u32,
-                Ordering::Release,
-            );
-            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-            RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
-        }
-        if let Some(used) = outbound {
-            if !transmit_udp6(link, state.peer, RAW_UDP6_PORT, &response[..used]) {
-                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
-            schedule_raw_client_service();
-        }
-    }
-    true
-}
-
-/// Queue the raw-UDP6 client turn after Main's exact one-shot deadline. The
-/// shared worker owns this callback and raw Ethernet ingress, so it cannot
-/// race a received ACK while reusing `RESPONSE_BUFFER`.
-pub fn schedule_raw_client_timer() {
-    let _ = crate::shared_ingress_esp::schedule_raw_udp6_client_timer(poll_raw_client);
-}
-
-/// Advance one due device-originated raw-UDP6 client deadline. This method is
-/// called only for an explicit probe's bootstrap retry, delayed ACK/PTO, or
-/// terminal timeout; there is no periodic UDP polling service.
-fn poll_raw_client() {
-    if !RAW_CLIENT_ACTIVE.load(Ordering::Acquire) {
-        return;
-    }
-    unsafe {
-        let state = &mut *core::ptr::addr_of_mut!(RAW_CLIENT).cast::<RawUdp6ClientState>();
-        let client = &mut *core::ptr::addr_of_mut!(RAW_CLIENT_ENGINE).cast::<RawUdp6Client>();
-        let now = esp_idf_sys::esp_timer_get_time();
-        if now >= state.deadline_us {
-            RAW_CLIENT_ERRORS.fetch_add(1, Ordering::Relaxed);
-            RAW_CLIENT_ACTIVE.store(false, Ordering::Release);
-            RAW_CLIENT_NEXT_DUE_MS.store(0, Ordering::Release);
-            crate::commands::send_stat(
-                b"raw udp6 client timeout_us=",
-                (state.deadline_us - state.started_at_us).max(0) as u64,
-            );
-            return;
-        }
-        let response = &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER);
-        let outbound = if client.server_cid().is_some() {
-            client
-                .poll_transmit_at((now.max(0) as u64) / 1_000, response)
-                .or_else(|error| {
-                    RAW_CLIENT_LAST_ERROR.store(
-                        u32::from(dmesh_server::raw_transport::receive_error_code(error)),
-                        Ordering::Release,
-                    );
-                    Err(error)
-                })
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    client
-                        .poll_retransmit((now.max(0) as u64) / 1_000, 600, response)
-                        .ok()
-                        .flatten()
-                })
-        } else if now >= state.next_bootstrap_retry_us {
-            let packet = client.retry_bootstrap(response).ok();
-            state.next_bootstrap_retry_us = now.saturating_add(400_000);
-            packet
-        } else {
-            None
-        };
-        if let Some(used) = outbound {
-            if !transmit_udp6(
-                crate::shared_ingress_esp::IngressLink::WifiSta,
-                state.peer,
-                RAW_UDP6_PORT,
-                &response[..used],
-            ) {
-                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-    publish_raw_client_deadline();
-}
-
-fn record_announce_peer(
+pub(crate) fn record_announce_peer(
     announce: dmesh_server::announce::Announce,
     source_mac: [u8; 6],
     source_ip: [u8; 16],
@@ -1256,7 +888,7 @@ fn paced_poll_work() {
     }
     let poll: RawUdp6PollHandler = unsafe { core::mem::transmute(poll) };
     let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
-    let result = dmesh_server::raw_transport::pump_egress(
+    let result = dmesh_server::transport::pump_egress(
         response,
         1,
         None,
@@ -1368,14 +1000,15 @@ pub(crate) fn transmit_udp6(
 /// common payload may advertise both deterministic link-local endpoints;
 /// each Ethernet frame uses the source MAC/IP of its own egress link.
 /// This is intentionally outside the QUIC-lite listener port, but the payload
-/// still uses the DCID-zero direct-record envelope. Multicast discovery must
+/// still uses the QUIC-lite private direct-message envelope. Multicast discovery must
 /// not be misparsed as a connection datagram.
 pub fn broadcast_announce(payload: &[u8]) -> bool {
     if payload.is_empty() || payload.len() > crate::TRANSPORT_MTU.saturating_sub(6) {
         return false;
     }
     let mut direct = [0u8; crate::TRANSPORT_MTU];
-    let Ok(used) = quic_lite::encode_direct_packet(0, payload, &mut direct) else {
+    let Some(used) = crate::core_runtime::encode_connectionless_message(payload, &mut direct)
+    else {
         return false;
     };
     let mut sent = false;
@@ -1408,7 +1041,7 @@ fn broadcast_announce_on_link(
         ANNOUNCE_IPV6,
         local_ip,
         ANNOUNCE_UDP6_PORT,
-        ANNOUNCE_UDP6_PORT,
+        RAW_UDP6_PORT,
         payload,
     ) else {
         return false;

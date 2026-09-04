@@ -4,13 +4,13 @@
 //! parsing, handler method IDs, snapshots, and delta semantics are in
 //! `dmesh-server`, so direct PPP and QUIC stream callers use identical bytes.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use dmesh_server::raw_wifi::{
-    RawWifiApMode, RawWifiBearer, RawWifiControlRequest, RawWifiCounters, RawWifiDwPolicy,
-    RawWifiInterface, RawWifiLabRequest, RawWifiRate, RawWifiRxFilter, RawWifiSnapshot,
-    RawWifiStaMode, RawWifiStaState, RAW_WIFI_METHOD_CHECK, RAW_WIFI_METHOD_CONTROL,
-    RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT,
+    RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT,
+    RawWifiApMode, RawWifiControlRequest, RawWifiCounters, RawWifiDwPolicy, RawWifiInterface,
+    RawWifiLabRequest, RawWifiRate, RawWifiRxFilter, RawWifiSnapshot, RawWifiStaMode,
+    RawWifiStaState,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);
@@ -80,8 +80,6 @@ pub const fn response_method(request: RawWifiLabRequest) -> Option<u64> {
         RawWifiLabRequest::Control(_) => Some(RAW_WIFI_METHOD_CONTROL),
         RawWifiLabRequest::Snapshot => Some(RAW_WIFI_METHOD_SNAPSHOT),
         RawWifiLabRequest::ResetCounters => Some(RAW_WIFI_METHOD_RESET_COUNTERS),
-        RawWifiLabRequest::Check(_) => Some(RAW_WIFI_METHOD_CHECK),
-        RawWifiLabRequest::Iperf(_) => Some(dmesh_server::raw_wifi::RAW_WIFI_METHOD_IPERF),
         RawWifiLabRequest::Scan(_) => Some(dmesh_server::raw_wifi::RAW_WIFI_METHOD_SCAN),
     }
 }
@@ -162,15 +160,6 @@ pub fn snapshot() -> RawWifiSnapshot {
     let (dispatcher, _tx_hook, parser_rejected, self_echo) =
         crate::wifi_espnow_esp::receive_diagnostics();
     let (
-        _peer_mismatches,
-        client_receive_ok,
-        client_receive_errors,
-        last_client_error,
-        client_bootstrap_acks,
-        client_stream_packets,
-        client_other_packets,
-    ) = crate::wifi_espnow_esp::client_diagnostics();
-    let (
         tx_duration_us_total,
         tx_duration_us_max,
         tx_duration_le_250us,
@@ -178,26 +167,6 @@ pub fn snapshot() -> RawWifiSnapshot {
         tx_duration_le_2ms,
         tx_duration_gt_2ms,
     ) = crate::wifi_espnow_esp::tx_timing();
-    let (action_service_bytes, _action_service_errors, action_service_elapsed_us) =
-        crate::wifi_espnow_esp::raw_client_result();
-    let (
-        raw_client_expected_server_cid,
-        raw_client_last_other_dcid,
-        raw_client_last_other_peer_suffix,
-    ) = crate::wifi_espnow_esp::raw_client_cid_diagnostics();
-    let (udp6_service_bytes, _udp6_service_errors, udp6_service_elapsed_us) =
-        crate::wifi_raw_udp6_esp::raw_client_result();
-    // One raw service is admitted at a time by the probe executor. Select
-    // the active/recent bearer result rather than inventing a separate
-    // response schema for UDP6; the shared snapshot records bytes and time
-    // identically for NOW and raw IPv6.
-    let use_udp6_client = crate::wifi_raw_udp6_esp::raw_client_active()
-        || (udp6_service_bytes != 0 && action_service_bytes == 0);
-    let (raw_service_bytes, raw_service_elapsed_us) = if use_udp6_client {
-        (udp6_service_bytes, udp6_service_elapsed_us)
-    } else {
-        (action_service_bytes, action_service_elapsed_us)
-    };
     let (
         _frames,
         _bytes,
@@ -282,23 +251,13 @@ pub fn snapshot() -> RawWifiSnapshot {
         tx_rate: rate_from(TX_RATE.load(Ordering::Acquire)),
         ap_active: Some(crate::wifi_esp::lab_open_ap_active()),
         mac_ack: Some(crate::wifi_espnow_esp::mac_ack_enabled()),
-        raw_service_active: Some(
-            crate::wifi_espnow_esp::raw_client_active()
-                || crate::wifi_raw_udp6_esp::raw_client_active(),
-        ),
         last_tx_error: Some(crate::wifi_espnow_esp::last_tx_error() as u32),
-        last_raw_client_error: Some(last_client_error),
-        last_raw_service_error: Some(crate::core_runtime::raw_service_last_error()),
-        raw_client_expected_server_cid,
-        raw_client_last_other_dcid,
-        raw_client_last_other_peer_suffix,
+        last_connection_error: Some(crate::core_runtime::connection_last_error()),
         sta_mac: crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta),
         ap_mac: crate::wifi_esp::lab_open_ap_active()
             .then(|| crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap))
             .flatten(),
         action_destination_broadcast: Some(ACTION_DESTINATION_BROADCAST.load(Ordering::Acquire)),
-        raw_service_bytes: Some(raw_service_bytes),
-        raw_service_elapsed_us: Some(raw_service_elapsed_us),
         sta_driver_tx: Some(crate::wifi_raw_udp6_esp::sta_driver_tx_enabled()),
         sta_bssid_check_disabled: Some(crate::wifi_esp::sta_bssid_check_disabled()),
         sta_ampdu_enabled: Some(crate::wifi_esp::sta_ampdu_enabled()),
@@ -346,11 +305,6 @@ pub fn snapshot() -> RawWifiSnapshot {
             tx_duration_le_750us,
             tx_duration_le_2ms,
             tx_duration_gt_2ms,
-            raw_client_receive_ok: client_receive_ok,
-            raw_client_receive_errors: client_receive_errors,
-            raw_client_bootstrap_acks: client_bootstrap_acks,
-            raw_client_stream_packets: client_stream_packets,
-            raw_client_other_packets: client_other_packets,
             roc_action_listen_requests: roc_requests,
             roc_action_listen_failures: roc_failures,
             roc_action_frames: roc_frames,
@@ -447,7 +401,10 @@ fn apply_control(control: RawWifiControlRequest) -> Result<(), &'static str> {
             return Err("open AP transition rejected");
         }
         if matches!(ap_mode, RawWifiApMode::Open)
-            && !crate::wifi_esp::start_raw_udp6_ap(crate::core_runtime::receive_raw_udp6)
+            && !crate::wifi_esp::start_raw_udp6_ap(
+                crate::core_runtime::receive_raw_udp6,
+                crate::core_runtime::receive_udp6_connectionless,
+            )
         {
             return Err("open AP raw UDP6 ingress rejected");
         }
@@ -510,8 +467,8 @@ fn apply_control(control: RawWifiControlRequest) -> Result<(), &'static str> {
 }
 
 /// Apply one host-decoded registered handler.  It returns a snapshot for all
-/// operations; callers encode it through `dmesh_server::raw_wifi` on either
-/// direct PPP or a QUIC stream.
+/// operations; callers encode it through `dmesh_server::raw_wifi` on a QUIC
+/// stream.
 pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static str> {
     match request {
         RawWifiLabRequest::Control(control) => {
@@ -526,64 +483,14 @@ pub fn handle(request: RawWifiLabRequest) -> Result<RawWifiSnapshot, &'static st
             EPOCH.fetch_add(1, Ordering::AcqRel);
         }
         RawWifiLabRequest::Snapshot => {}
-        RawWifiLabRequest::Check(check) => {
-            // A check request is an observation/control operation.  Return
-            // the common snapshot even if the client cannot be acquired or
-            // its first action TX is rejected; `raw_service_active` and
-            // `last_tx_error` make that result testable on the same bearer.
-            if crate::wifi_espnow_esp::start_check_client(
-                crate::wifi_espnow_esp::EspNowPeer { mac: check.peer },
-                check.nonce,
-                check.timeout_ms,
-            ) {
-                // Main blocks when idle. Tell its timer owner that this
-                // client has a concrete retry/PTO deadline; do not create a
-                // per-radio polling task here.
-                crate::wifi_espnow_esp::schedule_raw_client_service();
-            }
-        }
-        RawWifiLabRequest::Iperf(iperf) => {
-            // This starts a device-originated peer run.  The immediate
-            // snapshot records admission; the same bounded client publishes
-            // live/final bytes and errors through the normal radio counters.
-            let bearer = match iperf.bearer {
-                RawWifiBearer::Auto if crate::wifi_esp::sta_associated() => RawWifiBearer::Udp6,
-                RawWifiBearer::Auto => RawWifiBearer::Now,
-                bearer => bearer,
-            };
-            let started = if bearer == RawWifiBearer::Udp6 {
-                // In an associated probe row, raw UDP6 is the pair data
-                // bearer. The initiating STA targets the peer's link-local
-                // address derived from this same six-byte radio identity.
-                crate::wifi_raw_udp6_esp::start_iperf_client(
-                    iperf.peer,
-                    iperf.bytes,
-                    iperf.packet_size,
-                    iperf.timeout_ms,
-                )
-            } else {
-                crate::wifi_espnow_esp::start_iperf_client(
-                    crate::wifi_espnow_esp::EspNowPeer { mac: iperf.peer },
-                    iperf.bytes,
-                    iperf.packet_size,
-                    iperf.timeout_ms,
-                )
-            };
-            if !started {
-                return Err("raw IPERF client busy or rejected");
-            }
-            if bearer != RawWifiBearer::Udp6 {
-                crate::wifi_espnow_esp::schedule_raw_client_service();
-            }
-        }
         RawWifiLabRequest::Scan(_) => {}
     }
     Ok(snapshot())
 }
 
 /// Apply a decoded request and encode its matching handler response into a
-/// caller-owned bounded buffer.  UART direct PPP and QUIC stream adapters use
-/// this exact function; neither owns a second radio response schema.
+/// caller-owned bounded buffer. Every bearer reaches it through the same QUIC
+/// stream dispatcher; no adapter owns a second radio response schema.
 pub fn handle_encoded(request: RawWifiLabRequest, out: &mut [u8]) -> Result<usize, &'static str> {
     if let RawWifiLabRequest::Scan(request) = request {
         let mut entries = [dmesh_server::raw_wifi::RawWifiScanEntry::default();

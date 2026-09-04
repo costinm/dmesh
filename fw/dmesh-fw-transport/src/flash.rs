@@ -5,12 +5,12 @@
 //! durable ESP erase/write operations.
 
 use alloc::{
-    alloc::{alloc_zeroed, Layout},
+    alloc::{Layout, alloc_zeroed},
     boxed::Box,
     vec::Vec,
 };
 use core::ffi::c_void;
-use dmesh_server::protocol::{ImageSink, BLOCK_SIZE};
+use dmesh_server::protocol::{BLOCK_SIZE, ImageSink};
 
 const PENDING_FLASH_BLOCKS: usize = 8;
 const FLASH_WRITE_BLOCKS: usize = 2;
@@ -35,8 +35,8 @@ pub type SignedObjectFlashReceiver = dmesh_server::protocol::SignedObjectReceive
 /// object or performs flash I/O itself.
 pub struct SignedObjectFlashDownload {
     receiver: SignedObjectFlashReceiver,
-    client: dmesh_server::raw_transport::RawObjectClient<
-        { crate::RAW_SERVICE_HISTORY_CAPACITY },
+    client: dmesh_server::transport::ObjectClient<
+        { crate::CONNECTION_HISTORY_CAPACITY },
         { crate::TRANSPORT_MTU },
     >,
 }
@@ -104,7 +104,7 @@ impl SignedObjectFlashDownload {
         request: dmesh_server::protocol::FlashRequest<'_>,
     ) -> Result<Self, FlashSinkError> {
         let sink = sink_for_flash_request(request)?;
-        let client = dmesh_server::raw_transport::RawObjectClient::new(client_cid, request.object)
+        let client = dmesh_server::transport::ObjectClient::new(client_cid, request.object)
             .map_err(|_| FlashSinkError::UnsupportedTarget)?;
         Ok(Self {
             receiver: SignedObjectFlashReceiver::new(sink),
@@ -123,11 +123,10 @@ impl SignedObjectFlashDownload {
         self.client.accepts(input)
     }
 
-    pub fn retry_bootstrap(
-        &self,
-        output: &mut [u8; crate::TRANSPORT_MTU],
-    ) -> Result<usize, quic_lite::Error> {
-        self.client.retry_bootstrap(output)
+    /// Kept at the download boundary so the frame adapter can abandon an
+    /// interrupted mutation without knowing reset framing or object protocol.
+    pub fn is_peer_stateless_reset(&self, input: &[u8]) -> bool {
+        self.client.is_peer_stateless_reset(input)
     }
 
     pub fn receive(

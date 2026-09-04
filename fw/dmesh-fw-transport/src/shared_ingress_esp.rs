@@ -8,7 +8,7 @@
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 use quic_lite::packet_pool::{PacketPool, PacketSlot};
@@ -32,13 +32,12 @@ const EGRESS_RESERVED_SLOTS: usize = 2;
 /// NOW-private fast path.
 const QUEUE_SEND_TO_FRONT: i32 = 1;
 /// One active ingress worker owns the shared service-dispatch call chain for
-/// UART, NOW, UDP6, and NAN Service Info.  It does not own packet buffers:
-/// those are in [`PACKETS`].  The former 48 KiB value was an unmeasured
-/// construction peak and prevented classic ESP32 UART ingress after Wi-Fi
-/// initialization.  32 KiB is the previously measured safe floor for a
-/// single classic-IPERF service turn; `memory_stats` records its actual
-/// high-water mark so this can be reduced from device evidence later.
-const TASK_STACK_BYTES: u32 = 32 * 1024;
+/// UART, NOW, UDP6, and NAN Service Info. It does not own packet buffers:
+/// those are in [`PACKETS`]. A retained 16-packet association has a larger
+/// construction path than the old one-shot PROBE turn; 32 KiB produced a
+/// stack-protection fault while admitting its first stream. Keep 48 KiB until
+/// `memory_stats` proves a smaller high-water mark on the full catalog pass.
+const TASK_STACK_BYTES: u32 = 48 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -56,10 +55,10 @@ pub enum IngressKind {
     /// NAN active-subscribe/publish Service Info. The Wi-Fi callback copies
     /// only the bounded CBOR payload, then this common worker applies it.
     NanServiceInfo = 6,
-    /// A connection-owned raw-service deadline. This is queue metadata only:
-    /// it owns no packet slot and wakes the same worker that owns raw service
-    /// state, so a lost NOW server response can be retransmitted safely.
-    RawServiceTimer = 7,
+    /// A connection-owned deadline. This is queue metadata only: it owns no
+    /// packet slot and wakes the same worker that owns connection state, so a
+    /// lost NOW server response can be retransmitted safely.
+    ConnectionTimer = 7,
     /// One complete NOW datagram awaiting radio submission.  It uses the same
     /// device-wide packet pool and FreeRTOS worker as RX, rather than a
     /// bearer-private egress buffer or a second Wi-Fi task.  This serializes
@@ -67,22 +66,12 @@ pub enum IngressKind {
     /// packet-worker replies; those two producers may otherwise overwrite
     /// the driver's static request while a previous action is in flight.
     EspNowTx = 8,
-    /// A due NOW client retry, ACK, PTO, or close-drain turn.  It carries no
-    /// packet data: it makes the shared worker the sole owner of the client's
-    /// QUIC-lite state and response scratch, rather than letting Main's timer
-    /// race an RX callback.  UDP6 and UART will use the same shape when their
-    /// active client state moves into the common connection scheduler.
-    EspNowClientTimer = 9,
     /// The physical UART writer has released one bounded egress record. It
     /// carries no data and only wakes the existing worker so the shared raw
     /// service can produce the next packet within the real UART queue's
     /// capacity. This is the UART equivalent of a writable-socket event, not
     /// a periodic transmit poll or a bearer-private packet queue.
     UartEgressReady = 10,
-    /// A due raw-UDP6 client bootstrap, delayed-ACK, PTO, or timeout turn.
-    /// Like the NOW client timer, it contains no frame and makes the shared
-    /// ingress worker the sole mutable owner of the QUIC-lite client ledger.
-    RawUdp6ClientTimer = 11,
 }
 
 /// Link context preserved across the one required driver-buffer copy.
@@ -134,12 +123,8 @@ static UART_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_RAW_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static WORK_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static NAN_SERVICE_INFO_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static RAW_SERVICE_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static RAW_SERVICE_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
-static ESPNOW_CLIENT_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static ESPNOW_CLIENT_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
-static RAW_UDP6_CLIENT_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static RAW_UDP6_CLIENT_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
+static CONNECTION_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static CONNECTION_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
 static UART_EGRESS_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_EGRESS_READY_PENDING: AtomicBool = AtomicBool::new(false);
 static DROPS: AtomicU32 = AtomicU32::new(0);
@@ -173,6 +158,14 @@ static mut TASK_PACKET: core::mem::MaybeUninit<IngressPacket> = core::mem::Maybe
 /// distinguish heap exhaustion from malformed bearer traffic.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IngressMemoryStats {
+    /// Fixed device-wide pool capacity. This is intentionally not a
+    /// per-bearer queue size: UART, UDP6, NOW and NAN all draw from it.
+    pub packet_slots: u32,
+    /// Free packet slots at the instant the snapshot was taken. A non-egress
+    /// receive is rejected when this reaches the reserved egress floor.
+    pub packet_slots_available: u32,
+    /// Total bounded ingress/egress admission failures since boot.
+    pub packet_drops: u32,
     pub worker_stack_bytes: u32,
     pub worker_running: bool,
     pub worker_starts: u32,
@@ -187,6 +180,9 @@ pub struct IngressMemoryStats {
 /// worker. Stack high water is FreeRTOS words remaining, not bytes used.
 pub fn memory_stats() -> IngressMemoryStats {
     IngressMemoryStats {
+        packet_slots: PACKET_SLOTS as u32,
+        packet_slots_available: PACKETS.available() as u32,
+        packet_drops: DROPS.load(Ordering::Relaxed),
         worker_stack_bytes: TASK_STACK_BYTES,
         worker_running: !WORKER_HANDLE.load(Ordering::Relaxed).is_null(),
         worker_starts: WORKER_STARTS.load(Ordering::Relaxed),
@@ -203,11 +199,7 @@ pub fn memory_stats() -> IngressMemoryStats {
 }
 
 fn zero_if_unset(value: u32) -> u32 {
-    if value == u32::MAX {
-        0
-    } else {
-        value
-    }
+    if value == u32::MAX { 0 } else { value }
 }
 
 fn record_lowest(slot: &AtomicU32, value: u32) {
@@ -398,23 +390,23 @@ pub fn schedule_work(work: fn()) -> bool {
     queued
 }
 
-/// Queue one connection-owned raw-service deadline on the shared ingress
+/// Queue one connection-owned deadline on the shared ingress
 /// worker. Unlike [`schedule_work`], this has a dedicated typed queue item:
 /// unrelated deferred work cannot replace an outstanding retransmission.
-/// The event contains no bearer queue or payload; the raw-service ledger owns
+/// The event contains no bearer queue or payload; the connection ledger owns
 /// both the path and retransmittable packet history.
-pub fn schedule_raw_service_timer(handler: fn()) -> bool {
-    RAW_SERVICE_TIMER_HANDLER.store(handler as usize, Ordering::Release);
-    if RAW_SERVICE_TIMER_PENDING.swap(true, Ordering::AcqRel) {
+pub fn schedule_connection_timer(handler: fn()) -> bool {
+    CONNECTION_TIMER_HANDLER.store(handler as usize, Ordering::Release);
+    if CONNECTION_TIMER_PENDING.swap(true, Ordering::AcqRel) {
         return true;
     }
     let queue = QUEUE.load(Ordering::Acquire);
     if queue.is_null() || !wake_worker() {
-        RAW_SERVICE_TIMER_PENDING.store(false, Ordering::Release);
+        CONNECTION_TIMER_PENDING.store(false, Ordering::Release);
         return false;
     }
     let item = IngressPacket {
-        kind: IngressKind::RawServiceTimer,
+        kind: IngressKind::ConnectionTimer,
         link: IngressLink::None,
         source: [0; 6],
         len: 0,
@@ -425,69 +417,7 @@ pub fn schedule_raw_service_timer(handler: fn()) -> bool {
             == 1
     };
     if !queued {
-        RAW_SERVICE_TIMER_PENDING.store(false, Ordering::Release);
-        DROPS.fetch_add(1, Ordering::Relaxed);
-    }
-    queued
-}
-
-/// Queue one due NOW-client transition on the same worker as NOW ingress and
-/// egress.  Main's ESP timer only tells this owner that a deadline arrived;
-/// it must not touch the client ledger or its response scratch itself.
-pub fn schedule_espnow_client_timer(handler: fn()) -> bool {
-    ESPNOW_CLIENT_TIMER_HANDLER.store(handler as usize, Ordering::Release);
-    if ESPNOW_CLIENT_TIMER_PENDING.swap(true, Ordering::AcqRel) {
-        return true;
-    }
-    let queue = QUEUE.load(Ordering::Acquire);
-    if queue.is_null() || !wake_worker() {
-        ESPNOW_CLIENT_TIMER_PENDING.store(false, Ordering::Release);
-        return false;
-    }
-    let item = IngressPacket {
-        kind: IngressKind::EspNowClientTimer,
-        link: IngressLink::None,
-        source: [0; 6],
-        len: 0,
-        slot: PacketSlot::sentinel(),
-    };
-    let queued = unsafe {
-        esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
-            == 1
-    };
-    if !queued {
-        ESPNOW_CLIENT_TIMER_PENDING.store(false, Ordering::Release);
-        DROPS.fetch_add(1, Ordering::Relaxed);
-    }
-    queued
-}
-
-/// Queue one due raw-UDP6 client transition on the same worker that owns raw
-/// Ethernet receive and response scratch. Main's one-shot deadline merely
-/// requests this turn; it never races the RX callback by touching client state.
-pub fn schedule_raw_udp6_client_timer(handler: fn()) -> bool {
-    RAW_UDP6_CLIENT_TIMER_HANDLER.store(handler as usize, Ordering::Release);
-    if RAW_UDP6_CLIENT_TIMER_PENDING.swap(true, Ordering::AcqRel) {
-        return true;
-    }
-    let queue = QUEUE.load(Ordering::Acquire);
-    if queue.is_null() || !wake_worker() {
-        RAW_UDP6_CLIENT_TIMER_PENDING.store(false, Ordering::Release);
-        return false;
-    }
-    let item = IngressPacket {
-        kind: IngressKind::RawUdp6ClientTimer,
-        link: IngressLink::None,
-        source: [0; 6],
-        len: 0,
-        slot: PacketSlot::sentinel(),
-    };
-    let queued = unsafe {
-        esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
-            == 1
-    };
-    if !queued {
-        RAW_UDP6_CLIENT_TIMER_PENDING.store(false, Ordering::Release);
+        CONNECTION_TIMER_PENDING.store(false, Ordering::Release);
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
     queued
@@ -543,11 +473,9 @@ fn handler_slot(kind: IngressKind) -> &'static AtomicUsize {
         IngressKind::UartRaw => &UART_RAW_HANDLER,
         IngressKind::Work => &WORK_HANDLER,
         IngressKind::NanServiceInfo => &NAN_SERVICE_INFO_HANDLER,
-        IngressKind::RawServiceTimer => &RAW_SERVICE_TIMER_HANDLER,
+        IngressKind::ConnectionTimer => &CONNECTION_TIMER_HANDLER,
         IngressKind::EspNowTx => &ESPNOW_TX_HANDLER,
-        IngressKind::EspNowClientTimer => &ESPNOW_CLIENT_TIMER_HANDLER,
         IngressKind::UartEgressReady => &UART_EGRESS_READY_HANDLER,
-        IngressKind::RawUdp6ClientTimer => &RAW_UDP6_CLIENT_TIMER_HANDLER,
     }
 }
 
@@ -576,27 +504,9 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
             }
             continue;
         }
-        if item.kind == IngressKind::RawServiceTimer {
-            RAW_SERVICE_TIMER_PENDING.store(false, Ordering::Release);
-            let handler = RAW_SERVICE_TIMER_HANDLER.load(Ordering::Acquire);
-            if handler != 0 {
-                let handler: fn() = unsafe { core::mem::transmute(handler) };
-                handler();
-            }
-            continue;
-        }
-        if item.kind == IngressKind::EspNowClientTimer {
-            ESPNOW_CLIENT_TIMER_PENDING.store(false, Ordering::Release);
-            let handler = ESPNOW_CLIENT_TIMER_HANDLER.load(Ordering::Acquire);
-            if handler != 0 {
-                let handler: fn() = unsafe { core::mem::transmute(handler) };
-                handler();
-            }
-            continue;
-        }
-        if item.kind == IngressKind::RawUdp6ClientTimer {
-            RAW_UDP6_CLIENT_TIMER_PENDING.store(false, Ordering::Release);
-            let handler = RAW_UDP6_CLIENT_TIMER_HANDLER.load(Ordering::Acquire);
+        if item.kind == IngressKind::ConnectionTimer {
+            CONNECTION_TIMER_PENDING.store(false, Ordering::Release);
+            let handler = CONNECTION_TIMER_HANDLER.load(Ordering::Acquire);
             if handler != 0 {
                 let handler: fn() = unsafe { core::mem::transmute(handler) };
                 handler();
