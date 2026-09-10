@@ -1,0 +1,227 @@
+[
+  {
+    "name": "status",
+    "title": "Status",
+    "group": "Status",
+    "description": "Return mesh, interface, radio, and neighbor status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "messages.history",
+    "title": "Message History",
+    "group": "Status",
+    "description": "Return recent message, radio, and service notifications.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "string",
+          "title": "Keys",
+          "description": "Comma-separated method prefixes to include.",
+          "default": "messages,net,wifi,BLE,N"
+        },
+        "limit": {
+          "type": "integer",
+          "title": "Limit",
+          "description": "Maximum number of events to return.",
+          "default": 40,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.scan",
+    "title": "Wi-Fi Scan",
+    "group": "Wi-Fi",
+    "description": "Request a Wi-Fi scan through the local hardware adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "title": "Reason",
+          "default": "web"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.adv",
+    "title": "Advertise",
+    "group": "Wi-Fi",
+    "description": "Enable or disable Wi-Fi service advertisement.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "on": {
+          "type": "boolean",
+          "title": "On",
+          "default": true
+        },
+        "p2p": {
+          "type": "boolean",
+          "title": "P2P",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.con.start",
+    "title": "Start Discovery",
+    "group": "Wi-Fi",
+    "description": "Start Wi-Fi Direct/service discovery.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sd": {
+          "type": "boolean",
+          "title": "Service discovery",
+          "default": true
+        },
+        "wait": {
+          "type": "integer",
+          "title": "Wait seconds",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "wifi.con.stop",
+    "title": "Stop Discovery",
+    "group": "Wi-Fi",
+    "description": "Stop Wi-Fi Direct/service discovery.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ble.scan",
+    "title": "BLE Scan",
+    "group": "BLE",
+    "description": "Request a BLE scan through the local hardware adapter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "title": "Reason",
+          "default": "web"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "permission.status",
+    "title": "Permission Status",
+    "group": "Android",
+    "description": "Return Android permission status when running behind app-dmesh.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "messages.file",
+    "title": "Message File",
+    "group": "Messages",
+    "description": "Return the Android BLE/NAN message spool path and size.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "messages.list",
+    "title": "List Messages",
+    "group": "Messages",
+    "description": "List received Android BLE/NAN message headers.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "title": "Sequence",
+          "description": "Optional sequence number to filter to one message."
+        },
+        "limit": {
+          "type": "integer",
+          "title": "Limit",
+          "default": 40,
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "messages.read",
+    "title": "Read Messages",
+    "group": "Messages",
+    "description": "List received Android BLE/NAN messages with a short payload preview.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "title": "Sequence",
+          "description": "Optional sequence number to filter to one message."
+        },
+        "limit": {
+          "type": "integer",
+          "title": "Limit",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 200
+        },
+        "preview": {
+          "type": "integer",
+          "title": "Preview Bytes",
+          "default": 96,
+          "minimum": 1,
+          "maximum": 512
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "companion.status",
+    "title": "Companion Status",
+    "group": "Companion",
+    "description": "Return the paired ESP companion state for this Android device.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "companion.clear",
+    "title": "Clear Companion",
+    "group": "Companion",
+    "description": "Forget the paired ESP companion on this Android device.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  }
+]

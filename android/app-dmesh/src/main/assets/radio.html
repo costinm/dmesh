@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mesh Radio</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f7f8fa;
+            --panel: #ffffff;
+            --text: #18202f;
+            --muted: #657084;
+            --border: #d8dee8;
+            --accent: #1167b1;
+            --warn: #a15c00;
+            --ok: #146c43;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+        header {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            background: var(--panel);
+        }
+        h1 {
+            margin: 0;
+            font-size: 21px;
+            font-weight: 650;
+        }
+        main {
+            display: grid;
+            grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
+            gap: 16px;
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 18px;
+        }
+        section {
+            min-width: 0;
+        }
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        button {
+            min-height: 36px;
+            padding: 0 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--panel);
+            color: var(--text);
+            font: inherit;
+            cursor: pointer;
+        }
+        button.primary {
+            border-color: var(--accent);
+            background: var(--accent);
+            color: white;
+        }
+        button:hover { border-color: var(--accent); }
+        .group {
+            margin-bottom: 18px;
+        }
+        .group h2 {
+            margin: 0 0 8px;
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .tool {
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--panel);
+            margin-bottom: 8px;
+        }
+        .tool-title {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .tool strong {
+            font-size: 15px;
+        }
+        .tool p {
+            margin: 7px 0 0;
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.35;
+        }
+        form {
+            margin-top: 10px;
+            display: grid;
+            gap: 9px;
+        }
+        label {
+            display: grid;
+            gap: 4px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        input, select {
+            width: 100%;
+            min-height: 34px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 8px;
+            color: var(--text);
+            background: #fff;
+            font: inherit;
+        }
+        label.check {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        label.check input {
+            width: auto;
+            min-height: auto;
+        }
+        .panes {
+            display: grid;
+            grid-template-rows: auto 1fr;
+            gap: 16px;
+        }
+        .panel {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--panel);
+            overflow: hidden;
+        }
+        .panel h2 {
+            margin: 0;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 15px;
+        }
+        .panel-heading {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            padding: 10px 12px;
+        }
+        .panel-heading h2 {
+            padding: 0;
+            border: 0;
+        }
+        .panel-heading label {
+            display: flex;
+            grid-template-columns: none;
+            align-items: center;
+            gap: 7px;
+            white-space: nowrap;
+        }
+        .panel-heading input {
+            width: 76px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            font-size: 13px;
+        }
+        th, td {
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        th {
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .empty {
+            padding: 14px 12px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+        pre {
+            margin: 0;
+            padding: 12px;
+            min-height: 160px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 12px;
+            line-height: 1.45;
+        }
+        .tool-result {
+            margin-top: 10px;
+            min-height: 42px;
+            max-height: 280px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: #f9fafb;
+        }
+        .status {
+            font-size: 13px;
+            color: var(--muted);
+        }
+        .status.ok { color: var(--ok); }
+        .status.warn { color: var(--warn); }
+        @media (max-width: 760px) {
+            header { align-items: flex-start; flex-direction: column; }
+            main { grid-template-columns: 1fr; padding: 12px; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>Mesh Radio</h1>
+            <div id="status" class="status">Loading command registry</div>
+        </div>
+        <div class="toolbar">
+            <button id="refresh" type="button">Refresh</button>
+            <button id="history" type="button">History</button>
+        </div>
+    </header>
+    <main>
+        <section id="tools"></section>
+        <section class="panes">
+            <div class="panel">
+                <div class="panel-heading">
+                    <h2>Discovery</h2>
+                    <div class="toolbar">
+                        <label>Hours <input id="neighbor-hours" type="number" min="1" value="6"></label>
+                        <button id="ping-all" class="primary" type="button">Ping All Media</button>
+                    </div>
+                </div>
+                <div id="neighbors"></div>
+            </div>
+            <div class="panel">
+                <h2>Result</h2>
+                <pre id="result"></pre>
+            </div>
+            <div class="panel">
+                <h2>Notifications</h2>
+                <pre id="notifications"></pre>
+            </div>
+        </section>
+    </main>
+    <script src="radio.js"></script>
+</body>
+</html>

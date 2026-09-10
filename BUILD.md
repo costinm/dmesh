@@ -4,30 +4,56 @@ This repository owns device-specific mesh code: `lmesh`, `dmesh-store`,
 `mesh-tun`, and `fw/esp32`. It consumes upstream `mesh` for common telemetry
 and protocol support, and `ssh-mesh` for SSH, HTTPS, SFTP, and forwarding.
 
+## Prerequisites & Host Setup
+
+On a fresh environment (e.g., Linux VM or container):
+
+1. **Host tools**:
+   ```sh
+   sudo apt-get update && sudo apt-get install -y git curl
+   ```
+
+2. **Clone DMesh**:
+   ```sh
+   git clone https://github.com/costinm/dmesh.git
+   ```
+   *(Optional: Clone sibling `git clone https://github.com/costinm/ssh-mesh.git` if modifying API schemas or building `mesh-cli`)*
+
+3. **Install Nix**:
+   If Nix is not already present on the host:
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
+   . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+   ```
+
+> [!NOTE]
+> **Filesystem Symlinks (Android / FUSE / FAT / SD mounts)**:
+> In environments where the repository resides on a filesystem that restricts symlink creation (such as Android `/storage/emulated/10`), `env.sh` automatically detects this and falls back to `$HOME/.cache/ws/dmesh/` for Cargo targets and Nix profiles, keeping ephemeral build state within standard cache locations excluded from backups and syncs.
+
 ## Local build environment
 
 The checked-in build scripts source `env.sh` before invoking Cargo, Nix,
-Android, or firmware tools. It keeps all mutable state under `target/`: Cargo,
+Android, or firmware tools. It keeps mutable state under `target/` (or the automatic `$HOME/.cache/ws/dmesh` fallback): Cargo,
 Rustup, Gradle, Nix profiles, Android SDK/NDK, ESP-IDF, and the Rust ESP
-toolchain. It does not use a host home directory or host-installed build
-tools. Source `env.sh` manually only when using other repo tools.
+toolchain.
 
 ```sh
 cd "$(git rev-parse --show-toplevel)"
 . ./env.sh
-
-# For one-off commands from a sandboxed runner that does not inherit shell
-# initialization:
-./scripts/with-env.sh rg --version
 ```
 
 ## Linux MUSL binaries
 
-Install the repo-local Nix profile, then build every DMesh binary for static
-MUSL:
+Install the dependency profile via Nix and build the DMesh binaries:
 
 ```sh
+# For fast Linux MUSL build (avoids downloading Android SDK / multiple JDKs):
+scripts/build.sh musl-deps
+
+# Or for complete dependencies (including Android SDK/NDK, Wireshark, etc.):
 scripts/build.sh deps
+
+# Build release static binaries:
 scripts/build.sh musl
 ```
 
@@ -166,15 +192,35 @@ installs the stable Rust toolchain and MUSL target into `target/rustup`.
 ## Android
 
 Install the Android SDK, NDK, JDK, Rust/NDK helpers, and other host tools into
-the same repo-local profile, then build the Android apps:
+the repo-local profile:
 
 ```sh
 scripts/build-android.sh deps
-scripts/build-android.sh build debug
 ```
 
-Android SDK/NDK contents are installed under `target/android-sdk`; generated
-native libraries and APKs remain under `target/`.
+### Native Rust Libraries (`libdmesh.so`, `libdmeshui.so`)
+
+All Rust native compilation logic lives in `scripts/build.sh`:
+- When Rust code is changed, rebuild the native `.so` libraries:
+  ```sh
+  scripts/build.sh android-libs debug
+  # Or for release stripped libraries:
+  scripts/build.sh android-libs release
+  ```
+  This uses `cargo-ndk` for configured target ABIs (defaults to `arm64-v8a`), strips symbols (for release builds), and copies the libraries into `android/<app>/src/main/jniLibs/<abi>/`.
+
+### Gradle Packaging & APKs
+
+`scripts/build-android.sh` is dedicated strictly to Gradle packaging, device provisioning, and tests:
+- To build debug or release APKs:
+  ```sh
+  scripts/build-android.sh build debug
+  ```
+- **Native Library Reuse**: By default, `scripts/build-android.sh` reuses already built `.so` files from `jniLibs/`. It will only invoke `scripts/build.sh android-libs` if the native libraries do not exist yet, or if `DMESH_REBUILD_RUST=1` is explicitly set.
+
+### Web UI & Static Resources
+
+Web resources (HTML, JavaScript, and tool definitions) are packaged as Android file assets under `android/app-dmesh/src/main/assets/` and `android/app-web/src/main/assets/`, rather than linked or embedded into the native Rust binary. The in-app web views load these directly via standard Android asset protocols (`file:///android_asset/`), keeping the Rust binary lightweight and decoupling web UI updates from native rebuilds.
 
 ## ESP32 firmware
 

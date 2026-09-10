@@ -111,6 +111,8 @@ pub fn start_mesh(
             ssh_server: node.clone(),
             target_http_address: None,
             ssh_client_manager: client_manager.clone(),
+            mesh_services: Default::default(),
+            web_root: None,
         };
         let app = ssh_mesh::handlers::app(app_state);
         http_server_handle = Some(runtime.spawn(async move {

@@ -4,82 +4,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DMESH_NIX_PROFILE="${DMESH_NIX_PROFILE:-$SCRIPT_DIR/target/nix/profile}"
-
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/env.sh"
 
-export CARGO_HOME="${CARGO_HOME:-$SCRIPT_DIR/target/.cargo}"
-export RUSTUP_HOME="${RUSTUP_HOME:-$SCRIPT_DIR/target/rustup}"
-export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
+DMESH_NIX_PROFILE="${NIX_PROFILE:-${DMESH_NIX_PROFILE:-$SCRIPT_DIR/target/nix/profile}}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$SCRIPT_DIR/target/.gradle}"
-export TMPDIR="${TMPDIR:-$SCRIPT_DIR/target/tmp}"
-mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$GRADLE_USER_HOME" "$TMPDIR"
-
-SSH_MESH_GIT_URL="${SSH_MESH_GIT_URL:-https://github.com/costinm/ssh-mesh}"
-SSH_MESH_OVERRIDE_ACTIVE=0
-CARGO_LOCK_BACKUP=""
-
-restore_cargo_lock() {
-    if [ -n "${CARGO_LOCK_BACKUP:-}" ] && [ -f "$CARGO_LOCK_BACKUP" ]; then
-        cp "$CARGO_LOCK_BACKUP" "$SCRIPT_DIR/Cargo.lock"
-        rm -f "$CARGO_LOCK_BACKUP"
-        CARGO_LOCK_BACKUP=""
-    fi
-}
-
-configure_ssh_mesh_override() {
-    SSH_MESH_OVERRIDE_ACTIVE=0
-    local override_dir="${DMESH_SSH_MESH_DIR:-}"
-    if [ -z "$override_dir" ]; then
-        for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
-            if [ -f "$candidate/crates/ssh-mesh/Cargo.toml" ]; then
-                override_dir="$candidate"
-                break
-            fi
-        done
-    fi
-
-    local config="$CARGO_HOME/config.toml"
-    if [ -z "$override_dir" ] || [ ! -d "$override_dir" ]; then
-        if [ -f "$config" ] && grep -q "BEGIN DMESH SSH_MESH OVERRIDE" "$config"; then
-            sed -i '/# BEGIN DMESH SSH_MESH OVERRIDE/,/# END DMESH SSH_MESH OVERRIDE/d' "$config"
-        fi
-        return
-    fi
-
-    for crate_dir in crates/ssh-mesh crates/mesh; do
-        if [ ! -f "$override_dir/$crate_dir/Cargo.toml" ]; then
-            echo "ERROR: DMESH_SSH_MESH_DIR does not look like ssh-mesh: $override_dir"
-            echo "Missing: $crate_dir/Cargo.toml"
-            exit 1
-        fi
-    done
-
-    mkdir -p "$CARGO_HOME"
-    touch "$config"
-    if grep -q "BEGIN DMESH SSH_MESH OVERRIDE" "$config"; then
-        sed -i '/# BEGIN DMESH SSH_MESH OVERRIDE/,/# END DMESH SSH_MESH OVERRIDE/d' "$config"
-    fi
-    cat >>"$config" <<EOF
-# BEGIN DMESH SSH_MESH OVERRIDE
-[patch."$SSH_MESH_GIT_URL"]
-ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
-mesh = { path = "$override_dir/crates/mesh" }
-# END DMESH SSH_MESH OVERRIDE
-EOF
-    SSH_MESH_OVERRIDE_ACTIVE=1
-    echo "Using local ssh-mesh override: $override_dir"
-}
-
-preserve_cargo_lock_for_override() {
-    if [ "${SSH_MESH_OVERRIDE_ACTIVE:-0}" != "1" ] || [ ! -f "$SCRIPT_DIR/Cargo.lock" ]; then
-        return
-    fi
-    CARGO_LOCK_BACKUP="$CARGO_HOME/Cargo.lock.before-ssh-mesh-override"
-    cp "$SCRIPT_DIR/Cargo.lock" "$CARGO_LOCK_BACKUP"
-    trap restore_cargo_lock EXIT
-}
+export TMPDIR="${TMPDIR:-/tmp}"
+mkdir -p "$GRADLE_USER_HOME" "$TMPDIR" 2>/dev/null || true
 
 load_nix_profile_env() {
     if [ -f "$DMESH_NIX_PROFILE/bin/dmesh-setenv" ]; then
@@ -91,16 +22,6 @@ load_nix_profile_env() {
     elif [ -d "$DMESH_NIX_PROFILE/bin" ]; then
         export PATH="$DMESH_NIX_PROFILE/bin:$PATH"
     fi
-}
-
-use_rustup_toolchain() {
-    local rustup_bin="$DMESH_NIX_PROFILE/bin/rustup"
-    local rust_bin="$RUSTUP_HOME/toolchains/stable-x86_64-unknown-linux-gnu/bin"
-
-    if ! "$rustup_bin" toolchain list | grep -q '^stable-'; then
-        "$rustup_bin" toolchain install stable --profile minimal
-    fi
-    export PATH="$rust_bin:$PATH"
 }
 
 nix_cmd() {
@@ -126,20 +47,13 @@ install_nix_deps() {
     echo "Installed DMesh build dependencies in $DMESH_NIX_PROFILE"
     echo "Load with: . target/nix/profile/bin/dmesh-setenv"
 
-    if [ ! -d "$SCRIPT_DIR/target/android-sdk/ndk" ]; then
+    if [ ! -d "${ANDROID_HOME:-$SCRIPT_DIR/target/android-sdk}/ndk" ]; then
         "$DMESH_NIX_PROFILE/bin/dmesh-android-sdk"
     fi
-    use_rustup_toolchain
-    "$DMESH_NIX_PROFILE/bin/rustup" target add \
-        aarch64-linux-android \
-        armv7-linux-androideabi \
-        i686-linux-android \
-        x86_64-linux-android
 }
 
 detect_android_env() {
     load_nix_profile_env
-    use_rustup_toolchain
 
     if [ -z "${ANDROID_HOME:-}" ]; then
         echo "ERROR: ANDROID_HOME is unset. Run scripts/build-android.sh deps, then source env.sh."
@@ -169,151 +83,20 @@ APP_WEB_PKG="com.github.costinm.dmesh.web"
 APP_CHAT_PKG="com.github.costinm.dmesh.chat"
 ANDROID_EVIDENCE_STAMP="${DMESH_ANDROID_EVIDENCE_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
-profile_dir() {
-    echo "release"
-}
-
-target_triple() {
-    case "$1" in
-        arm64-v8a) echo "aarch64-linux-android" ;;
-        armeabi-v7a) echo "armv7-linux-androideabi" ;;
-        x86) echo "i686-linux-android" ;;
-        x86_64) echo "x86_64-linux-android" ;;
-        *)
-            echo "ERROR: unsupported Android ABI: $1" >&2
-            exit 1
-            ;;
-    esac
-}
-
-copy_android_lib() {
-    local crate_name="$1"
-    local lib_name="$2"
-    local android_build_type="$3"
-    local abi="$4"
-    local triple
-    triple="$(target_triple "$abi")"
-
-    local rust_profile
-    rust_profile="$(profile_dir "$android_build_type")"
-    local so_path="$SCRIPT_DIR/target/$triple/$rust_profile/lib$lib_name.so"
-    if [ ! -f "$so_path" ]; then
-        echo "ERROR: Built library not found at $so_path"
-        exit 1
-    fi
-
-    local strip_libs="${DMESH_STRIP_ANDROID_LIBS:-}"
-    if [ -z "$strip_libs" ]; then
-        if [ "$android_build_type" = "release" ]; then
-            strip_libs=1
-        else
-            strip_libs=0
-        fi
-    fi
-
-    local strip_bin=""
-    if [ "$strip_libs" = "1" ]; then
-        strip_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-        if [ ! -x "$strip_bin" ]; then
-            echo "ERROR: Android llvm-strip not found at $strip_bin"
-            exit 1
-        fi
-    fi
-
-    local app
-    for app in ${DMESH_JNILIB_APPS:-app-dmesh}; do
-        local jnilib_dir="$SCRIPT_DIR/android/$app/src/main/jniLibs/$abi"
-        local jnilib_so="$jnilib_dir/lib$lib_name.so"
-        mkdir -p "$jnilib_dir"
-        cp "$so_path" "$jnilib_so"
-        local copied_size
-        copied_size="$(stat -c%s "$jnilib_so")"
-        if [ "$strip_libs" = "1" ]; then
-            "$strip_bin" --strip-unneeded "$jnilib_so"
-            local stripped_size
-            stripped_size="$(stat -c%s "$jnilib_so")"
-            echo "Copied $crate_name (rust $rust_profile, android $android_build_type) to: $jnilib_so"
-            echo "Stripped $jnilib_so: $copied_size -> $stripped_size bytes"
-        else
-            echo "Copied $crate_name (rust $rust_profile, android $android_build_type, unstripped) to: $jnilib_so ($copied_size bytes)"
-        fi
-    done
-}
-
-clean_android_lib_outputs() {
-    local lib_name="$1"
-    local app
-    for app in ${DMESH_JNILIB_APPS:-app-dmesh}; do
-        local jnilib_dir="$SCRIPT_DIR/android/$app/src/main/jniLibs"
-        if [ -d "$jnilib_dir" ]; then
-            find "$jnilib_dir" -name "lib$lib_name.so" -type f -delete
-        fi
-    done
-}
-
-clean_app_dmesh_dmeshui() {
-    local jnilib_dir="$SCRIPT_DIR/android/app-dmesh/src/main/jniLibs"
-    if [ -d "$jnilib_dir" ]; then
-        find "$jnilib_dir" -name 'libdmeshui.so' -type f -delete
-    fi
-}
-
-copy_dmeshui_android_lib() {
-    local requested_apps="${DMESH_UI_APPS:-app-chat}"
-    local ui_apps=""
-    local app
-
-    for app in $requested_apps; do
-        if [ "$app" = "app-dmesh" ]; then
-            echo "Skipping dmeshui copy to app-dmesh; dmeshui is owned by app-chat."
-            continue
-        fi
-        ui_apps="$ui_apps $app"
-    done
-
-    clean_app_dmesh_dmeshui
-    if [ -z "${ui_apps// /}" ]; then
-        ui_apps=" app-chat"
-    fi
-
-    DMESH_JNILIB_APPS="$ui_apps" \
-        build_rust_package dmeshui dmeshui "$1" "$2"
-}
-
-build_rust_package() {
-    local package="$1"
-    local lib_name="$2"
-    local android_build_type="$3"
-    local abi_list="$4"
-    local cargo_args=(build -p "$package" --lib --release)
-
-    if [ "$android_build_type" != "debug" ] && [ "$android_build_type" != "release" ]; then
-        echo "Usage: $0 build [debug|release]"
-        exit 1
-    fi
-
-    clean_android_lib_outputs "$lib_name"
-    for abi in $abi_list; do
-        echo "=== Building $package for $abi (rust release, android $android_build_type) ==="
-        cargo ndk -t "$abi" -P 28 "${cargo_args[@]}"
-        copy_android_lib "$package" "$lib_name" "$android_build_type" "$abi"
-    done
-}
-
-build_rust_native() {
+ensure_android_native_libs() {
     local build_type="${1:-debug}"
+    local force_rebuild="${DMESH_REBUILD_RUST:-0}"
+    local dmesh_so="$SCRIPT_DIR/android/app-dmesh/src/main/jniLibs/${DMESH_ANDROID_ABIS:-arm64-v8a}/libdmesh.so"
+    local dmeshui_so="$SCRIPT_DIR/android/app-chat/src/main/jniLibs/${DMESH_UI_ANDROID_ABIS:-arm64-v8a}/libdmeshui.so"
 
-    echo "Using NDK: $ANDROID_NDK_HOME"
-    echo "Using SDK: $ANDROID_HOME"
-    echo ""
-    configure_ssh_mesh_override
-    preserve_cargo_lock_for_override
-    clean_app_dmesh_dmeshui
-    build_rust_package dmesh dmesh "$build_type" "${DMESH_ANDROID_ABIS:-arm64-v8a}"
-    copy_dmeshui_android_lib "$build_type" "${DMESH_UI_ANDROID_ABIS:-arm64-v8a}"
-    clean_app_dmesh_dmeshui
-    restore_cargo_lock
-    trap - EXIT
+    if [ "$force_rebuild" = "1" ] || [ ! -f "$dmesh_so" ] || [ ! -f "$dmeshui_so" ]; then
+        echo "=== Native libraries missing or rebuild requested; running scripts/build.sh android-libs $build_type ==="
+        "$SCRIPT_DIR/scripts/build.sh" android-libs "$build_type"
+    else
+        echo "Reusing existing Rust native libraries (set DMESH_REBUILD_RUST=1 or run scripts/build.sh android-libs to rebuild):"
+        echo "  $dmesh_so"
+        echo "  $dmeshui_so"
+    fi
 }
 
 build_apps() {
@@ -331,19 +114,13 @@ build_apps() {
         exit 1
     fi
 
-    build_rust_native "$build_type"
-    clean_app_dmesh_dmeshui
-    rm -rf \
-        "$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/target/apk/$build_type"
+    ensure_android_native_libs "$build_type"
+    rm -rf         "$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type"         "$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type"         "$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type"         "$SCRIPT_DIR/target/apk/$build_type"
     echo ""
-    echo "=== Building Android APKs ($build_type) ==="
+    echo "=== Building Android APKs with Gradle ($build_type) ==="
     gradle "$dmesh_task" "$web_task" "$chat_task"
     stage_apks "$build_type"
 }
-
 stage_apks() {
     local build_type="${1:-debug}"
     local out_dir="$SCRIPT_DIR/target/apk/$build_type"
@@ -938,7 +715,7 @@ Usage: $0 [command] [debug|release]
 
 Commands:
   deps                    Install Nix build dependencies into target/nix/profile.
-  build [debug|release]   Build Rust UI and Android apps. Default.
+  build [debug|release]   Build Android APKs with Gradle (reuses existing .so native libs). Default.
   emulator                Start a headless emulator and wait for boot.
   install [debug|release] Build and install all apps on selected physical devices.
   install-all [debug|release] Remove old DMesh apps, install all apps, and set permissions.
@@ -957,9 +734,8 @@ Commands:
   open-web-admin          Open app-web on the localhost ssh-mesh admin URL.
 
 Environment:
+  DMESH_REBUILD_RUST=1    Force rebuilding Rust native libraries before Gradle packaging.
   DMESH_NIX_PROFILE       Nix profile path. Default: target/nix/profile.
-  DMESH_SSH_MESH_DIR      Local ssh-mesh checkout override. A sibling checkout is detected automatically.
-  SSH_MESH_GIT_URL        Default ssh-mesh Git URL. Default: https://github.com/costinm/ssh-mesh.
   DMESH_ANDROID_ABIS      ABIs for libdmesh.so. Default: arm64-v8a.
   DMESH_UI_ANDROID_ABIS   ABIs for libdmeshui.so. Default: arm64-v8a.
   DMESH_UI_APPS           Apps receiving libdmeshui.so. Default: app-chat.

@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSH-Mesh – Connections</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        h1 {
+            color: #4ec9b0;
+            margin-bottom: 16px;
+            font-size: 24px;
+        }
+
+        h2 {
+            color: #569cd6;
+            margin: 16px 0 8px;
+            font-size: 18px;
+        }
+
+        .panel {
+            background: #252526;
+            padding: 16px;
+            border-radius: 5px;
+            margin-bottom: 16px;
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+
+        .section-header h2 {
+            margin: 0;
+        }
+
+        .badge {
+            background: #0e639c;
+            color: #fff;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        th {
+            background: #333;
+            color: #4ec9b0;
+            text-align: left;
+            padding: 8px 10px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #333;
+        }
+
+        tr:hover td {
+            background: rgba(78, 201, 176, 0.05);
+        }
+
+        button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        button:hover {
+            background: #1177bb;
+        }
+
+        button.danger {
+            background: #c72e2e;
+        }
+
+        button.danger:hover {
+            background: #e04040;
+        }
+
+        button.success {
+            background: #388a34;
+        }
+
+        button.success:hover {
+            background: #46a642;
+        }
+
+        input,
+        textarea,
+        select {
+            background: #3c3c3c;
+            color: #d4d4d4;
+            border: 1px solid #555;
+            padding: 6px 10px;
+            border-radius: 3px;
+            font-family: inherit;
+            font-size: 13px;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 60px;
+            width: 100%;
+        }
+
+        label {
+            display: block;
+            color: #858585;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .form-full {
+            grid-column: 1 / -1;
+        }
+
+        .form-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 2px;
+            margin-bottom: 12px;
+        }
+
+        .tab {
+            background: #333;
+            color: #858585;
+            padding: 8px 16px;
+            border: none;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+            border-radius: 3px 3px 0 0;
+        }
+
+        .tab.active {
+            background: #252526;
+            color: #4ec9b0;
+            font-weight: bold;
+        }
+
+        .tab-panel {
+            display: none;
+        }
+
+        .tab-panel.active {
+            display: block;
+        }
+
+        .empty-state {
+            color: #666;
+            text-align: center;
+            padding: 30px;
+            font-size: 14px;
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        .status-dot.active {
+            background: #4ec9b0;
+        }
+
+        .status-dot.inactive {
+            background: #f48771;
+            animation: none;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.4;
+            }
+        }
+
+        .terminal-output {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 3px;
+            padding: 12px;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin-top: 8px;
+        }
+
+        .stdout {
+            color: #d4d4d4;
+        }
+
+        .stderr {
+            color: #f48771;
+        }
+
+        .exit-code {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        .exit-code.ok {
+            background: #388a34;
+            color: white;
+        }
+
+        .exit-code.fail {
+            background: #c72e2e;
+            color: white;
+        }
+
+        .forward-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            margin: 2px;
+        }
+
+        .forward-badge.local {
+            background: rgba(86, 156, 214, 0.2);
+            border: 1px solid #569cd6;
+            color: #569cd6;
+        }
+
+        .forward-badge.remote {
+            background: rgba(220, 220, 170, 0.2);
+            border: 1px solid #dcdcaa;
+            color: #dcdcaa;
+        }
+
+        .conn-actions {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #333;
+            color: #d4d4d4;
+            padding: 12px 20px;
+            border-radius: 5px;
+            border-left: 4px solid #4ec9b0;
+            font-size: 13px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 100;
+        }
+
+        .toast.error {
+            border-left-color: #f48771;
+        }
+
+        .toast.visible {
+            opacity: 1;
+        }
+
+        /* Modal overlay */
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.6);
+            z-index: 50;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-backdrop.open {
+            display: flex;
+        }
+
+        .modal {
+            background: #252526;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 20px;
+            min-width: 420px;
+            max-width: 90vw;
+        }
+
+        .modal h2 {
+            margin-bottom: 12px;
+        }
+
+        .config-host-row {
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .config-host-row:hover td {
+            background: rgba(78, 201, 176, 0.1);
+        }
+
+        .config-host-name {
+            color: #4ec9b0;
+            font-weight: bold;
+        }
+
+        .config-host-detail {
+            color: #858585;
+            font-size: 12px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🔐 SSH-Mesh Connections</h1>
+
+    <div class="tabs">
+        <button class="tab active" data-tab="server">Server Clients</button>
+        <button class="tab" data-tab="client">SSH Client Manager</button>
+    </div>
+
+    <!-- ====== Server Clients Tab ====== -->
+    <div id="tab-server" class="tab-panel active">
+        <div class="panel">
+            <div class="section-header">
+                <h2>Active Server Clients</h2>
+                <span class="badge" id="server-count">0</span>
+                <button onclick="fetchServerClients()">⟳ Refresh</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>User</th>
+                        <th>Comment</th>
+                        <th>Connected At</th>
+                        <th>Forwards</th>
+                    </tr>
+                </thead>
+                <tbody id="server-clients-body"></tbody>
+            </table>
+            <div id="server-empty" class="empty-state">No server clients connected</div>
+        </div>
+    </div>
+
+    <!-- ====== SSH Client Manager Tab ====== -->
+    <div id="tab-client" class="tab-panel">
+        <!-- Config Hosts -->
+        <div class="panel" id="config-hosts-panel" style="display:none;">
+            <div class="section-header">
+                <h2>📋 SSH Config Hosts</h2>
+                <span class="badge" id="config-count">0</span>
+                <button onclick="fetchConfigHosts()">⟳ Refresh</button>
+            </div>
+            <table id="config-hosts-table">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Hostname</th>
+                        <th>Port</th>
+                        <th>User</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="config-hosts-body"></tbody>
+            </table>
+            <div id="config-empty" class="empty-state">No hosts found in SSH config</div>
+        </div>
+
+        <!-- New Connection Form -->
+        <div class="panel">
+            <h2>New Connection</h2>
+            <div class="form-grid">
+                <div>
+                    <label>Host</label>
+                    <input id="conn-host" type="text" placeholder="192.168.1.1" style="width:100%">
+                </div>
+                <div>
+                    <label>Port</label>
+                    <input id="conn-port" type="number" value="22" style="width:100%">
+                </div>
+                <div>
+                    <label>User</label>
+                    <input id="conn-user" type="text" placeholder="root" style="width:100%">
+                </div>
+                <div>
+                    <label>Server Key (optional, TOFU if empty)</label>
+                    <input id="conn-server-key" type="text" placeholder="ssh-ed25519 AAAA…" style="width:100%">
+                </div>
+            </div>
+            <div class="form-actions">
+                <button class="success" onclick="doConnect()">Connect</button>
+            </div>
+        </div>
+
+        <!-- Active Connections -->
+        <div class="panel">
+            <div class="section-header">
+                <h2>Active Connections</h2>
+                <span class="badge" id="client-count">0</span>
+                <button onclick="fetchClientConnections()">⟳ Refresh</button>
+            </div>
+            <table id="client-connections-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th></th>
+                        <th>Host</th>
+                        <th>User</th>
+                        <th>Forwards</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="client-connections-body"></tbody>
+            </table>
+            <div id="client-empty" class="empty-state">No active SSH client connections</div>
+        </div>
+
+        <!-- Exec Output -->
+        <div class="panel" id="exec-panel" style="display:none;">
+            <div class="section-header">
+                <h2>Command Output</h2>
+                <button onclick="document.getElementById('exec-panel').style.display='none'">✕ Close</button>
+            </div>
+            <div id="exec-output" class="terminal-output"></div>
+        </div>
+    </div>
+
+    <!-- ====== Forward Modal ====== -->
+    <div class="modal-backdrop" id="forward-modal">
+        <div class="modal">
+            <h2 id="forward-modal-title">Add Forward</h2>
+            <div id="forward-modal-body"></div>
+        </div>
+    </div>
+
+    <!-- ====== Exec Modal ====== -->
+    <div class="modal-backdrop" id="exec-modal">
+        <div class="modal">
+            <h2>Execute Command</h2>
+            <input type="hidden" id="exec-conn-id">
+            <div style="margin-bottom:12px">
+                <label>Command</label>
+                <input id="exec-command" type="text" placeholder="ls -la" style="width:100%"
+                    onkeydown="if(event.key==='Enter') doExec()">
+            </div>
+            <div class="form-actions">
+                <button onclick="closeModal('exec-modal')">Cancel</button>
+                <button class="success" onclick="doExec()">Run</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast"></div>
+
+    <script>
+        const API_SSHC = new URL('../api/sshc', window.location.href).toString();
+        const API_SSH = new URL('../api/ssh/clients', window.location.href).toString();
+
+        // ── Tabs ──────────────────────────────────────────────────
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                tab.classList.add('active');
+                document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+                // Auto-fetch on tab switch
+                if (tab.dataset.tab === 'client') fetchConfigHosts();
+            });
+        });
+
+        // ── Toast ─────────────────────────────────────────────────
+        function showToast(msg, isError = false) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast visible' + (isError ? ' error' : '');
+            setTimeout(() => t.classList.remove('visible'), 3000);
+        }
+
+        // ── Modals ────────────────────────────────────────────────
+        function openModal(id) { document.getElementById(id).classList.add('open'); }
+        function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+        // ── Config Hosts ──────────────────────────────────────────
+        async function fetchConfigHosts() {
+            try {
+                const resp = await fetch(API_SSHC + '/config/hosts');
+                const hosts = await resp.json();
+                const panel = document.getElementById('config-hosts-panel');
+                const body = document.getElementById('config-hosts-body');
+                const empty = document.getElementById('config-empty');
+                const table = document.getElementById('config-hosts-table');
+                body.innerHTML = '';
+                document.getElementById('config-count').textContent = hosts.length;
+
+                if (hosts.length === 0) {
+                    panel.style.display = 'none';
+                    return;
+                }
+
+                panel.style.display = '';
+                empty.style.display = 'none';
+                table.style.display = '';
+
+                for (const host of hosts) {
+                    body.innerHTML += `<tr class="config-host-row">
+                        <td class="config-host-name">${escapeHtml(host.name)}</td>
+                        <td>${escapeHtml(host.hostname)}</td>
+                        <td>${host.port}</td>
+                        <td>${escapeHtml(host.user)}</td>
+                        <td>
+                            <button class="success" onclick="connectConfigHost('${escapeAttr(host.name)}', '${escapeAttr(host.hostname)}', ${host.port}, '${escapeAttr(host.user)}')">⚡ Connect</button>
+                        </td>
+                    </tr>`;
+                }
+            } catch (e) {
+                // Config hosts are optional; silently ignore errors
+            }
+        }
+
+        function connectConfigHost(name, hostname, port, user) {
+            document.getElementById('conn-host').value = name;
+            document.getElementById('conn-port').value = port;
+            document.getElementById('conn-user').value = user;
+            document.getElementById('conn-server-key').value = '';
+            doConnect();
+        }
+
+        // ── Server Clients ────────────────────────────────────────
+        async function fetchServerClients() {
+            try {
+                const resp = await fetch(API_SSH);
+                const data = await resp.json();
+                const body = document.getElementById('server-clients-body');
+                const empty = document.getElementById('server-empty');
+                body.innerHTML = '';
+                const entries = Object.entries(data);
+                document.getElementById('server-count').textContent = entries.length;
+                empty.style.display = entries.length ? 'none' : 'block';
+
+                for (const [id, client] of entries) {
+                    const fwds = (client.remote_forward_listeners || [])
+                        .map(f => `<span class="forward-badge remote">${f[0]}:${f[1]}</span>`)
+                        .join(' ');
+                    const connTime = client.connected_at
+                        ? new Date(client.connected_at.secs_since_epoch * 1000).toLocaleString()
+                        : '—';
+                    body.innerHTML += `<tr>
+                        <td>${client.id}</td>
+                        <td>${client.user || '—'}</td>
+                        <td>${client.comment || '—'}</td>
+                        <td>${connTime}</td>
+                        <td>${fwds || '—'}</td>
+                    </tr>`;
+                }
+            } catch (e) {
+                showToast('Failed to fetch server clients: ' + e.message, true);
+            }
+        }
+
+        // ── SSH Client Connections ────────────────────────────────
+        async function fetchClientConnections() {
+            try {
+                const resp = await fetch(API_SSHC + '/connections');
+                const conns = await resp.json();
+                const body = document.getElementById('client-connections-body');
+                const empty = document.getElementById('client-empty');
+                body.innerHTML = '';
+                document.getElementById('client-count').textContent = conns.length;
+                empty.style.display = conns.length ? 'none' : 'block';
+                document.getElementById('client-connections-table').style.display =
+                    conns.length ? '' : 'none';
+
+                for (const conn of conns) {
+                    const fwds = (conn.forwards || []).map(f => {
+                        const cls = f.type || f.forward_type || 'local';
+                        return cls === 'local'
+                            ? `<span class="forward-badge local">L :${f.local_port}→${f.remote_host}:${f.remote_port}</span>`
+                            : `<span class="forward-badge remote">R :${f.remote_port}→${f.remote_host}:${f.local_port}</span>`;
+                    }).join(' ');
+
+                    body.innerHTML += `<tr>
+                        <td>${conn.id}</td>
+                        <td><span class="status-dot active"></span></td>
+                        <td>${conn.host}:${conn.port}</td>
+                        <td>${conn.user}</td>
+                        <td>${fwds || '—'}</td>
+                        <td class="conn-actions">
+                            <button onclick="openExecModal(${conn.id})">⌨ Exec</button>
+                            <button onclick="openForwardModal(${conn.id},'local')">⇄ Local Fwd</button>
+                            <button onclick="openForwardModal(${conn.id},'remote')">⇆ Remote Fwd</button>
+                            <button class="danger" onclick="doDisconnect(${conn.id})">✕</button>
+                        </td>
+                    </tr>`;
+                }
+            } catch (e) {
+                showToast('Failed to fetch client connections: ' + e.message, true);
+            }
+        }
+
+        // ── Connect ───────────────────────────────────────────────
+        async function doConnect() {
+            const payload = {
+                host: document.getElementById('conn-host').value,
+                port: parseInt(document.getElementById('conn-port').value) || 22,
+                user: document.getElementById('conn-user').value,
+                server_key: document.getElementById('conn-server-key').value,
+            };
+            if (!payload.host || !payload.user) {
+                return showToast('Host and user are required', true);
+            }
+            try {
+                const resp = await fetch(API_SSHC + '/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Connect failed');
+                showToast('Connected! ID: ' + data.id);
+                fetchClientConnections();
+            } catch (e) {
+                showToast('Connection failed: ' + e.message, true);
+            }
+        }
+
+        // ── Disconnect ────────────────────────────────────────────
+        async function doDisconnect(id) {
+            try {
+                const resp = await fetch(API_SSHC + '/connections/' + id, { method: 'DELETE' });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Disconnect failed');
+                showToast('Disconnected #' + id);
+                fetchClientConnections();
+            } catch (e) {
+                showToast('Disconnect failed: ' + e.message, true);
+            }
+        }
+
+        // ── Exec ──────────────────────────────────────────────────
+        function openExecModal(id) {
+            document.getElementById('exec-conn-id').value = id;
+            document.getElementById('exec-command').value = '';
+            openModal('exec-modal');
+            document.getElementById('exec-command').focus();
+        }
+
+        async function doExec() {
+            const id = document.getElementById('exec-conn-id').value;
+            const cmd = document.getElementById('exec-command').value;
+            if (!cmd) return;
+            closeModal('exec-modal');
+            try {
+                const resp = await fetch(API_SSHC + '/connections/' + id + '/exec', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: cmd }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Exec failed');
+
+                const panel = document.getElementById('exec-panel');
+                const out = document.getElementById('exec-output');
+                const exitCls = data.exit_code === 0 ? 'ok' : 'fail';
+                out.innerHTML =
+                    `<div style="margin-bottom:8px;color:#858585;">$ ${escapeHtml(cmd)}  `
+                    + `<span class="exit-code ${exitCls}">exit ${data.exit_code}</span></div>`
+                    + (data.stdout ? `<div class="stdout">${escapeHtml(data.stdout)}</div>` : '')
+                    + (data.stderr ? `<div class="stderr">${escapeHtml(data.stderr)}</div>` : '');
+                panel.style.display = '';
+            } catch (e) {
+                showToast('Exec failed: ' + e.message, true);
+            }
+        }
+
+        // ── Forward ───────────────────────────────────────────────
+        function openForwardModal(connId, type) {
+            const title = document.getElementById('forward-modal-title');
+            const body = document.getElementById('forward-modal-body');
+            title.textContent = (type === 'local' ? 'Local' : 'Remote') + ' Forward – Connection #' + connId;
+
+            if (type === 'local') {
+                body.innerHTML = `
+                    <div class="form-grid">
+                        <div><label>Local Port</label><input id="fwd-local-port" type="number" placeholder="0 = auto" style="width:100%"></div>
+                        <div><label>Remote Host</label><input id="fwd-remote-host" type="text" value="127.0.0.1" style="width:100%"></div>
+                        <div><label>Remote Port</label><input id="fwd-remote-port" type="number" placeholder="8080" style="width:100%"></div>
+                    </div>
+                    <div class="form-actions">
+                        <button onclick="closeModal('forward-modal')">Cancel</button>
+                        <button class="success" onclick="doLocalForward(${connId})">Add Forward</button>
+                    </div>`;
+            } else {
+                body.innerHTML = `
+                    <div class="form-grid">
+                        <div><label>Remote Port</label><input id="fwd-rremote-port" type="number" placeholder="0 = auto" style="width:100%"></div>
+                        <div><label>Local Host</label><input id="fwd-local-host" type="text" value="127.0.0.1" style="width:100%"></div>
+                        <div><label>Local Port</label><input id="fwd-rlocal-port" type="number" placeholder="3000" style="width:100%"></div>
+                    </div>
+                    <div class="form-actions">
+                        <button onclick="closeModal('forward-modal')">Cancel</button>
+                        <button class="success" onclick="doRemoteForward(${connId})">Add Forward</button>
+                    </div>`;
+            }
+            openModal('forward-modal');
+        }
+
+        async function doLocalForward(connId) {
+            const payload = {
+                local_port: parseInt(document.getElementById('fwd-local-port').value) || 0,
+                remote_host: document.getElementById('fwd-remote-host').value || '127.0.0.1',
+                remote_port: parseInt(document.getElementById('fwd-remote-port').value) || 0,
+            };
+            closeModal('forward-modal');
+            try {
+                const resp = await fetch(API_SSHC + '/connections/' + connId + '/forward/local', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Forward failed');
+                showToast('Local forward added');
+                fetchClientConnections();
+            } catch (e) {
+                showToast('Forward failed: ' + e.message, true);
+            }
+        }
+
+        async function doRemoteForward(connId) {
+            const payload = {
+                remote_port: parseInt(document.getElementById('fwd-rremote-port').value) || 0,
+                local_host: document.getElementById('fwd-local-host').value || '127.0.0.1',
+                local_port: parseInt(document.getElementById('fwd-rlocal-port').value) || 0,
+            };
+            closeModal('forward-modal');
+            try {
+                const resp = await fetch(API_SSHC + '/connections/' + connId + '/forward/remote', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Forward failed');
+                showToast('Remote forward added (port: ' + data.actual_port + ')');
+                fetchClientConnections();
+            } catch (e) {
+                showToast('Forward failed: ' + e.message, true);
+            }
+        }
+
+        // ── Utilities ─────────────────────────────────────────────
+        function escapeHtml(text) {
+            const d = document.createElement('div');
+            d.textContent = text;
+            return d.innerHTML;
+        }
+
+        function escapeAttr(text) {
+            return text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        }
+
+        // ── Init ──────────────────────────────────────────────────
+        fetchServerClients();
+        fetchClientConnections();
+        fetchConfigHosts();
+        setInterval(fetchServerClients, 5000);
+        setInterval(fetchClientConnections, 5000);
+    </script>
+</body>
+
+</html>
