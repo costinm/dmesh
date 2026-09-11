@@ -11,6 +11,8 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "android")]
 use std::ffi::CStr;
 #[cfg(target_os = "android")]
+use std::os::fd::FromRawFd;
+#[cfg(target_os = "android")]
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +51,7 @@ pub fn start_mesh(
     base_dir: &str,
     ssh_port: i32,
     http_port: i32,
+    #[cfg_attr(not(target_os = "android"), allow(unused_variables))] android_udp_fd: Option<i32>,
 ) -> Result<MeshHandle, anyhow::Error> {
     let base_path = PathBuf::from(base_dir);
     let _ = std::fs::create_dir_all(&base_path);
@@ -136,11 +139,30 @@ pub fn start_mesh(
     // the stable Wi-Fi UDP port merely by constructing a node.
     #[cfg(target_os = "android")]
     let udp_server_handle = {
+        // Java opens this descriptor on Android's selected Network.  Adopt it
+        // here so the single Rust QUIC-lite listener retains that route mark;
+        // a second bind would silently lose it.
+        let socket = runtime.block_on(async move {
+            match android_udp_fd {
+                Some(fd) => {
+                    let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+                    socket.set_nonblocking(true)?;
+                    tokio::net::UdpSocket::from_std(socket).map(Arc::new)
+                }
+                None => tokio::net::UdpSocket::bind((
+                    Ipv6Addr::UNSPECIFIED,
+                    dmesh_server::udp::STABLE_WIFI_UDP_PORT,
+                ))
+                .await
+                .map(Arc::new),
+            }
+        })?;
         let udp_config = dmesh_server::udp::UdpConfig {
             bind: SocketAddr::from((
                 Ipv6Addr::UNSPECIFIED,
                 dmesh_server::udp::STABLE_WIFI_UDP_PORT,
             )),
+            socket: Some(socket),
             artifact_root: base_path.clone(),
             ..dmesh_server::udp::UdpConfig::default()
         };
@@ -252,6 +274,7 @@ async fn android_announce_loop(
                             announce,
                             sender.to_string(),
                             "udp_multicast",
+                            &receive[..len],
                         );
                     }
                 }
@@ -274,13 +297,14 @@ async fn send_android_announce(
     uptime_secs: u64,
     boot: bool,
 ) -> bool {
-    let announce = if boot {
-        dmesh_server::announce::Announce::boot(id, id_len, 0)
-    } else {
-        dmesh_server::announce::Announce::discovery(
-            id, id_len, u32::try_from(uptime_secs).unwrap_or(u32::MAX), 0, 0,
-        )
-    };
+    // Discovery has one shared record shape; boot is local scheduling state,
+    // not a second on-wire identity.
+    let _ = boot;
+    let announce = dmesh_server::announce::Announce::discovery(
+        id,
+        id_len,
+        u32::try_from(uptime_secs).unwrap_or(u32::MAX),
+    );
     let mut wire = [0u8; 96];
     let Some(used) = dmesh_server::announce::encode(announce, &mut wire) else {
         return false;

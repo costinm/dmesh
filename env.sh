@@ -9,7 +9,16 @@ fi
 
 export DMESH_REPO="${DMESH_REPO:-${_dmesh_env_dir}}"
 
-_dmesh_target_base="${HOME:-/tmp}/.cache/ws/dmesh"
+# Keep ordinary checkouts self-contained.  A pre-existing cache location is an
+# explicit operator choice (for example, a persistent build volume), never a
+# side effect of sourcing this file.
+_dmesh_target_base="$DMESH_REPO/target"
+_dmesh_cache_base="${HOME:-/tmp}/.cache/ws/dmesh"
+_dmesh_cargo_target_dir="$DMESH_REPO/target"
+if [ -d "$_dmesh_cache_base" ]; then
+    _dmesh_target_base="$_dmesh_cache_base"
+    _dmesh_cargo_target_dir="$_dmesh_cache_base/target"
+fi
 mkdir -p "${_dmesh_target_base}" 2>/dev/null || true
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_dmesh_target_base}/cache}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_dmesh_target_base}/config}"
@@ -23,7 +32,7 @@ export RUSTUP_HOME="${DMESH_RUSTUP_HOME:-${_dmesh_target_base}/rustup}"
 export DMESH_ESP_ROOT="${DMESH_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
 export DMESH_BOOT_RECOVERY_SDK_VERSION="v6.0.2"
 export DMESH_BOOT_RECOVERY_ESP_ROOT="${DMESH_BOOT_RECOVERY_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
-export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${_dmesh_target_base}/target}"
+export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${_dmesh_cargo_target_dir}}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${_dmesh_target_base}/gradle}"
 export TMPDIR="/tmp"
 export NIX_PROFILE="${DMESH_NIX_PROFILE:-${_dmesh_target_base}/nix/profile}"
@@ -179,6 +188,8 @@ if [ -d "$_dmesh_rust_bin" ]; then
 fi
 
 unset _dmesh_env_dir
+unset _dmesh_cache_base
+unset _dmesh_cargo_target_dir
 unset _dmesh_rust_bin
 unset _dmesh_ssh_candidate
 unset _dmesh_ssh_mesh_release
