@@ -63,19 +63,47 @@ pub fn stream_service_by_name(name: &str) -> Option<ServiceIdentity> {
         "settings.get" => (control::CONTROL_COMPONENT, control::SETTINGS_GET),
         "settings.set" => (control::CONTROL_COMPONENT, control::SETTINGS_SET),
         "settings.list" => (control::CONTROL_COMPONENT, control::SETTINGS_LIST),
-        "discovery.nodes" => (announce::ANNOUNCE_COMPONENT, announce::ANNOUNCE_DEVICES_OBSERVED),
-        "status" => (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_STATUS_METHOD),
-        "services" => (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_SERVICES_METHOD),
-        "metrics" => (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_METRICS_METHOD),
-        "events" => (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_EVENTS_METHOD),
-        "log-watch" => (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_LOG_WATCH_METHOD),
+        "discovery.nodes" => (
+            announce::ANNOUNCE_COMPONENT,
+            announce::ANNOUNCE_DEVICES_OBSERVED,
+        ),
+        "status" => (
+            services::DIAGNOSTIC_COMPONENT,
+            services::DIAGNOSTIC_STATUS_METHOD,
+        ),
+        "services" => (
+            services::DIAGNOSTIC_COMPONENT,
+            services::DIAGNOSTIC_SERVICES_METHOD,
+        ),
+        "metrics" => (
+            services::DIAGNOSTIC_COMPONENT,
+            services::DIAGNOSTIC_METRICS_METHOD,
+        ),
+        "events" => (
+            services::DIAGNOSTIC_COMPONENT,
+            services::DIAGNOSTIC_EVENTS_METHOD,
+        ),
+        "log-watch" => (
+            services::DIAGNOSTIC_COMPONENT,
+            services::DIAGNOSTIC_LOG_WATCH_METHOD,
+        ),
         "telemetry.nan_status" => (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_STATUS_METHOD),
-        "telemetry.now_metrics" => (telemetry::TELEMETRY_COMPONENT, telemetry::NOW_METRICS_METHOD),
-        "telemetry.nan_metrics" => (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_METRICS_METHOD),
-        "telemetry.udp6_metrics" => (telemetry::TELEMETRY_COMPONENT, telemetry::UDP6_METRICS_METHOD),
-        "telemetry.wifi_link_metrics" => {
-            (telemetry::TELEMETRY_COMPONENT, telemetry::WIFI_LINK_METRICS_METHOD)
-        }
+        "telemetry.now_metrics" => (
+            telemetry::TELEMETRY_COMPONENT,
+            telemetry::NOW_METRICS_METHOD,
+        ),
+        "telemetry.nan_metrics" => (
+            telemetry::TELEMETRY_COMPONENT,
+            telemetry::NAN_METRICS_METHOD,
+        ),
+        "telemetry.udp6_metrics" => (
+            telemetry::TELEMETRY_COMPONENT,
+            telemetry::UDP6_METRICS_METHOD,
+        ),
+        "telemetry.wifi_link_metrics" => (
+            telemetry::TELEMETRY_COMPONENT,
+            telemetry::WIFI_LINK_METRICS_METHOD,
+        ),
         "wifi.scan" => (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN),
         _ => return None,
     };
@@ -121,7 +149,8 @@ pub const fn is_read_only_stream_service(component: u64, method: u64) -> bool {
             | (
                 telemetry::TELEMETRY_COMPONENT,
                 telemetry::WIFI_LINK_METRICS_METHOD
-            ) | (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN)
+            )
+            | (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN)
     )
 }
 

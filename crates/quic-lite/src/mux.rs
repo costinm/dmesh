@@ -17,6 +17,35 @@ struct RequestCollector {
 
 struct ValidationSink;
 
+struct StreamingSink<'a, F> {
+    handler: &'a mut F,
+    bytes: usize,
+    finished: bool,
+}
+
+impl<F> CopyingStreamEvents for StreamingSink<'_, F>
+where
+    F: FnMut(u64, bool, &[u8]) -> Result<(), ()>,
+{
+    type Error = ();
+
+    fn stream_chunk(
+        &mut self,
+        stream: u64,
+        _offset: u64,
+        end: bool,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        (self.handler)(stream, end, bytes)?;
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(())
+    }
+
+    fn stream_finished(&mut self, _stream: u64) {
+        self.finished = true;
+    }
+}
+
 impl CopyingStreamEvents for ValidationSink {
     type Error = ();
     fn stream_chunk(
@@ -231,6 +260,103 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         Ok(first)
     }
 
+    /// Receive a normal request stream while delivering one selected peer
+    /// stream incrementally and in offset order.  This keeps a large object
+    /// upload out of the request collector: packet framing, duplicate
+    /// suppression, bounded reordering, ACKs, and receive credit remain in
+    /// QUIC-lite, while the caller sees only ordered application bytes.
+    pub fn receive_request_with_stream<F>(
+        &mut self,
+        input: &[u8],
+        streamed_id: u64,
+        mut on_stream: F,
+    ) -> Result<Option<MuxRequest>, Error>
+    where
+        F: FnMut(u64, bool, &[u8]) -> Result<(), ()>,
+    {
+        if !self.ready.is_empty() {
+            return Ok(Some(self.ready.remove(0)));
+        }
+        let (_header, header_len) = crate::ShortHeader::decode_with_expected(
+            input,
+            self.endpoint.expected_packet_number(),
+        )?;
+        let mut offset = header_len;
+        let mut parsed_streams = Vec::new();
+        while offset < input.len() {
+            let (frame, used) = crate::decode_frame(&input[offset..])?;
+            if let crate::Frame::Stream(stream) = frame {
+                parsed_streams.push(stream);
+            }
+            offset += used;
+        }
+        if parsed_streams.is_empty() {
+            let _ = self.endpoint.receive_datagram(input)?;
+            return Ok(None);
+        }
+        let lease = Arc::new(input.to_vec());
+        let mut staged = self.ordered.clone();
+        for frame in &parsed_streams {
+            let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
+            let mut sink = ValidationSink;
+            staged
+                .receive_copying(
+                    frame.id,
+                    lease.clone(),
+                    frame.offset,
+                    start..start + frame.data.len(),
+                    frame.fin,
+                    &mut sink,
+                )
+                .map_err(|_| Error::Invalid)?;
+        }
+        let _ = self.endpoint.receive_datagram(input)?;
+        let mut first = None;
+        for frame in parsed_streams {
+            let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
+            let range = start..start + frame.data.len();
+            if frame.id == streamed_id {
+                if self.completed.contains(&frame.id) {
+                    continue;
+                }
+                let mut sink = StreamingSink {
+                    handler: &mut on_stream,
+                    bytes: 0,
+                    finished: false,
+                };
+                self.ordered
+                    .receive_copying(
+                        frame.id,
+                        lease.clone(),
+                        frame.offset,
+                        range,
+                        frame.fin,
+                        &mut sink,
+                    )
+                    .map_err(|_| Error::Invalid)?;
+                if sink.bytes != 0 {
+                    self.endpoint
+                        .stream_consumed_deferred(frame.id, sink.bytes)?;
+                }
+                if sink.finished {
+                    if self.completed.len() >= self.max_pending_streams {
+                        self.completed.remove(0);
+                    }
+                    self.completed.push(frame.id);
+                }
+                continue;
+            }
+            if let Some(request) = self.deliver_stream_frame(frame, lease.clone(), range)? {
+                if first.is_none() {
+                    first = Some(request);
+                } else {
+                    self.ready.push(request);
+                }
+            }
+        }
+        Ok(first)
+    }
+
     fn deliver_stream_frame(
         &mut self,
         frame: crate::StreamFrame<'_>,
@@ -328,6 +454,8 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     const SERVICE_ECHO: u8 = 2;
     const SERVICE_STATUS: u8 = 3;
     const SERVICE_METRICS: u8 = 6;
@@ -573,6 +701,66 @@ mod tests {
         let second = server.receive_datagram(&packet[..used]).unwrap().unwrap();
         assert_eq!(second.stream_id, 8);
         assert!(server.receive_datagram(&packet[..used]).unwrap().is_none());
+    }
+
+    #[test]
+    fn mux_stream_callback_keeps_command_and_object_stream_separate() {
+        let mut server =
+            StreamMux::<8, 8>::new(Role::Server, ConnectionLimits::default(), 1200, 8, 8, 1024);
+        let client_cid = ConnectionId::new(111).unwrap();
+        let server_cid = ConnectionId::new(112).unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        let mut packet = [0u8; 256];
+        let mut used = crate::ShortHeader {
+            flags: crate::FLAG_FIXED,
+            dcid: server_cid,
+            packet_number: 0,
+            packet_number_len: 1,
+        }
+        .encode(&mut packet)
+        .unwrap();
+        used += crate::Frame::Stream(crate::StreamFrame {
+            id: FIRST_CLIENT_BIDI_STREAM_ID,
+            offset: 0,
+            fin: true,
+            data: &[SERVICE_STATUS],
+        })
+        .encode(&mut packet[used..])
+        .unwrap();
+        used += crate::Frame::Stream(crate::StreamFrame {
+            id: FIRST_CLIENT_BIDI_STREAM_ID + 4,
+            offset: 0,
+            fin: true,
+            data: b"object-records",
+        })
+        .encode(&mut packet[used..])
+        .unwrap();
+
+        let mut chunks = Vec::new();
+        let request = server
+            .receive_request_with_stream(
+                &packet[..used],
+                FIRST_CLIENT_BIDI_STREAM_ID + 4,
+                |id, fin, bytes| {
+                    chunks.push((id, fin, bytes.to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.stream_id, FIRST_CLIENT_BIDI_STREAM_ID);
+        assert_eq!(request.data, [SERVICE_STATUS]);
+        assert_eq!(
+            chunks,
+            vec![(
+                FIRST_CLIENT_BIDI_STREAM_ID + 4,
+                true,
+                b"object-records".to_vec()
+            )]
+        );
+        assert_eq!(server.pending_streams(), 0);
     }
 
     #[test]

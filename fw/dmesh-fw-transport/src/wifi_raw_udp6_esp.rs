@@ -141,6 +141,7 @@ static START_STATUS: AtomicU32 = AtomicU32::new(0);
 static FIRST_RX_LEN: AtomicU32 = AtomicU32::new(0);
 static FIRST_RX_REPORTED: AtomicBool = AtomicBool::new(false);
 static RX_CALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
+static TIMER_POLL_REPORTS: AtomicU32 = AtomicU32::new(0);
 const ANNOUNCE_PEER_CAPACITY: usize = 10;
 
 /// A bounded, lock-free observation record. The shared ingress worker is the
@@ -578,6 +579,21 @@ unsafe fn rx_callback(
     }
     unsafe {
         let frame = core::slice::from_raw_parts(buffer.cast::<u8>(), len as usize);
+        // ESP-IDF delivers the whole associated Ethernet feed to this raw
+        // callback.  The shared eight-slot packet pool is for the UDP6
+        // bearer, not a general STA sniffer: copying ARP, IPv4, and unrelated
+        // L2 traffic can otherwise evict the IPv6 Neighbor Solicitation that
+        // establishes the return path for an incoming QUIC-lite association.
+        // Keep the callback's decision to the common raw-UDP6 frame classes;
+        // detailed NDP and UDP validation remains in the worker below.
+        if !quic_lite::raw_udp6::is_icmpv6_frame(frame)
+            && !quic_lite::raw_udp6::is_udp6_frame(frame)
+        {
+            if !eb.is_null() {
+                crate::wifi_esp::release_ethernet_rx_buffer(eb);
+            }
+            return esp_idf_sys::ESP_OK;
+        }
         let queued = crate::shared_ingress_esp::enqueue_on_link(
             crate::shared_ingress_esp::IngressKind::RawUdp6,
             link,
@@ -750,6 +766,10 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
         ip: packet.source_ip,
         port: packet.source_port,
     };
+    // The common connection deadline is keyed only by its bearer-neutral
+    // path. Retain the opaque UDP return tuple in this adapter so the Main
+    // timer can ask QUIC-lite for a delayed ACK/PTO without a fresh ingress.
+    store_paced_peer(item.link(), peer);
     let immediate = handler(peer, packet.payload, response);
     if immediate.is_none() && UDP_HANDLER_NO_RESPONSE.fetch_add(1, Ordering::Relaxed) == 0 {
         // This is expected for an ACK-only transport packet; retain one
@@ -898,6 +918,45 @@ fn paced_poll_work() {
     if result.sent != 0 {
         TX_FRAMES.fetch_add(result.sent as u32, Ordering::Relaxed);
         schedule_paced_poll(link, peer);
+    }
+    if result.invalid_length || result.submit_failed {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Execute one connection-owned delayed-ACK/PTO turn after Main's exact
+/// QUIC-lite deadline. This adapter supplies only the last validated UDP
+/// return tuple; it never decides ACK timing or retains packet data.
+pub(crate) fn poll_connection_timer() {
+    if !STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let link = match PACED_LINK.load(Ordering::Acquire) {
+        1 => crate::shared_ingress_esp::IngressLink::WifiSta,
+        2 => crate::shared_ingress_esp::IngressLink::WifiAp,
+        _ => return,
+    };
+    let peer = load_paced_peer();
+    let poll = POLL_HANDLER.load(Ordering::Acquire);
+    if poll == 0 {
+        return;
+    }
+    let poll: RawUdp6PollHandler = unsafe { core::mem::transmute(poll) };
+    let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
+    let result = dmesh_server::transport::pump_egress(
+        response,
+        1,
+        None,
+        |response| poll(peer, response),
+        |payload| transmit_udp6(link, peer, RAW_UDP6_PORT, payload),
+    );
+    if result.sent != 0 {
+        TX_FRAMES.fetch_add(result.sent as u32, Ordering::Relaxed);
+        if TIMER_POLL_REPORTS.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::commands::send_stat(b"raw udp6 timer egress=", result.sent as u64);
+        }
+    } else if TIMER_POLL_REPORTS.fetch_add(1, Ordering::Relaxed) < 2 {
+        crate::commands::send_response(b"raw udp6 timer no egress");
     }
     if result.invalid_length || result.submit_failed {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);

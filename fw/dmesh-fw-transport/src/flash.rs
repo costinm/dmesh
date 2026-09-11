@@ -30,23 +30,13 @@ pub type SignedObjectFlashReceiver = dmesh_server::protocol::SignedObjectReceive
     MAX_BLOB_RECORD_BYTES,
 >;
 
-/// One device-owned signed-object download/flash operation. A bearer sends
-/// packets returned by `start`, `receive`, and `poll_*`; it never buffers the
-/// object or performs flash I/O itself.
-pub struct SignedObjectFlashDownload {
-    receiver: SignedObjectFlashReceiver,
-    client: dmesh_server::transport::ObjectClient<
-        { crate::CONNECTION_HISTORY_CAPACITY },
-        { crate::TRANSPORT_MTU },
-    >,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlashSinkError {
     UnsupportedTarget,
     AddressOverrideUnsupported,
     MissingModuleName,
     PartitionUnavailable,
+    AllocationFailed,
 }
 
 /// Construct the hardware half of a shared `flash` request.
@@ -98,84 +88,27 @@ fn sink_for_flash_request(
     Ok(sink)
 }
 
-impl SignedObjectFlashDownload {
-    pub fn new(
-        client_cid: quic_lite::ConnectionId,
-        request: dmesh_server::protocol::FlashRequest<'_>,
-    ) -> Result<Self, FlashSinkError> {
+/// Allocate the large flash receiver directly in heap storage.  The receiver
+/// is an application sink; stream admission, ACKs, retransmission, and PTO
+/// remain entirely in `dmesh_server::transport::ObjectClient`/QUIC-lite.
+pub fn new_boxed_receiver(
+    request: dmesh_server::protocol::FlashRequest<'_>,
+) -> Result<Box<SignedObjectFlashReceiver>, FlashSinkError> {
         let sink = sink_for_flash_request(request)?;
-        let client = dmesh_server::transport::ObjectClient::new(client_cid, request.object)
-            .map_err(|_| FlashSinkError::UnsupportedTarget)?;
-        Ok(Self {
-            receiver: SignedObjectFlashReceiver::new(sink),
-            client,
-        })
-    }
-
-    pub fn start(
-        &mut self,
-        output: &mut [u8; crate::TRANSPORT_MTU],
-    ) -> Result<usize, quic_lite::Error> {
-        self.client.start(output)
-    }
-
-    pub fn accepts(&self, input: &[u8]) -> bool {
-        self.client.accepts(input)
-    }
-
-    /// Kept at the download boundary so the frame adapter can abandon an
-    /// interrupted mutation without knowing reset framing or object protocol.
-    pub fn is_peer_stateless_reset(&self, input: &[u8]) -> bool {
-        self.client.is_peer_stateless_reset(input)
-    }
-
-    pub fn receive(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8; crate::TRANSPORT_MTU],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        let receiver = &mut self.receiver;
-        let result = self.client.receive(input, output, |fragment| {
-            receiver
-                .push_ordered(fragment)
-                .map_err(|_| quic_lite::Error::Invalid)
-        })?;
-        self.receiver
-            .sink_mut()
-            .poll_completed()
-            .map_err(|_| quic_lite::Error::Invalid)?;
-        Ok(result)
-    }
-
-    pub fn poll_transmit(
-        &mut self,
-        output: &mut [u8; crate::TRANSPORT_MTU],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        self.receiver
-            .sink_mut()
-            .poll_completed()
-            .map_err(|_| quic_lite::Error::Invalid)?;
-        self.client.poll_transmit(output)
-    }
-
-    pub fn poll_retransmit(
-        &mut self,
-        now_us: u64,
-        pto_us: u64,
-        output: &mut [u8; crate::TRANSPORT_MTU],
-    ) -> Result<Option<usize>, quic_lite::Error> {
-        self.receiver
-            .sink_mut()
-            .poll_completed()
-            .map_err(|_| quic_lite::Error::Invalid)?;
-        self.client.poll_retransmit(now_us, pto_us, output)
-    }
-
-    pub fn is_complete_and_durable(&mut self) -> bool {
-        self.client.is_complete()
-            && self.receiver.is_complete()
-            && self.receiver.sink_mut().is_durable()
-    }
+        let raw = unsafe {
+            alloc_zeroed(Layout::new::<SignedObjectFlashReceiver>())
+                as *mut SignedObjectFlashReceiver
+        };
+        if raw.is_null() {
+            return Err(FlashSinkError::AllocationFailed);
+        }
+        unsafe {
+            SignedObjectFlashReceiver::new_in_place(
+                &mut *(raw.cast::<core::mem::MaybeUninit<SignedObjectFlashReceiver>>()),
+                sink,
+            );
+            Ok(Box::from_raw(raw))
+        }
 }
 
 /// ESP-IDF-backed durable sink for one application partition.

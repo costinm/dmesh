@@ -99,8 +99,7 @@ fn normalize_android_control_record(mut record: TaggedRecord) -> TaggedRecord {
             .rsplit_once('.')
             .map(|(base, prefix)| (base.to_owned(), format!("{prefix}.{method}"))),
         _ => None,
-    }
-    {
+    } {
         record.component = NameOrTag::Name(base);
         record.method = NameOrTag::Name(method);
     }
@@ -318,7 +317,10 @@ fn android_http_catalog() -> serde_json::Value {
     // Mark only bounded reads that the Android Rust terminal implements; a
     // missing capability remains visible rather than being called as a
     // mutating or platform-private operation.
-    let Some(tools) = catalog.get_mut("tools").and_then(serde_json::Value::as_array_mut) else {
+    let Some(tools) = catalog
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         return catalog;
     };
     for tool in tools {
@@ -1002,14 +1004,22 @@ mod tests {
             .filter(|tool| tool.get("x-check-all").is_some())
             .collect::<Vec<_>>();
         assert!(!checked.is_empty());
-        assert!(checked.iter().all(|tool| {
-            tool["x-check-all-platforms"] == json!(["android"])
-        }));
+        assert!(
+            checked
+                .iter()
+                .all(|tool| { tool["x-check-all-platforms"] == json!(["android"]) })
+        );
         assert!(checked.iter().any(|tool| tool["name"] == "settings.get"));
-        assert!(checked.iter().any(|tool| tool["name"] == "telemetry.nan_status"));
-        assert!(tools.iter().all(|tool| {
-            tool["name"] != "settings.set" || tool.get("x-check-all").is_none()
-        }));
+        assert!(
+            checked
+                .iter()
+                .any(|tool| tool["name"] == "telemetry.nan_status")
+        );
+        assert!(
+            tools.iter().all(|tool| {
+                tool["name"] != "settings.set" || tool.get("x-check-all").is_none()
+            })
+        );
     }
 
     #[test]
@@ -1133,7 +1143,10 @@ mod tests {
             .expect("terminal response");
         let response = mesh::cbor::decode_record(&response_wire).expect("decode response");
         assert_eq!(response.id, Some(json!(4)));
-        assert_eq!(response.result, Some(json!({"status_version": 1, "platform": "android"})));
+        assert_eq!(
+            response.result,
+            Some(json!({"status_version": 1, "platform": "android"}))
+        );
         assert!(response.error.is_none());
     }
 

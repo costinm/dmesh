@@ -68,6 +68,11 @@ const FIELD_NDP: u64 = 19;
 /// default remains WPA2-PSK; `open=1` is an explicit interoperability and
 /// measurement choice, never an implicit fallback for a missing passphrase.
 const FIELD_OPEN: u64 = 24;
+/// The hardware address which may accept a NAN wake profile.  This is
+/// deliberately part of the signed/bounded control record rather than NAN
+/// discovery metadata: an active Subscribe is normally broadcast, so its
+/// receiver must reject a wake for another device.
+const FIELD_WAKE_TARGET: u64 = 25;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
@@ -103,6 +108,8 @@ pub struct TransportConfig<'a> {
     pub ap: Option<u8>,
     pub open: Option<bool>,
     pub uart: Option<u8>,
+    /// Required for a NAN active-Subscribe wake. Other bearers may omit it.
+    pub wake_target: Option<[u8; 6]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +305,11 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
                 config.ap = Some(enabled);
             }
             FIELD_OPEN => config.open = Some(d.boolean()?),
+            FIELD_WAKE_TARGET => {
+                let bytes = d.bytes_ref()?;
+                config.wake_target = (bytes.len() == 6).then(|| bytes.try_into().ok()).flatten();
+                config.wake_target?;
+            }
             FIELD_UART => {
                 let speed = u8::try_from(d.uint()?).ok()?;
                 if speed > 8 {
@@ -433,6 +445,7 @@ fn transport_config_count(config: TransportConfig<'_>) -> u64 {
         config.ap.is_some(),
         config.open.is_some(),
         config.uart.is_some(),
+        config.wake_target.is_some(),
     ]
     .into_iter()
     .filter(|present| *present)
@@ -503,6 +516,10 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
         }
         e.uint(FIELD_UART)?;
         e.uint(u64::from(value))?;
+    }
+    if let Some(target) = config.wake_target {
+        e.uint(FIELD_WAKE_TARGET)?;
+        e.bytes_value(&target)?;
     }
     for (field, value) in [
         (FIELD_STA_DRIVER_TX, config.sta_driver_tx),

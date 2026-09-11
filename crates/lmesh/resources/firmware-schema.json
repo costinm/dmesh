@@ -6,6 +6,7 @@
     {"id": 2, "name": "recovery", "api": "fw/recovery-rust/README.md"},
     {"id": 3, "name": "stage2", "api": "fw/boot/API.md"},
     {"id": 4, "name": "mod_lora", "api": "fw/mod_lora/API.md"},
+    {"id": 10, "name": "object", "api": "crates/dmesh-server/src/core.rs"},
     {"id": 101, "name": "runtime", "api": "fw/dmesh-fw-transport/API.md"},
     {"id": 102, "name": "power", "api": "fw/dmesh-fw-transport/API.md"},
     {"id": 103, "name": "memory", "api": "fw/dmesh-fw-transport/API.md"}
@@ -37,10 +38,15 @@
       {"id": 15, "name": "now", "kind": "u8"},
       {"id": 16, "name": "ap", "kind": "u8"},
       {"id": 17, "name": "passphrase", "kind": "text"},
-      {"id": 24, "name": "open", "kind": "bool"}
+      {"id": 18, "name": "uart", "kind": "u8"},
+      {"id": 24, "name": "open", "kind": "bool"},
+      {"id": 25, "name": "wake_target", "kind": "mac"}
     ]},
     {"id": 3, "name": "relay.list", "component": 5, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
     {"id": 9, "name": "discovery.nodes", "component": 6, "x-ui-visibility": "default", "x-check-all": {}, "x-check-all-platforms": ["esp32", "host", "android"]},
+    {"id": 1, "name": "connection.configure", "component": 3, "x-check-all-platforms": ["esp32", "host", "android"], "fields": [
+      {"id": 2, "name": "ack_frequency", "kind": "u8"}, {"id": 3, "name": "ack_delay_ms", "kind": "u8"}, {"id": 4, "name": "tx_burst_packets", "kind": "u8"}, {"id": 11, "name": "path_policy", "kind": "u8"}, {"id": 12, "name": "timeout_ms", "kind": "u32"}
+    ]},
     {"id": 1, "name": "telemetry.nan_status", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
     {"id": 2, "name": "telemetry.now_metrics", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
     {"id": 3, "name": "telemetry.nan_metrics", "component": 7, "x-check-all": {}, "x-check-all-platforms": ["esp32", "host"]},
@@ -49,6 +55,7 @@
     {"id": 1, "name": "runtime.snapshot", "component": 101, "x-check-all": {}, "x-check-all-platforms": ["esp32"], "fields": [
       {"id": 0, "name": "desired_mode", "kind": "u32"}, {"id": 1, "name": "desired_generation", "kind": "u32"}, {"id": 2, "name": "request_id", "kind": "u32"}, {"id": 3, "name": "sleepy", "kind": "bool"}, {"id": 4, "name": "radio_lifecycle", "kind": "u32"}, {"id": 5, "name": "applied_generation", "kind": "u32"}, {"id": 6, "name": "power_lifecycle", "kind": "u32"}, {"id": 7, "name": "sleep_blockers", "kind": "u32"}, {"id": 8, "name": "last_error", "kind": "u32"}, {"id": 9, "name": "stale_completion_count", "kind": "u32"}, {"id": 10, "name": "queue_overflow_count", "kind": "u32"}, {"id": 11, "name": "wake_cause", "kind": "u32"}, {"id": 12, "name": "cpu_mhz", "kind": "u32"}, {"id": 13, "name": "pm_min_mhz", "kind": "u32"}, {"id": 14, "name": "pm_max_mhz", "kind": "u32"}, {"id": 15, "name": "pm_automatic_light_sleep", "kind": "bool"}, {"id": 16, "name": "pm_configured", "kind": "bool"}, {"id": 17, "name": "light_sleep_attempts", "kind": "u32"}, {"id": 18, "name": "light_sleep_entries", "kind": "u32"}, {"id": 19, "name": "light_sleep_skipped", "kind": "u32"}, {"id": 20, "name": "last_sleep_requested_us", "kind": "u32"}, {"id": 21, "name": "last_sleep_duration_us", "kind": "u32"}
     ]},
+    {"id": 2, "name": "runtime.reset", "component": 101, "x-check-all-platforms": ["esp32"]},
     {"id": 1, "name": "power.snapshot", "component": 102, "x-check-all": {}, "x-check-all-platforms": ["esp32"], "fields": [
       {"id": 0, "name": "cpu_mhz", "kind": "u32"}, {"id": 1, "name": "min_mhz", "kind": "u32"}, {"id": 2, "name": "max_mhz", "kind": "u32"}, {"id": 3, "name": "automatic_light_sleep", "kind": "bool"}, {"id": 4, "name": "configured", "kind": "bool"}, {"id": 5, "name": "light_sleep_attempts", "kind": "u32"}, {"id": 6, "name": "light_sleep_entries", "kind": "u32"}, {"id": 7, "name": "light_sleep_skipped", "kind": "u32"}, {"id": 8, "name": "last_sleep_requested_us", "kind": "u32"}, {"id": 9, "name": "last_sleep_duration_us", "kind": "u32"}
     ]},
@@ -66,6 +73,12 @@
       {"id": 8, "name": "low_priority_bytes", "kind": "u32"},
       {"id": 9, "name": "high_priority_bytes", "kind": "u32"},
       {"id": 10, "name": "parallel_streams", "kind": "u8"}
+    ]},
+    {"id": 2, "name": "object.flash", "component": 10, "fields": [
+      {"id": 1, "name": "cpu", "kind": "u8"},
+      {"id": 2, "name": "target", "kind": "u8"},
+      {"id": 4, "name": "transport", "kind": "u8"},
+      {"id": 5, "name": "dry_run", "kind": "bool"}
     ]},
     {"id": 1, "name": "status", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32", "android"]},
     {"id": 2, "name": "services", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
@@ -114,7 +127,14 @@
     {"id": 68, "name": "recovery"},
     {"id": 69, "name": "reset"},
     {"id": 70, "name": "module"},
-    {"id": 71, "name": "hello"},
+    {"id": 71, "name": "radio.tx", "component": 4, "fields": [
+      {"id": 1, "name": "frame", "kind": "hex"},
+      {"id": 2, "name": "channel", "kind": "u8"},
+      {"id": 3, "name": "interface", "kind": "enum", "values": {"auto": 0, "sta": 1, "ap": 2, "nan": 3}},
+      {"id": 4, "name": "system_sequence", "kind": "bool"},
+      {"id": 5, "name": "rate", "kind": "enum", "values": {"auto": 0, "6": 6, "9": 9, "12": 12, "18": 18, "24": 24, "36": 36, "48": 48, "54": 54}},
+      {"id": 6, "name": "disable_11b", "kind": "bool"}
+    ]},
     {"id": 72, "name": "radio.control", "component": 4, "fields": [
       {"id": 2, "name": "channel", "kind": "u8"},
       {"id": 3, "name": "interface", "kind": "enum", "values": {"auto": 0, "sta": 1, "ap": 2, "nan": 3}},

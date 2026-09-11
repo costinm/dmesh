@@ -136,12 +136,8 @@ fn next_action_client_cid() -> quic_lite::ConnectionId {
         // local CID allocation range. The wall-clock seed avoids the restart
         // collision while preserving the established four-byte CID range.
         let seed = ACTION_CLIENT_CID_SEED_BASE | (now_millis_u64() & ACTION_CLIENT_CID_SEED_MASK);
-        match NEXT_ACTION_CLIENT_CID.compare_exchange(
-            0,
-            seed,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match NEXT_ACTION_CLIENT_CID.compare_exchange(0, seed, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => current = seed,
             Err(initialized) => current = initialized,
         }
@@ -1094,20 +1090,14 @@ fn hydrate_udp_route_from_observed_peer(source: &str, peer: &str, announce: &mut
     let Some(announce) = announce.as_object_mut() else {
         return;
     };
-    if announce
-        .get("udp_link_local_v6")
-        .is_none_or(Value::is_null)
-    {
+    if announce.get("udp_link_local_v6").is_none_or(Value::is_null) {
         announce.insert(
             "udp_link_local_v6".to_owned(),
             Value::String(address.to_string()),
         );
     }
     if announce.get("udp_port").is_none_or(Value::is_null) {
-        announce.insert(
-            "udp_port".to_owned(),
-            Value::Number(u64::from(port).into()),
-        );
+        announce.insert("udp_port".to_owned(), Value::Number(u64::from(port).into()));
     }
 }
 
@@ -5951,7 +5941,9 @@ impl RadioService {
             let mut client = dmesh_server::transport::ProbeClient::<
                 16,
                 { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
-            >::from_request(next_action_client_cid(), effective_request)
+            >::from_request(
+                next_action_client_cid(), effective_request
+            )
             .map_err(|error| anyhow::anyhow!("NOW probe request: {error:?}"))?;
             // The public probe is an ordinary MeshClient stream. Retain its
             // first association just as a later tagged stream does; emitting
@@ -11084,37 +11076,38 @@ fn monitor_receive_loop(
                             else {
                                 continue;
                             };
-                        // Admit it before the raw endpoint so action-frame
-                        // discovery updates the same registry as NAN SDF.
-                        if let Some(announce) = dmesh_server::announce::decode_announce(payload)
-                            && announce_identity_valid(announce)
-                        {
-                            let bssid = mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
-                            let peer_text = colon_mac(&peer);
-                            discovered_devices
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .observe_announce(
-                                    "now",
-                                    peer_text.clone(),
-                                    bssid.clone(),
-                                    announce,
-                                );
-                            // A directed check is complete only when this is
-                            // the signed announce carrying its request ID and
-                            // it arrived from the selected NOW peer. Ordinary
-                            // unsolicited announcements still update the
-                            // inventory above, but never satisfy a check.
-                            if let Some(request_id) =
-                                dmesh_server::tagged::decode(payload).and_then(|record| record.id)
+                            // Admit it before the raw endpoint so action-frame
+                            // discovery updates the same registry as NAN SDF.
+                            if let Some(announce) = dmesh_server::announce::decode_announce(payload)
+                                && announce_identity_valid(announce)
                             {
-                                let pending = pending_now_discovery
+                                let bssid =
+                                    mac_at(frame, IEEE80211_ADDR3).map(|mac| colon_mac(&mac));
+                                let peer_text = colon_mac(&peer);
+                                discovered_devices
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .remove(&request_id);
-                                if let Some(waiter) = pending {
-                                    if waiter.peer == peer {
-                                        let _ = waiter.reply.send(json!({
+                                    .observe_announce(
+                                        "now",
+                                        peer_text.clone(),
+                                        bssid.clone(),
+                                        announce,
+                                    );
+                                // A directed check is complete only when this is
+                                // the signed announce carrying its request ID and
+                                // it arrived from the selected NOW peer. Ordinary
+                                // unsolicited announcements still update the
+                                // inventory above, but never satisfy a check.
+                                if let Some(request_id) = dmesh_server::tagged::decode(payload)
+                                    .and_then(|record| record.id)
+                                {
+                                    let pending = pending_now_discovery
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .remove(&request_id);
+                                    if let Some(waiter) = pending {
+                                        if waiter.peer == peer {
+                                            let _ = waiter.reply.send(json!({
                                             "authenticated": true,
                                             "source": peer_text,
                                             "announce": {
@@ -11125,66 +11118,68 @@ fn monitor_receive_loop(
                                                 "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
                                             },
                                         }));
-                                    } else {
-                                        // Preserve the waiter when an attacker
-                                        // or an unrelated peer reuses an ID.
-                                        pending_now_discovery
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                            .insert(request_id, waiter);
+                                        } else {
+                                            // Preserve the waiter when an attacker
+                                            // or an unrelated peer reuses an ID.
+                                            pending_now_discovery
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .insert(request_id, waiter);
+                                        }
                                     }
                                 }
+                                push_radio_event(
+                                    &history,
+                                    RadioEvent {
+                                        ts_millis: now_millis(),
+                                        key: "wifi.raw.discovery".to_string(),
+                                        source: monitor_iface.to_string(),
+                                        value: json!({
+                                            "ok": true,
+                                            "bearer": "now",
+                                            "peer": colon_mac(&peer),
+                                            "bssid": bssid,
+                                            "announce": {
+                                                "device_id": hex_bytes(announce.device_id()),
+                                                "kind": announce.kind,
+                                                "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
+                                                "uptime_secs": announce.uptime_secs,
+                                            },
+                                        }),
+                                        message: None,
+                                    },
+                                );
+                                continue;
                             }
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.raw.discovery".to_string(),
-                                    source: monitor_iface.to_string(),
-                                    value: json!({
-                                        "ok": true,
-                                        "bearer": "now",
-                                        "peer": colon_mac(&peer),
-                                        "bssid": bssid,
-                                        "announce": {
-                                            "device_id": hex_bytes(announce.device_id()),
-                                            "kind": announce.kind,
-                                            "wifi_channel": (announce.wifi_channel != 0).then_some(announce.wifi_channel),
-                                            "uptime_secs": announce.uptime_secs,
-                                        },
-                                    }),
-                                    message: None,
-                                },
-                            );
+                            // A newly booted device emits the same bounded CBOR
+                            // status and identity records over NOW as UART. They
+                            // are discovery records, not malformed QUIC-lite
+                            // datagrams, so publish them before raw dispatch.
+                            if let Some(message) =
+                                dmesh_server::services::decode_status_text(payload)
+                            {
+                                push_radio_event(
+                                    &history,
+                                    RadioEvent {
+                                        ts_millis: now_millis(),
+                                        key: "wifi.raw.boot".to_string(),
+                                        source: monitor_iface.to_string(),
+                                        value: json!({
+                                            "peer": colon_mac(&peer),
+                                            "message": String::from_utf8_lossy(message),
+                                        }),
+                                        message: None,
+                                    },
+                                );
+                                continue;
+                            }
+                            // A direct envelope has either updated presence above
+                            // or is a separately allowlisted connectionless
+                            // operation. It is never a normal association frame.
+                            // In particular, do not hand its inner tagged record
+                            // to the QUIC dispatcher, and do not make ordinary
+                            // short-header QUIC packets pass this direct decoder.
                             continue;
-                        }
-                        // A newly booted device emits the same bounded CBOR
-                        // status and identity records over NOW as UART. They
-                        // are discovery records, not malformed QUIC-lite
-                        // datagrams, so publish them before raw dispatch.
-                        if let Some(message) = dmesh_server::services::decode_status_text(payload) {
-                            push_radio_event(
-                                &history,
-                                RadioEvent {
-                                    ts_millis: now_millis(),
-                                    key: "wifi.raw.boot".to_string(),
-                                    source: monitor_iface.to_string(),
-                                    value: json!({
-                                        "peer": colon_mac(&peer),
-                                        "message": String::from_utf8_lossy(message),
-                                    }),
-                                    message: None,
-                                },
-                            );
-                            continue;
-                        }
-                        // A direct envelope has either updated presence above
-                        // or is a separately allowlisted connectionless
-                        // operation. It is never a normal association frame.
-                        // In particular, do not hand its inner tagged record
-                        // to the QUIC dispatcher, and do not make ordinary
-                        // short-header QUIC packets pass this direct decoder.
-                        continue;
                         }
                         let mut response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
                         let path = action_path_id(peer);
@@ -13938,8 +13933,9 @@ mod tests {
     #[test]
     fn action_ingress_keeps_normal_quic_packets_out_of_direct_decoder() {
         let mut direct = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-        let direct_used = dmesh_server::direct::ConnectionlessMessage::encode(b"direct", &mut direct)
-            .expect("direct envelope");
+        let direct_used =
+            dmesh_server::direct::ConnectionlessMessage::encode(b"direct", &mut direct)
+                .expect("direct envelope");
         assert!(action_payload_is_direct(&direct[..direct_used]));
 
         let mut stream = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
@@ -14050,7 +14046,8 @@ mod tests {
     #[test]
     fn directed_discovery_reply_does_not_erase_advertised_udp_route() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
+        let mut registry =
+            DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
         let mut id = [0_u8; 16];
         id[..10].copy_from_slice(b"android-p7");
         let mut multicast = dmesh_server::announce::Announce::discovery(id, 10, 1);
@@ -14076,13 +14073,17 @@ mod tests {
         let entry = registry.devices.get(&hex_bytes(&id[..10])).unwrap();
         assert_eq!(entry.announce["udp_link_local_v6"], "fe80::1234");
         assert_eq!(entry.announce["udp_port"], 3336);
-        assert_eq!(entry.observations["udp_multicast"].last_peer, "[fe80::1234%5]:3336");
+        assert_eq!(
+            entry.observations["udp_multicast"].last_peer,
+            "[fe80::1234%5]:3336"
+        );
     }
 
     #[test]
     fn directed_discovery_reply_seeds_cold_inventory_from_unicast_source() {
         let dir = tempfile::tempdir().unwrap();
-        let mut registry = DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
+        let mut registry =
+            DiscoveredDeviceRegistry::with_change_log(dir.path().join("nodes.jsonl"));
         let mut id = [0_u8; 16];
         id[..10].copy_from_slice(b"android-s2");
         registry.observe_announce(

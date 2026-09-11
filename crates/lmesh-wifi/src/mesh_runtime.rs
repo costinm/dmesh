@@ -79,16 +79,17 @@ fn firmware_stream_tools() -> Vec<serde_json::Value> {
                 let field_id = field["id"].as_u64()?;
                 let value_type = match field["kind"].as_str() {
                     Some("bool") => "boolean",
-                    Some("text" | "mac") => "string",
+                    Some("text" | "mac" | "hex") => "string",
                     _ => "integer",
                 };
-                properties.insert(
-                    field_name.to_owned(),
-                    serde_json::json!({
-                        "type": value_type,
-                        "x-protobuf-index": field_id,
-                    }),
-                );
+                let mut property = serde_json::json!({
+                    "type": value_type,
+                    "x-protobuf-index": field_id,
+                });
+                if field["kind"].as_str() == Some("hex") {
+                    property["format"] = serde_json::json!("hex");
+                }
+                properties.insert(field_name.to_owned(), property);
             }
             Some(serde_json::json!({
                 "name": name,
@@ -509,12 +510,23 @@ async fn start_http_admin(socket: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Serve admin assets from a configured development directory when requested;
-/// the embedded ssh-mesh bundle remains the normal production fallback.
+/// Serve the LMesh-owned dashboard before falling back to generic ssh-mesh
+/// admin assets. Keeping the discovery UI in `crates/lmesh/web` lets DMesh
+/// evolve its device/transport presentation without making ssh-mesh depend on
+/// DMesh or accepting an upstream asset change. `LMESH_HTTP_WEB_DIR` remains
+/// an explicit runtime override for packaged deployments and UI iteration.
 fn http_web_root(service_env: &str) -> Option<PathBuf> {
     std::env::var_os(service_env)
         .or_else(|| std::env::var_os("MESH_HTTP_WEB_DIR"))
         .map(PathBuf::from)
+        .or_else(|| Some(default_http_web_root()))
+}
+
+fn default_http_web_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("lmesh-wifi crate has a parent directory")
+        .join("lmesh/web")
 }
 
 fn announce_interval() -> Duration {
@@ -847,7 +859,7 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
         // route selection at this HTTP/QUIC boundary, never a recursively
         // forwarded application field.
         record.to = None;
-        let wire = mesh::cbor::encode_record(&record)?;
+        let wire = raw_wifi_tx_wire(&record, &id)?.unwrap_or(mesh::cbor::encode_record(&record)?);
         let response = self
             .service
             .forward_tagged_record(&destination, &wire)
@@ -870,10 +882,50 @@ impl mesh::wire::TaggedRecordHandler for LmeshCborHandler {
     }
 }
 
+/// Encode the one raw-frame handler through DMesh's shared adapter. JSON and
+/// text use `hex:` only at this boundary; the forwarded tagged-CBOR record
+/// contains the compact byte string expected by firmware.
+fn raw_wifi_tx_wire(
+    record: &mesh::tagged::TaggedRecord,
+    id: &serde_json::Value,
+) -> Result<Option<Vec<u8>>> {
+    let is_tx = matches!(
+        (&record.component, &record.method),
+        (
+            mesh::tagged::NameOrTag::Tag(4),
+            mesh::tagged::NameOrTag::Tag(71)
+        )
+    );
+    if !is_tx {
+        return Ok(None);
+    }
+    let id = id
+        .as_u64()
+        .context("radio.tx request ID must be an unsigned integer")?;
+    let mut fields = serde_json::Map::new();
+    for (key, value) in &record.env {
+        let name = match key {
+            mesh::tagged::NameOrTag::Tag(1) => "frame",
+            mesh::tagged::NameOrTag::Tag(2) => "channel",
+            mesh::tagged::NameOrTag::Tag(3) => "interface",
+            mesh::tagged::NameOrTag::Tag(4) => "system_sequence",
+            mesh::tagged::NameOrTag::Tag(5) => "rate",
+            mesh::tagged::NameOrTag::Tag(6) => "disable_11b",
+            _ => anyhow::bail!("unknown radio.tx field"),
+        };
+        fields.insert(name.to_owned(), value.clone());
+    }
+    let mut wire = vec![0; dmesh_server::raw_wifi::RAW_WIFI_MAX_FRAME + 64];
+    let used = dmesh_server::raw_wifi::encode_raw_wifi_tx_json_request(&fields, id, &mut wire)?;
+    wire.truncate(used);
+    Ok(Some(wire))
+}
+
 fn record_keeps_to_as_local_argument(record: &mesh::tagged::TaggedRecord) -> bool {
     matches!(
         decode_lmesh_tagged_request(record),
-        Ok(crate::mesh_core::Request::DiscoveryActive { .. } | crate::mesh_core::Request::Probe { .. })
+        Ok(crate::mesh_core::Request::DiscoveryActive { .. }
+            | crate::mesh_core::Request::Probe { .. })
     )
 }
 
@@ -947,6 +999,14 @@ mod tests {
     fn parse_announce_interval_rejects_zero_and_invalid_values() {
         assert_eq!(parse_announce_interval_secs("0"), None);
         assert_eq!(parse_announce_interval_secs("nope"), None);
+    }
+
+    #[test]
+    fn default_http_assets_are_owned_by_lmesh() {
+        let root = default_http_web_root();
+        assert!(root.ends_with("crates/lmesh/web"));
+        assert!(root.join("index.html").is_file());
+        assert!(root.join("dashboard.html").is_file());
     }
 
     #[test]
@@ -1071,7 +1131,10 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|tool| tool.get("x-check-all").is_some_and(serde_json::Value::is_object))
+            .filter(|tool| {
+                tool.get("x-check-all")
+                    .is_some_and(serde_json::Value::is_object)
+            })
             .filter_map(|tool| tool["name"].as_str())
             .collect::<std::collections::BTreeSet<_>>();
 
@@ -1301,5 +1364,38 @@ mod tests {
         record.id = Some(serde_json::json!(1));
         record.to = Some(serde_json::json!("udp://[fe80::44]:3339"));
         assert!(record_keeps_to_as_local_argument(&record));
+    }
+
+    #[test]
+    fn radio_tx_ui_and_forwarder_share_a_byte_frame_encoder() {
+        let catalog = public_tools_json();
+        let tool = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "radio.tx")
+            .unwrap();
+        assert_eq!(tool["inputSchema"]["properties"]["frame"]["type"], "string");
+        assert_eq!(tool["inputSchema"]["properties"]["frame"]["format"], "hex");
+
+        let record = tagged_record_from_jsonl(&serde_json::json!({
+            "id": 43,
+            "to": "e9",
+            "method": "radio.tx",
+            "frame": "hex:d000ffffffff00112233445566778899aabbccddeeff00112233445566",
+            "channel": 6,
+            "interface": 1,
+            "rate": 6,
+        }))
+        .unwrap();
+        let wire = raw_wifi_tx_wire(&record, record.id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        let request = dmesh_server::raw_wifi::decode_raw_wifi_tx_record(
+            dmesh_server::tagged::decode(&wire).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request.channel, 6);
+        assert_eq!(request.frame[0], 0xd0);
     }
 }

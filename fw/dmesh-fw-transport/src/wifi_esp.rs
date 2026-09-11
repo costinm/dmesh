@@ -450,11 +450,16 @@ unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate, allow_open: bool)
             sta.threshold.authmode = mode;
             sta.pmf_cfg.capable = true;
             sta.pmf_cfg.required = true;
+            // A zeroed `wifi_sta_config_t` selects UNSPECIFIED.  Advertise
+            // both derivation methods so a WPA3 AP that requires SAE-H2E and
+            // an older WPA3 AP can use the same provisioned PSK.
+            sta.sae_pwe_h2e = esp_idf_sys::wifi_sae_pwe_method_t_WPA3_SAE_PWE_BOTH;
         }
         mode if mode == esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_WPA3_PSK => {
             sta.threshold.authmode = mode;
             sta.pmf_cfg.capable = true;
             sta.pmf_cfg.required = false;
+            sta.sae_pwe_h2e = esp_idf_sys::wifi_sae_pwe_method_t_WPA3_SAE_PWE_BOTH;
         }
         _ => return false,
     }
@@ -1529,12 +1534,23 @@ pub(crate) fn enqueue_now_payload(source: [u8; 6], payload: &[u8]) -> bool {
 /// End a bounded sleepy-node STA session.  The caller owns the session policy;
 /// this adapter only releases the ESP-IDF STA bearer so the normal light-sleep
 /// scheduler can resume. Infrastructure callers intentionally never use it.
-pub fn stop_sta() {
+fn stop_sta_with_leave_grace(leave_grace_ms: u32) {
     stop_sta_extensions();
     crate::wifi_raw_udp6_esp::stop();
     unsafe {
         STA_ASSOCIATED_EVENT.store(false, Ordering::Release);
         let _ = esp_idf_sys::esp_wifi_disconnect();
+        // `esp_wifi_disconnect` initiates the 802.11 leave asynchronously.
+        // Normally a radio-epoch replacement may stop immediately, but a
+        // device reset must give the driver a short chance to put the leave
+        // frame on air. Otherwise an infrastructure AP can retain a stale
+        // station entry through its inactivity timeout after ROM restarts.
+        if leave_grace_ms != 0 {
+            let ticks = ((u64::from(leave_grace_ms) * u64::from(esp_idf_sys::configTICK_RATE_HZ))
+                .div_ceil(1_000)
+                .max(1)) as esp_idf_sys::TickType_t;
+            esp_idf_sys::vTaskDelay(ticks);
+        }
         let _ = esp_idf_sys::esp_wifi_stop();
         let netif = STA_NETIF.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !netif.is_null() {
@@ -1542,6 +1558,37 @@ pub fn stop_sta() {
         }
         leave_radio_mode(RadioMode::StaRawUdp6);
     }
+}
+
+pub fn stop_sta() {
+    stop_sta_with_leave_grace(0);
+}
+
+/// Explicitly leave the infrastructure AP before a controlled device reset.
+/// The grace period belongs only to reset semantics, never normal radio epoch
+/// replacement, because its purpose is peer-visible STA disassociation.
+pub fn stop_sta_for_reset() {
+    stop_sta_with_leave_grace(100);
+}
+
+/// Release the stopped Wi-Fi driver's power-management locks before an
+/// explicit Main light-sleep boundary.  `stop_sta()` intentionally retains
+/// the initialized driver for normal radio-profile replacements; that is not
+/// sufficient on classic ESP32, where an initialized-but-stopped driver can
+/// make `esp_light_sleep_start()` return immediately.  Main calls this only
+/// for its physical DW8 sleep path and `init_nan_now()` recreates the driver
+/// after the timer wake.
+pub fn deinit_for_light_sleep() {
+    unsafe {
+        let result = esp_idf_sys::esp_wifi_deinit();
+        if result != esp_idf_sys::ESP_OK
+            && result != esp_idf_sys::ESP_ERR_WIFI_NOT_INIT
+            && result != esp_idf_sys::ESP_ERR_INVALID_STATE
+        {
+            uart::send_stat(b"wifi light-sleep deinit result=", result as u32 as u64);
+        }
+    }
+    STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
 }
 
 /// Replace an already selected STA radio epoch. This is the sole Wi-Fi-owner

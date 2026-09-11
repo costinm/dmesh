@@ -8,8 +8,9 @@ starts, stops, or restores a managed serial forward. ESP-NOW/action and Wi-Fi
 flashing remain future paths for devices without a UART connection.
 
 Before replacing a running Main image, the wrapper makes one bounded
-best-effort `transport.set mode=nan now=1` request through dmesh-cli and
-waits one second for Main's queued radio owner to stop STA before USB reset.
+best-effort `runtime.reset` request through dmesh-cli.  Main explicitly
+leaves STA before restarting, so USB provisioning does not leave a stale AP
+association or replace the provisioned STA profile with a temporary NAN mode.
 The preflight never prevents a repair flash when the current firmware is
 crashed or UART is unavailable.
 """
@@ -94,7 +95,7 @@ def direct_serial_port(role: str, catalog: Path | None) -> str:
     return matches[0]
 
 
-def preflash_sta_off(role: str, target: str) -> None:
+def preflash_sta_off(role: str, target: str, physical: str) -> None:
     """Best-effort, observable Main STA teardown before USB flashing.
 
     Keep this outside the esptool path: entering the ROM loader first would
@@ -109,7 +110,11 @@ def preflash_sta_off(role: str, target: str) -> None:
     if not cli.is_file():
         print(f"{role}: STA-off preflight skipped (dmesh-cli is not built)", flush=True)
         return
-    command = [str(cli), role, "--command", "transport.set mode=nan now=1"]
+    # Reset is a normal correlated QUIC-lite service.  Keep it out of the
+    # connectionless direct-control allowlist: a reset must not become an
+    # unauthenticated radio-plane operation merely because this provisioning
+    # helper happens to own a local USB cable.
+    command = [str(cli), physical, "runtime.reset"]
     try:
         completed = subprocess.run(
             command,
@@ -126,13 +131,17 @@ def preflash_sta_off(role: str, target: str) -> None:
     if completed.returncode:
         print(f"{role}: STA-off preflight failed (continuing to flash): {completed.stdout.strip()}", flush=True)
         return
-    if "method=transport.set" not in completed.stdout:
+    # The low-level UART stream renderer preserves this minimal handler reply
+    # as a raw tagged record, so it does not currently attach the schema method
+    # label.  Its fixed acknowledgement text is still correlated to this
+    # one-request session and is the observable acceptance boundary.
+    if "reset scheduled" not in completed.stdout:
         print(f"{role}: STA-off preflight response was not correlated (continuing to flash)", flush=True)
         return
-    # The command only changes desired state; Main serializes physical STA
-    # teardown on its event owner. One second is ample for that bounded
-    # transition and avoids asking the flash wrapper to become a Wi-Fi scan
-    # or association-status verifier.
+    # Main returns its response before the owner performs the explicit STA
+    # leave/restart. One second is ample for that bounded transition and
+    # avoids asking the flash wrapper to become a Wi-Fi scan or association
+    # status verifier.
     time.sleep(1)
     print(f"{role}: STA-off preflight accepted; waited 1s for STA teardown", flush=True)
 
@@ -653,7 +662,7 @@ def main() -> int:
     # be disabled merely because the module name is `flash`.
     provisioning_started = time.monotonic()
     print(f"{args.role}: direct USB provisioning on {physical}", flush=True)
-    preflash_sta_off(args.role, args.target)
+    preflash_sta_off(args.role, args.target, physical)
     write_succeeded = False
     chip: str | None = None
     try:

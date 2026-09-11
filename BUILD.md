@@ -34,6 +34,13 @@ scripts/build.sh deps
 scripts/build.sh musl
 ```
 
+The resulting binaries are under
+`target/x86_64-unknown-linux-musl/release/`; use
+`target/x86_64-unknown-linux-musl/release/dmesh-cli` as ad-hoc CLI for UART or UDP
+sessions. The `lmesh-wifi` binary is managed and restarted automatically by mesh-init
+and runs with special CAP_NET_ADMIN to manage low-level Wifi - it can be used as a
+ relay for NOW and NAN interactions and for discovery.
+
 Run the lmesh unit tests through the repository wrapper:
 
 ```sh
@@ -44,9 +51,10 @@ scripts/build.sh object-store-test
 
 These host-only checks source `env.sh`, select the repo-local Rust toolchain,
 and keep Cargo state under `target/`. Do not run standalone Cargo commands for
-the DMesh or object-store checks. The `mesh-cli` artifact is built from the
-sibling `ssh-mesh` checkout by `scripts/build.sh musl`; that build sources
-ssh-mesh's own `env.sh` and writes only to its own `target/`.
+the DMesh or object-store checks. The `mesh` and `mesh-init` artifacts are
+built from the sibling `ssh-mesh` checkout by
+`scripts/build.sh musl`; that command delegates to ssh-mesh's main build script,
+which sources its own `env.sh` and writes only to its own `target/`.
 
 Run the host-side Recovery/DRS2 protocol checks with:
 
@@ -82,16 +90,16 @@ tmux send-keys -t "$session":build 'source ./env.sh && scripts/build-fw.sh e6' E
 # probe 65536, quit) without a second serial owner.
 tmux new-window -t "$session" -n e6.uart
 tmux send-keys -t "$session":e6.uart \
-  'source ./env.sh && target/debug/dmesh-cli /dev/serial/by-id/<e6-serial> --watch --interactive --timeout-secs 300' Enter
+  'source ./env.sh && dmesh-cli /dev/serial/by-id/<e6-serial> --watch --interactive --timeout-secs 300' Enter
 
 # Run stream requests and throughput checks in separate windows. Substitute
 # a serial path or udp://<device-ip>:3339; both use the same stream services.
 tmux new-window -t "$session" -n e6.udp
 tmux send-keys -t "$session":e6.udp \
-  'source ./env.sh && target/debug/dmesh-cli udp://10.78.0.101:3339 --service status' Enter
+  'source ./env.sh && dmesh-cli udp://10.78.0.101:3339 status' Enter
 tmux new-window -t "$session" -n e7.udp
 tmux send-keys -t "$session":e7.udp \
-  'source ./env.sh && target/debug/dmesh-cli udp://10.78.0.102:3339 --log-watch' Enter
+  'source ./env.sh && dmesh-cli udp://10.78.0.102:3339 log-watch' Enter
 
 tmux attach -t "$session"
 ```
@@ -114,21 +122,19 @@ captured logs stay attributable to one device.
 
 The profile is `target/nix/profile`; `lmesh`, `mesh-tun`, and `dmeshtui` are
 written to `target/x86_64-unknown-linux-musl/release/`. The generic `mesh` CLI
-is built only by the sibling ssh-mesh workspace, at
-`$DMESH_SSH_MESH_DIR/target/x86_64-unknown-linux-musl/release/mesh`. After
-sourcing `env.sh`, that is the only `mesh` selected through PATH and
-placed on `PATH`; `MESH_TOOLS` defaults to lmesh's
+and `mesh-init` are built by the sibling ssh-mesh workspace through
+`$DMESH_SSH_MESH_DIR/scripts/build.sh rust PACKAGE`. After sourcing
+`env.sh`, the sibling release directory is placed on `PATH`; `MESH_TOOLS`
+defaults to lmesh's
 generated command catalog. The default `MESH_SERVICE_DIR` selects the installed
-mesh-init service definitions. The `lmesh-uart` forwarding service is retired;
-use `dmesh-cli` for a physical serial interface. `mesh` itself remains
+mesh-init service definitions. `mesh` itself remains
 service-independent, and callers can override `MESH_TOOLS` or
 `MESH_SERVICE_DIR`.
 
 ### Managed Linux radio services
 
 The privileged stable AP/radio service is `lmesh-wifi` on `wlan0`. `lmesh` is
-the separate development/test service and normally uses `wlan1`; do not mix
-their interfaces or UDP test endpoints. After sourcing `env.sh`, use the
+a separate development/test service. After sourcing `env.sh`, use the
 ssh-mesh `mesh` client for operational RPC rather than invoking a service
 binary directly:
 
@@ -136,17 +142,14 @@ binary directly:
 # Read-only state useful before and after a firmware bearer test.
 mesh lmesh-wifi wifi.ap.stations iface=wlan0
 mesh lmesh-wifi wifi.rawnan.status iface=wlan0
-mesh lmesh wifi.ap.stations iface=wlan1
 ```
 
-Both are supervised by `mesh-init`. On this host its control socket is
-`/run/mesh/mesh-init/mesh.sock`; the checkout environment can select another
-run directory, so set it explicitly for supervisor calls:
+Both are supervised by `mesh-init`. The shared service resolver selects its
+standard control socket (`/run/mesh/mesh-init/mesh.sock` in root mode):
 
 ```sh
-export MESH_INIT_SOCK=/run/mesh/mesh-init/mesh.sock
-mesh-init status lmesh-wifi
-mesh-init status lmesh
+mesh mesh-init mesh-init status lmesh-wifi
+mesh mesh-init mesh-init status lmesh
 ```
 
 Do not use `systemctl`, signal a service PID, or spawn an unsupervised
@@ -156,8 +159,8 @@ does not automatically restart the service, so always issue the matching
 `start` and capture station/recovery evidence:
 
 ```sh
-mesh-init stop lmesh-wifi
-mesh-init start lmesh-wifi
+mesh mesh-init mesh-init stop lmesh-wifi
+mesh mesh-init mesh-init start lmesh-wifi
 ```
 
 Android JNI/UI crates remain Android build inputs and are not included in the

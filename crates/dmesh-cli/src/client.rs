@@ -34,7 +34,7 @@ use std::{
         fs::{FileTypeExt, OpenOptionsExt},
         net::{UnixListener, UnixStream},
     },
-    path::Path,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -160,8 +160,12 @@ impl DeviceSession {
                     {
                         match classify_uart_payload(&frame) {
                             Ok(UartIngress::Unmarked(packet)) => {
-                                if let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet) {
-                                    self.push_event(DeviceSessionEvent::DirectRecord(record.to_vec()));
+                                if let Some(record) =
+                                    dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                                {
+                                    self.push_event(DeviceSessionEvent::DirectRecord(
+                                        record.to_vec(),
+                                    ));
                                 }
                             }
                             Ok(UartIngress::Transport(input)) => {
@@ -199,6 +203,18 @@ impl DeviceSession {
                 self.assert_healthy()?;
                 let elapsed_us = started.elapsed().as_micros().max(1) as u64;
                 let transferred = client.bytes();
+                // This is a one-shot MeshClient operation.  Retire its
+                // association while the UART path is still live: otherwise
+                // a bounded firmware association table retains one CID for
+                // every standalone probe until an idle timeout.  The close
+                // packet is ordinary QUIC-lite framing, never UART policy.
+                let mut close_packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+                if let Some(close) = client
+                    .poll_close(&mut close_packet)
+                    .map_err(|error| format!("probe close: {error:?}"))?
+                {
+                    send_uart_transport(&mut self.serial, &close_packet[..close])?;
+                }
                 return Ok(SerialProbeResult {
                     bytes: transferred,
                     normal_bytes: client.normal_bytes(),
@@ -381,7 +397,9 @@ impl DeviceSession {
                         records += 1;
                         match classify_uart_payload(&frame) {
                             Ok(UartIngress::Unmarked(packet)) => {
-                                if let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet) {
+                                if let Some(record) =
+                                    dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                                {
                                     let event = DeviceSessionEvent::DirectRecord(record.to_vec());
                                     let is_match = matched(&event);
                                     self.push_event(event);
@@ -950,7 +968,9 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
                             }
                         }
                         Ok(UartIngress::Unmarked(packet)) => {
-                            if let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet) {
+                            if let Some(record) =
+                                dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                            {
                                 eprintln!(
                                     "dmesh_device_record bearer=uart bytes={} {}",
                                     record.len(),
@@ -1380,7 +1400,8 @@ fn run_serial_direct_record(arguments: &[String]) -> Result<(), String> {
                     .map_err(|error| error.to_string())?
                 {
                     if let Ok(UartIngress::Unmarked(packet)) = classify_uart_payload(&frame)
-                        && let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                        && let Some(record) =
+                            dmesh_server::direct::ConnectionlessMessage::decode(packet)
                     {
                         let rendered = render_device_record(&schema, record);
                         if text_filter.retain(&rendered) {
@@ -1454,7 +1475,9 @@ fn run_serial_service_request(
                     let packet = match classify_uart_payload(&record) {
                         Ok(UartIngress::Transport(packet)) => packet,
                         Ok(UartIngress::Unmarked(packet)) => {
-                            if let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet) {
+                            if let Some(record) =
+                                dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                            {
                                 report_uart_direct_record(path, record, &mut text_filter);
                             }
                             continue;
@@ -1468,8 +1491,7 @@ fn run_serial_service_request(
                     if connection.is_peer_stateless_reset(packet) {
                         return Err("UART bootstrap: peer restarted".into());
                     }
-                    if connection.receive_open_ack(uart_path, packet, 0).is_ok()
-                    {
+                    if connection.receive_open_ack(uart_path, packet, 0).is_ok() {
                         break 'bootstrap;
                     }
                 }
@@ -1506,7 +1528,9 @@ fn run_serial_service_request(
                     let packet = match classify_uart_payload(&record) {
                         Ok(UartIngress::Transport(packet)) => packet,
                         Ok(UartIngress::Unmarked(packet)) => {
-                            if let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet) {
+                            if let Some(record) =
+                                dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                            {
                                 report_uart_direct_record(path, record, &mut text_filter);
                             }
                             continue;
@@ -1530,6 +1554,17 @@ fn run_serial_service_request(
                         send_uart_transport(serial, &ack[..ack_len])?;
                     }
                     if stream_id == quic_lite::FIRST_SERVER_BIDI_STREAM_ID {
+                        // A one-shot CLI service request must retire its
+                        // association before closing the UART FD.  Keeping
+                        // the close inside QUIC-lite prevents a serial
+                        // command from consuming the firmware's bounded
+                        // multi-peer association table.
+                        if let Some((_close_path, close_used)) = connection
+                            .poll_close(&mut ack)
+                            .map_err(|error| format!("UART service close: {error:?}"))?
+                        {
+                            send_uart_transport(serial, &ack[..close_used])?;
+                        }
                         println!(
                             "dmesh_cli_stream_command target={} stream={} fin={} bytes={} {}",
                             path,
@@ -1685,7 +1720,9 @@ fn run_serial_watch(arguments: &[String]) -> Result<(), String> {
                 {
                     match classify_uart_payload(&record) {
                         Ok(UartIngress::Unmarked(packet)) => {
-                            if let Some(record) = dmesh_server::direct::ConnectionlessMessage::decode(packet) {
+                            if let Some(record) =
+                                dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                            {
                                 direct_records = direct_records.saturating_add(1);
                                 println!(
                                     "dmesh_uart_watch_record bytes={} {}",
@@ -1841,6 +1878,11 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         .and_then(dmesh_server::probe::decode_probe_run_record)
         .map(|(_, request)| request);
     let probe_request = tagged_probe;
+    // `object.flash` uses two client-initiated streams on this one QUIC-lite
+    // association: the command on stream 4 and its ordered object records on
+    // stream 8.  The CLI never starts a reverse UDP server or a second
+    // association for a flash upload.
+    let object_flash = dmesh_server::protocol::decode_flash_handler_request(&request).is_some();
     let relay = match (relay_forward_dcid, relay_reverse_dcid, relay_next_mac) {
         (None, None, None) => None,
         (Some(forward), Some(reverse), Some(next_mac)) => Some((
@@ -1850,6 +1892,9 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         )),
         _ => return Err("relay mode requires forward DCID, reverse DCID, and next MAC".into()),
     };
+    if object_flash && relay.is_some() {
+        return Err("object.flash cannot be combined with relay mode".into());
+    }
     // This CID is owned by dmesh-cli and remains stable across relay alias
     // allocation. It is never a relay allocation.
     let cid = fresh_connection_id()?;
@@ -2018,10 +2063,55 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
             }
         }
-        let (stream, response, fin) = client
-            .request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, &request, true)
-            .await
-            .map_err(|error| error.to_string())?;
+        let flash_response = if object_flash {
+            let (_, flash) = dmesh_server::protocol::decode_flash_handler_request(&request)
+                .ok_or("invalid object.flash request")?;
+            let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/flash"));
+            let records = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
+                artifact_root: artifact_root.clone(),
+                ..dmesh_server::ServerConfig::default()
+            })
+            .response_records(flash.object)
+            .map_err(|error| format!("object.flash artifact: {error}"))?;
+            let mut object = dmesh_server::protocol::ObjectRecordStream::new(records);
+            // The C6 raw-UDP6 adapter currently proves a 256-byte payload
+            // envelope on this STA link.  This is only QUIC-lite stream
+            // packet sizing; object record framing and recovery remain
+            // bearer-neutral.
+            let mut chunk = [0u8; 256];
+            eprintln!(
+                "dmesh_cli_object_upload association=single command_stream={} object_stream={} artifact_root={}",
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                artifact_root.display()
+            );
+
+            let response = client
+                .request_object_upload(
+                    quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                    &request,
+                    dmesh_server::transport::FLASH_OBJECT_STREAM,
+                    &mut object,
+                    &mut chunk,
+                    Duration::from_secs(300),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            eprintln!(
+                "dmesh_cli_object_upload_complete stream={} records={} bytes={}",
+                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                object.record_index(),
+                object.sent_bytes()
+            );
+            Ok((response.id, response.data, response.fin))
+        } else {
+            client
+                .request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, &request, true)
+                .await
+        };
+        let (stream, response, fin) = flash_response.map_err(|error| error.to_string())?;
         // A direct UDP CLI command is deliberately a one-shot client, unlike
         // lmesh's per-device association manager.  Send QUIC CLOSE while the
         // shared fixed-port socket is still alive; dropping it alone leaves a

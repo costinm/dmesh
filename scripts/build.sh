@@ -9,6 +9,33 @@ cd "$DMESH_REPO"
 
 profile="${DMESH_NIX_PROFILE:-$DMESH_REPO/target/nix/profile}"
 ssh_mesh_url="${SSH_MESH_GIT_URL:-https://github.com/costinm/ssh-mesh}"
+CARGO_LOCK_BACKUP=""
+
+# A local ssh-mesh patch can make Cargo select path packages and rewrite the
+# checked-in lockfile.  That selection is an operator-local build input, not a
+# source change; leaving it behind makes the next firmware or Android command
+# rebuild for a lockfile change it did not request.
+restore_cargo_lock() {
+    if [ -n "${CARGO_LOCK_BACKUP:-}" ] && [ -f "$CARGO_LOCK_BACKUP" ]; then
+        if ! cmp -s "$CARGO_LOCK_BACKUP" "$DMESH_REPO/Cargo.lock"; then
+            # Preserve the original lockfile timestamp as well as its bytes:
+            # Cargo fingerprints the lockfile and a restore must not look like
+            # a dependency-graph change to the next target build.
+            cp -p "$CARGO_LOCK_BACKUP" "$DMESH_REPO/Cargo.lock"
+        fi
+        rm -f "$CARGO_LOCK_BACKUP"
+        CARGO_LOCK_BACKUP=""
+    fi
+}
+
+preserve_cargo_lock_for_override() {
+    if [ "${SSH_MESH_OVERRIDE_ACTIVE:-0}" != "1" ] || [ ! -f "$DMESH_REPO/Cargo.lock" ]; then
+        return
+    fi
+    CARGO_LOCK_BACKUP="$CARGO_HOME/Cargo.lock.before-ssh-mesh-override"
+    cp -p "$DMESH_REPO/Cargo.lock" "$CARGO_LOCK_BACKUP"
+    trap restore_cargo_lock EXIT
+}
 
 resolve_cargo() {
     local cargo_bin
@@ -42,6 +69,7 @@ ensure_rust_toolchain() {
 }
 
 configure_ssh_mesh_override() {
+    SSH_MESH_OVERRIDE_ACTIVE=0
     local override_dir="${DMESH_SSH_MESH_DIR:-}"
     local config="$CARGO_HOME/config.toml"
 
@@ -70,6 +98,7 @@ ssh-mesh = { path = "$override_dir/crates/ssh-mesh" }
 mesh = { path = "$override_dir/crates/mesh" }
 # END DMESH SSH_MESH OVERRIDE
 EOF
+    SSH_MESH_OVERRIDE_ACTIVE=1
 }
 
 check_lmesh_api() {
@@ -94,16 +123,24 @@ check_lmesh_api() {
         if [ -f ./env.sh ]; then
             . ./env.sh
         fi
-        local generated normalized
+        local generated
         generated="$(mktemp)"
-        normalized="$(mktemp)"
         cargo run -p mesh-api-gen -- \
             --api "$DMESH_REPO/crates/dmesh-server/API.md" \
             --out-tools "$generated"
-        jq 'map(if (.name | startswith("telemetry.")) then .name |= sub("^telemetry\\."; "") else . end)' \
-            "$generated" > "$normalized"
-        cmp "$normalized" "$DMESH_REPO/crates/lmesh/resources/tools.json"
-        rm -f "$generated" "$normalized"
+        # The versioned firmware schema is the runtime catalog authority.
+        # API.md documents a reviewed subset, so check that every generated
+        # wire name and numeric tag agrees with that schema instead of
+        # overwriting the composed lmesh catalog (which also carries local
+        # controller operations).
+        jq -e --slurpfile schema "$DMESH_REPO/crates/lmesh/resources/firmware-schema.json" '
+            all(.[]; . as $tool |
+                any($schema[0].methods[];
+                    .name == $tool.name and
+                    .component == $tool["x-component-index"] and
+                    .id == $tool["x-method-index"]))
+        ' "$generated" >/dev/null
+        rm -f "$generated"
     )
 }
 
@@ -133,8 +170,17 @@ lmesh_api_generate() {
         cargo run -p mesh-api-gen -- \
             --api "$DMESH_REPO/crates/dmesh-server/API.md" \
             --out-tools "$generated"
-        jq 'map(if (.name | startswith("telemetry.")) then .name |= sub("^telemetry\\."; "") else . end)' \
-            "$generated" > "$DMESH_REPO/crates/lmesh/resources/tools.json"
+        # `firmware-schema.json` is the checked-in catalog source.  This
+        # command validates the API projection; it must never replace that
+        # schema with a partial generated list.
+        jq -e --slurpfile schema "$DMESH_REPO/crates/lmesh/resources/firmware-schema.json" '
+            all(.[]; . as $tool |
+                any($schema[0].methods[];
+                    .name == $tool.name and
+                    .component == $tool["x-component-index"] and
+                    .id == $tool["x-method-index"]))
+        ' "$generated" >/dev/null
+        echo "lmesh API projection matches firmware-schema.json; no catalog file rewritten"
         rm -f "$generated"
     )
 }
@@ -166,6 +212,7 @@ musl() {
     require_dmesh_cargo
     ensure_rust_toolchain
     configure_ssh_mesh_override
+    preserve_cargo_lock_for_override
     configure_musl
     # Android JNI/UI crates are libraries, not Linux MUSL binaries. Build the
     # device services and terminal UI explicitly so NativeActivity backends
@@ -186,38 +233,26 @@ musl() {
             "$DMESH_REPO/target/home/$service/bin/$service"
     done
 
-    # `mesh` is the generic client from ssh-mesh, not an lmesh-specific
-    # wrapper. Let Cargo retain the artifact under ssh-mesh/target, beside its
-    # source workspace; DMesh only supplies the generated lmesh catalog.
+    # `mesh` and `mesh-init` are owned by ssh-mesh. Let its checked-in build
+    # wrapper retain both artifacts under ssh-mesh/target; DMesh only supplies
+    # the generated lmesh catalog.
     local ssh_mesh_dir="${DMESH_SSH_MESH_DIR:-}"
     if [ -z "$ssh_mesh_dir" ]; then
         for candidate in "$DMESH_REPO/../rust/ssh-mesh" "$DMESH_REPO/../ssh-mesh"; do
-            if [ -f "$candidate/crates/mesh-cli/Cargo.toml" ]; then
+            if [ -x "$candidate/scripts/build.sh" ]; then
                 ssh_mesh_dir="$candidate"
                 break
             fi
         done
     fi
-    if [ -z "$ssh_mesh_dir" ] || [ ! -f "$ssh_mesh_dir/crates/mesh-cli/Cargo.toml" ]; then
-        echo "Missing ssh-mesh mesh-cli source; set DMESH_SSH_MESH_DIR" >&2
+    if [ -z "$ssh_mesh_dir" ] || [ ! -x "$ssh_mesh_dir/scripts/build.sh" ]; then
+        echo "Missing ssh-mesh build source; set DMESH_SSH_MESH_DIR" >&2
         return 1
     fi
-    (
-        cd "$ssh_mesh_dir"
-        # ssh-mesh owns its target directory, Cargo cache, and tool selection.
-        # Do not let the DMesh environment make this sibling build write into
-        # target/ or use a DMesh-local Cargo cache.
-        if [ -f ./env.sh ]; then
-            . ./env.sh
-        fi
-        local ssh_mesh_cargo
-        ssh_mesh_cargo="$(command -v cargo || true)"
-        if [ -z "$ssh_mesh_cargo" ]; then
-            echo "Missing Cargo in the ssh-mesh environment" >&2
-            exit 1
-        fi
-        "$ssh_mesh_cargo" build --release --target x86_64-unknown-linux-musl -p mesh-cli
-    )
+    "$ssh_mesh_dir/scripts/build.sh" rust mesh-cli
+    "$ssh_mesh_dir/scripts/build.sh" rust mesh-init
+    restore_cargo_lock
+    trap - EXIT
 }
 
 check() {

@@ -38,8 +38,8 @@ pub use connection::{
     AssociationProfile, ClientAssociation, ClientBootstrapIngress, ClientConnection,
     ClientStreamConnection, ConnectionCounters, ConnectionDebugState, ConnectionIdDiagnostic,
     ConnectionManager, ConnectionPolicy, DatagramClient, DatagramClientDriver, PathConnection,
-    PathId, ServerAssociationTable, ServerConnection, ServerConnectionIngress, ServerDatagram, ServerPacket,
-    ServerStreamConfig, ServerStreamConnection, classify_server_datagram,
+    PathId, ServerAssociationTable, ServerConnection, ServerConnectionIngress, ServerDatagram,
+    ServerPacket, ServerStreamConfig, ServerStreamConnection, classify_server_datagram,
     classify_server_packet, receive_error_code,
 };
 
@@ -1840,11 +1840,43 @@ pub fn encode_bootstrap_open_ack_packet_with_limits_and_reset_token(
     stateless_reset_token: Option<StatelessResetToken>,
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    encode_bootstrap_open_ack_packet_with_profile_and_reset_token(
+        client_cid,
+        server_cid,
+        packet_number,
+        limits,
+        0,
+        stateless_reset_token,
+        out,
+    )
+}
+
+/// Encode OPEN_ACK with the complete receiver profile.
+///
+/// `max_in_flight_packets` is the receiver's bounded datagram-ingress budget.
+/// Keeping it in the connection bootstrap lets every bearer use the same
+/// backpressure contract; zero retains compatibility with peers that did not
+/// advertise a packet-count bound.
+pub fn encode_bootstrap_open_ack_packet_with_profile_and_reset_token(
+    client_cid: ConnectionId,
+    server_cid: ConnectionId,
+    packet_number: u32,
+    limits: ConnectionLimits,
+    max_in_flight_packets: u16,
+    stateless_reset_token: Option<StatelessResetToken>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
     if client_cid.value() == 0 || server_cid.value() == 0 || client_cid == server_cid {
         return Err(Error::BootstrapInvalid);
     }
     let mut body = [0u8; 64];
-    let body_len = encode_bootstrap_profile(1, limits, 0, stateless_reset_token, &mut body)?;
+    let body_len = encode_bootstrap_profile(
+        1,
+        limits,
+        max_in_flight_packets,
+        stateless_reset_token,
+        &mut body,
+    )?;
     let mut frame = [0u8; 64];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,

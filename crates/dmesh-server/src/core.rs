@@ -904,6 +904,22 @@ impl<S, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
             complete: false,
         }
     }
+
+    /// Initialize a receiver in caller-owned storage without materializing
+    /// its bounded manifest/blob buffers on the current stack. Firmware uses
+    /// this when a flash command is received from a small packet task.
+    pub fn new_in_place(storage: &mut core::mem::MaybeUninit<Self>, sink: S) -> &mut Self {
+        unsafe {
+            let receiver = storage.as_mut_ptr();
+            // Every field of `FixedRecordDecoder` has a valid all-zero
+            // representation. Initializing it in place avoids copying the
+            // MAX_MANIFEST + MAX_BLOB scratch arrays through the caller.
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*receiver).records), 0, 1);
+            core::ptr::addr_of_mut!((*receiver).image).write(ImageReceiver::new(sink));
+            core::ptr::addr_of_mut!((*receiver).complete).write(false);
+            storage.assume_init_mut()
+        }
+    }
 }
 
 impl<S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
@@ -1407,6 +1423,22 @@ mod tests {
             Ok(())
         }
         fn abort(&mut self) {}
+    }
+
+    #[test]
+    fn signed_object_receiver_initializes_large_buffers_in_caller_storage() {
+        type Receiver = SignedObjectReceiver<ImageTestSink, NoSignatureVerifier, 64, 128>;
+        let mut storage = Box::new(core::mem::MaybeUninit::<Receiver>::uninit());
+        let receiver = Receiver::new_in_place(
+            &mut storage,
+            ImageTestSink {
+                blocks: 0,
+                bytes: 0,
+                done: false,
+            },
+        );
+        assert!(!receiver.is_complete());
+        assert_eq!(receiver.sink_mut().bytes, 0);
     }
 
     #[test]

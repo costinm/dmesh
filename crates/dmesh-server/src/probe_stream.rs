@@ -398,7 +398,8 @@ mod tests {
         let mut receiver = ProbeReceiver::new(2);
         let (first, first_fin) = sender
             .poll(&mut wire, |stream, offset, fin, payload, out| {
-                let _ = sender_endpoint.open_send_stream(stream, quic_lite::INITIAL_MAX_STREAM_DATA);
+                let _ =
+                    sender_endpoint.open_send_stream(stream, quic_lite::INITIAL_MAX_STREAM_DATA);
                 sender_endpoint
                     .encode_stream_packet(client, stream, offset, fin, payload, out)
                     .map(|(used, _)| used)
@@ -415,7 +416,8 @@ mod tests {
         receiver_endpoint.stream_consumed(3, 8).unwrap();
         let (second, second_fin) = sender
             .poll(&mut wire, |stream, offset, fin, payload, out| {
-                let _ = sender_endpoint.open_send_stream(stream, quic_lite::INITIAL_MAX_STREAM_DATA);
+                let _ =
+                    sender_endpoint.open_send_stream(stream, quic_lite::INITIAL_MAX_STREAM_DATA);
                 sender_endpoint
                     .encode_stream_packet(client, stream, offset, fin, payload, out)
                     .map(|(used, _)| used)

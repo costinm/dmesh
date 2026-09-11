@@ -66,7 +66,12 @@ pub const CONNECTION_HISTORY_CAPACITY: usize = 8;
 /// Maximum simultaneously live peer associations in Main.  Each entry owns
 /// its own bounded QUIC stream ledger; this is deliberately a firmware memory
 /// budget, not a bearer limit. UART, UDP6 and NOW all feed the same table.
-pub const MAX_QUIC_ASSOCIATIONS: usize = 4;
+/// Concurrent peer budget. One slot costs 312 bytes inline on the host ABI;
+/// an admitted peer additionally allocates a 3.8 KiB stream ledger. Twelve
+/// peers therefore bound connection state near 50 KiB while leaving embedded
+/// heap headroom. When full, zero-stream peers are reclaimed oldest-first;
+/// there is deliberately no firmware wall-clock expiry by default.
+pub const MAX_QUIC_ASSOCIATIONS: usize = 12;
 pub type ConnectionServer =
     dmesh_server::transport::ConnectionServer<CONNECTION_HISTORY_CAPACITY, { TRANSPORT_MTU }>;
 

@@ -56,6 +56,10 @@ impl PathId {
 /// failures therefore cannot redirect delayed ACKs or retransmissions.
 pub struct PathConnection<T> {
     connection: T,
+    /// Monotonic caller-supplied time of the latest valid packet. QUIC-lite
+    /// uses this only for association lifecycle; it deliberately assigns no
+    /// unit or wall-clock meaning to the value.
+    last_activity_at: u64,
     /// Paths that have carried a valid packet for this association.  The
     /// adapter resolves these opaque handles to UART ports, UDP tuples, or
     /// NOW peers; QUIC never learns or chooses bearer-specific addresses.
@@ -125,6 +129,9 @@ pub struct ServerStreamConnection<
     // private as well.
     pub mux: crate::mux::StreamMux<STREAMS, HISTORY, PACKET>,
     local_limits: crate::ConnectionLimits,
+    /// Packet-count receive budget advertised in OPEN_ACK. Zero retains the
+    /// compatibility profile used by ordinary socket transports.
+    local_max_in_flight_packets: u16,
     peer_open: crate::BootstrapOpen,
     /// Opaque token advertised with this server CID. It is association state
     /// owned by QUIC-lite so replayed OPENs cannot accidentally omit it.
@@ -191,6 +198,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
         Ok(Self {
             mux,
             local_limits,
+            local_max_in_flight_packets: 0,
             peer_open: crate::BootstrapOpen {
                 client_receive_cid: peer_cid,
                 max_data: peer_max_data,
@@ -256,12 +264,14 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
             open.client_receive_cid,
             server_cid,
             local_limits,
+            0,
             stateless_reset_token,
         )?;
         Ok((
             Self {
                 mux,
                 local_limits,
+                local_max_in_flight_packets: 0,
                 peer_open: open,
                 stateless_reset_token,
                 path_policy: crate::PathPolicy::HighestMeasuredSpeed,
@@ -340,6 +350,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
             core::ptr::addr_of_mut!((*out).path_policy)
                 .write(crate::PathPolicy::HighestMeasuredSpeed);
             core::ptr::addr_of_mut!((*out).local_limits).write(local_limits);
+            core::ptr::addr_of_mut!((*out).local_max_in_flight_packets).write(0);
             core::ptr::addr_of_mut!((*out).peer_open).write(open);
             core::ptr::addr_of_mut!((*out).stateless_reset_token).write(stateless_reset_token);
             core::ptr::addr_of_mut!((*out).next_response_stream)
@@ -355,6 +366,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
             open.client_receive_cid,
             server_cid,
             local_limits,
+            0,
             stateless_reset_token,
         )
     }
@@ -379,14 +391,16 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
         client_cid: crate::ConnectionId,
         server_cid: crate::ConnectionId,
         local_limits: crate::ConnectionLimits,
+        max_in_flight_packets: u16,
         stateless_reset_token: Option<crate::StatelessResetToken>,
     ) -> Result<Vec<u8>, crate::Error> {
         let mut ack = [0u8; PACKET];
-        let used = crate::encode_bootstrap_open_ack_packet_with_limits_and_reset_token(
+        let used = crate::encode_bootstrap_open_ack_packet_with_profile_and_reset_token(
             client_cid,
             server_cid,
             0,
             local_limits,
+            max_in_flight_packets,
             stateless_reset_token,
             &mut ack,
         )?;
@@ -411,6 +425,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
             open.client_receive_cid,
             local_cid,
             self.local_limits,
+            self.local_max_in_flight_packets,
             self.stateless_reset_token,
         )
     }
@@ -491,10 +506,14 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
         &mut self,
         history_packets: usize,
         initial_window_bytes: u64,
+        ack_frequency: u8,
+        ack_delay: u64,
     ) -> Result<(), crate::Error> {
         self.mux.endpoint.set_history_capacity(history_packets)?;
         self.mux.endpoint.congestion.congestion_window = initial_window_bytes;
         self.mux.endpoint.congestion.slow_start_threshold = initial_window_bytes;
+        self.mux.endpoint.set_ack_policy(ack_frequency, ack_delay);
+        self.local_max_in_flight_packets = history_packets.try_into().unwrap_or(u16::MAX);
         Ok(())
     }
 
@@ -563,10 +582,15 @@ impl<T> PathConnection<T> {
     pub const fn new(connection: T) -> Self {
         Self {
             connection,
+            last_activity_at: 0,
             known_paths: [None; 4],
             selected_path: None,
             active_path: None,
         }
+    }
+
+    pub const fn last_activity_at(&self) -> u64 {
+        self.last_activity_at
     }
 
     pub const fn active_path(&self) -> Option<PathId> {
@@ -656,6 +680,10 @@ impl<T> PathConnection<T> {
         }
         self.known_paths[0] = Some(path);
     }
+
+    fn has_path(&self, path: PathId) -> bool {
+        self.known_paths.contains(&Some(path))
+    }
 }
 
 /// Outcome of routing one frame through a server association owner.
@@ -731,9 +759,7 @@ pub fn classify_server_packet(packet: &[u8]) -> Result<ServerPacket, crate::Erro
         ServerDatagram::Established { .. } => Ok(ServerPacket::Established),
         // Long-header direct and client-side bootstrap ACK records cannot
         // enter a server association owner.
-        ServerDatagram::Direct | ServerDatagram::BootstrapAck { .. } => {
-            Err(crate::Error::Invalid)
-        }
+        ServerDatagram::Direct | ServerDatagram::BootstrapAck { .. } => Err(crate::Error::Invalid),
     }
 }
 
@@ -775,6 +801,8 @@ pub struct ServerAssociationTable<T, const ASSOCIATIONS: usize> {
     cid_epoch: u32,
     associations: [Option<PathConnection<T>>; ASSOCIATIONS],
     last_active_path: Option<PathId>,
+    now: u64,
+    idle_timeout: Option<u64>,
 }
 
 impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
@@ -784,7 +812,22 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
             cid_epoch: 0,
             associations: core::array::from_fn(|_| None),
             last_active_path: None,
+            now: 0,
+            idle_timeout: None,
         }
+    }
+
+    /// Advance the association lifecycle clock. The caller chooses the unit,
+    /// and must express `idle_timeout` in the same unit.
+    pub fn set_time(&mut self, now: u64) {
+        self.now = now;
+    }
+
+    /// Reclaim an association only after it has no active streams and has
+    /// received no valid packet for this interval. A full table may still
+    /// reclaim its oldest zero-stream entry immediately to admit a new peer.
+    pub fn set_idle_timeout(&mut self, idle_timeout: Option<u64>) {
+        self.idle_timeout = idle_timeout;
     }
 
     /// Route one complete packet to its independent association.  A fresh
@@ -799,20 +842,25 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
         replay: impl FnOnce(&mut T, &mut C) -> Result<R, crate::Error>,
         receive: impl FnOnce(&mut T, &mut C) -> Result<R, crate::Error>,
         is_closed: impl Fn(&T) -> bool,
+        active_streams: impl Fn(&T) -> usize,
         peer_cid: impl Fn(&T) -> Option<crate::ConnectionId>,
         receive_cid: impl Fn(&T) -> Option<crate::ConnectionId>,
     ) -> Result<ServerConnectionIngress<R>, crate::Error> {
         match classify_server_datagram(packet)? {
             ServerDatagram::Initial(open) => {
                 if let Some(slot) = self.associations.iter().position(|association| {
-                    association
-                        .as_ref()
-                        .is_some_and(|association| peer_cid(association.connection()) == Some(open.client_receive_cid))
+                    association.as_ref().is_some_and(|association| {
+                        peer_cid(association.connection()) == Some(open.client_receive_cid)
+                    })
                 }) {
                     let result = self.associations[slot]
                         .as_mut()
                         .expect("matched association remains installed")
                         .receive(path, |connection| replay(connection, context))?;
+                    self.associations[slot]
+                        .as_mut()
+                        .expect("matched association remains installed")
+                        .last_activity_at = self.now;
                     self.last_active_path = Some(path);
                     return Ok(ServerConnectionIngress::Accepted {
                         result,
@@ -820,30 +868,32 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
                     });
                 }
 
+                // A client restart normally reuses the same adapter-owned
+                // device path with a fresh source CID. Do not retain two idle
+                // associations for that device/path. An old association with
+                // unfinished streams is preserved; authenticated device
+                // identity may later make this invariant stronger across
+                // entirely different paths.
+                if let Some(slot) = self.associations.iter().position(|entry| {
+                    entry.as_ref().is_some_and(|association| {
+                        association.has_path(path) && active_streams(association.connection()) == 0
+                    })
+                }) {
+                    self.associations[slot] = None;
+                }
+                self.reclaim_idle(&active_streams);
                 let slot = match self.associations.iter().position(Option::is_none) {
                     Some(slot) => slot,
-                    // Preserve the historical single-association owner for
-                    // callers that deliberately instantiate a one-slot
-                    // endpoint. Multi-peer endpoints must never evict an
-                    // unrelated live association merely because another peer
-                    // sends an Initial.
-                    None if ASSOCIATIONS == 1 => {
-                        self.associations[0] = None;
-                        0
-                    }
-                    None => {
-                        // A bounded endpoint must reject a new peer rather
-                        // than evicting an unrelated live association. The
-                        // caller can expose this as admission pressure and
-                        // retry after an idle/CLOSE eviction.
-                        return Err(crate::Error::StreamLimit);
-                    }
+                    None => self
+                        .oldest_inactive_slot(&active_streams)
+                        .ok_or(crate::Error::StreamLimit)?,
                 };
                 let local_cid = self.allocate_cid(Some(open.client_receive_cid));
                 let (connection, result) = accept(local_cid, context)?;
                 let mut association = PathConnection::new(connection);
                 association.remember_path(path);
                 association.active_path = Some(path);
+                association.last_activity_at = self.now;
                 self.associations[slot] = Some(association);
                 self.last_active_path = Some(path);
                 Ok(ServerConnectionIngress::Accepted {
@@ -862,7 +912,9 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
                 let association = self.associations[slot]
                     .as_mut()
                     .expect("routed association remains installed");
-                let result = association.receive(path, |connection| receive(connection, context))?;
+                let result =
+                    association.receive(path, |connection| receive(connection, context))?;
+                association.last_activity_at = self.now;
                 self.last_active_path = Some(path);
                 let retired = is_closed(association.connection());
                 if retired {
@@ -960,7 +1012,10 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
     }
 
     pub fn active_len(&self) -> usize {
-        self.associations.iter().filter(|entry| entry.is_some()).count()
+        self.associations
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
     }
 
     pub fn replace_all(&mut self) {
@@ -968,13 +1023,57 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
         self.last_active_path = None;
     }
 
-    fn allocate_cid(&mut self, excluded_peer_cid: Option<crate::ConnectionId>) -> crate::ConnectionId {
+    /// Release timed-out associations which have no unfinished streams.
+    /// Returns the number released so endpoint diagnostics can account for
+    /// lifecycle churn without exposing table entries.
+    pub fn reclaim_idle(&mut self, active_streams: impl Fn(&T) -> usize) -> usize {
+        let Some(timeout) = self.idle_timeout else {
+            return 0;
+        };
+        let mut reclaimed = 0;
+        for entry in &mut self.associations {
+            let reclaim = entry.as_ref().is_some_and(|association| {
+                active_streams(association.connection()) == 0
+                    && self.now.saturating_sub(association.last_activity_at()) >= timeout
+            });
+            if reclaim {
+                *entry = None;
+                reclaimed += 1;
+            }
+        }
+        if reclaimed != 0 {
+            self.last_active_path = self
+                .associations
+                .iter()
+                .filter_map(Option::as_ref)
+                .find_map(PathConnection::active_path);
+        }
+        reclaimed
+    }
+
+    fn oldest_inactive_slot(&self, active_streams: &impl Fn(&T) -> usize) -> Option<usize> {
+        self.associations
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| {
+                let association = entry.as_ref()?;
+                (active_streams(association.connection()) == 0)
+                    .then_some((slot, association.last_activity_at()))
+            })
+            .min_by_key(|(_, last_activity_at)| *last_activity_at)
+            .map(|(slot, _)| slot)
+    }
+
+    fn allocate_cid(
+        &mut self,
+        excluded_peer_cid: Option<crate::ConnectionId>,
+    ) -> crate::ConnectionId {
         loop {
             let candidate = self.next_local_cid;
             self.cid_epoch = self.cid_epoch.wrapping_add(1).max(1);
             let next = candidate.value().wrapping_add(1).max(1);
-            self.next_local_cid = crate::ConnectionId::new(next)
-                .expect("rotated server CID must remain nonzero");
+            self.next_local_cid =
+                crate::ConnectionId::new(next).expect("rotated server CID must remain nonzero");
             // CIDs are allocated monotonically, so a live table entry cannot
             // collide before the u32 sequence wraps. The explicit peer-CID
             // exclusion avoids reflecting a client CID during the rare
@@ -1933,6 +2032,21 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         fin: bool,
         output: &mut [u8; PACKET],
     ) -> Result<(PathId, usize), crate::Error> {
+        self.encode_stream_payload_at(stream_id, 0, data, fin, output)
+    }
+
+    /// Encode one ordered client stream range at its caller-supplied offset.
+    /// The association still owns CIDs, packet numbering, stream credit,
+    /// congestion, and retransmission history; a streamed application source
+    /// owns only the already-ordered byte position it is offering.
+    pub fn encode_stream_payload_at(
+        &mut self,
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+        output: &mut [u8; PACKET],
+    ) -> Result<(PathId, usize), crate::Error> {
         let path = self.egress_path().ok_or(crate::Error::Invalid)?;
         let connection = self.connection_mut();
         let destination = connection
@@ -1941,7 +2055,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
         let endpoint = connection.endpoint_mut()?;
         endpoint.open_send_stream(stream_id, crate::INITIAL_MAX_STREAM_DATA)?;
         let (used, _) =
-            endpoint.encode_stream_packet(destination, stream_id, 0, fin, data, output)?;
+            endpoint.encode_stream_packet(destination, stream_id, offset, fin, data, output)?;
         Ok((path, used))
     }
 
@@ -2210,8 +2324,8 @@ mod tests {
             Ok(ServerDatagram::Initial(open)) if open.client_receive_cid == client
         ));
 
-        let ack_len = crate::encode_bootstrap_open_ack_packet(client, server, 0, &mut packet)
-            .unwrap();
+        let ack_len =
+            crate::encode_bootstrap_open_ack_packet(client, server, 0, &mut packet).unwrap();
         assert_eq!(
             classify_server_datagram(&packet[..ack_len]),
             Ok(ServerDatagram::BootstrapAck {
@@ -2464,6 +2578,64 @@ mod tests {
     }
 
     #[test]
+    fn client_association_preserves_explicit_stream_offsets() {
+        let client_cid = crate::ConnectionId::new(0x51).unwrap();
+        let server_cid = crate::ConnectionId::new(0x52).unwrap();
+        let path = PathId::new(1).unwrap();
+        let mut client = ClientAssociation::<4, 256>::new(client_cid);
+        client.select_path(path);
+        let mut open = [0u8; 256];
+        client.start(&mut open).unwrap();
+        let mut ack = [0u8; 256];
+        let ack_len = crate::encode_bootstrap_open_ack_packet_with_limits(
+            client_cid,
+            server_cid,
+            0,
+            crate::ConnectionLimits::default(),
+            &mut ack,
+        )
+        .unwrap();
+        client.receive_open_ack(path, &ack[..ack_len], 0).unwrap();
+
+        let mut packet = [0u8; 256];
+        let (_, first_len) = client
+            .encode_stream_payload_at(
+                crate::FIRST_CLIENT_BIDI_STREAM_ID + 4,
+                0,
+                b"one",
+                false,
+                &mut packet,
+            )
+            .unwrap();
+        let mut server = crate::EndpointState::<{ crate::DEFAULT_STREAM_STATE_SLOTS }, 256>::new(
+            crate::Role::Server,
+            crate::ConnectionLimits::default(),
+            256,
+        );
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        let first = server.receive_datagram(&packet[..first_len]).unwrap();
+        assert!(
+            matches!(first, crate::TransportPacket::Stream { frame, .. } if frame.offset == 0 && frame.data == b"one")
+        );
+
+        let (_, second_len) = client
+            .encode_stream_payload_at(
+                crate::FIRST_CLIENT_BIDI_STREAM_ID + 4,
+                3,
+                b"two",
+                true,
+                &mut packet,
+            )
+            .unwrap();
+        let second = server.receive_datagram(&packet[..second_len]).unwrap();
+        assert!(
+            matches!(second, crate::TransportPacket::Stream { frame, .. } if frame.offset == 3 && frame.fin && frame.data == b"two")
+        );
+    }
+
+    #[test]
     fn client_association_owns_client_bidi_stream_sequence_across_paths() {
         let mut association =
             ClientAssociation::<4, 1200>::new(crate::ConnectionId::new(0x63).unwrap());
@@ -2497,20 +2669,32 @@ mod tests {
         association.select_path(uart);
 
         let first = crate::FIRST_SERVER_BIDI_STREAM_ID;
-        assert!(association.accept_server_response_stream(first, true).unwrap());
+        assert!(
+            association
+                .accept_server_response_stream(first, true)
+                .unwrap()
+        );
         assert!(!association.has_active_server_response_stream());
 
         // Moving this logical association to UDP cannot turn the delayed
         // UART response into the result of the next operation.
         association.select_path(udp);
-        assert!(!association.accept_server_response_stream(first, true).unwrap());
-        assert!(association
-            .accept_server_response_stream(first + 4, false)
-            .unwrap());
+        assert!(
+            !association
+                .accept_server_response_stream(first, true)
+                .unwrap()
+        );
+        assert!(
+            association
+                .accept_server_response_stream(first + 4, false)
+                .unwrap()
+        );
         assert!(association.has_active_server_response_stream());
-        assert!(association
-            .accept_server_response_stream(first + 4, true)
-            .unwrap());
+        assert!(
+            association
+                .accept_server_response_stream(first + 4, true)
+                .unwrap()
+        );
         assert!(!association.has_active_server_response_stream());
         assert_eq!(association.active_path(), None);
         assert_eq!(association.selected_path(), Some(udp));
@@ -2773,9 +2957,8 @@ mod tests {
         let second_peer = crate::ConnectionId::new(0x72).unwrap();
         let first_path = PathId::new(0x101).unwrap();
         let second_path = PathId::new(0x202).unwrap();
-        let mut table = ServerAssociationTable::<Association, 2>::new(
-            crate::ConnectionId::new(0x70).unwrap(),
-        );
+        let mut table =
+            ServerAssociationTable::<Association, 2>::new(crate::ConnectionId::new(0x70).unwrap());
         let mut packet = [0u8; 64];
         let mut context = ();
 
@@ -2786,13 +2969,23 @@ mod tests {
                     path,
                     &packet[..used],
                     &mut context,
-                    |local, _| Ok((Association { local, peer, packets: 0 }, ())),
+                    |local, _| {
+                        Ok((
+                            Association {
+                                local,
+                                peer,
+                                packets: 0,
+                            },
+                            (),
+                        ))
+                    },
                     |_, _| Ok(()),
                     |association, _| {
                         association.packets += 1;
                         Ok(())
                     },
                     |_| false,
+                    |_| 0,
                     |association| Some(association.peer),
                     |association| Some(association.local),
                 )
@@ -2823,12 +3016,202 @@ mod tests {
                     Ok(())
                 },
                 |_| false,
+                |_| 0,
                 |association| Some(association.peer),
                 |association| Some(association.local),
             )
             .unwrap();
         assert_eq!(table.association_for_path(first_path).unwrap().packets, 1);
         assert_eq!(table.association_for_path(second_path).unwrap().packets, 0);
+    }
+
+    #[test]
+    fn association_table_reclaims_oldest_zero_stream_peer_under_pressure() {
+        #[derive(Debug)]
+        struct Association {
+            local: crate::ConnectionId,
+            peer: crate::ConnectionId,
+            active_streams: usize,
+        }
+
+        let mut table =
+            ServerAssociationTable::<Association, 2>::new(crate::ConnectionId::new(0x80).unwrap());
+        let mut packet = [0u8; 64];
+        let mut context = ();
+        let peers = [0x81, 0x82, 0x83].map(|cid| crate::ConnectionId::new(cid).unwrap());
+        let paths = [0x181, 0x182, 0x183].map(|path| PathId::new(path).unwrap());
+
+        for index in 0..2 {
+            table.set_time(10 + index as u64);
+            let used = crate::encode_bootstrap_open_packet(peers[index], 0, &mut packet).unwrap();
+            table
+                .receive_admitted(
+                    paths[index],
+                    &packet[..used],
+                    &mut context,
+                    |local, _| {
+                        Ok((
+                            Association {
+                                local,
+                                peer: peers[index],
+                                active_streams: 0,
+                            },
+                            (),
+                        ))
+                    },
+                    |_, _| Ok(()),
+                    |_, _| Ok(()),
+                    |_| false,
+                    |association| association.active_streams,
+                    |association| Some(association.peer),
+                    |association| Some(association.local),
+                )
+                .unwrap();
+        }
+
+        table.set_time(20);
+        let used = crate::encode_bootstrap_open_packet(peers[2], 0, &mut packet).unwrap();
+        table
+            .receive_admitted(
+                paths[2],
+                &packet[..used],
+                &mut context,
+                |local, _| {
+                    Ok((
+                        Association {
+                            local,
+                            peer: peers[2],
+                            active_streams: 0,
+                        },
+                        (),
+                    ))
+                },
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |_| false,
+                |association| association.active_streams,
+                |association| Some(association.peer),
+                |association| Some(association.local),
+            )
+            .unwrap();
+        assert!(table.association_for_path(paths[0]).is_none());
+        assert!(table.association_for_path(paths[1]).is_some());
+        assert!(table.association_for_path(paths[2]).is_some());
+    }
+
+    #[test]
+    fn association_table_never_reclaims_active_streams() {
+        #[derive(Debug)]
+        struct Association {
+            local: crate::ConnectionId,
+            peer: crate::ConnectionId,
+        }
+        let mut table =
+            ServerAssociationTable::<Association, 1>::new(crate::ConnectionId::new(0x90).unwrap());
+        let mut packet = [0u8; 64];
+        let mut context = ();
+        let first = crate::ConnectionId::new(0x91).unwrap();
+        let second = crate::ConnectionId::new(0x92).unwrap();
+        let path = PathId::new(0x191).unwrap();
+        let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
+        table
+            .receive_admitted(
+                path,
+                &packet[..used],
+                &mut context,
+                |local, _| Ok((Association { local, peer: first }, ())),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |_| false,
+                |_| 1,
+                |association| Some(association.peer),
+                |association| Some(association.local),
+            )
+            .unwrap();
+        let used = crate::encode_bootstrap_open_packet(second, 0, &mut packet).unwrap();
+        assert_eq!(
+            table.receive_admitted(
+                path,
+                &packet[..used],
+                &mut context,
+                |local, _| Ok((
+                    Association {
+                        local,
+                        peer: second
+                    },
+                    ()
+                )),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |_| false,
+                |_| 1,
+                |association| Some(association.peer),
+                |association| Some(association.local),
+            ),
+            Err(crate::Error::StreamLimit)
+        );
+    }
+
+    #[test]
+    fn association_table_reclaims_timed_out_idle_peer_before_full() {
+        #[derive(Debug)]
+        struct Association {
+            local: crate::ConnectionId,
+            peer: crate::ConnectionId,
+        }
+        let mut table =
+            ServerAssociationTable::<Association, 2>::new(crate::ConnectionId::new(0xa0).unwrap());
+        table.set_idle_timeout(Some(10));
+        table.set_time(5);
+        let first = crate::ConnectionId::new(0xa1).unwrap();
+        let second = crate::ConnectionId::new(0xa2).unwrap();
+        let first_path = PathId::new(0x1a1).unwrap();
+        let second_path = PathId::new(0x1a2).unwrap();
+        let mut packet = [0u8; 64];
+        let mut context = ();
+        let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
+        table
+            .receive_admitted(
+                first_path,
+                &packet[..used],
+                &mut context,
+                |local, _| Ok((Association { local, peer: first }, ())),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |_| false,
+                |_| 0,
+                |association| Some(association.peer),
+                |association| Some(association.local),
+            )
+            .unwrap();
+
+        table.set_time(15);
+        let used = crate::encode_bootstrap_open_packet(second, 0, &mut packet).unwrap();
+        table
+            .receive_admitted(
+                second_path,
+                &packet[..used],
+                &mut context,
+                |local, _| {
+                    Ok((
+                        Association {
+                            local,
+                            peer: second,
+                        },
+                        (),
+                    ))
+                },
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |_| false,
+                |_| 0,
+                |association| Some(association.peer),
+                |association| Some(association.local),
+            )
+            .unwrap();
+        assert_eq!(table.active_len(), 1);
+        assert!(table.association_for_path(first_path).is_none());
+        assert!(table.association_for_path(second_path).is_some());
     }
 
     #[test]

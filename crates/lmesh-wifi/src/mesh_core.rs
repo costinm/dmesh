@@ -581,20 +581,46 @@ fn semantic_inventory_device_key(
     destination: &str,
 ) -> Option<String> {
     let explicit = explicit_udp_endpoint(destination).ok().flatten();
-    inventory.get("devices")?.as_array()?.iter().find_map(|device| {
-        let identity = device.get("identity")?.as_str()?;
-        let matches = identity == destination
-            || explicit.is_some_and(|peer| semantic_inventory_udp_peer_for_device(device) == Some(peer));
-        if !matches {
-            return None;
-        }
-        let route_key = device
-            .get("announce")
-            .and_then(|announce| announce.get("route_key"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|key| !key.is_empty());
-        Some(format!("identity:{}", route_key.unwrap_or(identity)))
-    })
+    inventory
+        .get("devices")?
+        .as_array()?
+        .iter()
+        .find_map(|device| {
+            let identity = device.get("identity")?.as_str()?;
+            let announce = device.get("announce");
+            let vip = announce
+                .and_then(|announce| announce.get("vip6"))
+                .and_then(serde_json::Value::as_str);
+            let observed_path = device
+                .get("observations")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|observations| {
+                    observations.values().any(|observation| {
+                        observation
+                            .get("last_peer")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(destination)
+                    })
+                });
+            let matches = identity == destination
+                || vip == Some(destination)
+                || observed_path
+                || explicit.is_some_and(|peer| {
+                    semantic_inventory_udp_peer_for_device(device) == Some(peer)
+                });
+            if !matches {
+                return None;
+            }
+            let route_key = device
+                .get("announce")
+                .and_then(|announce| announce.get("route_key"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|key| !key.is_empty());
+            Some(format!(
+                "identity:{}",
+                route_key.or(vip).unwrap_or(identity)
+            ))
+        })
 }
 
 /// The dashboard and report use the same presentation inventory as routing.
@@ -2183,9 +2209,7 @@ struct DeviceUdpAssociation {
 
 impl DeviceUdpAssociation {
     const fn new() -> Self {
-        Self {
-            client: None,
-        }
+        Self { client: None }
     }
 }
 
@@ -2199,8 +2223,7 @@ fn tagged_record_is_safe_stale_association_retry(record: &[u8]) -> bool {
     // to `forward_tagged_record`; firmware's borrowed decoder below remains
     // the no-std-compatible fallback for adapter tests and ESP-originated
     // records.
-    if let Ok(record) = mesh::cbor::decode_record(record)
-    {
+    if let Ok(record) = mesh::cbor::decode_record(record) {
         return match (record.component, record.method) {
             (mesh::tagged::NameOrTag::Tag(component), mesh::tagged::NameOrTag::Tag(method)) => {
                 dmesh_server::service_catalog::is_read_only_stream_service(
@@ -2221,13 +2244,14 @@ fn tagged_record_is_safe_stale_association_retry(record: &[u8]) -> bool {
                     name.push_str(&method);
                     name
                 };
-                dmesh_server::service_catalog::stream_service_by_name(&name)
-                    .is_some_and(|service| {
+                dmesh_server::service_catalog::stream_service_by_name(&name).is_some_and(
+                    |service| {
                         dmesh_server::service_catalog::is_read_only_stream_service(
                             service.component,
                             service.method,
                         )
-                    })
+                    },
+                )
             }
             _ => false,
         };
@@ -2243,6 +2267,12 @@ fn tagged_record_is_safe_stale_association_retry(record: &[u8]) -> bool {
         return false;
     };
     dmesh_server::service_catalog::is_read_only_stream_service(component, method)
+}
+
+fn error_proves_peer_restarted(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<quic_lite::Error>() == Some(&quic_lite::Error::PeerRestarted)
+    })
 }
 
 /// Convert the compact DMesh tagged response into the schema-neutral mesh
@@ -2271,15 +2301,33 @@ fn decode_stream_response(response: &[u8]) -> Result<mesh::tagged::TaggedRecord>
     };
     let mut wire = vec![0u8; response.len().saturating_add(24)];
     let mut encoder = dmesh_server::cbor::Encoder::new(&mut wire);
-    encoder.map(4).ok_or_else(|| anyhow::anyhow!("encode mesh response map"))?;
-    encoder.uint(1).ok_or_else(|| anyhow::anyhow!("encode mesh response component"))?;
-    encoder.text_value(b"").ok_or_else(|| anyhow::anyhow!("encode empty mesh component"))?;
-    encoder.uint(2).ok_or_else(|| anyhow::anyhow!("encode mesh response method"))?;
-    encoder.text_value(b"").ok_or_else(|| anyhow::anyhow!("encode empty mesh method"))?;
-    encoder.uint(3).ok_or_else(|| anyhow::anyhow!("encode mesh response id"))?;
-    encoder.uint(id).ok_or_else(|| anyhow::anyhow!("encode mesh response id value"))?;
-    encoder.uint(key).ok_or_else(|| anyhow::anyhow!("encode mesh response terminal key"))?;
-    encoder.encoded_value(value).ok_or_else(|| anyhow::anyhow!("encode mesh response terminal value"))?;
+    encoder
+        .map(4)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response map"))?;
+    encoder
+        .uint(1)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response component"))?;
+    encoder
+        .text_value(b"")
+        .ok_or_else(|| anyhow::anyhow!("encode empty mesh component"))?;
+    encoder
+        .uint(2)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response method"))?;
+    encoder
+        .text_value(b"")
+        .ok_or_else(|| anyhow::anyhow!("encode empty mesh method"))?;
+    encoder
+        .uint(3)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response id"))?;
+    encoder
+        .uint(id)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response id value"))?;
+    encoder
+        .uint(key)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response terminal key"))?;
+    encoder
+        .encoded_value(value)
+        .ok_or_else(|| anyhow::anyhow!("encode mesh response terminal value"))?;
     let used = encoder.len();
     drop(encoder);
     mesh::cbor::decode_record(&wire[..used])
@@ -2547,10 +2595,10 @@ impl LmeshService {
         if self.discovery.get_node(destination).await.is_some() {
             return format!("identity:{destination}");
         }
-        if let Some(key) = semantic_inventory_device_key(
-            &presentation_radio_devices(&self.radio),
-            destination,
-        ) {
+        // Use the private inventory here: presentation intentionally removes
+        // route_key/public-key material, but association aliasing must map a
+        // hostname, VIP, UDP address, and radio address to one stable device.
+        if let Some(key) = semantic_inventory_device_key(&self.radio.radio_devices(), destination) {
             return key;
         }
         format!("unverified-udp:{destination}")
@@ -2776,18 +2824,20 @@ impl LmeshService {
                         }
                         anyhow::bail!("directed QUIC response ID mismatch");
                     }
-                    Err(_error)
-                        if retryable
-                            && stale_association_retries < 2 =>
+                    Err(error)
+                        if stale_association_retries < 2
+                            && (error_proves_peer_restarted(&error)
+                                || (retryable
+                                    && dmesh_server::transport::is_fresh_association_retry_error(
+                                        &error,
+                                    ))) =>
                     {
                         // The raw action association was discarded by its
                         // owner before this error reaches the service edge.
-                        // Whether the error was a token-verified reset, a
-                        // bounded timeout, or an action-window failure, a
-                        // retained CID cannot be reused. Repeat only a
-                        // reviewed read-only service with a bounded number
-                        // of fresh CIDs; mutations retain their ambiguous
-                        // outcome and are never replayed.
+                        // A token-verified reset proves the stale-CID packet
+                        // was rejected and is safe to retry for any service.
+                        // A bounded timeout remains ambiguous and is retried
+                        // only for a reviewed read-only service.
                         // `forward_tagged_record_on_action_path` reports a
                         // token-verified peer restart after decoding the
                         // opaque QUIC packet, but it cannot know the HTTP
@@ -2865,10 +2915,14 @@ impl LmeshService {
                     // or an exhausted bounded stream timeout; mutations keep
                     // their ambiguous result and are never replayed.
                     association.client = None;
-                    if retryable
-                        && reused_association
-                        && !retried_stale_association
-                        && dmesh_server::transport::is_fresh_association_retry_error(&error)
+                    let peer_restarted = error_proves_peer_restarted(&error);
+                    if !retried_stale_association
+                        && (peer_restarted
+                            || (retryable
+                                && reused_association
+                                && dmesh_server::transport::is_fresh_association_retry_error(
+                                    &error,
+                                )))
                     {
                         retried_stale_association = true;
                         continue;
@@ -3379,10 +3433,7 @@ impl LmeshService {
                     // the same call stack can otherwise receive that prior
                     // reset again. This is association recovery for every
                     // QUIC path, not a NOW timing rule.
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        500 * retry,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * retry)).await;
                     result = self.probe(&to, request, timeout_ms).await;
                 }
                 match result {
@@ -3730,6 +3781,16 @@ mod tests {
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn token_verified_peer_restart_is_a_distinct_recovery_signal() {
+        let restarted = anyhow::Error::new(quic_lite::Error::PeerRestarted)
+            .context("selected QUIC path failed");
+        assert!(error_proves_peer_restarted(&restarted));
+        assert!(!error_proves_peer_restarted(&anyhow::Error::new(
+            dmesh_server::transport::AssociationStreamTimeout { attempts: 3 },
+        )));
+    }
+
+    #[test]
     fn stale_association_retry_is_limited_to_catalogued_reads() {
         let mut read = [0u8; 64];
         let read_len = dmesh_server::tagged::encode_numeric_empty_request(
@@ -3775,7 +3836,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(tagged_record_is_safe_stale_association_retry(&named_mesh_wire));
+        assert!(tagged_record_is_safe_stale_association_retry(
+            &named_mesh_wire
+        ));
 
         let bare_status_wire = mesh::cbor::encode_record(&mesh::tagged::TaggedRecord {
             component: mesh::tagged::NameOrTag::Name(String::new()),
@@ -3784,7 +3847,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(tagged_record_is_safe_stale_association_retry(&bare_status_wire));
+        assert!(tagged_record_is_safe_stale_association_retry(
+            &bare_status_wire
+        ));
 
         let mut cached_scan = [0u8; 64];
         let cached_scan_len = dmesh_server::tagged::encode_numeric_empty_request(
@@ -4062,6 +4127,7 @@ mod tests {
                 "identity": "e7",
                 "announce": {
                     "route_key": "stable-e7-key",
+                    "vip6": "fd00::e7",
                     "udp_link_local_v6": "fe80::16c1:9fff:fee4:5d48",
                     "udp_port": 3339,
                 },
@@ -4069,6 +4135,7 @@ mod tests {
                     "udp_multicast": {
                         "last_peer": "[fe80::16c1:9fff:fee4:5d48%5]:3339",
                     },
+                    "now": {"last_peer": "14:c1:9f:e4:5d:48"},
                 },
             }],
         });
@@ -4077,11 +4144,16 @@ mod tests {
             Some("identity:stable-e7-key")
         );
         assert_eq!(
-            semantic_inventory_device_key(
-                &inventory,
-                "udp://[fe80::16c1:9fff:fee4:5d48%5]:3339",
-            )
-            .as_deref(),
+            semantic_inventory_device_key(&inventory, "fd00::e7").as_deref(),
+            Some("identity:stable-e7-key")
+        );
+        assert_eq!(
+            semantic_inventory_device_key(&inventory, "14:c1:9f:e4:5d:48").as_deref(),
+            Some("identity:stable-e7-key")
+        );
+        assert_eq!(
+            semantic_inventory_device_key(&inventory, "udp://[fe80::16c1:9fff:fee4:5d48%5]:3339",)
+                .as_deref(),
             Some("identity:stable-e7-key")
         );
     }

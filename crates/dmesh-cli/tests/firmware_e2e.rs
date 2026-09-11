@@ -825,7 +825,7 @@ fn run_android_udp_cli(target: &str, args: &[&str]) -> std::process::Output {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/debug/dmesh-cli")
+                .join("../../target/x86_64-unknown-linux-musl/release/dmesh-cli")
         });
     Command::new(cli)
         .arg(format!("udp://{target}:3336"))
@@ -4406,7 +4406,7 @@ async fn host_to_e6_udp6_checks(samples: u64) -> Vec<Result<u128, String>> {
                 &record[..record_len],
                 &mut packet,
             )
-            .map_err(|error| format!("encode UDP6 check packet: {error:?}"))?;
+            .ok_or_else(|| "encode UDP6 check packet".to_owned())?;
             let socket = tokio::net::UdpSocket::bind(bind)
                 .await
                 .map_err(|error| format!("bind UDP6 check: {error}"))?;
@@ -4420,10 +4420,9 @@ async fn host_to_e6_udp6_checks(samples: u64) -> Vec<Result<u128, String>> {
                     .await
                     .map_err(|_| "UDP6 check response deadline".to_owned())?
                     .map_err(|error| format!("receive UDP6 check: {error}"))?;
-            let payload = dmesh_server::direct::ConnectionlessMessage::decode(
-                &response[..response_len],
-            )
-            .ok_or_else(|| "decode UDP6 check packet".to_owned())?;
+            let payload =
+                dmesh_server::direct::ConnectionlessMessage::decode(&response[..response_len])
+                    .ok_or_else(|| "decode UDP6 check packet".to_owned())?;
             let response = dmesh_server::tagged::decode(payload)
                 .ok_or_else(|| "UDP6 check response is not tagged CBOR".to_owned())?;
             if response.id != Some(id) || dmesh_server::announce::decode_record(response).is_none()

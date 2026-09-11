@@ -45,6 +45,10 @@ static LAB_DW_POLICY: AtomicU8 = AtomicU8::new(0);
 static DW_INTERVAL: AtomicU8 = AtomicU8::new(0);
 
 static STARTED: AtomicBool = AtomicBool::new(false);
+/// Set only by Main immediately before an explicit DW8 sleep.  A generic
+/// profile replacement must reacquire, even though its previous cluster
+/// observation remains available for diagnostics.
+static RESUME_SAVED_SYNC: AtomicBool = AtomicBool::new(false);
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 /// A bounded raw-NOW client needs continuous management receive after its
 /// OPEN succeeds. The private C6 action dispatcher can receive the bootstrap
@@ -1505,6 +1509,30 @@ pub fn start(interval: u8) -> bool {
         return false;
     }
     let now = now_ms();
+    let (bssid, anchor_us, _) = sync_diagnostics();
+    // Light sleep retains these atomics, while `stop()` deliberately clears
+    // only the ESP-IDF callback/runtime state.  Reacquiring for 15 seconds
+    // after every DW8 wake kept the radio awake almost continuously.  Reuse
+    // a live cluster anchor to arm the next ordinary bounded DW instead.
+    if RESUME_SAVED_SYNC.swap(false, Ordering::AcqRel)
+        && !bssid_is_unset(bssid)
+        && anchor_us != 0
+    {
+        let next_us = dmesh_rawnan::next_nan_dw_start_us(
+            anchor_us,
+            now_us().saturating_add(NAN_DW_PRE_BEACON_US),
+        )
+        .saturating_sub(NAN_DW_PRE_BEACON_US);
+        CAPTURING.store(false, Ordering::Release);
+        ACQUIRING.store(false, Ordering::Release);
+        ACQUIRE_PENDING.store(false, Ordering::Release);
+        UNTIL_MS.store(0, Ordering::Release);
+        NEXT_MS.store(
+            (next_us / 1_000).min(u64::from(u32::MAX)) as u32,
+            Ordering::Release,
+        );
+        return true;
+    }
     if !crate::wifi_esp::set_promiscuous(true) {
         crate::shared_ingress_esp::stop(crate::shared_ingress_esp::IngressKind::NanServiceInfo);
         STARTED.store(false, Ordering::Release);
@@ -1518,6 +1546,13 @@ pub fn start(interval: u8) -> bool {
     drain_pending_followup_responses();
     drain_active_publish();
     true
+}
+
+/// Preserve a current cluster timing anchor across one intentional physical
+/// DW8 sleep. This is not a general profile-transition shortcut.
+pub fn prepare_light_sleep_resume() {
+    let (bssid, anchor_us, _) = sync_diagnostics();
+    RESUME_SAVED_SYNC.store(!bssid_is_unset(bssid) && anchor_us != 0, Ordering::Release);
 }
 
 /// Select whether an active NOW epoch listens continuously for initial

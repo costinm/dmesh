@@ -55,17 +55,113 @@ pub const RAW_WIFI_RESPONSE_MAX_BYTES: usize = 768;
 /// fragment, copy into a transport queue, or imply that the selected adapter
 /// supports raw injection.
 pub fn encode_raw_wifi_tx_request(request: RawWifiTxRequest<'_>, out: &mut [u8]) -> Option<usize> {
+    encode_raw_wifi_tx_request_with_optional_id(request, None, out)
+}
+
+/// Encode a correlated raw-action request for the normal QUIC stream surface.
+///
+/// Raw action TX is intentionally stream-only, so callers crossing UART,
+/// UDP, or a relay must retain the request ID for its accepted/rejected
+/// response rather than relying on a driver submission log.
+pub fn encode_raw_wifi_tx_request_with_id(
+    request: RawWifiTxRequest<'_>,
+    id: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    encode_raw_wifi_tx_request_with_optional_id(request, Some(id), out)
+}
+
+/// Convert the JSON/text adapter representation of `radio.tx` into the
+/// canonical CBOR byte-string request. This is deliberately shared by the
+/// CLI and lmesh HTTP/UI forwarder: `hex:` is local presentation syntax and
+/// never crosses the selected bearer as text.
+#[cfg(feature = "std")]
+pub fn encode_raw_wifi_tx_json_request(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    id: u64,
+    out: &mut [u8],
+) -> anyhow::Result<usize> {
+    let frame = fields
+        .get("frame")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("radio.tx frame must be hex"))?;
+    let frame = hex::decode(frame.strip_prefix("hex:").unwrap_or(frame))
+        .map_err(|error| anyhow::anyhow!("radio.tx frame must be hex: {error}"))?;
+    let channel = fields
+        .get("channel")
+        .and_then(serde_json::Value::as_u64)
+        .map(u8::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("radio.tx channel must be u8"))?
+        .unwrap_or(6);
+    let interface = match fields
+        .get("interface")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+    {
+        0 => RawWifiInterface::Auto,
+        1 => RawWifiInterface::Sta,
+        2 => RawWifiInterface::Ap,
+        3 => RawWifiInterface::Nan,
+        _ => anyhow::bail!("radio.tx interface is invalid"),
+    };
+    let rate = match fields
+        .get("rate")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+    {
+        0 => RawWifiRate::Auto,
+        6 => RawWifiRate::Mbps6,
+        9 => RawWifiRate::Mbps9,
+        12 => RawWifiRate::Mbps12,
+        18 => RawWifiRate::Mbps18,
+        24 => RawWifiRate::Mbps24,
+        36 => RawWifiRate::Mbps36,
+        48 => RawWifiRate::Mbps48,
+        54 => RawWifiRate::Mbps54,
+        _ => anyhow::bail!("radio.tx rate is invalid"),
+    };
+    encode_raw_wifi_tx_request_with_id(
+        RawWifiTxRequest {
+            frame: &frame,
+            channel,
+            interface,
+            system_sequence: fields
+                .get("system_sequence")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            rate,
+            disable_11b: fields
+                .get("disable_11b")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+        },
+        id,
+        out,
+    )
+    .ok_or_else(|| anyhow::anyhow!("radio.tx request is out of bounds"))
+}
+
+fn encode_raw_wifi_tx_request_with_optional_id(
+    request: RawWifiTxRequest<'_>,
+    id: Option<u64>,
+    out: &mut [u8],
+) -> Option<usize> {
     if !(24..=RAW_WIFI_MAX_FRAME).contains(&request.frame.len())
         || !(1..=13).contains(&request.channel)
     {
         return None;
     }
     let mut encoder = Encoder::new(out);
-    encoder.map(3)?;
+    encoder.map(if id.is_some() { 4 } else { 3 })?;
     encoder.uint(1)?;
     encoder.uint(RAW_WIFI_COMPONENT)?;
     encoder.uint(2)?;
     encoder.uint(RAW_WIFI_METHOD_TX)?;
+    if let Some(id) = id {
+        encoder.uint(3)?;
+        encoder.uint(id)?;
+    }
     encoder.uint(5)?;
     encoder.map(6)?;
     encoder.uint(1)?;
@@ -2264,6 +2360,28 @@ mod tests {
             decode_raw_wifi_tx(&wire[..used]).unwrap().interface,
             RawWifiInterface::Nan
         );
+    }
+
+    #[test]
+    fn correlated_raw_tx_keeps_the_stream_request_id() {
+        let frame = [0xd0; 24];
+        let mut wire = [0; 80];
+        let used = encode_raw_wifi_tx_request_with_id(
+            RawWifiTxRequest {
+                channel: 6,
+                interface: RawWifiInterface::Sta,
+                system_sequence: true,
+                rate: RawWifiRate::Mbps6,
+                disable_11b: true,
+                frame: &frame,
+            },
+            41,
+            &mut wire,
+        )
+        .unwrap();
+        let record = crate::tagged::decode(&wire[..used]).unwrap();
+        assert_eq!(record.id, Some(41));
+        assert_eq!(decode_raw_wifi_tx_record(record).unwrap().frame, frame);
     }
 
     #[test]

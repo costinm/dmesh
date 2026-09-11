@@ -87,6 +87,7 @@ if [ -d "$NIX_PROFILE/bin" ]; then
     # by the test harness).
     export PATH="/usr/bin:/bin:$NIX_PROFILE/bin:$PATH"
 fi
+export PATH=${DMESH_REPO}/target/x86_64-unknown-linux-musl/release:$PATH
 export PATH="$CARGO_HOME/bin:$PATH"
 if [ -d "$ANDROID_HOME/platform-tools" ]; then
     export PATH="$ANDROID_HOME/platform-tools:$PATH"

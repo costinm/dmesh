@@ -12,5 +12,10 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 CONFIG_ESP_WIFI_NAN_ENABLE=y
+# STA profiles may select a WPA3-Personal BSS after scanning.  Keep SAE and
+# H2E in the Main image so that selection is backed by the ESP-IDF supplicant,
+# rather than recognizing WPA3 only to fail authentication at runtime.
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
+CONFIG_ESP_WIFI_ENABLE_SAE_H2E=y
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y

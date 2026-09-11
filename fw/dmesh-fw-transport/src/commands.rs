@@ -129,6 +129,18 @@ impl Handler for ProfileControl<'_> {
         kind: TransportKind,
         config: TransportConfig<'_>,
     ) -> Result<(), Self::Error> {
+        // NAN active-Subscribe frames are broadcast at the 802.11 layer. A
+        // wake record therefore carries its intended receiver explicitly;
+        // never let a neighbouring sleepy device promote itself merely
+        // because it shares the DMesh service ID.  Ordinary UART/NOW control
+        // records omit this field and retain their existing semantics.
+        if let Some(target) = config.wake_target {
+            let station = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta);
+            let ap = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap);
+            if station != Some(target) && ap != Some(target) {
+                return Err(ProfileControlError::InvalidSetting);
+            }
+        }
         match kind {
             TransportKind::Sta => {
                 // One start selects one complete, ephemeral radio profile.
@@ -170,16 +182,9 @@ impl Handler for ProfileControl<'_> {
             TransportKind::Nan => {
                 let mut candidate = *self.profile;
                 apply_transport_config(config, &mut candidate);
-                // DW8 NAN+NOW is the sleepy profile. Keeping a real UART
-                // bearer enabled in that profile is contradictory, so reject it before any
-                // shared state is mutated and let the caller correlate `err`.
-                if candidate.nan_dw_interval == 8
-                    && candidate.now == 2
-                    && candidate.ap == 0
-                    && !crate::uart_esp::uart_is_off(candidate.uart)
-                {
-                    return Err(ProfileControlError::InvalidSetting);
-                }
+                // DW8 retains its control UART. It is not a light-sleep
+                // precondition, and keeping it available makes a sleepy node
+                // observable without a physical reconfiguration cycle.
                 candidate.requested_transport = Some(kind);
                 candidate.run_requested = true;
                 *self.profile = candidate;

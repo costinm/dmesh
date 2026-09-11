@@ -22,7 +22,11 @@ CARGO_LOCK_BACKUP=""
 
 restore_cargo_lock() {
     if [ -n "${CARGO_LOCK_BACKUP:-}" ] && [ -f "$CARGO_LOCK_BACKUP" ]; then
-        cp "$CARGO_LOCK_BACKUP" "$SCRIPT_DIR/Cargo.lock"
+        if ! cmp -s "$CARGO_LOCK_BACKUP" "$SCRIPT_DIR/Cargo.lock"; then
+            # Keep Cargo's lockfile fingerprint stable across a temporary
+            # local override.
+            cp -p "$CARGO_LOCK_BACKUP" "$SCRIPT_DIR/Cargo.lock"
+        fi
         rm -f "$CARGO_LOCK_BACKUP"
         CARGO_LOCK_BACKUP=""
     fi
@@ -77,7 +81,7 @@ preserve_cargo_lock_for_override() {
         return
     fi
     CARGO_LOCK_BACKUP="$CARGO_HOME/Cargo.lock.before-ssh-mesh-override"
-    cp "$SCRIPT_DIR/Cargo.lock" "$CARGO_LOCK_BACKUP"
+    cp -p "$SCRIPT_DIR/Cargo.lock" "$CARGO_LOCK_BACKUP"
     trap restore_cargo_lock EXIT
 }
 
@@ -225,17 +229,25 @@ copy_android_lib() {
         local jnilib_dir="$SCRIPT_DIR/android/$app/src/main/jniLibs/$abi"
         local jnilib_so="$jnilib_dir/lib$lib_name.so"
         mkdir -p "$jnilib_dir"
-        cp "$so_path" "$jnilib_so"
+        # Do not refresh an identical JNI library's mtime: Gradle correctly
+        # treats it as an APK input, so an unconditional copy turns every
+        # Android invocation into a repackaging build.
+        if ! cmp -s "$so_path" "$jnilib_so"; then
+            cp "$so_path" "$jnilib_so"
+            local copy_action="Copied"
+        else
+            local copy_action="Reused"
+        fi
         local copied_size
         copied_size="$(stat -c%s "$jnilib_so")"
         if [ "$strip_libs" = "1" ]; then
             "$strip_bin" --strip-unneeded "$jnilib_so"
             local stripped_size
             stripped_size="$(stat -c%s "$jnilib_so")"
-            echo "Copied $crate_name (rust $rust_profile, android $android_build_type) to: $jnilib_so"
+            echo "$copy_action $crate_name (rust $rust_profile, android $android_build_type) at: $jnilib_so"
             echo "Stripped $jnilib_so: $copied_size -> $stripped_size bytes"
         else
-            echo "Copied $crate_name (rust $rust_profile, android $android_build_type, unstripped) to: $jnilib_so ($copied_size bytes)"
+            echo "$copy_action $crate_name (rust $rust_profile, android $android_build_type, unstripped) at: $jnilib_so ($copied_size bytes)"
         fi
     done
 }
@@ -248,6 +260,24 @@ clean_android_lib_outputs() {
         if [ -d "$jnilib_dir" ]; then
             find "$jnilib_dir" -name "lib$lib_name.so" -type f -delete
         fi
+    done
+}
+
+prune_android_lib_abis() {
+    local lib_name="$1"
+    local abi_list="$2"
+    local app abi path
+    for app in ${DMESH_JNILIB_APPS:-app-dmesh}; do
+        local jnilib_dir="$SCRIPT_DIR/android/$app/src/main/jniLibs"
+        [ -d "$jnilib_dir" ] || continue
+        for path in "$jnilib_dir"/*/"lib$lib_name.so"; do
+            [ -f "$path" ] || continue
+            abi="$(basename "$(dirname "$path")")"
+            case " $abi_list " in
+                *" $abi "*) ;;
+                *) rm -f "$path" ;;
+            esac
+        done
     done
 }
 
@@ -292,7 +322,9 @@ build_rust_package() {
         exit 1
     fi
 
-    clean_android_lib_outputs "$lib_name"
+    # Retain matching files so Gradle can keep the dependent APK tasks
+    # up-to-date; only remove ABIs omitted from this invocation.
+    prune_android_lib_abis "$lib_name" "$abi_list"
     for abi in $abi_list; do
         echo "=== Building $package for $abi (rust release, android $android_build_type) ==="
         cargo ndk -t "$abi" -P 28 "${cargo_args[@]}"
@@ -335,12 +367,6 @@ build_apps() {
 
     build_rust_native "$build_type"
     clean_app_dmesh_dmeshui
-    rm -rf \
-        "$SCRIPT_DIR/android/app-dmesh/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/android/app-dmesh-transport/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/android/app-web/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/android/app-chat/build/outputs/apk/$build_type" \
-        "$SCRIPT_DIR/target/apk/$build_type"
     echo ""
     echo "=== Building Android APKs ($build_type) ==="
     gradle "$dmesh_task" "$transport_task" "$web_task" "$chat_task"
@@ -628,6 +654,16 @@ uninstall_apps_on_device() {
 setup_device() {
     local serial="$1"
     local deadline=$((SECONDS + ${DMESH_SERVICE_START_TIMEOUT:-15}))
+    # `filesDir` is credential-encrypted Android storage: the Rust listener,
+    # settings, and provisioned device secret cannot start safely until the
+    # primary user is unlocked. Do not misreport this device state as a missing
+    # manifest component or a NAN failure.
+    if ! adb -s "$serial" shell dumpsys user 2>/dev/null \
+        | grep -A 5 'UserInfo{0:' \
+        | grep -q 'State: RUNNING_UNLOCKED'; then
+        echo "ERROR: [$serial] Android user 0 is locked; unlock the device before starting app-dmesh." >&2
+        return 1
+    fi
     grant_app_permissions "$serial" "$APP_DMESH_PKG"
     adb -s "$serial" shell am start-foreground-service -n "$APP_DMESH_PKG/.DMService" >/dev/null || \
         adb -s "$serial" shell am startservice -n "$APP_DMESH_PKG/.DMService" >/dev/null
@@ -651,7 +687,7 @@ android_shell_command() {
     local serial="$1"
     local command="$2"
     # `adb shell` joins argv before Android's shell sees it. Quote the command
-    # as one remote-shell argument or `wifi.nan.role sub-active` becomes two
+    # as one remote-shell argument or a schema command becomes two
     # content arguments and is silently rejected by the provider CLI.
     local escaped_command
     escaped_command="${command//\'/\'\\\'\'}"
@@ -682,15 +718,15 @@ configure_nan_role() {
     local role
     role="$(nan_role_for_device "$serial")"
     case "$role" in
-        both|sub-active|sub-passive|sub-passive-empty-ssi|pub-solicited|pub-unsolicited) ;;
+        both) ;;
         *)
-            echo "ERROR: [$serial] invalid NAN role '$role'" >&2
+            echo "ERROR: [$serial] NAN role '$role' is retired; only the shared transport.set mode=nan profile is supported" >&2
             return 1
             ;;
     esac
-    echo "=== [$serial] NAN role: $role ==="
-    android_shell_command "$serial" "wifi.nan.role role=$role" >/dev/null
-    android_shell_command "$serial" "wifi.nan.status" >/dev/null
+    echo "=== [$serial] NAN profile: transport.set mode=nan ==="
+    android_shell_command "$serial" "transport.set mode=nan" >/dev/null
+    android_shell_command "$serial" "telemetry.nan_status" >/dev/null
 }
 
 capture_android_evidence() {
@@ -712,7 +748,7 @@ capture_android_evidence() {
     android_shell_command "$serial" \
         "history durationMs=$history_duration_ms limit=240 keys=net.NAN,wifi.nan" \
         >"$out_dir/$label-nan-history.txt" 2>&1 || true
-    android_shell_command "$serial" "wifi.nan.status" \
+    android_shell_command "$serial" "telemetry.nan_status" \
         >"$out_dir/$label-nan-status-command.txt" 2>&1 || true
     cat >"$out_dir/$label-meta.env" <<EOF
 DMESH_ADB_SERIAL=$serial
@@ -867,7 +903,7 @@ reset_all_nan_sessions() {
     mapfile -t devices < <(require_android_devices)
     for serial in "${devices[@]}"; do
         echo "=== [$serial] restarting NAN attachment and discovery sessions ==="
-        if ! android_shell_command "$serial" "wifi.nan.stop" >/dev/null; then
+        if ! android_shell_command "$serial" "transport.set mode=uart" >/dev/null; then
             echo "ERROR: [$serial] NAN stop failed." >&2
             failures=1
             continue
@@ -889,7 +925,7 @@ stop_all_nan_sessions() {
     mapfile -t devices < <(require_android_devices)
     for serial in "${devices[@]}"; do
         echo "=== [$serial] stopping NAN attachment and discovery sessions ==="
-        if ! android_shell_command "$serial" "wifi.nan.stop" >/dev/null; then
+        if ! android_shell_command "$serial" "transport.set mode=uart" >/dev/null; then
             echo "ERROR: [$serial] NAN stop failed." >&2
             failures=1
             continue

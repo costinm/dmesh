@@ -1198,17 +1198,15 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                     .and_then(Value::as_str)
                     .is_some_and(|value| value == "1");
             let sta = method == "transport.set"
-                && transport_mode.is_some_and(|mode| {
-                    mode.as_str() == Some("sta") || mode.as_u64() == Some(1)
-                });
+                && transport_mode
+                    .is_some_and(|mode| mode.as_str() == Some("sta") || mode.as_u64() == Some(1));
             // `uart` is the portable all-radio-off profile.  Android has no
             // UART bearer, so its projection only tears down the Android
             // Wi-Fi personalities; it does not invent a separate
             // `wifi.nan.stop` command surface.
             let radio_off = method == "transport.set"
-                && transport_mode.is_some_and(|mode| {
-                    mode.as_str() == Some("uart") || mode.as_u64() == Some(5)
-                });
+                && transport_mode
+                    .is_some_and(|mode| mode.as_str() == Some("uart") || mode.as_u64() == Some(5));
             let operation = if radio_off {
                 "stop"
             } else if sta {
@@ -2838,13 +2836,8 @@ mod tests {
 
     #[test]
     fn android_shell_projects_numeric_transport_set_nan_to_the_nan_adapter() {
-        let projection = radio_message(
-            "radio.shell.command",
-            "",
-            b"transport.set mode=nan",
-            -1,
-        )
-        .unwrap();
+        let projection =
+            radio_message("radio.shell.command", "", b"transport.set mode=nan", -1).unwrap();
         let projection: Value = serde_json::from_slice(&projection).unwrap();
         assert_eq!(projection["status"], "accepted");
         assert_eq!(projection["operation"], "nan");
@@ -2853,13 +2846,8 @@ mod tests {
 
     #[test]
     fn android_shell_projects_uart_transport_set_to_the_all_radio_off_adapter() {
-        let projection = radio_message(
-            "radio.shell.command",
-            "",
-            b"transport.set mode=uart",
-            -1,
-        )
-        .unwrap();
+        let projection =
+            radio_message("radio.shell.command", "", b"transport.set mode=uart", -1).unwrap();
         let projection: Value = serde_json::from_slice(&projection).unwrap();
         assert_eq!(projection["status"], "accepted");
         assert_eq!(projection["operation"], "stop");

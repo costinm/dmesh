@@ -1573,14 +1573,15 @@ mod tests {
         // through B or C.
         let request = [0xa4, 1, 0x18, 99, 2, 1, 3, 0x18, 55, 5, 0xa0];
         let mut direct_request = [0; 64];
-        let direct_request_len = crate::direct::ConnectionlessMessage::encode(
-            &request,
-            &mut direct_request,
-        )
-        .unwrap();
+        let direct_request_len =
+            crate::direct::ConnectionlessMessage::encode(&request, &mut direct_request).unwrap();
         let mut a_to_b = [0; 64];
         assert_eq!(
-            rewrite_dcid(&direct_request[..direct_request_len], b_forward, &mut a_to_b),
+            rewrite_dcid(
+                &direct_request[..direct_request_len],
+                b_forward,
+                &mut a_to_b
+            ),
             Err(quic_lite::Error::Invalid)
         );
     }

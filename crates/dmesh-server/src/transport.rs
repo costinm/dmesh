@@ -19,6 +19,11 @@ use crate::{
     stream_server::StreamServerConnection,
 };
 
+/// The second client-initiated stream of a flash association carries only
+/// signed object records. Stream 4 remains the correlated `object.flash`
+/// command/terminal-response stream.
+pub const FLASH_OBJECT_STREAM: u64 = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4;
+
 /// Typed host-side outcome after a bounded association request exhausts its
 /// retransmission budget. This does not assert a peer restart: it records only
 /// that the retained association cannot serve another request without a fresh
@@ -164,6 +169,8 @@ pub struct ConnectionServer<const HISTORY: usize, const PACKET: usize> {
     pending_flash: Option<Vec<u8>>,
     pending_flash_id: Option<u64>,
     flash_response: Option<Vec<u8>>,
+    flash_object_stream: Option<u64>,
+    flash_object_chunks: Vec<(Vec<u8>, bool)>,
     association: AssociationProfile,
 }
 
@@ -225,6 +232,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     ) -> Result<Option<usize>, Error> {
         let limits = self.limits;
         let association = self.association.clamp::<HISTORY>();
+        self.core.set_time(self.last_time);
         let ingress = self.core.receive_admitted(
             path,
             packet,
@@ -243,6 +251,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             |server, output| server.replay_open(packet, output),
             |server, output| server.receive_established(packet, output),
             ConnectionServer::is_closed,
+            ConnectionServer::active_stream_count,
             ConnectionServer::peer_cid,
             ConnectionServer::expected_receive_cid,
         );
@@ -276,11 +285,22 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// PTO and ACK timing identical across UDP6, action, and UART.
     pub fn set_time(&mut self, now: u64) {
         self.last_time = now;
+        self.core.set_time(now);
         for server in self.core.associations_mut() {
             if let Some(connection) = server.connection.as_mut() {
                 connection.set_time(now);
             }
         }
+        let _ = self
+            .core
+            .reclaim_idle(ConnectionServer::active_stream_count);
+    }
+
+    /// Configure idle association reclamation in the same monotonic units
+    /// supplied to [`Self::set_time`]. Full-table admission may additionally
+    /// reclaim the oldest association with no active streams.
+    pub fn set_association_idle_timeout(&mut self, timeout: Option<u64>) {
+        self.core.set_idle_timeout(timeout);
     }
 
     /// Install the reset-key branch derived from the platform's provisioned
@@ -358,9 +378,11 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         if self.core.active_path() != Some(path) {
             return Ok(None);
         }
-        self.core.association_for_path_mut(path).map_or(Ok(None), |server| {
-            server.poll_retransmit(now_us, pto_us, output)
-        })
+        self.core
+            .association_for_path_mut(path)
+            .map_or(Ok(None), |server| {
+                server.poll_retransmit(now_us, pto_us, output)
+            })
     }
 
     pub fn reply_path(&self) -> Option<PathId> {
@@ -393,10 +415,12 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// Return rejected-packet CID context without requiring the firmware or
     /// host bearer adapter to parse a QUIC header.
     pub fn connection_id_diagnostic(&self, packet: &[u8]) -> quic_lite::ConnectionIdDiagnostic {
-        let received = quic_lite::classify_server_datagram(packet).ok().and_then(|datagram| match datagram {
-            quic_lite::ServerDatagram::Established { destination } => Some(destination),
-            _ => None,
-        });
+        let received = quic_lite::classify_server_datagram(packet)
+            .ok()
+            .and_then(|datagram| match datagram {
+                quic_lite::ServerDatagram::Established { destination } => Some(destination),
+                _ => None,
+            });
         quic_lite::ConnectionIdDiagnostic {
             received,
             expected: self.expected_receive_cid(),
@@ -431,7 +455,11 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
 
     /// Snapshot common QUIC counters for a bearer-neutral diagnostic report.
     pub fn transport_stats(&self) -> Option<quic_lite::TransportStats> {
-        match self.core.active_path().and_then(|path| self.core.association_for_path(path)) {
+        match self
+            .core
+            .active_path()
+            .and_then(|path| self.core.association_for_path(path))
+        {
             Some(server) => match server.connection.as_ref() {
                 Some(connection) => Some(connection.transport_stats()),
                 None => None,
@@ -443,7 +471,11 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// ACK/congestion state needed to distinguish radio loss from a stalled
     /// peer ACK path in a raw-bearer report.
     pub fn transport_ack_state(&self) -> Option<(Option<u32>, u64, u64)> {
-        match self.core.active_path().and_then(|path| self.core.association_for_path(path)) {
+        match self
+            .core
+            .active_path()
+            .and_then(|path| self.core.association_for_path(path))
+        {
             Some(server) => match server.connection.as_ref() {
                 Some(connection) => Some(connection.transport_ack_state()),
                 None => None,
@@ -475,7 +507,19 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
 
     pub fn take_flash_request(&mut self) -> Option<Vec<u8>> {
         let path = self.core.active_path()?;
-        self.core.association_for_path_mut(path)?.take_flash_request()
+        self.core
+            .association_for_path_mut(path)?
+            .take_flash_request()
+    }
+
+    /// Take ordered object-upload fragments for the active flash command.
+    pub fn take_flash_object_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
+        let Some(path) = self.core.active_path() else {
+            return Vec::new();
+        };
+        self.core
+            .association_for_path_mut(path)
+            .map_or_else(Vec::new, ConnectionServer::take_flash_object_chunks)
     }
 
     pub fn complete_flash(&mut self, response: Vec<u8>) -> Result<(), Error> {
@@ -484,6 +528,16 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             .association_for_path_mut(path)
             .ok_or(Error::Invalid)?
             .complete_flash(response)
+    }
+
+    /// Release the correlated flash request after its QUIC association has
+    /// explicitly closed. The ESP sink is released by its platform owner.
+    pub fn abandon_flash(&mut self) {
+        if let Some(path) = self.core.active_path()
+            && let Some(server) = self.core.association_for_path_mut(path)
+        {
+            server.abandon_flash();
+        }
     }
 }
 
@@ -690,6 +744,22 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectClient<HISTORY, PACKET> {
         &mut self,
         input: &[u8],
         output: &mut [u8; PACKET],
+        on_fragment: F,
+    ) -> Result<Option<usize>, Error>
+    where
+        F: FnMut(&[u8]) -> Result<(), Error>,
+    {
+        self.receive_at(input, 0, output, on_fragment)
+    }
+
+    /// Feed an object datagram with the bearer's monotonic millisecond clock.
+    /// QUIC-lite retains packet timestamps in milliseconds, so an ESP adapter
+    /// must convert its microsecond timer before loss/PTO comparisons.
+    pub fn receive_at<F>(
+        &mut self,
+        input: &[u8],
+        now_ms: u64,
+        output: &mut [u8; PACKET],
         mut on_fragment: F,
     ) -> Result<Option<usize>, Error>
     where
@@ -697,7 +767,7 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectClient<HISTORY, PACKET> {
     {
         match self.connection.receive_bootstrap(
             input,
-            0,
+            now_ms,
             &self.request[..self.request_len],
             output,
         )? {
@@ -712,6 +782,7 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectClient<HISTORY, PACKET> {
             quic_lite::ClientBootstrapIngress::EstablishedPacket => {}
         }
         let endpoint = self.connection.endpoint_mut()?;
+        endpoint.set_time(now_ms);
         let TransportPacket::Stream { frame, .. } = endpoint.receive_datagram(input)? else {
             self.counters.other_packets = self.counters.other_packets.saturating_add(1);
             return endpoint.poll_transmit(output);
@@ -741,11 +812,19 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectClient<HISTORY, PACKET> {
 
     pub fn poll_retransmit(
         &mut self,
-        now_us: u64,
-        pto_us: u64,
+        now_ms: u64,
+        pto_ms: u64,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
-        self.connection.poll_retransmit(now_us, pto_us, output)
+        self.connection.poll_retransmit(now_ms, pto_ms, output)
+    }
+
+    /// Ask the QUIC-lite object association for its next datagram.  PTO,
+    /// loss repair, delayed ACKs, and flow-control output remain internal to
+    /// the transport; application sinks only supply ordered object fragments.
+    pub fn poll(&mut self, now_ms: u64, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
+        self.poll_retransmit(now_ms, 600, output)?
+            .map_or_else(|| self.poll_transmit(output), |used| Ok(Some(used)))
     }
 
     pub const fn is_complete(&self) -> bool {
@@ -929,9 +1008,8 @@ impl<const HISTORY: usize, const PACKET: usize> TaggedClient<HISTORY, PACKET> {
             endpoint.stream_consumed(frame.id, frame.data.len())?;
             if frame.fin {
                 self.complete = true;
-                self.next_server_bidi_stream_id = expected_stream
-                    .checked_add(4)
-                    .ok_or(Error::Invalid)?;
+                self.next_server_bidi_stream_id =
+                    expected_stream.checked_add(4).ok_or(Error::Invalid)?;
             }
         }
         if self.complete {
@@ -1407,6 +1485,16 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
             .is_some_and(|connection| connection.is_closed())
     }
 
+    /// Number of streams which still have unfinished send or receive state.
+    /// Association-table eviction uses this transport-neutral fact and never
+    /// inspects an application handler or bearer.
+    pub fn active_stream_count(&self) -> usize {
+        self.connection.as_ref().map_or(0, |connection| {
+            let stats = connection.stream_stats();
+            stats.locally_initiated.active as usize + stats.peer_initiated.active as usize
+        })
+    }
+
     /// Construct with a device-derived receive-window limit. This is used by
     /// bounded firmware bearers; `new` remains the host-compatible default.
     pub fn new_with_limits(local_cid: ConnectionId, local_limits: ConnectionLimits) -> Self {
@@ -1427,6 +1515,8 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
             pending_flash: None,
             pending_flash_id: None,
             flash_response: None,
+            flash_object_stream: None,
+            flash_object_chunks: Vec::new(),
             association: association.clamp::<HISTORY>(),
         }
     }
@@ -1483,7 +1573,7 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         stateless_reset_token: Option<quic_lite::StatelessResetToken>,
         output: &mut [u8; PACKET],
     ) -> Result<(Self, Option<usize>), Error> {
-        let (mut connection, ack) =
+        let (mut connection, _default_ack) =
             StreamServerConnection::accept_open_boxed_with_limits_and_reset_token(
                 packet,
                 local_cid,
@@ -1498,7 +1588,17 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         // full eight-packet ledger while firmware can choose less.
         let initial_window =
             (association.initial_window_packets as u64).saturating_mul(PACKET as u64);
-        connection.configure_raw_bearer(association.history_packets, initial_window)?;
+        connection.configure_raw_bearer(
+            association.history_packets,
+            initial_window,
+            association.ack_frequency,
+            u64::from(association.ack_delay_ms),
+        )?;
+        // `configure_raw_bearer` installs the receiver's bounded packet
+        // budget in the connection-owned bootstrap profile. Re-encode the
+        // deterministic OPEN_ACK from that state so the peer cannot overrun
+        // an eight-slot embedded ingress pool before loss recovery begins.
+        let ack = connection.replay_open_ack(packet)?;
         if ack.len() > output.len() {
             return Err(Error::Invalid);
         }
@@ -1513,6 +1613,8 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
                 pending_flash: None,
                 pending_flash_id: None,
                 flash_response: None,
+                flash_object_stream: None,
+                flash_object_chunks: Vec::new(),
                 association: association.clamp::<HISTORY>(),
             },
             Some(ack.len()),
@@ -1543,7 +1645,23 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
         let connection = self.connection.as_mut().ok_or(Error::WrongConnectionId)?;
-        let request = connection.receive_request(packet)?;
+        let object_stream = self.flash_object_stream;
+        let mut object_chunks = Vec::new();
+        let request = match object_stream {
+            Some(stream) => {
+                connection
+                    .mux
+                    .receive_request_with_stream(packet, stream, |id, fin, bytes| {
+                        if id != stream {
+                            return Err(());
+                        }
+                        object_chunks.push((bytes.to_vec(), fin));
+                        Ok(())
+                    })?
+            }
+            None => connection.receive_request(packet)?,
+        };
+        self.flash_object_chunks.extend(object_chunks);
         if let Some(request) = request {
             let tagged_probe = crate::tagged::decode(&request.data)
                 .and_then(crate::probe::decode_probe_run_record)
@@ -1592,6 +1710,18 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
                 return Err(Error::Invalid);
             }
             if let Some((id, flash_request)) = decode_flash_handler_request(&request.data) {
+                // Stream 4 is the fixed command stream for this two-stream
+                // operation.  Its FIN may be retransmitted while the object
+                // sink on stream 8 is active: QUIC-lite has already accepted
+                // that duplicate range, so preserve the live receiver and
+                // emit its ordinary ACK/window progress instead of treating
+                // the replay as a second flash request.
+                if request.stream_id == quic_lite::FIRST_CLIENT_BIDI_STREAM_ID
+                    && self.flash_object_stream == Some(FLASH_OBJECT_STREAM)
+                    && self.pending_flash_id == Some(id)
+                {
+                    return self.poll(output);
+                }
                 if self.pending_flash.is_some()
                     || self.pending_flash_id.is_some()
                     || self.flash_response.is_some()
@@ -1607,6 +1737,7 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
                 );
                 self.pending_flash = Some(fields.to_vec());
                 self.pending_flash_id = Some(id);
+                self.flash_object_stream = Some(FLASH_OBJECT_STREAM);
                 connection.complete_request(request.stream_id, request.data.len())?;
                 return Ok(None);
             }
@@ -1686,6 +1817,13 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         self.pending_flash.take()
     }
 
+    /// Take ordered signed-object fragments from the flash upload stream.
+    /// This is an application payload handoff; QUIC-lite has already handled
+    /// frame parsing, reordering, duplicate suppression, ACKs, and credit.
+    pub fn take_flash_object_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
+        core::mem::take(&mut self.flash_object_chunks)
+    }
+
     /// Queue the final response only after the platform reports that its
     /// signed-object sink is durable. This never blocks packet ingress.
     pub fn complete_flash(&mut self, response: Vec<u8>) -> Result<(), Error> {
@@ -1706,6 +1844,15 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         tagged.truncate(used);
         self.flash_response = Some(tagged);
         Ok(())
+    }
+
+    /// Forget flash bookkeeping when CLOSE has already retired the peer.
+    pub fn abandon_flash(&mut self) {
+        self.pending_flash = None;
+        self.pending_flash_id = None;
+        self.flash_response = None;
+        self.flash_object_stream = None;
+        self.flash_object_chunks.clear();
     }
 
     /// Let the connection-owned ledger produce a retransmission. The raw
@@ -1820,6 +1967,25 @@ impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_association_memory_budget_is_bounded() {
+        type Server = ConnectionServer<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
+        type Ledger = StreamServerConnection<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
+        type Four = ConnectionDispatcher<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }, 4>;
+        type Twenty = ConnectionDispatcher<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }, 20>;
+        eprintln!(
+            "association memory: server_inline={} ledger_heap={} dispatcher_4={} dispatcher_20={} incremental_slot={}",
+            core::mem::size_of::<Server>(),
+            core::mem::size_of::<Ledger>(),
+            core::mem::size_of::<Four>(),
+            core::mem::size_of::<Twenty>(),
+            (core::mem::size_of::<Twenty>() - core::mem::size_of::<Four>()) / 16,
+        );
+        // The stream ledger is heap-backed. Raising table capacity therefore
+        // adds only fixed association metadata until a peer is admitted.
+        assert!(core::mem::size_of::<Server>() < core::mem::size_of::<Ledger>());
+    }
 
     #[cfg(feature = "std")]
     #[test]
@@ -2115,6 +2281,11 @@ mod tests {
             .fields
             .unwrap();
         assert_eq!(listener.take_flash_request().unwrap(), fields);
+        // A lost ACK can replay the command-stream FIN while stream 8 is
+        // already owned by the platform flash sink. That replay must retain
+        // the sink and yield ordinary transport progress, not reject it as a
+        // second flash command.
+        assert!(listener.receive(&packet[..used], &mut out).is_ok());
         // The request may have released a transport ACK, but not an
         // application response before durable flash completion.
         let _ = listener.poll(&mut out).unwrap();
@@ -2345,6 +2516,26 @@ mod tests {
             .receive(&client_out[..open_len], &mut server_out)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            server
+                .connection
+                .as_ref()
+                .expect("OPEN installs raw association")
+                .mux
+                .endpoint
+                .ack_frequency(),
+            association.ack_frequency,
+            "accepted raw association must apply its QUIC ACK policy"
+        );
+        let (_, advertised) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..open_ack_len],
+            client_cid,
+        )
+        .unwrap();
+        assert_eq!(
+            advertised.max_in_flight_packets, 8,
+            "raw receiver packet budget must be negotiated in OPEN_ACK"
+        );
         let request_len = client
             .receive(&server_out[..open_ack_len], &mut client_out)
             .unwrap()
@@ -3228,14 +3419,18 @@ mod tests {
 
         // The second peer's Initial must not retire the first peer. Both
         // established requests remain routable by their separate server CID.
-        assert!(dispatcher
-            .receive(first_path, &first_out[..first_request], &mut server_out)
-            .unwrap()
-            .is_some());
-        assert!(dispatcher
-            .receive(second_path, &second_out[..second_request], &mut server_out)
-            .unwrap()
-            .is_some());
+        assert!(
+            dispatcher
+                .receive(first_path, &first_out[..first_request], &mut server_out)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            dispatcher
+                .receive(second_path, &second_out[..second_request], &mut server_out)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(dispatcher.active_association_count(), 2);
     }
 

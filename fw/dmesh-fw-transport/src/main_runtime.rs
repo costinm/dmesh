@@ -560,7 +560,6 @@ pub(crate) fn is_sleepy_profile(profile: &crate::TransportProfile) -> bool {
         && profile.nan_dw_interval == 8
         && profile.now == 2
         && profile.ap == 0
-        && crate::uart_esp::uart_is_off(profile.uart)
 }
 
 /// Apply a single explicit sleep boundary after Main has completed the radio
@@ -588,7 +587,7 @@ pub(crate) fn maybe_enter_sleep(
     send_transition_announce(
         dmesh_server::announce::ANNOUNCE_SLEEP_PENDING,
         now_ms / 1_000,
-        true,
+        profile.now != 2,
         false,
     );
     if soft_sleep {
@@ -609,8 +608,12 @@ pub(crate) fn maybe_enter_sleep(
     // no way to inspect the armed boundary.  The physical sleep entry below
     // owns the final shutdown instead.
     crate::commands::send_response(b"sleep DW8: entering explicit light sleep");
-    crate::core_runtime::apply_uart_profile(false);
+    // UART is not a light-sleep precondition. Retain it across DW8 so the
+    // device remains observable and we do not churn the physical serial
+    // driver on every wake cycle.
     crate::wifi_esp::stop_sta();
+    crate::wifi_esp::deinit_for_light_sleep();
+    crate::wifi_nan_dw_capture_esp::prepare_light_sleep_resume();
     let (bssid, anchor_us, _) = crate::wifi_nan_dw_capture_esp::sync_diagnostics();
     // Without a NAN timing anchor, use the prescribed 30-second acquisition
     // backoff instead of repeatedly missing a discovery window; synchronized
@@ -632,12 +635,18 @@ pub(crate) fn maybe_enter_sleep(
     if *nan_now_started {
         crate::wifi_espnow_esp::set_poll_handler(Some(crate::core_runtime::poll_espnow));
     }
-    *sleepy_awake_until_ms = ((unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000)
-        .saturating_add(5_000);
+    // A completed explicit sleep is not a new control session.  Keeping the
+    // former five-second command window here made every DW8 cycle spend more
+    // time awake than asleep, even when no peer had requested a wake.  The
+    // radio has already restored its saved NAN anchor, so its next owner
+    // deadline is the selected discovery window.  A targeted active
+    // Subscribe received in that window still replaces the profile; an idle
+    // device immediately returns to low duty operation.
+    *sleepy_awake_until_ms = 0;
     send_transition_announce(
         dmesh_server::announce::ANNOUNCE_WAKE,
         (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000_000,
-        *nan_now_started,
+        *nan_now_started && after_wake.now != 2,
         false,
     );
     true
@@ -655,7 +664,7 @@ pub(crate) fn service_radio_deadline(services: u8) {
         crate::wifi_nonpromisc_probe_esp::service_deadline();
     }
     if services & DEADLINE_CONNECTION != 0 {
-        crate::core_runtime::schedule_connection_now_timer();
+        crate::core_runtime::schedule_connection_timer();
     }
 }
 
@@ -1394,12 +1403,9 @@ fn apply_radio_transition(
         );
         state.transition_announced_generation = generation;
     }
-    // A DW8 profile uses the current control UART for its bounded command
-    // window; `maybe_enter_sleep` shuts it down immediately before the
-    // physical sleep call. All other profile changes apply immediately.
-    if !is_sleepy_profile(profile) {
-        apply_uart_profile(role, profile, &mut state.applied_uart);
-    }
+    // A DW8 profile retains the control UART through the physical sleep call.
+    // Apply the profile like every other transport configuration.
+    apply_uart_profile(role, profile, &mut state.applied_uart);
     // ESP-IDF has completed an association attempt without a connection.
     // Restore the normal unassociated radio personality once, then leave the
     // next scan/STA attempt to the discovery cadence below.
@@ -1717,7 +1723,7 @@ fn receive_sta_lifecycle(_associated: bool, _reason: u8) {
 fn next_deadline(sleep_deadline_ms: Option<u64>) -> Option<(u8, u32)> {
     let nan_delay = crate::wifi_nan_dw_capture_esp::next_service_delay_ms();
     let roc_delay = crate::wifi_nonpromisc_probe_esp::next_service_delay_ms();
-    let connection_delay = crate::core_runtime::connection_now_delay_ms();
+    let connection_delay = crate::core_runtime::connection_delay_ms();
     let now_ms = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000;
     let sleep_delay = sleep_deadline_ms
         .map(|deadline| deadline.saturating_sub(now_ms).min(u64::from(u32::MAX)) as u32);
@@ -2840,14 +2846,15 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // A valid NVS profile begins the Main STA canary directly; otherwise Main
     // starts its active unassociated AP+NAN+NOW epoch with DW1.
     let initial_profile = crate::core_runtime::transport_profile_snapshot();
-    if sleepy_boot {
-        crate::core_runtime::apply_uart_profile(false);
-    }
     let mut state = crate::main_runtime::MainRadioState::new(
         sleepy_boot,
         crate::profile_store::generation(),
         (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000,
     );
+    // The control UART is available for the boot proof above.  Afterwards it
+    // follows the requested profile exactly, including an explicit `uart=off`
+    // on a sleepy boot; DW8 itself never silently changes this choice.
+    crate::main_runtime::apply_uart_profile(service.role, &initial_profile, &mut state.applied_uart);
     if crate::main_runtime::wants_sta(&initial_profile) {
         // NVS only supplies the boot declaration. Apply it through the same
         // complete STA epoch path used by an accepted `transport.start`, so
@@ -2951,6 +2958,20 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             ),
         });
         crate::main_runtime::publish_snapshot(runtime_state.snapshot());
+        if RESET_REQUESTED.swap(false, Ordering::AcqRel) {
+            // Give the raw worker a bounded opportunity to transmit the
+            // response it already produced before Main resets the chip.
+            let ticks = ((250_u64 * u64::from(esp_idf_sys::configTICK_RATE_HZ))
+                .div_ceil(1_000)
+                .max(1)) as esp_idf_sys::TickType_t;
+            unsafe { esp_idf_sys::vTaskDelay(ticks) };
+            // A controlled remote reset must explicitly leave the AP before
+            // ROM starts. Otherwise the AP can retain a stale STA entry until
+            // its own inactivity timer, which makes the following STA test
+            // look associated before this device has rejoined.
+            crate::wifi_esp::stop_sta_for_reset();
+            unsafe { esp_idf_sys::esp_restart() };
+        }
         // Raw Ethernet owns its FreeRTOS ingress task and accepts
         // host-initiated QUIC-lite services. There is no legacy client
         // fallback: a profile only controls association and raw bearer
@@ -3025,6 +3046,9 @@ use dmesh_server::main_runtime_state::MainRuntimeSnapshot;
 /// Bearer-neutral component for one read-only Main runtime snapshot.
 pub const RUNTIME_COMPONENT: u64 = 101;
 pub const RUNTIME_SNAPSHOT: u64 = 1;
+/// Schedule a controlled Main restart after the tagged response has left its
+/// QUIC-lite association. This is not a modem-line reset.
+pub const RUNTIME_RESET: u64 = 2;
 /// Read-only ESP PM state. Separate from the portable runtime snapshot because
 /// frequency/PM-lock details are platform measurements, not transport policy.
 pub const POWER_COMPONENT: u64 = 102;
@@ -3040,6 +3064,7 @@ pub const MEMORY_SNAPSHOT: u64 = 1;
 // or taking the radio-owner lock from callback/ingress context.
 static SNAPSHOT_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static SNAPSHOT_WORDS: [AtomicU32; 22] = [const { AtomicU32::new(0) }; 22];
+static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn snapshot_words(snapshot: MainRuntimeSnapshot) -> [u32; 22] {
     [
@@ -3140,6 +3165,22 @@ pub(crate) fn receive_tagged_snapshot(
     let dmesh_server::tagged::Name::Tag(method) = record.method? else {
         return None;
     };
+    if method == RUNTIME_RESET {
+        // The packet worker returns this acknowledgement before the Main
+        // owner observes the marker and restarts the chip.
+        RESET_REQUESTED.store(true, Ordering::Release);
+        request_deadline_recheck();
+        let mut response = [0u8; 96];
+        let used = dmesh_server::tagged::encode_numeric_data_response(
+            RUNTIME_COMPONENT,
+            RUNTIME_RESET,
+            id,
+            b"reset scheduled",
+            true,
+            &mut response,
+        )?;
+        return Some(alloc::vec::Vec::from(&response[..used]));
+    }
     if method != RUNTIME_SNAPSHOT {
         return None;
     }

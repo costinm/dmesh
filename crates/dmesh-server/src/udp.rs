@@ -1361,31 +1361,392 @@ impl UdpClient {
         bail!("UDP direct exchange timeout after {BOOTSTRAP_ATTEMPTS} attempts")
     }
 
-    /// Send one complete application request stream and wait for its
-    /// transport control response. The caller chooses the service tag/schema.
-    pub async fn send_stream(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<()> {
+    /// Send one stream fragment and wait for the peer's next transport
+    /// packet.  A terminal application response is returned rather than
+    /// discarded so an upload can finish on the packet carrying its last
+    /// fragment.  Packet numbering, ACK processing, and retransmission stay
+    /// entirely in `quic-lite`; callers only supply ordered stream bytes.
+    pub async fn send_stream_with_response(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<Option<ReceivedStream>> {
         let mut packet = [0u8; MTU];
         let (_path, used) = self
             .connection
             .encode_stream_payload(stream_id, data, fin, &mut packet)
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
         self.send_endpoint_packet(&packet[..used]).await?;
-        let mut response = [0u8; MTU];
-        let (len, peer) = timeout(ACK_TIMEOUT, self.socket.recv_from(&mut response))
+        let started = Instant::now();
+        for attempt in 0..STREAM_ATTEMPTS {
+            let mut response = [0u8; MTU];
+            if let Ok(Ok((len, peer))) =
+                timeout(ACK_TIMEOUT, self.recv_association_packet(&mut response)).await
+            {
+                if peer != self.peer {
+                    bail!("UDP client peer changed");
+                }
+                let control = self
+                    .connection
+                    .receive_stream_payload(self.path, &response[..len])
+                    .map_err(|error| anyhow::anyhow!("client transport input: {error:?}"))?;
+                let Some((id, offset, response_fin, response_data)) = control else {
+                    return Ok(None);
+                };
+                let stream = ReceivedStream {
+                    id,
+                    offset,
+                    fin: response_fin,
+                    data: response_data.to_vec(),
+                };
+                self.connection
+                    .stream_consumed(stream.id, stream.data.len(), self.deferred_receive_credit)
+                    .map_err(|error| anyhow::anyhow!("client stream accounting: {error:?}"))?;
+                let mut ack = [0u8; MTU];
+                if let Some((_path, used)) = self
+                    .connection
+                    .poll_transmit(&mut ack)
+                    .map_err(|error| anyhow::anyhow!("client response ACK: {error:?}"))?
+                {
+                    self.send_endpoint_packet(&ack[..used]).await?;
+                }
+                if !self
+                    .connection
+                    .accept_server_response_stream(stream.id, stream.fin)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "UDP stream response id {} is not the association response: {error:?}",
+                            stream.id
+                        )
+                    })?
+                {
+                    bail!("unexpected duplicate completed stream while waiting for ACK");
+                }
+                return Ok(Some(stream));
+            }
+            if attempt + 1 == STREAM_ATTEMPTS {
+                break;
+            }
+            let now = started.elapsed().as_millis() as u64;
+            self.endpoint_mut().set_time(now);
+            let mut retry = [0u8; MTU];
+            let pto = self.endpoint().pto_timeout();
+            if let Some((retry_len, _)) =
+                self.endpoint_mut()
+                    .retransmit_due(now, pto, &mut retry)
+                    .map_err(|error| anyhow::anyhow!("client stream retransmission: {error:?}"))?
+            {
+                self.send_endpoint_packet(&retry[..retry_len]).await?;
+            }
+        }
+        bail!("UDP client ACK timeout after {STREAM_ATTEMPTS} transport attempts")
+    }
+
+    /// Queue one ordered stream fragment on this association without making
+    /// an application-level assumption about when the peer will next poll and
+    /// emit an ACK.  A following `send_stream_with_response` or
+    /// `recv_stream_frame` performs the normal QUIC-lite receive/ACK pump.
+    pub async fn send_stream_no_wait(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<()> {
+        let mut packet = [0u8; MTU];
+        let (_path, used) = self
+            .connection
+            .encode_stream_payload(stream_id, data, fin, &mut packet)
+            .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
+        self.send_endpoint_packet(&packet[..used]).await
+    }
+
+    /// Attempt to admit one ordered fragment to QUIC-lite without waiting for
+    /// a peer packet. `false` means the association's existing flow,
+    /// congestion, or retained-packet limits require the caller to drain
+    /// transport progress first; no application byte was accepted in that
+    /// case.
+    pub async fn try_send_stream_no_wait(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<bool> {
+        self.try_send_stream_no_wait_at(stream_id, 0, data, fin)
             .await
-            .context("UDP client ACK timeout")??;
+    }
+
+    /// Attempt to admit one ordered range at `offset`.  This is the streaming
+    /// counterpart to [`Self::try_send_stream_no_wait`]; it does not make the
+    /// UDP adapter responsible for stream sequencing.
+    pub async fn try_send_stream_no_wait_at(
+        &mut self,
+        stream_id: u64,
+        offset: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<bool> {
+        let mut packet = [0u8; MTU];
+        let (_path, used) = match self.connection.encode_stream_payload_at(
+            stream_id,
+            offset,
+            data,
+            fin,
+            &mut packet,
+        ) {
+            Ok(encoded) => encoded,
+            Err(
+                quic_lite::Error::FlowControl
+                | quic_lite::Error::HistoryFull
+                | quic_lite::Error::Invalid,
+            ) => return Ok(false),
+            Err(error) => return Err(anyhow::anyhow!("client packet: {error:?}")),
+        };
+        self.send_endpoint_packet(&packet[..used]).await?;
+        Ok(true)
+    }
+
+    /// Consume one incoming QUIC-lite packet without pretending that every
+    /// ACK acknowledges the most recently submitted application fragment.
+    /// Senders use this only after `try_send_stream_no_wait` reports blocked;
+    /// endpoint state decides when stream/connection credit is available.
+    pub async fn recv_transport_progress(
+        &mut self,
+        progress_timeout: Duration,
+    ) -> Result<Option<ReceivedStream>> {
+        if progress_timeout.is_zero() {
+            bail!("UDP transport progress timeout must be non-zero");
+        }
+        let mut packet = [0u8; MTU];
+        let (len, peer) = timeout(progress_timeout, self.recv_association_packet(&mut packet))
+            .await
+            .context("UDP transport progress timeout")??;
         if peer != self.peer {
             bail!("UDP client peer changed");
         }
-        let control = self
+        let payload = self
             .connection
-            .receive_stream_payload(self.path, &response[..len])
+            .receive_stream_payload(self.path, &packet[..len])
             .map_err(|error| anyhow::anyhow!("client transport input: {error:?}"))?;
-        if control.is_none() {
-            Ok(())
-        } else {
+        let Some((id, offset, fin, data)) = payload else {
+            return Ok(None);
+        };
+        let stream = ReceivedStream {
+            id,
+            offset,
+            fin,
+            data: data.to_vec(),
+        };
+        self.connection
+            .stream_consumed(stream.id, stream.data.len(), self.deferred_receive_credit)
+            .map_err(|error| anyhow::anyhow!("client stream accounting: {error:?}"))?;
+        let mut ack = [0u8; MTU];
+        if let Some((_path, used)) = self
+            .connection
+            .poll_transmit(&mut ack)
+            .map_err(|error| anyhow::anyhow!("client response ACK: {error:?}"))?
+        {
+            self.send_endpoint_packet(&ack[..used]).await?;
+        }
+        if !self
+            .connection
+            .accept_server_response_stream(stream.id, stream.fin)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "UDP stream response id {} is not the association response: {error:?}",
+                    stream.id
+                )
+            })?
+        {
+            bail!("unexpected duplicate completed stream while draining progress");
+        }
+        Ok(Some(stream))
+    }
+
+    /// Run the two-stream object upload shape on one established QUIC-lite
+    /// association.  The caller supplies only the command bytes and an
+    /// ordered record producer; ACKs, MAX_DATA, congestion history, and
+    /// response-stream accounting remain private to this transport adapter.
+    pub async fn request_object_upload(
+        &mut self,
+        command_stream: u64,
+        command: &[u8],
+        object_stream: u64,
+        records: &mut ObjectRecordStream,
+        scratch: &mut [u8],
+        response_timeout: Duration,
+    ) -> Result<ReceivedStream> {
+        if scratch.is_empty() || response_timeout.is_zero() {
+            bail!("object upload scratch and response timeout must be non-zero");
+        }
+        let started = Instant::now();
+        let deadline = started + response_timeout;
+        // A flash command arms the receiver's stream-8 sink.  Do not rely on
+        // adjacent UDP ordering to make that visible before object bytes: the
+        // first ordinary transport packet after stream 4 proves that the
+        // peer's QUIC-lite endpoint has admitted it.  It also gives the
+        // association its first RTT/ACK sample before the bulk stream fills
+        // the bounded raw-UDP ingress window.
+        self.send_stream_no_wait(command_stream, command, true)
+            .await?;
+        let mut command_admitted = false;
+        let mut packet = [0u8; MTU];
+        while Instant::now() < deadline {
+            // Once the command is transport-admitted, fill only the credit
+            // the common endpoint has made available.  `ObjectRecordStream`
+            // owns record ordering; packet history, congestion, ACKs and
+            // retransmission remain entirely inside quic-lite.
+            if command_admitted && !records.is_complete() {
+                if let Some(next) = records.copy_next(scratch) {
+                    let now_ms = started.elapsed().as_millis() as u64;
+                    self.endpoint_mut().set_time(now_ms);
+                    match self.connection.encode_stream_payload_at(
+                        object_stream,
+                        next.offset,
+                        &scratch[..next.len],
+                        next.fin,
+                        &mut packet,
+                    ) {
+                        Ok((_path, used)) => {
+                            self.send_endpoint_packet(&packet[..used]).await?;
+                            if !records.advance(next) {
+                                bail!("object record producer rejected admitted stream bytes");
+                            }
+                            continue;
+                        }
+                        Err(
+                            quic_lite::Error::FlowControl
+                            | quic_lite::Error::HistoryFull
+                            | quic_lite::Error::Invalid,
+                        ) => {}
+                        Err(error) => {
+                            return Err(anyhow::anyhow!("object upload packet: {error:?}"));
+                        }
+                    }
+                }
+            }
+
+            // The bearer only waits for and injects a complete datagram.  A
+            // short timeout is a normal QUIC-lite scheduling edge, not an
+            // upload-level retry: after it, poll the association-owned PTO
+            // ledger and delayed-control queue below.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let receive_wait = remaining.min(Duration::from_millis(20));
+            match timeout(receive_wait, self.recv_association_packet(&mut packet)).await {
+                Ok(Ok((len, peer))) => {
+                    if peer != self.peer {
+                        bail!("UDP client peer changed");
+                    }
+                    let now_ms = started.elapsed().as_millis() as u64;
+                    let payload = self
+                        .connection
+                        .receive_stream_payload(self.path, &packet[..len])
+                        .map_err(|error| {
+                            anyhow::anyhow!("object upload transport input: {error:?}")
+                        })?;
+                    // Any established peer packet after stream 4 means its
+                    // endpoint accepted that request.  The application
+                    // receiver is armed in that same ingress turn.
+                    command_admitted = true;
+                    if let Some((id, offset, fin, data)) = payload {
+                        let stream = ReceivedStream {
+                            id,
+                            offset,
+                            fin,
+                            data: data.to_vec(),
+                        };
+                        self.connection
+                            .stream_consumed(
+                                stream.id,
+                                stream.data.len(),
+                                self.deferred_receive_credit,
+                            )
+                            .map_err(|error| {
+                                anyhow::anyhow!("object upload stream accounting: {error:?}")
+                            })?;
+                        if !self
+                            .connection
+                            .accept_server_response_stream(stream.id, stream.fin)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "object upload response stream {}: {error:?}",
+                                    stream.id
+                                )
+                            })?
+                        {
+                            continue;
+                        }
+                        // A response stream may span more than one packet.
+                        // It remains QUIC-lite's ordinary ordered response
+                        // stream until FIN; only that terminal fragment can
+                        // complete an upload operation.
+                        if !stream.fin {
+                            continue;
+                        }
+                        if !records.is_complete() {
+                            bail!(
+                                "object upload rejected before the object stream FIN: {:?}",
+                                stream.data
+                            );
+                        }
+                        return Ok(stream);
+                    }
+                    // Keep the association clock in the same domain used by
+                    // every later PTO calculation, including control-only
+                    // peer packets.
+                    self.endpoint_mut().set_time(now_ms);
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {}
+            }
+
+            let now_ms = started.elapsed().as_millis() as u64;
+            self.endpoint_mut().set_time(now_ms);
+            let pto = self.endpoint().pto_timeout();
+            if let Some((_path, used)) =
+                self.connection
+                    .poll_retransmit(now_ms, pto, &mut packet)
+                    .map_err(|error| anyhow::anyhow!("object upload retransmission: {error:?}"))?
+            {
+                self.send_endpoint_packet(&packet[..used]).await?;
+                continue;
+            }
+            if let Some((_path, used)) = self
+                .connection
+                .poll_transmit(&mut packet)
+                .map_err(|error| anyhow::anyhow!("object upload control: {error:?}"))?
+            {
+                self.send_endpoint_packet(&packet[..used]).await?;
+            }
+        }
+        bail!("object upload response timeout after QUIC-lite transport progress")
+    }
+
+    /// Send one complete application request stream and require a transport
+    /// control response. The caller chooses the service tag/schema.
+    pub async fn send_stream(&mut self, stream_id: u64, data: &[u8], fin: bool) -> Result<()> {
+        if self
+            .send_stream_with_response(stream_id, data, fin)
+            .await?
+            .is_some()
+        {
             bail!("unexpected stream while waiting for ACK")
         }
+        Ok(())
+    }
+
+    /// Wait for a terminal application stream response after an upload has
+    /// already sent its command and body on this same association.
+    pub async fn wait_stream_response(
+        &mut self,
+        response_timeout: Duration,
+    ) -> Result<ReceivedStream> {
+        if response_timeout.is_zero() {
+            bail!("UDP stream response timeout must be non-zero");
+        }
+        timeout(response_timeout, self.recv_stream_frame())
+            .await
+            .context("UDP client response timeout")?
     }
 
     /// Send a stream operation and wait for the first application response,
@@ -1400,6 +1761,33 @@ impl UdpClient {
         Ok((frame.id, frame.data, frame.fin))
     }
 
+    /// Send a request which may legitimately defer its terminal response.
+    ///
+    /// Object mutations use this for the original control stream: the peer
+    /// first completes a separate object association and only then replies to
+    /// the request. `attempts=1` is useful for a mutation whose receiver has
+    /// already admitted the request, because replaying it while it is active
+    /// is neither useful nor safe.
+    pub async fn request_stream_with_response_timeout(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+        response_timeout: Duration,
+        attempts: u32,
+    ) -> Result<(u64, Vec<u8>, bool)> {
+        let frame = self
+            .request_stream_frame_with_response_timeout(
+                stream_id,
+                data,
+                fin,
+                response_timeout,
+                attempts,
+            )
+            .await?;
+        Ok((frame.id, frame.data, frame.fin))
+    }
+
     /// Send one request and wait for its first application response while
     /// retaining the stream offset for a multi-frame consumer.
     pub async fn request_stream_frame(
@@ -1408,6 +1796,27 @@ impl UdpClient {
         data: &[u8],
         fin: bool,
     ) -> Result<ReceivedStream> {
+        self.request_stream_frame_with_response_timeout(
+            stream_id,
+            data,
+            fin,
+            ACK_TIMEOUT,
+            STREAM_ATTEMPTS,
+        )
+        .await
+    }
+
+    async fn request_stream_frame_with_response_timeout(
+        &mut self,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+        response_timeout: Duration,
+        attempts: u32,
+    ) -> Result<ReceivedStream> {
+        if response_timeout.is_zero() || attempts == 0 {
+            bail!("UDP stream response timeout and attempts must be non-zero");
+        }
         if self.connection.has_active_server_response_stream() {
             bail!("previous UDP response stream has not reached FIN");
         }
@@ -1418,8 +1827,8 @@ impl UdpClient {
             .map_err(|error| anyhow::anyhow!("client packet: {error:?}"))?;
         self.send_endpoint_packet(&packet[..used]).await?;
         let started = Instant::now();
-        for attempt in 0..STREAM_ATTEMPTS {
-            let deadline = Instant::now() + ACK_TIMEOUT;
+        for attempt in 0..attempts {
+            let deadline = Instant::now() + response_timeout;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -1479,7 +1888,7 @@ impl UdpClient {
                     }
                 }
             }
-            if attempt + 1 == STREAM_ATTEMPTS {
+            if attempt + 1 == attempts {
                 break;
             }
             let now = started.elapsed().as_millis() as u64;
@@ -1496,9 +1905,7 @@ impl UdpClient {
             self.send_endpoint_packet(&retry[..retry_len]).await?;
         }
         Err(anyhow::Error::new(
-            crate::transport::AssociationStreamTimeout {
-                attempts: STREAM_ATTEMPTS,
-            },
+            crate::transport::AssociationStreamTimeout { attempts },
         ))
     }
 
@@ -1616,16 +2023,17 @@ impl UdpClient {
             if self
                 .connection
                 .accept_server_response_stream(stream.id, stream.fin)
-                .map_err(|error| anyhow::anyhow!(
-                    "UDP stream response id {} is not the association response: {error:?}",
-                    stream.id
-                ))?
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "UDP stream response id {} is not the association response: {error:?}",
+                        stream.id
+                    )
+                })?
             {
                 return Ok(stream);
             }
         }
     }
-
 }
 
 /// Start the host-side UDP bearer used by Recovery and Main object transfers.
@@ -1814,7 +2222,11 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                     .await
                 {
                     let mut response = [0u8; MTU];
-                    match quic_lite::encode_direct_message_response(request, &payload, &mut response) {
+                    match quic_lite::encode_direct_message_response(
+                        request,
+                        &payload,
+                        &mut response,
+                    ) {
                         Ok(used) => {
                             socket.send_to(&response[..used], peer).await?;
                             tracing::debug!(%peer, bytes = used, "udp_direct_response");
@@ -1831,6 +2243,12 @@ pub async fn run(config: UdpConfig) -> Result<()> {
         }
         if let quic_lite::ServerDatagram::Initial(open) = classified {
             let client_cid = open.client_receive_cid;
+            if let Some(control) = config.control.as_ref() {
+                control.record_event(format!(
+                    "bootstrap initial peer={peer} client_cid={}",
+                    client_cid.value()
+                ));
+            }
             let key = (peer, client_cid.value());
             if let Some(previous) = pending_open_bytes.get(&key) {
                 if decode_bootstrap_open_payload(&packet)
@@ -1942,6 +2360,13 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 &mut ack,
             )?;
             socket.send_to(&ack[..used], peer).await?;
+            if let Some(control) = config.control.as_ref() {
+                control.record_event(format!(
+                    "bootstrap ack peer={peer} client_cid={} server_cid={}",
+                    client_cid.value(),
+                    server_cid.value()
+                ));
+            }
             tracing::info!(%peer, client_cid = client_cid.value(), server_cid = server_cid.value(),
                 packet_number, "object_udp_bootstrap_ack");
             continue;
@@ -3215,8 +3640,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(peer, bind);
-        let payload = crate::direct::ConnectionlessMessage::decode(&response[..response_len])
-            .unwrap();
+        let payload =
+            crate::direct::ConnectionlessMessage::decode(&response[..response_len]).unwrap();
         assert_eq!(payload, &request_payload[..request_payload_len]);
         server.abort();
     }
@@ -3337,8 +3762,8 @@ mod tests {
                 quic_lite::decode_bootstrap_open_packet_with_limits(&inbound[..received]).unwrap();
 
             let mut direct = [0u8; MTU];
-            let direct_len = crate::direct::ConnectionlessMessage::encode(b"discovery", &mut direct)
-                .unwrap();
+            let direct_len =
+                crate::direct::ConnectionlessMessage::encode(b"discovery", &mut direct).unwrap();
             server_socket
                 .send_to(&direct[..direct_len], client)
                 .await
@@ -3397,11 +3822,9 @@ mod tests {
         let payload_len =
             crate::tagged::encode_numeric_empty_request(7, 1, 9, &mut payload).unwrap();
         let mut packet = [0u8; 64];
-        let packet_len = crate::direct::ConnectionlessMessage::encode(
-            &payload[..payload_len],
-            &mut packet,
-        )
-        .unwrap();
+        let packet_len =
+            crate::direct::ConnectionlessMessage::encode(&payload[..payload_len], &mut packet)
+                .unwrap();
         client.send_to(&packet[..packet_len], bind).await.unwrap();
         let mut response = [0u8; 64];
         assert!(
@@ -3830,26 +4253,32 @@ mod tests {
             fin: true,
             data: vec![1],
         };
-        assert!(client
-            .connection
-            .accept_server_response_stream(first.id, first.fin)
-            .unwrap());
+        assert!(
+            client
+                .connection
+                .accept_server_response_stream(first.id, first.fin)
+                .unwrap()
+        );
         // A peer may retransmit this final response after the client has
         // already ACKed it. It is not the next request's result.
-        assert!(!client
-            .connection
-            .accept_server_response_stream(first.id, first.fin)
-            .unwrap());
+        assert!(
+            !client
+                .connection
+                .accept_server_response_stream(first.id, first.fin)
+                .unwrap()
+        );
         let next = ReceivedStream {
             id: quic_lite::FIRST_SERVER_BIDI_STREAM_ID + 4,
             offset: 0,
             fin: true,
             data: vec![2],
         };
-        assert!(client
-            .connection
-            .accept_server_response_stream(next.id, next.fin)
-            .unwrap());
+        assert!(
+            client
+                .connection
+                .accept_server_response_stream(next.id, next.fin)
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -73,6 +73,14 @@ The current radio architecture, verified Linux Wi-Fi/USB results, reproduction
 commands, and next-session test order are in
 `../../notes/ai/lmesh-radio-handoff.md`.
 
+## Web UI
+
+`web/` contains the DMesh discovery dashboard served by lmesh at
+`/_m/adm/`. It shadows only the local assets and falls back to ssh-mesh's
+generic admin pages (for example `services.html`). Edit this directory for
+DMesh UI work; ssh-mesh remains independent of DMesh. Set
+`LMESH_HTTP_WEB_DIR` to use a packaged or alternate asset directory.
+
 ## TODO
 
 - add the actual signature

@@ -418,6 +418,10 @@ impl FirmwareSchema {
             // host-owned radio schema validates and converts it at its CBOR
             // handler boundary, avoiding a UART-only byte convention.
             Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
+            // Text has no byte-string type. Keep the representation marker
+            // local to the JSON/text adapter; the shared CBOR encoder turns
+            // it into a byte string for every client surface.
+            Some("hex") => Ok(Value::String(format!("hex:{value}"))),
             _ => Ok(Value::String(value.to_owned())),
         }
     }
@@ -518,6 +522,14 @@ fn encode_schema_fields_with_id(
             &mut wire,
         )
         .context("raw radio snapshot request")?;
+        return Ok(wire[..used].to_vec());
+    }
+    if component == dmesh_server::raw_wifi::RAW_WIFI_COMPONENT as u16
+        && u64::from(entry.id) == dmesh_server::raw_wifi::RAW_WIFI_METHOD_TX
+    {
+        let mut wire = [0u8; dmesh_server::raw_wifi::RAW_WIFI_MAX_FRAME + 64];
+        let used = dmesh_server::raw_wifi::encode_raw_wifi_tx_json_request(fields, id, &mut wire)
+            .context("radio.tx request")?;
         return Ok(wire[..used].to_vec());
     }
     let mut record = TaggedRecord {
@@ -832,6 +844,25 @@ mod tests {
     }
 
     #[test]
+    fn object_flash_is_a_schema_driven_stream_request() {
+        assert!(
+            encode_direct_command("object.flash cpu=13 target=3 transport=0 dry_run=true").is_err()
+        );
+        let command = encode_stream_command_with_id(
+            "object.flash cpu=13 target=3 transport=0 dry_run=true",
+            45,
+        )
+        .expect("stream flash request");
+        let (id, request) = dmesh_server::protocol::decode_flash_handler_request(&command)
+            .expect("canonical flash request");
+        assert_eq!(id, 45);
+        assert_eq!(request.object.cpu, 13);
+        assert_eq!(request.object.target, 3);
+        assert_eq!(request.transport, 0);
+        assert!(request.dry_run);
+    }
+
+    #[test]
     fn connection_diagnostics_are_schema_driven_tagged_streams() {
         for (name, method) in [
             ("status", 1),
@@ -881,6 +912,30 @@ mod tests {
             dmesh_server::raw_wifi::decode_raw_wifi_handler(&expected[..used]),
             Ok(dmesh_server::raw_wifi::RawWifiLabRequest::Snapshot)
         );
+    }
+
+    #[test]
+    fn radio_tx_hex_is_a_correlated_stream_byte_request() {
+        assert!(
+            encode_direct_command("radio.tx frame=d000000000000000000000000000000000000000000000")
+                .is_err()
+        );
+        let stream = encode_stream_command_with_id(
+            "radio.tx frame=d000ffffffff00112233445566778899aabbccddeeff00112233445566 channel=6 interface=sta rate=6",
+            43,
+        )
+        .expect("stream radio TX");
+        let record = dmesh_server::tagged::decode(&stream).expect("tagged radio TX");
+        assert_eq!(record.id, Some(43));
+        let request =
+            dmesh_server::raw_wifi::decode_raw_wifi_tx_record(record).expect("raw TX bytes");
+        assert_eq!(request.channel, 6);
+        assert_eq!(
+            request.interface,
+            dmesh_server::raw_wifi::RawWifiInterface::Sta
+        );
+        assert_eq!(request.rate, dmesh_server::raw_wifi::RawWifiRate::Mbps6);
+        assert_eq!(request.frame[0], 0xd0);
     }
 
     #[test]

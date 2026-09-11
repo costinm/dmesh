@@ -7,8 +7,8 @@
 //! relay lookup table.
 
 use crate::{
-    ConnectionId, Error, ShortHeaderPrefix, decode_direct_packet,
-    decode_routing_prefix, rewrite_bootstrap_destination, rewrite_dcid,
+    ConnectionId, Error, ShortHeaderPrefix, decode_direct_packet, decode_routing_prefix,
+    rewrite_bootstrap_destination, rewrite_dcid,
 };
 
 /// Destination selected by an opaque relay rule.
