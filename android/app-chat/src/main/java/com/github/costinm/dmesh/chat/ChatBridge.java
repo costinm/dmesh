@@ -134,17 +134,28 @@ public class ChatBridge {
         synchronized (LOCK) {
             binder = remote;
         }
+        Log.i(TAG, "sendNow: binder=" + binder + " frame=" + (frame != null ? frame.method : null));
         if (binder == null) {
+            Log.w(TAG, "sendNow: binder is null!");
             return;
         }
-        boolean ok = DirectBinder.transact(
-                binder,
-                DirectBinder.TRANSACT_MESSAGE,
-                frame,
-                CALLBACK,
-                null);
+        Log.i(TAG, "sendNow: isBinderAlive=" + binder.isBinderAlive() + " ping=" + binder.pingBinder());
+        boolean ok = false;
+        try {
+            ok = DirectBinder.transact(
+                    binder,
+                    DirectBinder.TRANSACT_MESSAGE,
+                    frame,
+                    CALLBACK,
+                    null);
+        } catch (Throwable t) {
+            Log.e(TAG, "sendNow: DirectBinder.transact threw", t);
+            enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"transact exception: " + t + "\"}}");
+            return;
+        }
+        Log.i(TAG, "sendNow: transact returned ok=" + ok);
         if (!ok) {
-            enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed\"}}");
+            enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed (returned false)\"}}");
         }
     }
 

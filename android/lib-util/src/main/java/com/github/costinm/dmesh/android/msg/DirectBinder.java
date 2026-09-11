@@ -15,30 +15,10 @@ import java.io.FileDescriptor;
 import java.util.ArrayList;
 import java.util.List;
 
-
-/** DirectBinder is a raw, direct binder interface - not using AIDL or generated interface,
+/**
+ * DirectBinder is a raw, direct binder interface - not using AIDL or generated interface,
  * but closer to a protocol transport.
- *
- *  The payload is a []byte - not relying on generated code, avoiding String and copy.
- *  The binder has a limited number of threads - blocking operations can be done, but
- *  if the concurrency is close - it needs to switch to a separate thread pool and
- *  return immediately to allow other request to be processed. That means the response
- *  needs to be sent a a callback to the client, which implies the client needs to
- *  pass it's binder address to the server for 2-way message based communication.
- *
- *  Messenger is processing all the incomming messages on the single looper thread
- *  associated with the messenger - it could also dispatch to a thread pool to insure
- *  concurrency, and use the return Messenger to send back results if needed. The difference
- *  is that with DirectBinder there is less overhead in processing the data and in normal
- *  cases ( low QPS ) it an use the binder thread directly.
- *
- *  Parcel data is in a mmap buffer. If processing directly it doesn't need to be copied -
- *  otherwise (moving to thread pool) it does.
- *
- *  Note: it is not required to have a Service, the DirectBinder can be passed as a parameter
- *  and used without any Service declaration while the app is running. Service is needed to
- *  start or bind (and keep at higher importance) the process.
- *
+ * Supports both 1-way (asynchronous, FLAG_ONEWAY) and 2-way (synchronous) transactions.
  */
 public class DirectBinder extends Binder {
     private static final String TAG = "DirectBinder";
@@ -60,7 +40,7 @@ public class DirectBinder extends Binder {
     protected boolean onTransact(int code, Parcel data, Parcel reply,
                                  int flags) throws RemoteException {
         if (code == TRANSACT_MESSAGE || code == TRANSACT_OPEN) {
-            DirectMessage msg = readMessage(data);
+            DirectMessage msg = readMessage(data, flags);
             if (receiver != null) {
                 return receiver.onDirectMessage(code, msg, reply);
             }
@@ -73,19 +53,53 @@ public class DirectBinder extends Binder {
         return false;
     }
 
+    /**
+     * Send a one-way (asynchronous) transaction with optional callback binder and file descriptors.
+     */
     public static boolean transact(IBinder binder, int code, MsgFrame frame, IBinder callback,
                                    List<ParcelFileDescriptor> fds) {
+        return transactAsync(binder, code, frame, callback, fds);
+    }
+
+    /**
+     * Send a one-way (asynchronous) transaction.
+     */
+    public static boolean transactAsync(IBinder binder, int code, MsgFrame frame, IBinder callback,
+                                        List<ParcelFileDescriptor> fds) {
         Parcel in = Parcel.obtain();
-        Parcel out = Parcel.obtain();
         try {
             writeMessage(in, frame, callback, fds);
-            return binder.transact(code, in, out, 0);
+            return binder.transact(code, in, null, IBinder.FLAG_ONEWAY);
         } catch (RemoteException e) {
-            Log.d(TAG, "Direct binder transaction failed", e);
+            Log.d(TAG, "Direct binder async transaction failed", e);
             return false;
         } finally {
             in.recycle();
-            out.recycle();
+        }
+    }
+
+    /**
+     * Send a two-way (synchronous) transaction. If replyOut is provided and length >= 1,
+     * the reply message frame will be stored in replyOut[0].
+     */
+    public static boolean transactSync(IBinder binder, int code, MsgFrame frame,
+                                       List<ParcelFileDescriptor> fds, MsgFrame[] replyOut) {
+        Parcel in = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            writeMessage(in, frame, null, fds);
+            boolean ok = binder.transact(code, in, reply, 0);
+            if (ok && replyOut != null && replyOut.length > 0 && reply.dataAvail() > 0) {
+                DirectMessage replyMsg = readMessage(reply, 0);
+                replyOut[0] = replyMsg.frame;
+            }
+            return ok;
+        } catch (RemoteException e) {
+            Log.d(TAG, "Direct binder sync transaction failed", e);
+            return false;
+        } finally {
+            in.recycle();
+            reply.recycle();
         }
     }
 
@@ -114,6 +128,10 @@ public class DirectBinder extends Binder {
     }
 
     public static DirectMessage readMessage(Parcel in) {
+        return readMessage(in, 0);
+    }
+
+    public static DirectMessage readMessage(Parcel in, int flags) {
         String id = in.readString();
         String method = in.readString();
         MsgFrame frame = new MsgFrame(method);
@@ -128,7 +146,7 @@ public class DirectBinder extends Binder {
         for (int i = 0; i < fdCount; i++) {
             fds.add(in.readFileDescriptor());
         }
-        return new DirectMessage(frame, callback, fds);
+        return new DirectMessage(frame, callback, fds, flags);
     }
 
     public void dial(Context ctx, String addr) {
@@ -137,17 +155,9 @@ public class DirectBinder extends Binder {
         i.setComponent(new ComponentName(parts[0], parts[1]));
         i.setAction(ACTION_DIRECT);
 
-        // TODO: exp backoff, stop after X retries, etc.
         ServiceConnection sc = new ServiceConnection() {
             @Override
             public void onServiceConnected(ComponentName name, IBinder service) {
-
-                //                svc = new Messenger(service);
-//                Log.d(TAG, "Connected to " + name);
-//
-//                Message m = Message.obtain();
-//                m.getData().putBoolean(":open", true);
-//                send(m);
                 MsgFrame open = new MsgFrame(null);
                 open.fields.put(":open", "1");
                 transact(service, TRANSACT_OPEN, open, DirectBinder.this, null);
@@ -155,21 +165,10 @@ public class DirectBinder extends Binder {
 
             @Override
             public void onServiceDisconnected(ComponentName name) {
-//                svc = null;
-//                Log.d(TAG, "LM service disconnected" + name);
-//                mux.broadcastHandler.postDelayed(new Runnable() {
-//                    @Override
-//                    public void run() {
-//                        bind(ctx);
-//                    }
-//                }, 1000);
             }
         };
 
-        boolean b = ctx.bindService(i, sc, Context.BIND_AUTO_CREATE);
-        if (!b) {
-        }
-
+        ctx.bindService(i, sc, Context.BIND_AUTO_CREATE);
     }
 
     public interface Receiver {
@@ -180,11 +179,25 @@ public class DirectBinder extends Binder {
         public final MsgFrame frame;
         public final IBinder callback;
         public final ArrayList<ParcelFileDescriptor> fds;
+        public final int flags;
 
         DirectMessage(MsgFrame frame, IBinder callback, ArrayList<ParcelFileDescriptor> fds) {
+            this(frame, callback, fds, 0);
+        }
+
+        DirectMessage(MsgFrame frame, IBinder callback, ArrayList<ParcelFileDescriptor> fds, int flags) {
             this.frame = frame;
             this.callback = callback;
             this.fds = fds;
+            this.flags = flags;
+        }
+
+        public boolean isOneWay() {
+            return (flags & IBinder.FLAG_ONEWAY) != 0;
+        }
+
+        public boolean hasCallback() {
+            return callback != null;
         }
     }
 }

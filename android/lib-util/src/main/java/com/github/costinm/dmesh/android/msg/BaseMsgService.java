@@ -14,17 +14,8 @@ import android.os.RemoteException;
 import android.util.Log;
 
 /**
- * Server-side messaging mux, using Messenger. This is similar to typical HTTP - using Binder
- * but without requiring an AIDL. Parameters can be marshalled as a Bundle (like json) or
- * in byte[] - including proto, CBOR, json - as received from remote device and without
- * expensive conversions.
- * <p>
- * The base service is exposing a Messenger interface for bind, and accepting a Messenger callback.
- * <p>
- * Works on GB+, but only LMP+ has support for credential passing and can verify the identity of the
- * caller.
- * <p>
- * Client side is Mux, who handles all in/out connections and dispatching.
+ * Server-side messaging mux, using Messenger or DirectBinder.
+ * Handles both 1-way (asynchronous with callback binder) and 2-way (synchronous with reply Parcel).
  */
 public class BaseMsgService extends Service {
 
@@ -56,17 +47,12 @@ public class BaseMsgService extends Service {
     }
 
     /**
-     * Return a Messenger object. Clients must send Messages.
-     * <p>
-     * For <LMP, the identity of the caller is no available - we are going to relax the security
-     * and allow the caller.
-     * <p>
-     * All received messages are processed via mux.handleInMessage
+     * Return DirectBinder for "mesh.direct" or Messenger binder.
      */
     @Override
     public IBinder onBind(Intent intent) {
         Log.d(TAG, "BIND Intent " + intent + " " + intent.getExtras());
-        if (intent != null && "mesh.direct".equals(intent.getAction())) {
+        if (intent != null && DirectBinder.ACTION_DIRECT.equals(intent.getAction())) {
             return db;
         }
         return inMessenger.getBinder();
@@ -82,12 +68,7 @@ public class BaseMsgService extends Service {
     }
 
     /**
-     * onTransact implements the raw binder interface - no marshalling with Parcelable is done,
-     * receiver can use the Parcel directly.
-     *
-     * This is the most memory efficient way to use binder - call  data.readBlob();
-     * reply.writeByte((byte)n), etc;
-     *
+     * onTransact implements the raw binder interface.
      */
     protected boolean onTransact(int code, Parcel data, Parcel reply,
                                  int flags) throws RemoteException {
@@ -99,22 +80,48 @@ public class BaseMsgService extends Service {
         String key = "direct:" + Binder.getCallingUid();
         MsgConn c = mux.activeIn.get(key);
         boolean open = direct.frame != null && "1".equals(direct.frame.fields.get(":open"));
+        boolean oneWay = direct.isOneWay();
+
         if (c == null || open) {
             c = new DirectMsgConn(mux, direct.callback, key);
             mux.addInConnection(key, c, direct.frame == null ? Message.obtain() : direct.frame.toMessage());
-            Log.d(TAG, "New direct binder client " + key);
+            Log.d(TAG, "New direct binder client " + key + " oneWay=" + oneWay + " hasCallback=" + direct.hasCallback());
         } else if (c instanceof DirectMsgConn && direct.callback != null) {
             ((DirectMsgConn) c).out = direct.callback;
         }
-        return mux.handleFrame(key, c, direct.frame == null ? new MsgFrame(null) : direct.frame);
+
+        if (oneWay) {
+            if (!direct.hasCallback() && direct.frame != null && !":open".equals(direct.frame.method)) {
+                Log.w(TAG, "One-way direct message received without callback binder: " + direct.frame.method);
+            }
+        }
+
+        MsgFrame frame = direct.frame == null ? new MsgFrame(null) : direct.frame;
+
+        // If 2-way call and reply parcel is provided, allow generating a direct synchronous response
+        if (!oneWay && reply != null) {
+            MsgFrame syncReply = handleDirectSyncRequest(key, c, frame);
+            if (syncReply != null) {
+                DirectBinder.writeMessage(reply, syncReply, null, null);
+                return true;
+            }
+        }
+
+        return mux.handleFrame(key, c, frame);
+    }
+
+    /**
+     * Hook for subclasses or services to provide a synchronous response for 2-way transactions.
+     * Returns null if standard asynchronous dispatch via MsgMux should occur instead.
+     */
+    protected MsgFrame handleDirectSyncRequest(String src, MsgConn con, MsgFrame frame) {
+        return null;
     }
 
     /**
      * Message received using the Messenger interface exposed to clients (registered handlers)
      */
     protected boolean handleInMessage(Message msg) {
-        // TODO: verify MsgConn first call, replyTo
-        // TODO: inject debug handler
         String key = "" + msg.sendingUid;
         MsgConn c = mux.activeIn.get(key);
 
@@ -127,23 +134,11 @@ public class BaseMsgService extends Service {
         return mux.handleMessage(key, c, msg);
     }
 
-    /**
-     * Alternative to binding to the service: will pass a Messenger ("m") and a PendingIntent ("p").
-     * <p>
-     * The service will use the Messenger parameter to send back an initial Message with 'replyTo'
-     * set to the service Messenger.
-     * <p>
-     * At this point the communication continues just like in the case of 'bind'.
-     * <p>
-     * This works in BroadcastReceivers and cases where a full bind is not needed. Note that the
-     * service or the app may go away at any time.
-     */
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null) {
             return START_NOT_STICKY;
         }
-        // Send back our messenger. Used instead of bind.
         Messenger m = intent.getParcelableExtra("m");
         if (m != null) {
             Message msg = Message.obtain();
@@ -163,25 +158,12 @@ public class BaseMsgService extends Service {
     static class MsgConMessengerS extends MsgConn {
         Messenger out;
 
-        /**
-         * Server-side connection, using a Messenger and optional PendingIntent
-         * <p>
-         * TODO: If myPendingIntent is present, will be used as a Service (or Broadcast?), to restart the app,
-         * passing a Messenger. The messages will be queued.
-         */
         MsgConMessengerS(MsgMux mux, Messenger out, String name) {
             super(mux);
             this.out = out;
             this.name = name;
         }
 
-        /**
-         * Send a message to the remote side.
-         * <p>
-         * For server connections (DMMsgService, or internal activeIn with callbacks), it is sent to the client.
-         * <p>
-         * For client connections (bind to a server), it is sent to the server.
-         */
         public boolean send(Message m) {
             if (out == null) {
                 return false;
@@ -200,10 +182,10 @@ public class BaseMsgService extends Service {
         }
     }
 
-    static class DirectMsgConn extends MsgConn {
-        IBinder out;
+    public static class DirectMsgConn extends MsgConn {
+        public IBinder out;
 
-        DirectMsgConn(MsgMux mux, IBinder out, String name) {
+        public DirectMsgConn(MsgMux mux, IBinder out, String name) {
             super(mux);
             this.out = out;
             this.name = name;

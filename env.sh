@@ -25,7 +25,7 @@ export DMESH_BOOT_RECOVERY_SDK_VERSION="v6.0.2"
 export DMESH_BOOT_RECOVERY_ESP_ROOT="${DMESH_BOOT_RECOVERY_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
 export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${_dmesh_target_base}/target}"
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${_dmesh_target_base}/gradle}"
-export TMPDIR="${TMPDIR:-/tmp}"
+export TMPDIR="/tmp"
 export NIX_PROFILE="${DMESH_NIX_PROFILE:-${_dmesh_target_base}/nix/profile}"
 export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes}"
 # Android tooling is repository-local too.  Keep platform-tools available to
