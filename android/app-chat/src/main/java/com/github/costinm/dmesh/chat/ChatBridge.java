@@ -52,16 +52,19 @@ public class ChatBridge {
 
     private static MsgFrame frameForText(String text) {
         String trimmed = text == null ? "" : text.trim();
-        if (trimmed.equals("/messages") || trimmed.startsWith("/messages ")) {
+        while (trimmed.startsWith("/")) {
+            trimmed = trimmed.substring(1).trim();
+        }
+        if (trimmed.equals("messages") || trimmed.startsWith("messages ")) {
             MsgFrame frame = new MsgFrame("messages.subscribe");
             String[] parts = trimmed.split("\\s+", 2);
             frame.fields.put("keys", parts.length > 1 ? parts[1].trim() : "all");
             frame.fields.put("from", "app-chat-ui");
             return frame;
         }
-        if (trimmed.startsWith("/")) {
+        if (text != null && text.trim().startsWith("/")) {
             String[] parts = trimmed.split("\\s+", 2);
-            MsgFrame frame = new MsgFrame(parts[0].substring(1).replace('/', '.'));
+            MsgFrame frame = new MsgFrame(parts[0].replace('/', '.'));
             frame.fields.put("from", "app-chat-ui");
             if (parts.length > 1) {
                 frame.fields.put("text", parts[1]);
@@ -140,22 +143,65 @@ public class ChatBridge {
             return;
         }
         Log.i(TAG, "sendNow: isBinderAlive=" + binder.isBinderAlive() + " ping=" + binder.pingBinder());
-        boolean ok = false;
-        try {
-            ok = DirectBinder.transact(
-                    binder,
-                    DirectBinder.TRANSACT_MESSAGE,
-                    frame,
-                    CALLBACK,
-                    null);
-        } catch (Throwable t) {
-            Log.e(TAG, "sendNow: DirectBinder.transact threw", t);
-            enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"transact exception: " + t + "\"}}");
-            return;
-        }
-        Log.i(TAG, "sendNow: transact returned ok=" + ok);
-        if (!ok) {
-            enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed (returned false)\"}}");
+        
+        // Check if this is a streaming subscription vs request
+        boolean isSubscribe = frame != null && "messages.subscribe".equals(frame.method);
+        
+        if (isSubscribe) {
+            // For continuous subscriptions, use 1-way transaction with CALLBACK binder
+            boolean ok = false;
+            try {
+                ok = DirectBinder.transactAsync(
+                        binder,
+                        DirectBinder.TRANSACT_MESSAGE,
+                        frame,
+                        CALLBACK,
+                        null);
+            } catch (Throwable t) {
+                Log.e(TAG, "sendNow: DirectBinder.transactAsync threw", t);
+                enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"transact exception: " + t + "\"}}");
+                return;
+            }
+            Log.i(TAG, "sendNow async transact returned ok=" + ok);
+            if (!ok) {
+                enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed (returned false)\"}}");
+            }
+        } else {
+            // Try 2-way synchronous transaction first to receive direct responses
+            MsgFrame[] replyOut = new MsgFrame[1];
+            boolean ok = false;
+            try {
+                ok = DirectBinder.transactSync(
+                        binder,
+                        DirectBinder.TRANSACT_MESSAGE,
+                        frame,
+                        null,
+                        replyOut);
+            } catch (Throwable t) {
+                Log.e(TAG, "sendNow: DirectBinder.transactSync threw", t);
+            }
+            if (ok && replyOut[0] != null) {
+                Log.i(TAG, "sendNow sync response received: " + replyOut[0].method);
+                enqueueEvent(replyOut[0].toJsonLine());
+            } else if (!ok) {
+                // Fallback to async transaction with CALLBACK
+                Log.i(TAG, "sendNow sync not handled or failed, trying async fallback");
+                try {
+                    ok = DirectBinder.transactAsync(
+                            binder,
+                            DirectBinder.TRANSACT_MESSAGE,
+                            frame,
+                            CALLBACK,
+                            null);
+                } catch (Throwable t) {
+                    Log.e(TAG, "sendNow: DirectBinder.transactAsync fallback threw", t);
+                    enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"transact exception: " + t + "\"}}");
+                    return;
+                }
+                if (!ok) {
+                    enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed (returned false)\"}}");
+                }
+            }
         }
     }
 

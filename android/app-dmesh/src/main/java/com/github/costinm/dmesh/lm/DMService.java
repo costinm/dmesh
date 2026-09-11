@@ -119,6 +119,37 @@ public class DMService extends BaseMsgService implements MessageHandler {
         }
     }
 
+    @Override
+    protected MsgFrame handleDirectSyncRequest(String src, MsgConn con, MsgFrame frame) {
+        if (frame == null || frame.method == null) {
+            return null;
+        }
+        String method = frame.method;
+        StringBuilder line = new StringBuilder(method);
+        String text = frame.fields.get("text");
+        if (text != null && !text.isEmpty()) {
+            line.append(" ").append(text);
+        }
+        for (Map.Entry<String, String> entry : frame.fields.entrySet()) {
+            if ("text".equals(entry.getKey()) || "from".equals(entry.getKey())) continue;
+            line.append(" ").append(entry.getKey()).append("=").append(entry.getValue());
+        }
+        try {
+            DMeshCommand.Result res = DMeshCommand.run(this, mux, meshNode, line.toString());
+            MsgFrame reply = new MsgFrame(method + ".reply");
+            reply.id = frame.id;
+            reply.fields.putAll(res.fields);
+            recordJsonFrame(reply);
+            return reply;
+        } catch (Throwable t) {
+            Log.w(TAG, "Sync command failed: " + line, t);
+            MsgFrame err = new MsgFrame(method + ".error");
+            err.id = frame.id;
+            err.fields.put("error", String.valueOf(t.getMessage()));
+            return err;
+        }
+    }
+
     public void onLowMemory() {
         Log.d(TAG, "On Low memory");
     }
