@@ -8,29 +8,33 @@ else
 fi
 
 export DMESH_REPO="${DMESH_REPO:-${_dmesh_env_dir}}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${DMESH_REPO}/target/cache}"
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${DMESH_REPO}/target/config}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-${DMESH_REPO}/target/share}"
-export XDG_STATE_HOME="${XDG_STATE_HOME:-${DMESH_REPO}/target/state}"
-export CARGO_HOME="${DMESH_CARGO_HOME:-${DMESH_REPO}/target/cargo}"
-export RUSTUP_HOME="${DMESH_RUSTUP_HOME:-${DMESH_REPO}/target/rustup}"
+
+_dmesh_target_base="${HOME:-/tmp}/.cache/ws/dmesh"
+mkdir -p "${_dmesh_target_base}" 2>/dev/null || true
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_dmesh_target_base}/cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_dmesh_target_base}/config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${_dmesh_target_base}/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${_dmesh_target_base}/state}"
+export CARGO_HOME="${DMESH_CARGO_HOME:-${_dmesh_target_base}/cargo}"
+export RUSTUP_HOME="${DMESH_RUSTUP_HOME:-${_dmesh_target_base}/rustup}"
 # SDK 6 is the repository default.  Do not inherit an old SDK environment
 # from the parent shell: that was the source of commands needing `env -u`
 # during the migration.  An alternate SDK is an explicit exception.
-export DMESH_ESP_ROOT="${DMESH_ESP_ROOT_OVERRIDE:-${DMESH_REPO}/target/esp32-6.0}"
+export DMESH_ESP_ROOT="${DMESH_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
 export DMESH_BOOT_RECOVERY_SDK_VERSION="v6.0.2"
-export DMESH_BOOT_RECOVERY_ESP_ROOT="${DMESH_BOOT_RECOVERY_ESP_ROOT_OVERRIDE:-${DMESH_REPO}/target/esp32-6.0}"
-export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${DMESH_REPO}/target}"
-export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${DMESH_REPO}/target/gradle}"
-export TMPDIR="${TMPDIR:-${DMESH_REPO}/target/tmp}"
-export NIX_PROFILE="${DMESH_NIX_PROFILE:-${DMESH_REPO}/target/nix/profile}"
+export DMESH_BOOT_RECOVERY_ESP_ROOT="${DMESH_BOOT_RECOVERY_ESP_ROOT_OVERRIDE:-${_dmesh_target_base}/esp32-6.0}"
+export CARGO_TARGET_DIR="${DMESH_CARGO_TARGET_DIR:-${_dmesh_target_base}/target}"
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${_dmesh_target_base}/gradle}"
+export TMPDIR="/tmp"
+export NIX_PROFILE="${DMESH_NIX_PROFILE:-${_dmesh_target_base}/nix/profile}"
 export NIX_CONFIG="${NIX_CONFIG:-experimental-features = nix-command flakes}"
 # Android tooling is repository-local too.  Keep platform-tools available to
 # interactive callers after sourcing env.sh, not only inside build-android.sh.
 # Do not set or replace HOME here: ADB must use the caller's normal trust-key
 # location, while DMesh-specific build state stays in the XDG/target paths.
-export ANDROID_HOME="${ANDROID_HOME:-${DMESH_REPO}/target/android-sdk}"
+export ANDROID_HOME="${ANDROID_HOME:-${_dmesh_target_base}/android-sdk}"
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+export DMESH_ANDROID_SDK="${DMESH_ANDROID_SDK:-${ANDROID_HOME}}"
 
 # Keep the default catalog and the lab lmesh endpoint in one sourced place;
 # callers may override either for another component.

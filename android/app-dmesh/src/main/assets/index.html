@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mesh Console</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #f6f8fb;
+            --panel: #ffffff;
+            --text: #172033;
+            --muted: #667085;
+            --border: #d8dee8;
+            --accent: #1466cc;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+        header {
+            padding: 22px 28px;
+            border-bottom: 1px solid var(--border);
+            background: var(--panel);
+        }
+        h1 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 650;
+        }
+        main {
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 28px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+        }
+        a, .card {
+            display: block;
+            min-height: 108px;
+            padding: 18px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--panel);
+            color: inherit;
+            text-decoration: none;
+        }
+        a:hover {
+            border-color: var(--accent);
+        }
+        strong {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 16px;
+        }
+        span {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Mesh Console</h1>
+    </header>
+    <main>
+        <div class="grid">
+            <section class="card" id="this-node">
+                <strong>This node</strong>
+                <span>Loading the announced local status…</span>
+            </section>
+            <a href="discovery.html">
+                <strong>Discovery</strong>
+                <span>View discovered physical, VM, container, and control-plane nodes, then request bounded discovery.</span>
+            </a>
+            <a href="probe.html">
+                <strong>Probe</strong>
+                <span>Run the public end-to-end probe when this mesh advertises probe.run.</span>
+            </a>
+            <a href="services.html">
+                <strong>Services</strong>
+                <span>Browse the intended interface, or enable Show all tagged methods for legacy, debug, protocol, and service-specific APIs.</span>
+            </a>
+            <a href="trace/trace_viewer.html">
+                <strong>Trace</strong>
+                <span>Open the trace aggregation viewer.</span>
+            </a>
+        </div>
+    </main>
+    <script>
+        const base = new URL('../mesh/', location.href);
+        const key = new URL(location.href).searchParams.get('apikey');
+        const root = document.getElementById('this-node');
+        const url = path => { const value = new URL(path, base); if (key) value.searchParams.set('apikey', key); return value; };
+        async function request(path, options) { const response = await fetch(url(path), options); const value = await response.json().catch(() => ({})); if (!response.ok) throw Error(value.error || `HTTP ${response.status}`); return value; }
+        async function loadThisNode() {
+            try {
+                const registry = await request('services'); let service;
+                for (const candidate of registry.services || []) {
+                    const catalog = await request(`services/${encodeURIComponent(candidate.name)}/tools?view=default`);
+                    if ((Array.isArray(catalog) ? catalog : catalog.tools || []).some(tool => tool.name === 'discovery.status')) { service = candidate.name; break; }
+                }
+                if (!service) throw Error('discovery.status is not advertised.');
+                const response = await request(`services/${encodeURIComponent(service)}/call/discovery.status`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:1})});
+                const status = response?.result || response || {};
+                const rows = [];
+                for (const network of status.local_networks || []) { const address = network.link_local_v6 || network.addresses?.[0]; if (address) rows.push(`${network.interface ? `${network.interface}: ` : ''}${address}${network.interface && !address.includes('%') ? `%${network.interface}` : ''}`); }
+                root.replaceChildren(Object.assign(document.createElement('strong'), {textContent:'This node'}), Object.assign(document.createElement('span'), {textContent:rows.length ? rows.join(' · ') : 'No announced local address is currently available.'}));
+            } catch (error) { root.replaceChildren(Object.assign(document.createElement('strong'), {textContent:'This node'}), Object.assign(document.createElement('span'), {textContent:error.message})); }
+        }
+        loadThisNode();
+    </script>
+</body>
+</html>

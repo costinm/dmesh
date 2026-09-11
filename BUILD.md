@@ -4,42 +4,58 @@ This repository owns device-specific mesh code: `lmesh`, `dmesh-store`,
 `mesh-tun`, and `fw/esp32`. It consumes upstream `mesh` for common telemetry
 and protocol support, and `ssh-mesh` for SSH, HTTPS, SFTP, and forwarding.
 
+## Prerequisites & Host Setup
+
+On a fresh environment (e.g., Linux VM or container):
+
+1. **Host tools**:
+   ```sh
+   sudo apt-get update && sudo apt-get install -y git curl
+   ```
+
+2. **Clone DMesh**:
+   ```sh
+   git clone https://github.com/costinm/dmesh.git
+   ```
+   *(Optional: Clone sibling `git clone https://github.com/costinm/ssh-mesh.git` if modifying API schemas or building `mesh-cli`)*
+
+3. **Install Nix**:
+   If Nix is not already present on the host:
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
+   . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+   ```
+
+> [!NOTE]
+> **Filesystem Symlinks (Android / FUSE / FAT / SD mounts)**:
+> In environments where the repository resides on a filesystem that restricts symlink creation (such as Android `/storage/emulated/10`), `env.sh` automatically detects this and falls back to `$HOME/.cache/ws/dmesh/` for Cargo targets and Nix profiles, keeping ephemeral build state within standard cache locations excluded from backups and syncs.
+
 ## Local build environment
 
 The checked-in build scripts source `env.sh` before invoking Cargo, Nix,
-Android, or firmware tools. Source it yourself before any direct Android or
-device command too: it selects the repo-local SDK's `adb` and makes attached
-devices visible. It keeps all mutable state under `target/`: Cargo,
+Android, or firmware tools. It keeps mutable state under `target/` (or the automatic `$HOME/.cache/ws/dmesh` fallback): Cargo,
 Rustup, Gradle, Nix profiles, Android SDK/NDK, ESP-IDF, and the Rust ESP
-toolchain. It does not use a host home directory or host-installed build
-tools. Source `env.sh` manually before using other repo tools, especially
-`adb`.
+toolchain.
 
 ```sh
 cd "$(git rev-parse --show-toplevel)"
 . ./env.sh
-
-# For one-off commands from a sandboxed runner that does not inherit shell
-# initialization:
-./scripts/with-env.sh rg --version
 ```
 
 ## Linux MUSL binaries
 
-Install the repo-local Nix profile, then build every DMesh binary for static
-MUSL:
+Install the dependency profile via Nix and build the DMesh binaries:
 
 ```sh
+# For fast Linux MUSL build (avoids downloading Android SDK / multiple JDKs):
+scripts/build.sh musl-deps
+
+# Or for complete dependencies (including Android SDK/NDK, Wireshark, etc.):
 scripts/build.sh deps
+
+# Build release static binaries:
 scripts/build.sh musl
 ```
-
-The resulting binaries are under
-`target/x86_64-unknown-linux-musl/release/`; use
-`target/x86_64-unknown-linux-musl/release/dmesh-cli` as ad-hoc CLI for UART or UDP
-sessions. The `lmesh-wifi` binary is managed and restarted automatically by mesh-init
-and runs with special CAP_NET_ADMIN to manage low-level Wifi - it can be used as a
- relay for NOW and NAN interactions and for discovery.
 
 Run the lmesh unit tests through the repository wrapper:
 
@@ -51,10 +67,9 @@ scripts/build.sh object-store-test
 
 These host-only checks source `env.sh`, select the repo-local Rust toolchain,
 and keep Cargo state under `target/`. Do not run standalone Cargo commands for
-the DMesh or object-store checks. The `mesh` and `mesh-init` artifacts are
-built from the sibling `ssh-mesh` checkout by
-`scripts/build.sh musl`; that command delegates to ssh-mesh's main build script,
-which sources its own `env.sh` and writes only to its own `target/`.
+the DMesh or object-store checks. The `mesh-cli` artifact is built from the
+sibling `ssh-mesh` checkout by `scripts/build.sh musl`; that build sources
+ssh-mesh's own `env.sh` and writes only to its own `target/`.
 
 Run the host-side Recovery/DRS2 protocol checks with:
 
@@ -87,19 +102,19 @@ tmux send-keys -t "$session":build 'source ./env.sh && scripts/build-fw.sh e6' E
 # Naming convention: build, DEVICE.uart, DEVICE.udp, and matrix.DESCRIPTION.
 # DEVICE.uart is interactive: it renders UART diagnostics and accepts commands
 # on stdin (status, services, log-watch 8, metrics, events, control,
-# probe 65536, quit) without a second serial owner.
+# iperf 65536, quit) without a second serial owner.
 tmux new-window -t "$session" -n e6.uart
 tmux send-keys -t "$session":e6.uart \
-  'source ./env.sh && dmesh-cli /dev/serial/by-id/<e6-serial> --watch --interactive --timeout-secs 300' Enter
+  'source ./env.sh && target/debug/dmesh-cli /dev/serial/by-id/<e6-serial> --watch --interactive --timeout-secs 300' Enter
 
 # Run stream requests and throughput checks in separate windows. Substitute
 # a serial path or udp://<device-ip>:3339; both use the same stream services.
 tmux new-window -t "$session" -n e6.udp
 tmux send-keys -t "$session":e6.udp \
-  'source ./env.sh && dmesh-cli udp://10.78.0.101:3339 status' Enter
+  'source ./env.sh && target/debug/dmesh-cli udp://10.78.0.101:3339 --service status' Enter
 tmux new-window -t "$session" -n e7.udp
 tmux send-keys -t "$session":e7.udp \
-  'source ./env.sh && dmesh-cli udp://10.78.0.102:3339 log-watch' Enter
+  'source ./env.sh && target/debug/dmesh-cli udp://10.78.0.102:3339 --log-watch' Enter
 
 tmux attach -t "$session"
 ```
@@ -122,19 +137,21 @@ captured logs stay attributable to one device.
 
 The profile is `target/nix/profile`; `lmesh`, `mesh-tun`, and `dmeshtui` are
 written to `target/x86_64-unknown-linux-musl/release/`. The generic `mesh` CLI
-and `mesh-init` are built by the sibling ssh-mesh workspace through
-`$DMESH_SSH_MESH_DIR/scripts/build.sh rust PACKAGE`. After sourcing
-`env.sh`, the sibling release directory is placed on `PATH`; `MESH_TOOLS`
-defaults to lmesh's
+is built only by the sibling ssh-mesh workspace, at
+`$DMESH_SSH_MESH_DIR/target/x86_64-unknown-linux-musl/release/mesh`. After
+sourcing `env.sh`, that is the only `mesh` selected through PATH and
+placed on `PATH`; `MESH_TOOLS` defaults to lmesh's
 generated command catalog. The default `MESH_SERVICE_DIR` selects the installed
-mesh-init service definitions. `mesh` itself remains
+mesh-init service definitions. The `lmesh-uart` forwarding service is retired;
+use `dmesh-cli` for a physical serial interface. `mesh` itself remains
 service-independent, and callers can override `MESH_TOOLS` or
 `MESH_SERVICE_DIR`.
 
 ### Managed Linux radio services
 
 The privileged stable AP/radio service is `lmesh-wifi` on `wlan0`. `lmesh` is
-a separate development/test service. After sourcing `env.sh`, use the
+the separate development/test service and normally uses `wlan1`; do not mix
+their interfaces or UDP test endpoints. After sourcing `env.sh`, use the
 ssh-mesh `mesh` client for operational RPC rather than invoking a service
 binary directly:
 
@@ -142,14 +159,17 @@ binary directly:
 # Read-only state useful before and after a firmware bearer test.
 mesh lmesh-wifi wifi.ap.stations iface=wlan0
 mesh lmesh-wifi wifi.rawnan.status iface=wlan0
+mesh lmesh wifi.ap.stations iface=wlan1
 ```
 
-Both are supervised by `mesh-init`. The shared service resolver selects its
-standard control socket (`/run/mesh/mesh-init/mesh.sock` in root mode):
+Both are supervised by `mesh-init`. On this host its control socket is
+`/run/mesh/mesh-init/mesh.sock`; the checkout environment can select another
+run directory, so set it explicitly for supervisor calls:
 
 ```sh
-mesh mesh-init mesh-init status lmesh-wifi
-mesh mesh-init mesh-init status lmesh
+export MESH_INIT_SOCK=/run/mesh/mesh-init/mesh.sock
+mesh-init status lmesh-wifi
+mesh-init status lmesh
 ```
 
 Do not use `systemctl`, signal a service PID, or spawn an unsupervised
@@ -159,8 +179,8 @@ does not automatically restart the service, so always issue the matching
 `start` and capture station/recovery evidence:
 
 ```sh
-mesh mesh-init mesh-init stop lmesh-wifi
-mesh mesh-init mesh-init start lmesh-wifi
+mesh-init stop lmesh-wifi
+mesh-init start lmesh-wifi
 ```
 
 Android JNI/UI crates remain Android build inputs and are not included in the
@@ -172,26 +192,35 @@ installs the stable Rust toolchain and MUSL target into `target/rustup`.
 ## Android
 
 Install the Android SDK, NDK, JDK, Rust/NDK helpers, and other host tools into
-the same repo-local profile, then build the Android apps:
+the repo-local profile:
 
 ```sh
 scripts/build-android.sh deps
-scripts/build-android.sh build debug
 ```
 
-Android SDK/NDK contents are installed under `target/android-sdk`; generated
-native libraries and APKs remain under `target/`.
+### Native Rust Libraries (`libdmesh.so`, `libdmeshui.so`)
 
-For a direct device command or the standalone P2P/NAN qualifier, source the
-environment first and select a serial explicitly when more than one device is
-attached:
+All Rust native compilation logic lives in `scripts/build.sh`:
+- When Rust code is changed, rebuild the native `.so` libraries:
+  ```sh
+  scripts/build.sh android-libs debug
+  # Or for release stripped libraries:
+  scripts/build.sh android-libs release
+  ```
+  This uses `cargo-ndk` for configured target ABIs (defaults to `arm64-v8a`), strips symbols (for release builds), and copies the libraries into `android/<app>/src/main/jniLibs/<abi>/`.
 
-```sh
-. ./env.sh
-adb devices -l
-adb -s <serial> install -r target/apk/debug/app-dmesh-transport-debug.apk
-adb -s <serial> shell am start -n com.github.costinm.dmesh.transport/.ReproActivity
-```
+### Gradle Packaging & APKs
+
+`scripts/build-android.sh` is dedicated strictly to Gradle packaging, device provisioning, and tests:
+- To build debug or release APKs:
+  ```sh
+  scripts/build-android.sh build debug
+  ```
+- **Native Library Reuse**: By default, `scripts/build-android.sh` reuses already built `.so` files from `jniLibs/`. It will only invoke `scripts/build.sh android-libs` if the native libraries do not exist yet, or if `DMESH_REBUILD_RUST=1` is explicitly set.
+
+### Web UI & Static Resources
+
+Web resources (HTML, JavaScript, and tool definitions) are packaged as Android file assets under `android/app-dmesh/src/main/assets/` and `android/app-web/src/main/assets/`, rather than linked or embedded into the native Rust binary. The in-app web views load these directly via standard Android asset protocols (`file:///android_asset/`), keeping the Rust binary lightweight and decoupling web UI updates from native rebuilds.
 
 ## ESP32 firmware
 
@@ -278,11 +307,10 @@ Main/Recovery behavioral differences as bugs.
 For the lab host's Recovery network, install the separate
 `crates/lmesh-wifi/examples/mesh-init/lmesh-wifi.toml` mesh-init service and set its
 `LMESH_INTERFACES` value to the AP interface, for example `wlan0`.
-`lmesh-wifi` owns the fixed open `DIRECT-dmesh` AP and the
+`lmesh-wifi` owns the open MAC-derived `Direct-XXXXXXXX-Dmesh-local` AP and the
 shared raw-NAN monitor on `wlan0` at startup. Do not run a separate hostapd or
-WPA/NAN control daemon. Use `mesh lmesh-wifi nan.status` for radio state and
-the bearer-neutral `mesh lmesh-wifi probe to=NODE` QUIC stream service for a
-bounded end-to-end test.
+WPA/NAN control daemon. Use `mesh lmesh-wifi wifi.rawnan.status` and
+`mesh lmesh-wifi wifi.rawnan.ping` for bounded host tests.
 
 The frequently rebuilt experimental `lmesh` service is separate: its
 `LMESH_INTERFACES` should be `wlan1`, and it starts the same raw-NAN monitor on

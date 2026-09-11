@@ -137,6 +137,7 @@
               pkgs.which
               wpa-supplicant-nan
               pkgs.zip
+              pkgs.stdenv.cc
               musl-toolchain
             ];
             meta.priority = 10;
@@ -154,9 +155,27 @@
               fi
             done
           '';
+          muslDeps = pkgs.symlinkJoin {
+            name = "dmesh-musl-deps";
+            paths = [
+              pkgs.stdenv.cc
+              pkgs.coreutils
+              pkgs.findutils
+              pkgs.git
+              pkgs.gnugrep
+              pkgs.gnused
+              pkgs.ripgrep
+              pkgs.rustc
+              pkgs.rustup
+              pkgs.which
+              musl-toolchain
+            ];
+            meta.priority = 10;
+          };
         in
         {
           inherit deps musl-toolchain wpa-supplicant-nan;
+          musl-deps = muslDeps;
           default = deps;
         }
       );

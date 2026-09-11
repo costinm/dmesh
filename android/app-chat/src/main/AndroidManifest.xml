@@ -16,14 +16,11 @@
         android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".ChatActivity"
             android:label="DMesh Chat"
             android:exported="true"
-            android:configChanges="orientation|keyboardHidden|screenSize"
-            android:windowSoftInputMode="stateVisible|adjustResize">
-            <meta-data
-                android:name="android.app.lib_name"
-                android:value="dmeshui" />
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|keyboardHidden|screenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -34,8 +31,8 @@
             android:name=".RatatuiActivity"
             android:label="DMesh Ratatui"
             android:exported="true"
-            android:configChanges="orientation|keyboardHidden|screenSize"
-            android:windowSoftInputMode="stateVisible|adjustResize">
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|screenSize">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="dmeshui" />

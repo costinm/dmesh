@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mesh Services</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f8fb; --panel:#fff; --text:#172033; --muted:#667085; --border:#d8dee8; --accent:#1466cc; }
+    * { box-sizing: border-box; } body { margin:0; font:14px system-ui,sans-serif; color:var(--text); background:var(--bg); }
+    header, main { max-width:900px; margin:auto; } header { padding:20px; } main { padding:0 20px 28px; }
+    section { border:1px solid var(--border); border-radius:8px; background:var(--panel); padding:14px; } h1,h2 { margin:0 0 12px; } h1 { font-size:22px; } h2 { font-size:15px; }
+    button, select, input, textarea { font:inherit; } button { padding:7px 10px; border:1px solid var(--border); border-radius:5px; background:#fff; cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .muted { color:var(--muted); } label { display:grid; gap:4px; margin:10px 0; }
+    textarea { min-height:220px; width:100%; resize:vertical; border:1px solid var(--border); border-radius:5px; padding:8px; font-family:ui-monospace,monospace; }
+    pre { white-space:pre-wrap; overflow:auto; background:#f8fafc; border:1px solid var(--border); padding:10px; border-radius:5px; min-height:80px; }
+    .row { display:flex; gap:8px; align-items:end; flex-wrap:wrap; } .row label { min-width:180px; flex:1; }
+  </style>
+</head>
+<body>
+    <header><h1>Mesh Services</h1><p class="muted">Browse the intended interface by default. Show all includes legacy, debug, protocol, and service-specific tagged methods; policy still controls every call.</p><div id="status" class="muted">Loading service registry…</div></header>
+  <main><section>
+      <h2 id="title">Mesh methods</h2><p id="service-name" class="muted">Loading service…</p><p id="target" class="muted"></p>
+      <div class="row"><label>Discovered device<select id="target-node"><option value="">This server</option></select></label><label>Other target<input id="target-route" type="text" placeholder="[IPv6]:port or URL"></label><button id="apply-target">Use target</button><button id="clear-target">This server</button></div>
+      <div id="catalog-panel" hidden>
+        <div class="row"><label>Method<select id="method"></select></label><label><input id="show-all" type="checkbox"> Show all tagged methods</label></div>
+        <p id="view-note" class="muted">Showing the intended public interface.</p>
+        <div id="arguments"></div>
+        <div class="row"><button id="call" class="primary">Call method</button></div>
+      </div>
+      <details><summary>Advanced raw tagged-record JSON</summary><label>Tagged-record JSON<textarea id="record">{
+  "component": 0,
+  "method": 0,
+  "id": 1,
+  "env": {"1": 4}
+}</textarea></label>
+      <div class="row"><button id="send">Send raw record</button></div></details>
+      <h2>Result</h2><pre id="result"></pre>
+  </section></main>
+  <script>
+    const base = new URL('../mesh/', location.href);
+    const pageQuery = new URL(location.href).searchParams;
+    const apiKey = pageQuery.get('apikey');
+    let target = pageQuery.get('to');
+    const targetName = pageQuery.get('node');
+    const resultEl = document.querySelector('#result');
+    const statusEl = document.querySelector('#status');
+    let service; let catalog = []; let nextId = 1;
+    const showAll = document.querySelector('#show-all');
+    const viewNote = document.querySelector('#view-note');
+    showAll.checked = pageQuery.get('view') === 'all';
+    function selectedView() { return showAll.checked ? 'all' : 'default'; }
+    function renderViewNote() { viewNote.textContent = showAll.checked ? 'Showing every registered tagged method, including masked compatibility, debug, protocol, and service-specific methods.' : 'Showing the intended public interface.'; }
+    renderViewNote();
+    // A valid query key is persisted by the REST endpoint as an HttpOnly
+    // cookie. Keep sending it on this first page load; later navigation needs
+    // only the cookie and can omit it.
+    const url = path => { const value = new URL(path, base); if (apiKey) value.searchParams.set('apikey', apiKey); return value.toString(); };
+    function show(value) { resultEl.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+    function callPath(path) { const value = new URL(path, base); if (target) value.searchParams.set('to', target); if (apiKey) value.searchParams.set('apikey', apiKey); return `${value.pathname}${value.search}`; }
+    const targetInput = document.querySelector('#target-route');
+    const targetSelect = document.querySelector('#target-node');
+    targetInput.value = target || '';
+    function targetLabel() { const option = [...targetSelect.options].find(option => option.value === target); return targetName || option?.textContent || target; }
+    function renderTarget() { document.querySelector('#target').textContent = target ? `Target: ${targetLabel()} (${target}). Calls are directed through the selected mesh next hop.` : 'Target: this server. Select a discovered device or enter an explicit target.'; }
+    renderTarget();
+    function navigateTarget(value) { const next = new URL(location.href); if (value) next.searchParams.set('to', value); else next.searchParams.delete('to'); if (!value) next.searchParams.delete('node'); location.assign(next.toString()); }
+    document.querySelector('#apply-target').onclick = () => navigateTarget(targetInput.value.trim() || targetSelect.value);
+    document.querySelector('#clear-target').onclick = () => navigateTarget('');
+    targetSelect.onchange = () => { if (targetSelect.value) targetInput.value = ''; };
+    async function fetchJson(path, options) { const response = await fetch(url(path), options); const value = await response.json().catch(() => ({})); if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`); return value; }
+    async function load() {
+      try {
+        const registry = await fetchJson('services');
+        const services = registry.services || [];
+        const selected = services.find(entry => entry.name === 'lmesh') || services[0];
+        if (!selected) { statusEl.textContent = 'No services registered'; return; }
+        service = selected.name;
+        document.querySelector('#service-name').textContent = `${service} (${selected.backend})`;
+        statusEl.textContent = 'Ready.';
+        await loadTools();
+      } catch (error) { statusEl.textContent = `Registry error: ${error.message}`; }
+    }
+    function toolsArray(value) { return Array.isArray(value) ? value : (Array.isArray(value.tools) ? value.tools : []); }
+    function nodeList(value) { const data = value?.result ?? value ?? {}; return data.devices || data.nodes || data.discovered_devices || []; }
+    function nodeAddress(node) { const announce = node.announce || node; return announce.udp_link_local_v6 || announce.sta_link_local_v6 || announce.ap_link_local_v6; }
+    function nodeName(node) { const announce = node.announce || node; return announce.device_name || node.device_name || node.name || node.id || node.device_id || 'Unnamed node'; }
+    function nodeTarget(node) { const announce = node.announce || node; const address = nodeAddress(node); const port = announce.udp_port || (node.platform === 'esp32' ? 3339 : 3336); return address ? {value:`udp://${address.includes(':') ? `[${address}]` : address}:${port}`} : undefined; }
+    async function loadTargets() {
+      try {
+        const inventory = catalog.find(tool => tool.name === 'discovery.nodes');
+        if (!inventory) return;
+        const response = await fetch(url(`services/${encodeURIComponent(service)}/call/${encodeURIComponent(inventory.name)}`), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:nextId++}) });
+        if (!response.ok) return;
+        const nodes = nodeList(await response.json());
+        for (const node of nodes) {
+          const route = nodeTarget(node); if (!route) continue;
+          const address = nodeAddress(node);
+          targetSelect.add(new Option(`${nodeName(node)}${address ? ` · ${address}` : ''}`, route.value, false, route.value === target));
+        }
+        renderTarget();
+      } catch (_) { /* The target input remains usable when discovery is unavailable. */ }
+    }
+    async function loadTools() {
+      const panel = document.querySelector('#catalog-panel'); const select = document.querySelector('#method');
+      panel.hidden = true; select.replaceChildren(); catalog = [];
+      try {
+        const view = selectedView();
+        catalog = toolsArray(await fetchJson(`services/${encodeURIComponent(service)}/tools?view=${view}`));
+        for (const tool of catalog) { const option = document.createElement('option'); option.value = tool.name; option.textContent = tool.title ? `${tool.title} (${tool.name})` : tool.name; select.append(option); }
+        if (catalog.length) { panel.hidden = false; renderArguments(); await loadTargets(); }
+      } catch (error) { if (!String(error.message).includes('204')) show(`Catalog unavailable: ${error.message}`); }
+    }
+    function renderArguments() {
+      const tool = catalog.find(tool => tool.name === document.querySelector('#method').value); const root = document.querySelector('#arguments'); root.replaceChildren();
+      const properties = tool?.inputSchema?.properties || {}; const required = new Set(tool?.inputSchema?.required || []);
+      for (const [name, schema] of Object.entries(properties)) {
+        const label = document.createElement('label'); label.textContent = schema.title || name; label.dataset.name = name; label.dataset.required = required.has(name);
+        const type = Array.isArray(schema.type) ? schema.type.find(type => type !== 'null') : schema.type;
+        const input = schema.enum ? document.createElement('select') : document.createElement('input');
+        if (schema.enum) for (const value of schema.enum) { const option = document.createElement('option'); option.value = value; option.textContent = value; input.append(option); }
+        else if (type === 'boolean') { input.type = 'checkbox'; input.checked = Boolean(schema.default); }
+        else { input.type = type === 'integer' || type === 'number' ? 'number' : 'text'; if (schema.default !== undefined) input.value = schema.default; }
+        input.dataset.type = type || 'string'; label.append(input); root.append(label);
+      }
+      if (tool?.name === 'transport.start') {
+        const presets = document.createElement('div'); presets.className = 'row';
+        const note = document.createElement('span'); note.className = 'muted'; note.textContent = 'ESP NAN profiles:'; presets.append(note);
+        for (const [label, profile] of [
+          ['Sleepy NAN only', {kind: 6, nan_dw_interval: 8, now: 2, ap: 0}],
+          ['Awake NAN + NOW', {kind: 6, nan_dw_interval: 1, now: 1, ap: 0}],
+        ]) {
+          const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+          button.title = 'Sets the intended ESP transport profile; send it to a reachable target.';
+          button.onclick = () => {
+            for (const [name, value] of Object.entries(profile)) {
+              const input = root.querySelector(`label[data-name="${name}"] input, label[data-name="${name}"] select`);
+              if (input) input.value = value;
+            }
+          };
+          presets.append(button);
+        }
+        root.append(presets);
+      }
+    }
+    function callArguments() {
+      const values = {};
+      for (const label of document.querySelectorAll('#arguments label')) {
+        const input = label.querySelector('input,select'); const name = label.dataset.name; const type = input.dataset.type;
+        if (type === 'boolean') values[name] = input.checked;
+        else if (input.value || label.dataset.required === 'true') values[name] = type === 'integer' ? Number.parseInt(input.value, 10) : type === 'number' ? Number.parseFloat(input.value) : input.value;
+      }
+      return values;
+    }
+    document.querySelector('#send').onclick = async () => {
+      if (!service) return show('No service is registered.');
+      try {
+        const body = document.querySelector('#record').value;
+        if (!body) throw new Error('Enter a tagged record.');
+        const response = await fetch(url(callPath(`services/${encodeURIComponent(service)}/records`)), { method:'POST', headers:{'Content-Type':'application/json','Accept':'application/json'}, body });
+        show(await response.json().catch(() => ({error:`HTTP ${response.status}`})));
+      } catch (error) { show(`Error: ${error.message}`); }
+    };
+    showAll.onchange = () => { renderViewNote(); if (service) loadTools(); };
+    document.querySelector('#method').onchange = renderArguments;
+    document.querySelector('#call').onclick = async () => {
+      if (!service) return show('No service is registered.');
+      try {
+        const method = document.querySelector('#method').value;
+        const arguments = callArguments(); arguments.id = nextId++;
+        const response = await fetch(url(callPath(`services/${encodeURIComponent(service)}/call/${encodeURIComponent(method)}`)), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(arguments) });
+        show(await response.json().catch(() => ({error:`HTTP ${response.status}`})));
+      } catch (error) { show(`Error: ${error.message}`); }
+    };
+    load();
+  </script>
+</body>
+</html>

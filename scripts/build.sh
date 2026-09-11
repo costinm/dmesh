@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$SCRIPT_DIR/env.sh"
 cd "$DMESH_REPO"
 
-profile="${DMESH_NIX_PROFILE:-$DMESH_REPO/target/nix/profile}"
+profile="${NIX_PROFILE:-${DMESH_NIX_PROFILE:-$DMESH_REPO/target/nix/profile}}"
 ssh_mesh_url="${SSH_MESH_GIT_URL:-https://github.com/costinm/ssh-mesh}"
 CARGO_LOCK_BACKUP=""
 
@@ -58,6 +58,13 @@ require_dmesh_cargo() {
 
 ensure_rust_toolchain() {
     local rustup_bin="$profile/bin/rustup"
+    if [ ! -x "$rustup_bin" ]; then
+        rustup_bin="$(command -v rustup || true)"
+    fi
+    if [ -z "$rustup_bin" ]; then
+        echo "Missing rustup; run scripts/build.sh deps or install rustup" >&2
+        return 1
+    fi
 
     if ! "$rustup_bin" toolchain list | grep -q '^stable-'; then
         "$rustup_bin" toolchain install stable --profile minimal
@@ -65,7 +72,9 @@ ensure_rust_toolchain() {
     if ! "$rustup_bin" target list --installed | grep -qx 'x86_64-unknown-linux-musl'; then
         "$rustup_bin" target add x86_64-unknown-linux-musl
     fi
-    export PATH="$RUSTUP_HOME/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
+    if [ -d "$RUSTUP_HOME/toolchains/stable-x86_64-unknown-linux-gnu/bin" ]; then
+        export PATH="$RUSTUP_HOME/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
+    fi
 }
 
 configure_ssh_mesh_override() {
@@ -395,6 +404,186 @@ lmesh_wifi_restart() {
     restart_managed_service lmesh-wifi
 }
 
+
+target_triple() {
+    case "$1" in
+        arm64-v8a) echo "aarch64-linux-android" ;;
+        armeabi-v7a) echo "armv7-linux-androideabi" ;;
+        x86) echo "i686-linux-android" ;;
+        x86_64) echo "x86_64-linux-android" ;;
+        *)
+            echo "ERROR: unsupported Android ABI: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+detect_android_env() {
+    if [ -f "$profile/bin/dmesh-setenv" ]; then
+        . "$profile/bin/dmesh-setenv"
+    elif command -v dmesh-setenv >/dev/null 2>&1; then
+        . "$(command -v dmesh-setenv)"
+    elif [ -d "$profile/bin" ]; then
+        export PATH="$profile/bin:$PATH"
+    fi
+
+    if [ -z "${ANDROID_HOME:-}" ]; then
+        echo "ERROR: ANDROID_HOME is unset. Run scripts/build-android.sh deps, then source env.sh." >&2
+        exit 1
+    fi
+
+    if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+        local ndk_dir
+        ndk_dir=$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1 || true)
+        if [ -z "$ndk_dir" ]; then
+            echo "ERROR: No Android NDK found under $ANDROID_HOME/ndk." >&2
+            exit 1
+        fi
+        export ANDROID_NDK_HOME="$ndk_dir"
+    fi
+}
+
+copy_android_lib() {
+    local crate_name="$1"
+    local lib_name="$2"
+    local android_build_type="$3"
+    local abi="$4"
+    local triple
+    triple="$(target_triple "$abi")"
+
+    local rust_profile="release"
+    local target_dir="${CARGO_TARGET_DIR:-$DMESH_REPO/target}"
+    local so_path="$target_dir/$triple/$rust_profile/lib$lib_name.so"
+    if [ ! -f "$so_path" ]; then
+        echo "ERROR: Built library not found at $so_path" >&2
+        exit 1
+    fi
+
+    local strip_libs="${DMESH_STRIP_ANDROID_LIBS:-}"
+    if [ -z "$strip_libs" ]; then
+        if [ "$android_build_type" = "release" ]; then
+            strip_libs=1
+        else
+            strip_libs=0
+        fi
+    fi
+
+    local strip_bin=""
+    if [ "$strip_libs" = "1" ]; then
+        strip_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+        if [ ! -x "$strip_bin" ]; then
+            echo "ERROR: Android llvm-strip not found at $strip_bin" >&2
+            exit 1
+        fi
+    fi
+
+    local app
+    for app in ${DMESH_JNILIB_APPS:-app-dmesh}; do
+        local jnilib_dir="$DMESH_REPO/android/$app/src/main/jniLibs/$abi"
+        local jnilib_so="$jnilib_dir/lib$lib_name.so"
+        mkdir -p "$jnilib_dir"
+        cp -f "$so_path" "$jnilib_so"
+        local copied_size
+        copied_size="$(stat -c%s "$jnilib_so")"
+        if [ "$strip_libs" = "1" ]; then
+            "$strip_bin" --strip-unneeded "$jnilib_so"
+            local stripped_size
+            stripped_size="$(stat -c%s "$jnilib_so")"
+            echo "Copied $crate_name (rust $rust_profile, android $android_build_type) to: $jnilib_so"
+            echo "Stripped $jnilib_so: $copied_size -> $stripped_size bytes"
+        else
+            echo "Copied $crate_name (rust $rust_profile, android $android_build_type, unstripped) to: $jnilib_so ($copied_size bytes)"
+        fi
+    done
+}
+
+clean_android_lib_outputs() {
+    local lib_name="$1"
+    local app
+    for app in ${DMESH_JNILIB_APPS:-app-dmesh}; do
+        local jnilib_dir="$DMESH_REPO/android/$app/src/main/jniLibs"
+        if [ -d "$jnilib_dir" ]; then
+            find "$jnilib_dir" -name "lib$lib_name.so" -type f -delete
+        fi
+    done
+}
+
+clean_app_dmesh_dmeshui() {
+    local jnilib_dir="$DMESH_REPO/android/app-dmesh/src/main/jniLibs"
+    if [ -d "$jnilib_dir" ]; then
+        find "$jnilib_dir" -name 'libdmeshui.so' -type f -delete
+    fi
+}
+
+copy_dmeshui_android_lib() {
+    local requested_apps="${DMESH_UI_APPS:-app-chat}"
+    local ui_apps=""
+    local app
+
+    for app in $requested_apps; do
+        if [ "$app" = "app-dmesh" ]; then
+            echo "Skipping dmeshui copy to app-dmesh; dmeshui is owned by app-chat."
+            continue
+        fi
+        ui_apps="$ui_apps $app"
+    done
+
+    clean_app_dmesh_dmeshui
+    if [ -z "${ui_apps// /}" ]; then
+        ui_apps=" app-chat"
+    fi
+
+    DMESH_JNILIB_APPS="$ui_apps"         build_rust_android_package dmeshui dmeshui "$1" "$2"
+}
+
+build_rust_android_package() {
+    local package="$1"
+    local lib_name="$2"
+    local android_build_type="$3"
+    local abi_list="$4"
+    local cargo_args=(build -p "$package" --lib --release)
+
+    if [ "$android_build_type" != "debug" ] && [ "$android_build_type" != "release" ]; then
+        echo "Usage: $0 android-libs [debug|release]" >&2
+        exit 1
+    fi
+
+    clean_android_lib_outputs "$lib_name"
+    for abi in $abi_list; do
+        echo "=== Building $package for $abi (rust release, android $android_build_type) ==="
+        cargo ndk -t "$abi" -P 28 "${cargo_args[@]}"
+        copy_android_lib "$package" "$lib_name" "$android_build_type" "$abi"
+    done
+}
+
+build_android_libs() {
+    local build_type="${1:-debug}"
+    detect_android_env
+    ensure_rust_toolchain
+    require_dmesh_cargo
+
+    local rustup_bin="$profile/bin/rustup"
+    if [ ! -x "$rustup_bin" ]; then
+        rustup_bin="$(command -v rustup || true)"
+    fi
+    if [ -n "$rustup_bin" ]; then
+        for target in aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android; do
+            if ! "$rustup_bin" target list --installed | grep -qx "$target"; then
+                "$rustup_bin" target add "$target"
+            fi
+        done
+    fi
+
+    echo "Using NDK: $ANDROID_NDK_HOME"
+    echo "Using SDK: $ANDROID_HOME"
+    echo ""
+    configure_ssh_mesh_override
+    clean_app_dmesh_dmeshui
+    build_rust_android_package dmesh dmesh "$build_type" "${DMESH_ANDROID_ABIS:-arm64-v8a}"
+    copy_dmeshui_android_lib "$build_type" "${DMESH_UI_ANDROID_ABIS:-arm64-v8a}"
+    clean_app_dmesh_dmeshui
+}
+
 restart_managed_service() {
     local service="$1"
     local binary="$DMESH_REPO/target/x86_64-unknown-linux-musl/release/$service"
@@ -439,5 +628,6 @@ case "${1:-musl}" in
     object-store-tcp-loopback) object_store_tcp_loopback "$@" ;;
     lmesh-restart) lmesh_restart ;;
     lmesh-wifi-restart) lmesh_wifi_restart ;;
-    *) echo "Usage: scripts/build.sh {deps|musl|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|firmware-e2e|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
+    android-libs|android-native) shift; build_android_libs "${1:-debug}" ;;
+    *) echo "Usage: scripts/build.sh {deps|musl|android-libs|check|lmesh-check|lmesh-test|lmesh-control-test|lmesh-api-generate|object-store-test|transport-test|firmware-e2e|transport-coverage|transport-fuzz-smoke|transport-loopback|transport-tcp-loopback|transport-compare|object-store-tcp-loopback|lmesh-restart|lmesh-wifi-restart}" >&2; exit 2 ;;
 esac

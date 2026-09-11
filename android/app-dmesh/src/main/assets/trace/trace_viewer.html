@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔭 Trace Hub — Local Observability</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0f0f13;
+            --bg-secondary: #16161d;
+            --bg-tertiary: #1c1c26;
+            --bg-card: #1e1e28;
+            --border: #2a2a3a;
+            --text-primary: #e4e4ef;
+            --text-secondary: #8888a0;
+            --text-muted: #555570;
+            --accent: #6c63ff;
+            --accent-glow: rgba(108, 99, 255, 0.15);
+            --green: #3dd68c;
+            --green-dim: rgba(61, 214, 140, 0.12);
+            --red: #ff6b6b;
+            --red-dim: rgba(255, 107, 107, 0.12);
+            --yellow: #ffd93d;
+            --yellow-dim: rgba(255, 217, 61, 0.12);
+            --blue: #4da6ff;
+            --blue-dim: rgba(77, 166, 255, 0.12);
+            --cyan: #4ec9b0;
+            --purple: #b18cfe;
+            --orange: #ff9f43;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            grid-template-rows: 56px 1fr;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            grid-column: 1 / -1;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            z-index: 10;
+        }
+
+        .header h1 {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .header h1 span {
+            font-size: 18px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            overflow-y: auto;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .sidebar-section h3 {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+            padding: 0 8px;
+        }
+
+        .source-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.15s;
+            font-size: 13px;
+        }
+
+        .source-item:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .source-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .source-dot.connected {
+            background: var(--green);
+            box-shadow: 0 0 6px var(--green);
+        }
+
+        .source-dot.disconnected {
+            background: var(--text-muted);
+        }
+
+        .source-name {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .source-toggle {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .source-toggle:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .source-toggle.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        /* Panels */
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .panel-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .panel-status {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 500;
+        }
+
+        .panel-status.active {
+            background: var(--green-dim);
+            color: var(--green);
+        }
+
+        .panel-status.inactive {
+            background: var(--red-dim);
+            color: var(--red);
+        }
+
+        .panel-body {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .panel-input {
+            width: 100%;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            margin-top: 6px;
+        }
+
+        .panel-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        /* Main content */
+        .main {
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Controls bar */
+        .controls {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .filter-buttons {
+            display: flex;
+            gap: 4px;
+        }
+
+        .filter-btn {
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 500;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .filter-btn.trace {
+            background: var(--bg-tertiary);
+            color: var(--text-muted);
+        }
+
+        .filter-btn.debug {
+            background: var(--bg-tertiary);
+            color: var(--cyan);
+        }
+
+        .filter-btn.info {
+            background: var(--bg-tertiary);
+            color: var(--blue);
+        }
+
+        .filter-btn.warn {
+            background: var(--bg-tertiary);
+            color: var(--yellow);
+        }
+
+        .filter-btn.error {
+            background: var(--bg-tertiary);
+            color: var(--red);
+        }
+
+        .filter-btn.active {
+            opacity: 1;
+            font-weight: 600;
+        }
+
+        .filter-btn:not(.active) {
+            opacity: 0.4;
+        }
+
+        .search-input {
+            flex: 1;
+            min-width: 150px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .btn {
+            padding: 5px 12px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            font-size: 12px;
+            cursor: pointer;
+            font-family: 'Inter', sans-serif;
+            transition: all 0.15s;
+        }
+
+        .btn:hover {
+            border-color: var(--accent);
+            color: var(--text-primary);
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .btn-primary:hover {
+            background: #5a52e0;
+        }
+
+        /* Log entries */
+        #logs {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 16px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .log-entry {
+            display: grid;
+            grid-template-columns: 80px 42px 90px 1fr;
+            gap: 8px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            line-height: 1.6;
+            animation: fadeIn 0.15s ease-out;
+            border-left: 2px solid transparent;
+        }
+
+        .log-entry:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .log-entry.trace {
+            border-left-color: var(--text-muted);
+        }
+
+        .log-entry.debug {
+            border-left-color: var(--cyan);
+        }
+
+        .log-entry.info {
+            border-left-color: var(--blue);
+        }
+
+        .log-entry.warn {
+            border-left-color: var(--yellow);
+        }
+
+        .log-entry.error {
+            border-left-color: var(--red);
+        }
+
+        .log-entry.hidden {
+            display: none;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-2px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .log-time {
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+
+        .log-level {
+            font-weight: 600;
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+
+        .log-level.trace {
+            color: var(--text-muted);
+        }
+
+        .log-level.debug {
+            color: var(--cyan);
+        }
+
+        .log-level.info {
+            color: var(--blue);
+        }
+
+        .log-level.warn {
+            color: var(--yellow);
+        }
+
+        .log-level.error {
+            color: var(--red);
+        }
+
+        .log-source {
+            font-size: 10px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: var(--accent-glow);
+            color: var(--accent);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 90px;
+            display: inline-block;
+        }
+
+        .log-message {
+            color: var(--text-primary);
+            word-break: break-word;
+        }
+
+        .log-target {
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+
+        .log-fields {
+            grid-column: 1 / -1;
+            color: var(--purple);
+            font-size: 11px;
+            padding-left: 220px;
+        }
+
+        /* Stats bar */
+        .stats {
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border);
+            padding: 6px 16px;
+            display: flex;
+            gap: 16px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .stat-value {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        label input[type="checkbox"] {
+            accent-color: var(--accent);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1><span>🔭</span> Trace Hub</h1>
+        <div class="header-actions">
+            <button class="btn" id="refresh-btn">⟳ Refresh trace</button>
+            <button class="btn" id="clear-btn">Clear</button>
+            <label><input type="checkbox" id="auto-scroll" checked> Auto-scroll</label>
+        </div>
+    </div>
+
+    <div class="sidebar">
+        <div class="sidebar-section">
+            <h3>Trace connection</h3>
+            <div id="sources-list">
+                <div class="source-item" style="color: var(--text-muted); font-style: italic;">
+                    Checking local trace buffer…
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <h3>Event watches</h3>
+            <div class="panel">
+                <div class="panel-body">
+                    <div class="controls"><input type="text" class="search-input" id="watch-name" placeholder="wifi.raw.monitor"><button class="btn" id="watch-add-btn">Watch</button></div>
+                    <div id="watch-status" class="source-item" aria-live="polite"></div>
+                    <div id="events-list" class="sources-list">Collecting event counters…</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="controls">
+            <input type="text" class="search-input" id="search" placeholder="Filter by text...">
+        </div>
+
+        <div id="logs"></div>
+
+        <div class="stats">
+            <div>Displayed: <span class="stat-value" id="total-count">0</span></div>
+            <div>Selected event records only</div>
+            <div style="margin-left: auto">Sources: <span class="stat-value" id="sources-count">0</span></div>
+        </div>
+    </div>
+
+    <script>
+        let connection = null;
+        let counts = { total: 0 };
+        let connectedSources = new Set();
+        // Keep both the queued SSE work and rendered DOM bounded.  A trace
+        // burst must not make a browser tab retain an unbounded event queue.
+        const MAX_ENTRIES = 4000;
+        const MAX_PENDING_ENTRIES = 4000;
+        const RENDER_BATCH_SIZE = 100;
+        const MAX_RENDERED_TEXT = 16 * 1024;
+        let pendingEntries = [];
+        const seenEntries = new Set();
+        let renderScheduled = false;
+        let droppedPendingEntries = 0;
+        // Do not use an absolute origin: nested SSH forwarding prefixes are
+        // part of the path. The viewer can be served directly at `/_m/trace`
+        // or as the admin asset `/_m/adm/trace/trace_viewer.html`.
+        const meshRoot = window.location.pathname.indexOf('/_m/');
+        const API_BASE = window.location.pathname.includes('/_m/adm/')
+            ? `${window.location.pathname.slice(0, meshRoot + 3)}trace`
+            : window.location.pathname.replace(/\/$/, '');
+
+        const logsDiv = document.getElementById('logs');
+        const searchInput = document.getElementById('search');
+
+        // ── Source management ──────────────────────────────────
+
+        async function refreshSources() {
+            const list = document.getElementById('sources-list');
+            try {
+                const res = await fetch(`${API_BASE}/api/level`);
+                const level = await res.json();
+                if (!res.ok) throw new Error(level.message || `HTTP ${res.status}`);
+                connectedSources = new Set(['local']);
+                renderSources([{name: 'local process buffer', path: '', connected: true,
+                    level: level.level || level.current_level || 'configured'}]);
+            } catch (e) {
+                connectedSources.clear();
+                list.innerHTML = '<div class="source-item" style="color: var(--red)">Local trace unavailable</div>';
+            }
+        }
+
+        function renderSources(sockets) {
+            const list = document.getElementById('sources-list');
+            if (sockets.length === 0) {
+                list.innerHTML = '<div class="source-item" style="color: var(--text-muted); font-style: italic;">No sources discovered</div>';
+                return;
+            }
+
+            list.innerHTML = sockets.map(s => `
+                <div class="source-item" data-name="${s.name}" data-path="${s.path}">
+                    <span class="source-dot ${s.connected ? 'connected' : 'disconnected'}"></span>
+                    <span class="source-name">${s.name}</span>
+                    <span class="meta">${s.connected ? 'connected' : 'disconnected'}</span>
+                </div>
+            `).join('');
+
+            document.getElementById('sources-count').textContent = sockets.filter(s => s.connected).length;
+        }
+
+        // ── Event counters and on-demand watches ──────────────
+
+        async function refreshEvents() {
+            const list = document.getElementById('events-list');
+            try {
+                const res = await fetch(`${API_BASE}/api/events`);
+                const body = await res.json();
+                if (!res.ok) throw new Error(body.message || `HTTP ${res.status}`);
+                const events = body.events || [];
+                if (!events.length) {
+                    list.textContent = 'No structured event types seen in this process yet.';
+                    return;
+                }
+                list.replaceChildren();
+                for (const event of events) {
+                    const row = document.createElement('label');
+                    row.className = 'source-item';
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.checked = Boolean(event.selected);
+                    checkbox.addEventListener('change', async () => {
+                        const enabled = checkbox.checked;
+                        checkbox.disabled = true;
+                        const applied = await setEventInfo(event.name, enabled);
+                        if (!applied) checkbox.checked = !enabled;
+                        checkbox.disabled = false;
+                    });
+                    const name = document.createElement('span');
+                    name.className = 'source-name';
+                    name.textContent = event.name;
+                    const count = document.createElement('span');
+                    count.className = 'meta';
+                    count.textContent = String(event.count);
+                    row.append(checkbox, name, count);
+                    list.append(row);
+                }
+            } catch (e) {
+                    list.textContent = `Event watches unavailable: ${e.message}`;
+            }
+        }
+
+        async function setEventInfo(name, enabled) {
+            const status = document.getElementById('watch-status');
+            try {
+                const res = await fetch(`${API_BASE}/api/events/${encodeURIComponent(name)}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled })
+                });
+                const body = await res.json();
+                if (!res.ok) throw new Error(body.message || `HTTP ${res.status}`);
+                status.textContent = enabled
+                    ? `Watching ${body.name}; new matching records will appear below.`
+                    : `Stopped watching ${body.name}; its counter will continue to increase.`;
+                // A reconnect makes an already-open page immediately observe the
+                // new subscription even when an intervening proxy dropped SSE.
+                reconnectStream();
+                refreshEvents();
+                return true;
+            } catch (e) {
+                console.error('Unable to change event trace selection', e);
+                status.textContent = `Could not change ${name}: ${e.message}`;
+                return false;
+            }
+        }
+
+        document.getElementById('watch-add-btn').addEventListener('click', () => {
+            const input = document.getElementById('watch-name');
+            const name = input.value.trim();
+            if (name) setEventInfo(name, true);
+        });
+
+        async function toggleSource(name, path, isConnected) {
+            try {
+                if (isConnected) {
+                    return;
+                } else {
+                    return;
+                }
+                await refreshSources();
+                reconnectStream();
+            } catch (e) {
+                console.error('Toggle source error:', e);
+            }
+        }
+
+        // ── SSE streaming ─────────────────────────────────────
+
+        function connectStream() {
+            if (connection) connection.close();
+            connection = new EventSource(`${API_BASE}/api/stream`);
+            connection.onmessage = (event) => {
+                try { queueLogEntry(JSON.parse(event.data)); } catch (e) {}
+            };
+            connection.onerror = () => {
+                if (connection.readyState === EventSource.CLOSED) {
+                    setTimeout(connectStream, 2000);
+                }
+            };
+        }
+
+        function reconnectStream() {
+            if (connection) connection.close();
+            connectStream();
+        }
+
+        // ── Log entries ───────────────────────────────────────
+
+        function queueLogEntry(log) {
+            const key = `${log.timestamp || ''}|${log.target || ''}|${log.message || ''}|${JSON.stringify(log.fields || null)}`;
+            if (seenEntries.has(key)) return;
+            seenEntries.add(key);
+            if (seenEntries.size > MAX_ENTRIES * 2) seenEntries.clear();
+            if (pendingEntries.length >= MAX_PENDING_ENTRIES) {
+                pendingEntries.shift();
+                droppedPendingEntries++;
+            }
+            pendingEntries.push(log);
+            if (!renderScheduled) {
+                renderScheduled = true;
+                requestAnimationFrame(flushLogEntries);
+            }
+        }
+
+        function flushLogEntries() {
+            renderScheduled = false;
+            for (let index = 0; index < RENDER_BATCH_SIZE && pendingEntries.length; index++) {
+                addLogEntry(pendingEntries.shift());
+            }
+            if (pendingEntries.length) {
+                renderScheduled = true;
+                requestAnimationFrame(flushLogEntries);
+            }
+        }
+
+        function clipRenderedText(value) {
+            const text = String(value || '');
+            return text.length > MAX_RENDERED_TEXT
+                ? `${text.slice(0, MAX_RENDERED_TEXT)} … [truncated in viewer]`
+                : text;
+        }
+
+        function addLogEntry(log) {
+            const entry = document.createElement('div');
+            const level = log.level || 'info';
+            entry.className = `log-entry ${level}`;
+
+            const searchTerm = searchInput.value.toLowerCase();
+            if (searchTerm && !(log.message || '').toLowerCase().includes(searchTerm)
+                && !(log.target || '').toLowerCase().includes(searchTerm)
+                && !(log.source || '').toLowerCase().includes(searchTerm)) {
+                entry.classList.add('hidden');
+            }
+
+            const ts = log.timestamp ? new Date(log.timestamp).toLocaleTimeString() : '';
+            const source = clipRenderedText(log.source || '—');
+            const message = clipRenderedText(log.message || '');
+            const target = clipRenderedText(log.target || '');
+
+            let html = `
+                <span class="log-time">${ts}</span>
+                <span class="log-level ${level}">${level}</span>
+                <span class="log-source" title="${source}">${source}</span>
+                <span class="log-message">${escapeHtml(message)} <span class="log-target">${escapeHtml(target)}</span></span>
+            `;
+
+            if (log.fields && Object.keys(log.fields).length > 0) {
+                html += `<div class="log-fields">${escapeHtml(clipRenderedText(JSON.stringify(log.fields)))}</div>`;
+            }
+
+            entry.innerHTML = html;
+            logsDiv.appendChild(entry);
+
+            counts.total++;
+            updateCounts();
+
+            while (logsDiv.children.length > MAX_ENTRIES) {
+                const removed = logsDiv.firstChild;
+                logsDiv.removeChild(removed);
+                counts.total = Math.max(0, counts.total - 1);
+            }
+
+            if (droppedPendingEntries) {
+                console.warn(`Trace viewer discarded ${droppedPendingEntries} queued entries to stay bounded`);
+                droppedPendingEntries = 0;
+            }
+
+            if (document.getElementById('auto-scroll').checked) {
+                logsDiv.scrollTop = logsDiv.scrollHeight;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function updateCounts() {
+            document.getElementById('total-count').textContent = counts.total;
+        }
+
+        // Some forwards do not keep EventSource connections alive. The same
+        // bounded server history is polled as a reliable fallback.
+        async function refreshEntries() {
+            try {
+                const res = await fetch(`${API_BASE}/api/entries`);
+                const body = await res.json();
+                if (!res.ok) return;
+                for (const entry of body.entries || []) queueLogEntry(entry);
+            } catch (_) {}
+        }
+
+        searchInput.addEventListener('input', () => applyFilters());
+
+        function applyFilters() {
+            const searchTerm = searchInput.value.toLowerCase();
+            document.querySelectorAll('.log-entry').forEach(el => {
+                let visible = true;
+                if (searchTerm) visible = el.textContent.toLowerCase().includes(searchTerm);
+                el.classList.toggle('hidden', !visible);
+            });
+        }
+
+        // ── Clear ─────────────────────────────────────────────
+
+        document.getElementById('clear-btn').addEventListener('click', () => {
+            logsDiv.innerHTML = '';
+            counts = { total: 0 };
+            updateCounts();
+        });
+
+        // ── Refresh sources ───────────────────────────────────
+
+        document.getElementById('refresh-btn').addEventListener('click', refreshSources);
+
+        // ── Init ──────────────────────────────────────────────
+
+        refreshSources();
+        refreshEvents();
+        refreshEntries();
+        connectStream();
+
+        // Periodic refresh
+        setInterval(refreshSources, 10000);
+        setInterval(refreshEvents, 5000);
+        setInterval(refreshEntries, 2000);
+    </script>
+</body>
+
+</html>

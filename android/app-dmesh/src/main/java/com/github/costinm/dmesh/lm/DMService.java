@@ -95,6 +95,58 @@ public class DMService extends MeshService {
 
     boolean fg = false;
 
+    /**
+     * MsgMux defines this for processing incoming messages. Binder is one of the mechanisms to
+     * receive messages, but authenticated remote messages are also accepted.
+     *
+     * @param topic
+     * @param msgType
+     * @param m       the actual message. The Bundle has the parsed metadata.
+     * @param replyTo null if the message was generated locally.
+     * @param args
+     */
+    @Override
+    public void handleMessage(String topic, String msgType, Message m, MsgConn replyTo, String[] args) {
+        if (args.length < 2) {
+            return;
+        }
+        if (args[1].equals("I")) {
+                // Update id4 for wifi. Will be used in announcements.
+                wifi.handleMessage(topic, msgType, m, replyTo, args);
+        }
+    }
+
+    @Override
+    protected MsgFrame handleDirectSyncRequest(String src, MsgConn con, MsgFrame frame) {
+        if (frame == null || frame.method == null) {
+            return null;
+        }
+        String method = frame.method;
+        StringBuilder line = new StringBuilder(method);
+        String text = frame.fields.get("text");
+        if (text != null && !text.isEmpty()) {
+            line.append(" ").append(text);
+        }
+        for (Map.Entry<String, String> entry : frame.fields.entrySet()) {
+            if ("text".equals(entry.getKey()) || "from".equals(entry.getKey())) continue;
+            line.append(" ").append(entry.getKey()).append("=").append(entry.getValue());
+        }
+        try {
+            DMeshCommand.Result res = DMeshCommand.run(this, mux, meshNode, line.toString());
+            MsgFrame reply = new MsgFrame(method + ".reply");
+            reply.id = frame.id;
+            reply.fields.putAll(res.fields);
+            recordJsonFrame(reply);
+            return reply;
+        } catch (Throwable t) {
+            Log.w(TAG, "Sync command failed: " + line, t);
+            MsgFrame err = new MsgFrame(method + ".error");
+            err.id = frame.id;
+            err.fields.put("error", String.valueOf(t.getMessage()));
+            return err;
+        }
+    }
+
     public void onLowMemory() {
         Log.d(TAG, "On Low memory");
     }
