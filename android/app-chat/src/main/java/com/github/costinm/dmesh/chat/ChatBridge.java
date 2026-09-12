@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteException;
@@ -21,8 +22,8 @@ public class ChatBridge {
     private static final String TAG = "DMeshChat";
     private static final Object LOCK = new Object();
     private static final ArrayDeque<String> EVENTS = new ArrayDeque<>();
-    private static final ArrayList<byte[]> PENDING = new ArrayList<>();
     private static IBinder remote;
+
     private static ServiceConnection connection;
 
     private static final DirectBinder CALLBACK = new DirectBinder((code, msg, reply) -> {
@@ -33,8 +34,9 @@ public class ChatBridge {
     public static void submitText(Context context, String text) {
         Log.d(TAG, "rust ui typed: " + text);
         Context app = context.getApplicationContext();
-        sendPayload(app, payloadForText(text));
+        sendPayload(app, requestForText(text));
     }
+
 
     public static String drainEvents() {
         StringBuilder out = new StringBuilder();
@@ -46,7 +48,21 @@ public class ChatBridge {
         return out.toString();
     }
 
-    private static byte[] payloadForText(String text) {
+    private static class ChatRequest {
+        final String method;
+        final byte[] payload;
+        final Bundle extras;
+
+        ChatRequest(String method, byte[] payload, Bundle extras) {
+            this.method = method;
+            this.payload = payload;
+            this.extras = extras;
+        }
+    }
+
+    private static final ArrayList<ChatRequest> PENDING = new ArrayList<>();
+
+    private static ChatRequest requestForText(String text) {
         String trimmed = text == null ? "" : text.trim();
         String method;
         String body = trimmed;
@@ -66,23 +82,30 @@ public class ChatBridge {
             data.put("from", "app-chat-ui");
             data.put("text", body);
             if ("messages.subscribe".equals(method)) data.put("keys", body);
-            return new JSONObject().put("method", method).put("data", data)
+            byte[] payload = new JSONObject().put("method", method).put("data", data)
                     .toString().getBytes(StandardCharsets.UTF_8);
+            Bundle extras = new Bundle();
+            extras.putString(DirectBinder.METHOD, method);
+            extras.putString("keys", body);
+            extras.putString("text", body);
+            extras.putString("from", "app-chat-ui");
+            return new ChatRequest(method, payload, extras);
         } catch (Exception e) {
             throw new IllegalStateException("cannot encode chat request", e);
         }
     }
 
-    private static void sendPayload(Context app, byte[] payload) {
+    private static void sendPayload(Context app, ChatRequest req) {
         synchronized (LOCK) {
             if (remote != null) {
-                sendNow(payload);
+                sendNow(req);
                 return;
             }
-            PENDING.add(payload);
+            PENDING.add(req);
         }
         bind(app);
     }
+
 
     private static void bind(Context app) {
         synchronized (LOCK) {
@@ -98,14 +121,14 @@ public class ChatBridge {
         ServiceConnection sc = new ServiceConnection() {
             @Override
             public void onServiceConnected(ComponentName name, IBinder service) {
-                ArrayList<byte[]> copy;
+                ArrayList<ChatRequest> copy;
                 synchronized (LOCK) {
                     remote = service;
                     copy = new ArrayList<>(PENDING);
                     PENDING.clear();
                 }
-                for (byte[] payload : copy) {
-                    sendNow(payload);
+                for (ChatRequest req : copy) {
+                    sendNow(req);
                 }
             }
 
@@ -128,20 +151,39 @@ public class ChatBridge {
         }
     }
 
-    private static void sendNow(byte[] payload) {
+    private static void sendNow(ChatRequest req) {
         IBinder binder;
         synchronized (LOCK) {
             binder = remote;
         }
-        if (binder == null) {
+        if (binder == null || req == null) {
             return;
         }
-        boolean ok = DirectBinder.transact(
-                binder, DirectBinder.TRANSACT_MESSAGE, payload, "json", null, CALLBACK, null);
-        if (!ok) {
-            enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed\"}}");
+
+        // 1-way async for continuous subscriptions, 2-way sync for queries/commands
+        if ("messages.subscribe".equals(req.method)) {
+            boolean ok = DirectBinder.transactAsync(
+                    binder, DirectBinder.TRANSACT_MESSAGE, req.payload, "json", req.extras, CALLBACK, null);
+            if (!ok) {
+                enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder async send failed\"}}");
+            }
+        } else {
+            DirectBinder.DirectMessage[] replyOut = new DirectBinder.DirectMessage[1];
+            boolean ok = DirectBinder.transactSync(
+                    binder, DirectBinder.TRANSACT_MESSAGE, req.payload, "json", req.extras, null, replyOut);
+            if (ok && replyOut[0] != null && replyOut[0].payload != null && replyOut[0].payload.length > 0) {
+                enqueueEvent(new String(replyOut[0].payload, StandardCharsets.UTF_8));
+            } else if (!ok) {
+                // Fallback to async if sync is unsupported or failed
+                boolean asyncOk = DirectBinder.transactAsync(
+                        binder, DirectBinder.TRANSACT_MESSAGE, req.payload, "json", req.extras, CALLBACK, null);
+                if (!asyncOk) {
+                    enqueueEvent("{\"method\":\"messages.error\",\"data\":{\"error\":\"direct binder send failed\"}}");
+                }
+            }
         }
     }
+
 
     private static void enqueueEvent(String line) {
         synchronized (LOCK) {

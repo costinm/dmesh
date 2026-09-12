@@ -21,7 +21,14 @@ public class MeshService extends Service {
     protected boolean handleDirectMessage(int code, DirectBinder.DirectMessage message, Parcel reply)
             throws RemoteException {
         if (code != DirectBinder.TRANSACT_MESSAGE && code != DirectBinder.TRANSACT_EVENT) return false;
-        return onDirectStream(message.stream, message.callback, reply);
+        return onDirectStream(message, reply);
+    }
+
+    /** Platform-adapter hook; services must not install a Java message router. */
+    protected boolean onDirectStream(DirectBinder.DirectMessage message, Parcel reply)
+            throws RemoteException {
+        return onDirectStream(message == null ? null : message.stream,
+                message == null ? null : message.callback, reply);
     }
 
     /** Platform-adapter hook; services must not install a Java message router. */
