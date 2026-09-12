@@ -2741,7 +2741,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             params.nan_dw_interval = 8;
             params.now = 2;
             params.ap = 0;
-            params.uart = dmesh_server::firmware_profile::UART_OFF;
+            // UART is an explicit profile choice, not a sleepy-boot or
+            // light-sleep prerequisite.  Preserve the configured/default
+            // value so a DW8 node remains diagnosable unless its operator
+            // explicitly selected `uart=off`.
         } else if service.role == 1 && !crate::main_runtime::apply_sta_profile_from_nvs(params) {
             // Main's active default is NAN+NOW only. An AP is an explicit
             // transport.start personality, not an unconditional boot side

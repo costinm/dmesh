@@ -13,7 +13,11 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 use dmesh_server::protocol::{BLOCK_SIZE, ImageSink};
 
-const PENDING_FLASH_BLOCKS: usize = 8;
+// Four 4 KiB blocks retain a bounded 16 KiB production write window.  The
+// classic ESP32 Recovery heap must also accommodate QUIC's copied receive
+// datagram and flash-worker queue metadata; eight blocks left no contiguous
+// 1.1 KiB allocation after several records.
+const PENDING_FLASH_BLOCKS: usize = 4;
 const FLASH_WRITE_BLOCKS: usize = 2;
 const FLASH_WRITE_BATCH_BYTES: usize = BLOCK_SIZE * FLASH_WRITE_BLOCKS;
 const BLOCK_RECORD_OVERHEAD: usize = 5 + 12;
@@ -56,6 +60,8 @@ type ConnectionService = dmesh_server::transport::ConnectionDispatcher<
 struct FlashStream {
     receiver: Box<SignedObjectFlashReceiver>,
     expires_at_us: u64,
+    dry_run: bool,
+    receiver_complete_reported: bool,
 }
 
 impl FlashStream {
@@ -63,6 +69,7 @@ impl FlashStream {
         request: dmesh_server::protocol::FlashRequest<'_>,
         now_us: u64,
     ) -> Result<Box<Self>, FlashSinkError> {
+        let dry_run = request.dry_run;
         let receiver = new_boxed_receiver(request)?;
         let raw = alloc_zeroed(Layout::new::<Self>()) as *mut Self;
         if raw.is_null() {
@@ -71,6 +78,8 @@ impl FlashStream {
         core::ptr::addr_of_mut!((*raw).receiver).write(receiver);
         core::ptr::addr_of_mut!((*raw).expires_at_us)
             .write(now_us.saturating_add(FLASH_STREAM_IDLE_TIMEOUT_US));
+        core::ptr::addr_of_mut!((*raw).dry_run).write(dry_run);
+        core::ptr::addr_of_mut!((*raw).receiver_complete_reported).write(false);
         Ok(Box::from_raw(raw))
     }
 
@@ -142,10 +151,16 @@ unsafe fn finish(service: &mut ConnectionService) -> bool {
     {
         return false;
     }
+    let dry_run = (*slot).as_ref().is_some_and(|(_, stream)| stream.dry_run);
     *slot = None;
     crate::commands::send_response(b"flash object durable");
     let _ = service.complete_flash(Vec::from(&b"flash complete"[..]));
-    DURABLE_FLASH_COMPLETED.store(true, Ordering::Release);
+    // A dry-run validates the authenticated object stream without changing
+    // flash or selecting Main. Recovery must remain available for the real
+    // transfer that follows.
+    if !dry_run {
+        DURABLE_FLASH_COMPLETED.store(true, Ordering::Release);
+    }
     true
 }
 
@@ -201,9 +216,15 @@ pub(crate) unsafe fn after_receive(
                 }
                 Ok(_) => {}
                 Err(()) => {
-                    crate::recovery_runtime::log(b"DMESH recovery: flash object rejected\n\0");
                     crate::commands::send_response(b"flash object receiver rejected");
                 }
+            }
+            if stream.receiver.is_complete() && !stream.receiver_complete_reported {
+                // Recovery's UART is the only available postmortem surface
+                // while validating a classic ESP32 STA upload. This records
+                // semantic DONE admission, not a bearer-level ACK.
+                crate::recovery_runtime::log(b"DMESH recovery: flash receiver complete\n\0");
+                stream.receiver_complete_reported = true;
             }
             completed = finish(service);
         }
@@ -406,14 +427,17 @@ impl FlashWorker {
             esp_idf_sys::xQueueCreateWithCaps(
                 (PENDING_FLASH_BLOCKS / FLASH_WRITE_BLOCKS + 1) as _,
                 core::mem::size_of::<FlashJob>() as _,
-                esp_idf_sys::MALLOC_CAP_INTERNAL as _,
+                // On classic ESP32, INTERNAL alone may select instruction
+                // RAM. FreeRTOS queue metadata is byte-addressed, so require
+                // data-capable internal RAM as well.
+                (esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT) as _,
             )
         };
         let done = unsafe {
             esp_idf_sys::xQueueCreateWithCaps(
                 (PENDING_FLASH_BLOCKS / FLASH_WRITE_BLOCKS) as _,
                 core::mem::size_of::<FlashCompletion>() as _,
-                esp_idf_sys::MALLOC_CAP_INTERNAL as _,
+                (esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT) as _,
             )
         };
         if work.is_null() || done.is_null() {
@@ -559,9 +583,12 @@ unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
                 0,
             )
         };
-        // The peer may now be fully ACKed and blocked solely on the receive
-        // window. Wake the common connection owner explicitly; a duplicate
-        // packet or loss timer is neither required nor expected.
+        // Publish the durable-completion edge after the completion itself is
+        // visible. On Main this wakes the one connection owner so QUIC-lite
+        // can emit its MAX_DATA/MAX_STREAM_DATA update even when the peer is
+        // fully ACKed and waiting for credit. The shared ingress queue is not
+        // installed in reduced Recovery, where this returns false and its
+        // bounded UDP turn performs the same handler-neutral poll.
         let _ = crate::core_runtime::schedule_storage_ready();
     }
 }
@@ -809,6 +836,11 @@ impl EspPartitionSink {
                 _ => return Err(()),
             }
             if completion.result != esp_idf_sys::ESP_OK {
+                crate::recovery_runtime::log(match completion.kind {
+                    FLASH_JOB_ERASE => b"DMESH recovery: flash erase failed\n\0",
+                    FLASH_JOB_WRITE => b"DMESH recovery: flash write failed\n\0",
+                    _ => b"DMESH recovery: flash worker failed\n\0",
+                });
                 return Err(());
             }
         }

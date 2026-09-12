@@ -31,6 +31,7 @@ pub const fn stream_service(component: u64, method: u64) -> Option<ServiceIdenti
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_METRICS_METHOD) => "metrics",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_EVENTS_METHOD) => "events",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_LOG_WATCH_METHOD) => "log-watch",
+        (services::BOOT_COMPONENT, services::BOOT_RECOVERY_METHOD) => "boot.recovery",
         (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_STATUS_METHOD) => "telemetry.nan_status",
         (telemetry::TELEMETRY_COMPONENT, telemetry::NOW_METRICS_METHOD) => "telemetry.now_metrics",
         (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_METRICS_METHOD) => "telemetry.nan_metrics",
@@ -87,6 +88,7 @@ pub fn stream_service_by_name(name: &str) -> Option<ServiceIdentity> {
             services::DIAGNOSTIC_COMPONENT,
             services::DIAGNOSTIC_LOG_WATCH_METHOD,
         ),
+        "boot.recovery" => (services::BOOT_COMPONENT, services::BOOT_RECOVERY_METHOD),
         "telemetry.nan_status" => (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_STATUS_METHOD),
         "telemetry.now_metrics" => (
             telemetry::TELEMETRY_COMPONENT,

@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# Recovery is intentionally frozen while Main becomes the only active firmware
-# lane. Keep this entry point as a loud guard so automation cannot silently
-# produce an image for the retired Recovery path.
+# Recovery is the reduced STA/UDP6 update lane.  It is built explicitly by CPU
+# family so normal Main builds do not accidentally widen the image matrix.
 set -euo pipefail
-
-if [[ "${DMESH_ALLOW_RECOVERY_BUILD:-0}" != "1" ]]; then
-    echo "FATAL: Rust Recovery builds are disabled; build Main with scripts/build-fw.sh" >&2
-    echo "Set DMESH_ALLOW_RECOVERY_BUILD=1 only to compile/measure the frozen lane." >&2
-    exit 1
-fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 usage() {
@@ -93,8 +86,8 @@ SDK_DEFAULTS_DIGEST="$(sha256sum \
     "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_module_loader.c" \
     "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_hw_host.c" \
     "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_module_weak_platform.c" \
-    "$ROOT/fw/esp32/rust/native/dmesh_boot_health/CMakeLists.txt" \
-    "$ROOT/fw/esp32/rust/native/dmesh_boot_health/dmesh_boot_health.c" \
+    "$PROJECT/native/dmesh_boot_health/CMakeLists.txt" \
+    "$PROJECT/native/dmesh_boot_health/dmesh_boot_health.c" \
     | sha256sum | awk '{print $1}')"
 SDK_ID="cache-v6:modules=${RECOVERY_MODULES}:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${SDK_DEFAULTS_DIGEST}"
 if [[ ! -f "$SDK_STAMP" || "$(cat "$SDK_STAMP")" != "$SDK_ID" ]]; then

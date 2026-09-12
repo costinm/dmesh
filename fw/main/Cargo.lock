@@ -364,6 +364,7 @@ dependencies = [
  "dmesh-ble",
  "dmesh-fw-modules",
  "dmesh-fw-transport",
+ "dmesh-server",
  "embuild",
  "esp-idf-sys",
 ]

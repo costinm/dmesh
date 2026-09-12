@@ -1351,9 +1351,10 @@ pub trait DatagramClient<const PACKET: usize> {
     ) -> Result<Option<usize>, crate::Error>;
     fn accepts(&self, input: &[u8]) -> bool;
     /// Recognize the opaque reset token issued during this association's
-    /// OPEN_ACK before the normal short-header CID filter. Bearers must not
+    /// OPEN_ACK after normal association admission fails. Bearers must not
     /// parse reset framing themselves: they submit one complete frame and the
-    /// common driver turns a matching token into `PeerRestarted`.
+    /// common driver turns an otherwise-unaccepted matching token into
+    /// `PeerRestarted`.
     fn is_peer_stateless_reset(&self, _input: &[u8]) -> bool {
         false
     }
@@ -1458,16 +1459,16 @@ impl<const PACKET: usize> DatagramClientDriver<PACKET> {
         input: &[u8],
         now: u64,
     ) -> Result<bool, crate::Error> {
+        if client.accepts(input) {
+            self.bootstrap_pending = false;
+            self.rx_packets = self.rx_packets.saturating_add(1);
+            self.pending = client.receive_at(input, now, &mut self.packet)?;
+            return Ok(true);
+        }
         if client.is_peer_stateless_reset(input) {
             return Err(crate::Error::PeerRestarted);
         }
-        if !client.accepts(input) {
-            return Ok(false);
-        }
-        self.bootstrap_pending = false;
-        self.rx_packets = self.rx_packets.saturating_add(1);
-        self.pending = client.receive_at(input, now, &mut self.packet)?;
-        Ok(true)
+        Ok(false)
     }
 
     /// Poll delayed control, established-packet retransmission, and finally
@@ -2274,7 +2275,12 @@ impl AssociationProfile {
         }
     }
 
-    pub const fn c6_default() -> Self {
+    /// Default profile for a normal datagram-backed association.
+    ///
+    /// This is deliberately independent of the Wi-Fi bearer and CPU family:
+    /// it is suitable for a plain UDP socket over an ordinary STA link as
+    /// well as adapters with their own radio policy.
+    pub const fn datagram_default() -> Self {
         Self {
             history_packets: 8,
             ack_frequency: 8,
@@ -2282,6 +2288,11 @@ impl AssociationProfile {
             tx_burst_packets: 8,
             initial_window_packets: 8,
         }
+    }
+
+    /// Historical name retained for existing C6 call sites.
+    pub const fn c6_default() -> Self {
+        Self::datagram_default()
     }
 
     pub fn clamp<const HISTORY: usize>(self) -> Self {
@@ -3376,7 +3387,7 @@ mod tests {
     }
 
     #[test]
-    fn datagram_driver_reports_an_opaque_peer_reset_before_cid_filtering() {
+    fn datagram_driver_reports_an_opaque_peer_reset_after_cid_filtering() {
         struct Client;
 
         impl DatagramClient<16> for Client {
@@ -3430,5 +3441,60 @@ mod tests {
             driver.receive(&mut client, b"opaque-reset", 1),
             Err(crate::Error::PeerRestarted)
         );
+    }
+
+    #[test]
+    fn datagram_driver_admits_valid_packet_before_reset_token_check() {
+        struct Client {
+            received: bool,
+        }
+
+        impl DatagramClient<16> for Client {
+            fn start(&mut self, output: &mut [u8; 16]) -> Result<usize, crate::Error> {
+                output[0] = 1;
+                Ok(1)
+            }
+
+            fn receive_at(
+                &mut self,
+                input: &[u8],
+                _now_ms: u64,
+                _output: &mut [u8; 16],
+            ) -> Result<Option<usize>, crate::Error> {
+                assert_eq!(input, b"valid-token-suffix");
+                self.received = true;
+                Ok(None)
+            }
+
+            fn accepts(&self, input: &[u8]) -> bool {
+                input == b"valid-token-suffix"
+            }
+
+            fn is_peer_stateless_reset(&self, input: &[u8]) -> bool {
+                input == b"valid-token-suffix"
+            }
+
+            fn is_complete(&self) -> bool { false }
+
+            fn poll_transmit_at(
+                &mut self,
+                _now_ms: u64,
+                _output: &mut [u8; 16],
+            ) -> Result<Option<usize>, crate::Error> { Ok(None) }
+
+            fn poll_retransmit(
+                &mut self,
+                _now_us: u64,
+                _pto_us: u64,
+                _output: &mut [u8; 16],
+            ) -> Result<Option<usize>, crate::Error> { Ok(None) }
+        }
+
+        let mut client = Client { received: false };
+        let mut driver = DatagramClientDriver::start(&mut client, 0).unwrap();
+        assert!(driver
+            .receive(&mut client, b"valid-token-suffix", 1)
+            .unwrap());
+        assert!(client.received);
     }
 }

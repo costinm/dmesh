@@ -24,6 +24,10 @@ pub const DIAGNOSTIC_SERVICES_METHOD: u64 = 2;
 pub const DIAGNOSTIC_METRICS_METHOD: u64 = 3;
 pub const DIAGNOSTIC_EVENTS_METHOD: u64 = 4;
 pub const DIAGNOSTIC_LOG_WATCH_METHOD: u64 = 5;
+/// Main-only boot-control component. It is stream-only; Recovery deliberately
+/// does not register it.
+pub const BOOT_COMPONENT: u64 = 11;
+pub const BOOT_RECOVERY_METHOD: u64 = 1;
 
 const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
     (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_STATUS_METHOD, b"status"),
@@ -54,6 +58,7 @@ const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
         crate::protocol::OBJECT_FLASH_METHOD,
         b"object.flash",
     ),
+    (BOOT_COMPONENT, BOOT_RECOVERY_METHOD, b"boot.recovery"),
 ];
 
 /// Encode the built-in tagged QUIC handler catalog as

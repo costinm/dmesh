@@ -13,6 +13,7 @@ modules = ["dep:dmesh-fw-modules"]
 [dependencies]
 dmesh-ble = { path = "../ble" }
 dmesh-fw-transport = { path = "../dmesh-fw-transport" }
+dmesh-server = { path = "../../crates/dmesh-server", default-features = false }
 dmesh-fw-modules = { path = "../modules", optional = true }
 esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
 

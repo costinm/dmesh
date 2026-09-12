@@ -1,4 +1,26 @@
+extern crate alloc;
+
 mod platform;
+
+fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<alloc::vec::Vec<u8>> {
+    use dmesh_server::{services, tagged::Name};
+    if record.to.is_some()
+        || record.component != Some(Name::Tag(services::BOOT_COMPONENT))
+        || record.method != Some(Name::Tag(services::BOOT_RECOVERY_METHOD))
+        || record.params.is_some()
+        || record.data.is_some()
+        || record.fields.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+    {
+        return None;
+    }
+    if platform::schedule_recovery_boot() {
+        Some(alloc::vec::Vec::from(&b"recovery scheduled"[..]))
+    } else {
+        None
+    }
+}
 
 fn main() {
     app_main();
@@ -11,6 +33,10 @@ pub extern "C" fn app_main() {
     // before the runtime can emit its own ROM markers.
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: entry\n\0".as_ptr().cast()) };
     platform::mark_main_boot_start();
+    assert!(dmesh_server::services::register_tagged_component(
+        dmesh_server::services::BOOT_COMPONENT,
+        receive_boot_control,
+    ));
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();

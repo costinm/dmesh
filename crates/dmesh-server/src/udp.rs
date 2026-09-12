@@ -44,12 +44,38 @@ use tokio::time::{Duration, Instant, timeout};
 
 const MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
 
-/// Adapter-local opaque handle for a UDP peer tuple. The hash is never put on
-/// the wire or used as a device identity; it merely lets `quic-lite` retain
-/// path history without learning socket-address syntax.
+/// Linux may omit the outgoing interface scope on an inbound IPv6 link-local
+/// source.  Scope selects the local egress interface, not the remote UDP
+/// peer, so association identity is address plus port.
+fn same_udp_peer(received: SocketAddr, expected: SocketAddr) -> bool {
+    match (received, expected) {
+        (SocketAddr::V4(received), SocketAddr::V4(expected)) => {
+            received.ip() == expected.ip() && received.port() == expected.port()
+        }
+        (SocketAddr::V6(received), SocketAddr::V6(expected)) => {
+            received.ip() == expected.ip() && received.port() == expected.port()
+        }
+        _ => false,
+    }
+}
+
+/// Adapter-local opaque handle for a UDP peer endpoint. The hash is never put
+/// on the wire or used as a device identity; the connection's DCID remains
+/// the peer-specific transport identity. IPv6 scope is deliberately excluded:
+/// it selects our local egress interface, whereas the UDP bearer identifies
+/// its peer by address and service port.
 fn udp_path_id(peer: SocketAddr) -> quic_lite::PathId {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    peer.hash(&mut hasher);
+    match peer {
+        SocketAddr::V4(peer) => {
+            peer.ip().hash(&mut hasher);
+            peer.port().hash(&mut hasher);
+        }
+        SocketAddr::V6(peer) => {
+            peer.ip().hash(&mut hasher);
+            peer.port().hash(&mut hasher);
+        }
+    }
     let value = hasher.finish() | (1_u64 << 63);
     quic_lite::PathId::new(value).expect("tagged UDP path ID is nonzero")
 }
@@ -1120,7 +1146,7 @@ impl UdpClient {
                 let Ok(Ok((len, response_peer))) = received else {
                     break;
                 };
-                if response_peer != client.peer {
+                if !same_udp_peer(response_peer, client.peer) {
                     last_observation = Some(format!(
                         "reply_peer={} expected_peer={} bytes={len}",
                         response_peer, client.peer
@@ -1192,7 +1218,7 @@ impl UdpClient {
             else {
                 continue;
             };
-            if response_peer != peer
+            if !same_udp_peer(response_peer, peer)
                 || quic_lite::decode_direct_message_response(&response[..used]).is_err()
             {
                 continue;
@@ -1225,8 +1251,10 @@ impl UdpClient {
             if let Ok(Ok((len, peer))) =
                 timeout(ACK_TIMEOUT, self.recv_association_packet(&mut response)).await
             {
-                if peer != self.peer {
-                    bail!("UDP client peer changed");
+                if !same_udp_peer(peer, self.peer) {
+                    // A shared UDP socket can receive a delayed packet from
+                    // an earlier association. It is not a path migration.
+                    continue;
                 }
                 let control = self
                     .connection
@@ -1358,13 +1386,17 @@ impl UdpClient {
         if progress_timeout.is_zero() {
             bail!("UDP transport progress timeout must be non-zero");
         }
+        let deadline = Instant::now() + progress_timeout;
         let mut packet = [0u8; MTU];
-        let (len, peer) = timeout(progress_timeout, self.recv_association_packet(&mut packet))
-            .await
-            .context("UDP transport progress timeout")??;
-        if peer != self.peer {
-            bail!("UDP client peer changed");
-        }
+        let (len, _peer) = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (len, peer) = timeout(remaining, self.recv_association_packet(&mut packet))
+                .await
+                .context("UDP transport progress timeout")??;
+            if same_udp_peer(peer, self.peer) {
+                break (len, peer);
+            }
+        };
         let payload = self
             .connection
             .receive_stream_payload(self.path, &packet[..len])
@@ -1483,8 +1515,8 @@ impl UdpClient {
             let receive_wait = remaining.min(Duration::from_millis(1));
             match timeout(receive_wait, self.recv_association_packet(&mut packet)).await {
                 Ok(Ok((len, peer))) => {
-                    if peer != self.peer {
-                        bail!("UDP client peer changed");
+                    if !same_udp_peer(peer, self.peer) {
+                        continue;
                     }
                     let now_ms = started.elapsed().as_millis() as u64;
                     let payload = self
@@ -1689,8 +1721,8 @@ impl UdpClient {
                 let Ok(Ok((len, peer))) = received else {
                     break;
                 };
-                if peer != self.peer {
-                    bail!("UDP client peer changed");
+                if !same_udp_peer(peer, self.peer) {
+                    continue;
                 }
                 // The CLI intentionally uses one fixed diagnostic source
                 // port. A delayed response from a retired association can
@@ -1842,8 +1874,8 @@ impl UdpClient {
         loop {
             let mut packet = [0u8; MTU];
             let (len, peer) = self.recv_association_packet(&mut packet).await?;
-            if peer != self.peer {
-                bail!("UDP client peer changed");
+            if !same_udp_peer(peer, self.peer) {
+                continue;
             }
             let stream = match self
                 .connection
@@ -2036,7 +2068,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                 // its reset token, so no adapter derives a CID from it.
                 let mut delivered = false;
                 for route in outbound_routes.values() {
-                    if route.peer != peer {
+                    if !same_udp_peer(route.peer, peer) {
                         continue;
                     }
                     match route.sender.try_send(ConnectionDatagram {
@@ -2263,7 +2295,7 @@ pub async fn run(config: UdpConfig) -> Result<()> {
             }
         }
         if let Ok(route) = connections.route_mut(0, &packet) {
-            if route.peer != peer {
+            if !same_udp_peer(route.peer, peer) {
                 tracing::warn!(
                     %peer,
                     dcid = key,
@@ -3882,12 +3914,12 @@ mod tests {
     }
 
     #[test]
-    fn udp_path_id_keeps_ipv6_link_local_scopes_distinct() {
+    fn udp_path_id_ignores_local_ipv6_link_local_scope() {
         let address: std::net::Ipv6Addr = "fe80::44".parse().unwrap();
         let on_br_lan = SocketAddr::V6(std::net::SocketAddrV6::new(address, 3339, 0, 5));
         let on_wlan = SocketAddr::V6(std::net::SocketAddrV6::new(address, 3339, 0, 7));
 
-        assert_ne!(udp_path_id(on_br_lan), udp_path_id(on_wlan));
+        assert_eq!(udp_path_id(on_br_lan), udp_path_id(on_wlan));
     }
 
     #[test]
@@ -5197,7 +5229,7 @@ mod tests {
             let registry = registry_record.result.unwrap();
             // `services` is compact CBOR
             // `[[component, method, name], ...]`, not a text command surface.
-            assert_eq!(registry.first(), Some(&0x88));
+            assert_eq!(registry.first(), Some(&0x89));
             assert!(
                 registry
                     .windows(b"metrics".len())

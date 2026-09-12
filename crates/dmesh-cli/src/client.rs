@@ -2336,9 +2336,24 @@ async fn udp_object_upload(
     command: &[u8],
     records: dmesh_server::protocol::ObjectRecordStream,
 ) -> Result<UdpObjectUploadResult, String> {
-    let socket = tokio::net::UdpSocket::bind(udp_bind_for_peer(peer))
-        .await
-        .map_err(|error| error.to_string())?;
+    let bind = udp_bind_for_peer(peer);
+    let socket = match tokio::net::UdpSocket::bind(bind).await {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == ErrorKind::AddrInUse => {
+            // Keep 3338 as the reproducible default, but do not let an
+            // unrelated direct diagnostic monopolize every independent
+            // QUIC association. The selected UDP peer and the association
+            // DCID remain unchanged when the OS assigns a source port.
+            let ephemeral: SocketAddr = match peer {
+                SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid IPv4 wildcard"),
+                SocketAddr::V6(_) => "[::]:0".parse().expect("valid IPv6 wildcard"),
+            };
+            tokio::net::UdpSocket::bind(ephemeral)
+                .await
+                .map_err(|fallback| format!("UDP bind {bind} busy ({error}); ephemeral fallback: {fallback}"))?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let mut client = dmesh_server::transport::ObjectUploadClient::<
         512,
         { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
@@ -2361,6 +2376,7 @@ async fn udp_object_upload(
         .map_err(|error| error.to_string())?;
     driver.mark_sent(0);
     let mut input = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    let mut unexpected_peer = None;
     while Instant::now() < deadline {
         let now_ms = started.elapsed().as_millis() as u64;
         if let Ok(Ok((used, source))) = tokio::time::timeout(
@@ -2369,17 +2385,40 @@ async fn udp_object_upload(
         )
         .await
         {
-            if source != peer {
+            // Linux reports an inbound link-local source without the local
+            // egress scope used to send to it.  The QUIC DCID authenticates
+            // the association; UDP peer matching is remote IP plus port.
+            if !same_udp_endpoint(source, peer) {
+                unexpected_peer.get_or_insert(source);
                 continue;
             }
-            if driver
-                .receive(&mut client, &input[..used], now_ms)
-                .map_err(|error| format!(
+            if driver.rx_packets() == 0 {
+                if let Ok((_, ack)) =
+                    quic_lite::decode_bootstrap_open_ack_packet_with_limits(&input[..used], cid)
+                {
+                    eprintln!(
+                        "dmesh_cli_object_upload_open_ack server_cid={} reset_token={}",
+                        ack.server_receive_cid.value(),
+                        ack.stateless_reset_token.is_some()
+                    );
+                }
+            }
+            let admitted = driver.receive(&mut client, &input[..used], now_ms).map_err(|error| {
+                format!(
                     "object upload receive: {error:?} records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={}",
                     client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), driver.rx_packets(), driver.retransmit_packets()
-                ))?
-                && let Some(packet) = driver.packet()
-            {
+                )
+            })?;
+            if admitted && let Some(packet) = driver.packet() {
+                if driver.rx_packets() == 1
+                    && let Ok(quic_lite::ServerDatagram::Established { destination }) =
+                        quic_lite::classify_server_datagram(packet)
+                {
+                    eprintln!(
+                        "dmesh_cli_object_upload_first_request dcid={}",
+                        destination.value()
+                    );
+                }
                 socket.send_to(packet, peer).await.map_err(|error| error.to_string())?;
                 driver.mark_sent(now_ms);
             }
@@ -2404,9 +2443,21 @@ async fn udp_object_upload(
         }
     }
     Err(format!(
-        "object upload timeout records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={}",
+        "object upload timeout records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={} unexpected_peer={unexpected_peer:?}",
         client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), driver.rx_packets(), driver.retransmit_packets()
     ))
+}
+
+fn same_udp_endpoint(received: SocketAddr, expected: SocketAddr) -> bool {
+    match (received, expected) {
+        (SocketAddr::V4(received), SocketAddr::V4(expected)) => {
+            received.ip() == expected.ip() && received.port() == expected.port()
+        }
+        (SocketAddr::V6(received), SocketAddr::V6(expected)) => {
+            received.ip() == expected.ip() && received.port() == expected.port()
+        }
+        _ => false,
+    }
 }
 
 /// Select the wildcard address family from the peer. A raw IPv6 bearer must
@@ -2737,7 +2788,7 @@ fn fresh_connection_id() -> Result<quic_lite::ConnectionId, String> {
 mod tests {
     use super::{
         ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic, parse_udp_peer,
-        proxy_request, proxy_socket_target,
+        proxy_request, proxy_socket_target, same_udp_endpoint,
     };
     use dmesh_server::relay::{
         DesiredRule, PairRequest, RelayRoute, RelayState, Request, decode_pair_request,
@@ -3221,5 +3272,14 @@ mod tests {
     fn scoped_link_local_udp_peer_uses_the_raw_firmware_default_port() {
         let peer = parse_udp_peer("[fe80::16c1:9fff:fee5:9800%9]").unwrap();
         assert_eq!(peer.to_string(), "[fe80::16c1:9fff:fee5:9800%9]:3339");
+    }
+
+    #[test]
+    fn udp_endpoint_match_ignores_local_link_local_scope() {
+        let configured: SocketAddr = "[fe80::12bd:a3ff:feac:5a20%5]:3339".parse().unwrap();
+        let received: SocketAddr = "[fe80::12bd:a3ff:feac:5a20]:3339".parse().unwrap();
+        assert!(same_udp_endpoint(received, configured));
+        let wrong_port: SocketAddr = "[fe80::12bd:a3ff:feac:5a20]:3338".parse().unwrap();
+        assert!(!same_udp_endpoint(wrong_port, configured));
     }
 }

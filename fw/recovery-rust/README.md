@@ -1,12 +1,13 @@
-# Rust Recovery (frozen)
+# Rust Recovery
 
-Rust Recovery is retained as a low-priority historical/update lane while Main
-is the active firmware. It is not part of the current build or e6/e7 runtime
-workflow. Stage2 can still select the existing image, but new Recovery builds
-are deliberately rejected by `scripts/build-recovery-rust.sh`. Set
-`DMESH_ALLOW_RECOVERY_BUILD=1` only for a compile/size check.
+Rust Recovery is a deliberately narrow, supported Wi-Fi update lane alongside
+Main. Its current canaries are lora2 (classic ESP32) and one RISC-V board.
+Stage2 selects its separate Recovery partition; it associates to the
+provisioned STA and accepts authenticated QUIC-lite object updates that write
+Main. It is not a general radio runtime: NAN, NOW, AP, modules, and generic
+application handlers remain Main-only.
 
-The frozen Recovery lane historically owned:
+Recovery owns:
 
 - compact CBOR command/log records over PPP-like UART framing;
 - persisted STA identity/network defaults and raw-bearer association settings;
@@ -21,18 +22,16 @@ The ESP bearer adapter supplies packet I/O only. `dmesh-server` owns service
 framing and signed-object verification; `dmesh-fw-transport` owns durable
 partition/Stage2 writes. ACK and retransmission remain QUIC-lite concerns.
 
-Do not build this crate. Use `scripts/build-fw.sh` for the active Main image.
+Build the explicit CPU family with the checked-in script, for example
+`scripts/build-recovery-rust.sh esp32c6`. Use `scripts/build-fw.sh` for
+ordinary Main images.
 
-Historical Recovery provisioning is retained in the flasher for emergency
-rollback only; it is not a current device workflow. Use Main for normal
-firmware builds and deployment.
-
-`flash-device.py` is the only supported flashing interface. It currently uses
-esptool for all targets; do not invoke esptool directly. A future Recovery
-cleanup may retain only the open-STA UDP6 flashing path, with UDP server ports
-selected per session. Successful completion would require durable image
-completion, reboot, and a fresh direct Main status; command acknowledgement
-alone is insufficient.
+`flash-device.py` is the only supported provisioning interface; do not invoke
+esptool directly. Provision the protected STA profile from the host-owned
+input rather than exposing credentials in commands or logs. A successful
+Wi-Fi Main update requires association, scoped UDP6 reachability, manifest and
+block delivery, digest verification, durable commit, reboot, and fresh Main
+health; command acknowledgement alone is insufficient.
 
 The paused Wi-Fi measurements, transport counters, and exact restart commands
 are in

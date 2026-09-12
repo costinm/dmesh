@@ -7,12 +7,6 @@
 
 use core::ffi::c_void;
 
-type ConnectionService = dmesh_server::transport::ConnectionDispatcher<
-    { crate::CONNECTION_HISTORY_CAPACITY },
-    { crate::TRANSPORT_MTU },
-    { crate::MAX_QUIC_ASSOCIATIONS },
->;
-
 const RECOVERY_UDP_PORT: u16 = 3339;
 const ANNOUNCE_UDP_PORT: u16 = 5227;
 // A host AP may retain a previous association briefly after Recovery takes
@@ -39,6 +33,7 @@ pub fn run() {
     let started_us = now_us();
     let mut association_logged = false;
     let mut last_reconnect_ms = 0;
+    let mut last_disconnect_reason = 0;
     while !crate::wifi_esp::sta_associated() || !crate::wifi_esp::sta_link_local_ready() {
         if crate::wifi_esp::sta_associated() && !association_logged {
             log(b"DMESH recovery: associated\n\0");
@@ -49,6 +44,14 @@ pub fn run() {
             return_to_main();
         }
         let elapsed = elapsed_ms(started_us);
+        let disconnect_reason = crate::wifi_esp::sta_last_disconnect_reason();
+        if disconnect_reason != 0 && disconnect_reason != last_disconnect_reason {
+            crate::commands::send_stat(
+                b"DMESH recovery: STA disconnect_reason=",
+                disconnect_reason as u64,
+            );
+            last_disconnect_reason = disconnect_reason;
+        }
         if elapsed.saturating_sub(last_reconnect_ms) >= 5_000 {
             let _ = crate::wifi_esp::reconnect_sta_once();
             log(b"DMESH recovery: STA reconnect\n\0");
@@ -62,22 +65,21 @@ pub fn run() {
         return_to_main();
     };
     log(b"DMESH recovery: upload wait\n\0");
-    serve_upload(&mut socket, started_us, &profile);
+    serve_upload(&mut socket, started_us);
 }
 
-fn serve_upload(
-    socket: &mut Udp6Socket,
-    started_us: u64,
-    profile: &crate::TransportProfile,
-) -> ! {
+fn serve_upload(socket: &mut Udp6Socket, started_us: u64) -> ! {
     // Use Main's same bounded QUIC-lite association policy. The UDP socket is
     // only a datagram adapter; it does not own a separate ACK, window, or
     // retransmission policy.
-    let association = crate::core_runtime::raw_association(profile);
-    let mut service = ConnectionService::new(
-        quic_lite::ConnectionId::new(1).expect("valid server CID"),
-        quic_lite::recovery_connection_limits(false, 0),
-        association,
+    // Recovery intentionally uses only the basic QUIC responder over an
+    // ordinary STA/lwIP UDP6 socket.  It does not inherit Main's raw UDP6,
+    // NAN, NOW, or radio-epoch association tuning.
+    // Recovery is a minimal, low-rate STA path.  ACK every packet so an
+    // Initial command stream does not wait for Main's higher-throughput
+    // radio batching profile before it can advance its first flash credit.
+    let mut service = crate::core_runtime::new_connection_dispatcher(
+        quic_lite::AssociationProfile::conservative(),
     );
     let mut rx = [0u8; crate::TRANSPORT_MTU];
     let mut tx = [0u8; crate::TRANSPORT_MTU];
@@ -88,12 +90,25 @@ fn serve_upload(
     let mut last_announce_ms = elapsed_ms(started_us).saturating_sub(2_000);
     let mut complete_at_ms = None;
     let mut ingress_error_logged = false;
+    let mut first_udp_receive_logged = false;
+    let mut udp_receive_count = 0_u32;
     loop {
         let now = now_us();
         let elapsed = elapsed_ms(started_us);
         if elapsed.saturating_sub(last_announce_ms) >= 2_000 {
             if let Some((record, used)) = crate::main_runtime::recovery_discovery_record(elapsed / 1_000) {
-                let _ = socket.send_discovery(&record[..used]);
+                log(b"DMESH recovery: multicast announce\n\0");
+                if socket.send_discovery(&record[..used]) {
+                    log(b"DMESH recovery: multicast queued\n\0");
+                } else {
+                    // `lwip_sendto` rejected the scoped ff02::5227 packet;
+                    // this distinguishes a local socket/routing failure from
+                    // a host multicast receive failure without a second
+                    // protocol or packet capture dependency.
+                    log(b"DMESH recovery: multicast send failed\n\0");
+                }
+            } else {
+                log(b"DMESH recovery: multicast record unavailable\n\0");
             }
             last_announce_ms = elapsed;
         }
@@ -110,11 +125,21 @@ fn serve_upload(
         // normal initial QUIC flight from lwIP before Recovery could emit its
         // ACKs, making loss recovery look like a flash failure.
         let mut received = false;
+        let mut drained_since_idle = 0_u8;
         while let Some((used, peer)) = socket.receive(&mut rx) {
+            udp_receive_count = udp_receive_count.saturating_add(1);
+            if !first_udp_receive_logged {
+                log(b"DMESH recovery: UDP receive\n\0");
+                first_udp_receive_logged = true;
+            }
+            if udp_receive_count == 2 {
+                log(b"DMESH recovery: second UDP receive\n\0");
+            }
             let packet_now = now_us();
             service.set_time(elapsed_ms(started_us));
             unsafe { crate::stream_handlers::before_receive(&mut service, packet_now) };
             last_packet_ms = elapsed_ms(started_us);
+            let owned_before_receive = service.owns_packet_for_path(path, &rx[..used]);
             let immediate = match service.receive(path, &rx[..used], &mut tx) {
                 Ok(response) => {
                     ingress_error_logged = false;
@@ -142,6 +167,20 @@ fn serve_upload(
                     None
                 }
             };
+            if !owned_before_receive {
+                if let Some(reset) = service.last_stateless_reset() {
+                    if reset.cause
+                        == dmesh_server::transport::StatelessResetCause::UnknownDestinationCid
+                    {
+                        // OPEN always enters the dispatcher; this marker is reserved
+                        // for an established datagram naming no live destination CID.
+                        log(b"DMESH recovery: reset cause=unknown_dcid\n\0");
+                        if let Some(dcid) = reset.connection_id.received {
+                            crate::commands::send_stat(b"DMESH recovery: reset dcid=", dcid.value());
+                        }
+                    }
+                }
+            }
             let response = unsafe {
                 crate::stream_handlers::after_receive(
                     &mut service,
@@ -153,7 +192,9 @@ fn serve_upload(
                 )
             };
             if let Some(used) = response {
-                let _ = socket.send_to(&tx[..used], peer);
+                if !socket.send_to(&tx[..used], peer) {
+                    log(b"DMESH recovery: UDP reply send failed\n\0");
+                }
             }
             received = true;
             if crate::flash::take_durable_flash_completion() {
@@ -162,6 +203,18 @@ fn serve_upload(
                 // the device before selecting the newly durable Main image.
                 complete_at_ms = Some(elapsed);
             }
+            // A sustained Wi-Fi datagram backlog can keep this loop non-empty
+            // for seconds. `vTaskDelay(0)` only rotates equal-priority tasks;
+            // it does not necessarily run classic ESP32's lower-priority
+            // IDLE0 watchdog task. One tick after a bounded batch gives IDLE
+            // and Wi-Fi housekeeping that opportunity without making every
+            // packet pay a timed delay. QUIC-lite still owns all protocol
+            // pacing, ordering, loss, and flow control.
+            drained_since_idle = drained_since_idle.saturating_add(1);
+            if drained_since_idle >= 8 {
+                delay_ms(1);
+                drained_since_idle = 0;
+            }
         }
         // Flash workers release receive capacity asynchronously. Polling this
         // hook does not add a recovery protocol: it only lets QUIC-lite emit
@@ -169,23 +222,22 @@ fn serve_upload(
         if let Ok(Some(reply_path)) = unsafe { crate::stream_handlers::storage_ready(&mut service, now) } {
             if reply_path == path {
                 if let Ok(Some(used)) = service.poll_for(path, &mut tx) {
-                    let _ = socket.send_last(&tx[..used]);
+                    if !socket.send_last(&tx[..used]) {
+                        log(b"DMESH recovery: UDP storage reply failed\n\0");
+                    }
                 }
             }
         }
         unsafe { crate::stream_handlers::before_poll(&mut service, path, now) };
         if let Ok(Some(used)) = service.poll_for(path, &mut tx) {
-            let _ = socket.send_last(&tx[..used]);
+            if !socket.send_last(&tx[..used]) {
+                log(b"DMESH recovery: UDP poll reply failed\n\0");
+            }
         }
         if let Some(completed) = complete_at_ms {
             if elapsed.saturating_sub(completed) >= 250 {
                 return_to_main();
             }
-        }
-        // No valid client reached the receiver. This is before destructive
-        // work and is therefore safe to return to Main as requested.
-        if elapsed >= START_TIMEOUT_MS && last_packet_ms == 0 {
-            return_to_main();
         }
         // Once a client has started a stream, leave Recovery selected on a
         // timeout: a partially erased Main must not be selected.
@@ -209,6 +261,12 @@ struct Udp6Socket {
 
 impl Udp6Socket {
     fn bind(port: u16) -> Option<Self> {
+        // Do not bind `::` and hope lwIP selects the STA interface when an
+        // incoming link-local packet arrives.  Classic ESP32 lwIP can keep
+        // that socket detached from the scoped STA address.  This remains a
+        // normal UDP6 bind, using the address which `esp_netif` assigned.
+        let scope_id = crate::wifi_esp::sta_netif_index()?;
+        let local_address = crate::wifi_esp::sta_link_local_address()?;
         let fd = unsafe {
             esp_idf_sys::lwip_socket(
                 esp_idf_sys::AF_INET6 as i32,
@@ -222,6 +280,12 @@ impl Udp6Socket {
         let mut address = esp_idf_sys::sockaddr_in6::default();
         address.sin6_family = esp_idf_sys::AF_INET6 as _;
         address.sin6_port = port.to_be();
+        address.sin6_scope_id = scope_id;
+        address.sin6_addr = esp_idf_sys::in6_addr {
+            un: esp_idf_sys::in6_addr__bindgen_ty_1 {
+                u8_addr: local_address,
+            },
+        };
         if unsafe {
             esp_idf_sys::lwip_bind(
                 fd,
@@ -238,7 +302,7 @@ impl Udp6Socket {
             unsafe { esp_idf_sys::lwip_close(fd) };
             return None;
         }
-        Some(Self { fd, scope_id: crate::wifi_esp::sta_netif_index()?, last_peer: None })
+        Some(Self { fd, scope_id, last_peer: None })
     }
 
     fn receive(&mut self, output: &mut [u8]) -> Option<(usize, Peer)> {

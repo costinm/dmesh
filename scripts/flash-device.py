@@ -31,7 +31,10 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FW_RUST = ROOT / "fw" / "esp32" / "rust"
+# The Rust firmware workspace moved out of the retired fw/esp32/rust tree.
+# Keep esptool and the NVS generator rooted at the active workspace so a
+# repair flash remains available when Main is not answering on UART.
+FW_RUST = ROOT / "fw" / "dmesh-fw-transport"
 sys.path.insert(0, str(ROOT))
 DEFAULT_DEVICE_CATALOG = ROOT / "crates" / "dmesh-cli" / "examples" / "device-catalog.toml"
 

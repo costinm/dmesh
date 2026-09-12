@@ -26,3 +26,16 @@ pub fn mark_main_boot_healthy() {
         rtc_write(RTC_HANDOFF_OFFSET, 0);
     }
 }
+
+/// Select Recovery for the next Stage2 decision, then reboot only after the
+/// correlated QUIC response has had time to leave the active association.
+pub fn schedule_recovery_boot() -> bool {
+    // Do not leave a Recovery handoff armed if task creation failed.  The
+    // restart task cannot run before this call returns, so a successful
+    // schedule can be followed safely by the retained-state write.
+    if !dmesh_fw_transport::task_esp::schedule_restart_ms(250) {
+        return false;
+    }
+    unsafe { rtc_write(RTC_HANDOFF_OFFSET, 1) };
+    true
+}

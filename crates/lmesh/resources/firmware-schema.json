@@ -7,6 +7,7 @@
     {"id": 3, "name": "stage2", "api": "fw/boot/API.md"},
     {"id": 4, "name": "mod_lora", "api": "fw/mod_lora/API.md"},
     {"id": 10, "name": "object", "api": "crates/dmesh-server/src/core.rs"},
+    {"id": 11, "name": "boot", "api": "fw/boot/API.md"},
     {"id": 101, "name": "runtime", "api": "fw/dmesh-fw-transport/API.md"},
     {"id": 102, "name": "power", "api": "fw/dmesh-fw-transport/API.md"},
     {"id": 103, "name": "memory", "api": "fw/dmesh-fw-transport/API.md"}
@@ -82,6 +83,7 @@
       {"id": 4, "name": "transport", "kind": "u8"},
       {"id": 5, "name": "dry_run", "kind": "bool"}
     ]},
+    {"id": 1, "name": "boot.recovery", "component": 11},
     {"id": 1, "name": "status", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32", "android"]},
     {"id": 2, "name": "services", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
     {"id": 3, "name": "metrics", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},

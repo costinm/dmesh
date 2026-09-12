@@ -159,21 +159,40 @@ pub(crate) fn connection_last_error() -> u32 {
     CONNECTION_LAST_ERROR.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Construct one ordinary QUIC responder with the firmware-wide CID and
+/// stateless-reset policy.  This owns no bearer state: Main supplies its
+/// raw-bearer association policy, while Recovery uses the basic profile over
+/// its normal STA/lwIP UDP6 socket.
+pub(crate) fn new_connection_dispatcher(
+    association: quic_lite::AssociationProfile,
+) -> ConnectionDispatcher {
+    let mut dispatcher = ConnectionDispatcher::new(
+        initial_server_cid(),
+        // Storage-backed application streams publish receive capacity as it
+        // becomes available; the initial credit is bearer-neutral.
+        quic_lite::recovery_connection_limits(false, 0),
+        association,
+    );
+    // Keep a Recovery OPEN_ACK and Main OPEN_ACK on the identical CID/reset
+    // contract. The derived key contains no raw NVS secret and is unrelated
+    // to Wi-Fi/NAN/NOW ownership.
+    dispatcher.set_stateless_reset_key(crate::main_runtime::stateless_reset_key());
+    dispatcher
+}
+
+/// Seed each firmware boot with a distinct server CID sequence.  A
+/// stateless-reset token is derived from the server CID, so reusing a fixed
+/// seed makes a delayed reset from a pre-reset association valid for the new
+/// Recovery listener.  The sequence remains monotonic and bounded inside the
+/// QUIC dispatcher; this only chooses its first opaque value.
+fn initial_server_cid() -> quic_lite::ConnectionId {
+    let value = unsafe { esp_idf_sys::esp_random() }.max(1);
+    quic_lite::ConnectionId::new(u64::from(value)).expect("nonzero ESP random CID")
+}
+
 unsafe fn connection_dispatcher_mut() -> &'static mut ConnectionDispatcher {
     if !CONNECTION_DISPATCHER_READY.load(core::sync::atomic::Ordering::Acquire) {
-        let mut dispatcher = ConnectionDispatcher::new(
-            // An empty Initial DCID means this is a new association. The
-            // shared dispatcher allocates a local, nonzero server CID instead
-            // of deriving QUIC state from a radio MAC.
-            quic_lite::ConnectionId::new(1).expect("one is a valid CID"),
-            // Storage-backed application streams publish receive capacity as
-            // it becomes available; the initial credit is bearer-neutral.
-            quic_lite::recovery_connection_limits(false, 0),
-            *core::ptr::addr_of!(RAW_ASSOCIATION),
-        );
-        // The dispatcher owns CID/restart behavior for UART, NOW, and UDP6.
-        // Bearer adapters never see the NVS-derived branch or reset framing.
-        dispatcher.set_stateless_reset_key(crate::main_runtime::stateless_reset_key());
+        let dispatcher = new_connection_dispatcher(*core::ptr::addr_of!(RAW_ASSOCIATION));
         // Firmware keeps idle associations so later streams can reuse their
         // handshake and validated paths. QUIC-lite still reclaims the oldest
         // zero-active-stream association whenever this bounded table fills.
