@@ -499,10 +499,16 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
         ConnectionDebugState::from_endpoint(&self.mux.endpoint)
     }
 
-    /// Apply bounded raw-bearer policy while the association is being
-    /// accepted.  The caller supplies policy values, never the endpoint, so
-    /// UART/NOW/UDP adapters cannot alter packet framing or ledger state.
-    pub fn configure_raw_bearer(
+    /// Apply the association's shared transport policy while it is accepted.
+    /// The caller supplies policy values, never the endpoint, so UART, UDP,
+    /// NOW, and NAN adapters cannot alter packet framing or ledger state.
+    ///
+    /// `history_packets` bounds this endpoint's own retransmission ledger. It
+    /// is deliberately not advertised as a peer packet credit: an outbound
+    /// ledger size says nothing about how many inbound datagrams the
+    /// application can consume. Receive backpressure is expressed by the
+    /// ordinary connection and stream byte credit returned after consumption.
+    pub fn configure_transport(
         &mut self,
         history_packets: usize,
         initial_window_bytes: u64,
@@ -513,7 +519,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
         self.mux.endpoint.congestion.congestion_window = initial_window_bytes;
         self.mux.endpoint.congestion.slow_start_threshold = initial_window_bytes;
         self.mux.endpoint.set_ack_policy(ack_frequency, ack_delay);
-        self.local_max_in_flight_packets = history_packets.try_into().unwrap_or(u16::MAX);
+        self.local_max_in_flight_packets = 0;
         Ok(())
     }
 
@@ -1825,15 +1831,23 @@ impl<const HISTORY: usize, const PACKET: usize> ClientConnection<HISTORY, PACKET
 
     pub fn poll_retransmit(
         &mut self,
-        now_us: u64,
-        pto_us: u64,
+        now_ms: u64,
+        pto_ms: u64,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, crate::Error> {
         let Some(endpoint) = self.endpoint.as_mut() else {
             return Ok(None);
         };
+        // This is the same caller-owned monotonic clock as
+        // `poll_transmit_at`.  In particular, a retransmission replaces the
+        // ledger entry with a fresh send timestamp; leaving the endpoint at
+        // its previous clock made that replacement immediately eligible for
+        // time-threshold loss on the next ACK.  Every bearer reaches this
+        // method through DatagramClientDriver, so keep the timing ownership
+        // here rather than teaching UDP/UART/NOW adapters separate rules.
+        endpoint.set_time(now_ms);
         Ok(endpoint
-            .retransmit_due(now_us, pto_us, output)?
+            .retransmit_due(now_ms, pto_ms, output)?
             .map(|(used, _)| used))
     }
 }

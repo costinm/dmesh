@@ -72,6 +72,11 @@ pub enum IngressKind {
     /// capacity. This is the UART equivalent of a writable-socket event, not
     /// a periodic transmit poll or a bearer-private packet queue.
     UartEgressReady = 10,
+    /// Durable/application storage has completed work and may be able to
+    /// return receive credit. This is an application-owned readiness edge,
+    /// not a loss timer: the connection can be fully ACKed and flow-control
+    /// blocked when it fires.
+    StorageReady = 11,
 }
 
 /// Link context preserved across the one required driver-buffer copy.
@@ -127,6 +132,8 @@ static CONNECTION_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CONNECTION_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
 static UART_EGRESS_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_EGRESS_READY_PENDING: AtomicBool = AtomicBool::new(false);
+static STORAGE_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static STORAGE_READY_PENDING: AtomicBool = AtomicBool::new(false);
 static DROPS: AtomicU32 = AtomicU32::new(0);
 // This worker is created lazily on the first accepted packet, then blocks on
 // the shared queue for the active firmware lifetime. It must not retire after
@@ -458,6 +465,44 @@ pub fn schedule_uart_egress_ready(handler: fn()) -> bool {
     queued
 }
 
+/// Queue an application-storage readiness edge on the connection owner.
+///
+/// The producer may block until the metadata item is queued: it has already
+/// placed its completion in the bounded sink queue, and losing this edge
+/// would leave an otherwise fully ACKed peer permanently flow-control
+/// blocked. No packet buffer or bearer-specific credit is allocated here.
+pub fn schedule_storage_ready(handler: fn()) -> bool {
+    STORAGE_READY_HANDLER.store(handler as usize, Ordering::Release);
+    if STORAGE_READY_PENDING.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    let queue = QUEUE.load(Ordering::Acquire);
+    if queue.is_null() || !wake_worker() {
+        STORAGE_READY_PENDING.store(false, Ordering::Release);
+        return false;
+    }
+    let item = IngressPacket {
+        kind: IngressKind::StorageReady,
+        link: IngressLink::None,
+        source: [0; 6],
+        len: 0,
+        slot: PacketSlot::sentinel(),
+    };
+    let queued = unsafe {
+        esp_idf_sys::xQueueGenericSend(
+            queue.cast(),
+            (&item as *const IngressPacket).cast(),
+            u32::MAX,
+            0,
+        ) == 1
+    };
+    if !queued {
+        STORAGE_READY_PENDING.store(false, Ordering::Release);
+        DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    queued
+}
+
 pub fn available() -> usize {
     PACKETS.available()
 }
@@ -476,6 +521,7 @@ fn handler_slot(kind: IngressKind) -> &'static AtomicUsize {
         IngressKind::ConnectionTimer => &CONNECTION_TIMER_HANDLER,
         IngressKind::EspNowTx => &ESPNOW_TX_HANDLER,
         IngressKind::UartEgressReady => &UART_EGRESS_READY_HANDLER,
+        IngressKind::StorageReady => &STORAGE_READY_HANDLER,
     }
 }
 
@@ -516,6 +562,15 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
         if item.kind == IngressKind::UartEgressReady {
             UART_EGRESS_READY_PENDING.store(false, Ordering::Release);
             let handler = UART_EGRESS_READY_HANDLER.load(Ordering::Acquire);
+            if handler != 0 {
+                let handler: fn() = unsafe { core::mem::transmute(handler) };
+                handler();
+            }
+            continue;
+        }
+        if item.kind == IngressKind::StorageReady {
+            STORAGE_READY_PENDING.store(false, Ordering::Release);
+            let handler = STORAGE_READY_HANDLER.load(Ordering::Acquire);
             if handler != 0 {
                 let handler: fn() = unsafe { core::mem::transmute(handler) };
                 handler();

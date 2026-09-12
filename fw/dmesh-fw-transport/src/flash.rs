@@ -10,12 +10,17 @@ use alloc::{
     vec::Vec,
 };
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
 use dmesh_server::protocol::{BLOCK_SIZE, ImageSink};
 
 const PENDING_FLASH_BLOCKS: usize = 8;
 const FLASH_WRITE_BLOCKS: usize = 2;
 const FLASH_WRITE_BATCH_BYTES: usize = BLOCK_SIZE * FLASH_WRITE_BLOCKS;
 const BLOCK_RECORD_OVERHEAD: usize = 5 + 12;
+/// No application bytes have arrived for this bounded period. This is a
+/// receiver liveness guard, not a transport retransmission deadline: QUIC-lite
+/// continues to own ACK/PTO behavior below the flash sink.
+const FLASH_STREAM_IDLE_TIMEOUT_US: u64 = 120_000_000;
 /// Stage2 occupies the boot region below the partition table.  A signed
 /// object may select a narrower address within this region, never raw flash
 /// beyond it.
@@ -37,6 +42,225 @@ pub enum FlashSinkError {
     MissingModuleName,
     PartitionUnavailable,
     AllocationFailed,
+}
+
+type ConnectionService = dmesh_server::transport::ConnectionDispatcher<
+    { crate::CONNECTION_HISTORY_CAPACITY },
+    { crate::TRANSPORT_MTU },
+    { crate::MAX_QUIC_ASSOCIATIONS },
+>;
+
+/// One application stream receiver. QUIC-lite owns associations, packet
+/// numbers, ACKs, retransmission, ordering, FIN, and flow control; this state
+/// only consumes ordered bytes and reports durable storage capacity.
+struct FlashStream {
+    receiver: Box<SignedObjectFlashReceiver>,
+    expires_at_us: u64,
+}
+
+impl FlashStream {
+    unsafe fn new_boxed(
+        request: dmesh_server::protocol::FlashRequest<'_>,
+        now_us: u64,
+    ) -> Result<Box<Self>, FlashSinkError> {
+        let receiver = new_boxed_receiver(request)?;
+        let raw = alloc_zeroed(Layout::new::<Self>()) as *mut Self;
+        if raw.is_null() {
+            return Err(FlashSinkError::AllocationFailed);
+        }
+        core::ptr::addr_of_mut!((*raw).receiver).write(receiver);
+        core::ptr::addr_of_mut!((*raw).expires_at_us)
+            .write(now_us.saturating_add(FLASH_STREAM_IDLE_TIMEOUT_US));
+        Ok(Box::from_raw(raw))
+    }
+
+    fn receive(&mut self, chunks: Vec<(Vec<u8>, bool)>, now_us: u64) -> Result<usize, ()> {
+        let mut admitted = false;
+        for (bytes, _) in chunks {
+            self.receiver.push_ordered(&bytes).map_err(|_| ())?;
+            admitted = true;
+        }
+        if admitted {
+            self.expires_at_us = now_us.saturating_add(FLASH_STREAM_IDLE_TIMEOUT_US);
+        }
+        self.receiver.sink_mut().poll_completed()
+    }
+
+    fn receive_window_bytes(&mut self) -> usize {
+        self.receiver.sink_mut().receive_window_bytes()
+    }
+
+    fn complete_and_durable(&mut self) -> bool {
+        self.receiver.is_complete() && self.receiver.sink_mut().is_durable()
+    }
+}
+
+// Exactly one object.flash operation may own the firmware update stream. It
+// contains no bearer identity beyond QUIC-lite's opaque PathId.
+static mut ACTIVE_STREAM: Option<(quic_lite::PathId, Box<FlashStream>)> = None;
+
+// The stream handler owns durable completion.  A reduced Recovery runtime may
+// consume this edge to hand Stage2 back to Main; it is deliberately neither a
+// bearer signal nor an extra flash protocol message.
+static DURABLE_FLASH_COMPLETED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn take_durable_flash_completion() -> bool {
+    DURABLE_FLASH_COMPLETED.swap(false, Ordering::AcqRel)
+}
+
+unsafe fn begin(
+    service: &mut ConnectionService,
+    path: quic_lite::PathId,
+    request: Vec<u8>,
+    now_us: u64,
+) {
+    let Some(request) = dmesh_server::protocol::decode_flash_request(&request) else {
+        let _ = service.complete_flash(Vec::from(&b"flash invalid"[..]));
+        return;
+    };
+    let slot = core::ptr::addr_of_mut!(ACTIVE_STREAM);
+    if (*slot).take().is_some() {
+        crate::commands::send_response(b"flash receiver replaced");
+    }
+    crate::commands::send_response(b"flash receiver allocating");
+    match FlashStream::new_boxed(request, now_us) {
+        Ok(stream) => {
+            crate::commands::send_response(b"flash object stream armed");
+            *slot = Some((path, stream));
+        }
+        Err(_) => {
+            let _ = service.complete_flash(Vec::from(&b"flash rejected"[..]));
+        }
+    }
+}
+
+unsafe fn finish(service: &mut ConnectionService) -> bool {
+    let slot = core::ptr::addr_of_mut!(ACTIVE_STREAM);
+    if !(*slot)
+        .as_mut()
+        .is_some_and(|(_, stream)| stream.complete_and_durable())
+    {
+        return false;
+    }
+    *slot = None;
+    crate::commands::send_response(b"flash object durable");
+    let _ = service.complete_flash(Vec::from(&b"flash complete"[..]));
+    DURABLE_FLASH_COMPLETED.store(true, Ordering::Release);
+    true
+}
+
+pub(crate) unsafe fn expire(service: &mut ConnectionService, now_us: u64) {
+    let slot = core::ptr::addr_of_mut!(ACTIVE_STREAM);
+    if !(*slot)
+        .as_ref()
+        .is_some_and(|(_, stream)| now_us >= stream.expires_at_us)
+    {
+        return;
+    }
+    *slot = None;
+    crate::commands::send_response(b"flash receiver timeout");
+    let _ = service.complete_flash(Vec::from(&b"flash timeout"[..]));
+}
+
+/// Apply application-stream work after one QUIC receive turn. The caller
+/// supplies only QUIC state and an opaque path; no UART, UDP, NOW, MAC, or
+/// socket fact enters this module.
+pub(crate) unsafe fn after_receive(
+    service: &mut ConnectionService,
+    path: quic_lite::PathId,
+    now_us: u64,
+    closed: bool,
+    mut response_len: Option<usize>,
+    response: &mut [u8; crate::TRANSPORT_MTU],
+) -> Option<usize> {
+    if let Some(request) = service.take_flash_request() {
+        begin(service, path, request, now_us);
+    }
+    if closed {
+        if (*core::ptr::addr_of_mut!(ACTIVE_STREAM)).take().is_some() {
+            crate::commands::send_response(b"flash receiver closed");
+        }
+        service.abandon_flash();
+        return response_len;
+    }
+    let mut completed = false;
+    let mut released_credit = false;
+    if let Some((active_path, stream)) = (*core::ptr::addr_of_mut!(ACTIVE_STREAM)).as_mut() {
+        if *active_path == path {
+            match stream.receive(service.take_flash_object_chunks(), now_us) {
+                Ok(credit) if credit != 0 => {
+                    crate::recovery_runtime::log(b"DMESH recovery: flash storage released\n\0");
+                    if service
+                        .grant_flash_receive_window(stream.receive_window_bytes())
+                        .is_err()
+                    {
+                        crate::commands::send_response(b"flash credit rejected");
+                    } else {
+                        released_credit = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(()) => {
+                    crate::recovery_runtime::log(b"DMESH recovery: flash object rejected\n\0");
+                    crate::commands::send_response(b"flash object receiver rejected");
+                }
+            }
+            completed = finish(service);
+        }
+    }
+    // `service.receive` may already have produced the ACK for this packet
+    // before the application sink published its newly free storage. Prefer a
+    // second, ordinary QUIC-lite control poll in that case: it carries the
+    // MAX_DATA/MAX_STREAM_DATA update that unblocks the peer.  Keeping the
+    // earlier ACK instead would consume the one socket send turn and strand a
+    // dry-run or fast flash sink at its initial byte window.
+    if released_credit || response_len.is_none() {
+        response_len = service.poll_for(path, response).ok().flatten();
+    }
+    if completed {
+        response_len = service
+            .poll_for(path, response)
+            .ok()
+            .flatten()
+            .or(response_len);
+    }
+    response_len
+}
+
+/// Poll durable completion before a normal QUIC transmit turn.
+pub(crate) unsafe fn before_poll(
+    service: &mut ConnectionService,
+    path: quic_lite::PathId,
+    now_us: u64,
+) {
+    if (*core::ptr::addr_of_mut!(ACTIVE_STREAM))
+        .as_ref()
+        .is_some_and(|(active_path, _)| *active_path == path)
+    {
+        let _ = finish(service);
+    }
+    expire(service, now_us);
+}
+
+/// Consume completed storage work and publish the released receive window to
+/// QUIC-lite. The returned opaque path tells the generic runtime only where
+/// pending QUIC output should be polled.
+pub(crate) unsafe fn storage_ready(
+    service: &mut ConnectionService,
+    now_us: u64,
+) -> Result<Option<quic_lite::PathId>, ()> {
+    let Some((path, stream)) = (*core::ptr::addr_of_mut!(ACTIVE_STREAM)).as_mut() else {
+        return Ok(None);
+    };
+    let path = *path;
+    let credit = stream.receive(Vec::new(), now_us)?;
+    if credit != 0 {
+        service
+            .grant_flash_receive_window(stream.receive_window_bytes())
+            .map_err(|_| ())?;
+    }
+    let _ = finish(service);
+    Ok(Some(path))
 }
 
 /// Construct the hardware half of a shared `flash` request.
@@ -94,21 +318,20 @@ fn sink_for_flash_request(
 pub fn new_boxed_receiver(
     request: dmesh_server::protocol::FlashRequest<'_>,
 ) -> Result<Box<SignedObjectFlashReceiver>, FlashSinkError> {
-        let sink = sink_for_flash_request(request)?;
-        let raw = unsafe {
-            alloc_zeroed(Layout::new::<SignedObjectFlashReceiver>())
-                as *mut SignedObjectFlashReceiver
-        };
-        if raw.is_null() {
-            return Err(FlashSinkError::AllocationFailed);
-        }
-        unsafe {
-            SignedObjectFlashReceiver::new_in_place(
-                &mut *(raw.cast::<core::mem::MaybeUninit<SignedObjectFlashReceiver>>()),
-                sink,
-            );
-            Ok(Box::from_raw(raw))
-        }
+    let sink = sink_for_flash_request(request)?;
+    let raw = unsafe {
+        alloc_zeroed(Layout::new::<SignedObjectFlashReceiver>()) as *mut SignedObjectFlashReceiver
+    };
+    if raw.is_null() {
+        return Err(FlashSinkError::AllocationFailed);
+    }
+    unsafe {
+        SignedObjectFlashReceiver::new_in_place(
+            &mut *(raw.cast::<core::mem::MaybeUninit<SignedObjectFlashReceiver>>()),
+            sink,
+        );
+        Ok(Box::from_raw(raw))
+    }
 }
 
 /// ESP-IDF-backed durable sink for one application partition.
@@ -336,6 +559,10 @@ unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
                 0,
             )
         };
+        // The peer may now be fully ACKed and blocked solely on the receive
+        // window. Wake the common connection owner explicitly; a duplicate
+        // packet or loss timer is neither required nor expected.
+        let _ = crate::core_runtime::schedule_storage_ready();
     }
 }
 
@@ -483,6 +710,7 @@ impl EspPartitionSink {
 
     fn write_image_block(&mut self, index: u32, data: &[u8]) -> Result<(), ()> {
         if self.dry_run {
+            self.release_record_credit(data.len().saturating_add(BLOCK_RECORD_OVERHEAD));
             return Ok(());
         }
         let data_len = data.len();
@@ -527,6 +755,24 @@ impl EspPartitionSink {
 
     fn release_record_credit(&mut self, credit: usize) {
         self.ready_credit = self.ready_credit.saturating_add(credit);
+    }
+
+    /// Current bounded application storage available for one more ordered
+    /// stream window. QUIC-lite uses this as a sliding-window capacity, not
+    /// as an increment: reporting only a just-completed record could leave a
+    /// peer below its already-advertised initial window forever.
+    pub fn receive_window_bytes(&self) -> usize {
+        const RECORD_BYTES: usize = BLOCK_SIZE + BLOCK_RECORD_OVERHEAD;
+        if self.dry_run {
+            return PENDING_FLASH_BLOCKS * RECORD_BYTES;
+        }
+        let free_blocks = self.free_blocks.len() * FLASH_WRITE_BLOCKS;
+        let staged_space = self
+            .staged_write
+            .as_ref()
+            .map(|job| FLASH_WRITE_BATCH_BYTES.saturating_sub(job.len) / BLOCK_SIZE)
+            .unwrap_or(0);
+        free_blocks.saturating_add(staged_space) * RECORD_BYTES
     }
 
     /// Poll completed flash jobs without blocking the stream receive path.

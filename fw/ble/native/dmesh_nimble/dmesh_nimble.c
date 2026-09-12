@@ -130,7 +130,10 @@ static uint16_t s_tx_handle;
 /* A deliberately small, opt-in CoC transport.  The application creates the
  * server only after a `ble coc=true` command; normal GATT/rendezvous traffic
  * does not allocate a channel. */
-#define DMESH_COC_MTU 256
+/* CoC itself is reliable and segments/reassembles below this SDU size.  Keep
+ * a normal QUIC-lite packet plus stream framing in one bounded application
+ * buffer; 256 was only the original echo-test ceiling. */
+#define DMESH_COC_MTU 1152
 #define DMESH_COC_BUF_COUNT 4
 static os_membuf_t s_coc_mem[OS_MEMPOOL_SIZE(DMESH_COC_BUF_COUNT, DMESH_COC_MTU)];
 static struct os_mempool s_coc_mempool;
@@ -324,12 +327,7 @@ static int dmesh_coc_event(struct ble_l2cap_event *event, void *arg) {
             if (len <= sizeof(buf) &&
                 ble_hs_mbuf_to_flat(rx, buf, sizeof(buf), &copied) == 0 &&
                 copied == len) {
-                if (len == sizeof("dmesh-coc-ping") - 1 &&
-                    memcmp(buf, "dmesh-coc-ping", len) == 0) {
-                    (void)dmesh_coc_send_now(buf, len);
-                } else {
-                    dmesh_nimble_on_coc_write(buf, len);
-                }
+                dmesh_nimble_on_coc_write(buf, len);
             }
             os_mbuf_free_chain(rx);
         }

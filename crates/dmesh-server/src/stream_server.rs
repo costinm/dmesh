@@ -244,6 +244,27 @@ impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, 
         local_limits: ConnectionLimits,
         stateless_reset_token: Option<quic_lite::StatelessResetToken>,
     ) -> Result<(Box<Self>, Vec<u8>), Error> {
+        Self::accept_open_boxed_with_config_and_reset_token(
+            packet,
+            server_cid,
+            event_capacity,
+            local_limits,
+            quic_lite::ServerStreamConfig::default(),
+            stateless_reset_token,
+        )
+    }
+
+    /// Heap-backed accept with an association-specific callback reordering
+    /// allowance. The allowance remains bounded by the caller's negotiated
+    /// packet ledger; it is not a bearer queue.
+    pub fn accept_open_boxed_with_config_and_reset_token(
+        packet: &[u8],
+        server_cid: ConnectionId,
+        event_capacity: usize,
+        local_limits: ConnectionLimits,
+        config: quic_lite::ServerStreamConfig,
+        stateless_reset_token: Option<quic_lite::StatelessResetToken>,
+    ) -> Result<(Box<Self>, Vec<u8>), Error> {
         // Initialize the generic connection core directly in its final outer
         // allocation, then add only DMesh event state around it.
         let mut connection = Box::<Self>::new_uninit();
@@ -254,7 +275,7 @@ impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, 
                 packet,
                 server_cid,
                 local_limits,
-                quic_lite::ServerStreamConfig::default(),
+                config,
                 stateless_reset_token,
             )?;
             core::ptr::addr_of_mut!((*pointer).events).write(EventRing::new(event_capacity));

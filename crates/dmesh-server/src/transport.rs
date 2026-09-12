@@ -11,11 +11,14 @@ use core::mem::MaybeUninit;
 
 pub use quic_lite::Error;
 use quic_lite::{AssociationProfile, ConnectionCounters, ConnectionDebugState, DatagramClient};
-use quic_lite::{ConnectionId, ConnectionLimits, PathId, TransportPacket};
+use quic_lite::{ConnectionId, ConnectionLimits, PathId, ServerStreamConfig, TransportPacket};
 
 use crate::{
     probe::{ProbeRun, ProbeSender, ProbeServicePlan},
-    protocol::{GetRequest, REQUEST_MAX, decode_flash_handler_request, encode_get_request},
+    protocol::{
+        GetRequest, ObjectRecordStream, REQUEST_MAX, decode_flash_handler_request,
+        encode_get_request,
+    },
     stream_server::StreamServerConnection,
 };
 
@@ -23,6 +26,217 @@ use crate::{
 /// signed object records. Stream 4 remains the correlated `object.flash`
 /// command/terminal-response stream.
 pub const FLASH_OBJECT_STREAM: u64 = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4;
+
+/// Largest conservative application slice that fits with the QUIC-lite short
+/// header and STREAM frame in the normal 1200-byte datagram. This is shared by
+/// every ObjectUploadClient bearer; it is not a UDP fragment size or a
+/// handler-owned retransmission unit.
+const OBJECT_UPLOAD_STREAM_CHUNK: usize = 1024;
+
+/// Bearer-neutral client for the `object.flash` two-stream operation.
+///
+/// Adapters drive this through [`quic_lite::DatagramClientDriver`]. They only
+/// exchange complete datagrams; this type owns the association, command and
+/// object streams, response correlation, ACK/credit polling, and loss repair.
+pub struct ObjectUploadClient<const HISTORY: usize, const PACKET: usize> {
+    association: quic_lite::ClientAssociation<HISTORY, PACKET>,
+    command: [u8; PACKET],
+    command_len: usize,
+    records: ObjectRecordStream,
+    scratch: [u8; OBJECT_UPLOAD_STREAM_CHUNK],
+    command_admitted: bool,
+    complete: bool,
+    response: [u8; PACKET],
+    response_len: usize,
+    path: PathId,
+    last_admission_block: Option<Error>,
+}
+
+impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACKET> {
+    pub fn new(
+        client_cid: ConnectionId,
+        command: &[u8],
+        records: ObjectRecordStream,
+    ) -> Result<Self, Error> {
+        if command.is_empty() || command.len() > PACKET {
+            return Err(Error::BufferTooSmall);
+        }
+        let path = PathId::new(1).ok_or(Error::Invalid)?;
+        let mut stored = [0; PACKET];
+        stored[..command.len()].copy_from_slice(command);
+        let mut association = quic_lite::ClientAssociation::new(client_cid);
+        association.select_path(path);
+        Ok(Self {
+            association,
+            command: stored,
+            command_len: command.len(),
+            records,
+            scratch: [0; OBJECT_UPLOAD_STREAM_CHUNK],
+            command_admitted: false,
+            complete: false,
+            response: [0; PACKET],
+            response_len: 0,
+            path,
+            last_admission_block: None,
+        })
+    }
+
+    fn poll_application(&mut self, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
+        if self.command_admitted && !self.records.is_complete() {
+            if let Some(next) = self.records.copy_next(&mut self.scratch) {
+                match self.association.encode_stream_payload_at(
+                    FLASH_OBJECT_STREAM,
+                    next.offset,
+                    &self.scratch[..next.len],
+                    next.fin,
+                    output,
+                ) {
+                    Ok((_path, used)) => {
+                        self.last_admission_block = None;
+                        if !self.records.advance(next) {
+                            return Err(Error::Invalid);
+                        }
+                        return Ok(Some(used));
+                    }
+                    Err(error @ (Error::FlowControl | Error::HistoryFull | Error::Invalid)) => {
+                        self.last_admission_block = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(self
+            .association
+            .poll_transmit(output)?
+            .map(|(_, used)| used))
+    }
+
+    pub fn response(&self) -> Option<&[u8]> {
+        self.complete.then_some(&self.response[..self.response_len])
+    }
+
+    pub fn record_index(&self) -> usize {
+        self.records.record_index()
+    }
+
+    pub fn sent_bytes(&self) -> usize {
+        self.records.sent_bytes()
+    }
+
+    /// Most recent ordinary QUIC-lite admission boundary encountered while
+    /// offering the next object fragment. This is diagnostic state only;
+    /// retransmission and scheduling remain in the driver.
+    pub const fn last_admission_block(&self) -> Option<Error> {
+        self.last_admission_block
+    }
+
+    /// Transport-owned admission facts for a bounded progress report. They
+    /// distinguish a retained-ledger limit from byte/congestion backpressure
+    /// without exposing packets or giving an adapter scheduling authority.
+    pub fn admission_state(&self) -> Option<(usize, usize, u64, usize, u64, u64)> {
+        let endpoint = self.association.connection().endpoint()?;
+        let (connection_credit, stream_credit) = endpoint.peer_send_credit(FLASH_OBJECT_STREAM)?;
+        Some((
+            endpoint.history_len(),
+            endpoint.peer_max_in_flight_packets(),
+            endpoint.bytes_in_flight(),
+            endpoint.history_storage_slots(),
+            connection_credit,
+            stream_credit,
+        ))
+    }
+}
+
+impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
+    for ObjectUploadClient<HISTORY, PACKET>
+{
+    fn start(&mut self, output: &mut [u8; PACKET]) -> Result<usize, Error> {
+        self.association.start(output).map(|(_, used)| used)
+    }
+
+    fn receive_at(
+        &mut self,
+        input: &[u8],
+        now_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        if self.association.peer_cid().is_none() {
+            self.association
+                .receive_open_ack(self.path, input, now_ms)?;
+            let command_stream = self.association.allocate_client_bidi_stream()?;
+            return self
+                .association
+                .encode_stream_payload(
+                    command_stream,
+                    &self.command[..self.command_len],
+                    true,
+                    output,
+                )
+                .map(|(_, used)| Some(used));
+        }
+        let payload = self
+            .association
+            .receive_serial_response_payload(self.path, input, false)?;
+        self.command_admitted = true;
+        if let Some(payload) = payload {
+            if payload.offset != self.response_len as u64
+                || self.response_len.saturating_add(payload.data.len()) > PACKET
+            {
+                return Err(Error::Invalid);
+            }
+            self.response[self.response_len..self.response_len + payload.data.len()]
+                .copy_from_slice(payload.data);
+            self.response_len += payload.data.len();
+            if payload.fin {
+                if !self.records.is_complete() {
+                    return Err(Error::Invalid);
+                }
+                self.complete = true;
+                return Ok(self.association.poll_close(output)?.map(|(_, used)| used));
+            }
+        }
+        self.poll_application(output)
+    }
+
+    fn accepts(&self, input: &[u8]) -> bool {
+        self.association.connection().accepts(input)
+    }
+
+    fn is_peer_stateless_reset(&self, input: &[u8]) -> bool {
+        self.association.is_peer_stateless_reset(input)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn poll_transmit_at(
+        &mut self,
+        now_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        // Object source progress is ACK-clocked through `receive_at`: an
+        // admitted peer packet opens the next ordered source slice.  An idle
+        // bearer turn may still emit ordinary QUIC-lite ACK/MAX/PTO control,
+        // but it must not create an adapter-local burst queue by offering
+        // another object slice every scheduler tick.
+        self.association
+            .connection_mut()
+            .poll_transmit_at(now_ms, output)
+    }
+
+    fn poll_retransmit(
+        &mut self,
+        now_ms: u64,
+        pto_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        Ok(self
+            .association
+            .poll_retransmit(now_ms, pto_ms, output)?
+            .map(|(_, used)| used))
+    }
+}
 
 /// Typed host-side outcome after a bounded association request exhausts its
 /// retransmission budget. This does not assert a peer restart: it records only
@@ -530,6 +744,14 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             .complete_flash(response)
     }
 
+    pub fn grant_flash_receive_window(&mut self, window_bytes: usize) -> Result<(), Error> {
+        let path = self.core.active_path().ok_or(Error::Invalid)?;
+        self.core
+            .association_for_path_mut(path)
+            .ok_or(Error::Invalid)?
+            .grant_flash_receive_window(window_bytes)
+    }
+
     /// Release the correlated flash request after its QUIC association has
     /// explicitly closed. The ESP sink is released by its platform owner.
     pub fn abandon_flash(&mut self) {
@@ -656,6 +878,19 @@ pub struct ProbeClient<const HISTORY: usize, const PACKET: usize> {
     /// The next locally initiated stream remains association state while this
     /// ordinary probe temporarily owns the operation collector.
     next_client_bidi_stream_id: u64,
+    deferred_consumption: [DeferredConsumption; crate::probe::PROBE_MAX_NORMAL_STREAMS + 2],
+    initial_consume_delay_ms: u32,
+    consume_delay_ms: u32,
+    first_chunk_seen: bool,
+    consume_barrier_until_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DeferredConsumption {
+    stream: u64,
+    bytes: usize,
+    release_at_ms: u64,
+    active: bool,
 }
 
 /// Bounded tagged-CBOR request/response client for a complete-datagram
@@ -1146,6 +1381,12 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
             first_response_stream_id,
             next_server_bidi_stream_id: first_response_stream_id,
             next_client_bidi_stream_id,
+            deferred_consumption: [DeferredConsumption::default();
+                crate::probe::PROBE_MAX_NORMAL_STREAMS + 2],
+            initial_consume_delay_ms: request.initial_consume_delay_ms.unwrap_or(0),
+            consume_delay_ms: request.consume_delay_ms.unwrap_or(0),
+            first_chunk_seen: false,
+            consume_barrier_until_ms: None,
         };
         let peer = client.connection.peer_cid().ok_or(Error::Invalid)?;
         let endpoint = client.connection.endpoint_mut()?;
@@ -1185,6 +1426,22 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
         Self::new_with_packet_size(client_cid, bytes, PACKET as u16)
     }
 
+    /// Construct a probe whose receiving side advertises an explicit,
+    /// application-selected byte window.  This is deliberately a generic
+    /// QUIC connection limit, rather than a probe-specific packet credit, so
+    /// host tests can model slow flash/file consumers exactly.
+    pub fn new_with_receive_window(
+        client_cid: ConnectionId,
+        bytes: u64,
+        receive_window_bytes: u64,
+    ) -> Result<Self, Error> {
+        Self::from_request_with_limits(
+            client_cid,
+            crate::probe::ProbeServiceRequest::new(bytes, PACKET as u16),
+            ConnectionLimits::with_receive_window(receive_window_bytes),
+        )
+    }
+
     /// Construct a complete-datagram client with a caller-selected payload
     /// size.  Radio adapters use this to compare a small robust action frame
     /// against the normal MTU-sized UDP path; the service request remains the
@@ -1207,6 +1464,17 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
         client_cid: ConnectionId,
         request: crate::probe::ProbeServiceRequest,
     ) -> Result<Self, Error> {
+        Self::from_request_with_limits(client_cid, request, ConnectionLimits::default())
+    }
+
+    /// As [`Self::from_request`], with the receiver's ordinary QUIC byte
+    /// limits supplied by the caller.  The probe request remains handler
+    /// policy; bootstrap flow control remains a QUIC-lite setting.
+    pub fn from_request_with_limits(
+        client_cid: ConnectionId,
+        request: crate::probe::ProbeServiceRequest,
+        local_limits: ConnectionLimits,
+    ) -> Result<Self, Error> {
         // See `from_tagged_association`: the common plan clamps this request
         // to the active path's payload budget.
         if request.packet_size < 4 {
@@ -1217,7 +1485,7 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
             .ok_or(Error::Invalid)?;
         let plan = crate::probe::ProbeServicePlan::from_request(request, PACKET.saturating_sub(32));
         Ok(Self {
-            connection: quic_lite::ClientConnection::new(client_cid),
+            connection: quic_lite::ClientConnection::with_limits(client_cid, local_limits),
             request: request_wire,
             request_len,
             run: ProbeRun::new(
@@ -1234,6 +1502,12 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
             first_response_stream_id: quic_lite::FIRST_SERVER_BIDI_STREAM_ID,
             next_server_bidi_stream_id: quic_lite::FIRST_SERVER_BIDI_STREAM_ID,
             next_client_bidi_stream_id: quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4,
+            deferred_consumption: [DeferredConsumption::default();
+                crate::probe::PROBE_MAX_NORMAL_STREAMS + 2],
+            initial_consume_delay_ms: request.initial_consume_delay_ms.unwrap_or(0),
+            consume_delay_ms: request.consume_delay_ms.unwrap_or(0),
+            first_chunk_seen: false,
+            consume_barrier_until_ms: None,
         })
     }
 
@@ -1287,8 +1561,59 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
                 .write(quic_lite::FIRST_SERVER_BIDI_STREAM_ID);
             core::ptr::addr_of_mut!((*client).next_client_bidi_stream_id)
                 .write(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4);
+            core::ptr::addr_of_mut!((*client).deferred_consumption).write(
+                [DeferredConsumption::default(); crate::probe::PROBE_MAX_NORMAL_STREAMS + 2],
+            );
+            core::ptr::addr_of_mut!((*client).initial_consume_delay_ms).write(0);
+            core::ptr::addr_of_mut!((*client).consume_delay_ms).write(0);
+            core::ptr::addr_of_mut!((*client).first_chunk_seen).write(false);
+            core::ptr::addr_of_mut!((*client).consume_barrier_until_ms).write(None);
             Ok(&mut *client)
         }
+    }
+
+    fn release_due_consumption(&mut self, now_ms: u64) -> Result<(), Error> {
+        for pending in &mut self.deferred_consumption {
+            if !pending.active || pending.release_at_ms > now_ms {
+                continue;
+            }
+            self.connection
+                .endpoint_mut()?
+                .stream_consumed(pending.stream, pending.bytes)?;
+            *pending = DeferredConsumption::default();
+        }
+        Ok(())
+    }
+
+    fn defer_consumption(
+        &mut self,
+        stream: u64,
+        bytes: usize,
+        release_at_ms: u64,
+    ) -> Result<(), Error> {
+        let index = self
+            .deferred_consumption
+            .iter()
+            .position(|pending| pending.active && pending.stream == stream)
+            .or_else(|| {
+                self.deferred_consumption
+                    .iter()
+                    .position(|pending| !pending.active)
+            })
+            .ok_or(Error::StreamLimit)?;
+        let pending = &mut self.deferred_consumption[index];
+        if pending.active {
+            pending.bytes = pending.bytes.saturating_add(bytes);
+            pending.release_at_ms = pending.release_at_ms.max(release_at_ms);
+        } else {
+            *pending = DeferredConsumption {
+                stream,
+                bytes,
+                release_at_ms,
+                active: true,
+            };
+        }
+        Ok(())
     }
 
     /// Start bootstrap. Call once, then transmit the returned packet.
@@ -1332,6 +1657,7 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
         if !self.connection.is_started() || self.complete {
             return Err(Error::Invalid);
         }
+        self.release_due_consumption(now_ms)?;
         match self.connection.receive_bootstrap(
             input,
             now_ms,
@@ -1355,9 +1681,11 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
             self.other_packets = self.other_packets.saturating_add(1);
             return self.connection.poll_close(output);
         }
-        let endpoint = self.connection.endpoint_mut()?;
-        endpoint.set_time(now_ms);
-        let packet = endpoint.receive_datagram(input)?;
+        let packet = {
+            let endpoint = self.connection.endpoint_mut()?;
+            endpoint.set_time(now_ms);
+            endpoint.receive_datagram(input)?
+        };
         if let TransportPacket::Stream { frame, .. } = packet {
             self.stream_packets = self.stream_packets.saturating_add(1);
             let (complete, consumed) = self
@@ -1367,7 +1695,21 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
             self.next_server_bidi_stream_id = self
                 .next_server_bidi_stream_id
                 .max(frame.id.checked_add(4).ok_or(Error::Invalid)?);
-            endpoint.stream_consumed(frame.id, consumed)?;
+            if !self.first_chunk_seen {
+                self.first_chunk_seen = true;
+                self.consume_barrier_until_ms =
+                    Some(now_ms.saturating_add(u64::from(self.initial_consume_delay_ms)));
+            }
+            let release_at = now_ms
+                .saturating_add(u64::from(self.consume_delay_ms))
+                .max(self.consume_barrier_until_ms.unwrap_or(0));
+            if release_at <= now_ms {
+                self.connection
+                    .endpoint_mut()?
+                    .stream_consumed(frame.id, consumed)?;
+            } else {
+                self.defer_consumption(frame.id, consumed, release_at)?;
+            }
             self.complete = complete;
             if complete {
                 // Raw-action servers deliberately own one bounded association
@@ -1377,15 +1719,16 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
                 // The adapter sends this returned CLOSE on the same bearer
                 // and then drops the completed client state.
                 if self.close_when_complete {
+                    let endpoint = self.connection.endpoint_mut()?;
                     endpoint.close(0);
                     return endpoint.poll_close(output);
                 }
-                return endpoint.poll_transmit(output);
+                return self.connection.endpoint_mut()?.poll_transmit(output);
             }
         } else {
             self.other_packets = self.other_packets.saturating_add(1);
         }
-        endpoint.poll_transmit(output)
+        self.connection.endpoint_mut()?.poll_transmit(output)
     }
 
     /// Poll an ACK/window/control datagram after a bearer clock advance.
@@ -1397,6 +1740,7 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
         now_ms: u64,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
+        self.release_due_consumption(now_ms)?;
         self.connection.poll_transmit_at(now_ms, output)
     }
 
@@ -1404,9 +1748,21 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
     /// It is a scalar scheduling hint only; packet production remains in the
     /// shared ingress owner after that deadline fires.
     pub fn next_service_deadline_ms(&self, pto_ms: u64) -> Option<u64> {
-        self.connection
+        let transport = self
+            .connection
             .endpoint()
-            .and_then(|endpoint| endpoint.next_bearer_deadline(pto_ms))
+            .and_then(|endpoint| endpoint.next_bearer_deadline(pto_ms));
+        let consumption = self
+            .deferred_consumption
+            .iter()
+            .filter(|pending| pending.active)
+            .map(|pending| pending.release_at_ms)
+            .min();
+        match (transport, consumption) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     /// Re-emit the terminal CLOSE after a completed one-shot PROBE run.
@@ -1573,31 +1929,47 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         stateless_reset_token: Option<quic_lite::StatelessResetToken>,
         output: &mut [u8; PACKET],
     ) -> Result<(Self, Option<usize>), Error> {
+        // Ordered stream callbacks retain only datagrams which arrived ahead
+        // of a gap.  Size that shared reordering allowance from this
+        // association's already-bounded packet ledger, rather than the old
+        // 4 KiB generic RPC default: a normal eight-packet Wi-Fi flight can
+        // otherwise be rejected before it reaches the application sink.
+        let stream_config = ServerStreamConfig {
+            max_pending_streams: quic_lite::DEFAULT_STREAM_STATE_SLOTS,
+            // The callback retains only out-of-order datagrams, but a gap can
+            // span the receiver's admitted byte window even when its local
+            // outbound retransmission ledger is smaller. Bound retention by
+            // that configured window (Recovery: flash slots; host: selected
+            // memory policy), never by a bearer-private queue.
+            max_stream_bytes: usize::try_from(local_limits.max_data)
+                .unwrap_or(usize::MAX)
+                .max(association.history_packets.saturating_mul(PACKET)),
+        };
         let (mut connection, _default_ack) =
-            StreamServerConnection::accept_open_boxed_with_limits_and_reset_token(
+            StreamServerConnection::accept_open_boxed_with_config_and_reset_token(
                 packet,
                 local_cid,
                 0,
                 local_limits,
+                stream_config,
                 stateless_reset_token,
             )?;
         // The RFC initial window is intentionally conservative for a
         // generic path.  A raw action association has already supplied a
-        // bounded packet budget, so apply its runtime window here before
-        // the first service response.  This lets host links use their
-        // full eight-packet ledger while firmware can choose less.
+        // Apply the one shared association policy before the first service
+        // response. The local retransmission ledger is bounded, while peer
+        // receive backpressure remains ordinary QUIC-lite byte credit rather
+        // than a bearer-specific packet counter.
         let initial_window =
             (association.initial_window_packets as u64).saturating_mul(PACKET as u64);
-        connection.configure_raw_bearer(
+        connection.configure_transport(
             association.history_packets,
             initial_window,
             association.ack_frequency,
             u64::from(association.ack_delay_ms),
         )?;
-        // `configure_raw_bearer` installs the receiver's bounded packet
-        // budget in the connection-owned bootstrap profile. Re-encode the
-        // deterministic OPEN_ACK from that state so the peer cannot overrun
-        // an eight-slot embedded ingress pool before loss recovery begins.
+        // Re-encode the deterministic OPEN_ACK from the configured shared
+        // transport state before returning it to the client.
         let ack = connection.replay_open_ack(packet)?;
         if ack.len() > output.len() {
             return Err(Error::Invalid);
@@ -1652,11 +2024,18 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
                 connection
                     .mux
                     .receive_request_with_stream(packet, stream, |id, fin, bytes| {
-                        if id != stream {
-                            return Err(());
+                        if id == stream {
+                            object_chunks.push((bytes.to_vec(), fin));
+                            return Ok(());
                         }
-                        object_chunks.push((bytes.to_vec(), fin));
-                        Ok(())
+                        // Stream 4 may be retransmitted while stream 8 is
+                        // active. Let the normal request path below identify
+                        // the same flash request and make that replay
+                        // idempotent; rejecting it here strands a valid
+                        // two-stream upload on an unrelated packet loss.
+                        (id == quic_lite::FIRST_CLIENT_BIDI_STREAM_ID)
+                            .then_some(())
+                            .ok_or(())
                     })?
             }
             None => connection.receive_request(packet)?,
@@ -1822,6 +2201,21 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
     /// frame parsing, reordering, duplicate suppression, ACKs, and credit.
     pub fn take_flash_object_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
         core::mem::take(&mut self.flash_object_chunks)
+    }
+
+    /// Publish application storage which is available again to the peer.
+    /// `window_bytes` is the sink's current sliding-window capacity; QUIC-lite
+    /// owns the absolute MAX_DATA/MAX_STREAM_DATA values and their emission.
+    pub fn grant_flash_receive_window(&mut self, window_bytes: usize) -> Result<(), Error> {
+        if window_bytes == 0 || self.flash_object_stream != Some(FLASH_OBJECT_STREAM) {
+            return Ok(());
+        }
+        self.connection
+            .as_mut()
+            .ok_or(Error::WrongConnectionId)?
+            .mux
+            .endpoint
+            .grant_receive_window(FLASH_OBJECT_STREAM, window_bytes as u64)
     }
 
     /// Queue the final response only after the platform reports that its
@@ -2305,6 +2699,103 @@ mod tests {
     }
 
     #[test]
+    fn flash_object_credit_after_an_immediate_ack_advances_stream_eight() {
+        let client = ConnectionId::new(81).unwrap();
+        let server = ConnectionId::new(82).unwrap();
+        let limits = ConnectionLimits {
+            max_data: 64,
+            max_stream_data: 64,
+            ..ConnectionLimits::default()
+        };
+        let mut listener = ConnectionServer::<4, 1200>::new_with_association(
+            server,
+            limits,
+            AssociationProfile::conservative(),
+        );
+        let mut open = [0u8; 1200];
+        let open_len =
+            encode_bootstrap_open_packet_with_profile(client, 0, limits, 4, &mut open).unwrap();
+        let mut out = [0u8; 1200];
+        let _ack_len = listener
+            .receive(&open[..open_len], &mut out)
+            .unwrap()
+            .unwrap();
+
+        let mut endpoint =
+            EndpointState::<4, 4, 1200>::new(Role::Client, ConnectionLimits::default(), 1200);
+        endpoint.install_connection_ids(client, server).unwrap();
+        endpoint.set_initial_peer_credit(64, 64).unwrap();
+        endpoint.continue_packet_numbers_from(1).unwrap();
+
+        let request = crate::protocol::FlashRequest {
+            object: GetRequest {
+                name: None,
+                cpu: 13,
+                target: 6,
+            },
+            address: None,
+            transport: 0,
+            dry_run: true,
+        };
+        let mut body = [0u8; 128];
+        let body_len =
+            crate::protocol::encode_flash_handler_request(request, 9, &mut body).unwrap();
+        endpoint
+            .open_send_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, 64)
+            .unwrap();
+        let mut packet = [0u8; 1200];
+        let (used, _) = endpoint
+            .encode_stream_packet(
+                server,
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                0,
+                true,
+                &body[..body_len],
+                &mut packet,
+            )
+            .unwrap();
+        assert_eq!(listener.receive(&packet[..used], &mut out).unwrap(), None);
+        let _ = listener.take_flash_request();
+
+        endpoint.open_send_stream(FLASH_OBJECT_STREAM, 64).unwrap();
+        let (used, _) = endpoint
+            .encode_stream_packet(
+                server,
+                FLASH_OBJECT_STREAM,
+                0,
+                false,
+                &[0x5a; 16],
+                &mut packet,
+            )
+            .unwrap();
+        let immediate = listener
+            .receive(&packet[..used], &mut out)
+            .unwrap()
+            .unwrap();
+        // This is the ACK generated before the flash sink reports storage.
+        endpoint.receive_datagram(&out[..immediate]).unwrap();
+        let before = endpoint.peer_send_credit(FLASH_OBJECT_STREAM).unwrap();
+        assert_eq!(before, (98, 64));
+        assert_eq!(listener.take_flash_object_chunks().len(), 1);
+        assert_eq!(
+            listener
+                .connection
+                .as_ref()
+                .unwrap()
+                .mux
+                .endpoint
+                .receive_credit_state(FLASH_OBJECT_STREAM),
+            Some((50, 16, 64))
+        );
+
+        listener.grant_flash_receive_window(64).unwrap();
+        let credit = listener.poll(&mut out).unwrap().unwrap();
+        endpoint.receive_datagram(&out[..credit]).unwrap();
+        let after = endpoint.peer_send_credit(FLASH_OBJECT_STREAM).unwrap();
+        assert!(after.0 > before.0 && after.1 > before.1);
+    }
+
+    #[test]
     fn accepts_a_socket_free_probe_request_and_produces_stream_data() {
         let client = ConnectionId::new(7).unwrap();
         let server = ConnectionId::new(9).unwrap();
@@ -2460,6 +2951,60 @@ mod tests {
     }
 
     #[test]
+    fn prober_completes_large_transfer_with_small_configurable_receive_windows() {
+        // This is deliberately receiver-side flow control, not a packet
+        // bearer setting.  It exercises the same pattern a flash/file sink
+        // uses: accept an MTU-sized stream fragment, defer consumption while
+        // work is pending, then let ordinary QUIC MAX_* credit resume the
+        // sender.  Keep the transfer much larger than every tested window.
+        for window in [1_200u64, 2_400, 4_800] {
+            let client_cid = ConnectionId::new(0x6000 + window).unwrap();
+            let server_cid = ConnectionId::new(0x7000 + window).unwrap();
+            let request = ProbeServiceRequest {
+                initial_consume_delay_ms: Some(3),
+                consume_delay_ms: Some(1),
+                ..ProbeServiceRequest::new(128 * 1024, 1_100)
+            };
+            let mut client = ProbeClient::<8, 1200>::from_request_with_limits(
+                client_cid,
+                request,
+                ConnectionLimits::with_receive_window(window),
+            )
+            .unwrap();
+            let mut server = ConnectionServer::<8, 1200>::new(server_cid);
+            let mut client_out = [0u8; 1200];
+            let mut server_out = [0u8; 1200];
+            let mut to_server = std::collections::VecDeque::new();
+            let mut to_client = std::collections::VecDeque::new();
+            let started = client.start(&mut client_out).unwrap();
+            to_server.push_back(client_out[..started].to_vec());
+
+            for now_ms in 0..20_000 {
+                while let Some(packet) = to_server.pop_front() {
+                    if let Some(used) = server.receive(&packet, &mut server_out).unwrap() {
+                        to_client.push_back(server_out[..used].to_vec());
+                    }
+                }
+                while let Some(packet) = to_client.pop_front() {
+                    if let Some(used) = client.receive_at(&packet, now_ms, &mut client_out).unwrap()
+                    {
+                        to_server.push_back(client_out[..used].to_vec());
+                    }
+                }
+                if let Some(used) = client.poll_transmit_at(now_ms, &mut client_out).unwrap() {
+                    to_server.push_back(client_out[..used].to_vec());
+                }
+                if client.is_complete() {
+                    break;
+                }
+            }
+            assert!(client.is_complete(), "window={window}");
+            assert_eq!(client.bytes(), 128 * 1024, "window={window}");
+            assert_eq!(client.callback_errors(), [0; 6], "window={window}");
+        }
+    }
+
+    #[test]
     fn in_place_client_has_the_same_wire_state_as_the_normal_constructor() {
         // Firmware constructs the raw action client directly in its final
         // heap allocation so a large bounded ledger is never copied through
@@ -2533,8 +3078,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            advertised.max_in_flight_packets, 8,
-            "raw receiver packet budget must be negotiated in OPEN_ACK"
+            advertised.max_in_flight_packets, 0,
+            "shared byte credit must not be coupled to a raw-bearer packet cap"
         );
         let request_len = client
             .receive(&server_out[..open_ack_len], &mut client_out)
@@ -3590,14 +4135,13 @@ mod tests {
         let expected = crate::probe::ProbeServiceRequest {
             bytes: 65_536,
             packet_size: 512,
-            pace_us: Some(250),
-            burst_packets: Some(3),
-            burst_delay_us: Some(1_000),
             ack_frequency: None,
             ack_delay_ms: None,
             low_priority_bytes: Some(1_024),
             high_priority_bytes: Some(2_048),
             parallel_streams: Some(3),
+            initial_consume_delay_ms: Some(500),
+            consume_delay_ms: Some(10),
         };
         let client =
             ProbeClient::<8, 1200>::from_request(ConnectionId::new(0x45).unwrap(), expected)

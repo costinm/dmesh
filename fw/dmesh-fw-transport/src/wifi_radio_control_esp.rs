@@ -267,7 +267,9 @@ pub fn snapshot() -> RawWifiSnapshot {
         sta_last_disconnect_reason: Some(crate::wifi_esp::sta_last_disconnect_reason()),
         sta_ap_rssi_dbm: crate::wifi_esp::sta_ap_rssi_dbm(),
         max_tx_power_qdbm: crate::wifi_esp::max_tx_power_qdbm(),
-        udp6_tx_burst_packets: Some(crate::wifi_raw_udp6_esp::tx_burst_packets()),
+        // Packet pacing is owned by quic-lite; the bearer exposes no burst
+        // credit as a radio setting.
+        udp6_tx_burst_packets: None,
         udp6_tx_submit_calls: Some(udp6_tx_submit_calls),
         udp6_tx_submit_us_total: Some(udp6_tx_submit_us_total),
         udp6_tx_submit_us_max: Some(udp6_tx_submit_us_max),

@@ -1846,6 +1846,10 @@ pub enum Request {
         #[serde(default)]
         parallel_streams: Option<u8>,
         #[serde(default)]
+        initial_consume_delay_ms: Option<u32>,
+        #[serde(default)]
+        consume_delay_ms: Option<u32>,
+        #[serde(default)]
         timeout_ms: Option<u64>,
     },
     /// Open or replace one retained QUIC control connection to a directly
@@ -3405,6 +3409,8 @@ impl LmeshService {
                 bytes,
                 packet_size,
                 parallel_streams,
+                initial_consume_delay_ms,
+                consume_delay_ms,
                 timeout_ms,
             } => {
                 let mut request = dmesh_server::probe::ProbeServiceRequest::new(
@@ -3412,6 +3418,8 @@ impl LmeshService {
                     packet_size.unwrap_or(1200),
                 );
                 request.parallel_streams = parallel_streams;
+                request.initial_consume_delay_ms = initial_consume_delay_ms;
+                request.consume_delay_ms = consume_delay_ms;
                 let timeout_ms = timeout_ms.unwrap_or(30_000);
                 // Probe is a normal read-only stream. A peer restart can
                 // invalidate a retained CID just after a service restart;

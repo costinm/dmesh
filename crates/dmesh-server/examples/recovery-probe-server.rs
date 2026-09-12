@@ -13,24 +13,9 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .unwrap_or_else(|| "127.0.0.1:3337".to_owned())
         .parse()?;
-    let pace_us = args
-        .next()
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .unwrap_or(0);
-    let burst_packets = args
-        .next()
-        .map(|value| value.parse::<usize>())
-        .transpose()?
-        .unwrap_or(0);
-    let burst_delay_us = args
-        .next()
-        .map(|value| value.parse::<u64>())
-        .transpose()?
-        .unwrap_or(0);
     // This is a host performance listener, not a device-memory emulator.
     // Use the largest bounded host ledger by default; device comparisons pass
-    // their explicit device window as the fifth argument.
+    // their explicit device window as the second argument.
     let history_capacity = args
         .next()
         .map(|value| value.parse::<usize>())
@@ -68,9 +53,6 @@ async fn main() -> anyhow::Result<()> {
         // Keep object records below the one shared QUIC-lite bearer MTU.
         // UdpConfig's default reserves the framing headroom required by all
         // bearers, including UART and extended vendor-action frames.
-        probe_pace: Duration::from_micros(pace_us),
-        probe_burst_packets: burst_packets,
-        probe_burst_delay: Duration::from_micros(burst_delay_us),
         history_capacity,
         ip_tos,
         control: Some(control),

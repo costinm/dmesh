@@ -433,41 +433,16 @@ pub(crate) fn boot_power_policy_from_nvs() -> BootPowerPolicy {
 /// measurements and opaque packet but does not feed back into the local
 /// tagged dispatcher or create a new radio task.
 pub fn forward_lora_packet(payload: &[u8], rssi: i16, snr: i8) -> bool {
-    if payload.is_empty() || payload.len() > crate::TRANSPORT_MTU {
-        return false;
-    }
-    // {1:1002, 2:5(packet), 5:{1:rssi,2:snr}, 10:h'packet'}
-    let mut record = [0u8; crate::TRANSPORT_MTU];
-    let mut encoder = dmesh_server::cbor::Encoder::new(&mut record);
-    if encoder.map(4).is_none()
-        || encoder.uint(1).is_none()
-        || encoder.uint(1002).is_none()
-        || encoder.uint(2).is_none()
-        || encoder.uint(5).is_none()
-        || encoder.uint(5).is_none()
-        || encoder.map(2).is_none()
-        || encoder.uint(1).is_none()
-        || encoder.int(i64::from(rssi)).is_none()
-        || encoder.uint(2).is_none()
-        || encoder.int(i64::from(snr)).is_none()
-        || encoder.uint(10).is_none()
-        || encoder.bytes_value(payload).is_none()
-    {
-        return false;
-    }
-    let used = encoder.len();
-    drop(encoder);
-    let record = &record[..used];
-    let uart = crate::uart_esp::send_direct_record(record);
-    let now = crate::wifi_espnow_esp::broadcast_record(record);
-    let udp6 = crate::wifi_raw_udp6_esp::broadcast_announce(record);
-    uart || now || udp6
+    // LoRa payload fan-out used a connectionless application side channel on
+    // UART, NOW, and UDP6. Do not bypass a QUIC stream: a future stream event
+    // subscriber owns delivery and backpressure. Keep this ABI hook inert
+    // while module callers migrate to that stream service.
+    let _ = (payload, rssi, snr);
+    false
 }
 
 pub(crate) fn send_startup_records_on_now(boot_message: &[u8], role: u8, partition: u8) {
-    if let Some(record) = dmesh_server::services::encode_status_text(boot_message) {
-        let _ = crate::wifi_espnow_esp::broadcast_record(&record);
-    }
+    let _ = boot_message;
     send_announce_on_now(
         dmesh_server::announce::ANNOUNCE_DISCOVERY,
         0,
@@ -612,6 +587,10 @@ pub(crate) fn maybe_enter_sleep(
     // device remains observable and we do not churn the physical serial
     // driver on every wake cycle.
     crate::wifi_esp::stop_sta();
+    // Classic ESP32 retains a Wi-Fi PM lock after `esp_wifi_stop()`. Release
+    // the initialized driver before the explicit timer sleep; `init_nan_now`
+    // recreates it after wake. Without this, `esp_light_sleep_start()` returns
+    // immediately and the device remains at its active current.
     crate::wifi_esp::deinit_for_light_sleep();
     crate::wifi_nan_dw_capture_esp::prepare_light_sleep_resume();
     let (bssid, anchor_us, _) = crate::wifi_nan_dw_capture_esp::sync_diagnostics();
@@ -1109,12 +1088,11 @@ fn apply_sta_live_settings(profile: &crate::TransportProfile, state: &mut MainRa
     if state.applied_sta_raw_rx_enabled != Some(profile.sta_raw_rx_enabled) {
         crate::wifi_raw_udp6_esp::stop();
         if profile.sta_raw_rx_enabled {
-            let raw_tx_burst_packets = crate::core_runtime::prepare_raw_association(profile);
+            crate::core_runtime::prepare_raw_association(profile);
             if crate::wifi_esp::start_raw_udp6(
                 crate::core_runtime::receive_main_raw_udp6,
                 crate::core_runtime::receive_udp6_connectionless,
             ) {
-                crate::wifi_raw_udp6_esp::set_tx_burst_packets(raw_tx_burst_packets);
                 crate::wifi_raw_udp6_esp::set_poll_handler(Some(
                     crate::core_runtime::poll_raw_udp6,
                 ));
@@ -1149,8 +1127,7 @@ fn apply_sta_live_settings(profile: &crate::TransportProfile, state: &mut MainRa
         || state.applied_ack_delay_ms != Some(profile.ack_delay_ms)
         || state.applied_tx_burst_packets != Some(profile.tx_burst_packets)
     {
-        let raw_tx_burst_packets = crate::core_runtime::replace_raw_association(profile);
-        crate::wifi_raw_udp6_esp::set_tx_burst_packets(raw_tx_burst_packets);
+        crate::core_runtime::replace_raw_association(profile);
         state.applied_ack_frequency = Some(profile.ack_frequency);
         state.applied_ack_delay_ms = Some(profile.ack_delay_ms);
         state.applied_tx_burst_packets = Some(profile.tx_burst_packets);
@@ -1307,8 +1284,42 @@ fn announce_record(
 fn build_announce_record(
     kind: u64,
     uptime_secs: u64,
+    role: u8,
+    partition: u8,
+) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
+    build_announce_record_with_capabilities(
+        kind,
+        uptime_secs,
+        role,
+        partition,
+        dmesh_server::probe::PROBE_CAP_NAN
+            | dmesh_server::probe::PROBE_CAP_NOW
+            | dmesh_server::probe::PROBE_CAP_STA
+            | dmesh_server::probe::PROBE_CAP_AP
+            | dmesh_server::probe::PROBE_CAP_UDP6,
+    )
+}
+
+/// Signed Recovery presence for the ordinary STA/UDP6 update server.  This
+/// deliberately advertises neither NAN, NOW nor AP capabilities.
+pub(crate) fn recovery_discovery_record(
+    uptime_secs: u64,
+) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
+    build_announce_record_with_capabilities(
+        dmesh_server::announce::ANNOUNCE_DISCOVERY,
+        uptime_secs,
+        0,
+        0,
+        dmesh_server::probe::PROBE_CAP_STA | dmesh_server::probe::PROBE_CAP_UDP6,
+    )
+}
+
+fn build_announce_record_with_capabilities(
+    kind: u64,
+    uptime_secs: u64,
     _role: u8,
     _partition: u8,
+    capabilities: u16,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
     let mac = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta)
         .or_else(|| crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap))?;
@@ -1325,14 +1336,7 @@ fn build_announce_record(
     if !announce.set_public_key(&public_key) {
         return None;
     }
-    announce.set_probe_descriptor(
-        dmesh_server::announce::DEVICE_CLASS_ESP,
-        dmesh_server::probe::PROBE_CAP_NAN
-            | dmesh_server::probe::PROBE_CAP_NOW
-            | dmesh_server::probe::PROBE_CAP_STA
-            | dmesh_server::probe::PROBE_CAP_AP
-            | dmesh_server::probe::PROBE_CAP_UDP6,
-    );
+    announce.set_probe_descriptor(dmesh_server::announce::DEVICE_CLASS_ESP, capabilities);
     let mut name = [0u8; dmesh_server::announce::MAX_DEVICE_NAME];
     if let Some(used) = read_setting(b"name", &mut name) {
         if let Ok(name) = core::str::from_utf8(&name[..used]) {
@@ -2854,7 +2858,11 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // The control UART is available for the boot proof above.  Afterwards it
     // follows the requested profile exactly, including an explicit `uart=off`
     // on a sleepy boot; DW8 itself never silently changes this choice.
-    crate::main_runtime::apply_uart_profile(service.role, &initial_profile, &mut state.applied_uart);
+    crate::main_runtime::apply_uart_profile(
+        service.role,
+        &initial_profile,
+        &mut state.applied_uart,
+    );
     if crate::main_runtime::wants_sta(&initial_profile) {
         // NVS only supplies the boot declaration. Apply it through the same
         // complete STA epoch path used by an accepted `transport.start`, so

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "dmesh_pm.c"
+    SRCS "dmesh_nimble.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_pm esp_timer
+    REQUIRES bt nvs_flash
 )

@@ -72,7 +72,9 @@
       {"id": 7, "name": "ack_delay_ms", "kind": "u8"},
       {"id": 8, "name": "low_priority_bytes", "kind": "u32"},
       {"id": 9, "name": "high_priority_bytes", "kind": "u32"},
-      {"id": 10, "name": "parallel_streams", "kind": "u8"}
+      {"id": 10, "name": "parallel_streams", "kind": "u8"},
+      {"id": 11, "name": "initial_consume_delay_ms", "kind": "u32"},
+      {"id": 12, "name": "consume_delay_ms", "kind": "u32"}
     ]},
     {"id": 2, "name": "object.flash", "component": 10, "fields": [
       {"id": 1, "name": "cpu", "kind": "u8"},

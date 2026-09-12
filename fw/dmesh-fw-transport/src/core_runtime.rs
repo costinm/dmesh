@@ -5,7 +5,7 @@
 //!
 //! The reusable pieces are split by bearer: `uart` handles the command/control
 //! channel, `wifi` owns STA setup and the UDP transport adapter, and
-//! `udp_flash` consumes ordered application stream bytes.
+//! application handlers consume ordered QUIC stream bytes.
 // This association and dispatcher are one shared bearer service.  They are
 // private on purpose: Main selects *when* the profile takes effect, while this
 // module performs the paired association/dispatcher mutation atomically from
@@ -38,7 +38,7 @@ pub(crate) fn apply_uart_profile(enabled: bool) {
     crate::uart_esp::set_always_on(enabled);
 }
 
-fn raw_association(profile: &crate::TransportProfile) -> quic_lite::AssociationProfile {
+pub(crate) fn raw_association(profile: &crate::TransportProfile) -> quic_lite::AssociationProfile {
     let window = crate::CONNECTION_HISTORY_CAPACITY;
     let tx_burst_packets = if profile.tx_burst_packets == 0 {
         window
@@ -166,7 +166,9 @@ unsafe fn connection_dispatcher_mut() -> &'static mut ConnectionDispatcher {
             // shared dispatcher allocates a local, nonzero server CID instead
             // of deriving QUIC state from a radio MAC.
             quic_lite::ConnectionId::new(1).expect("one is a valid CID"),
-            quic_lite::ConnectionLimits::default(),
+            // Storage-backed application streams publish receive capacity as
+            // it becomes available; the initial credit is bearer-neutral.
+            quic_lite::recovery_connection_limits(false, 0),
             *core::ptr::addr_of!(RAW_ASSOCIATION),
         );
         // The dispatcher owns CID/restart behavior for UART, NOW, and UDP6.
@@ -193,12 +195,10 @@ unsafe fn connection_dispatcher_if_ready() -> Option<&'static mut ConnectionDisp
 /// Install the association defaults that the next connection will use.
 ///
 /// Called once during a STA/raw-radio start transition, before the receive
-/// callback can construct a dispatcher.  Returning the burst limit keeps the
-/// radio adapter independent of this private static state.
-pub(crate) fn prepare_raw_association(profile: &crate::TransportProfile) -> usize {
+/// callback can construct a dispatcher.
+pub(crate) fn prepare_raw_association(profile: &crate::TransportProfile) {
     unsafe {
         RAW_ASSOCIATION = raw_association(profile);
-        RAW_ASSOCIATION.tx_burst_packets
     }
 }
 
@@ -207,20 +207,13 @@ pub(crate) fn prepare_raw_association(profile: &crate::TransportProfile) -> usiz
 /// UDP6, so replace it rather than letting an old eight-packet association
 /// survive into the packet-at-a-time action path. The physical bearer is not
 /// touched here; callers have already serialized the radio transition.
-pub(crate) fn prepare_espnow_association(profile: &crate::TransportProfile) -> usize {
+pub(crate) fn prepare_espnow_association(profile: &crate::TransportProfile) {
     unsafe {
         RAW_ASSOCIATION = espnow_association(profile);
         let association = RAW_ASSOCIATION;
-        // The connection dispatcher controls QUIC admission, whereas the
-        // action adapter controls how many already-admitted datagrams one
-        // callback turn submits. Keep the two values synchronized here at
-        // the epoch boundary; otherwise a stale adapter default can create a
-        // radio burst that contradicts the selected association profile.
-        crate::wifi_espnow_esp::set_tx_burst_packets(association.tx_burst_packets);
         if let Some(service) = connection_dispatcher_if_ready() {
             service.set_association_defaults(association);
         }
-        association.tx_burst_packets
     }
 }
 
@@ -228,82 +221,15 @@ pub(crate) fn prepare_espnow_association(profile: &crate::TransportProfile) -> u
 /// state.  Main calls this only for an explicit ACK/burst profile transition;
 /// the raw callback never invokes it.  A not-yet-created dispatcher simply
 /// picks up the prepared defaults on its first valid OPEN.
-pub(crate) fn replace_raw_association(profile: &crate::TransportProfile) -> usize {
+pub(crate) fn replace_raw_association(profile: &crate::TransportProfile) {
     unsafe {
         RAW_ASSOCIATION = raw_association(profile);
         let association = RAW_ASSOCIATION;
         if let Some(service) = connection_dispatcher_if_ready() {
             service.set_association_defaults(association);
         }
-        association.tx_burst_packets
     }
 }
-// Exactly one device-initiated object transfer may be active for the current
-// one-association connection. The state is allocated only after a validated
-// `flash` request; it is not a bearer queue and owns no copy of object data.
-/// The only ESP flash handler state: an ordered signed-object receiver.  The
-/// active connection's QUIC-lite mux owns all packet and stream mechanics.
-struct FlashDownload {
-    receiver: alloc::boxed::Box<crate::flash::SignedObjectFlashReceiver>,
-    expires_at_us: u64,
-}
-
-impl FlashDownload {
-    unsafe fn new_boxed(
-        request: dmesh_server::protocol::FlashRequest<'_>,
-        now_us: u64,
-    ) -> Result<alloc::boxed::Box<Self>, crate::flash::FlashSinkError> {
-        let receiver = crate::flash::new_boxed_receiver(request)?;
-        let raw = alloc::alloc::alloc_zeroed(alloc::alloc::Layout::new::<Self>()) as *mut Self;
-        if raw.is_null() {
-            return Err(crate::flash::FlashSinkError::AllocationFailed);
-        }
-        core::ptr::addr_of_mut!((*raw).receiver).write(receiver);
-        // A sender must keep advancing its ordered object stream.  Bound the
-        // receiver lifetime after a lost CLI or bearer without creating a
-        // UART/UDP/NOW-private timeout.
-        core::ptr::addr_of_mut!((*raw).expires_at_us).write(now_us.saturating_add(30_000_000));
-        Ok(alloc::boxed::Box::from_raw(raw))
-    }
-
-    fn receive_chunks(
-        &mut self,
-        chunks: alloc::vec::Vec<(alloc::vec::Vec<u8>, bool)>,
-        now_us: u64,
-    ) -> Result<(), ()> {
-        let mut admitted = false;
-        for (fragment, _) in chunks {
-            self.receiver
-                .push_ordered(&fragment)
-                .map_err(|_| ())?;
-            admitted = true;
-        }
-        // This is an idle deadline, not an overall-transfer deadline.  The
-        // shared QUIC-lite endpoint can deliberately pace a large image for
-        // longer than thirty seconds; each already-admitted ordered fragment
-        // proves that its single association remains live.  A stalled client
-        // still expires after the same bounded interval, while CLOSE clears
-        // the receiver immediately.
-        if admitted {
-            self.expires_at_us = now_us.saturating_add(30_000_000);
-        }
-        self.receiver
-            .sink_mut()
-            .poll_completed()
-            .map(|_| ())
-            .map_err(|_| ())
-    }
-
-    fn is_complete_and_durable(&mut self) -> bool {
-        self.receiver.is_complete() && self.receiver.sink_mut().is_durable()
-    }
-
-    fn is_expired(&self, now_us: u64) -> bool {
-        now_us >= self.expires_at_us
-    }
-}
-
-static mut FLASH_DOWNLOAD: Option<(quic_lite::PathId, alloc::boxed::Box<FlashDownload>)> = None;
 // PPP needs a response buffer while its callback sends an immediate ACK. It
 // is allocated only after the first valid UART service packet; this is bearer
 // scratch, not a second QUIC ledger or egress queue.
@@ -343,7 +269,7 @@ pub fn receive_connection_frame_ingress(
         let service = connection_dispatcher_mut();
         let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
         service.set_time(now_us);
-        expire_flash_download(service, now_us);
+        crate::stream_handlers::before_receive(service, now_us);
         // Component handlers execute synchronously inside `receive`. Give
         // them a pre-dispatch association snapshot rather than allowing a
         // diagnostic handler to re-enter this mutable shared owner.
@@ -354,14 +280,8 @@ pub fn receive_connection_frame_ingress(
             crate::relay_main::with_connection_status(connection_status, last_close_at, || {
                 service.receive(path, packet, response)
             });
-        let (accepted, mut result) = match receive {
-            Ok(value) => match service.take_flash_request() {
-                Some(request) => (
-                    true,
-                    begin_flash_download(service, path, request, response, value),
-                ),
-                None => (true, value),
-            },
+        let (accepted, result) = match receive {
+            Ok(value) => (true, value),
             Err(error) => {
                 CONNECTION_LAST_ERROR.store(
                     quic_lite::receive_error_code(error) as u32,
@@ -384,51 +304,12 @@ pub fn receive_connection_frame_ingress(
                 (false, None)
             }
         };
-        if service.last_close_at() != close_before {
-            // The QUIC association was retired, so neither its platform sink
-            // nor its correlated request ID may poison the next attempt.
-            abandon_flash_download(service, b"flash receiver closed");
-        }
-        let mut flash_completed = false;
-        if accepted {
-            if let Some((download_path, download)) =
-                (*core::ptr::addr_of_mut!(FLASH_DOWNLOAD)).as_mut()
-            {
-                if *download_path == path {
-                    let chunks = service.take_flash_object_chunks();
-                    if !chunks.is_empty()
-                        && download
-                            .receive_chunks(
-                                chunks,
-                                esp_idf_sys::esp_timer_get_time().max(0) as u64,
-                            )
-                            .is_err()
-                    {
-                        // The ordered-stream callback has already performed
-                        // QUIC framing/reassembly. This is therefore an
-                        // object-record or sink admission failure, not a
-                        // bearer retry condition.
-                        crate::commands::send_response(b"flash object receiver rejected");
-                    }
-                    flash_completed = finish_flash_download();
-                }
-            }
-        }
-        // A handler may accept a request without an immediate application
-        // response (notably object.flash while its durable sink is active).
-        // QUIC-lite has still queued an ACK/MAX_DATA packet. Poll it on this
-        // same bearer turn so raw UDP6/UART/NOW do not require an unrelated
-        // later ingress packet merely to release client flow control.
-        if accepted && result.is_none() {
-            result = service.poll_for(path, response).ok().flatten();
-        }
-        // The final object fragment may have produced an ACK as the immediate
-        // response.  Prefer the now-ready terminal stream response in this
-        // same bearer turn so a one-packet egress budget cannot strand a
-        // durable flash completion behind an idle poll timer.
-        if flash_completed {
-            result = service.poll_for(path, response).ok().flatten().or(result);
-        }
+        let closed = service.last_close_at() != close_before;
+        let result = if accepted {
+            crate::stream_handlers::after_receive(service, path, now_us, closed, result, response)
+        } else {
+            result
+        };
         if connection_path_transport(path) == dmesh_server::transport_path::TransportId::NOW.0 {
             if service.reply_path() == Some(path) {
                 // The C6 continuous private action dispatcher sees the
@@ -464,100 +345,15 @@ pub fn receive_connection_frame_ingress(
     }
 }
 
-/// Flash setup is cold and may construct a large receiver. Keep it out of the
-/// raw packet service frame so a normal UDP/NOW/UART PROBE packet does not
-/// reserve the flash constructor's stack footprint.
-#[inline(never)]
-unsafe fn begin_flash_download(
-    service: &mut ConnectionDispatcher,
-    path: quic_lite::PathId,
-    request: alloc::vec::Vec<u8>,
-    _response: &mut [u8; crate::TRANSPORT_MTU],
-    fallback: Option<usize>,
-) -> Option<usize> {
-    let download_slot = core::ptr::addr_of_mut!(FLASH_DOWNLOAD);
-    let Some(request) = dmesh_server::protocol::decode_flash_request(&request) else {
-        let _ = service.complete_flash(alloc::vec::Vec::from(&b"flash invalid"[..]));
-        return fallback;
-    };
-    // An incomplete receiver can survive only when its prior peer vanished
-    // without CLOSE. This newly admitted request already owns the current
-    // dispatcher's flash ID, so replace the orphaned sink instead of making
-    // every later attempt require a board reset.
-    if (*download_slot).take().is_some() {
-        crate::commands::send_response(b"flash receiver replaced");
-    }
-    crate::commands::send_response(b"flash receiver allocating");
-    let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
-    match FlashDownload::new_boxed(request, now_us) {
-        Ok(download) => {
-            crate::commands::send_response(b"flash object stream armed");
-            *download_slot = Some((path, download));
-            fallback
-        }
-        Err(_) => {
-            let _ = service.complete_flash(alloc::vec::Vec::from(&b"flash rejected"[..]));
-            fallback
-        }
-    }
-}
-
-/// Complete the original `flash` request only after the sink has committed
-/// all accepted blocks. The next normal connection poll emits this response.
-unsafe fn finish_flash_download() -> bool {
-    let download_slot = core::ptr::addr_of_mut!(FLASH_DOWNLOAD);
-    let complete = (*download_slot)
-        .as_mut()
-        .is_some_and(|(_, download)| download.is_complete_and_durable());
-    if !complete {
-        return false;
-    }
-    *download_slot = None;
-    if let Some(service) = connection_dispatcher_if_ready() {
-        crate::commands::send_response(b"flash object durable");
-        let _ = service.complete_flash(alloc::vec::Vec::from(&b"flash complete"[..]));
-    }
-    true
-}
-
-/// Resolve a lost/incomplete upload without relying on a particular bearer.
-/// If the association is still live its original request receives the terminal
-/// timeout response; QUIC-lite owns delivery/retransmission of that response.
-unsafe fn expire_flash_download(service: &mut ConnectionDispatcher, now_us: u64) {
-    let download_slot = core::ptr::addr_of_mut!(FLASH_DOWNLOAD);
-    if !(*download_slot)
-        .as_ref()
-        .is_some_and(|(_, download)| download.is_expired(now_us))
-    {
-        return;
-    }
-    *download_slot = None;
-    crate::commands::send_response(b"flash receiver timeout");
-    let _ = service.complete_flash(alloc::vec::Vec::from(&b"flash timeout"[..]));
-}
-
-/// Release platform and dispatcher flash state after the peer's explicit
-/// CLOSE. No reply is generated because that QUIC association is retired.
-unsafe fn abandon_flash_download(service: &mut ConnectionDispatcher, reason: &[u8]) {
-    if (*core::ptr::addr_of_mut!(FLASH_DOWNLOAD)).take().is_some() {
-        crate::commands::send_response(reason);
-    }
-    service.abandon_flash();
-}
-
 pub fn poll_connection(
     path: quic_lite::PathId,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
     unsafe {
-        let download_slot = core::ptr::addr_of_mut!(FLASH_DOWNLOAD);
-        if (*download_slot).as_ref().is_some_and(|(download_path, _)| *download_path == path) {
-            let _ = finish_flash_download();
-        }
         let service = connection_dispatcher_if_ready()?;
         let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
         service.set_time(now_us);
-        expire_flash_download(service, now_us);
+        crate::stream_handlers::before_poll(service, path, now_us);
         // Prefer endpoint-owned loss recovery over a fresh ACK/control frame:
         // an action response can be accepted by the local driver yet lost on
         // air, and no bearer-local response queue is allowed to mask that.
@@ -633,7 +429,9 @@ fn service_connection_timer() {
                 }
             }
             transport if transport == dmesh_server::transport_path::TransportId::UDP6.0 => {
-                if CONNECTION_TIMER_UDP6_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 2 {
+                if CONNECTION_TIMER_UDP6_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    < 2
+                {
                     crate::commands::send_response(b"connection timer UDP6");
                 }
                 crate::wifi_raw_udp6_esp::poll_connection_timer();
@@ -897,7 +695,51 @@ fn service_uart_egress_ready() {
     }
 }
 
-/// Pump only as many UART packets as the physical writer can accept now.
+/// Notify the shared connection owner that an application stream's storage
+/// completed work. This edge is independent of packet loss and bearer choice.
+pub(crate) fn schedule_storage_ready() -> bool {
+    crate::shared_ingress_esp::schedule_storage_ready(service_storage_ready)
+}
+
+/// Let the application publish newly available receive capacity to QUIC-lite,
+/// then submit any resulting opaque transport packet on its active path.
+fn service_storage_ready() {
+    unsafe {
+        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
+        let Some(service) = connection_dispatcher_if_ready() else {
+            return;
+        };
+        let Ok(Some(path)) = crate::stream_handlers::storage_ready(service, now_us) else {
+            return;
+        };
+        match connection_path_transport(path) {
+            transport if transport == dmesh_server::transport_path::TransportId::UART.0 => {
+                let Some(response) = (*core::ptr::addr_of_mut!(UART_SERVICE_RESPONSE)).as_mut()
+                else {
+                    return;
+                };
+                pump_uart_egress(path, response, None);
+            }
+            transport if transport == dmesh_server::transport_path::TransportId::NOW.0 => {
+                let response = &mut *core::ptr::addr_of_mut!(CONNECTION_TIMER_RESPONSE);
+                if let Some(used) = poll_connection(path, response) {
+                    let _ = crate::wifi_espnow_esp::transmit_from_worker(
+                        crate::wifi_espnow_esp::EspNowPeer {
+                            mac: connection_path_peer(path),
+                        },
+                        &response[..used],
+                    );
+                }
+            }
+            transport if transport == dmesh_server::transport_path::TransportId::UDP6.0 => {
+                crate::wifi_raw_udp6_esp::poll_connection_timer();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Submit one QUIC-lite packet only when the physical UART writer has space.
 ///
 /// A classic ESP32 deliberately has one MTU-sized egress slot to preserve
 /// internal RAM. Unlike a socket, `poll_transmit` advances the QUIC ledger as
@@ -909,15 +751,11 @@ fn pump_uart_egress(
     immediate: Option<usize>,
 ) {
     let (queued, capacity) = crate::uart_esp::transport_egress_capacity();
-    let credit = capacity.saturating_sub(queued);
-    if credit == 0 {
+    if queued >= capacity {
         return;
     }
-    let _ = dmesh_server::transport::pump_egress(
-        response,
-        credit,
-        immediate,
-        |response| poll_connection(path, response),
-        crate::uart_esp::send_transport_packet,
-    );
+    let used = immediate.or_else(|| poll_connection(path, response));
+    if let Some(used) = used.filter(|used| *used <= response.len()) {
+        let _ = crate::uart_esp::send_transport_packet(&response[..used]);
+    }
 }

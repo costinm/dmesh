@@ -658,6 +658,48 @@ mod tests {
     }
 
     #[test]
+    fn reordering_allowance_covers_the_configured_packet_window() {
+        const PACKET: usize = 1200;
+        let mut too_small = CallbackStreams::new(2, 4096);
+        let mut sink = CopySink::default();
+        for offset in [PACKET, PACKET * 2, PACKET * 3, PACKET * 4] {
+            let result = too_small.receive_copying(
+                8,
+                Arc::new(vec![0x5a; PACKET]),
+                offset as u64,
+                0..PACKET,
+                false,
+                &mut sink,
+            );
+            if offset == PACKET * 4 {
+                assert!(matches!(
+                    result,
+                    Err(CopyingError::Transport(CallbackError::Capacity))
+                ));
+            } else {
+                result.unwrap();
+            }
+        }
+
+        let mut streams = CallbackStreams::new(2, 8 * PACKET);
+        let mut sink = CopySink::default();
+        for offset in [PACKET, PACKET * 2, PACKET * 3, PACKET * 4, 0] {
+            streams
+                .receive_copying(
+                    8,
+                    Arc::new(vec![0x5a; PACKET]),
+                    offset as u64,
+                    0..PACKET,
+                    false,
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        assert_eq!(sink.data.len(), 5 * PACKET);
+        assert_eq!(streams.retained_bytes(), 0);
+    }
+
+    #[test]
     fn exact_retransmission_does_not_fail_when_callback_window_is_full() {
         let mut streams = CallbackStreams::new(2, 4);
         let mut sink = CopySink::default();

@@ -1,0 +1,12 @@
+[package]
+name = "dmesh-ble"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+esp-idf-sys = { version = "0.37", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git", rev = "8369f610a31e9c90a5479ed7f366f983589dfa0a" }

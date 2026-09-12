@@ -196,14 +196,6 @@ const UDP_MIN_RETRANSMIT_PTO_MS: u64 = 250;
 // is deliberately host-only: embedded receive budgets remain negotiated in
 // the bootstrap/profile, not enlarged by a socket setting.
 const HOST_UDP_SOCKET_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
-// A sender that has just declared loss needs a small amount of temporal
-// separation between subsequent new datagrams.  This is scheduler policy
-// derived from transport feedback, not a bearer ACK/retry mechanism.  Keep
-// it bounded: Wi-Fi needs microsecond-scale spacing, while a long fixed delay
-// would recreate stop-and-wait on a clean link.
-const ADAPTIVE_PACING_MIN: Duration = Duration::from_micros(125);
-const ADAPTIVE_PACING_MAX: Duration = Duration::from_millis(2);
-const ADAPTIVE_PACING_CLEAN_ACKS: u64 = 32;
 // An object transfer must keep its connection scheduler responsive to a
 // delayed ACK/window update. This is a wakeup bound, not sender pacing.
 const ACTIVE_OBJECT_SCHEDULER_TICK: Duration = Duration::from_millis(1);
@@ -377,7 +369,6 @@ struct BootstrapPacketNumbers {
 struct PendingObjectTransfer {
     stream: ObjectRecordStream,
     chunk_size: usize,
-    pacer: AdaptivePacer,
     first_send: Option<Instant>,
     sent_datagrams: u64,
 }
@@ -390,10 +381,6 @@ struct PendingByteTransfer {
     remaining: usize,
     chunk_size: usize,
     packet_id: u32,
-    pace: Duration,
-    burst_packets: usize,
-    burst_delay: Duration,
-    pacer: AdaptivePacer,
     /// Host-side scheduler evidence for one transport PROBE response.  This
     /// is deliberately aggregate-only: logging a datagram would itself
     /// perturb the Wi-Fi benchmark.
@@ -414,131 +401,12 @@ struct PendingTaggedResponse {
     offset: usize,
 }
 
-/// Conservative feedback pacer shared by object and byte response streams.
-/// It starts disabled. A transport-declared repair enables a bounded delay
-/// based on the observed RTT and current congestion window; clean ACK
-/// progress progressively removes it. The scheduler merely decides when to
-/// call `send_to`; all ACK, loss, credit, and retransmission semantics remain
-/// in `EndpointState`.
-#[derive(Clone, Copy, Debug)]
-struct AdaptivePacer {
-    delay: Duration,
-    next_send: Instant,
-    seen_loss_repairs: u64,
-    seen_control_datagrams: u64,
-    clean_acks: u64,
-    activations: u64,
-}
-
-impl AdaptivePacer {
-    fn new() -> Self {
-        Self {
-            delay: Duration::ZERO,
-            next_send: Instant::now(),
-            seen_loss_repairs: 0,
-            seen_control_datagrams: 0,
-            clean_acks: 0,
-            activations: 0,
-        }
-    }
-
-    fn observe(
-        &mut self,
-        stats: quic_lite::TransportStats,
-        smoothed_rtt_ms: Option<u64>,
-        congestion_window: u64,
-        max_datagram_size: u64,
-    ) {
-        let repairs = stats
-            .loss_retransmitted_datagrams
-            .saturating_add(stats.pto_retransmitted_datagrams);
-        let new_repairs = repairs.saturating_sub(self.seen_loss_repairs);
-        self.seen_loss_repairs = repairs;
-        let controls = stats.control_datagrams;
-        let new_controls = controls.saturating_sub(self.seen_control_datagrams);
-        self.seen_control_datagrams = controls;
-        if new_repairs != 0 {
-            let packets = (congestion_window / max_datagram_size.max(1)).max(1);
-            let target = Duration::from_micros(
-                smoothed_rtt_ms
-                    .unwrap_or(5)
-                    .saturating_mul(1_000)
-                    .saturating_div(packets),
-            )
-            .clamp(ADAPTIVE_PACING_MIN, ADAPTIVE_PACING_MAX);
-            self.delay = self
-                .delay
-                .saturating_mul(2)
-                .max(target)
-                .min(ADAPTIVE_PACING_MAX);
-            self.clean_acks = 0;
-            self.activations = self.activations.saturating_add(1);
-            return;
-        }
-        if self.delay.is_zero() || new_controls == 0 {
-            return;
-        }
-        self.clean_acks = self.clean_acks.saturating_add(new_controls);
-        while self.clean_acks >= ADAPTIVE_PACING_CLEAN_ACKS {
-            self.clean_acks -= ADAPTIVE_PACING_CLEAN_ACKS;
-            let relaxed = self.delay / 2;
-            self.delay = if relaxed <= ADAPTIVE_PACING_MIN {
-                Duration::ZERO
-            } else {
-                relaxed
-            };
-            if self.delay.is_zero() {
-                self.clean_acks = 0;
-                break;
-            }
-        }
-    }
-
-    fn ready(&self) -> bool {
-        Instant::now() >= self.next_send
-    }
-
-    fn sent(&mut self, explicit_delay: Duration) {
-        let delay = if explicit_delay.is_zero() {
-            self.delay
-        } else {
-            explicit_delay
-        };
-        self.next_send = Instant::now() + delay;
-    }
-
-    fn next_delay(&self, explicit_delay: Duration) -> Option<Duration> {
-        if explicit_delay.is_zero() && self.delay.is_zero() {
-            return None;
-        }
-        Some(self.next_send.saturating_duration_since(Instant::now()))
-    }
-}
-
 fn interpacket_gap_bucket(gap: Duration) -> usize {
     quic_lite::interpacket_gap_bucket(gap.as_micros().try_into().unwrap_or(u64::MAX))
 }
 
-/// Read optional, request-scoped PROBE scheduling controls from the canonical
-/// tagged request. Absent fields deliberately inherit listener defaults.
-fn probe_schedule(
-    request: ProbeServiceRequest,
-    default_pace: Duration,
-    default_burst_packets: usize,
-    default_burst_delay: Duration,
-) -> (Duration, usize, Duration, u8, u64) {
-    let pace = request
-        .pace_us
-        .map(|pace| Duration::from_micros(u64::from(pace)))
-        .unwrap_or(default_pace);
-    let burst_packets = request
-        .burst_packets
-        .map(usize::from)
-        .unwrap_or(default_burst_packets);
-    let burst_delay = request
-        .burst_delay_us
-        .map(|delay| Duration::from_micros(u64::from(delay)))
-        .unwrap_or(default_burst_delay);
+/// Read request-scoped ACK policy from the canonical tagged request.
+fn probe_ack_policy(request: ProbeServiceRequest) -> (u8, u64) {
     // ACK_FREQUENCY's wire threshold is one below the human-facing packet
     // ratio. Keep it request-scoped so a benchmark does not depend on a
     // local-only Recovery setting that the peer can silently overwrite.
@@ -554,13 +422,7 @@ fn probe_schedule(
         .ack_delay_ms
         .map(|milliseconds| u64::from(milliseconds.clamp(1, 25)) * 1_000)
         .unwrap_or(RECOVERY_MAX_ACK_DELAY_US);
-    (
-        pace,
-        burst_packets,
-        burst_delay,
-        ack_frequency,
-        ack_delay_us,
-    )
+    (ack_frequency, ack_delay_us)
 }
 
 impl PendingByteTransfer {
@@ -568,9 +430,6 @@ impl PendingByteTransfer {
         stream_id: u64,
         bytes: usize,
         chunk_size: usize,
-        pace: Duration,
-        burst_packets: usize,
-        burst_delay: Duration,
     ) -> Self {
         Self {
             stream_id,
@@ -578,10 +437,6 @@ impl PendingByteTransfer {
             remaining: bytes,
             chunk_size,
             packet_id: 0,
-            pace,
-            burst_packets,
-            burst_delay,
-            pacer: AdaptivePacer::new(),
             first_send: None,
             last_send: None,
             sent_datagrams: 0,
@@ -602,7 +457,7 @@ fn report_byte_transfer<const N: usize, const H: usize>(
         .map(|first| first.elapsed().as_micros())
         .unwrap_or(0);
     eprintln!(
-        "probe_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} history={}/{} peer_flight={} cwnd={} inflight={} fills={} max_fill={} pace_us={} pace_activations={} elapsed_us={} \
+        "probe_udp_send_summary stream={} datagrams={} endpoint_stream={} endpoint_control={} history={}/{} peer_flight={} cwnd={} inflight={} rtt_ms={:?} pto_ms={} fills={} max_fill={} elapsed_us={} \
          gaps=<1ms:{},1-5ms:{},5-10ms:{},10-25ms:{},25-50ms:{},>=50ms:{} \
          loss=gap:{} time:{} events:{} loss_retx:{} pto_retx:{}",
         transfer.stream_id,
@@ -614,10 +469,10 @@ fn report_byte_transfer<const N: usize, const H: usize>(
         endpoint.peer_max_in_flight_packets(),
         endpoint.congestion.congestion_window,
         endpoint.bytes_in_flight(),
+        endpoint.smoothed_rtt(),
+        endpoint.pto_timeout(),
         transfer.window_fills,
         transfer.max_window_fill,
-        transfer.pacer.delay.as_micros(),
-        transfer.pacer.activations,
         elapsed_us,
         transfer.interpacket_gaps[0],
         transfer.interpacket_gaps[1],
@@ -639,16 +494,15 @@ fn report_object_transfer(transfer: &PendingObjectTransfer, stats: quic_lite::Tr
         .map(|first| first.elapsed().as_micros())
         .unwrap_or(0);
     eprintln!(
-        "object_udp_send_summary bytes={} datagrams={} endpoint_stream={} endpoint_control={} pace_us={} pace_activations={} elapsed_us={} loss=gap:{} time:{} loss_retx:{} pto_retx:{}",
+        "object_udp_send_summary bytes={} datagrams={} endpoint_stream={} endpoint_control={} elapsed_us={} loss=gap:{} time:{} events:{} loss_retx:{} pto_retx:{}",
         transfer.stream.sent_bytes(),
         transfer.sent_datagrams,
         stats.sent_stream_datagrams,
         stats.sent_control_datagrams,
-        transfer.pacer.delay.as_micros(),
-        transfer.pacer.activations,
         elapsed_us,
         stats.loss_packet_threshold_datagrams,
         stats.loss_time_threshold_datagrams,
+        stats.loss_events,
         stats.loss_retransmitted_datagrams,
         stats.pto_retransmitted_datagrams,
     );
@@ -665,7 +519,6 @@ impl PendingObjectTransfer {
         Self {
             stream: ObjectRecordStream::new(records),
             chunk_size,
-            pacer: AdaptivePacer::new(),
             first_send: None,
             sent_datagrams: 0,
         }
@@ -710,15 +563,6 @@ pub struct UdpConfig {
     /// the transport window: even small diagnostic records must still be sent
     /// in flight as a window, not as stop-and-wait packets.
     pub object_chunk: usize,
-    /// Optional host-only interval between transport PROBE response packets.
-    /// Zero preserves flood behavior. This is a diagnostic knob, not a
-    /// transport reliability mechanism.
-    pub probe_pace: Duration,
-    /// Test-only maximum PROBE datagrams in one sender pass. Zero preserves
-    /// the normal unlimited congestion-window fill.
-    pub probe_burst_packets: usize,
-    /// Test-only wait after an PROBE burst. Zero preserves unpaced sending.
-    pub probe_burst_delay: Duration,
     /// Optional IPv4 DSCP/TOS applied to this listener's outbound datagrams.
     /// It is a host-bearer diagnostic only; `None` preserves best-effort.
     pub ip_tos: Option<u8>,
@@ -754,9 +598,6 @@ impl Default for UdpConfig {
             receive_timeout: Duration::from_secs(1),
             ledger_resize_interval: Duration::from_secs(5),
             object_chunk: OBJECT_CHUNK,
-            probe_pace: Duration::ZERO,
-            probe_burst_packets: 0,
-            probe_burst_delay: Duration::ZERO,
             ip_tos: None,
             control: None,
             direct_handler: None,
@@ -1612,7 +1453,11 @@ impl UdpClient {
                             if !records.advance(next) {
                                 bail!("object record producer rejected admitted stream bytes");
                             }
-                            continue;
+                            // Return to the association receive/poll turn
+                            // before offering another object range. The peer
+                            // owns ACK and window production; a UDP adapter
+                            // must not bypass those packets with an
+                            // application-local burst loop.
                         }
                         Err(
                             quic_lite::Error::FlowControl
@@ -1631,7 +1476,11 @@ impl UdpClient {
             // upload-level retry: after it, poll the association-owned PTO
             // ledger and delayed-control queue below.
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let receive_wait = remaining.min(Duration::from_millis(20));
+            // A local mesh peer normally replies within one scheduler turn.
+            // Keep that turn short: a longer idle wait per object fragment
+            // turns a megabyte transfer into a receiver-timeout even though
+            // both QUIC-lite endpoints remain healthy.
+            let receive_wait = remaining.min(Duration::from_millis(1));
             match timeout(receive_wait, self.recv_association_packet(&mut packet)).await {
                 Ok(Ok((len, peer))) => {
                     if peer != self.peer {
@@ -2312,9 +2161,6 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         config.ledger_memory,
                         ledger_resize_interval,
                         config.object_chunk,
-                        config.probe_pace,
-                        config.probe_burst_packets,
-                        config.probe_burst_delay,
                         control_for_connection,
                         tagged_handler_for_connection,
                     )
@@ -2486,9 +2332,6 @@ async fn serve_persistent_peer_with_ids(
     ledger_memory: Option<LedgerMemorySnapshot>,
     ledger_resize_interval: Duration,
     object_chunk: usize,
-    probe_pace: Duration,
-    probe_burst_packets: usize,
-    probe_burst_delay: Duration,
     control: Option<Arc<TransportControl>>,
     tagged_handler: Option<Arc<dyn TaggedStreamHandler>>,
 ) -> Result<()> {
@@ -2545,9 +2388,6 @@ async fn serve_persistent_peer_with_ids(
             &mut tagged_response,
             started,
             object_chunk,
-            probe_pace,
-            probe_burst_packets,
-            probe_burst_delay,
             control.as_deref(),
             tagged_handler.as_deref(),
         )
@@ -2561,31 +2401,12 @@ async fn serve_persistent_peer_with_ids(
         if let Some(control) = control.as_deref() {
             control.record_server_stats(&connection.mux.endpoint);
         }
-        let object_next_send = object_transfer
-            .as_ref()
-            .and_then(|transfer| transfer.pacer.next_delay(Duration::ZERO));
-        // Each stream owns a pacer.  Use the earliest deadline, rather than
-        // whichever transfer happens to be stored first, so a low-priority
-        // stream cannot accidentally stall a ready higher-priority stream
-        // (or vice versa) while both are active.
-        let byte_next_send = byte_transfers
-            .iter()
-            .filter_map(|transfer| transfer.as_ref())
-            .chain(high_byte_transfer.as_ref())
-            .chain(low_byte_transfer.as_ref())
-            .filter_map(|transfer| transfer.pacer.next_delay(transfer.pace))
-            .min();
-        let next_send = match (object_next_send, byte_next_send) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(value), None) | (None, Some(value)) => Some(value),
-            (None, None) => None,
-        };
         let receive_wait = connection_receive_wait(
             object_transfer.is_some(),
             byte_transfers.iter().any(Option::is_some)
                 || high_byte_transfer.is_some()
                 || low_byte_transfer.is_some(),
-            next_send,
+            None,
         );
         match timeout(receive_wait, receiver.recv()).await {
             Ok(Some(datagram)) if datagram.peer == peer => {
@@ -2616,9 +2437,6 @@ async fn serve_persistent_peer_with_ids(
                     &mut tagged_response,
                     started,
                     object_chunk,
-                    probe_pace,
-                    probe_burst_packets,
-                    probe_burst_delay,
                     control.as_deref(),
                     tagged_handler.as_deref(),
                 )
@@ -2890,9 +2708,6 @@ async fn process_persistent_packet<const H: usize>(
     tagged_response: &mut Option<PendingTaggedResponse>,
     started: Instant,
     object_chunk: usize,
-    probe_pace: Duration,
-    probe_burst_packets: usize,
-    probe_burst_delay: Duration,
     control: Option<&TransportControl>,
     tagged_handler: Option<&dyn TaggedStreamHandler>,
 ) -> Result<()> {
@@ -3027,12 +2842,7 @@ async fn process_persistent_packet<const H: usize>(
             // PROBE request. Normal object transfers keep UdpConfig's
             // default unpaced scheduling, and an older Recovery request
             // (11 bytes) still uses the listener defaults.
-            let (request_pace, request_burst, request_burst_delay, _, _) = probe_schedule(
-                probe_request,
-                probe_pace,
-                probe_burst_packets,
-                probe_burst_delay,
-            );
+            let (ack_frequency, ack_delay_us) = probe_ack_policy(probe_request);
             connection
                 .mux
                 .complete_request(request.stream_id, request.data.len())
@@ -3045,8 +2855,8 @@ async fn process_persistent_packet<const H: usize>(
                 .endpoint
                 .request_ack_frequency(
                     0,
-                    u64::from(probe_plan.ack_frequency.saturating_sub(1)),
-                    u64::from(probe_plan.ack_delay_ms) * 1_000,
+                    u64::from(ack_frequency.saturating_sub(1)),
+                    ack_delay_us,
                     1,
                 )
                 .map_err(|error| anyhow::anyhow!("probe ACK_FREQUENCY: {error:?}"))?;
@@ -3069,9 +2879,6 @@ async fn process_persistent_packet<const H: usize>(
                     response_stream,
                     bytes,
                     probe_plan.packet_size,
-                    request_pace,
-                    request_burst,
-                    request_burst_delay,
                 ));
             }
             if probe_plan.high_priority_bytes != 0 {
@@ -3080,9 +2887,6 @@ async fn process_persistent_packet<const H: usize>(
                     response_stream,
                     probe_plan.high_priority_bytes,
                     probe_plan.packet_size,
-                    request_pace,
-                    request_burst,
-                    request_burst_delay,
                 ));
             }
             if probe_plan.low_priority_bytes != 0 {
@@ -3091,9 +2895,6 @@ async fn process_persistent_packet<const H: usize>(
                     response_stream,
                     probe_plan.low_priority_bytes,
                     probe_plan.packet_size,
-                    request_pace,
-                    request_burst,
-                    request_burst_delay,
                 ));
             }
         } else {
@@ -3266,17 +3067,10 @@ async fn fill_byte_window<const H: usize>(
     packet: &mut [u8; MTU],
     packet_budget: usize,
 ) -> Result<bool> {
-    transfer.pacer.observe(
-        mux.endpoint.stats(),
-        mux.endpoint.smoothed_rtt(),
-        mux.endpoint.congestion.congestion_window,
-        mux.endpoint.congestion.max_datagram_size,
-    );
     let mut sent = false;
     let mut burst_sent = 0usize;
     while burst_sent < packet_budget
         && transfer.remaining != 0
-        && transfer.pacer.ready()
         && mux.endpoint.history_len() < mux.endpoint.history_capacity()
     {
         mux.endpoint
@@ -3328,18 +3122,6 @@ async fn fill_byte_window<const H: usize>(
         transfer.packet_id = transfer.packet_id.wrapping_add(1);
         sent = true;
         burst_sent = burst_sent.saturating_add(1);
-        let adaptive_active = !transfer.pacer.delay.is_zero();
-        transfer.pacer.sent(transfer.pace);
-        if !transfer.pace.is_zero() {
-            break;
-        }
-        if adaptive_active {
-            break;
-        }
-        if transfer.burst_packets != 0 && burst_sent >= transfer.burst_packets {
-            transfer.pacer.sent(transfer.burst_delay);
-            break;
-        }
     }
     if sent {
         transfer.window_fills = transfer.window_fills.saturating_add(1);
@@ -3436,7 +3218,6 @@ async fn send_next_object_packet<const H: usize>(
         Ok(packet) => packet,
     };
     socket.send_to(&packet[..used], peer).await?;
-    transfer.pacer.sent(Duration::ZERO);
     if transfer.first_send.is_none() {
         transfer.first_send = Some(Instant::now());
     }
@@ -3458,15 +3239,6 @@ async fn fill_object_window<const H: usize>(
     transfer: &mut PendingObjectTransfer,
     packet: &mut [u8; MTU],
 ) -> Result<bool> {
-    transfer.pacer.observe(
-        mux.endpoint.stats(),
-        mux.endpoint.smoothed_rtt(),
-        mux.endpoint.congestion.congestion_window,
-        mux.endpoint.congestion.max_datagram_size,
-    );
-    if !transfer.pacer.ready() {
-        return Ok(false);
-    }
     let mut sent_any = false;
     let mut sent_packets = 0usize;
     while mux.endpoint.history_len() < mux.endpoint.history_capacity() {
@@ -3475,9 +3247,6 @@ async fn fill_object_window<const H: usize>(
         }
         sent_any = true;
         sent_packets += 1;
-        if !transfer.pacer.delay.is_zero() {
-            break;
-        }
         // The manifest is on a separate stream and must be accepted before a
         // block can be verified. It is therefore a one-time application
         // barrier. Blocks are all on the same ordered stream and independent
@@ -3849,31 +3618,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_pacer_uses_transport_loss_then_relaxes_after_clean_acks() {
-        let mut pacer = AdaptivePacer::new();
-        let mut stats = quic_lite::TransportStats::default();
-        // Clean startup remains a full-window, unpaced sender.
-        pacer.observe(stats, Some(5), 32 * 1200, 1200);
-        assert!(pacer.delay.is_zero());
-
-        // A declared retransmission enables RTT/cwnd-derived pacing. With a
-        // 5 ms RTT and 32 packets in cwnd the target is 156 us, above the
-        // 125 us lower bound.
-        stats.loss_retransmitted_datagrams = 1;
-        stats.control_datagrams = 1;
-        pacer.observe(stats, Some(5), 32 * 1200, 1200);
-        assert_eq!(pacer.delay, Duration::from_micros(156));
-        assert_eq!(pacer.activations, 1);
-
-        // Thirty-two clean peer control/ACK packets remove this small delay;
-        // an adaptive policy must not permanently pace a recovered link.
-        stats.control_datagrams = ADAPTIVE_PACING_CLEAN_ACKS + 1;
-        pacer.observe(stats, Some(5), 32 * 1200, 1200);
-        assert!(pacer.delay.is_zero());
-    }
-
-    #[test]
-    fn active_scheduler_honors_sub_millisecond_pacing_deadline() {
+    fn active_scheduler_honors_sub_millisecond_transport_deadline() {
         assert_eq!(
             connection_receive_wait(true, false, Some(Duration::from_micros(250))),
             Duration::from_micros(250),
@@ -3903,43 +3648,15 @@ mod tests {
     }
 
     #[test]
-    fn probe_request_schedule_is_scoped_to_the_tagged_request() {
-        let defaults = (Duration::from_micros(17), 3, Duration::from_micros(29));
-        assert_eq!(
-            probe_schedule(
-                ProbeServiceRequest::new(1024, 1200),
-                defaults.0,
-                defaults.1,
-                defaults.2,
-            ),
-            (
-                defaults.0,
-                defaults.1,
-                defaults.2,
-                2,
-                RECOVERY_MAX_ACK_DELAY_US
-            )
-        );
-
+    fn probe_request_ack_policy_is_scoped_to_the_tagged_request() {
+        assert_eq!(probe_ack_policy(ProbeServiceRequest::new(1024, 1200)), (2, RECOVERY_MAX_ACK_DELAY_US));
         let mut request = ProbeServiceRequest::new(1024, 1200);
-        request.pace_us = Some(250);
-        request.burst_packets = Some(4);
-        request.burst_delay_us = Some(1_000);
         request.ack_frequency = Some(8);
         request.ack_delay_ms = Some(1);
-        assert_eq!(
-            probe_schedule(request, defaults.0, defaults.1, defaults.2,),
-            (
-                Duration::from_micros(250),
-                4,
-                Duration::from_micros(1_000),
-                8,
-                1_000
-            )
-        );
+        assert_eq!(probe_ack_policy(request), (8, 1_000));
         request.ack_frequency = Some(u8::MAX);
         assert_eq!(
-            probe_schedule(request, defaults.0, defaults.1, defaults.2,).3,
+            probe_ack_policy(request).0,
             quic_lite::ACK_RANGE_CAPACITY as u8
         );
     }
@@ -5206,7 +4923,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(response.contains("metrics_version=1"));
+        assert!(response.contains("metrics_version=2"));
         assert!(response.contains("history_capacity=2"));
         assert!(response.contains("next_packet_number=1"));
         server_task.abort();
@@ -5242,7 +4959,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(response.contains("metrics_version=1"));
+        assert!(response.contains("metrics_version=2"));
 
         // A listener-owned socket must behave exactly like the private
         // diagnostic socket: opening an ordinary tagged stream cannot leave
@@ -5401,10 +5118,6 @@ mod tests {
         let server_task = tokio::spawn(run(UdpConfig {
             bind,
             artifact_root: root.path().to_path_buf(),
-            // Exercise a bounded diagnostic burst. The default (exercised
-            // by the Recovery profile tests) remains unpaced/unlimited.
-            probe_burst_packets: 2,
-            probe_burst_delay: Duration::from_micros(100),
             ..UdpConfig::default()
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5427,7 +5140,7 @@ mod tests {
             let metrics =
                 request_diagnostic_text(client, stream, crate::services::DIAGNOSTIC_METRICS_METHOD)
                     .await;
-            assert!(metrics.contains("metrics_version=1"));
+            assert!(metrics.contains("metrics_version=2"));
             let event_stream = stream + 4;
             let events = request_diagnostic_text(
                 client,
@@ -5531,7 +5244,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(first_metrics.contains("metrics_version=1"));
+        assert!(first_metrics.contains("metrics_version=2"));
         drop(first);
 
         // This is the old Recovery behavior: CID=1 on every command. The
@@ -5553,7 +5266,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(second_metrics.contains("metrics_version=1"));
+        assert!(second_metrics.contains("metrics_version=2"));
         server_task.abort();
     }
 
@@ -5660,7 +5373,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(metrics.contains("metrics_version=1"));
+        assert!(metrics.contains("metrics_version=2"));
         server_task.abort();
     }
 
@@ -5707,7 +5420,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(metrics.contains("metrics_version=1"));
+        assert!(metrics.contains("metrics_version=2"));
         server_task.abort();
     }
 
@@ -5747,7 +5460,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(metrics.contains("metrics_version=1"));
+        assert!(metrics.contains("metrics_version=2"));
         server_task.abort();
     }
 
@@ -5850,7 +5563,7 @@ mod tests {
             crate::services::DIAGNOSTIC_METRICS_METHOD,
         )
         .await;
-        assert!(metrics.contains("metrics_version=1"));
+        assert!(metrics.contains("metrics_version=2"));
         server_task.abort();
     }
 

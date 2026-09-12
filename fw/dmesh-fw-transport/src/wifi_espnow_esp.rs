@@ -65,11 +65,6 @@ const NOW_ACTION_TX_SERVER_WAIT_MS: u32 = 1_000;
 const PUBLIC_ACTION_TX_WAIT_MS: u32 = 10;
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 static POLL_HANDLER: AtomicUsize = AtomicUsize::new(0);
-/// Endpoint-owned egress credit for NOW. This is the pre-refactor proven
-/// value: the connection may emit its ACK/control follow-up without waiting
-/// for an unrelated driver callback. It remains bounded by the association
-/// history and changes only NOW action egress, never UDP6 or UART.
-static TX_BURST_PACKETS: AtomicUsize = AtomicUsize::new(4);
 // Direct NOW frames are unicast by default, so let the Wi-Fi hardware retry a
 // missed hop before QUIC-lite's end-to-end PTO is needed.  Broadcast records
 // override this below: 802.11 does not acknowledge group-addressed frames.
@@ -278,13 +273,6 @@ pub fn set_poll_handler(handler: Option<EspNowPollHandler>) {
 }
 
 /// Bound one action-bearer egress burst by the association's packet history.
-pub fn set_tx_burst_packets(packets: usize) {
-    TX_BURST_PACKETS.store(
-        packets.clamp(1, crate::CONNECTION_HISTORY_CAPACITY),
-        Ordering::Release,
-    );
-}
-
 /// Capture evidence for the raw radio input. These counters deliberately do
 /// not implement NAN synchronization or power decisions, which remain Main
 /// policy, but make filter experiments observable in either firmware image.
@@ -372,7 +360,10 @@ pub(crate) fn receive_registered_action_payload(
         let header = second as *const u8;
         let start = third as usize;
         let end = fourth as usize;
-        let Some(len) = end.checked_sub(start).filter(|len| *len <= crate::TRANSPORT_MTU) else {
+        let Some(len) = end
+            .checked_sub(start)
+            .filter(|len| *len <= crate::TRANSPORT_MTU)
+        else {
             LAST_REGISTERED_BODY_LEN.store(second.min(u32::MAX as usize) as u32, Ordering::Relaxed);
             RX_INVALID_DROPS.fetch_add(1, Ordering::Relaxed);
             RX_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -574,14 +565,10 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
     let poll = POLL_HANDLER.load(Ordering::Acquire);
     let poll: Option<EspNowPollHandler> =
         (poll != 0).then(|| unsafe { core::mem::transmute(poll) });
-    let result = dmesh_server::transport::pump_egress(
-        response,
-        TX_BURST_PACKETS.load(Ordering::Acquire),
-        immediate,
-        |response| poll.and_then(|poll| poll(peer, response)),
-        |packet| transmit_from_worker(peer, packet),
-    );
-    if result.invalid_length || result.submit_failed {
+    let used = immediate.or_else(|| poll.and_then(|poll| poll(peer, response)));
+    if used.is_some_and(|used| {
+        used > response.len() || !transmit_from_worker(peer, &response[..used])
+    }) {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 }

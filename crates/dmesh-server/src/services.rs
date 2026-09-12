@@ -545,7 +545,7 @@ fn metrics_status<const N: usize, const H: usize, const P: usize>(
 ) -> Vec<u8> {
     let stats = endpoint.stats();
     format!(
-        "metrics_version=1;connection_dcid={};local_cid={:?};peer_cid={:?};stream_id={stream_id};received_packets={};largest_received={:?};next_packet_number={};bytes_in_flight={};congestion_window={};slow_start_threshold={};latest_rtt={:?};smoothed_rtt={:?};rtt_variance={};pto_timeout={};history_used={};history_capacity={};history_storage_slots={};history_storage_bytes={};retained_payload_bytes={};retransmission_capacity_bytes={};max_data={};max_stream_data={};max_streams_bidi={};max_streams_uni={};received_datagrams={};stream_datagrams={};control_datagrams={};duplicate_datagrams={};out_of_order_datagrams={};inferred_missing_packets={};sent_datagrams={};sent_stream_datagrams={};sent_control_datagrams={};retransmitted_datagrams={};loss_packet_threshold_datagrams={};loss_time_threshold_datagrams={};loss_events={};loss_retransmitted_datagrams={};pto_retransmitted_datagrams={};ack_datagrams={};ack_immediate_datagrams={};ack_threshold_datagrams={};ack_timer_datagrams={}",
+        "metrics_version=2;connection_dcid={};local_cid={:?};peer_cid={:?};stream_id={stream_id};received_packets={};largest_received={:?};next_packet_number={};bytes_in_flight={};congestion_window={};slow_start_threshold={};latest_rtt={:?};smoothed_rtt={:?};rtt_variance={};pto_timeout={};history_used={};history_capacity={};history_storage_slots={};history_storage_bytes={};retained_payload_bytes={};retransmission_capacity_bytes={};max_data={};max_stream_data={};max_streams_bidi={};max_streams_uni={};received_datagrams={};stream_datagrams={};control_datagrams={};duplicate_datagrams={};out_of_order_datagrams={};inferred_missing_packets={};sent_datagrams={};sent_stream_datagrams={};sent_control_datagrams={};retransmitted_datagrams={};loss_packet_threshold_datagrams={};loss_time_threshold_datagrams={};loss_events={};loss_retransmitted_datagrams={};pto_retransmitted_datagrams={};ack_datagrams={};ack_immediate_datagrams={};ack_threshold_datagrams={};ack_timer_datagrams={};afrx={};aftx={};rxgaps={},{},{},{}",
         cid.value(), endpoint.local_connection_id().map(|v| v.value()), endpoint.peer_connection_id().map(|v| v.value()),
         endpoint.received_packet_count(), endpoint.largest_received(), endpoint.next_packet_number,
         endpoint.bytes_in_flight(), endpoint.congestion.congestion_window, endpoint.congestion.slow_start_threshold,
@@ -561,7 +561,9 @@ fn metrics_status<const N: usize, const H: usize, const P: usize>(
         stats.loss_time_threshold_datagrams, stats.loss_events,
         stats.loss_retransmitted_datagrams, stats.pto_retransmitted_datagrams,
         stats.ack_datagrams, stats.ack_immediate_datagrams, stats.ack_threshold_datagrams,
-        stats.ack_timer_datagrams,
+        stats.ack_timer_datagrams, stats.ack_frequency_received, stats.ack_frequency_sent,
+        stats.receive_interpacket_samples, stats.receive_interpacket_total,
+        stats.receive_interpacket_min, stats.receive_interpacket_max,
     ).into_bytes()
 }
 

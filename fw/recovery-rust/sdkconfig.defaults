@@ -15,6 +15,13 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+# Recovery's normal UDP6 socket requires ESP-IDF to bring the associated STA
+# link-local address through DAD/SLAAC; no raw IPv6 frame path is available.
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+# Recovery's address is a stable EUI-64 from the unique STA MAC.  The lab AP
+# does not complete lwIP's DAD exchange reliably during the short Recovery
+# window, so admit the link-local address immediately for its UDP6-only job.
+CONFIG_LWIP_IPV6_DUP_DETECT_ATTEMPTS=0
 # This ESP32 target caps static RX buffers at 25. It cannot equal the
 # 32-packet BA window, but 25 is valid and meets ESP-IDF's requirement that
 # the BA window not exceed twice the static buffer count. Dynamic buffers

@@ -1514,10 +1514,7 @@ pub fn start(interval: u8) -> bool {
     // only the ESP-IDF callback/runtime state.  Reacquiring for 15 seconds
     // after every DW8 wake kept the radio awake almost continuously.  Reuse
     // a live cluster anchor to arm the next ordinary bounded DW instead.
-    if RESUME_SAVED_SYNC.swap(false, Ordering::AcqRel)
-        && !bssid_is_unset(bssid)
-        && anchor_us != 0
-    {
+    if RESUME_SAVED_SYNC.swap(false, Ordering::AcqRel) && !bssid_is_unset(bssid) && anchor_us != 0 {
         let next_us = dmesh_rawnan::next_nan_dw_start_us(
             anchor_us,
             now_us().saturating_add(NAN_DW_PRE_BEACON_US),

@@ -69,7 +69,7 @@ export ESP_IDF_SDKCONFIG_DEFAULTS="$PROJECT/sdkconfig.defaults;$OVERLAY"
 # Recovery's default firmware lane is raw IPv6/UDP rather than the lwIP socket
 # worker. ESP-IDF still supplies Wi-Fi/FreeRTOS primitives and may link lwIP.
 RECOVERY_MODULES="${DMESH_RECOVERY_MODULES:-0}"
-export ESP_IDF_COMPONENTS="main;driver;esp_wifi;esp_event;esp_netif;esp_partition;nvs_flash;esp_driver_uart"
+export ESP_IDF_COMPONENTS="main;driver;esp_wifi;esp_event;esp_netif;esp_partition;nvs_flash;esp_driver_uart;dmesh_boot_health"
 BUILD_FEATURES=()
 if [[ "$RECOVERY_MODULES" == "1" ]]; then
     # The moved loader is optional in Recovery so its flash cost can be
@@ -93,6 +93,8 @@ SDK_DEFAULTS_DIGEST="$(sha256sum \
     "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_module_loader.c" \
     "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_hw_host.c" \
     "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_module_weak_platform.c" \
+    "$ROOT/fw/esp32/rust/native/dmesh_boot_health/CMakeLists.txt" \
+    "$ROOT/fw/esp32/rust/native/dmesh_boot_health/dmesh_boot_health.c" \
     | sha256sum | awk '{print $1}')"
 SDK_ID="cache-v6:modules=${RECOVERY_MODULES}:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${SDK_DEFAULTS_DIGEST}"
 if [[ ! -f "$SDK_STAMP" || "$(cat "$SDK_STAMP")" != "$SDK_ID" ]]; then

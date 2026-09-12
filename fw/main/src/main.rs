@@ -14,6 +14,10 @@ pub extern "C" fn app_main() {
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();
+    // BLE is linked as a Main bearer. Its CoC byte-stream adapter will feed
+    // this same runtime; it never revives the retired command/GATT payload
+    // dispatcher.
+    let _ = dmesh_ble::link_snapshot();
     // Route ESP-IDF logs through the UART writer queue. Direct console writes
     // would splice text into PPP-framed tagged responses.
     unsafe {
@@ -23,10 +27,7 @@ pub extern "C" fn app_main() {
 }
 
 extern "C" {
-    fn dmesh_uart_log_vprintf(
-        format: *const core::ffi::c_char,
-        args: esp_idf_sys::va_list,
-    ) -> i32;
+    fn dmesh_uart_log_vprintf(format: *const core::ffi::c_char, args: esp_idf_sys::va_list) -> i32;
 }
 
 /// Module-to-transport bridge for a completed radio receive.  This is invoked
@@ -43,5 +44,7 @@ pub unsafe extern "C" fn dmesh_module_lora_receive(
         return -1;
     }
     let payload = core::slice::from_raw_parts(payload, payload_len);
-    i32::from(dmesh_fw_transport::main_runtime::forward_lora_packet(payload, rssi, snr))
+    i32::from(dmesh_fw_transport::main_runtime::forward_lora_packet(
+        payload, rssi, snr,
+    ))
 }

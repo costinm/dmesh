@@ -472,6 +472,10 @@ unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate, allow_open: bool)
 // handle for the lifetime of the firmware and reuse it after `stop_sta()`.
 static STA_NETIF: AtomicPtr<esp_idf_sys::esp_netif_t> = AtomicPtr::new(core::ptr::null_mut());
 static STA_DRIVER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+// Recovery may use the already-provisioned WPA profile while a platform scan
+// is being diagnosed.  This is consumed by exactly one `init_sta` call and
+// does not change Main's scan/select policy.
+static STA_SKIP_INITIAL_SCAN: AtomicBool = AtomicBool::new(false);
 static STA_AMPDU_ENABLED: AtomicBool = AtomicBool::new(true);
 static STA_11B_RATES_DISABLED: AtomicBool = AtomicBool::new(true);
 // `esp_wifi_init` may allocate part of its driver state before returning
@@ -745,6 +749,7 @@ pub fn init_sta(params: &TransportProfile) {
         for (dst, src) in sta.ssid.iter_mut().zip(ssid.iter().copied()) {
             *dst = src;
         }
+        let configured_recovery_fallback = STA_SKIP_INITIAL_SCAN.load(Ordering::Acquire);
         // The selected BSSID's scan record decides the actual RSN mode below.
         // This initial configuration only starts the driver to perform that
         // scan while retaining the supplied credential for the selected AP.
@@ -758,9 +763,20 @@ pub fn init_sta(params: &TransportProfile) {
                 *dst = src;
             }
         }
-        sta.threshold.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
-        sta.pmf_cfg.capable = false;
-        sta.pmf_cfg.required = false;
+        if configured_recovery_fallback && !params.open {
+            // NVS carries a WPA PSK but not an AP scan record.  Set the
+            // strongest interoperable configured policy up front; WPA2/WPA3
+            // transition APs may then negotiate either method without a
+            // scan-derived BSSID/authmode rewrite.
+            sta.threshold.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_WPA2_WPA3_PSK;
+            sta.pmf_cfg.capable = true;
+            sta.pmf_cfg.required = false;
+            sta.sae_pwe_h2e = esp_idf_sys::wifi_sae_pwe_method_t_WPA3_SAE_PWE_BOTH;
+        } else {
+            sta.threshold.authmode = esp_idf_sys::wifi_auth_mode_t_WIFI_AUTH_OPEN;
+            sta.pmf_cfg.capable = false;
+            sta.pmf_cfg.required = false;
+        }
         let mut config = esp_idf_sys::wifi_config_t { sta };
         // `transport.start { mode=sta, ap=1 }` is a complete APSTA epoch,
         // not an after-the-fact lab toggle.  Configure both personalities
@@ -848,23 +864,31 @@ pub fn init_sta(params: &TransportProfile) {
         }
         uart::send_stat(b"wifi raw sta started_ms=", elapsed_ms(init_started_us));
         let _ = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
-        let mut association_candidate_ready = false;
-        if let Some(selection) = scan_dmesh_sta_candidate(
-            &params.ssid[..params.ssid_len],
-            params.sta_bssid_set.then_some(params.sta_bssid),
-        ) {
-            if apply_sta_candidate(&selection, params.open) {
-                association_candidate_ready = true;
-                uart::send_response(if selection.preferred {
-                    b"wifi initial preferred candidate"
+        let mut association_candidate_ready = STA_SKIP_INITIAL_SCAN.swap(false, Ordering::AcqRel);
+        if !association_candidate_ready {
+            if let Some(selection) = scan_dmesh_sta_candidate(
+                &params.ssid[..params.ssid_len],
+                params.sta_bssid_set.then_some(params.sta_bssid),
+            ) {
+                if apply_sta_candidate(&selection, params.open) {
+                    association_candidate_ready = true;
+                    uart::send_response(if selection.preferred {
+                        b"wifi initial preferred candidate"
+                    } else {
+                        b"wifi initial fallback candidate"
+                    });
                 } else {
-                    b"wifi initial fallback candidate"
-                });
-            } else {
-                uart::send_response(b"wifi initial candidate config failed");
+                    uart::send_response(b"wifi initial candidate config failed");
+                }
+            }
+            if !association_candidate_ready {
+                uart::send_response(b"wifi initial scan no eligible AP");
             }
         } else {
-            uart::send_response(b"wifi initial scan no eligible AP");
+            // Recovery's WPA fallback keeps the configured SSID/PSK in the
+            // driver and lets ESP-IDF perform its ordinary connect scan.
+            // It must not inherit a stale BSSID from a former epoch.
+            uart::send_response(b"wifi configured STA fallback");
         }
         if !association_candidate_ready {
             // Do not enter ESP-IDF's indefinite connecting state when the
@@ -901,6 +925,14 @@ pub fn init_sta(params: &TransportProfile) {
         // Do not install it as a side effect of raw UDP6 association: its
         // driver callback is global and would make Recovery run two modes.
     }
+}
+
+/// Start one ordinary WPA STA association from its configured SSID/PSK without
+/// waiting in the ESP-IDF scan path.  This is Recovery's bounded fallback;
+/// it owns no raw bearer, NAN, NOW, or UART transport.
+pub fn init_sta_configured(params: &TransportProfile) {
+    STA_SKIP_INITIAL_SCAN.store(true, Ordering::Release);
+    init_sta(params);
 }
 
 /// Start the unassociated NAN+NOW radio epoch.  This deliberately duplicates
@@ -1847,6 +1879,33 @@ pub fn lab_open_ap_active() -> bool {
 /// Cheap association observation for Main's nonblocking session owner.
 pub fn sta_associated() -> bool {
     STA_ASSOCIATED_EVENT.load(Ordering::Acquire)
+}
+
+/// Return the ESP-IDF interface index for a scoped STA IPv6 endpoint.  The
+/// socket user owns the endpoint; Wi-Fi exposes only this association fact so
+/// Recovery can use the same normal lwIP UDP6 path as any other STA client.
+pub fn sta_netif_index() -> Option<u32> {
+    let netif = STA_NETIF.load(Ordering::Acquire);
+    if netif.is_null() {
+        return None;
+    }
+    let index = unsafe { esp_idf_sys::esp_netif_get_netif_impl_index(netif) };
+    (index > 0).then_some(index as u32)
+}
+
+/// Request and observe the STA link-local address.  ESP-IDF creates this
+/// address asynchronously after association, so callers must retry until it
+/// becomes preferred rather than guessing an EUI-64 address.
+pub fn sta_link_local_ready() -> bool {
+    let netif = STA_NETIF.load(Ordering::Acquire);
+    if netif.is_null() {
+        return false;
+    }
+    unsafe {
+        let _ = esp_idf_sys::esp_netif_create_ip6_linklocal(netif);
+        let mut address = esp_idf_sys::esp_ip6_addr_t::default();
+        esp_idf_sys::esp_netif_get_ip6_linklocal(netif, &mut address) == esp_idf_sys::ESP_OK
+    }
 }
 
 /// Driver-observed association phase only. This excludes lifecycle work such

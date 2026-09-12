@@ -378,10 +378,8 @@ fn encode_relay_list(out: &mut [u8]) -> Option<usize> {
             return;
         };
         complete = complete.and_then(|()| {
-            let has_destination = matches!(
-                destination,
-                quic_lite::ForwardDestination::Connection(_)
-            );
+            let has_destination =
+                matches!(destination, quic_lite::ForwardDestination::Connection(_));
             encoder.map(3 + u64::from(has_destination) + u64::from(connection.is_some()))?;
             encoder.uint(1)?;
             encoder.uint(dcid.value())?;

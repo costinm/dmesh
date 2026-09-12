@@ -2977,6 +2977,21 @@ pub const INITIAL_MAX_DATA: u64 = 256 * 1024;
 // exercises the smaller credit-extension boundary.
 pub const INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
 
+impl ConnectionLimits {
+    /// Construct ordinary connection and per-stream receive credit from one
+    /// application-selected byte window.  QUIC-lite does not attach that
+    /// choice to a bearer or handler: a flash sink, file sink, and prober may
+    /// each select a different bounded consumer window.
+    pub const fn with_receive_window(window_bytes: u64) -> Self {
+        Self {
+            max_data: window_bytes,
+            max_stream_data: window_bytes,
+            max_streams_bidi: DEFAULT_MAX_BIDI_STREAMS,
+            max_streams_uni: 4,
+        }
+    }
+}
+
 impl Default for ConnectionLimits {
     fn default() -> Self {
         Self {
@@ -3198,6 +3213,11 @@ pub struct EndpointState<
     // bounded deduplicated set so one stream's MAX_STREAM_DATA cannot erase
     // another's credit update. The bound matches active stream state `N`.
     pending_stream_ids: [Option<u64>; N],
+    /// Latest flow-credit control packet. MAX_* frames are reliable
+    /// connection state, not a best-effort UDP hint: retain their intent
+    /// until the peer ACKs the packet that carried it.
+    credit_pending: bool,
+    credit_packet_number: Option<u32>,
     send_clock: u64,
     rtt: RttEstimator,
     /// Endpoint-owned PTO scheduling. A bearer may poll in a tight loop when
@@ -3353,6 +3373,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             core::ptr::addr_of_mut!((*out).peer_max_ack_delay_ms).write(25);
             core::ptr::addr_of_mut!((*out).peer_max_in_flight_packets).write(usize::MAX);
             core::ptr::addr_of_mut!((*out).pending_stream_ids).write([None; N]);
+            core::ptr::addr_of_mut!((*out).credit_pending).write(false);
+            core::ptr::addr_of_mut!((*out).credit_packet_number).write(None);
             core::ptr::addr_of_mut!((*out).send_clock).write(0);
             core::ptr::addr_of_mut!((*out).rtt).write(RttEstimator::default());
             core::ptr::addr_of_mut!((*out).last_pto_probe_at).write(None);
@@ -3420,6 +3442,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             peer_max_ack_delay_ms: 25,
             peer_max_in_flight_packets: usize::MAX,
             pending_stream_ids: [None; N],
+            credit_pending: false,
+            credit_packet_number: None,
             send_clock: 0,
             rtt: RttEstimator::default(),
             last_pto_probe_at: None,
@@ -3517,6 +3541,24 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     /// Receiver-advertised bound on retained outbound STREAM packets.
     pub fn peer_max_in_flight_packets(&self) -> usize {
         self.peer_max_in_flight_packets
+    }
+
+    /// Current peer-advertised byte limits for a locally initiated stream.
+    /// This is bounded transport telemetry for stalled-sender diagnosis.
+    pub fn peer_send_credit(&self, stream_id: u64) -> Option<(u64, u64)> {
+        Some((self.send.max_data, self.send.stream_credit(stream_id)?))
+    }
+
+    /// Receiver-side consumption and current limits for bounded stream-sink
+    /// diagnostics. This exposes no packet payload or bearer state.
+    pub fn receive_credit_state(&self, stream_id: u64) -> Option<(u64, u64, u64)> {
+        let index = self.receive.find(stream_id)?;
+        let stream = self.receive.streams[index]?;
+        Some((
+            self.receive.connection.consumed,
+            stream.consumed,
+            stream.max_data,
+        ))
     }
 
     /// Largest packet number the peer has acknowledged on this association.
@@ -3961,7 +4003,9 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             }
             match frame {
                 Frame::Ack { .. } | Frame::AckRanges { .. } => has_ack = true,
-                Frame::Ping => ack_eliciting = true,
+                Frame::Ping | Frame::MaxData(_) | Frame::MaxStreamData { .. } => {
+                    ack_eliciting = true
+                }
                 Frame::AckFrequency {
                     sequence,
                     packet_threshold,
@@ -4346,6 +4390,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     }
 
     fn queue_stream_credit(&mut self, stream_id: u64) {
+        self.credit_pending = true;
         if self
             .pending_stream_ids
             .iter()
@@ -4396,7 +4441,15 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         let ack_timer_due = self.ack_pending
             && self.send_clock.saturating_sub(self.largest_received_at) >= self.max_ack_delay_ms;
         let delayed_ack_due = ack_threshold_due || ack_timer_due;
-        let send_ack = self.control_pending || delayed_ack_due;
+        // Retry a lost MAX_* control packet on the same endpoint-owned
+        // delayed-control cadence. This is intentionally independent of the
+        // bearer: a sender may be flow-blocked and have no stream packet left
+        // to provoke another ACK.
+        let credit_retry_due = self.credit_pending
+            && self
+                .credit_packet_number
+                .is_some_and(|_| self.send_clock.saturating_sub(self.last_ack_time) >= 50);
+        let send_ack = self.control_pending || delayed_ack_due || credit_retry_due;
         let ack_frequency = self.pending_ack_frequency;
         if !send_ack && ack_frequency.is_none() {
             return Ok(None);
@@ -4422,7 +4475,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             }
             .encode(&mut out[p..])?;
             p += Frame::MaxData(self.receive.connection.max_data).encode(&mut out[p..])?;
-            for stream_id in self.pending_stream_ids.iter_mut().filter_map(Option::take) {
+            for stream_id in self.pending_stream_ids.iter().filter_map(|id| *id) {
                 let max = self
                     .receive
                     .stream_max_data(stream_id)
@@ -4433,6 +4486,9 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             self.ack_pending = false;
             self.ack_packets = 0;
             self.last_ack_time = self.send_clock;
+            if self.credit_pending {
+                self.credit_packet_number = Some(self.next_packet_number);
+            }
             self.stats.ack_datagrams += 1;
             if immediate_ack {
                 self.stats.ack_immediate_datagrams += 1;
@@ -4500,6 +4556,14 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             return Err(Error::Invalid);
         }
         self.peer_ack_ranges = acknowledged;
+        if self
+            .credit_packet_number
+            .is_some_and(|packet_number| acknowledged.contains(packet_number))
+        {
+            self.credit_pending = false;
+            self.credit_packet_number = None;
+            self.pending_stream_ids = [None; N];
+        }
         self.largest_acked_by_peer = acknowledged.get(0).map(|range| range.end);
         let largest_acked = acknowledged.get(0).map(|range| range.end);
         // A fresh wire packet number can carry a retransmission of an older

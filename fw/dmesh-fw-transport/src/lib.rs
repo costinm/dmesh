@@ -41,6 +41,7 @@ pub mod recovery_runtime;
 /// register this handler or accept transit rules.
 pub mod relay_main;
 pub mod state;
+mod stream_handlers;
 pub mod task_esp;
 pub mod uart_esp;
 // One device-wide pool is also the UART packet handoff. It is available in a

@@ -19,7 +19,7 @@ use dmesh_server::{
     uart::{UartIngress, classify_uart_payload, encode_uart_datagram},
 };
 use quic_lite::{
-    ClientAssociation, ConnectionLimits, PathId, StreamFrame,
+    ClientAssociation, ConnectionLimits, DatagramClient, PathId, StreamFrame,
     path_bridge::{PathBridge, PathBridgeAction},
 };
 use serde::Deserialize;
@@ -77,6 +77,13 @@ pub struct SerialProbeResult {
     pub low_bytes: u64,
     pub elapsed_us: u64,
     pub bps: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SerialObjectUploadResult {
+    pub response: Vec<u8>,
+    pub records: usize,
+    pub bytes: usize,
 }
 
 impl DeviceSession {
@@ -233,6 +240,116 @@ impl DeviceSession {
             request.bytes,
             client.packet_classes(),
             client.callback_errors(),
+        ))
+    }
+
+    /// Run the ordinary two-stream `object.flash` operation over this UART.
+    /// The UART adapter moves only framed datagrams; `ObjectUploadClient` and
+    /// `DatagramClientDriver` own streams, ACKs, credit, and retransmission.
+    pub fn object_upload(
+        &mut self,
+        command: &[u8],
+        records: dmesh_server::protocol::ObjectRecordStream,
+    ) -> Result<SerialObjectUploadResult, String> {
+        self.assert_healthy()?;
+        let cid = fresh_connection_id()?;
+        let mut client = dmesh_server::transport::ObjectUploadClient::<
+            8,
+            { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+        >::new(cid, command, records)
+        .map_err(|error| format!("object upload client: {error:?}"))?;
+        let started = Instant::now();
+        let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0)
+            .map_err(|error| format!("object upload OPEN: {error:?}"))?;
+        send_uart_transport(
+            &mut self.serial,
+            driver.packet().expect("a started driver has an OPEN"),
+        )?;
+        driver.mark_sent(0);
+        let deadline = started + Duration::from_secs(300);
+        let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
+        while Instant::now() < deadline {
+            match self.serial.read(&mut buffer) {
+                Ok(used) if used != 0 => {
+                    for line in self.text_tap.push(&buffer[..used]) {
+                        if is_fatal_diagnostic(&line) {
+                            self.fatal_diagnostic.get_or_insert_with(|| line.clone());
+                        }
+                        self.push_event(DeviceSessionEvent::Diagnostic(line));
+                    }
+                    for frame in self
+                        .decoder
+                        .push(&buffer[..used])
+                        .map_err(|error| error.to_string())?
+                    {
+                        match classify_uart_payload(&frame) {
+                            Ok(UartIngress::Unmarked(packet)) => {
+                                if let Some(record) =
+                                    dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                                {
+                                    self.push_event(DeviceSessionEvent::DirectRecord(
+                                        record.to_vec(),
+                                    ));
+                                }
+                            }
+                            Ok(UartIngress::Transport(input)) => {
+                                self.push_event(DeviceSessionEvent::TransportPacket(
+                                    input.to_vec(),
+                                ));
+                                let now_ms = started.elapsed().as_millis() as u64;
+                                let received = match driver.receive(&mut client, input, now_ms) {
+                                    Ok(received) => received,
+                                    Err(error) => {
+                                        self.assert_healthy()?;
+                                        return Err(format!(
+                                            "object upload receive: {error:?} records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
+                                            client.record_index(),
+                                            client.sent_bytes(),
+                                            driver.tx_packets(),
+                                            driver.rx_packets(),
+                                            driver.retransmit_packets()
+                                        ));
+                                    }
+                                };
+                                if received && let Some(packet) = driver.packet() {
+                                    send_uart_transport(&mut self.serial, packet)?;
+                                    driver.mark_sent(now_ms);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            let now_ms = started.elapsed().as_millis() as u64;
+            driver
+                .poll(&mut client, now_ms, 600, 400)
+                .map_err(|error| format!("object upload poll: {error:?}"))?;
+            if let Some(packet) = driver.packet() {
+                send_uart_transport(&mut self.serial, packet)?;
+                driver.mark_sent(now_ms);
+            }
+            if client.is_complete() {
+                self.assert_healthy()?;
+                return Ok(SerialObjectUploadResult {
+                    response: client.response().unwrap_or_default().to_vec(),
+                    records: client.record_index(),
+                    bytes: client.sent_bytes(),
+                });
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        self.assert_healthy()?;
+        Err(format!(
+            "object upload timeout records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
+            client.record_index(),
+            client.sent_bytes(),
+            driver.tx_packets(),
+            driver.rx_packets(),
+            driver.retransmit_packets()
         ))
     }
 
@@ -1271,6 +1388,42 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         );
         return Ok(());
     }
+    if let Some((_, flash)) = dmesh_server::protocol::decode_flash_handler_request(&body) {
+        let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/flash"));
+        let records = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
+            artifact_root: artifact_root.clone(),
+            ..dmesh_server::ServerConfig::default()
+        })
+        .response_records(flash.object)
+        .map_err(|error| format!("object.flash artifact: {error}"))?;
+        eprintln!(
+            "dmesh_cli_object_upload bearer=uart association=single command_stream={} object_stream={} artifact_root={}",
+            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+            dmesh_server::transport::FLASH_OBJECT_STREAM,
+            artifact_root.display()
+        );
+        let mut session = DeviceSession::open(path.clone(), baud)?;
+        let result = session.object_upload(
+            &body,
+            dmesh_server::protocol::ObjectRecordStream::new(records),
+        )?;
+        eprintln!(
+            "dmesh_cli_object_upload_complete bearer=uart stream={} records={} bytes={}",
+            dmesh_server::transport::FLASH_OBJECT_STREAM,
+            result.records,
+            result.bytes
+        );
+        println!(
+            "dmesh_cli_stream_command target={} stream={} fin=true bytes={} {}",
+            path,
+            quic_lite::FIRST_SERVER_BIDI_STREAM_ID,
+            result.response.len(),
+            render_device_record(&FirmwareSchema::load(), &result.response)
+        );
+        return Ok(());
+    }
     let mut serial = open_serial(path)?;
     configure_serial(&serial, baud)?;
     run_serial_service_request(&mut serial, path, &body).map(|_| ())
@@ -1940,6 +2093,49 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     let schema = FirmwareSchema::load();
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
+        // `object.flash` is one QUIC-lite association with its command and
+        // object streams.  Do not first bootstrap UdpClient's legacy upload
+        // loop: ObjectUploadClient is the shared stream/ACK/credit owner
+        // used by UART and must be the UDP owner as well.
+        if object_flash {
+            let (_, flash) = dmesh_server::protocol::decode_flash_handler_request(&request)
+                .ok_or("invalid object.flash request")?;
+            let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/flash"));
+            let records = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
+                artifact_root: artifact_root.clone(),
+                ..dmesh_server::ServerConfig::default()
+            })
+            .response_records(flash.object)
+            .map_err(|error| format!("object.flash artifact: {error}"))?;
+            eprintln!(
+                "dmesh_cli_object_upload bearer=udp association=single command_stream={} object_stream={} artifact_root={}",
+                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                artifact_root.display()
+            );
+            let result = udp_object_upload(
+                peer,
+                cid,
+                &request,
+                dmesh_server::protocol::ObjectRecordStream::new(records),
+            )
+            .await?;
+            eprintln!(
+                "dmesh_cli_object_upload_complete bearer=udp stream={} records={} bytes={}",
+                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                result.records,
+                result.bytes
+            );
+            println!(
+                "dmesh_cli_stream_command target={peer} stream={} fin=true bytes={} {}",
+                quic_lite::FIRST_SERVER_BIDI_STREAM_ID,
+                result.response.len(),
+                render_device_record(&schema, &result.response)
+            );
+            return Ok(());
+        }
         let mut client = if let Some((_, observed)) = relay_pair {
             dmesh_server::udp::UdpClient::connect_with_quic_lite_wire_dcid(
                 udp_bind_for_peer(peer),
@@ -2124,6 +2320,93 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         );
         Ok(())
     })
+}
+
+struct UdpObjectUploadResult {
+    response: Vec<u8>,
+    records: usize,
+    bytes: usize,
+}
+
+/// Move complete UDP datagrams for the bearer-neutral object client.  The
+/// adapter has no stream, ACK, loss, or flow-control policy of its own.
+async fn udp_object_upload(
+    peer: SocketAddr,
+    cid: quic_lite::ConnectionId,
+    command: &[u8],
+    records: dmesh_server::protocol::ObjectRecordStream,
+) -> Result<UdpObjectUploadResult, String> {
+    let socket = tokio::net::UdpSocket::bind(udp_bind_for_peer(peer))
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut client = dmesh_server::transport::ObjectUploadClient::<
+        512,
+        { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+    >::new(cid, command, records)
+    .map_err(|error| format!("object upload client: {error:?}"))?;
+    let started = Instant::now();
+    // A bounded diagnostic run may shorten this host-side wait without
+    // changing the wire protocol or Recovery's receive deadline.
+    let timeout_secs = env::var("DMESH_OBJECT_UPLOAD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(300);
+    let deadline = started + Duration::from_secs(timeout_secs);
+    let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0)
+        .map_err(|error| format!("object upload OPEN: {error:?}"))?;
+    socket
+        .send_to(driver.packet().expect("started object upload has OPEN"), peer)
+        .await
+        .map_err(|error| error.to_string())?;
+    driver.mark_sent(0);
+    let mut input = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    while Instant::now() < deadline {
+        let now_ms = started.elapsed().as_millis() as u64;
+        if let Ok(Ok((used, source))) = tokio::time::timeout(
+            Duration::from_millis(2),
+            socket.recv_from(&mut input),
+        )
+        .await
+        {
+            if source != peer {
+                continue;
+            }
+            if driver
+                .receive(&mut client, &input[..used], now_ms)
+                .map_err(|error| format!(
+                    "object upload receive: {error:?} records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={}",
+                    client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), driver.rx_packets(), driver.retransmit_packets()
+                ))?
+                && let Some(packet) = driver.packet()
+            {
+                socket.send_to(packet, peer).await.map_err(|error| error.to_string())?;
+                driver.mark_sent(now_ms);
+            }
+        }
+        let now_ms = started.elapsed().as_millis() as u64;
+        driver
+            // Use the same QUIC-lite PTO/bootstrap cadence as every other
+            // complete-datagram bearer. The adapter owns no UDP-specific
+            // retransmission or pacing policy.
+            .poll(&mut client, now_ms, 600, 400)
+            .map_err(|error| format!("object upload poll: {error:?}"))?;
+        if let Some(packet) = driver.packet() {
+            socket.send_to(packet, peer).await.map_err(|error| error.to_string())?;
+            driver.mark_sent(now_ms);
+        }
+        if client.is_complete() {
+            return Ok(UdpObjectUploadResult {
+                response: client.response().unwrap_or_default().to_vec(),
+                records: client.record_index(),
+                bytes: client.sent_bytes(),
+            });
+        }
+    }
+    Err(format!(
+        "object upload timeout records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={}",
+        client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), driver.rx_packets(), driver.retransmit_packets()
+    ))
 }
 
 /// Select the wildcard address family from the peer. A raw IPv6 bearer must

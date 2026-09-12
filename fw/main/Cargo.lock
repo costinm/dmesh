@@ -326,6 +326,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesh-ble"
+version = "0.1.0"
+dependencies = [
+ "esp-idf-sys",
+]
+
+[[package]]
 name = "dmesh-fw-modules"
 version = "0.1.0"
 dependencies = [
@@ -354,6 +361,7 @@ dependencies = [
 name = "dmesh-rs"
 version = "0.1.0"
 dependencies = [
+ "dmesh-ble",
  "dmesh-fw-modules",
  "dmesh-fw-transport",
  "embuild",

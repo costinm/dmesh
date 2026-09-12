@@ -336,7 +336,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                     .map_err(|_| Error::Invalid)?;
                 if sink.bytes != 0 {
                     self.endpoint
-                        .stream_consumed_deferred(frame.id, sink.bytes)?;
+                        .stream_consumed_without_credit(frame.id, sink.bytes)?;
                 }
                 if sink.finished {
                     if self.completed.len() >= self.max_pending_streams {
@@ -554,7 +554,6 @@ mod tests {
         server
             .install_connection_ids(server_cid, client_cid)
             .unwrap();
-
         let streams = [4_u64, 8, 12];
         let mut packet = [0_u8; 256];
         for stream in streams {
@@ -761,6 +760,77 @@ mod tests {
             )]
         );
         assert_eq!(server.pending_streams(), 0);
+    }
+
+    #[test]
+    fn streamed_sink_withholds_credit_until_storage_window_is_granted() {
+        let limits = ConnectionLimits {
+            max_data: 16,
+            max_stream_data: 16,
+            ..ConnectionLimits::default()
+        };
+        let mut client = StreamMux::<8, 8>::new(Role::Client, limits, 1200, 8, 8, 1024);
+        let mut server = StreamMux::<8, 8>::new(Role::Server, limits, 1200, 8, 8, 1024);
+        let client_cid = ConnectionId::new(121).unwrap();
+        let server_cid = ConnectionId::new(122).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        server.endpoint.set_ack_policy(1, 5);
+        client.endpoint.set_initial_peer_credit(16, 16).unwrap();
+        client.endpoint.open_send_stream(8, 16).unwrap();
+
+        let mut packet = [0u8; 256];
+        let (used, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, &[0x55; 16], &mut packet)
+            .unwrap();
+        let mut delivered = 0;
+        server
+            .receive_request_with_stream(&packet[..used], 8, |_, _, bytes| {
+                delivered += bytes.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, 16);
+
+        // ACKing receipt must not imply that application storage is free.
+        let mut control = [0u8; 256];
+        let ack_len = server
+            .endpoint
+            .poll_transmit(&mut control)
+            .unwrap()
+            .unwrap();
+        client
+            .endpoint
+            .receive_datagram(&control[..ack_len])
+            .unwrap();
+        assert_eq!(
+            client
+                .endpoint
+                .encode_stream_packet(server_cid, 8, 16, false, b"x", &mut packet),
+            Err(Error::FlowControl)
+        );
+
+        server.endpoint.grant_receive_window(8, 16).unwrap();
+        let grant_len = server
+            .endpoint
+            .poll_transmit(&mut control)
+            .unwrap()
+            .unwrap();
+        client
+            .endpoint
+            .receive_datagram(&control[..grant_len])
+            .unwrap();
+        assert!(
+            client
+                .endpoint
+                .encode_stream_packet(server_cid, 8, 16, false, b"x", &mut packet)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -80,7 +80,6 @@ pub type RawUdp6PollHandler =
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CONNECTIONLESS_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static POLL_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static TX_BURST_PACKETS: AtomicUsize = AtomicUsize::new(8);
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Whether raw UDP6 currently owns the STA Ethernet RX callback. `false`
@@ -121,7 +120,6 @@ static TX_SUBMIT_US_MAX: AtomicU32 = AtomicU32::new(0);
 // the existing shared ingress worker (and its already-accounted stack), not
 // a per-bearer task or queue.  It is armed only for the explicit burst-one
 // pacing mode, where yielding the CPU also gives the STA an RX/ACK window.
-static PACED_POLL_PENDING: AtomicBool = AtomicBool::new(false);
 static PACED_LINK: AtomicUsize = AtomicUsize::new(0);
 static PACED_PEER_MAC_LOW: AtomicU32 = AtomicU32::new(0);
 static PACED_PEER_MAC_HIGH: AtomicU32 = AtomicU32::new(0);
@@ -492,20 +490,6 @@ pub fn set_poll_handler(handler: Option<RawUdp6PollHandler>) {
     );
 }
 
-/// Applies to the next association; the raw adapter keeps no packet queue.
-pub fn set_tx_burst_packets(packets: usize) {
-    TX_BURST_PACKETS.store(
-        packets.clamp(1, crate::CONNECTION_HISTORY_CAPACITY),
-        Ordering::Release,
-    );
-}
-
-/// Current ingress-turn egress credit, exposed through the shared radio
-/// snapshot so packet-timing investigations do not infer it from gaps.
-pub fn tx_burst_packets() -> u8 {
-    TX_BURST_PACKETS.load(Ordering::Acquire) as u8
-}
-
 pub fn tx_submit_timing() -> (u32, u32, u32) {
     (
         TX_SUBMIT_CALLS.load(Ordering::Relaxed),
@@ -779,36 +763,31 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
     let poll = POLL_HANDLER.load(Ordering::Acquire);
     let poll: Option<RawUdp6PollHandler> =
         (poll != 0).then(|| unsafe { core::mem::transmute(poll) });
-    let result = dmesh_server::transport::pump_egress(
-        response,
-        TX_BURST_PACKETS.load(Ordering::Acquire),
-        immediate,
-        |response| poll.and_then(|poll| poll(peer, response)),
-        |payload| transmit_udp6(item.link(), peer, RAW_UDP6_PORT, payload),
-    );
-    if result.sent != 0 {
+    let used = immediate.or_else(|| poll.and_then(|poll| poll(peer, response)));
+    let sent = used.is_some_and(|used| {
+        used <= response.len()
+            && transmit_udp6(item.link(), peer, RAW_UDP6_PORT, &response[..used])
+    });
+    if sent {
         UDP_DELIVERED.fetch_add(1, Ordering::Relaxed);
-        TX_FRAMES.fetch_add(result.sent as u32, Ordering::Relaxed);
+        TX_FRAMES.fetch_add(1, Ordering::Relaxed);
         // Keep a small physical-path breadcrumb for the host->STA direct
         // responder. A client timeout alone cannot distinguish a handler
         // that produced nothing from a Wi-Fi submit or AP-forwarding loss.
         if UDP_DELIVERED.load(Ordering::Relaxed) <= 2 {
-            crate::commands::send_stat(b"raw udp6 egress sent=", result.sent as u64);
+            crate::commands::send_stat(b"raw udp6 egress sent=", 1);
             crate::commands::send_stat(
                 b"raw udp6 egress tx result=",
                 LAST_TX_RESULT.load(Ordering::Relaxed) as u64,
             );
         }
     }
-    if result.invalid_length || result.submit_failed {
+    if used.is_some() && !sent {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
         crate::commands::send_stat(
             b"raw udp6 egress submit_failed=",
-            u64::from(result.submit_failed),
+            1,
         );
-    }
-    if result.sent != 0 {
-        schedule_paced_poll(item.link(), peer);
     }
 }
 
@@ -884,46 +863,6 @@ pub fn record_connectionless_announce(
     record_announce_peer(announce, source_mac, [0; 16]);
 }
 
-/// Continue an explicit one-packet burst after yielding the shared worker for
-/// one RTOS tick.  This is deliberately a worker action, not a timer task:
-/// it retains no driver buffer and disappears with normal ingress idleness.
-fn paced_poll_work() {
-    PACED_POLL_PENDING.store(false, Ordering::Release);
-    if !STARTED.load(Ordering::Acquire) {
-        return;
-    }
-    unsafe { esp_idf_sys::vTaskDelay(1) };
-    if !STARTED.load(Ordering::Acquire) {
-        return;
-    }
-    let link = match PACED_LINK.load(Ordering::Acquire) {
-        1 => crate::shared_ingress_esp::IngressLink::WifiSta,
-        2 => crate::shared_ingress_esp::IngressLink::WifiAp,
-        _ => return,
-    };
-    let peer = load_paced_peer();
-    let poll = POLL_HANDLER.load(Ordering::Acquire);
-    if poll == 0 {
-        return;
-    }
-    let poll: RawUdp6PollHandler = unsafe { core::mem::transmute(poll) };
-    let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
-    let result = dmesh_server::transport::pump_egress(
-        response,
-        1,
-        None,
-        |response| poll(peer, response),
-        |payload| transmit_udp6(link, peer, RAW_UDP6_PORT, payload),
-    );
-    if result.sent != 0 {
-        TX_FRAMES.fetch_add(result.sent as u32, Ordering::Relaxed);
-        schedule_paced_poll(link, peer);
-    }
-    if result.invalid_length || result.submit_failed {
-        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// Execute one connection-owned delayed-ACK/PTO turn after Main's exact
 /// QUIC-lite deadline. This adapter supplies only the last validated UDP
 /// return tuple; it never decides ACK timing or retains packet data.
@@ -943,38 +882,20 @@ pub(crate) fn poll_connection_timer() {
     }
     let poll: RawUdp6PollHandler = unsafe { core::mem::transmute(poll) };
     let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
-    let result = dmesh_server::transport::pump_egress(
-        response,
-        1,
-        None,
-        |response| poll(peer, response),
-        |payload| transmit_udp6(link, peer, RAW_UDP6_PORT, payload),
-    );
-    if result.sent != 0 {
-        TX_FRAMES.fetch_add(result.sent as u32, Ordering::Relaxed);
+    let used = poll(peer, response);
+    let sent = used.is_some_and(|used| {
+        used <= response.len() && transmit_udp6(link, peer, RAW_UDP6_PORT, &response[..used])
+    });
+    if sent {
+        TX_FRAMES.fetch_add(1, Ordering::Relaxed);
         if TIMER_POLL_REPORTS.fetch_add(1, Ordering::Relaxed) < 2 {
-            crate::commands::send_stat(b"raw udp6 timer egress=", result.sent as u64);
+            crate::commands::send_stat(b"raw udp6 timer egress=", 1);
         }
     } else if TIMER_POLL_REPORTS.fetch_add(1, Ordering::Relaxed) < 2 {
         crate::commands::send_response(b"raw udp6 timer no egress");
     }
-    if result.invalid_length || result.submit_failed {
+    if used.is_some() && !sent {
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn schedule_paced_poll(link: crate::shared_ingress_esp::IngressLink, peer: RawUdp6Peer) {
-    if !STARTED.load(Ordering::Acquire)
-        || TX_BURST_PACKETS.load(Ordering::Acquire) != 1
-        || PACED_POLL_PENDING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return;
-    }
-    store_paced_peer(link, peer);
-    if !crate::shared_ingress_esp::schedule_work(paced_poll_work) {
-        PACED_POLL_PENDING.store(false, Ordering::Release);
     }
 }
 
