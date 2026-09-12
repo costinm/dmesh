@@ -630,7 +630,17 @@ struct BridgeCommand {
 
 fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::Result<Vec<u8>> {
     let cmd = parse_bridge_human(&format!("{} {}", method, args.trim()))?;
+    if let Some(uid) = cmd.data.get("caller_uid") {
+        let pkg = cmd.data.get("caller_package").map(String::as_str).unwrap_or("");
+        let same_sig = cmd.data.get("caller_same_sig").map(String::as_str).unwrap_or("false");
+        let cert = cmd.data.get("caller_cert_sha256").map(String::as_str).unwrap_or("");
+        log::info!(
+            "radio_message caller identity: uid={} pkg={} same_sig={} cert_sha256={}",
+            uid, pkg, same_sig, cert
+        );
+    }
     let response = match cmd.method.as_str() {
+
         "radio.nan.build_service_info" => {
             let role = cmd
                 .data
@@ -1277,8 +1287,24 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .to_string()
                 .into_bytes()
         }
+        "chat.message" => {
+            let from = cmd.data.get("from").cloned().unwrap_or_else(|| "remote".to_string());
+            let text = cmd.data.get("text").cloned().unwrap_or_default();
+            log::info!("Rust chat.message from {}: {}", from, text);
+            json!({"method": "chat.message", "from": from, "text": text, "status": "ok"})
+                .to_string()
+                .into_bytes()
+        }
+        "messages.subscribe" => {
+            let keys = cmd.data.get("keys").cloned().unwrap_or_else(|| "all".to_string());
+            log::info!("Rust messages.subscribe keys: {}", keys);
+            json!({"method": "messages.subscribed", "keys": keys, "status": "ok"})
+                .to_string()
+                .into_bytes()
+        }
         _ => anyhow::bail!("unknown radio method: {}", cmd.method),
     };
+
     Ok(response)
 }
 

@@ -60,6 +60,15 @@ public final class MessageStreamGateway implements MeshNode.MeshCallback {
         if (clientId != 0) onMessage(nativeEndpointFor(clientId), record);
     }
 
+    /** Compatibility for existing prebuilt libdmesh.so calling onMessage(long, String). */
+    @Override
+    public void onMessage(long clientId, String recordStr) {
+        if (clientId != 0 && recordStr != null) {
+            onMessage(nativeEndpointFor(clientId), recordStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+
     @Override
     public void onMessageClosed(long clientId) {
         NativeEndpoint endpoint;

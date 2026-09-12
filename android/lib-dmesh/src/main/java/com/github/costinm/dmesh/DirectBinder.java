@@ -78,10 +78,11 @@ public class DirectBinder extends Binder {
     protected boolean onTransact(int code, Parcel data, Parcel reply,
                                  int flags) throws RemoteException {
         if (code == TRANSACT_MESSAGE || code == TRANSACT_EVENT) {
-            DirectMessage msg = readMessage(data);
+            DirectMessage msg = readMessage(data, flags, Binder.getCallingUid(), Binder.getCallingPid());
             if (receiver != null) {
                 return receiver.onDirectMessage(code, msg, reply);
             }
+
             return onDirectMessage(code, msg, reply);
         }
         return super.onTransact(code, data, reply, flags);
@@ -94,18 +95,51 @@ public class DirectBinder extends Binder {
     public static boolean transact(IBinder binder, int code, byte[] payload, String encoding,
                                    Bundle extras, IBinder callback,
                                    List<ParcelFileDescriptor> fds) {
+        return transactAsync(binder, code, payload, encoding, extras, callback, fds);
+    }
+
+    /**
+     * One-way asynchronous transaction. Flags the transaction with IBinder.FLAG_ONEWAY.
+     */
+    public static boolean transactAsync(IBinder binder, int code, byte[] payload, String encoding,
+                                        Bundle extras, IBinder callback,
+                                        List<ParcelFileDescriptor> fds) {
         if (binder == null || !validPayload(payload)) return false;
         Parcel in = Parcel.obtain();
-        Parcel out = Parcel.obtain();
         try {
             writeMessage(in, payload, encoding, extras, callback, fds);
-            return binder.transact(code, in, out, 0);
+            return binder.transact(code, in, null, IBinder.FLAG_ONEWAY);
         } catch (RemoteException | IllegalArgumentException e) {
-            Log.d(TAG, "Direct binder transaction failed", e);
+            Log.d(TAG, "Direct binder async transaction failed", e);
             return false;
         } finally {
             in.recycle();
-            out.recycle();
+        }
+    }
+
+    /**
+     * Synchronous two-way transaction. Waits for the server to populate reply and
+     * optionally reads the returned DirectMessage into replyOut[0].
+     */
+    public static boolean transactSync(IBinder binder, int code, byte[] payload, String encoding,
+                                       Bundle extras, List<ParcelFileDescriptor> fds,
+                                       DirectMessage[] replyOut) {
+        if (binder == null || !validPayload(payload)) return false;
+        Parcel in = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            writeMessage(in, payload, encoding, extras, null, fds);
+            boolean ok = binder.transact(code, in, reply, 0);
+            if (ok && replyOut != null && replyOut.length > 0 && reply.dataAvail() > 0) {
+                replyOut[0] = readMessage(reply, 0);
+            }
+            return ok;
+        } catch (RemoteException | IllegalArgumentException e) {
+            Log.d(TAG, "Direct binder sync transaction failed", e);
+            return false;
+        } finally {
+            in.recycle();
+            reply.recycle();
         }
     }
 
@@ -119,6 +153,36 @@ public class DirectBinder extends Binder {
         MeshStream value = stream == null ? new MeshStream(null) : stream;
         return transact(binder, code, value.payload, value.encoding, value.toDirectExtras(), callback, fds);
     }
+
+    public static boolean transactAsync(IBinder binder, int code, MeshStream stream, IBinder callback,
+                                        List<ParcelFileDescriptor> fds) {
+        MeshStream value = stream == null ? new MeshStream(null) : stream;
+        return transactAsync(binder, code, value.payload, value.encoding, value.toDirectExtras(), callback, fds);
+    }
+
+    public static boolean transactSync(IBinder binder, int code, MeshStream stream,
+                                       List<ParcelFileDescriptor> fds, MeshStream[] replyOut) {
+        MeshStream value = stream == null ? new MeshStream(null) : stream;
+        DirectMessage[] msgReply = replyOut != null && replyOut.length > 0 ? new DirectMessage[1] : null;
+        boolean ok = transactSync(binder, code, value.payload, value.encoding, value.toDirectExtras(), fds, msgReply);
+        if (ok && msgReply != null && msgReply[0] != null) {
+            replyOut[0] = msgReply[0].stream;
+        }
+        return ok;
+    }
+
+    public static void writeReply(Parcel reply, MeshStream stream) {
+        if (reply == null) return;
+        MeshStream value = stream == null ? new MeshStream(null) : stream;
+        writeMessage(reply, value.payload, value.encoding, value.toDirectExtras(), null, null);
+    }
+
+    public static void writeReply(Parcel reply, byte[] payload, String encoding, Bundle extras) {
+        if (reply == null) return;
+        writeMessage(reply, payload == null ? new byte[0] : payload,
+                encoding == null ? "" : encoding, extras, null, null);
+    }
+
 
     public static void writeMessage(Parcel out, byte[] payload, String encoding, Bundle extras,
                                     IBinder callback, List<ParcelFileDescriptor> fds) {
@@ -155,6 +219,14 @@ public class DirectBinder extends Binder {
     }
 
     public static DirectMessage readMessage(Parcel in) {
+        return readMessage(in, 0, 0, 0);
+    }
+
+    public static DirectMessage readMessage(Parcel in, int flags) {
+        return readMessage(in, flags, 0, 0);
+    }
+
+    public static DirectMessage readMessage(Parcel in, int flags, int callingUid, int callingPid) {
         int version = in.readInt();
         if (version != 1) throw new IllegalArgumentException("unsupported DirectBinder version " + version);
         byte[] payload = in.createByteArray();
@@ -170,8 +242,9 @@ public class DirectBinder extends Binder {
             fds.add(in.readFileDescriptor());
         }
         return new DirectMessage(payload == null ? new byte[0] : payload,
-                encoding == null ? "" : encoding, extras, callback, fds);
+                encoding == null ? "" : encoding, extras, callback, fds, flags, callingUid, callingPid);
     }
+
 
     public void dial(Context ctx, String addr) {
         String[] parts = addr.split("/");
@@ -222,17 +295,43 @@ public class DirectBinder extends Binder {
         public final Bundle extras;
         public final IBinder callback;
         public final ArrayList<ParcelFileDescriptor> fds;
+        public final int flags;
+        public final int callingUid;
+        public final int callingPid;
         /** Java projection of the Rust envelope; never separately serialized. */
         public final MeshStream stream;
 
-        DirectMessage(byte[] payload, String encoding, Bundle extras, IBinder callback,
-                      ArrayList<ParcelFileDescriptor> fds) {
+        public DirectMessage(byte[] payload, String encoding, Bundle extras, IBinder callback,
+                             ArrayList<ParcelFileDescriptor> fds) {
+            this(payload, encoding, extras, callback, fds, 0, 0, 0);
+        }
+
+        public DirectMessage(byte[] payload, String encoding, Bundle extras, IBinder callback,
+                             ArrayList<ParcelFileDescriptor> fds, int flags) {
+            this(payload, encoding, extras, callback, fds, flags, 0, 0);
+        }
+
+        public DirectMessage(byte[] payload, String encoding, Bundle extras, IBinder callback,
+                             ArrayList<ParcelFileDescriptor> fds, int flags,
+                             int callingUid, int callingPid) {
             this.payload = payload;
             this.encoding = encoding;
             this.extras = extras;
             this.callback = callback;
             this.fds = fds;
+            this.flags = flags;
+            this.callingUid = callingUid;
+            this.callingPid = callingPid;
             this.stream = MeshStream.fromDirect(payload, encoding, extras);
+        }
+
+
+        public boolean isOneWay() {
+            return (flags & IBinder.FLAG_ONEWAY) != 0;
+        }
+
+        public boolean hasCallback() {
+            return callback != null;
         }
 
         public String id() { return extra(ID); }

@@ -54,8 +54,13 @@ import java.security.PrivateKey;
 import java.security.UnrecoverableEntryException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
+import java.security.MessageDigest;
+import android.os.Process;
+import android.content.pm.Signature;
+import com.github.costinm.dmesh.DirectBinder;
 import java.util.ArrayList;
 import java.util.TreeMap;
+
 
 /**
  * Foreground service maintaining the notification, wifi/BT/net and native code..
@@ -423,11 +428,119 @@ public class DMService extends MeshService {
     }
 
     @Override
+    protected boolean onDirectStream(DirectBinder.DirectMessage message, Parcel reply)
+            throws RemoteException {
+        if (message == null) return false;
+        MeshStream stream = message.stream != null ? message.stream : new MeshStream(null);
+
+        // Caller identity plumbing
+        int uid = message.callingUid;
+        int pid = message.callingPid;
+        PackageManager pm = getPackageManager();
+        String callingPkg = "";
+        String certSha256 = "";
+        boolean isSameSig = false;
+
+        if (uid == Process.myUid()) {
+            callingPkg = getPackageName();
+            isSameSig = true;
+        } else if (pm != null && uid > 0) {
+            String[] packages = pm.getPackagesForUid(uid);
+            if (packages != null && packages.length > 0) {
+                callingPkg = packages[0];
+            }
+            isSameSig = (pm.checkSignatures(uid, Process.myUid()) == PackageManager.SIGNATURE_MATCH);
+            try {
+                if (callingPkg != null && !callingPkg.isEmpty()) {
+                    android.content.pm.PackageInfo pi = pm.getPackageInfo(callingPkg, PackageManager.GET_SIGNING_CERTIFICATES);
+                    if (pi != null && pi.signingInfo != null) {
+                        Signature[] sigs = pi.signingInfo.getApkContentsSigners();
+                        if (sigs != null && sigs.length > 0) {
+                            MessageDigest md = MessageDigest.getInstance("SHA-256");
+                            byte[] digest = md.digest(sigs[0].toByteArray());
+                            StringBuilder sb = new StringBuilder();
+                            for (byte b : digest) {
+                                sb.append(String.format("%02x", b));
+                            }
+                            certSha256 = sb.toString();
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                Log.d(TAG, "failed to get caller signing certificate", t);
+            }
+        }
+
+        stream.data.putInt("caller_uid", uid);
+        stream.data.putInt("caller_pid", pid);
+        stream.data.putString("caller_package", callingPkg);
+        stream.data.putBoolean("caller_same_sig", isSameSig);
+        stream.data.putString("caller_cert_sha256", certSha256);
+        stream.fields.put("caller_uid", String.valueOf(uid));
+        stream.fields.put("caller_package", callingPkg);
+        stream.fields.put("caller_same_sig", String.valueOf(isSameSig));
+        stream.fields.put("caller_cert_sha256", certSha256);
+
+        // Routing: if external intent target, delegate to messageGateway
+        if (stream.to != null && stream.to.startsWith("intent:")) {
+            MessageStreamGateway gateway = messageGateway;
+            return gateway != null && gateway.onDirectMessage(stream, message.callback);
+        }
+
+        // Local node command/query: dispatch to Rust MeshNode
+        String method = stream.method;
+        if (method == null || method.isEmpty()) {
+            method = stream.uri;
+        }
+        if (method == null || method.isEmpty()) {
+            method = "discovery.nodes";
+        }
+        if ("lmesh.nodes".equals(method) || "nodes".equals(method) || "devices".equals(method)) {
+            method = "discovery.nodes";
+        } else if ("lmesh.status".equals(method) || "status".equals(method)) {
+            method = "discovery.status";
+        }
+
+        StringBuilder args = new StringBuilder();
+        args.append("caller_uid=").append(uid);
+        if (!callingPkg.isEmpty()) args.append(" caller_package=").append(callingPkg);
+        args.append(" caller_same_sig=").append(isSameSig);
+        if (!certSha256.isEmpty()) args.append(" caller_cert_sha256=").append(certSha256);
+        for (String key : stream.fields.keySet()) {
+            if (!key.startsWith("caller_")) {
+                args.append(" ").append(key).append("=").append(stream.fields.get(key));
+            }
+        }
+
+        byte[] respBytes = null;
+        try {
+            respBytes = MeshNode.radioMessage(method, args.toString(), stream.payload, -1);
+        } catch (Throwable t) {
+            Log.w(TAG, "MeshNode dispatch failed for " + method, t);
+        }
+        if (respBytes == null) {
+            respBytes = new byte[0];
+        }
+
+        // Return reply: synchronous 2-way vs asynchronous 1-way
+        if (!message.isOneWay() && reply != null) {
+            DirectBinder.writeReply(reply, respBytes, stream.encoding, null);
+            return true;
+        } else if (message.callback != null) {
+            DirectBinder.transact(message.callback, DirectBinder.TRANSACT_EVENT,
+                    respBytes, stream.encoding, null, null, null);
+            return true;
+        }
+        return true;
+    }
+
+    @Override
     protected boolean onDirectStream(MeshStream stream, IBinder callback, Parcel reply)
             throws RemoteException {
         MessageStreamGateway gateway = messageGateway;
         return gateway != null && gateway.onDirectMessage(stream, callback);
     }
+
 
     public void stop() {
         VpnService.stopVpn();

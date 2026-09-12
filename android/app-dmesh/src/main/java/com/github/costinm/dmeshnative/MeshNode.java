@@ -364,8 +364,11 @@ public class MeshNode implements AutoCloseable {
         void onTransportConnection(long clientId, String peer);
         /** Opaque message bytes; dmeshnative maps them to the Android Bundle API. */
         void onMessage(long clientId, byte[] message);
+        /** Compatibility for existing prebuilt libdmesh.so calling onMessage(long, String). */
+        void onMessage(long clientId, String message);
         /** The transport endpoint is gone; release its Android-side gateway state. */
         void onMessageClosed(long clientId);
+
         void onInboundStream(long clientId, String host, int port, long streamHandle);
         void onForwardedStream(long connId, String host, int port, long streamHandle);
     }
