@@ -1,7 +1,7 @@
 use mesh::tun::{TunDnsHandler, TunUdpHandler, TunUdpPacket};
 use mesh_tun::policy::AllowAllPolicy;
 use mesh_tun::{MeshTun, MeshTunConfig};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,30 @@ fn raw_ipv4_udp(
     packet[10..12].copy_from_slice(&checksum.to_be_bytes());
 
     let udp = &mut packet[20..];
+    udp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[8..].copy_from_slice(payload);
+    packet
+}
+
+fn raw_ipv6_udp(
+    src: Ipv6Addr,
+    src_port: u16,
+    dst: Ipv6Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let mut packet = vec![0u8; 40 + udp_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    packet[6] = 17;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src.octets());
+    packet[24..40].copy_from_slice(&dst.octets());
+
+    let udp = &mut packet[40..];
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
     udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
@@ -148,6 +172,88 @@ async fn injector_emits_raw_udp_packet() {
             "10.5.0.2".parse().unwrap(),
             49152,
             b"reply",
+        )
+    );
+}
+
+#[tokio::test]
+async fn channel_stack_captures_ipv6_udp_destination_metadata() {
+    let config = MeshTunConfig::default();
+    let tun = MeshTun::new(config).unwrap();
+    let udp_packets = Arc::new(Mutex::new(Vec::new()));
+    let udp = Arc::new(RecordingUdpHandler {
+        packets: udp_packets.clone(),
+    });
+    let dns = Arc::new(MockDnsHandler);
+    let (_injector, tun_tx, _stack_rx) = tun
+        .run_with_channels_and_policy(Arc::new(AllowAllPolicy), udp, dns)
+        .await
+        .unwrap();
+
+    tun_tx
+        .send(raw_ipv6_udp(
+            "fd00::2".parse().unwrap(),
+            49152,
+            "2001:db8::7".parse().unwrap(),
+            8080,
+            b"payload6",
+        ))
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        if !udp_packets.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let packets = udp_packets.lock().unwrap();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].src_addr, "fd00::2".parse::<IpAddr>().unwrap());
+    assert_eq!(packets[0].src_port, 49152);
+    assert_eq!(
+        packets[0].dst_addr,
+        "2001:db8::7".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(packets[0].dst_port, 8080);
+    assert_eq!(packets[0].payload, b"payload6");
+}
+
+#[tokio::test]
+async fn injector_emits_raw_ipv6_udp_packet() {
+    let config = MeshTunConfig::default();
+    let tun = MeshTun::new(config).unwrap();
+    let udp = Arc::new(MockUdpHandler);
+    let dns = Arc::new(MockDnsHandler);
+    let (injector, _tun_tx, mut stack_rx) = tun
+        .run_with_channels_and_policy(Arc::new(AllowAllPolicy), udp, dns)
+        .await
+        .unwrap();
+
+    injector
+        .inject_udp(
+            "2001:db8::7".parse().unwrap(),
+            8080,
+            "fd00::2".parse().unwrap(),
+            49152,
+            b"reply6",
+        )
+        .await
+        .unwrap();
+
+    let packet = tokio::time::timeout(Duration::from_secs(1), stack_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        packet,
+        raw_ipv6_udp(
+            "2001:db8::7".parse().unwrap(),
+            8080,
+            "fd00::2".parse().unwrap(),
+            49152,
+            b"reply6",
         )
     );
 }

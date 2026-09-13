@@ -533,6 +533,115 @@ fn parse_ipv6_packet(packet: &[u8]) -> TunPacket {
     }
 }
 
+pub fn build_ipv6_udp_packet(
+    src_addr: Ipv6Addr,
+    src_port: u16,
+    dst_addr: Ipv6Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, anyhow::Error> {
+    let udp_len = 8usize
+        .checked_add(payload.len())
+        .ok_or_else(|| anyhow::anyhow!("UDP payload too large"))?;
+    if udp_len > u16::MAX as usize {
+        anyhow::bail!("IPv6 packet too large: {udp_len}");
+    }
+
+    let total_len = 40usize
+        .checked_add(udp_len)
+        .ok_or_else(|| anyhow::anyhow!("IPv6 packet too large"))?;
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    packet[6] = 17;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_addr.octets());
+    packet[24..40].copy_from_slice(&dst_addr.octets());
+
+    let udp = &mut packet[40..];
+    udp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[8..].copy_from_slice(payload);
+
+    Ok(packet)
+}
+
+pub fn build_ipv6_tcp_packet(
+    src_addr: Ipv6Addr,
+    src_port: u16,
+    dst_addr: Ipv6Addr,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>, anyhow::Error> {
+    build_ipv6_tcp_packet_with_options(
+        src_addr,
+        src_port,
+        dst_addr,
+        dst_port,
+        flags,
+        seq,
+        ack,
+        &[],
+        payload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_ipv6_tcp_packet_with_options(
+    src_addr: Ipv6Addr,
+    src_port: u16,
+    dst_addr: Ipv6Addr,
+    dst_port: u16,
+    flags: u8,
+    seq: u32,
+    ack: u32,
+    options: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, anyhow::Error> {
+    if options.len() % 4 != 0 {
+        anyhow::bail!("TCP options length must be 32-bit aligned");
+    }
+    let tcp_header_len = 20usize
+        .checked_add(options.len())
+        .ok_or_else(|| anyhow::anyhow!("TCP options too large"))?;
+    if tcp_header_len > 60 {
+        anyhow::bail!("TCP header too large: {tcp_header_len}");
+    }
+    let tcp_len = tcp_header_len
+        .checked_add(payload.len())
+        .ok_or_else(|| anyhow::anyhow!("TCP payload too large"))?;
+    let total_len = 40usize
+        .checked_add(tcp_len)
+        .ok_or_else(|| anyhow::anyhow!("IPv6 packet too large"))?;
+
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+    packet[6] = 6;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_addr.octets());
+    packet[24..40].copy_from_slice(&dst_addr.octets());
+
+    let tcp = &mut packet[40..];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = ((tcp_header_len / 4) as u8) << 4;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&64240u16.to_be_bytes());
+    tcp[20..20 + options.len()].copy_from_slice(options);
+    tcp[tcp_header_len..].copy_from_slice(payload);
+    let tcp_checksum = ipv6_tcp_checksum(src_addr, dst_addr, tcp)?;
+    tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    Ok(packet)
+}
+
 fn parse_udp_payload(src_addr: IpAddr, dst_addr: IpAddr, payload: &[u8]) -> TunPacket {
     if payload.len() < 8 {
         return TunPacket::Other;
@@ -591,6 +700,26 @@ fn ipv4_tcp_checksum(
     add_checksum_bytes(&mut sum, &dst_addr.octets());
     sum += 6;
     sum += tcp_segment.len() as u32;
+    add_checksum_bytes(&mut sum, tcp_segment);
+    Ok(finish_checksum(sum))
+}
+
+fn ipv6_tcp_checksum(
+    src_addr: Ipv6Addr,
+    dst_addr: Ipv6Addr,
+    tcp_segment: &[u8],
+) -> Result<u16, anyhow::Error> {
+    if tcp_segment.len() > u16::MAX as usize {
+        anyhow::bail!("TCP segment too large: {}", tcp_segment.len());
+    }
+    // IPv6 pseudo-header: source (16) + destination (16) + upper-layer length
+    // (4) + reserved zero (3) + next header (1). The zero bytes add nothing
+    // to the one's-complement sum.
+    let mut sum = 0u32;
+    add_checksum_bytes(&mut sum, &src_addr.octets());
+    add_checksum_bytes(&mut sum, &dst_addr.octets());
+    sum += tcp_segment.len() as u32;
+    sum += 6;
     add_checksum_bytes(&mut sum, tcp_segment);
     Ok(finish_checksum(sum))
 }
@@ -795,6 +924,91 @@ mod tests {
             }
             _ => panic!("Expected TCP"),
         }
+    }
+
+    #[test]
+    fn test_build_ipv6_udp_roundtrip() {
+        let pkt = build_ipv6_udp_packet(
+            Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 52),
+            44650,
+            Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            53,
+            b"mesh dns",
+        )
+        .unwrap();
+        assert_eq!(pkt[0], 0x60);
+        assert_eq!(pkt[6], 17);
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 8 + 8);
+        match parse_ip_packet(&pkt) {
+            TunPacket::Udp(udp) => {
+                assert_eq!(
+                    udp.src_addr,
+                    IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 52))
+                );
+                assert_eq!(udp.src_port, 44650);
+                assert_eq!(
+                    udp.dst_addr,
+                    IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
+                );
+                assert_eq!(udp.dst_port, 53);
+                assert_eq!(udp.payload, b"mesh dns");
+            }
+            _ => panic!("Expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_build_ipv6_tcp_syn_and_checksum() {
+        let src = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 52);
+        let dst = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let pkt = build_ipv6_tcp_packet(src, 44650, dst, 80, 0x02, 7, 0, &[]).unwrap();
+        assert_eq!(pkt[0], 0x60);
+        assert_eq!(pkt[6], 6);
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 20);
+        match parse_ip_packet(&pkt) {
+            TunPacket::Tcp(tcp) => {
+                assert_eq!(tcp.src_addr, IpAddr::V6(src));
+                assert_eq!(tcp.dst_addr, IpAddr::V6(dst));
+                assert_eq!(tcp.src_port, 44650);
+                assert_eq!(tcp.dst_port, 80);
+                assert!(tcp.syn);
+                assert!(!tcp.ack);
+                assert_eq!(tcp.seq, 7);
+            }
+            _ => panic!("Expected TCP"),
+        }
+        // A valid embedded checksum recomputes to zero (see ipv4_tcp_checksum_valid).
+        assert_eq!(ipv6_tcp_checksum(src, dst, &pkt[40..]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_build_ipv6_tcp_with_options_and_payload() {
+        let src = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 52);
+        let pkt = build_ipv6_tcp_packet_with_options(
+            src,
+            80,
+            dst,
+            44650,
+            0x12,
+            100,
+            8,
+            &[2, 4, 0x05, 0xb4, 1, 3, 3, 7],
+            b"hello mesh",
+        )
+        .unwrap();
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 28 + 10);
+        match parse_ip_packet(&pkt) {
+            TunPacket::Tcp(tcp) => {
+                assert!(tcp.syn);
+                assert!(tcp.ack);
+                assert_eq!(tcp.seq, 100);
+                assert_eq!(tcp.ack_num, 8);
+                assert_eq!(&tcp.payload[..], b"hello mesh");
+            }
+            _ => panic!("Expected TCP"),
+        }
+        assert_eq!(ipv6_tcp_checksum(src, dst, &pkt[40..]).unwrap(), 0);
     }
 
     #[test]

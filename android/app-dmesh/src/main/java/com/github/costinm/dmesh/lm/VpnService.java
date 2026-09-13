@@ -205,9 +205,10 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
                 // Can't happen
             }
 
-            String dns = "1.1.1.1";
-            builder.addDnsServer(dns);
+            // IPv6-first DNS: the v6 server is listed first so the resolver
+            // prefers the IPv6 UDP path; the v4 server remains as fallback.
             builder.addDnsServer("2606:4700:4700::1111");
+            builder.addDnsServer("1.1.1.1");
 
             //builder.addSearchDomain(".dm." + dm.rClient.vpn);
 
@@ -255,7 +256,7 @@ public class VpnService extends android.net.VpnService implements Handler.Callba
             fd = null;
             nativeTunHandle = MeshNode.startTunFd(rawFd);
             lastTunTestResult = nativeTunHandle;
-            if (lastTunTestResult < 0) {
+            if (lastTunTestResult <= 0) {
                 lastTunTestError = "Rust rejected Android VPN fd";
                 Log.w(TAG, lastTunTestError);
                 try {

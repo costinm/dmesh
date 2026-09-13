@@ -1,5 +1,7 @@
 use crate::control::{TapInject, TapInjectSender};
-use crate::packet::{TunTcpPacket, build_ipv4_tcp_packet_with_options};
+use crate::packet::{
+    TunTcpPacket, build_ipv4_tcp_packet_with_options, build_ipv6_tcp_packet_with_options,
+};
 use crate::policy::{FlowContext, FlowProtocol, MeshTunPolicy, TcpRouteDecision};
 use bytes::{Bytes, BytesMut};
 use mesh::config::DEFAULT_MESH_TUN_MTU;
@@ -13,6 +15,7 @@ use tokio::sync::mpsc;
 
 const TCP_REORDER_BUFFER_MAX_BYTES: usize = 256 * 1024;
 const IPV4_TCP_HEADER_BYTES: u32 = 40;
+const IPV6_TCP_HEADER_BYTES: u32 = 74;
 const TCP_WINDOW_SCALE_SHIFT: u8 = 7;
 // This is a conservative host-to-guest burst cap, not the guest-visible TCP
 // receive window. The TAP worker drains 16 near-MTU frames per pass, so cap
@@ -24,11 +27,21 @@ const DELAYED_ACK_EVERY_SEGMENTS: u8 = 2;
 const DELAYED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 
 fn default_tcp_mss() -> u16 {
+    tcp_mss_for(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+}
+
+/// Advertised MSS for a guest address. IPv6 needs a larger header (54 vs 20
+/// bytes), so its MSS is smaller than IPv4's for the same MTU.
+fn tcp_mss_for(ip: IpAddr) -> u16 {
     // Keep synthetic TCP segments below the jumbo TAP MTU. 64 KiB packets are
     // fast when accepted, but reverse iperf can randomly stop ACKing after a
     // jumbo burst. 16 KiB still amortizes per-packet cost while staying stable.
+    let header = match ip {
+        IpAddr::V4(_) => IPV4_TCP_HEADER_BYTES,
+        IpAddr::V6(_) => IPV6_TCP_HEADER_BYTES,
+    };
     DEFAULT_MESH_TUN_MTU
-        .saturating_sub(IPV4_TCP_HEADER_BYTES)
+        .saturating_sub(header)
         .min(16 * 1024)
         .min(u16::MAX as u32) as u16
 }
@@ -311,30 +324,27 @@ async fn handle_inbound_tcp_flow(
     config: TcpProxyConfig,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) -> Result<(), anyhow::Error> {
-    let src_ip_v4 = match src.ip() {
-        IpAddr::V4(ip) => ip,
-        _ => anyhow::bail!("IPv6 inbound TCP is not implemented yet"),
-    };
-    let dst_ip_v4 = match dst.ip() {
-        IpAddr::V4(ip) => ip,
-        _ => anyhow::bail!("IPv6 inbound TCP is not implemented yet"),
-    };
+    let src_ip = src.ip();
+    let dst_ip = dst.ip();
+    if src_ip.is_ipv4() != dst_ip.is_ipv4() {
+        anyhow::bail!("inbound TCP flow src and dst IP versions differ")
+    }
     let direct_guest_tx = crate::control::destination_sender(&dst.ip());
     let initial_remote_seq = initial_tcp_sequence();
     let remote_seq_shared = Arc::new(AtomicU32::new(initial_remote_seq.wrapping_add(1)));
     let guest_seq_shared = Arc::new(AtomicU32::new(0));
     let remote_acked_shared = Arc::new(AtomicU32::new(initial_remote_seq));
 
-    if !send_tcp4_output(
-        Tcp4Output {
-            src_addr: src_ip_v4,
+    if !send_tcp_output(
+        TcpOutput {
+            src_addr: src_ip,
             src_port: src.port(),
-            dst_addr: dst_ip_v4,
+            dst_addr: dst_ip,
             dst_port: dst.port(),
             flags: 0x02,
             seq: initial_remote_seq,
             ack: 0,
-            options: tcp_syn_options().to_vec(),
+            options: tcp_syn_options(dst_ip).to_vec(),
             payload: Bytes::new(),
         },
         &outgoing_tx,
@@ -389,11 +399,11 @@ async fn handle_inbound_tcp_flow(
     guest_seq_shared.store(guest_seq, Ordering::Release);
     advance_tcp_seq(&remote_acked_shared, syn_ack.ack_num);
 
-    if !send_tcp4_output(
-        Tcp4Output {
-            src_addr: src_ip_v4,
+    if !send_tcp_output(
+        TcpOutput {
+            src_addr: src_ip,
             src_port: src.port(),
-            dst_addr: dst_ip_v4,
+            dst_addr: dst_ip,
             dst_port: dst.port(),
             flags: 0x10,
             seq: expected_ack,
@@ -464,11 +474,11 @@ async fn handle_inbound_tcp_flow(
                     }
                 }
                 let r_seq = remote_seq_a.load(Ordering::Relaxed);
-                let _ = send_tcp4_output(
-                    Tcp4Output {
-                        src_addr: src_ip_v4,
+                let _ = send_tcp_output(
+                    TcpOutput {
+                        src_addr: src_ip,
                         src_port: src.port(),
-                        dst_addr: dst_ip_v4,
+                        dst_addr: dst_ip,
                         dst_port: dst.port(),
                         flags: 0x10,
                         seq: r_seq,
@@ -486,11 +496,11 @@ async fn handle_inbound_tcp_flow(
                 let r_seq = remote_seq_a.load(Ordering::Relaxed);
                 let final_guest_seq = guest_seq.wrapping_add(1);
                 guest_seq_a.store(final_guest_seq, Ordering::Release);
-                let _ = send_tcp4_output(
-                    Tcp4Output {
-                        src_addr: src_ip_v4,
+                let _ = send_tcp_output(
+                    TcpOutput {
+                        src_addr: src_ip,
                         src_port: src.port(),
-                        dst_addr: dst_ip_v4,
+                        dst_addr: dst_ip,
                         dst_port: dst.port(),
                         flags: 0x11,
                         seq: r_seq,
@@ -515,11 +525,11 @@ async fn handle_inbound_tcp_flow(
                 Ok(0) => {
                     let r_seq = remote_seq_shared.fetch_add(1, Ordering::Relaxed);
                     let g_seq = guest_seq_shared.load(Ordering::Relaxed);
-                    let _ = send_tcp4_output(
-                        Tcp4Output {
-                            src_addr: src_ip_v4,
+                    let _ = send_tcp_output(
+                        TcpOutput {
+                            src_addr: src_ip,
                             src_port: src.port(),
-                            dst_addr: dst_ip_v4,
+                            dst_addr: dst_ip,
                             dst_port: dst.port(),
                             flags: 0x11,
                             seq: r_seq,
@@ -566,11 +576,11 @@ async fn handle_inbound_tcp_flow(
 
                     let g_seq = guest_seq_shared.load(Ordering::Relaxed);
                     let payload = payload.freeze();
-                    if !send_tcp4_output(
-                        Tcp4Output {
-                            src_addr: src_ip_v4,
+                    if !send_tcp_output(
+                        TcpOutput {
+                            src_addr: src_ip,
                             src_port: src.port(),
-                            dst_addr: dst_ip_v4,
+                            dst_addr: dst_ip,
                             dst_port: dst.port(),
                             flags: 0x10,
                             seq: r_seq,
@@ -638,15 +648,12 @@ async fn handle_tcp_flow(
         .tcp_flow_open
         .fetch_add(1, Ordering::Relaxed);
 
-    let src_ip_v4 = match src.ip() {
-        IpAddr::V4(ip) => ip,
-        _ => return,
-    };
+    let src_ip = src.ip();
+    let dst_ip = dst.ip();
+    if src_ip.is_ipv4() != dst_ip.is_ipv4() {
+        return;
+    }
     let direct_guest_tx = crate::control::destination_sender(&src.ip());
-    let dst_ip_v4 = match dst.ip() {
-        IpAddr::V4(ip) => ip,
-        _ => return,
-    };
 
     let context = FlowContext {
         vm_id,
@@ -665,9 +672,9 @@ async fn handle_tcp_flow(
                 .tcp_flow_rejected
                 .fetch_add(1, Ordering::Relaxed);
             send_tcp_reset(
-                src_ip_v4,
+                src_ip,
                 src.port(),
-                dst_ip_v4,
+                dst_ip,
                 dst.port(),
                 &syn_pkt,
                 &outgoing_tx,
@@ -686,9 +693,9 @@ async fn handle_tcp_flow(
                 .tcp_flow_error
                 .fetch_add(1, Ordering::Relaxed);
             send_tcp_reset(
-                src_ip_v4,
+                src_ip,
                 src.port(),
-                dst_ip_v4,
+                dst_ip,
                 dst.port(),
                 &syn_pkt,
                 &outgoing_tx,
@@ -703,9 +710,9 @@ async fn handle_tcp_flow(
                 .tcp_flow_error
                 .fetch_add(1, Ordering::Relaxed);
             send_tcp_reset(
-                src_ip_v4,
+                src_ip,
                 src.port(),
-                dst_ip_v4,
+                dst_ip,
                 dst.port(),
                 &syn_pkt,
                 &outgoing_tx,
@@ -740,12 +747,12 @@ async fn handle_tcp_flow(
     let client_acked_shared = Arc::new(AtomicU32::new(initial_server_seq));
 
     // Send SYN-ACK
-    let syn_ack_options = tcp_syn_ack_options().to_vec();
-    if !send_tcp4_output(
-        Tcp4Output {
-            src_addr: dst_ip_v4,
+    let syn_ack_options = tcp_syn_ack_options(src_ip).to_vec();
+    if !send_tcp_output(
+        TcpOutput {
+            src_addr: dst_ip,
             src_port: dst.port(),
-            dst_addr: src_ip_v4,
+            dst_addr: src_ip,
             dst_port: src.port(),
             flags: 0x12,
             seq: initial_server_seq,
@@ -804,11 +811,11 @@ async fn handle_tcp_flow(
             return;
         }
         if pkt.syn && !pkt.ack {
-            if !send_tcp4_output(
-                Tcp4Output {
-                    src_addr: dst_ip_v4,
+            if !send_tcp_output(
+                TcpOutput {
+                    src_addr: dst_ip,
                     src_port: dst.port(),
-                    dst_addr: src_ip_v4,
+                    dst_addr: src_ip,
                     dst_port: src.port(),
                     flags: 0x12,
                     seq: initial_server_seq,
@@ -899,9 +906,9 @@ async fn handle_tcp_flow(
                     _ = tokio::time::sleep(DELAYED_ACK_TIMEOUT) => {
                         let s_seq = server_seq_a.load(Ordering::Relaxed);
                         if !send_tcp_ack(
-                            dst_ip_v4,
+                            dst_ip,
                             dst.port(),
-                            src_ip_v4,
+                            src_ip,
                             src.port(),
                             s_seq,
                             pending_ack_seq,
@@ -1001,11 +1008,11 @@ async fn handle_tcp_flow(
                             .tcp_flow_error
                             .fetch_add(1, Ordering::Relaxed);
                         let s_seq = server_seq_a.load(Ordering::Relaxed);
-                        let _ = send_tcp4_output(
-                            Tcp4Output {
-                                src_addr: dst_ip_v4,
+                        let _ = send_tcp_output(
+                            TcpOutput {
+                                src_addr: dst_ip,
                                 src_port: dst.port(),
-                                dst_addr: src_ip_v4,
+                                dst_addr: src_ip,
                                 dst_port: src.port(),
                                 flags: 0x14,
                                 seq: s_seq,
@@ -1032,9 +1039,9 @@ async fn handle_tcp_flow(
                 if pending_ack_segments >= DELAYED_ACK_EVERY_SEGMENTS {
                     let s_seq = server_seq_a.load(Ordering::Relaxed);
                     if !send_tcp_ack(
-                        dst_ip_v4,
+                        dst_ip,
                         dst.port(),
-                        src_ip_v4,
+                        src_ip,
                         src.port(),
                         s_seq,
                         pending_ack_seq,
@@ -1057,9 +1064,9 @@ async fn handle_tcp_flow(
                 if pending_ack {
                     let s_seq = server_seq_a.load(Ordering::Relaxed);
                     let _ = send_tcp_ack(
-                        dst_ip_v4,
+                        dst_ip,
                         dst.port(),
-                        src_ip_v4,
+                        src_ip,
                         src.port(),
                         s_seq,
                         pending_ack_seq,
@@ -1073,11 +1080,11 @@ async fn handle_tcp_flow(
                 client_seq_a.store(final_client_seq, Ordering::Release);
                 // B3: Reply with FIN|ACK (0x11) instead of bare ACK (0x10) for
                 // a cleaner close per RFC 793.
-                let _ = send_tcp4_output(
-                    Tcp4Output {
-                        src_addr: dst_ip_v4,
+                let _ = send_tcp_output(
+                    TcpOutput {
+                        src_addr: dst_ip,
                         src_port: dst.port(),
-                        dst_addr: src_ip_v4,
+                        dst_addr: src_ip,
                         dst_port: src.port(),
                         flags: 0x11,
                         seq: s_seq,
@@ -1109,11 +1116,11 @@ async fn handle_tcp_flow(
                 Ok(0) => {
                     let s_seq = server_seq_shared.fetch_add(1, Ordering::Relaxed);
                     let c_seq = client_seq_shared.load(Ordering::Relaxed);
-                    let _ = send_tcp4_output(
-                        Tcp4Output {
-                            src_addr: dst_ip_v4,
+                    let _ = send_tcp_output(
+                        TcpOutput {
+                            src_addr: dst_ip,
                             src_port: dst.port(),
-                            dst_addr: src_ip_v4,
+                            dst_addr: src_ip,
                             dst_port: src.port(),
                             flags: 0x11,
                             seq: s_seq,
@@ -1242,11 +1249,11 @@ async fn handle_tcp_flow(
                     let c_seq = client_seq_shared.load(Ordering::Relaxed);
                     let payload = payload.freeze();
                     let send_started = tokio::time::Instant::now();
-                    let sent = send_tcp4_output(
-                        Tcp4Output {
-                            src_addr: dst_ip_v4,
+                    let sent = send_tcp_output(
+                        TcpOutput {
+                            src_addr: dst_ip,
                             src_port: dst.port(),
-                            dst_addr: src_ip_v4,
+                            dst_addr: src_ip,
                             dst_port: src.port(),
                             flags: 0x10,
                             seq: s_seq,
@@ -1310,18 +1317,18 @@ async fn handle_tcp_flow(
     crate::stats::flush_hot_counters();
 }
 
-fn tcp_syn_ack_options() -> [u8; 8] {
-    // Kind=2, Len=4, MSS=default MTU minus IPv4/TCP headers. Kind=3, Len=3,
-    // Shift=7 advertises an
-    // ~8 MiB receive window instead of the unscaled ~64 KiB TCP header field.
-    // Without MSS, Linux falls back to ~536-byte segments; without window
-    // scaling, large-MSS uploads keep only one segment in flight.
-    let mss = default_tcp_mss().to_be_bytes();
+fn tcp_syn_ack_options(guest_ip: IpAddr) -> [u8; 8] {
+    // Kind=2, Len=4, MSS=MTU minus the guest's IP/TCP headers. Kind=3, Len=3,
+    // Shift=7 advertises an ~8 MiB receive window instead of the unscaled ~64
+    // KiB TCP header field. Without MSS, Linux falls back to ~536-byte
+    // segments; without window scaling, large-MSS uploads keep only one
+    // segment in flight.
+    let mss = tcp_mss_for(guest_ip).to_be_bytes();
     [2, 4, mss[0], mss[1], 1, 3, 3, TCP_WINDOW_SCALE_SHIFT]
 }
 
-fn tcp_syn_options() -> [u8; 8] {
-    tcp_syn_ack_options()
+fn tcp_syn_options(guest_ip: IpAddr) -> [u8; 8] {
+    tcp_syn_ack_options(guest_ip)
 }
 
 fn initial_tcp_sequence() -> u32 {
@@ -1338,10 +1345,10 @@ fn tcp_flags(pkt: &TunTcpPacket) -> u8 {
         | (if pkt.ack { 0x10 } else { 0 })
 }
 
-struct Tcp4Output {
-    src_addr: std::net::Ipv4Addr,
+struct TcpOutput {
+    src_addr: IpAddr,
     src_port: u16,
-    dst_addr: std::net::Ipv4Addr,
+    dst_addr: IpAddr,
     dst_port: u16,
     flags: u8,
     seq: u32,
@@ -1350,22 +1357,26 @@ struct Tcp4Output {
     payload: Bytes,
 }
 
-async fn send_tcp4_output(
-    output: Tcp4Output,
+async fn send_tcp_output(
+    output: TcpOutput,
     outgoing_tx: &mpsc::Sender<Vec<u8>>,
     direct_guest_tx: Option<&TapInjectSender>,
 ) -> bool {
-    if let Some(tx) = direct_guest_tx {
+    // The direct TAP-inject fast path is IPv4-only (the inject enum carries
+    // Ipv4Addr). IPv6 output always goes through the generic builder below.
+    if let Some(tx) = direct_guest_tx
+        && let (IpAddr::V4(src_v4), IpAddr::V4(dst_v4)) = (output.src_addr, output.dst_addr)
+    {
         let direct = TapInject::Tcp4 {
-            src_addr: output.src_addr,
+            src_addr: src_v4,
             src_port: output.src_port,
-            dst_addr: output.dst_addr,
+            dst_addr: dst_v4,
             dst_port: output.dst_port,
             flags: output.flags,
             seq: output.seq,
             ack: output.ack,
-            options: output.options,
-            payload: output.payload,
+            options: output.options.clone(),
+            payload: output.payload.clone(),
         };
         match tx.send(direct).await {
             Ok(()) => {
@@ -1374,55 +1385,44 @@ async fn send_tcp4_output(
                     .fetch_add(1, Ordering::Relaxed);
                 return true;
             }
-            Err(error) => {
-                let TapInject::Tcp4 {
-                    src_addr,
-                    src_port,
-                    dst_addr,
-                    dst_port,
-                    flags,
-                    seq,
-                    ack,
-                    options,
-                    payload,
-                } = error.0
-                else {
-                    unreachable!("direct TCP output returned unexpected inject variant")
-                };
-                return build_and_send_tcp4(
-                    Tcp4Output {
-                        src_addr,
-                        src_port,
-                        dst_addr,
-                        dst_port,
-                        flags,
-                        seq,
-                        ack,
-                        options,
-                        payload,
-                    },
-                    outgoing_tx,
-                )
-                .await;
+            Err(_) => {
+                // Fall through to the generic build path.
             }
         }
     }
 
-    build_and_send_tcp4(output, outgoing_tx).await
+    build_and_send_tcp(output, outgoing_tx).await
 }
 
-async fn build_and_send_tcp4(output: Tcp4Output, outgoing_tx: &mpsc::Sender<Vec<u8>>) -> bool {
-    let packet = build_ipv4_tcp_packet_with_options(
-        output.src_addr,
-        output.src_port,
-        output.dst_addr,
-        output.dst_port,
-        output.flags,
-        output.seq,
-        output.ack,
-        &output.options,
-        &output.payload,
-    );
+async fn build_and_send_tcp(output: TcpOutput, outgoing_tx: &mpsc::Sender<Vec<u8>>) -> bool {
+    let packet = match (output.src_addr, output.dst_addr) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => build_ipv4_tcp_packet_with_options(
+            src,
+            output.src_port,
+            dst,
+            output.dst_port,
+            output.flags,
+            output.seq,
+            output.ack,
+            &output.options,
+            &output.payload,
+        ),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => build_ipv6_tcp_packet_with_options(
+            src,
+            output.src_port,
+            dst,
+            output.dst_port,
+            output.flags,
+            output.seq,
+            output.ack,
+            &output.options,
+            &output.payload,
+        ),
+        _ => {
+            tracing::error!("TCP output src/dst IP versions differ");
+            return false;
+        }
+    };
     match packet {
         Ok(packet) => outgoing_tx.send(packet).await.is_ok(),
         Err(error) => {
@@ -1433,17 +1433,17 @@ async fn build_and_send_tcp4(output: Tcp4Output, outgoing_tx: &mpsc::Sender<Vec<
 }
 
 async fn send_tcp_ack(
-    src_addr: std::net::Ipv4Addr,
+    src_addr: IpAddr,
     src_port: u16,
-    dst_addr: std::net::Ipv4Addr,
+    dst_addr: IpAddr,
     dst_port: u16,
     seq: u32,
     ack: u32,
     outgoing_tx: &mpsc::Sender<Vec<u8>>,
     direct_guest_tx: Option<&TapInjectSender>,
 ) -> bool {
-    let sent = send_tcp4_output(
-        Tcp4Output {
+    let sent = send_tcp_output(
+        TcpOutput {
             src_addr,
             src_port,
             dst_addr,
@@ -1465,19 +1465,19 @@ async fn send_tcp_ack(
 }
 
 async fn send_tcp_reset(
-    src_ip_v4: std::net::Ipv4Addr,
+    src_ip: IpAddr,
     src_port: u16,
-    dst_ip_v4: std::net::Ipv4Addr,
+    dst_ip: IpAddr,
     dst_port: u16,
     syn_pkt: &TunTcpPacket,
     outgoing_tx: &mpsc::Sender<Vec<u8>>,
     direct_guest_tx: Option<&TapInjectSender>,
 ) {
-    let _ = send_tcp4_output(
-        Tcp4Output {
-            src_addr: dst_ip_v4,
+    let _ = send_tcp_output(
+        TcpOutput {
+            src_addr: dst_ip,
             src_port: dst_port,
-            dst_addr: src_ip_v4,
+            dst_addr: src_ip,
             dst_port: src_port,
             flags: 0x14,
             seq: 0,
@@ -1494,10 +1494,10 @@ async fn send_tcp_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{TunPacket, build_ipv4_tcp_packet, parse_ip_packet};
+    use crate::packet::{TunPacket, build_ipv4_tcp_packet, build_ipv6_tcp_packet, parse_ip_packet};
     use crate::policy::{PolicyDecision, TcpRouteDecision};
     use crate::transport::{BoxTunByteStream, ConnectedTcpStream, TcpConnector};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
     struct DuplexConnector;
@@ -1573,6 +1573,18 @@ mod tests {
             &[],
         )
         .unwrap();
+        let TunPacket::Tcp(tcp) = parse_ip_packet(&packet) else {
+            panic!("expected TCP packet");
+        };
+        tcp
+    }
+
+    const GUEST_V6: Ipv6Addr = Ipv6Addr::new(0x0a05, 0, 0, 0, 0, 0, 0, 2);
+    const BACKEND_V6: Ipv6Addr = Ipv6Addr::new(0xc633, 0x64, 0, 0, 0, 0, 0, 10);
+
+    fn tcp6_packet(src_port: u16) -> TunTcpPacket {
+        let packet =
+            build_ipv6_tcp_packet(GUEST_V6, src_port, BACKEND_V6, 80, 0x02, 1, 0, &[]).unwrap();
         let TunPacket::Tcp(tcp) = parse_ip_packet(&packet) else {
             panic!("expected TCP packet");
         };
@@ -1806,6 +1818,198 @@ mod tests {
             match src.ip() {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => unreachable!(),
+            },
+            src.port(),
+            0x10,
+            1001,
+            data_tcp.seq.wrapping_add(data_tcp.payload.len() as u32),
+            b"pong",
+        )
+        .unwrap();
+        match parse_ip_packet(&guest_payload) {
+            TunPacket::Tcp(tcp) => manager.handle_packet(tcp).await,
+            _ => panic!("expected guest payload"),
+        }
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+    }
+
+    #[tokio::test]
+    async fn guest_originated_v6_flow_completes_handshake() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(DuplexPolicy),
+            TcpProxyConfig {
+                max_flows: 16,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_secs(1),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+        let guest = IpAddr::V6(GUEST_V6);
+        let backend = IpAddr::V6(BACKEND_V6);
+
+        manager.handle_packet(tcp6_packet(40000)).await;
+
+        let syn_ack = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let syn_ack_tcp = match parse_ip_packet(&syn_ack) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected SYN-ACK"),
+        };
+        assert_eq!(syn_ack_tcp.src_addr, backend);
+        assert_eq!(syn_ack_tcp.src_port, 80);
+        assert_eq!(syn_ack_tcp.dst_addr, guest);
+        assert_eq!(syn_ack_tcp.dst_port, 40000);
+        assert!(syn_ack_tcp.syn);
+        assert!(syn_ack_tcp.ack);
+
+        let guest_ack = build_ipv6_tcp_packet(
+            GUEST_V6,
+            40000,
+            BACKEND_V6,
+            80,
+            0x10,
+            2,
+            syn_ack_tcp.seq.wrapping_add(1),
+            &[],
+        )
+        .unwrap();
+        match parse_ip_packet(&guest_ack) {
+            TunPacket::Tcp(tcp) => manager.handle_packet(tcp).await,
+            _ => panic!("expected guest ACK"),
+        }
+
+        // The duplex backend's peer is dropped, so the flow task reads EOF and
+        // closes with a v6 FIN-ACK.
+        let fin = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let fin_tcp = match parse_ip_packet(&fin) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected FIN"),
+        };
+        assert_eq!(fin_tcp.src_addr, backend);
+        assert_eq!(fin_tcp.src_port, 80);
+        assert_eq!(fin_tcp.dst_addr, guest);
+        assert_eq!(fin_tcp.dst_port, 40000);
+        assert!(fin_tcp.fin);
+        assert!(fin_tcp.ack);
+        assert!(!fin_tcp.syn);
+    }
+
+    #[tokio::test]
+    async fn inbound_connect_tcp_v6_preserves_tuple_and_streams_bytes() {
+        crate::stats::stats().reset();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let manager = TcpProxyManager::new(
+            "vm-a".to_string(),
+            outgoing_tx,
+            Arc::new(DuplexPolicy),
+            TcpProxyConfig {
+                max_flows: 16,
+                per_flow_queue_capacity: 4,
+                handshake_timeout: Duration::from_secs(1),
+                connect_timeout: Duration::from_secs(30),
+            },
+        );
+        let src: SocketAddr = "[2001:db8::10]:50000".parse().unwrap();
+        let dst: SocketAddr = "[fd00::52]:5201".parse().unwrap();
+        assert!(src.ip().is_ipv6() && dst.ip().is_ipv6());
+
+        let connect_manager = manager.clone();
+        let connect_task =
+            tokio::spawn(async move { connect_manager.connect_inbound(src, dst).await });
+
+        let syn = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let syn_tcp = match parse_ip_packet(&syn) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected inbound SYN"),
+        };
+        assert_eq!(syn_tcp.src_addr, src.ip());
+        assert_eq!(syn_tcp.src_port, src.port());
+        assert_eq!(syn_tcp.dst_addr, dst.ip());
+        assert_eq!(syn_tcp.dst_port, dst.port());
+        assert!(syn_tcp.syn);
+        assert!(!syn_tcp.ack);
+
+        let syn_ack = build_ipv6_tcp_packet(
+            match dst.ip() {
+                IpAddr::V6(ip) => ip,
+                IpAddr::V4(_) => unreachable!(),
+            },
+            dst.port(),
+            match src.ip() {
+                IpAddr::V6(ip) => ip,
+                IpAddr::V4(_) => unreachable!(),
+            },
+            src.port(),
+            0x12,
+            1000,
+            syn_tcp.seq.wrapping_add(1),
+            &[],
+        )
+        .unwrap();
+        match parse_ip_packet(&syn_ack) {
+            TunPacket::Tcp(tcp) => manager.handle_packet(tcp).await,
+            _ => panic!("expected TCP SYN-ACK"),
+        }
+
+        let mut stream = tokio::time::timeout(Duration::from_secs(1), connect_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ack_tcp = match parse_ip_packet(&ack) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected inbound ACK"),
+        };
+        assert_eq!(ack_tcp.src_addr, src.ip());
+        assert_eq!(ack_tcp.dst_addr, dst.ip());
+        assert!(ack_tcp.ack);
+        assert!(!ack_tcp.syn);
+        assert_eq!(ack_tcp.ack_num, 1001);
+
+        stream.write_all(b"ping").await.unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let data_tcp = match parse_ip_packet(&data) {
+            TunPacket::Tcp(tcp) => tcp,
+            _ => panic!("expected inbound data"),
+        };
+        assert_eq!(data_tcp.src_addr, src.ip());
+        assert_eq!(data_tcp.dst_addr, dst.ip());
+        assert_eq!(&data_tcp.payload[..], b"ping");
+
+        let guest_payload = build_ipv6_tcp_packet(
+            match dst.ip() {
+                IpAddr::V6(ip) => ip,
+                IpAddr::V4(_) => unreachable!(),
+            },
+            dst.port(),
+            match src.ip() {
+                IpAddr::V6(ip) => ip,
+                IpAddr::V4(_) => unreachable!(),
             },
             src.port(),
             0x10,

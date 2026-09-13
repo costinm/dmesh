@@ -1,4 +1,4 @@
-use crate::packet::build_ipv4_udp_packet;
+use crate::packet::{build_ipv4_udp_packet, build_ipv6_udp_packet};
 use crate::tcp_proxy::TcpProxyManager;
 use mesh::tun::TunInjector;
 use std::net::{IpAddr, SocketAddr};
@@ -62,8 +62,8 @@ impl TunInjector for MeshTunInjector {
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
                 build_ipv4_udp_packet(src, src_port, dst, dst_port, payload)?
             }
-            (IpAddr::V6(_), IpAddr::V6(_)) => {
-                anyhow::bail!("IPv6 UDP injection is not implemented yet")
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                build_ipv6_udp_packet(src, src_port, dst, dst_port, payload)?
             }
             _ => anyhow::bail!("source and destination IP versions differ"),
         };
