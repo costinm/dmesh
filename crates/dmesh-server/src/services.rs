@@ -49,13 +49,13 @@ const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
         b"probe",
     ),
     (
-        crate::protocol::OBJECT_COMPONENT,
-        crate::protocol::OBJECT_GET_METHOD,
+        crate::verified_object::OBJECT_COMPONENT,
+        crate::verified_object::OBJECT_GET_METHOD,
         b"object.get",
     ),
     (
-        crate::protocol::OBJECT_COMPONENT,
-        crate::protocol::OBJECT_FLASH_METHOD,
+        crate::verified_object::OBJECT_COMPONENT,
+        crate::verified_object::OBJECT_FLASH_METHOD,
         b"object.flash",
     ),
     (BOOT_COMPONENT, BOOT_RECOVERY_METHOD, b"boot.recovery"),

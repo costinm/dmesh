@@ -318,6 +318,33 @@ mod tests {
     }
 
     #[test]
+    fn firmware_boxed_open_allocates_only_selected_history() {
+        let client = ConnectionId::new(0x621).unwrap();
+        let server = ConnectionId::new(0x622).unwrap();
+        let mut bootstrap = BootstrapClient::new(client, 500_000, 4).unwrap();
+        let mut open = [0_u8; 1200];
+        let open_len = bootstrap.start_open(0, &mut open).unwrap();
+
+        let (connection, _) =
+            StreamServerConnection::<64, 1200>::accept_open_boxed_with_config_and_reset_token(
+                &open[..open_len],
+                server,
+                0,
+                ConnectionLimits::with_receive_window(1200),
+                quic_lite::ServerStreamConfig {
+                    history_packets: 3,
+                    max_pending_streams: quic_lite::DEFAULT_STREAM_STATE_SLOTS,
+                    max_stream_bytes: 3600,
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(connection.mux.endpoint.history_capacity(), 3);
+        assert_eq!(connection.mux.endpoint.allocated_history_packets(), 3);
+    }
+
+    #[test]
     fn response_stream_ids_are_server_bidi_and_monotonic() {
         let client = ConnectionId::new(30).unwrap();
         let server = ConnectionId::new(31).unwrap();
@@ -344,6 +371,62 @@ mod tests {
         };
         assert_eq!(first_stream_id, FIRST_SERVER_BIDI_STREAM_ID);
         assert_eq!(second_stream.id, FIRST_SERVER_BIDI_STREAM_ID + 4);
+    }
+
+    #[test]
+    fn response_retry_keeps_its_stream_id_until_history_has_credit() {
+        let client = ConnectionId::new(40).unwrap();
+        let server = ConnectionId::new(41).unwrap();
+        let mut bootstrap = BootstrapClient::new(client, 500_000, 4).unwrap();
+        let mut open = [0u8; 1200];
+        let open_len = bootstrap.start_open(0, &mut open).unwrap();
+        let (mut connection, _) =
+            StreamServerConnection::<1>::accept_open(&open[..open_len], server, 0).unwrap();
+        let mut output = [0u8; 1200];
+
+        let first = connection.encode_response(b"first", &mut output).unwrap().0;
+        let (_, first_header_len) = ShortHeader::decode(&output[..first]).unwrap();
+        let (Frame::Stream(first_stream), _) =
+            decode_frame(&output[first_header_len..first]).unwrap()
+        else {
+            panic!("first stream");
+        };
+        let first_stream_id = first_stream.id;
+        assert_eq!(
+            connection.encode_response(b"retry", &mut output),
+            Err(Error::HistoryFull)
+        );
+
+        let mut acknowledgement = [0u8; 64];
+        let header = ShortHeader {
+            flags: quic_lite::FLAG_FIXED,
+            dcid: server,
+            packet_number: 1,
+            packet_number_len: 1,
+        };
+        let header_len = header.encode(&mut acknowledgement).unwrap();
+        let frame_len = Frame::Ack {
+            largest: 1,
+            delay: 0,
+        }
+        .encode(&mut acknowledgement[header_len..])
+        .unwrap();
+        connection
+            .mux
+            .endpoint
+            .receive_datagram(&acknowledgement[..header_len + frame_len])
+            .unwrap();
+
+        let retry = connection.encode_response(b"retry", &mut output).unwrap().0;
+        let (_, retry_header_len) = ShortHeader::decode(&output[..retry]).unwrap();
+        let (Frame::Stream(retry_stream), _) =
+            decode_frame(&output[retry_header_len..retry]).unwrap()
+        else {
+            panic!("retry stream");
+        };
+        let retry_stream_id = retry_stream.id;
+        assert_eq!(first_stream_id, FIRST_SERVER_BIDI_STREAM_ID);
+        assert_eq!(retry_stream_id, FIRST_SERVER_BIDI_STREAM_ID + 4);
     }
 
     #[test]

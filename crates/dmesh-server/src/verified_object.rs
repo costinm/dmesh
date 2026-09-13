@@ -5,7 +5,7 @@
 
 extern crate alloc;
 use super::cbor::Decoder;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use sha2::{Digest, Sha256};
 
 #[allow(clippy::result_unit_err)]
@@ -23,9 +23,153 @@ pub const RECORD_BLOB: u8 = 2;
 pub const RECORD_DONE: u8 = 3;
 pub const MAX_RECORD: usize = 16 * 1024 * 1024;
 pub const REQUEST_MAX: usize = 1024;
+/// The image digest remains full SHA-256. Per-block proofs use a 128-bit
+/// prefix so the bounded firmware manifest scales with image size without a
+/// CBOR item wrapper per block.
+pub const BLOCK_DIGEST_BYTES: usize = 16;
+/// The sole currently supported immutable-object wire format.
+pub const VERIFIED_OBJECT_VERSION: u8 = 1;
 pub const OBJECT_COMPONENT: u64 = 10;
 pub const OBJECT_GET_METHOD: u64 = 1;
 pub const OBJECT_FLASH_METHOD: u64 = 2;
+pub const FLASH_BUSY_ERROR: &[u8] = b"flash already in progress";
+
+/// Select a bounded number of application storage slots from current memory.
+///
+/// This is application capacity, not QUIC packet credit. Firmware supplies its
+/// current heap observation and host tests can inject the same values. The
+/// caller must still allocate the selected slots fallibly and advertise only
+/// the capacity actually obtained.
+pub const fn bounded_storage_slots(
+    available_bytes: usize,
+    reserve_bytes: usize,
+    bytes_per_slot: usize,
+    minimum_slots: usize,
+    maximum_slots: usize,
+) -> usize {
+    if bytes_per_slot == 0 || minimum_slots == 0 || maximum_slots < minimum_slots {
+        return 0;
+    }
+    let slots = available_bytes.saturating_sub(reserve_bytes) / bytes_per_slot;
+    if slots < minimum_slots {
+        0
+    } else if slots > maximum_slots {
+        maximum_slots
+    } else {
+        slots
+    }
+}
+
+/// One association-scoped owner for a verified immutable-object sink.
+///
+/// The receiver storage may be platform-specific, but admission is shared:
+/// a competing association cannot replace or release the current writer.
+/// Zero is reserved by `ConnectionId`, so it is also the unowned sentinel.
+pub struct ExclusiveTransfer<T> {
+    active: Option<ExclusiveTransferEntry<T>>,
+}
+
+struct ExclusiveTransferEntry<T> {
+    owner: quic_lite::ConnectionId,
+    request_id: u64,
+    expires_at: u64,
+    value: T,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExclusiveTransferStartError<E> {
+    Busy,
+    Start(E),
+}
+
+impl<T> ExclusiveTransfer<T> {
+    pub const fn new() -> Self {
+        Self { active: None }
+    }
+
+    /// Start and install an operation as one application-level transition.
+    /// A contender never invokes `start`, which is important when construction
+    /// allocates scarce firmware memory or opens a host file.
+    pub fn try_start_with<E>(
+        &mut self,
+        owner: quic_lite::ConnectionId,
+        request_id: u64,
+        now: u64,
+        idle_timeout: u64,
+        start: impl FnOnce() -> Result<T, E>,
+    ) -> Result<(), ExclusiveTransferStartError<E>> {
+        if self.active.is_some() {
+            return Err(ExclusiveTransferStartError::Busy);
+        }
+        let value = start().map_err(ExclusiveTransferStartError::Start)?;
+        self.active = Some(ExclusiveTransferEntry {
+            owner,
+            request_id,
+            expires_at: now.saturating_add(idle_timeout),
+            value,
+        });
+        Ok(())
+    }
+
+    pub fn owner(&self) -> Option<quic_lite::ConnectionId> {
+        self.active.as_ref().map(|entry| entry.owner)
+    }
+
+    pub fn request_id_for(&self, owner: quic_lite::ConnectionId) -> Option<u64> {
+        self.active
+            .as_ref()
+            .filter(|entry| entry.owner == owner)
+            .map(|entry| entry.request_id)
+    }
+
+    pub fn get_mut_for(&mut self, owner: quic_lite::ConnectionId) -> Option<&mut T> {
+        self.active
+            .as_mut()
+            .filter(|entry| entry.owner == owner)
+            .map(|entry| &mut entry.value)
+    }
+
+    /// Refresh liveness only for application bytes consumed by the owner.
+    /// ACKs, control packets, and traffic from another association cannot keep
+    /// a stalled operation alive.
+    pub fn touch(&mut self, owner: quic_lite::ConnectionId, now: u64, idle_timeout: u64) -> bool {
+        let Some(entry) = self.active.as_mut().filter(|entry| entry.owner == owner) else {
+            return false;
+        };
+        entry.expires_at = now.saturating_add(idle_timeout);
+        true
+    }
+
+    /// Only the owning association may remove the operation. The returned
+    /// value lets the application perform any platform-specific teardown.
+    pub fn take_for(&mut self, owner: quic_lite::ConnectionId) -> Option<T> {
+        if self.owner() != Some(owner) {
+            return None;
+        }
+        self.active.take().map(|entry| entry.value)
+    }
+
+    /// Expire one stalled application operation. This does not inspect QUIC
+    /// packet or ACK state; the deadline advances only through [`Self::touch`].
+    pub fn take_expired(&mut self, now: u64) -> Option<(quic_lite::ConnectionId, u64, T)> {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|entry| now >= entry.expires_at)
+        {
+            return None;
+        }
+        self.active
+            .take()
+            .map(|entry| (entry.owner, entry.request_id, entry.value))
+    }
+}
+
+impl<T> Default for ExclusiveTransfer<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Credit return after one verified object record. This policy is independent
 /// of UDP/UART/radio: a persistent sink returns blob credit only when it has
@@ -34,6 +178,35 @@ pub const OBJECT_FLASH_METHOD: u64 = 2;
 pub enum ObjectRecordCredit {
     Immediate(usize),
     Deferred,
+}
+
+/// Coalesced readiness for application storage which must start outside the
+/// stream callback that requested it.
+///
+/// One later maintenance turn consumes the edge. Requiring a second turn can
+/// deadlock a fully ACKed sender at its advertised receive-window boundary,
+/// while duplicate requests before that turn need no additional queue item.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeferredStorageWork {
+    pending: bool,
+}
+
+impl DeferredStorageWork {
+    pub const fn new() -> Self {
+        Self { pending: false }
+    }
+
+    pub fn request(&mut self) {
+        self.pending = true;
+    }
+
+    pub const fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    pub fn take(&mut self) -> bool {
+        core::mem::take(&mut self.pending)
+    }
 }
 
 pub const fn verified_object_record_credit(
@@ -347,6 +520,28 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
         }
         Ok(())
     }
+
+    /// Bytes currently retained for the incomplete record, including its
+    /// partial header. A completed record resets this to zero before the next
+    /// stream fragment is admitted.
+    const fn buffered_record_bytes(&self) -> usize {
+        if self.header_len < self.header.len() {
+            self.header_len
+        } else {
+            self.header.len().saturating_add(self.used)
+        }
+    }
+
+    /// Exact additional bytes needed to finish the current record boundary.
+    /// Before any header arrives this is only the fixed five-byte header; once
+    /// decoded it becomes the validated declared payload length.
+    const fn current_record_remaining_bytes(&self) -> usize {
+        if self.header_len < self.header.len() {
+            self.header.len() - self.header_len
+        } else {
+            self.expected.saturating_sub(self.used)
+        }
+    }
 }
 
 impl RecordBuffer {
@@ -400,7 +595,8 @@ pub fn encode_flash_request(request: FlashRequest<'_>, out: &mut [u8]) -> Option
         return None;
     }
     let mut encoder = super::cbor::Encoder::new(out);
-    let fields = 4 + usize::from(request.object.name.is_some()) + usize::from(request.address.is_some());
+    let fields =
+        4 + usize::from(request.object.name.is_some()) + usize::from(request.address.is_some());
     encoder.map(fields as u64)?;
     if let Some(name) = request.object.name {
         encoder.uint(0)?;
@@ -455,6 +651,22 @@ pub fn decode_flash_handler_request(input: &[u8]) -> Option<(u64, FlashRequest<'
         return None;
     }
     Some((record.id?, decode_flash_request(record.fields?)?))
+}
+
+/// Decode a correlated `object.flash` application error. Transport clients
+/// use this after QUIC has delivered the terminal response; no handler error
+/// is inferred from ACK, CLOSE, timeout, or bearer state.
+pub fn decode_flash_handler_error(input: &[u8]) -> Option<&[u8]> {
+    let record = super::tagged::decode(input)?;
+    if record.component != Some(super::tagged::Name::Tag(OBJECT_COMPONENT))
+        || record.method != Some(super::tagged::Name::Tag(OBJECT_FLASH_METHOD))
+        || record.result.is_some()
+    {
+        return None;
+    }
+    let mut decoder = super::cbor::Decoder::new(record.error?);
+    let error = decoder.text_ref()?;
+    decoder.is_finished().then_some(error)
 }
 
 /// Decode a complete canonical `flash` handler body. Duplicate, unknown, or
@@ -651,7 +863,7 @@ pub struct ImageManifest {
     pub block_count: u32,
     pub image_size: u32,
     pub image_sha256: [u8; 32],
-    pub block_sha256: Vec<[u8; 32]>,
+    pub block_digests: Vec<[u8; BLOCK_DIGEST_BYTES]>,
     pub signature: Option<Vec<u8>>,
 }
 
@@ -670,7 +882,7 @@ impl ImageManifest {
         let mut block_count = 0u32;
         let mut image_size = 0u32;
         let mut image_sha256 = None;
-        let mut block_sha256 = None;
+        let mut block_digest_bytes = None;
         let mut signature = None;
         let mut seen = 0u16;
         for _ in 0..count {
@@ -753,27 +965,11 @@ impl ImageManifest {
                         return Err(ImageError::InvalidManifest);
                     }
                     seen |= 64;
-                    let (major, length) = decoder.head().ok_or(ImageError::Truncated)?;
-                    if major != 4 || length > 4096 {
+                    let bytes = decoder.bytes_ref().ok_or(ImageError::Truncated)?;
+                    if bytes.len() % BLOCK_DIGEST_BYTES != 0 {
                         return Err(ImageError::InvalidManifest);
                     }
-                    // Embedded Recovery must reject a manifest it cannot
-                    // retain rather than invoking Rust's allocation-failure
-                    // abort after a valid transport delivery.
-                    let mut hashes = Vec::new();
-                    hashes
-                        .try_reserve_exact(length as usize)
-                        .map_err(|_| ImageError::InvalidManifest)?;
-                    for _ in 0..length {
-                        let bytes = decoder.bytes_ref().ok_or(ImageError::Truncated)?;
-                        if bytes.len() != 32 {
-                            return Err(ImageError::InvalidManifest);
-                        }
-                        let mut digest = [0u8; 32];
-                        digest.copy_from_slice(bytes);
-                        hashes.push(digest);
-                    }
-                    block_sha256 = Some(hashes);
+                    block_digest_bytes = Some(bytes);
                 }
                 7 => {
                     if seen & 128 != 0 {
@@ -792,6 +988,29 @@ impl ImageManifest {
         if !decoder.is_finished() {
             return Err(ImageError::InvalidManifest);
         }
+        // Field 6 is one flat byte string in the sole current wire format.
+        // Retaining just the fixed-width values avoids both CBOR wrapper
+        // overhead and a variable number of nested decoder states.
+        if version != Some(VERIFIED_OBJECT_VERSION) {
+            return Err(ImageError::InvalidManifest);
+        }
+        let bytes = block_digest_bytes.ok_or(ImageError::InvalidManifest)?;
+        let expected_digest_bytes = usize::try_from(block_count)
+            .ok()
+            .and_then(|count| count.checked_mul(BLOCK_DIGEST_BYTES))
+            .ok_or(ImageError::InvalidManifest)?;
+        if bytes.len() != expected_digest_bytes {
+            return Err(ImageError::InvalidManifest);
+        }
+        let mut block_digests = Vec::new();
+        block_digests
+            .try_reserve_exact(block_count as usize)
+            .map_err(|_| ImageError::InvalidManifest)?;
+        for bytes in bytes.chunks_exact(BLOCK_DIGEST_BYTES) {
+            let mut digest = [0u8; BLOCK_DIGEST_BYTES];
+            digest.copy_from_slice(bytes);
+            block_digests.push(digest);
+        }
         let manifest = Self {
             target: target.ok_or(ImageError::InvalidManifest)?,
             version: version.ok_or(ImageError::InvalidManifest)?,
@@ -799,16 +1018,16 @@ impl ImageManifest {
             block_count,
             image_size,
             image_sha256: image_sha256.ok_or(ImageError::InvalidManifest)?,
-            block_sha256: block_sha256.ok_or(ImageError::InvalidManifest)?,
+            block_digests,
             signature,
         };
-        if manifest.version != 1
+        if manifest.version != VERIFIED_OBJECT_VERSION
             || manifest.block_size == 0
             || manifest.block_count == 0
             || manifest.block_count as u64
                 != (manifest.image_size as u64 + manifest.block_size as u64 - 1)
                     / manifest.block_size as u64
-            || manifest.block_sha256.len() != manifest.block_count as usize
+            || manifest.block_digests.len() != manifest.block_count as usize
         {
             return Err(ImageError::InvalidManifest);
         }
@@ -822,6 +1041,24 @@ pub trait ImageSink {
     fn write_block(&mut self, index: u32, data: &[u8]) -> Result<(), Self::Error>;
     fn finish(&mut self, manifest: &ImageManifest) -> Result<(), Self::Error>;
     fn abort(&mut self);
+}
+
+/// Incremental storage lifecycle used by a streamed verified-object consumer.
+///
+/// Flash, disk, RAM, and delayed probe sinks implement this same interface.
+/// QUIC is deliberately absent: the sink reports reusable byte capacity and
+/// the caller publishes that capacity through its ordinary stream API.
+pub trait StreamingImageSink: ImageSink {
+    /// Bytes the sink can currently retain beyond parser-owned record buffers.
+    fn receive_window_bytes(&self) -> usize;
+
+    /// Poll asynchronous completion and return newly reusable storage bytes.
+    fn poll_completed(&mut self) -> Result<usize, Self::Error>;
+
+    /// Allow storage work such as an erase to start before a transport poll.
+    fn poll_before_transport(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// Apply one complete signed-object record sequence to an arbitrary sink.
@@ -866,10 +1103,16 @@ pub struct SignedObjectReceiver<S, V, const MAX_MANIFEST: usize, const MAX_BLOB:
     complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoxedReceiverError<E> {
+    Allocation,
+    Sink(E),
+}
 
 struct SignedObjectEvents<'a, S, V> {
     image: &'a mut ImageReceiver<S, V>,
     complete: &'a mut bool,
+    control_credit: &'a mut usize,
 }
 
 impl<S, V> RecordEvents for SignedObjectEvents<'_, S, V>
@@ -889,6 +1132,11 @@ where
             RECORD_DONE => self.image.on_done()?,
             _ => return Err(ImageError::InvalidBlock),
         };
+        if matches!(kind, RECORD_MANIFEST | RECORD_DONE) {
+            *self.control_credit = self
+                .control_credit
+                .saturating_add(payload.len().saturating_add(5));
+        }
         *self.complete = matches!(event, ImageEvent::Complete);
         Ok(())
     }
@@ -920,6 +1168,35 @@ impl<S, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
             storage.assume_init_mut()
         }
     }
+
+    /// Fallibly allocate the receiver in its final heap location and
+    /// initialize its bounded parser buffers in place. Host and firmware use
+    /// this same ordinary allocator path; allocation failure is returned to
+    /// the application instead of invoking the global OOM handler.
+    pub fn try_new_boxed(sink: S) -> Result<Box<Self>, ()> {
+        Self::try_new_boxed_with(|| Ok::<_, core::convert::Infallible>(sink)).map_err(|_| ())
+    }
+
+    /// Allocate parser/manifest storage before constructing a platform sink.
+    ///
+    /// A firmware sink may create a task, queues, or file/partition handles.
+    /// Deferring that work until the largest allocation succeeds prevents a
+    /// rejected request from leaking platform resources. It also lets the sink
+    /// choose its dynamic storage window from the post-receiver heap.
+    pub fn try_new_boxed_with<E>(
+        sink: impl FnOnce() -> Result<S, E>,
+    ) -> Result<Box<Self>, BoxedReceiverError<E>> {
+        let mut allocation = Vec::<core::mem::MaybeUninit<Self>>::new();
+        allocation
+            .try_reserve_exact(1)
+            .map_err(|_| BoxedReceiverError::Allocation)?;
+        allocation.push(core::mem::MaybeUninit::uninit());
+        let mut allocation = allocation.into_boxed_slice();
+        let sink = sink().map_err(BoxedReceiverError::Sink)?;
+        Self::new_in_place(&mut allocation[0], sink);
+        let raw = Box::into_raw(allocation) as *mut core::mem::MaybeUninit<Self>;
+        Ok(unsafe { Box::from_raw(raw.cast::<Self>()) })
+    }
 }
 
 impl<S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
@@ -940,6 +1217,8 @@ where
         self.complete
     }
 
+    /// Whether the signed manifest boundary has been fully decoded and
+    /// accepted. This is application-state diagnostics, not transport state.
     pub fn sink_mut(&mut self) -> &mut S {
         self.image.sink_mut()
     }
@@ -947,14 +1226,97 @@ where
     /// Feed any ordered response fragment. A fragment may split either the
     /// five-byte record header or a blob body.
     pub fn push_ordered(&mut self, bytes: &[u8]) -> Result<(), ImageError> {
+        self.push_ordered_with_control_credit(bytes).map(|_| ())
+    }
+
+    /// Feed ordered bytes and return the record-framing bytes which no longer
+    /// occupy application storage. Blob bytes deliberately do not contribute
+    /// here: their credit belongs to the durable image sink. A manifest, by
+    /// contrast, is retained only until its complete record has been
+    /// validated and applied, so withholding its stream credit can deadlock a
+    /// small flash window before the first durable block is available.
+    pub fn push_ordered_with_control_credit(&mut self, bytes: &[u8]) -> Result<usize, ImageError> {
+        let mut control_credit = 0usize;
         let mut events = SignedObjectEvents {
             image: &mut self.image,
             complete: &mut self.complete,
+            control_credit: &mut control_credit,
         };
-        self.records.push(bytes, &mut events).map_err(|error| match error {
-            FixedRecordError::Invalid => ImageError::InvalidBlock,
-            FixedRecordError::Callback(error) => error,
-        })
+        self.records
+            .push(bytes, &mut events)
+            .map_err(|error| match error {
+                FixedRecordError::Invalid => ImageError::InvalidBlock,
+                FixedRecordError::Callback(error) => error,
+            })?;
+        Ok(control_credit)
+    }
+
+    /// Consume already ordered chunks and combine parser-control credit with
+    /// capacity reclaimed by the concrete storage sink. This is the exact
+    /// handler-side operation shared by host tests and ESP flash; it neither
+    /// parses nor emits transport packets.
+    pub fn push_stream_chunks<I, B>(&mut self, chunks: I) -> Result<(bool, usize), ImageError>
+    where
+        S: StreamingImageSink,
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let mut received = false;
+        let mut credit = 0usize;
+        for bytes in chunks {
+            credit = credit.saturating_add(self.push_ordered_with_control_credit(bytes.as_ref())?);
+            received = true;
+        }
+        let storage_credit = self
+            .image
+            .sink_mut()
+            .poll_completed()
+            .map_err(|_| ImageError::Sink)?;
+        Ok((received, credit.saturating_add(storage_credit)))
+    }
+
+    /// Current ordinary stream window selected by the storage consumer.
+    pub fn stream_receive_window_bytes(&mut self) -> usize
+    where
+        S: StreamingImageSink,
+    {
+        if self.image.manifest().is_none() {
+            // Admit exactly the current manifest boundary. Advertising the
+            // parser's worst-case array plus sink space up front turns unused
+            // manifest allowance into permission to overrun a slow sink.
+            return self.records.current_record_remaining_bytes();
+        }
+        let sink_window = self.image.sink_mut().receive_window_bytes();
+        let buffered = self.records.buffered_record_bytes();
+        if buffered == 0 {
+            return sink_window;
+        }
+        // Once a sink with non-zero capacity starts an atomic object record,
+        // the decoder's already-allocated record buffer must be allowed to
+        // finish it. Otherwise a sink window smaller than one record can stop
+        // forever halfway through that record even though no additional sink
+        // slot is needed until its callback runs.
+        sink_window
+            .saturating_sub(buffered)
+            .max(self.records.current_record_remaining_bytes())
+    }
+
+    /// Parser plus storage capacity required before the first object record.
+    pub fn initial_stream_receive_window_bytes(&mut self) -> usize
+    where
+        S: StreamingImageSink,
+    {
+        self.records.current_record_remaining_bytes()
+    }
+
+    pub fn poll_storage_before_transport(&mut self) -> Result<(), ImageError>
+    where
+        S: StreamingImageSink,
+    {
+        self.image
+            .sink_mut()
+            .poll_before_transport()
+            .map_err(|_| ImageError::Sink)
     }
 }
 
@@ -1204,7 +1566,7 @@ impl<S, V: SignatureVerifier> ImageReceiver<S, V> {
         }
         let block = &payload[12..12 + len];
         let actual = hash(block).ok_or(ImageError::InvalidBlock)?;
-        if actual != manifest.block_sha256[index as usize] {
+        if actual[..BLOCK_DIGEST_BYTES] != manifest.block_digests[index as usize] {
             return Err(ImageError::InvalidBlock);
         }
         self.sink
@@ -1345,6 +1707,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_slots_follow_injected_memory_without_becoming_transport_credit() {
+        assert_eq!(
+            bounded_storage_slots(64 * 1024, 32 * 1024, 8 * 1024, 1, 4),
+            4
+        );
+        assert_eq!(
+            bounded_storage_slots(48 * 1024, 32 * 1024, 8 * 1024, 1, 4),
+            2
+        );
+        assert_eq!(
+            bounded_storage_slots(39 * 1024, 32 * 1024, 8 * 1024, 1, 4),
+            0
+        );
+        assert_eq!(
+            bounded_storage_slots(512 * 1024, 32 * 1024, 8 * 1024, 1, 4),
+            4
+        );
+        assert_eq!(bounded_storage_slots(64 * 1024, 0, 0, 1, 4), 0);
+        assert_eq!(bounded_storage_slots(64 * 1024, 0, 8 * 1024, 0, 4), 0);
+    }
+
+    #[test]
+    fn boxed_receiver_factory_reports_sink_failure_without_installing_receiver() {
+        type Receiver = SignedObjectReceiver<(), NoSignatureVerifier, 256, 256>;
+        let mut called = false;
+        let result = Receiver::try_new_boxed_with(|| {
+            called = true;
+            Err::<(), _>(7_u8)
+        });
+        assert!(called);
+        assert!(matches!(result, Err(BoxedReceiverError::Sink(7))));
+    }
+
+    #[test]
+    fn exclusive_transfer_rejects_contender_and_only_owner_releases() {
+        let mut operation = ExclusiveTransfer::new();
+        let first = quic_lite::ConnectionId::new(0x4101).unwrap();
+        let second = quic_lite::ConnectionId::new(0x4102).unwrap();
+
+        assert_eq!(
+            operation.try_start_with(first, 7, 100, 50, || Ok::<_, ()>(11)),
+            Ok(())
+        );
+        assert_eq!(
+            operation.try_start_with(second, 8, 101, 50, || Ok::<_, ()>(22)),
+            Err(ExclusiveTransferStartError::Busy)
+        );
+        assert_eq!(operation.owner(), Some(first));
+        assert_eq!(operation.get_mut_for(second), None);
+        assert_eq!(operation.take_for(second), None);
+        assert_eq!(operation.take_for(first), Some(11));
+        assert_eq!(
+            operation.try_start_with(second, 8, 101, 50, || Ok::<_, ()>(22)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn exclusive_transfer_does_not_construct_a_busy_operation() {
+        let mut operation = ExclusiveTransfer::new();
+        let first = quic_lite::ConnectionId::new(0x5101).unwrap();
+        let second = quic_lite::ConnectionId::new(0x5102).unwrap();
+        let mut starts = 0;
+
+        assert_eq!(
+            operation.try_start_with(first, 7, 100, 50, || {
+                starts += 1;
+                Ok::<_, ()>(11)
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            operation.try_start_with(second, 8, 101, 50, || {
+                starts += 1;
+                Ok::<_, ()>(22)
+            }),
+            Err(ExclusiveTransferStartError::Busy)
+        );
+        assert_eq!(starts, 1);
+        assert_eq!(operation.take_for(first), Some(11));
+    }
+
+    #[test]
+    fn exclusive_transfer_timeout_tracks_only_owner_application_progress() {
+        let mut operation = ExclusiveTransfer::new();
+        let first = quic_lite::ConnectionId::new(0x6101).unwrap();
+        let second = quic_lite::ConnectionId::new(0x6102).unwrap();
+        operation
+            .try_start_with(first, 91, 100, 20, || Ok::<_, ()>(11))
+            .unwrap();
+
+        assert!(!operation.touch(second, 115, 20));
+        assert_eq!(operation.take_expired(119), None);
+        assert!(operation.touch(first, 119, 20));
+        assert_eq!(operation.take_expired(120), None);
+        assert_eq!(operation.request_id_for(first), Some(91));
+        assert_eq!(operation.take_expired(138), None);
+        assert_eq!(operation.take_expired(139), Some((first, 91, 11)));
+        assert_eq!(operation.owner(), None);
+    }
+
+    #[test]
     fn verified_object_credit_is_storage_not_bearer_policy() {
         assert_eq!(
             verified_object_record_credit(RECORD_MANIFEST, 10, false),
@@ -1359,6 +1823,27 @@ mod tests {
             Some(ObjectRecordCredit::Immediate(4101))
         );
     }
+
+    #[test]
+    fn deferred_storage_work_needs_exactly_one_later_turn() {
+        let mut work = DeferredStorageWork::new();
+        assert!(!work.is_pending());
+        assert!(!work.take());
+
+        work.request();
+        work.request();
+        assert!(work.is_pending());
+        assert!(work.take(), "the first later maintenance turn starts work");
+        assert!(!work.is_pending());
+        assert!(!work.take(), "no unrequested second wake is required");
+
+        work.request();
+        assert!(
+            work.take(),
+            "a failed platform enqueue can explicitly retry"
+        );
+    }
+
     struct Sink {
         blocks: u32,
         bytes: usize,
@@ -1439,6 +1924,15 @@ mod tests {
         );
         assert!(!receiver.is_complete());
         assert_eq!(receiver.sink_mut().bytes, 0);
+
+        let mut boxed = Receiver::try_new_boxed(ImageTestSink {
+            blocks: 0,
+            bytes: 0,
+            done: false,
+        })
+        .expect("one receiver allocation");
+        assert!(!boxed.is_complete());
+        assert_eq!(boxed.sink_mut().bytes, 0);
     }
 
     #[test]
@@ -1448,16 +1942,17 @@ mod tests {
         let image = Sha256::digest(b"12345678");
         let mut manifest = Vec::new();
         crate::cbor::encode::map(7, &mut manifest);
-        for (key, value) in [(0, 6), (1, 1), (2, 4), (3, 2), (4, 8)] {
+        for (key, value) in [(0, 6), (1, VERIFIED_OBJECT_VERSION), (2, 4), (3, 2), (4, 8)] {
             crate::cbor::encode::uint(key, &mut manifest);
-            crate::cbor::encode::uint(value, &mut manifest);
+            crate::cbor::encode::uint(u64::from(value), &mut manifest);
         }
         crate::cbor::encode::uint(5, &mut manifest);
         crate::cbor::encode::bytes(&image, &mut manifest);
         crate::cbor::encode::uint(6, &mut manifest);
-        crate::cbor::encode::array(2, &mut manifest);
-        crate::cbor::encode::bytes(&first, &mut manifest);
-        crate::cbor::encode::bytes(&second, &mut manifest);
+        let mut block_digests = Vec::new();
+        block_digests.extend_from_slice(&first[..BLOCK_DIGEST_BYTES]);
+        block_digests.extend_from_slice(&second[..BLOCK_DIGEST_BYTES]);
+        crate::cbor::encode::bytes(&block_digests, &mut manifest);
         let mut receiver = ImageReceiver::new(ImageTestSink {
             blocks: 0,
             bytes: 0,
@@ -1523,21 +2018,131 @@ mod tests {
         let image = Sha256::digest(b"12345678");
         let mut manifest = Vec::new();
         crate::cbor::encode::map(if signature.is_some() { 8 } else { 7 }, &mut manifest);
-        for (key, value) in [(0, 6), (1, 1), (2, 4), (3, 2), (4, 8)] {
+        for (key, value) in [(0, 6), (1, VERIFIED_OBJECT_VERSION), (2, 4), (3, 2), (4, 8)] {
             crate::cbor::encode::uint(key, &mut manifest);
-            crate::cbor::encode::uint(value, &mut manifest);
+            crate::cbor::encode::uint(u64::from(value), &mut manifest);
         }
         crate::cbor::encode::uint(5, &mut manifest);
         crate::cbor::encode::bytes(&image, &mut manifest);
         crate::cbor::encode::uint(6, &mut manifest);
-        crate::cbor::encode::array(2, &mut manifest);
-        crate::cbor::encode::bytes(&first, &mut manifest);
-        crate::cbor::encode::bytes(&second, &mut manifest);
+        let mut block_digests = Vec::new();
+        block_digests.extend_from_slice(&first[..BLOCK_DIGEST_BYTES]);
+        block_digests.extend_from_slice(&second[..BLOCK_DIGEST_BYTES]);
+        crate::cbor::encode::bytes(&block_digests, &mut manifest);
         if let Some(signature) = signature {
             crate::cbor::encode::uint(7, &mut manifest);
             crate::cbor::encode::bytes(signature, &mut manifest);
         }
         manifest
+    }
+
+    struct DelayedStreamSink {
+        bytes: usize,
+        pending_credit: usize,
+        polls: usize,
+        release_every: usize,
+        window: usize,
+        done: bool,
+    }
+
+    impl ImageSink for DelayedStreamSink {
+        type Error = ();
+
+        fn begin(&mut self, _: &ImageManifest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn write_block(&mut self, _: u32, data: &[u8]) -> Result<(), Self::Error> {
+            self.bytes = self.bytes.saturating_add(data.len());
+            self.pending_credit = self
+                .pending_credit
+                .saturating_add(data.len().saturating_add(17));
+            Ok(())
+        }
+
+        fn finish(&mut self, _: &ImageManifest) -> Result<(), Self::Error> {
+            self.done = true;
+            Ok(())
+        }
+
+        fn abort(&mut self) {}
+    }
+
+    impl StreamingImageSink for DelayedStreamSink {
+        fn receive_window_bytes(&self) -> usize {
+            self.window
+        }
+
+        fn poll_completed(&mut self) -> Result<usize, Self::Error> {
+            self.polls = self.polls.saturating_add(1);
+            if self.polls % self.release_every != 0 {
+                return Ok(0);
+            }
+            Ok(core::mem::take(&mut self.pending_credit))
+        }
+    }
+
+    fn framed_record(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(5 + payload.len());
+        record.push(kind);
+        record.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        record.extend_from_slice(payload);
+        record
+    }
+
+    #[test]
+    fn streamed_consumer_uses_injected_storage_window_and_delayed_credit() {
+        type Receiver = SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 256, 64>;
+        let sink_window = 37;
+        let mut receiver = Receiver::new(DelayedStreamSink {
+            bytes: 0,
+            pending_credit: 0,
+            polls: 0,
+            release_every: 2,
+            window: sink_window,
+            done: false,
+        });
+        assert_eq!(receiver.initial_stream_receive_window_bytes(), 5);
+
+        let manifest = framed_record(RECORD_MANIFEST, &test_image_manifest(None));
+        let (received, first_header_credit) = receiver
+            .push_stream_chunks([manifest[..3].to_vec()])
+            .unwrap();
+        assert!(received);
+        assert_eq!(first_header_credit, 0);
+        assert_eq!(receiver.stream_receive_window_bytes(), 2);
+        let (_, manifest_credit) = receiver
+            .push_stream_chunks([manifest[3..].to_vec()])
+            .unwrap();
+        assert_eq!(manifest_credit, manifest.len());
+        assert_eq!(receiver.stream_receive_window_bytes(), sink_window);
+
+        let mut block = [0u8; 16];
+        block[4..8].copy_from_slice(&0u32.to_be_bytes());
+        block[8..12].copy_from_slice(&4u32.to_be_bytes());
+        block[12..16].copy_from_slice(b"1234");
+        let first = framed_record(RECORD_BLOB, &block);
+        let (_, partial_credit) = receiver.push_stream_chunks([first[..7].to_vec()]).unwrap();
+        assert_eq!(partial_credit, 0);
+        assert_eq!(receiver.stream_receive_window_bytes(), sink_window - 7);
+        let (_, first_credit) = receiver.push_stream_chunks([first[7..].to_vec()]).unwrap();
+        assert_eq!(first_credit, 4 + 17);
+
+        block[4..8].copy_from_slice(&1u32.to_be_bytes());
+        block[12..16].copy_from_slice(b"5678");
+        let second = framed_record(RECORD_BLOB, &block);
+        let (_, second_credit) = receiver.push_stream_chunks([second]).unwrap();
+        assert_eq!(second_credit, 0);
+        let (_, released) = receiver
+            .push_stream_chunks(core::iter::empty::<Vec<u8>>())
+            .unwrap();
+        assert_eq!(released, 4 + 17);
+
+        let done = framed_record(RECORD_DONE, &[]);
+        let (_, done_credit) = receiver.push_stream_chunks([done.clone()]).unwrap();
+        assert_eq!(done_credit, done.len());
+        assert!(receiver.is_complete());
+        assert!(receiver.sink_mut().done);
     }
 
     #[test]
@@ -1656,7 +2261,23 @@ mod tests {
         };
         let mut wire = [0u8; 160];
         let used = encode_flash_handler_request(flash, 42, &mut wire).unwrap();
-        assert_eq!(decode_flash_handler_request(&wire[..used]), Some((42, flash)));
+        assert_eq!(
+            decode_flash_handler_request(&wire[..used]),
+            Some((42, flash))
+        );
+
+        let used = crate::tagged::encode_numeric_error(
+            OBJECT_COMPONENT,
+            OBJECT_FLASH_METHOD,
+            42,
+            FLASH_BUSY_ERROR,
+            &mut wire,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_flash_handler_error(&wire[..used]),
+            Some(FLASH_BUSY_ERROR)
+        );
 
         // A raw fields map is no longer a callable stream request.
         assert!(decode_get_request(&[0xa2, 0x01, 0x0d, 0x02, 0x06]).is_none());
@@ -1698,7 +2319,10 @@ mod tests {
         assert_eq!(decode_flash_request(&bytes[..used]), Some(request));
         // Duplicate transport field and trailing bytes are not safe to pass
         // through to an erase/write implementation.
-        assert!(decode_flash_request(&[0xa5, 0x01, 13, 0x02, 2, 0x04, 0, 0x04, 1, 0x05, 0xf4]).is_none());
+        assert!(
+            decode_flash_request(&[0xa5, 0x01, 13, 0x02, 2, 0x04, 0, 0x04, 1, 0x05, 0xf4])
+                .is_none()
+        );
         let mut trailing = bytes[..used].to_vec();
         trailing.push(0);
         assert!(decode_flash_request(&trailing).is_none());
@@ -1750,9 +2374,8 @@ mod tests {
             (RECORD_BLOB, block(1, b"5678")),
             (RECORD_DONE, Vec::new()),
         ]);
-        let mut receiver = SignedObjectReceiver::<_, _, 1024, 4096>::new(
-            FileImageSink::new(&destination, false),
-        );
+        let mut receiver =
+            SignedObjectReceiver::<_, _, 1024, 4096>::new(FileImageSink::new(&destination, false));
         let mut encoded = [0u8; 7];
         while let Some(chunk) = stream.next_chunk(&mut encoded) {
             receiver.push_ordered(&encoded[..chunk.len]).unwrap();

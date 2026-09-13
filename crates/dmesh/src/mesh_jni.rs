@@ -176,6 +176,21 @@ struct AndroidVpnHandle {
     _injector: Arc<dyn mesh::tun::TunInjector>,
 }
 
+// The JNI handle is a small positive id into this registry, never a raw
+// pointer: pointer values can be negative when cast to jlong, which the
+// Java side (and the instrumentation test) interpret as failure and would
+// then close the TUN fd that Rust owns.
+#[cfg(target_os = "android")]
+static ANDROID_VPN_NEXT_HANDLE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+#[cfg(target_os = "android")]
+static ANDROID_VPN_HANDLES: OnceLock<Mutex<HashMap<i64, AndroidVpnHandle>>> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+fn android_vpn_handles() -> &'static Mutex<HashMap<i64, AndroidVpnHandle>> {
+    ANDROID_VPN_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn bridge_senders() -> &'static Mutex<HashMap<u64, UnboundedSender<Vec<u8>>>> {
     BRIDGE_SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -631,16 +646,30 @@ struct BridgeCommand {
 fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::Result<Vec<u8>> {
     let cmd = parse_bridge_human(&format!("{} {}", method, args.trim()))?;
     if let Some(uid) = cmd.data.get("caller_uid") {
-        let pkg = cmd.data.get("caller_package").map(String::as_str).unwrap_or("");
-        let same_sig = cmd.data.get("caller_same_sig").map(String::as_str).unwrap_or("false");
-        let cert = cmd.data.get("caller_cert_sha256").map(String::as_str).unwrap_or("");
+        let pkg = cmd
+            .data
+            .get("caller_package")
+            .map(String::as_str)
+            .unwrap_or("");
+        let same_sig = cmd
+            .data
+            .get("caller_same_sig")
+            .map(String::as_str)
+            .unwrap_or("false");
+        let cert = cmd
+            .data
+            .get("caller_cert_sha256")
+            .map(String::as_str)
+            .unwrap_or("");
         log::info!(
             "radio_message caller identity: uid={} pkg={} same_sig={} cert_sha256={}",
-            uid, pkg, same_sig, cert
+            uid,
+            pkg,
+            same_sig,
+            cert
         );
     }
     let response = match cmd.method.as_str() {
-
         "radio.nan.build_service_info" => {
             let role = cmd
                 .data
@@ -1288,7 +1317,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .into_bytes()
         }
         "chat.message" => {
-            let from = cmd.data.get("from").cloned().unwrap_or_else(|| "remote".to_string());
+            let from = cmd
+                .data
+                .get("from")
+                .cloned()
+                .unwrap_or_else(|| "remote".to_string());
             let text = cmd.data.get("text").cloned().unwrap_or_default();
             log::info!("Rust chat.message from {}: {}", from, text);
             json!({"method": "chat.message", "from": from, "text": text, "status": "ok"})
@@ -1296,7 +1329,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .into_bytes()
         }
         "messages.subscribe" => {
-            let keys = cmd.data.get("keys").cloned().unwrap_or_else(|| "all".to_string());
+            let keys = cmd
+                .data
+                .get("keys")
+                .cloned()
+                .unwrap_or_else(|| "all".to_string());
             log::info!("Rust messages.subscribe keys: {}", keys);
             json!({"method": "messages.subscribed", "keys": keys, "status": "ok"})
                 .to_string()
@@ -2463,13 +2500,17 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartT
             passthrough.set_injector(injector.clone());
             anyhow::Ok(injector)
         })?;
-        let handle = AndroidVpnHandle {
+        let vpn_handle = AndroidVpnHandle {
             _runtime: runtime,
             _injector: injector,
         };
-        let ptr = Box::into_raw(Box::new(handle)) as jlong;
-        log::info!("Android VPN mesh-tun started handle={}", ptr);
-        Ok(ptr)
+        let handle_id = ANDROID_VPN_NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        android_vpn_handles()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(handle_id, vpn_handle);
+        log::info!("Android VPN mesh-tun started handle={}", handle_id);
+        Ok(handle_id)
     })
 }
 
@@ -2485,7 +2526,10 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStopTu
         return;
     }
     log::info!("Stopping Android VPN mesh-tun handle={}", handle);
-    let _ = unsafe { Box::from_raw(handle as *mut AndroidVpnHandle) };
+    let _ = android_vpn_handles()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&handle);
 }
 
 #[cfg(test)]

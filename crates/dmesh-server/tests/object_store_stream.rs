@@ -1,4 +1,4 @@
-use dmesh_server::protocol::{decode_get, encode_get};
+use dmesh_server::verified_object::{decode_get, encode_get};
 use quic_lite::{
     ConnectionId, ConnectionIds, ConnectionLimits, EndpointState, FIRST_CLIENT_BIDI_STREAM_ID,
     INITIAL_MAX_STREAM_DATA, Role,

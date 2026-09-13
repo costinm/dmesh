@@ -164,9 +164,12 @@ impl ChatApp {
                 ui.heading("DMesh Chat");
                 if !self.history.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("({} in history, ↑/↓ to browse)", self.history.len()))
-                            .weak()
-                            .small(),
+                        egui::RichText::new(format!(
+                            "({} in history, ↑/↓ to browse)",
+                            self.history.len()
+                        ))
+                        .weak()
+                        .small(),
                     );
                 }
             });
@@ -203,7 +206,8 @@ impl ChatApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new("Suggestions:").small().strong());
                         for (idx, (name, title, desc)) in suggestions.iter().enumerate() {
-                            let is_selected = idx == self.selected_suggestion.min(suggestions.len() - 1);
+                            let is_selected =
+                                idx == self.selected_suggestion.min(suggestions.len() - 1);
                             let slash_cmd = format!("/{}", name.replace('.', "/"));
                             let label_text = if !title.is_empty() {
                                 format!("{} ({})", slash_cmd, title)
@@ -450,19 +454,16 @@ mod android_bridge {
                 return Vec::new();
             }
         };
-        let value = match env.call_static_method(
-            &bridge_class,
-            "drainEvents",
-            "()Ljava/lang/String;",
-            &[],
-        ) {
-            Ok(value) => value,
-            Err(e) => {
-                log::warn!("ChatBridge.drainEvents failed: {}", e);
-                let _ = env.exception_clear();
-                return Vec::new();
-            }
-        };
+        let value =
+            match env.call_static_method(&bridge_class, "drainEvents", "()Ljava/lang/String;", &[])
+            {
+                Ok(value) => value,
+                Err(e) => {
+                    log::warn!("ChatBridge.drainEvents failed: {}", e);
+                    let _ = env.exception_clear();
+                    return Vec::new();
+                }
+            };
         let obj = match value.l() {
             Ok(obj) => obj,
             Err(e) => {
@@ -486,9 +487,9 @@ mod android_surface {
     use super::*;
     use glutin_egl_sys::egl;
     use glutin_egl_sys::egl::types;
+    use jni::JNIEnv;
     use jni::objects::{JClass, JObject, JString};
     use jni::sys::{jboolean, jfloat, jint, jlong};
-    use jni::JNIEnv;
     use ndk::native_window::NativeWindow;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -556,7 +557,17 @@ mod android_surface {
 
             let mut config: types::EGLConfig = std::ptr::null();
             let mut num_configs = 0;
-            if unsafe { egl.ChooseConfig(display, attribs.as_ptr(), &mut config as *mut _ as *mut *const c_void, 1, &mut num_configs) } == 0 || num_configs == 0 {
+            if unsafe {
+                egl.ChooseConfig(
+                    display,
+                    attribs.as_ptr(),
+                    &mut config as *mut _ as *mut *const c_void,
+                    1,
+                    &mut num_configs,
+                )
+            } == 0
+                || num_configs == 0
+            {
                 return Err("eglChooseConfig failed".to_string());
             }
 
@@ -566,17 +577,21 @@ mod android_surface {
                 egl::NONE as i32,
             ];
 
-            let context = unsafe { egl.CreateContext(display, config, egl::NO_CONTEXT, context_attribs.as_ptr()) };
+            let context = unsafe {
+                egl.CreateContext(display, config, egl::NO_CONTEXT, context_attribs.as_ptr())
+            };
             if context == egl::NO_CONTEXT {
                 return Err("eglCreateContext failed".to_string());
             }
 
-            let surface = unsafe { egl.CreateWindowSurface(
-                display,
-                config,
-                native_window.ptr().as_ptr() as *mut _,
-                std::ptr::null(),
-            ) };
+            let surface = unsafe {
+                egl.CreateWindowSurface(
+                    display,
+                    config,
+                    native_window.ptr().as_ptr() as *mut _,
+                    std::ptr::null(),
+                )
+            };
             if surface == egl::NO_SURFACE {
                 return Err("eglCreateWindowSurface failed".to_string());
             }
@@ -612,13 +627,20 @@ mod android_surface {
         }
 
         unsafe fn swap_buffers(&self) {
-            unsafe { self.egl.SwapBuffers(self.display, self.surface); }
+            unsafe {
+                self.egl.SwapBuffers(self.display, self.surface);
+            }
         }
 
         unsafe fn destroy(&mut self) {
             self.painter.destroy();
             unsafe {
-                self.egl.MakeCurrent(self.display, egl::NO_SURFACE, egl::NO_SURFACE, egl::NO_CONTEXT);
+                self.egl.MakeCurrent(
+                    self.display,
+                    egl::NO_SURFACE,
+                    egl::NO_SURFACE,
+                    egl::NO_CONTEXT,
+                );
                 if self.surface != egl::NO_SURFACE {
                     self.egl.DestroySurface(self.display, self.surface);
                     self.surface = egl::NO_SURFACE;
@@ -744,7 +766,12 @@ mod android_surface {
 
                     unsafe {
                         use glow::HasContext as _;
-                        ctx.gl.viewport(0, insets_bottom as i32, w as i32, (h as f32 - insets_bottom) as i32);
+                        ctx.gl.viewport(
+                            0,
+                            insets_bottom as i32,
+                            w as i32,
+                            (h as f32 - insets_bottom) as i32,
+                        );
                         ctx.gl.clear_color(0.12, 0.12, 0.14, 1.0);
                         ctx.gl.clear(glow::COLOR_BUFFER_BIT);
 
@@ -758,7 +785,11 @@ mod android_surface {
                         ctx.swap_buffers();
                     }
 
-                    if full_output.viewport_output.values().any(|v| v.repaint_delay.is_zero()) {
+                    if full_output
+                        .viewport_output
+                        .values()
+                        .any(|v| v.repaint_delay.is_zero())
+                    {
                         render_req.store(true, Ordering::Relaxed);
                     }
                 }
@@ -796,7 +827,8 @@ mod android_surface {
             let mut s = self.state.lock().unwrap();
             let pos = egui::pos2(x / s.density, y / s.density);
             match action {
-                0 => { // ACTION_DOWN
+                0 => {
+                    // ACTION_DOWN
                     s.last_touch_pos = Some(pos);
                     s.raw_input.events.push(egui::Event::PointerMoved(pos));
                     s.raw_input.events.push(egui::Event::PointerButton {
@@ -806,7 +838,8 @@ mod android_surface {
                         modifiers: egui::Modifiers::default(),
                     });
                 }
-                1 => { // ACTION_UP
+                1 => {
+                    // ACTION_UP
                     s.last_touch_pos = None;
                     s.raw_input.events.push(egui::Event::PointerButton {
                         pos,
@@ -815,7 +848,8 @@ mod android_surface {
                         modifiers: egui::Modifiers::default(),
                     });
                 }
-                2 => { // ACTION_MOVE
+                2 => {
+                    // ACTION_MOVE
                     if let Some(prev_pos) = s.last_touch_pos {
                         let dy = pos.y - prev_pos.y;
                         let dx = pos.x - prev_pos.x;
@@ -831,7 +865,8 @@ mod android_surface {
                     s.last_touch_pos = Some(pos);
                     s.raw_input.events.push(egui::Event::PointerMoved(pos));
                 }
-                3 => { // ACTION_CANCEL
+                3 => {
+                    // ACTION_CANCEL
                     s.last_touch_pos = None;
                     s.raw_input.events.push(egui::Event::PointerGone);
                 }
@@ -894,10 +929,19 @@ mod android_surface {
         );
 
         let vm = env.get_java_vm().expect("Failed to get JavaVM");
-        let context_ref = env.new_global_ref(context).expect("Failed to get global context ref");
-        let cl_ref = match env.call_method(context_ref.as_obj(), "getClassLoader", "()Ljava/lang/ClassLoader;", &[]) {
+        let context_ref = env
+            .new_global_ref(context)
+            .expect("Failed to get global context ref");
+        let cl_ref = match env.call_method(
+            context_ref.as_obj(),
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ) {
             Ok(cl_val) => match cl_val.l() {
-                Ok(cl_obj) => env.new_global_ref(cl_obj).expect("Failed to get ClassLoader ref"),
+                Ok(cl_obj) => env
+                    .new_global_ref(cl_obj)
+                    .expect("Failed to get ClassLoader ref"),
                 Err(e) => panic!("getClassLoader returned non-object: {e}"),
             },
             Err(e) => panic!("failed to call getClassLoader: {e}"),
@@ -918,10 +962,13 @@ mod android_surface {
         width: jint,
         height: jint,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
-            let win_ptr = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw());
+            let win_ptr =
+                ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface.as_raw());
             if !win_ptr.is_null() {
                 let window = NativeWindow::from_ptr(std::ptr::NonNull::new_unchecked(win_ptr));
                 renderer.set_surface(Some(window), width as u32, height as u32);
@@ -937,7 +984,9 @@ mod android_surface {
         width: jint,
         height: jint,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             renderer.set_size(width as u32, height as u32);
@@ -950,7 +999,9 @@ mod android_surface {
         _class: JClass,
         ptr: jlong,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             renderer.set_surface(None, 0, 0);
@@ -966,7 +1017,9 @@ mod android_surface {
         x: jfloat,
         y: jfloat,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             renderer.push_touch(action, x as f32, y as f32);
@@ -980,7 +1033,9 @@ mod android_surface {
         ptr: jlong,
         text: JString,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             if let Ok(text_str) = env.get_string(&text) {
@@ -998,7 +1053,9 @@ mod android_surface {
         key_code: jint,
         pressed: jboolean,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             if key_code == 67 && pressed != 0 {
@@ -1046,7 +1103,9 @@ mod android_surface {
         dx: jfloat,
         dy: jfloat,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             renderer.push_scroll(dx as f32, dy as f32);
@@ -1060,7 +1119,9 @@ mod android_surface {
         ptr: jlong,
         bottom: jfloat,
     ) {
-        if ptr == 0 { return; }
+        if ptr == 0 {
+            return;
+        }
         unsafe {
             let renderer = &*(ptr as *const AndroidBridgeRenderer);
             renderer.set_insets_bottom(bottom as f32);

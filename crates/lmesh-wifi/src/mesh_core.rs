@@ -2481,8 +2481,9 @@ impl LmeshService {
 
     /// Merge an already validated multicast observation with the host radio's
     /// bounded device inventory. This uses the same change-only log policy as
-    /// raw NAN observations; it does not expose an unauthenticated remote
-    /// mutation surface.
+    /// raw NAN observations; it neither starts an object transfer nor exposes
+    /// an unauthenticated remote mutation surface. In particular, a Recovery
+    /// announce remains passive while automatic flashing is disabled.
     pub fn observe_multicast_announce(
         &self,
         peer: SocketAddr,
@@ -3971,6 +3972,7 @@ mod tests {
                 packet_size: Some(512),
                 parallel_streams: Some(2),
                 timeout_ms: Some(5000),
+                ..
             } if to == "02:00:00:00:00:44"
         ));
     }

@@ -52,6 +52,11 @@ Default:
 - Send/Receive signed announcements, including the public key, cert and IPs
   Respond to multicasts with directed signed response.
 
+- Recovery announcements are discovery-only. Neither `lmesh` nor
+  `lmesh-wifi` automatically starts `object.flash`; for now exactly one
+  explicitly invoked client owns a transfer, and a concurrent flash request is
+  rejected without interrupting the active transfer.
+
 - send and receive signed unicast messages, using the discovery data.
 
 

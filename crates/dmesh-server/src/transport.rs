@@ -15,17 +15,9 @@ use quic_lite::{ConnectionId, ConnectionLimits, PathId, ServerStreamConfig, Tran
 
 use crate::{
     probe::{ProbeRun, ProbeSender, ProbeServicePlan},
-    protocol::{
-        GetRequest, ObjectRecordStream, REQUEST_MAX, decode_flash_handler_request,
-        encode_get_request,
-    },
     stream_server::StreamServerConnection,
+    verified_object::{GetRequest, ObjectRecordStream, REQUEST_MAX, encode_get_request},
 };
-
-/// The second client-initiated stream of a flash association carries only
-/// signed object records. Stream 4 remains the correlated `object.flash`
-/// command/terminal-response stream.
-pub const FLASH_OBJECT_STREAM: u64 = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4;
 
 /// Largest conservative application slice that fits with the QUIC-lite short
 /// header and STREAM frame in the normal 1200-byte datagram. This is shared by
@@ -42,12 +34,14 @@ pub struct ObjectUploadClient<const HISTORY: usize, const PACKET: usize> {
     association: quic_lite::ClientAssociation<HISTORY, PACKET>,
     command: [u8; PACKET],
     command_len: usize,
+    object_stream: Option<u64>,
     records: ObjectRecordStream,
     scratch: [u8; OBJECT_UPLOAD_STREAM_CHUNK],
     command_admitted: bool,
     complete: bool,
     response: [u8; PACKET],
     response_len: usize,
+    terminal_before_records: bool,
     path: PathId,
     last_admission_block: Option<Error>,
 }
@@ -70,12 +64,14 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
             association,
             command: stored,
             command_len: command.len(),
+            object_stream: None,
             records,
             scratch: [0; OBJECT_UPLOAD_STREAM_CHUNK],
             command_admitted: false,
             complete: false,
             response: [0; PACKET],
             response_len: 0,
+            terminal_before_records: false,
             path,
             last_admission_block: None,
         })
@@ -83,9 +79,18 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
 
     fn poll_application(&mut self, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
         if self.command_admitted && !self.records.is_complete() {
-            if let Some(next) = self.records.copy_next(&mut self.scratch) {
+            let object_stream = self.object_stream.ok_or(Error::Invalid)?;
+            let offset = self.records.sent_bytes() as u64;
+            let available = self
+                .association
+                .available_stream_send_bytes(object_stream, offset)
+                .unwrap_or(0)
+                .min(self.scratch.len() as u64) as usize;
+            if available == 0 {
+                self.last_admission_block = Some(Error::FlowControl);
+            } else if let Some(next) = self.records.copy_next(&mut self.scratch[..available]) {
                 match self.association.encode_stream_payload_at(
-                    FLASH_OBJECT_STREAM,
+                    object_stream,
                     next.offset,
                     &self.scratch[..next.len],
                     next.fin,
@@ -115,6 +120,14 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
         self.complete.then_some(&self.response[..self.response_len])
     }
 
+    /// A terminal handler response received before the upload completed.
+    /// This is an application rejection (for example, an unavailable flash
+    /// target), rather than a malformed QUIC packet.
+    pub fn rejected_response(&self) -> Option<&[u8]> {
+        self.terminal_before_records
+            .then(|| &self.response[..self.response_len])
+    }
+
     pub fn record_index(&self) -> usize {
         self.records.record_index()
     }
@@ -135,7 +148,8 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
     /// without exposing packets or giving an adapter scheduling authority.
     pub fn admission_state(&self) -> Option<(usize, usize, u64, usize, u64, u64)> {
         let endpoint = self.association.connection().endpoint()?;
-        let (connection_credit, stream_credit) = endpoint.peer_send_credit(FLASH_OBJECT_STREAM)?;
+        let object_stream = self.object_stream?;
+        let (connection_credit, stream_credit) = endpoint.peer_send_credit(object_stream)?;
         Some((
             endpoint.history_len(),
             endpoint.peer_max_in_flight_packets(),
@@ -144,6 +158,16 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
             connection_credit,
             stream_credit,
         ))
+    }
+
+    /// Bounded QUIC packet/control state for diagnosing a stalled operation.
+    /// This is the same endpoint view used by server adapters and contains no
+    /// object, flash, UART, or UDP-specific state.
+    pub fn connection_debug_state(&self) -> Option<ConnectionDebugState> {
+        self.association
+            .connection()
+            .endpoint()
+            .map(ConnectionDebugState::from_endpoint)
     }
 }
 
@@ -163,7 +187,9 @@ impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
         if self.association.peer_cid().is_none() {
             self.association
                 .receive_open_ack(self.path, input, now_ms)?;
-            let command_stream = self.association.allocate_client_bidi_stream()?;
+            let command_stream = self.association.open_next_client_bidi_stream()?;
+            let object_stream = self.association.open_next_client_bidi_stream()?;
+            self.object_stream = Some(object_stream);
             return self
                 .association
                 .encode_stream_payload(
@@ -173,6 +199,13 @@ impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
                     output,
                 )
                 .map(|(_, used)| Some(used));
+        }
+        // The transport driver admits a replayed OPEN_ACK as valid
+        // association traffic before it considers opaque reset tokens.  Do
+        // not hand that long-header setup replay to the ordinary short-header
+        // response parser.
+        if self.association.is_duplicate_open_ack(input) {
+            return Ok(None);
         }
         let payload = self
             .association
@@ -188,14 +221,19 @@ impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
                 .copy_from_slice(payload.data);
             self.response_len += payload.data.len();
             if payload.fin {
-                if !self.records.is_complete() {
-                    return Err(Error::Invalid);
-                }
+                self.terminal_before_records = !self.records.is_complete();
                 self.complete = true;
                 return Ok(self.association.poll_close(output)?.map(|(_, used)| used));
             }
         }
-        self.poll_application(output)
+        // This receive turn may have declared an earlier stream range lost.
+        // Return only endpoint control here; DatagramClientDriver gives due
+        // retransmission priority before asking for another fresh object
+        // slice on its following service turn.
+        Ok(self
+            .association
+            .poll_transmit(output)?
+            .map(|(_, used)| used))
     }
 
     fn accepts(&self, input: &[u8]) -> bool {
@@ -212,17 +250,35 @@ impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
 
     fn poll_transmit_at(
         &mut self,
-        now_ms: u64,
+        _now_ms: u64,
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
-        // Object source progress is ACK-clocked through `receive_at`: an
-        // admitted peer packet opens the next ordered source slice.  An idle
-        // bearer turn may still emit ordinary QUIC-lite ACK/MAX/PTO control,
-        // but it must not create an adapter-local burst queue by offering
-        // another object slice every scheduler tick.
-        self.association
-            .connection_mut()
-            .poll_transmit_at(now_ms, output)
+        // Re-offer one ordered source slice after a prior congestion or
+        // retained-history admission boundary.  The endpoint still decides
+        // whether it can encode it; a rejected offer falls through to its
+        // ordinary ACK/MAX/PTO control.  Waiting solely for another inbound
+        // packet strands a sender when the last ACK freed congestion space
+        // but did not itself cause an application callback.
+        self.poll_application(output)
+    }
+
+    fn poll_control_at(
+        &mut self,
+        _now_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        Ok(self
+            .association
+            .poll_transmit(output)?
+            .map(|(_, used)| used))
+    }
+
+    fn poll_application_at(
+        &mut self,
+        _now_ms: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        self.poll_application(output)
     }
 
     fn poll_retransmit(
@@ -312,6 +368,51 @@ pub struct ActiveConnectionStatus {
     pub last_close_at: Option<u64>,
 }
 
+/// Opaque identity of one encoded terminal application response.
+///
+/// The stream number remains transport-private. Runtimes may retain this
+/// value across one receive/poll turn solely to detect that a new terminal
+/// response entered QUIC-lite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalResponseSnapshot {
+    receive_cid: ConnectionId,
+    stream: u64,
+}
+
+/// Join an application completion edge with terminal response delivery.
+///
+/// Persistent sinks commonly finish in the receive turn that also encodes
+/// their response, so either edge may be observed first by a platform loop.
+/// Keeping this order-independent join in host code prevents each runtime
+/// from recreating a fragile pending-transition heuristic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalCompletionGate {
+    application_complete: bool,
+    response_delivered: bool,
+}
+
+impl TerminalCompletionGate {
+    pub fn application_complete(&mut self) {
+        self.application_complete = true;
+    }
+
+    pub fn response_delivered(&mut self) {
+        self.response_delivered = true;
+    }
+
+    pub const fn application_is_complete(&self) -> bool {
+        self.application_complete
+    }
+
+    pub fn take_complete(&mut self) -> bool {
+        if !self.application_complete || !self.response_delivered {
+            return false;
+        }
+        *self = Self::default();
+        true
+    }
+}
+
 /// Submit an optional immediate response and then poll up to the remaining
 /// packet credit. The connection retains retransmission history; this helper
 /// owns no packet, path, peer, or bearer queue.
@@ -380,11 +481,16 @@ pub struct ConnectionServer<const HISTORY: usize, const PACKET: usize> {
     /// prevent the same association from starting a later probe on a new
     /// stream.
     probe_request_stream: Option<u64>,
-    pending_flash: Option<Vec<u8>>,
-    pending_flash_id: Option<u64>,
-    flash_response: Option<Vec<u8>>,
-    flash_object_stream: Option<u64>,
-    flash_object_chunks: Vec<(Vec<u8>, bool)>,
+    // A handler-neutral two-stream operation.  The first peer bidi stream is
+    // a tagged command; its next peer bidi stream carries ordered bytes for
+    // the application that claimed that command.  Transport never decodes a
+    // component-specific request or record format here.
+    pending_stream_command: Option<Vec<u8>>,
+    command_stream: Option<u64>,
+    terminal_stream_response: Option<Vec<u8>>,
+    terminal_response_stream: Option<u64>,
+    inbound_stream: Option<u64>,
+    inbound_stream_chunks: Vec<(Vec<u8>, bool)>,
     association: AssociationProfile,
 }
 
@@ -411,6 +517,7 @@ pub struct ConnectionDispatcher<
     last_stateless_reset: Option<StatelessResetDiagnostic>,
     last_time: u64,
     last_close_at: Option<u64>,
+    last_closed_receive_cid: Option<ConnectionId>,
     // The dispatcher is long-lived firmware state.  Its server metadata is
     // small and fixed-size, so keeping it inline avoids a first-packet heap
     // allocation in every bearer.  The potentially large QUIC ledger remains
@@ -451,6 +558,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             last_stateless_reset: None,
             last_time: 0,
             last_close_at: None,
+            last_closed_receive_cid: None,
         }
     }
 
@@ -464,6 +572,10 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         packet: &[u8],
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
+        let addressed_receive_cid = match quic_lite::classify_server_datagram(packet) {
+            Ok(quic_lite::ServerDatagram::Established { destination }) => Some(destination),
+            _ => None,
+        };
         let limits = self.limits;
         let association = self.association.clamp::<HISTORY>();
         self.core.set_time(self.last_time);
@@ -499,7 +611,9 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             // association was discarded.
             Err(Error::WrongConnectionId)
                 if self.stateless_reset_key.is_some()
-                    && !self.core.owns_packet(packet, ConnectionServer::expected_receive_cid) =>
+                    && !self
+                        .core
+                        .owns_packet(packet, ConnectionServer::expected_receive_cid) =>
             {
                 self.last_stateless_reset = Some(StatelessResetDiagnostic {
                     cause: StatelessResetCause::UnknownDestinationCid,
@@ -521,15 +635,17 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             quic_lite::ServerConnectionIngress::Accepted { result, retired } => {
                 if retired {
                     self.last_close_at = Some(self.last_time);
+                    self.last_closed_receive_cid = addressed_receive_cid;
                 }
                 Ok(result)
             }
         }
     }
 
-    /// Advance the connection-owned transport clock before receive or egress
-    /// work. Raw bearers supply their monotonic clock; keeping it here makes
-    /// PTO and ACK timing identical across UDP6, action, and UART.
+    /// Advance the connection-owned millisecond transport clock before
+    /// receive or egress work. Platform adapters convert their monotonic
+    /// source once at this boundary; keeping one unit here makes PTO, ACK,
+    /// credit retry, and idle timing identical across UDP6, action, and UART.
     pub fn set_time(&mut self, now: u64) {
         self.last_time = now;
         self.core.set_time(now);
@@ -571,6 +687,25 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             .and_then(ConnectionServer::expected_receive_cid)
     }
 
+    /// Select a live association by its local receive CID and return its
+    /// current opaque path. Deferred handler work must use this instead of a
+    /// bearer path, because several associations may share one UDP tuple.
+    pub fn select_receive_cid(&mut self, receive_cid: ConnectionId) -> Option<PathId> {
+        self.core
+            .select_receive_cid(receive_cid, ConnectionServer::expected_receive_cid)
+    }
+
+    /// Peer receive CID for the currently selected association.  Recovery
+    /// uses this only to distinguish a fresh bootstrap from a replay when it
+    /// replaces an abandoned flash receiver; bearer adapters never route on
+    /// this value.
+    pub fn active_peer_cid(&self) -> Option<ConnectionId> {
+        self.core
+            .active_path()
+            .and_then(|path| self.core.association_for_path(path))
+            .and_then(ConnectionServer::peer_cid)
+    }
+
     /// Snapshot the one active logical association. This remains valid when
     /// the peer moves from UART to UDP or NOW: only the opaque path fields
     /// change after a valid packet; the CIDs and stream totals do not.
@@ -602,6 +737,13 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         self.last_close_at
     }
 
+    /// Receive CID retired by the latest accepted CLOSE. Application
+    /// operation ownership is association-scoped, so a rejected contender
+    /// sharing the same bearer path cannot close another association's sink.
+    pub const fn last_closed_receive_cid(&self) -> Option<ConnectionId> {
+        self.last_closed_receive_cid
+    }
+
     /// Poll delayed control only for the path that last made valid service
     /// progress. This gives current single-association measurements stable
     /// same-bearer replies while preserving a clean hook for multipath policy.
@@ -616,6 +758,34 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         self.core
             .association_for_path_mut(path)
             .map_or(Ok(None), |server| server.poll(output))
+    }
+
+    /// Finish one application receive turn after its stream consumer ran.
+    ///
+    /// An inbound packet can cause an ACK/control datagram before the consumer
+    /// releases storage. If consumption subsequently queues a newer QUIC
+    /// control or response packet, send that packet now; otherwise retain the
+    /// already encoded packet. This keeps one receive turn to one bearer
+    /// datagram without making a flash/file/prober handler depend on a later
+    /// timer turn for its MAX_* update.
+    pub fn finish_receive_turn(
+        &mut self,
+        path: PathId,
+        immediate: Option<usize>,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        // A service response is already the one useful packet for this
+        // receive turn. Do not replace it with a fresh ACK-only packet merely
+        // because the endpoint also has ordinary control pending. ACK/MAX
+        // packets, in contrast, may be superseded by capacity the consumer
+        // just released.
+        if immediate.is_some_and(|used| quic_lite::packet_has_stream_frame(&output[..used])) {
+            return Ok(immediate);
+        }
+        match self.poll_for(path, output)? {
+            Some(used) => Ok(Some(used)),
+            None => Ok(immediate),
+        }
     }
 
     /// Drive one endpoint-owned PTO retransmission on the bearer which last
@@ -638,8 +808,36 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             })
     }
 
+    /// Drive the next association-owned service packet on a valid path.
+    ///
+    /// Newly queued QUIC control (for example a receive-window update after
+    /// any stream consumer releases storage) takes precedence over a due
+    /// retransmission.  Otherwise a flow-blocked peer can repeatedly receive
+    /// an older packet while the one packet that grants it more credit stays
+    /// queued.  Both packets remain wholly QUIC-lite owned; this only chooses
+    /// their service order and is independent of bearer and handler.
+    pub fn poll_service_for(
+        &mut self,
+        path: PathId,
+        now_us: u64,
+        pto_us: u64,
+        output: &mut [u8; PACKET],
+    ) -> Result<Option<usize>, Error> {
+        self.poll_for(path, output)?.map_or_else(
+            || self.poll_retransmit_for(path, now_us, pto_us, output),
+            |used| Ok(Some(used)),
+        )
+    }
+
     pub fn reply_path(&self) -> Option<PathId> {
         self.core.active_path()
+    }
+
+    /// Whether an admitted association still owns this opaque platform path.
+    /// Adapters use this only to reclaim stale address bindings; it exposes no
+    /// CID, peer address, or transport state.
+    pub fn has_path(&self, path: PathId) -> bool {
+        self.core.association_for_path(path).is_some()
     }
 
     /// Whether `packet` is addressed to this dispatcher's live server
@@ -748,6 +946,15 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             .and_then(|server| server.next_service_deadline(pto))
     }
 
+    /// Earliest timer target across all live associations. The receive CID
+    /// keeps two clients on one physical path distinct.
+    pub fn next_service_target(&self, pto: u64) -> Option<(ConnectionId, PathId, u64)> {
+        self.core
+            .earliest_deadline(ConnectionServer::expected_receive_cid, |server| {
+                server.next_service_deadline(pto)
+            })
+    }
+
     /// Return bounded ACK ranges and retained packet numbers for automated
     /// bearer diagnostics.  The host action adapter serializes this into its
     /// event history; firmware can consume the same structure without a
@@ -758,48 +965,390 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         Some(connection.debug_state())
     }
 
-    pub fn take_flash_request(&mut self) -> Option<Vec<u8>> {
+    /// Take one tagged command which requires a following inbound stream.
+    /// The application owns decoding and decides whether to accept it.
+    pub fn take_stream_command(&mut self) -> Option<Vec<u8>> {
         let path = self.core.active_path()?;
         self.core
             .association_for_path_mut(path)?
-            .take_flash_request()
+            .take_stream_command()
     }
 
-    /// Take ordered object-upload fragments for the active flash command.
-    pub fn take_flash_object_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
+    /// Take ordered fragments from the stream claimed by the active command.
+    fn take_inbound_stream_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
         let Some(path) = self.core.active_path() else {
             return Vec::new();
         };
         self.core
             .association_for_path_mut(path)
-            .map_or_else(Vec::new, ConnectionServer::take_flash_object_chunks)
+            .map_or_else(Vec::new, ConnectionServer::take_inbound_stream_chunks)
     }
 
-    pub fn complete_flash(&mut self, response: Vec<u8>) -> Result<(), Error> {
+    /// Whether the currently selected association has ordered application
+    /// bytes ready for its stream consumer. Receive callbacks use this to
+    /// avoid invoking a storage hook on a command-only packet; asynchronous
+    /// storage completion has its separate explicit maintenance turn.
+    pub fn has_inbound_stream_chunks(&self) -> bool {
+        let Some(path) = self.core.active_path() else {
+            return false;
+        };
+        self.core
+            .association_for_path(path)
+            .is_some_and(ConnectionServer::has_inbound_stream_chunks)
+    }
+
+    /// Queue an already encoded handler response after its inbound stream is
+    /// complete. Tagged response construction is deliberately handler code.
+    pub fn complete_stream_command(&mut self, response: Vec<u8>) -> Result<(), Error> {
         let path = self.core.active_path().ok_or(Error::Invalid)?;
         self.core
             .association_for_path_mut(path)
             .ok_or(Error::Invalid)?
-            .complete_flash(response)
+            .complete_stream_command(response)
     }
 
-    pub fn grant_flash_receive_window(&mut self, window_bytes: usize) -> Result<(), Error> {
+    /// Whether the active application operation has queued a terminal
+    /// response. Runtimes use this only for lifecycle transitions after the
+    /// connection emits that response; packet ownership remains in QUIC-lite.
+    pub fn terminal_response_pending(&self) -> bool {
+        self.core
+            .active_path()
+            .and_then(|path| self.core.association_for_path(path))
+            .is_some_and(ConnectionServer::terminal_response_pending)
+    }
+
+    /// Opaque snapshot of the currently encoded terminal response.
+    pub fn terminal_response_snapshot(&self) -> Option<TerminalResponseSnapshot> {
+        let path = self.core.active_path()?;
+        let server = self.core.association_for_path(path)?;
+        Some(TerminalResponseSnapshot {
+            receive_cid: server.expected_receive_cid()?,
+            stream: server.terminal_response_stream?,
+        })
+    }
+
+    /// Association whose encoded response differs from `before`.
+    pub fn terminal_response_started_after(
+        &self,
+        before: Option<TerminalResponseSnapshot>,
+    ) -> Option<ConnectionId> {
+        let current = self.terminal_response_snapshot()?;
+        (Some(current) != before).then_some(current.receive_cid)
+    }
+
+    /// Take the active association's generic terminal-response delivery edge.
+    /// QUIC-lite has already processed the peer acknowledgement internally.
+    pub fn take_terminal_response_delivered(&mut self) -> Option<ConnectionId> {
+        let Some(path) = self.core.active_path() else {
+            return None;
+        };
+        let server = self.core.association_for_path_mut(path)?;
+        let receive_cid = server.expected_receive_cid()?;
+        server
+            .take_terminal_response_delivered()
+            .then_some(receive_cid)
+    }
+
+    fn grant_inbound_stream_window(&mut self, window_bytes: usize) -> Result<(), Error> {
         let path = self.core.active_path().ok_or(Error::Invalid)?;
         self.core
             .association_for_path_mut(path)
             .ok_or(Error::Invalid)?
-            .grant_flash_receive_window(window_bytes)
+            .grant_inbound_stream_window(window_bytes)
     }
 
-    /// Release the correlated flash request after its QUIC association has
-    /// explicitly closed. The ESP sink is released by its platform owner.
-    pub fn abandon_flash(&mut self) {
+    /// Reserve the peer stream which follows the admitted command, then
+    /// publish its handler-owned initial window.
+    fn prepare_inbound_stream_window(&mut self, window_bytes: usize) -> Result<(), Error> {
+        let path = self.core.active_path().ok_or(Error::Invalid)?;
+        self.core
+            .association_for_path_mut(path)
+            .ok_or(Error::Invalid)?
+            .prepare_inbound_stream_window(window_bytes)
+    }
+
+    /// Release the active handler-neutral stream command after its QUIC
+    /// association has explicitly closed. The platform consumer owns its
+    /// sink lifetime.
+    pub fn abandon_stream_command(&mut self) {
         if let Some(path) = self.core.active_path()
             && let Some(server) = self.core.association_for_path_mut(path)
         {
-            server.abandon_flash();
+            server.abandon_stream_command();
         }
     }
+}
+
+/// Run one complete server ingress turn for every datagram bearer.
+///
+/// Host simulations, Main, and Recovery use this same ordering: advance the
+/// transport clock, let the application expire stale state, admit the packet,
+/// deliver ordered stream bytes, then prefer newly released MAX_* credit over
+/// an older ACK-only packet. The physical adapter only supplies complete
+/// datagrams, an opaque path, time, and a buffer for the returned datagram.
+pub fn receive_server_turn<
+    Before,
+    After,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    path: PathId,
+    packet: &[u8],
+    now: u64,
+    output: &mut [u8; PACKET],
+    before_receive: Before,
+    after_receive: After,
+) -> Result<Option<usize>, Error>
+where
+    Before: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, u64),
+    After: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, PathId, u64, bool),
+{
+    service.set_time(now);
+    before_receive(service, now);
+    let close_before = service.last_close_at();
+    let immediate = service.receive(path, packet, output)?;
+    let closed = service.last_close_at() != close_before;
+    after_receive(service, path, now, closed);
+    service.finish_receive_turn(path, immediate, output)
+}
+
+/// Run the common application-maintenance and QUIC control/PTO turn.
+/// Adapters schedule this at [`ConnectionDispatcher::next_service_deadline`]
+/// and transmit the returned datagram without interpreting it.
+pub fn poll_server_turn<
+    Before,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    path: PathId,
+    now: u64,
+    pto: u64,
+    output: &mut [u8; PACKET],
+    before_poll: Before,
+) -> Result<Option<usize>, Error>
+where
+    Before: FnOnce(&mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, PathId, u64),
+{
+    service.set_time(now);
+    before_poll(service, path, now);
+    service.poll_service_for(path, now, pto, output)
+}
+
+/// Publish application storage completion and immediately run the same
+/// control/PTO selection used by an ordinary timer turn.
+pub fn storage_ready_server_turn<
+    Ready,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    now: u64,
+    pto: u64,
+    output: &mut [u8; PACKET],
+    storage_ready: Ready,
+) -> Result<Option<(PathId, usize)>, Error>
+where
+    Ready: FnOnce(
+        &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+        u64,
+    ) -> Result<Option<PathId>, ()>,
+{
+    service.set_time(now);
+    let Some(path) = storage_ready(service, now).map_err(|_| Error::Invalid)? else {
+        return Ok(None);
+    };
+    service
+        .poll_service_for(path, now, pto, output)
+        .map(|packet| packet.map(|used| (path, used)))
+}
+
+/// Application result from consuming one batch of ordered QUIC stream bytes.
+/// The consumer reports storage facts only; ACKs, retransmission, and packet
+/// scheduling remain private to QUIC-lite and [`ConnectionDispatcher`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboundStreamConsumption {
+    /// At least one new application byte entered the consumer. Only this edge
+    /// should refresh an application-level idle deadline.
+    pub application_progress: bool,
+    /// Capacity reclaimed by asynchronous storage work during this callback.
+    pub reclaimed_credit: usize,
+    /// Current absolute application receive boundary after consumption.
+    pub receive_window: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboundStreamTurn {
+    pub had_chunks: bool,
+    pub application_progress: bool,
+    pub reclaimed_credit: usize,
+    pub window_published: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundStreamTurnError<E> {
+    Consumer(E),
+    Transport(Error),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ExclusiveInboundStreamTurnError<T, E> {
+    /// The application rejected the ordered bytes. The failed operation has
+    /// already been removed, so a later request cannot remain falsely busy.
+    Consumer { request_id: u64, value: T, error: E },
+    /// QUIC could not publish the resulting receive boundary. The application
+    /// remains owned because its already-consumed state must not be discarded.
+    Transport(Error),
+}
+
+/// Reserve the application stream following an admitted command and publish
+/// the consumer's initial storage boundary. Keeping this beside
+/// [`consume_inbound_stream`] prevents handlers from manipulating QUIC flow
+/// control directly.
+pub fn prepare_inbound_stream<
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    initial_window: usize,
+) -> Result<(), Error> {
+    service.prepare_inbound_stream_window(initial_window)
+}
+
+/// Consume the dispatcher's committed ordered chunks and publish the current
+/// absolute application window in the same server turn.
+///
+/// Firmware and host/fake constrained sinks use this exact edge. Probe and
+/// future file receivers can use it without adding handler-specific packet
+/// loops. The injected closure is the only application-specific part; it
+/// performs no packet I/O and returns only consumption/storage state.
+pub fn consume_inbound_stream<
+    Consume,
+    ConsumerError,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    consume: Consume,
+) -> Result<InboundStreamTurn, InboundStreamTurnError<ConsumerError>>
+where
+    Consume: FnOnce(Vec<(Vec<u8>, bool)>) -> Result<InboundStreamConsumption, ConsumerError>,
+{
+    let chunks = service.take_inbound_stream_chunks();
+    let had_chunks = !chunks.is_empty();
+    let consumed = consume(chunks).map_err(InboundStreamTurnError::Consumer)?;
+    let window_published = consumed.reclaimed_credit != 0 || had_chunks;
+    if window_published {
+        service
+            .grant_inbound_stream_window(consumed.receive_window)
+            .map_err(InboundStreamTurnError::Transport)?;
+    }
+    Ok(InboundStreamTurn {
+        had_chunks,
+        application_progress: consumed.application_progress,
+        reclaimed_credit: consumed.reclaimed_credit,
+        window_published,
+    })
+}
+
+/// Consume one admitted exclusive operation's ordered stream bytes.
+///
+/// This joins only application lifecycle facts: the owning association and
+/// its idle deadline. Packet acknowledgement, retransmission, and receive
+/// window encoding remain inside [`consume_inbound_stream`] and QUIC-lite.
+/// Host/fake sinks and firmware flash use this exact turn so a storage-ready
+/// callback cannot differ from an ordinary receive callback in how progress
+/// keeps the operation alive.
+pub fn consume_exclusive_inbound_stream<
+    T,
+    Consume,
+    ConsumerError,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    operation: &mut crate::verified_object::ExclusiveTransfer<T>,
+    owner: ConnectionId,
+    now: u64,
+    idle_timeout: u64,
+    consume: Consume,
+) -> Result<InboundStreamTurn, ExclusiveInboundStreamTurnError<T, ConsumerError>>
+where
+    Consume:
+        FnOnce(&mut T, Vec<(Vec<u8>, bool)>) -> Result<InboundStreamConsumption, ConsumerError>,
+{
+    let turn = match consume_inbound_stream(service, |chunks| {
+        let value = operation
+            .get_mut_for(owner)
+            .expect("exclusive stream owner must remain active during its consume turn");
+        consume(value, chunks)
+    }) {
+        Ok(turn) => turn,
+        Err(InboundStreamTurnError::Consumer(error)) => {
+            let request_id = operation
+                .request_id_for(owner)
+                .expect("exclusive stream owner must retain its request id");
+            let value = operation
+                .take_for(owner)
+                .expect("exclusive stream owner must remain active after consumer failure");
+            return Err(ExclusiveInboundStreamTurnError::Consumer {
+                request_id,
+                value,
+                error,
+            });
+        }
+        Err(InboundStreamTurnError::Transport(error)) => {
+            return Err(ExclusiveInboundStreamTurnError::Transport(error));
+        }
+    };
+    if turn.application_progress {
+        let retained = operation.touch(owner, now, idle_timeout);
+        debug_assert!(
+            retained,
+            "exclusive stream owner changed during consume turn"
+        );
+    }
+    Ok(turn)
+}
+
+/// Consume an exclusive stream only when QUIC has committed ordered bytes.
+///
+/// This is the normal packet-ingress edge. It deliberately does not poll an
+/// application sink for asynchronous completion on an empty turn; callers use
+/// [`consume_exclusive_inbound_stream`] from their explicit storage-ready turn
+/// for that purpose. Host fakes and firmware therefore exercise the same
+/// callback boundary.
+pub fn consume_available_exclusive_inbound_stream<
+    T,
+    Consume,
+    ConsumerError,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    operation: &mut crate::verified_object::ExclusiveTransfer<T>,
+    owner: ConnectionId,
+    now: u64,
+    idle_timeout: u64,
+    consume: Consume,
+) -> Result<Option<InboundStreamTurn>, ExclusiveInboundStreamTurnError<T, ConsumerError>>
+where
+    Consume:
+        FnOnce(&mut T, Vec<(Vec<u8>, bool)>) -> Result<InboundStreamConsumption, ConsumerError>,
+{
+    if !service.has_inbound_stream_chunks() {
+        return Ok(None);
+    }
+    consume_exclusive_inbound_stream(service, operation, owner, now, idle_timeout, consume)
+        .map(Some)
 }
 
 /// Thread-safe owner for one bearer-neutral connection dispatcher.
@@ -1281,6 +1830,7 @@ impl<const HISTORY: usize, const PACKET: usize> TaggedClient<HISTORY, PACKET> {
             self.response_len += frame.data.len();
             endpoint.stream_consumed(frame.id, frame.data.len())?;
             if frame.fin {
+                endpoint.request_stream_reack();
                 self.complete = true;
                 self.next_server_bidi_stream_id =
                     expected_stream.checked_add(4).ok_or(Error::Invalid)?;
@@ -1552,13 +2102,13 @@ impl<const HISTORY: usize, const PACKET: usize> ProbeClient<HISTORY, PACKET> {
 
     /// Construct the client directly in caller-provided static storage.
     ///
-    /// ESP radio command tasks have deliberately small stacks, while an
-    /// `Option<EndpointState<..>>` reserves the complete bounded ledger even
-    /// before the bootstrap reply arrives.  The usual return-by-value
-    /// constructor is ideal for host code, but it can transiently materialize
-    /// that ledger on an embedded command stack.  This variant writes every
-    /// field into the supplied destination and leaves allocation policy with
-    /// the adapter; it retains the same fixed HISTORY/PACKET bound as `new`.
+    /// ESP radio command tasks have deliberately small stacks. The QUIC
+    /// ledger itself is the same heap-backed `Vec` used by host, but the probe
+    /// receiver's bounded multi-stream callback state is still large enough
+    /// that returning the complete client by value can transiently exceed an
+    /// embedded task stack. This changes only construction placement: every
+    /// subsequently executed driver, stream, and ledger method is identical
+    /// to [`Self::new`]. Host tests cover both constructors' wire state.
     pub fn new_in_place(
         storage: &mut MaybeUninit<Self>,
         client_cid: ConnectionId,
@@ -1872,8 +2422,8 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
     }
 
     /// Whether the admitted QUIC peer explicitly retired this connection
-    /// association. A dispatcher uses this to release the fixed ledger before
-    /// accepting the next bootstrap.
+    /// association. A dispatcher uses this to release the association-owned,
+    /// admission-sized ledger before accepting the next bootstrap.
     pub fn is_closed(&self) -> bool {
         self.connection
             .as_ref()
@@ -1907,11 +2457,12 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
             connection: None,
             sender: None,
             probe_request_stream: None,
-            pending_flash: None,
-            pending_flash_id: None,
-            flash_response: None,
-            flash_object_stream: None,
-            flash_object_chunks: Vec::new(),
+            pending_stream_command: None,
+            command_stream: None,
+            terminal_stream_response: None,
+            terminal_response_stream: None,
+            inbound_stream: None,
+            inbound_stream_chunks: Vec::new(),
             association: association.clamp::<HISTORY>(),
         }
     }
@@ -1971,9 +2522,10 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         // Ordered stream callbacks retain only datagrams which arrived ahead
         // of a gap.  Size that shared reordering allowance from this
         // association's already-bounded packet ledger, rather than the old
-        // 4 KiB generic RPC default: a normal eight-packet Wi-Fi flight can
+        // 4 KiB generic RPC default: a normal bounded Wi-Fi flight can
         // otherwise be rejected before it reaches the application sink.
         let stream_config = ServerStreamConfig {
+            history_packets: association.history_packets,
             max_pending_streams: quic_lite::DEFAULT_STREAM_STATE_SLOTS,
             // The callback retains only out-of-order datagrams, but a gap can
             // span the receiver's admitted byte window even when its local
@@ -2021,11 +2573,12 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
                 connection: Some(connection),
                 sender: None,
                 probe_request_stream: None,
-                pending_flash: None,
-                pending_flash_id: None,
-                flash_response: None,
-                flash_object_stream: None,
-                flash_object_chunks: Vec::new(),
+                pending_stream_command: None,
+                command_stream: None,
+                terminal_stream_response: None,
+                terminal_response_stream: None,
+                inbound_stream: None,
+                inbound_stream_chunks: Vec::new(),
                 association: association.clamp::<HISTORY>(),
             },
             Some(ack.len()),
@@ -2056,30 +2609,36 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         output: &mut [u8; PACKET],
     ) -> Result<Option<usize>, Error> {
         let connection = self.connection.as_mut().ok_or(Error::WrongConnectionId)?;
-        let object_stream = self.flash_object_stream;
-        let mut object_chunks = Vec::new();
-        let request = match object_stream {
+        let inbound_stream = self.inbound_stream;
+        let mut inbound_chunks = Vec::new();
+        let request = match inbound_stream {
             Some(stream) => {
                 connection
                     .mux
                     .receive_request_with_stream(packet, stream, |id, fin, bytes| {
                         if id == stream {
-                            object_chunks.push((bytes.to_vec(), fin));
+                            inbound_chunks.push((bytes.to_vec(), fin));
                             return Ok(());
                         }
-                        // Stream 4 may be retransmitted while stream 8 is
-                        // active. Let the normal request path below identify
+                        // The command stream may be retransmitted while its
+                        // dynamically allocated object stream is active. Let
+                        // the normal request path below identify
                         // the same flash request and make that replay
                         // idempotent; rejecting it here strands a valid
                         // two-stream upload on an unrelated packet loss.
-                        (id == quic_lite::FIRST_CLIENT_BIDI_STREAM_ID)
-                            .then_some(())
-                            .ok_or(())
+                        (Some(id) == self.command_stream).then_some(()).ok_or(())
                     })?
             }
             None => connection.receive_request(packet)?,
         };
-        self.flash_object_chunks.extend(object_chunks);
+        self.inbound_stream_chunks.extend(inbound_chunks);
+        // Stream fragments are already handed to the application consumer
+        // after this receive turn. They are not tagged commands, so do not
+        // fall through to command dispatch and turn valid ordered bytes into
+        // `Invalid`; emit ordinary QUIC ACK/control.
+        if request.is_none() && !self.inbound_stream_chunks.is_empty() {
+            return self.poll(output);
+        }
         if let Some(request) = request {
             let tagged_probe = crate::tagged::decode(&request.data)
                 .and_then(crate::probe::decode_probe_run_record)
@@ -2100,9 +2659,22 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
                     diagnostic.or_else(|| crate::services::dispatch_tagged_stream(&request.data))
                 {
                     connection.complete_request(request.stream_id, request.data.len())?;
-                    return connection
-                        .encode_response(&response, output)
-                        .map(|(used, _)| Some(used));
+                    let response_stream = connection.response_stream_id();
+                    match connection.encode_response(&response, output) {
+                        Ok((used, _)) => {
+                            self.terminal_response_stream = Some(response_stream);
+                            return Ok(Some(used));
+                        }
+                        Err(Error::FlowControl | Error::HistoryFull) => {
+                            // Immediate and deferred handlers share the same
+                            // terminal-response queue. QUIC-lite may need an
+                            // ACK/control turn before its send ledger admits
+                            // this result; never discard handler completion.
+                            self.terminal_stream_response = Some(response);
+                            return connection.poll_transmit(output);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             // A lost response can make the client retransmit the final
@@ -2127,40 +2699,25 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
             if self.sender.is_some() {
                 return Err(Error::Invalid);
             }
-            if let Some((id, flash_request)) = decode_flash_handler_request(&request.data) {
-                // Stream 4 is the fixed command stream for this two-stream
-                // operation.  Its FIN may be retransmitted while the object
-                // sink on stream 8 is active: QUIC-lite has already accepted
-                // that duplicate range, so preserve the live receiver and
-                // emit its ordinary ACK/window progress instead of treating
-                // the replay as a second flash request.
-                if request.stream_id == quic_lite::FIRST_CLIENT_BIDI_STREAM_ID
-                    && self.flash_object_stream == Some(FLASH_OBJECT_STREAM)
-                    && self.pending_flash_id == Some(id)
-                {
+            if tagged_probe.is_none() {
+                // Keep command semantics above this generic transport layer.
+                // A client-side bidi stream sequence is assigned by QUIC-lite;
+                // this only reserves the following peer stream as opaque
+                // ordered application input.
+                if self.command_stream == Some(request.stream_id) && self.inbound_stream.is_some() {
                     return self.poll(output);
                 }
-                if self.pending_flash.is_some()
-                    || self.pending_flash_id.is_some()
-                    || self.flash_response.is_some()
+                if self.pending_stream_command.is_some()
+                    || self.command_stream.is_some()
+                    || self.terminal_stream_response.is_some()
                 {
                     return Err(Error::Invalid);
                 }
-                let fields = crate::tagged::decode(&request.data)
-                    .and_then(|record| record.fields)
-                    .ok_or(Error::Invalid)?;
-                debug_assert_eq!(
-                    crate::protocol::decode_flash_request(fields),
-                    Some(flash_request)
-                );
-                self.pending_flash = Some(fields.to_vec());
-                self.pending_flash_id = Some(id);
-                self.flash_object_stream = Some(FLASH_OBJECT_STREAM);
+                self.pending_stream_command = Some(request.data.to_vec());
+                self.command_stream = Some(request.stream_id);
+                self.inbound_stream = Some(request.stream_id.checked_add(4).ok_or(Error::Invalid)?);
                 connection.complete_request(request.stream_id, request.data.len())?;
                 return Ok(None);
-            }
-            if tagged_probe.is_none() {
-                return Err(Error::Invalid);
             }
             let request_spec = tagged_probe.ok_or(Error::Invalid)?;
             let plan = ProbeServicePlan::from_request(request_spec, PACKET.saturating_sub(32));
@@ -2194,10 +2751,23 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
     /// Produce one PROBE packet when transport flow credit permits it.
     pub fn poll(&mut self, output: &mut [u8; PACKET]) -> Result<Option<usize>, Error> {
         let connection = self.connection.as_mut().ok_or(Error::WrongConnectionId)?;
-        if let Some(response) = self.flash_response.take() {
-            return connection
-                .encode_response(&response, output)
-                .map(|(used, _)| Some(used));
+        if let Some(response) = self.terminal_stream_response.as_deref() {
+            let response_stream = connection.response_stream_id();
+            match connection.encode_response(response, output) {
+                Ok((used, _)) => {
+                    self.terminal_stream_response = None;
+                    self.terminal_response_stream = Some(response_stream);
+                    return Ok(Some(used));
+                }
+                // The response has not entered QUIC-lite's retransmission
+                // ledger yet. Keep application completion state intact and
+                // let ordinary transport ACK/MAX/PTO output free admission;
+                // a later poll retries on the same server stream.
+                Err(Error::FlowControl | Error::HistoryFull) => {
+                    return connection.poll_transmit(output);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let Some(sender) = self.sender.as_mut() else {
             return connection.poll_transmit(output);
@@ -2227,26 +2797,30 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
             .and_then(|connection| connection.next_bearer_deadline(pto))
     }
 
-    /// Take one validated device-flash command. The platform handler owns the
-    /// sink and object-client lifecycle, while this shared server retains the
-    /// original request stream until [`Self::complete_flash`] supplies its
-    /// final response.
-    pub fn take_flash_request(&mut self) -> Option<Vec<u8>> {
-        self.pending_flash.take()
+    /// Take one validated tagged command for a handler which consumes the
+    /// next peer bidi stream. This server deliberately does not decode it.
+    pub fn take_stream_command(&mut self) -> Option<Vec<u8>> {
+        self.pending_stream_command.take()
     }
 
-    /// Take ordered signed-object fragments from the flash upload stream.
-    /// This is an application payload handoff; QUIC-lite has already handled
-    /// frame parsing, reordering, duplicate suppression, ACKs, and credit.
-    pub fn take_flash_object_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
-        core::mem::take(&mut self.flash_object_chunks)
+    /// Take ordered bytes from the active application-owned inbound stream.
+    /// QUIC-lite has already handled frame parsing, reordering, duplicate
+    /// suppression, ACKs, and credit.
+    fn take_inbound_stream_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
+        core::mem::take(&mut self.inbound_stream_chunks)
     }
 
-    /// Publish application storage which is available again to the peer.
-    /// `window_bytes` is the sink's current sliding-window capacity; QUIC-lite
+    fn has_inbound_stream_chunks(&self) -> bool {
+        !self.inbound_stream_chunks.is_empty()
+    }
+
+    /// Publish storage reclaimed by the active stream consumer. QUIC-lite
     /// owns the absolute MAX_DATA/MAX_STREAM_DATA values and their emission.
-    pub fn grant_flash_receive_window(&mut self, window_bytes: usize) -> Result<(), Error> {
-        if window_bytes == 0 || self.flash_object_stream != Some(FLASH_OBJECT_STREAM) {
+    fn grant_inbound_stream_window(&mut self, window_bytes: usize) -> Result<(), Error> {
+        let Some(stream) = self.inbound_stream else {
+            return Ok(());
+        };
+        if window_bytes == 0 {
             return Ok(());
         }
         self.connection
@@ -2254,38 +2828,72 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
             .ok_or(Error::WrongConnectionId)?
             .mux
             .endpoint
-            .grant_receive_window(FLASH_OBJECT_STREAM, window_bytes as u64)
+            .grant_receive_window(stream, window_bytes as u64)
     }
 
-    /// Queue the final response only after the platform reports that its
-    /// signed-object sink is durable. This never blocks packet ingress.
-    pub fn complete_flash(&mut self, response: Vec<u8>) -> Result<(), Error> {
-        if self.pending_flash.is_some() || self.flash_response.is_some() {
+    /// Reserve the stream following the accepted command so its consumer can
+    /// advertise its actual initial storage window without a deadlock.
+    fn prepare_inbound_stream_window(&mut self, window_bytes: usize) -> Result<(), Error> {
+        let Some(stream) = self.inbound_stream else {
+            return Ok(());
+        };
+        if window_bytes == 0 {
+            return Ok(());
+        }
+        let endpoint = &mut self
+            .connection
+            .as_mut()
+            .ok_or(Error::WrongConnectionId)?
+            .mux
+            .endpoint;
+        endpoint.prepare_receive_stream(stream)?;
+        endpoint.grant_receive_window(stream, window_bytes as u64)
+    }
+
+    /// Queue a handler-owned terminal response. This never blocks ingress.
+    pub fn complete_stream_command(&mut self, response: Vec<u8>) -> Result<(), Error> {
+        if self.pending_stream_command.is_some() || self.terminal_stream_response.is_some() {
             return Err(Error::Invalid);
         }
-        let id = self.pending_flash_id.take().ok_or(Error::Invalid)?;
-        let mut tagged = alloc::vec![0; response.len().saturating_add(64)];
-        let used = crate::tagged::encode_numeric_data_response(
-            crate::protocol::OBJECT_COMPONENT,
-            crate::protocol::OBJECT_FLASH_METHOD,
-            id,
-            &response,
-            core::str::from_utf8(&response).is_ok(),
-            &mut tagged,
-        )
-        .ok_or(Error::Invalid)?;
-        tagged.truncate(used);
-        self.flash_response = Some(tagged);
+        if self.command_stream.is_none() {
+            return Err(Error::Invalid);
+        }
+        self.terminal_stream_response = Some(response);
+        self.terminal_response_stream = None;
         Ok(())
     }
 
-    /// Forget flash bookkeeping when CLOSE has already retired the peer.
-    pub fn abandon_flash(&mut self) {
-        self.pending_flash = None;
-        self.pending_flash_id = None;
-        self.flash_response = None;
-        self.flash_object_stream = None;
-        self.flash_object_chunks.clear();
+    /// Consume the lifecycle edge after QUIC-lite has retired the terminal
+    /// response from its retransmission ledger. Applications can attach a
+    /// post-response action without learning ACK or packet-number details.
+    pub fn take_terminal_response_delivered(&mut self) -> bool {
+        let Some(stream) = self.terminal_response_stream else {
+            return false;
+        };
+        let delivered = self
+            .connection
+            .as_mut()
+            .is_some_and(|connection| connection.take_acknowledged_fin_stream(stream));
+        if delivered {
+            self.terminal_response_stream = None;
+        }
+        delivered
+    }
+
+    /// True until `poll` encodes the terminal application response.
+    pub const fn terminal_response_pending(&self) -> bool {
+        self.terminal_stream_response.is_some()
+    }
+
+    /// Forget handler-neutral inbound-stream bookkeeping when CLOSE retires
+    /// the peer.
+    pub fn abandon_stream_command(&mut self) {
+        self.pending_stream_command = None;
+        self.command_stream = None;
+        self.terminal_stream_response = None;
+        self.terminal_response_stream = None;
+        self.inbound_stream = None;
+        self.inbound_stream_chunks.clear();
     }
 
     /// Let the connection-owned ledger produce a retransmission. The raw
@@ -2402,6 +3010,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_completion_gate_accepts_both_platform_event_orders() {
+        let mut durable_first = TerminalCompletionGate::default();
+        durable_first.application_complete();
+        assert!(!durable_first.take_complete());
+        durable_first.response_delivered();
+        assert!(durable_first.take_complete());
+        assert!(!durable_first.take_complete());
+
+        // This is the Recovery device regression: the response can leave in
+        // the receive turn before its outer loop observes sink durability.
+        let mut response_first = TerminalCompletionGate::default();
+        response_first.response_delivered();
+        assert!(!response_first.take_complete());
+        response_first.application_complete();
+        assert!(response_first.take_complete());
+    }
+
+    #[test]
     fn firmware_association_memory_budget_is_bounded() {
         type Server = ConnectionServer<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
         type Ledger = StreamServerConnection<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>;
@@ -2493,6 +3119,55 @@ mod tests {
         ConnectionLimits, DatagramClientDriver, EndpointState, Role,
         encode_bootstrap_open_packet_with_profile,
     };
+
+    struct HostDelayedObjectSink {
+        bytes: Vec<u8>,
+        pending_credit: usize,
+        polls: usize,
+        release_every: usize,
+        capacity: usize,
+        available: usize,
+        durable: bool,
+    }
+
+    impl crate::verified_object::ImageSink for HostDelayedObjectSink {
+        type Error = ();
+
+        fn begin(&mut self, _: &crate::verified_object::ImageManifest) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn write_block(&mut self, _: u32, data: &[u8]) -> Result<(), Self::Error> {
+            self.bytes.extend_from_slice(data);
+            let retained = data.len().saturating_add(17);
+            self.available = self.available.saturating_sub(retained);
+            self.pending_credit = self.pending_credit.saturating_add(retained);
+            Ok(())
+        }
+
+        fn finish(&mut self, _: &crate::verified_object::ImageManifest) -> Result<(), Self::Error> {
+            self.durable = true;
+            Ok(())
+        }
+
+        fn abort(&mut self) {}
+    }
+
+    impl crate::verified_object::StreamingImageSink for HostDelayedObjectSink {
+        fn receive_window_bytes(&self) -> usize {
+            self.available
+        }
+
+        fn poll_completed(&mut self) -> Result<usize, Self::Error> {
+            self.polls = self.polls.saturating_add(1);
+            if self.polls % self.release_every != 0 {
+                return Ok(0);
+            }
+            let credit = core::mem::take(&mut self.pending_credit);
+            self.available = self.capacity.min(self.available.saturating_add(credit));
+            Ok(credit)
+        }
+    }
 
     #[test]
     fn retained_tagged_client_owns_later_client_stream_ids() {
@@ -2673,7 +3348,7 @@ mod tests {
         let mut out = [0u8; 1200];
         listener.receive(&open[..open_len], &mut out).unwrap();
 
-        let request = crate::protocol::FlashRequest {
+        let request = crate::verified_object::FlashRequest {
             object: GetRequest {
                 name: None,
                 cpu: 13,
@@ -2685,7 +3360,7 @@ mod tests {
         };
         let mut body = [0u8; 128];
         let body_len =
-            crate::protocol::encode_flash_handler_request(request, 7, &mut body).unwrap();
+            crate::verified_object::encode_flash_handler_request(request, 7, &mut body).unwrap();
         let mut endpoint =
             EndpointState::<4, 4, 1200>::new(Role::Client, ConnectionLimits::default(), 1200);
         endpoint.install_connection_ids(client, server).unwrap();
@@ -2709,12 +3384,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(listener.receive(&packet[..used], &mut out).unwrap(), None);
-        let fields = crate::tagged::decode(&body[..body_len])
-            .unwrap()
-            .fields
-            .unwrap();
-        assert_eq!(listener.take_flash_request().unwrap(), fields);
-        // A lost ACK can replay the command-stream FIN while stream 8 is
+        assert_eq!(listener.take_stream_command().unwrap(), body[..body_len]);
+        // A lost ACK can replay the command-stream FIN while the dynamically
+        // selected object stream is
         // already owned by the platform flash sink. That replay must retain
         // the sink and yield ordinary transport progress, not reject it as a
         // second flash command.
@@ -2722,8 +3394,23 @@ mod tests {
         // The request may have released a transport ACK, but not an
         // application response before durable flash completion.
         let _ = listener.poll(&mut out).unwrap();
-        listener.complete_flash(b"flash complete".to_vec()).unwrap();
+        let mut tagged = [0_u8; 128];
+        let tagged_len = crate::tagged::encode_numeric_data_response(
+            crate::verified_object::OBJECT_COMPONENT,
+            crate::verified_object::OBJECT_FLASH_METHOD,
+            7,
+            b"flash complete",
+            true,
+            &mut tagged,
+        )
+        .unwrap();
+        listener
+            .complete_stream_command(tagged[..tagged_len].to_vec())
+            .unwrap();
+        assert!(listener.terminal_response_pending());
         let response_len = listener.poll(&mut out).unwrap().unwrap();
+        assert!(!listener.terminal_response_pending());
+        assert!(!listener.take_terminal_response_delivered());
         let response = endpoint.receive_datagram(&out[..response_len]).unwrap();
         let TransportPacket::Stream { frame, .. } = response else {
             panic!("expected tagged flash response stream");
@@ -2735,18 +3422,162 @@ mod tests {
         let mut result = crate::cbor::Decoder::new(record.result.unwrap());
         assert_eq!(result.text_ref(), Some(&b"flash complete"[..]));
         assert!(result.is_finished());
+        // The terminal response ACK must make this association reclaimable
+        // even if the client's subsequent CLOSE is lost. Firmware cannot
+        // retain one heap-backed ledger per short-lived CLI process until a
+        // large host-style table fills.
+        endpoint.set_time(100);
+        let ack_len = endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        listener.receive(&packet[..ack_len], &mut out).unwrap();
+        assert!(listener.take_terminal_response_delivered());
+        assert!(!listener.take_terminal_response_delivered());
+        assert_eq!(listener.active_stream_count(), 0);
     }
 
     #[test]
-    fn flash_object_credit_after_an_immediate_ack_advances_stream_eight() {
+    fn finish_receive_turn_preserves_an_immediate_transport_packet() {
+        let path = PathId::new(1).unwrap();
+        let mut dispatcher = ConnectionDispatcher::<2, 1200>::new(
+            ConnectionId::new(61).unwrap(),
+            ConnectionLimits::default(),
+            AssociationProfile::conservative(),
+        );
+        let mut output = [0u8; 1200];
+        assert_eq!(
+            dispatcher
+                .finish_receive_turn(path, Some(73), &mut output)
+                .unwrap(),
+            Some(73)
+        );
+        assert_eq!(
+            dispatcher
+                .finish_receive_turn(path, None, &mut output)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_consumer_turn_distinguishes_idle_consumer_and_transport_failures() {
+        let mut dispatcher = ConnectionDispatcher::<2, 1200>::new(
+            ConnectionId::new(71).unwrap(),
+            ConnectionLimits::default(),
+            AssociationProfile::conservative(),
+        );
+        assert_eq!(
+            consume_inbound_stream(&mut dispatcher, |chunks| {
+                assert!(chunks.is_empty());
+                Ok::<_, u8>(InboundStreamConsumption {
+                    application_progress: false,
+                    reclaimed_credit: 0,
+                    receive_window: 64,
+                })
+            }),
+            Ok(InboundStreamTurn {
+                had_chunks: false,
+                application_progress: false,
+                reclaimed_credit: 0,
+                window_published: false,
+            })
+        );
+        assert_eq!(
+            consume_inbound_stream(&mut dispatcher, |_| Err::<InboundStreamConsumption, _>(7)),
+            Err(InboundStreamTurnError::Consumer(7))
+        );
+        assert_eq!(
+            consume_inbound_stream(&mut dispatcher, |_| {
+                Ok::<_, u8>(InboundStreamConsumption {
+                    application_progress: false,
+                    reclaimed_credit: 1,
+                    receive_window: 64,
+                })
+            }),
+            Err(InboundStreamTurnError::Transport(Error::Invalid))
+        );
+    }
+
+    #[test]
+    fn exclusive_consumer_turn_refreshes_timeout_from_application_progress() {
+        let owner = ConnectionId::new(91).unwrap();
+        let mut operation = crate::verified_object::ExclusiveTransfer::new();
+        operation
+            .try_start_with(owner, 7, 0, 10, || Ok::<_, ()>(0_u8))
+            .unwrap();
+        let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
+            ConnectionId::new(92).unwrap(),
+            ConnectionLimits::default(),
+            AssociationProfile::conservative(),
+        );
+
+        let turn = consume_exclusive_inbound_stream(
+            &mut dispatcher,
+            &mut operation,
+            owner,
+            5,
+            10,
+            |value, chunks| {
+                assert!(chunks.is_empty());
+                *value += 1;
+                Ok::<_, ()>(InboundStreamConsumption {
+                    application_progress: true,
+                    reclaimed_credit: 0,
+                    receive_window: 0,
+                })
+            },
+        )
+        .unwrap();
+        assert!(turn.application_progress);
+        assert_eq!(operation.get_mut_for(owner).copied(), Some(1));
+        assert!(operation.take_expired(14).is_none());
+        assert!(operation.take_expired(15).is_some());
+    }
+
+    #[test]
+    fn exclusive_consumer_failure_releases_operation_for_next_request() {
+        let owner = ConnectionId::new(93).unwrap();
+        let mut operation = crate::verified_object::ExclusiveTransfer::new();
+        operation
+            .try_start_with(owner, 17, 0, 10, || Ok::<_, ()>(41_u8))
+            .unwrap();
+        let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
+            ConnectionId::new(94).unwrap(),
+            ConnectionLimits::default(),
+            AssociationProfile::conservative(),
+        );
+
+        assert_eq!(
+            consume_exclusive_inbound_stream(
+                &mut dispatcher,
+                &mut operation,
+                owner,
+                5,
+                10,
+                |_value, _chunks| Err::<InboundStreamConsumption, _>(7_u8),
+            ),
+            Err(ExclusiveInboundStreamTurnError::Consumer {
+                request_id: 17,
+                value: 41,
+                error: 7,
+            })
+        );
+        assert_eq!(operation.owner(), None);
+        operation
+            .try_start_with(owner, 18, 6, 10, || Ok::<_, ()>(42_u8))
+            .unwrap();
+        assert_eq!(operation.get_mut_for(owner).copied(), Some(42));
+    }
+
+    #[test]
+    fn flash_object_credit_after_an_immediate_ack_advances_selected_stream() {
         let client = ConnectionId::new(81).unwrap();
         let server = ConnectionId::new(82).unwrap();
+        let path = PathId::new(81).unwrap();
         let limits = ConnectionLimits {
             max_data: 64,
             max_stream_data: 64,
             ..ConnectionLimits::default()
         };
-        let mut listener = ConnectionServer::<4, 1200>::new_with_association(
+        let mut listener = ConnectionDispatcher::<4, 1200>::new(
             server,
             limits,
             AssociationProfile::conservative(),
@@ -2756,7 +3587,7 @@ mod tests {
             encode_bootstrap_open_packet_with_profile(client, 0, limits, 4, &mut open).unwrap();
         let mut out = [0u8; 1200];
         let _ack_len = listener
-            .receive(&open[..open_len], &mut out)
+            .receive(path, &open[..open_len], &mut out)
             .unwrap()
             .unwrap();
 
@@ -2766,7 +3597,7 @@ mod tests {
         endpoint.set_initial_peer_credit(64, 64).unwrap();
         endpoint.continue_packet_numbers_from(1).unwrap();
 
-        let request = crate::protocol::FlashRequest {
+        let request = crate::verified_object::FlashRequest {
             object: GetRequest {
                 name: None,
                 cpu: 13,
@@ -2778,59 +3609,101 @@ mod tests {
         };
         let mut body = [0u8; 128];
         let body_len =
-            crate::protocol::encode_flash_handler_request(request, 9, &mut body).unwrap();
-        endpoint
-            .open_send_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, 64)
-            .unwrap();
+            crate::verified_object::encode_flash_handler_request(request, 9, &mut body).unwrap();
+        // This deliberately makes the flash command the second client bidi
+        // stream. The receiver must derive its object stream from the command
+        // stream, not assume the first association's numerical IDs.
+        let command_stream = quic_lite::FIRST_CLIENT_BIDI_STREAM_ID + 4;
+        let object_stream = command_stream + 4;
+        endpoint.open_send_stream(command_stream, 64).unwrap();
         let mut packet = [0u8; 1200];
         let (used, _) = endpoint
             .encode_stream_packet(
                 server,
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
+                command_stream,
                 0,
                 true,
                 &body[..body_len],
                 &mut packet,
             )
             .unwrap();
-        assert_eq!(listener.receive(&packet[..used], &mut out).unwrap(), None);
-        let _ = listener.take_flash_request();
+        assert_eq!(
+            listener.receive(path, &packet[..used], &mut out).unwrap(),
+            None
+        );
+        let _ = listener.take_stream_command();
 
-        endpoint.open_send_stream(FLASH_OBJECT_STREAM, 64).unwrap();
+        // The sink learns of the command before the selected stream has a fragment. It
+        // must be able to publish its current storage window at that point:
+        // waiting for a first fragment deadlocks when the generic bootstrap
+        // window is intentionally only one datagram.
+        prepare_inbound_stream(&mut listener, 64).unwrap();
+        // The client reserves the application-named stream before accepting
+        // its peer's first MAX_STREAM_DATA update.
+        endpoint.open_send_stream(object_stream, 64).unwrap();
+        let initial_credit = listener.poll_for(path, &mut out).unwrap().unwrap();
+        endpoint.receive_datagram(&out[..initial_credit]).unwrap();
+        // The command consumed 30 bytes of the original connection window;
+        // the prepared storage window extends that absolute bound to 128.
+        assert_eq!(endpoint.peer_send_credit(object_stream), Some((98, 64)));
+
         let (used, _) = endpoint
-            .encode_stream_packet(
-                server,
-                FLASH_OBJECT_STREAM,
-                0,
-                false,
-                &[0x5a; 16],
-                &mut packet,
-            )
+            .encode_stream_packet(server, object_stream, 0, false, &[0x5a; 16], &mut packet)
             .unwrap();
-        let immediate = listener
-            .receive(&packet[..used], &mut out)
+        let _immediate = listener
+            .receive(path, &packet[..used], &mut out)
             .unwrap()
             .unwrap();
-        // This is the ACK generated before the flash sink reports storage.
-        endpoint.receive_datagram(&out[..immediate]).unwrap();
-        let before = endpoint.peer_send_credit(FLASH_OBJECT_STREAM).unwrap();
+        // The receiver has encoded an ACK before its stream consumer reports
+        // storage. Do not deliver that old packet yet: the common
+        // storage-ready turn must prefer the freshly queued MAX_* update.
+        let before = endpoint.peer_send_credit(object_stream).unwrap();
         assert_eq!(before, (98, 64));
-        assert_eq!(listener.take_flash_object_chunks().len(), 1);
+        assert_eq!(listener.take_inbound_stream_chunks().len(), 1);
         assert_eq!(
             listener
+                .core
+                .association_for_path(path)
+                .unwrap()
                 .connection
                 .as_ref()
                 .unwrap()
                 .mux
                 .endpoint
-                .receive_credit_state(FLASH_OBJECT_STREAM),
+                .receive_credit_state(object_stream),
             Some((50, 16, 64))
         );
 
-        listener.grant_flash_receive_window(64).unwrap();
-        let credit = listener.poll(&mut out).unwrap().unwrap();
+        // Model the asynchronous storage-completion edge used by Main and
+        // Recovery. The immediate ACK above remains queued in QUIC-lite's
+        // ledger; the common storage-ready turn must emit the later MAX_*
+        // packet without a flash-specific ACK or retransmission loop.
+        let credit = storage_ready_server_turn(&mut listener, 5, 600, &mut out, |service, _| {
+            let turn = consume_inbound_stream(service, |chunks| {
+                assert!(chunks.is_empty());
+                Ok::<_, ()>(InboundStreamConsumption {
+                    application_progress: false,
+                    reclaimed_credit: 16,
+                    receive_window: 64,
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                turn,
+                InboundStreamTurn {
+                    had_chunks: false,
+                    application_progress: false,
+                    reclaimed_credit: 16,
+                    window_published: true,
+                }
+            );
+            Ok(Some(path))
+        })
+        .unwrap()
+        .unwrap()
+        .1;
         endpoint.receive_datagram(&out[..credit]).unwrap();
-        let after = endpoint.peer_send_credit(FLASH_OBJECT_STREAM).unwrap();
+        let after = endpoint.peer_send_credit(object_stream).unwrap();
         assert!(after.0 > before.0 && after.1 > before.1);
     }
 
@@ -2944,9 +3817,9 @@ mod tests {
     }
 
     #[test]
-    fn eight_packet_client_completes_a_64k_transfer() {
+    fn constrained_client_completes_a_64k_transfer() {
         // Firmware's raw UDP6 client and service association both retain a
-        // bounded eight-packet history.  Exercise a transfer substantially
+        // bounded small-packet history. Exercise a transfer substantially
         // larger than one flight so a future capacity mismatch cannot strand
         // the client after its initial window while appearing to work for a
         // 4 KiB smoke test.
@@ -2990,19 +3863,20 @@ mod tests {
     }
 
     #[test]
-    fn prober_completes_large_transfer_with_small_configurable_receive_windows() {
+    fn prober_stress_completes_ten_large_transfers_with_small_configurable_receive_windows() {
         // This is deliberately receiver-side flow control, not a packet
         // bearer setting.  It exercises the same pattern a flash/file sink
         // uses: accept an MTU-sized stream fragment, defer consumption while
         // work is pending, then let ordinary QUIC MAX_* credit resume the
         // sender.  Keep the transfer much larger than every tested window.
-        for window in [1_200u64, 2_400, 4_800] {
-            let client_cid = ConnectionId::new(0x6000 + window).unwrap();
-            let server_cid = ConnectionId::new(0x7000 + window).unwrap();
+        for run in 0..10u64 {
+            let window = [1_200u64, 2_400, 4_800][run as usize % 3];
+            let client_cid = ConnectionId::new(0x6000 + run).unwrap();
+            let server_cid = ConnectionId::new(0x7000 + run).unwrap();
             let request = ProbeServiceRequest {
                 initial_consume_delay_ms: Some(3),
                 consume_delay_ms: Some(1),
-                ..ProbeServiceRequest::new(128 * 1024, 1_100)
+                ..ProbeServiceRequest::new(1024 * 1024, 1_100)
             };
             let mut client = ProbeClient::<8, 1200>::from_request_with_limits(
                 client_cid,
@@ -3018,7 +3892,7 @@ mod tests {
             let started = client.start(&mut client_out).unwrap();
             to_server.push_back(client_out[..started].to_vec());
 
-            for now_ms in 0..20_000 {
+            for now_ms in 0..200_000 {
                 while let Some(packet) = to_server.pop_front() {
                     if let Some(used) = server.receive(&packet, &mut server_out).unwrap() {
                         to_client.push_back(server_out[..used].to_vec());
@@ -3037,9 +3911,13 @@ mod tests {
                     break;
                 }
             }
-            assert!(client.is_complete(), "window={window}");
-            assert_eq!(client.bytes(), 128 * 1024, "window={window}");
-            assert_eq!(client.callback_errors(), [0; 6], "window={window}");
+            assert!(client.is_complete(), "run={run} window={window}");
+            assert_eq!(client.bytes(), 1024 * 1024, "run={run} window={window}");
+            assert_eq!(
+                client.callback_errors(),
+                [0; 6],
+                "run={run} window={window}"
+            );
         }
     }
 
@@ -3173,6 +4051,46 @@ mod tests {
     }
 
     #[test]
+    fn zero_retention_dispatcher_keeps_open_across_adapter_clock_turn() {
+        let client_cid = ConnectionId::new(0x1660).unwrap();
+        let server_cid = ConnectionId::new(0x1770).unwrap();
+        let path = PathId::new(1).unwrap();
+        let mut client = status_test_client(client_cid, 0x1235);
+        let mut server = ConnectionDispatcher::<4, 1200, 4>::new(
+            server_cid,
+            ConnectionLimits::default(),
+            AssociationProfile::c6_default(),
+        );
+        server.set_association_idle_timeout(Some(0));
+        let mut client_out = [0_u8; 1200];
+        let mut server_out = [0_u8; 1200];
+
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack_len = server
+            .receive(path, &client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive(&server_out[..open_ack_len], &mut client_out)
+            .unwrap()
+            .unwrap();
+
+        // Main and Recovery run their clock/deadline scheduler between UART
+        // or UDP datagrams. This exact turn was absent from the old host test
+        // and used to reclaim the association before its first request.
+        server.set_time(1);
+        let response_len = server
+            .receive(path, &client_out[..request_len], &mut server_out)
+            .unwrap()
+            .expect("the first established request must retain its OPEN");
+        let _ = client
+            .receive(&server_out[..response_len], &mut client_out)
+            .unwrap();
+        assert!(client.is_complete());
+        assert!(server.last_stateless_reset().is_none());
+    }
+
+    #[test]
     fn tagged_client_round_trips_a_direct_record_over_raw_bearer() {
         const COMPONENT: u64 = 60_001;
         assert!(crate::services::register_tagged_component(
@@ -3184,6 +4102,7 @@ mod tests {
         let client_cid = ConnectionId::new(0x166).unwrap();
         let server_cid = ConnectionId::new(0x177).unwrap();
         let mut client = TaggedClient::<4, 1200>::new(client_cid, &request).unwrap();
+        client.set_close_when_complete(false);
         let mut server = ConnectionServer::<4, 1200>::new(server_cid);
         let mut client_out = [0u8; 1200];
         let mut server_out = [0u8; 1200];
@@ -3201,9 +4120,23 @@ mod tests {
             .receive(&client_out[..request_len], &mut server_out)
             .unwrap()
             .unwrap();
-        let _ = client
+        assert!(!server.take_terminal_response_delivered());
+        let ack_len = client
             .receive_at(&server_out[..response_len], 2, &mut client_out)
+            .unwrap()
+            .expect("terminal tagged response must produce transport control");
+        server
+            .receive(&client_out[..ack_len], &mut server_out)
             .unwrap();
+        let in_flight = server
+            .connection
+            .as_ref()
+            .map_or(u64::MAX, |connection| connection.bytes_in_flight());
+        assert!(
+            server.take_terminal_response_delivered(),
+            "terminal response remained in flight: {in_flight}"
+        );
+        assert!(!server.take_terminal_response_delivered());
 
         assert!(client.is_complete());
         assert_eq!(client.response(), Some(b"tagged-response".as_slice()));
@@ -3301,6 +4234,53 @@ mod tests {
         assert!(client.is_complete());
         assert_eq!(client.response(), Some(b"tagged-response".as_slice()));
         assert_eq!(dispatcher.reply_path(), Some(action_path));
+    }
+
+    #[test]
+    fn receive_turn_keeps_an_immediate_tagged_stream_response() {
+        // Component IDs are process-global production registrations. Keep
+        // every test ID unique so parallel host tests cannot accidentally
+        // share or reject a handler registration.
+        const COMPONENT: u64 = 60_007;
+        assert!(crate::services::register_tagged_component(
+            COMPONENT,
+            raw_tagged_test_handler
+        ));
+        let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x67, 2, 1, 3, 9];
+        let path = PathId::new(0x6007).unwrap();
+        let mut client =
+            TaggedClient::<4, 1200>::new(ConnectionId::new(0x16d).unwrap(), &request).unwrap();
+        let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
+            ConnectionId::new(0x17d).unwrap(),
+            ConnectionLimits::default(),
+            AssociationProfile::c6_default(),
+        );
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack = dispatcher
+            .receive(path, &client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive(&server_out[..open_ack], &mut client_out)
+            .unwrap()
+            .unwrap();
+        let immediate = dispatcher
+            .receive(path, &client_out[..request_len], &mut server_out)
+            .unwrap()
+            .expect("tagged handler encodes an immediate stream response");
+        assert!(quic_lite::packet_has_stream_frame(&server_out[..immediate]));
+        let response = dispatcher
+            .finish_receive_turn(path, Some(immediate), &mut server_out)
+            .unwrap()
+            .expect("receive turn retains the stream response");
+        assert!(quic_lite::packet_has_stream_frame(&server_out[..response]));
+        client
+            .receive(&server_out[..response], &mut client_out)
+            .unwrap();
+        assert_eq!(client.response(), Some(b"tagged-response".as_slice()));
     }
 
     #[test]
@@ -3546,6 +4526,10 @@ mod tests {
         );
         assert!(dispatcher.active_connection_status().is_none());
         assert_eq!(dispatcher.last_close_at(), Some(300));
+        assert_eq!(
+            dispatcher.last_closed_receive_cid(),
+            Some(ConnectionId::new(0x17a).unwrap())
+        );
     }
 
     #[test]
@@ -3968,7 +4952,10 @@ mod tests {
     #[test]
     fn multi_association_dispatcher_keeps_two_firmware_peers_live() {
         let first_path = PathId::new(0x5101).unwrap();
-        let second_path = PathId::new(0x5102).unwrap();
+        // Two independent UDP clients can share the same peer tuple when the
+        // host falls back to an ephemeral local port. The path is therefore
+        // deliberately identical; only each association's CID is unique.
+        let second_path = first_path;
         let mut dispatcher = ConnectionDispatcher::<4, 1200, 2>::new(
             ConnectionId::new(0x5100).unwrap(),
             ConnectionLimits::default(),
@@ -3985,6 +4972,11 @@ mod tests {
             .receive(first_path, &first_out[..first_open], &mut server_out)
             .unwrap()
             .unwrap();
+        let (_, first_open_ack) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..first_ack],
+            ConnectionId::new(0x5111).unwrap(),
+        )
+        .unwrap();
         let first_request = first
             .receive(&server_out[..first_ack], &mut first_out)
             .unwrap()
@@ -3995,11 +4987,28 @@ mod tests {
             .receive(second_path, &second_out[..second_open], &mut server_out)
             .unwrap()
             .unwrap();
+        let (_, second_open_ack) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
+            &server_out[..second_ack],
+            ConnectionId::new(0x5112).unwrap(),
+        )
+        .unwrap();
         let second_request = second
             .receive(&server_out[..second_ack], &mut second_out)
             .unwrap()
             .unwrap();
         assert_eq!(dispatcher.active_association_count(), 2);
+        assert_eq!(
+            dispatcher.select_receive_cid(first_open_ack.server_receive_cid),
+            Some(first_path)
+        );
+        assert_eq!(
+            dispatcher.expected_receive_cid(),
+            Some(first_open_ack.server_receive_cid)
+        );
+        assert_eq!(
+            dispatcher.select_receive_cid(second_open_ack.server_receive_cid),
+            Some(second_path)
+        );
 
         // The second peer's Initial must not retire the first peer. Both
         // established requests remain routable by their separate server CID.
@@ -4206,13 +5215,610 @@ mod tests {
         let initial = driver.packet().unwrap();
         let mut dispatcher = ConnectionDispatcher::<8, 1200>::new(
             server_cid,
-            quic_lite::recovery_connection_limits(false, 0),
+            ConnectionLimits::with_receive_window(1200),
             AssociationProfile::conservative(),
         );
         let mut response = [0_u8; 1200];
-        assert!(dispatcher
-            .receive(PathId::new(1).unwrap(), initial, &mut response)
+        assert!(
+            dispatcher
+                .receive(PathId::new(1).unwrap(), initial, &mut response)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn object_upload_initial_is_accepted_by_recovery_sta_dispatcher() {
+        let client_cid = ConnectionId::new(0x885).unwrap();
+        let server_cid = ConnectionId::new(0x886).unwrap();
+        let mut client = ObjectUploadClient::<512, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>::new(
+            client_cid,
+            &[0xa0],
+            ObjectRecordStream::new(Vec::new()),
+        )
+        .unwrap();
+        let driver = quic_lite::DatagramClientDriver::start(&mut client, 0).unwrap();
+        let initial = driver.packet().unwrap();
+        let mut dispatcher =
+            ConnectionDispatcher::<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }, 12>::new(
+                server_cid,
+                ConnectionLimits::with_receive_window(quic_lite::DEFAULT_MAX_DATAGRAM_SIZE as u64),
+                AssociationProfile::datagram_default(),
+            );
+        let mut response = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+        assert!(
+            dispatcher
+                .receive(PathId::new(1).unwrap(), initial, &mut response)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn object_upload_reserves_allocated_stream_before_initial_flash_credit() {
+        let client_cid = ConnectionId::new(0x883).unwrap();
+        let server_cid = ConnectionId::new(0x884).unwrap();
+        let request = crate::verified_object::FlashRequest {
+            object: GetRequest {
+                name: None,
+                cpu: 13,
+                target: 6,
+            },
+            address: None,
+            transport: 0,
+            dry_run: true,
+        };
+        let mut command = [0_u8; 128];
+        let command_len =
+            crate::verified_object::encode_flash_handler_request(request, 1, &mut command).unwrap();
+        let mut client = ObjectUploadClient::<8, 1200>::new(
+            client_cid,
+            &command[..command_len],
+            ObjectRecordStream::new(Vec::new()),
+        )
+        .unwrap();
+        let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0).unwrap();
+        let mut listener = ConnectionServer::<8, 1200>::new_with_association(
+            server_cid,
+            ConnectionLimits::with_receive_window(1200),
+            AssociationProfile::conservative(),
+        );
+        let mut response = [0_u8; 1200];
+        let open_ack = listener
+            .receive(driver.packet().unwrap(), &mut response)
             .unwrap()
-            .is_some());
+            .unwrap();
+        driver.mark_sent(0);
+        driver
+            .receive(&mut client, &response[..open_ack], 1)
+            .unwrap();
+        let command_packet = driver.packet().unwrap().to_vec();
+        driver.mark_sent(1);
+        assert_eq!(
+            listener.receive(&command_packet, &mut response).unwrap(),
+            None
+        );
+        assert!(listener.take_stream_command().is_some());
+        // This unit exercises ConnectionServer directly, below the public
+        // dispatcher adapter used by applications.
+        listener.prepare_inbound_stream_window(1024).unwrap();
+        let credit = listener.poll(&mut response).unwrap().unwrap();
+        assert!(driver.receive(&mut client, &response[..credit], 2).unwrap());
+        assert_eq!(client.last_admission_block(), None);
+        assert!(client.admission_state().is_some());
+    }
+
+    #[test]
+    fn command_only_receive_does_not_poll_the_object_sink() {
+        // Recovery selects this profile from live heap headroom. Cover every
+        // possible small C6 result, not only the roomy host default of eight.
+        for history_packets in 2..=8 {
+            let client_cid = ConnectionId::new(0x889 + history_packets as u64 * 2).unwrap();
+            let server_cid = ConnectionId::new(0x88a + history_packets as u64 * 2).unwrap();
+            let request = crate::verified_object::FlashRequest {
+                object: GetRequest {
+                    name: None,
+                    cpu: 13,
+                    target: 6,
+                },
+                address: None,
+                transport: 0,
+                dry_run: true,
+            };
+            let mut command = [0_u8; 128];
+            let command_len =
+                crate::verified_object::encode_flash_handler_request(request, 1, &mut command)
+                    .unwrap();
+            let mut client = ObjectUploadClient::<8, 1200>::new(
+                client_cid,
+                &command[..command_len],
+                ObjectRecordStream::new(Vec::new()),
+            )
+            .unwrap();
+            let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0).unwrap();
+            let path = PathId::new(1).unwrap();
+            let mut listener = ConnectionDispatcher::<8, 1200>::new(
+                server_cid,
+                ConnectionLimits::with_receive_window(1200),
+                AssociationProfile {
+                    history_packets,
+                    ack_frequency: 8,
+                    ack_delay_ms: 5,
+                    tx_burst_packets: history_packets,
+                    initial_window_packets: history_packets,
+                },
+            );
+            let mut operation = crate::verified_object::ExclusiveTransfer::new();
+            let mut response = [0_u8; 1200];
+            let open_ack = receive_server_turn(
+                &mut listener,
+                path,
+                driver.packet().unwrap(),
+                0,
+                &mut response,
+                |_, _| {},
+                |_, _, _, _| {},
+            )
+            .unwrap()
+            .unwrap();
+            driver.mark_sent(0);
+            driver
+                .receive(&mut client, &response[..open_ack], 1)
+                .unwrap();
+            let command_packet = driver.packet().unwrap().to_vec();
+            driver.mark_sent(1);
+            let mut consumer_called = false;
+            let credit = receive_server_turn(
+                &mut listener,
+                path,
+                &command_packet,
+                1,
+                &mut response,
+                |_, _| {},
+                |service, _, now, _| {
+                    assert!(service.take_stream_command().is_some());
+                    let owner = service.expected_receive_cid().unwrap();
+                    operation
+                        .try_start_with(owner, 1, now, 100, || Ok::<_, ()>(()))
+                        .unwrap();
+                    prepare_inbound_stream(service, 5).unwrap();
+                    assert_eq!(
+                        consume_available_exclusive_inbound_stream(
+                            service,
+                            &mut operation,
+                            owner,
+                            now,
+                            100,
+                            |_, _| {
+                                consumer_called = true;
+                                Ok::<_, ()>(InboundStreamConsumption {
+                                    application_progress: false,
+                                    reclaimed_credit: 0,
+                                    receive_window: 5,
+                                })
+                            },
+                        )
+                        .unwrap(),
+                        None
+                    );
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!consumer_called);
+            assert!(driver.receive(&mut client, &response[..credit], 2).unwrap());
+            assert!(client.admission_state().is_some());
+        }
+    }
+
+    #[test]
+    fn object_upload_advances_past_a_small_initial_window() {
+        let limits = quic_lite::ConnectionLimits::with_receive_window(1_100);
+        let path = PathId::new(1).unwrap();
+        // Keep the real long-lived firmware dispatcher across every client.
+        // Each completed client intentionally leaves its final CLOSE pending,
+        // reproducing a UART/UDP process exit where that last packet is lost.
+        let mut listener =
+            ConnectionDispatcher::<8, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }, 12>::new(
+                ConnectionId::new(0x886).unwrap(),
+                limits,
+                AssociationProfile {
+                    history_packets: 8,
+                    ack_frequency: 1,
+                    ack_delay_ms: 5,
+                    tx_burst_packets: 8,
+                    initial_window_packets: 8,
+                },
+            );
+        listener.set_association_idle_timeout(Some(0));
+        for run in 0_u64..10 {
+            let client_cid = ConnectionId::new(0x885 + run * 2).unwrap();
+            let request = crate::verified_object::FlashRequest {
+                object: GetRequest {
+                    name: None,
+                    cpu: 13,
+                    target: 6,
+                },
+                address: None,
+                transport: 0,
+                dry_run: true,
+            };
+            let mut command = [0_u8; 128];
+            let command_len =
+                crate::verified_object::encode_flash_handler_request(request, 1, &mut command)
+                    .unwrap();
+            // Build the same manifest/block/DONE sequence used by the host file
+            // server. The receiver below is the same incremental consumer used by
+            // ESP flash, with only its storage sink replaced.
+            let directory = tempfile::tempdir().unwrap();
+            let artifact = directory.path().join("esp32c6/main-app.bin");
+            std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            // Exceed the current Recovery artifact so the host gate covers the
+            // same sustained-transfer duration and record count as the device.
+            let expected = (0..1024 * 1024 + 123)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            std::fs::write(&artifact, &expected).unwrap();
+            let object_server = crate::host::ObjectServer::new(crate::host::ServerConfig {
+                artifact_root: directory.path().to_path_buf(),
+                archive_root: None,
+            });
+            let records =
+                ObjectRecordStream::new(object_server.response_records(request.object).unwrap());
+            // Match dmesh-cli's actual host sender allocation. The receiver still
+            // selects its smaller runtime history/window below; using an 8-entry
+            // client here hid the many-retained-gap condition observed on UART.
+            let mut client =
+                ObjectUploadClient::<512, { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE }>::new(
+                    client_cid,
+                    &command[..command_len],
+                    records,
+                )
+                .unwrap();
+            let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0).unwrap();
+            type Receiver = crate::verified_object::SignedObjectReceiver<
+                HostDelayedObjectSink,
+                crate::verified_object::NoSignatureVerifier,
+                { 20 * 1024 },
+                { 12 + crate::verified_object::BLOCK_SIZE },
+            >;
+            let sink_window = if run == 0 {
+                512
+            } else {
+                // Exercise the same adaptive 1-4 write-buffer policy used by
+                // ESP flash. Each write buffer holds two 4 KiB blocks; the
+                // extra 17 bytes are the immutable-object record envelope.
+                let requested_buffers = 1 + run as usize % 4;
+                let selected_buffers = crate::verified_object::bounded_storage_slots(
+                    32 * 1024 + requested_buffers * 8 * 1024,
+                    32 * 1024,
+                    8 * 1024,
+                    1,
+                    4,
+                );
+                assert_eq!(selected_buffers, requested_buffers);
+                selected_buffers * 2 * (crate::verified_object::BLOCK_SIZE + 17)
+            };
+            // Keep the large receiver in the same final heap allocation used
+            // by firmware. An inline host value hides stack/heap placement and
+            // move differences precisely where constrained ESP runs have
+            // exposed bugs that the protocol simulation otherwise missed.
+            let mut operation: crate::verified_object::ExclusiveTransfer<Box<Receiver>> =
+                crate::verified_object::ExclusiveTransfer::new();
+            operation
+                .try_start_with(client_cid, 1, 0, 120_000, || {
+                    Receiver::try_new_boxed(HostDelayedObjectSink {
+                        bytes: Vec::new(),
+                        pending_credit: 0,
+                        polls: 0,
+                        release_every: 1 + run as usize % 4,
+                        // Recreate the live e9 residual-credit boundary in the first
+                        // run: the peer may grant only 512 bytes while this source would
+                        // otherwise keep offering its preferred 1,024-byte slice.
+                        capacity: sink_window,
+                        available: sink_window,
+                        durable: false,
+                    })
+                })
+                .unwrap();
+            let mut reply = [0_u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+            let open_ack = receive_server_turn(
+                &mut listener,
+                path,
+                driver.packet().unwrap(),
+                0,
+                &mut reply,
+                |_, _| {},
+                |_, _, _, _| {},
+            )
+            .unwrap()
+            .unwrap();
+            driver.mark_sent(0);
+            driver.receive(&mut client, &reply[..open_ack], 1).unwrap();
+            let command_packet = driver.packet().unwrap().to_vec();
+            driver.mark_sent(1);
+            let initial_credit = receive_server_turn(
+                &mut listener,
+                path,
+                &command_packet,
+                1,
+                &mut reply,
+                |_, _| {},
+                |service, _, _, _| {
+                    assert!(service.take_stream_command().is_some());
+                    let consumer = operation.get_mut_for(client_cid).unwrap();
+                    prepare_inbound_stream(service, consumer.initial_stream_receive_window_bytes())
+                        .unwrap();
+                },
+            )
+            .unwrap()
+            .or_else(|| {
+                poll_server_turn(&mut listener, path, 2, 600, &mut reply, |_, _, _| {}).unwrap()
+            })
+            .unwrap();
+            driver
+                .receive(&mut client, &reply[..initial_credit], 2)
+                .unwrap();
+
+            // Drop one receiver response after several complete records. This is
+            // the device failure shape: the sender must stop at congestion/credit,
+            // retransmit from QUIC's ledger, receive a duplicate re-ACK, and then
+            // resume without an upload-specific retry loop.
+            let mut dropped_response = false;
+            let mut response_blackout_until = None;
+            let mut delayed_client_packets = std::collections::VecDeque::new();
+            let mut delayed_responses = std::collections::VecDeque::new();
+            let mut reordered_client_packet = false;
+            let mut dropped_client_packet = false;
+            let mut client_drop_budget = if run == 0 { 24usize } else { 0 };
+            let mut response_drop_budget = if run == 0 { 24usize } else { 0 };
+            let mut reordered_response = false;
+            let mut client_packet_attempts = 0usize;
+            let mut sustained_client_losses = 0usize;
+            let mut sustained_response_losses = 0usize;
+            let mut terminal_queued = false;
+            let mut completed = false;
+            let mut completed_at = None;
+            let mut generated_responses = 0usize;
+            let mut delivered_responses = 0usize;
+            for now in 3..60_000 {
+                if let Some(packet) = driver.packet().map(ToOwned::to_owned) {
+                    driver.mark_sent(now);
+                    delayed_client_packets.push_back(packet);
+                }
+                let client_packet =
+                    if run == 0 && client.record_index() >= 9 && !reordered_client_packet {
+                        if delayed_client_packets.len() >= 2 {
+                            reordered_client_packet = true;
+                            delayed_client_packets.pop_back()
+                        } else {
+                            None
+                        }
+                    } else {
+                        delayed_client_packets.pop_front()
+                    };
+                if let Some(packet) = client_packet {
+                    client_packet_attempts = client_packet_attempts.saturating_add(1);
+                    // The C6 USB-JTAG ingress queue can discard a complete frame
+                    // while Wi-Fi callbacks occupy the shared worker. Exercise
+                    // that adapter fact as ordinary datagram loss; neither the
+                    // object consumer nor its stream API receives a retry hook.
+                    if run == 0
+                        && client.record_index() >= 9
+                        && client_packet_attempts % 3 == 0
+                        && client_drop_budget != 0
+                    {
+                        dropped_client_packet = true;
+                        client_drop_budget -= 1;
+                        driver.poll(&mut client, now, 600, 400).unwrap();
+                        continue;
+                    }
+                    // Every non-corner run sustains deterministic loss for the
+                    // complete image, rather than proving only that one early
+                    // hole eventually recovers. This is the host counterpart
+                    // of the bidirectional loss observed on ESP STA UDP.
+                    if run != 0 && client_packet_attempts % (7 + run as usize % 3) == 0 {
+                        sustained_client_losses += 1;
+                        driver.poll(&mut client, now, 600, 400).unwrap();
+                        continue;
+                    }
+                    let response = receive_server_turn(
+                    &mut listener,
+                    path,
+                    &packet,
+                    now,
+                    &mut reply,
+                    |_, _| {},
+                    |service, _, _, _| {
+                        let consumed = consume_exclusive_inbound_stream(
+                            service,
+                            &mut operation,
+                            client_cid,
+                            now,
+                            120_000,
+                            |consumer, received| {
+                                let (had_chunks, credit) = consumer
+                                    .push_stream_chunks(
+                                        received.into_iter().map(|(bytes, _)| bytes),
+                                    )
+                                    .unwrap();
+                                Ok::<_, ()>(InboundStreamConsumption {
+                                    application_progress: had_chunks,
+                                    reclaimed_credit: credit,
+                                    receive_window: consumer.stream_receive_window_bytes(),
+                                })
+                            },
+                        );
+                        match consumed {
+                            Ok(_) => {}
+                            Err(ExclusiveInboundStreamTurnError::Consumer {
+                                request_id,
+                                error,
+                                ..
+                            }) => panic!(
+                                "host object consumer rejected request {request_id}: {error:?}"
+                            ),
+                            Err(ExclusiveInboundStreamTurnError::Transport(error)) => {
+                                panic!("host object credit publication failed: {error:?}")
+                            }
+                        }
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "server rejected reordered upload packet at now={now} records={} bytes={} error={error:?}",
+                        client.record_index(),
+                        client.sent_bytes(),
+                    )
+                })
+                .or_else(|| {
+                    poll_server_turn(
+                        &mut listener,
+                        path,
+                        now,
+                        600,
+                        &mut reply,
+                        |_, _, _| {},
+                    )
+                    .unwrap()
+                });
+                    if let Some(used) = response {
+                        generated_responses += 1;
+                        if run == 0
+                            && response_blackout_until.is_none()
+                            && client.record_index() >= 9
+                        {
+                            dropped_response = true;
+                            // Reproduce the sparse ESP failure: lose every ACK
+                            // and MAX_* packet for longer than the transport's
+                            // credit retry interval while sender PTO packets keep
+                            // reaching the same shared server turn.
+                            // Lose the first storage-credit flight for longer
+                            // than one 600 ms PTO. The sender is then flow
+                            // blocked and can provoke recovery only with its
+                            // retained stream retransmission, matching the live
+                            // UART 41,040-byte boundary.
+                            response_blackout_until = Some(now + 750);
+                        }
+                        if response_blackout_until.is_some_and(|deadline| now < deadline) {
+                            dropped_response = true;
+                        } else if run == 0
+                            && generated_responses % 3 == 1
+                            && response_drop_budget != 0
+                        {
+                            // Keep losing sparse server ACK/control packets after
+                            // the initial blackout. This is the duplex-loss shape
+                            // seen on the physical UART run: acknowledgements make
+                            // progress, but no handler or bearer may assume every
+                            // fresh re-ACK reaches the sender.
+                            response_drop_budget -= 1;
+                            dropped_response = true;
+                        } else if !dropped_response && client.record_index() >= 9 {
+                            dropped_response = true;
+                        } else if run != 0 && generated_responses % (11 + run as usize % 3) == 0 {
+                            sustained_response_losses += 1;
+                        } else {
+                            delayed_responses.push_back(reply[..used].to_vec());
+                        }
+                    }
+                }
+                // Match the event-driven Main adapter: a quiet or flow-blocked
+                // sender cannot be the server's clock. Service QUIC's exact
+                // delayed-ACK/PTO deadline even when no ingress packet arrived.
+                if listener
+                    .next_service_deadline(600)
+                    .is_some_and(|deadline| deadline <= now)
+                    && let Some(used) =
+                        poll_server_turn(&mut listener, path, now, 600, &mut reply, |_, _, _| {})
+                            .unwrap()
+                {
+                    delayed_responses.push_back(reply[..used].to_vec());
+                    generated_responses += 1;
+                }
+                // Deliver receiver packets in bounded bursts and deliberately
+                // reverse some adjacent packet numbers. This matches a Wi-Fi
+                // callback/task boundary much more closely than the former
+                // lock-step request/ACK test.
+                if delayed_responses.len() >= 4 || (now % 7 == 0 && !delayed_responses.is_empty()) {
+                    let response = if delayed_responses.len() >= 2 {
+                        reordered_response = true;
+                        delayed_responses.pop_back().unwrap()
+                    } else {
+                        delayed_responses.pop_front().unwrap()
+                    };
+                    driver.receive(&mut client, &response, now).unwrap();
+                    delivered_responses += 1;
+                }
+                if operation
+                    .get_mut_for(client_cid)
+                    .is_some_and(|consumer| consumer.is_complete())
+                    && !terminal_queued
+                {
+                    assert!(dropped_response);
+                    assert!(reordered_response);
+                    if run == 0 {
+                        assert!(reordered_client_packet);
+                        assert!(dropped_client_packet);
+                    }
+                    let consumer = operation.get_mut_for(client_cid).unwrap();
+                    assert_eq!(consumer.sink_mut().bytes, expected);
+                    assert!(consumer.sink_mut().durable);
+                    let mut tagged = [0_u8; 128];
+                    let tagged_len = crate::tagged::encode_numeric_data_response(
+                        crate::verified_object::OBJECT_COMPONENT,
+                        crate::verified_object::OBJECT_FLASH_METHOD,
+                        1,
+                        b"flash complete",
+                        true,
+                        &mut tagged,
+                    )
+                    .unwrap();
+                    listener
+                        .complete_stream_command(tagged[..tagged_len].to_vec())
+                        .unwrap();
+                    terminal_queued = true;
+                }
+                if terminal_queued {
+                    if let Some(used) =
+                        poll_server_turn(&mut listener, path, now, 600, &mut reply, |_, _, _| {})
+                            .unwrap()
+                    {
+                        delayed_responses.push_back(reply[..used].to_vec());
+                    }
+                }
+                driver.poll(&mut client, now, 600, 400).unwrap();
+                if client.is_complete() {
+                    let response = crate::tagged::decode(client.response().unwrap()).unwrap();
+                    assert_eq!(response.component, Some(crate::tagged::Name::Tag(10)));
+                    assert_eq!(response.method, Some(crate::tagged::Name::Tag(2)));
+                    assert_eq!(response.id, Some(1));
+                    let mut result = crate::cbor::Decoder::new(response.result.unwrap());
+                    assert_eq!(result.text_ref(), Some(&b"flash complete"[..]));
+                    assert!(result.is_finished());
+                    completed = true;
+                    completed_at = Some(now);
+                    break;
+                }
+            }
+            assert!(
+                completed,
+                "object upload run {run} stalled records={} bytes={} blocked={:?} admission={:?} generated_responses={generated_responses} delivered_responses={delivered_responses} queued_responses={} client={:?} server={:?}",
+                client.record_index(),
+                client.sent_bytes(),
+                client.last_admission_block(),
+                client.admission_state(),
+                delayed_responses.len(),
+                client.connection_debug_state(),
+                listener.connection_debug_state(),
+            );
+            assert_eq!(operation.request_id_for(client_cid), Some(1));
+            assert!(operation.take_for(client_cid).is_some());
+            if run != 0 {
+                assert!(sustained_client_losses > 100);
+                assert!(sustained_response_losses > 50);
+                assert!(driver.retransmit_packets() > 100);
+                assert!(completed_at.is_some_and(|now| now < 30_000));
+            }
+        }
     }
 }

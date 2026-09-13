@@ -417,20 +417,50 @@ responsible only for an authenticated ordered stream.
 `flash` is the device-handler contract, not an ESP transport feature. Its body extends
 the same object identity with optional `address` and `transport` plus
 `dry_run`: `{0:name?,1:cpu,2:target,3:address?,4:transport,5:dry_run}`.
-An implementation fetches from `signed_object` and feeds the response to `SignedObjectReceiver`.
-That receiver performs shared record framing, manifest/signature/block
+The host produces `signed_object` records and the device feeds their ordered
+stream bytes to `SignedObjectReceiver`. That receiver performs shared record framing, manifest/signature/block
 validation, and calls an injected sink. Firmware injects the erase/write
 partition sink; host tests inject `FileImageSink`.
 
-The device retains the `flash` request stream while it opens the separate
-`signed_object` GET on the selected authenticated path. It sends the command
-response only after the sink is complete and durable; the request handler does
-not wait or block a bearer task.
+The host owns object selection and opens one QUIC-lite association containing
+the `flash` command stream and the ordered object-data stream. The device sends
+the correlated command response only after the sink is complete and durable;
+the request handler does not wait or block a bearer task.
+
+Only one association may own a mutable object sink at a time. The shared
+`ExclusiveTransfer` state admits and constructs that operation atomically from
+the application's point of view, without allocating for a contender. A request
+from another association receives the correlated application error
+`flash already in progress`; it cannot replace, release, or feed the incumbent
+operation. Only completion, rejection, owner close, or the bounded application
+idle timeout releases it. Multicast Recovery announcements are discovery and
+never imply automatic transfer ownership.
 
 The sink must be nonblocking on the receive path. It returns stream credit
 only after accepted bounded storage is available; failure aborts the transfer. No
 transport, UART, or radio adapter may create a private unbounded queue for
 flash records.
+
+Firmware derives its bounded storage-slot count from current available memory
+with `bounded_storage_slots`, then fallibly allocates those slots and advertises
+only the byte capacity actually obtained. The slot count is application sink
+configuration that host tests can inject; it is never a QUIC packet or bearer
+credit constant. Receiver storage is allocated before the platform sink factory
+runs, so allocation failure cannot leave a flash worker or file handle behind.
+
+Stream consumers enter through `prepare_inbound_stream` and
+`consume_inbound_stream`. The latter atomically takes the ordered committed
+chunks, invokes the application consumer, and publishes its absolute reclaimed
+window. Exclusive mutable sinks use `consume_exclusive_inbound_stream`, which
+adds only association ownership and application-progress timeout refresh; both
+ordinary receive and asynchronous storage-ready turns use that same helper.
+An application-consumer failure removes and returns the failed operation with
+its request ID, allowing the handler to send one correlated error and admit a
+later request immediately; a transport publication error retains it because
+already-consumed application state must not be discarded.
+Raw chunk extraction and QUIC receive-window mutation are private to the shared
+transport module, so firmware flash, host file storage, and future upload probes
+cannot grow separate ACK, credit, or operation-liveness loops.
 
 ## Radio laboratory handlers
 

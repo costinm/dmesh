@@ -71,6 +71,90 @@ pub struct PacketPath {
     pub link_hint: u8,
 }
 
+/// Exact bounded mapping between a platform address and QUIC-lite's opaque
+/// path handle.
+///
+/// Small adapters cannot squeeze a complete UDP6 address, port, interface and
+/// MAC into `PathId` without collisions. They use this table to allocate a
+/// handle and retain the complete return address outside QUIC. Host socket
+/// code naturally retains the same tuple in its connection task; tests use
+/// this table to exercise the bounded firmware ownership rule.
+pub struct PathBindingTable<K, const N: usize> {
+    entries: [Option<(quic_lite::PathId, K)>; N],
+    next: u64,
+}
+
+impl<K: Copy + Eq, const N: usize> PathBindingTable<K, N> {
+    pub const fn new(first_path_value: u64) -> Self {
+        Self {
+            entries: [None; N],
+            next: first_path_value,
+        }
+    }
+
+    /// Return the stable handle for an exact address, allocating one empty
+    /// slot when first observed. A full table applies bounded backpressure;
+    /// it never aliases or evicts another live return address.
+    pub fn bind(&mut self, key: K) -> Option<quic_lite::PathId> {
+        if let Some((path, _)) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|(_, known)| *known == key)
+        {
+            return Some(*path);
+        }
+        let slot = self.entries.iter().position(Option::is_none)?;
+        let path = loop {
+            let candidate = quic_lite::PathId::new(self.next)?;
+            self.next = self.next.checked_add(1)?;
+            if !self
+                .entries
+                .iter()
+                .flatten()
+                .any(|(known, _)| *known == candidate)
+            {
+                break candidate;
+            }
+        };
+        self.entries[slot] = Some((path, key));
+        Some(path)
+    }
+
+    pub fn get(&self, path: quic_lite::PathId) -> Option<K> {
+        self.entries
+            .iter()
+            .flatten()
+            .find_map(|(known, key)| (*known == path).then_some(*key))
+    }
+
+    pub fn remove(&mut self, path: quic_lite::PathId) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|(known, _)| known == path))
+        else {
+            return false;
+        };
+        *entry = None;
+        true
+    }
+
+    /// Reclaim one platform binding only after its connection owner confirms
+    /// the opaque path is no longer live.
+    pub fn reclaim_one(&mut self, reclaimable: impl Fn(quic_lite::PathId) -> bool) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.as_ref().is_some_and(|(path, _)| reclaimable(*path)))
+        else {
+            return false;
+        };
+        *entry = None;
+        true
+    }
+}
+
 /// Policy supplied with a queued outbound frame.
 ///
 /// Initially replies use `preferred` only, preserving today's same-bearer
@@ -136,5 +220,51 @@ mod tests {
             policy.select(TransportMask::only(TransportId::UDP6)),
             Some(TransportId::UDP6)
         );
+    }
+
+    #[test]
+    fn exact_path_bindings_do_not_alias_two_udp_ports_on_one_peer() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct UdpPeer {
+            ip: [u8; 16],
+            port: u16,
+            mac: [u8; 6],
+        }
+        let first = UdpPeer {
+            ip: [1; 16],
+            port: 3337,
+            mac: [2; 6],
+        };
+        let second = UdpPeer {
+            port: 49152,
+            ..first
+        };
+        let mut bindings = PathBindingTable::<UdpPeer, 2>::new(0x1_0000_0000_0001);
+        let first_path = bindings.bind(first).unwrap();
+        let second_path = bindings.bind(second).unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(bindings.bind(first), Some(first_path));
+        assert_eq!(bindings.get(first_path), Some(first));
+        assert_eq!(bindings.get(second_path), Some(second));
+        assert!(bindings.remove(first_path));
+        assert_eq!(bindings.get(first_path), None);
+    }
+
+    #[test]
+    fn full_path_table_reclaims_only_connection_confirmed_inactive_binding() {
+        let mut bindings = PathBindingTable::<u16, 2>::new(10);
+        let live = bindings.bind(3337).unwrap();
+        let stale = bindings.bind(49152).unwrap();
+        assert_eq!(bindings.bind(49153), None);
+        assert!(!bindings.reclaim_one(|_| false));
+        assert_eq!(bindings.get(live), Some(3337));
+        assert_eq!(bindings.get(stale), Some(49152));
+
+        assert!(bindings.reclaim_one(|path| path == stale));
+        let replacement = bindings.bind(49153).unwrap();
+        assert_ne!(replacement, live);
+        assert_ne!(replacement, stale);
+        assert_eq!(bindings.get(live), Some(3337));
+        assert_eq!(bindings.get(replacement), Some(49153));
     }
 }

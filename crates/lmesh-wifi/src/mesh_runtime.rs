@@ -300,7 +300,10 @@ async fn run_server(
     }
     // The multicast receiver validates a common announce before invoking this
     // local callback. Its radio-side destination is the same bounded registry
-    // used by raw NAN, so host discovery does not split by bearer.
+    // used by raw NAN, so host discovery does not split by bearer. Automatic
+    // Recovery flashing is deliberately disabled in both launchers: observing
+    // or forwarding an announce may update inventory only. An operator must
+    // still start the one explicit object.flash association.
     let announce_service = service.clone();
     let wifi_discovery_socket = wifi_discovery_socket();
     discovery

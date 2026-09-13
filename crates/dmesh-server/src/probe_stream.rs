@@ -3,7 +3,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use quic_lite::{
-    Error, RECOVERY_REORDER_CAPACITY_BYTES, StreamFrame,
+    DEFAULT_REORDER_CAPACITY_BYTES, Error, StreamFrame,
     callback::{CallbackError, CallbackStreams, CopyingError, CopyingStreamEvents},
 };
 
@@ -261,7 +261,7 @@ impl<const NORMAL: usize> ProbeRun<NORMAL> {
 impl ProbeReceiver {
     pub fn new(validation: u8) -> Self {
         Self {
-            ordered: CallbackStreams::new(1, RECOVERY_REORDER_CAPACITY_BYTES),
+            ordered: CallbackStreams::new(1, DEFAULT_REORDER_CAPACITY_BYTES),
             validation,
             bytes: 0,
             next_offset: 0,

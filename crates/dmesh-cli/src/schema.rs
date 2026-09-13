@@ -853,7 +853,7 @@ mod tests {
             45,
         )
         .expect("stream flash request");
-        let (id, request) = dmesh_server::protocol::decode_flash_handler_request(&command)
+        let (id, request) = dmesh_server::verified_object::decode_flash_handler_request(&command)
             .expect("canonical flash request");
         assert_eq!(id, 45);
         assert_eq!(request.object.cpu, 13);

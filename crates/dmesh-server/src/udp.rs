@@ -11,14 +11,13 @@ use crate::services::{dispatch_diagnostic_tagged_stream, dispatch_tagged_stream}
 use crate::{ObjectServer, ServerConfig};
 use crate::{
     probe::{ProbeServicePlan, ProbeServiceRequest},
-    protocol::{GetRequest, ObjectRecordStream, decode_get_request},
+    verified_object::{GetRequest, ObjectRecordStream, decode_get_request},
 };
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use quic_lite::Role;
 use quic_lite::ledger::{
-    LedgerCapacityController, LedgerMemoryPolicy, LedgerMemorySnapshot, select_capacity,
-    system_memory_snapshot,
+    LedgerMemoryPolicy, LedgerMemorySnapshot, select_capacity, system_memory_snapshot,
 };
 use quic_lite::mux::StreamMux;
 use quic_lite::{
@@ -452,11 +451,7 @@ fn probe_ack_policy(request: ProbeServiceRequest) -> (u8, u64) {
 }
 
 impl PendingByteTransfer {
-    fn new(
-        stream_id: u64,
-        bytes: usize,
-        chunk_size: usize,
-    ) -> Self {
+    fn new(stream_id: u64, bytes: usize, chunk_size: usize) -> Self {
         Self {
             stream_id,
             offset: 0,
@@ -583,8 +578,6 @@ pub struct UdpConfig {
     pub idle_timeout: Duration,
     /// Receive-loop tick used to run idle cleanup even when no datagrams arrive.
     pub receive_timeout: Duration,
-    /// Host ledger memory resampling interval. Zero disables runtime resizing.
-    pub ledger_resize_interval: Duration,
     /// Application payload size for object datagrams. This is independent of
     /// the transport window: even small diagnostic records must still be sent
     /// in flight as a window, not as stop-and-wait packets.
@@ -622,7 +615,6 @@ impl Default for UdpConfig {
             max_active_connections: MAX_ACTIVE_CONNECTIONS,
             idle_timeout: IDLE_TIMEOUT,
             receive_timeout: Duration::from_secs(1),
-            ledger_resize_interval: Duration::from_secs(5),
             object_chunk: OBJECT_CHUNK,
             ip_tos: None,
             control: None,
@@ -1442,9 +1434,7 @@ impl UdpClient {
     /// response-stream accounting remain private to this transport adapter.
     pub async fn request_object_upload(
         &mut self,
-        command_stream: u64,
         command: &[u8],
-        object_stream: u64,
         records: &mut ObjectRecordStream,
         scratch: &mut [u8],
         response_timeout: Duration,
@@ -1454,12 +1444,21 @@ impl UdpClient {
         }
         let started = Instant::now();
         let deadline = started + response_timeout;
-        // A flash command arms the receiver's stream-8 sink.  Do not rely on
-        // adjacent UDP ordering to make that visible before object bytes: the
-        // first ordinary transport packet after stream 4 proves that the
+        // QUIC-lite allocates the command and object stream IDs for this
+        // association. Do not rely on adjacent UDP ordering to make the
+        // command visible before object bytes: the
+        // first ordinary transport packet after the command proves that the
         // peer's QUIC-lite endpoint has admitted it.  It also gives the
         // association its first RTT/ACK sample before the bulk stream fills
         // the bounded raw-UDP ingress window.
+        let command_stream = self
+            .connection
+            .open_next_client_bidi_stream()
+            .map_err(|error| anyhow::anyhow!("command stream allocation: {error:?}"))?;
+        let object_stream = self
+            .connection
+            .open_next_client_bidi_stream()
+            .map_err(|error| anyhow::anyhow!("object stream allocation: {error:?}"))?;
         self.send_stream_no_wait(command_stream, command, true)
             .await?;
         let mut command_admitted = false;
@@ -1525,7 +1524,7 @@ impl UdpClient {
                         .map_err(|error| {
                             anyhow::anyhow!("object upload transport input: {error:?}")
                         })?;
-                    // Any established peer packet after stream 4 means its
+                    // Any established peer packet after the command means its
                     // endpoint accepted that request.  The application
                     // receiver is armed in that same ingress turn.
                     command_admitted = true;
@@ -1737,6 +1736,7 @@ impl UdpClient {
                 if self.connection.is_peer_stateless_reset(&incoming[..len]) {
                     return Err(anyhow::Error::new(quic_lite::Error::PeerRestarted));
                 }
+                let before_stats = self.connection.connection().endpoint().map(|e| e.stats());
                 let received = match self.connection.receive_serial_response_payload(
                     self.path,
                     &incoming[..len],
@@ -1748,6 +1748,23 @@ impl UdpClient {
                     }
                     Err(error) => bail!("client transport input: {error:?}"),
                 };
+                if std::env::var_os("DMESH_UDP_TRACE").is_some() {
+                    match received {
+                        Some(payload) => eprintln!(
+                            "dmesh_udp_trace response stream={} offset={} bytes={} fin={}",
+                            payload.stream_id,
+                            payload.offset,
+                            payload.data.len(),
+                            payload.fin
+                        ),
+                        None => {
+                            let after = self.connection.connection().endpoint().map(|e| e.stats());
+                            eprintln!(
+                                "dmesh_udp_trace non_response bytes={len} before={before_stats:?} after={after:?}"
+                            )
+                        }
+                    }
+                }
                 match received {
                     None => continue,
                     Some(payload) => {
@@ -1951,14 +1968,6 @@ pub async fn run(config: UdpConfig) -> Result<()> {
         )
     } else {
         config.history_capacity
-    };
-    // A non-zero history is an explicit bearer profile. Do not let the
-    // memory-policy resizer silently widen it later; embedded receivers may
-    // be sized for exactly that burst and cannot advertise a larger budget.
-    let ledger_resize_interval = if config.history_capacity == 0 {
-        config.ledger_resize_interval
-    } else {
-        Duration::ZERO
     };
     let socket = match config.socket.clone() {
         Some(socket) => socket,
@@ -2188,10 +2197,6 @@ pub async fn run(config: UdpConfig) -> Result<()> {
                         open.max_in_flight_packets,
                         history_capacity,
                         bootstrap_numbers,
-                        config.max_active_connections,
-                        config.ledger_memory_policy,
-                        config.ledger_memory,
-                        ledger_resize_interval,
                         config.object_chunk,
                         control_for_connection,
                         tagged_handler_for_connection,
@@ -2359,10 +2364,6 @@ async fn serve_persistent_peer_with_ids(
     peer_max_in_flight_packets: u16,
     history_capacity: usize,
     bootstrap_packet_numbers: Arc<BootstrapPacketNumbers>,
-    max_active_connections: usize,
-    ledger_memory_policy: LedgerMemoryPolicy,
-    ledger_memory: Option<LedgerMemorySnapshot>,
-    ledger_resize_interval: Duration,
     object_chunk: usize,
     control: Option<Arc<TransportControl>>,
     tagged_handler: Option<Arc<dyn TaggedStreamHandler>>,
@@ -2376,8 +2377,8 @@ async fn serve_persistent_peer_with_ids(
             peer_max_stream_data,
             peer_max_in_flight_packets,
             0,
-            history_capacity,
             ServerStreamConfig {
+                history_packets: history_capacity,
                 max_pending_streams: 8,
                 max_stream_bytes: 256 * 1024,
             },
@@ -2392,8 +2393,6 @@ async fn serve_persistent_peer_with_ids(
     let mut low_byte_transfer = None;
     let mut tagged_response = None;
     let started = Instant::now();
-    let mut ledger_controller = LedgerCapacityController::new(history_capacity, 2);
-    let mut next_ledger_resize = Instant::now() + ledger_resize_interval;
     if let Some(first_packet) = first_packet {
         let next = bootstrap_packet_numbers.next.load(Ordering::Acquire);
         if next > connection.mux.endpoint.next_packet_number {
@@ -2491,17 +2490,6 @@ async fn serve_persistent_peer_with_ids(
                         ));
                     }
                 }
-                if !ledger_resize_interval.is_zero() {
-                    maybe_resize_ledger(
-                        &mut connection.mux,
-                        &mut ledger_controller,
-                        &mut next_ledger_resize,
-                        ledger_resize_interval,
-                        max_active_connections,
-                        ledger_memory_policy,
-                        ledger_memory,
-                    );
-                }
                 if connection.mux.is_closed() {
                     break;
                 }
@@ -2579,17 +2567,6 @@ async fn serve_persistent_peer_with_ids(
                     &mut packet,
                 )
                 .await?;
-                if !ledger_resize_interval.is_zero() {
-                    maybe_resize_ledger(
-                        &mut connection.mux,
-                        &mut ledger_controller,
-                        &mut next_ledger_resize,
-                        ledger_resize_interval,
-                        max_active_connections,
-                        ledger_memory_policy,
-                        ledger_memory,
-                    );
-                }
             }
         }
     }
@@ -2612,41 +2589,6 @@ fn connection_receive_wait(
     } else {
         Duration::from_millis(50)
     }
-}
-
-fn maybe_resize_ledger<const H: usize>(
-    mux: &mut StreamMux<8, H>,
-    controller: &mut LedgerCapacityController,
-    next_resize: &mut Instant,
-    interval: Duration,
-    max_active_connections: usize,
-    policy: LedgerMemoryPolicy,
-    injected_memory: Option<LedgerMemorySnapshot>,
-) {
-    if interval == Duration::ZERO || Instant::now() < *next_resize {
-        return;
-    }
-    let memory = injected_memory
-        .or_else(system_memory_snapshot)
-        .unwrap_or(LedgerMemorySnapshot {
-            total_bytes: 512 * 1024 * 1024,
-            available_bytes: 256 * 1024 * 1024,
-        });
-    if let Some(target) = controller.observe(
-        memory,
-        max_active_connections,
-        MTU,
-        policy,
-        mux.endpoint.history_len(),
-    ) {
-        if mux.endpoint.set_history_capacity(target).is_err() {
-            // A live entry may occupy a ring slot above the requested limit
-            // even when the count fits. Keep the existing allocation and
-            // retry after the next stable memory sample.
-            *controller = LedgerCapacityController::new(mux.endpoint.history_capacity(), 2);
-        }
-    }
-    *next_resize = Instant::now() + interval;
 }
 
 fn allocate_server_cid(
@@ -3681,7 +3623,10 @@ mod tests {
 
     #[test]
     fn probe_request_ack_policy_is_scoped_to_the_tagged_request() {
-        assert_eq!(probe_ack_policy(ProbeServiceRequest::new(1024, 1200)), (2, RECOVERY_MAX_ACK_DELAY_US));
+        assert_eq!(
+            probe_ack_policy(ProbeServiceRequest::new(1024, 1200)),
+            (2, RECOVERY_MAX_ACK_DELAY_US)
+        );
         let mut request = ProbeServiceRequest::new(1024, 1200);
         request.ack_frequency = Some(8);
         request.ack_delay_ms = Some(1);
@@ -3733,21 +3678,34 @@ mod tests {
         assert_eq!(interpacket_gap_bucket(Duration::from_micros(25_000)), 4);
         assert_eq!(interpacket_gap_bucket(Duration::from_micros(50_000)), 5);
     }
-    use crate::protocol::{
+    use crate::verified_object::{
         BLOCK_SIZE, ImageEvent, ImageManifest, ImageReceiver, ImageSink, RECORD_BLOB, RECORD_DONE,
         RECORD_MANIFEST, RecordBuffer, encode_get_request,
     };
     use quic_lite::callback::{CallbackStreams, CopyingStreamEvents};
     use quic_lite::{
-        ConnectionId, EndpointState, FIRST_CLIENT_BIDI_STREAM_ID, FLAG_FIXED, Frame,
-        RECOVERY_MAX_HISTORY_PACKETS, RECOVERY_REORDER_CAPACITY_BYTES, RecoveryEndpoint,
-        ShortHeader,
+        ConnectionId, EndpointState, FIRST_CLIENT_BIDI_STREAM_ID, FLAG_FIXED, Frame, ShortHeader,
     };
     use std::format;
     use std::string::String;
     use std::sync::Arc;
     use std::vec;
     use tempfile::tempdir;
+
+    // Host-side constrained consumer profile. These are injected storage and
+    // parser capacities, not a Recovery or QUIC transport constant.
+    const TEST_MANIFEST_CAPACITY: usize = 20 * 1024;
+    const TEST_DATA_RECORD_CAPACITY: usize = 12 + BLOCK_SIZE;
+    const TEST_SINK_WINDOW_BYTES: usize = 4 * BLOCK_SIZE;
+    // This deliberately generous callback/reordering budget belongs only to
+    // the host UDP download matrix. The verified-object consumer advertises
+    // its exact current parser/storage window dynamically; production code
+    // must not reuse this worst-case sum as initial peer credit.
+    const TEST_OBJECT_RECEIVE_WINDOW: usize =
+        TEST_MANIFEST_CAPACITY + TEST_DATA_RECORD_CAPACITY + TEST_SINK_WINDOW_BYTES;
+    const TEST_DOWNLOAD_HISTORY_CEILING: usize = 64;
+    const TEST_DOWNLOAD_HISTORY: usize = 32;
+    const TEST_DOWNLOAD_REORDER_BYTES: usize = 64 * MTU;
 
     struct FakeFlash {
         bytes: Vec<u8>,
@@ -3856,6 +3814,7 @@ mod tests {
             .is_err()
         );
 
+        let (release_server, keep_server) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let mut input = [0u8; MTU];
             let (_, source) = server.recv_from(&mut input).await.unwrap();
@@ -3868,16 +3827,19 @@ mod tests {
             )
             .unwrap();
             server.send_to(&output[..used], source).await.unwrap();
+            // Retain the ephemeral port through every client retry. Dropping
+            // it here lets another parallel UDP test rebind the same port and
+            // accidentally answer this client's later OPEN with a valid ACK.
+            let _ = keep_server.await;
         });
-        assert!(
-            UdpClient::connect(
-                "127.0.0.1:0".parse().unwrap(),
-                server_addr,
-                ConnectionId::new(7).unwrap(),
-            )
-            .await
-            .is_err()
-        );
+        let result = UdpClient::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            ConnectionId::new(7).unwrap(),
+        )
+        .await;
+        let _ = release_server.send(());
+        assert!(result.is_err());
         task.await.unwrap();
     }
 
@@ -4163,12 +4125,12 @@ mod tests {
         assert_eq!(receiver.sink_mut().bytes, expected);
     }
 
-    struct RecoveryMirrorSink<'a> {
+    struct ObjectDownloadSink<'a> {
         records: &'a mut RecordBuffer,
         bytes: usize,
     }
 
-    impl CopyingStreamEvents for RecoveryMirrorSink<'_> {
+    impl CopyingStreamEvents for ObjectDownloadSink<'_> {
         type Error = ();
 
         fn stream_chunk(
@@ -4187,48 +4149,46 @@ mod tests {
         }
     }
 
-    struct RecoveryMirror {
-        endpoint: RecoveryEndpoint<2>,
+    struct ObjectDownloadHarness {
+        endpoint: EndpointState<2, TEST_DOWNLOAD_HISTORY_CEILING, MTU>,
         ordered: CallbackStreams<Arc<Vec<u8>>>,
         records: RecordBuffer,
         receiver: ImageReceiver<FakeFlash>,
         drop_outbound_control: usize,
-        /// Production Recovery drains completed flash slots from its bounded
-        /// socket-timeout path.  Keep accepted record credit pending until
-        /// that path runs; otherwise a host test can hide the exact
-        /// sender-waits-for-MAX_* deadlock that a full initial window exposes.
+        /// Keep accepted record credit pending until the harness timer runs;
+        /// otherwise a lock-step test can hide a sender-waits-for-MAX_*
+        /// deadlock when the initial receive window is exhausted.
         pending_flash_credit: usize,
-        /// Mirror the real-flash bootstrap erase barrier. Recovery must ACK
-        /// the full advertised application window before flash erase pauses
-        /// Wi-Fi; until then completed records retain their storage credit.
+        /// Optional storage barrier: ACK accepted bytes before completed
+        /// records return their application storage credit.
         hold_credit_until_bootstrap: bool,
         delivered_stream_bytes: usize,
         timer_credit_updates: usize,
         /// Bearer-only ACK/control latency. The stream callback and transport
         /// policy remain unchanged, so this models the measured Wi-Fi
-        /// refill-cycle delay without inventing Recovery-side ACK logic.
+        /// refill-cycle delay without inventing handler-side ACK logic.
         outbound_control_delay: Duration,
         /// Control waiting in the simulated bearer. Delaying a packet on the
-        /// air must not suspend Recovery's receive loop.
+        /// air must not suspend the receiver loop.
         pending_outbound: Vec<(Instant, Vec<u8>)>,
     }
 
-    impl RecoveryMirror {
+    impl ObjectDownloadHarness {
         fn new() -> Self {
             Self {
-                endpoint: RecoveryEndpoint::<2>::new(
+                endpoint: EndpointState::<2, TEST_DOWNLOAD_HISTORY_CEILING, MTU>::new_with_history_capacity(
                     Role::Client,
                     ConnectionLimits {
-                        max_data: quic_lite::RECOVERY_INITIAL_MAX_DATA,
-                        max_stream_data: quic_lite::RECOVERY_INITIAL_MAX_DATA,
+                        max_data: TEST_OBJECT_RECEIVE_WINDOW as u64,
+                        max_stream_data: TEST_OBJECT_RECEIVE_WINDOW as u64,
                         ..ConnectionLimits::default()
                     },
                     MTU as u64,
+                    TEST_DOWNLOAD_HISTORY,
                 ),
-                // Match fw/dmesh-fw-transport/src/flash.rs. This is deliberately
-                // not UdpClient: the test must exercise Recovery's callback,
-                // flow-credit, and two-stage ACK behavior.
-                ordered: CallbackStreams::new(2, RECOVERY_REORDER_CAPACITY_BYTES),
+                // This is a generic host download receiver, deliberately
+                // separate from the current host-opened Recovery upload path.
+                ordered: CallbackStreams::new(2, TEST_DOWNLOAD_REORDER_BYTES),
                 records: RecordBuffer::new(),
                 receiver: ImageReceiver::new(FakeFlash { bytes: Vec::new() }),
                 drop_outbound_control: 0,
@@ -4264,7 +4224,7 @@ mod tests {
             Ok(())
         }
 
-        fn accept_recovery_records(
+        fn accept_download_records(
             stream: u64,
             records: &mut RecordBuffer,
             receiver: &mut ImageReceiver<FakeFlash>,
@@ -4276,12 +4236,12 @@ mod tests {
                     RECORD_MANIFEST => receiver.on_manifest(&body).unwrap(),
                     RECORD_BLOB => receiver.on_block(&body).unwrap(),
                     RECORD_DONE => receiver.on_done().unwrap(),
-                    other => panic!("unexpected Recovery mirror record {other}"),
+                    other => panic!("unexpected object download harness record {other}"),
                 };
                 if kind == RECORD_DONE {
                     assert_eq!(event, ImageEvent::Complete);
                 }
-                // Match Recovery's fixed record sink: durable/reusable
+                // Match constrained receiver's fixed record sink: durable/reusable
                 // storage returns exactly the framed record bytes, never an
                 // arbitrary transport-packet size.
                 released = released.saturating_add(5 + body.len());
@@ -4297,7 +4257,7 @@ mod tests {
             now_ms: u64,
         ) -> Result<()> {
             self.flush_outbound(socket, peer).await?;
-            // Match Recovery's receive loop: packet arrival advances the
+            // Match constrained receiver's receive loop: packet arrival advances the
             // transport clock before delayed ACK eligibility is evaluated.
             // Without this, a continuously nonempty host socket can leave a
             // mirror's ACK timer at its old value indefinitely.
@@ -4315,7 +4275,7 @@ mod tests {
             endpoint
                 .receive_with_committed_callback_dispositions(packet, |stream| {
                     let consumed = {
-                        let mut sink = RecoveryMirrorSink { records, bytes: 0 };
+                        let mut sink = ObjectDownloadSink { records, bytes: 0 };
                         ordered
                             .receive_copying(
                                 stream.id,
@@ -4331,25 +4291,25 @@ mod tests {
                     if consumed != 0 {
                         delivered_bytes = delivered_bytes.saturating_add(consumed);
                         released_credit = released_credit.saturating_add(
-                            Self::accept_recovery_records(stream.id, records, receiver),
+                            Self::accept_download_records(stream.id, records, receiver),
                         );
                     }
                     Ok(if consumed == 0 {
                         CommittedStreamDisposition::Reack
                     } else {
-                        // Recovery first ACKs the drained burst, then
+                        // constrained download receiver first ACKs the drained burst, then
                         // returns credit only after its record storage is
                         // reusable. This catches a benchmark path that
                         // accidentally retains bootstrap credit forever.
                         CommittedStreamDisposition::Deferred
                     })
                 })
-                .map_err(|error| anyhow::anyhow!("Recovery mirror input: {error:?}"))?;
+                .map_err(|error| anyhow::anyhow!("object download harness input: {error:?}"))?;
             self.delivered_stream_bytes =
                 self.delivered_stream_bytes.saturating_add(delivered_bytes);
             if let Some(used) = endpoint
                 .poll_transmit(&mut transport_out)
-                .map_err(|error| anyhow::anyhow!("Recovery mirror ACK: {error:?}"))?
+                .map_err(|error| anyhow::anyhow!("object download harness ACK: {error:?}"))?
             {
                 outputs.push(transport_out[..used].to_vec());
             }
@@ -4364,7 +4324,7 @@ mod tests {
             Ok(())
         }
 
-        /// Mirror Recovery's bounded `recvfrom` timeout.  Delayed ACKs and
+        /// Mirror constrained receiver's bounded `recvfrom` timeout.  Delayed ACKs and
         /// other transport control are clock-driven; they must not depend on
         /// another application datagram arriving.  This deliberately emits
         /// opaque transport output only, matching the shared ESP firmware runtime.
@@ -4381,7 +4341,7 @@ mod tests {
                 // record fits. It can be credit-blocked just below the byte
                 // limit; mirror the sink's bounded record reserve.
                 && self.delivered_stream_bytes
-                    < quic_lite::RECOVERY_INITIAL_MAX_DATA as usize - (5 + 12 + BLOCK_SIZE)
+                    < TEST_OBJECT_RECEIVE_WINDOW - (5 + 12 + BLOCK_SIZE)
             {
                 0
             } else {
@@ -4391,13 +4351,15 @@ mod tests {
                 self.timer_credit_updates = self.timer_credit_updates.saturating_add(1);
                 self.endpoint
                     .stream_consumed_deferred(OBJECT_STREAM, released_credit)
-                    .map_err(|error| anyhow::anyhow!("Recovery mirror timer credit: {error:?}"))?;
+                    .map_err(|error| {
+                        anyhow::anyhow!("object download harness timer credit: {error:?}")
+                    })?;
             }
             let mut output = [0u8; MTU];
             if let Some(used) = self
                 .endpoint
                 .poll_transmit(&mut output)
-                .map_err(|error| anyhow::anyhow!("Recovery mirror timer: {error:?}"))?
+                .map_err(|error| anyhow::anyhow!("object download harness timer: {error:?}"))?
             {
                 self.queue_outbound(output[..used].to_vec());
             }
@@ -4407,8 +4369,8 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct RecoveryMirrorResult {
-        /// Stream datagrams intentionally withheld before Recovery's
+    struct ObjectDownloadResult {
+        /// Stream datagrams intentionally withheld before constrained receiver's
         /// transport.  This is a bearer fault, not an application fault.
         dropped_streams: usize,
         /// A withheld stream offset later observed in a fresh-number packet.
@@ -4420,11 +4382,11 @@ mod tests {
         /// retransmission caused solely by ACK/refill timing.
         unexpected_retransmissions: usize,
         /// Completed record storage first became reusable while the socket
-        /// was empty, so Recovery had to advertise MAX_* from its timer path.
+        /// was empty, so constrained download receiver had to advertise MAX_* from its timer path.
         timer_credit_updates: usize,
     }
 
-    async fn run_recovery_mirror(
+    async fn run_object_download_harness(
         size: usize,
         object_chunk: usize,
         history_capacity: usize,
@@ -4434,8 +4396,8 @@ mod tests {
         late_loss_burst: bool,
         drop_initial_alternate: bool,
         outbound_control_delay: Duration,
-    ) -> RecoveryMirrorResult {
-        run_recovery_mirror_with_bootstrap_erase(
+    ) -> ObjectDownloadResult {
+        run_object_download_with_storage_barrier(
             size,
             object_chunk,
             history_capacity,
@@ -4450,7 +4412,7 @@ mod tests {
         .await
     }
 
-    async fn run_recovery_mirror_with_bootstrap_erase(
+    async fn run_object_download_with_storage_barrier(
         size: usize,
         object_chunk: usize,
         history_capacity: usize,
@@ -4461,7 +4423,7 @@ mod tests {
         drop_initial_alternate: bool,
         outbound_control_delay: Duration,
         hold_credit_until_bootstrap: bool,
-    ) -> RecoveryMirrorResult {
+    ) -> ObjectDownloadResult {
         let directory = tempdir().unwrap();
         let artifact_root = directory.path().join("flash");
         let artifact = artifact_root.join("esp32c6/main-app.bin");
@@ -4479,10 +4441,9 @@ mod tests {
             artifact_root,
             history_capacity,
             object_chunk,
-            // Exercise the explicit Recovery profile while the automatic
+            // Exercise the explicit constrained download receiver profile while the automatic
             // memory-policy tick is active. A regression must not widen the
             // four-packet service profile behind the test's back.
-            ledger_resize_interval: Duration::from_millis(1),
             ledger_memory: Some(LedgerMemorySnapshot {
                 total_bytes: 512 * 1024 * 1024,
                 available_bytes: 512 * 1024 * 1024,
@@ -4509,7 +4470,7 @@ mod tests {
                 }
             }
         };
-        let mut mirror = RecoveryMirror::new();
+        let mut mirror = ObjectDownloadHarness::new();
         mirror.hold_credit_until_bootstrap = hold_credit_until_bootstrap;
         mirror
             .endpoint
@@ -4540,7 +4501,7 @@ mod tests {
             .unwrap();
 
         let started = Instant::now();
-        // The host suite runs several Recovery fault profiles concurrently.
+        // The host suite runs several constrained download receiver fault profiles concurrently.
         // Keep a generous absolute cap, but fail a real transport deadlock on
         // lack of delivered stream progress rather than scheduler contention.
         let deadline = started + Duration::from_secs(60);
@@ -4557,7 +4518,7 @@ mod tests {
         // must be admitted; otherwise the test fault model can discard repairs
         // indefinitely instead of testing recovery.
         let mut initial_stream_offsets = HashSet::new();
-        let mut result = RecoveryMirrorResult::default();
+        let mut result = ObjectDownloadResult::default();
         while !mirror.receiver.is_complete() {
             if mirror.delivered_stream_bytes != last_delivered_bytes {
                 last_delivered_bytes = mirror.delivered_stream_bytes;
@@ -4565,14 +4526,14 @@ mod tests {
             }
             assert!(
                 last_delivery.elapsed() < Duration::from_secs(10),
-                "Recovery mirror made no delivery progress for 10 seconds after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
+                "object download harness made no delivery progress for 10 seconds after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
                 mirror.delivered_stream_bytes,
                 mirror.pending_flash_credit,
             );
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
-                "Recovery mirror transfer timed out after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
+                "object download harness transfer timed out after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
                 mirror.delivered_stream_bytes,
                 mirror.pending_flash_credit,
             );
@@ -4601,7 +4562,7 @@ mod tests {
                         let late_stream_drop = stream_datagrams >= 849 && late_drops_remaining != 0;
                         // A bounded alternating initial burst models the
                         // ESP/lwIP overflow seen live: the AP reports the
-                        // frames transmitted, while Recovery observes only
+                        // frames transmitted, while constrained download receiver observes only
                         // about half. This must recover through selective
                         // ACK/loss repair, not require another application
                         // record or a service restart.
@@ -4639,7 +4600,7 @@ mod tests {
                         .await
                     {
                         Ok(()) => {}
-                        // Recovery keeps its socket loop alive when the
+                        // constrained download receiver keeps its socket loop alive when the
                         // bounded callback credit rejects far-ahead data.
                         // Earlier selective ACKs make the sender repair the
                         // missing range; this is backpressure, not a session
@@ -4647,10 +4608,10 @@ mod tests {
                         Err(error)
                             if error.to_string().contains("FlowControl")
                                 || error.to_string().contains("Invalid") => {}
-                        Err(error) => panic!("Recovery mirror input failed: {error}"),
+                        Err(error) => panic!("object download harness input failed: {error}"),
                     }
                 }
-                Ok(Err(error)) => panic!("Recovery mirror receive failed: {error}"),
+                Ok(Err(error)) => panic!("object download harness receive failed: {error}"),
                 Err(_) => mirror
                     .poll_timer(&socket, bind, started.elapsed().as_millis() as u64)
                     .await
@@ -4669,12 +4630,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_receive_loop_matrix_matches_device_profiles() {
+    async fn object_download_matrix_uses_injected_receiver_profiles() {
         for history_capacity in [2, 4, 16, 32] {
             // Exercise both the 512-byte diagnostic profile and the normal
             // MTU-friendly production profile.
             for object_chunk in [512, OBJECT_CHUNK] {
-                let result = run_recovery_mirror(
+                let result = run_object_download_harness(
                     128 * 1024 + 123,
                     object_chunk,
                     history_capacity,
@@ -4692,11 +4653,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_benchmark_matches_esp32_dry_run_size() {
+    async fn object_download_large_transfer_benchmark() {
         let size = 2_122_528;
         let started = Instant::now();
         let object_chunk = OBJECT_CHUNK;
-        let result = run_recovery_mirror(
+        let result = run_object_download_harness(
             size,
             object_chunk,
             32,
@@ -4711,7 +4672,7 @@ mod tests {
         assert_eq!(result.dropped_streams, 0);
         assert!(
             result.timer_credit_updates != 0,
-            "the full Recovery profile must exercise timer-driven flash credit",
+            "the full constrained download receiver profile must exercise timer-driven flash credit",
         );
         let elapsed = started.elapsed();
         let mib_per_second = size as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
@@ -4725,12 +4686,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_recovers_when_first_delayed_ack_is_lost() {
+    async fn object_download_recovers_when_first_delayed_ack_is_lost() {
         // A 2 MiB image has a manifest larger than the initial congestion
         // window.  Drop the first timer-driven ACK exactly as Wi-Fi can; the
         // server must PTO a retained packet even though its history is not
         // yet full, then resume the same ordered response stream.
-        let result = run_recovery_mirror(
+        let result = run_object_download_harness(
             2_122_528,
             OBJECT_CHUNK,
             16,
@@ -4746,10 +4707,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_recovers_from_late_three_packet_loss_burst() {
+    async fn object_download_recovers_from_late_three_packet_loss_burst() {
         // Matches the device stall boundary: do not let a late selective-ACK
-        // gap turn an otherwise healthy 2 MiB Recovery transfer into silence.
-        let result = run_recovery_mirror(
+        // gap turn an otherwise healthy 2 MiB constrained download receiver transfer into silence.
+        let result = run_object_download_harness(
             2_122_528,
             OBJECT_CHUNK,
             32,
@@ -4766,12 +4727,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_reorders_one_stream_packet_with_bounded_credit() {
+    async fn object_download_reorders_one_stream_packet_with_bounded_credit() {
         // This mirrors the Wi-Fi fault that previously let the server send
-        // roughly 256 KiB past a missing early range, overflowing Recovery's
+        // roughly 256 KiB past a missing early range, overflowing constrained receiver's
         // callback buffer.  The receiver must advertise only its bounded
         // reorder budget and the sender must repair the gap.
-        let result = run_recovery_mirror(
+        let result = run_object_download_harness(
             2_122_528,
             OBJECT_CHUNK,
             16,
@@ -4788,13 +4749,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_delayed_ack_refills_without_spurious_retransmission() {
+    async fn object_download_delayed_ack_refills_without_spurious_retransmission() {
         // The live AP shows roughly one sender refill per ACK and recurrent
-        // 10--25 ms gaps.  Model only that bearer delay: Recovery continues
+        // 10--25 ms gaps.  Model only that bearer delay: constrained download receiver continues
         // to use its normal callback, flow credit, and transport-owned ACK
         // policy. A contiguous delayed ACK must refill the sender without a
         // replacement stream packet or congestion-loss episode.
-        let result = run_recovery_mirror(
+        let result = run_object_download_harness(
             128 * 1024,
             OBJECT_CHUNK,
             16,
@@ -4811,13 +4772,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_real_flash_acks_bootstrap_before_erase_credit_barrier() {
+    async fn object_download_storage_barrier_acks_bootstrap_before_releasing_credit() {
         // Mirror MainSink's real-flash ordering: receive and ACK the whole
         // initial 76 KiB application window, withhold MAX_* while erase owns
         // the radio, then resume only through returned storage slots. This
         // must resume by the timer-driven MAX_* update rather than deadlock
         // below a partial record boundary.
-        let result = run_recovery_mirror_with_bootstrap_erase(
+        let result = run_object_download_with_storage_barrier(
             2_122_528,
             OBJECT_CHUNK,
             32,
@@ -4836,13 +4797,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_recovers_after_a_full_window_of_lost_acks() {
+    async fn object_download_recovers_after_a_full_window_of_lost_acks() {
         // This is the exact host-side analogue of a live sender retaining a
-        // full 32-packet flight while Recovery emits no usable ACKs. Once a
+        // full 32-packet flight while constrained download receiver emits no usable ACKs. Once a
         // PTO probe reaches the receiver, duplicate re-ACK and normal window
         // refill must complete the stream; the connection may not wait for a
         // new application record or an external socket event.
-        let result = run_recovery_mirror(
+        let result = run_object_download_harness(
             128 * 1024,
             OBJECT_CHUNK,
             32,
@@ -4858,12 +4819,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_profile_recovers_from_initial_alternating_loss_burst() {
+    async fn object_download_recovers_from_initial_alternating_loss_burst() {
         // The fault is confined to the first 64 stream datagrams (32 drops).
         // 128 KiB leaves enough post-repair data to verify resumed progress
         // without making this host determinism gate compete with the larger
-        // multi-megabyte Recovery benchmark tests.
-        let result = run_recovery_mirror(
+        // multi-megabyte constrained download receiver benchmark tests.
+        let result = run_object_download_harness(
             128 * 1024,
             OBJECT_CHUNK,
             32,
@@ -4880,26 +4841,23 @@ mod tests {
     }
 
     #[test]
-    fn recovery_production_window_fits_callback_reorder_budget() {
-        const RECEIVER_PACKET_BUDGET: usize =
-            quic_lite::RECOVERY_MAX_DIAGNOSTIC_IN_FLIGHT_PACKETS as usize;
+    fn object_download_window_fits_callback_reorder_budget() {
+        const RECEIVER_PACKET_BUDGET: usize = TEST_DOWNLOAD_HISTORY_CEILING;
         const HOST_PAYLOAD_BYTES: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
         assert!(
-            RECEIVER_PACKET_BUDGET * HOST_PAYLOAD_BYTES <= RECOVERY_REORDER_CAPACITY_BYTES,
-            "Recovery callback reassembly must cover every outstanding host payload"
+            RECEIVER_PACKET_BUDGET * HOST_PAYLOAD_BYTES <= TEST_DOWNLOAD_REORDER_BYTES,
+            "constrained download receiver callback reassembly must cover every outstanding host payload"
         );
         assert!(
-            RECOVERY_MAX_HISTORY_PACKETS >= RECEIVER_PACKET_BUDGET,
-            "host retransmission ledger must cover Recovery's packet budget"
+            TEST_DOWNLOAD_HISTORY_CEILING >= RECEIVER_PACKET_BUDGET,
+            "host retransmission ledger must cover constrained receiver's packet budget"
         );
-        // Packet history and byte credit are deliberately independent. The
-        // C6 can retain/reorder a 64-packet sender history, while its fixed
-        // application pool admits eight complete 4 KiB records before flash
-        // releases credit.  Requiring both at startup would overcommit
-        // internal RAM and turn a valid manifest into an allocator abort.
-        assert!(
-            quic_lite::RECOVERY_INITIAL_MAX_DATA as usize >= 8 * (5 + 12 + 4096),
-            "initial byte credit must cover the fixed Recovery blob pool"
+        // Packet history and byte credit are independent. The object
+        // consumer derives its initial window from its parser and sink
+        // capacities; QUIC has no flash-record or fixed-slot policy.
+        assert_eq!(
+            TEST_OBJECT_RECEIVE_WINDOW,
+            TEST_MANIFEST_CAPACITY + TEST_DATA_RECORD_CAPACITY + TEST_SINK_WINDOW_BYTES
         );
     }
 
@@ -5090,58 +5048,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_runtime_ledger_resize_grows_after_stable_memory_samples() {
-        let root = tempdir().unwrap();
-        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let bind = probe.local_addr().unwrap();
-        drop(probe);
-        let server_task = tokio::spawn(run(UdpConfig {
-            bind,
-            artifact_root: root.path().to_path_buf(),
-            // Zero selects the memory-aware policy; an explicit capacity is
-            // intentionally fixed for embedded-compatible profiles.
-            history_capacity: 0,
-            max_active_connections: 1,
-            ledger_memory_policy: quic_lite::ledger::LedgerMemoryPolicy {
-                min_packets: 4,
-                max_packets: 16,
-                reserve_bytes: 0,
-                ..quic_lite::ledger::LedgerMemoryPolicy::default()
-            },
-            ledger_memory: Some(quic_lite::ledger::LedgerMemorySnapshot {
-                total_bytes: 1024 * 1024,
-                available_bytes: 1024 * 1024,
-            }),
-            ledger_resize_interval: Duration::from_millis(10),
-            ..UdpConfig::default()
-        }));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let mut client = UdpClient::connect(
-            "127.0.0.1:0".parse().unwrap(),
-            bind,
-            ConnectionId::new(0x5b).unwrap(),
-        )
-        .await
-        .unwrap();
-        let mut final_metrics = String::new();
-        for (index, stream_id) in [4_u64, 8, 12, 16].into_iter().enumerate() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let metrics = request_diagnostic_text(
-                &mut client,
-                stream_id,
-                crate::services::DIAGNOSTIC_METRICS_METHOD,
-            )
-            .await;
-            if index == 3 {
-                final_metrics = metrics;
-            }
-        }
-        assert!(final_metrics.contains("history_capacity=16"));
-        assert!(final_metrics.contains("history_storage_slots=16"));
-        server_task.abort();
-    }
-
-    #[tokio::test]
     async fn udp_bootstrap_supports_two_connections_and_multiple_operations() {
         let root = tempdir().unwrap();
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -5315,8 +5221,8 @@ mod tests {
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
         let limits = ConnectionLimits {
-            max_data: quic_lite::RECOVERY_INITIAL_MAX_DATA,
-            max_stream_data: quic_lite::RECOVERY_INITIAL_MAX_DATA,
+            max_data: TEST_OBJECT_RECEIVE_WINDOW as u64,
+            max_stream_data: TEST_OBJECT_RECEIVE_WINDOW as u64,
             ..ConnectionLimits::default()
         };
         let mut client = UdpClient::connect_with_limits(
@@ -5909,7 +5815,7 @@ mod tests {
         let used = encode_get_request(&mut encoded, 17, None, 13, 6).unwrap();
         assert_eq!(
             object_request(&encoded[..used]).unwrap(),
-            crate::protocol::GetRequest {
+            crate::verified_object::GetRequest {
                 name: None,
                 cpu: 13,
                 target: 6,

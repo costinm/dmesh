@@ -19,6 +19,19 @@ pub use espnow::{
     parse_action_frame as parse_espnow_action_frame,
 };
 
+/// ESP-NOW broadcast discovery cluster: the NAN fallback bearer for devices
+/// that cannot transmit NAN beacons. Reuses NAN's selection algorithm and
+/// 512-TU window math over a lean NOW-native beacon-equivalent payload.
+pub mod now_sync;
+pub use now_sync::{
+    elect_now_master, is_now_sync, next_now_dw_start_us, now_sync_observe, now_sync_tick,
+    parse_now_sync_body, parse_now_sync_frame, select_now_cluster, build_now_sync_body,
+    build_now_sync_frame, NowSyncAction, NowSyncFrame, NowSyncObservation, NowSyncState,
+    NOW_SYNC_DEFAULT_INTERVAL_TU, NOW_SYNC_FLAG_MASTER, NOW_SYNC_FLAG_NAN_ALIGNED,
+    NOW_SYNC_HEADER_LEN, NOW_SYNC_MAGIC, NOW_SYNC_PRESENCE_RSSI_DBM, NOW_SYNC_RESELECT_AFTER_US,
+    NOW_SYNC_SERVICE_INFO_MAX_LEN, NOW_SYNC_STALE_AFTER_US, NOW_SYNC_VERSION,
+};
+
 /// Wi-Fi Direct/P2P passive-discovery wire primitives. Active Service
 /// Discovery and negotiation are deliberately controller-triggered.
 pub mod p2p;

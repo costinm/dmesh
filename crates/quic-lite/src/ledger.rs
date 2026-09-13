@@ -1,9 +1,12 @@
 //! Retransmission-ledger sizing policy.
 //!
 //! The packet store itself remains owned by `EndpointState`.  This module
-//! keeps memory-policy decisions deterministic and bearer-neutral so host
-//! adapters can size a heap-backed ledger while embedded adapters continue to
-//! use fixed profiles.
+//! keeps memory-policy decisions deterministic and bearer-neutral. Host and
+//! embedded adapters both sample their platform's available memory and use
+//! [`select_capacity`] to size the same heap-backed endpoint ledger. They may
+//! supply different reserve/ceiling values because their address spaces and
+//! workloads differ; those are resource-policy inputs, not different QUIC
+//! behavior or storage representations.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LedgerMemoryPolicy {
@@ -32,74 +35,6 @@ impl Default for LedgerMemoryPolicy {
 pub struct LedgerMemorySnapshot {
     pub total_bytes: u64,
     pub available_bytes: u64,
-}
-
-/// Allocation-free hysteresis for adapting a host ledger to changing memory
-/// pressure.  The bearer samples memory and calls [`observe`] periodically;
-/// the controller only proposes a resize after the same target has remained
-/// stable for the configured number of observations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LedgerCapacityController {
-    current: usize,
-    pending: usize,
-    stable_observations: u8,
-    required_observations: u8,
-}
-
-impl LedgerCapacityController {
-    pub fn new(current: usize, required_observations: u8) -> Self {
-        assert!(current > 0);
-        Self {
-            current,
-            pending: current,
-            stable_observations: 0,
-            required_observations: required_observations.max(1),
-        }
-    }
-
-    pub const fn current(&self) -> usize {
-        self.current
-    }
-
-    pub const fn pending(&self) -> usize {
-        self.pending
-    }
-
-    pub const fn stable_observations(&self) -> u8 {
-        self.stable_observations
-    }
-
-    /// Observe a new memory budget.  Returns a new capacity only when it is
-    /// safe to apply immediately; a shrink below `live_entries` is deferred
-    /// without evicting or overwriting retransmittable packets.
-    pub fn observe(
-        &mut self,
-        memory: LedgerMemorySnapshot,
-        active_connections: usize,
-        payload_bytes: usize,
-        policy: LedgerMemoryPolicy,
-        live_entries: usize,
-    ) -> Option<usize> {
-        let target = select_capacity(memory, active_connections, payload_bytes, policy);
-        if target == self.current || target < live_entries {
-            self.pending = target;
-            self.stable_observations = 0;
-            return None;
-        }
-        if self.pending != target {
-            self.pending = target;
-            self.stable_observations = 1;
-            return None;
-        }
-        self.stable_observations = self.stable_observations.saturating_add(1);
-        if self.stable_observations < self.required_observations {
-            return None;
-        }
-        self.current = target;
-        self.pending = target;
-        self.stable_observations = 0;
-        Some(target)
-    }
 }
 
 /// Select a per-connection ledger capacity. The result is deterministic for
@@ -224,57 +159,5 @@ mod tests {
             available_bytes: 1 << 40,
         };
         assert_eq!(select_capacity(memory, 1, 1400, policy), 512);
-    }
-
-    #[test]
-    fn capacity_controller_requires_stability_and_preserves_live_entries() {
-        let policy = LedgerMemoryPolicy {
-            min_packets: 4,
-            max_packets: 64,
-            reserve_bytes: 0,
-            ..LedgerMemoryPolicy::default()
-        };
-        let low = LedgerMemorySnapshot {
-            total_bytes: 16 * 1024,
-            available_bytes: 16 * 1024,
-        };
-        let high = LedgerMemorySnapshot {
-            total_bytes: 4 * 1024 * 1024,
-            available_bytes: 4 * 1024 * 1024,
-        };
-        let mut controller = LedgerCapacityController::new(4, 2);
-        assert_eq!(controller.observe(high, 1, 1400, policy, 0), None);
-        assert_eq!(controller.observe(high, 1, 1400, policy, 0), Some(64));
-        assert_eq!(controller.current(), 64);
-        assert_eq!(controller.observe(low, 1, 1400, policy, 8), None);
-        assert_eq!(controller.current(), 64);
-        assert_eq!(controller.observe(low, 1, 1400, policy, 4), None);
-        assert_eq!(controller.observe(low, 1, 1400, policy, 4), Some(4));
-        assert_eq!(controller.current(), 4);
-    }
-
-    #[test]
-    fn capacity_controller_ignores_oscillation_until_target_is_stable() {
-        let policy = LedgerMemoryPolicy {
-            min_packets: 4,
-            max_packets: 64,
-            reserve_bytes: 0,
-            ..LedgerMemoryPolicy::default()
-        };
-        let low = LedgerMemorySnapshot {
-            total_bytes: 16 * 1024,
-            available_bytes: 16 * 1024,
-        };
-        let high = LedgerMemorySnapshot {
-            total_bytes: 4 * 1024 * 1024,
-            available_bytes: 4 * 1024 * 1024,
-        };
-        let mut controller = LedgerCapacityController::new(16, 3);
-        assert_eq!(controller.observe(high, 1, 1400, policy, 0), None);
-        assert_eq!(controller.observe(low, 1, 1400, policy, 0), None);
-        assert_eq!(controller.observe(high, 1, 1400, policy, 0), None);
-        assert_eq!(controller.current(), 16);
-        assert_eq!(controller.observe(high, 1, 1400, policy, 0), None);
-        assert_eq!(controller.observe(high, 1, 1400, policy, 0), Some(64));
     }
 }

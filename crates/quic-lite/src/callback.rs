@@ -167,11 +167,7 @@ impl<P: PacketLease> OrderedStream<P> {
                 // Exact retransmissions are handled below. Partial overlap
                 // is rejected so retained-byte accounting remains exact and
                 // no range is counted twice.
-                if existing.offset != offset
-                    || existing.range.len() != range.len()
-                    || existing.range.start != range.start
-                    || existing.range.end != range.end
-                {
+                if existing.offset != offset || existing.range.len() != range.len() {
                     return Err(CallbackError::InvalidOverlap);
                 }
             }
@@ -320,12 +316,28 @@ impl<P: PacketLease> CallbackStreams<P> {
         fin: bool,
         events: &mut E,
     ) -> Result<(), CopyingError<E::Error>> {
+        // A synchronous consumer does not retain the packet which closes the
+        // current gap. Permit that one immediately consumable range in
+        // addition to the reorder budget; otherwise a full tail buffer rejects
+        // the missing prefix forever and can never drain. Asynchronous leased
+        // delivery keeps the strict bound because its outstanding packet must
+        // remain owned until an explicit completion.
+        let directly_consumable = self
+            .streams
+            .iter()
+            .find(|state| state.id == stream)
+            .map_or(offset == 0, |state| {
+                !state.finished && state.outstanding.is_none() && offset == state.consumed
+            });
+        let temporary_allowance = directly_consumable.then_some(range.len()).unwrap_or(0);
+        self.max_retained_bytes = self.max_retained_bytes.saturating_add(temporary_allowance);
         let mut sink = CopyAdapter {
             events,
             error: None,
         };
-        self.receive_leased(stream, packet, offset, range, fin, &mut sink)
-            .map_err(CopyingError::Transport)?;
+        let received = self.receive_leased(stream, packet, offset, range, fin, &mut sink);
+        self.max_retained_bytes = self.max_retained_bytes.saturating_sub(temporary_allowance);
+        received.map_err(CopyingError::Transport)?;
         if let Some(error) = sink.error.take() {
             sink.events.stream_reset(stream, 1);
             return Err(CopyingError::Callback(error));
@@ -703,17 +715,42 @@ mod tests {
     fn exact_retransmission_does_not_fail_when_callback_window_is_full() {
         let mut streams = CallbackStreams::new(2, 4);
         let mut sink = CopySink::default();
-        let packet = Arc::new(b"tail".to_vec());
+        let packet = Arc::new(b"hdr1tail".to_vec());
         streams
-            .receive_copying(4, packet.clone(), 4, 0..4, false, &mut sink)
+            .receive_copying(4, packet, 4, 4..8, false, &mut sink)
             .unwrap();
         assert_eq!(streams.retained_bytes(), 4);
         // This models a fresh-number transport retransmission of the same
-        // stream range after the receiver's bounded reassembly is full.
+        // stream range after the receiver's bounded reassembly is full. Its
+        // packet-number/header encoding may put the payload at a different
+        // offset in the replacement datagram.
         streams
-            .receive_copying(4, packet, 4, 0..4, false, &mut sink)
+            .receive_copying(4, Arc::new(b"htail".to_vec()), 4, 1..5, false, &mut sink)
             .unwrap();
         assert_eq!(streams.retained_bytes(), 4);
+    }
+
+    #[test]
+    fn full_reorder_window_accepts_the_missing_prefix_and_drains() {
+        let mut streams = CallbackStreams::new(2, 4);
+        let mut sink = CopySink::default();
+        streams
+            .receive_copying(8, Arc::new(b"tail".to_vec()), 4, 0..4, false, &mut sink)
+            .unwrap();
+        assert_eq!(streams.retained_bytes(), 4);
+        assert!(matches!(
+            streams.receive_copying(8, Arc::new(b"next".to_vec()), 8, 0..4, false, &mut sink),
+            Err(CopyingError::Transport(CallbackError::Capacity))
+        ));
+        assert_eq!(streams.streams[0].consumed, 0);
+        assert!(streams.streams[0].outstanding.is_none());
+        assert_eq!(streams.streams[0].retained.len(), 1);
+        assert_eq!(streams.streams[0].retained[0].offset, 4);
+        streams
+            .receive_copying(8, Arc::new(b"head".to_vec()), 0, 0..4, false, &mut sink)
+            .unwrap();
+        assert_eq!(sink.data, b"headtail");
+        assert_eq!(streams.retained_bytes(), 0);
     }
 
     #[test]

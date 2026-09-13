@@ -87,7 +87,10 @@ pub mod udp;
 
 #[cfg(feature = "std")]
 mod host {
-    use crate::cbor;
+    use crate::{
+        cbor,
+        verified_object::{BLOCK_DIGEST_BYTES, VERIFIED_OBJECT_VERSION},
+    };
     use anyhow::{Context, Result, bail};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
@@ -96,7 +99,7 @@ mod host {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
-    pub use crate::protocol::{
+    pub use crate::verified_object::{
         GetRequest, MAX_RECORD, RECORD_BLOB, RECORD_DONE, RECORD_MANIFEST, REQUEST_MAX,
     };
 
@@ -279,15 +282,16 @@ mod host {
         if manifest.image_size > u32::MAX as u64 {
             bail!("object too large");
         }
-        let mut out = Vec::with_capacity(64 + manifest.block_sha256.len() * 32);
+        let mut out = Vec::with_capacity(64 + manifest.block_sha256.len() * BLOCK_DIGEST_BYTES);
         // CBOR map: target, version, block size, block count, image size,
-        // full image digest, and full per-block SHA-256 digests. The receiver
-        // must verify these fields before accepting or committing the image.
+        // full image digest, and a flat, fixed-width per-block digest table.
+        // The receiver indexes the table by block number before accepting or
+        // committing an image.
         cbor::encode::map(7, &mut out);
         cbor::encode::uint(0, &mut out);
         cbor::encode::uint(request.target as u64, &mut out);
         cbor::encode::uint(1, &mut out);
-        cbor::encode::uint(1, &mut out);
+        cbor::encode::uint(VERIFIED_OBJECT_VERSION as u64, &mut out);
         cbor::encode::uint(2, &mut out);
         cbor::encode::uint(manifest.block_size as u64, &mut out);
         cbor::encode::uint(3, &mut out);
@@ -296,12 +300,17 @@ mod host {
         cbor::encode::uint(manifest.image_size, &mut out);
         cbor::encode::uint(5, &mut out);
         cbor::encode::bytes(&hex::decode(&manifest.image_sha256)?, &mut out);
-        cbor::encode::uint(6, &mut out);
-        cbor::encode::array(manifest.block_sha256.len() as u64, &mut out);
+        let mut block_digests =
+            Vec::with_capacity(manifest.block_sha256.len() * BLOCK_DIGEST_BYTES);
         for digest in &manifest.block_sha256 {
             let bytes = hex::decode(digest)?;
-            cbor::encode::bytes(&bytes, &mut out);
+            if bytes.len() != 32 {
+                bail!("invalid block SHA-256 length")
+            }
+            block_digests.extend_from_slice(&bytes[..BLOCK_DIGEST_BYTES]);
         }
+        cbor::encode::uint(6, &mut out);
+        cbor::encode::bytes(&block_digests, &mut out);
         Ok(out)
     }
 
@@ -350,6 +359,7 @@ mod host {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::verified_object::ImageManifest;
         use tempfile::tempdir;
 
         #[test]
@@ -407,15 +417,51 @@ mod host {
             );
             assert_eq!(&records[2].1[12..], &bytes[BLOCK_SIZE..]);
         }
+
+        #[test]
+        fn flat_block_digest_manifest_stays_small_for_four_mebibytes() {
+            let manifest = FileManifest {
+                source: "main-app.bin".into(),
+                source_mtime_ns: 0,
+                source_size: 4 * 1024 * 1024,
+                block_size: BLOCK_SIZE as u32,
+                image_size: 4 * 1024 * 1024,
+                image_sha256: "00".repeat(32),
+                block_sha256: vec!["00".repeat(32); 1024],
+            };
+            let bytes = manifest_bytes(
+                &manifest,
+                GetRequest {
+                    name: None,
+                    cpu: 13,
+                    target: 6,
+                },
+            )
+            .unwrap();
+            // 60 bytes of fixed fields plus key 6 and a 16,384-byte CBOR
+            // byte string: no per-block CBOR wrappers.
+            assert_eq!(bytes.len(), 16_448);
+            let decoded = ImageManifest::decode(&bytes).unwrap();
+            assert_eq!(decoded.block_digests.len(), 1024);
+            assert!(
+                decoded
+                    .block_digests
+                    .iter()
+                    .all(|digest| digest == &[0; BLOCK_DIGEST_BYTES])
+            );
+        }
     }
 }
 
 #[cfg(feature = "std")]
 pub use host::*;
 
-pub mod protocol {
-    include!("core.rs");
+/// Bearer-neutral immutable object records, manifest validation, and stream
+/// consumers. Flash supplies only its durable partition sink; QUIC-lite and
+/// generic transport do not depend on this module.
+pub mod verified_object {
+    include!("verified_object.rs");
 }
 
 #[cfg(not(feature = "std"))]
-pub use protocol::*;
+pub use verified_object::*;

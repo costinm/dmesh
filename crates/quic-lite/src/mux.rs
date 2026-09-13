@@ -4,7 +4,7 @@
 //! encodes returned responses using [`StreamMux::encode_response`].  Socket,
 //! radio, timer, and peer-address policy stays outside this module.
 
-use crate::callback::{CallbackStreams, CopyingError, CopyingStreamEvents};
+use crate::callback::{CallbackError, CallbackStreams, CopyingError, CopyingStreamEvents};
 use crate::{ConnectionId, EndpointState, Error, Role};
 use alloc::{sync::Arc, vec::Vec};
 
@@ -108,6 +108,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         max_datagram_size: u64,
         max_pending_streams: usize,
         max_stream_bytes: usize,
+        history_capacity: usize,
     ) {
         unsafe {
             crate::EndpointState::init_in_place(
@@ -115,7 +116,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 role,
                 limits,
                 max_datagram_size,
-                H,
+                history_capacity,
             );
             core::ptr::addr_of_mut!((*out).completed).write(Vec::new());
             core::ptr::addr_of_mut!((*out).max_pending_streams).write(max_pending_streams);
@@ -222,16 +223,29 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         for frame in &parsed_streams {
             let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
             let mut sink = ValidationSink;
-            staged
-                .receive_copying(
-                    frame.id,
-                    lease.clone(),
-                    frame.offset,
-                    start..start + frame.data.len(),
-                    frame.fin,
-                    &mut sink,
-                )
-                .map_err(|_| Error::Invalid)?;
+            match staged.receive_copying(
+                frame.id,
+                lease.clone(),
+                frame.offset,
+                start..start + frame.data.len(),
+                frame.fin,
+                &mut sink,
+            ) {
+                Ok(()) => {}
+                Err(CopyingError::Transport(CallbackError::Capacity)) => {
+                    // Do not admit or ACK a datagram whose out-of-order bytes
+                    // cannot be retained. This is receive backpressure, not a
+                    // malformed stream: the peer's ordinary QUIC loss repair
+                    // will resend it after the preceding gap is consumed.
+                    return Ok(None);
+                }
+                Err(CopyingError::Transport(_)) => {
+                    return Err(Error::Invalid);
+                }
+                Err(CopyingError::Callback(_)) => {
+                    return Err(Error::Invalid);
+                }
+            }
         }
         let packet = match self.endpoint.receive_datagram(input) {
             Ok(packet) => packet,
@@ -299,16 +313,25 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         for frame in &parsed_streams {
             let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
             let mut sink = ValidationSink;
-            staged
-                .receive_copying(
-                    frame.id,
-                    lease.clone(),
-                    frame.offset,
-                    start..start + frame.data.len(),
-                    frame.fin,
-                    &mut sink,
-                )
-                .map_err(|_| Error::Invalid)?;
+            match staged.receive_copying(
+                frame.id,
+                lease.clone(),
+                frame.offset,
+                start..start + frame.data.len(),
+                frame.fin,
+                &mut sink,
+            ) {
+                Ok(()) => {}
+                Err(CopyingError::Transport(CallbackError::Capacity)) => {
+                    // The packet remains unacknowledged. Once the preceding
+                    // gap is repaired, ordinary loss recovery may submit it
+                    // again without terminating this stream or association.
+                    return Ok(None);
+                }
+                Err(CopyingError::Transport(_)) | Err(CopyingError::Callback(_)) => {
+                    return Err(Error::Invalid);
+                }
+            }
         }
         let _ = self.endpoint.receive_datagram(input)?;
         let mut first = None;
@@ -337,6 +360,13 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 if sink.bytes != 0 {
                     self.endpoint
                         .stream_consumed_without_credit(frame.id, sink.bytes)?;
+                } else {
+                    // This packet number is new even when its ordered stream
+                    // range is a retransmission or remains behind a gap.
+                    // Re-ACK it through the same endpoint operation used by
+                    // committed callbacks; otherwise sparse loss can rotate
+                    // the range out of a bounded ACK summary indefinitely.
+                    self.endpoint.request_stream_reack();
                 }
                 if sink.finished {
                     if self.completed.len() >= self.max_pending_streams {
@@ -541,6 +571,69 @@ mod tests {
     }
 
     #[test]
+    fn streamed_reorder_capacity_declines_packet_without_killing_connection() {
+        let limits = ConnectionLimits {
+            max_data: 32,
+            max_stream_data: 32,
+            ..ConnectionLimits::default()
+        };
+        let mut client = StreamMux::<4, 4>::new(Role::Client, limits, 1200, 8, 4, 32);
+        let mut server = StreamMux::<4, 4>::new(Role::Server, limits, 1200, 8, 4, 4);
+        let client_cid = ConnectionId::new(0x81).unwrap();
+        let server_cid = ConnectionId::new(0x82).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        client.endpoint.open_send_stream(8, 32).unwrap();
+
+        let mut packet = [0u8; 128];
+        let (tail, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 4, false, b"tail", &mut packet)
+            .unwrap();
+        assert!(
+            server
+                .receive_request_with_stream(&packet[..tail], 8, |_, _, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(server.endpoint.expected_packet_number(), 1);
+        assert_eq!(server.ordered.retained_bytes(), 4);
+
+        let (beyond, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 8, false, b"next", &mut packet)
+            .unwrap();
+        assert!(
+            server
+                .receive_request_with_stream(&packet[..beyond], 8, |_, _, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        // The unretainable packet was deliberately not admitted or ACKed.
+        assert_eq!(server.endpoint.expected_packet_number(), 1);
+        assert_eq!(server.ordered.retained_bytes(), 4);
+
+        let (head, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, b"head", &mut packet)
+            .unwrap();
+        let mut delivered = Vec::new();
+        server
+            .receive_request_with_stream(&packet[..head], 8, |_, _, bytes| {
+                delivered.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(server.ordered.retained_bytes(), 0);
+        assert_eq!(delivered, b"headtail");
+        assert_eq!(server.endpoint.expected_packet_number(), 3);
+    }
+
+    #[test]
     fn persistent_mux_interleaves_multiple_streams_without_cross_delivery() {
         let mut client =
             StreamMux::<8, 8>::new(Role::Client, ConnectionLimits::default(), 1200, 8, 8, 1024);
@@ -634,6 +727,55 @@ mod tests {
             server.endpoint.receive.received_data,
             received_before_conflict
         );
+    }
+
+    #[test]
+    fn streamed_mux_immediately_reacks_a_fresh_packet_for_consumed_range() {
+        let mut client =
+            StreamMux::<4, 4, 256>::new(Role::Client, ConnectionLimits::default(), 256, 4, 1, 256);
+        let mut server =
+            StreamMux::<4, 4, 256>::new(Role::Server, ConnectionLimits::default(), 256, 4, 1, 256);
+        let client_cid = ConnectionId::new(91).unwrap();
+        let server_cid = ConnectionId::new(92).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        client
+            .endpoint
+            .open_send_stream(8, crate::INITIAL_MAX_STREAM_DATA)
+            .unwrap();
+        let mut packet = [0_u8; 256];
+        let mut ack = [0_u8; 256];
+        let (first_len, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, b"range", &mut packet)
+            .unwrap();
+        let mut delivered = Vec::new();
+        server
+            .receive_request_with_stream(&packet[..first_len], 8, |_, _, bytes| {
+                delivered.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, b"range");
+        let _ = server.endpoint.poll_transmit(&mut ack).unwrap();
+
+        let (retry_len, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, b"range", &mut packet)
+            .unwrap();
+        let mut duplicate_bytes = 0;
+        server
+            .receive_request_with_stream(&packet[..retry_len], 8, |_, _, bytes| {
+                duplicate_bytes += bytes.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(duplicate_bytes, 0);
+        assert!(server.endpoint.poll_transmit(&mut ack).unwrap().is_some());
     }
 
     #[test]

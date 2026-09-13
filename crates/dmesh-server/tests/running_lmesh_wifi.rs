@@ -3,8 +3,8 @@
 //! Run explicitly with the service already running:
 //! `cargo test -p quic-lite --features udp --test running_lmesh_wifi -- --ignored --nocapture`
 
-use dmesh_server::protocol::{RECORD_MANIFEST, encode_get_request};
 use dmesh_server::udp::UdpClient;
+use dmesh_server::verified_object::{RECORD_MANIFEST, encode_get_request};
 use quic_lite::FIRST_CLIENT_BIDI_STREAM_ID;
 use tokio::time::Instant;
 use tokio::time::{Duration, timeout};

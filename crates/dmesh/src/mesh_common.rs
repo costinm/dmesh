@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "android")]
 use std::ffi::CStr;
 #[cfg(target_os = "android")]
-use std::os::fd::FromRawFd;
-#[cfg(target_os = "android")]
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+#[cfg(target_os = "android")]
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -183,7 +183,10 @@ pub fn start_mesh(
             .to_openssh()
             .unwrap_or_default();
         let (trigger, receiver) = tokio::sync::mpsc::unbounded_channel();
-        (Some(runtime.spawn(android_announce_loop(public_key, receiver))), Some(trigger))
+        (
+            Some(runtime.spawn(android_announce_loop(public_key, receiver))),
+            Some(trigger),
+        )
     };
     #[cfg(not(target_os = "android"))]
     let (announce_server_handle, announce_trigger) = (None, None);
@@ -314,7 +317,9 @@ async fn send_android_announce(
         if joined_interfaces.insert(*interface_index)
             && let Err(error) = socket.join_multicast_v6(&group, *interface_index)
         {
-            log::warn!("Android announce multicast join failed on interface {interface_index}: {error}");
+            log::warn!(
+                "Android announce multicast join failed on interface {interface_index}: {error}"
+            );
         }
     }
     let mut sent = false;
@@ -322,7 +327,9 @@ async fn send_android_announce(
         let destination = SocketAddr::V6(SocketAddrV6::new(group, port, 0, interface_index));
         match socket.send_to(&wire[..used], destination).await {
             Ok(_) => sent = true,
-            Err(error) => log::warn!("Android announce multicast send failed on interface {interface_index}: {error}"),
+            Err(error) => log::warn!(
+                "Android announce multicast send failed on interface {interface_index}: {error}"
+            ),
         }
     }
     sent

@@ -1651,21 +1651,24 @@ impl RadioService {
                 }
             };
         let started = self.object_udp_started.clone();
+        // Service policy ceiling only. QUIC-lite allocates the selected
+        // heap-backed ledger identically on host and firmware and has no
+        // Recovery-specific history type or constant.
+        const OBJECT_UDP_HISTORY_CEILING: usize = 64;
         let mut udp_config = dmesh_server::udp::UdpConfig {
             bind: address,
             socket: Some(socket),
             client_ingress: Some(self.object_udp_client_ingress.clone()),
             stateless_reset_key,
             artifact_root: root,
-            // The host retains the sender window. Recovery processes receive
-            // callbacks immediately and does not mirror this payload ledger,
-            // so use a window large enough to cover Wi-Fi ACK latency. Four
-            // slots accidentally imposed one round trip per 4 KiB block.
+            // The sending endpoint retains its own retransmission window.
+            // Use enough history to cover normal Wi-Fi ACK latency; four
+            // packets accidentally imposed one round trip per object block.
             history_capacity: std::env::var("DMESH_UDP_HISTORY_CAPACITY")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| (1..=quic_lite::RECOVERY_MAX_HISTORY_PACKETS).contains(value))
-                .unwrap_or(quic_lite::RECOVERY_MAX_HISTORY_PACKETS),
+                .filter(|value| (1..=OBJECT_UDP_HISTORY_CEILING).contains(value))
+                .unwrap_or(OBJECT_UDP_HISTORY_CEILING),
             // 512 bytes remains in the host fault matrix, but production
             // Recovery uses a near-MTU application chunk. This reduces the
             // number of transport/ACK cycles while staying below the 1400

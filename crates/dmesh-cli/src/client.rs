@@ -77,6 +77,9 @@ pub struct SerialProbeResult {
     pub low_bytes: u64,
     pub elapsed_us: u64,
     pub bps: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub retransmits: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +87,9 @@ pub struct SerialObjectUploadResult {
     pub response: Vec<u8>,
     pub records: usize,
     pub bytes: usize,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub retransmits: u64,
 }
 
 impl DeviceSession {
@@ -229,6 +235,9 @@ impl DeviceSession {
                     low_bytes: client.low_bytes(),
                     elapsed_us,
                     bps: transferred.saturating_mul(8_000_000) / elapsed_us,
+                    tx_packets: driver.tx_packets(),
+                    rx_packets: driver.rx_packets(),
+                    retransmits: driver.retransmit_packets(),
                 });
             }
             thread::sleep(Duration::from_millis(2));
@@ -249,12 +258,12 @@ impl DeviceSession {
     pub fn object_upload(
         &mut self,
         command: &[u8],
-        records: dmesh_server::protocol::ObjectRecordStream,
+        records: dmesh_server::verified_object::ObjectRecordStream,
     ) -> Result<SerialObjectUploadResult, String> {
         self.assert_healthy()?;
         let cid = fresh_connection_id()?;
         let mut client = dmesh_server::transport::ObjectUploadClient::<
-            8,
+            512,
             { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
         >::new(cid, command, records)
         .map_err(|error| format!("object upload client: {error:?}"))?;
@@ -266,14 +275,21 @@ impl DeviceSession {
             driver.packet().expect("a started driver has an OPEN"),
         )?;
         driver.mark_sent(0);
-        let deadline = started + Duration::from_secs(300);
+        let deadline = started + object_upload_timeout();
         let mut buffer = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE + 1];
+        let mut operation_diagnostics = VecDeque::new();
         while Instant::now() < deadline {
             match self.serial.read(&mut buffer) {
                 Ok(used) if used != 0 => {
                     for line in self.text_tap.push(&buffer[..used]) {
                         if is_fatal_diagnostic(&line) {
                             self.fatal_diagnostic.get_or_insert_with(|| line.clone());
+                        }
+                        if line.contains("DMESH") || line.contains("flash") {
+                            operation_diagnostics.push_back(line.clone());
+                            if operation_diagnostics.len() > 32 {
+                                operation_diagnostics.pop_front();
+                            }
                         }
                         self.push_event(DeviceSessionEvent::Diagnostic(line));
                     }
@@ -287,6 +303,13 @@ impl DeviceSession {
                                 if let Some(record) =
                                     dmesh_server::direct::ConnectionlessMessage::decode(packet)
                                 {
+                                    operation_diagnostics.push_back(render_device_record(
+                                        &FirmwareSchema::load(),
+                                        record,
+                                    ));
+                                    if operation_diagnostics.len() > 32 {
+                                        operation_diagnostics.pop_front();
+                                    }
                                     self.push_event(DeviceSessionEvent::DirectRecord(
                                         record.to_vec(),
                                     ));
@@ -334,19 +357,57 @@ impl DeviceSession {
             }
             if client.is_complete() {
                 self.assert_healthy()?;
+                if let Some(response) = client.rejected_response() {
+                    let reason = object_upload_rejection(response);
+                    return Err(format!(
+                        "object upload rejected: {} records={} bytes={} blocked={:?} admission={:?}",
+                        reason,
+                        client.record_index(),
+                        client.sent_bytes(),
+                        client.last_admission_block(),
+                        client.admission_state(),
+                    ));
+                }
                 return Ok(SerialObjectUploadResult {
                     response: client.response().unwrap_or_default().to_vec(),
                     records: client.record_index(),
                     bytes: client.sent_bytes(),
+                    tx_packets: driver.tx_packets(),
+                    rx_packets: driver.rx_packets(),
+                    retransmits: driver.retransmit_packets(),
                 });
             }
             thread::sleep(Duration::from_millis(2));
         }
         self.assert_healthy()?;
+        let recent = self
+            .history
+            .iter()
+            .filter_map(|event| match event {
+                DeviceSessionEvent::Diagnostic(line) => Some(line.clone()),
+                DeviceSessionEvent::DirectRecord(record) => {
+                    Some(render_device_record(&FirmwareSchema::load(), record))
+                }
+                _ => None,
+            })
+            .rev()
+            .take(16)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let diagnostics = operation_diagnostics
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(" | ");
         Err(format!(
-            "object upload timeout records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
+            "object upload timeout records={} bytes={} blocked={:?} admission={:?} connection={:?} tx_packets={} rx_packets={} retransmits={} operation_diagnostics={diagnostics:?} recent={recent:?}",
             client.record_index(),
             client.sent_bytes(),
+            client.last_admission_block(),
+            client.admission_state(),
+            client.connection_debug_state(),
             driver.tx_packets(),
             driver.rx_packets(),
             driver.retransmit_packets()
@@ -1378,17 +1439,20 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         let mut session = DeviceSession::open(path.clone(), baud)?;
         let result = session.probe_request(request)?;
         println!(
-            "dmesh_cli_probe_result bearer=uart bytes={} normal_bytes={} high_bytes={} low_bytes={} elapsed_us={} bps={}",
+            "dmesh_cli_probe_result bearer=uart bytes={} normal_bytes={} high_bytes={} low_bytes={} elapsed_us={} bps={} tx_packets={} rx_packets={} retransmits={}",
             result.bytes,
             result.normal_bytes,
             result.high_bytes,
             result.low_bytes,
             result.elapsed_us,
             result.bps,
+            result.tx_packets,
+            result.rx_packets,
+            result.retransmits,
         );
         return Ok(());
     }
-    if let Some((_, flash)) = dmesh_server::protocol::decode_flash_handler_request(&body) {
+    if let Some((_, flash)) = dmesh_server::verified_object::decode_flash_handler_request(&body) {
         let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/flash"));
@@ -1399,21 +1463,17 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         .response_records(flash.object)
         .map_err(|error| format!("object.flash artifact: {error}"))?;
         eprintln!(
-            "dmesh_cli_object_upload bearer=uart association=single command_stream={} object_stream={} artifact_root={}",
-            quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-            dmesh_server::transport::FLASH_OBJECT_STREAM,
+            "dmesh_cli_object_upload bearer=uart association=single artifact_root={}",
             artifact_root.display()
         );
         let mut session = DeviceSession::open(path.clone(), baud)?;
         let result = session.object_upload(
             &body,
-            dmesh_server::protocol::ObjectRecordStream::new(records),
+            dmesh_server::verified_object::ObjectRecordStream::new(records),
         )?;
         eprintln!(
-            "dmesh_cli_object_upload_complete bearer=uart stream={} records={} bytes={}",
-            dmesh_server::transport::FLASH_OBJECT_STREAM,
-            result.records,
-            result.bytes
+            "dmesh_cli_object_upload_complete bearer=uart records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
+            result.records, result.bytes, result.tx_packets, result.rx_packets, result.retransmits
         );
         println!(
             "dmesh_cli_stream_command target={} stream={} fin=true bytes={} {}",
@@ -2031,11 +2091,11 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         .and_then(dmesh_server::probe::decode_probe_run_record)
         .map(|(_, request)| request);
     let probe_request = tagged_probe;
-    // `object.flash` uses two client-initiated streams on this one QUIC-lite
-    // association: the command on stream 4 and its ordered object records on
-    // stream 8.  The CLI never starts a reverse UDP server or a second
-    // association for a flash upload.
-    let object_flash = dmesh_server::protocol::decode_flash_handler_request(&request).is_some();
+    // `object.flash` uses one client association with a command and an
+    // ordered object-record stream. The CLI never starts a reverse UDP
+    // server or a second association.
+    let object_flash =
+        dmesh_server::verified_object::decode_flash_handler_request(&request).is_some();
     let relay = match (relay_forward_dcid, relay_reverse_dcid, relay_next_mac) {
         (None, None, None) => None,
         (Some(forward), Some(reverse), Some(next_mac)) => Some((
@@ -2094,11 +2154,11 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
         // `object.flash` is one QUIC-lite association with its command and
-        // object streams.  Do not first bootstrap UdpClient's legacy upload
-        // loop: ObjectUploadClient is the shared stream/ACK/credit owner
-        // used by UART and must be the UDP owner as well.
+        // object streams. Do not first bootstrap UdpClient's legacy upload
+        // loop: ObjectUploadClient is the shared stream owner used by UART
+        // and UDP alike.
         if object_flash {
-            let (_, flash) = dmesh_server::protocol::decode_flash_handler_request(&request)
+            let (_, flash) = dmesh_server::verified_object::decode_flash_handler_request(&request)
                 .ok_or("invalid object.flash request")?;
             let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
                 .map(PathBuf::from)
@@ -2110,23 +2170,23 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
             .response_records(flash.object)
             .map_err(|error| format!("object.flash artifact: {error}"))?;
             eprintln!(
-                "dmesh_cli_object_upload bearer=udp association=single command_stream={} object_stream={} artifact_root={}",
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                "dmesh_cli_object_upload bearer=udp association=single artifact_root={}",
                 artifact_root.display()
             );
             let result = udp_object_upload(
                 peer,
                 cid,
                 &request,
-                dmesh_server::protocol::ObjectRecordStream::new(records),
+                dmesh_server::verified_object::ObjectRecordStream::new(records),
             )
             .await?;
             eprintln!(
-                "dmesh_cli_object_upload_complete bearer=udp stream={} records={} bytes={}",
-                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                "dmesh_cli_object_upload_complete bearer=udp records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
                 result.records,
-                result.bytes
+                result.bytes,
+                result.tx_packets,
+                result.rx_packets,
+                result.retransmits
             );
             println!(
                 "dmesh_cli_stream_command target={peer} stream={} fin=true bytes={} {}",
@@ -2232,6 +2292,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
                 if complete {
                     let elapsed = started.elapsed();
                     let bytes = receiver.bytes();
+                    let transport = client.transport_stats();
                     let bps = if elapsed.is_zero() {
                         0
                     } else {
@@ -2239,12 +2300,19 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
                             / elapsed.as_micros().max(1) as u64
                     };
                     println!(
-                        "dmesh_cli_probe_result bearer=udp target={peer} stream={first_stream} bytes={bytes} normal_bytes={} high_bytes={} low_bytes={} elapsed_us={} bps={bps} callback_errors={:?}",
+                        "dmesh_cli_probe_result bearer=udp target={peer} stream={first_stream} bytes={bytes} normal_bytes={} high_bytes={} low_bytes={} elapsed_us={} bps={bps} callback_errors={:?} received_datagrams={} duplicate_datagrams={} out_of_order_datagrams={} inferred_missing_packets={} retransmitted_datagrams={} loss_retransmits={} pto_retransmits={}",
                         receiver.normal_bytes(),
                         receiver.high_bytes(),
                         receiver.low_bytes(),
                         elapsed.as_micros(),
-                        receiver.callback_errors()
+                        receiver.callback_errors(),
+                        transport.received_datagrams,
+                        transport.duplicate_datagrams,
+                        transport.out_of_order_datagrams,
+                        transport.inferred_missing_packets,
+                        transport.retransmitted_datagrams,
+                        transport.loss_retransmitted_datagrams,
+                        transport.pto_retransmitted_datagrams,
                     );
                     // dmesh-cli owns this one-shot association.  Retire it
                     // explicitly before the process exits so an embedded
@@ -2260,7 +2328,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
             }
         }
         let flash_response = if object_flash {
-            let (_, flash) = dmesh_server::protocol::decode_flash_handler_request(&request)
+            let (_, flash) = dmesh_server::verified_object::decode_flash_handler_request(&request)
                 .ok_or("invalid object.flash request")?;
             let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
                 .map(PathBuf::from)
@@ -2271,24 +2339,20 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
             })
             .response_records(flash.object)
             .map_err(|error| format!("object.flash artifact: {error}"))?;
-            let mut object = dmesh_server::protocol::ObjectRecordStream::new(records);
+            let mut object = dmesh_server::verified_object::ObjectRecordStream::new(records);
             // The C6 raw-UDP6 adapter currently proves a 256-byte payload
             // envelope on this STA link.  This is only QUIC-lite stream
             // packet sizing; object record framing and recovery remain
             // bearer-neutral.
             let mut chunk = [0u8; 256];
             eprintln!(
-                "dmesh_cli_object_upload association=single command_stream={} object_stream={} artifact_root={}",
-                quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
-                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                "dmesh_cli_object_upload association=single artifact_root={}",
                 artifact_root.display()
             );
 
             let response = client
                 .request_object_upload(
-                    quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
                     &request,
-                    dmesh_server::transport::FLASH_OBJECT_STREAM,
                     &mut object,
                     &mut chunk,
                     Duration::from_secs(300),
@@ -2296,8 +2360,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|error| error.to_string())?;
             eprintln!(
-                "dmesh_cli_object_upload_complete stream={} records={} bytes={}",
-                dmesh_server::transport::FLASH_OBJECT_STREAM,
+                "dmesh_cli_object_upload_complete records={} bytes={}",
                 object.record_index(),
                 object.sent_bytes()
             );
@@ -2326,6 +2389,9 @@ struct UdpObjectUploadResult {
     response: Vec<u8>,
     records: usize,
     bytes: usize,
+    tx_packets: u64,
+    rx_packets: u64,
+    retransmits: u64,
 }
 
 /// Move complete UDP datagrams for the bearer-neutral object client.  The
@@ -2334,7 +2400,7 @@ async fn udp_object_upload(
     peer: SocketAddr,
     cid: quic_lite::ConnectionId,
     command: &[u8],
-    records: dmesh_server::protocol::ObjectRecordStream,
+    records: dmesh_server::verified_object::ObjectRecordStream,
 ) -> Result<UdpObjectUploadResult, String> {
     let bind = udp_bind_for_peer(peer);
     let socket = match tokio::net::UdpSocket::bind(bind).await {
@@ -2350,7 +2416,9 @@ async fn udp_object_upload(
             };
             tokio::net::UdpSocket::bind(ephemeral)
                 .await
-                .map_err(|fallback| format!("UDP bind {bind} busy ({error}); ephemeral fallback: {fallback}"))?
+                .map_err(|fallback| {
+                    format!("UDP bind {bind} busy ({error}); ephemeral fallback: {fallback}")
+                })?
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -2360,31 +2428,31 @@ async fn udp_object_upload(
     >::new(cid, command, records)
     .map_err(|error| format!("object upload client: {error:?}"))?;
     let started = Instant::now();
-    // A bounded diagnostic run may shorten this host-side wait without
-    // changing the wire protocol or Recovery's receive deadline.
-    let timeout_secs = env::var("DMESH_OBJECT_UPLOAD_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value != 0)
-        .unwrap_or(300);
-    let deadline = started + Duration::from_secs(timeout_secs);
+    let deadline = started + object_upload_timeout();
     let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0)
         .map_err(|error| format!("object upload OPEN: {error:?}"))?;
     socket
-        .send_to(driver.packet().expect("started object upload has OPEN"), peer)
+        .send_to(
+            driver.packet().expect("started object upload has OPEN"),
+            peer,
+        )
         .await
         .map_err(|error| error.to_string())?;
     driver.mark_sent(0);
     let mut input = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
     let mut unexpected_peer = None;
+    // Adapter evidence only: QUIC-lite's rx_packets intentionally counts
+    // packets admitted to this association. Keep the socket boundary visible
+    // as well so a field failure can distinguish network loss from CID/parser
+    // rejection without teaching the UDP adapter any transport policy.
+    let mut socket_rx_packets = 0_u64;
+    let mut quic_rejected_packets = 0_u64;
     while Instant::now() < deadline {
         let now_ms = started.elapsed().as_millis() as u64;
-        if let Ok(Ok((used, source))) = tokio::time::timeout(
-            Duration::from_millis(2),
-            socket.recv_from(&mut input),
-        )
-        .await
+        if let Ok(Ok((used, source))) =
+            tokio::time::timeout(Duration::from_millis(2), socket.recv_from(&mut input)).await
         {
+            socket_rx_packets = socket_rx_packets.saturating_add(1);
             // Linux reports an inbound link-local source without the local
             // egress scope used to send to it.  The QUIC DCID authenticates
             // the association; UDP peer matching is remote IP plus port.
@@ -2392,34 +2460,20 @@ async fn udp_object_upload(
                 unexpected_peer.get_or_insert(source);
                 continue;
             }
-            if driver.rx_packets() == 0 {
-                if let Ok((_, ack)) =
-                    quic_lite::decode_bootstrap_open_ack_packet_with_limits(&input[..used], cid)
-                {
-                    eprintln!(
-                        "dmesh_cli_object_upload_open_ack server_cid={} reset_token={}",
-                        ack.server_receive_cid.value(),
-                        ack.stateless_reset_token.is_some()
-                    );
-                }
-            }
             let admitted = driver.receive(&mut client, &input[..used], now_ms).map_err(|error| {
                 format!(
-                    "object upload receive: {error:?} records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={}",
-                    client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), driver.rx_packets(), driver.retransmit_packets()
+                    "object upload receive: {error:?} records={} bytes={} blocked={:?} admission={:?} tx_packets={} socket_rx_packets={} quic_rx_packets={} quic_rejected_packets={} retransmits={}",
+                    client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), socket_rx_packets, driver.rx_packets(), quic_rejected_packets, driver.retransmit_packets()
                 )
             })?;
+            if !admitted {
+                quic_rejected_packets = quic_rejected_packets.saturating_add(1);
+            }
             if admitted && let Some(packet) = driver.packet() {
-                if driver.rx_packets() == 1
-                    && let Ok(quic_lite::ServerDatagram::Established { destination }) =
-                        quic_lite::classify_server_datagram(packet)
-                {
-                    eprintln!(
-                        "dmesh_cli_object_upload_first_request dcid={}",
-                        destination.value()
-                    );
-                }
-                socket.send_to(packet, peer).await.map_err(|error| error.to_string())?;
+                socket
+                    .send_to(packet, peer)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 driver.mark_sent(now_ms);
             }
         }
@@ -2431,21 +2485,67 @@ async fn udp_object_upload(
             .poll(&mut client, now_ms, 600, 400)
             .map_err(|error| format!("object upload poll: {error:?}"))?;
         if let Some(packet) = driver.packet() {
-            socket.send_to(packet, peer).await.map_err(|error| error.to_string())?;
+            socket
+                .send_to(packet, peer)
+                .await
+                .map_err(|error| error.to_string())?;
             driver.mark_sent(now_ms);
         }
         if client.is_complete() {
+            if let Some(response) = client.rejected_response() {
+                let reason = object_upload_rejection(response);
+                return Err(format!(
+                    "object upload rejected: {} records={} bytes={} blocked={:?} admission={:?}",
+                    reason,
+                    client.record_index(),
+                    client.sent_bytes(),
+                    client.last_admission_block(),
+                    client.admission_state(),
+                ));
+            }
             return Ok(UdpObjectUploadResult {
                 response: client.response().unwrap_or_default().to_vec(),
                 records: client.record_index(),
                 bytes: client.sent_bytes(),
+                tx_packets: driver.tx_packets(),
+                rx_packets: driver.rx_packets(),
+                retransmits: driver.retransmit_packets(),
             });
         }
     }
     Err(format!(
-        "object upload timeout records={} bytes={} blocked={:?} admission={:?} tx_packets={} rx_packets={} retransmits={} unexpected_peer={unexpected_peer:?}",
-        client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), driver.rx_packets(), driver.retransmit_packets()
+        "object upload timeout records={} bytes={} blocked={:?} admission={:?} connection={:?} tx_packets={} socket_rx_packets={} quic_rx_packets={} quic_rejected_packets={} retransmits={} unexpected_peer={unexpected_peer:?}",
+        client.record_index(),
+        client.sent_bytes(),
+        client.last_admission_block(),
+        client.admission_state(),
+        client.connection_debug_state(),
+        driver.tx_packets(),
+        socket_rx_packets,
+        driver.rx_packets(),
+        quic_rejected_packets,
+        driver.retransmit_packets()
     ))
+}
+
+/// Bound the operator-side wait identically for UART and UDP. This is only a
+/// diagnostic/client deadline; QUIC loss recovery and the firmware receiver's
+/// idle timeout remain transport-owned and handler-owned respectively.
+fn object_upload_timeout() -> Duration {
+    Duration::from_secs(
+        env::var("DMESH_OBJECT_UPLOAD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .unwrap_or(60),
+    )
+}
+
+fn object_upload_rejection(response: &[u8]) -> String {
+    dmesh_server::verified_object::decode_flash_handler_error(response)
+        .map(String::from_utf8_lossy)
+        .map(|reason| reason.into_owned())
+        .unwrap_or_else(|| format!("invalid object.flash error ({})", hex_encode(response)))
 }
 
 fn same_udp_endpoint(received: SocketAddr, expected: SocketAddr) -> bool {
@@ -2463,12 +2563,18 @@ fn same_udp_endpoint(received: SocketAddr, expected: SocketAddr) -> bool {
 /// Select the wildcard address family from the peer. A raw IPv6 bearer must
 /// not first fail in the host client by binding an IPv4 socket.
 fn udp_bind_for_peer(peer: SocketAddr) -> SocketAddr {
+    let port = env::var("DMESH_UDP_SOURCE_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(3338);
     match peer {
         // Keep the operator/client socket distinct from both managed host
         // listeners (wlan0:3336, wlan1:3337) and firmware raw UDP6 (3339).
         // A fixed source port also makes link-local captures reproducible.
-        SocketAddr::V4(_) => "0.0.0.0:3338".parse().expect("valid IPv4 UDP bind"),
-        SocketAddr::V6(_) => "[::]:3338".parse().expect("valid IPv6 UDP bind"),
+        // A concurrent operator can explicitly select `0` for an ephemeral
+        // source without changing the peer or QUIC association identity.
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], port)),
+        SocketAddr::V6(_) => SocketAddr::from(([0; 16], port)),
     }
 }
 
@@ -2622,21 +2728,34 @@ fn exchange_udp_direct_record(peer: SocketAddr, record: &[u8]) -> Result<Vec<u8>
 fn exchange_udp_stream_record(peer: SocketAddr, record: &[u8]) -> Result<Vec<u8>, String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
-        let mut client = dmesh_server::udp::UdpClient::connect(
-            udp_bind_for_peer(peer),
-            peer,
-            fresh_connection_id()?,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let (_, response, fin) = client
-            .request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, record, true)
+        for attempt in 0..2 {
+            let mut client = dmesh_server::udp::UdpClient::connect(
+                udp_bind_for_peer(peer),
+                peer,
+                fresh_connection_id()?,
+            )
             .await
             .map_err(|error| error.to_string())?;
-        if !fin {
-            return Err("relay administration stream did not finish".to_owned());
+            match client
+                .request_stream(quic_lite::FIRST_CLIENT_BIDI_STREAM_ID, record, true)
+                .await
+            {
+                Ok((_, response, true)) => return Ok(response),
+                Ok((_, _, false)) => {
+                    return Err("UDP application stream did not finish".to_owned());
+                }
+                Err(error)
+                    if attempt == 0
+                        && dmesh_server::transport::is_fresh_association_retry_error(&error) =>
+                {
+                    // The old association has already been discarded. A
+                    // fresh CID repeats the application request once; no ACK,
+                    // packet number, or stream ID is selected by the CLI.
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
-        Ok(response)
+        unreachable!("bounded retry loop returns on its final attempt")
     })
 }
 
@@ -2787,8 +2906,9 @@ fn fresh_connection_id() -> Result<quic_lite::ConnectionId, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic, parse_udp_peer,
-        proxy_request, proxy_socket_target, same_udp_endpoint,
+        ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic,
+        object_upload_rejection, parse_udp_peer, proxy_request, proxy_socket_target,
+        same_udp_endpoint,
     };
     use dmesh_server::relay::{
         DesiredRule, PairRequest, RelayRoute, RelayState, Request, decode_pair_request,
@@ -3281,5 +3401,22 @@ mod tests {
         assert!(same_udp_endpoint(received, configured));
         let wrong_port: SocketAddr = "[fe80::12bd:a3ff:feac:5a20]:3338".parse().unwrap();
         assert!(!same_udp_endpoint(wrong_port, configured));
+    }
+
+    #[test]
+    fn object_upload_busy_response_is_reported_as_application_error() {
+        let mut response = [0_u8; 96];
+        let used = dmesh_server::tagged::encode_numeric_error(
+            dmesh_server::verified_object::OBJECT_COMPONENT,
+            dmesh_server::verified_object::OBJECT_FLASH_METHOD,
+            7,
+            dmesh_server::verified_object::FLASH_BUSY_ERROR,
+            &mut response,
+        )
+        .unwrap();
+        assert_eq!(
+            object_upload_rejection(&response[..used]),
+            "flash already in progress"
+        );
     }
 }
