@@ -12,6 +12,89 @@
 // that single runtime task.
 static mut RAW_ASSOCIATION: quic_lite::AssociationProfile =
     quic_lite::AssociationProfile::c6_default();
+// Recovery observes this application-delivery edge after the common
+// dispatcher has consumed the ACK. Main uses the same edge immediately for
+// its RTC recovery-boot request; no ACK details escape quic-lite.
+static TERMINAL_RESPONSE_DELIVERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+// Main and Recovery have different owner tasks, but the packet worker needs
+// one common way to wake whichever owner currently owns the QUIC deadline.
+// The hook is scheduling glue only: QUIC still calculates and emits every
+// ACK, MAX_*, and PTO packet from its normal poll turn.
+static CONNECTION_DEADLINE_WAKER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn install_connection_deadline_waker(waker: Option<fn()>) {
+    CONNECTION_DEADLINE_WAKER.store(
+        waker.map(|wake| wake as usize).unwrap_or(0),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+pub(crate) fn request_connection_deadline_recheck() {
+    let waker = CONNECTION_DEADLINE_WAKER.load(core::sync::atomic::Ordering::Acquire);
+    if waker != 0 {
+        let waker: fn() = unsafe { core::mem::transmute(waker) };
+        waker();
+    } else {
+        crate::main_runtime::request_connection_deadline_recheck();
+    }
+}
+
+/// Select active association credit from current internal-memory headroom.
+/// CONNECTION_HISTORY_CAPACITY is only the static allocation ceiling; the
+/// advertised ledger, initial window, and default burst are selected for each
+/// new association through the same QUIC-lite memory policy used by host
+/// simulations.
+fn firmware_datagram_association_for_available(
+    available: u64,
+) -> quic_lite::AssociationProfile {
+    quic_lite::AssociationProfile::datagram_with_memory::<{ crate::CONNECTION_HISTORY_CAPACITY }>(
+        quic_lite::ledger::LedgerMemorySnapshot {
+            total_bytes: available,
+            available_bytes: available,
+        },
+        1,
+        crate::TRANSPORT_MTU,
+        quic_lite::ledger::LedgerMemoryPolicy {
+            min_packets: 2,
+            max_packets: crate::CONNECTION_HISTORY_CAPACITY,
+            memory_fraction_numerator: 1,
+            memory_fraction_denominator: 8,
+            reserve_bytes: 32 * 1024,
+            metadata_bytes_per_packet: 96,
+        },
+    )
+}
+
+pub(crate) fn firmware_datagram_association() -> quic_lite::AssociationProfile {
+    let capabilities = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+    let available = unsafe { esp_idf_sys::heap_caps_get_free_size(capabilities) as u64 };
+    firmware_datagram_association_for_available(available)
+}
+
+/// The sampled memory and resulting association are one admission decision.
+/// Recovery logs this through its console-only boundary so a live window can
+/// be compared directly with the host's injected-memory tests.
+#[derive(Clone, Copy)]
+pub(crate) struct RawAssociationSelection {
+    pub association: quic_lite::AssociationProfile,
+    pub internal_available_bytes: u64,
+}
+
+/// Derive the advertised receive budget from the association selected for
+/// this boot.  The association's packet count is the device-owned memory
+/// budget; it must not be discarded in favour of a fixed flash-sized window.
+///
+/// Four MTU-sized streams remain the minimum useful profile (command, logs,
+/// transfer, and probe).  Above that floor, split the connection budget
+/// evenly across those streams.  Handlers only consume ordered bytes; they
+/// neither select nor publish a QUIC window.
+fn firmware_receive_limits(
+    association: quic_lite::AssociationProfile,
+) -> quic_lite::ConnectionLimits {
+    association.receive_limits(crate::TRANSPORT_MTU as u64, 4)
+}
 
 /// Copy the committed profile for a Main policy effect. Called only by the
 /// Main event owner after it receives an explicit event; callbacks never keep
@@ -38,33 +121,47 @@ pub(crate) fn apply_uart_profile(enabled: bool) {
     crate::uart_esp::set_always_on(enabled);
 }
 
-pub(crate) fn raw_association(profile: &crate::TransportProfile) -> quic_lite::AssociationProfile {
-    let window = crate::CONNECTION_HISTORY_CAPACITY;
-    let tx_burst_packets = if profile.tx_burst_packets == 0 {
-        window
+fn raw_association_for_available(
+    profile: &crate::TransportProfile,
+    available: u64,
+) -> quic_lite::AssociationProfile {
+    let mut association = firmware_datagram_association_for_available(available);
+    association.tx_burst_packets = if profile.tx_burst_packets == 0 {
+        association.history_packets
     } else {
         usize::from(profile.tx_burst_packets)
     };
-    quic_lite::AssociationProfile {
-        history_packets: window,
-        // Raw Ethernet ingress has one bounded shared packet queue. Return
-        // QUIC-lite credit for every datagram rather than allow a persisted
-        // generic association setting to hold a first eight-packet flight
-        // behind a delayed ACK. This is the same C6 raw-bearer policy as
-        // NOW, not STA-specific transfer behavior.
-        ack_frequency: 1,
-        ack_delay_ms: if profile.ack_delay_ms == 0 {
-            5
-        } else {
-            profile.ack_delay_ms
-        },
-        tx_burst_packets,
-        // This governs transport admission/bootstrap, not the bounded
-        // immediate raw-send turn. Keep the existing ledger window so a
-        // paced egress setting cannot deadlock OPEN/ACK progress.
-        initial_window_packets: window,
+    if profile.ack_frequency != 0 {
+        association.ack_frequency = profile.ack_frequency;
     }
-    .clamp::<{ crate::CONNECTION_HISTORY_CAPACITY }>()
+    if profile.ack_delay_ms != 0 {
+        association.ack_delay_ms = profile.ack_delay_ms;
+    }
+    // ACK batching is association policy, selected from the shared
+    // memory-based datagram profile. Raw UDP6, UART, and NOW must not
+    // silently choose different credit/ACK semantics merely because one
+    // final bearer is callback-driven.
+    association
+        // The raw callback pool is an adapter-owned, transient admission limit.
+        // It must not alter QUIC's association/window contract: a packet dropped
+        // before ingress is ordinary bearer loss, recovered from the shared
+        // ledger exactly as it is on UART, NOW, and the host.
+        .clamp::<{ crate::CONNECTION_HISTORY_CAPACITY }>()
+}
+
+pub(crate) fn raw_association(profile: &crate::TransportProfile) -> quic_lite::AssociationProfile {
+    let capabilities = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+    let available = unsafe { esp_idf_sys::heap_caps_get_free_size(capabilities) as u64 };
+    raw_association_for_available(profile, available)
+}
+
+fn raw_association_selection(profile: &crate::TransportProfile) -> RawAssociationSelection {
+    let capabilities = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+    let available = unsafe { esp_idf_sys::heap_caps_get_free_size(capabilities) as u64 };
+    RawAssociationSelection {
+        association: raw_association_for_available(profile, available),
+        internal_available_bytes: available,
+    }
 }
 
 /// Construct the association used by the packet-at-a-time action bearer.
@@ -84,7 +181,7 @@ pub fn espnow_association(profile: &crate::TransportProfile) -> quic_lite::Assoc
     // initial flight. This is set only at an explicit NAN/NOW epoch boundary,
     // before a new association is admitted; it creates neither a timer tick
     // nor an adapter-private egress queue.
-    let mut association = quic_lite::AssociationProfile::c6_default();
+    let mut association = firmware_datagram_association();
     association.ack_frequency = 1;
     if profile.ack_delay_ms != 0 {
         association.ack_delay_ms = profile.ack_delay_ms;
@@ -147,13 +244,6 @@ static CONNECTION_DISPATCHER_READY: core::sync::atomic::AtomicBool =
 /// receives OPEN_ACK but the server rejects its following stream request.
 /// It stores the portable compact error code, not packet bytes or state.
 static CONNECTION_LAST_ERROR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-// Bounded bring-up evidence for the shared delayed-ACK/PTO owner.  This is
-// intentionally not a transport counter or retry policy: QUIC-lite retains
-// both.  It distinguishes a missing Main deadline wake from a timer turn that
-// had no packet ready while validating raw UDP6 on hardware.
-static CONNECTION_TIMER_UDP6_REPORTS: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
 /// Read the bounded connection error diagnostic for the radio snapshot.
 pub(crate) fn connection_last_error() -> u32 {
     CONNECTION_LAST_ERROR.load(core::sync::atomic::Ordering::Acquire)
@@ -161,22 +251,41 @@ pub(crate) fn connection_last_error() -> u32 {
 
 /// Construct one ordinary QUIC responder with the firmware-wide CID and
 /// stateless-reset policy.  This owns no bearer state: Main supplies its
-/// raw-bearer association policy, while Recovery uses the basic profile over
-/// its normal STA/lwIP UDP6 socket.
+/// raw-bearer association policy, while Recovery supplies its smaller
+/// memory-derived profile over the same associated-STA raw UDP6 bearer.
 pub(crate) fn new_connection_dispatcher(
     association: quic_lite::AssociationProfile,
 ) -> ConnectionDispatcher {
     let mut dispatcher = ConnectionDispatcher::new(
         initial_server_cid(),
-        // Storage-backed application streams publish receive capacity as it
-        // becomes available; the initial credit is bearer-neutral.
-        quic_lite::recovery_connection_limits(false, 0),
+        firmware_receive_limits(association),
         association,
+    );
+    // The normal profile is selected from live internal heap. For controlled
+    // host stress tests, an OPEN may request a larger receive window up to
+    // this compile-time allocation envelope; without that explicit request,
+    // the live-heap profile above remains authoritative.
+    dispatcher.set_receive_profile_ceiling(
+        quic_lite::AssociationProfile {
+            history_packets: crate::CONNECTION_HISTORY_CAPACITY,
+            initial_window_packets: crate::CONNECTION_HISTORY_CAPACITY,
+            tx_burst_packets: association.tx_burst_packets,
+            ..association
+        }
+        .clamp::<{ crate::CONNECTION_HISTORY_CAPACITY }>(),
     );
     // Keep a Recovery OPEN_ACK and Main OPEN_ACK on the identical CID/reset
     // contract. The derived key contains no raw NVS secret and is unrelated
     // to Wi-Fi/NAN/NOW ownership.
     dispatcher.set_stateless_reset_key(crate::main_runtime::stateless_reset_key());
+    // A firmware peer may intentionally retain and reuse its existing CID,
+    // but a fresh OPEN is a new association and must first release completed
+    // zero-stream associations. Host servers can retain many idle ledgers;
+    // the ESP heap cannot safely accumulate one ledger per short-lived CLI
+    // process while waiting for a possibly lost CLOSE. The shared association
+    // table applies this setting only during fresh OPEN admission and never
+    // reclaims an active stream or a duplicate OPEN.
+    dispatcher.set_association_idle_timeout(Some(0));
     dispatcher
 }
 
@@ -193,9 +302,9 @@ fn initial_server_cid() -> quic_lite::ConnectionId {
 unsafe fn connection_dispatcher_mut() -> &'static mut ConnectionDispatcher {
     if !CONNECTION_DISPATCHER_READY.load(core::sync::atomic::Ordering::Acquire) {
         let dispatcher = new_connection_dispatcher(*core::ptr::addr_of!(RAW_ASSOCIATION));
-        // Firmware keeps idle associations so later streams can reuse their
-        // handshake and validated paths. QUIC-lite still reclaims the oldest
-        // zero-active-stream association whenever this bounded table fills.
+        // The same CID can keep an established association for later streams.
+        // A fresh CID releases completed idle entries according to the
+        // firmware-sized policy installed by `new_connection_dispatcher`.
         core::ptr::addr_of_mut!(CONNECTION_DISPATCHER)
             .write(core::mem::MaybeUninit::new(dispatcher));
         CONNECTION_DISPATCHER_READY.store(true, core::sync::atomic::Ordering::Release);
@@ -215,15 +324,25 @@ unsafe fn connection_dispatcher_if_ready() -> Option<&'static mut ConnectionDisp
 ///
 /// Called once during a STA/raw-radio start transition, before the receive
 /// callback can construct a dispatcher.
-pub(crate) fn prepare_raw_association(profile: &crate::TransportProfile) {
+pub(crate) fn prepare_raw_association(
+    profile: &crate::TransportProfile,
+) -> RawAssociationSelection {
     unsafe {
-        RAW_ASSOCIATION = raw_association(profile);
+        let selection = raw_association_selection(profile);
+        RAW_ASSOCIATION = selection.association;
+        // This is normally called before receive starts, but making the
+        // already-live case identical to NOW prevents a previous default
+        // dispatcher from silently retaining its old receive limits.
+        if let Some(service) = connection_dispatcher_if_ready() {
+            service.set_association_defaults(selection.association);
+        }
+        selection
     }
 }
 
 /// Install the action-bearer association at an explicit NAN/NOW epoch
 /// boundary. A previous connection may have been reached over UART or
-/// UDP6, so replace it rather than letting an old eight-packet association
+/// UDP6, so replace it rather than letting an old bounded association
 /// survive into the packet-at-a-time action path. The physical bearer is not
 /// touched here; callers have already serialized the radio transition.
 pub(crate) fn prepare_espnow_association(profile: &crate::TransportProfile) {
@@ -286,18 +405,30 @@ pub fn receive_connection_frame_ingress(
 ) -> ConnectionFrameIngress {
     unsafe {
         let service = connection_dispatcher_mut();
-        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
-        service.set_time(now_us);
-        crate::stream_handlers::before_receive(service, now_us);
+        // QUIC-lite's public transport clock is milliseconds on host and
+        // device. ESP-IDF exposes microseconds; convert once at this adapter
+        // boundary so ACK delay, credit retry, PTO, and idle retention use
+        // the same units as dmesh-cli and host tests.
+        let now_ms = (esp_idf_sys::esp_timer_get_time().max(0) as u64) / 1_000;
         // Component handlers execute synchronously inside `receive`. Give
         // them a pre-dispatch association snapshot rather than allowing a
         // diagnostic handler to re-enter this mutable shared owner.
         let connection_status = service.active_connection_status();
         let last_close_at = service.last_close_at();
-        let close_before = service.last_close_at();
+        let terminal_before = service.terminal_response_snapshot();
         let receive =
             crate::relay_main::with_connection_status(connection_status, last_close_at, || {
-                service.receive(path, packet, response)
+                dmesh_server::transport::receive_server_turn(
+                    service,
+                    path,
+                    packet,
+                    now_ms,
+                    response,
+                    |service, now| crate::stream_handlers::before_receive(service, now),
+                    |service, path, now, closed| {
+                        crate::stream_handlers::after_receive(service, path, now, closed)
+                    },
+                )
             });
         let (accepted, result) = match receive {
             Ok(value) => (true, value),
@@ -323,12 +454,15 @@ pub fn receive_connection_frame_ingress(
                 (false, None)
             }
         };
-        let closed = service.last_close_at() != close_before;
-        let result = if accepted {
-            crate::stream_handlers::after_receive(service, path, now_us, closed, result, response)
-        } else {
-            result
-        };
+        if accepted {
+            if let Some(receive_cid) = service.take_terminal_response_delivered() {
+                TERMINAL_RESPONSE_DELIVERED.store(true, core::sync::atomic::Ordering::Release);
+                crate::rtc::response_delivered(receive_cid);
+            }
+            if let Some(receive_cid) = service.terminal_response_started_after(terminal_before) {
+                crate::rtc::bind_recovery_response(receive_cid);
+            }
+        }
         if connection_path_transport(path) == dmesh_server::transport_path::TransportId::NOW.0 {
             if service.reply_path() == Some(path) {
                 // The C6 continuous private action dispatcher sees the
@@ -345,17 +479,19 @@ pub fn receive_connection_frame_ingress(
                 crate::wifi_nan_dw_capture_esp::end_now_service_receive_lease();
             }
         }
-        // The packet worker may just have created or advanced a NOW server
+        // The packet worker may just have created or advanced a server
         // association. Main could otherwise still be blocked with the old
-        // (or no) deadline and miss the connection-owned PTO until an
-        // unrelated NAN event occurs. This marker only wakes Main to
+        // (or no) deadline and miss the connection-owned PTO. This matters
+        // equally when UART's single physical egress slot temporarily cannot
+        // submit a generated control packet. This marker only wakes Main to
         // recompute its one-shot timer; it neither polls nor sends here.
         if matches!(
             connection_path_transport(path),
             transport if transport == dmesh_server::transport_path::TransportId::NOW.0
                 || transport == dmesh_server::transport_path::TransportId::UDP6.0
+                || transport == dmesh_server::transport_path::TransportId::UART.0
         ) {
-            crate::main_runtime::request_connection_deadline_recheck();
+            request_connection_deadline_recheck();
         }
         ConnectionFrameIngress {
             accepted,
@@ -370,58 +506,78 @@ pub fn poll_connection(
 ) -> Option<usize> {
     unsafe {
         let service = connection_dispatcher_if_ready()?;
-        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
-        service.set_time(now_us);
-        crate::stream_handlers::before_poll(service, path, now_us);
-        // Prefer endpoint-owned loss recovery over a fresh ACK/control frame:
-        // an action response can be accepted by the local driver yet lost on
-        // air, and no bearer-local response queue is allowed to mask that.
-        service
-            .poll_retransmit_for(path, now_us, 600_000, response)
-            .ok()
-            .flatten()
-            .or_else(|| service.poll_for(path, response).ok().flatten())
+        let now_ms = (esp_idf_sys::esp_timer_get_time().max(0) as u64) / 1_000;
+        let terminal_before = service.terminal_response_snapshot();
+        let result = dmesh_server::transport::poll_server_turn(
+            service,
+            path,
+            now_ms,
+            600,
+            response,
+            |service, path, now| crate::stream_handlers::before_poll(service, path, now),
+        )
+        .ok()
+        .flatten();
+        if let Some(receive_cid) = service.take_terminal_response_delivered() {
+            TERMINAL_RESPONSE_DELIVERED.store(true, core::sync::atomic::Ordering::Release);
+            crate::rtc::response_delivered(receive_cid);
+        }
+        if let Some(receive_cid) = service.terminal_response_started_after(terminal_before) {
+            crate::rtc::bind_recovery_response(receive_cid);
+        }
+        result
     }
 }
 
-/// Return the next transport-owned NOW server deadline in Main milliseconds.
+/// Return the active connection's bounded ready-flight limit. Physical
+/// adapters use this only as the cap passed to quic-lite's shared egress
+/// drainer; packet eligibility remains connection-owned.
+pub(crate) fn connection_tx_burst_packets() -> usize {
+    unsafe {
+        connection_dispatcher_if_ready()
+            .map(|service| service.tx_burst_packets())
+            .unwrap_or(1)
+    }
+}
+
+/// Return the next transport-owned server deadline in Main milliseconds.
 ///
 /// The raw endpoint reports only a pending ACK or retained-packet PTO in its
-/// microsecond clock.  Main converts that one value into a blocking queue
-/// timeout; this does not create a periodic radio service tick and leaves
-/// idle, UART, and UDP6 services entirely ingress-driven.
+/// millisecond clock. Main converts that one value into a blocking queue
+/// timeout; this does not create a periodic service tick. UART needs the same
+/// one-shot PTO as UDP6/NOW when its single physical egress slot was full.
 pub(crate) fn connection_delay_ms() -> Option<u32> {
     unsafe {
         let service = connection_dispatcher_if_ready()?;
-        let path = service.reply_path()?;
+        let (_, path, deadline_ms) = service.next_service_target(600)?;
         if !matches!(
             connection_path_transport(path),
             transport if transport == dmesh_server::transport_path::TransportId::NOW.0
                 || transport == dmesh_server::transport_path::TransportId::UDP6.0
+                || transport == dmesh_server::transport_path::TransportId::UART.0
         ) {
             return None;
         }
-        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
-        let deadline_us = service.next_service_deadline(600_000)?;
+        let now_ms = (esp_idf_sys::esp_timer_get_time().max(0) as u64) / 1_000;
         Some(
-            deadline_us
-                .saturating_sub(now_us)
-                .saturating_add(999)
-                .div_euclid(1_000)
+            deadline_ms
+                .saturating_sub(now_ms)
                 .clamp(1, u64::from(u32::MAX)) as u32,
         )
     }
 }
 
-/// Ask the shared ingress owner to retransmit one due NOW server packet.
-/// Called only after Main's one-shot deadline; it does not touch the service
-/// directly because UART, UDP6, and NOW ingress all serialize that state on
-/// the packet worker.
+/// Ask the shared ingress owner for one normal application-maintenance turn.
+///
+/// Usually this is scheduled at a QUIC deadline. A handler may also request
+/// it after admitting asynchronous storage work; the worker then runs the
+/// same `before_poll` hook and QUIC decides whether any packet is due. It
+/// does not create a flash-, ACK-, or bearer-specific service loop.
 pub(crate) fn schedule_connection_timer() {
     let _ = crate::shared_ingress_esp::schedule_connection_timer(service_connection_timer);
 }
 
-/// Perform one server-side NOW PTO turn on the packet worker. The reply path
+/// Perform one server-side PTO turn on the packet worker. The reply path
 /// comes from the accepted connection packet, not from an adapter-private
 /// queue, so future multipath policy can replace this final transport match.
 fn service_connection_timer() {
@@ -429,30 +585,36 @@ fn service_connection_timer() {
         let Some(service) = connection_dispatcher_if_ready() else {
             return;
         };
-        let Some(path) = service.reply_path() else {
+        let Some((receive_cid, path, _)) = service.service_target_or_active(600) else {
             return;
         };
+        if service.select_receive_cid(receive_cid) != Some(path) {
+            return;
+        }
         match connection_path_transport(path) {
+            transport if transport == dmesh_server::transport_path::TransportId::UART.0 => {
+                let Some(response) = (*core::ptr::addr_of_mut!(UART_SERVICE_RESPONSE)).as_mut()
+                else {
+                    return;
+                };
+                pump_uart_egress(path, response, None);
+            }
             transport if transport == dmesh_server::transport_path::TransportId::NOW.0 => {
                 let response = &mut *core::ptr::addr_of_mut!(CONNECTION_TIMER_RESPONSE);
                 let Some(used) = poll_connection(path, response) else {
                     return;
                 };
                 if used <= response.len() {
+                    let packet = &response[..used];
                     let _ = crate::wifi_espnow_esp::transmit_from_worker(
                         crate::wifi_espnow_esp::EspNowPeer {
                             mac: connection_path_peer(path),
                         },
-                        &response[..used],
+                        packet,
                     );
                 }
             }
             transport if transport == dmesh_server::transport_path::TransportId::UDP6.0 => {
-                if CONNECTION_TIMER_UDP6_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                    < 2
-                {
-                    crate::commands::send_response(b"connection timer UDP6");
-                }
                 crate::wifi_raw_udp6_esp::poll_connection_timer();
             }
             _ => {}
@@ -464,15 +626,23 @@ fn service_connection_timer() {
 /// handler contains no flash, Wi-Fi, or address policy: those stay outside
 /// the host-tested connection and ESP adapter respectively.
 pub(crate) fn receive_raw_udp6(
-    peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
+    path: quic_lite::PathId,
+    _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    receive_connection_frame(
-        connection_path_id(dmesh_server::transport_path::TransportId::UDP6.0, peer.mac),
-        packet,
-        response,
-    )
+    receive_connection_frame(path, packet, response)
+}
+
+/// Recovery installs no connectionless command catalog. Multicast presence
+/// is outbound only; directed control and flashing use the ordinary QUIC
+/// association handled by [`receive_raw_udp6`].
+pub(crate) fn reject_recovery_connectionless(
+    _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
+    _packet: &[u8],
+    _response: &mut [u8; crate::TRANSPORT_MTU],
+) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
+    crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected
 }
 
 /// Construct a bounded connectionless application packet at the shared QUIC
@@ -532,6 +702,7 @@ pub(crate) fn receive_udp6_connectionless(
 /// its configured local next hop; every other packet retains the existing raw
 /// endpoint behavior. Recovery continues to call [`receive_raw_udp6`].
 pub(crate) fn receive_main_raw_udp6(
+    path: quic_lite::PathId,
     peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
     packet: &[u8],
     response: &mut [u8; crate::TRANSPORT_MTU],
@@ -568,18 +739,23 @@ pub(crate) fn receive_main_raw_udp6(
             link: peer.link,
             peer,
         },
-        || receive_raw_udp6(peer, packet, response),
+        || receive_raw_udp6(path, peer, packet, response),
     )
 }
 
 pub(crate) fn poll_raw_udp6(
-    peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
+    path: quic_lite::PathId,
     response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> Option<usize> {
-    poll_connection(
-        connection_path_id(dmesh_server::transport_path::TransportId::UDP6.0, peer.mac),
-        response,
-    )
+    poll_connection(path, response)
+}
+
+pub(crate) fn connection_reply_path() -> Option<quic_lite::PathId> {
+    unsafe { connection_dispatcher_if_ready()?.reply_path() }
+}
+
+pub(crate) fn connection_has_path(path: quic_lite::PathId) -> bool {
+    unsafe { connection_dispatcher_if_ready().is_some_and(|service| service.has_path(path)) }
 }
 
 /// Feed one complete ESP-NOW frame into the same connection dispatcher used
@@ -720,15 +896,21 @@ pub(crate) fn schedule_storage_ready() -> bool {
     crate::shared_ingress_esp::schedule_storage_ready(service_storage_ready)
 }
 
+/// Take the generic terminal stream delivery edge. Recovery combines this
+/// with its durable-flash completion before arming Main; Main does not poll it.
+pub(crate) fn take_terminal_response_delivered() -> bool {
+    TERMINAL_RESPONSE_DELIVERED.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// Let the application publish newly available receive capacity to QUIC-lite,
 /// then submit any resulting opaque transport packet on its active path.
 fn service_storage_ready() {
     unsafe {
-        let now_us = esp_idf_sys::esp_timer_get_time().max(0) as u64;
+        let now_ms = (esp_idf_sys::esp_timer_get_time().max(0) as u64) / 1_000;
         let Some(service) = connection_dispatcher_if_ready() else {
             return;
         };
-        let Ok(Some(path)) = crate::stream_handlers::storage_ready(service, now_us) else {
+        let Ok(Some(path)) = crate::stream_handlers::storage_ready(service, now_ms) else {
             return;
         };
         match connection_path_transport(path) {
@@ -742,11 +924,12 @@ fn service_storage_ready() {
             transport if transport == dmesh_server::transport_path::TransportId::NOW.0 => {
                 let response = &mut *core::ptr::addr_of_mut!(CONNECTION_TIMER_RESPONSE);
                 if let Some(used) = poll_connection(path, response) {
+                    let packet = &response[..used];
                     let _ = crate::wifi_espnow_esp::transmit_from_worker(
                         crate::wifi_espnow_esp::EspNowPeer {
                             mac: connection_path_peer(path),
                         },
-                        &response[..used],
+                        packet,
                     );
                 }
             }
@@ -775,6 +958,7 @@ fn pump_uart_egress(
     }
     let used = immediate.or_else(|| poll_connection(path, response));
     if let Some(used) = used.filter(|used| *used <= response.len()) {
-        let _ = crate::uart_esp::send_transport_packet(&response[..used]);
+        let packet = &response[..used];
+        let _ = crate::uart_esp::send_transport_packet(packet);
     }
 }

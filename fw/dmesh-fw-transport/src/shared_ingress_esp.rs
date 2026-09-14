@@ -8,15 +8,30 @@
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use quic_lite::packet_pool::{PacketPool, PacketSlot};
 
 /// Ethernet plus the common QUIC-lite datagram, sufficient for raw IPv6.
 pub const FRAME_CAPACITY: usize = crate::TRANSPORT_MTU + 96;
-/// This is the device-wide count, not a per-bearer multiplier.
-pub const PACKET_SLOTS: usize = 8;
+/// Device-wide ESP driver callback buffers, not QUIC retransmission entries.
+///
+/// Linux has no corresponding userspace pool: socket ingress is retained by
+/// the dynamically sized kernel socket queues until `recvmsg`, while ESP-IDF
+/// owns an RX frame only for the duration of its Wi-Fi callback. The callback
+/// cannot keep that pointer and must not allocate from the general heap, so it
+/// copies into this statically allocated, lock-free pool before waking the
+/// common QUIC worker. The pool may drop a newly received frame when full;
+/// normal QUIC loss recovery handles that drop using the separately allocated,
+/// dynamically selected endpoint ledger. All ESP bearers share these slots.
+/// Eight is only the current ESP static-RAM budget (roughly eight MTU frames),
+/// and is exported by `memory_stats` with the live free count so fleet tests
+/// can justify changing it. It never enters OPEN, MAX_DATA, congestion, or
+/// retransmission calculations. A host must not emulate this adapter buffer in
+/// production because its socket receive queue is the corresponding platform
+/// primitive; constrained host tests exercise `PacketPool<N, MTU>` directly.
+pub const ESP_CALLBACK_PACKET_SLOTS: usize = 8;
 /// A received frame may be dropped under pressure, but a response that has
 /// already been admitted by the QUIC-lite endpoint must still have room to
 /// leave the device.  Reserve two of the single, shared packet slots for
@@ -33,10 +48,12 @@ const EGRESS_RESERVED_SLOTS: usize = 2;
 const QUEUE_SEND_TO_FRONT: i32 = 1;
 /// One active ingress worker owns the shared service-dispatch call chain for
 /// UART, NOW, UDP6, and NAN Service Info. It does not own packet buffers:
-/// those are in [`PACKETS`]. A retained 16-packet association has a larger
-/// construction path than the old one-shot PROBE turn; 32 KiB produced a
-/// stack-protection fault while admitting its first stream. Keep 48 KiB until
-/// `memory_stats` proves a smaller high-water mark on the full catalog pass.
+/// those are in [`PACKETS`]. The selected association and multi-stream
+/// callback state have a larger construction path than the old one-shot
+/// PROBE turn; 32 KiB produced a stack-protection fault while admitting its
+/// first stream. Keep 48 KiB until `memory_stats` proves a smaller high-water
+/// mark on the full catalog pass. This is an ESP task-stack allocation, not a
+/// QUIC window, ledger, or device-only protocol path.
 const TASK_STACK_BYTES: u32 = 48 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,7 +135,7 @@ pub type IngressHandler = fn(IngressPacket, &[u8]);
 
 struct QueueStorage<const N: usize>([u8; N]);
 
-static PACKETS: PacketPool<PACKET_SLOTS, FRAME_CAPACITY> = PacketPool::new();
+static PACKETS: PacketPool<ESP_CALLBACK_PACKET_SLOTS, FRAME_CAPACITY> = PacketPool::new();
 static QUEUE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static STARTED: AtomicBool = AtomicBool::new(false);
 static RAW_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -155,8 +172,9 @@ static WORKER_LARGEST_INTERNAL_BLOCK_BYTES: AtomicU32 = AtomicU32::new(0);
 
 static mut QUEUE_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticQueue_t> =
     core::mem::MaybeUninit::uninit();
-static mut QUEUE_STORAGE: QueueStorage<{ PACKET_SLOTS * core::mem::size_of::<IngressPacket>() }> =
-    QueueStorage([0; PACKET_SLOTS * core::mem::size_of::<IngressPacket>()]);
+static mut QUEUE_STORAGE: QueueStorage<
+    { ESP_CALLBACK_PACKET_SLOTS * core::mem::size_of::<IngressPacket>() },
+> = QueueStorage([0; ESP_CALLBACK_PACKET_SLOTS * core::mem::size_of::<IngressPacket>()]);
 static mut TASK_PACKET: core::mem::MaybeUninit<IngressPacket> = core::mem::MaybeUninit::uninit();
 
 /// Memory evidence for sizing the shared event-driven dispatcher. These
@@ -187,7 +205,7 @@ pub struct IngressMemoryStats {
 /// worker. Stack high water is FreeRTOS words remaining, not bytes used.
 pub fn memory_stats() -> IngressMemoryStats {
     IngressMemoryStats {
-        packet_slots: PACKET_SLOTS as u32,
+        packet_slots: ESP_CALLBACK_PACKET_SLOTS as u32,
         packet_slots_available: PACKETS.available() as u32,
         packet_drops: DROPS.load(Ordering::Relaxed),
         worker_stack_bytes: TASK_STACK_BYTES,
@@ -206,7 +224,11 @@ pub fn memory_stats() -> IngressMemoryStats {
 }
 
 fn zero_if_unset(value: u32) -> u32 {
-    if value == u32::MAX { 0 } else { value }
+    if value == u32::MAX {
+        0
+    } else {
+        value
+    }
 }
 
 fn record_lowest(slot: &AtomicU32, value: u32) {
@@ -243,7 +265,7 @@ pub fn start(kind: IngressKind, handler: IngressHandler) -> bool {
     }
     let queue = unsafe {
         esp_idf_sys::xQueueGenericCreateStatic(
-            PACKET_SLOTS as _,
+            ESP_CALLBACK_PACKET_SLOTS as _,
             core::mem::size_of::<IngressPacket>() as _,
             core::ptr::addr_of_mut!(QUEUE_STORAGE.0).cast(),
             core::ptr::addr_of_mut!(QUEUE_CONTROL).cast(),
@@ -302,7 +324,7 @@ pub fn enqueue_on_link(
     // burst of NAN/action capture consume the last shared packet slots and
     // prevent the worker from submitting an already-admitted response.  This
     // is one pool and one queue: only admission priority differs.  Egress is
-    // bounded by the same eight slots and remains subject to normal failure
+    // bounded by the same device callback pool and remains subject to normal failure
     // accounting when both reserved slots are occupied.
     if kind != IngressKind::EspNowTx && PACKETS.available() <= EGRESS_RESERVED_SLOTS {
         DROPS.fetch_add(1, Ordering::Relaxed);
@@ -548,6 +570,7 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
                 let work: fn() = unsafe { core::mem::transmute(work) };
                 work();
             }
+            unsafe { esp_idf_sys::vTaskDelay(1) };
             continue;
         }
         if item.kind == IngressKind::ConnectionTimer {
@@ -557,6 +580,15 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
                 let handler: fn() = unsafe { core::mem::transmute(handler) };
                 handler();
             }
+            // Unlike host socket drivers, Main and the connection owner are
+            // separate tasks. Main may have recomputed its one-shot timeout
+            // before this worker changed ACK/PTO/MAX_* state. Publish a
+            // completion edge after the shared QUIC turn so Main observes and
+            // arms the next transport-owned deadline. This is task scheduling
+            // glue only; it neither creates a periodic tick nor chooses a
+            // retransmission or flow-control policy.
+            crate::core_runtime::request_connection_deadline_recheck();
+            unsafe { esp_idf_sys::vTaskDelay(1) };
             continue;
         }
         if item.kind == IngressKind::UartEgressReady {
@@ -566,6 +598,7 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
                 let handler: fn() = unsafe { core::mem::transmute(handler) };
                 handler();
             }
+            unsafe { esp_idf_sys::vTaskDelay(1) };
             continue;
         }
         if item.kind == IngressKind::StorageReady {
@@ -575,6 +608,11 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
                 let handler: fn() = unsafe { core::mem::transmute(handler) };
                 handler();
             }
+            // Storage consumption can queue MAX_* and emit only one packet in
+            // this worker turn. Re-arm Main from the post-handler state for
+            // exactly the same reason as the connection-timer edge above.
+            crate::core_runtime::request_connection_deadline_recheck();
+            unsafe { esp_idf_sys::vTaskDelay(1) };
             continue;
         }
         let handler = handler_slot(item.kind).load(Ordering::Acquire);
@@ -590,6 +628,12 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
         record_lowest(&WORKER_STACK_MIN_FREE_WORDS, unsafe {
             esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) as u32
         });
+        // A continuously retransmitting peer can keep this queue non-empty.
+        // Yield after one complete bearer frame so Wi-Fi, flash completion,
+        // and the IDLE watchdog get normal FreeRTOS scheduling.  This changes
+        // no QUIC ordering, ACK, or credit policy; it is common adapter
+        // scheduling for UART, UDP, and NOW alike.
+        unsafe { esp_idf_sys::vTaskDelay(1) };
     }
 }
 

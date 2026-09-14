@@ -10,9 +10,9 @@ use core::{
 };
 
 use quic_lite::raw_udp6::{
-    Error, encode_neighbor_advertisement, encode_station_ipv6_data_frame,
-    encode_station_udp6_data_frame, encode_udp6, link_local_from_mac, parse_neighbor_solicitation,
-    parse_udp6, parse_udp6_for_destination,
+    encode_neighbor_advertisement, encode_station_ipv6_data_frame, encode_station_udp6_data_frame,
+    encode_udp6, link_local_from_mac, parse_neighbor_solicitation, parse_udp6,
+    parse_udp6_for_destination, Error,
 };
 
 pub const RAW_UDP6_PORT: u16 = 3339;
@@ -54,8 +54,12 @@ pub struct RawUdp6Peer {
 
 /// The handler owns QUIC-lite/DCID/service state. It receives one complete
 /// UDP payload and writes at most one response payload into `response`.
-pub type RawUdp6Handler =
-    fn(RawUdp6Peer, &[u8], &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
+pub type RawUdp6Handler = fn(
+    quic_lite::PathId,
+    RawUdp6Peer,
+    &[u8],
+    &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+) -> Option<usize>;
 /// Consume one complete connectionless UDP payload with immutable source
 /// metadata. The adapter selects this callback by UDP destination only; it
 /// does not decode direct envelopes or application records.
@@ -75,7 +79,7 @@ pub type ConnectionlessUdp6Handler = fn(
 /// bearer queue: the connection retains the packet ledger and the adapter
 /// immediately transmits each returned datagram.
 pub type RawUdp6PollHandler =
-    fn(RawUdp6Peer, &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
+    fn(quic_lite::PathId, &mut [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE]) -> Option<usize>;
 
 static HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CONNECTIONLESS_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -103,7 +107,6 @@ static RX_QUEUE_DROPS: AtomicU32 = AtomicU32::new(0);
 static RX_INVALID: AtomicU32 = AtomicU32::new(0);
 static UDP_DELIVERED: AtomicU32 = AtomicU32::new(0);
 static UDP_PARSED: AtomicU32 = AtomicU32::new(0);
-static UDP_HANDLER_NO_RESPONSE: AtomicU32 = AtomicU32::new(0);
 static NDP_ADVERTISEMENTS: AtomicU32 = AtomicU32::new(0);
 static NDP_INVALID: AtomicU32 = AtomicU32::new(0);
 static TX_FRAMES: AtomicU32 = AtomicU32::new(0);
@@ -120,26 +123,17 @@ static TX_SUBMIT_US_MAX: AtomicU32 = AtomicU32::new(0);
 // the existing shared ingress worker (and its already-accounted stack), not
 // a per-bearer task or queue.  It is armed only for the explicit burst-one
 // pacing mode, where yielding the CPU also gives the STA an RX/ACK window.
-static PACED_LINK: AtomicUsize = AtomicUsize::new(0);
-static PACED_PEER_MAC_LOW: AtomicU32 = AtomicU32::new(0);
-static PACED_PEER_MAC_HIGH: AtomicU32 = AtomicU32::new(0);
-static PACED_PEER_IP: [AtomicU32; 4] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-static PACED_PEER_PORT: AtomicU32 = AtomicU32::new(0);
+type UdpPathBindings =
+    dmesh_server::transport_path::PathBindingTable<RawUdp6Peer, { crate::MAX_QUIC_ASSOCIATIONS }>;
+// Access is serialized by the one shared packet worker. Unlike the previous
+// global last-peer atomics, every opaque path retains its exact link/MAC/IP/
+// port return tuple, matching the host UDP association owner.
+static mut UDP_PATH_BINDINGS: UdpPathBindings =
+    UdpPathBindings::new(((dmesh_server::transport_path::TransportId::UDP6.0 as u64) << 48) | 1);
 /// 0=not attempted, 1=started, 2=shared worker unavailable, 3=RX callback
 /// registration failed. This is deliberately a small status value rather
 /// than a boot-only log: a host can inspect it after association has settled.
 static START_STATUS: AtomicU32 = AtomicU32::new(0);
-// Startup breadcrumbs are atomics so the Wi-Fi RX callback never formats or
-// allocates. The consumer emits at most one report after it owns the frame.
-static FIRST_RX_LEN: AtomicU32 = AtomicU32::new(0);
-static FIRST_RX_REPORTED: AtomicBool = AtomicBool::new(false);
-static RX_CALLBACK_LOGGED: AtomicU32 = AtomicU32::new(0);
-static TIMER_POLL_REPORTS: AtomicU32 = AtomicU32::new(0);
 const ANNOUNCE_PEER_CAPACITY: usize = 10;
 
 /// A bounded, lock-free observation record. The shared ingress worker is the
@@ -235,6 +229,14 @@ static mut TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
 static mut IEEE80211_TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
 static mut RESPONSE_BUFFER: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
     [0; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+// One common writable-edge slot preserves an encoded QUIC datagram when the
+// nonblocking ESP Wi-Fi submit queue is full. It is not a UDP retransmission
+// queue; quic-lite owns packet history and this driver retries the exact
+// physically-unsubmitted bytes before polling for anything new.
+static mut EGRESS_DRIVER: quic_lite::connection::DatagramEgressDriver<
+    quic_lite::PathId,
+    { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
+> = quic_lite::connection::DatagramEgressDriver::new();
 /// Snapshot counters for status/log adapters.  The counters are deliberately
 /// separate from the packet ingress path and remain meaningful across bearers.
 pub fn stats() -> (u32, u32, u32, u32, u32, u32) {
@@ -277,7 +279,6 @@ pub fn reset_diagnostics() {
     RX_INVALID.store(0, Ordering::Relaxed);
     UDP_DELIVERED.store(0, Ordering::Relaxed);
     UDP_PARSED.store(0, Ordering::Relaxed);
-    UDP_HANDLER_NO_RESPONSE.store(0, Ordering::Relaxed);
     NDP_ADVERTISEMENTS.store(0, Ordering::Relaxed);
     NDP_INVALID.store(0, Ordering::Relaxed);
     TX_FRAMES.store(0, Ordering::Relaxed);
@@ -595,27 +596,11 @@ unsafe fn rx_callback(
             return esp_idf_sys::ESP_FAIL;
         }
     }
-    // Keep the callback bounded: reporting happens in the consumer task.
-    let _ = FIRST_RX_LEN.compare_exchange(0, len as u32, Ordering::Relaxed, Ordering::Relaxed);
-    let received = RX_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if received <= 4 {
-        RX_CALLBACK_LOGGED.store(len as u32, Ordering::Relaxed);
-    }
+    RX_FRAMES.fetch_add(1, Ordering::Relaxed);
     esp_idf_sys::ESP_OK
 }
 
 fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]) {
-    // One bounded startup breadcrumb for hardware bring-up. This adapter
-    // otherwise has no logging in the RX path, so a C6-specific frame-shape
-    // mismatch is indistinguishable from AP delivery failure.
-    let first_len = FIRST_RX_LEN.load(Ordering::Relaxed);
-    if first_len != 0 && !FIRST_RX_REPORTED.swap(true, Ordering::Relaxed) {
-        crate::commands::send_stat(b"raw udp6 rx first len=", first_len as u64);
-    }
-    let callback_len = RX_CALLBACK_LOGGED.swap(0, Ordering::Relaxed);
-    if callback_len != 0 {
-        crate::commands::send_stat(b"raw udp6 rx callback len=", callback_len as u64);
-    }
     let local_mac = local_mac_for(item.link());
     let local_ip = link_local_from_mac(local_mac);
     // Linux resolves a link-local IPv6 destination with NDP; it does not
@@ -704,7 +689,7 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
             }
             ConnectionlessUdp6Outcome::Handled => {}
             ConnectionlessUdp6Outcome::Response(used) if used <= response.len() => {
-                if !transmit_udp6(item.link(), peer, peer.port, &response[..used]) {
+                if !transmit_udp6(item.link(), peer, RAW_UDP6_PORT, &response[..used]) {
                     TX_FAILURES.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -750,27 +735,46 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
         ip: packet.source_ip,
         port: packet.source_port,
     };
-    // The common connection deadline is keyed only by its bearer-neutral
-    // path. Retain the opaque UDP return tuple in this adapter so the Main
-    // timer can ask QUIC-lite for a delayed ACK/PTO without a fresh ingress.
-    store_paced_peer(item.link(), peer);
-    let immediate = handler(peer, packet.payload, response);
-    if immediate.is_none() && UDP_HANDLER_NO_RESPONSE.fetch_add(1, Ordering::Relaxed) == 0 {
-        // This is expected for an ACK-only transport packet; retain one
-        // breadcrumb for non-service handlers without treating it as a drop.
-        crate::commands::send_response(b"raw udp6 handler no immediate response");
-    }
+    // Preserve the complete UDP return tuple behind a stable opaque path.
+    // MAC alone is insufficient: independent host processes can use the same
+    // L2 peer with different source ports and associations.
+    let Some(path) = bind_udp_peer(peer) else {
+        RX_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let immediate = handler(path, peer, packet.payload, response);
     let poll = POLL_HANDLER.load(Ordering::Acquire);
     let poll: Option<RawUdp6PollHandler> =
         (poll != 0).then(|| unsafe { core::mem::transmute(poll) });
-    let used = immediate.or_else(|| poll.and_then(|poll| poll(peer, response)));
-    let sent = used.is_some_and(|used| {
-        used <= response.len()
-            && transmit_udp6(item.link(), peer, RAW_UDP6_PORT, &response[..used])
-    });
-    if sent {
-        UDP_DELIVERED.fetch_add(1, Ordering::Relaxed);
-        TX_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let mut attempted = false;
+    let submitted = unsafe { &mut *core::ptr::addr_of_mut!(EGRESS_DRIVER) }
+        .drain(
+            path,
+            response,
+            crate::core_runtime::connection_tx_burst_packets(),
+            immediate,
+            |response| {
+                Ok::<_, core::convert::Infallible>(poll.and_then(|poll| poll(path, response)))
+            },
+            |send_path, packet| {
+                attempted = true;
+                let Some(send_peer) =
+                    (unsafe { (*core::ptr::addr_of!(UDP_PATH_BINDINGS)).get(send_path) })
+                else {
+                    return false;
+                };
+                let sent = transmit_udp6(send_peer.link, send_peer, RAW_UDP6_PORT, packet);
+                if sent {
+                    UDP_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                    TX_FRAMES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+                sent
+            },
+        )
+        .unwrap_or(0);
+    if submitted != 0 {
         // Keep a small physical-path breadcrumb for the host->STA direct
         // responder. A client timeout alone cannot distinguish a handler
         // that produced nothing from a Wi-Fi submit or AP-forwarding loss.
@@ -782,12 +786,8 @@ fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, frame: &[u8]
             );
         }
     }
-    if used.is_some() && !sent {
-        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-        crate::commands::send_stat(
-            b"raw udp6 egress submit_failed=",
-            1,
-        );
+    if attempted && submitted == 0 {
+        crate::commands::send_stat(b"raw udp6 egress submit_failed=", 1);
     }
 }
 
@@ -870,66 +870,55 @@ pub(crate) fn poll_connection_timer() {
     if !STARTED.load(Ordering::Acquire) {
         return;
     }
-    let link = match PACED_LINK.load(Ordering::Acquire) {
-        1 => crate::shared_ingress_esp::IngressLink::WifiSta,
-        2 => crate::shared_ingress_esp::IngressLink::WifiAp,
-        _ => return,
+    let Some(path) = crate::core_runtime::connection_reply_path() else {
+        return;
     };
-    let peer = load_paced_peer();
+    let Some(_) = (unsafe { (*core::ptr::addr_of!(UDP_PATH_BINDINGS)).get(path) }) else {
+        return;
+    };
     let poll = POLL_HANDLER.load(Ordering::Acquire);
     if poll == 0 {
         return;
     }
     let poll: RawUdp6PollHandler = unsafe { core::mem::transmute(poll) };
     let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE_BUFFER) };
-    let used = poll(peer, response);
-    let sent = used.is_some_and(|used| {
-        used <= response.len() && transmit_udp6(link, peer, RAW_UDP6_PORT, &response[..used])
-    });
-    if sent {
-        TX_FRAMES.fetch_add(1, Ordering::Relaxed);
-        if TIMER_POLL_REPORTS.fetch_add(1, Ordering::Relaxed) < 2 {
-            crate::commands::send_stat(b"raw udp6 timer egress=", 1);
+    let first = poll(path, response);
+    let submitted = unsafe { &mut *core::ptr::addr_of_mut!(EGRESS_DRIVER) }
+        .drain(
+            path,
+            response,
+            crate::core_runtime::connection_tx_burst_packets(),
+            first,
+            |response| Ok::<_, core::convert::Infallible>(poll(path, response)),
+            |send_path, packet| {
+                let Some(send_peer) =
+                    (unsafe { (*core::ptr::addr_of!(UDP_PATH_BINDINGS)).get(send_path) })
+                else {
+                    return false;
+                };
+                let sent = transmit_udp6(send_peer.link, send_peer, RAW_UDP6_PORT, packet);
+                if sent {
+                    TX_FRAMES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+                sent
+            },
+        )
+        .unwrap_or(0);
+    let _ = submitted;
+}
+
+fn bind_udp_peer(peer: RawUdp6Peer) -> Option<quic_lite::PathId> {
+    unsafe {
+        let bindings = &mut *core::ptr::addr_of_mut!(UDP_PATH_BINDINGS);
+        if let Some(path) = bindings.bind(peer) {
+            return Some(path);
         }
-    } else if TIMER_POLL_REPORTS.fetch_add(1, Ordering::Relaxed) < 2 {
-        crate::commands::send_response(b"raw udp6 timer no egress");
-    }
-    if used.is_some() && !sent {
-        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn store_paced_peer(link: crate::shared_ingress_esp::IngressLink, peer: RawUdp6Peer) {
-    PACED_LINK.store(link as usize, Ordering::Release);
-    PACED_PEER_MAC_LOW.store(
-        u32::from_le_bytes([peer.mac[0], peer.mac[1], peer.mac[2], peer.mac[3]]),
-        Ordering::Release,
-    );
-    PACED_PEER_MAC_HIGH.store(
-        u32::from_le_bytes([peer.mac[4], peer.mac[5], 0, 0]),
-        Ordering::Release,
-    );
-    for (slot, bytes) in PACED_PEER_IP.iter().zip(peer.ip.chunks_exact(4)) {
-        slot.store(
-            u32::from_be_bytes(bytes.try_into().unwrap()),
-            Ordering::Release,
-        );
-    }
-    PACED_PEER_PORT.store(u32::from(peer.port), Ordering::Release);
-}
-
-fn load_paced_peer() -> RawUdp6Peer {
-    let low = PACED_PEER_MAC_LOW.load(Ordering::Acquire).to_le_bytes();
-    let high = PACED_PEER_MAC_HIGH.load(Ordering::Acquire).to_le_bytes();
-    let mut ip = [0; 16];
-    for (index, slot) in PACED_PEER_IP.iter().enumerate() {
-        ip[index * 4..index * 4 + 4].copy_from_slice(&slot.load(Ordering::Acquire).to_be_bytes());
-    }
-    RawUdp6Peer {
-        link: crate::shared_ingress_esp::IngressLink::WifiSta,
-        mac: [low[0], low[1], low[2], low[3], high[0], high[1]],
-        ip,
-        port: PACED_PEER_PORT.load(Ordering::Acquire) as u16,
+        if !bindings.reclaim_one(|path| !crate::core_runtime::connection_has_path(path)) {
+            return None;
+        }
+        bindings.bind(peer)
     }
 }
 

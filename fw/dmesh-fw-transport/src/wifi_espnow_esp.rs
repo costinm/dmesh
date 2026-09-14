@@ -566,10 +566,15 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
     let poll: Option<EspNowPollHandler> =
         (poll != 0).then(|| unsafe { core::mem::transmute(poll) });
     let used = immediate.or_else(|| poll.and_then(|poll| poll(peer, response)));
-    if used.is_some_and(|used| {
-        used > response.len() || !transmit_from_worker(peer, &response[..used])
-    }) {
-        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+    if let Some(used) = used {
+        if used > response.len() {
+            TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let packet = &response[..used];
+            if !transmit_from_worker(peer, packet) {
+                TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 

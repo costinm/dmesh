@@ -8,6 +8,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # this task at 64 KiB; stream state and manifest storage are heap-owned.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+# Preserve the Stage2 custom RTC block until Recovery writes its one-shot
+# return-to-Main handoff after a durable flash commit.
+CONFIG_BOOTLOADER_RESERVE_RTC_MEM=y
+CONFIG_BOOTLOADER_RESERVE_RTC_SIZE=0x10
+CONFIG_BOOTLOADER_CUSTOM_RESERVE_RTC=y
+CONFIG_BOOTLOADER_CUSTOM_RESERVE_RTC_SIZE=0x20
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_NUM=0
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
@@ -15,13 +21,9 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
-# Recovery's normal UDP6 socket requires ESP-IDF to bring the associated STA
-# link-local address through DAD/SLAAC; no raw IPv6 frame path is available.
-CONFIG_LWIP_IPV6_AUTOCONFIG=y
-# Recovery's address is a stable EUI-64 from the unique STA MAC.  The lab AP
-# does not complete lwIP's DAD exchange reliably during the short Recovery
-# window, so admit the link-local address immediately for its UDP6-only job.
-CONFIG_LWIP_IPV6_DUP_DETECT_ATTEMPTS=0
+# DMesh derives its stable EUI-64 link-local address from the STA MAC and
+# transmits/parses IPv6 datagrams in the shared raw UDP6 bearer. Recovery does
+# not depend on lwIP address creation, DAD, or a socket transport.
 # This ESP32 target caps static RX buffers at 25. It cannot equal the
 # 32-packet BA window, but 25 is valid and meets ESP-IDF's requirement that
 # the BA window not exceed twice the static buffer count. Dynamic buffers
@@ -36,3 +38,7 @@ CONFIG_ESP_WIFI_TX_BA_WIN=32
 # with APs that require the newer password-element derivation.
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
 CONFIG_ESP_WIFI_ENABLE_SAE_H2E=y
+# A Recovery write must never turn an unexpected partition-protection decision
+# into a device reset.  The flash receiver reports the failed durable operation
+# and leaves Stage2 able to return to the known-good Main image instead.
+CONFIG_SPI_FLASH_DANGEROUS_WRITE_FAILS=y

@@ -4,13 +4,13 @@
 //! parsing, handler method IDs, snapshots, and delta semantics are in
 //! `dmesh-server`, so direct PPP and QUIC stream callers use identical bytes.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use dmesh_server::raw_wifi::{
-    RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS, RAW_WIFI_METHOD_SNAPSHOT,
     RawWifiApMode, RawWifiControlRequest, RawWifiCounters, RawWifiDwPolicy, RawWifiInterface,
     RawWifiLabRequest, RawWifiRate, RawWifiRxFilter, RawWifiSnapshot, RawWifiStaMode,
-    RawWifiStaState,
+    RawWifiStaState, RAW_WIFI_METHOD_CONTROL, RAW_WIFI_METHOD_RESET_COUNTERS,
+    RAW_WIFI_METHOD_SNAPSHOT,
 };
 
 static EPOCH: AtomicU32 = AtomicU32::new(1);

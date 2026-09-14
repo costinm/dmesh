@@ -7,11 +7,11 @@
 //! bootstrap, datagram receive/send, and QUIC-lite scheduling. The
 //! flashing module sees only ordered application stream callbacks.
 
-use crate::{TransportProfile, commands as uart};
+use crate::{commands as uart, TransportProfile};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 // Recovery-only PHY policy. It is deliberately not an NVS setting: normal
@@ -1879,51 +1879,6 @@ pub fn lab_open_ap_active() -> bool {
 /// Cheap association observation for Main's nonblocking session owner.
 pub fn sta_associated() -> bool {
     STA_ASSOCIATED_EVENT.load(Ordering::Acquire)
-}
-
-/// Return the ESP-IDF interface index for a scoped STA IPv6 endpoint.  The
-/// socket user owns the endpoint; Wi-Fi exposes only this association fact so
-/// Recovery can use the same normal lwIP UDP6 path as any other STA client.
-pub fn sta_netif_index() -> Option<u32> {
-    let netif = STA_NETIF.load(Ordering::Acquire);
-    if netif.is_null() {
-        return None;
-    }
-    let index = unsafe { esp_idf_sys::esp_netif_get_netif_impl_index(netif) };
-    (index > 0).then_some(index as u32)
-}
-
-/// Request and observe the STA link-local address.  ESP-IDF creates this
-/// address asynchronously after association, so callers must retry until it
-/// becomes preferred rather than guessing an EUI-64 address.
-pub fn sta_link_local_ready() -> bool {
-    sta_link_local_address().is_some()
-}
-
-/// Return the actual STA link-local address as network-order octets.
-///
-/// A scoped link-local UDP socket must bind this address rather than rely on
-/// lwIP choosing a source/interface from the unspecified IPv6 address.  That
-/// distinction matters on the classic ESP32, and it keeps Recovery's socket
-/// path an ordinary STA/lwIP path with no raw-radio fallback.
-pub fn sta_link_local_address() -> Option<[u8; 16]> {
-    let netif = STA_NETIF.load(Ordering::Acquire);
-    if netif.is_null() {
-        return None;
-    }
-    unsafe {
-        let _ = esp_idf_sys::esp_netif_create_ip6_linklocal(netif);
-        let mut address = esp_idf_sys::esp_ip6_addr_t::default();
-        if esp_idf_sys::esp_netif_get_ip6_linklocal(netif, &mut address) != esp_idf_sys::ESP_OK {
-            return None;
-        }
-        let mut bytes = [0u8; 16];
-        for (index, word) in address.addr.iter().copied().enumerate() {
-            bytes[index * 4..index * 4 + 4]
-                .copy_from_slice(&u32::from_be(word).to_be_bytes());
-        }
-        Some(bytes)
-    }
 }
 
 /// Driver-observed association phase only. This excludes lifecycle work such

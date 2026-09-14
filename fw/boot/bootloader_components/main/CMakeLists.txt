@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "bootloader_start.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES bootloader_support nvs_flash efuse)
+    PRIV_REQUIRES bootloader_support nvs_flash)
 
 if(NOT DEFINED ENV{DMESH_STAGE2_VERSION} OR "$ENV{DMESH_STAGE2_VERSION}" STREQUAL "")
     string(TIMESTAMP DMESH_STAGE2_DATE "%Y%m%d" UTC)

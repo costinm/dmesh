@@ -7,7 +7,7 @@
 //! window are handed to the same shared action ingress as the private driver
 //! hook; outside the window there is no promiscuous capture.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 const NAN_DW_PERIOD_MS: u32 = 512 * 1_024 / 1_000;
 /// Open a little before the selected cluster's beacon. The ESP timestamp is

@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering
 
 use dmesh_server::{
     firmware_profile::{UART_DEFAULT, UART_OFF},
-    uart::{UART_TRANSPORT_MARKER, UartIngress, classify_uart_payload},
+    uart::{classify_uart_payload, UartIngress, UART_TRANSPORT_MARKER},
 };
 use uart_codec::codec::{Decoder as UartDecoder, Encoder as UartEncoder};
 

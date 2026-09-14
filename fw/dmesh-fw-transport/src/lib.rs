@@ -40,6 +40,10 @@ pub mod recovery_runtime;
 /// Main-only bounded DCID forwarding state. Recovery intentionally does not
 /// register this handler or accept transit rules.
 pub mod relay_main;
+/// Shared Stage2 retained-memory handoff/health contract for Main and
+/// Recovery. This is hardware state only, never a transport control plane.
+pub mod rtc;
+mod sta_profile_esp;
 pub mod state;
 mod stream_handlers;
 pub mod task_esp;
@@ -59,19 +63,20 @@ pub mod wifi_raw_udp6_esp;
 /// The one packet payload limit used by every bearer. A bearer that cannot
 /// carry this must reject it at bring-up; it must not fragment at this layer.
 pub const TRANSPORT_MTU: usize = quic_lite::DEFAULT_MAX_DATAGRAM_SIZE;
-/// Static maximum for one retained association's outstanding packet ledger.
-/// The negotiated/request-scoped burst may lower active use, but no image
-/// gets a silently different transport profile. Finished sequential streams
-/// release this ledger through normal bidirectional ACK traffic.
-pub const CONNECTION_HISTORY_CAPACITY: usize = 8;
+/// Safety ceiling for one retained association's outstanding packet ledger.
+/// The actual heap-backed ledger is selected from current memory at admission,
+/// using the same `Vec` representation and policy exercised by host tests.
+/// This constant reserves no packet slots and is not an eight-packet firmware
+/// behavior; finished streams release live entries through ordinary QUIC ACKs.
+pub const CONNECTION_HISTORY_CAPACITY: usize = 64;
 /// Maximum simultaneously live peer associations in Main.  Each entry owns
 /// its own bounded QUIC stream ledger; this is deliberately a firmware memory
 /// budget, not a bearer limit. UART, UDP6 and NOW all feed the same table.
-/// Concurrent peer budget. One slot costs 312 bytes inline on the host ABI;
-/// an admitted peer additionally allocates a 3.8 KiB stream ledger. Twelve
-/// peers therefore bound connection state near 50 KiB while leaving embedded
-/// heap headroom. When full, zero-stream peers are reclaimed oldest-first;
-/// there is deliberately no firmware wall-clock expiry by default.
+/// Concurrent peer budget. Metadata is fixed and small, while each admitted
+/// peer allocates exactly the retransmission history selected from current
+/// memory (not this 64-packet ceiling). When full, zero-stream peers are
+/// reclaimed oldest-first; there is deliberately no firmware wall-clock
+/// expiry by default.
 pub const MAX_QUIC_ASSOCIATIONS: usize = 12;
 pub type ConnectionServer =
     dmesh_server::transport::ConnectionServer<CONNECTION_HISTORY_CAPACITY, { TRANSPORT_MTU }>;

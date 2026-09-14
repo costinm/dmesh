@@ -1,7 +1,8 @@
 #pragma once
 
-/* Local copy of the RTC layout contract. API.md documents the byte offsets;
- * keep this header and the Main/Recovery copies synchronized. */
+/* Local C copy of the RTC layout contract. Rust Main and Recovery use
+ * dmesh-fw-transport/src/rtc.rs; API.md documents the byte offsets. Keep this
+ * pre-Rust Stage2 header synchronized with that module. */
 
 #include <stdint.h>
 #include "sdkconfig.h"

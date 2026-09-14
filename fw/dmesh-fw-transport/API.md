@@ -3,34 +3,25 @@
 `dmesh-fw-transport` is the no-std ESP firmware integration layer shared by
 Recovery and Main. It may contain ESP-IDF/FreeRTOS adapters, UART tasks,
 sockets, NVS, flash workers, and ESP SHA callbacks when those are genuinely
-shared by the firmware binaries. RTC boot-target/reboot policy remains a
-Recovery-shell concern.
-
-`recovery-rust` has no reusable implementation modules and Main must never
-depend on it. Both binaries depend directly on this crate, `quic-lite`, and
-`dmesh-server` at the appropriate layer.
+shared by the firmware binaries.
 
 Code that can be host-tested without firmware ownership belongs in
 `quic-lite` (transport mechanics) or `dmesh-server` (CBOR schema, services,
-object records). Every Rust source file in this crate repeats that boundary.
+object records).
 
 ## Radio setup
 
-The implementation keeps a fixed-capacity, allocation-free cache while it
-starts Wi-Fi. It is not a public "profile" or a third transport choice. The
-public choice is one `transport.start`: `mode=Sta` associates, and `mode=Nan`
-does not. Its SSID is ephemeral, supplied only by an accepted start command,
-and discarded when the radio setup is replaced or the device reboots. Firmware
-has no SSID NVS read/write path, and ESP-IDF Wi-Fi NVS support is disabled.
+The mesh defines a 'desired state' for different transports. This can be sent
+as a message or in (signed) NAN SD requests.
 
-Raw UDP6 derives its link-local source address from the STA MAC and its peer
-from received packets/the associated AP BSSID. It does not use an NVS IPv4
-address, gateway, mask, server, or UDP port.
+Battery devices are expected to be in a sleepy state, with ~4 sec sync with an
+aware cluster - the Wifi (STA, NOW, AP) transport activation opens an active window.
 
 ### Shared packet bound
 
 UART, raw UDP6, and the current NOW/vendor-action bearer use one common
 transport datagram maximum: **1100 bytes** (`quic_lite::DEFAULT_MAX_DATAGRAM_SIZE`).
+
 All firmware buffers and complete-datagram clients derive from that bound.
 Current control/probe callers must request at most 1100 bytes; there is no
 per-bearer MTU negotiation yet. This prevents a host client from emitting a
@@ -86,15 +77,6 @@ not keep a NAN DW or NAN Service Info active; it continues to emit the same
 bounded announce over co-channel NOW and UDP6 multicast. The announce carries
 the current Wi-Fi channel and the STA UDP6 endpoint/network metadata so a
 receiver can choose the normal shared-network UDP6 path.
-
-The normal radio snapshot separates active-Publish `attempted`, locally
-driver-accepted `sent`, and locally rejected `dropped` counters. These are
-submission diagnostics only: `radio.devices` observations on a different
-device remain the required receipt evidence.
-
-When a platform exposes it, the same snapshot includes
-`max_tx_power_qdbm`, the local maximum transmit power in quarter-dBm. It is
-configuration telemetry, not evidence that a peer received a frame.
 
 Mode replacement emits additional announce methods using the same schema:
 `5=transition-begin`, `6=sleep-pending`, `7=transition-complete`, and
@@ -224,7 +206,7 @@ resetting the association, NOW callback, or NAN capture state.
 | `espnow_capture` | `false` | Legacy volatile setting; do not use it to select staged Main coexistence. |
 | `sta_driver_tx` | `true` | ESP-IDF associated Ethernet TX for raw UDP6 egress. Set `false` only for the raw-802.11-injection diagnostic A/B; it takes effect on the next replacement start. |
 | `raw_tx_rate` | `0` | Request raw injection PHY rate; live diagnostic and driver/capture verification required. |
-| `sta_raw_rx_enabled` | `true` | Select raw UDP6 RX callback, or ESP-IDF esp-netif/lwIP RX when false. |
+| `sta_raw_rx_enabled` | `true` | Select the DMesh raw UDP6 RX callback. Setting it false leaves frames to ESP-IDF internals and disables the DMesh STA UDP6 bearer; it does not select a second socket implementation. |
 | `sta_bssid_check_disabled` | `true` | **Accept other BSSIDs** in the private raw RX path. Keep this historical bypass enabled by default; set `false` only for standard STA BSSID-filter A/B. It applies on the next replacement start. |
 | `sta_ampdu_enabled` | `true` | A-MPDU policy; changing it recreates the STA driver and reassociates. |
 | `sta_11b_rates_disabled` | `true` | Pre-start legacy-rate policy; changing it recreates the STA driver and reassociates. |
@@ -313,7 +295,7 @@ QUIC-lite stream with the same handler schema.
 
 | Direct record | Why it may bypass QUIC-lite | Direction/limits |
 | --- | --- | --- |
-| Stage2 boot selection/status | Stage2 runs before the transport runtime exists | UART only; small CBOR request/response |
+| Stage2 boot status | Stage2 runs before the transport runtime exists | plain console log only; selection is the NVS `stg2:boot_target` and the one-shot RTC handoff |
 | Initial STA bootstrap request | Needed only to select the first raw UDP6 association | UART only; bounded SSID preference; no bulk data |
 | Boot identity and fatal bootstrap failure | Lets an attached operator diagnose failure before a connection exists | device-to-host only; one bounded record per event |
 | Explicit recovery escape/reboot request | Last-resort repair when no usable transport can be established | UART only; authenticated in the future security layer |
@@ -411,6 +393,26 @@ special case.
 - Both use the same start settings and tested STA adapter. Infrastructure Main
   starts STA from `transport.start`; battery Main starts with NAN/LoRA/FSK discovery and
   activates STA for an active session with explicit idle timeout/exit policy.
+
+### Stage2 RTC contract
+
+`rtc.rs` is the sole Rust owner of the retained-state layout shared by Main
+and Recovery. Stage2 is C and retains a matching small header because it runs
+before Rust exists. The shared `rtc_retain_mem_t` custom area begins at byte
+12 of the retained block: byte 16 is the Main health event (`1=start`,
+`2=healthy`) and byte 17 is the one-shot handoff (`0=normal`,
+`1=Recovery`, `2=Main`). The retained block is 48 bytes on the supported
+targets; its target-specific base address is intentionally private to
+`rtc.rs` and the Stage2 header.
+
+Main marks its start and later healthy state through `rtc.rs`. A successful
+Recovery Main write first arms the one-shot Main handoff and verifies the
+write, then reboots. Stage2 consumes that Main handoff before any persistent
+`boot_target` or failure policy and clears it immediately. Therefore a
+completed update returns to Main even when Recovery was selected for the
+preceding boot, while subsequent Main crashes are again governed by the normal
+Stage2 crash-loop policy. No transport handler, NVS setting, or application
+protocol may write these retained bytes directly.
 
 ## Deferred stream records
 

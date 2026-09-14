@@ -312,62 +312,18 @@ fn parse_port(value: &[u8]) -> Option<u16> {
 /// firmware, so it is retained only as a validated future UDP endpoint input;
 /// the Wi-Fi adapter never derives an address from a BSSID.
 pub(crate) fn apply_sta_profile_from_nvs(profile: &mut crate::TransportProfile) -> bool {
-    let _ = unsafe { nvs_flash_init() };
-    let mut handle = 0_u32;
-    if unsafe { nvs_open(b"dmesh\0".as_ptr().cast(), NVS_READONLY, &mut handle) } != 0 {
+    if !crate::sta_profile_esp::load(profile) {
         return false;
     }
-    let mut ssid = [0u8; 33];
-    let mut server_ll = [0u8; 40];
-    let mut server_port = [0u8; 6];
-    let result = (|| {
-        let ssid_len = nvs_string(handle, b"sta_ssid\0", &mut ssid)?;
-        let server_len = nvs_string(handle, b"sta_server_ll\0", &mut server_ll);
-        let port_len = nvs_string(handle, b"sta_server_port\0", &mut server_port);
-        if !dmesh_server::firmware_profile::valid_ssid(&ssid[..ssid_len]) {
-            return None;
-        }
-        // Main discovers its UDP6 peer through multicast/NAN when no server
-        // endpoint is provisioned. If one is present, retain the former
-        // all-or-nothing endpoint validation for Recovery compatibility.
-        match (server_len, port_len) {
-            (None, None) => {}
-            (Some(server_len), Some(port_len))
-                if server_ll[..server_len].starts_with(b"fe80:")
-                    && !server_ll[..server_len].contains(&b'%')
-                    && parse_port(&server_port[..port_len]).is_some() => {}
-            _ => return None,
-        }
-        let mut psk = [0u8; 64];
-        let mut secret_handle = 0_u32;
-        if unsafe { nvs_open(b"sec\0".as_ptr().cast(), NVS_READONLY, &mut secret_handle) } != 0 {
-            return None;
-        }
-        let psk_len = nvs_string(secret_handle, b"sta\0", &mut psk);
-        unsafe { nvs_close(secret_handle) };
-        let Some(psk_len) = psk_len else {
-            return None;
-        };
-        if !(8..=63).contains(&psk_len) {
-            return None;
-        }
-        profile.ssid[..ssid_len].copy_from_slice(&ssid[..ssid_len]);
-        profile.ssid_len = ssid_len;
-        profile.sta_passphrase[..psk_len].copy_from_slice(&psk[..psk_len]);
-        profile.sta_passphrase_len = psk_len;
-        profile.requested_transport = Some(dmesh_server::control::TransportKind::Sta);
-        // A provisioned STA remains a NAN participant on its associated
-        // channel. `now=2` keeps the pre-existing STA NOW power policy while
-        // DW1 supplies discovery receive/respond windows.
-        profile.now = 2;
-        profile.nan_dw_interval = 1;
-        profile.ap = 0;
-        profile.run_requested = true;
-        Some(())
-    })()
-    .is_some();
-    unsafe { nvs_close(handle) };
-    result
+    // Recovery deliberately stays STA + UDP6 only.  Main has a different
+    // product role: an infrastructure STA remains a co-channel NAN + NOW
+    // participant whenever its AP is on channel 6, so remote flashing never
+    // silently turns a normal relay into a flash-only radio personality.
+    // `now = 0` is the normal enabled setting; the effective NAN interval is
+    // reduced to zero by `effective_sta_nan_dw_interval` on another channel.
+    profile.now = 0;
+    profile.nan_dw_interval = 1;
+    true
 }
 
 /// Complete Main-only boot power policy read from the product NVS namespace.
@@ -3050,7 +3006,7 @@ impl MainRuntime {
 pub fn run(mark_healthy: fn()) {
     MainRuntime::new(mark_healthy).run();
 }
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use dmesh_server::main_runtime_state::MainRuntimeSnapshot;
 

@@ -10,32 +10,31 @@ type ConnectionService = dmesh_server::transport::ConnectionDispatcher<
     { crate::MAX_QUIC_ASSOCIATIONS },
 >;
 
-pub(crate) unsafe fn before_receive(service: &mut ConnectionService, now_us: u64) {
-    crate::flash::expire(service, now_us);
+pub(crate) unsafe fn before_receive(service: &mut ConnectionService, now_ms: u64) {
+    crate::flash::expire(service, now_ms);
 }
 
 pub(crate) unsafe fn after_receive(
     service: &mut ConnectionService,
     path: quic_lite::PathId,
-    now_us: u64,
+    now_ms: u64,
     closed: bool,
-    response_len: Option<usize>,
-    response: &mut [u8; crate::TRANSPORT_MTU],
-) -> Option<usize> {
-    crate::flash::after_receive(service, path, now_us, closed, response_len, response)
+) {
+    crate::flash::after_receive(service, path, now_ms, closed)
 }
 
 pub(crate) unsafe fn before_poll(
     service: &mut ConnectionService,
     path: quic_lite::PathId,
-    now_us: u64,
+    now_ms: u64,
 ) {
-    crate::flash::before_poll(service, path, now_us);
+    crate::flash::expire(service, now_ms);
+    crate::flash::before_poll(service, path, now_ms);
 }
 
 pub(crate) unsafe fn storage_ready(
     service: &mut ConnectionService,
-    now_us: u64,
+    now_ms: u64,
 ) -> Result<Option<quic_lite::PathId>, ()> {
-    crate::flash::storage_ready(service, now_us)
+    crate::flash::storage_ready(service, now_ms)
 }

@@ -25,7 +25,15 @@ use crate::TransportProfile;
 /// stream client can request status/events. Normal on-demand replies belong
 /// on their requesting stream, and state transitions belong in event history.
 pub fn send_record(record: &[u8]) -> bool {
-    crate::uart_esp::send_direct_record(record)
+    #[cfg(feature = "uart-transport")]
+    {
+        crate::uart_esp::send_direct_record(record)
+    }
+    #[cfg(not(feature = "uart-transport"))]
+    {
+        let _ = record;
+        false
+    }
 }
 
 /// Emit the shared diagnostic envelope over the registered direct-record
@@ -427,8 +435,8 @@ impl ProfileControlError {
 
 #[cfg(test)]
 mod command_tests {
-    use super::{ControlApplyResult, apply_control_record, apply_control_record_result};
-    use crate::{TransportProfile, state::direct_record_generation_changed_from};
+    use super::{apply_control_record, apply_control_record_result, ControlApplyResult};
+    use crate::{state::direct_record_generation_changed_from, TransportProfile};
 
     #[test]
     fn direct_record_arrival_during_worker_is_not_missed() {

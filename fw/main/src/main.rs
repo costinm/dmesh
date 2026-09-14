@@ -1,7 +1,5 @@
 extern crate alloc;
 
-mod platform;
-
 fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<alloc::vec::Vec<u8>> {
     use dmesh_server::{services, tagged::Name};
     if record.to.is_some()
@@ -15,11 +13,29 @@ fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<allo
     {
         return None;
     }
-    if platform::schedule_recovery_boot() {
-        Some(alloc::vec::Vec::from(&b"recovery scheduled"[..]))
-    } else {
-        None
-    }
+    // A stream handler always returns a correlated tagged record.  Returning
+    // bare text here left the caller without the normal response contract and
+    // prevented the RTC handoff from being tied to delivery of that response.
+    let id = record.id?;
+    let mut response = [0u8; 64];
+    let used = dmesh_server::tagged::encode_numeric_data_response(
+        services::BOOT_COMPONENT,
+        services::BOOT_RECOVERY_METHOD,
+        id,
+        b"recovery scheduled",
+        true,
+        &mut response,
+    )?;
+    // This remains one transition log per accepted command; Recovery's UART
+    // console is deliberately output-only, so it is also the bounded fallback
+    // evidence when a remote client loses the terminal stream response.
+    unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: recovery requested\n\0".as_ptr().cast()) };
+    dmesh_fw_transport::rtc::request_recovery_boot().then(|| {
+        unsafe {
+            esp_idf_sys::esp_rom_printf(b"DMESH main: recovery response queued\n\0".as_ptr().cast())
+        };
+        alloc::vec::Vec::from(&response[..used])
+    })
 }
 
 fn main() {
@@ -32,7 +48,20 @@ pub extern "C" fn app_main() {
     // diagnosed: this distinguishes a failed Main entry from a bad RTC write
     // before the runtime can emit its own ROM markers.
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: entry\n\0".as_ptr().cast()) };
-    platform::mark_main_boot_start();
+    let handoff = dmesh_fw_transport::rtc::handoff();
+    unsafe {
+        esp_idf_sys::esp_rom_printf(
+            if handoff == 1 {
+                b"DMESH main: entry handoff=recovery\n\0".as_ptr()
+            } else if handoff == 2 {
+                b"DMESH main: entry handoff=main\n\0".as_ptr()
+            } else {
+                b"DMESH main: entry handoff=normal\n\0".as_ptr()
+            }
+            .cast(),
+        )
+    };
+    dmesh_fw_transport::rtc::mark_main_start();
     assert!(dmesh_server::services::register_tagged_component(
         dmesh_server::services::BOOT_COMPONENT,
         receive_boot_control,
@@ -49,7 +78,7 @@ pub extern "C" fn app_main() {
     unsafe {
         esp_idf_sys::esp_log_set_vprintf(Some(dmesh_uart_log_vprintf));
     }
-    dmesh_fw_transport::main_runtime::run(platform::mark_main_boot_healthy);
+    dmesh_fw_transport::main_runtime::run(dmesh_fw_transport::rtc::mark_main_healthy);
 }
 
 extern "C" {

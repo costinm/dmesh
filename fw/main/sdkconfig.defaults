@@ -2,8 +2,19 @@ CONFIG_IDF_TARGET="esp32"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
+# The classic ESP32's Bluetooth controller reserves internal DRAM before
+# app_startup creates `main`.  A 64 KiB main stack consequently makes task
+# creation fail before Rust runs.  Keep this aligned with the C6 budget; the
+# S3 profile explicitly retains its 64 KiB override where that memory exists.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+# Stage2, Main, and Recovery share the bootloader custom RTC block for the
+# one-shot partition handoff.  Reserve the complete 16-byte IDF header plus
+# 32-byte custom region so the application RTC heap cannot overwrite it.
+CONFIG_BOOTLOADER_RESERVE_RTC_MEM=y
+CONFIG_BOOTLOADER_RESERVE_RTC_SIZE=0x10
+CONFIG_BOOTLOADER_CUSTOM_RESERVE_RTC=y
+CONFIG_BOOTLOADER_CUSTOM_RESERVE_RTC_SIZE=0x20
 # Stack canaries turn an undersized task into a reboot with a serial panic
 # record instead of silent adjacent-memory corruption. High-water telemetry
 # then supplies the evidence for reducing task stacks safely.

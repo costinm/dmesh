@@ -1,80 +1,100 @@
 # DMesh ESP second-stage bootloader
 
-The normative stage2 wire/RTC contract is [API.md](API.md). This README is
-operational/build guidance only.
+`fw/boot` is the small (<32k) adapter between the ESP ROM and the two application
+partitions. To save space, it expects a small Recovery partition (< 1M - most 
+of it in Wifi libraries) and the rest is Main or modules.
 
-`fw/boot` is the small supervisor between the ESP ROM and the two application
-partitions. It normally starts Main and selects Recovery when Main requested an
-update, a host responds during the bounded 500 ms UART window, rapid resets are observed,
-or Main repeatedly fails to reach its healthy marker.
+It normally boots Main. 
+
+Recovery is selected:
+- when Main requests an upgrade
+- if rapid resets are observed
+- if Main repeatedly fails to reach its healthy marker.
+
+RTC is used to communicate - reboots, selecting recovery, 'good state' from main.
 
 ```text
 ROM -> stage2 -> Main
-               Recovery -> Wi-Fi DRS2 update -> reboot -> Main
+                 Recovery -> Wi-Fi STA and flash server -> reboot -> Main
 ```
 
-There is no OTA-data partition and no ESP-IDF boot-partition switch. Recovery
-is the fixed `factory` application and Main is the fixed `ota_0` application.
-Wi-Fi, signatures, flash writes, and update policy are outside this component.
+There is no OTA-data partition and no ESP-IDF boot-partition switch.
 
-Current release artifacts:
+Stage2 must be compiled with the correct partition size, matching the device
+(4M, 8M, etc). This is required only for stage2.  Main and Recovery are not
+ actually using their partition size so both are compiled with 4M even if 
+ the device has more.
 
-| chip | bootloader size | configured raw boot region |
-|---|---:|---:|
-| ESP32 | 28,192 bytes | `0x7000` bytes |
-| ESP32-S3 | 22,816 bytes | `0x7000` bytes |
+| Region | Offset | Size |
+|---|---:|---:|---:|
+| second stage | chip boot offset | up to `0x7000` |
+| partition table | `0x8000` | `0x1000` |
+| NVS | `0x9000` | `0x6000` |
+| PHY init | `0xf000` | `0x1000` |
+| Recovery | `0x10000` | `0x100000` |
+| Main | `0x110000` | `0x2b0000` |
+| data | `0x3c0000` | `0x40000` |
 
-Build both fleet variants from the repository root:
+Recovery and main are compiled with a 4M partition.csv - main can use 
+the full 8M, with top 4M for data. Only boot needs to have the right
+partition table, so 8M devices need to be provisioned with 8M table
+when boot/recovery are installed - no longer needed after that.
 
-```sh
-scripts/build-stage2.sh all
-```
+This simplifies the main and recovery images - they are independent
+of the flash size.
+
+The 4 MiB layout reserves a 256 KiB `data` partition at `0x3c0000`; Main uses
+additional physical flash above that range for modules and other explicit raw
+data when the hardware provides it - so max size for Main is ~3M, and 
+can use extra flash for data (most ESP32 devices I have are 4M - just few are 8M).
+
+Routine Main updates do not flash stage2 or Recovery. Both must be flashed 
+over UART/USB - Main can be flashed over Wifi, using Recovery. After Main is 
+flashed, it can upgrade both stage2 and Recovery.
+
+# Build
+
 
 Outputs are under `target/stage2/<chip>/` and contain only the matching
 bootloader and partition table. Rust Recovery is built separately.
 
-The application images are deliberately built against the common 4 MiB
-layout in [`partitions.csv`](partitions.csv). Recovery and Main keep those
-offsets and are not rebuilt or reprovisioned for the physical flash size.
-The 4 MiB layout reserves a 256 KiB `data` partition at `0x3c0000`; Main uses
-additional physical flash above that range for modules and other explicit raw
-data when the hardware provides it.
+## Failure behavior and power loss
 
-The bootloader has a provisioning-only physical-size variant. Any board with
-more than 4 MiB of flash must receive a stage2 and partition table whose
-configured limit covers that physical flash. The current fleet is:
+- A crashing Main leaves `MAIN_OK` unset, so repeated stage2 handoffs eventually
+  select Recovery.
+- An interrupted Main write leaves the Recovery request set. The next boot
+  selects Recovery and retries.
+- An unavailable AP does not make Recovery reboot immediately; Recovery keeps
+  retrying association in bounded windows.
+- A corrupt or non-starting Recovery eventually causes a Main fallback.
+- If both Main and Recovery exhaust their retry budgets, Stage2 keeps
+  booting Recovery. Recovery stays in its bounded repair state (AP retry,
+  flash-server wait) until an operator flashes a new image, so a device
+  never dead-ends in the bootloader.
 
-| board | chip | physical flash | initial stage2/table |
-|---|---|---:|---|
-| `e5`, `lora1`, `lora2`, `lora3` | ESP32 | 4 MiB | common 4 MiB build |
-| `lora4` | ESP32-S3 | 8 MiB | 8 MiB stage2 and table |
+Stage2 emits no framed wire events. It logs plain console lines (tag
+`dmesh-boot`): one boot line with the stage2 version, reset reason, RTC
+handoff/health state, failure counters, and the NVS `boot_target`, followed by
+the selection decision and its reason.
 
-`lora4` needs the 8 MiB stage2/table because stage2 validates the installed
-partition table against the configured flash limit. The same rule applies to
-any future board above 4 MiB; use the smallest matching expanded table and
-stage2 variant. This distinction applies only to initial USB
-provisioning (or emergency repair). It is not a second Main/Recovery image
-family and it is never part of routine updates. Use the real chip size with
-the provisioning tool when provisioning; do not flash an expanded table onto a smaller
-board.
+## Security boundary
 
-Routine Main updates do not flash stage2 and do not use USB. USB provisioning is
-reserved for first provisioning or emergency repair. Although Main's shared
-flash worker can technically target stage2, rewriting the only bootloader copy
-has no power-loss rollback and should remain rare and explicitly controlled.
+Stage2 is not currently verifying the signature on Main or Stage2, and it is not 
+encrypted/verified. It is possible to add this - but without disabling JTAG and
+making the device fully locked it is not useful.
 
-The stage2 UART selector is controlled by binary `u32` `stg2:uart_boot` in
-NVS. It is enabled when the key is missing or nonzero, preserving the lab/default behavior.
-Production provisioning should write `uart_boot=0`; stage2 then emits no
-UART identity and performs no UART polling, leaving rapid resets and the RTC
-failure counters as the recovery path. The enabled selector window is 1000 ms.
-For an NVS image made from a dump, use
-`scripts/prepare-nvs-image.py ... --uart-boot 0`.
+In general the main assumption of the device mesh is that relay nodes are completely
+untrusted - and not all of them are under our control, but other users who have
+their own policies (and can't be trusted). ESP32 is not a secure device - no TPM,
+manufacturer is not specialized in secure devices - which is fine in a mesh that
+doesn't depend on trusting the infra.
 
-Implemented triggers are UART (when enabled), rapid resets, and RTC failure
-counters. A button trigger is not currently implemented. The intended
-both-images-failed halt and RTC-corruption handling still need the hardening
-listed in [DESIGN.md](DESIGN.md).
 
-See [DESIGN.md](DESIGN.md) for the exact selector, RTC ABI, request ABI,
-partition layout, limitations, and long-term options.
+# Notes
+
+- `stg2:boot_target` (1=Main, 2=Recovery) in NVS overrides the boot recovery logic.
+- current implementation of recovery is passive: sends discovery multicast but waits for a server to create associations.
+
+Rationale: with encryption/auth we want the ESP32 and recovery to just verify, not have the code to originate associations
+and handle control plane. ESP32 to ESP32 is not needed even in main mode - Android or host create relays and use the 
+control plane to authn/z with the relays.
