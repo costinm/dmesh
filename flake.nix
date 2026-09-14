@@ -138,9 +138,15 @@
               wpa-supplicant-nan
               pkgs.zip
               pkgs.stdenv.cc
+              # `/usr/bin/time` is not guaranteed in the base runner; keep
+              # timing evidence for device flashing reproducible.
+              (pkgs.lib.hiPrio pkgs.time)
               musl-toolchain
             ];
-            meta.priority = 10;
+            # Win command-name collisions with the sibling ssh-mesh BusyBox
+            # runtime bundle. DMesh diagnostics require GNU coreutils and GNU
+            # time semantics (notably timeout --foreground and time -f).
+            meta.priority = 1;
           };
 
           musl-toolchain = pkgs.runCommand "dmesh-musl-toolchain" { } ''
@@ -159,6 +165,7 @@
             name = "dmesh-musl-deps";
             paths = [
               pkgs.stdenv.cc
+              (pkgs.lib.hiPrio pkgs.time)
               pkgs.coreutils
               pkgs.findutils
               pkgs.git
@@ -170,7 +177,7 @@
               pkgs.which
               musl-toolchain
             ];
-            meta.priority = 10;
+            meta.priority = 1;
           };
         in
         {

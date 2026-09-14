@@ -59,37 +59,24 @@ fi
 export CARGO_TARGET_DIR="$TARGET_DIR"
 export CARGO_WORKSPACE_DIR="$PROJECT"
 export ESP_IDF_SDKCONFIG_DEFAULTS="$PROJECT/sdkconfig.defaults;$OVERLAY"
-# Recovery's default firmware lane is raw IPv6/UDP rather than the lwIP socket
-# worker. ESP-IDF still supplies Wi-Fi/FreeRTOS primitives and may link lwIP.
-RECOVERY_MODULES="${DMESH_RECOVERY_MODULES:-0}"
-export ESP_IDF_COMPONENTS="main;driver;esp_wifi;esp_event;esp_netif;esp_partition;nvs_flash;esp_driver_uart;dmesh_boot_health"
-BUILD_FEATURES=()
-if [[ "$RECOVERY_MODULES" == "1" ]]; then
-    # The moved loader is optional in Recovery so its flash cost can be
-    # measured independently from the raw UDP6 transport core.
-    export ESP_IDF_COMPONENTS+=";dmesh_module_loader"
-    BUILD_FEATURES+=(--features modules)
-fi
-
-# The raw UDP6 and raw ESP-NOW bearers are Recovery defaults. Keep an explicit
+# Recovery uses the shared associated-STA raw UDP6 bearer. ESP-IDF still owns
+# Wi-Fi association, but Recovery does not install an lwIP socket transport.
+# Console output uses the chip-selected ESP console and does not install UART
+# input or a framed UART transport.
+export ESP_IDF_COMPONENTS="main;esp_wifi;esp_event;esp_netif;esp_partition;nvs_flash"
 
 # Keep the same SDK-cache invalidation rule as scripts/build-fw.sh. This is
 # important when the component list changes: esp-idf-sys otherwise reuses a
 # bindings/CMake tree made for a different ESP-IDF surface.
 SDK_STAMP="$TARGET_DIR/.dmesh-esp-idf-sdk"
 # ESP-IDF bakes sdkconfig into the esp-idf-sys CMake tree. Include both
-# defaults files in the cache key: otherwise an edited lwIP setting can leave
+# defaults files in the cache key: otherwise an edited Wi-Fi setting can leave
 # a successful Rust rebuild carrying the previous SDK configuration.
 SDK_DEFAULTS_DIGEST="$(sha256sum \
     "$PROJECT/sdkconfig.defaults" "$OVERLAY" \
-    "$ROOT/fw/modules/native/dmesh_module_loader/CMakeLists.txt" \
-    "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_module_loader.c" \
-    "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_hw_host.c" \
-    "$ROOT/fw/modules/native/dmesh_module_loader/dmesh_module_weak_platform.c" \
-    "$PROJECT/native/dmesh_boot_health/CMakeLists.txt" \
-    "$PROJECT/native/dmesh_boot_health/dmesh_boot_health.c" \
+    "$ROOT/fw/dmesh-fw-transport/src/rtc.rs" \
     | sha256sum | awk '{print $1}')"
-SDK_ID="cache-v6:modules=${RECOVERY_MODULES}:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${SDK_DEFAULTS_DIGEST}"
+SDK_ID="cache-v9:sta-raw-udp6:${IDF_PATH}:$(git -C "$IDF_PATH" describe --tags --always 2>/dev/null || true):${SDK_DEFAULTS_DIGEST}"
 if [[ ! -f "$SDK_STAMP" || "$(cat "$SDK_STAMP")" != "$SDK_ID" ]]; then
     cargo clean -p esp-idf-sys 2>/dev/null || true
     rm -rf "$TARGET_DIR/$RUST_TARGET/release/build"/esp-idf-sys-* \
@@ -99,7 +86,7 @@ if [[ ! -f "$SDK_STAMP" || "$(cat "$SDK_STAMP")" != "$SDK_ID" ]]; then
 fi
 
 cd "$PROJECT"
-cargo build --target "$RUST_TARGET" --release "${BUILD_FEATURES[@]}"
+cargo build --target "$RUST_TARGET" --release
 
 # Recovery artifacts are architecture-specific. Keeping a single shared
 # filename made it possible to build classic ESP32 and then accidentally hand
@@ -124,8 +111,17 @@ fi
     --output "$IMAGE_DIR/dmesh-recovery-rs-merged.bin" \
     "$BOOT_OFFSET" "$BOOT" 0x8000 "$PARTITION_TABLE" 0x10000 "$APP_IMAGE"
 
+# ObjectServer serves every update target from one CPU-qualified artifact
+# root. Publish Recovery beside Main so `object.flash target=3` exercises the
+# same host object path as the Recovery-to-Main update; the deployment script
+# retains its architecture-specific immutable build artifact above.
+OBJECT_DIR="$ROOT/target/flash/$IDF_TARGET_NAME"
+mkdir -p "$OBJECT_DIR"
+cp "$APP_IMAGE" "$OBJECT_DIR/recovery.bin"
+
 app_size="$(stat -c '%s' "$APP_IMAGE")"
 printf 'Rust Recovery app bytes: %s (0x%x)\n' "$app_size" "$app_size"
 printf 'Rust Recovery target: %s (%s)\n' "$RUST_TARGET" "$CHIP"
 printf 'Rust Recovery ELF: %s\n' "$TARGET_DIR/$RUST_TARGET/release/dmesh-recovery-rs"
 printf 'Rust Recovery image: %s\n' "$IMAGE_DIR/dmesh-recovery-rs-merged.bin"
+printf 'Rust Recovery object: %s\n' "$OBJECT_DIR/recovery.bin"

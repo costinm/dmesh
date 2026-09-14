@@ -434,7 +434,7 @@ def read_flash_with_fallback(port: str, chip: str, offset: str, size: str, outpu
 
 def nvs_boot_target_image(
     port: str, chip: str, role: str, boot_target: int | None, clear_boot_target: bool,
-    uart_boot: int | None, mode: str | None, clear_sta_profile: bool,
+    mode: str | None, clear_sta_profile: bool,
     server: str, board_ip: str, server_port: int, flash_baud: int,
     source_override: Path | None = None, sta_profile: Path | None = None,
     sta_ssid: str | None = None, sta_server_ll: str | None = None,
@@ -462,8 +462,6 @@ def nvs_boot_target_image(
         command.append("--clear-boot-target")
     elif boot_target is not None:
         command.extend(("--boot-target", str(boot_target)))
-    if uart_boot is not None:
-        command.extend(("--uart-boot", str(uart_boot)))
     if mode is not None:
         command.extend(("--mode", mode))
     if clear_sta_profile:
@@ -598,8 +596,6 @@ def main() -> int:
                         help="with target=nvs: set Stage2 stg2:boot_target (1=Main, 2=Recovery)")
     parser.add_argument("--clear-boot-target", action="store_true",
                         help="with target=nvs: remove Stage2 boot target override")
-    parser.add_argument("--uart-boot", type=int, choices=(0, 1),
-                        help="with target=nvs: set Stage2 stg2:uart_boot (0 disables selector)")
     parser.add_argument("--nvs-source", type=Path,
                         help="with target=nvs: explicit preserved NVS source image")
     parser.add_argument("--sta-profile", type=Path,
@@ -645,7 +641,7 @@ def main() -> int:
         return 0
     if args.boot_target is not None and args.clear_boot_target:
         parser.error("--boot-target and --clear-boot-target are mutually exclusive")
-    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.uart_boot is None and args.mode is None and not args.clear_sta_profile and args.sta_profile is None and args.device_catalog is None:
+    if args.target == "nvs" and args.boot_target is None and not args.clear_boot_target and args.mode is None and not args.clear_sta_profile and args.sta_profile is None and args.device_catalog is None:
         parser.error("target=nvs requires a Stage2 override, mode, --sta-profile, or --device-catalog")
     if args.sta_ssid is not None and args.sta_profile is None:
         parser.error("--sta-ssid requires --sta-profile")
@@ -677,7 +673,7 @@ def main() -> int:
                 "esp32s3" if bool(getattr(device, "is_s3", False)) else "esp32"
             )
             image = nvs_boot_target_image(
-                physical, chip, args.role, args.boot_target, args.clear_boot_target, args.uart_boot,
+                physical, chip, args.role, args.boot_target, args.clear_boot_target,
                 args.mode, args.clear_sta_profile, args.server, args.board_ip, args.server_port, args.flash_baud,
                 args.nvs_source, args.sta_profile, args.sta_ssid, args.sta_server_ll,
                 args.sta_server_port, args.device_catalog,

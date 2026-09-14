@@ -184,7 +184,7 @@ def read_entries(source: Path) -> list[dict]:
 
 
 def write_csv(
-    entries: list[dict], destination: Path, uart_boot: int | None = None,
+    entries: list[dict], destination: Path,
     boot_target: int | None = None, device_profile: dict[str, str] | None = None,
     clear_boot_target: bool = False, mode: str | None = None,
     clear_sta_profile: bool = False,
@@ -197,7 +197,6 @@ def write_csv(
     for entry in entries:
         namespaces.setdefault(entry["namespace"], []).append(entry)
     removed = 0
-    saw_uart_boot = False
     saw_boot_target = False
     saw_dmesh = False
     saw_secret_namespace = False
@@ -220,11 +219,11 @@ def write_csv(
                 # so it cannot survive another preserve-and-update cycle.
                 if entry["key"] == "mode" and current != "dmesh":
                     continue
+                # `uart_boot` belonged to the removed UART boot selector.
+                # Discard it so preserve-and-update cycles do not carry the
+                # inert key forward.
                 if current == STAGE2_NAMESPACE and entry["key"] == "uart_boot":
-                    saw_uart_boot = True
-                    if uart_boot is not None:
-                        writer.writerow(("uart_boot", "data", "u32", str(uart_boot)))
-                        continue
+                    continue
                 if current == STAGE2_NAMESPACE and entry["key"] == "boot_target":
                     saw_boot_target = True
                     if clear_boot_target:
@@ -232,9 +231,12 @@ def write_csv(
                     if boot_target is not None:
                         writer.writerow(("boot_target", "data", "u32", str(boot_target)))
                         continue
-                # Correct a short-lived host-tool bug that wrote the lab
-                # override under dmesh. It is a Stage2 key, not a profile key.
-                if current == "dmesh" and entry["key"] == "boot_target" and (
+                # A prior generator could append a duplicate `stg2`
+                # namespace after another namespace. Its following selector
+                # was then decoded under that preceding namespace (commonly
+                # `sec`). A Stage2 selector is meaningful only in `stg2`, so
+                # discard every misplaced copy when updating or clearing it.
+                if current != STAGE2_NAMESPACE and entry["key"] == "boot_target" and (
                     boot_target is not None or clear_boot_target
                 ):
                     continue
@@ -282,6 +284,14 @@ def write_csv(
                         f"{current}:{entry['key']}"
                     )
                 writer.writerow((entry["key"], "data", encoding, entry["data"]))
+            # A decoded NVS image can already contain `stg2` while lacking
+            # one requested key. Emit that key before leaving this namespace:
+            # appending another namespace row later assigns a new namespace
+            # id, while the bootloader lookup resolves the original one.
+            if current == STAGE2_NAMESPACE:
+                if boot_target is not None and not saw_boot_target:
+                    writer.writerow(("boot_target", "data", "u32", str(boot_target)))
+                    saw_boot_target = True
             if current == "dmesh":
                 if mode is not None and not saw_mode:
                     writer.writerow(("mode", "data", "string", mode))
@@ -299,11 +309,6 @@ def write_csv(
                         writer.writerow((key, "data", "base64" if key == SHARED_SECRET_KEY else "string", device_profile[profile_key]))
                         saw_secret_keys.add(key)
         namespace = next(reversed(namespaces), None)
-        if uart_boot is not None and not saw_uart_boot:
-            if namespace != STAGE2_NAMESPACE:
-                writer.writerow((STAGE2_NAMESPACE, "namespace", "", ""))
-                namespace = STAGE2_NAMESPACE
-            writer.writerow(("uart_boot", "data", "u32", str(uart_boot)))
         if boot_target is not None and not saw_boot_target:
             if namespace != STAGE2_NAMESPACE:
                 writer.writerow((STAGE2_NAMESPACE, "namespace", "", ""))
@@ -343,10 +348,6 @@ def main() -> int:
     parser.add_argument("csv", type=Path)
     parser.add_argument("image", type=Path)
     parser.add_argument("--size", type=lambda value: int(value, 0), default=None)
-    parser.add_argument(
-        "--uart-boot", type=int, choices=(0, 1),
-        help="set stg2:uart_boot in the generated NVS image; use 0 for production",
-    )
     parser.add_argument(
         "--boot-target", type=int, choices=(1, 2),
         help="set stg2:boot_target (1=Main, 2=Recovery); omit for normal policy",
@@ -406,7 +407,7 @@ def main() -> int:
         except ValueError as error:
             parser.error(str(error))
     removed = write_csv(
-        entries, args.csv, args.uart_boot, args.boot_target, device_profile or None,
+        entries, args.csv, args.boot_target, device_profile or None,
         args.clear_boot_target, args.mode, args.clear_sta_profile,
     )
     size = args.size or args.source.stat().st_size
@@ -417,8 +418,6 @@ def main() -> int:
         check=True,
     )
     setting = ""
-    if args.uart_boot is not None:
-        setting = f"; stg2:uart_boot={args.uart_boot}"
     if args.boot_target is not None:
         setting += f"; stg2:boot_target={args.boot_target}"
     elif args.clear_boot_target:
