@@ -449,8 +449,10 @@ credit constant. Receiver storage is allocated before the platform sink factory
 runs, so allocation failure cannot leave a flash worker or file handle behind.
 
 Stream consumers enter through `prepare_inbound_stream` and
-`consume_inbound_stream`. The latter atomically takes the ordered committed
-chunks, invokes the application consumer, and publishes its absolute reclaimed
+`consume_inbound_stream`. The latter gives the application an ordered reader;
+each `read()` copies only the bytes the handler has accepted into its bounded
+parser or storage buffer, then the dispatcher publishes the corresponding
+reclaimed window. The handler neither observes QUIC chunks nor chooses a
 window. Exclusive mutable sinks use `consume_exclusive_inbound_stream`, which
 adds only association ownership and application-progress timeout refresh; both
 ordinary receive and asynchronous storage-ready turns use that same helper.

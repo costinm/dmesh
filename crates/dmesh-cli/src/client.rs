@@ -357,6 +357,13 @@ impl DeviceSession {
             }
             if client.is_complete() {
                 self.assert_healthy()?;
+                let mut close_packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+                if let Some(close) = client
+                    .poll_close(&mut close_packet)
+                    .map_err(|error| format!("object upload close: {error:?}"))?
+                {
+                    send_uart_transport(&mut self.serial, &close_packet[..close])?;
+                }
                 if let Some(response) = client.rejected_response() {
                     let reason = object_upload_rejection(response);
                     return Err(format!(
@@ -2096,6 +2103,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     // server or a second association.
     let object_flash =
         dmesh_server::verified_object::decode_flash_handler_request(&request).is_some();
+    let requested_peer_receive_profile = requested_peer_receive_profile_from_env()?;
     let relay = match (relay_forward_dcid, relay_reverse_dcid, relay_next_mac) {
         (None, None, None) => None,
         (Some(forward), Some(reverse), Some(next_mac)) => Some((
@@ -2178,6 +2186,7 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
                 cid,
                 &request,
                 dmesh_server::verified_object::ObjectRecordStream::new(records),
+                requested_peer_receive_profile,
             )
             .await?;
             eprintln!(
@@ -2401,6 +2410,7 @@ async fn udp_object_upload(
     cid: quic_lite::ConnectionId,
     command: &[u8],
     records: dmesh_server::verified_object::ObjectRecordStream,
+    requested_peer_receive_profile: Option<quic_lite::ReceiveWindowRequest>,
 ) -> Result<UdpObjectUploadResult, String> {
     let bind = udp_bind_for_peer(peer);
     let socket = match tokio::net::UdpSocket::bind(bind).await {
@@ -2427,6 +2437,15 @@ async fn udp_object_upload(
         { quic_lite::DEFAULT_MAX_DATAGRAM_SIZE },
     >::new(cid, command, records)
     .map_err(|error| format!("object upload client: {error:?}"))?;
+    if let Some(profile) = requested_peer_receive_profile {
+        client
+            .set_requested_peer_receive_profile(profile)
+            .map_err(|error| format!("object upload peer receive profile: {error:?}"))?;
+        eprintln!(
+            "dmesh_cli_object_upload_requested_peer_receive max_data={} max_stream_data={}",
+            profile.max_data, profile.max_stream_data
+        );
+    }
     let started = Instant::now();
     let deadline = started + object_upload_timeout();
     let mut driver = quic_lite::DatagramClientDriver::start(&mut client, 0)
@@ -2468,6 +2487,12 @@ async fn udp_object_upload(
             })?;
             if !admitted {
                 quic_rejected_packets = quic_rejected_packets.saturating_add(1);
+            } else if std::env::var_os("DMESH_OBJECT_UPLOAD_DEBUG_CREDIT").is_some() {
+                eprintln!(
+                    "dmesh_cli_object_upload_credit rx={} state={:?}",
+                    socket_rx_packets,
+                    client.admission_state()
+                );
             }
             if admitted && let Some(packet) = driver.packet() {
                 socket
@@ -2478,13 +2503,19 @@ async fn udp_object_upload(
             }
         }
         let now_ms = started.elapsed().as_millis() as u64;
-        driver
-            // Use the same QUIC-lite PTO/bootstrap cadence as every other
-            // complete-datagram bearer. The adapter owns no UDP-specific
-            // retransmission or pacing policy.
-            .poll(&mut client, now_ms, 600, 400)
-            .map_err(|error| format!("object upload poll: {error:?}"))?;
-        if let Some(packet) = driver.packet() {
+        // Drain the complete currently-admissible QUIC-lite flight before
+        // returning to the socket receive wait. A previous one-packet turn
+        // inserted the adapter's 2 ms receive timeout between every fresh
+        // stream packet, turning a normal window into stop-and-wait. The
+        // driver remains the only source of packets, retransmissions, and
+        // flow-control decisions; this loop only submits each ready packet.
+        loop {
+            driver
+                .poll(&mut client, now_ms, 600, 400)
+                .map_err(|error| format!("object upload poll: {error:?}"))?;
+            let Some(packet) = driver.packet() else {
+                break;
+            };
             socket
                 .send_to(packet, peer)
                 .await
@@ -2492,6 +2523,22 @@ async fn udp_object_upload(
             driver.mark_sent(now_ms);
         }
         if client.is_complete() {
+            // `receive` has already returned and sent the terminal response's
+            // ACK. Send a separate QUIC CLOSE before this short-lived UDP
+            // socket disappears, so the device does not retain a dead
+            // association and retry its final MAX_* packet every control
+            // cadence.
+            let mut close_packet = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+            if let Some(close) = client
+                .poll_close(&mut close_packet)
+                .map_err(|error| format!("object upload close: {error:?}"))?
+            {
+                socket
+                    .send_to(&close_packet[..close], peer)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                driver.mark_sent(now_ms);
+            }
             if let Some(response) = client.rejected_response() {
                 let reason = object_upload_rejection(response);
                 return Err(format!(
@@ -2539,6 +2586,35 @@ fn object_upload_timeout() -> Duration {
             .filter(|value| *value != 0)
             .unwrap_or(60),
     )
+}
+
+/// Optional host-side association request for constrained-device tests.
+/// Both values are required so a partial environment cannot accidentally
+/// change an ordinary upload. The device still clamps this request and the
+/// OPEN_ACK remains the source of truth.
+fn requested_peer_receive_profile_from_env(
+) -> Result<Option<quic_lite::ReceiveWindowRequest>, String> {
+    const DATA: &str = "DMESH_QUIC_REQUEST_PEER_MAX_DATA";
+    const STREAM: &str = "DMESH_QUIC_REQUEST_PEER_MAX_STREAM_DATA";
+    match (env::var(DATA).ok(), env::var(STREAM).ok()) {
+        (None, None) => Ok(None),
+        (Some(max_data), Some(max_stream_data)) => {
+            let max_data = max_data
+                .parse()
+                .map_err(|error| format!("{DATA}: {error}"))?;
+            let max_stream_data = max_stream_data
+                .parse()
+                .map_err(|error| format!("{STREAM}: {error}"))?;
+            if max_data == 0 || max_stream_data == 0 {
+                return Err("requested peer receive profile must be non-zero".into());
+            }
+            Ok(Some(quic_lite::ReceiveWindowRequest {
+                max_data,
+                max_stream_data,
+            }))
+        }
+        _ => Err(format!("set both {DATA} and {STREAM}, or neither")),
+    }
 }
 
 fn object_upload_rejection(response: &[u8]) -> String {

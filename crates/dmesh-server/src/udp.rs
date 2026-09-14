@@ -1569,6 +1569,34 @@ impl UdpClient {
                                 stream.data
                             );
                         }
+                        // The terminal application record is still an
+                        // ordinary incoming QUIC-lite stream fragment.  Drive
+                        // QUIC-lite's delayed-ACK deadline before returning,
+                        // rather than making Recovery or the flash handler
+                        // infer ACK state.  Recovery waits for that generic
+                        // delivery edge before handing Stage2 back to Main.
+                        self.endpoint_mut().set_time(now_ms);
+                        let pto = self.endpoint().pto_timeout();
+                        if let Some(wake_at_ms) = self.endpoint().next_bearer_deadline(pto) {
+                            let current_ms = started.elapsed().as_millis() as u64;
+                            if wake_at_ms > current_ms {
+                                tokio::time::sleep(Duration::from_millis(
+                                    wake_at_ms.saturating_sub(current_ms),
+                                ))
+                                .await;
+                            }
+                            self.endpoint_mut()
+                                .set_time(started.elapsed().as_millis() as u64);
+                        }
+                        if let Some((_path, ack_len)) = self
+                            .connection
+                            .poll_transmit(&mut packet)
+                            .map_err(|error| {
+                                anyhow::anyhow!("object upload terminal ACK: {error:?}")
+                            })?
+                        {
+                            self.send_endpoint_packet(&packet[..ack_len]).await?;
+                        }
                         return Ok(stream);
                     }
                     // Keep the association clock in the same domain used by
@@ -4139,13 +4167,13 @@ mod tests {
             _offset: u64,
             _end: bool,
             bytes: &[u8],
-        ) -> Result<(), Self::Error> {
+        ) -> Result<usize, Self::Error> {
             if stream != OBJECT_STREAM {
                 return Err(());
             }
             self.records.push(bytes);
             self.bytes = self.bytes.saturating_add(bytes.len());
-            Ok(())
+            Ok(bytes.len())
         }
     }
 
@@ -4155,15 +4183,15 @@ mod tests {
         records: RecordBuffer,
         receiver: ImageReceiver<FakeFlash>,
         drop_outbound_control: usize,
-        /// Keep accepted record credit pending until the harness timer runs;
+        /// Keep accepted application consumption pending until the harness timer runs;
         /// otherwise a lock-step test can hide a sender-waits-for-MAX_*
         /// deadlock when the initial receive window is exhausted.
-        pending_flash_credit: usize,
+        pending_application_consumption: usize,
         /// Optional storage barrier: ACK accepted bytes before completed
         /// records return their application storage credit.
         hold_credit_until_bootstrap: bool,
         delivered_stream_bytes: usize,
-        timer_credit_updates: usize,
+        timer_consumption_updates: usize,
         /// Bearer-only ACK/control latency. The stream callback and transport
         /// policy remain unchanged, so this models the measured Wi-Fi
         /// refill-cycle delay without inventing handler-side ACK logic.
@@ -4192,10 +4220,10 @@ mod tests {
                 records: RecordBuffer::new(),
                 receiver: ImageReceiver::new(FakeFlash { bytes: Vec::new() }),
                 drop_outbound_control: 0,
-                pending_flash_credit: 0,
+                pending_application_consumption: 0,
                 hold_credit_until_bootstrap: false,
                 delivered_stream_bytes: 0,
-                timer_credit_updates: 0,
+                timer_consumption_updates: 0,
                 outbound_control_delay: Duration::ZERO,
                 pending_outbound: Vec::new(),
             }
@@ -4314,8 +4342,9 @@ mod tests {
                 outputs.push(transport_out[..used].to_vec());
             }
             if released_credit != 0 {
-                self.pending_flash_credit =
-                    self.pending_flash_credit.saturating_add(released_credit);
+                self.pending_application_consumption = self
+                    .pending_application_consumption
+                    .saturating_add(released_credit);
             }
             for output in outputs {
                 self.queue_outbound(output);
@@ -4345,10 +4374,10 @@ mod tests {
             {
                 0
             } else {
-                core::mem::take(&mut self.pending_flash_credit)
+                core::mem::take(&mut self.pending_application_consumption)
             };
             if released_credit != 0 {
-                self.timer_credit_updates = self.timer_credit_updates.saturating_add(1);
+                self.timer_consumption_updates = self.timer_consumption_updates.saturating_add(1);
                 self.endpoint
                     .stream_consumed_deferred(OBJECT_STREAM, released_credit)
                     .map_err(|error| {
@@ -4382,8 +4411,9 @@ mod tests {
         /// retransmission caused solely by ACK/refill timing.
         unexpected_retransmissions: usize,
         /// Completed record storage first became reusable while the socket
-        /// was empty, so constrained download receiver had to advertise MAX_* from its timer path.
-        timer_credit_updates: usize,
+        /// was empty, so the constrained consumer had to report its ordinary
+        /// application consumption from a timer turn.
+        timer_consumption_updates: usize,
     }
 
     async fn run_object_download_harness(
@@ -4528,14 +4558,14 @@ mod tests {
                 last_delivery.elapsed() < Duration::from_secs(10),
                 "object download harness made no delivery progress for 10 seconds after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
                 mirror.delivered_stream_bytes,
-                mirror.pending_flash_credit,
+                mirror.pending_application_consumption,
             );
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
                 "object download harness transfer timed out after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
                 mirror.delivered_stream_bytes,
-                mirror.pending_flash_credit,
+                mirror.pending_application_consumption,
             );
             match tokio::time::timeout(
                 remaining.min(Duration::from_millis(10)),
@@ -4625,7 +4655,7 @@ mod tests {
             "host did not retransmit {} intentionally withheld stream ranges",
             dropped_streams.len()
         );
-        result.timer_credit_updates = mirror.timer_credit_updates;
+        result.timer_consumption_updates = mirror.timer_consumption_updates;
         result
     }
 
@@ -4671,8 +4701,8 @@ mod tests {
         .await;
         assert_eq!(result.dropped_streams, 0);
         assert!(
-            result.timer_credit_updates != 0,
-            "the full constrained download receiver profile must exercise timer-driven flash credit",
+            result.timer_consumption_updates != 0,
+            "the constrained receiver must exercise timer-driven application consumption",
         );
         let elapsed = started.elapsed();
         let mib_per_second = size as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
@@ -4793,7 +4823,7 @@ mod tests {
         .await;
         assert_eq!(result.dropped_streams, 0);
         assert_eq!(result.recovered_streams, 0);
-        assert!(result.timer_credit_updates > 0);
+        assert!(result.timer_consumption_updates > 0);
     }
 
     #[tokio::test]

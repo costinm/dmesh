@@ -184,9 +184,11 @@ pub fn encode_action_frame_with_layout(
     Ok(used)
 }
 
-/// Parse a raw-injected ESP-NOW-compatible action frame. The adapter owns
-/// monitor metadata and optional FCS removal; this function only validates
-/// the portable 802.11/action envelope and returns the complete L2 payload.
+/// Parse a single-IE raw-injected ESP-NOW-compatible action frame. The
+/// adapter owns monitor metadata and optional FCS removal; this function only
+/// validates the portable 802.11/action envelope and returns the vendor-IE
+/// body (at most 250 bytes). It rejects frames whose IE sets the more flag;
+/// reassemble multi-IE v2 datagrams with `parse_action_frame_into`.
 pub fn parse_action_frame(frame: &[u8]) -> Option<([u8; 6], &[u8])> {
     if frame.len() < IEEE80211_HEADER_LEN + ACTION_HEADER_LEN + VENDOR_IE_HEADER_LEN
         || frame[0] != 0xd0

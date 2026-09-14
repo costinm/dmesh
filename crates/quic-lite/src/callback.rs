@@ -61,7 +61,7 @@ pub trait CopyingStreamEvents {
         offset: u64,
         end: bool,
         bytes: &[u8],
-    ) -> Result<(), Self::Error>;
+    ) -> Result<usize, Self::Error>;
     fn stream_finished(&mut self, _stream: u64) {}
     fn stream_reset(&mut self, _stream: u64, _code: u64) {}
 }
@@ -384,7 +384,6 @@ impl<P: PacketLease> CallbackStreams<P> {
         // retained ranges must remain owned until their preceding gap closes.
         if !state.finished
             && state.outstanding.is_none()
-            && state.retained.is_empty()
             && offset == state.consumed
         {
             if let Some(final_size) = state.final_size {
@@ -392,9 +391,26 @@ impl<P: PacketLease> CallbackStreams<P> {
                     return Err(CopyingError::Transport(CallbackError::InvalidFin));
                 }
             }
-            if let Err(error) = events.stream_chunk(stream, offset, fin, bytes) {
-                events.stream_reset(stream, 1);
-                return Err(CopyingError::Callback(error));
+            let consumed = match events.stream_chunk(stream, offset, fin, bytes) {
+                Ok(consumed) if consumed <= bytes.len() => consumed,
+                Ok(_) => return Err(CopyingError::Transport(CallbackError::InvalidOverlap)),
+                Err(error) => {
+                    events.stream_reset(stream, 1);
+                    return Err(CopyingError::Callback(error));
+                }
+            };
+            if consumed != bytes.len() {
+                // The handler may stop exactly at a storage boundary. Keep
+                // only the unread suffix under QUIC-lite ordering ownership;
+                // never materialize a dispatcher-private fragment queue.
+                let packet = retain();
+                state.insert(packet, offset + consumed as u64, consumed..bytes.len(), fin)
+                    .map_err(CopyingError::Transport)?;
+                state.consumed = offset + consumed as u64;
+                let retained = bytes.len().saturating_sub(consumed);
+                let _ = state;
+                self.retained_bytes = self.retained_bytes.saturating_add(retained);
+                return Ok(());
             }
             if fin {
                 state.final_size = Some(end);
@@ -403,11 +419,69 @@ impl<P: PacketLease> CallbackStreams<P> {
             if fin {
                 state.finished = true;
                 events.stream_finished(stream);
+                return Ok(());
             }
+            // A borrowed prefix may close a gap in already retained ranges.
+            // Drain those ordinary ordered ranges now when the consumer took
+            // the full prefix, preserving the historical copying behaviour.
+            let _ = state;
+            self.resume_copying(stream, events)?;
             return Ok(());
         }
 
         self.receive_copying(stream, retain(), offset, 0..bytes.len(), fin, events)
+    }
+
+    /// Resume an ordered copying consumer after application storage becomes
+    /// ready.  A consumer that stopped part way through a borrowed packet
+    /// leaves only its unread suffix here; this method redelivers that suffix
+    /// without inventing a dispatcher- or handler-specific packet queue.
+    pub fn resume_copying<E: CopyingStreamEvents>(
+        &mut self,
+        stream: u64,
+        events: &mut E,
+    ) -> Result<usize, CopyingError<E::Error>> {
+        let mut total = 0usize;
+        loop {
+            let Some(index) = self.streams.iter().position(|state| state.id == stream) else {
+                return Ok(total);
+            };
+            let state = &mut self.streams[index];
+            if state.finished || state.outstanding.is_some() {
+                return Ok(total);
+            }
+            let Some(item_index) = state.retained.iter().position(|item| item.offset == state.consumed) else {
+                return Ok(total);
+            };
+            let item = state.retained[item_index].clone();
+            let bytes = &item.packet.bytes()[item.range.clone()];
+            let consumed = match events.stream_chunk(stream, item.offset, item.end, bytes) {
+                Ok(consumed) if consumed <= bytes.len() => consumed,
+                Ok(_) => return Err(CopyingError::Transport(CallbackError::InvalidOverlap)),
+                Err(error) => {
+                    events.stream_reset(stream, 1);
+                    return Err(CopyingError::Callback(error));
+                }
+            };
+            if consumed == 0 {
+                return Ok(total);
+            }
+            total = total.saturating_add(consumed);
+            self.retained_bytes = self.retained_bytes.saturating_sub(consumed);
+            state.consumed = state.consumed.saturating_add(consumed as u64);
+            if consumed != bytes.len() {
+                let retained = &mut state.retained[item_index];
+                retained.offset = retained.offset.saturating_add(consumed as u64);
+                retained.range.start += consumed;
+                return Ok(total);
+            }
+            let item = state.retained.remove(item_index);
+            if item.end {
+                state.finished = true;
+                events.stream_finished(stream);
+                return Ok(total);
+            }
+        }
     }
 
     pub fn done<E: StreamEvents<P>>(
@@ -488,6 +562,7 @@ impl<'a, P: PacketLease, E: CopyingStreamEvents> StreamEvents<P> for CopyAdapter
             self.error = self
                 .events
                 .stream_chunk(chunk.stream, chunk.offset, chunk.end, chunk.bytes())
+                .map(|_| ())
                 .err();
         }
     }
@@ -545,15 +620,41 @@ mod tests {
             _offset: u64,
             _end: bool,
             bytes: &[u8],
-        ) -> Result<(), Self::Error> {
+        ) -> Result<usize, Self::Error> {
             self.data.extend_from_slice(bytes);
-            Ok(())
+            Ok(bytes.len())
         }
         fn stream_finished(&mut self, stream: u64) {
             self.finished.push(stream);
         }
         fn stream_reset(&mut self, stream: u64, code: u64) {
             self.reset.push((stream, code));
+        }
+    }
+
+    struct PartialSink {
+        data: Vec<u8>,
+        limit: usize,
+        finished: Vec<u64>,
+    }
+
+    impl CopyingStreamEvents for PartialSink {
+        type Error = ();
+
+        fn stream_chunk(
+            &mut self,
+            _stream: u64,
+            _offset: u64,
+            _end: bool,
+            bytes: &[u8],
+        ) -> Result<usize, Self::Error> {
+            let count = bytes.len().min(self.limit);
+            self.data.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn stream_finished(&mut self, stream: u64) {
+            self.finished.push(stream);
         }
     }
 
@@ -609,6 +710,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sink.data, b"in-order");
+        assert_eq!(sink.finished, vec![4]);
+        assert_eq!(streams.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn borrowed_partial_prefix_is_retained_and_resumed_without_a_fragment_queue() {
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
+        let mut sink = PartialSink { data: Vec::new(), limit: 3, finished: Vec::new() };
+        streams
+            .receive_copying_borrowed(
+                4,
+                b"abcdef",
+                0,
+                true,
+                || Arc::new(b"abcdef".to_vec()),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.data, b"abc");
+        assert_eq!(streams.retained_bytes(), 3);
+
+        sink.limit = usize::MAX;
+        assert_eq!(streams.resume_copying(4, &mut sink).unwrap(), 3);
+        assert_eq!(sink.data, b"abcdef");
+        assert_eq!(sink.finished, vec![4]);
+        assert_eq!(streams.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn partial_consumer_resumes_in_order_across_an_out_of_order_tail() {
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
+        let mut sink = PartialSink { data: Vec::new(), limit: 2, finished: Vec::new() };
+        // The tail arrives first and is retained by the same bounded QUIC
+        // ordering state. It must not be exposed before the missing prefix.
+        streams
+            .receive_copying_borrowed(
+                4, b"ef", 4, true, || Arc::new(b"ef".to_vec()), &mut sink,
+            )
+            .unwrap();
+        assert!(sink.data.is_empty());
+        streams
+            .receive_copying_borrowed(
+                4, b"abcd", 0, false, || Arc::new(b"abcd".to_vec()), &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.data, b"ab");
+        // The remainder of the prefix and the previously out-of-order tail
+        // are both resumed through one handler-neutral QUIC operation.
+        sink.limit = usize::MAX;
+        assert_eq!(streams.resume_copying(4, &mut sink).unwrap(), 4);
+        assert_eq!(sink.data, b"abcdef");
         assert_eq!(sink.finished, vec![4]);
         assert_eq!(streams.retained_bytes(), 0);
     }

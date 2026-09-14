@@ -101,7 +101,7 @@ impl CopyingStreamEvents for Sink<'_> {
         offset: u64,
         end: bool,
         bytes: &[u8],
-    ) -> Result<(), ()> {
+    ) -> Result<usize, ()> {
         if self.validation >= 1 {
             let packet_id = bytes
                 .get(..4)
@@ -123,7 +123,7 @@ impl CopyingStreamEvents for Sink<'_> {
         *self.next_offset = self.next_offset.saturating_add(bytes.len() as u64);
         *self.bytes = self.bytes.saturating_add(bytes.len() as u64);
         *self.complete = end;
-        Ok(())
+        Ok(bytes.len())
     }
 }
 

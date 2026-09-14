@@ -267,6 +267,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
                 max_data: peer_max_data,
                 max_stream_data: peer_max_stream_data,
                 max_in_flight_packets: peer_max_in_flight_packets,
+                requested_peer_limits: None,
             },
             stateless_reset_token: None,
             path_policy: crate::PathPolicy::HighestMeasuredSpeed,
@@ -323,6 +324,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
             return Err(crate::Error::Invalid);
         }
         let (bootstrap_header, open) = crate::decode_bootstrap_open_packet_with_limits(packet)?;
+        let local_limits = local_limits.clamped_to_request(open.requested_peer_limits);
         let mut mux = crate::mux::StreamMux::new_with_history_capacity(
             crate::Role::Server,
             local_limits,
@@ -420,6 +422,7 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
             return Err(crate::Error::Invalid);
         }
         let (bootstrap_header, open) = crate::decode_bootstrap_open_packet_with_limits(packet)?;
+        let local_limits = local_limits.clamped_to_request(open.requested_peer_limits);
         unsafe {
             crate::mux::StreamMux::init_in_place(
                 core::ptr::addr_of_mut!((*out).mux),
@@ -600,6 +603,13 @@ impl<const STREAMS: usize, const HISTORY: usize, const PACKET: usize>
 
     pub fn is_closed(&self) -> bool {
         self.mux.endpoint.is_closed()
+    }
+
+    /// End this association after its application has abandoned an
+    /// interrupted operation. Packet encoding remains endpoint-owned and is
+    /// emitted by the normal bearer poll.
+    pub fn close(&mut self, code: u64) {
+        self.mux.endpoint.close(code);
     }
 
     pub fn next_bearer_deadline(&self, pto: u64) -> Option<u64> {
@@ -1046,6 +1056,13 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
                 // established packet arrives. Reclaim it here, at the fresh
                 // OPEN admission boundary, instead.
                 if self.idle_timeout == Some(0) {
+                    // A handler may have aborted an unfinished application
+                    // stream after its peer disappeared. A closed endpoint is
+                    // terminal even though its stream bookkeeping still
+                    // records that interrupted stream; retain neither its
+                    // ledger nor its stale MAX_* egress when a fresh OPEN
+                    // arrives.
+                    self.reclaim_closed(&is_closed);
                     self.reclaim_inactive(&active_streams);
                 } else {
                     self.reclaim_idle(&active_streams);
@@ -1298,6 +1315,33 @@ impl<T, const ASSOCIATIONS: usize> ServerAssociationTable<T, ASSOCIATIONS> {
 
     fn reclaim_inactive(&mut self, active_streams: &impl Fn(&T) -> usize) -> usize {
         self.reclaim_matching(active_streams, |_| true)
+    }
+
+    fn reclaim_closed(&mut self, is_closed: &impl Fn(&T) -> bool) -> usize {
+        let mut reclaimed = 0;
+        for (slot, entry) in self.associations.iter_mut().enumerate() {
+            if entry
+                .as_ref()
+                .is_some_and(|association| is_closed(association.connection()))
+            {
+                *entry = None;
+                self.verified_identities[slot] = None;
+                reclaimed += 1;
+            }
+        }
+        if reclaimed != 0 {
+            // Keep the selection coherent if another association survives;
+            // a closed peer must not make an unrelated live peer disappear
+            // from the CID demultiplexer's active selection.
+            let selected = self
+                .associations
+                .iter()
+                .enumerate()
+                .find_map(|(slot, entry)| entry.as_ref().map(|entry| (slot, entry.active_path)));
+            self.last_active_slot = selected.map(|(slot, _)| slot);
+            self.last_active_path = selected.and_then(|(_, path)| path);
+        }
+        reclaimed
     }
 
     fn reclaim_matching(
@@ -1879,10 +1923,11 @@ impl<const PACKET: usize> DatagramClientDriver<PACKET> {
         Ok(false)
     }
 
-    /// Poll delayed control, due retained ranges, fresh application data, and
+    /// Poll due retained ranges, delayed control, fresh application data, and
     /// finally bounded OPEN replay. Returns whether a packet is ready for the
-    /// adapter. Loss repair precedes new bytes so a small ledger cannot fill
-    /// with later ranges while an earlier stream gap remains unresolved.
+    /// adapter. Loss repair precedes both control and new bytes: a continuing
+    /// ACK/MAX exchange must not starve the one retained range that fills a
+    /// receive-ordering gap and unblocks the peer's flow-control edge.
     pub fn poll<C: DatagramClient<PACKET>>(
         &mut self,
         client: &mut C,
@@ -1893,13 +1938,13 @@ impl<const PACKET: usize> DatagramClientDriver<PACKET> {
         if self.pending.is_some() {
             return Ok(true);
         }
-        self.pending = client.poll_control_at(now, &mut self.packet)?;
-        if self.pending.is_some() {
-            return Ok(true);
-        }
         self.pending = client.poll_retransmit(now, pto, &mut self.packet)?;
         if self.pending.is_some() {
             self.retransmit_packets = self.retransmit_packets.saturating_add(1);
+            return Ok(true);
+        }
+        self.pending = client.poll_control_at(now, &mut self.packet)?;
+        if self.pending.is_some() {
             return Ok(true);
         }
         self.pending = client.poll_application_at(now, &mut self.packet)?;
@@ -1950,6 +1995,7 @@ pub enum ClientBootstrapIngress {
 pub struct ClientConnection<const HISTORY: usize, const PACKET: usize> {
     local_cid: crate::ConnectionId,
     local_limits: crate::ConnectionLimits,
+    requested_peer_limits: Option<crate::ReceiveWindowRequest>,
     peer_cid: Option<crate::ConnectionId>,
     peer_reset_token: Option<crate::StatelessResetToken>,
     endpoint: Option<crate::EndpointState<{ crate::DEFAULT_STREAM_STATE_SLOTS }, HISTORY, PACKET>>,
@@ -2061,6 +2107,7 @@ impl<const HISTORY: usize, const PACKET: usize> ClientConnection<HISTORY, PACKET
         Self {
             local_cid,
             local_limits,
+            requested_peer_limits: None,
             peer_cid: None,
             peer_reset_token: None,
             endpoint: None,
@@ -2071,6 +2118,21 @@ impl<const HISTORY: usize, const PACKET: usize> ClientConnection<HISTORY, PACKET
 
     pub const fn local_cid(&self) -> crate::ConnectionId {
         self.local_cid
+    }
+
+    /// Ask the peer to select no more than this receive profile for this new
+    /// association. The peer's OPEN_ACK reports the effective, hard-clamped
+    /// value; this is intended for host stress tests and capability-aware
+    /// provisioning, not a way to expand peer memory.
+    pub fn set_requested_peer_receive_profile(
+        &mut self,
+        request: crate::ReceiveWindowRequest,
+    ) -> Result<(), crate::Error> {
+        if self.started || request.max_data == 0 || request.max_stream_data == 0 {
+            return Err(crate::Error::Invalid);
+        }
+        self.requested_peer_limits = Some(request);
+        Ok(())
     }
 
     pub const fn peer_cid(&self) -> Option<crate::ConnectionId> {
@@ -2126,11 +2188,12 @@ impl<const HISTORY: usize, const PACKET: usize> ClientConnection<HISTORY, PACKET
     }
 
     fn encode_open(&self, output: &mut [u8; PACKET]) -> Result<usize, crate::Error> {
-        crate::encode_bootstrap_open_packet_with_profile(
+        crate::encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
             self.local_cid,
             self.open_packet_number,
             self.local_limits,
             0,
+            self.requested_peer_limits,
             output,
         )
     }
@@ -2242,6 +2305,14 @@ impl<const HISTORY: usize, const PACKET: usize> ClientConnection<HISTORY, PACKET
         self.endpoint
             .as_mut()
             .map_or(Ok(None), |endpoint| endpoint.poll_close(output))
+    }
+
+    /// Mark the established association terminal.  This is deliberately
+    /// separate from `poll_close`: polling never invents a close merely
+    /// because an application happens to be one-shot.
+    pub fn close(&mut self, code: u64) -> Result<(), crate::Error> {
+        self.endpoint_mut()?.close(code);
+        Ok(())
     }
 
     pub fn poll_retransmit(
@@ -2665,6 +2736,13 @@ impl<const HISTORY: usize, const PACKET: usize> ClientAssociation<HISTORY, PACKE
             .map(|used| (path, used)))
     }
 
+    /// Retire this client association through ordinary QUIC framing.  The
+    /// path is selected by the association; a UDP/UART/NOW adapter only
+    /// transmits the returned complete datagram.
+    pub fn close(&mut self, code: u64) -> Result<(), crate::Error> {
+        self.connection_mut().close(code)
+    }
+
     /// Poll a PTO/loss retransmission on the selected or current return path.
     /// Packet timing and retransmission history remain in QUIC-lite; frame
     /// adapters only write the selected complete datagram.
@@ -2778,12 +2856,41 @@ impl AssociationProfile {
         );
         Self {
             history_packets: packets,
+            // ACK cadence is normal transport policy, distinct from the
+            // memory-derived receive window, loss history, and initial
+            // burst. A small device may advertise two packets of flight
+            // while retaining the same bounded ACK policy as host and other
+            // bearers; coupling these causes ACK/control amplification under
+            // reordering.
             ack_frequency: Self::datagram_default().ack_frequency,
             ack_delay_ms: Self::datagram_default().ack_delay_ms,
             tx_burst_packets: packets,
             initial_window_packets: packets,
         }
         .clamp::<HISTORY>()
+    }
+
+    /// Derive a bounded receive-credit profile from this association's
+    /// selected packet budget. A connection total remains the actual memory
+    /// bound, while each stream may use up to half of that total. Thus an
+    /// eight-packet connection can give a slow stream four MTUs without
+    /// letting it consume all eight and starve a concurrent command, log, or
+    /// probe stream.
+    ///
+    /// The result is ordinary QUIC byte credit; it is independent of the
+    /// bearer and of the stream consumer (flash, probe, or file transfer).
+    pub fn receive_limits(
+        self,
+        mtu: u64,
+        max_streams_bidi: u64,
+    ) -> crate::ConnectionLimits {
+        let streams = max_streams_bidi.max(1);
+        let mtu = mtu.max(1);
+        let total = (self.initial_window_packets as u64)
+            .saturating_mul(mtu)
+            .max(streams.saturating_mul(mtu));
+        let per_stream = (total / 2).max(mtu);
+        crate::ConnectionLimits::with_receive_profile(total, per_stream, streams)
     }
 
     /// Limit the initial datagram flight to the platform's currently
@@ -3018,11 +3125,54 @@ mod tests {
             policy,
         );
         assert_eq!(low.history_packets, 2);
+        assert_eq!(low.ack_frequency, 8);
         assert_eq!(low.initial_window_packets, 2);
         assert_eq!(low.tx_burst_packets, 2);
         assert_eq!(high.history_packets, 8);
+        assert_eq!(high.ack_frequency, 8);
         assert_eq!(high.initial_window_packets, 8);
         assert_eq!(high.tx_burst_packets, 8);
+    }
+
+    #[test]
+    fn recovery_sized_heap_keeps_the_normal_profile_conservative() {
+        // Recovery may accept a controlled 32- or 64-packet host stress
+        // request, but an ordinary boot must not reserve that stress budget.
+        // Keep this exact ESP policy input host-testable: 126 KiB internal
+        // free memory, 32 KiB retained for the image/flash runtime, and one
+        // eighth of the remainder available to a retransmission ledger.
+        let profile = AssociationProfile::datagram_with_memory::<64>(
+            crate::ledger::LedgerMemorySnapshot {
+                total_bytes: 126 * 1024,
+                available_bytes: 126 * 1024,
+            },
+            1,
+            1200,
+            crate::ledger::LedgerMemoryPolicy {
+                min_packets: 2,
+                max_packets: 64,
+                memory_fraction_numerator: 1,
+                memory_fraction_denominator: 8,
+                reserve_bytes: 32 * 1024,
+                metadata_bytes_per_packet: 96,
+            },
+        );
+        assert_eq!(profile.history_packets, 9);
+        assert_eq!(profile.initial_window_packets, 9);
+        assert_eq!(profile.tx_burst_packets, 9);
+    }
+
+    #[test]
+    fn association_receive_limits_keep_a_multi_stream_floor_and_scale_with_memory() {
+        let low = AssociationProfile::conservative().receive_limits(1100, 4);
+        assert_eq!(low.max_data, 4400);
+        assert_eq!(low.max_stream_data, 2200);
+        assert_eq!(low.max_streams_bidi, 4);
+
+        let high = AssociationProfile::datagram_default().receive_limits(1100, 4);
+        assert_eq!(high.max_data, 8800);
+        assert_eq!(high.max_stream_data, 4400);
+        assert_eq!(high.max_streams_bidi, 4);
     }
 
     #[test]
@@ -3972,6 +4122,7 @@ mod tests {
         struct Association {
             local: crate::ConnectionId,
             peer: crate::ConnectionId,
+            closed: bool,
         }
         let mut table =
             ServerAssociationTable::<Association, 3>::new(crate::ConnectionId::new(0xb0).unwrap());
@@ -3983,7 +4134,7 @@ mod tests {
         let mut packet = [0_u8; 64];
         let mut context = ();
         let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
-        let mut accept = |local, _: &mut ()| Ok((Association { local, peer: first }, ()));
+        let mut accept = |local, _: &mut ()| Ok((Association { local, peer: first, closed: false }, ()));
         table
             .receive_admitted(
                 first_path,
@@ -3992,7 +4143,7 @@ mod tests {
                 &mut accept,
                 |_, _| Ok(()),
                 |_, _| Ok(()),
-                |_| false,
+                |association| association.closed,
                 |_| 0,
                 |association| Some(association.peer),
                 |association| Some(association.local),
@@ -4006,7 +4157,7 @@ mod tests {
                 |_, _| unreachable!("duplicate OPEN must replay"),
                 |_, _| Ok(()),
                 |_, _| Ok(()),
-                |_| false,
+                |association| association.closed,
                 |_| 0,
                 |association| Some(association.peer),
                 |association| Some(association.local),
@@ -4022,6 +4173,7 @@ mod tests {
         table.set_time(1);
         assert_eq!(table.reclaim_idle(|_| 0), 0);
         assert_eq!(table.active_len(), 1);
+        table.association_for_path_mut(first_path).unwrap().closed = true;
 
         let used = crate::encode_bootstrap_open_packet(second, 0, &mut packet).unwrap();
         table
@@ -4034,14 +4186,15 @@ mod tests {
                         Association {
                             local,
                             peer: second,
+                            closed: false,
                         },
                         (),
                     ))
                 },
                 |_, _| Ok(()),
                 |_, _| Ok(()),
-                |_| false,
-                |_| 0,
+                |association| association.closed,
+                |_| 1,
                 |association| Some(association.peer),
                 |association| Some(association.local),
             )

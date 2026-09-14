@@ -1205,6 +1205,22 @@ pub struct BootstrapOpen {
     /// Maximum outstanding STREAM datagrams this receiver can absorb. Zero
     /// means no packet-count bound for compatibility with older peers.
     pub max_in_flight_packets: u16,
+    /// Optional receiver profile requested for the peer.  This is an
+    /// admission-time diagnostic/control request, not a promise: the peer
+    /// clamps it to its compiled hard memory ceiling and returns the actual
+    /// profile in OPEN_ACK.
+    pub requested_peer_limits: Option<ReceiveWindowRequest>,
+}
+
+/// Host-selected upper bounds for the peer's initial receive credit.
+///
+/// A small device never trusts these as capacity claims.  They only let a
+/// host deliberately exercise a lower point within the device's fixed
+/// allocation envelope; the OPEN_ACK is authoritative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiveWindowRequest {
+    pub max_data: u64,
+    pub max_stream_data: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1286,6 +1302,7 @@ impl BootstrapOpen {
             max_data,
             max_stream_data,
             max_in_flight_packets,
+            requested_peer_limits: None,
         })
     }
 }
@@ -1365,6 +1382,7 @@ fn encode_bootstrap_profile(
     limits: ConnectionLimits,
     max_in_flight_packets: u16,
     stateless_reset_token: Option<StatelessResetToken>,
+    requested_peer_limits: Option<ReceiveWindowRequest>,
     out: &mut [u8],
 ) -> Result<usize, Error> {
     if out.len() < 3 || kind > 1 {
@@ -1372,7 +1390,8 @@ fn encode_bootstrap_profile(
     }
     out[0] = kind;
     let mut at = 1;
-    at += put_varint(u64::from(stateless_reset_token.is_some()), &mut out[at..])?;
+    let version = if requested_peer_limits.is_some() { 2 } else { u64::from(stateless_reset_token.is_some()) };
+    at += put_varint(version, &mut out[at..])?;
     let mut parameters = [0u8; 64];
     let mut used = 0;
     used += put_varint(limits.max_data, &mut parameters[used..])?;
@@ -1381,6 +1400,13 @@ fn encode_bootstrap_profile(
     if let Some(token) = stateless_reset_token {
         parameters[used..used + STATELESS_RESET_TOKEN_LEN].copy_from_slice(&token.0);
         used += STATELESS_RESET_TOKEN_LEN;
+    }
+    if let Some(request) = requested_peer_limits {
+        if request.max_data == 0 || request.max_stream_data == 0 {
+            return Err(Error::BootstrapInvalid);
+        }
+        used += put_varint(request.max_data, &mut parameters[used..])?;
+        used += put_varint(request.max_stream_data, &mut parameters[used..])?;
     }
     at += put_varint(used as u64, &mut out[at..])?;
     if out.len() < at + used {
@@ -1393,12 +1419,12 @@ fn encode_bootstrap_profile(
 fn decode_bootstrap_profile(
     input: &[u8],
     expected_kind: u8,
-) -> Result<(ConnectionLimits, u16, Option<StatelessResetToken>), Error> {
+) -> Result<(ConnectionLimits, u16, Option<StatelessResetToken>, Option<ReceiveWindowRequest>), Error> {
     if input.first().copied() != Some(expected_kind) {
         return Err(Error::BootstrapInvalid);
     }
     let (version, version_len) = get_varint(&input[1..])?;
-    if version > 1 {
+    if version > 2 {
         return Err(Error::BootstrapInvalid);
     }
     let (length, length_len) = get_varint(&input[1 + version_len..])?;
@@ -1410,12 +1436,21 @@ fn decode_bootstrap_profile(
     let (max_stream_data, stream_len) = get_varint(&parameters[data_len..])?;
     let (packets, packets_len) = get_varint(&parameters[data_len + stream_len..])?;
     let values_len = data_len + stream_len + packets_len;
-    let reset_token = match version {
-        0 if values_len == parameters.len() => None,
+    let (reset_token, requested_peer_limits) = match version {
+        0 if values_len == parameters.len() => (None, None),
         1 if values_len + STATELESS_RESET_TOKEN_LEN == parameters.len() => {
             let mut token = [0u8; STATELESS_RESET_TOKEN_LEN];
             token.copy_from_slice(&parameters[values_len..]);
-            Some(StatelessResetToken(token))
+            (Some(StatelessResetToken(token)), None)
+        }
+        2 if expected_kind == 0 => {
+            let request = &parameters[values_len..];
+            let (max_data, data_len) = get_varint(request)?;
+            let (max_stream_data, stream_len) = get_varint(&request[data_len..])?;
+            if data_len + stream_len != request.len() || max_data == 0 || max_stream_data == 0 {
+                return Err(Error::BootstrapInvalid);
+            }
+            (None, Some(ReceiveWindowRequest { max_data, max_stream_data }))
         }
         _ => return Err(Error::BootstrapInvalid),
     };
@@ -1434,6 +1469,7 @@ fn decode_bootstrap_profile(
         },
         packets as u16,
         reset_token,
+        requested_peer_limits,
     ))
 }
 
@@ -1667,11 +1703,27 @@ pub fn encode_bootstrap_open_packet_with_profile(
     max_in_flight_packets: u16,
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
+        client_cid, packet_number, limits, max_in_flight_packets, None, out,
+    )
+}
+
+/// Encode OPEN with an optional request to lower the peer's receiver profile.
+/// The request is bounded and clamped by the peer; it never changes the
+/// opener's advertised receive credit.
+pub fn encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
+    client_cid: ConnectionId,
+    packet_number: u32,
+    limits: ConnectionLimits,
+    max_in_flight_packets: u16,
+    requested_peer_limits: Option<ReceiveWindowRequest>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
     if client_cid.value() == 0 {
         return Err(Error::BootstrapInvalid);
     }
-    let mut body = [0u8; 32];
-    let body_len = encode_bootstrap_profile(0, limits, max_in_flight_packets, None, &mut body)?;
+    let mut body = [0u8; 48];
+    let body_len = encode_bootstrap_profile(0, limits, max_in_flight_packets, None, requested_peer_limits, &mut body)?;
     let mut frame = [0u8; 64];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,
@@ -1716,7 +1768,7 @@ pub fn decode_bootstrap_open_packet_with_limits(
     if stream.id != CONTROL_STREAM_ID || stream.offset != 0 || !stream.fin {
         return Err(Error::BootstrapInvalid);
     }
-    let (limits, max_in_flight_packets, reset_token) = decode_bootstrap_profile(stream.data, 0)?;
+    let (limits, max_in_flight_packets, reset_token, requested_peer_limits) = decode_bootstrap_profile(stream.data, 0)?;
     if reset_token.is_some() {
         return Err(Error::BootstrapInvalid);
     }
@@ -1725,6 +1777,7 @@ pub fn decode_bootstrap_open_packet_with_limits(
         max_data: limits.max_data,
         max_stream_data: limits.max_stream_data,
         max_in_flight_packets,
+        requested_peer_limits,
     };
     Ok((
         ShortHeader {
@@ -1840,6 +1893,7 @@ pub fn encode_bootstrap_open_ack_packet_with_profile_and_reset_token(
         limits,
         max_in_flight_packets,
         stateless_reset_token,
+        None,
         &mut body,
     )?;
     let mut frame = [0u8; 64];
@@ -1893,8 +1947,11 @@ pub fn decode_bootstrap_open_ack_packet_with_limits(
     if server_cid == expected_client_cid {
         return Err(Error::BootstrapInvalid);
     }
-    let (limits, max_in_flight_packets, stateless_reset_token) =
+    let (limits, max_in_flight_packets, stateless_reset_token, requested_peer_limits) =
         decode_bootstrap_profile(stream.data, 1)?;
+    if requested_peer_limits.is_some() {
+        return Err(Error::BootstrapInvalid);
+    }
     let ack = BootstrapOpenAck {
         server_receive_cid: server_cid,
         max_data: limits.max_data,
@@ -2958,17 +3015,42 @@ pub const INITIAL_MAX_DATA: u64 = 256 * 1024;
 pub const INITIAL_MAX_STREAM_DATA: u64 = 256 * 1024;
 
 impl ConnectionLimits {
+    /// Apply a host's requested lower receive profile without ever relaxing
+    /// this endpoint's compile-time memory limit.
+    pub const fn clamped_to_request(self, request: Option<ReceiveWindowRequest>) -> Self {
+        match request {
+            Some(request) => Self {
+                max_data: if request.max_data < self.max_data { request.max_data } else { self.max_data },
+                max_stream_data: if request.max_stream_data < self.max_stream_data { request.max_stream_data } else { self.max_stream_data },
+                ..self
+            },
+            None => self,
+        }
+    }
+    /// Construct a bounded receiver profile.  The connection total and each
+    /// stream's share are independent: a small device can admit four useful
+    /// concurrent 1 KiB streams without ever retaining more than 4 KiB of
+    /// QUIC stream payload.  Applications may request a smaller working
+    /// window, but cannot raise either ceiling after association.
+    pub const fn with_receive_profile(
+        max_data: u64,
+        max_stream_data: u64,
+        max_streams_bidi: u64,
+    ) -> Self {
+        Self {
+            max_data,
+            max_stream_data,
+            max_streams_bidi,
+            max_streams_uni: 4,
+        }
+    }
+
     /// Construct ordinary connection and per-stream receive credit from one
     /// application-selected byte window.  QUIC-lite does not attach that
     /// choice to a bearer or handler: a flash sink, file sink, and prober may
     /// each select a different bounded consumer window.
     pub const fn with_receive_window(window_bytes: u64) -> Self {
-        Self {
-            max_data: window_bytes,
-            max_stream_data: window_bytes,
-            max_streams_bidi: DEFAULT_MAX_BIDI_STREAMS,
-            max_streams_uni: 4,
-        }
+        Self::with_receive_profile(window_bytes, window_bytes, DEFAULT_MAX_BIDI_STREAMS)
     }
 }
 
@@ -3224,6 +3306,11 @@ pub struct EndpointState<
     /// until the peer ACKs the packet that carried it.
     credit_pending: bool,
     credit_packet_number: Option<u32>,
+    // Consumption may advance the absolute MAX_* limits while the previous
+    // publication is still in flight.  Retain one packet until it is ACKed;
+    // this bit requests exactly one replacement carrying the newest limits.
+    credit_dirty: bool,
+    credit_retry_backoff: u8,
     send_clock: u64,
     rtt: RttEstimator,
     /// Endpoint-owned PTO scheduling. A bearer may poll in a tight loop when
@@ -3355,6 +3442,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             core::ptr::addr_of_mut!((*out).acknowledged_fin_streams).write([None; N]);
             core::ptr::addr_of_mut!((*out).credit_pending).write(false);
             core::ptr::addr_of_mut!((*out).credit_packet_number).write(None);
+            core::ptr::addr_of_mut!((*out).credit_dirty).write(false);
+            core::ptr::addr_of_mut!((*out).credit_retry_backoff).write(0);
             core::ptr::addr_of_mut!((*out).send_clock).write(0);
             core::ptr::addr_of_mut!((*out).rtt).write(RttEstimator::default());
             core::ptr::addr_of_mut!((*out).last_pto_probe_at).write(None);
@@ -3421,6 +3510,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             acknowledged_fin_streams: [None; N],
             credit_pending: false,
             credit_packet_number: None,
+            credit_dirty: false,
+            credit_retry_backoff: 0,
             send_clock: 0,
             rtt: RttEstimator::default(),
             last_pto_probe_at: None,
@@ -3776,11 +3867,25 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         // needs a wake after a submitted update may have been lost. Polling
         // socket loops used to hide this missing edge, while the ESP worker
         // slept forever with its peer flow-control blocked.
-        let credit_deadline = self
-            .credit_pending
-            .then_some(self.credit_packet_number)
-            .flatten()
-            .map(|_| self.last_ack_time.saturating_add(50));
+        // Consumption can be reported after this receive turn already emitted
+        // its ordinary ACK.  In that case there is no credit packet number
+        // yet, but the newly released MAX_* state still needs a wake of its
+        // own: a flow-blocked peer has no further packet with which to wake
+        // us.  Keep the same bounded delayed-control cadence for both the
+        // first publication and a later unacknowledged publication.
+        let credit_deadline = self.credit_pending.then_some(
+            self.last_ack_time.saturating_add(if self.credit_packet_number.is_some() {
+                // A MAX_* update is reliable connection state. Once it has
+                // been sent, retry it on the normal adaptive loss clock, not
+                // a fixed control tick: otherwise an unreachable peer is
+                // sent the identical ACK/MAX packet twenty times per second.
+                self.pto_timeout().saturating_mul(
+                    1u64 << self.credit_retry_backoff.min(MAX_PTO_BACKOFF_EXPONENT),
+                )
+            } else {
+                self.max_ack_delay_ms
+            }),
+        );
         let earliest_sent = self
             .sent_packets
             .iter()
@@ -4392,8 +4497,14 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     /// smaller value therefore withholds replenishment and never revokes an
     /// already advertised peer credit.
     pub fn grant_receive_window(&mut self, stream_id: u64, window_bytes: u64) -> Result<(), Error> {
-        self.receive.extend_connection_credit(window_bytes);
-        self.receive.extend_stream_credit(stream_id, window_bytes)?;
+        // The endpoint's device/application profile is the authoritative
+        // receive-memory ceiling. A handler may report a larger private
+        // buffer (for example a manifest or file cache), but it must never
+        // turn that allocation into extra QUIC credit.
+        let connection_window = window_bytes.min(self.receive.limits.max_data);
+        let stream_window = window_bytes.min(self.receive.limits.max_stream_data);
+        self.receive.extend_connection_credit(connection_window);
+        self.receive.extend_stream_credit(stream_id, stream_window)?;
         self.control_pending = true;
         self.queue_stream_credit(stream_id);
         Ok(())
@@ -4406,6 +4517,13 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     }
 
     fn queue_stream_credit(&mut self, stream_id: u64) {
+        // A MAX_* packet may be in flight while the application consumes more
+        // ordered bytes.  Keep that one reliable publication intact and mark
+        // the latest absolute limit dirty.  Clearing its marker here made an
+        // event-driven receiver re-send MAX_* at every delayed-ACK tick until
+        // the peer replied, creating a control backlog at ordinary Wi-Fi RTT.
+        // Its ACK releases exactly one replacement carrying the newest value.
+        self.credit_dirty |= self.credit_packet_number.is_some();
         self.credit_pending = true;
         if self
             .pending_stream_ids
@@ -4457,14 +4575,18 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         let ack_timer_due = self.ack_pending
             && self.send_clock.saturating_sub(self.largest_received_at) >= self.max_ack_delay_ms;
         let delayed_ack_due = ack_threshold_due || ack_timer_due;
-        // Retry a lost MAX_* control packet on the same endpoint-owned
-        // delayed-control cadence. This is intentionally independent of the
-        // bearer: a sender may be flow-blocked and have no stream packet left
-        // to provoke another ACK.
+        // Retry a lost MAX_* control packet on the endpoint's adaptive PTO.
+        // This is intentionally independent of the bearer: a sender may be
+        // flow-blocked and have no stream packet left to provoke another ACK.
         let credit_retry_due = self.credit_pending
-            && self
-                .credit_packet_number
-                .is_some_and(|_| self.send_clock.saturating_sub(self.last_ack_time) >= 50);
+            && self.send_clock.saturating_sub(self.last_ack_time)
+                >= if self.credit_packet_number.is_some() {
+                    self.pto_timeout().saturating_mul(
+                        1u64 << self.credit_retry_backoff.min(MAX_PTO_BACKOFF_EXPONENT),
+                    )
+                } else {
+                    self.max_ack_delay_ms
+                };
         let send_ack = self.control_pending || delayed_ack_due || credit_retry_due;
         let ack_frequency = self.pending_ack_frequency;
         if !send_ack && ack_frequency.is_none() {
@@ -4511,8 +4633,16 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             self.ack_pending = false;
             self.ack_packets = 0;
             self.last_ack_time = self.send_clock;
+            let retrying_credit = self.credit_pending && self.credit_packet_number.is_some();
             if self.credit_pending {
                 self.credit_packet_number = Some(self.next_packet_number);
+                self.credit_dirty = false;
+                if retrying_credit {
+                    self.credit_retry_backoff = self
+                        .credit_retry_backoff
+                        .saturating_add(1)
+                        .min(MAX_PTO_BACKOFF_EXPONENT);
+                }
             }
             self.stats.ack_datagrams += 1;
             if immediate_ack {
@@ -4585,9 +4715,17 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             .credit_packet_number
             .is_some_and(|packet_number| acknowledged.contains(packet_number))
         {
-            self.credit_pending = false;
             self.credit_packet_number = None;
-            self.pending_stream_ids = [None; N];
+            self.credit_retry_backoff = 0;
+            if self.credit_dirty {
+                // Preserve the deduplicated stream set and publish the
+                // latest consumed offsets on the next transport turn.
+                self.credit_pending = true;
+                self.control_pending = true;
+            } else {
+                self.credit_pending = false;
+                self.pending_stream_ids = [None; N];
+            }
         }
         self.largest_acked_by_peer = acknowledged.get(0).map(|range| range.end);
         let largest_acked = acknowledged.get(0).map(|range| range.end);
@@ -5364,6 +5502,64 @@ mod tests {
     }
 
     #[test]
+    fn handler_grant_cannot_exceed_the_device_receive_window() {
+        let limits = ConnectionLimits::with_receive_window(1024);
+        let mut endpoint = EndpointState::<2>::new(Role::Client, limits, 1200);
+        endpoint.receive.accept(3, 0, 512, false).unwrap();
+        endpoint.stream_consumed_without_credit(3, 512).unwrap();
+
+        // A manifest/file handler may have a much larger private buffer, but
+        // it cannot turn that into more live QUIC receive memory.
+        endpoint.grant_receive_window(3, 64 * 1024).unwrap();
+        assert_eq!(endpoint.receive.connection.max_data, 512 + 1024);
+        assert_eq!(endpoint.receive.stream_max_data(3), Some(512 + 1024));
+    }
+
+    #[test]
+    fn receiver_profile_bounds_four_mtu_streams_and_the_connection_total() {
+        let limits = ConnectionLimits::with_receive_profile(4 * 1200, 1200, 4);
+        assert_eq!(limits.max_data, 4 * 1200);
+        assert_eq!(limits.max_stream_data, 1200);
+        assert_eq!(limits.max_streams_bidi, 4);
+
+        let mut endpoint = EndpointState::<8>::new(Role::Server, limits, 1200);
+        for stream in [4, 8, 12, 16] {
+            endpoint.receive.accept(stream, 0, 1200, false).unwrap();
+        }
+        assert_eq!(endpoint.receive.accept(20, 0, 1, false), Err(Error::StreamLimit));
+    }
+
+    #[test]
+    fn open_peer_receive_request_round_trips_and_cannot_raise_a_hard_cap() {
+        let client = ConnectionId::new(0x731).unwrap();
+        let local = ConnectionLimits::with_receive_profile(48_000, 12_000, 4);
+        let request = ReceiveWindowRequest {
+            max_data: 1_200,
+            max_stream_data: 900,
+        };
+        let mut packet = [0u8; 256];
+        let used = encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
+            client,
+            0,
+            ConnectionLimits::default(),
+            0,
+            Some(request),
+            &mut packet,
+        )
+        .unwrap();
+        let (_, open) = decode_bootstrap_open_packet_with_limits(&packet[..used]).unwrap();
+        assert_eq!(open.requested_peer_limits, Some(request));
+        assert_eq!(local.clamped_to_request(open.requested_peer_limits).max_data, 1_200);
+        assert_eq!(local.clamped_to_request(open.requested_peer_limits).max_stream_data, 900);
+
+        let larger = ReceiveWindowRequest {
+            max_data: u64::MAX,
+            max_stream_data: u64::MAX,
+        };
+        assert_eq!(local.clamped_to_request(Some(larger)), local);
+    }
+
+    #[test]
     fn sparse_bearer_retries_a_lost_receive_credit_update_at_its_deadline() {
         let client_cid = ConnectionId::new(0x721).unwrap();
         let server_cid = ConnectionId::new(0x722).unwrap();
@@ -5400,10 +5596,10 @@ mod tests {
         // packet arrives to wake the receiver again.
         let first_credit = receiver.poll_transmit(&mut packet).unwrap().unwrap();
         assert!(first_credit > 0);
-        assert_eq!(receiver.next_bearer_deadline(600), Some(51));
-        receiver.set_time(50);
+        assert_eq!(receiver.next_bearer_deadline(600), Some(501));
+        receiver.set_time(500);
         assert!(receiver.poll_transmit(&mut packet).unwrap().is_none());
-        receiver.set_time(51);
+        receiver.set_time(501);
         let retry = receiver.poll_transmit(&mut packet).unwrap().unwrap();
         let (_, header) = ShortHeader::decode(&packet[..retry]).unwrap();
         let mut offset = header;
@@ -5414,6 +5610,9 @@ mod tests {
             offset += frame_len;
         }
         assert!(saw_max_stream_data);
+        // A peer that vanished after the first lost MAX update must not make
+        // the receiver keep a fixed-rate control loop alive.
+        assert_eq!(receiver.next_bearer_deadline(600), Some(1_501));
     }
 
     #[test]
@@ -5429,6 +5628,7 @@ mod tests {
             max_data: recovery.max_data,
             max_stream_data: recovery.max_stream_data,
             max_in_flight_packets: DEFAULT_MAX_IN_FLIGHT_PACKETS,
+            requested_peer_limits: None,
         };
         let mut encoded = [0u8; 32];
         let used = open.encode(&mut encoded).unwrap();
@@ -5647,6 +5847,7 @@ mod tests {
             max_data: 4096,
             max_stream_data: 2048,
             max_in_flight_packets: 8,
+            requested_peer_limits: None,
         };
         let mut encoded = [0u8; 32];
         let used = client.encode(&mut encoded).unwrap();
@@ -5677,6 +5878,7 @@ mod tests {
             max_data: 64,
             max_stream_data: 64,
             max_in_flight_packets: 0,
+            requested_peer_limits: None,
         };
         let mut encoded = [0u8; 32];
         let used = smallest.encode(&mut encoded).unwrap();
@@ -5690,6 +5892,7 @@ mod tests {
             max_data: 64,
             max_stream_data: 64,
             max_in_flight_packets: 0,
+            requested_peer_limits: None,
         };
         let used = largest.encode(&mut encoded).unwrap();
         assert_eq!(
@@ -7707,20 +7910,26 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(64 * 1024 * 1024);
-        let mtu = 1200usize;
+        // Use the same retained-packet capacity as the default host and ESP
+        // endpoint. The former 1200-byte synthetic MTU exceeded this
+        // endpoint's 1024-byte packet store, and the old loop silently
+        // treated `RetransmissionTooLarge` as backpressure without ever
+        // transferring a byte.
+        let mtu = DEFAULT_MAX_DATAGRAM_SIZE;
         let dcid = ConnectionId::new(1).unwrap();
         let mut sender =
             EndpointState::<2>::new(Role::Server, ConnectionLimits::default(), mtu as u64);
         let mut receiver =
             EndpointState::<2>::new(Role::Client, ConnectionLimits::default(), mtu as u64);
+        sender
+            .install_connection_ids(ConnectionId::new(2).unwrap(), dcid)
+            .unwrap();
         sender.open_send_stream(3, INITIAL_MAX_STREAM_DATA).unwrap();
 
         struct Flight {
             packet_number: u32,
             offset: u64,
-            data: Vec<u8>,
             packet: Vec<u8>,
-            packet_len: u64,
             acked: bool,
             lost: bool,
         }
@@ -7732,6 +7941,7 @@ mod tests {
         let mut packet_count = 0u64;
         let mut retransmits = 0u64;
         let mut dropped = false;
+        let mut receiver_packet_number = 0u32;
         let started = Instant::now();
 
         while contiguous < total {
@@ -7749,15 +7959,14 @@ mod tests {
                     &mut packet,
                 ) {
                     Ok(value) => value,
-                    Err(_) => break,
+                    Err(Error::HistoryFull) => break,
+                    Err(error) => panic!("memory stream send offset={next_offset}: {error:?}"),
                 };
                 packet.truncate(used);
                 flights.push_back(Flight {
                     packet_number,
                     offset: next_offset,
-                    data,
                     packet: packet.clone(),
-                    packet_len: used as u64,
                     acked: false,
                     lost: false,
                 });
@@ -7774,7 +7983,7 @@ mod tests {
                     dropped = true;
                     continue;
                 }
-                let (header, header_len) = ShortHeader::decode(&flight.packet).unwrap();
+                let (_, header_len) = ShortHeader::decode(&flight.packet).unwrap();
                 let (Frame::Stream(stream), _) =
                     decode_frame(&flight.packet[header_len..]).unwrap()
                 else {
@@ -7785,8 +7994,13 @@ mod tests {
                     .receive
                     .accept(stream.id, stream.offset, stream.data.len(), stream.fin)
                     .unwrap();
-                receiver.observe_packet(header.packet_number);
-                received.insert(header.packet_number);
+                // The packet header contains a truncated packet number.
+                // Production reconstructs it using connection state before
+                // ACKing; this in-memory test already owns the authoritative
+                // sent value, so never turn a wrap after 255 packets into a
+                // bogus ACK range by using `ShortHeader::decode` directly.
+                receiver.observe_packet(flight.packet_number);
+                received.insert(flight.packet_number);
                 segments.entry(stream.offset).or_insert(stream.data.len());
             }
 
@@ -7794,65 +8008,98 @@ mod tests {
                 contiguous += len as u64;
                 receiver.receive.consume(3, len as u64).unwrap();
             }
-            receiver.receive.extend_connection_credit(INITIAL_MAX_DATA);
-            receiver
-                .receive
-                .extend_stream_credit(3, INITIAL_MAX_STREAM_DATA)
-                .unwrap();
-            sender
-                .send
-                .extend_connection(receiver.receive.connection.consumed + INITIAL_MAX_DATA);
-            sender
-                .send
-                .extend_stream(3, receiver.receive.stream_max_data(3).unwrap())
-                .unwrap();
+            // A FIN closes the receive stream as soon as its final range is
+            // consumed. There is no next byte to credit in that terminal
+            // turn, so model the real handler boundary rather than trying to
+            // extend a stream the endpoint has retired.
+            if contiguous < total {
+                receiver.receive.extend_connection_credit(INITIAL_MAX_DATA);
+                receiver
+                    .receive
+                    .extend_stream_credit(3, INITIAL_MAX_STREAM_DATA)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "stream credit after contiguous={contiguous} total={total} max={:?}: {error:?}",
+                            receiver.receive.stream_max_data(3)
+                        )
+                    });
+                sender
+                    .send
+                    .extend_connection(receiver.receive.connection.consumed + INITIAL_MAX_DATA);
+                sender
+                    .send
+                    .extend_stream(3, receiver.receive.stream_max_data(3).unwrap())
+                    .unwrap();
+            }
 
+            if let Some(largest) = received.get(0).map(|range| range.end) {
+                let mut ack = vec![0u8; mtu];
+                let mut used = ShortHeader {
+                    flags: FLAG_FIXED,
+                    dcid,
+                    packet_number: receiver_packet_number,
+                    packet_number_len: 1,
+                }
+                .encode(&mut ack)
+                .unwrap();
+                used += Frame::AckRanges {
+                    largest,
+                    delay: 0,
+                    ranges: received,
+                }
+                .encode(&mut ack[used..])
+                .unwrap();
+                receiver_packet_number = receiver_packet_number.saturating_add(1);
+                sender.receive_ack_packet(&ack[..used]).unwrap();
+            }
             for flight in flights.iter_mut().filter(|flight| !flight.acked) {
                 if received.contains(flight.packet_number) {
                     flight.acked = true;
-                    sender.acked(flight.packet_len);
                 }
             }
-            let has_later_ack = flights.iter().any(|flight| flight.acked);
-            let mut resend = Vec::new();
-            for flight in flights
-                .iter_mut()
-                .filter(|flight| !flight.acked && !flight.lost)
-            {
-                if has_later_ack {
-                    flight.lost = true;
-                    sender.lost(flight.packet_len);
-                    resend.push((flight.offset, flight.data.clone()));
-                }
-            }
-            let had_resend = !resend.is_empty();
-            for (offset, data) in resend {
+            let mut had_resend = false;
+            loop {
                 let mut packet = vec![0u8; mtu];
-                let (used, packet_number) = sender
-                    .encode_stream_packet(
-                        dcid,
-                        3,
-                        offset,
-                        offset + data.len() as u64 == total,
-                        &data,
-                        &mut packet,
-                    )
-                    .unwrap();
+                let Some((used, packet_number)) = sender
+                    .retransmit_marked_loss(&mut packet)
+                    .unwrap()
+                else {
+                    break;
+                };
+                let (_, header_len) = ShortHeader::decode(&packet[..used]).unwrap();
+                let (Frame::Stream(stream), _) = decode_frame(&packet[header_len..used]).unwrap()
+                else {
+                    panic!("memory stream retransmission was not a stream frame");
+                };
+                let offset = stream.offset;
+                if let Some(original) = flights
+                    .iter_mut()
+                    .find(|flight| !flight.acked && flight.offset == offset)
+                {
+                    original.lost = true;
+                }
                 packet.truncate(used);
                 flights.push_back(Flight {
                     packet_number,
                     offset,
-                    data,
                     packet,
-                    packet_len: used as u64,
                     acked: false,
                     lost: false,
                 });
                 packet_count += 1;
                 retransmits += 1;
+                had_resend = true;
             }
             flights.retain(|flight| !flight.acked && !flight.lost);
-            assert!(sent_this_round != 0 || had_resend || contiguous == total);
+            assert!(
+                sent_this_round != 0 || had_resend || contiguous == total,
+                "memory stream stalled next_offset={next_offset} contiguous={contiguous} flights={} sender_credit={:?} receiver_credit={:?} cwnd={} history={}",
+                flights.len(),
+                sender.send.stream_credit(3),
+                receiver.receive.stream_max_data(3),
+                sender.congestion.congestion_window,
+                sender.history_len(),
+            );
         }
 
         let elapsed_ms = started.elapsed().as_millis().max(1);
@@ -7915,6 +8162,162 @@ mod tests {
         assert_eq!(credits, 2);
         assert!(credit_ids.contains(&1));
         assert!(credit_ids.contains(&5));
+    }
+
+    #[test]
+    fn deferred_consumption_batches_paired_connection_and_stream_credit() {
+        let limits = ConnectionLimits {
+            max_data: 64,
+            max_stream_data: 64,
+            max_streams_bidi: 1,
+            max_streams_uni: 0,
+        };
+        let mut endpoint = EndpointState::<2, 4, 256>::new(Role::Server, limits, 256);
+        endpoint
+            .install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap())
+            .unwrap();
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.highest_received_packet = Some(0);
+        endpoint.largest_received_at = 1;
+        endpoint.set_time(1);
+        endpoint.stream_consumed_deferred(4, 32).unwrap();
+        // Default delayed ACK policy is every second ack-eliciting packet or
+        // 25 ms. This one-packet stream must publish both limits at the timer
+        // deadline, without any application-specific wake or credit value.
+        endpoint.set_time(26);
+        let mut packet = [0u8; 256];
+        let used = endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let (_, mut offset) = ShortHeader::decode(&packet[..used]).unwrap();
+        let mut max_data = None;
+        let mut max_stream_data = None;
+        while offset < used {
+            let (frame, frame_len) = decode_frame(&packet[offset..used]).unwrap();
+            match frame {
+                Frame::MaxData(max) => max_data = Some(max),
+                Frame::MaxStreamData { id: 4, max } => max_stream_data = Some(max),
+                _ => {}
+            }
+            offset += frame_len;
+        }
+        assert_eq!(max_data, Some(96));
+        assert_eq!(max_stream_data, Some(96));
+    }
+
+    #[test]
+    fn deferred_consumption_after_an_already_emitted_ack_gets_a_credit_deadline() {
+        let limits = ConnectionLimits::with_receive_window(64);
+        let mut endpoint = EndpointState::<2, 4, 256>::new(Role::Server, limits, 256);
+        endpoint
+            .install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap())
+            .unwrap();
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.highest_received_packet = Some(0);
+        endpoint.largest_received_at = 10;
+        endpoint.set_time(10);
+
+        // This models a receive turn that had already selected and encoded
+        // its ACK before the application callback reports durable bytes.
+        endpoint.control_pending = true;
+        let mut packet = [0u8; 256];
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert_eq!(endpoint.next_bearer_deadline(600), None);
+
+        endpoint.stream_consumed_deferred(4, 32).unwrap();
+        assert_eq!(endpoint.next_bearer_deadline(600), Some(35));
+        endpoint.set_time(34);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_none());
+        endpoint.set_time(35);
+        let used = endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        let (_, mut offset) = ShortHeader::decode(&packet[..used]).unwrap();
+        let mut saw_credit = false;
+        while offset < used {
+            let (frame, frame_len) = decode_frame(&packet[offset..used]).unwrap();
+            saw_credit |= matches!(frame, Frame::MaxData(_) | Frame::MaxStreamData { .. });
+            offset += frame_len;
+        }
+        assert!(saw_credit);
+    }
+
+    #[test]
+    fn unacknowledged_credit_retries_on_pto_not_delayed_ack_cadence() {
+        let limits = ConnectionLimits::with_receive_window(64);
+        let mut endpoint = EndpointState::<2, 4, 256>::new(Role::Server, limits, 256);
+        endpoint
+            .install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap())
+            .unwrap();
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.highest_received_packet = Some(0);
+        endpoint.largest_received_at = 10;
+        endpoint.set_time(10);
+        endpoint.stream_consumed_deferred(4, 32).unwrap();
+
+        let mut packet = [0u8; 256];
+        // The first MAX_* publication is delayed once with the ordinary ACK.
+        endpoint.set_time(35);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert!(endpoint.credit_packet_number.is_some());
+
+        // An unreachable peer must not cause a new ACK+MAX packet at every
+        // delayed-ACK wake. The next retry is transport-owned PTO (500 ms
+        // before RTT samples), not the 25 ms ACK cadence seen in the capture.
+        assert_eq!(endpoint.next_bearer_deadline(600), Some(535));
+        endpoint.set_time(60);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_none());
+        endpoint.set_time(534);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_none());
+        endpoint.set_time(535);
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert_eq!(endpoint.credit_retry_backoff, 1);
+        assert_eq!(endpoint.next_bearer_deadline(600), Some(1535));
+    }
+
+    #[test]
+    fn newer_consumption_is_not_cleared_by_an_older_credit_ack() {
+        let limits = ConnectionLimits::with_receive_window(64);
+        let mut endpoint = EndpointState::<2, 4, 256>::new(Role::Server, limits, 256);
+        endpoint
+            .install_connection_ids(ConnectionId::new(7).unwrap(), ConnectionId::new(8).unwrap())
+            .unwrap();
+        endpoint.receive.accept(4, 0, 32, false).unwrap();
+        endpoint.received_packets.insert(0);
+        endpoint.highest_received_packet = Some(0);
+        endpoint.set_time(1);
+        endpoint.stream_consumed(4, 32).unwrap();
+        let mut packet = [0u8; 256];
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert!(endpoint.credit_packet_number.is_some());
+
+        // More bytes arrive before the peer's ACK for that earlier MAX_*.
+        // The new absolute credit must survive that late ACK.
+        endpoint.receive.accept(4, 32, 16, false).unwrap();
+        endpoint.stream_consumed_deferred(4, 16).unwrap();
+        assert!(endpoint.credit_packet_number.is_some());
+        assert!(endpoint.credit_pending);
+        let credit_packet = endpoint.credit_packet_number.unwrap();
+        let mut ack = [0u8; 256];
+        let mut used = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: ConnectionId::new(7).unwrap(),
+            packet_number: 1,
+            packet_number_len: 1,
+        }
+        .encode(&mut ack)
+        .unwrap();
+        used += Frame::Ack {
+            largest: credit_packet,
+            delay: 0,
+        }
+        .encode(&mut ack[used..])
+        .unwrap();
+        endpoint.receive_datagram(&ack[..used]).unwrap();
+        assert!(endpoint.credit_pending);
+        assert_eq!(endpoint.credit_packet_number, None);
+        assert_eq!(endpoint.next_bearer_deadline(600), Some(1));
+        assert!(endpoint.poll_transmit(&mut packet).unwrap().is_some());
+        assert!(endpoint.credit_packet_number.is_some());
     }
 
     #[test]

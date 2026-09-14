@@ -158,15 +158,13 @@ impl Default for NanFollowupQueue {
 }
 
 impl NanFollowupQueue {
-    /// A zero-capacity queue would silently discard a valid control response,
-    /// so callers must select a small positive bound explicitly.
+    /// A zero capacity is clamped to one, mirroring `FollowupDedup`, so a
+    /// misconfigured caller retains a single valid control response instead
+    /// of panicking (firmware targets abort on panic). Callers should still
+    /// select a small positive bound explicitly.
     pub fn new(capacity: usize) -> Self {
-        assert!(
-            capacity != 0,
-            "NAN follow-up queue capacity must be nonzero"
-        );
         Self {
-            capacity,
+            capacity: capacity.max(1),
             intents: VecDeque::new(),
         }
     }
@@ -903,6 +901,21 @@ mod tests {
         assert_eq!(taken[0].destination, [2; 6]);
         assert_eq!(taken[1].destination, [3; 6]);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn followup_queue_clamps_a_zero_capacity_instead_of_panicking() {
+        let mut queue = NanFollowupQueue::new(0);
+        let intent = NanFollowupIntent {
+            destination: [1; 6],
+            instance: 1,
+            requestor_instance: 0,
+            payload: vec![1],
+            queued_at_us: 10,
+        };
+        assert_eq!(queue.enqueue(intent.clone()), NanFollowupEnqueue::Queued);
+        assert_eq!(queue.enqueue(intent), NanFollowupEnqueue::Duplicate);
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]

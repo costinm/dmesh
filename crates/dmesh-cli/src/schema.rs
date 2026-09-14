@@ -863,6 +863,33 @@ mod tests {
     }
 
     #[test]
+    fn boot_recovery_is_an_empty_tagged_stream_request() {
+        assert!(encode_direct_command("boot.recovery").is_err());
+        let command = encode_stream_command_with_id("boot.recovery", 46)
+            .expect("stream boot request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged boot request");
+        assert_eq!(
+            record.component,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::services::BOOT_COMPONENT,
+            ))
+        );
+        assert_eq!(
+            record.method,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::services::BOOT_RECOVERY_METHOD,
+            ))
+        );
+        assert_eq!(record.id, Some(46));
+        assert!(record.to.is_none());
+        assert!(record.params.is_none());
+        assert!(record.data.is_none());
+        assert!(record.fields.is_none());
+        assert!(record.result.is_none());
+        assert!(record.error.is_none());
+    }
+
+    #[test]
     fn connection_diagnostics_are_schema_driven_tagged_streams() {
         for (name, method) in [
             ("status", 1),

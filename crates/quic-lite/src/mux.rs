@@ -25,7 +25,7 @@ struct StreamingSink<'a, F> {
 
 impl<F> CopyingStreamEvents for StreamingSink<'_, F>
 where
-    F: FnMut(u64, bool, &[u8]) -> Result<(), ()>,
+    F: FnMut(u64, bool, &[u8]) -> Result<usize, ()>,
 {
     type Error = ();
 
@@ -35,10 +35,13 @@ where
         _offset: u64,
         end: bool,
         bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        (self.handler)(stream, end, bytes)?;
-        self.bytes = self.bytes.saturating_add(bytes.len());
-        Ok(())
+    ) -> Result<usize, Self::Error> {
+        let consumed = (self.handler)(stream, end, bytes)?;
+        if consumed > bytes.len() {
+            return Err(());
+        }
+        self.bytes = self.bytes.saturating_add(consumed);
+        Ok(consumed)
     }
 
     fn stream_finished(&mut self, _stream: u64) {
@@ -53,9 +56,9 @@ impl CopyingStreamEvents for ValidationSink {
         _stream: u64,
         _offset: u64,
         _end: bool,
-        _bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        Ok(())
+        bytes: &[u8],
+    ) -> Result<usize, Self::Error> {
+        Ok(bytes.len())
     }
 }
 
@@ -68,10 +71,10 @@ impl CopyingStreamEvents for RequestCollector {
         _offset: u64,
         _end: bool,
         bytes: &[u8],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<usize, Self::Error> {
         self.stream = stream;
         self.data.extend_from_slice(bytes);
-        Ok(())
+        Ok(bytes.len())
     }
 
     fn stream_finished(&mut self, stream: u64) {
@@ -218,17 +221,21 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             let _ = self.endpoint.receive_datagram(input)?;
             return Ok(None);
         };
-        let lease = Arc::new(input.to_vec());
         let mut staged = self.ordered.clone();
         for frame in &parsed_streams {
-            let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
             let mut sink = ValidationSink;
-            match staged.receive_copying(
+            // The common in-order stream frame is valid only for this
+            // receive turn and does not need an owned packet.  Allocate a
+            // lease only if ordered delivery must retain a range behind a
+            // gap.  This is the same QUIC callback policy on host and ESP;
+            // an embedded receiver must not OOM merely by accepting a
+            // packet that it can consume synchronously.
+            match staged.receive_copying_borrowed(
                 frame.id,
-                lease.clone(),
+                frame.data,
                 frame.offset,
-                start..start + frame.data.len(),
                 frame.fin,
+                || Arc::new(frame.data.to_vec()),
                 &mut sink,
             ) {
                 Ok(()) => {}
@@ -259,6 +266,7 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         // deliver those frames after any accepted packet rather than silently
         // losing a valid stream behind an ACK.
         let _ = packet;
+        let lease = Arc::new(input.to_vec());
         let mut first = None;
         for frame in parsed_streams {
             let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
@@ -283,10 +291,87 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         &mut self,
         input: &[u8],
         streamed_id: u64,
-        mut on_stream: F,
+        on_stream: F,
     ) -> Result<Option<MuxRequest>, Error>
     where
-        F: FnMut(u64, bool, &[u8]) -> Result<(), ()>,
+        F: FnMut(u64, bool, &[u8]) -> Result<usize, ()>,
+    {
+        self.receive_request_with_stream_inner(input, streamed_id, on_stream, false)
+    }
+
+    /// Deliver an ordered stream directly to a consumer which declares that
+    /// each returned byte is durably consumed. QUIC-lite may immediately turn
+    /// that consumption into receive credit. Use
+    /// `receive_request_with_stream` when storage admission is deferred.
+    pub fn receive_request_with_consuming_stream<F>(
+        &mut self,
+        input: &[u8],
+        streamed_id: u64,
+        on_stream: F,
+    ) -> Result<Option<MuxRequest>, Error>
+    where
+        F: FnMut(u64, bool, &[u8]) -> Result<usize, ()>,
+    {
+        self.receive_request_with_stream_inner(input, streamed_id, on_stream, true)
+    }
+
+    /// Explicit spelling of the deferred-consumption entry point. A handler
+    /// has consumed the supplied prefix, but retains responsibility for
+    /// granting storage credit later. This is useful for a queued file sink
+    /// or deliberately slow probe consumer.
+    pub fn receive_request_with_deferred_stream<F>(
+        &mut self,
+        input: &[u8],
+        streamed_id: u64,
+        on_stream: F,
+    ) -> Result<Option<MuxRequest>, Error>
+    where
+        F: FnMut(u64, bool, &[u8]) -> Result<usize, ()>,
+    {
+        self.receive_request_with_stream_inner(input, streamed_id, on_stream, false)
+    }
+
+    /// Resume a selected application's ordered stream after it has made
+    /// storage progress.  QUIC-lite retains any unread suffix and accounts
+    /// the consumed prefix; callers only supply application byte handling.
+    pub fn resume_consuming_request_stream<F>(
+        &mut self,
+        streamed_id: u64,
+        mut on_stream: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(u64, bool, &[u8]) -> Result<usize, ()>,
+    {
+        let mut sink = StreamingSink {
+            handler: &mut on_stream,
+            bytes: 0,
+            finished: false,
+        };
+        self.ordered
+            .resume_copying(streamed_id, &mut sink)
+            .map_err(|_| Error::Invalid)?;
+        if sink.bytes != 0 {
+            self.endpoint
+                .stream_consumed_deferred(streamed_id, sink.bytes)?;
+        }
+        if sink.finished && !self.completed.contains(&streamed_id) {
+            if self.completed.len() >= self.max_pending_streams {
+                self.completed.remove(0);
+            }
+            self.completed.push(streamed_id);
+        }
+        Ok(sink.bytes)
+    }
+
+    fn receive_request_with_stream_inner<F>(
+        &mut self,
+        input: &[u8],
+        streamed_id: u64,
+        mut on_stream: F,
+        consume_callback_bytes: bool,
+    ) -> Result<Option<MuxRequest>, Error>
+    where
+        F: FnMut(u64, bool, &[u8]) -> Result<usize, ()>,
     {
         if !self.ready.is_empty() {
             return Ok(Some(self.ready.remove(0)));
@@ -308,17 +393,18 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
             let _ = self.endpoint.receive_datagram(input)?;
             return Ok(None);
         }
-        let lease = Arc::new(input.to_vec());
         let mut staged = self.ordered.clone();
         for frame in &parsed_streams {
-            let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
             let mut sink = ValidationSink;
-            match staged.receive_copying(
+            // The selected upload stream can be synchronously consumed from
+            // this bearer packet.  Allocate a retained lease only if an
+            // out-of-order range actually needs it.
+            match staged.receive_copying_borrowed(
                 frame.id,
-                lease.clone(),
+                frame.data,
                 frame.offset,
-                start..start + frame.data.len(),
                 frame.fin,
+                || Arc::new(frame.data.to_vec()),
                 &mut sink,
             ) {
                 Ok(()) => {}
@@ -336,8 +422,6 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         let _ = self.endpoint.receive_datagram(input)?;
         let mut first = None;
         for frame in parsed_streams {
-            let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
-            let range = start..start + frame.data.len();
             if frame.id == streamed_id {
                 if self.completed.contains(&frame.id) {
                     continue;
@@ -348,19 +432,27 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                     finished: false,
                 };
                 self.ordered
-                    .receive_copying(
+                    .receive_copying_borrowed(
                         frame.id,
-                        lease.clone(),
+                        frame.data,
                         frame.offset,
-                        range,
                         frame.fin,
+                        || Arc::new(frame.data.to_vec()),
                         &mut sink,
                     )
                     .map_err(|_| Error::Invalid)?;
-                if sink.bytes != 0 {
+                if sink.bytes != 0 && consume_callback_bytes {
+                    self.endpoint
+                        .stream_consumed_deferred(frame.id, sink.bytes)?;
+                } else if sink.bytes != 0 {
+                    // The application has consumed the ordered prefix, but
+                    // its storage policy has deliberately withheld new
+                    // receive capacity.  Remember the cursor so a later
+                    // `grant_receive_window` can publish exactly this
+                    // progress without replaying application bytes.
                     self.endpoint
                         .stream_consumed_without_credit(frame.id, sink.bytes)?;
-                } else {
+                } else if sink.bytes == 0 {
                     // This packet number is new even when its ordered stream
                     // range is a retransmission or remains behind a gap.
                     // Re-ACK it through the same endpoint operation used by
@@ -368,6 +460,10 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                     // the range out of a bounded ACK summary indefinitely.
                     self.endpoint.request_stream_reack();
                 }
+                // The deferred entry point leaves `sink.bytes` for its
+                // dispatcher to report through `EndpointState::stream_consumed*`.
+                // The compatibility entry point retains the historical
+                // callback-consumed behavior above.
                 if sink.finished {
                     if self.completed.len() >= self.max_pending_streams {
                         self.completed.remove(0);
@@ -376,7 +472,13 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
                 }
                 continue;
             }
-            if let Some(request) = self.deliver_stream_frame(frame, lease.clone(), range)? {
+            let start = frame.data.as_ptr() as usize - input.as_ptr() as usize;
+            let range = start..start + frame.data.len();
+            // Non-streamed command frames retain the established request
+            // collector contract.  Object-stream packets use the borrowed
+            // branch above and avoid this allocation entirely.
+            let lease = Arc::new(input.to_vec());
+            if let Some(request) = self.deliver_stream_frame(frame, lease, range)? {
                 if first.is_none() {
                     first = Some(request);
                 } else {
@@ -596,7 +698,7 @@ mod tests {
             .unwrap();
         assert!(
             server
-                .receive_request_with_stream(&packet[..tail], 8, |_, _, _| Ok(()))
+                .receive_request_with_stream(&packet[..tail], 8, |_, _, bytes| Ok(bytes.len()))
                 .unwrap()
                 .is_none()
         );
@@ -609,7 +711,7 @@ mod tests {
             .unwrap();
         assert!(
             server
-                .receive_request_with_stream(&packet[..beyond], 8, |_, _, _| Ok(()))
+                .receive_request_with_stream(&packet[..beyond], 8, |_, _, bytes| Ok(bytes.len()))
                 .unwrap()
                 .is_none()
         );
@@ -625,12 +727,62 @@ mod tests {
         server
             .receive_request_with_stream(&packet[..head], 8, |_, _, bytes| {
                 delivered.extend_from_slice(bytes);
-                Ok(())
+                Ok(bytes.len())
             })
             .unwrap();
         assert_eq!(server.ordered.retained_bytes(), 0);
         assert_eq!(delivered, b"headtail");
         assert_eq!(server.endpoint.expected_packet_number(), 3);
+    }
+
+    #[test]
+    fn consuming_stream_handler_drains_an_out_of_order_tail_and_credits_it_once() {
+        let limits = ConnectionLimits {
+            max_data: 32,
+            max_stream_data: 32,
+            ..ConnectionLimits::default()
+        };
+        let mut client = StreamMux::<4, 4>::new(Role::Client, limits, 1200, 8, 4, 32);
+        let mut server = StreamMux::<4, 4>::new(Role::Server, limits, 1200, 8, 4, 32);
+        let client_cid = ConnectionId::new(0x91).unwrap();
+        let server_cid = ConnectionId::new(0x92).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
+        client.endpoint.set_initial_peer_credit(32, 32).unwrap();
+        client.endpoint.open_send_stream(8, 32).unwrap();
+
+        let mut packet = [0u8; 128];
+        let (tail, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 4, false, b"tail", &mut packet)
+            .unwrap();
+        let mut received = Vec::new();
+        server
+            .receive_request_with_consuming_stream(&packet[..tail], 8, |_, _, bytes| {
+                received.extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
+            .unwrap();
+        assert!(received.is_empty());
+        assert_eq!(server.endpoint.receive_credit_state(8), Some((0, 0, 32)));
+
+        let (head, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, b"head", &mut packet)
+            .unwrap();
+        server
+            .receive_request_with_consuming_stream(&packet[..head], 8, |_, _, bytes| {
+                received.extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
+            .unwrap();
+        assert_eq!(received, b"headtail");
+        assert_eq!(server.ordered.retained_bytes(), 0);
+        assert_eq!(server.endpoint.receive_credit_state(8), Some((8, 8, 40)));
     }
 
     #[test]
@@ -757,7 +909,7 @@ mod tests {
         server
             .receive_request_with_stream(&packet[..first_len], 8, |_, _, bytes| {
                 delivered.extend_from_slice(bytes);
-                Ok(())
+                Ok(bytes.len())
             })
             .unwrap();
         assert_eq!(delivered, b"range");
@@ -771,7 +923,7 @@ mod tests {
         server
             .receive_request_with_stream(&packet[..retry_len], 8, |_, _, bytes| {
                 duplicate_bytes += bytes.len();
-                Ok(())
+                Ok(bytes.len())
             })
             .unwrap();
         assert_eq!(duplicate_bytes, 0);
@@ -886,7 +1038,7 @@ mod tests {
                 FIRST_CLIENT_BIDI_STREAM_ID + 4,
                 |id, fin, bytes| {
                     chunks.push((id, fin, bytes.to_vec()));
-                    Ok(())
+                    Ok(bytes.len())
                 },
             )
             .unwrap()
@@ -934,7 +1086,7 @@ mod tests {
         server
             .receive_request_with_stream(&packet[..used], 8, |_, _, bytes| {
                 delivered += bytes.len();
-                Ok(())
+                Ok(bytes.len())
             })
             .unwrap();
         assert_eq!(delivered, 16);
@@ -973,6 +1125,41 @@ mod tests {
                 .encode_stream_packet(server_cid, 8, 16, false, b"x", &mut packet)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn streamed_sink_resumes_a_partial_prefix_and_publishes_only_consumed_credit() {
+        let limits = ConnectionLimits {
+            max_data: 16,
+            max_stream_data: 16,
+            ..ConnectionLimits::default()
+        };
+        let mut client = StreamMux::<8, 8>::new(Role::Client, limits, 1200, 8, 8, 1024);
+        let mut server = StreamMux::<8, 8>::new(Role::Server, limits, 1200, 8, 8, 1024);
+        let client_cid = ConnectionId::new(131).unwrap();
+        let server_cid = ConnectionId::new(132).unwrap();
+        client.install_connection_ids(client_cid, server_cid).unwrap();
+        server.install_connection_ids(server_cid, client_cid).unwrap();
+        client.endpoint.set_initial_peer_credit(16, 16).unwrap();
+        client.endpoint.open_send_stream(8, 16).unwrap();
+        let mut packet = [0u8; 256];
+        let (used, _) = client.endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, b"abcdefgh", &mut packet)
+            .unwrap();
+        let mut received = Vec::new();
+        server.receive_request_with_consuming_stream(&packet[..used], 8, |_, _, bytes| {
+            received.extend_from_slice(&bytes[..4]);
+            Ok(4)
+        }).unwrap();
+        assert_eq!(received, b"abcd");
+        assert_eq!(server.endpoint.receive_credit_state(8), Some((4, 4, 20)));
+
+        server.resume_consuming_request_stream(8, |_, _, bytes| {
+            received.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }).unwrap();
+        assert_eq!(received, b"abcdefgh");
+        assert_eq!(server.endpoint.receive_credit_state(8), Some((8, 8, 24)));
     }
 
     #[test]

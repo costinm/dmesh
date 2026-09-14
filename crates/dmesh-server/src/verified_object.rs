@@ -26,7 +26,11 @@ pub const REQUEST_MAX: usize = 1024;
 /// The image digest remains full SHA-256. Per-block proofs use a 128-bit
 /// prefix so the bounded firmware manifest scales with image size without a
 /// CBOR item wrapper per block.
-pub const BLOCK_DIGEST_BYTES: usize = 16;
+/// A block proof is a prefix of SHA-256.  The full image digest remains
+/// SHA-256 and the signed manifest binds this table; eight bytes keeps a
+/// 4-MiB/4-KiB image manifest below 9 KiB without allocating one CBOR object
+/// per block.
+pub const BLOCK_DIGEST_BYTES: usize = 8;
 /// The sole currently supported immutable-object wire format.
 pub const VERIFIED_OBJECT_VERSION: u8 = 1;
 pub const OBJECT_COMPONENT: u64 = 10;
@@ -34,12 +38,41 @@ pub const OBJECT_GET_METHOD: u64 = 1;
 pub const OBJECT_FLASH_METHOD: u64 = 2;
 pub const FLASH_BUSY_ERROR: &[u8] = b"flash already in progress";
 
-/// Select a bounded number of application storage slots from current memory.
+/// Immutable application storage policy for a streaming object consumer.
 ///
-/// This is application capacity, not QUIC packet credit. Firmware supplies its
-/// current heap observation and host tests can inject the same values. The
-/// caller must still allocate the selected slots fallibly and advertise only
-/// the capacity actually obtained.
+/// This is application capacity, not QUIC packet credit. Firmware supplies a
+/// current heap observation; host tests inject the same observation and policy
+/// before they create a sink. The caller still allocates selected slots
+/// fallibly and advertises only the capacity actually obtained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageSlotPolicy {
+    pub reserve_bytes: usize,
+    pub bytes_per_slot: usize,
+    pub minimum_slots: usize,
+    pub maximum_slots: usize,
+}
+
+impl StorageSlotPolicy {
+    /// Select bounded application storage from an observed free-memory value.
+    pub const fn slots_for(self, available_bytes: usize) -> usize {
+        if self.bytes_per_slot == 0
+            || self.minimum_slots == 0
+            || self.maximum_slots < self.minimum_slots
+        {
+            return 0;
+        }
+        let slots = available_bytes.saturating_sub(self.reserve_bytes) / self.bytes_per_slot;
+        if slots < self.minimum_slots {
+            0
+        } else if slots > self.maximum_slots {
+            self.maximum_slots
+        } else {
+            slots
+        }
+    }
+}
+
+/// Compatibility helper for call sites that receive policy fields separately.
 pub const fn bounded_storage_slots(
     available_bytes: usize,
     reserve_bytes: usize,
@@ -47,17 +80,13 @@ pub const fn bounded_storage_slots(
     minimum_slots: usize,
     maximum_slots: usize,
 ) -> usize {
-    if bytes_per_slot == 0 || minimum_slots == 0 || maximum_slots < minimum_slots {
-        return 0;
+    StorageSlotPolicy {
+        reserve_bytes,
+        bytes_per_slot,
+        minimum_slots,
+        maximum_slots,
     }
-    let slots = available_bytes.saturating_sub(reserve_bytes) / bytes_per_slot;
-    if slots < minimum_slots {
-        0
-    } else if slots > maximum_slots {
-        maximum_slots
-    } else {
-        slots
-    }
+    .slots_for(available_bytes)
 }
 
 /// One association-scoped owner for a verified immutable-object sink.
@@ -100,6 +129,43 @@ impl<T> ExclusiveTransfer<T> {
     ) -> Result<(), ExclusiveTransferStartError<E>> {
         if self.active.is_some() {
             return Err(ExclusiveTransferStartError::Busy);
+        }
+        let value = start().map_err(ExclusiveTransferStartError::Start)?;
+        self.active = Some(ExclusiveTransferEntry {
+            owner,
+            request_id,
+            expires_at: now.saturating_add(idle_timeout),
+            value,
+        });
+        Ok(())
+    }
+
+    /// Start an operation, replacing an existing one only when the
+    /// application explicitly declares that existing value pristine/stale.
+    ///
+    /// This is deliberately association- rather than bearer-scoped. A fresh
+    /// client CID may take over an operation which has not consumed any
+    /// application bytes after its predecessor disappeared, while a duplicate
+    /// request on the same association and every operation with admitted data
+    /// remains exclusive. The predicate is application-owned: transport ACKs,
+    /// packet counters, and bearer identity never participate.
+    pub fn try_start_or_replace_if<E>(
+        &mut self,
+        owner: quic_lite::ConnectionId,
+        request_id: u64,
+        now: u64,
+        idle_timeout: u64,
+        replace: impl FnOnce(&T) -> bool,
+        start: impl FnOnce() -> Result<T, E>,
+    ) -> Result<(), ExclusiveTransferStartError<E>> {
+        if let Some(active) = self.active.as_ref() {
+            if active.owner == owner || !replace(&active.value) {
+                return Err(ExclusiveTransferStartError::Busy);
+            }
+            // The application says no bytes reached this receiver, so it has
+            // no durable state to preserve. Release scarce storage before the
+            // replacement constructor runs.
+            let _ = self.active.take();
         }
         let value = start().map_err(ExclusiveTransferStartError::Start)?;
         self.active = Some(ExclusiveTransferEntry {
@@ -426,7 +492,26 @@ pub struct RecordBuffer {
 /// blocks and the manifest is the only variable-size record.
 pub trait RecordEvents {
     type Error;
+    /// Bytes copied into handler-owned storage. This is deliberately distinct
+    /// from record completion: a manifest can be consumed into its bounded
+    /// parser buffer incrementally while QUIC retains only its small sliding
+    /// receive window.
+    fn consumed(&mut self, _kind: u8, _bytes: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn record(&mut self, kind: u8, payload: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Ordered bytes supplied by a transport-owned stream reader.
+///
+/// Object verification deliberately depends on this small read boundary rather
+/// than a transport's packet/chunk representation.  A QUIC adapter retains
+/// out-of-order packets and returns flow credit only for bytes read here; the
+/// object handler sees neither packet ownership nor a receive window.
+pub trait OrderedStreamRead {
+    /// Copy the next ordered prefix into `out`, returning zero only when no
+    /// committed bytes are currently available.
+    fn read(&mut self, out: &mut [u8]) -> usize;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -458,11 +543,16 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
         }
     }
 
+    pub const fn at_record_boundary(&self) -> bool {
+        self.header_len == 0
+    }
+
     pub fn push<E: RecordEvents>(
         &mut self,
         mut input: &[u8],
         events: &mut E,
-    ) -> Result<(), FixedRecordError<E::Error>> {
+    ) -> Result<usize, FixedRecordError<E::Error>> {
+        let mut consumed = 0usize;
         while !input.is_empty() {
             if self.header_len < self.header.len() {
                 let copied = (self.header.len() - self.header_len).min(input.len());
@@ -470,6 +560,7 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
                     .copy_from_slice(&input[..copied]);
                 self.header_len += copied;
                 input = &input[copied..];
+                consumed = consumed.saturating_add(copied);
                 if self.header_len < self.header.len() {
                     continue;
                 }
@@ -485,6 +576,9 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
                 if self.expected > max {
                     return Err(FixedRecordError::Invalid);
                 }
+                events
+                    .consumed(self.kind, self.header.len())
+                    .map_err(FixedRecordError::Callback)?;
                 if self.expected == 0 {
                     if self.kind != RECORD_DONE {
                         return Err(FixedRecordError::Invalid);
@@ -493,6 +587,12 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
                         .record(self.kind, &[])
                         .map_err(FixedRecordError::Callback)?;
                     self.header_len = 0;
+                    // A receiver may need to start durable work after a
+                    // complete record (notably manifest-triggered erase)
+                    // before admitting the following record.  Stop exactly
+                    // at this record boundary; the caller retains any tail
+                    // and QUIC returns credit only for `consumed` bytes.
+                    return Ok(consumed);
                 }
                 continue;
             }
@@ -506,6 +606,10 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
             dst.copy_from_slice(&input[..copied]);
             self.used += copied;
             input = &input[copied..];
+            consumed = consumed.saturating_add(copied);
+            events
+                .consumed(self.kind, copied)
+                .map_err(FixedRecordError::Callback)?;
             if self.used == self.expected {
                 let payload = match self.kind {
                     RECORD_MANIFEST => &self.manifest[..self.expected],
@@ -516,32 +620,83 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
                     .record(self.kind, payload)
                     .map_err(FixedRecordError::Callback)?;
                 self.header_len = 0;
+                // See the zero-length DONE branch above.  One record per
+                // callback is a storage boundary, not a transport policy.
+                return Ok(consumed);
             }
         }
-        Ok(())
+        Ok(consumed)
     }
 
-    /// Bytes currently retained for the incomplete record, including its
-    /// partial header. A completed record resets this to zero before the next
-    /// stream fragment is admitted.
-    const fn buffered_record_bytes(&self) -> usize {
-        if self.header_len < self.header.len() {
-            self.header_len
-        } else {
-            self.header.len().saturating_add(self.used)
+    /// Read exactly the next available ordered prefix, stopping after one
+    /// completed record.  The destination is this decoder's bounded header,
+    /// manifest, or blob storage, so callers never retain a QUIC packet or
+    /// need to know how transport chunks were divided.
+    pub fn read_one<R: OrderedStreamRead, E: RecordEvents>(
+        &mut self,
+        reader: &mut R,
+        events: &mut E,
+    ) -> Result<usize, FixedRecordError<E::Error>> {
+        let mut consumed = 0usize;
+        loop {
+            if self.header_len < self.header.len() {
+                let copied = reader.read(&mut self.header[self.header_len..]);
+                if copied == 0 {
+                    return Ok(consumed);
+                }
+                self.header_len += copied;
+                consumed = consumed.saturating_add(copied);
+                if self.header_len < self.header.len() {
+                    continue;
+                }
+                self.kind = self.header[0];
+                self.expected = u32::from_be_bytes(self.header[1..5].try_into().unwrap()) as usize;
+                self.used = 0;
+                let max = match self.kind {
+                    RECORD_MANIFEST => MAX_MANIFEST,
+                    RECORD_BLOB => MAX_BLOB,
+                    RECORD_DONE => 0,
+                    _ => return Err(FixedRecordError::Invalid),
+                };
+                if self.expected > max {
+                    return Err(FixedRecordError::Invalid);
+                }
+                events.consumed(self.kind, self.header.len()).map_err(FixedRecordError::Callback)?;
+                if self.expected == 0 {
+                    if self.kind != RECORD_DONE {
+                        return Err(FixedRecordError::Invalid);
+                    }
+                    events.record(self.kind, &[]).map_err(FixedRecordError::Callback)?;
+                    self.header_len = 0;
+                    return Ok(consumed);
+                }
+            }
+
+            let destination = match self.kind {
+                RECORD_MANIFEST => &mut self.manifest[self.used..self.expected],
+                RECORD_BLOB => &mut self.blob[self.used..self.expected],
+                _ => return Err(FixedRecordError::Invalid),
+            };
+            let copied = reader.read(destination);
+            if copied == 0 {
+                return Ok(consumed);
+            }
+            self.used += copied;
+            consumed = consumed.saturating_add(copied);
+            events.consumed(self.kind, copied).map_err(FixedRecordError::Callback)?;
+            if self.used == self.expected {
+                let payload = match self.kind {
+                    RECORD_MANIFEST => &self.manifest[..self.expected],
+                    RECORD_BLOB => &self.blob[..self.expected],
+                    _ => return Err(FixedRecordError::Invalid),
+                };
+                events.record(self.kind, payload).map_err(FixedRecordError::Callback)?;
+                self.header_len = 0;
+                return Ok(consumed);
+            }
         }
     }
 
-    /// Exact additional bytes needed to finish the current record boundary.
-    /// Before any header arrives this is only the fixed five-byte header; once
-    /// decoded it becomes the validated declared payload length.
-    const fn current_record_remaining_bytes(&self) -> usize {
-        if self.header_len < self.header.len() {
-            self.header.len() - self.header_len
-        } else {
-            self.expected.saturating_sub(self.used)
-        }
-    }
 }
 
 impl RecordBuffer {
@@ -1046,19 +1201,32 @@ pub trait ImageSink {
 /// Incremental storage lifecycle used by a streamed verified-object consumer.
 ///
 /// Flash, disk, RAM, and delayed probe sinks implement this same interface.
-/// QUIC is deliberately absent: the sink reports reusable byte capacity and
-/// the caller publishes that capacity through its ordinary stream API.
-pub trait StreamingImageSink: ImageSink {
-    /// Bytes the sink can currently retain beyond parser-owned record buffers.
-    fn receive_window_bytes(&self) -> usize;
+/// QUIC is deliberately absent: ordered bytes have been copied out of its
+/// receive buffers before this sink is called, so QUIC credits them through
+/// its ordinary stream-consumption API.
+/// Result of an ordinary asynchronous-storage poll.
+///
+/// This is deliberately application state rather than a transport signal. A
+/// [`Pending`] result merely means that a following call to the record reader
+/// must leave its ordered bytes unread; QUIC observes only bytes actually
+/// copied through that reader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoragePoll {
+    Ready,
+    Pending,
+}
 
-    /// Poll asynchronous completion and return newly reusable storage bytes.
-    fn poll_completed(&mut self) -> Result<usize, Self::Error>;
+pub trait StreamingImageSink: ImageSink {
+    /// Poll asynchronous storage completion and report whether the sink can
+    /// accept the next complete record. Storage availability is handler state;
+    /// it must never be converted into a QUIC receive-window value.
+    fn poll_completed(&mut self) -> Result<StoragePoll, Self::Error>;
 
     /// Allow storage work such as an erase to start before a transport poll.
     fn poll_before_transport(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
+
 }
 
 /// Apply one complete signed-object record sequence to an arbitrary sink.
@@ -1103,6 +1271,17 @@ pub struct SignedObjectReceiver<S, V, const MAX_MANIFEST: usize, const MAX_BLOB:
     complete: bool,
 }
 
+/// Result of reading one verified-object record from an ordered stream.
+///
+/// The reader owns transport buffering and reports consumed bytes to its
+/// dispatcher.  This remains object framing only: the same receiver is used
+/// by host file tests, Main, and Recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectStreamRead {
+    pub application_progress: bool,
+    pub consumed_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoxedReceiverError<E> {
     Allocation,
@@ -1112,7 +1291,6 @@ pub enum BoxedReceiverError<E> {
 struct SignedObjectEvents<'a, S, V> {
     image: &'a mut ImageReceiver<S, V>,
     complete: &'a mut bool,
-    control_credit: &'a mut usize,
 }
 
 impl<S, V> RecordEvents for SignedObjectEvents<'_, S, V>
@@ -1132,12 +1310,11 @@ where
             RECORD_DONE => self.image.on_done()?,
             _ => return Err(ImageError::InvalidBlock),
         };
-        if matches!(kind, RECORD_MANIFEST | RECORD_DONE) {
-            *self.control_credit = self
-                .control_credit
-                .saturating_add(payload.len().saturating_add(5));
-        }
         *self.complete = matches!(event, ImageEvent::Complete);
+        Ok(())
+    }
+
+    fn consumed(&mut self, _kind: u8, _bytes: usize) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -1217,6 +1394,13 @@ where
         self.complete
     }
 
+    /// Whether the last incremental push finished a complete object record.
+    /// A stream adapter may retain the following bytes until its sink has
+    /// completed the storage work initiated by that record.
+    pub const fn at_record_boundary(&self) -> bool {
+        self.records.at_record_boundary()
+    }
+
     /// Whether the signed manifest boundary has been fully decoded and
     /// accepted. This is application-state diagnostics, not transport state.
     pub fn sink_mut(&mut self) -> &mut S {
@@ -1225,88 +1409,81 @@ where
 
     /// Feed any ordered response fragment. A fragment may split either the
     /// five-byte record header or a blob body.
-    pub fn push_ordered(&mut self, bytes: &[u8]) -> Result<(), ImageError> {
-        self.push_ordered_with_control_credit(bytes).map(|_| ())
-    }
-
-    /// Feed ordered bytes and return the record-framing bytes which no longer
-    /// occupy application storage. Blob bytes deliberately do not contribute
-    /// here: their credit belongs to the durable image sink. A manifest, by
-    /// contrast, is retained only until its complete record has been
-    /// validated and applied, so withholding its stream credit can deadlock a
-    /// small flash window before the first durable block is available.
-    pub fn push_ordered_with_control_credit(&mut self, bytes: &[u8]) -> Result<usize, ImageError> {
-        let mut control_credit = 0usize;
+    pub fn push_ordered(&mut self, bytes: &[u8]) -> Result<usize, ImageError> {
         let mut events = SignedObjectEvents {
             image: &mut self.image,
             complete: &mut self.complete,
-            control_credit: &mut control_credit,
         };
         self.records
             .push(bytes, &mut events)
             .map_err(|error| match error {
                 FixedRecordError::Invalid => ImageError::InvalidBlock,
                 FixedRecordError::Callback(error) => error,
-            })?;
-        Ok(control_credit)
+            })
     }
 
-    /// Consume already ordered chunks and combine parser-control credit with
-    /// capacity reclaimed by the concrete storage sink. This is the exact
-    /// handler-side operation shared by host tests and ESP flash; it neither
-    /// parses nor emits transport packets.
-    pub fn push_stream_chunks<I, B>(&mut self, chunks: I) -> Result<(bool, usize), ImageError>
+    /// Read at most one complete object record from owned ordered chunks.
+    /// A manifest can schedule asynchronous erase work; stopping at its
+    /// boundary prevents a following blob from reaching a not-yet-ready sink.
+    pub fn consume_one_stream_record<R: OrderedStreamRead>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<ObjectStreamRead, ImageError>
+    where
+        S: StreamingImageSink,
+    {
+        // Complete any asynchronous sink work before deciding whether the
+        // next ordered record is admissible. This is independent of the
+        // stream reader and applies equally to flash, a delayed host file,
+        // or a probe sink: the handler owns storage readiness while QUIC
+        // observes only bytes subsequently copied by `read()`.
+        let storage = self.image
+            .sink_mut()
+            .poll_completed()
+            .map_err(|_| ImageError::Sink)?;
+        // A manifest itself must be admitted so it can start asynchronous
+        // erase work. Every later record waits for the sink-owned readiness
+        // edge, retaining its ordered bytes without releasing QUIC credit.
+        if self.image.manifest.is_some() && storage == StoragePoll::Pending {
+            return Ok(ObjectStreamRead {
+                application_progress: false,
+                consumed_bytes: 0,
+            });
+        }
+        let mut events = SignedObjectEvents { image: &mut self.image, complete: &mut self.complete };
+        let consumed_bytes = self.records.read_one(reader, &mut events).map_err(|error| match error {
+            FixedRecordError::Invalid => ImageError::InvalidBlock,
+            FixedRecordError::Callback(error) => error,
+        })?;
+        Ok(ObjectStreamRead {
+            application_progress: consumed_bytes != 0,
+            consumed_bytes,
+        })
+    }
+
+    /// Consume already ordered chunks. This is the exact handler-side
+    /// operation shared by host tests and ESP flash; it neither parses nor
+    /// emits transport packets or transport-credit values.
+    pub fn push_stream_chunks<I, B>(&mut self, chunks: I) -> Result<bool, ImageError>
     where
         S: StreamingImageSink,
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
         let mut received = false;
-        let mut credit = 0usize;
         for bytes in chunks {
-            credit = credit.saturating_add(self.push_ordered_with_control_credit(bytes.as_ref())?);
-            received = true;
+            let mut bytes = bytes.as_ref();
+            while !bytes.is_empty() {
+                let consumed = self.push_ordered(bytes)?;
+                if consumed == 0 || consumed > bytes.len() {
+                    return Err(ImageError::InvalidBlock);
+                }
+                bytes = &bytes[consumed..];
+                received = true;
+            }
         }
-        let storage_credit = self
-            .image
-            .sink_mut()
-            .poll_completed()
-            .map_err(|_| ImageError::Sink)?;
-        Ok((received, credit.saturating_add(storage_credit)))
-    }
-
-    /// Current ordinary stream window selected by the storage consumer.
-    pub fn stream_receive_window_bytes(&mut self) -> usize
-    where
-        S: StreamingImageSink,
-    {
-        if self.image.manifest().is_none() {
-            // Admit exactly the current manifest boundary. Advertising the
-            // parser's worst-case array plus sink space up front turns unused
-            // manifest allowance into permission to overrun a slow sink.
-            return self.records.current_record_remaining_bytes();
-        }
-        let sink_window = self.image.sink_mut().receive_window_bytes();
-        let buffered = self.records.buffered_record_bytes();
-        if buffered == 0 {
-            return sink_window;
-        }
-        // Once a sink with non-zero capacity starts an atomic object record,
-        // the decoder's already-allocated record buffer must be allowed to
-        // finish it. Otherwise a sink window smaller than one record can stop
-        // forever halfway through that record even though no additional sink
-        // slot is needed until its callback runs.
-        sink_window
-            .saturating_sub(buffered)
-            .max(self.records.current_record_remaining_bytes())
-    }
-
-    /// Parser plus storage capacity required before the first object record.
-    pub fn initial_stream_receive_window_bytes(&mut self) -> usize
-    where
-        S: StreamingImageSink,
-    {
-        self.records.current_record_remaining_bytes()
+        let _ = self.image.sink_mut().poll_completed().map_err(|_| ImageError::Sink)?;
+        Ok(received)
     }
 
     pub fn poll_storage_before_transport(&mut self) -> Result<(), ImageError>
@@ -1371,7 +1548,15 @@ where
     }
 
     pub fn receive_ordered(&mut self, bytes: &[u8]) -> Result<(), ImageError> {
-        self.receiver.push_ordered(bytes)
+        let mut bytes = bytes;
+        while !bytes.is_empty() {
+            let consumed = self.receiver.push_ordered(bytes)?;
+            if consumed == 0 || consumed > bytes.len() {
+                return Err(ImageError::InvalidBlock);
+            }
+            bytes = &bytes[consumed..];
+        }
+        Ok(())
     }
 
     pub fn is_complete(&self) -> bool {
@@ -1708,21 +1893,36 @@ mod tests {
 
     #[test]
     fn storage_slots_follow_injected_memory_without_becoming_transport_credit() {
+        let flash_policy = StorageSlotPolicy {
+            reserve_bytes: 16 * 1024,
+            bytes_per_slot: 4 * 1024,
+            minimum_slots: 1,
+            maximum_slots: 1,
+        };
+        // This is the classic-ESP flash admission boundary: the receiver must
+        // reject before it opens an object stream when it cannot preserve the
+        // worker/runtime reserve and one ordinary 4 KiB image block. Host
+        // tests inject the same heap observation instead of discovering it
+        // only on a board.
+        assert_eq!(flash_policy.slots_for(20 * 1024 - 1), 0);
+        assert_eq!(flash_policy.slots_for(20 * 1024), 1);
+        assert_eq!(flash_policy.slots_for(24 * 1024), 1);
+        assert_eq!(flash_policy.slots_for(64 * 1024), 1);
         assert_eq!(
-            bounded_storage_slots(64 * 1024, 32 * 1024, 8 * 1024, 1, 4),
-            4
+            bounded_storage_slots(64 * 1024, 16 * 1024, 4 * 1024, 1, 1),
+            1
         );
         assert_eq!(
-            bounded_storage_slots(48 * 1024, 32 * 1024, 8 * 1024, 1, 4),
-            2
+            bounded_storage_slots(24 * 1024, 16 * 1024, 4 * 1024, 1, 1),
+            1
         );
         assert_eq!(
-            bounded_storage_slots(39 * 1024, 32 * 1024, 8 * 1024, 1, 4),
+            bounded_storage_slots(20 * 1024 - 1, 16 * 1024, 4 * 1024, 1, 1),
             0
         );
         assert_eq!(
-            bounded_storage_slots(512 * 1024, 32 * 1024, 8 * 1024, 1, 4),
-            4
+            bounded_storage_slots(512 * 1024, 16 * 1024, 4 * 1024, 1, 1),
+            1
         );
         assert_eq!(bounded_storage_slots(64 * 1024, 0, 0, 1, 4), 0);
         assert_eq!(bounded_storage_slots(64 * 1024, 0, 8 * 1024, 0, 4), 0);
@@ -1787,6 +1987,36 @@ mod tests {
         );
         assert_eq!(starts, 1);
         assert_eq!(operation.take_for(first), Some(11));
+    }
+
+    #[test]
+    fn exclusive_transfer_replaces_only_pristine_operation_from_new_owner() {
+        let mut operation = ExclusiveTransfer::new();
+        let first = quic_lite::ConnectionId::new(0x5201).unwrap();
+        let second = quic_lite::ConnectionId::new(0x5202).unwrap();
+        operation
+            .try_start_with(first, 7, 100, 50, || Ok::<_, ()>(0usize))
+            .unwrap();
+
+        assert_eq!(
+            operation.try_start_or_replace_if(second, 8, 101, 50, |value| *value == 0, || {
+                Ok::<_, ()>(1usize)
+            }),
+            Ok(())
+        );
+        assert_eq!(operation.owner(), Some(second));
+        assert_eq!(operation.take_for(second), Some(1));
+
+        operation
+            .try_start_with(first, 9, 102, 50, || Ok::<_, ()>(2usize))
+            .unwrap();
+        assert_eq!(
+            operation.try_start_or_replace_if(second, 10, 103, 50, |_| false, || {
+                Ok::<_, ()>(3usize)
+            }),
+            Err(ExclusiveTransferStartError::Busy)
+        );
+        assert_eq!(operation.owner(), Some(first));
     }
 
     #[test]
@@ -1996,9 +2226,11 @@ mod tests {
         decoder
             .push(&[RECORD_MANIFEST, 0, 0, 0], &mut sink)
             .unwrap();
-        decoder
-            .push(&[3, b'a', b'b', b'c', RECORD_DONE, 0, 0, 0, 0], &mut sink)
-            .unwrap();
+        let tail = [3, b'a', b'b', b'c', RECORD_DONE, 0, 0, 0, 0];
+        let consumed = decoder.push(&tail, &mut sink).unwrap();
+        assert_eq!(consumed, 4);
+        assert!(decoder.at_record_boundary());
+        assert_eq!(decoder.push(&tail[consumed..], &mut sink), Ok(5));
         assert_eq!(
             sink.0,
             vec![
@@ -2038,10 +2270,8 @@ mod tests {
 
     struct DelayedStreamSink {
         bytes: usize,
-        pending_credit: usize,
         polls: usize,
         release_every: usize,
-        window: usize,
         done: bool,
     }
 
@@ -2054,9 +2284,6 @@ mod tests {
 
         fn write_block(&mut self, _: u32, data: &[u8]) -> Result<(), Self::Error> {
             self.bytes = self.bytes.saturating_add(data.len());
-            self.pending_credit = self
-                .pending_credit
-                .saturating_add(data.len().saturating_add(17));
             Ok(())
         }
 
@@ -2069,16 +2296,13 @@ mod tests {
     }
 
     impl StreamingImageSink for DelayedStreamSink {
-        fn receive_window_bytes(&self) -> usize {
-            self.window
-        }
-
-        fn poll_completed(&mut self) -> Result<usize, Self::Error> {
+        fn poll_completed(&mut self) -> Result<StoragePoll, Self::Error> {
             self.polls = self.polls.saturating_add(1);
-            if self.polls % self.release_every != 0 {
-                return Ok(0);
-            }
-            Ok(core::mem::take(&mut self.pending_credit))
+            Ok(if self.polls % self.release_every == 0 {
+                StoragePoll::Ready
+            } else {
+                StoragePoll::Pending
+            })
         }
     }
 
@@ -2091,58 +2315,108 @@ mod tests {
     }
 
     #[test]
-    fn streamed_consumer_uses_injected_storage_window_and_delayed_credit() {
+    fn streamed_consumer_is_transport_credit_independent() {
         type Receiver = SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 256, 64>;
-        let sink_window = 37;
         let mut receiver = Receiver::new(DelayedStreamSink {
             bytes: 0,
-            pending_credit: 0,
             polls: 0,
             release_every: 2,
-            window: sink_window,
             done: false,
         });
-        assert_eq!(receiver.initial_stream_receive_window_bytes(), 5);
 
         let manifest = framed_record(RECORD_MANIFEST, &test_image_manifest(None));
-        let (received, first_header_credit) = receiver
-            .push_stream_chunks([manifest[..3].to_vec()])
-            .unwrap();
+        let received = receiver.push_stream_chunks([manifest[..3].to_vec()]).unwrap();
         assert!(received);
-        assert_eq!(first_header_credit, 0);
-        assert_eq!(receiver.stream_receive_window_bytes(), 2);
-        let (_, manifest_credit) = receiver
-            .push_stream_chunks([manifest[3..].to_vec()])
-            .unwrap();
-        assert_eq!(manifest_credit, manifest.len());
-        assert_eq!(receiver.stream_receive_window_bytes(), sink_window);
+        assert!(receiver.push_stream_chunks([manifest[3..].to_vec()]).unwrap());
 
         let mut block = [0u8; 16];
         block[4..8].copy_from_slice(&0u32.to_be_bytes());
         block[8..12].copy_from_slice(&4u32.to_be_bytes());
         block[12..16].copy_from_slice(b"1234");
         let first = framed_record(RECORD_BLOB, &block);
-        let (_, partial_credit) = receiver.push_stream_chunks([first[..7].to_vec()]).unwrap();
-        assert_eq!(partial_credit, 0);
-        assert_eq!(receiver.stream_receive_window_bytes(), sink_window - 7);
-        let (_, first_credit) = receiver.push_stream_chunks([first[7..].to_vec()]).unwrap();
-        assert_eq!(first_credit, 4 + 17);
+        assert!(receiver.push_stream_chunks([first[..7].to_vec()]).unwrap());
+        assert!(receiver.push_stream_chunks([first[7..].to_vec()]).unwrap());
 
         block[4..8].copy_from_slice(&1u32.to_be_bytes());
         block[12..16].copy_from_slice(b"5678");
         let second = framed_record(RECORD_BLOB, &block);
-        let (_, second_credit) = receiver.push_stream_chunks([second]).unwrap();
-        assert_eq!(second_credit, 0);
-        let (_, released) = receiver
-            .push_stream_chunks(core::iter::empty::<Vec<u8>>())
-            .unwrap();
-        assert_eq!(released, 4 + 17);
+        assert!(receiver.push_stream_chunks([second]).unwrap());
+        assert!(!receiver.push_stream_chunks(core::iter::empty::<Vec<u8>>()).unwrap());
 
         let done = framed_record(RECORD_DONE, &[]);
-        let (_, done_credit) = receiver.push_stream_chunks([done.clone()]).unwrap();
-        assert_eq!(done_credit, done.len());
+        assert!(receiver.push_stream_chunks([done]).unwrap());
         assert!(receiver.is_complete());
         assert!(receiver.sink_mut().done);
+    }
+
+    #[test]
+    fn ordered_reader_polls_async_sink_before_retaining_the_next_record() {
+        struct EmptyReader;
+
+        impl OrderedStreamRead for EmptyReader {
+            fn read(&mut self, _: &mut [u8]) -> usize {
+                0
+            }
+        }
+
+        type Receiver = SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 256, 64>;
+        let mut receiver = Receiver::new(DelayedStreamSink {
+            bytes: 0,
+            polls: 0,
+            release_every: 1,
+            done: false,
+        });
+        let mut reader = EmptyReader;
+
+        let read = receiver.consume_one_stream_record(&mut reader).unwrap();
+        assert_eq!(read.consumed_bytes, 0);
+        assert!(!read.application_progress);
+        // A storage-ready turn can contain no new QUIC bytes. It must still
+        // collect the sink completion that makes retained ordered bytes
+        // eligible on the following turn.
+        assert_eq!(receiver.sink_mut().polls, 1);
+    }
+
+    #[test]
+    fn pending_storage_leaves_the_ordered_reader_unread_until_the_same_next_turn() {
+        struct SliceReader {
+            bytes: Vec<u8>,
+            offset: usize,
+        }
+
+        impl OrderedStreamRead for SliceReader {
+            fn read(&mut self, out: &mut [u8]) -> usize {
+                let count = out.len().min(self.bytes.len().saturating_sub(self.offset));
+                out[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+                self.offset += count;
+                count
+            }
+        }
+
+        type Receiver = SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 256, 64>;
+        let mut receiver = Receiver::new(DelayedStreamSink {
+            bytes: 0,
+            polls: 0,
+            // The first manifest is always admissible so it can start work.
+            // The first following record observes Pending, then Ready.
+            release_every: 3,
+            done: false,
+        });
+        let mut block = [0u8; 16];
+        block[4..8].copy_from_slice(&0u32.to_be_bytes());
+        block[8..12].copy_from_slice(&4u32.to_be_bytes());
+        block[12..16].copy_from_slice(b"1234");
+        let mut bytes = framed_record(RECORD_MANIFEST, &test_image_manifest(None));
+        bytes.extend_from_slice(&framed_record(RECORD_BLOB, &block));
+        let mut reader = SliceReader { bytes, offset: 0 };
+
+        assert!(receiver.consume_one_stream_record(&mut reader).unwrap().application_progress);
+        let offset_after_manifest = reader.offset;
+        let blocked = receiver.consume_one_stream_record(&mut reader).unwrap();
+        assert_eq!(blocked.consumed_bytes, 0);
+        assert_eq!(reader.offset, offset_after_manifest);
+        assert!(receiver.consume_one_stream_record(&mut reader).unwrap().application_progress);
+        assert!(reader.offset > offset_after_manifest);
     }
 
     #[test]

@@ -318,6 +318,35 @@ mod tests {
     }
 
     #[test]
+    fn host_open_can_request_a_smaller_firmware_receive_profile() {
+        let client = ConnectionId::new(0x631).unwrap();
+        let server = ConnectionId::new(0x632).unwrap();
+        let mut open = [0u8; 1200];
+        let open_len = quic_lite::encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
+            client,
+            0,
+            ConnectionLimits::default(),
+            0,
+            Some(quic_lite::ReceiveWindowRequest {
+                max_data: 1200,
+                max_stream_data: 900,
+            }),
+            &mut open,
+        )
+        .unwrap();
+        let (_, ack) = StreamServerConnection::<1>::accept_open_with_limits(
+            &open[..open_len],
+            server,
+            0,
+            ConnectionLimits::with_receive_profile(4800, 1200, 4),
+        )
+        .unwrap();
+        let (_, ack) = decode_bootstrap_open_ack_packet_with_limits(&ack, client).unwrap();
+        assert_eq!(ack.max_data, 1200);
+        assert_eq!(ack.max_stream_data, 900);
+    }
+
+    #[test]
     fn firmware_boxed_open_allocates_only_selected_history() {
         let client = ConnectionId::new(0x621).unwrap();
         let server = ConnectionId::new(0x622).unwrap();

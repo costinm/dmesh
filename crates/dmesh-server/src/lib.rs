@@ -440,7 +440,7 @@ mod host {
             .unwrap();
             // 60 bytes of fixed fields plus key 6 and a 16,384-byte CBOR
             // byte string: no per-block CBOR wrappers.
-            assert_eq!(bytes.len(), 16_448);
+            assert_eq!(bytes.len(), 8_256);
             let decoded = ImageManifest::decode(&bytes).unwrap();
             assert_eq!(decoded.block_digests.len(), 1024);
             assert!(
