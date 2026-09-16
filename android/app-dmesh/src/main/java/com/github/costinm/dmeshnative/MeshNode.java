@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.wifi.WifiManager;
 import android.os.ParcelFileDescriptor;
 
 import java.io.IOException;
@@ -17,6 +18,11 @@ public class MeshNode implements AutoCloseable {
     private long nativeHandle;
     private final String baseDir;
     private MeshCallback callback;
+    // Android filters multicast to save power unless this foreground-service
+    // lifetime lock is held. The Rust 5227 receiver remains the only packet
+    // implementation; this is solely the framework admission gate required
+    // before packets can reach its marked descriptor.
+    private WifiManager.MulticastLock multicastLock;
 
     static {
         Rust.loadLibrary();
@@ -41,18 +47,37 @@ public class MeshNode implements AutoCloseable {
      */
     public void start(Context context, int sshPort, int httpPort) {
         int udpFd = -1;
+        int discoveryFd = -1;
         if (context != null) {
             try {
+                acquireWifiMulticastLock(context);
                 udpFd = openNetworkUdpSocket(context, 3336);
+                // Android-only route-mark handoff: UDP/5227 is still wholly
+                // implemented by Rust (group join, packet parsing, replies,
+                // and cache). Java creates this descriptor only because
+                // Network.bindSocket is the platform API that applies the
+                // selected Wi-Fi network mark. A Rust wildcard socket has no
+                // such mark and, in live testing, did not answer the LAN
+                // multicast probe; the marked socket did. Keep this limited
+                // to descriptor creation rather than duplicating discovery.
+                discoveryFd = openNetworkUdpSocket(context, 5227);
             } catch (IOException error) {
+                if (udpFd >= 0) {
+                    try { ParcelFileDescriptor.adoptFd(udpFd).close(); } catch (IOException ignored) { }
+                }
+                releaseWifiMulticastLock();
                 throw new RuntimeException("Failed to open Android mesh UDP socket", error);
             }
         }
-        nativeHandle = nativeStartMesh(baseDir, sshPort, httpPort, udpFd);
+        nativeHandle = nativeStartMesh(baseDir, sshPort, httpPort, udpFd, discoveryFd);
         if (nativeHandle == 0) {
             if (udpFd >= 0) {
                 try { ParcelFileDescriptor.adoptFd(udpFd).close(); } catch (IOException ignored) { }
             }
+            if (discoveryFd >= 0) {
+                try { ParcelFileDescriptor.adoptFd(discoveryFd).close(); } catch (IOException ignored) { }
+            }
+            releaseWifiMulticastLock();
             throw new RuntimeException("Failed to start MeshNode");
         }
     }
@@ -84,6 +109,21 @@ public class MeshNode implements AutoCloseable {
         }
     }
 
+    private void acquireWifiMulticastLock(Context context) {
+        if (multicastLock != null && multicastLock.isHeld()) return;
+        WifiManager manager = context.getApplicationContext().getSystemService(WifiManager.class);
+        if (manager == null) return;
+        WifiManager.MulticastLock lock = manager.createMulticastLock("dmesh-udp6-discovery");
+        lock.setReferenceCounted(false);
+        lock.acquire();
+        multicastLock = lock;
+    }
+
+    private void releaseWifiMulticastLock() {
+        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
+        multicastLock = null;
+    }
+
     /**
      * Link-local DMesh UDP must use the Wi-Fi network that owns the received
      * address. `getActiveNetwork()` may be cellular even while Wi-Fi Aware or
@@ -111,6 +151,7 @@ public class MeshNode implements AutoCloseable {
             nativeStop(nativeHandle);
             nativeHandle = 0;
         }
+        releaseWifiMulticastLock();
     }
 
     @Override
@@ -291,6 +332,18 @@ public class MeshNode implements AutoCloseable {
         return radioMessageText("radio.nan.parse_followup", "", followup, -1);
     }
 
+    /** Build the targeted STA activation carried by `nan.wakeup` over NAN. */
+    public static byte[] buildNanWakeup(byte[] wakeTarget) {
+        return radioMessage("radio.nan.build_sta_activation",
+                "wake_target=" + hex(wakeTarget), new byte[0], -1);
+    }
+
+    /** @deprecated use {@link #buildNanWakeup(byte[])}. */
+    @Deprecated
+    public static byte[] buildNanStaActivation(byte[] wakeTarget) {
+        return buildNanWakeup(wakeTarget);
+    }
+
     public static boolean injectNanFollowup(byte[] followup, int rssi) {
         byte[] result = radioMessage(
                 "radio.nan.inject_frame",
@@ -368,12 +421,17 @@ public class MeshNode implements AutoCloseable {
         void onMessage(long clientId, String message);
         /** The transport endpoint is gone; release its Android-side gateway state. */
         void onMessageClosed(long clientId);
+        /** Rust accepted a common QUIC discovery.active action; schedule Android NAN work. */
+        void onDiscoveryActive();
+        /** Rust accepted a targeted common NAN wake action. */
+        void onNanWakeup(String target);
 
         void onInboundStream(long clientId, String host, int port, long streamHandle);
         void onForwardedStream(long connId, String host, int port, long streamHandle);
     }
 
-    private static native long nativeStartMesh(String baseDir, int sshPort, int httpPort, int udpFd);
+    private static native long nativeStartMesh(
+            String baseDir, int sshPort, int httpPort, int udpFd, int discoveryFd);
     private static native boolean nativeProvisionDeviceSecret(String baseDir, byte[] secret);
     private native void nativeStop(long handle);
     private native long nativeConnect(long handle, String host, int port, String user, String serverKey);

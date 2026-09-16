@@ -102,6 +102,10 @@ public final class WifiController {
     private WifiAwareSession awareSession;
     private PublishDiscoverySession publishSession;
     private SubscribeDiscoverySession subscribeSession;
+    // Android's public active-Subscribe API does not consistently expose its
+    // Service Specific Info in the raw SDEA received by ESP peers. Keep one
+    // bounded directed message for the temporary discovery instead.
+    private byte[] directedNanMessage;
     private int discoveryResponseMessageId;
     private WifiManager.LocalOnlyHotspotReservation lohsReservation;
     private ConnectivityManager.NetworkCallback staAttachment;
@@ -878,10 +882,18 @@ public final class WifiController {
                 if (DmeshControl.isDiscoveryRequest(info)) {
                     respondToActiveDiscover(peer);
                 }
+                sendDirectedNanMessage(peer);
             }
             @Override public void onMessageReceived(PeerHandle peer, byte[] message) {
                 byte[] payload = message == null ? new byte[0] : message;
                 note("aware.on_message_received bytes=" + payload.length);
+                // An active DMesh discovery request receives the cached
+                // signed announce as a Follow-up. That callback already
+                // carries the framework PeerHandle, even when the peer's
+                // short DW did not produce a separate onServiceDiscovered
+                // callback in this Subscribe session. Use it for a pending
+                // target-checked wake control record as well.
+                sendDirectedNanMessage(peer);
                 WifiEventSink sink = eventSink;
                 if (sink != null) {
                     // WifiAware does not expose per-message RSSI through this
@@ -893,6 +905,29 @@ public final class WifiController {
             @Override public void onSessionConfigFailed() { note("aware.on_subscribe_config_failed"); }
             @Override public void onSessionTerminated() { note("aware.on_subscribe_terminated"); }
         }, handler);
+    }
+
+    /**
+     * Attach one bounded Follow-up payload to the current temporary
+     * discovery. This remains separate from Discover.serviceInfo because
+     * some Wi-Fi Aware implementations omit that value from active-Subscribe
+     * SDEAs visible to raw-NAN peers.
+     */
+    public void setDirectedNanMessage(byte[] payload) {
+        final byte[] copy = payload == null ? null : Arrays.copyOf(payload, payload.length);
+        handler.post(() -> directedNanMessage = copy);
+    }
+
+    private void sendDirectedNanMessage(PeerHandle peer) {
+        byte[] payload = directedNanMessage;
+        SubscribeDiscoverySession subscribe = subscribeSession;
+        if (payload == null || payload.length == 0 || subscribe == null) return;
+        try {
+            subscribe.sendMessage(peer, ++discoveryResponseMessageId, payload);
+            note("aware.directed_message bytes=" + payload.length);
+        } catch (RuntimeException error) {
+            note("aware.directed_message exception=" + describe(error));
+        }
     }
 
     /**

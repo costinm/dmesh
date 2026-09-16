@@ -41,12 +41,21 @@ public final class MessageStreamGateway implements MeshNode.MeshCallback {
         boolean send(byte[] record);
     }
 
+    /** Framework NAN work remains Java-owned; Rust supplies a validated MAC. */
+    public interface NanWakeup {
+        void request(String target);
+    }
+
     private final Context context;
+    private final Runnable activeDiscovery;
+    private final NanWakeup nanWakeup;
     private final Map<String, AppLease> appConnections = new HashMap<>();
     private final Map<Long, NativeEndpoint> nativeEndpoints = new HashMap<>();
 
-    public MessageStreamGateway(Context context) {
+    public MessageStreamGateway(Context context, Runnable activeDiscovery, NanWakeup nanWakeup) {
         this.context = context.getApplicationContext();
+        this.activeDiscovery = activeDiscovery;
+        this.nanWakeup = nanWakeup;
     }
 
     @Override
@@ -76,6 +85,16 @@ public final class MessageStreamGateway implements MeshNode.MeshCallback {
             endpoint = nativeEndpoints.remove(clientId);
         }
         if (endpoint != null) close(endpoint);
+    }
+
+    @Override
+    public void onDiscoveryActive() {
+        if (activeDiscovery != null) activeDiscovery.run();
+    }
+
+    @Override
+    public void onNanWakeup(String target) {
+        if (nanWakeup != null) nanWakeup.request(target);
     }
 
     @Override

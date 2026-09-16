@@ -408,7 +408,17 @@ public class DMService extends MeshService {
             }
             MeshNode node = new MeshNode(baseDir.getAbsolutePath());
             node.start(getApplicationContext(), RUST_SSH_PORT, RUST_HTTP_PORT);
-            messageGateway = new MessageStreamGateway(this);
+            messageGateway = new MessageStreamGateway(this, () -> {
+                if (transport != null) transport.requestActiveNanDiscovery();
+            }, target -> {
+                if (transport != null) {
+                    try {
+                        transport.requestNanActivation(MeshNode.buildNanWakeup(hexBytes(target)));
+                    } catch (IllegalArgumentException error) {
+                        Log.w(TAG, "invalid native targeted NAN activation", error);
+                    }
+                }
+            });
             node.setCallback(messageGateway);
             meshNode = node;
             // Start Aware only after the native event sink exists. Starting
@@ -501,6 +511,40 @@ public class DMService extends MeshService {
             method = "discovery.status";
         }
 
+        // Android is a normal controller for sleepy peers. These operations
+        // are common NAN records; Java only schedules their temporary active
+        // Subscribe through the framework. Keep them before the Rust status
+        // dispatcher because the latter has no direct JNI call back into the
+        // Wi-Fi Aware owner.
+        if ("discovery.active".equals(method)) {
+            if (transport != null) transport.requestActiveNanDiscovery();
+            byte[] accepted = "{\"status\":\"accepted\",\"bearer\":\"nan\",\"operation\":\"discovery.active\"}"
+                    .getBytes(StandardCharsets.UTF_8);
+            if (!message.isOneWay() && reply != null) {
+                DirectBinder.writeReply(reply, accepted, stream.encoding, null);
+            }
+            return true;
+        }
+        if ("nan.wakeup".equals(method) || "transport.set".equals(method)) {
+            String target = stream.fields.get("to");
+            if (target == null || target.isEmpty()) target = stream.fields.get("wake_target");
+            if (target == null || target.isEmpty()) target = stream.fields.get("target");
+            if (target != null && !target.isEmpty() && transport != null) {
+                try {
+                    transport.requestNanActivation(MeshNode.buildNanWakeup(hexBytes(target)));
+                    byte[] accepted = ("{\"status\":\"accepted\",\"bearer\":\"nan\","
+                            + "\"operation\":\"nan.wakeup\",\"to\":\"" + target + "\"}")
+                            .getBytes(StandardCharsets.UTF_8);
+                    if (!message.isOneWay() && reply != null) {
+                        DirectBinder.writeReply(reply, accepted, stream.encoding, null);
+                    }
+                    return true;
+                } catch (IllegalArgumentException error) {
+                    Log.w(TAG, "invalid targeted NAN activation", error);
+                }
+            }
+        }
+
         StringBuilder args = new StringBuilder();
         args.append("caller_uid=").append(uid);
         if (!callingPkg.isEmpty()) args.append(" caller_package=").append(callingPkg);
@@ -532,6 +576,16 @@ public class DMService extends MeshService {
             return true;
         }
         return true;
+    }
+
+    private static byte[] hexBytes(String value) {
+        String normalized = value == null ? "" : value.replace(":", "").replace("-", "");
+        if (normalized.length() != 12) throw new IllegalArgumentException("wake_target must be MAC hex");
+        byte[] out = new byte[6];
+        for (int index = 0; index < out.length; index++) {
+            out[index] = (byte) Integer.parseInt(normalized.substring(index * 2, index * 2 + 2), 16);
+        }
+        return out;
     }
 
     @Override

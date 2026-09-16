@@ -44,6 +44,20 @@ public final class AndroidTransportBridge {
     // Replaced only when the DMesh NAN identity/session is configured again.
     // Wifi Aware may retransmit the Subscribe many times in that session.
     private long nanDiscoveryRequestId;
+    // One active Subscribe is a bounded transaction, not a permanent radio
+    // personality.  Retain the passive/baseline record so discovery or a
+    // targeted sleepy-device activation restores it after the DW interval.
+    private byte[] baselineNanDiscoverRecord;
+    private final Runnable restoreNanDiscovery = new Runnable() {
+        @Override public void run() {
+            wifi.setDirectedNanMessage(null);
+            byte[] baseline = baselineNanDiscoverRecord;
+            if (baseline == null) return;
+            wifi.setDiscover(new Discover(baseline, Collections.singletonList("active")),
+                    ignored -> { });
+            MeshNode.recordNanEvent("aware.active_discovery_restored", "", new byte[0]);
+        }
+    };
     private final Runnable refreshNanPresence = new Runnable() {
         @Override public void run() {
             publishNanPresence();
@@ -118,8 +132,9 @@ public final class AndroidTransportBridge {
             // Subscribe session: Android repeats the SDF, and a sleepy peer
             // must answer once per discovery ping, not once per repeated RF
             // packet.
-            wifi.setDiscover(new Discover(nanDiscoverRecord(), Collections.singletonList("active")),
-                    ignored -> { });
+            baselineNanDiscoverRecord = nanDiscoverRecord();
+            wifi.setDiscover(new Discover(baselineNanDiscoverRecord,
+                    Collections.singletonList("active")), ignored -> { });
         } catch (Exception ignored) {
             // The framework lifecycle retains its event history; do not crash
             // the foreground service merely because a provider is unavailable.
@@ -149,6 +164,54 @@ public final class AndroidTransportBridge {
                 (byte) (id >>> 24), (byte) (id >>> 16), (byte) (id >>> 8), (byte) id,
                 0x05, (byte) 0xa0
         };
+    }
+
+    /**
+     * Emit one bounded active NAN discovery transaction.  The payload is the
+     * common directed `announce.discovery` CBOR record; Android only supplies
+     * the Wi-Fi Aware scheduling API.
+     */
+    public void requestActiveNanDiscovery() {
+        byte[] baseline = baselineNanDiscoverRecord;
+        if (baseline == null) {
+            MeshNode.recordNanEvent("aware.active_discovery_rejected", "", new byte[0]);
+            return;
+        }
+        nanDiscoveryRequestId = (nanDiscoveryRequestId + 1) & 0xffff_ffffL;
+        byte[] request = nanDiscoverRecord();
+        requestTemporaryActiveSubscribe(request, "aware.active_discovery_requested");
+    }
+
+    /**
+     * Carry a pre-validated common direct control record in one temporary
+     * active NAN Subscribe.  The target ESP verifies `wake_target`; Java
+     * neither decodes nor rewrites the control profile.
+     */
+    public void requestNanActivation(byte[] transportSet) {
+        if (transportSet == null || transportSet.length == 0 || baselineNanDiscoverRecord == null) {
+            MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
+            return;
+        }
+        // Do not use control bytes as Subscribe Service Specific Info: some
+        // framework implementations treat it as a discovery filter, so the
+        // target Publish is never surfaced to the Follow-up sender. The
+        // record travels only in the directed message after discovery.
+        requestTemporaryActiveSubscribe(new byte[0], transportSet,
+                "aware.nan_activation_requested");
+    }
+
+    private void requestTemporaryActiveSubscribe(byte[] payload, String event) {
+        requestTemporaryActiveSubscribe(payload, null, event);
+    }
+
+    private void requestTemporaryActiveSubscribe(byte[] payload, byte[] directedMessage, String event) {
+        presenceHandler.removeCallbacks(restoreNanDiscovery);
+        wifi.setDirectedNanMessage(directedMessage);
+        wifi.setDiscover(new Discover(payload, Collections.singletonList("active")), ignored -> { });
+        MeshNode.recordNanEvent(event, "", payload);
+        // Four seconds covers DW8 plus scheduling margin without retaining a
+        // repeated activation Subscribe indefinitely.
+        presenceHandler.postDelayed(restoreNanDiscovery, 4_000L);
     }
     /** Network callbacks use this to publish a changed STA mode/SSID promptly. */
     public void refreshNanPresence() { publishNanPresence(); }
@@ -237,6 +300,11 @@ public final class AndroidTransportBridge {
         for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(value.substring(i * 2, i * 2 + 2), 16);
         return out;
     }
-    public void close() { presenceHandler.removeCallbacks(refreshNanPresence); ble.close(); wifi.close(); }
+    public void close() {
+        presenceHandler.removeCallbacks(refreshNanPresence);
+        presenceHandler.removeCallbacks(restoreNanDiscovery);
+        ble.close();
+        wifi.close();
+    }
     public static void handlePendingIntent(Context context, Intent intent) { Ble.handlePendingIntentScan(context, intent); }
 }
