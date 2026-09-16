@@ -504,6 +504,23 @@ fn encode_schema_fields_with_id(
     let component = entry
         .component
         .context("direct firmware command has no component")?;
+    // The inventory uses the shared correlated *empty* request constructor.
+    // It must carry an id for a normal QUIC stream, unlike the older
+    // connectionless observation form.
+    if component == dmesh_server::announce::ANNOUNCE_COMPONENT as u16
+        && u64::from(entry.id) == dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED
+        && fields.is_empty()
+    {
+        let mut wire = [0u8; 32];
+        let used = dmesh_server::tagged::encode_numeric_empty_request(
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+            dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED,
+            id,
+            &mut wire,
+        )
+        .context("discovery.nodes request")?;
+        return Ok(wire[..used].to_vec());
+    }
     // Raw-radio snapshot/reset use a registered empty *fields map*, not an
     // omitted payload. `mesh::cbor::encode_record` correctly omits an empty
     // generic environment, but that would make the embedded raw handler
@@ -788,6 +805,36 @@ mod tests {
     }
 
     #[test]
+    fn discovery_nodes_uses_the_correlated_empty_stream_request() {
+        let wire = encode_stream_command_with_id("discovery.nodes", 22).unwrap();
+        assert!(dmesh_server::announce::is_devices_observed_request(&wire));
+        let record = dmesh_server::tagged::decode(&wire).unwrap();
+        assert_eq!(record.id, Some(22));
+        assert!(record.fields.is_none());
+    }
+
+    #[test]
+    fn discovery_active_uses_the_common_correlated_action() {
+        let wire = encode_stream_command_with_id("discovery.active", 23).unwrap();
+        let record = dmesh_server::tagged::decode(&wire).unwrap();
+        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(6)));
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(10)));
+        assert_eq!(record.id, Some(23));
+        assert!(record.fields.is_none());
+    }
+
+    #[test]
+    fn nan_wakeup_encodes_the_targeted_controller_action() {
+        let wire = encode_stream_command_with_id("nan.wakeup to=84:0d:8e:07:41:70", 9).unwrap();
+        let record = dmesh_server::tagged::decode(&wire).unwrap();
+        assert_eq!(record.id, Some(9));
+        assert_eq!(
+            dmesh_server::announce::decode_nan_wakeup_request(record),
+            Some([0x84, 0x0d, 0x8e, 0x07, 0x41, 0x70])
+        );
+    }
+
+    #[test]
     fn relay_pair_is_stream_only() {
         assert!(encode_direct_command_with_id("relay.pair forward_allocation=7", 20).is_err());
     }
@@ -860,13 +907,23 @@ mod tests {
         assert_eq!(request.object.target, 3);
         assert_eq!(request.transport, 0);
         assert!(request.dry_run);
+
+        let command = encode_stream_command_with_id("object.flash cpu=13 target=3", 46)
+            .expect("flash request with defaults");
+        let (id, request) = dmesh_server::verified_object::decode_flash_handler_request(&command)
+            .expect("canonical flash request with defaults");
+        assert_eq!(id, 46);
+        assert_eq!(request.object.cpu, 13);
+        assert_eq!(request.object.target, 3);
+        assert_eq!(request.transport, 0);
+        assert!(!request.dry_run);
     }
 
     #[test]
     fn boot_recovery_is_an_empty_tagged_stream_request() {
         assert!(encode_direct_command("boot.recovery").is_err());
-        let command = encode_stream_command_with_id("boot.recovery", 46)
-            .expect("stream boot request");
+        let command =
+            encode_stream_command_with_id("boot.recovery", 46).expect("stream boot request");
         let record = dmesh_server::tagged::decode(&command).expect("tagged boot request");
         assert_eq!(
             record.component,
@@ -887,6 +944,28 @@ mod tests {
         assert!(record.fields.is_none());
         assert!(record.result.is_none());
         assert!(record.error.is_none());
+    }
+
+    #[test]
+    fn firmware_identity_is_a_read_only_tagged_stream_request() {
+        assert!(encode_direct_command("firmware.identity").is_err());
+        let command = encode_stream_command_with_id("firmware.identity", 47)
+            .expect("stream firmware identity request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged identity request");
+        assert_eq!(
+            record.component,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::services::FIRMWARE_COMPONENT,
+            ))
+        );
+        assert_eq!(
+            record.method,
+            Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::services::FIRMWARE_IDENTITY_METHOD,
+            ))
+        );
+        assert_eq!(record.id, Some(47));
+        assert!(record.fields.is_none());
     }
 
     #[test]

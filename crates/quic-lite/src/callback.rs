@@ -179,6 +179,12 @@ impl<P: PacketLease> OrderedStream<P> {
         }) {
             return Ok(());
         }
+        // This is the bounded receive ledger shared by every bearer. Firmware
+        // must turn heap pressure into normal transport backpressure, never a
+        // Rust allocation abort while an application handler is active.
+        self.retained
+            .try_reserve(1)
+            .map_err(|_| CallbackError::Capacity)?;
         self.retained.push(Retained {
             offset,
             packet,
@@ -266,6 +272,9 @@ impl<P: PacketLease> CallbackStreams<P> {
         if self.streams.len() >= self.max_streams {
             return Err(CallbackError::Capacity);
         }
+        self.streams
+            .try_reserve(1)
+            .map_err(|_| CallbackError::Capacity)?;
         self.streams.push(OrderedStream::new(id));
         Ok(self.streams.last_mut().unwrap())
     }
@@ -382,10 +391,7 @@ impl<P: PacketLease> CallbackStreams<P> {
 
         // Only a packet exactly at the application cursor can be borrowed:
         // retained ranges must remain owned until their preceding gap closes.
-        if !state.finished
-            && state.outstanding.is_none()
-            && offset == state.consumed
-        {
+        if !state.finished && state.outstanding.is_none() && offset == state.consumed {
             if let Some(final_size) = state.final_size {
                 if end > final_size || (fin && end != final_size) {
                     return Err(CopyingError::Transport(CallbackError::InvalidFin));
@@ -404,7 +410,8 @@ impl<P: PacketLease> CallbackStreams<P> {
                 // only the unread suffix under QUIC-lite ordering ownership;
                 // never materialize a dispatcher-private fragment queue.
                 let packet = retain();
-                state.insert(packet, offset + consumed as u64, consumed..bytes.len(), fin)
+                state
+                    .insert(packet, offset + consumed as u64, consumed..bytes.len(), fin)
                     .map_err(CopyingError::Transport)?;
                 state.consumed = offset + consumed as u64;
                 let retained = bytes.len().saturating_sub(consumed);
@@ -450,7 +457,11 @@ impl<P: PacketLease> CallbackStreams<P> {
             if state.finished || state.outstanding.is_some() {
                 return Ok(total);
             }
-            let Some(item_index) = state.retained.iter().position(|item| item.offset == state.consumed) else {
+            let Some(item_index) = state
+                .retained
+                .iter()
+                .position(|item| item.offset == state.consumed)
+            else {
                 return Ok(total);
             };
             let item = state.retained[item_index].clone();
@@ -717,7 +728,11 @@ mod tests {
     #[test]
     fn borrowed_partial_prefix_is_retained_and_resumed_without_a_fragment_queue() {
         let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
-        let mut sink = PartialSink { data: Vec::new(), limit: 3, finished: Vec::new() };
+        let mut sink = PartialSink {
+            data: Vec::new(),
+            limit: 3,
+            finished: Vec::new(),
+        };
         streams
             .receive_copying_borrowed(
                 4,
@@ -741,18 +756,25 @@ mod tests {
     #[test]
     fn partial_consumer_resumes_in_order_across_an_out_of_order_tail() {
         let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, 16);
-        let mut sink = PartialSink { data: Vec::new(), limit: 2, finished: Vec::new() };
+        let mut sink = PartialSink {
+            data: Vec::new(),
+            limit: 2,
+            finished: Vec::new(),
+        };
         // The tail arrives first and is retained by the same bounded QUIC
         // ordering state. It must not be exposed before the missing prefix.
         streams
-            .receive_copying_borrowed(
-                4, b"ef", 4, true, || Arc::new(b"ef".to_vec()), &mut sink,
-            )
+            .receive_copying_borrowed(4, b"ef", 4, true, || Arc::new(b"ef".to_vec()), &mut sink)
             .unwrap();
         assert!(sink.data.is_empty());
         streams
             .receive_copying_borrowed(
-                4, b"abcd", 0, false, || Arc::new(b"abcd".to_vec()), &mut sink,
+                4,
+                b"abcd",
+                0,
+                false,
+                || Arc::new(b"abcd".to_vec()),
+                &mut sink,
             )
             .unwrap();
         assert_eq!(sink.data, b"ab");
@@ -797,6 +819,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sink.data, b"headtail");
+    }
+
+    #[test]
+    fn borrowed_repair_replays_many_retained_packets_byte_for_byte() {
+        let source = (0..(48 * 1036))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut streams = CallbackStreams::<Arc<Vec<u8>>>::new(2, source.len());
+        let mut sink = CopySink::default();
+        // Model a lost first datagram followed by one repaired fresh-number
+        // copy. The callback layer must replay the retained tail exactly once
+        // and preserve every byte; object/flash parsing is intentionally not
+        // involved in this transport regression.
+        for (packet, bytes) in source[1036..].chunks(1036).enumerate() {
+            let offset = (packet + 1) as u64 * 1036;
+            streams
+                .receive_copying_borrowed(
+                    8,
+                    bytes,
+                    offset,
+                    offset as usize + bytes.len() == source.len(),
+                    || Arc::new(bytes.to_vec()),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        assert!(sink.data.is_empty());
+        streams
+            .receive_copying_borrowed(
+                8,
+                &source[..1036],
+                0,
+                false,
+                || Arc::new(source[..1036].to_vec()),
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.data, source);
+        assert_eq!(streams.retained_bytes(), 0);
     }
 
     #[test]
@@ -1007,28 +1068,24 @@ mod tests {
             .receive_leased(8, Arc::new(b"two".to_vec()), 0, 0..3, true, &mut sink)
             .unwrap();
         assert_eq!(sink.chunks.len(), 2);
-        assert!(
-            streams
-                .done(
-                    StreamDone {
-                        stream: 8,
-                        delivery_id: sink.chunks[1].3
-                    },
-                    &mut sink
-                )
-                .is_ok()
-        );
+        assert!(streams
+            .done(
+                StreamDone {
+                    stream: 8,
+                    delivery_id: sink.chunks[1].3
+                },
+                &mut sink
+            )
+            .is_ok());
         assert_eq!(sink.finished, vec![8]);
-        assert!(
-            streams
-                .done(
-                    StreamDone {
-                        stream: 4,
-                        delivery_id: 99
-                    },
-                    &mut sink
-                )
-                .is_err()
-        );
+        assert!(streams
+            .done(
+                StreamDone {
+                    stream: 4,
+                    delivery_id: 99
+                },
+                &mut sink
+            )
+            .is_err());
     }
 }

@@ -23,6 +23,8 @@ use mesh::{
     wire::response_ok,
 };
 use serde_json::{Value, json};
+#[cfg(target_os = "android")]
+use sha2::{Digest, Sha256};
 use ssh_mesh::MeshListener;
 use ssh_mesh::sshc::SshClientListener;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -236,6 +238,241 @@ fn update_local_networks(payload: &[u8]) -> anyhow::Result<usize> {
         .replace(snapshot)
         .ok_or_else(|| anyhow::anyhow!("local-networks snapshot has duplicate interface"))?;
     Ok(current.networks.len())
+}
+
+/// Serve the compact, bearer-neutral `discovery.nodes` result used by ESP and
+/// lmesh. Android's JSON inventory remains useful to its UI, but a QUIC peer
+/// must receive this CBOR shape so controller-side discovery can merge
+/// observer provenance without a platform exception.
+#[cfg(target_os = "android")]
+pub(crate) fn android_discovery_nodes_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    if record.to.is_some()
+        || record.id.is_none()
+        || !dmesh_server::announce::is_devices_observed_request(request)
+    {
+        return None;
+    }
+    let id = record.id?;
+    let devices = discovered_devices().lock().ok()?;
+    let mut ids = Vec::<[u8; 16]>::new();
+    let mut device_keys = Vec::<String>::new();
+    for (device_id, _) in devices.iter().take(8) {
+        let Ok(value) = hex_to_bytes(device_id) else {
+            continue;
+        };
+        if value.is_empty() || value.len() > 16 {
+            continue;
+        }
+        let mut stable_id = [0u8; 16];
+        stable_id[..value.len()].copy_from_slice(&value);
+        ids.push(stable_id);
+        device_keys.push(device_id.clone());
+    }
+    let mut metadata = Vec::<dmesh_server::announce::ObservedDevice>::new();
+    for (device_id, stable_id) in device_keys.iter().zip(ids.iter()) {
+        let device = devices.get(device_id)?;
+        let value = hex_to_bytes(device_id).ok()?;
+        let observation = device.observations.values().next();
+        let available_fields = observation
+            .map(|observation| observation.available_fields)
+            .unwrap_or(dmesh_server::discovery::OBSERVATION_PAYLOAD_FINGERPRINT);
+        metadata.push(dmesh_server::announce::ObservedDevice {
+            device_id: &stable_id[..value.len()],
+            // Android's PeerHandle is intentionally opaque. It is not a MAC
+            // and must not be serialized as one; a nonzero semantic id above
+            // is the cross-bearer merge key.
+            peer: [0; 6],
+            bssid: None,
+            channel: None,
+            available_fields,
+            first_seen_ms: observation
+                .map(|value| u32::try_from(value.first_seen_ms).unwrap_or(u32::MAX))
+                .unwrap_or(0),
+            last_seen_ms: observation
+                .map(|value| u32::try_from(value.last_seen_ms).unwrap_or(u32::MAX))
+                .unwrap_or(0),
+            packets: observation.map(|value| value.packets).unwrap_or(0),
+            active_publish_rx: observation
+                .map(|value| value.active_publish_rx)
+                .unwrap_or(0),
+            active_subscribe_rx: observation
+                .map(|value| value.active_subscribe_rx)
+                .unwrap_or(0),
+            followup_rx: observation.map(|value| value.followup_rx).unwrap_or(0),
+            last_kind: observation.map(|value| value.last_kind as u8).unwrap_or(0),
+            last_payload_len: observation.map(|value| value.last_payload_len).unwrap_or(0),
+            last_payload_hash: observation
+                .map(|value| value.last_payload_hash)
+                .unwrap_or(0),
+        });
+    }
+    let mut direct = [0u8; 1024];
+    let direct_len =
+        dmesh_server::announce::encode_devices_observed_response(&metadata, &mut direct)?;
+    let fields = dmesh_server::tagged::decode(&direct[..direct_len])?.fields?;
+    let mut response = [0u8; 1100];
+    let response_len = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::announce::ANNOUNCE_COMPONENT,
+        dmesh_server::announce::ANNOUNCE_DEVICES_OBSERVED,
+        id,
+        fields,
+        &mut response,
+    )?;
+    Some(response[..response_len].to_vec())
+}
+
+/// Schedule Android's framework-owned NAN active-discovery operation from the
+/// common correlated QUIC action. Rust validates/correlates the request; Java
+/// only calls the Wi-Fi Aware API through the already-installed callback.
+#[cfg(target_os = "android")]
+pub(crate) fn android_discovery_active_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    if record.to.is_some()
+        || record.component
+            != Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::announce::ANNOUNCE_COMPONENT,
+            ))
+        || record.method
+            != Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::announce::ANNOUNCE_DISCOVERY_ACTIVE,
+            ))
+        || record.id.is_none()
+        || record.params.is_some()
+    {
+        return None;
+    }
+    let (jvm, callback) = android_message_callback().lock().ok()?.clone()?;
+    let mut env = jvm.attach_current_thread().ok()?;
+    if env
+        .call_method(&callback, "onDiscoveryActive", "()V", &[])
+        .is_err()
+    {
+        return None;
+    }
+    let mut response = [0u8; 32];
+    let used = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::announce::ANNOUNCE_COMPONENT,
+        dmesh_server::announce::ANNOUNCE_DISCOVERY_ACTIVE,
+        record.id?,
+        &[0xa1, 1, 0xf5],
+        &mut response,
+    )?;
+    Some(response[..used].to_vec())
+}
+
+/// Schedule a targeted framework-owned NAN Subscribe from the common
+/// `nan.wakeup` action.  This is deliberately adjacent to discovery.active:
+/// direct UDP/QUIC callers reach the same Android Aware owner as Binder and
+/// HTTP callers, while Rust retains validation and request correlation.
+#[cfg(target_os = "android")]
+pub(crate) fn android_nan_wakeup_response(request: &[u8]) -> Option<Vec<u8>> {
+    let record = dmesh_server::tagged::decode(request)?;
+    let id = record.id?;
+    let target = dmesh_server::announce::decode_nan_wakeup_request(record)?;
+    let target = target
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (jvm, callback) = android_message_callback().lock().ok()?.clone()?;
+    let mut env = jvm.attach_current_thread().ok()?;
+    let target = env.new_string(target).ok()?;
+    if env
+        .call_method(
+            &callback,
+            "onNanWakeup",
+            "(Ljava/lang/String;)V",
+            &[jni::objects::JValue::Object((&*target).into())],
+        )
+        .is_err()
+    {
+        return None;
+    }
+    let mut response = [0u8; 32];
+    let used = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::announce::ANNOUNCE_COMPONENT,
+        dmesh_server::announce::ANNOUNCE_NAN_WAKEUP,
+        id,
+        &[0xa1, 1, 0xf5],
+        &mut response,
+    )?;
+    Some(response[..used].to_vec())
+}
+
+/// Build Android's current bearer-neutral presence record from framework
+/// facts already retained by Rust.  Both UDP directed discovery and the
+/// Java NAN projection use this identity/routing shape: Android must not
+/// advertise a second, UDP-only identity or a synthetic endpoint.
+#[cfg(target_os = "android")]
+pub(crate) fn android_discovery_announce(
+    public_key: &str,
+    uptime_secs: u32,
+) -> dmesh_server::announce::Announce {
+    let digest = Sha256::digest(public_key.as_bytes());
+    let mut device_id = [0u8; 16];
+    device_id.copy_from_slice(&digest[..16]);
+    let mut announce =
+        dmesh_server::announce::Announce::discovery(device_id, device_id.len() as u8, uptime_secs);
+    announce.set_probe_descriptor(
+        dmesh_server::announce::DEVICE_CLASS_ANDROID,
+        dmesh_server::probe::PROBE_CAP_NAN
+            | dmesh_server::probe::PROBE_CAP_STA
+            | dmesh_server::probe::PROBE_CAP_AP
+            | dmesh_server::probe::PROBE_CAP_UDP6,
+    );
+    if let Ok(networks) = local_networks().lock() {
+        let Some(network) = networks.networks.values().find(|network| {
+            network.active
+                && network
+                    .transports
+                    .iter()
+                    .any(|transport| transport == "wifi")
+        }) else {
+            return announce;
+        };
+        if let Some(ssid) = network.ssid.as_deref().filter(|ssid| !ssid.is_empty()) {
+            let _ = announce.set_network_name(ssid);
+        }
+        if let Some(address) = network.addresses.iter().find_map(|address| {
+            address
+                .parse::<Ipv6Addr>()
+                .ok()
+                .filter(Ipv6Addr::is_unicast_link_local)
+        }) {
+            announce.set_sta_link_local_v6(address.octets());
+            announce.set_udp_link_local_v6(address.octets());
+            announce.set_udp_port(dmesh_server::udp::STABLE_WIFI_UDP_PORT);
+        }
+    }
+    announce
+}
+
+/// Return the unsigned, receiver-side NAN facts carried beside Android's
+/// signed discovery record. Wi-Fi Aware does not expose a peer cluster/BSSID
+/// through its public API, so the cluster suffix stays absent; service receipt
+/// and visible-node counts come from the same bounded NAN observation cache
+/// returned by `discovery.nodes`.
+#[cfg(target_os = "android")]
+pub(crate) fn android_discovery_facts() -> dmesh_server::announce::DiscoveryFacts {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let Ok(mut devices) = discovered_devices().lock() else {
+        return dmesh_server::announce::DiscoveryFacts::default();
+    };
+    prune_discovered_devices(&mut devices, now_ms);
+    let mut services = 0u16;
+    let mut nodes = 0u16;
+    for device in devices.values() {
+        if let Some(observation) = device.observations.get("nan") {
+            nodes = nodes.saturating_add(1);
+            services = services
+                .saturating_add(u16::try_from(observation.packets).unwrap_or(u16::MAX));
+        }
+    }
+    dmesh_server::announce::DiscoveryFacts {
+        nan_cluster_suffix: None,
+        nan_service_observations: services,
+        nan_visible_nodes: nodes,
+    }
 }
 
 fn prune_discovered_devices(devices: &mut BTreeMap<String, DiscoveredDevice>, now_ms: i64) {
@@ -938,7 +1175,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                         .and_then(|value| u8::try_from(value).ok())
                         .unwrap_or(dmesh_server::announce::DEVICE_CLASS_UNKNOWN);
                     let kind = match class {
-                        dmesh_server::announce::DEVICE_CLASS_ESP => {
+                        class if dmesh_server::announce::is_esp_device_class(class) => {
                             dmesh_server::probe::ProbeEndpointKind::Esp
                         }
                         dmesh_server::announce::DEVICE_CLASS_HOST => {
@@ -1001,7 +1238,7 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
                 .filter_map(|(_, device)| {
                     let class = device.info.get("device_class")?.as_u64()? as u8;
                     let kind = match class {
-                        dmesh_server::announce::DEVICE_CLASS_ESP => "esp",
+                        class if dmesh_server::announce::is_esp_device_class(class) => "esp",
                         dmesh_server::announce::DEVICE_CLASS_HOST => "host",
                         dmesh_server::announce::DEVICE_CLASS_ANDROID => "android",
                         _ => return None,
@@ -1270,6 +1507,24 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let device_id = hex_to_bytes(required_data(&cmd, "device_id")?)?;
             let target_id = hex_to_bytes(required_data(&cmd, "target_id")?)?;
             radio_protocol::build_nan_followup(msg_type, &device_id, &target_id, payload)?
+        }
+        "radio.nan.build_sta_activation" => {
+            let wake_target = hex_to_bytes(required_data(&cmd, "wake_target")?)?;
+            let wake_target: [u8; 6] = wake_target
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("wake_target must be exactly six bytes"))?;
+            let request = dmesh_server::control::Request::TransportSet {
+                kind: dmesh_server::control::TransportKind::Sta,
+                config: dmesh_server::control::TransportConfig {
+                    wake_target: Some(wake_target),
+                    ..dmesh_server::control::TransportConfig::default()
+                },
+            };
+            let mut out = [0u8; 96];
+            let used = dmesh_server::control::encode_request(request, None, &mut out)
+                .ok_or_else(|| anyhow::anyhow!("encode targeted STA activation"))?;
+            out[..used].to_vec()
         }
         "radio.nan.parse_followup" => radio_protocol::parse_nan_followup(payload)?
             .to_string()
@@ -2001,6 +2256,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
     ssh_port: jint,
     http_port: jint,
     udp_fd: jint,
+    discovery_fd: jint,
 ) -> jlong {
     #[cfg(target_os = "android")]
     init_android_logging();
@@ -2017,6 +2273,7 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStartM
         ssh_port,
         http_port,
         (udp_fd >= 0).then_some(udp_fd),
+        (discovery_fd >= 0).then_some(discovery_fd),
     ) {
         Ok(handle) => Box::into_raw(Box::new(handle)) as jlong,
         Err(e) => {
@@ -2912,6 +3169,27 @@ mod tests {
         assert_eq!(projection["status"], "accepted");
         assert_eq!(projection["operation"], "nan");
         assert_eq!(projection["request"]["params"]["mode"], 6);
+    }
+
+    #[test]
+    fn android_nan_sta_activation_is_a_targeted_common_transport_set() {
+        let wire = radio_message(
+            "radio.nan.build_sta_activation",
+            "wake_target=d8a01d4c5e1c",
+            &[],
+            -1,
+        )
+        .unwrap();
+        assert!(matches!(
+            dmesh_server::control::decode_request(&wire),
+            Some(dmesh_server::control::Request::TransportSet {
+                kind: dmesh_server::control::TransportKind::Sta,
+                config: dmesh_server::control::TransportConfig {
+                    wake_target: Some([0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c]),
+                    ..
+                },
+            })
+        ));
     }
 
     #[test]

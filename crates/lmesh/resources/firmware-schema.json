@@ -35,6 +35,11 @@
       {"id": 4, "name": "channel", "kind": "u8"},
       {"id": 5, "name": "raw_tx_rate", "kind": "u8"},
       {"id": 6, "name": "sta_driver_tx", "kind": "bool"},
+      {"id": 7, "name": "sta_bssid_check_disabled", "kind": "bool"},
+      {"id": 8, "name": "sta_ampdu_enabled", "kind": "bool"},
+      {"id": 9, "name": "sta_11b_rates_disabled", "kind": "bool"},
+      {"id": 10, "name": "sta_raw_rx_enabled", "kind": "bool"},
+      {"id": 13, "name": "espnow_capture", "kind": "bool"},
       {"id": 14, "name": "nan_dw_interval", "kind": "u8"},
       {"id": 15, "name": "now", "kind": "u8"},
       {"id": 16, "name": "ap", "kind": "u8"},
@@ -45,6 +50,10 @@
     ]},
     {"id": 3, "name": "relay.list", "component": 5, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
     {"id": 9, "name": "discovery.nodes", "component": 6, "x-ui-visibility": "default", "x-check-all": {}, "x-check-all-platforms": ["esp32", "host", "android"]},
+    {"id": 10, "name": "discovery.active", "component": 6, "x-ui-visibility": "default", "x-check-all-platforms": ["esp32", "host", "android"]},
+    {"id": 11, "name": "nan.wakeup", "component": 6, "x-ui-visibility": "default", "x-check-all-platforms": ["esp32", "host", "android"], "fields": [
+      {"id": 1, "name": "to", "kind": "mac"}
+    ]},
     {"id": 1, "name": "connection.configure", "component": 3, "x-check-all-platforms": ["esp32", "host", "android"], "fields": [
       {"id": 2, "name": "ack_frequency", "kind": "u8"}, {"id": 3, "name": "ack_delay_ms", "kind": "u8"}, {"id": 4, "name": "tx_burst_packets", "kind": "u8"}, {"id": 11, "name": "path_policy", "kind": "u8"}, {"id": 12, "name": "timeout_ms", "kind": "u32"}
     ]},
@@ -84,6 +93,7 @@
       {"id": 5, "name": "dry_run", "kind": "bool"}
     ]},
     {"id": 1, "name": "boot.recovery", "component": 11},
+    {"id": 1, "name": "firmware.identity", "component": 12},
     {"id": 1, "name": "status", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32", "android"]},
     {"id": 2, "name": "services", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
     {"id": 3, "name": "metrics", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},

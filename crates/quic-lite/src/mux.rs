@@ -350,17 +350,29 @@ impl<const N: usize, const H: usize, const P: usize> StreamMux<N, H, P> {
         self.ordered
             .resume_copying(streamed_id, &mut sink)
             .map_err(|_| Error::Invalid)?;
-        if sink.bytes != 0 {
-            self.endpoint
-                .stream_consumed_deferred(streamed_id, sink.bytes)?;
+        let consumed = sink.bytes;
+        let finished = sink.finished;
+        drop(sink);
+        // A readiness edge can complete asynchronous application work after
+        // the stream's final byte was already delivered. Invoke the same
+        // consumer once with an empty slice so it can observe that completion;
+        // zero bytes are transport-neutral and cannot manufacture credit.
+        if consumed == 0 && !finished {
+            if on_stream(streamed_id, false, &[]).map_err(|_| Error::Invalid)? != 0 {
+                return Err(Error::Invalid);
+            }
         }
-        if sink.finished && !self.completed.contains(&streamed_id) {
+        if consumed != 0 {
+            self.endpoint
+                .stream_consumed_deferred(streamed_id, consumed)?;
+        }
+        if finished && !self.completed.contains(&streamed_id) {
             if self.completed.len() >= self.max_pending_streams {
                 self.completed.remove(0);
             }
             self.completed.push(streamed_id);
         }
-        Ok(sink.bytes)
+        Ok(consumed)
     }
 
     fn receive_request_with_stream_inner<F>(
@@ -1160,6 +1172,77 @@ mod tests {
         }).unwrap();
         assert_eq!(received, b"abcdefgh");
         assert_eq!(server.endpoint.receive_credit_state(8), Some((8, 8, 24)));
+    }
+
+    #[test]
+    fn consuming_stream_credit_unblocks_the_peer_through_the_mux() {
+        // Exercise the same persistent association boundary as the UDP object
+        // sender: a full receive window is consumed by a stream callback,
+        // then the peer receives only the mux's opaque ACK/MAX control packet.
+        // No handler gets to parse or manufacture flow-control frames.
+        let limits = ConnectionLimits {
+            max_data: 16,
+            max_stream_data: 16,
+            ..ConnectionLimits::default()
+        };
+        let mut client = StreamMux::<8, 8>::new(Role::Client, limits, 1200, 8, 8, 1024);
+        let mut server = StreamMux::<8, 8>::new(Role::Server, limits, 1200, 8, 8, 1024);
+        let client_cid = ConnectionId::new(151).unwrap();
+        let server_cid = ConnectionId::new(152).unwrap();
+        client.install_connection_ids(client_cid, server_cid).unwrap();
+        server.install_connection_ids(server_cid, client_cid).unwrap();
+        client.endpoint.set_initial_peer_credit(16, 16).unwrap();
+        client.endpoint.open_send_stream(8, 16).unwrap();
+
+        let mut packet = [0u8; 256];
+        let (used, _) = client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 0, false, b"0123456789abcdef", &mut packet)
+            .unwrap();
+        server
+            .receive_request_with_consuming_stream(&packet[..used], 8, |_, _, bytes| {
+                Ok(bytes.len())
+            })
+            .unwrap();
+
+        server.endpoint.set_time(server.endpoint.max_ack_delay_ms());
+        let control_len = server.endpoint.poll_transmit(&mut packet).unwrap().unwrap();
+        client.receive_request(&packet[..control_len]).unwrap();
+        assert_eq!(client.endpoint.send.stream_credit(8), Some(32));
+        assert!(client
+            .endpoint
+            .encode_stream_packet(server_cid, 8, 16, false, b"next", &mut packet)
+            .is_ok());
+    }
+
+    #[test]
+    fn resumed_idle_consumer_observes_async_completion_without_credit() {
+        let mut mux = StreamMux::<8, 8>::new(
+            Role::Server,
+            ConnectionLimits::default(),
+            1200,
+            8,
+            8,
+            1024,
+        );
+        let local = ConnectionId::new(141).unwrap();
+        let peer = ConnectionId::new(142).unwrap();
+        mux.install_connection_ids(local, peer).unwrap();
+        let before = mux.endpoint.receive_credit_state(8);
+        let mut polls = 0;
+        assert_eq!(
+            mux.resume_consuming_request_stream(8, |stream, fin, bytes| {
+                assert_eq!(stream, 8);
+                assert!(!fin);
+                assert!(bytes.is_empty());
+                polls += 1;
+                Ok(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(polls, 1);
+        assert_eq!(mux.endpoint.receive_credit_state(8), before);
     }
 
     #[test]

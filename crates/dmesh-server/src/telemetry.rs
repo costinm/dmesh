@@ -55,6 +55,20 @@ pub mod nan_metric {
     pub const ACTIVE_PUBLISH_ATTEMPTED: u16 = 11;
     pub const ACTIVE_PUBLISH_SENT: u16 = 12;
     pub const ACTIVE_PUBLISH_DROPPED: u16 = 13;
+    /// Common `discovery.active` requests admitted by the Main owner.
+    pub const ACTIVE_DISCOVERY_QUEUED: u16 = 14;
+    /// Active-discovery Subscribe SDFs accepted by the Wi-Fi action submitter.
+    pub const ACTIVE_DISCOVERY_SENT: u16 = 15;
+    /// Active-discovery Subscribe SDF driver submission failures.
+    pub const ACTIVE_DISCOVERY_DROPPED: u16 = 16;
+    /// Time spent stopping STA/AP/NAN/NOW before the most recent DW8 sleep.
+    pub const DW8_RADIO_STOP_US: u16 = 17;
+    /// Time from timer wake to restored NAN/NOW receive ownership.
+    pub const DW8_RADIO_RESUME_US: u16 = 18;
+    /// Total awake time from a DW8 timer wake to the following sleep entry.
+    pub const DW8_AWAKE_US: u16 = 19;
+    /// Last received NAN SDF relative to the selected cluster beacon.
+    pub const LAST_SDF_AFTER_BEACON_US: u16 = 20;
 }
 
 pub mod udp6_metric {

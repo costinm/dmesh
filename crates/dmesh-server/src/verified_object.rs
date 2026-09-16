@@ -366,15 +366,21 @@ pub struct ObjectStreamChunk {
 /// its congestion/credit window with consecutive blob chunks. `out` is owned
 /// by the bearer adapter, so this core helper neither allocates per packet nor
 /// knows which bearer will transmit the result.
-pub struct ObjectRecordStream {
+#[derive(Clone)]
+pub struct ObjectBodyStream {
     records: Vec<(u8, Vec<u8>)>,
     record_index: usize,
     record_offset: usize,
     stream_offset: u64,
     sent_bytes: usize,
+    /// New wire format: exactly one CBOR manifest followed by raw body bytes.
+    /// The legacy record vector remains temporarily accepted by `new` so
+    /// downstream tests can be migrated independently; production uses this
+    /// flat entry point.
+    flat: Option<Vec<u8>>,
 }
 
-impl ObjectRecordStream {
+impl ObjectBodyStream {
     pub fn new(records: Vec<(u8, Vec<u8>)>) -> Self {
         Self {
             records,
@@ -382,11 +388,30 @@ impl ObjectRecordStream {
             record_offset: 0,
             stream_offset: 0,
             sent_bytes: 0,
+            flat: None,
+        }
+    }
+
+    pub fn from_object(manifest: Vec<u8>, body: Vec<u8>) -> Self {
+        let mut bytes = Vec::with_capacity(manifest.len().saturating_add(body.len()));
+        bytes.extend_from_slice(&manifest);
+        bytes.extend_from_slice(&body);
+        Self {
+            records: Vec::new(),
+            record_index: 0,
+            record_offset: 0,
+            stream_offset: 0,
+            sent_bytes: 0,
+            flat: Some(bytes),
         }
     }
 
     pub fn is_complete(&self) -> bool {
-        self.record_index == self.records.len()
+        self.flat
+            .as_ref()
+            .map_or(self.record_index == self.records.len(), |bytes| {
+                self.sent_bytes == bytes.len()
+            })
     }
 
     pub fn sent_bytes(&self) -> usize {
@@ -406,6 +431,17 @@ impl ObjectRecordStream {
     pub fn copy_next(&self, out: &mut [u8]) -> Option<ObjectStreamChunk> {
         if out.is_empty() || self.is_complete() {
             return None;
+        }
+        if let Some(bytes) = self.flat.as_ref() {
+            let remaining = &bytes[self.sent_bytes..];
+            let len = out.len().min(remaining.len());
+            out[..len].copy_from_slice(&remaining[..len]);
+            return Some(ObjectStreamChunk {
+                offset: self.stream_offset,
+                len,
+                fin: len == remaining.len(),
+                record_index: 0,
+            });
         }
         let (kind, body) = self.records.get(self.record_index)?;
         let record_len = body.len().checked_add(5)?;
@@ -435,6 +471,20 @@ impl ObjectRecordStream {
     /// Commit exactly the preceding [`Self::copy_next`] result after the
     /// transport has accepted it for transmission.
     pub fn advance(&mut self, chunk: ObjectStreamChunk) -> bool {
+        if let Some(bytes) = self.flat.as_ref() {
+            let remaining = bytes.len().saturating_sub(self.sent_bytes);
+            if chunk.offset != self.stream_offset
+                || chunk.record_index != 0
+                || chunk.len == 0
+                || chunk.len > remaining
+                || chunk.fin != (chunk.len == remaining)
+            {
+                return false;
+            }
+            self.stream_offset = self.stream_offset.saturating_add(chunk.len as u64);
+            self.sent_bytes += chunk.len;
+            return true;
+        }
         let Some(expected) = self.copy_next(&mut [0u8; 1]) else {
             return false;
         };
@@ -477,6 +527,9 @@ impl ObjectRecordStream {
     }
 }
 
+#[cfg(test)]
+type ObjectRecordStream = ObjectBodyStream;
+
 /// Byte-record extraction over an already ordered transport stream. The
 /// transport owns packet reassembly and flow control; this only handles the
 /// object stream's five-byte `(kind, length)` record prefix.
@@ -512,6 +565,47 @@ pub trait OrderedStreamRead {
     /// Copy the next ordered prefix into `out`, returning zero only when no
     /// committed bytes are currently available.
     fn read(&mut self, out: &mut [u8]) -> usize;
+
+    /// True once the reader has consumed through the peer's stream FIN.
+    fn is_finished(&self) -> bool {
+        false
+    }
+}
+
+/// An in-memory implementation of [`OrderedStreamRead`] for a currently
+/// borrowed ordered prefix. It is useful to synchronous handlers on both host
+/// and firmware: the transport retains any unread suffix and decides credit.
+pub struct BorrowedOrderedRead<'a> {
+    bytes: &'a [u8],
+    used: usize,
+    fin: bool,
+}
+
+impl<'a> BorrowedOrderedRead<'a> {
+    pub const fn new(bytes: &'a [u8], fin: bool) -> Self {
+        Self {
+            bytes,
+            used: 0,
+            fin,
+        }
+    }
+
+    pub const fn consumed(&self) -> usize {
+        self.used
+    }
+}
+
+impl OrderedStreamRead for BorrowedOrderedRead<'_> {
+    fn read(&mut self, out: &mut [u8]) -> usize {
+        let len = out.len().min(self.bytes.len().saturating_sub(self.used));
+        out[..len].copy_from_slice(&self.bytes[self.used..self.used + len]);
+        self.used += len;
+        len
+    }
+
+    fn is_finished(&self) -> bool {
+        self.fin && self.used == self.bytes.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -661,12 +755,16 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
                 if self.expected > max {
                     return Err(FixedRecordError::Invalid);
                 }
-                events.consumed(self.kind, self.header.len()).map_err(FixedRecordError::Callback)?;
+                events
+                    .consumed(self.kind, self.header.len())
+                    .map_err(FixedRecordError::Callback)?;
                 if self.expected == 0 {
                     if self.kind != RECORD_DONE {
                         return Err(FixedRecordError::Invalid);
                     }
-                    events.record(self.kind, &[]).map_err(FixedRecordError::Callback)?;
+                    events
+                        .record(self.kind, &[])
+                        .map_err(FixedRecordError::Callback)?;
                     self.header_len = 0;
                     return Ok(consumed);
                 }
@@ -683,20 +781,23 @@ impl<const MAX_MANIFEST: usize, const MAX_BLOB: usize> FixedRecordDecoder<MAX_MA
             }
             self.used += copied;
             consumed = consumed.saturating_add(copied);
-            events.consumed(self.kind, copied).map_err(FixedRecordError::Callback)?;
+            events
+                .consumed(self.kind, copied)
+                .map_err(FixedRecordError::Callback)?;
             if self.used == self.expected {
                 let payload = match self.kind {
                     RECORD_MANIFEST => &self.manifest[..self.expected],
                     RECORD_BLOB => &self.blob[..self.expected],
                     _ => return Err(FixedRecordError::Invalid),
                 };
-                events.record(self.kind, payload).map_err(FixedRecordError::Callback)?;
+                events
+                    .record(self.kind, payload)
+                    .map_err(FixedRecordError::Callback)?;
                 self.header_len = 0;
                 return Ok(consumed);
             }
         }
     }
-
 }
 
 impl RecordBuffer {
@@ -829,7 +930,11 @@ pub fn decode_flash_handler_error(input: &[u8]) -> Option<&[u8]> {
 pub fn decode_flash_request(input: &[u8]) -> Option<FlashRequest<'_>> {
     let mut d = Decoder::new(input);
     let (major, count) = d.head()?;
-    if major != 5 || !(4..=6).contains(&count) {
+    // `transport=0` (automatic/default bearer selection) and `dry_run=false`
+    // are operator-facing defaults.  Keep the canonical encoder explicit,
+    // but accept their omission so a normal `object.flash cpu=N target=N`
+    // command has the same meaning on every client and device.
+    if major != 5 || !(2..=6).contains(&count) {
         return None;
     }
     let mut name = None;
@@ -863,8 +968,8 @@ pub fn decode_flash_request(input: &[u8]) -> Option<FlashRequest<'_>> {
             target: target.filter(|target| *target != 0)?,
         },
         address,
-        transport: transport?,
-        dry_run: dry_run?,
+        transport: transport.unwrap_or(0),
+        dry_run: dry_run.unwrap_or(false),
     })
     .filter(|_| d.is_finished())
 }
@@ -1013,6 +1118,10 @@ impl SignatureVerifier for NoSignatureVerifier {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageManifest {
     pub target: u8,
+    /// CPU family selected by the host artifact catalog. This is part of the
+    /// immutable manifest so a receiver can reject a valid-but-wrong-family
+    /// ESP image before it erases its destination partition.
+    pub cpu: u8,
     pub version: u8,
     pub block_size: u32,
     pub block_count: u32,
@@ -1026,12 +1135,23 @@ impl ImageManifest {
     pub const HEADER_LEN: usize = 20;
 
     pub fn decode(input: &[u8]) -> Result<Self, ImageError> {
+        let (manifest, used) = Self::decode_prefix(input)?;
+        if used != input.len() {
+            return Err(ImageError::InvalidManifest);
+        }
+        Ok(manifest)
+    }
+
+    /// Decode the first complete CBOR value and return its exact boundary.
+    /// Bytes after that boundary are the raw immutable-object body.
+    pub fn decode_prefix(input: &[u8]) -> Result<(Self, usize), ImageError> {
         let mut decoder = Decoder::new(input);
         let (major, count) = decoder.head().ok_or(ImageError::Truncated)?;
         if major != 5 {
             return Err(ImageError::InvalidManifest);
         }
         let mut target = None;
+        let mut cpu = None;
         let mut version = None;
         let mut block_size = 0u32;
         let mut block_count = 0u32;
@@ -1062,6 +1182,19 @@ impl ImageManifest {
                     }
                     seen |= 2;
                     version = Some(
+                        decoder
+                            .uint()
+                            .ok_or(ImageError::Truncated)?
+                            .try_into()
+                            .map_err(|_| ImageError::InvalidManifest)?,
+                    );
+                }
+                8 => {
+                    if seen & 256 != 0 {
+                        return Err(ImageError::InvalidManifest);
+                    }
+                    seen |= 256;
+                    cpu = Some(
                         decoder
                             .uint()
                             .ok_or(ImageError::Truncated)?
@@ -1140,9 +1273,7 @@ impl ImageManifest {
                 _ => decoder.skip().ok_or(ImageError::Truncated)?,
             }
         }
-        if !decoder.is_finished() {
-            return Err(ImageError::InvalidManifest);
-        }
+        let used = decoder.position();
         // Field 6 is one flat byte string in the sole current wire format.
         // Retaining just the fixed-width values avoids both CBOR wrapper
         // overhead and a variable number of nested decoder states.
@@ -1160,7 +1291,12 @@ impl ImageManifest {
         let mut block_digests = Vec::new();
         block_digests
             .try_reserve_exact(block_count as usize)
-            .map_err(|_| ImageError::InvalidManifest)?;
+            // A syntactically valid manifest can still be too large for the
+            // receiver's current application heap.  Preserve that distinction
+            // for the caller: `InvalidManifest` means reject the wire object,
+            // while `Allocation` lets a constrained device report ordinary
+            // local resource exhaustion without blaming the sender's bytes.
+            .map_err(|_| ImageError::Allocation)?;
         for bytes in bytes.chunks_exact(BLOCK_DIGEST_BYTES) {
             let mut digest = [0u8; BLOCK_DIGEST_BYTES];
             digest.copy_from_slice(bytes);
@@ -1168,6 +1304,7 @@ impl ImageManifest {
         }
         let manifest = Self {
             target: target.ok_or(ImageError::InvalidManifest)?,
+            cpu: cpu.ok_or(ImageError::InvalidManifest)?,
             version: version.ok_or(ImageError::InvalidManifest)?,
             block_size,
             block_count,
@@ -1186,7 +1323,7 @@ impl ImageManifest {
         {
             return Err(ImageError::InvalidManifest);
         }
-        Ok(manifest)
+        Ok((manifest, used))
     }
 }
 
@@ -1226,7 +1363,6 @@ pub trait StreamingImageSink: ImageSink {
     fn poll_before_transport(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
-
 }
 
 /// Apply one complete signed-object record sequence to an arbitrary sink.
@@ -1266,7 +1402,15 @@ where
 /// bearer, or return transport credit.  The same client therefore works with
 /// an ESP partition sink and the host file sink.
 pub struct SignedObjectReceiver<S, V, const MAX_MANIFEST: usize, const MAX_BLOB: usize> {
-    records: FixedRecordDecoder<MAX_MANIFEST, MAX_BLOB>,
+    // A manifest is immutable-object metadata, not a permanently resident
+    // packet buffer.  Keep only the bytes actually received, with fallible
+    // bounded growth, so a small image does not reserve the worst-case
+    // 4-MiB-image digest table for the lifetime of every flash receiver.
+    manifest_bytes: Vec<u8>,
+    manifest_used: usize,
+    prefetched_body_offset: usize,
+    block: [u8; MAX_BLOB],
+    block_used: usize,
     image: ImageReceiver<S, V>,
     complete: bool,
 }
@@ -1288,43 +1432,16 @@ pub enum BoxedReceiverError<E> {
     Sink(E),
 }
 
-struct SignedObjectEvents<'a, S, V> {
-    image: &'a mut ImageReceiver<S, V>,
-    complete: &'a mut bool,
-}
-
-impl<S, V> RecordEvents for SignedObjectEvents<'_, S, V>
-where
-    S: ImageSink,
-    V: SignatureVerifier,
-{
-    type Error = ImageError;
-
-    fn record(&mut self, kind: u8, payload: &[u8]) -> Result<(), Self::Error> {
-        if *self.complete {
-            return Err(ImageError::InvalidBlock);
-        }
-        let event = match kind {
-            RECORD_MANIFEST => self.image.on_manifest(payload)?,
-            RECORD_BLOB => self.image.on_block(payload)?,
-            RECORD_DONE => self.image.on_done()?,
-            _ => return Err(ImageError::InvalidBlock),
-        };
-        *self.complete = matches!(event, ImageEvent::Complete);
-        Ok(())
-    }
-
-    fn consumed(&mut self, _kind: u8, _bytes: usize) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
 impl<S, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
     SignedObjectReceiver<S, NoSignatureVerifier, MAX_MANIFEST, MAX_BLOB>
 {
     pub const fn new(sink: S) -> Self {
         Self {
-            records: FixedRecordDecoder::new(),
+            manifest_bytes: Vec::new(),
+            manifest_used: 0,
+            prefetched_body_offset: 0,
+            block: [0; MAX_BLOB],
+            block_used: 0,
             image: ImageReceiver::new(sink),
             complete: false,
         }
@@ -1336,10 +1453,11 @@ impl<S, const MAX_MANIFEST: usize, const MAX_BLOB: usize>
     pub fn new_in_place(storage: &mut core::mem::MaybeUninit<Self>, sink: S) -> &mut Self {
         unsafe {
             let receiver = storage.as_mut_ptr();
-            // Every field of `FixedRecordDecoder` has a valid all-zero
-            // representation. Initializing it in place avoids copying the
-            // MAX_MANIFEST + MAX_BLOB scratch arrays through the caller.
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*receiver).records), 0, 1);
+            core::ptr::addr_of_mut!((*receiver).manifest_bytes).write(Vec::new());
+            core::ptr::addr_of_mut!((*receiver).manifest_used).write(0);
+            core::ptr::addr_of_mut!((*receiver).prefetched_body_offset).write(0);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*receiver).block), 0, 1);
+            core::ptr::addr_of_mut!((*receiver).block_used).write(0);
             core::ptr::addr_of_mut!((*receiver).image).write(ImageReceiver::new(sink));
             core::ptr::addr_of_mut!((*receiver).complete).write(false);
             storage.assume_init_mut()
@@ -1384,7 +1502,11 @@ where
 {
     pub fn new_with_verifier(sink: S, verifier: V) -> Self {
         Self {
-            records: FixedRecordDecoder::new(),
+            manifest_bytes: Vec::new(),
+            manifest_used: 0,
+            prefetched_body_offset: 0,
+            block: [0; MAX_BLOB],
+            block_used: 0,
             image: ImageReceiver::new_with_verifier(sink, verifier),
             complete: false,
         }
@@ -1394,11 +1516,29 @@ where
         self.complete
     }
 
+    pub fn received_body_bytes(&self) -> u64 {
+        self.image.bytes
+    }
+
+    pub fn buffered_body_bytes(&self) -> usize {
+        self.block_used
+    }
+
+    pub fn body_is_fully_consumed(&self) -> bool {
+        self.image.manifest.is_some()
+            && self.prefetched_body_offset == self.manifest_used
+            && self.block_used == 0
+            && self
+                .image
+                .manifest()
+                .is_some_and(|manifest| self.image.bytes == manifest.image_size as u64)
+    }
+
     /// Whether the last incremental push finished a complete object record.
     /// A stream adapter may retain the following bytes until its sink has
     /// completed the storage work initiated by that record.
     pub const fn at_record_boundary(&self) -> bool {
-        self.records.at_record_boundary()
+        self.block_used == 0
     }
 
     /// Whether the signed manifest boundary has been fully decoded and
@@ -1410,22 +1550,31 @@ where
     /// Feed any ordered response fragment. A fragment may split either the
     /// five-byte record header or a blob body.
     pub fn push_ordered(&mut self, bytes: &[u8]) -> Result<usize, ImageError> {
-        let mut events = SignedObjectEvents {
-            image: &mut self.image,
-            complete: &mut self.complete,
-        };
-        self.records
-            .push(bytes, &mut events)
-            .map_err(|error| match error {
-                FixedRecordError::Invalid => ImageError::InvalidBlock,
-                FixedRecordError::Callback(error) => error,
-            })
+        let mut reader = BorrowedOrderedRead::new(bytes, false);
+        loop {
+            let before_reader = reader.consumed();
+            let before = self.image.bytes;
+            self.consume_ordered(&mut reader)?;
+            // A synchronous consumer must drain every immediately usable
+            // byte from this ordered callback. Stopping merely because one
+            // image block completed leaves a suffix under QUIC's ordering
+            // ownership after the object parser has already advanced to the
+            // next block. A later resume would then duplicate that boundary.
+            // An asynchronous sink uses `consume_stream_body`, which polls
+            // storage readiness and intentionally stops at its own boundary.
+            if reader.consumed() == bytes.len()
+                || (reader.consumed() == before_reader && self.image.bytes == before)
+            {
+                break;
+            }
+        }
+        Ok(reader.consumed())
     }
 
     /// Read at most one complete object record from owned ordered chunks.
     /// A manifest can schedule asynchronous erase work; stopping at its
     /// boundary prevents a following blob from reaching a not-yet-ready sink.
-    pub fn consume_one_stream_record<R: OrderedStreamRead>(
+    pub fn consume_stream_body<R: OrderedStreamRead>(
         &mut self,
         reader: &mut R,
     ) -> Result<ObjectStreamRead, ImageError>
@@ -1437,28 +1586,153 @@ where
         // stream reader and applies equally to flash, a delayed host file,
         // or a probe sink: the handler owns storage readiness while QUIC
         // observes only bytes subsequently copied by `read()`.
-        let storage = self.image
+        let storage = self
+            .image
             .sink_mut()
             .poll_completed()
             .map_err(|_| ImageError::Sink)?;
-        // A manifest itself must be admitted so it can start asynchronous
-        // erase work. Every later record waits for the sink-owned readiness
-        // edge, retaining its ordered bytes without releasing QUIC credit.
+        // Once admitted, an asynchronous erase/write gates only further
+        // application reads. QUIC sees ordinary consumption and owns credit.
         if self.image.manifest.is_some() && storage == StoragePoll::Pending {
             return Ok(ObjectStreamRead {
                 application_progress: false,
                 consumed_bytes: 0,
             });
         }
-        let mut events = SignedObjectEvents { image: &mut self.image, complete: &mut self.complete };
-        let consumed_bytes = self.records.read_one(reader, &mut events).map_err(|error| match error {
-            FixedRecordError::Invalid => ImageError::InvalidBlock,
-            FixedRecordError::Callback(error) => error,
-        })?;
+        let initial_image_bytes = self.image.bytes;
+        let mut consumed_bytes = 0usize;
+        loop {
+            let copied = self.consume_ordered(reader)?;
+            consumed_bytes = consumed_bytes.saturating_add(copied);
+            if copied == 0 {
+                break;
+            }
+            if self.image.manifest.is_some()
+                && self
+                    .image
+                    .sink_mut()
+                    .poll_completed()
+                    .map_err(|_| ImageError::Sink)?
+                    == StoragePoll::Pending
+            {
+                break;
+            }
+        }
+        if reader.is_finished() && self.body_is_fully_consumed() && !self.complete {
+            self.finish_ordered()?;
+        }
         Ok(ObjectStreamRead {
-            application_progress: consumed_bytes != 0,
+            application_progress: consumed_bytes != 0 || self.image.bytes != initial_image_bytes,
             consumed_bytes,
         })
+    }
+
+    fn consume_ordered<R: OrderedStreamRead>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<usize, ImageError> {
+        let mut consumed = 0usize;
+        if self.image.manifest.is_none() {
+            if self.manifest_used == MAX_MANIFEST {
+                return Err(ImageError::InvalidManifest);
+            }
+            // Grow in bounded chunks and expose only initialized bytes to the
+            // stream reader.  `try_reserve_exact` turns a constrained-device
+            // manifest allocation into an ordinary application error instead
+            // of the global OOM path.
+            // A CBOR manifest normally reaches its digest-table length in
+            // the first read.  Give that first bounded read two MTUs of
+            // backing storage, then only grow when the *allocated capacity*
+            // cannot hold the next parser read.  `try_reserve_exact` takes
+            // an additional length relative to `len`, not relative to the
+            // spare capacity: calling it unconditionally here used to force
+            // a needless realloc for every MTU fragment.  That is harmless
+            // on a host allocator but turns an otherwise adequate fragmented
+            // ESP heap into a spurious object `Allocation` error.
+            let read_capacity = (MAX_MANIFEST - self.manifest_used).min(1024);
+            let wanted = self.manifest_used.saturating_add(read_capacity);
+            if self.manifest_bytes.capacity() < wanted {
+                let initial_capacity = if self.manifest_used == 0 {
+                    wanted.max(2 * 1024).min(MAX_MANIFEST)
+                } else {
+                    wanted
+                };
+                let additional = initial_capacity.saturating_sub(self.manifest_bytes.len());
+                self.manifest_bytes
+                    .try_reserve_exact(additional)
+                    .map_err(|_| ImageError::Allocation)?;
+            }
+            let start = self.manifest_used;
+            unsafe {
+                self.manifest_bytes.set_len(start + read_capacity);
+            }
+            let copied = reader.read(&mut self.manifest_bytes[start..start + read_capacity]);
+            self.manifest_bytes.truncate(start + copied);
+            self.manifest_used += copied;
+            consumed += copied;
+            if copied == 0 {
+                return Ok(consumed);
+            }
+            match ImageManifest::decode_prefix(&self.manifest_bytes[..self.manifest_used]) {
+                Ok((_, used)) => {
+                    self.image.on_manifest(&self.manifest_bytes[..used])?;
+                    self.prefetched_body_offset = used;
+                    // Manifest admission may start asynchronous erase work.
+                    // Retain any already-copied body tail, but do not read or
+                    // submit a body block until the next storage-ready turn.
+                    return Ok(consumed);
+                }
+                Err(ImageError::Truncated) if self.manifest_used < MAX_MANIFEST => {
+                    return Ok(consumed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        loop {
+            let manifest = self.image.manifest().ok_or(ImageError::InvalidManifest)?;
+            let remaining_image = manifest.image_size as usize - self.image.bytes as usize;
+            let next_len = (manifest.block_size as usize).min(remaining_image);
+            if next_len == 0 {
+                break;
+            }
+            if self.block_used < next_len {
+                let prefetched = self
+                    .manifest_used
+                    .saturating_sub(self.prefetched_body_offset)
+                    .min(next_len - self.block_used);
+                if prefetched != 0 {
+                    self.block[self.block_used..self.block_used + prefetched].copy_from_slice(
+                        &self.manifest_bytes
+                            [self.prefetched_body_offset..self.prefetched_body_offset + prefetched],
+                    );
+                    self.prefetched_body_offset += prefetched;
+                    self.block_used += prefetched;
+                }
+                let copied = if self.block_used < next_len {
+                    reader.read(&mut self.block[self.block_used..next_len])
+                } else {
+                    0
+                };
+                self.block_used += copied;
+                consumed += copied;
+                if (copied == 0 && prefetched == 0) || self.block_used < next_len {
+                    break;
+                }
+            }
+            self.image.on_raw_block(&self.block[..next_len])?;
+            self.block_used = 0;
+            break;
+        }
+        Ok(consumed)
+    }
+
+    pub fn finish_ordered(&mut self) -> Result<(), ImageError> {
+        if self.block_used != 0 {
+            return Err(ImageError::InvalidBlock);
+        }
+        self.image.on_done()?;
+        self.complete = true;
+        Ok(())
     }
 
     /// Consume already ordered chunks. This is the exact handler-side
@@ -1482,7 +1756,11 @@ where
                 received = true;
             }
         }
-        let _ = self.image.sink_mut().poll_completed().map_err(|_| ImageError::Sink)?;
+        let _ = self
+            .image
+            .sink_mut()
+            .poll_completed()
+            .map_err(|_| ImageError::Sink)?;
         Ok(received)
     }
 
@@ -1634,6 +1912,9 @@ impl ImageSink for FileImageSink {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageError {
     Truncated,
+    /// The bounded application receiver could not grow its manifest storage.
+    /// This is neither malformed metadata nor a QUIC transport failure.
+    Allocation,
     InvalidManifest,
     InvalidBlock,
     InvalidSignature,
@@ -1719,6 +2000,35 @@ impl<S, V: SignatureVerifier> ImageReceiver<S, V> {
             let mut out = [0u8; 32];
             out.copy_from_slice(&digest);
             Some(out)
+        })
+    }
+
+    /// Accept the next raw body block. Its index, offset, and exact length are
+    /// derived from the signed manifest and current body position; none are
+    /// repeated on the wire.
+    pub fn on_raw_block(&mut self, block: &[u8]) -> Result<ImageEvent, ImageError>
+    where
+        S: ImageSink,
+    {
+        let manifest = self.manifest.as_ref().ok_or(ImageError::InvalidManifest)?;
+        let remaining = manifest.image_size as usize - self.bytes as usize;
+        let expected = (manifest.block_size as usize).min(remaining);
+        if self.complete || block.len() != expected || self.next_block >= manifest.block_count {
+            return Err(ImageError::InvalidBlock);
+        }
+        let digest = Sha256::digest(block);
+        if digest[..BLOCK_DIGEST_BYTES] != manifest.block_digests[self.next_block as usize] {
+            return Err(ImageError::InvalidBlock);
+        }
+        let index = self.next_block;
+        self.sink
+            .write_block(index, block)
+            .map_err(|_| ImageError::Sink)?;
+        self.next_block += 1;
+        self.bytes += block.len() as u64;
+        Ok(ImageEvent::BlockAccepted {
+            index,
+            bytes: block.len(),
         })
     }
 
@@ -1892,6 +2202,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn borrowed_ordered_reader_reports_fin_only_after_consumption() {
+        let mut reader = BorrowedOrderedRead::new(b"final", true);
+        assert!(!reader.is_finished());
+        let mut out = [0u8; 8];
+        assert_eq!(reader.read(&mut out), 5);
+        assert_eq!(&out[..5], b"final");
+        assert_eq!(reader.consumed(), 5);
+        assert!(reader.is_finished());
+    }
+
+    #[test]
     fn storage_slots_follow_injected_memory_without_becoming_transport_credit() {
         let flash_policy = StorageSlotPolicy {
             reserve_bytes: 16 * 1024,
@@ -1999,9 +2320,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            operation.try_start_or_replace_if(second, 8, 101, 50, |value| *value == 0, || {
-                Ok::<_, ()>(1usize)
-            }),
+            operation.try_start_or_replace_if(
+                second,
+                8,
+                101,
+                50,
+                |value| *value == 0,
+                || { Ok::<_, ()>(1usize) }
+            ),
             Ok(())
         );
         assert_eq!(operation.owner(), Some(second));
@@ -2011,9 +2337,14 @@ mod tests {
             .try_start_with(first, 9, 102, 50, || Ok::<_, ()>(2usize))
             .unwrap();
         assert_eq!(
-            operation.try_start_or_replace_if(second, 10, 103, 50, |_| false, || {
-                Ok::<_, ()>(3usize)
-            }),
+            operation.try_start_or_replace_if(
+                second,
+                10,
+                103,
+                50,
+                |_| false,
+                || { Ok::<_, ()>(3usize) }
+            ),
             Err(ExclusiveTransferStartError::Busy)
         );
         assert_eq!(operation.owner(), Some(first));
@@ -2171,7 +2502,7 @@ mod tests {
         let second = Sha256::digest(b"5678");
         let image = Sha256::digest(b"12345678");
         let mut manifest = Vec::new();
-        crate::cbor::encode::map(7, &mut manifest);
+        crate::cbor::encode::map(8, &mut manifest);
         for (key, value) in [(0, 6), (1, VERIFIED_OBJECT_VERSION), (2, 4), (3, 2), (4, 8)] {
             crate::cbor::encode::uint(key, &mut manifest);
             crate::cbor::encode::uint(u64::from(value), &mut manifest);
@@ -2183,6 +2514,8 @@ mod tests {
         block_digests.extend_from_slice(&first[..BLOCK_DIGEST_BYTES]);
         block_digests.extend_from_slice(&second[..BLOCK_DIGEST_BYTES]);
         crate::cbor::encode::bytes(&block_digests, &mut manifest);
+        crate::cbor::encode::uint(8, &mut manifest);
+        crate::cbor::encode::uint(13, &mut manifest);
         let mut receiver = ImageReceiver::new(ImageTestSink {
             blocks: 0,
             bytes: 0,
@@ -2208,6 +2541,29 @@ mod tests {
         );
         assert_eq!(receiver.on_done(), Ok(ImageEvent::Complete));
         assert!(receiver.sink_mut().done);
+    }
+
+    #[test]
+    fn image_receiver_rejects_a_legacy_manifest_without_cpu_before_sink_begin() {
+        let mut manifest = test_image_manifest(None);
+        // Test construction writes the required CPU field last. An old host
+        // used the otherwise identical seven-field encoding; accepting it
+        // would let the ESP partition sink erase a destination before it can
+        // distinguish an S3, C6, or classic image.
+        assert_eq!(manifest[0], 0xa8);
+        assert_eq!(&manifest[manifest.len() - 2..], &[8, 13]);
+        manifest[0] = 0xa7;
+        manifest.truncate(manifest.len() - 2);
+
+        let mut receiver = ImageReceiver::new(ImageTestSink {
+            blocks: 0,
+            bytes: 0,
+            done: false,
+        });
+        assert_eq!(receiver.on_manifest(&manifest), Err(ImageError::InvalidManifest));
+        assert_eq!(receiver.sink_mut().blocks, 0);
+        assert_eq!(receiver.sink_mut().bytes, 0);
+        assert!(!receiver.sink_mut().done);
     }
 
     #[test]
@@ -2249,7 +2605,7 @@ mod tests {
         let second = Sha256::digest(b"5678");
         let image = Sha256::digest(b"12345678");
         let mut manifest = Vec::new();
-        crate::cbor::encode::map(if signature.is_some() { 8 } else { 7 }, &mut manifest);
+        crate::cbor::encode::map(if signature.is_some() { 9 } else { 8 }, &mut manifest);
         for (key, value) in [(0, 6), (1, VERIFIED_OBJECT_VERSION), (2, 4), (3, 2), (4, 8)] {
             crate::cbor::encode::uint(key, &mut manifest);
             crate::cbor::encode::uint(u64::from(value), &mut manifest);
@@ -2261,6 +2617,8 @@ mod tests {
         block_digests.extend_from_slice(&first[..BLOCK_DIGEST_BYTES]);
         block_digests.extend_from_slice(&second[..BLOCK_DIGEST_BYTES]);
         crate::cbor::encode::bytes(&block_digests, &mut manifest);
+        crate::cbor::encode::uint(8, &mut manifest);
+        crate::cbor::encode::uint(13, &mut manifest);
         if let Some(signature) = signature {
             crate::cbor::encode::uint(7, &mut manifest);
             crate::cbor::encode::bytes(signature, &mut manifest);
@@ -2306,45 +2664,45 @@ mod tests {
         }
     }
 
-    fn framed_record(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut record = Vec::with_capacity(5 + payload.len());
-        record.push(kind);
-        record.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        record.extend_from_slice(payload);
-        record
-    }
-
     #[test]
     fn streamed_consumer_is_transport_credit_independent() {
         type Receiver = SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 256, 64>;
         let mut receiver = Receiver::new(DelayedStreamSink {
             bytes: 0,
             polls: 0,
-            release_every: 2,
+            release_every: 1,
             done: false,
         });
 
-        let manifest = framed_record(RECORD_MANIFEST, &test_image_manifest(None));
-        let received = receiver.push_stream_chunks([manifest[..3].to_vec()]).unwrap();
+        let manifest = test_image_manifest(None);
+        let received = receiver
+            .push_stream_chunks([manifest[..3].to_vec()])
+            .unwrap();
         assert!(received);
-        assert!(receiver.push_stream_chunks([manifest[3..].to_vec()]).unwrap());
+        assert!(
+            receiver
+                .push_stream_chunks([manifest[3..].to_vec()])
+                .unwrap()
+        );
 
-        let mut block = [0u8; 16];
-        block[4..8].copy_from_slice(&0u32.to_be_bytes());
-        block[8..12].copy_from_slice(&4u32.to_be_bytes());
-        block[12..16].copy_from_slice(b"1234");
-        let first = framed_record(RECORD_BLOB, &block);
-        assert!(receiver.push_stream_chunks([first[..7].to_vec()]).unwrap());
-        assert!(receiver.push_stream_chunks([first[7..].to_vec()]).unwrap());
+        let first = b"1234";
+        assert!(receiver.push_stream_chunks([first[..2].to_vec()]).unwrap());
+        assert!(receiver.push_stream_chunks([first[2..].to_vec()]).unwrap());
 
-        block[4..8].copy_from_slice(&1u32.to_be_bytes());
-        block[12..16].copy_from_slice(b"5678");
-        let second = framed_record(RECORD_BLOB, &block);
-        assert!(receiver.push_stream_chunks([second]).unwrap());
-        assert!(!receiver.push_stream_chunks(core::iter::empty::<Vec<u8>>()).unwrap());
+        assert!(receiver.push_stream_chunks([b"5678"]).unwrap());
+        assert!(
+            !receiver
+                .push_stream_chunks(core::iter::empty::<Vec<u8>>())
+                .unwrap()
+        );
 
-        let done = framed_record(RECORD_DONE, &[]);
-        assert!(receiver.push_stream_chunks([done]).unwrap());
+        receiver.finish_ordered().unwrap_or_else(|error| {
+            panic!(
+                "finish {error:?}: received={} buffered={}",
+                receiver.received_body_bytes(),
+                receiver.buffered_body_bytes()
+            )
+        });
         assert!(receiver.is_complete());
         assert!(receiver.sink_mut().done);
     }
@@ -2368,7 +2726,7 @@ mod tests {
         });
         let mut reader = EmptyReader;
 
-        let read = receiver.consume_one_stream_record(&mut reader).unwrap();
+        let read = receiver.consume_stream_body(&mut reader).unwrap();
         assert_eq!(read.consumed_bytes, 0);
         assert!(!read.application_progress);
         // A storage-ready turn can contain no new QUIC bytes. It must still
@@ -2402,21 +2760,21 @@ mod tests {
             release_every: 3,
             done: false,
         });
-        let mut block = [0u8; 16];
-        block[4..8].copy_from_slice(&0u32.to_be_bytes());
-        block[8..12].copy_from_slice(&4u32.to_be_bytes());
-        block[12..16].copy_from_slice(b"1234");
-        let mut bytes = framed_record(RECORD_MANIFEST, &test_image_manifest(None));
-        bytes.extend_from_slice(&framed_record(RECORD_BLOB, &block));
+        let mut bytes = test_image_manifest(None);
+        bytes.extend_from_slice(b"1234");
         let mut reader = SliceReader { bytes, offset: 0 };
 
-        assert!(receiver.consume_one_stream_record(&mut reader).unwrap().application_progress);
+        assert!(
+            receiver
+                .consume_stream_body(&mut reader)
+                .unwrap()
+                .application_progress
+        );
         let offset_after_manifest = reader.offset;
-        let blocked = receiver.consume_one_stream_record(&mut reader).unwrap();
-        assert_eq!(blocked.consumed_bytes, 0);
+        let resumed = receiver.consume_stream_body(&mut reader).unwrap();
+        assert!(resumed.application_progress);
         assert_eq!(reader.offset, offset_after_manifest);
-        assert!(receiver.consume_one_stream_record(&mut reader).unwrap().application_progress);
-        assert!(reader.offset > offset_after_manifest);
+        assert_eq!(receiver.received_body_bytes(), 4);
     }
 
     #[test]
@@ -2558,6 +2916,25 @@ mod tests {
     }
 
     #[test]
+    fn flash_request_uses_default_transport_and_durable_mode_when_omitted() {
+        // { cpu: 13, target: 6 }; normal operators should not need to carry
+        // implementation/debug defaults in every invocation.
+        assert_eq!(
+            decode_flash_request(&[0xa2, 0x01, 0x0d, 0x02, 0x06]),
+            Some(FlashRequest {
+                object: GetRequest {
+                    name: None,
+                    cpu: 13,
+                    target: 6,
+                },
+                address: None,
+                transport: 0,
+                dry_run: false,
+            })
+        );
+    }
+
+    #[test]
     fn get_request_rejects_duplicate_and_trailing_fields() {
         // {2: 6, 2: 6}
         assert!(decode_get(&[0xa2, 0x02, 0x06, 0x02, 0x06]).is_none());
@@ -2604,28 +2981,21 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn signed_object_records_use_the_same_file_sink_as_firmware() {
+    fn signed_object_body_uses_the_same_file_sink_as_firmware() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("main.bin");
         let manifest = test_image_manifest(None);
-        let block = |index: u32, bytes: &[u8]| {
-            let mut payload = vec![0; 12];
-            payload[4..8].copy_from_slice(&index.to_be_bytes());
-            payload[8..12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
-            payload.extend_from_slice(bytes);
-            payload
-        };
-        let records = vec![
-            (RECORD_MANIFEST, manifest),
-            (RECORD_BLOB, block(0, b"1234")),
-            (RECORD_BLOB, block(1, b"5678")),
-            (RECORD_DONE, Vec::new()),
-        ];
-        let mut receiver = ImageReceiver::new(FileImageSink::new(&destination, false));
-        assert_eq!(
-            apply_signed_object_records(&mut receiver, &records),
-            Ok(ImageEvent::Complete)
-        );
+        let mut receiver =
+            SignedObjectReceiver::<_, _, 1024, 4096>::new(FileImageSink::new(&destination, false));
+        receiver.push_ordered(&manifest).unwrap();
+        let mut body = b"12345678".as_slice();
+        while !body.is_empty() {
+            let used = receiver.push_ordered(body).unwrap();
+            body = &body[used..];
+        }
+        assert_eq!(receiver.received_body_bytes(), 8);
+        assert_eq!(receiver.buffered_body_bytes(), 0);
+        receiver.finish_ordered().unwrap();
         assert_eq!(std::fs::read(destination).unwrap(), b"12345678");
     }
 
@@ -2635,24 +3005,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("stage2.bin");
         let manifest = test_image_manifest(None);
-        let block = |index: u32, bytes: &[u8]| {
-            let mut payload = vec![0; 12];
-            payload[4..8].copy_from_slice(&index.to_be_bytes());
-            payload[8..12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
-            payload.extend_from_slice(bytes);
-            payload
-        };
-        let mut stream = ObjectRecordStream::new(vec![
-            (RECORD_MANIFEST, manifest),
-            (RECORD_BLOB, block(0, b"1234")),
-            (RECORD_BLOB, block(1, b"5678")),
-            (RECORD_DONE, Vec::new()),
-        ]);
+        let mut stream = ObjectRecordStream::from_object(manifest, b"12345678".to_vec());
         let mut receiver =
             SignedObjectReceiver::<_, _, 1024, 4096>::new(FileImageSink::new(&destination, false));
         let mut encoded = [0u8; 7];
         while let Some(chunk) = stream.next_chunk(&mut encoded) {
-            receiver.push_ordered(&encoded[..chunk.len]).unwrap();
+            let mut bytes = &encoded[..chunk.len];
+            while !bytes.is_empty() {
+                let used = receiver.push_ordered(bytes).unwrap();
+                bytes = &bytes[used..];
+            }
+            if chunk.fin {
+                while !receiver.body_is_fully_consumed() {
+                    receiver.push_ordered(&[]).unwrap();
+                }
+                receiver.finish_ordered().unwrap();
+            }
         }
         assert!(receiver.is_complete());
         assert_eq!(std::fs::read(destination).unwrap(), b"12345678");
@@ -2734,5 +3102,204 @@ mod tests {
         assert!(chunks.last().unwrap().fin);
         assert_eq!(stream.sent_bytes(), bytes.len());
         assert!(stream.is_complete());
+    }
+
+    #[test]
+    fn flat_object_stream_is_manifest_then_raw_body_with_fin_only_at_end() {
+        let manifest = test_image_manifest(None);
+        let body = b"12345678".to_vec();
+        let mut expected = manifest.clone();
+        expected.extend_from_slice(&body);
+        let mut stream = ObjectRecordStream::from_object(manifest.clone(), body);
+        let mut actual = Vec::new();
+        let mut scratch = [0u8; 3];
+        let mut saw_fin = false;
+        while let Some(chunk) = stream.next_chunk(&mut scratch) {
+            actual.extend_from_slice(&scratch[..chunk.len]);
+            assert!(!saw_fin);
+            saw_fin = chunk.fin;
+        }
+        assert_eq!(actual, expected);
+        assert!(saw_fin);
+        let (decoded, used) = ImageManifest::decode_prefix(&actual).unwrap();
+        assert_eq!(used, manifest.len());
+        assert_eq!(&actual[used..], b"12345678");
+        assert_eq!(decoded.image_size, 8);
+    }
+
+    #[test]
+    fn flat_receiver_accepts_fragmented_manifest_and_unframed_body() {
+        type Receiver = SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 256, 64>;
+        let manifest = test_image_manifest(None);
+        let mut wire = manifest.clone();
+        wire.extend_from_slice(b"12345678");
+        let mut receiver = Receiver::new(DelayedStreamSink {
+            bytes: 0,
+            polls: 0,
+            release_every: 1,
+            done: false,
+        });
+        for chunk in wire.chunks(7) {
+            let mut remaining = chunk;
+            while !remaining.is_empty() {
+                let used = receiver.push_ordered(remaining).unwrap();
+                assert!(used > 0);
+                remaining = &remaining[used..];
+            }
+        }
+        while !receiver.body_is_fully_consumed() {
+            receiver.push_ordered(&[]).unwrap();
+        }
+        assert_eq!(receiver.received_body_bytes(), 8);
+        assert_eq!(receiver.buffered_body_bytes(), 0);
+        receiver.finish_ordered().unwrap();
+        assert!(receiver.is_complete());
+        assert_eq!(receiver.sink_mut().bytes, 8);
+        assert!(receiver.sink_mut().done);
+    }
+
+    #[test]
+    fn flat_receiver_accepts_a_large_manifest_and_mtu_fragmented_body() {
+        const BODY_LEN: usize = 2 * 1024 * 1024 + 17;
+        let body = (0..BODY_LEN)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let blocks = body.chunks(BLOCK_SIZE).collect::<Vec<_>>();
+        let mut manifest = Vec::new();
+        crate::cbor::encode::map(8, &mut manifest);
+        for (key, value) in [
+            (0, 6_u64),
+            (1, u64::from(VERIFIED_OBJECT_VERSION)),
+            (2, BLOCK_SIZE as u64),
+            (3, blocks.len() as u64),
+            (4, BODY_LEN as u64),
+        ] {
+            crate::cbor::encode::uint(key, &mut manifest);
+            crate::cbor::encode::uint(value, &mut manifest);
+        }
+        crate::cbor::encode::uint(5, &mut manifest);
+        crate::cbor::encode::bytes(&Sha256::digest(&body), &mut manifest);
+        crate::cbor::encode::uint(6, &mut manifest);
+        let mut digests = Vec::with_capacity(blocks.len() * BLOCK_DIGEST_BYTES);
+        for block in &blocks {
+            digests.extend_from_slice(&Sha256::digest(block)[..BLOCK_DIGEST_BYTES]);
+        }
+        crate::cbor::encode::bytes(&digests, &mut manifest);
+        crate::cbor::encode::uint(8, &mut manifest);
+        crate::cbor::encode::uint(13, &mut manifest);
+        assert!(manifest.len() < 10_240);
+        let mut wire = manifest;
+        wire.extend_from_slice(&body);
+        type Receiver =
+            SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 10_240, BLOCK_SIZE>;
+        let mut receiver = Receiver::new(DelayedStreamSink {
+            bytes: 0,
+            polls: 0,
+            release_every: 1,
+            done: false,
+        });
+        for chunk in wire.chunks(1036) {
+            // A ready synchronous sink must consume the whole ordered
+            // callback, even when this fragment crosses a verified 4 KiB
+            // block boundary. Returning only the prefix leaves a duplicate
+            // suffix under the stream reassembler after parser state has
+            // advanced, which corrupts the next block on loss recovery.
+            assert_eq!(receiver.push_ordered(chunk).unwrap(), chunk.len());
+        }
+        assert!(receiver.body_is_fully_consumed());
+        receiver.finish_ordered().unwrap();
+        assert!(receiver.is_complete());
+        assert_eq!(receiver.sink_mut().bytes, BODY_LEN);
+    }
+
+    #[test]
+    fn delayed_receiver_preserves_a_large_manifest_body_boundary_across_mtu_turns() {
+        // Exercise the device shape exactly: the CBOR manifest crosses two
+        // MTU-sized reads, carries a prefetched raw-body suffix, then the
+        // sink withholds the same ordered bytes while its initial erase is
+        // pending.  A later consumer-ready turn must resume the identical
+        // byte boundary, never duplicate or skip it.
+        const BODY_LEN: usize = 512 * 1024 + 17;
+        let body = (0..BODY_LEN)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let blocks = body.chunks(BLOCK_SIZE).collect::<Vec<_>>();
+        let mut manifest = Vec::new();
+        crate::cbor::encode::map(8, &mut manifest);
+        for (key, value) in [
+            (0, 3_u64),
+            (1, u64::from(VERIFIED_OBJECT_VERSION)),
+            (2, BLOCK_SIZE as u64),
+            (3, blocks.len() as u64),
+            (4, BODY_LEN as u64),
+        ] {
+            crate::cbor::encode::uint(key, &mut manifest);
+            crate::cbor::encode::uint(value, &mut manifest);
+        }
+        crate::cbor::encode::uint(5, &mut manifest);
+        crate::cbor::encode::bytes(&Sha256::digest(&body), &mut manifest);
+        crate::cbor::encode::uint(6, &mut manifest);
+        let mut digests = Vec::with_capacity(blocks.len() * BLOCK_DIGEST_BYTES);
+        for block in &blocks {
+            digests.extend_from_slice(&Sha256::digest(block)[..BLOCK_DIGEST_BYTES]);
+        }
+        crate::cbor::encode::bytes(&digests, &mut manifest);
+        crate::cbor::encode::uint(8, &mut manifest);
+        crate::cbor::encode::uint(13, &mut manifest);
+        assert!(manifest.len() > 1024);
+
+        struct SliceReader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+        impl OrderedStreamRead for SliceReader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> usize {
+                let count = out.len().min(self.bytes.len().saturating_sub(self.offset));
+                out[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+                self.offset += count;
+                count
+            }
+        }
+
+        let mut wire = manifest;
+        wire.extend_from_slice(&body);
+        type Receiver =
+            SignedObjectReceiver<DelayedStreamSink, NoSignatureVerifier, 10_240, BLOCK_SIZE>;
+        let mut receiver = Receiver::new(DelayedStreamSink {
+            bytes: 0,
+            polls: 0,
+            // Simulate an erase/write completion becoming available only on
+            // a later consumer-ready turn.
+            release_every: 3,
+            done: false,
+        });
+        for packet in wire.chunks(1024) {
+            let mut reader = SliceReader {
+                bytes: packet,
+                offset: 0,
+            };
+            for _ in 0..16 {
+                let before = reader.offset;
+                let read = receiver.consume_stream_body(&mut reader).unwrap();
+                if reader.offset == packet.len() {
+                    break;
+                }
+                // A body block may consume a prefix before deferred storage
+                // stalls the suffix. A ready edge may instead consume zero;
+                // only a nonzero report without reader progress is invalid.
+                assert!(read.consumed_bytes == 0 || reader.offset > before);
+            }
+            assert_eq!(reader.offset, packet.len());
+        }
+        while !receiver.body_is_fully_consumed() {
+            let mut reader = SliceReader {
+                bytes: &[],
+                offset: 0,
+            };
+            receiver.consume_stream_body(&mut reader).unwrap();
+        }
+        receiver.finish_ordered().unwrap();
+        assert!(receiver.is_complete());
+        assert_eq!(receiver.sink_mut().bytes, BODY_LEN);
     }
 }

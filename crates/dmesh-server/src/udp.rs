@@ -11,7 +11,7 @@ use crate::services::{dispatch_diagnostic_tagged_stream, dispatch_tagged_stream}
 use crate::{ObjectServer, ServerConfig};
 use crate::{
     probe::{ProbeServicePlan, ProbeServiceRequest},
-    verified_object::{GetRequest, ObjectRecordStream, decode_get_request},
+    verified_object::{GetRequest, ObjectBodyStream, decode_get_request},
 };
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
@@ -392,7 +392,7 @@ struct BootstrapPacketNumbers {
 }
 
 struct PendingObjectTransfer {
-    stream: ObjectRecordStream,
+    stream: ObjectBodyStream,
     chunk_size: usize,
     first_send: Option<Instant>,
     sent_datagrams: u64,
@@ -530,15 +530,26 @@ fn report_object_transfer(transfer: &PendingObjectTransfer, stats: quic_lite::Tr
 }
 
 impl PendingObjectTransfer {
+    fn from_object_with_chunk(manifest: Vec<u8>, body: Vec<u8>, chunk_size: usize) -> Self {
+        assert!((1..=MAX_OBJECT_CHUNK).contains(&chunk_size));
+        Self {
+            stream: ObjectBodyStream::from_object(manifest, body),
+            chunk_size,
+            first_send: None,
+            sent_datagrams: 0,
+        }
+    }
+
     #[cfg(test)]
     fn new(records: Vec<(u8, Vec<u8>)>) -> Self {
         Self::with_chunk(records, OBJECT_CHUNK)
     }
 
+    #[cfg(test)]
     fn with_chunk(records: Vec<(u8, Vec<u8>)>, chunk_size: usize) -> Self {
         assert!((1..=MAX_OBJECT_CHUNK).contains(&chunk_size));
         Self {
-            stream: ObjectRecordStream::new(records),
+            stream: ObjectBodyStream::new(records),
             chunk_size,
             first_send: None,
             sent_datagrams: 0,
@@ -827,6 +838,42 @@ impl UdpClient {
             .connection_mut()
             .endpoint_mut()
             .expect("UDP client methods require an established connection")
+    }
+
+    /// Publish the ACK for a terminal application response before a
+    /// short-lived caller can send CLOSE or drop its socket.  Delayed ACK is
+    /// still QUIC-lite policy; this adapter merely waits for the endpoint's
+    /// advertised deadline and transmits the resulting complete datagram.
+    ///
+    /// This is shared by ordinary commands and object upload.  In particular,
+    /// a `boot.recovery` response must not be followed immediately by CLOSE
+    /// with no separately observable delivery edge on the device.
+    async fn acknowledge_terminal_response(
+        &mut self,
+        started: Instant,
+        packet: &mut [u8; MTU],
+        context: &str,
+    ) -> Result<()> {
+        let now_ms = started.elapsed().as_millis() as u64;
+        self.endpoint_mut().set_time(now_ms);
+        let pto = self.endpoint().pto_timeout();
+        if let Some(wake_at_ms) = self.endpoint().next_bearer_deadline(pto) {
+            let current_ms = started.elapsed().as_millis() as u64;
+            if wake_at_ms > current_ms {
+                tokio::time::sleep(Duration::from_millis(
+                    wake_at_ms.saturating_sub(current_ms),
+                ))
+                .await;
+            }
+            self.endpoint_mut()
+                .set_time(started.elapsed().as_millis() as u64);
+        }
+        if let Some((_path, ack_len)) = self.connection.poll_transmit(packet).map_err(|error| {
+            anyhow::anyhow!("{context} terminal ACK: {error:?}")
+        })? {
+            self.send_endpoint_packet(&packet[..ack_len]).await?;
+        }
+        Ok(())
     }
 
     pub fn peer_connection_id(&self) -> Option<quic_lite::ConnectionId> {
@@ -1435,7 +1482,7 @@ impl UdpClient {
     pub async fn request_object_upload(
         &mut self,
         command: &[u8],
-        records: &mut ObjectRecordStream,
+        records: &mut ObjectBodyStream,
         scratch: &mut [u8],
         response_timeout: Duration,
     ) -> Result<ReceivedStream> {
@@ -1465,7 +1512,7 @@ impl UdpClient {
         let mut packet = [0u8; MTU];
         while Instant::now() < deadline {
             // Once the command is transport-admitted, fill only the credit
-            // the common endpoint has made available.  `ObjectRecordStream`
+            // the common endpoint has made available. `ObjectBodyStream`
             // owns record ordering; packet history, congestion, ACKs and
             // retransmission remain entirely inside quic-lite.
             if command_admitted && !records.is_complete() {
@@ -1575,28 +1622,12 @@ impl UdpClient {
                         // rather than making Recovery or the flash handler
                         // infer ACK state.  Recovery waits for that generic
                         // delivery edge before handing Stage2 back to Main.
-                        self.endpoint_mut().set_time(now_ms);
-                        let pto = self.endpoint().pto_timeout();
-                        if let Some(wake_at_ms) = self.endpoint().next_bearer_deadline(pto) {
-                            let current_ms = started.elapsed().as_millis() as u64;
-                            if wake_at_ms > current_ms {
-                                tokio::time::sleep(Duration::from_millis(
-                                    wake_at_ms.saturating_sub(current_ms),
-                                ))
-                                .await;
-                            }
-                            self.endpoint_mut()
-                                .set_time(started.elapsed().as_millis() as u64);
-                        }
-                        if let Some((_path, ack_len)) = self
-                            .connection
-                            .poll_transmit(&mut packet)
-                            .map_err(|error| {
-                                anyhow::anyhow!("object upload terminal ACK: {error:?}")
-                            })?
-                        {
-                            self.send_endpoint_packet(&packet[..ack_len]).await?;
-                        }
+                        self.acknowledge_terminal_response(
+                            started,
+                            &mut packet,
+                            "object upload",
+                        )
+                        .await?;
                         return Ok(stream);
                     }
                     // Keep the association clock in the same domain used by
@@ -1803,13 +1834,8 @@ impl UdpClient {
                             data: payload.data.to_vec(),
                         };
                         let mut ack = [0u8; MTU];
-                        if let Some((_path, ack_len)) = self
-                            .connection
-                            .poll_transmit(&mut ack)
-                            .map_err(|error| anyhow::anyhow!("client response ACK: {error:?}"))?
-                        {
-                            self.send_endpoint_packet(&ack[..ack_len]).await?;
-                        }
+                        self.acknowledge_terminal_response(started, &mut ack, "client response")
+                            .await?;
                         return Ok(response);
                     }
                 }
@@ -2794,16 +2820,20 @@ async fn process_persistent_packet<const H: usize>(
             if get.target == 0 || get.name.as_ref().is_some_and(|name| name.len() > 128) {
                 bail!("invalid bootstrapped object target");
             }
-            let records = server.response_records(get)?;
+            let (manifest, body) = server.response_object(get)?;
             if let Some(control) = control {
                 control.record_event(format!(
-                    "object accepted peer={peer} records={}",
-                    records.len()
+                    "object accepted peer={peer} bytes={}",
+                    body.len()
                 ));
             }
-            tracing::info!(%peer, stream = request.stream_id, records = records.len(),
+            tracing::info!(%peer, stream = request.stream_id, bytes = body.len(),
                 "object_udp_get_accepted");
-            *object_transfer = Some(PendingObjectTransfer::with_chunk(records, object_chunk));
+            *object_transfer = Some(PendingObjectTransfer::from_object_with_chunk(
+                manifest,
+                body,
+                object_chunk,
+            ));
             connection
                 .mux
                 .complete_request(request.stream_id, request.data.len())
@@ -3180,9 +3210,11 @@ async fn send_next_object_packet<const H: usize>(
     packet: &mut [u8; MTU],
 ) -> Result<bool> {
     let stream_id = OBJECT_STREAM;
-    mux.endpoint
-        .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
-        .ok();
+    if transfer.first_send.is_none() {
+        mux.endpoint
+            .open_send_stream(stream_id, INITIAL_MAX_STREAM_DATA)
+            .map_err(|error| anyhow::anyhow!("object response stream open: {error:?}"))?;
+    }
     let mut object_bytes = [0u8; MAX_OBJECT_CHUNK];
     let Some(chunk) = transfer
         .stream
@@ -3190,7 +3222,7 @@ async fn send_next_object_packet<const H: usize>(
     else {
         return Ok(false);
     };
-    let encoded = mux.endpoint.encode_stream_packet(
+    let encoded = mux.endpoint.encode_stream_packet_fitting(
         mux.endpoint
             .peer_connection_id()
             .ok_or(quic_lite::Error::WrongConnectionId)
@@ -3201,7 +3233,7 @@ async fn send_next_object_packet<const H: usize>(
         &object_bytes[..chunk.len],
         packet,
     );
-    let (used, _) = match encoded {
+    let (used, _, written) = match encoded {
         // Flow/congestion blockers are normal persistent-transfer states;
         // the next ACK/MAX_* control packet resumes this same offset.
         Err(quic_lite::Error::FlowControl | quic_lite::Error::Invalid) => return Ok(false),
@@ -3225,7 +3257,13 @@ async fn send_next_object_packet<const H: usize>(
     }
     transfer.sent_datagrams = transfer.sent_datagrams.saturating_add(1);
     let previous_bytes = transfer.stream.sent_bytes();
-    debug_assert!(transfer.stream.advance(chunk));
+    let sent_chunk = crate::verified_object::ObjectStreamChunk {
+        offset: chunk.offset,
+        len: written,
+        fin: chunk.fin && written == chunk.len,
+        record_index: chunk.record_index,
+    };
+    debug_assert!(transfer.stream.advance(sent_chunk));
     let sent_bytes = transfer.stream.sent_bytes();
     if sent_bytes / (64 * 1024) != previous_bytes / (64 * 1024) {
         tracing::info!(%peer, stream = stream_id, record = chunk.record_index,
@@ -3707,8 +3745,7 @@ mod tests {
         assert_eq!(interpacket_gap_bucket(Duration::from_micros(50_000)), 5);
     }
     use crate::verified_object::{
-        BLOCK_SIZE, ImageEvent, ImageManifest, ImageReceiver, ImageSink, RECORD_BLOB, RECORD_DONE,
-        RECORD_MANIFEST, RecordBuffer, encode_get_request,
+        BLOCK_SIZE, ImageManifest, ImageSink, RECORD_BLOB, RECORD_MANIFEST, encode_get_request,
     };
     use quic_lite::callback::{CallbackStreams, CopyingStreamEvents};
     use quic_lite::{
@@ -4080,6 +4117,12 @@ mod tests {
         fn abort(&mut self) {}
     }
 
+    impl crate::verified_object::StreamingImageSink for FakeFlash {
+        fn poll_completed(&mut self) -> Result<crate::verified_object::StoragePoll, Self::Error> {
+            Ok(crate::verified_object::StoragePoll::Ready)
+        }
+    }
+
     async fn run_object_transfer(size: usize, object_chunk: usize) {
         let directory = tempdir().unwrap();
         let artifact_root = directory.path().join("flash");
@@ -4113,8 +4156,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut records = RecordBuffer::new();
-        let mut receiver = ImageReceiver::new(FakeFlash { bytes: Vec::new() });
+        let mut receiver = crate::verified_object::SignedObjectReceiver::<_, _, 10240, 4096>::new(
+            FakeFlash { bytes: Vec::new() },
+        );
         let (stream_id, first, fin) = client
             .request_stream(
                 quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
@@ -4128,20 +4172,14 @@ mod tests {
         let mut packets = vec![(stream_id, first, fin)];
         while let Some((id, data, finished)) = packets.pop() {
             assert_eq!(id, OBJECT_STREAM);
-            records.push(&data);
-            while let Some((kind, body)) = records.next() {
-                match kind {
-                    RECORD_MANIFEST => {
-                        receiver.on_manifest(&body).unwrap();
-                    }
-                    RECORD_BLOB => {
-                        receiver.on_block(&body).unwrap();
-                    }
-                    RECORD_DONE => {
-                        assert_eq!(receiver.on_done().unwrap(), ImageEvent::Complete);
-                    }
-                    other => panic!("unexpected object record {other}"),
-                }
+            let mut data = data.as_slice();
+            while !data.is_empty() {
+                let used = receiver.push_ordered(data).unwrap();
+                assert_ne!(used, 0);
+                data = &data[used..];
+            }
+            if finished && !receiver.is_complete() {
+                receiver.finish_ordered().unwrap();
             }
             if finished {
                 break;
@@ -4154,7 +4192,12 @@ mod tests {
     }
 
     struct ObjectDownloadSink<'a> {
-        records: &'a mut RecordBuffer,
+        receiver: &'a mut crate::verified_object::SignedObjectReceiver<
+            FakeFlash,
+            crate::verified_object::NoSignatureVerifier,
+            10240,
+            4096,
+        >,
         bytes: usize,
     }
 
@@ -4165,23 +4208,30 @@ mod tests {
             &mut self,
             stream: u64,
             _offset: u64,
-            _end: bool,
+            end: bool,
             bytes: &[u8],
         ) -> Result<usize, Self::Error> {
             if stream != OBJECT_STREAM {
                 return Err(());
             }
-            self.records.push(bytes);
-            self.bytes = self.bytes.saturating_add(bytes.len());
-            Ok(bytes.len())
+            let used = self.receiver.push_ordered(bytes).map_err(|_| ())?;
+            self.bytes = self.bytes.saturating_add(used);
+            if end && used == bytes.len() && !self.receiver.is_complete() {
+                self.receiver.finish_ordered().map_err(|_| ())?;
+            }
+            Ok(used)
         }
     }
 
     struct ObjectDownloadHarness {
         endpoint: EndpointState<2, TEST_DOWNLOAD_HISTORY_CEILING, MTU>,
         ordered: CallbackStreams<Arc<Vec<u8>>>,
-        records: RecordBuffer,
-        receiver: ImageReceiver<FakeFlash>,
+        receiver: crate::verified_object::SignedObjectReceiver<
+            FakeFlash,
+            crate::verified_object::NoSignatureVerifier,
+            10240,
+            4096,
+        >,
         drop_outbound_control: usize,
         /// Keep accepted application consumption pending until the harness timer runs;
         /// otherwise a lock-step test can hide a sender-waits-for-MAX_*
@@ -4217,8 +4267,9 @@ mod tests {
                 // This is a generic host download receiver, deliberately
                 // separate from the current host-opened Recovery upload path.
                 ordered: CallbackStreams::new(2, TEST_DOWNLOAD_REORDER_BYTES),
-                records: RecordBuffer::new(),
-                receiver: ImageReceiver::new(FakeFlash { bytes: Vec::new() }),
+                receiver: crate::verified_object::SignedObjectReceiver::new(FakeFlash {
+                    bytes: Vec::new(),
+                }),
                 drop_outbound_control: 0,
                 pending_application_consumption: 0,
                 hold_credit_until_bootstrap: false,
@@ -4252,31 +4303,6 @@ mod tests {
             Ok(())
         }
 
-        fn accept_download_records(
-            stream: u64,
-            records: &mut RecordBuffer,
-            receiver: &mut ImageReceiver<FakeFlash>,
-        ) -> usize {
-            assert_eq!(stream, OBJECT_STREAM);
-            let mut released = 0usize;
-            while let Some((kind, body)) = records.next() {
-                let event = match kind {
-                    RECORD_MANIFEST => receiver.on_manifest(&body).unwrap(),
-                    RECORD_BLOB => receiver.on_block(&body).unwrap(),
-                    RECORD_DONE => receiver.on_done().unwrap(),
-                    other => panic!("unexpected object download harness record {other}"),
-                };
-                if kind == RECORD_DONE {
-                    assert_eq!(event, ImageEvent::Complete);
-                }
-                // Match constrained receiver's fixed record sink: durable/reusable
-                // storage returns exactly the framed record bytes, never an
-                // arbitrary transport-packet size.
-                released = released.saturating_add(5 + body.len());
-            }
-            released
-        }
-
         async fn receive_one(
             &mut self,
             socket: &UdpSocket,
@@ -4292,10 +4318,9 @@ mod tests {
             self.endpoint.set_time(now_ms);
             let mut transport_out = [0u8; MTU];
             let mut outputs: Vec<Vec<u8>> = Vec::new();
-            let (endpoint, ordered, records, receiver) = (
+            let (endpoint, ordered, receiver) = (
                 &mut self.endpoint,
                 &mut self.ordered,
-                &mut self.records,
                 &mut self.receiver,
             );
             let mut released_credit = 0usize;
@@ -4303,14 +4328,14 @@ mod tests {
             endpoint
                 .receive_with_committed_callback_dispositions(packet, |stream| {
                     let consumed = {
-                        let mut sink = ObjectDownloadSink { records, bytes: 0 };
+                        let mut sink = ObjectDownloadSink { receiver, bytes: 0 };
                         ordered
-                            .receive_copying(
+                            .receive_copying_borrowed(
                                 stream.id,
-                                Arc::new(stream.data.to_vec()),
+                                stream.data,
                                 stream.offset,
-                                0..stream.data.len(),
                                 stream.fin,
+                                || Arc::new(stream.data.to_vec()),
                                 &mut sink,
                             )
                             .map_err(|_| quic_lite::Error::Invalid)?;
@@ -4318,9 +4343,7 @@ mod tests {
                     };
                     if consumed != 0 {
                         delivered_bytes = delivered_bytes.saturating_add(consumed);
-                        released_credit = released_credit.saturating_add(
-                            Self::accept_download_records(stream.id, records, receiver),
-                        );
+                        released_credit = released_credit.saturating_add(consumed);
                     }
                     Ok(if consumed == 0 {
                         CommittedStreamDisposition::Reack
@@ -4365,13 +4388,25 @@ mod tests {
         ) -> Result<()> {
             self.flush_outbound(socket, peer).await?;
             self.endpoint.set_time(now_ms);
-            let released_credit = if self.hold_credit_until_bootstrap
-                // Object transfer opens another record only when that whole
-                // record fits. It can be credit-blocked just below the byte
-                // limit; mirror the sink's bounded record reserve.
+            let storage_blocked = self.hold_credit_until_bootstrap
+                // Hold one body block behind the injected storage barrier.
                 && self.delivered_stream_bytes
-                    < TEST_OBJECT_RECEIVE_WINDOW - (5 + 12 + BLOCK_SIZE)
-            {
+                    < TEST_OBJECT_RECEIVE_WINDOW - BLOCK_SIZE;
+            if !storage_blocked {
+                let mut sink = ObjectDownloadSink {
+                    receiver: &mut self.receiver,
+                    bytes: 0,
+                };
+                self.ordered
+                    .resume_copying(OBJECT_STREAM, &mut sink)
+                    .map_err(|_| anyhow::anyhow!("object download resume"))?;
+                self.delivered_stream_bytes =
+                    self.delivered_stream_bytes.saturating_add(sink.bytes);
+                self.pending_application_consumption = self
+                    .pending_application_consumption
+                    .saturating_add(sink.bytes);
+            }
+            let released_credit = if storage_blocked {
                 0
             } else {
                 core::mem::take(&mut self.pending_application_consumption)
@@ -4466,6 +4501,7 @@ mod tests {
         let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bind = probe.local_addr().unwrap();
         drop(probe);
+        let control = Arc::new(TransportControl::default());
         let server_task = tokio::spawn(run(UdpConfig {
             bind,
             artifact_root,
@@ -4478,14 +4514,27 @@ mod tests {
                 total_bytes: 512 * 1024 * 1024,
                 available_bytes: 512 * 1024 * 1024,
             }),
+            control: Some(control.clone()),
             ..UdpConfig::default()
         }));
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_cid = ConnectionId::new(1).unwrap();
+        let receiver_limits = ConnectionLimits {
+            max_data: TEST_OBJECT_RECEIVE_WINDOW as u64,
+            max_stream_data: TEST_OBJECT_RECEIVE_WINDOW as u64,
+            ..ConnectionLimits::default()
+        };
         let mut open = [0u8; MTU];
-        let open_len = encode_bootstrap_open(client_cid, 0, &mut open).unwrap();
+        let open_len = quic_lite::encode_bootstrap_open_packet_with_profile(
+            client_cid,
+            0,
+            receiver_limits,
+            TEST_DOWNLOAD_HISTORY as u16,
+            &mut open,
+        )
+        .unwrap();
         socket.send_to(&open[..open_len], bind).await.unwrap();
         let mut input = [0u8; MTU];
         let server_cid = loop {
@@ -4556,9 +4605,13 @@ mod tests {
             }
             assert!(
                 last_delivery.elapsed() < Duration::from_secs(10),
-                "object download harness made no delivery progress for 10 seconds after {mirror_datagrams} datagrams; delivered={} pending_credit={}",
+                "object download harness made no delivery progress for 10 seconds after {mirror_datagrams} datagrams; delivered={} pending_credit={} credit={:?} client_stats={:?} server_stats={:?} server_errors={:?}",
                 mirror.delivered_stream_bytes,
                 mirror.pending_application_consumption,
+                mirror.endpoint.receive_credit_state(OBJECT_STREAM),
+                mirror.endpoint.stats(),
+                control.server_stats(),
+                control.take_errors(),
             );
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
@@ -5165,7 +5218,7 @@ mod tests {
             let registry = registry_record.result.unwrap();
             // `services` is compact CBOR
             // `[[component, method, name], ...]`, not a text command surface.
-            assert_eq!(registry.first(), Some(&0x89));
+            assert_eq!(registry.first(), Some(&0x8a));
             assert!(
                 registry
                     .windows(b"metrics".len())
@@ -5741,24 +5794,20 @@ mod tests {
             .unwrap();
         assert!(!fin);
         assert_eq!(stream_id, OBJECT_STREAM);
-        assert_eq!(first[0], RECORD_MANIFEST);
-        let mut records = RecordBuffer::new();
-        records.push(&first);
-        let mut saw_done = false;
+        let mut object = first;
+        let mut saw_fin = false;
         for _ in 0..16 {
             let (id, data, finished) = client.recv_stream().await.unwrap();
             assert_eq!(id, OBJECT_STREAM);
-            records.push(&data);
-            while let Some((kind, _)) = records.next() {
-                if kind == RECORD_DONE {
-                    saw_done = true;
-                }
-            }
-            if saw_done || finished {
+            object.extend_from_slice(&data);
+            if finished {
+                saw_fin = true;
                 break;
             }
         }
-        assert!(saw_done);
+        assert!(saw_fin);
+        let (manifest, used) = ImageManifest::decode_prefix(&object).unwrap();
+        assert_eq!(object.len() - used, manifest.image_size as usize);
         server_task.abort();
     }
 

@@ -42,6 +42,10 @@ pub struct Record<'a> {
     pub error: Option<&'a [u8]>,
     pub to: Option<Name<'a>>,
     pub data: Option<&'a [u8]>,
+    /// Unsigned, bearer-local observation facts paired with an otherwise
+    /// signed record.  Discovery uses this for volatile radio state (for
+    /// example NAN visibility) without invalidating the cached signature.
+    pub extensions: Option<&'a [u8]>,
 }
 
 fn name<'a>(decoder: &mut Decoder<'a>) -> Option<Name<'a>> {
@@ -91,6 +95,11 @@ pub fn decode(packet: &[u8]) -> Option<Record<'_>> {
             }
             9 => record.to = Some(name(&mut d)?),
             10 => record.data = Some(d.bytes_ref()?),
+            11 => {
+                let start = d.position();
+                d.skip()?;
+                record.extensions = Some(&packet[start..d.position()]);
+            }
             _ => d.skip()?,
         }
     }

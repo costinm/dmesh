@@ -1908,6 +1908,10 @@ pub enum Request {
         #[serde(default)]
         to: Option<String>,
     },
+    /// Ask this NAN observer to wake one sleepy ESP into its configured STA
+    /// profile. `to` is the observed peer MAC, not an IP route or relay hop.
+    #[serde(rename = "nan.wakeup")]
+    NanWakeup { to: String },
     /// Return recent radio/backend message history.
     #[serde(rename = "messages.history")]
     MessagesHistory {
@@ -2556,7 +2560,7 @@ impl LmeshService {
             .or_else(|| {
                 announce
                     .filter(|announce| {
-                        announce.device_class == dmesh_server::announce::DEVICE_CLASS_ESP
+                        dmesh_server::announce::is_esp_device_class(announce.device_class)
                     })
                     .map(|_| dmesh_server::udp::RAW_UDP6_PORT)
             })
@@ -3539,6 +3543,9 @@ impl LmeshService {
                 }
                 mesh::protocol::Response::ok_with_data(result)
             }
+            Request::NanWakeup { to } => {
+                mesh::protocol::Response::ok_with_data(self.radio.nan_wakeup(to))
+            }
             Request::MessagesHistory { keys, limit } => {
                 mesh::protocol::Response::ok_with_data(self.radio.history(keys, limit))
             }
@@ -4010,6 +4017,17 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn nan_wakeup_is_a_local_observer_action_with_a_mac_target() {
+        let request = serde_json::from_value::<Request>(serde_json::json!({
+            "method": "nan.wakeup",
+            "to": "d8:a0:1d:4c:5e:1c"
+        }))
+        .unwrap();
+        assert!(matches!(request, Request::NanWakeup { to }
+            if to == "d8:a0:1d:4c:5e:1c"));
     }
 
     #[test]

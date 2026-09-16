@@ -28,6 +28,9 @@ pub const DIAGNOSTIC_LOG_WATCH_METHOD: u64 = 5;
 /// does not register it.
 pub const BOOT_COMPONENT: u64 = 11;
 pub const BOOT_RECOVERY_METHOD: u64 = 1;
+/// Read-only identity of the currently executing firmware image.
+pub const FIRMWARE_COMPONENT: u64 = 12;
+pub const FIRMWARE_IDENTITY_METHOD: u64 = 1;
 
 const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
     (DIAGNOSTIC_COMPONENT, DIAGNOSTIC_STATUS_METHOD, b"status"),
@@ -59,7 +62,47 @@ const BUILTIN_TAGGED_SERVICES: &[(u64, u64, &[u8])] = &[
         b"object.flash",
     ),
     (BOOT_COMPONENT, BOOT_RECOVERY_METHOD, b"boot.recovery"),
+    (
+        FIRMWARE_COMPONENT,
+        FIRMWARE_IDENTITY_METHOD,
+        b"firmware.identity",
+    ),
 ];
+
+/// Encode the one running-image identity string supplied by a firmware
+/// platform. The portable service owns validation and the tagged response;
+/// ESP-IDF only supplies its ELF SHA-256 bytes.
+pub fn encode_firmware_identity_response(
+    record: crate::tagged::Record<'_>,
+    identity: &[u8],
+) -> Option<Vec<u8>> {
+    if record.component != Some(crate::tagged::Name::Tag(FIRMWARE_COMPONENT))
+        || record.method != Some(crate::tagged::Name::Tag(FIRMWARE_IDENTITY_METHOD))
+        || record.to.is_some()
+        || record.params.is_some()
+        || record.data.is_some()
+        || record.fields.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+        || identity.is_empty()
+        || identity.len() > 128
+        || !identity.is_ascii()
+    {
+        return None;
+    }
+    let id = record.id?;
+    let mut response = alloc::vec![0; identity.len().checked_add(64)?];
+    let used = crate::tagged::encode_numeric_data_response(
+        FIRMWARE_COMPONENT,
+        FIRMWARE_IDENTITY_METHOD,
+        id,
+        identity,
+        true,
+        &mut response,
+    )?;
+    response.truncate(used);
+    Some(response)
+}
 
 /// Encode the built-in tagged QUIC handler catalog as
 /// `[[component, method, "service"], ...]`.
@@ -826,6 +869,25 @@ mod tests {
         assert_eq!(decoder.uint(), Some(42));
         assert!(decoder.is_finished());
         assert!(encode_status_numeric(&[b'x'; 97], 1).is_none());
+    }
+
+    #[test]
+    fn firmware_identity_is_one_correlated_text_result() {
+        let mut request = [0u8; 32];
+        let used = crate::tagged::encode_numeric_empty_request(
+            FIRMWARE_COMPONENT,
+            FIRMWARE_IDENTITY_METHOD,
+            91,
+            &mut request,
+        )
+        .unwrap();
+        let record = crate::tagged::decode(&request[..used]).unwrap();
+        let response = encode_firmware_identity_response(record, b"0123456789abcdef").unwrap();
+        let response = crate::tagged::decode(&response).unwrap();
+        assert_eq!(response.id, Some(91));
+        let mut result = crate::cbor::Decoder::new(response.result.unwrap());
+        assert_eq!(result.text_ref(), Some(&b"0123456789abcdef"[..]));
+        assert!(result.is_finished());
     }
 
     #[test]

@@ -26,12 +26,14 @@ pub const fn stream_service(component: u64, method: u64) -> Option<ServiceIdenti
         (control::CONTROL_COMPONENT, control::SETTINGS_SET) => "settings.set",
         (control::CONTROL_COMPONENT, control::SETTINGS_LIST) => "settings.list",
         (announce::ANNOUNCE_COMPONENT, announce::ANNOUNCE_DEVICES_OBSERVED) => "discovery.nodes",
+        (announce::ANNOUNCE_COMPONENT, announce::ANNOUNCE_DISCOVERY_ACTIVE) => "discovery.active",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_STATUS_METHOD) => "status",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_SERVICES_METHOD) => "services",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_METRICS_METHOD) => "metrics",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_EVENTS_METHOD) => "events",
         (services::DIAGNOSTIC_COMPONENT, services::DIAGNOSTIC_LOG_WATCH_METHOD) => "log-watch",
         (services::BOOT_COMPONENT, services::BOOT_RECOVERY_METHOD) => "boot.recovery",
+        (services::FIRMWARE_COMPONENT, services::FIRMWARE_IDENTITY_METHOD) => "firmware.identity",
         (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_STATUS_METHOD) => "telemetry.nan_status",
         (telemetry::TELEMETRY_COMPONENT, telemetry::NOW_METRICS_METHOD) => "telemetry.now_metrics",
         (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_METRICS_METHOD) => "telemetry.nan_metrics",
@@ -68,6 +70,10 @@ pub fn stream_service_by_name(name: &str) -> Option<ServiceIdentity> {
             announce::ANNOUNCE_COMPONENT,
             announce::ANNOUNCE_DEVICES_OBSERVED,
         ),
+        "discovery.active" => (
+            announce::ANNOUNCE_COMPONENT,
+            announce::ANNOUNCE_DISCOVERY_ACTIVE,
+        ),
         "status" => (
             services::DIAGNOSTIC_COMPONENT,
             services::DIAGNOSTIC_STATUS_METHOD,
@@ -89,6 +95,10 @@ pub fn stream_service_by_name(name: &str) -> Option<ServiceIdentity> {
             services::DIAGNOSTIC_LOG_WATCH_METHOD,
         ),
         "boot.recovery" => (services::BOOT_COMPONENT, services::BOOT_RECOVERY_METHOD),
+        "firmware.identity" => (
+            services::FIRMWARE_COMPONENT,
+            services::FIRMWARE_IDENTITY_METHOD,
+        ),
         "telemetry.nan_status" => (telemetry::TELEMETRY_COMPONENT, telemetry::NAN_STATUS_METHOD),
         "telemetry.now_metrics" => (
             telemetry::TELEMETRY_COMPONENT,
@@ -153,6 +163,10 @@ pub const fn is_read_only_stream_service(component: u64, method: u64) -> bool {
                 telemetry::WIFI_LINK_METRICS_METHOD
             )
             | (raw_wifi::RAW_WIFI_COMPONENT, raw_wifi::RAW_WIFI_METHOD_SCAN)
+            | (
+                services::FIRMWARE_COMPONENT,
+                services::FIRMWARE_IDENTITY_METHOD
+            )
     )
 }
 

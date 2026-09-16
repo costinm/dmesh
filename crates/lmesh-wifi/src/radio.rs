@@ -1220,7 +1220,9 @@ fn discovered_device_json(entry: &DiscoveredDevice) -> Value {
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
     {
-        Some(dmesh_server::announce::DEVICE_CLASS_ESP) => "esp32",
+        Some(class) if dmesh_server::announce::is_esp_device_class(class) => {
+            dmesh_server::announce::device_class_name(class)
+        }
         Some(dmesh_server::announce::DEVICE_CLASS_ANDROID) => "android",
         Some(dmesh_server::announce::DEVICE_CLASS_HOST) => "host",
         _ => "unknown",
@@ -1769,6 +1771,17 @@ impl RadioService {
     pub fn nan_status(&self, iface: Option<String>) -> Value {
         let raw = self.rawnan_status(iface);
         let mut status = serde_json::Map::new();
+        // Monitor ownership and NAN synchronization are different facts: a
+        // host can listen successfully while it has no recent cluster beacon
+        // and therefore cannot schedule a DW-bound active Subscribe.
+        let synced = raw
+            .get("cluster_bssid")
+            .and_then(Value::as_str)
+            .is_some_and(|cluster| !cluster.is_empty())
+            && raw
+                .get("sync_age_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|age_ms| age_ms <= 4_000);
         if let Some(value) = raw.get("cluster_bssid").filter(|value| !value.is_null()) {
             status.insert("cluster_id".to_owned(), value.clone());
         }
@@ -1778,6 +1791,11 @@ impl RadioService {
         status.insert(
             "active".to_owned(),
             raw.get("listener").cloned().unwrap_or(Value::Bool(false)),
+        );
+        status.insert("synced".to_owned(), Value::Bool(synced));
+        status.insert(
+            "sync_age_ms".to_owned(),
+            raw.get("sync_age_ms").cloned().unwrap_or(Value::Null),
         );
         if let Some(enabled) = raw
             .get("active_publish")
@@ -1801,6 +1819,17 @@ impl RadioService {
                 .cloned()
                 .unwrap_or(Value::Null),
         );
+        let nan_devices = raw
+            .get("discovered_devices")
+            .and_then(Value::as_array)
+            .map(|devices| {
+                devices
+                    .iter()
+                    .filter(|device| device.get("source").and_then(Value::as_str) == Some("nan"))
+                    .count()
+            })
+            .unwrap_or(0);
+        status.insert("nan_devices".to_owned(), Value::from(nan_devices));
         Value::Object(status)
     }
 
@@ -2037,6 +2066,50 @@ impl RadioService {
             "service_info_len": publish.service_info().len(),
             "pending": publish.pending(),
         }))
+    }
+
+    /// Schedule one active NAN Subscribe that asks a sleepy peer to restore
+    /// its configured STA profile.  The wire payload is deliberately the
+    /// same target-checked `transport.set` used by ESP and Android; this
+    /// method owns only host monitor scheduling and never changes local STA.
+    pub fn nan_wakeup(&self, target: String) -> Value {
+        let Some(target_mac) = parse_mac(Some(&target)) else {
+            return json!({"ok": false, "error": "nan.wakeup to must be a MAC", "to": target});
+        };
+        if target_mac == [0; 6] || target_mac[0] & 1 != 0 {
+            return json!({"ok": false, "error": "nan.wakeup to must be a unicast MAC", "to": target});
+        }
+        let request = dmesh_server::control::Request::TransportSet {
+            kind: dmesh_server::control::TransportKind::Sta,
+            config: dmesh_server::control::TransportConfig {
+                wake_target: Some(target_mac),
+                ..dmesh_server::control::TransportConfig::default()
+            },
+        };
+        let mut record = [0u8; 96];
+        let Some(used) = dmesh_server::control::encode_request(request, None, &mut record) else {
+            return json!({"ok": false, "error": "encode targeted STA activation"});
+        };
+        let request_id = now_millis_u64();
+        *self
+            .pending_nan_active_subscribe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(PendingNanActiveSubscribe {
+                service_info: record[..used].to_vec(),
+                request_id,
+                sent_windows: 0,
+                last_slot: None,
+            });
+        json!({
+            "ok": true,
+            "operation": "nan.wakeup",
+            "to": colon_mac(&target_mac),
+            "carrier": "nan_active_subscribe",
+            "request_id": request_id,
+            "control_len": used,
+            "schedule": ["next_dw", "next_dw0_or_dw8"],
+        })
     }
 
     /// Request current DMesh presence without replacing the selected transport.
@@ -2700,8 +2773,11 @@ impl RadioService {
         // recognize the tagged-CBOR request in the NAN SDEA and immediately
         // re-publish their current presence descriptor.
         if matches!(radio.as_str(), "all" | "nan" | "best") {
+            // DW8 endpoints may need almost a complete four-second cadence
+            // before receiving the queued active Subscribe. Return the
+            // bounded collection instead of a local-TX-only result.
             let active =
-                self.request_discovery(None, None, true, true, true, false, false, Some(1_000));
+                self.request_discovery(None, None, true, true, true, false, false, Some(4_000));
             let active_ok = active["nan_active_subscribe"]["ok"] == true;
             result["submissions"]["nan"] = active;
             result["ok"] = json!(result["ok"] == true && active_ok);

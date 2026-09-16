@@ -25,6 +25,14 @@ pub const ANNOUNCE_FOLLOWUPS_OBSERVED: u64 = 4;
 /// list. Unlike [`ANNOUNCE_OBSERVED`], entries may be provisional radio peers
 /// without a decoded DMesh announce identity.
 pub const ANNOUNCE_DEVICES_OBSERVED: u64 = 9;
+/// Ask this observer to perform one active discovery pass on every medium it
+/// owns, then return promptly once the work has been scheduled.
+pub const ANNOUNCE_DISCOVERY_ACTIVE: u64 = 10;
+/// Ask a local NAN-capable observer to send one directed wake Subscribe for a
+/// sleepy peer.  The emitted over-the-air Service Info remains the canonical
+/// `control.transport.set { mode: sta, wake_target }` record so the target
+/// has one profile parser and one target-admission rule on every bearer.
+pub const ANNOUNCE_NAN_WAKEUP: u64 = 11;
 /// Transition markers use the same presence schema so every bearer can carry
 /// timing evidence without inventing a UART-only event format.
 pub const ANNOUNCE_TRANSITION_BEGIN: u64 = 5;
@@ -42,9 +50,48 @@ pub const FIELD_DEVICE_CLASS: u64 = 7;
 /// descriptor override or decline capability-dependent rows.
 pub const FIELD_PROBE_CAPABILITIES: u64 = 8;
 pub const DEVICE_CLASS_UNKNOWN: u8 = 0;
+/// Historical generic ESP value. Old firmware used this for every ESP family,
+/// so it remains an ESP radio class but cannot select a firmware artifact.
 pub const DEVICE_CLASS_ESP: u8 = 1;
 pub const DEVICE_CLASS_HOST: u8 = 2;
 pub const DEVICE_CLASS_ANDROID: u8 = 3;
+/// Classic Xtensa ESP32.
+pub const DEVICE_CLASS_ESP32: u8 = 4;
+/// RISC-V ESP32-C6.
+pub const DEVICE_CLASS_ESP32C6: u8 = 5;
+/// Xtensa ESP32-S3.
+pub const DEVICE_CLASS_ESP32S3: u8 = 6;
+
+/// True when a signed announce identifies a flashable ESP family.
+pub const fn is_esp_device_class(device_class: u8) -> bool {
+    matches!(
+        device_class,
+        DEVICE_CLASS_ESP | DEVICE_CLASS_ESP32 | DEVICE_CLASS_ESP32C6 | DEVICE_CLASS_ESP32S3
+    )
+}
+
+/// Immutable artifact CPU selector for a concrete signed ESP class.
+pub const fn flash_cpu_for_device_class(device_class: u8) -> Option<u8> {
+    match device_class {
+        DEVICE_CLASS_ESP32 => Some(0),
+        DEVICE_CLASS_ESP32S3 => Some(9),
+        DEVICE_CLASS_ESP32C6 => Some(13),
+        _ => None,
+    }
+}
+
+/// Stable human/CLI spelling for the producer family carried in an announce.
+pub const fn device_class_name(device_class: u8) -> &'static str {
+    match device_class {
+        DEVICE_CLASS_ESP => "esp-legacy",
+        DEVICE_CLASS_ESP32 => "esp32",
+        DEVICE_CLASS_ESP32C6 => "esp32c6",
+        DEVICE_CLASS_ESP32S3 => "esp32s3",
+        DEVICE_CLASS_HOST => "host",
+        DEVICE_CLASS_ANDROID => "android",
+        _ => "unknown",
+    }
+}
 /// Optional compressed SEC1 P-256 public key in the announce CBOR body. This
 /// is not an envelope key. It is retained temporarily for signed announces;
 /// the intended compact form is a VIP/identity-hint-only announce, with the
@@ -206,6 +253,20 @@ pub struct Announce {
     /// address without serializing Android's interface name.
     pub udp_link_local_v6: [u8; 16],
     pub udp_link_local_v6_present: bool,
+}
+
+/// Volatile, unsigned local-radio facts carried alongside a signed discovery
+/// announce. These are deliberately outside the signed announce fields: NAN
+/// cluster selection and local observation counts change far more often than
+/// the cached identity/transport announce and must not trigger re-signing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DiscoveryFacts {
+    /// Last three bytes of the selected NAN cluster BSSID, when one exists.
+    pub nan_cluster_suffix: Option<[u8; 3]>,
+    /// Local count of received DMesh NAN Service-Info observations.
+    pub nan_service_observations: u16,
+    /// Local count of currently visible NAN peers/nodes.
+    pub nan_visible_nodes: u16,
 }
 
 /// Typed entry in a local announce-observation cache.
@@ -493,6 +554,92 @@ pub fn encode_discovery_response(announce: Announce, id: u64, out: &mut [u8]) ->
     encode_inner(announce, true, Some(id), out)
 }
 
+/// Pair an already signed discovery record with volatile local-radio facts.
+///
+/// The signed `fields` value is copied byte-for-byte, so receivers can verify
+/// the same cached announce while operators still get current NAN state from
+/// UDP multicast and its directed discovery replies.
+pub fn encode_with_discovery_facts(
+    packet: &[u8],
+    facts: DiscoveryFacts,
+    out: &mut [u8],
+) -> Option<usize> {
+    let record = decode(packet)?;
+    if record.to.is_some()
+        || record.params.is_some()
+        || record.result.is_some()
+        || record.error.is_some()
+        || record.data.is_some()
+        || record.extensions.is_some()
+        || decode_record(record)?.kind != ANNOUNCE_DISCOVERY
+    {
+        return None;
+    }
+    let component = match record.component? {
+        Name::Tag(value) => value,
+        _ => return None,
+    };
+    let method = match record.method? {
+        Name::Tag(value) => value,
+        _ => return None,
+    };
+    let fields = record.fields?;
+    let mut e = Encoder::new(out);
+    e.map(if record.id.is_some() { 5 } else { 4 })?;
+    e.uint(1)?;
+    e.uint(component)?;
+    e.uint(2)?;
+    e.uint(method)?;
+    if let Some(id) = record.id {
+        e.uint(3)?;
+        e.uint(id)?;
+    }
+    e.uint(5)?;
+    e.encoded_value(fields)?;
+    e.uint(11)?;
+    e.map(2 + u64::from(facts.nan_cluster_suffix.is_some()))?;
+    if let Some(suffix) = facts.nan_cluster_suffix {
+        e.uint(1)?;
+        e.bytes_value(&suffix)?;
+    }
+    e.uint(2)?;
+    e.uint(u64::from(facts.nan_service_observations))?;
+    e.uint(3)?;
+    e.uint(u64::from(facts.nan_visible_nodes))?;
+    Some(e.len())
+}
+
+/// Decode optional local-radio discovery facts. Absence is normal for older
+/// peers and means unavailable, never zero.
+pub fn discovery_facts(record: Record<'_>) -> Option<DiscoveryFacts> {
+    let encoded = record.extensions?;
+    let mut d = Decoder::new(encoded);
+    let (major, count) = d.head()?;
+    if major != 5 || count == u64::MAX {
+        return None;
+    }
+    let mut facts = DiscoveryFacts::default();
+    let mut services = false;
+    let mut nodes = false;
+    for _ in 0..count {
+        match d.uint()? {
+            1 if facts.nan_cluster_suffix.is_none() => {
+                facts.nan_cluster_suffix = Some(d.bytes_ref()?.try_into().ok()?);
+            }
+            2 if !services => {
+                facts.nan_service_observations = u16::try_from(d.uint()?).ok()?;
+                services = true;
+            }
+            3 if !nodes => {
+                facts.nan_visible_nodes = u16::try_from(d.uint()?).ok()?;
+                nodes = true;
+            }
+            _ => return None,
+        }
+    }
+    (services && nodes && d.is_finished()).then_some(facts)
+}
+
 /// Transient canonical CBOR bytes signed by an identified announce. They
 /// include the public-key field but omit the signature field itself; only
 /// [`encode`] emits the final key-plus-signature wire record.
@@ -646,8 +793,12 @@ fn is_empty_observation_request(packet: &[u8], method: u64) -> bool {
     {
         return false;
     }
+    // A normal QUIC request has a correlation id and uses the common empty
+    // tagged envelope, which omits fields entirely. The older direct form
+    // carries `{5:{}}`; retain support for it, but do not reject the canonical
+    // stream request merely because it has no fields.
     let Some(fields) = record.fields else {
-        return false;
+        return record.params.is_none();
     };
     let mut fields = Decoder::new(fields);
     matches!(fields.head(), Some((5, 0))) && fields.is_finished()
@@ -666,6 +817,62 @@ pub fn encode_followups_observed_request(out: &mut [u8]) -> Option<usize> {
 /// Encode the empty request for the common `discovery.nodes` observation facts.
 pub fn encode_devices_observed_request(out: &mut [u8]) -> Option<usize> {
     encode_empty_observation_request(ANNOUNCE_DEVICES_OBSERVED, out)
+}
+
+/// Encode the local controller action `nan.wakeup {to: MAC}`.  This does not
+/// travel to the sleepy peer directly: an Android, ESP32, or host observer
+/// consumes it and emits the established targeted active-Subscribe payload.
+pub fn encode_nan_wakeup_request(target: [u8; 6], id: u64, out: &mut [u8]) -> Option<usize> {
+    let mut e = Encoder::new(out);
+    e.map(4)?;
+    e.uint(1)?;
+    e.uint(ANNOUNCE_COMPONENT)?;
+    e.uint(2)?;
+    e.uint(ANNOUNCE_NAN_WAKEUP)?;
+    e.uint(3)?;
+    e.uint(id)?;
+    e.uint(5)?;
+    e.map(1)?;
+    e.uint(1)?;
+    e.bytes_value(&target)?;
+    Some(e.len())
+}
+
+/// Decode the local controller action `nan.wakeup {to: MAC}`.
+pub fn decode_nan_wakeup_request(record: Record<'_>) -> Option<[u8; 6]> {
+    if record.to.is_some()
+        || record.component != Some(Name::Tag(ANNOUNCE_COMPONENT))
+        || record.method != Some(Name::Tag(ANNOUNCE_NAN_WAKEUP))
+    {
+        return None;
+    }
+    let mut d = Decoder::new(record.fields?);
+    if d.head()? != (5, 1) || d.uint()? != 1 {
+        return None;
+    }
+    let value_start = d.position();
+    let target = if let Some(target) = d.bytes_ref().and_then(|value| value.try_into().ok()) {
+        target
+    } else {
+        // JSON/HTTP adapters have no byte-string scalar. Accept their
+        // canonical MAC spelling at this boundary; binary CBOR remains the
+        // preferred on-air/control representation.
+        d.set_position(value_start);
+        parse_mac_text(core::str::from_utf8(d.text_ref()?).ok()?)?
+    };
+    d.is_finished().then_some(target)
+}
+
+fn parse_mac_text(value: &str) -> Option<[u8; 6]> {
+    let compact = value.replace([':', '-'], "");
+    if compact.len() != 12 {
+        return None;
+    }
+    let mut target = [0u8; 6];
+    for (index, byte) in target.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(target)
 }
 
 fn encode_empty_observation_request(method: u64, out: &mut [u8]) -> Option<usize> {
@@ -764,9 +971,14 @@ pub fn encode_devices_observed_response(
     e.uint(1)?;
     e.array(entries.len() as u64)?;
     for entry in entries {
-        e.map(12 + u64::from(entry.bssid.is_some()) + u64::from(entry.channel.is_some()))?;
+        e.map(13 + u64::from(entry.bssid.is_some()) + u64::from(entry.channel.is_some()))?;
         e.uint(1)?;
         e.bytes_value(entry.device_id)?;
+        // The receiver-local peer MAC is needed to merge observations from
+        // several devices when the peer has not yet supplied a signed
+        // identity hint. It is observation metadata, never an identity claim.
+        e.uint(2)?;
+        e.bytes_value(&entry.peer)?;
         if let Some(bssid) = entry.bssid {
             e.uint(3)?;
             e.bytes_value(&bssid)?;
@@ -967,6 +1179,19 @@ mod tests {
     use std::net::Ipv6Addr;
 
     #[test]
+    fn concrete_esp_classes_select_the_matching_flash_cpu() {
+        assert!(is_esp_device_class(DEVICE_CLASS_ESP));
+        assert!(is_esp_device_class(DEVICE_CLASS_ESP32));
+        assert!(is_esp_device_class(DEVICE_CLASS_ESP32C6));
+        assert!(is_esp_device_class(DEVICE_CLASS_ESP32S3));
+        assert_eq!(flash_cpu_for_device_class(DEVICE_CLASS_ESP), None);
+        assert_eq!(flash_cpu_for_device_class(DEVICE_CLASS_ESP32), Some(0));
+        assert_eq!(flash_cpu_for_device_class(DEVICE_CLASS_ESP32C6), Some(13));
+        assert_eq!(flash_cpu_for_device_class(DEVICE_CLASS_ESP32S3), Some(9));
+        assert_eq!(device_class_name(DEVICE_CLASS_ESP), "esp-legacy");
+    }
+
+    #[test]
     fn announce_round_trips_as_one_direct_record() {
         let mut id = [0; MAX_DEVICE_ID];
         id[..6].copy_from_slice(b"e6-c6!");
@@ -1000,6 +1225,37 @@ mod tests {
         let record = decode(&response[..response_len]).unwrap();
         assert_eq!(record.id, Some(71));
         assert_eq!(decode_announce(&response[..response_len]), Some(announce));
+    }
+
+    #[test]
+    fn volatile_discovery_facts_preserve_the_signed_announce() {
+        let mut id = [0; MAX_DEVICE_ID];
+        id[..6].copy_from_slice(b"e6-c6!");
+        let mut announce = Announce::discovery(id, 6, 900);
+        assert!(announce.set_public_key(&[0x02; 33]));
+        assert!(announce.set_signature(&[0xa5; SIGNATURE_LEN]));
+        let mut signed = [0u8; 256];
+        let signed_len = encode(announce, &mut signed).unwrap();
+        let facts = DiscoveryFacts {
+            nan_cluster_suffix: Some([4, 5, 6]),
+            nan_service_observations: 7,
+            nan_visible_nodes: 2,
+        };
+        let mut wrapped = [0u8; 320];
+        let wrapped_len =
+            encode_with_discovery_facts(&signed[..signed_len], facts, &mut wrapped).unwrap();
+        let record = decode(&wrapped[..wrapped_len]).unwrap();
+        assert_eq!(decode_record(record), Some(announce));
+        assert_eq!(discovery_facts(record), Some(facts));
+        let mut original_signing = [0u8; 256];
+        let mut wrapped_signing = [0u8; 256];
+        let original_signing_len = signing_bytes(announce, &mut original_signing).unwrap();
+        let wrapped_signing_len =
+            signing_bytes(decode_record(record).unwrap(), &mut wrapped_signing).unwrap();
+        assert_eq!(
+            &original_signing[..original_signing_len],
+            &wrapped_signing[..wrapped_signing_len]
+        );
     }
 
     #[test]
@@ -1069,6 +1325,16 @@ mod tests {
         let entries = [entry; 10];
         let mut response = [0; 1_100];
         assert!(encode_devices_observed_response(&entries, &mut response).is_some());
+    }
+
+    #[test]
+    fn nan_wakeup_is_a_bounded_targeted_controller_action() {
+        let target = [0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c];
+        let mut wire = [0; 48];
+        let used = encode_nan_wakeup_request(target, 7, &mut wire).unwrap();
+        let record = crate::tagged::decode(&wire[..used]).unwrap();
+        assert_eq!(record.id, Some(7));
+        assert_eq!(decode_nan_wakeup_request(record), Some(target));
     }
 
     #[test]

@@ -1,8 +1,6 @@
-//! Tagged-CBOR stream handlers for one-way DCID forwarding.
+//! Stream handlers for one-way / multi-path DCID forwarding.
 //!
-//! Relay administration uses authenticated QUIC streams. The forwarding
-//! table may carry Initial setup or approved direct application records,
-//! but their payload type never grants a second relay-configuration path.
+//! Relay administration uses authenticated QUIC streams or messages.
 
 use crate::transport_path::TransportId;
 use crate::{

@@ -2701,6 +2701,18 @@ impl<const N: usize> SendFlowControl<N> {
         end <= stream.max_data && self.sent_data.saturating_add(new_bytes) <= self.max_data
     }
 
+    fn available_at(&self, id: u64, offset: u64) -> Result<usize, Error> {
+        let stream = self.stream(id).ok_or(Error::Invalid)?;
+        let maximum_end = min(
+            stream.max_data,
+            stream
+                .sent
+                .saturating_add(self.max_data.saturating_sub(self.sent_data)),
+        );
+        Ok(usize::try_from(maximum_end.saturating_sub(offset)).unwrap_or(usize::MAX))
+    }
+
+
     pub fn reserve(&mut self, id: u64, offset: u64, len: usize) -> Result<(), Error> {
         if !self.can_send(id, offset, len) {
             return Err(Error::FlowControl);
@@ -4054,6 +4066,7 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         self.send.reserve(id, offset, len)
     }
 
+
     pub fn packet_sent(&mut self, bytes: u64) -> bool {
         self.congestion.on_packet_sent(bytes)
     }
@@ -4180,6 +4193,13 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         }
         if has_ack {
             self.receive_ack_packet(input)?;
+        } else {
+            // MAX_DATA/MAX_STREAM_DATA are independently meaningful control
+            // frames. A receiver that releases storage after its ACK turn may
+            // emit a credit-only packet while the sender is flow blocked.
+            // Requiring an ACK in the same datagram silently discarded that
+            // only liveness edge.
+            self.receive_flow_control_packet(input)?;
         }
         if let Some((sequence, packet_threshold, max_ack_delay_us, reordering_threshold)) =
             ack_frequency
@@ -4789,6 +4809,24 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         Ok(())
     }
 
+    fn receive_flow_control_packet(&mut self, input: &[u8]) -> Result<(), Error> {
+        let (_, header_len) = ShortHeader::decode(input)?;
+        let mut offset = header_len;
+        while offset < input.len() {
+            let (frame, used) = decode_frame(&input[offset..])?;
+            if used == 0 {
+                return Err(Error::Invalid);
+            }
+            match frame {
+                Frame::MaxData(max) => self.send.extend_connection(max),
+                Frame::MaxStreamData { id, max } => self.send.extend_stream(id, max)?,
+                _ => {}
+            }
+            offset += used;
+        }
+        Ok(())
+    }
+
     /// Consume delivery of one FIN-bearing stream range. ACK parsing and
     /// retransmission lineage remain entirely internal to this endpoint.
     pub fn take_acknowledged_fin_stream(&mut self, stream_id: u64) -> bool {
@@ -4925,6 +4963,34 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
             .checked_add(1)
             .ok_or(Error::PacketNumberExhausted)?;
         Ok((header_len + frame_len, packet_number))
+    }
+
+    /// Encode the largest fresh prefix that currently fits peer flow credit.
+    /// This is the sender-side analogue of ordered partial consumption: a
+    /// stream producer supplies ordinary bytes, while QUIC-lite chooses the
+    /// packet boundary and retains all credit/packet accounting.
+    pub fn encode_stream_packet_fitting(
+        &mut self,
+        dcid: ConnectionId,
+        stream_id: u64,
+        offset: u64,
+        fin: bool,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, u32, usize), Error> {
+        let length = data.len().min(self.send.available_at(stream_id, offset)?);
+        if length == 0 {
+            return Err(Error::FlowControl);
+        }
+        let (used, packet_number) = self.encode_stream_packet(
+            dcid,
+            stream_id,
+            offset,
+            fin && length == data.len(),
+            &data[..length],
+            out,
+        )?;
+        Ok((used, packet_number, length))
     }
 
     /// Re-encode one outstanding stream frame with a fresh packet number.
@@ -5466,6 +5532,35 @@ mod tests {
             let n = frame.encode(&mut b).unwrap();
             assert_eq!(decode_frame(&b[..n]).unwrap(), (frame, n));
         }
+    }
+
+    #[test]
+    fn credit_only_packet_advances_a_flow_blocked_sender() {
+        let client_cid = ConnectionId::new(0x701).unwrap();
+        let server_cid = ConnectionId::new(0x702).unwrap();
+        let mut client = EndpointState::<4, 8, 256>::new(
+            Role::Client,
+            ConnectionLimits::default(),
+            256,
+        );
+        client.install_connection_ids(client_cid, server_cid).unwrap();
+        client.set_initial_peer_credit(100, 100).unwrap();
+        client.open_send_stream(8, 100).unwrap();
+
+        let mut packet = [0u8; 128];
+        let header = ShortHeader {
+            flags: FLAG_FIXED,
+            dcid: client_cid,
+            packet_number: 1,
+            packet_number_len: 1,
+        };
+        let mut used = header.encode(&mut packet).unwrap();
+        used += Frame::MaxData(500).encode(&mut packet[used..]).unwrap();
+        used += Frame::MaxStreamData { id: 8, max: 400 }
+            .encode(&mut packet[used..])
+            .unwrap();
+        client.receive_datagram_batch(&packet[..used]).unwrap();
+        assert_eq!(client.peer_send_credit(8), Some((500, 400)));
     }
 
     #[test]

@@ -6,9 +6,13 @@
 //! results. Keeping this state here makes UART, UDP, simulated links, and
 //! firmware use the same bootstrap and response-stream rules.
 
-use alloc::boxed::Box;
+use alloc::{
+    alloc::{alloc, Layout},
+    boxed::Box,
+};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 pub use quic_lite::ClientStreamConnection as StreamClientConnection;
 use quic_lite::{ConnectionId, ConnectionLimits, Error, ServerStreamConnection};
@@ -19,6 +23,27 @@ use quic_lite::{
 };
 
 use crate::services::{EventRing, MAX_BINARY_EVENT_PAYLOAD_BYTES};
+
+/// Allocate final stream-connection storage without allowing a peer's OPEN to
+/// invoke the global OOM handler.  Embedded heaps can be fragmented even when
+/// their aggregate free-byte count is healthy; admission must reject that
+/// connection rather than reset the firmware.  The transport maps the result
+/// to its existing bounded-capacity error and leaves no association installed.
+fn try_connection_storage<T>(
+    allocate: impl FnOnce(Layout) -> *mut u8,
+) -> Result<Box<MaybeUninit<T>>, Error> {
+    let raw = allocate(Layout::new::<T>());
+    if raw.is_null() {
+        return Err(Error::HistoryFull);
+    }
+    // `raw` was obtained from the global allocator with exactly this layout.
+    // Until `assume_init`, dropping the Box releases only the allocation.
+    Ok(unsafe { Box::from_raw(raw.cast::<MaybeUninit<T>>()) })
+}
+
+fn try_connection_storage_global<T>() -> Result<Box<MaybeUninit<T>>, Error> {
+    try_connection_storage(|layout| unsafe { alloc(layout) })
+}
 
 /// Compact peer/DCID association retained after an active stream connection
 /// is reclaimed. The peer type is bearer-owned: MACs, socket addresses, and
@@ -267,7 +292,7 @@ impl<const HISTORY: usize, const PACKET: usize> StreamServerConnection<HISTORY, 
     ) -> Result<(Box<Self>, Vec<u8>), Error> {
         // Initialize the generic connection core directly in its final outer
         // allocation, then add only DMesh event state around it.
-        let mut connection = Box::<Self>::new_uninit();
+        let mut connection = try_connection_storage_global::<Self>()?;
         let pointer = connection.as_mut_ptr().cast::<Self>();
         unsafe {
             let ack = ServerStreamConnection::accept_open_in_place_with_config_and_reset_token(
@@ -291,6 +316,12 @@ mod tests {
         BootstrapClient, Frame, ShortHeader, decode_bootstrap_open_ack_packet_with_limits,
         decode_frame,
     };
+
+    #[test]
+    fn connection_storage_allocation_failure_is_a_transport_error() {
+        let result = try_connection_storage::<u64>(|_| core::ptr::null_mut());
+        assert_eq!(result.unwrap_err(), Error::HistoryFull);
+    }
 
     #[test]
     fn accepts_open_with_budget_and_nonzero_response_packet_number() {

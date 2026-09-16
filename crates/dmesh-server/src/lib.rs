@@ -283,13 +283,18 @@ mod host {
             bail!("object too large");
         }
         let mut out = Vec::with_capacity(64 + manifest.block_sha256.len() * BLOCK_DIGEST_BYTES);
-        // CBOR map: target, version, block size, block count, image size,
-        // full image digest, and a flat, fixed-width per-block digest table.
+        // CBOR map: target, CPU family, version, block size, block count,
+        // image size, full image digest, and a flat, fixed-width per-block
+        // digest table. The CPU belongs to the immutable object contract: a
+        // device must never successfully commit a valid image for another
+        // ESP family merely because the host selected the wrong catalog row.
         // The receiver indexes the table by block number before accepting or
         // committing an image.
-        cbor::encode::map(7, &mut out);
+        cbor::encode::map(8, &mut out);
         cbor::encode::uint(0, &mut out);
         cbor::encode::uint(request.target as u64, &mut out);
+        cbor::encode::uint(8, &mut out);
+        cbor::encode::uint(request.cpu as u64, &mut out);
         cbor::encode::uint(1, &mut out);
         cbor::encode::uint(VERIFIED_OBJECT_VERSION as u64, &mut out);
         cbor::encode::uint(2, &mut out);
@@ -328,31 +333,34 @@ mod host {
             }
         }
 
-        /// Resolve a GET and materialize transport-neutral response records.
-        /// Bearer adapters stream them through QUIC-lite without making the
-        /// object service aware of a socket or radio implementation.
-        pub fn response_records(&self, request: GetRequest<'_>) -> Result<Vec<(u8, Vec<u8>)>> {
+        /// Resolve a GET as one ordered object: canonical CBOR manifest
+        /// followed immediately by the unencoded binary body.
+        pub fn response_object(&self, request: GetRequest<'_>) -> Result<(Vec<u8>, Vec<u8>)> {
             let source = target_file(&self.config.artifact_root, request)?;
-            let manifest = self.manifests.get(&source)?;
-            let mut records = vec![(RECORD_MANIFEST, manifest_bytes(&manifest, request)?)];
-            let mut file = std::fs::File::open(source)?;
-            let mut block = vec![0u8; BLOCK_SIZE];
-            let mut index = 0u32;
-            loop {
-                let n = file.read(&mut block)?;
-                if n == 0 {
-                    break;
-                }
-                let mut body = Vec::with_capacity(12 + n);
-                body.extend_from_slice(&[0, 0, 0, 0]);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&(n as u32).to_be_bytes());
-                body.extend_from_slice(&block[..n]);
-                records.push((RECORD_BLOB, body));
-                index = index.checked_add(1).context("block count overflow")?;
+            self.response_file(request, &source)
+        }
+
+        /// Serve an explicitly selected immutable object with the same
+        /// manifest/body representation as catalog-selected artifacts.  The
+        /// caller remains responsible for choosing a file appropriate for the
+        /// requested target; the receiver validates the signed manifest and
+        /// its permitted flash range.
+        pub fn response_file(
+            &self,
+            request: GetRequest<'_>,
+            source: &Path,
+        ) -> Result<(Vec<u8>, Vec<u8>)> {
+            if !source.is_file() {
+                bail!("artifact not found: {}", source.display());
             }
-            records.push((RECORD_DONE, Vec::new()));
-            Ok(records)
+            let manifest = self.manifests.get(&source)?;
+            Ok((manifest_bytes(&manifest, request)?, std::fs::read(source)?))
+        }
+
+        #[deprecated(note = "use response_object; record framing is not used on the wire")]
+        pub fn response_records(&self, request: GetRequest<'_>) -> Result<Vec<(u8, Vec<u8>)>> {
+            let (manifest, body) = self.response_object(request)?;
+            Ok(vec![(RECORD_MANIFEST, manifest), (RECORD_BLOB, body), (RECORD_DONE, Vec::new())])
         }
     }
 
@@ -363,7 +371,7 @@ mod host {
         use tempfile::tempdir;
 
         #[test]
-        fn response_records_preserve_manifest_and_block_digests() {
+        fn response_object_is_manifest_followed_by_exact_binary_body() {
             let directory = tempdir().unwrap();
             let artifact_root = directory.path().join("flash");
             let artifact = artifact_root.join("esp32c6/main-app.bin");
@@ -380,42 +388,26 @@ mod host {
                 cpu: 13,
                 target: 6,
             };
-            let records = server.response_records(request).unwrap();
-            assert_eq!(records.len(), 4);
-            assert_eq!(records[0].0, RECORD_MANIFEST);
-            assert_eq!(records[1].0, RECORD_BLOB);
-            assert_eq!(records[2].0, RECORD_BLOB);
-            assert_eq!(records[3], (RECORD_DONE, Vec::new()));
+            let (manifest_bytes, body) = server.response_object(request).unwrap();
+            assert_eq!(body, bytes);
+            let manifest = ImageManifest::decode(&manifest_bytes).unwrap();
+            assert_eq!(manifest.image_size, body.len() as u32);
+            assert_eq!(manifest.cpu, 13);
+            assert_eq!(manifest.block_count, 2);
 
             let full_digest = Sha256::digest(&bytes).to_vec();
             assert!(
-                records[0]
-                    .1
+                manifest_bytes
                     .windows(full_digest.len())
                     .any(|window| window == &full_digest[..])
             );
             let first_digest = Sha256::digest(&bytes[..BLOCK_SIZE]).to_vec();
             assert!(
-                records[0]
-                    .1
+                manifest_bytes
                     .windows(4)
                     .any(|window| window == &first_digest[..4])
             );
-            assert_eq!(&records[1].1[..4], &[0, 0, 0, 0]);
-            assert_eq!(
-                u32::from_be_bytes(records[1].1[4..8].try_into().unwrap()),
-                0
-            );
-            assert_eq!(
-                u32::from_be_bytes(records[1].1[8..12].try_into().unwrap()),
-                BLOCK_SIZE as u32
-            );
-            assert_eq!(&records[1].1[12..], &bytes[..BLOCK_SIZE]);
-            assert_eq!(
-                u32::from_be_bytes(records[2].1[4..8].try_into().unwrap()),
-                1
-            );
-            assert_eq!(&records[2].1[12..], &bytes[BLOCK_SIZE..]);
+            assert_eq!(manifest.block_size, BLOCK_SIZE as u32);
         }
 
         #[test]
@@ -438,9 +430,9 @@ mod host {
                 },
             )
             .unwrap();
-            // 60 bytes of fixed fields plus key 6 and a 16,384-byte CBOR
+            // 62 bytes of fixed fields plus key 6 and a 16,384-byte CBOR
             // byte string: no per-block CBOR wrappers.
-            assert_eq!(bytes.len(), 8_256);
+            assert_eq!(bytes.len(), 8_258);
             let decoded = ImageManifest::decode(&bytes).unwrap();
             assert_eq!(decoded.block_digests.len(), 1024);
             assert!(

@@ -19,6 +19,28 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::Runtime;
 
+#[cfg(target_os = "android")]
+struct AndroidDiscoveryApplication;
+
+#[cfg(target_os = "android")]
+impl dmesh_server::udp::TaggedApplicationHandler for AndroidDiscoveryApplication {
+    fn handle_tagged<'a>(
+        &'a self,
+        _context: dmesh_server::udp::TaggedStreamContext,
+        request: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(response) = crate::mesh_jni::android_discovery_active_response(&request) {
+                return Some(response);
+            }
+            if let Some(response) = crate::mesh_jni::android_nan_wakeup_response(&request) {
+                return Some(response);
+            }
+            crate::mesh_jni::android_discovery_nodes_response(&request)
+        })
+    }
+}
+
 /// Opaque handle for a running mesh node instance.
 ///
 /// Owns the tokio runtime, the `MeshNode`, the SSH client manager,
@@ -52,6 +74,9 @@ pub fn start_mesh(
     ssh_port: i32,
     http_port: i32,
     #[cfg_attr(not(target_os = "android"), allow(unused_variables))] android_udp_fd: Option<i32>,
+    #[cfg_attr(not(target_os = "android"), allow(unused_variables))] android_discovery_fd: Option<
+        i32,
+    >,
 ) -> Result<MeshHandle, anyhow::Error> {
     let base_path = PathBuf::from(base_dir);
     let _ = std::fs::create_dir_all(&base_path);
@@ -164,6 +189,11 @@ pub fn start_mesh(
             )),
             socket: Some(socket),
             artifact_root: base_path.clone(),
+            tagged_handler: Some(Arc::new(
+                dmesh_server::udp::CanonicalTaggedStreamHandler::new(Arc::new(
+                    AndroidDiscoveryApplication,
+                )),
+            )),
             ..dmesh_server::udp::UdpConfig::default()
         };
         Some(runtime.spawn(async move {
@@ -184,7 +214,11 @@ pub fn start_mesh(
             .unwrap_or_default();
         let (trigger, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
-            Some(runtime.spawn(android_announce_loop(public_key, receiver))),
+            Some(runtime.spawn(android_announce_loop(
+                public_key,
+                receiver,
+                android_discovery_fd,
+            ))),
             Some(trigger),
         )
     };
@@ -236,20 +270,39 @@ pub fn stop_mesh(handle: MeshHandle) {
 async fn android_announce_loop(
     public_key: String,
     mut trigger: tokio::sync::mpsc::UnboundedReceiver<()>,
+    android_discovery_fd: Option<i32>,
 ) {
     const PORT: u16 = 5227;
     let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
-    let socket = match tokio::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, PORT)).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            log::error!("Android announce UDP bind failed: {error}");
-            return;
+    let socket = match android_discovery_fd {
+        Some(fd) => {
+            // Android-specific descriptor handoff only: Java used
+            // `Network.bindSocket`, the sole platform API for applying the
+            // selected Wi-Fi route mark. Rust retains all discovery behavior
+            // after adoption. Without that mark the prior Rust-created 5227
+            // socket did not answer a live LAN multicast probe; the marked
+            // descriptor did, including its directed unicast reply.
+            let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            if let Err(error) = socket.set_nonblocking(true) {
+                log::error!("Android announce UDP nonblocking setup failed: {error}");
+                return;
+            }
+            match tokio::net::UdpSocket::from_std(socket) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    log::error!("Android announce UDP descriptor adoption failed: {error}");
+                    return;
+                }
+            }
         }
+        None => match tokio::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, PORT)).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                log::error!("Android announce UDP bind failed: {error}");
+                return;
+            }
+        },
     };
-    let mut id = [0; 16];
-    let key_bytes = public_key.as_bytes();
-    let take = key_bytes.len().min(id.len());
-    id[..take].copy_from_slice(&key_bytes[..take]);
     let started = tokio::time::Instant::now();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
     let mut receive = [0u8; 256];
@@ -259,7 +312,7 @@ async fn android_announce_loop(
         tokio::select! {
             _ = interval.tick() => {
                 let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
-                    id, take as u8, started.elapsed().as_secs(), boot_pending).await;
+                    &public_key, started.elapsed().as_secs(), boot_pending).await;
                 if sent { boot_pending = false; }
             }
             Some(()) = trigger.recv() => {
@@ -267,17 +320,47 @@ async fn android_announce_loop(
                 // scoped multicast interface and emit the same bounded record
                 // now, rather than waiting for the periodic interval.
                 let sent = send_android_announce(&socket, group, PORT, &mut joined_interfaces,
-                    id, take as u8, started.elapsed().as_secs(), boot_pending).await;
+                    &public_key, started.elapsed().as_secs(), boot_pending).await;
                 if sent { boot_pending = false; }
             }
             received = socket.recv_from(&mut receive) => match received {
                 Ok((len, sender)) => {
-                    if let Some(announce) = dmesh_server::announce::decode_announce(&receive[..len]) {
+                    let packet = &receive[..len];
+                    if let Some(request) = dmesh_server::direct::ConnectionlessMessage::decode(packet)
+                        && let Some(request_id) = dmesh_server::announce::discovery_request_id(request)
+                    {
+                        let announce = crate::mesh_jni::android_discovery_announce(
+                            &public_key,
+                            u32::try_from(started.elapsed().as_secs()).unwrap_or(u32::MAX),
+                        );
+                        let mut response = [0u8; 256];
+                        let mut record = [0u8; 320];
+                        let mut envelope = [0u8; 384];
+                        if let Some(response_len) = dmesh_server::announce::encode_discovery_response(
+                            announce, request_id, &mut response,
+                        )
+                            && let Some(record_len) = dmesh_server::announce::encode_with_discovery_facts(
+                                &response[..response_len],
+                                crate::mesh_jni::android_discovery_facts(),
+                                &mut record,
+                            )
+                            && let Some(envelope_len) = dmesh_server::direct::ConnectionlessMessage::encode(
+                                &record[..record_len], &mut envelope,
+                            )
+                        {
+                            match socket.send_to(&envelope[..envelope_len], sender).await {
+                                Ok(_) => log::info!("Android replied to directed UDP discovery from {sender}"),
+                                Err(error) => log::warn!("Android directed UDP discovery reply failed: {error}"),
+                            }
+                        } else {
+                            log::warn!("Android could not encode directed UDP discovery reply");
+                        }
+                    } else if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
                         crate::mesh_jni::observe_announce(
                             announce,
                             sender.to_string(),
                             "udp_multicast",
-                            &receive[..len],
+                            packet,
                         );
                     }
                 }
@@ -295,31 +378,42 @@ async fn send_android_announce(
     group: Ipv6Addr,
     port: u16,
     joined_interfaces: &mut BTreeSet<u32>,
-    id: [u8; 16],
-    id_len: u8,
+    public_key: &str,
     uptime_secs: u64,
     boot: bool,
 ) -> bool {
     // Discovery has one shared record shape; boot is local scheduling state,
     // not a second on-wire identity.
     let _ = boot;
-    let announce = dmesh_server::announce::Announce::discovery(
-        id,
-        id_len,
+    let announce = crate::mesh_jni::android_discovery_announce(
+        public_key,
         u32::try_from(uptime_secs).unwrap_or(u32::MAX),
     );
-    let mut wire = [0u8; 96];
-    let Some(used) = dmesh_server::announce::encode(announce, &mut wire) else {
+    // Android includes its normal UDP6 endpoint when Wi-Fi has supplied one;
+    // that is larger than the older identity-only multicast form.
+    let mut signed = [0u8; 256];
+    let Some(signed_len) = dmesh_server::announce::encode(announce, &mut signed) else {
+        return false;
+    };
+    let mut wire = [0u8; 320];
+    let Some(used) = dmesh_server::announce::encode_with_discovery_facts(
+        &signed[..signed_len],
+        crate::mesh_jni::android_discovery_facts(),
+        &mut wire,
+    ) else {
         return false;
     };
     let interfaces = multicast_interface_indices();
     for interface_index in &interfaces {
-        if joined_interfaces.insert(*interface_index)
-            && let Err(error) = socket.join_multicast_v6(&group, *interface_index)
-        {
-            log::warn!(
-                "Android announce multicast join failed on interface {interface_index}: {error}"
-            );
+        if joined_interfaces.insert(*interface_index) {
+            match socket.join_multicast_v6(&group, *interface_index) {
+                Ok(()) => log::info!(
+                    "Android announce multicast joined ff02::5227 on interface {interface_index}"
+                ),
+                Err(error) => log::warn!(
+                    "Android announce multicast join failed on interface {interface_index}: {error}"
+                ),
+            }
         }
     }
     let mut sent = false;

@@ -2350,7 +2350,13 @@ fn wait_for_stable_control_plane_devices(
         if found == wanted.len() {
             let esp = devices
                 .iter()
-                .filter(|entry| entry["announce"]["device_class"].as_u64() == Some(1))
+                .filter(|entry| {
+                    entry["announce"]["device_class"]
+                        .as_u64()
+                        .is_some_and(|class| {
+                            dmesh_server::announce::is_esp_device_class(class as u8)
+                        })
+                })
                 .count();
             let android = devices
                 .iter()

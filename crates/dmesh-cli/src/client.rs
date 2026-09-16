@@ -258,7 +258,7 @@ impl DeviceSession {
     pub fn object_upload(
         &mut self,
         command: &[u8],
-        records: dmesh_server::verified_object::ObjectRecordStream,
+        records: dmesh_server::verified_object::ObjectBodyStream,
     ) -> Result<SerialObjectUploadResult, String> {
         self.assert_healthy()?;
         let cid = fresh_connection_id()?;
@@ -712,7 +712,7 @@ impl ClientPathPolicy {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli NODE SERVICE [field=value ...]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli uds:///run/mesh/lmesh[-wifi]/mesh.sock|lmesh://lmesh[-wifi] --method METHOD [--data JSON] [--to NODE]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli NODE SERVICE [field=value ...]\n       dmesh-cli hosts check\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--file MAIN_IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli uds:///run/mesh/lmesh[-wifi]/mesh.sock|lmesh://lmesh[-wifi] --method METHOD [--data JSON] [--to NODE]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH"
     );
     std::process::exit(2)
 }
@@ -731,6 +731,11 @@ fn hex(value: &str) -> Result<Vec<u8>, String> {
 
 fn hex_encode(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Render a 6-byte radio MAC as a colon-separated lowercase hex string.
+fn mac_encode(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(":")
 }
 
 fn physical_baud(value: u32) -> Option<libc::speed_t> {
@@ -828,6 +833,15 @@ pub fn run_dmesh_cli() -> Result<(), String> {
 /// gateway keep one L2/session implementation.
 pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut arguments: Vec<String> = args.into_iter().collect();
+    if arguments.as_slice() == ["hosts", "check"] {
+        return run_hosts_check();
+    }
+    if arguments.as_slice() == ["discover"] {
+        return run_hosts_discovery();
+    }
+    if arguments.first().is_some_and(|argument| argument == "flash") {
+        return run_automated_flash(&arguments[1..]);
+    }
     if arguments.get(1).is_some_and(|argument| argument == "check") {
         let explicit_baud = match arguments.as_slice() {
             [_, _] => None,
@@ -1463,11 +1477,11 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/flash"));
-        let records = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
+        let (manifest, image) = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
             artifact_root: artifact_root.clone(),
             ..dmesh_server::ServerConfig::default()
         })
-        .response_records(flash.object)
+        .response_object(flash.object)
         .map_err(|error| format!("object.flash artifact: {error}"))?;
         eprintln!(
             "dmesh_cli_object_upload bearer=uart association=single artifact_root={}",
@@ -1476,7 +1490,7 @@ fn run_serial_stream_command(arguments: &[String]) -> Result<(), String> {
         let mut session = DeviceSession::open(path.clone(), baud)?;
         let result = session.object_upload(
             &body,
-            dmesh_server::verified_object::ObjectRecordStream::new(records),
+            dmesh_server::verified_object::ObjectBodyStream::from_object(manifest, image),
         )?;
         eprintln!(
             "dmesh_cli_object_upload_complete bearer=uart records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
@@ -2009,6 +2023,7 @@ fn parse_interactive_service_command(line: &str) -> Result<Vec<u8>, String> {
 /// Long-lived log subscription delivery is not enabled yet; `log-watch` is a
 /// bounded record poll until the server-side framed subscription is added.
 fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
+    let (arguments, object_file) = split_object_file_argument(arguments)?;
     let peer = arguments
         .first()
         .and_then(|target| target.strip_prefix("udp://"))
@@ -2103,7 +2118,15 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     // server or a second association.
     let object_flash =
         dmesh_server::verified_object::decode_flash_handler_request(&request).is_some();
-    let requested_peer_receive_profile = requested_peer_receive_profile_from_env()?;
+    // Firmware update is deliberately conservative by default: Recovery may
+    // pause Wi-Fi while erasing flash, whereas the board's normal relay and
+    // module traffic does not use this stream operation. The host can raise
+    // this association-only profile explicitly for capability/stress tests.
+    let requested_peer_receive_profile = if object_flash {
+        requested_peer_receive_profile_from_env()?
+    } else {
+        None
+    };
     let relay = match (relay_forward_dcid, relay_reverse_dcid, relay_next_mac) {
         (None, None, None) => None,
         (Some(forward), Some(reverse), Some(next_mac)) => Some((
@@ -2168,35 +2191,29 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
         if object_flash {
             let (_, flash) = dmesh_server::verified_object::decode_flash_handler_request(&request)
                 .ok_or("invalid object.flash request")?;
-            let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target/flash"));
-            let records = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
-                artifact_root: artifact_root.clone(),
-                ..dmesh_server::ServerConfig::default()
-            })
-            .response_records(flash.object)
-            .map_err(|error| format!("object.flash artifact: {error}"))?;
+            let (manifest, image, artifact) = flash_upload_object(flash.object, object_file.as_deref())?;
             eprintln!(
-                "dmesh_cli_object_upload bearer=udp association=single artifact_root={}",
-                artifact_root.display()
+                "dmesh_cli_object_upload bearer=udp association=single artifact={}",
+                artifact.display()
             );
             let result = udp_object_upload(
                 peer,
                 cid,
                 &request,
-                dmesh_server::verified_object::ObjectRecordStream::new(records),
+                dmesh_server::verified_object::ObjectBodyStream::from_object(manifest, image),
                 requested_peer_receive_profile,
             )
             .await?;
             eprintln!(
-                "dmesh_cli_object_upload_complete bearer=udp records={} bytes={} tx_packets={} rx_packets={} retransmits={}",
+                "dmesh_cli_object_upload_complete bearer=udp records={} bytes={} elapsed_ms={} tx_packets={} rx_packets={} retransmits={}",
                 result.records,
                 result.bytes,
+                result.elapsed_ms,
                 result.tx_packets,
                 result.rx_packets,
                 result.retransmits
             );
+            flash_upload_success(&result.response)?;
             println!(
                 "dmesh_cli_stream_command target={peer} stream={} fin=true bytes={} {}",
                 quic_lite::FIRST_SERVER_BIDI_STREAM_ID,
@@ -2342,13 +2359,13 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
             let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("target/flash"));
-            let records = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
+            let (manifest, image) = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
                 artifact_root: artifact_root.clone(),
                 ..dmesh_server::ServerConfig::default()
             })
-            .response_records(flash.object)
+            .response_object(flash.object)
             .map_err(|error| format!("object.flash artifact: {error}"))?;
-            let mut object = dmesh_server::verified_object::ObjectRecordStream::new(records);
+            let mut object = dmesh_server::verified_object::ObjectBodyStream::from_object(manifest, image);
             // The C6 raw-UDP6 adapter currently proves a 256-byte payload
             // envelope on this STA link.  This is only QUIC-lite stream
             // packet sizing; object record framing and recovery remain
@@ -2394,10 +2411,74 @@ fn run_udp_service_client(arguments: &[String]) -> Result<(), String> {
     })
 }
 
+/// Remove the CLI-only object source selector before schema encoding.  A
+/// source path is host policy, not a firmware command field, so it must never
+/// be sent to the device or become part of the signed object manifest.
+fn split_object_file_argument(
+    arguments: &[String],
+) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let mut retained = Vec::with_capacity(arguments.len());
+    let mut object_file = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--file" {
+            let value = arguments.get(index + 1).ok_or("missing --file path")?;
+            if object_file.replace(PathBuf::from(value)).is_some() {
+                return Err("object.flash accepts only one --file path".into());
+            }
+            index += 2;
+        } else {
+            retained.push(arguments[index].clone());
+            index += 1;
+        }
+    }
+    Ok((retained, object_file))
+}
+
+fn flash_upload_object(
+    object: dmesh_server::verified_object::GetRequest<'_>,
+    source: Option<&Path>,
+) -> Result<(Vec<u8>, Vec<u8>, PathBuf), String> {
+    let artifact_root = env::var_os("DMESH_OBJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/flash"));
+    let server = dmesh_server::ObjectServer::new(dmesh_server::ServerConfig {
+        artifact_root,
+        ..dmesh_server::ServerConfig::default()
+    });
+    if let Some(source) = source {
+        let source = source.to_path_buf();
+        let (manifest, image) = server
+            .response_file(object, &source)
+            .map_err(|error| format!("object.flash artifact: {error}"))?;
+        Ok((manifest, image, source))
+    } else {
+        let (manifest, image) = server
+            .response_object(object)
+            .map_err(|error| format!("object.flash artifact: {error}"))?;
+        Ok((manifest, image, server.config.artifact_root.clone()))
+    }
+}
+
+fn flash_upload_success(response: &[u8]) -> Result<(), String> {
+    let record = dmesh_server::tagged::decode(response)
+        .ok_or("object.flash completed without a tagged terminal response")?;
+    let result = record
+        .result
+        .ok_or("object.flash terminal response was not successful")?;
+    let mut decoder = dmesh_server::cbor::Decoder::new(result);
+    if decoder.text_ref() != Some(&b"flash complete"[..]) || !decoder.is_finished() {
+        return Err("object.flash terminal response was not `flash complete`".into());
+    }
+    println!("SUCCESS object.flash complete");
+    Ok(())
+}
+
 struct UdpObjectUploadResult {
     response: Vec<u8>,
     records: usize,
     bytes: usize,
+    elapsed_ms: u64,
     tx_packets: u64,
     rx_packets: u64,
     retransmits: u64,
@@ -2409,7 +2490,48 @@ async fn udp_object_upload(
     peer: SocketAddr,
     cid: quic_lite::ConnectionId,
     command: &[u8],
-    records: dmesh_server::verified_object::ObjectRecordStream,
+    records: dmesh_server::verified_object::ObjectBodyStream,
+    requested_peer_receive_profile: Option<quic_lite::ReceiveWindowRequest>,
+) -> Result<UdpObjectUploadResult, String> {
+    // A token-verified peer restart means this association was discarded. It
+    // is safe to repeat the idempotent object request only on a fresh CID;
+    // never continue its packets or streams on the retired association.
+    const PEER_RESTART_ATTEMPTS: usize = 3;
+    let mut cid = cid;
+    for attempt in 0..PEER_RESTART_ATTEMPTS {
+        match udp_object_upload_once(
+            peer,
+            cid,
+            command,
+            records.clone(),
+            requested_peer_receive_profile,
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if error.contains("PeerRestarted") && attempt + 1 < PEER_RESTART_ATTEMPTS =>
+            {
+                let delay = Duration::from_millis(100_u64 << attempt);
+                eprintln!(
+                    "dmesh_cli_object_upload_peer_restarted attempt={} retry_in_ms={}",
+                    attempt + 1,
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                cid = fresh_connection_id()?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded retry loop returns on its final attempt")
+}
+
+async fn udp_object_upload_once(
+    peer: SocketAddr,
+    cid: quic_lite::ConnectionId,
+    command: &[u8],
+    records: dmesh_server::verified_object::ObjectBodyStream,
     requested_peer_receive_profile: Option<quic_lite::ReceiveWindowRequest>,
 ) -> Result<UdpObjectUploadResult, String> {
     let bind = udp_bind_for_peer(peer);
@@ -2481,8 +2603,8 @@ async fn udp_object_upload(
             }
             let admitted = driver.receive(&mut client, &input[..used], now_ms).map_err(|error| {
                 format!(
-                    "object upload receive: {error:?} records={} bytes={} blocked={:?} admission={:?} tx_packets={} socket_rx_packets={} quic_rx_packets={} quic_rejected_packets={} retransmits={}",
-                    client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), socket_rx_packets, driver.rx_packets(), quic_rejected_packets, driver.retransmit_packets()
+                    "object upload receive: {error:?} records={} bytes={} blocked={:?} admission={:?} tx_packets={} socket_rx_packets={} quic_rx_packets={} quic_rejected_packets={} retransmits={} packet_hex={}",
+                    client.record_index(), client.sent_bytes(), client.last_admission_block(), client.admission_state(), driver.tx_packets(), socket_rx_packets, driver.rx_packets(), quic_rejected_packets, driver.retransmit_packets(), hex_encode(&input[..used])
                 )
             })?;
             if !admitted {
@@ -2554,6 +2676,7 @@ async fn udp_object_upload(
                 response: client.response().unwrap_or_default().to_vec(),
                 records: client.record_index(),
                 bytes: client.sent_bytes(),
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 tx_packets: driver.tx_packets(),
                 rx_packets: driver.rx_packets(),
                 retransmits: driver.retransmit_packets(),
@@ -2588,15 +2711,16 @@ fn object_upload_timeout() -> Duration {
     )
 }
 
-/// Optional host-side association request for constrained-device tests.
-/// Both values are required so a partial environment cannot accidentally
-/// change an ordinary upload. The device still clamps this request and the
-/// OPEN_ACK remains the source of truth.
-fn requested_peer_receive_profile_from_env(
-) -> Result<Option<quic_lite::ReceiveWindowRequest>, String> {
+fn requested_peer_receive_profile_from_env()
+-> Result<Option<quic_lite::ReceiveWindowRequest>, String> {
     const DATA: &str = "DMESH_QUIC_REQUEST_PEER_MAX_DATA";
     const STREAM: &str = "DMESH_QUIC_REQUEST_PEER_MAX_STREAM_DATA";
     match (env::var(DATA).ok(), env::var(STREAM).ok()) {
+        // The peer is authoritative for its normal memory profile. In
+        // particular, a constrained ESP must not be inflated to a host-side
+        // four-packet default before it can allocate its application sink.
+        // Supplying both variables is deliberately an explicit stress or
+        // capability experiment; OPEN_ACK remains the proof of acceptance.
         (None, None) => Ok(None),
         (Some(max_data), Some(max_stream_data)) => {
             let max_data = max_data
@@ -2728,6 +2852,592 @@ fn run_udp_direct_discovery(peer: SocketAddr) -> Result<(), String> {
         started.elapsed().as_micros()
     );
     Ok(())
+}
+
+/// Check every direct ESP endpoint in the checked-in hosts inventory without
+/// consulting the host radio service.  Each candidate gets its own directed
+/// discovery record followed by a normal QUIC telemetry request: a multicast
+/// sighting, a local TX completion, or one peer's failure cannot make another
+/// candidate appear reachable.
+fn run_hosts_check() -> Result<(), String> {
+    let path = env::var_os("DMESH_HOSTS_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("hosts"));
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("read hosts inventory {}: {error}", path.display()))?;
+    let mut candidates = Vec::<(String, SocketAddr)>::new();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or_default();
+        let mut fields = line.split_whitespace();
+        let Some(address) = fields.next() else {
+            continue;
+        };
+        let Ok(address) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        for name in fields {
+            candidates.push((
+                name.to_owned(),
+                SocketAddr::new(address, dmesh_server::udp::RAW_UDP6_PORT),
+            ));
+        }
+    }
+    if candidates.is_empty() {
+        return Err(format!(
+            "hosts inventory {} has no IP/name entries",
+            path.display()
+        ));
+    }
+
+    let mut reachable = 0usize;
+    for (name, peer) in candidates {
+        let discovery = run_udp_direct_discovery(peer);
+        if let Err(error) = discovery {
+            println!(
+                "dmesh_hosts_check name={name} peer={peer} reachable=false stage=discovery error={error}"
+            );
+            continue;
+        }
+        let request = encode_stream_command_with_id("telemetry.nan_status", fresh_request_id())
+            .map_err(|error| format!("encode telemetry.nan_status: {error}"))?;
+        match exchange_udp_stream_record(peer, &request) {
+            Ok(response) => {
+                let schema = FirmwareSchema::load();
+                println!(
+                    "dmesh_hosts_check name={name} peer={peer} reachable=true {}",
+                    render_device_record(&schema, &response)
+                );
+                reachable = reachable.saturating_add(1);
+            }
+            Err(error) => println!(
+                "dmesh_hosts_check name={name} peer={peer} reachable=false stage=quic error={error}"
+            ),
+        }
+    }
+    if reachable == 0 {
+        return Err("no hosts-inventory peer completed direct discovery and QUIC telemetry".into());
+    }
+    Ok(())
+}
+
+/// Ask every directly reachable inventory node for a fresh discovery reply,
+/// wait one DW8 interval plus margin, then collect each observer's local
+/// `discovery.nodes` cache.  Every line describes one node; direct replies
+/// are self reports without `visible_from`, observer cache rows carry the
+/// single `visible_from` nodeID, and receiver-side facts keep one row per
+/// (node, observer) pair because they differ per observer.
+fn run_hosts_discovery() -> Result<(), String> {
+    let reachable = multicast_discover_peers()?;
+    if reachable.is_empty() {
+        return Err("no peer answered UDP6 multicast discovery".into());
+    }
+    // Each observer owns different local media. Ask every reachable one to
+    // run its common active pass (UDP, NAN, NOW where available), then allow
+    // the sleepy-device DW and Android's temporary Aware Subscribe to report
+    // before reading any observer cache.
+    for discovered in &reachable {
+        if !discovered.passive_ready {
+            continue;
+        }
+        let request = encode_stream_command_with_id("discovery.active", fresh_request_id())
+            .map_err(|error| format!("encode discovery.active: {error}"))?;
+        let _ = exchange_udp_stream_record(discovered.peer, &request);
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    let mut rows = Vec::<(String, String, String)>::new();
+    for discovered in &reachable {
+        let peer = discovered.peer;
+        let observer = discovered.node.clone();
+        let request = encode_stream_command_with_id("discovery.nodes", fresh_request_id())
+            .map_err(|error| format!("encode discovery.nodes: {error}"))?;
+        match exchange_udp_stream_record(peer, &request) {
+            Ok(response) => match observed_nodes(&response) {
+                Some(nodes) => {
+                    for entry in nodes {
+                        rows.push((entry.node, observer.clone(), entry.fields));
+                    }
+                }
+                None => println!("observer={observer} result=invalid_discovery_nodes"),
+            },
+            Err(error) => println!("observer={observer} error={error}"),
+        }
+    }
+    rows.sort();
+    for (node, observer, fields) in rows {
+        let node_field = if node.is_empty() {
+            String::new()
+        } else {
+            format!("node={node} ")
+        };
+        println!("{node_field}{fields} visible_from={observer}");
+    }
+    Ok(())
+}
+
+/// Flash one Main image without requiring an operator to stitch together the
+/// discovery, NAN wake, Recovery handoff, and verified-object steps.  The
+/// target is either its signed announce node ID/device name (when awake) or
+/// the NAN MAC recorded by an observer's `discovery.nodes` cache.  A legacy
+/// generic ESP announce is deliberately refused for writes: it cannot select
+/// a safe CPU artifact.
+fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
+    let (target, source) = match arguments {
+        [target] => (target.as_str(), None),
+        [target, flag, path] if flag == "--file" => (target.as_str(), Some(path.as_str())),
+        _ => return Err("usage: dmesh-cli flash TARGET [--file MAIN_IMAGE]".into()),
+    };
+    let target_mac = parse_mac(target);
+    let mut observed_node_id = None::<String>;
+    let mut peers = multicast_discover_peers()?;
+    let mut target_peer = peers.iter().find(|peer| flash_target_matches(peer, target));
+    let mut selected = target_peer.map(|peer| (peer.peer, peer.announce));
+    println!("dmesh_flash_gate target_found={}", selected.is_some());
+
+    // A DW-only target is absent from UDP multicast. Ask every reachable
+    // observer to refresh all of its media, then use the observation cache to
+    // locate the observer which actually saw the requested radio MAC/node.
+    if selected.is_none() {
+        for peer in &peers {
+            if peer.passive_ready {
+                let request = encode_stream_command_with_id("discovery.active", fresh_request_id())
+                    .map_err(|error| error.to_string())?;
+                let _ = exchange_udp_stream_record(peer.peer, &request);
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        let mut wake = None;
+        for peer in &peers {
+            let request = encode_stream_command_with_id("discovery.nodes", fresh_request_id())
+                .map_err(|error| error.to_string())?;
+            let Ok(response) = exchange_udp_stream_record(peer.peer, &request) else { continue };
+            let Some(nodes) = observed_nodes(&response) else { continue };
+            for node in nodes {
+                let matches = target_mac.is_some_and(|mac| node.peer_mac == Some(mac))
+                    || (!target.contains(':') && node.node.eq_ignore_ascii_case(target));
+                if matches {
+                    if let Some(mac) = node.peer_mac {
+                        if !node.node.is_empty() {
+                            observed_node_id = Some(node.node);
+                        }
+                        wake = Some((peer.peer, mac));
+                        break;
+                    }
+                }
+            }
+            if wake.is_some() { break; }
+        }
+        let (observer, mac) = wake.ok_or_else(|| {
+            format!("target_not_visible target={target}; no synced observer cache has its NAN peer")
+        })?;
+        let request = encode_stream_command_with_id(
+            &format!("nan.wakeup to={}", mac_encode(&mac)),
+            fresh_request_id(),
+        )
+        .map_err(|error| error.to_string())?;
+        ensure_stream_success(exchange_udp_stream_record(observer, &request)?, "nan.wakeup")?;
+        println!("dmesh_flash_gate nan_wake_accepted=true observer={observer} target_mac={}", mac_encode(&mac));
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            peers = multicast_discover_peers()?;
+            if let Some(peer) = peers.iter().find(|peer| {
+                observed_node_id
+                    .as_deref()
+                    .is_some_and(|node| peer.node.eq_ignore_ascii_case(node))
+                    || flash_target_matches(peer, target)
+            }) {
+                selected = Some((peer.peer, peer.announce));
+                break;
+            }
+        }
+        target_peer = peers.iter().find(|peer| flash_target_matches(peer, target));
+    }
+    let (peer, announce) = selected.or_else(|| target_peer.map(|peer| (peer.peer, peer.announce)))
+        .ok_or_else(|| format!("target_wake_timeout target={target}"))?;
+    let cpu = announce::flash_cpu_for_device_class(announce.device_class).ok_or_else(|| {
+        format!("target_cpu_unknown device_class={}; flash a concrete-family Main over a controlled path first", announce.device_class)
+    })?;
+    run_udp_direct_discovery(peer)?;
+    let main_identity = firmware_identity(peer)?;
+    println!("dmesh_flash_gate target_udp_ready=true peer={peer} cpu={cpu}");
+
+    let recovery = encode_stream_command_with_id("boot.recovery", fresh_request_id())
+        .map_err(|error| error.to_string())?;
+    ensure_stream_success(exchange_udp_stream_record(peer, &recovery)?, "boot.recovery")?;
+    println!("dmesh_flash_gate recovery_requested=true peer={peer}");
+
+    // Recovery reuses the target identity and endpoint. Prefer its fresh
+    // multicast announce, but a bridged WLAN can suppress link-local
+    // multicast even when Recovery has submitted it. In that case a direct
+    // `firmware.identity` response different from the pre-handoff Main image
+    // is stronger evidence: it proves this exact endpoint ran another image,
+    // not merely that a multicast packet was queued by the sender.
+    let deadline = Instant::now() + Duration::from_secs(75);
+    let recovery_peer = loop {
+        if Instant::now() >= deadline {
+            return Err("recovery_seen=false timeout waiting for fresh Recovery identity or multicast".into());
+        }
+        let candidates = multicast_discover_peers()?;
+        if let Some(candidate) = candidates.into_iter().find(|candidate| {
+            candidate.node == hex_encode(announce.device_id())
+                && candidate.announce.device_class == announce.device_class
+        }) {
+            if firmware_identity(candidate.peer).is_ok_and(|identity| identity != main_identity) {
+                println!("dmesh_flash_recovery_evidence source=multicast_identity");
+                break candidate.peer;
+            }
+        }
+        if firmware_identity(peer).is_ok_and(|identity| identity != main_identity) {
+            println!("dmesh_flash_recovery_evidence source=direct_identity");
+            break peer;
+        }
+    };
+    println!("dmesh_flash_gate recovery_seen=true peer={recovery_peer}");
+    let mut upload = vec![
+        format!("udp://{recovery_peer}"),
+        "object.flash".to_owned(),
+        format!("cpu={cpu}"),
+        "target=6".to_owned(),
+    ];
+    if let Some(source) = source {
+        upload.push("--file".to_owned());
+        upload.push(source.to_owned());
+    }
+    run_udp_service_client(&upload)?;
+    println!("dmesh_flash_gate object_committed=true peer={recovery_peer}");
+
+    let deadline = Instant::now() + Duration::from_secs(75);
+    loop {
+        if Instant::now() >= deadline {
+            return Err("main_healthy=false timeout waiting for Main status".into());
+        }
+        let candidates = multicast_discover_peers()?;
+        if let Some(candidate) = candidates.into_iter().find(|candidate| {
+            candidate.node == hex_encode(announce.device_id())
+                && candidate.announce.device_class == announce.device_class
+        }) {
+            let status = encode_stream_command_with_id("status", fresh_request_id())
+                .map_err(|error| error.to_string())?;
+            if ensure_stream_success(exchange_udp_stream_record(candidate.peer, &status)?, "Main status").is_ok() {
+                println!("dmesh_flash_gate main_healthy=true peer={}", candidate.peer);
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn flash_target_matches(peer: &DiscoveredPeer, target: &str) -> bool {
+    peer.node.eq_ignore_ascii_case(target) || peer.announce.device_name() == Some(target)
+}
+
+fn parse_mac(value: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut parts = value.split(':');
+    for byte in &mut mac {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+fn ensure_stream_success(response: Vec<u8>, action: &str) -> Result<(), String> {
+    let record = dmesh_server::tagged::decode(&response)
+        .ok_or_else(|| format!("{action} response is not tagged CBOR"))?;
+    if record.error.is_some() || record.result.is_none() {
+        return Err(format!("{action} rejected by peer"));
+    }
+    Ok(())
+}
+
+/// Return the exact running-image identity published by the common firmware
+/// handler.  It is compared only for one endpoint across a requested reboot;
+/// it is never used as a device identity or a substitute for the signed
+/// announce identity.
+fn firmware_identity(peer: SocketAddr) -> Result<String, String> {
+    let request = encode_stream_command_with_id("firmware.identity", fresh_request_id())
+        .map_err(|error| error.to_string())?;
+    let response = exchange_udp_stream_record(peer, &request)?;
+    let record = dmesh_server::tagged::decode(&response)
+        .ok_or("firmware.identity response is not tagged CBOR")?;
+    if record.error.is_some() {
+        return Err("firmware.identity rejected by peer".into());
+    }
+    let mut result = dmesh_server::cbor::Decoder::new(
+        record.result.ok_or("firmware.identity response has no result")?,
+    );
+    let identity = result
+        .text_ref()
+        .and_then(|value| core::str::from_utf8(value).ok())
+        .ok_or("firmware.identity response is not a UTF-8 image hash")?;
+    result.is_finished().then(|| identity.to_owned()).ok_or_else(|| {
+        "firmware.identity response has trailing fields".to_owned()
+    })
+}
+
+/// Send the common discovery request directly to every local IPv6 multicast
+/// scope and return only peers that supplied the matching signed response.
+struct DiscoveredPeer {
+    peer: SocketAddr,
+    /// Lowercase hex of the announce `device_id`, the stable nodeID for
+    /// output; the peer address when the announce carries no device identity.
+    node: String,
+    /// The signed announce matched to this UDP6 endpoint.  The orchestrator
+    /// uses its immutable device identity/class rather than inferring either
+    /// from an address or a configured board nickname.
+    announce: announce::Announce,
+    /// A target relay must have receiver-side NAN evidence. A UDP multicast
+    /// reply alone says nothing about whether it can see a sleepy device.
+    passive_ready: bool,
+}
+
+/// Render the announce CBOR fields that are present, using the schema field
+/// names. The virtual IPv6 identity replaces the raw public key/signature.
+fn announce_log_fields(announce: &announce::Announce) -> Vec<String> {
+    let mut fields = Vec::new();
+    if announce.has_identity() {
+        if let Some(vip) = announce::virtual_ip6(announce.public_key()) {
+            fields.push(format!("vip6={}", Ipv6Addr::from(vip)));
+        }
+    }
+    fields.push(format!("kind={}", announce.kind));
+    fields.push(format!("uptime_secs={}", announce.uptime_secs));
+    if announce.device_class != announce::DEVICE_CLASS_UNKNOWN {
+        fields.push(format!("device_class={}", announce.device_class));
+        fields.push(format!(
+            "device_family={}",
+            announce::device_class_name(announce.device_class)
+        ));
+        if let Some(cpu) = announce::flash_cpu_for_device_class(announce.device_class) {
+            fields.push(format!("flash_cpu={cpu}"));
+        }
+    }
+    if announce.probe_capabilities != 0 {
+        fields.push(format!("probe_capabilities={}", announce.probe_capabilities));
+    }
+    if let Some(name) = announce.device_name() {
+        fields.push(format!("device_name={name}"));
+    }
+    if let Some(domain) = announce.device_domain() {
+        fields.push(format!("device_domain={domain}"));
+    }
+    if let Some(name) = announce.network_name() {
+        fields.push(format!("network_name={name}"));
+    }
+    if announce.wifi_channel != 0 {
+        fields.push(format!("wifi_channel={}", announce.wifi_channel));
+    }
+    if let Some(addr) = announce.sta_link_local_v6() {
+        fields.push(format!("sta_link_local_v6={}", Ipv6Addr::from(addr)));
+    }
+    if announce.udp_port != 0 {
+        fields.push(format!("udp_port={}", announce.udp_port));
+    }
+    if let Some(addr) = announce.udp_link_local_v6() {
+        fields.push(format!("udp_link_local_v6={}", Ipv6Addr::from(addr)));
+    }
+    fields
+}
+
+fn multicast_discover_peers() -> Result<Vec<DiscoveredPeer>, String> {
+    const PORT: u16 = 5227;
+    let request_id = fresh_request_id();
+    let mut record = [0u8; 96];
+    let record_len = announce::encode_discovery_request(request_id, &mut record)
+        .ok_or("encode UDP6 multicast discovery request")?;
+    let mut wire = [0u8; 128];
+    let wire_len =
+        dmesh_server::direct::ConnectionlessMessage::encode(&record[..record_len], &mut wire)
+            .ok_or("wrap UDP6 multicast discovery request")?;
+    let socket = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        0,
+        0,
+        0,
+    )))
+    .map_err(|error| format!("bind UDP6 multicast discovery: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|error| error.to_string())?;
+    let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x5227);
+    let mut submitted = 0usize;
+    for entry in std::fs::read_dir("/sys/class/net").map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if name == "lo" {
+            continue;
+        }
+        let index = std::fs::read_to_string(entry.path().join("ifindex"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let Some(index) = index else { continue };
+        let destination = SocketAddr::V6(SocketAddrV6::new(group, PORT, 0, index));
+        if socket.send_to(&wire[..wire_len], destination).is_ok() {
+            submitted = submitted.saturating_add(1);
+        }
+    }
+    if submitted == 0 {
+        return Err("UDP6 multicast discovery was not submitted on any interface".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut peers = Vec::<DiscoveredPeer>::new();
+    let mut input = [0u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
+    while Instant::now() < deadline {
+        let Ok((used, peer)) = socket.recv_from(&mut input) else {
+            continue;
+        };
+        let Some(payload) = dmesh_server::direct::ConnectionlessMessage::decode(&input[..used])
+        else {
+            continue;
+        };
+        let Some(record) = dmesh_server::tagged::decode(payload) else {
+            continue;
+        };
+        let facts = (record.id == Some(request_id))
+            .then(|| announce::discovery_facts(record))
+            .flatten();
+        let Some(announce) = (record.id == Some(request_id))
+            .then(|| announce::decode_record(record))
+            .flatten()
+        else {
+            continue;
+        };
+        let peer = match peer {
+            SocketAddr::V6(value) if announce.udp_port != 0 => SocketAddr::V6(SocketAddrV6::new(
+                *value.ip(),
+                announce.udp_port,
+                value.flowinfo(),
+                value.scope_id(),
+            )),
+            peer => peer,
+        };
+        if !peers.iter().any(|known| known.peer == peer) {
+            let passive_ready = facts.is_some_and(|facts| {
+                facts.nan_service_observations != 0 || facts.nan_visible_nodes != 0
+            });
+            let node_id = hex_encode(announce.device_id());
+            let node = if node_id.is_empty() {
+                peer.to_string()
+            } else {
+                node_id.clone()
+            };
+            let mut line = vec![format!("peer={peer}")];
+            if !node_id.is_empty() {
+                line.insert(0, format!("node={node_id}"));
+            }
+            line.extend(announce_log_fields(&announce));
+            if let Some(facts) = facts {
+                if let Some(suffix) = facts.nan_cluster_suffix {
+                    line.push(format!("nan_cluster_suffix={}", hex_encode(&suffix)));
+                }
+                line.push(format!(
+                    "nan_service_observations={}",
+                    facts.nan_service_observations
+                ));
+                line.push(format!("nan_visible_nodes={}", facts.nan_visible_nodes));
+            }
+            if !passive_ready {
+                line.push("passive_ready=false".to_owned());
+            }
+            println!("{}", line.join(" "));
+            peers.push(DiscoveredPeer {
+                peer,
+                node,
+                announce,
+                passive_ready,
+            });
+        }
+    }
+    Ok(peers)
+}
+
+/// One decoded `discovery.nodes` observation. `node` is the hex of the
+/// announce `device_id` (the truncated key used for the VIP6), empty for
+/// provisional peers whose identity was never decoded; those rows are keyed
+/// by the `peer` radio MAC inside `fields` instead. `fields` renders every
+/// remaining observation fact with its CBOR schema name, in wire order.
+struct ObservedNode {
+    node: String,
+    peer_mac: Option<[u8; 6]>,
+    fields: String,
+}
+
+/// Decode the full bounded observation cache. The caller retains observer
+/// provenance rather than pretending that a controller-local observation is
+/// global mesh truth; receiver-side facts differ per observer and must not
+/// be averaged together.
+fn observed_nodes(response: &[u8]) -> Option<Vec<ObservedNode>> {
+    let record = dmesh_server::tagged::decode(response)?;
+    let mut result = dmesh_server::cbor::Decoder::new(record.result?);
+    let (major, count) = result.head()?;
+    if major != 5 {
+        return None;
+    }
+    let mut nodes = Vec::new();
+    for _ in 0..count {
+        let key = result.uint()?;
+        if key != 1 {
+            result.skip()?;
+            continue;
+        }
+        let (major, entries) = result.head()?;
+        if major != 4 {
+            return None;
+        }
+        for _ in 0..entries {
+            let (major, field_count) = result.head()?;
+            if major != 5 {
+                return None;
+            }
+            let mut device_id = String::new();
+            let mut peer_mac = None;
+            let mut fields = Vec::<String>::new();
+            for _ in 0..field_count {
+                match result.uint()? {
+                    1 => device_id = result.bytes_ref().map(hex_encode)?,
+                    // Android reports its opaque PeerHandle as a zero MAC; a
+                    // zero peer is a placeholder, not a radio observation.
+                    2 => {
+                        let bytes: [u8; 6] = result.bytes_ref()?.try_into().ok()?;
+                        if bytes != [0; 6] {
+                            peer_mac = Some(bytes);
+                            fields.push(format!("peer={}", mac_encode(&bytes)));
+                        }
+                    }
+                    3 => fields.push(format!("bssid={}", mac_encode(result.bytes_ref()?))),
+                    4 => fields.push(format!("available_fields={}", result.uint()?)),
+                    // 0 (no observation) and u32::MAX (Android wall clock does
+                    // not fit the 32-bit field) are sentinels, not times.
+                    5 => {
+                        let value = result.uint()?;
+                        if value != 0 && value != u32::MAX as u64 {
+                            fields.push(format!("first_seen_ms={value}"));
+                        }
+                    }
+                    6 => {
+                        let value = result.uint()?;
+                        if value != 0 && value != u32::MAX as u64 {
+                            fields.push(format!("last_seen_ms={value}"));
+                        }
+                    }
+                    7 => fields.push(format!("packets={}", result.uint()?)),
+                    8 => fields.push(format!("active_publish_rx={}", result.uint()?)),
+                    9 => fields.push(format!("active_subscribe_rx={}", result.uint()?)),
+                    10 => fields.push(format!("followup_rx={}", result.uint()?)),
+                    11 => fields.push(format!("last_kind={}", result.uint()?)),
+                    12 => fields.push(format!("last_payload_len={}", result.uint()?)),
+                    // 13 last_payload_hash is decoded but not rendered.
+                    14 => fields.push(format!("unavailable_fields={}", result.uint()?)),
+                    15 => fields.push(format!("channel={}", result.uint()?)),
+                    _ => result.skip()?,
+                }
+            }
+            nodes.push(ObservedNode {
+                node: device_id,
+                peer_mac,
+                fields: fields.join(" "),
+            });
+        }
+    }
+    result.is_finished().then_some(nodes)
 }
 
 /// Send one schema-backed private direct control record to an explicit UDP
@@ -2983,8 +3693,8 @@ fn fresh_connection_id() -> Result<quic_lite::ConnectionId, String> {
 mod tests {
     use super::{
         ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic,
-        object_upload_rejection, parse_udp_peer, proxy_request, proxy_socket_target,
-        same_udp_endpoint,
+        object_upload_rejection, observed_nodes, parse_udp_peer, proxy_request,
+        proxy_socket_target, same_udp_endpoint,
     };
     use dmesh_server::relay::{
         DesiredRule, PairRequest, RelayRoute, RelayState, Request, decode_pair_request,
@@ -3493,6 +4203,74 @@ mod tests {
         assert_eq!(
             object_upload_rejection(&response[..used]),
             "flash already in progress"
+        );
+    }
+
+    #[test]
+    fn observed_nodes_render_the_full_observation_facts() {
+        let entries = [
+            dmesh_server::announce::ObservedDevice {
+                device_id: b"peer-a",
+                peer: [1, 2, 3, 4, 5, 6],
+                bssid: Some([0x50, 0x6f, 0x9a, 1, 2, 3]),
+                channel: Some(6),
+                available_fields: dmesh_server::discovery::OBSERVATION_ALL_FIELDS,
+                first_seen_ms: 1,
+                last_seen_ms: 2,
+                packets: 3,
+                active_publish_rx: 4,
+                active_subscribe_rx: 5,
+                followup_rx: 6,
+                last_kind: 1,
+                last_payload_len: 7,
+                last_payload_hash: 8,
+            },
+            dmesh_server::announce::ObservedDevice {
+                device_id: b"",
+                peer: [7, 8, 9, 10, 11, 12],
+                bssid: None,
+                channel: None,
+                available_fields: dmesh_server::discovery::OBSERVATION_PEER,
+                first_seen_ms: 9,
+                last_seen_ms: 10,
+                packets: 11,
+                active_publish_rx: 0,
+                active_subscribe_rx: 0,
+                followup_rx: 0,
+                last_kind: 0,
+                last_payload_len: 0,
+                last_payload_hash: 0,
+            },
+        ];
+        let mut result = [0u8; 512];
+        let result_len =
+            dmesh_server::announce::encode_devices_observed_response(&entries, &mut result)
+                .expect("encode discovery inventory");
+        let fields = dmesh_server::tagged::decode(&result[..result_len])
+            .and_then(|record| record.fields)
+            .expect("extract discovery inventory fields");
+        let mut response = [0u8; 640];
+        let response_len =
+            dmesh_server::tagged::encode_numeric_response(6, 9, 1, fields, &mut response)
+                .expect("wrap discovery inventory");
+        let nodes = observed_nodes(&response[..response_len]).expect("decode observations");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].node, "706565722d61");
+        assert_eq!(
+            nodes[0].fields,
+            "peer=01:02:03:04:05:06 bssid=50:6f:9a:01:02:03 channel=6 \
+              available_fields=31 first_seen_ms=1 last_seen_ms=2 packets=3 \
+              active_publish_rx=4 active_subscribe_rx=5 followup_rx=6 \
+              last_kind=1 last_payload_len=7 unavailable_fields=0"
+        );
+        // A provisional radio peer without a decoded identity has no nodeID;
+        // its row is keyed by the peer MAC inside the facts.
+        assert_eq!(nodes[1].node, "");
+        assert_eq!(
+            nodes[1].fields,
+            "peer=07:08:09:0a:0b:0c available_fields=1 first_seen_ms=9 \
+              last_seen_ms=10 packets=11 active_publish_rx=0 active_subscribe_rx=0 \
+              followup_rx=0 last_kind=0 last_payload_len=0 unavailable_fields=30"
         );
     }
 }

@@ -409,18 +409,22 @@ next-hop description is resolved locally.
 
 ## Signed objects and flash
 
-`signed_object` is the host/Android service for image retrieval. Its GET body
-is `{0:name?,1:cpu,2:target}` and its ordered response is manifest, blob, and
-done records. `ObjectServer` is its host implementation; the transport is
-responsible only for an authenticated ordered stream.
+`signed_object` identifies an immutable image with
+`{0:name?,1:cpu,2:target}`. The host-side `ObjectServer` resolves that identity
+to one object body. On the wire the object-data stream is exactly one complete
+canonical CBOR manifest followed immediately by `image_size` raw binary bytes
+and QUIC FIN. There is no per-block CBOR or private manifest/blob/done framing.
 
 `flash` is the device-handler contract, not an ESP transport feature. Its body extends
 the same object identity with optional `address` and `transport` plus
 `dry_run`: `{0:name?,1:cpu,2:target,3:address?,4:transport,5:dry_run}`.
-The host produces `signed_object` records and the device feeds their ordered
-stream bytes to `SignedObjectReceiver`. That receiver performs shared record framing, manifest/signature/block
-validation, and calls an injected sink. Firmware injects the erase/write
-partition sink; host tests inject `FileImageSink`.
+The host sends that body and the device feeds ordinary ordered stream bytes to
+`SignedObjectReceiver`. The CBOR decoder reports the exact manifest boundary;
+the receiver validates the signed manifest before admitting body data, derives
+block indexes and lengths from it, verifies the body incrementally, and calls
+an injected sink. Firmware injects the erase/write partition sink; host tests
+inject `FileImageSink`. Invalid manifest, length, proof, digest, or sink state
+is an application rejection and terminates the stream/operation.
 
 The host owns object selection and opens one QUIC-lite association containing
 the `flash` command stream and the ordered object-data stream. The device sends

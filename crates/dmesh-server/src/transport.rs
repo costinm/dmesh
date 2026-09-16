@@ -16,8 +16,10 @@ use quic_lite::{ConnectionId, ConnectionLimits, PathId, ServerStreamConfig, Tran
 use crate::{
     probe::{ProbeRun, ProbeSender, ProbeServicePlan},
     stream_server::StreamServerConnection,
-    verified_object::{GetRequest, ObjectRecordStream, REQUEST_MAX, encode_get_request},
+    verified_object::{GetRequest, ObjectBodyStream, REQUEST_MAX, encode_get_request},
 };
+#[cfg(test)]
+use crate::verified_object::ObjectBodyStream as ObjectRecordStream;
 
 /// Largest conservative application slice that fits with the QUIC-lite short
 /// header and STREAM frame in the normal 1200-byte datagram. This is shared by
@@ -35,7 +37,7 @@ pub struct ObjectUploadClient<const HISTORY: usize, const PACKET: usize> {
     command: [u8; PACKET],
     command_len: usize,
     object_stream: Option<u64>,
-    records: ObjectRecordStream,
+    records: ObjectBodyStream,
     scratch: [u8; OBJECT_UPLOAD_STREAM_CHUNK],
     command_admitted: bool,
     complete: bool,
@@ -50,7 +52,7 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
     pub fn new(
         client_cid: ConnectionId,
         command: &[u8],
-        records: ObjectRecordStream,
+        records: ObjectBodyStream,
     ) -> Result<Self, Error> {
         if command.is_empty() || command.len() > PACKET {
             return Err(Error::BufferTooSmall);
@@ -217,6 +219,12 @@ impl<const HISTORY: usize, const PACKET: usize> DatagramClient<PACKET>
             let command_stream = self.association.open_next_client_bidi_stream()?;
             let object_stream = self.association.open_next_client_bidi_stream()?;
             self.object_stream = Some(object_stream);
+            // The command and object are two streams in the same accepted
+            // association. Opening the object stream must not wait for a
+            // delayed ACK of the command stream: QUIC already supplied the
+            // peer receive limits in OPEN_ACK, and a terminal application
+            // rejection still stops the upload as soon as it arrives.
+            self.command_admitted = true;
             return self
                 .association
                 .encode_stream_payload(
@@ -568,6 +576,11 @@ pub struct ConnectionDispatcher<
     last_time: u64,
     last_close_at: Option<u64>,
     last_closed_receive_cid: Option<ConnectionId>,
+    // A CLOSE may carry the ACK for a terminal response.  The association
+    // table correctly releases the connection in that same receive turn, so
+    // retain this handler-neutral lifecycle edge outside the retired ledger
+    // until the runtime consumes it.
+    terminal_response_delivered: Option<ConnectionId>,
     // The dispatcher is long-lived firmware state.  Its server metadata is
     // small and fixed-size, so keeping it inline avoids a first-packet heap
     // allocation in every bearer.  The potentially large QUIC ledger remains
@@ -610,6 +623,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             last_time: 0,
             last_close_at: None,
             last_closed_receive_cid: None,
+            terminal_response_delivered: None,
         }
     }
 
@@ -629,6 +643,12 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         };
         let (limits, association) = self.requested_receive_profile(packet);
         self.core.set_time(self.last_time);
+        // The table removes a peer as soon as it accepts CLOSE.  Capture a
+        // terminal-response ACK while the ConnectionServer is still live:
+        // short-lived UDP clients commonly combine their delayed ACK with
+        // CLOSE, and a runtime post-turn query must not lose that delivery
+        // edge merely because it is intentionally releasing the ledger.
+        let mut terminal_response_delivered = None;
         let ingress = self.core.receive_admitted(
             path,
             packet,
@@ -645,7 +665,13 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
                 )
             },
             |server, output| server.replay_open(packet, output),
-            |server, output| server.receive_established(packet, output),
+            |server, output| {
+                let result = server.receive_established(packet, output);
+                if result.is_ok() && server.take_terminal_response_delivered() {
+                    terminal_response_delivered = server.expected_receive_cid();
+                }
+                result
+            },
             ConnectionServer::is_closed,
             ConnectionServer::active_stream_count,
             ConnectionServer::peer_cid,
@@ -680,6 +706,9 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             }
             Err(error) => return Err(error),
         };
+        if terminal_response_delivered.is_some() {
+            self.terminal_response_delivered = terminal_response_delivered;
+        }
         match ingress {
             quic_lite::ServerConnectionIngress::IgnoredOpen => Ok(None),
             quic_lite::ServerConnectionIngress::Accepted { result, retired } => {
@@ -1008,6 +1037,13 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         self.association = association.clamp::<HISTORY>();
     }
 
+    /// Defaults used only for the next admitted association.  Platform code
+    /// may resample its current allocator state between short-lived peers,
+    /// while a live CID keeps the profile it accepted in OPEN_ACK.
+    pub const fn association_defaults(&self) -> AssociationProfile {
+        self.association
+    }
+
     /// Permit a host OPEN to select a larger initial receive profile for a
     /// controlled capability or stress test. The ceiling is an allocation
     /// bound, never an automatic increase: without an OPEN request the
@@ -1029,6 +1065,17 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             },
             None => None,
         }
+    }
+
+    /// Profile accepted by the currently live association.  This is useful
+    /// to a constrained callback adapter only for sizing its temporary
+    /// packet handoff; QUIC's advertised credit, loss recovery and pacing
+    /// remain entirely inside the connection.
+    pub fn active_association_profile(&self) -> Option<AssociationProfile> {
+        self.core
+            .active_path()
+            .and_then(|path| self.core.association_for_path(path))
+            .map(ConnectionServer::association_profile)
     }
 
     /// ACK/congestion state needed to distinguish radio loss from a stalled
@@ -1163,6 +1210,9 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     /// Take the active association's generic terminal-response delivery edge.
     /// QUIC-lite has already processed the peer acknowledgement internally.
     pub fn take_terminal_response_delivered(&mut self) -> Option<ConnectionId> {
+        if let Some(receive_cid) = self.terminal_response_delivered.take() {
+            return Some(receive_cid);
+        }
         let Some(path) = self.core.active_path() else {
             return None;
         };
@@ -1279,7 +1329,7 @@ where
 
 /// Publish application storage completion and immediately run the same
 /// control/PTO selection used by an ordinary timer turn.
-pub fn storage_ready_server_turn<
+pub fn stream_consumer_ready_server_turn<
     Ready,
     const HISTORY: usize,
     const PACKET: usize,
@@ -1289,7 +1339,7 @@ pub fn storage_ready_server_turn<
     now: u64,
     pto: u64,
     output: &mut [u8; PACKET],
-    storage_ready: Ready,
+    consumer_ready: Ready,
 ) -> Result<Option<(PathId, usize)>, Error>
 where
     Ready: FnOnce(
@@ -1298,7 +1348,7 @@ where
     ) -> Result<Option<PathId>, ()>,
 {
     service.set_time(now);
-    let Some(path) = storage_ready(service, now).map_err(|_| Error::Invalid)? else {
+    let Some(path) = consumer_ready(service, now).map_err(|_| Error::Invalid)? else {
         return Ok(None);
     };
     service
@@ -1363,6 +1413,11 @@ impl InboundStreamReader {
 
 impl crate::verified_object::OrderedStreamRead for InboundStreamReader {
     fn read(&mut self, out: &mut [u8]) -> usize { Self::read(self, out) }
+
+    fn is_finished(&self) -> bool {
+        let Some((bytes, fin)) = self.chunks.get(self.chunk) else { return false };
+        *fin && self.offset == bytes.len() && self.chunk + 1 == self.chunks.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2595,6 +2650,14 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         self.connection
             .as_ref()
             .and_then(|connection| connection.peer_connection_id())
+    }
+
+    /// The profile which was accepted with this association's OPEN.  This is
+    /// association state, not a handler or bearer policy: a callback-driven
+    /// adapter may use it to acquire its temporary ingress storage while the
+    /// association is live.
+    pub const fn association_profile(&self) -> AssociationProfile {
+        self.association
     }
 
     /// Compatibility entry point for an application endpoint used without a
@@ -4421,6 +4484,73 @@ mod tests {
     }
 
     #[test]
+    fn terminal_delivery_survives_a_close_that_carries_its_ack() {
+        // A one-shot UDP client commonly receives a terminal response, then
+        // emits CLOSE with its delayed ACK rather than a separate control
+        // datagram. The association table releases the connection during
+        // that CLOSE, but Main still needs the generic response-delivered
+        // edge to arm its Stage2 Recovery handoff.
+        const COMPONENT: u64 = 60_008;
+        assert!(crate::services::register_tagged_component(
+            COMPONENT,
+            raw_tagged_test_handler
+        ));
+        let request = [0xa3, 1, 0x1a, 0, 0, 0xea, 0x68, 2, 1, 3, 10];
+        let path = PathId::new(0x6008).unwrap();
+        let mut client =
+            TaggedClient::<4, 1200>::new(ConnectionId::new(0x16e).unwrap(), &request).unwrap();
+        client.set_close_when_complete(false);
+        let mut dispatcher = ConnectionDispatcher::<4, 1200>::new(
+            ConnectionId::new(0x17e).unwrap(),
+            ConnectionLimits::default(),
+            AssociationProfile::c6_default(),
+        );
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let open_len = client.start(&mut client_out).unwrap();
+        let open_ack = dispatcher
+            .receive(path, &client_out[..open_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let request_len = client
+            .receive(&server_out[..open_ack], &mut client_out)
+            .unwrap()
+            .unwrap();
+        let response_len = dispatcher
+            .receive(path, &client_out[..request_len], &mut server_out)
+            .unwrap()
+            .unwrap();
+        let delayed_ack = client
+            .receive(&server_out[..response_len], &mut client_out)
+            .unwrap();
+        assert!(client.is_complete());
+
+        // The UDP adapter waits for and sends this delayed ACK before its
+        // one-shot CLOSE. Do not consume the dispatcher edge yet: model a
+        // platform runtime which performs its post-turn lifecycle action
+        // after the table has already retired that association.
+        let delayed_ack = delayed_ack.expect("terminal response queues delayed ACK");
+        dispatcher
+            .receive(path, &client_out[..delayed_ack], &mut server_out)
+            .unwrap();
+
+        client.connection.close(0).unwrap();
+        let close_len = client
+            .connection
+            .poll_close(&mut client_out)
+            .unwrap()
+            .expect("CLOSE follows the terminal response ACK");
+        dispatcher
+            .receive(path, &client_out[..close_len], &mut server_out)
+            .unwrap();
+
+        assert!(dispatcher.last_close_at().is_some());
+        assert!(dispatcher.take_terminal_response_delivered().is_some());
+        assert!(dispatcher.take_terminal_response_delivered().is_none());
+    }
+
+    #[test]
     fn retained_tagged_client_reuses_association_on_a_later_stream() {
         const COMPONENT: u64 = 60_005;
         assert!(crate::services::register_tagged_component(
@@ -5235,6 +5365,47 @@ mod tests {
     }
 
     #[test]
+    fn resampled_defaults_apply_to_the_next_association_only() {
+        let server_cid = ConnectionId::new(0x99b1).unwrap();
+        let first_client_cid = ConnectionId::new(0x99b2).unwrap();
+        let second_client_cid = ConnectionId::new(0x99b3).unwrap();
+        let first_path = PathId::new(0x0311).unwrap();
+        let second_path = PathId::new(0x0312).unwrap();
+        let original = AssociationProfile::c6_default();
+        let resampled = AssociationProfile::conservative();
+        let mut dispatcher = ConnectionDispatcher::<8, 1200>::new(
+            server_cid,
+            ConnectionLimits::default(),
+            original,
+        );
+        let mut first = ProbeClient::<8, 1200>::new(first_client_cid, 64).unwrap();
+        let mut second = ProbeClient::<8, 1200>::new(second_client_cid, 64).unwrap();
+        let mut client_out = [0u8; 1200];
+        let mut server_out = [0u8; 1200];
+
+        let first_open = first.start(&mut client_out).unwrap();
+        dispatcher
+            .receive(first_path, &client_out[..first_open], &mut server_out)
+            .unwrap();
+        assert_eq!(dispatcher.active_association_profile(), Some(original));
+
+        // Platform code may refresh its allocator sample after driver setup.
+        // The current CID must keep its OPEN_ACK contract unchanged.
+        dispatcher.set_association_defaults(resampled);
+        assert_eq!(dispatcher.active_association_profile(), Some(original));
+
+        // Retire the first logical peer, then admit a distinct OPEN. This is
+        // the same boundary used by the ESP adapter before it refreshes the
+        // dynamic callback-frame budget for a newly admitted association.
+        dispatcher.replace_association(resampled);
+        let second_open = second.start(&mut client_out).unwrap();
+        dispatcher
+            .receive(second_path, &client_out[..second_open], &mut server_out)
+            .unwrap();
+        assert_eq!(dispatcher.active_association_profile(), Some(resampled));
+    }
+
+    #[test]
     fn conservative_action_profile_completes_16k_in_256_byte_packets() {
         // This is the exact packet-at-a-time association used by the raw
         // ESP-NOW-compatible adapter. It deliberately contains no radio,
@@ -5315,16 +5486,31 @@ mod tests {
         )
         .unwrap();
         let mut client_driver = quic_lite::DatagramClientDriver::start(&mut client, 0).unwrap();
-        let mut server = ConnectionServer::<16, 1200>::new_with_association(
+        // Match a C6 Recovery boot with heap selecting a 20-packet ledger.
+        // Bootstrap uses the platform's tiny always-present callback scratch;
+        // after OPEN admission the callback handoff grows to this selected
+        // association capacity and is released with the association. The host
+        // must exercise that lifecycle rather than a permanently reserved
+        // flash-sized pool.
+        let recovery_association = AssociationProfile {
+            history_packets: 20,
+            ack_frequency: AssociationProfile::datagram_default().ack_frequency,
+            ack_delay_ms: AssociationProfile::datagram_default().ack_delay_ms,
+            tx_burst_packets: 20,
+            initial_window_packets: 20,
+        }
+        .clamp::<32>();
+        let mut server = ConnectionServer::<32, 1200>::new_with_association(
             server_cid,
-            ConnectionLimits::with_receive_window(1200),
-            AssociationProfile::datagram_default(),
+            recovery_association.receive_limits(1100, 4),
+            recovery_association,
         );
         let mut server_packet = [0u8; 1200];
         let mut egress = quic_lite::connection::DatagramEgressDriver::<PathId, 1200>::new();
         let path = PathId::new(1).unwrap();
         let mut callback_queue = std::collections::VecDeque::new();
         let mut callback_drops = 0usize;
+        let callback_capacity = recovery_association.initial_window_packets;
         let mut to_client: std::collections::VecDeque<Vec<u8>> =
             std::collections::VecDeque::new();
         let mut rejected_submissions = 3usize;
@@ -5348,7 +5534,7 @@ mod tests {
                 };
                 client_driver.mark_sent(now);
                 // One duplicated Wi-Fi callback burst is enough to fill the
-                // six admissible slots. It is still an ordinary identical
+                // dynamically selected association handoff. It is still an ordinary identical
                 // QUIC datagram: the server's packet-number handling, not a
                 // probe/flash retry hook, decides its effect.
                 // Keep exercising full callback bursts throughout the image,
@@ -5358,7 +5544,7 @@ mod tests {
                     .then_some(8)
                     .unwrap_or(1);
                 for _ in 0..copies {
-                    if callback_queue.len() < 6 {
+                    if callback_queue.len() < callback_capacity {
                         callback_queue.push_back(packet.clone());
                     } else {
                         callback_drops += 1;
@@ -5367,28 +5553,30 @@ mod tests {
                 client_driver.poll(&mut client, now, 600, 400).unwrap();
             }
 
-            // Exactly one callback handoff is consumed per worker turn.
-            let first = callback_queue
-                .pop_front()
-                .and_then(|packet| server.receive(&packet, &mut server_packet).unwrap());
-            let _ = egress
-                .drain(
-                    path,
-                    &mut server_packet,
-                    16,
-                    first,
-                    |packet| server.poll(packet),
-                    |_, packet| {
-                        if rejected_submissions != 0 {
-                            rejected_submissions -= 1;
-                            false
-                        } else {
-                            to_client.push_back(packet.to_vec());
-                            true
-                        }
-                    },
-                )
-                .unwrap();
+            // The worker drains the currently queued burst before blocking
+            // again. A one-tick sleep after each callback frame is an ESP
+            // adapter bug: it turns a normal Wi-Fi burst into a full queue.
+            while let Some(packet) = callback_queue.pop_front() {
+                let first = server.receive(&packet, &mut server_packet).unwrap();
+                let _ = egress
+                    .drain(
+                        path,
+                        &mut server_packet,
+                        16,
+                        first,
+                        |packet| server.poll(packet),
+                        |_, packet| {
+                            if rejected_submissions != 0 {
+                                rejected_submissions -= 1;
+                                false
+                            } else {
+                                to_client.push_back(packet.to_vec());
+                                true
+                            }
+                        },
+                    )
+                    .unwrap();
+            }
 
             // A quiet/flow-blocked sender does not own the responder clock.
             // Service the same common poll turn while its retained egress
@@ -5420,7 +5608,7 @@ mod tests {
                 break;
             }
         }
-        assert!(callback_drops > 0);
+        assert_eq!(callback_drops, 0, "association-sized handoff must absorb its advertised flight");
         assert_eq!(rejected_submissions, 0);
         assert!(client.is_complete(), "probe stalled queue={}", callback_queue.len());
         assert_eq!(client.bytes(), 800 * 1024);
@@ -5837,8 +6025,8 @@ mod tests {
                 artifact_root: directory.path().to_path_buf(),
                 archive_root: None,
             });
-            let records =
-                ObjectRecordStream::new(object_server.response_records(request.object).unwrap());
+            let (manifest, image) = object_server.response_object(request.object).unwrap();
+            let records = ObjectRecordStream::from_object(manifest, image);
             // Match dmesh-cli's actual host sender allocation. The receiver still
             // selects its smaller runtime history/window below; using an 8-entry
             // client here hid the many-retained-gap condition observed on UART.
@@ -5952,7 +6140,7 @@ mod tests {
                     delayed_client_packets.push_back(packet);
                 }
                 let client_packet =
-                    if run == 0 && client.record_index() >= 9 && !reordered_client_packet {
+                    if run == 0 && client.sent_bytes() >= 32 * 1024 && !reordered_client_packet {
                         if delayed_client_packets.len() >= 2 {
                             reordered_client_packet = true;
                             delayed_client_packets.pop_back()
@@ -5969,7 +6157,7 @@ mod tests {
                     // that adapter fact as ordinary datagram loss; neither the
                     // object consumer nor its stream API receives a retry hook.
                     if run == 0
-                        && client.record_index() >= 9
+                        && client.sent_bytes() >= 32 * 1024
                         && client_packet_attempts % 3 == 0
                         && client_drop_budget != 0
                     {
@@ -6009,7 +6197,7 @@ mod tests {
                             now,
                             120_000,
                             |consumer, reader| {
-                                let read = consumer.consume_one_stream_record(reader)?;
+                                let read = consumer.consume_stream_body(reader)?;
                                 Ok::<_, crate::verified_object::ImageError>(read.application_progress)
                             },
                         );
@@ -6077,7 +6265,7 @@ mod tests {
                             // fresh re-ACK reaches the sender.
                             response_drop_budget -= 1;
                             dropped_response = true;
-                        } else if !dropped_response && client.record_index() >= 9 {
+                        } else if !dropped_response && client.sent_bytes() >= 32 * 1024 {
                             dropped_response = true;
                         } else if run != 0 && generated_responses % (11 + run as usize % 3) == 0 {
                             sustained_response_losses += 1;
