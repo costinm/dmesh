@@ -7,6 +7,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # Recovery starts the shared UART/raw-bearer runtime and flash worker. Keep
 # this task at 64 KiB; stream state and manifest storage are heap-owned.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
+# Recovery performs one bounded STA/UDP transfer and has no radio-worker
+# workload that needs the APP CPU.  Running it on the PRO CPU only removes an
+# otherwise unnecessary dual-core startup dependency on classic ESP32.
+CONFIG_FREERTOS_UNICORE=y
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 # Preserve the Stage2 custom RTC block until Recovery writes its one-shot
 # return-to-Main handoff after a durable flash commit.
@@ -38,7 +42,11 @@ CONFIG_ESP_WIFI_TX_BA_WIN=32
 # with APs that require the newer password-element derivation.
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
 CONFIG_ESP_WIFI_ENABLE_SAE_H2E=y
-# A Recovery write must never turn an unexpected partition-protection decision
-# into a device reset.  The flash receiver reports the failed durable operation
-# and leaves Stage2 able to return to the known-good Main image instead.
-CONFIG_SPI_FLASH_DANGEROUS_WRITE_FAILS=y
+# Stage2 boots this factory Recovery image directly while OTA metadata still
+# names Main as the running partition.  ESP-IDF's default flash guard therefore
+# rejects (and, through the generic driver's yield callback, aborts) the exact
+# Main partition that Recovery must replace.  Permit the low-level operation
+# only in Recovery: `flash.rs` remains the policy boundary and accepts signed
+# requests solely for its fixed Main/Recovery/module targets, never arbitrary
+# addresses (except the separately bounded Stage2 region).
+CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y

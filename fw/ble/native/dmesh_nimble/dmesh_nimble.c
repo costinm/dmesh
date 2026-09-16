@@ -9,19 +9,12 @@
 #include "sdkconfig.h"
 #include "hal/gpio_ll.h"
 #include "soc/gpio_struct.h"
-#if CONFIG_IDF_TARGET_ESP32
-#include "esp_bt.h"
-#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
-#include "host/ble_gatt.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_id.h"
-#include "host/ble_hs_mbuf.h"
 #include "host/ble_l2cap.h"
-#include "host/ble_store.h"
-#include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -31,9 +24,6 @@
 #include "syscfg/syscfg.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
-#include "store/config/ble_store_config.h"
-
-void ble_store_config_init(void);
 
 static const char *TAG = "dmesh_nimble";
 
@@ -112,19 +102,6 @@ static uint8_t s_adv_data[31];
 static uint8_t s_adv_len;
 static uint16_t s_adv_min = 0x20;
 static uint16_t s_adv_max = 0x40;
-static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-static bool s_notify_enabled;
-static bool s_scan_wanted;
-/* 1s interval with latency 3 permits up to four seconds between mandatory
- * peripheral connection events.  Thirty-second supervision keeps a raw-NAN
- * wake gap from being misclassified as a lost link. */
-#define DMESH_RAW_NAN_CONN_INTERVAL 800
-#define DMESH_RAW_NAN_CONN_LATENCY 3
-#define DMESH_RAW_NAN_SUPERVISION_TIMEOUT 3000
-static bool s_raw_nan_link_profile;
-
-static uint16_t s_rx_handle;
-static uint16_t s_tx_handle;
 
 #if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) >= 1
 /* A deliberately small, opt-in CoC transport.  The application creates the
@@ -154,8 +131,6 @@ static SemaphoreHandle_t s_coc_tx_lock;
 #endif
 
 static int dmesh_gap_event(struct ble_gap_event *event, void *arg);
-static int dmesh_chr_access(uint16_t conn_handle, uint16_t attr_handle,
-                            struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int start_adv_now(void);
 static void log_line(const char *line);
 
@@ -174,60 +149,6 @@ static void dmesh_adv_start_event_cb(struct ble_npl_event *event) {
     }
 }
 
-/* Android service discovery is latency-sensitive.  Keep the initial GAP link
- * at the central's normal parameters, then request the raw-NAN duty profile
- * only after the client has subscribed to TX notifications. */
-static int apply_raw_nan_link_profile(void) {
-    if (!s_raw_nan_link_profile || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        return 0;
-    }
-    struct ble_gap_upd_params params = {
-        .itvl_min = DMESH_RAW_NAN_CONN_INTERVAL,
-        .itvl_max = DMESH_RAW_NAN_CONN_INTERVAL,
-        .latency = DMESH_RAW_NAN_CONN_LATENCY,
-        .supervision_timeout = DMESH_RAW_NAN_SUPERVISION_TIMEOUT,
-    };
-    return ble_gap_update_params(s_conn_handle, &params);
-}
-
-static const ble_uuid128_t dmesh_service_uuid =
-    BLE_UUID128_INIT(0x03, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c,
-                     0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f);
-static const ble_uuid128_t dmesh_pairing_uuid =
-    BLE_UUID128_INIT(0x01, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c,
-                     0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f);
-static const ble_uuid128_t dmesh_rx_uuid =
-    BLE_UUID128_INIT(0x04, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c,
-                     0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f);
-static const ble_uuid128_t dmesh_tx_uuid =
-    BLE_UUID128_INIT(0x05, 0x00, 0x68, 0x73, 0x65, 0x4d, 0x42, 0x8c,
-                     0x6f, 0x4a, 0x2a, 0x4f, 0x80, 0x6f, 0x6b, 0x5f);
-
-static const struct ble_gatt_chr_def dmesh_chrs[] = {
-    {
-        .uuid = &dmesh_rx_uuid.u,
-        .access_cb = dmesh_chr_access,
-        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
-        .val_handle = &s_rx_handle,
-    },
-    {
-        .uuid = &dmesh_tx_uuid.u,
-        .access_cb = dmesh_chr_access,
-        .flags = BLE_GATT_CHR_F_NOTIFY,
-        .val_handle = &s_tx_handle,
-    },
-    {0},
-};
-
-static const struct ble_gatt_svc_def dmesh_svcs[] = {
-    {
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = &dmesh_service_uuid.u,
-        .characteristics = dmesh_chrs,
-    },
-    {0},
-};
-
 static void log_line(const char *line) {
     ESP_LOGI(TAG, "%s", line);
     dmesh_nimble_on_log(line);
@@ -240,10 +161,6 @@ static int dmesh_coc_recv_ready(struct ble_l2cap_chan *chan) {
         return BLE_HS_ENOMEM;
     }
     return ble_l2cap_recv_ready(chan, sdu);
-}
-
-bool dmesh_nimble_coc_connected(void) {
-    return s_coc_chan != NULL;
 }
 
 static int dmesh_coc_send_now(const uint8_t *data, uint16_t len) {
@@ -430,125 +347,18 @@ static int start_adv_now(void) {
     return rc == 0 ? 0 : 4000 + rc;
 }
 
-int32_t dmesh_nimble_start_pairing_advertising(uint16_t min_units,
-                                               uint16_t max_units) {
-    struct ble_hs_adv_fields fields = {0};
-    struct ble_hs_adv_fields response = {0};
-    int rc;
-
-    if (s_adv_lock == NULL || xSemaphoreTake(s_adv_lock, portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* Reconfigure an existing operational advertisement as a single GAP
-     * transition.  In particular, do not update the pairing UUID while the
-     * old advertisement is active: on the classic ESP32 controller that can
-     * leave the GAP procedure marked active and make the following start
-     * return BLE_HS_EALREADY. */
-    s_adv_wanted = false;
-    rc = ble_gap_adv_stop();
-    /* See start_adv_now(): both targets may report an already-idle stop with
-     * different NimBLE status codes. */
-    if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_EINVAL) {
-        xSemaphoreGive(s_adv_lock);
-        return 5000 + rc;
-    }
-
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.uuids128 = (ble_uuid128_t *)&dmesh_pairing_uuid;
-    fields.num_uuids128 = 1;
-    fields.uuids128_is_complete = 1;
-    rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        xSemaphoreGive(s_adv_lock);
-        return 6000 + rc;
-    }
-
-    response.name = (const uint8_t *)"DMesh";
-    response.name_len = 5;
-    response.name_is_complete = 1;
-    rc = ble_gap_adv_rsp_set_fields(&response);
-    if (rc != 0) {
-        xSemaphoreGive(s_adv_lock);
-        return 7000 + rc;
-    }
-
-    struct ble_gap_adv_params params = {0};
-    params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    params.itvl_min = min_units;
-    params.itvl_max = max_units < min_units ? min_units : max_units;
-    rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &params,
-                           dmesh_gap_event, NULL);
-    if (rc == 0) s_adv_wanted = true;
-    xSemaphoreGive(s_adv_lock);
-    return rc == 0 ? 0 : 8000 + rc;
-}
-
-static int dmesh_chr_access(uint16_t conn_handle, uint16_t attr_handle,
-                            struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && attr_handle == s_rx_handle) {
-        uint8_t buf[512];
-        uint16_t len = 0;
-        struct os_mbuf *om = ctxt->om;
-        while (om != NULL) {
-            uint16_t chunk = OS_MBUF_PKTLEN(om);
-            if ((size_t)len + chunk > sizeof(buf)) {
-                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-            }
-            int rc = ble_hs_mbuf_to_flat(om, buf + len, sizeof(buf) - len, &chunk);
-            if (rc != 0) {
-                return BLE_ATT_ERR_UNLIKELY;
-            }
-            len += chunk;
-            break;
-        }
-        dmesh_nimble_on_write(buf, len);
-        return 0;
-    }
-    return BLE_ATT_ERR_UNLIKELY;
-}
-
 static int dmesh_gap_event(struct ble_gap_event *event, void *arg) {
     (void)arg;
 #if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) >= 1
     dmesh_coc_start_if_requested();
 #endif
     /* Keep this callback deliberately small: it runs on the NimBLE host task.
-     * ATT discovery works without application work here, but notifications
-     * need the current connection and CCCD state.  Do not query the peer,
-     * restart advertising, emit console records, or wake other radios here. */
+     * Do not query the peer, restart advertising, emit console records, or
+     * wake other radios here. */
     switch (event->type) {
-    case BLE_GAP_EVENT_DISC: {
-        /* Android's queue wake is a normal DMesh service-data advertisement.
-         * Copy neither state nor work into the NimBLE callback: Rust only
-         * records a matching wake flag and the raw-NAN scheduler acts later. */
-        struct ble_hs_adv_fields fields = {0};
-        if (ble_hs_adv_parse_fields(&fields, event->disc.data,
-                                    event->disc.length_data) == 0) {
-            /* Android normally advertises compact 16-bit IPSP service data.
-             * Keep the 128-bit path for older DMesh lab builds. */
-            if (fields.svc_data_uuid128 != NULL && fields.svc_data_uuid128_len >= 2) {
-                dmesh_nimble_on_scan(fields.svc_data_uuid128,
-                                     fields.svc_data_uuid128_len,
-                                     event->disc.rssi);
-            } else if (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len >= 2) {
-                dmesh_nimble_on_scan(fields.svc_data_uuid16,
-                                     fields.svc_data_uuid16_len,
-                                     event->disc.rssi);
-            }
-        }
-        break;
-    }
-    case BLE_GAP_EVENT_DISC_COMPLETE:
-        s_scan_wanted = false;
-        break;
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            s_conn_handle = event->connect.conn_handle;
-            s_notify_enabled = false;
-            uint8_t zero[6] = {0};
-            dmesh_nimble_on_connect(event->connect.conn_handle, zero, 0, 0, 0);
+            dmesh_nimble_on_connect(event->connect.conn_handle);
             log_line("event type=ble.gap state=connected");
         } else {
             char line[80];
@@ -558,8 +368,6 @@ static int dmesh_gap_event(struct ble_gap_event *event, void *arg) {
         }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
-        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        s_notify_enabled = false;
         dmesh_nimble_on_disconnect(event->disconnect.reason);
         {
             char line[80];
@@ -580,16 +388,6 @@ static int dmesh_gap_event(struct ble_gap_event *event, void *arg) {
             } else {
                 log_line("event type=ble.advertise state=restarted");
             }
-        }
-        break;
-    case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.attr_handle == s_tx_handle) {
-            s_notify_enabled = event->subscribe.cur_notify;
-            if (s_notify_enabled) {
-                (void)apply_raw_nan_link_profile();
-            }
-            dmesh_nimble_on_subscribe(event->subscribe.attr_handle,
-                                      event->subscribe.cur_notify);
         }
         break;
     default:
@@ -628,11 +426,6 @@ static void on_stack_sync(void) {
     }
 }
 
-static void gatts_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
-    (void)ctxt;
-    (void)arg;
-}
-
 static void nimble_host_task(void *param) {
     (void)param;
     nimble_port_run();
@@ -660,17 +453,12 @@ int32_t dmesh_nimble_init(void) {
 
     ble_hs_cfg.reset_cb = on_stack_reset;
     ble_hs_cfg.sync_cb = on_stack_sync;
-    ble_hs_cfg.gatts_register_cb = gatts_register_cb;
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
-    /* Establish basic ATT/GATT before asking Android to negotiate SMP.  The
-     * companion policy adds bonding only after this transport smoke path is
-     * proven on classic ESP32 hardware. */
+    /* Establish basic ATT/GATT for CoC negotiation.  DMesh does not expose a
+     * GATT payload or bond-management control surface. */
     ble_hs_cfg.sm_bonding = 0;
     ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
-
-    ble_store_config_init();
 
 #if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) >= 1
     rc = os_mempool_init(&s_coc_mempool, DMESH_COC_BUF_COUNT, DMESH_COC_MTU,
@@ -741,19 +529,7 @@ int32_t dmesh_nimble_start_coc_server(uint16_t psm) {
 #endif
 }
 
-uint16_t dmesh_nimble_coc_server_psm(void) {
-#if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) >= 1
-    return s_coc_server_started ? s_coc_psm : 0;
-#else
-    return 0;
-#endif
-}
-
 #if MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) < 1
-bool dmesh_nimble_coc_connected(void) {
-    return false;
-}
-
 int32_t dmesh_nimble_coc_send(const uint8_t *data, uint16_t len) {
     (void)data;
     (void)len;
@@ -789,86 +565,4 @@ int32_t dmesh_nimble_stop_advertising(void) {
     ble_gap_adv_stop();
     xSemaphoreGive(s_adv_lock);
     return 0;
-}
-
-int32_t dmesh_nimble_start_scan(uint32_t duration_ms, uint8_t active) {
-    struct ble_gap_disc_params params = {0};
-    int rc;
-    if (!s_started || !s_synced) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    params.passive = active ? 0 : 1;
-    params.itvl = 0x10;
-    params.window = 0x10;
-    params.filter_duplicates = 1;
-    params.filter_policy = 0;
-    /* NimBLE uses milliseconds for legacy discovery duration. */
-    rc = ble_gap_disc(s_addr_type, duration_ms, &params, dmesh_gap_event, NULL);
-    if (rc == 0) s_scan_wanted = true;
-    return rc;
-}
-
-int32_t dmesh_nimble_stop_scan(void) {
-    int rc = ble_gap_disc_cancel();
-    if (rc == 0 || rc == BLE_HS_EALREADY) {
-        s_scan_wanted = false;
-        return 0;
-    }
-    return rc;
-}
-
-int32_t dmesh_nimble_notify(const uint8_t *data, uint16_t len) {
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_notify_enabled) {
-        return BLE_HS_ENOTCONN;
-    }
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
-    if (om == NULL) {
-        return BLE_HS_ENOMEM;
-    }
-    return ble_gatts_notify_custom(s_conn_handle, s_tx_handle, om);
-}
-
-int32_t dmesh_nimble_clear_bonds(void) {
-    int rc = ble_store_clear();
-    return rc == 0 ? 0 : rc;
-}
-
-int32_t dmesh_nimble_set_bonding(uint8_t enabled) {
-    /* This is a lab policy control, not a pairing trigger.  It must be set
-     * before Android creates the next connection so NimBLE requests SMP on
-     * that link; existing connections retain their negotiated security. */
-    ble_hs_cfg.sm_bonding = enabled ? 1 : 0;
-    ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 1;
-    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
-    return 0;
-}
-
-int32_t dmesh_nimble_set_raw_nan_link_profile(uint8_t enabled) {
-    s_raw_nan_link_profile = enabled != 0;
-    return apply_raw_nan_link_profile();
-}
-
-uint16_t dmesh_nimble_tx_handle(void) {
-    return s_tx_handle;
-}
-
-uint16_t dmesh_nimble_rx_handle(void) {
-    return s_rx_handle;
-}
-
-int32_t dmesh_nimble_enable_sleep(void) {
-#if CONFIG_IDF_TARGET_ESP32
-    return esp_bt_sleep_enable();
-#else
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
-}
-
-int32_t dmesh_nimble_disable_sleep(void) {
-#if CONFIG_IDF_TARGET_ESP32
-    return esp_bt_sleep_disable();
-#else
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
 }

@@ -6,36 +6,23 @@
 //! helpers below only bridge a small firmware action to an explicit FreeRTOS
 //! task; they never create a host-thread wrapper.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
-// `esp_wifi_disconnect`/stop tears down driver-owned callbacks and cannot run
-// on the old 2 KiB delayed-restart stack. This is platform execution space,
-// not a QUIC or flash buffer; keep it separate from packet-pool sizing.
-const RESTART_TASK_STACK_BYTES: u32 = 8 * 1024;
+static RESTART_DELAY_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Schedule a single restart after `delay_ms` without blocking the caller.
 ///
-/// `vTaskDelay` yields the FreeRTOS task; it does not busy-wait or block the
-/// UART/transport task.  Duplicate requests intentionally coalesce because a
-/// restart is terminal for the running image.
+/// `vTaskDelay` yields the already-running shared ingress task; it does not
+/// busy-wait or allocate a second rare-event task stack. Duplicate requests
+/// intentionally coalesce because a restart is terminal for the running
+/// image.
 pub fn schedule_restart_ms(delay_ms: u32) -> bool {
     if RESTART_PENDING.swap(true, Ordering::AcqRel) {
         return true;
     }
-    let mut task = core::ptr::null_mut();
-    let result = unsafe {
-        esp_idf_sys::xTaskCreatePinnedToCore(
-            Some(restart_task),
-            b"dmesh_restart\0".as_ptr().cast(),
-            RESTART_TASK_STACK_BYTES,
-            delay_ms as usize as *mut core::ffi::c_void,
-            4,
-            &mut task,
-            0,
-        )
-    };
-    if result == 1 && !task.is_null() {
+    RESTART_DELAY_MS.store(delay_ms, Ordering::Release);
+    if crate::shared_ingress_esp::schedule_work(restart_work) {
         true
     } else {
         RESTART_PENDING.store(false, Ordering::Release);
@@ -43,15 +30,18 @@ pub fn schedule_restart_ms(delay_ms: u32) -> bool {
     }
 }
 
-unsafe extern "C" fn restart_task(argument: *mut core::ffi::c_void) {
-    let delay_ms = argument as usize as u32;
+fn restart_work() {
+    let delay_ms = RESTART_DELAY_MS.load(Ordering::Acquire);
     let ticks = (u64::from(delay_ms) * u64::from(esp_idf_sys::configTICK_RATE_HZ)).div_ceil(1_000)
         as esp_idf_sys::TickType_t;
     unsafe {
-        // This task is separate from the QUIC ingress worker. Stopping the
-        // STA tears down raw UDP callbacks, so the terminal response must be
-        // delivered before this leave runs. A visible 802.11 leave prevents
-        // the AP retaining a stale station through ROM reset.
+        // Stopping the STA tears down raw UDP callbacks, so the terminal
+        // response must be delivered before this leave runs. A visible 802.11
+        // leave prevents the AP retaining a stale station through ROM reset.
+        // The shared worker has already drained that response and has enough
+        // stack for the IDF Wi-Fi teardown; allocating another 8 KiB task at
+        // this point fails on a constrained classic ESP exactly when recovery
+        // needs to be reliable.
         crate::wifi_esp::stop_sta_for_reset();
         esp_idf_sys::vTaskDelay(ticks.max(1));
         esp_idf_sys::esp_restart();

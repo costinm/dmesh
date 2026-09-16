@@ -6,6 +6,7 @@
 //! Bearer parsing and transmission stay in their own adapters; this module is
 //! only the ESP/FreeRTOS ownership boundary.
 
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering},
@@ -25,13 +26,17 @@ pub const FRAME_CAPACITY: usize = crate::TRANSPORT_MTU + 96;
 /// common QUIC worker. The pool may drop a newly received frame when full;
 /// normal QUIC loss recovery handles that drop using the separately allocated,
 /// dynamically selected endpoint ledger. All ESP bearers share these slots.
-/// Eight is only the current ESP static-RAM budget (roughly eight MTU frames),
-/// and is exported by `memory_stats` with the live free count so fleet tests
-/// can justify changing it. It never enters OPEN, MAX_DATA, congestion, or
-/// retransmission calculations. A host must not emulate this adapter buffer in
-/// production because its socket receive queue is the corresponding platform
-/// primitive; constrained host tests exercise `PacketPool<N, MTU>` directly.
+/// This is the bootstrap/relay pool, not an association flight limit.  It is
+/// deliberately small and permanently available for ordinary direct relay,
+/// control and module traffic. A live QUIC association uses its available
+/// inbound slots first and obtains a temporary extension only above that
+/// capacity, releasing the extension on close. That keeps rare high-flight
+/// stress transfers from permanently claiming relay RAM.
 pub const ESP_CALLBACK_PACKET_SLOTS: usize = 8;
+/// The callback queue stores only metadata. It is larger than the permanent
+/// frame pool because an admitted stress association may own a temporary
+/// ingress extension. This is not a second packet queue.
+const MAX_ASSOCIATION_INGRESS_SLOTS: usize = 64;
 /// A received frame may be dropped under pressure, but a response that has
 /// already been admitted by the QUIC-lite endpoint must still have room to
 /// leave the device.  Reserve two of the single, shared packet slots for
@@ -39,6 +44,11 @@ pub const ESP_CALLBACK_PACKET_SLOTS: usize = 8;
 /// serve UDP6, UART, FSK, and relay output as their adapters move to the
 /// common sender.
 const EGRESS_RESERVED_SLOTS: usize = 2;
+/// The permanent callback pool can already carry this many inbound frames
+/// while retaining its two reply slots.  A normal firmware association is
+/// deliberately within this floor, so it must not allocate a second heap
+/// pool merely to duplicate capacity that is idle in the shared relay pool.
+const BOOTSTRAP_INGRESS_CAPACITY: usize = ESP_CALLBACK_PACKET_SLOTS - EGRESS_RESERVED_SLOTS;
 /// FreeRTOS `xQueueGenericSend` copy-position value for the queue head.
 /// ESP-IDF exposes the generic call but not this macro through every bindgen
 /// configuration.  Egress uses it only after a packet has been admitted: a
@@ -49,12 +59,14 @@ const QUEUE_SEND_TO_FRONT: i32 = 1;
 /// One active ingress worker owns the shared service-dispatch call chain for
 /// UART, NOW, UDP6, and NAN Service Info. It does not own packet buffers:
 /// those are in [`PACKETS`]. The selected association and multi-stream
-/// callback state have a larger construction path than the old one-shot
-/// PROBE turn; 32 KiB produced a stack-protection fault while admitting its
-/// first stream. Keep 48 KiB until `memory_stats` proves a smaller high-water
-/// mark on the full catalog pass. This is an ESP task-stack allocation, not a
-/// QUIC window, ledger, or device-only protocol path.
-const TASK_STACK_BYTES: u32 = 48 * 1024;
+/// callback state no longer constructs or copies a stream ledger on this
+/// stack: QUIC-lite initializes the admitted connection in its final heap
+/// allocation.  Sixteen KiB leaves headroom for packet parsing while avoiding
+/// the former permanent 48 KiB reservation, which left classic ESP32 boards
+/// unable to admit even an ordinary control association after Wi-Fi started.
+/// This is an ESP task-stack allocation, not a QUIC window, ledger, or
+/// device-only protocol path.
+const TASK_STACK_BYTES: u32 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -89,11 +101,6 @@ pub enum IngressKind {
     /// capacity. This is the UART equivalent of a writable-socket event, not
     /// a periodic transmit poll or a bearer-private packet queue.
     UartEgressReady = 10,
-    /// Durable/application storage has completed work and may be able to
-    /// return receive credit. This is an application-owned readiness edge,
-    /// not a loss timer: the connection can be fully ACKed and flow-control
-    /// blocked when it fires.
-    StorageReady = 11,
 }
 
 /// Link context preserved across the one required driver-buffer copy.
@@ -118,7 +125,17 @@ pub struct IngressPacket {
     pub link: IngressLink,
     pub source: [u8; 6],
     pub len: u16,
-    slot: PacketSlot,
+    slot: IngressSlot,
+}
+
+/// Ownership token for either the permanent bootstrap pool or the temporary
+/// association pool. Queue items are the sole owners; the worker returns the
+/// slot once the registered bearer handler has consumed its frame.
+#[derive(Clone, Copy)]
+enum IngressSlot {
+    Bootstrap(PacketSlot),
+    Association(u8),
+    None,
 }
 
 impl IngressPacket {
@@ -136,6 +153,120 @@ pub type IngressHandler = fn(IngressPacket, &[u8]);
 struct QueueStorage<const N: usize>([u8; N]);
 
 static PACKETS: PacketPool<ESP_CALLBACK_PACKET_SLOTS, FRAME_CAPACITY> = PacketPool::new();
+
+/// Heap-backed callback storage for one live association. Allocation happens
+/// only on the common worker after OPEN is accepted; the Wi-Fi callback only
+/// performs its bounded copy into an already-owned slot. `free_low/high`
+/// avoid a 64-bit atomic so classic ESP32 and RISC-V use the same code.
+struct AssociationIngressPool {
+    frames: Box<[[u8; FRAME_CAPACITY]]>,
+    free_low: AtomicU32,
+    free_high: AtomicU32,
+    outstanding: AtomicU32,
+}
+
+unsafe impl Sync for AssociationIngressPool {}
+
+impl AssociationIngressPool {
+    fn new(slots: usize) -> Option<Box<Self>> {
+        let slots = slots.clamp(1, MAX_ASSOCIATION_INGRESS_SLOTS);
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(slots).ok()?;
+        for _ in 0..slots {
+            frames.push([0; FRAME_CAPACITY]);
+        }
+        let low_slots = slots.min(32);
+        let high_slots = slots.saturating_sub(32);
+        Some(Box::new(Self {
+            frames: frames.into_boxed_slice(),
+            free_low: AtomicU32::new(slot_mask(low_slots)),
+            free_high: AtomicU32::new(slot_mask(high_slots)),
+            outstanding: AtomicU32::new(0),
+        }))
+    }
+
+    fn capacity(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn acquire(&self) -> Option<u8> {
+        acquire_pool_word(&self.free_low, 0)
+            .or_else(|| acquire_pool_word(&self.free_high, 32))
+            .map(|slot| {
+                self.outstanding.fetch_add(1, Ordering::AcqRel);
+                slot
+            })
+    }
+
+    fn write(&self, slot: u8, bytes: &[u8]) -> bool {
+        let index = slot as usize;
+        if index >= self.frames.len() || bytes.len() > FRAME_CAPACITY {
+            return false;
+        }
+        // A successful acquire clears this slot's bit until the worker
+        // releases it, so this mutable access cannot alias another producer.
+        unsafe {
+            (&mut *(self.frames.as_ptr().add(index) as *mut [u8; FRAME_CAPACITY]))[..bytes.len()]
+                .copy_from_slice(bytes);
+        }
+        true
+    }
+
+    fn packet(&self, slot: u8, len: usize) -> Option<&[u8]> {
+        let index = slot as usize;
+        (index < self.frames.len() && len <= FRAME_CAPACITY).then(|| &self.frames[index][..len])
+    }
+
+    fn release(&self, slot: u8) -> bool {
+        let index = slot as usize;
+        if index >= self.frames.len() {
+            return false;
+        }
+        let (free, bit) = if index < 32 {
+            (&self.free_low, 1_u32 << index)
+        } else {
+            (&self.free_high, 1_u32 << (index - 32))
+        };
+        let previous = free.fetch_or(bit, Ordering::AcqRel);
+        if previous & bit != 0 {
+            return false;
+        }
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        true
+    }
+}
+
+fn slot_mask(slots: usize) -> u32 {
+    if slots >= 32 {
+        u32::MAX
+    } else {
+        (1_u32 << slots) - 1
+    }
+}
+
+fn acquire_pool_word(free: &AtomicU32, base: u8) -> Option<u8> {
+    let mut current = free.load(Ordering::Acquire);
+    loop {
+        if current == 0 {
+            return None;
+        }
+        let bit = current.trailing_zeros();
+        let next = current & !(1_u32 << bit);
+        match free.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(base.saturating_add(bit as u8)),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+// `POOL_READERS` pins the pointer while a callback obtains/copies a slot.
+// Reclamation first removes the pointer, then waits for this counter and the
+// queued-slot count; callbacks never allocate or retain the backing storage.
+static ASSOCIATION_POOL: AtomicPtr<AssociationIngressPool> = AtomicPtr::new(core::ptr::null_mut());
+static RETIRED_ASSOCIATION_POOL: AtomicPtr<AssociationIngressPool> =
+    AtomicPtr::new(core::ptr::null_mut());
+static ASSOCIATION_POOL_READERS: AtomicU32 = AtomicU32::new(0);
+static DESIRED_ASSOCIATION_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static QUEUE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 static STARTED: AtomicBool = AtomicBool::new(false);
 static RAW_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -149,8 +280,6 @@ static CONNECTION_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CONNECTION_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
 static UART_EGRESS_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_EGRESS_READY_PENDING: AtomicBool = AtomicBool::new(false);
-static STORAGE_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static STORAGE_READY_PENDING: AtomicBool = AtomicBool::new(false);
 static DROPS: AtomicU32 = AtomicU32::new(0);
 // This worker is created lazily on the first accepted packet, then blocks on
 // the shared queue for the active firmware lifetime. It must not retire after
@@ -173,8 +302,8 @@ static WORKER_LARGEST_INTERNAL_BLOCK_BYTES: AtomicU32 = AtomicU32::new(0);
 static mut QUEUE_CONTROL: core::mem::MaybeUninit<esp_idf_sys::StaticQueue_t> =
     core::mem::MaybeUninit::uninit();
 static mut QUEUE_STORAGE: QueueStorage<
-    { ESP_CALLBACK_PACKET_SLOTS * core::mem::size_of::<IngressPacket>() },
-> = QueueStorage([0; ESP_CALLBACK_PACKET_SLOTS * core::mem::size_of::<IngressPacket>()]);
+    { MAX_ASSOCIATION_INGRESS_SLOTS * core::mem::size_of::<IngressPacket>() },
+> = QueueStorage([0; MAX_ASSOCIATION_INGRESS_SLOTS * core::mem::size_of::<IngressPacket>()]);
 static mut TASK_PACKET: core::mem::MaybeUninit<IngressPacket> = core::mem::MaybeUninit::uninit();
 
 /// Memory evidence for sizing the shared event-driven dispatcher. These
@@ -223,6 +352,189 @@ pub fn memory_stats() -> IngressMemoryStats {
     }
 }
 
+/// Set the temporary callback capacity for the accepted association. This is
+/// called only by the common connection worker after OPEN admission. The
+/// permanent pool supplies the first [`BOOTSTRAP_INGRESS_CAPACITY`] inbound
+/// frames without a heap allocation; only a requested stress flight above
+/// that common capacity obtains a short-lived extension. Its two egress
+/// reservations are never borrowed. A `None` request retires an extension
+/// after its final queued frame drains.
+///
+/// This is not a flash allocation. Any stream-oriented handler receives the
+/// same temporary capacity selected by the association profile, and the heap
+/// frames are released when that association closes.
+pub fn set_association_ingress_slots(slots: Option<usize>) {
+    let association_slots = slots.unwrap_or(0);
+    let desired = association_slots
+        .saturating_sub(BOOTSTRAP_INGRESS_CAPACITY)
+        .min(MAX_ASSOCIATION_INGRESS_SLOTS);
+    let previous = DESIRED_ASSOCIATION_SLOTS.swap(desired, Ordering::AcqRel);
+    if desired != previous {
+        // Bounded boot/association diagnostic: the callback extension is
+        // transient heap state, so a field allocation failure must make its
+        // selected capacity visible without implying that it is QUIC credit.
+        unsafe {
+            esp_idf_sys::esp_rom_printf(
+                b"DMESH ingress: association callback slots=%u\n\0"
+                    .as_ptr()
+                    .cast(),
+                association_slots as u32,
+            );
+        }
+    }
+    // This is deliberately an association-bound snapshot, not a packet-path
+    // trace.  It separates the permanent callback pool (BSS) from the small
+    // dynamic extension selected after OPEN, so a constrained board can show
+    // whether admission itself or an application sink consumed its remaining
+    // internal heap.  The receiver profile remains QUIC-owned.
+    if desired != previous && desired != 0 {
+        let caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+        unsafe {
+            esp_idf_sys::esp_rom_printf(
+                b"DMESH ingress: association heap before=%u largest=%u\n\0"
+                    .as_ptr()
+                    .cast(),
+                esp_idf_sys::heap_caps_get_free_size(caps) as u32,
+                esp_idf_sys::heap_caps_get_largest_free_block(caps) as u32,
+            );
+        }
+    }
+    reconcile_association_pool();
+    if desired != previous && desired != 0 {
+        let caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+        unsafe {
+            esp_idf_sys::esp_rom_printf(
+                b"DMESH ingress: association heap after=%u largest=%u\n\0"
+                    .as_ptr()
+                    .cast(),
+                esp_idf_sys::heap_caps_get_free_size(caps) as u32,
+                esp_idf_sys::heap_caps_get_largest_free_block(caps) as u32,
+            );
+        }
+    }
+}
+
+fn reconcile_association_pool() {
+    let desired = DESIRED_ASSOCIATION_SLOTS.load(Ordering::Acquire);
+    let retired = RETIRED_ASSOCIATION_POOL.load(Ordering::Acquire);
+    if !retired.is_null() && ASSOCIATION_POOL_READERS.load(Ordering::Acquire) == 0 {
+        let retired = RETIRED_ASSOCIATION_POOL.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            unsafe {
+                drop(Box::from_raw(retired));
+            }
+        }
+    }
+    let pool = ASSOCIATION_POOL.load(Ordering::Acquire);
+    if !pool.is_null() {
+        let pool = unsafe { &*pool };
+        if pool.capacity() == desired {
+            return;
+        }
+        // The worker is the only releaser. A pool survives until no queued
+        // items own slots and no callback is copying into one of them.
+        if pool.outstanding.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        // Remove the live pointer before waiting for callback readers. A
+        // reader that started before this exchange has counted itself and may
+        // safely finish its bounded copy; a later reader observes null.
+        let retired = ASSOCIATION_POOL.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            debug_assert!(
+                RETIRED_ASSOCIATION_POOL
+                    .compare_exchange(
+                        core::ptr::null_mut(),
+                        retired,
+                        Ordering::AcqRel,
+                        Ordering::Acquire
+                    )
+                    .is_ok(),
+                "only one association pool may retire at a time"
+            );
+        }
+        if ASSOCIATION_POOL_READERS.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let retired = RETIRED_ASSOCIATION_POOL.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !retired.is_null() {
+            unsafe {
+                drop(Box::from_raw(retired));
+            }
+        }
+    }
+    if desired != 0 && ASSOCIATION_POOL.load(Ordering::Acquire).is_null() {
+        if let Some(pool) = AssociationIngressPool::new(desired) {
+            let raw = Box::into_raw(pool);
+            if ASSOCIATION_POOL
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    raw,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                unsafe {
+                    drop(Box::from_raw(raw));
+                }
+            }
+        }
+    }
+}
+
+fn acquire_association_slot(bytes: &[u8]) -> Option<u8> {
+    ASSOCIATION_POOL_READERS.fetch_add(1, Ordering::AcqRel);
+    let pool = ASSOCIATION_POOL.load(Ordering::Acquire);
+    let result = if pool.is_null() {
+        None
+    } else {
+        let pool = unsafe { &*pool };
+        match pool.acquire() {
+            Some(slot) if pool.write(slot, bytes) => Some(slot),
+            Some(slot) => {
+                let _ = pool.release(slot);
+                None
+            }
+            None => None,
+        }
+    };
+    ASSOCIATION_POOL_READERS.fetch_sub(1, Ordering::AcqRel);
+    result
+}
+
+fn packet_for_slot(slot: IngressSlot, len: usize) -> Option<&'static [u8]> {
+    match slot {
+        IngressSlot::Bootstrap(slot) => PACKETS.packet(slot, len),
+        IngressSlot::Association(slot) => {
+            let pool = ASSOCIATION_POOL.load(Ordering::Acquire);
+            (!pool.is_null())
+                .then(|| unsafe { (&*pool).packet(slot, len) })
+                .flatten()
+        }
+        IngressSlot::None => None,
+    }
+}
+
+fn release_slot(slot: IngressSlot) {
+    match slot {
+        IngressSlot::Bootstrap(slot) => {
+            let _ = PACKETS.release(slot);
+        }
+        IngressSlot::Association(slot) => {
+            let pool = ASSOCIATION_POOL.load(Ordering::Acquire);
+            if !pool.is_null() {
+                let _ = unsafe { (&*pool).release(slot) };
+            }
+        }
+        IngressSlot::None => {}
+    }
+    // Called by the worker after an item is consumed. This is the natural
+    // final-release edge for a closed association, without a flash-specific
+    // timer or a callback-side free.
+    reconcile_association_pool();
+}
+
 fn zero_if_unset(value: u32) -> u32 {
     if value == u32::MAX {
         0
@@ -265,7 +577,7 @@ pub fn start(kind: IngressKind, handler: IngressHandler) -> bool {
     }
     let queue = unsafe {
         esp_idf_sys::xQueueGenericCreateStatic(
-            ESP_CALLBACK_PACKET_SLOTS as _,
+            MAX_ASSOCIATION_INGRESS_SLOTS as _,
             core::mem::size_of::<IngressPacket>() as _,
             core::ptr::addr_of_mut!(QUEUE_STORAGE.0).cast(),
             core::ptr::addr_of_mut!(QUEUE_CONTROL).cast(),
@@ -320,23 +632,30 @@ pub fn enqueue_on_link(
         DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    // RX callbacks are producers, not guaranteed delivery.  Do not let a
-    // burst of NAN/action capture consume the last shared packet slots and
-    // prevent the worker from submitting an already-admitted response.  This
-    // is one pool and one queue: only admission priority differs.  Egress is
-    // bounded by the same device callback pool and remains subject to normal failure
-    // accounting when both reserved slots are occupied.
-    if kind != IngressKind::EspNowTx && PACKETS.available() <= EGRESS_RESERVED_SLOTS {
-        DROPS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
     let queue = QUEUE.load(Ordering::Acquire);
-    let Some(slot) = PACKETS.acquire() else {
+    // An accepted stress association uses its temporary extension first;
+    // ordinary associations use the permanent bootstrap slots. In both cases
+    // the two egress reservations remain available for immediate replies.
+    let slot = if kind != IngressKind::EspNowTx {
+        acquire_association_slot(bytes).map(IngressSlot::Association)
+    } else {
+        None
+    }
+    .or_else(|| {
+        if kind != IngressKind::EspNowTx && PACKETS.available() <= EGRESS_RESERVED_SLOTS {
+            return None;
+        }
+        let slot = PACKETS.acquire()?;
+        PACKETS
+            .write(slot, bytes)
+            .then_some(IngressSlot::Bootstrap(slot))
+    });
+    let Some(slot) = slot else {
         DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    if queue.is_null() || !PACKETS.write(slot, bytes) {
-        let _ = PACKETS.release(slot);
+    if queue.is_null() {
+        release_slot(slot);
         DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -344,7 +663,7 @@ pub fn enqueue_on_link(
     // a frame arrives after an idle interval. Do this before publishing the
     // slot so a low-memory failure can release it without touching the queue.
     if !wake_worker() {
-        let _ = PACKETS.release(slot);
+        release_slot(slot);
         DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -373,7 +692,7 @@ pub fn enqueue_on_link(
         ) == 1
     };
     if !queued {
-        let _ = PACKETS.release(slot);
+        release_slot(slot);
         DROPS.fetch_add(1, Ordering::Relaxed);
     } else {
         // A worker can observe an empty queue and begin retirement between
@@ -405,7 +724,7 @@ pub fn schedule_work(work: fn()) -> bool {
         link: IngressLink::None,
         source: [0; 6],
         len: 0,
-        slot: PacketSlot::sentinel(),
+        slot: IngressSlot::None,
     };
     let queued = unsafe {
         esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
@@ -439,7 +758,7 @@ pub fn schedule_connection_timer(handler: fn()) -> bool {
         link: IngressLink::None,
         source: [0; 6],
         len: 0,
-        slot: PacketSlot::sentinel(),
+        slot: IngressSlot::None,
     };
     let queued = unsafe {
         esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
@@ -474,7 +793,7 @@ pub fn schedule_uart_egress_ready(handler: fn()) -> bool {
         link: IngressLink::None,
         source: [0; 6],
         len: 0,
-        slot: PacketSlot::sentinel(),
+        slot: IngressSlot::None,
     };
     let queued = unsafe {
         esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
@@ -482,44 +801,6 @@ pub fn schedule_uart_egress_ready(handler: fn()) -> bool {
     };
     if !queued {
         UART_EGRESS_READY_PENDING.store(false, Ordering::Release);
-        DROPS.fetch_add(1, Ordering::Relaxed);
-    }
-    queued
-}
-
-/// Queue an application-storage readiness edge on the connection owner.
-///
-/// The producer may block until the metadata item is queued: it has already
-/// placed its completion in the bounded sink queue, and losing this edge
-/// would leave an otherwise fully ACKed peer permanently flow-control
-/// blocked. No packet buffer or bearer-specific credit is allocated here.
-pub fn schedule_storage_ready(handler: fn()) -> bool {
-    STORAGE_READY_HANDLER.store(handler as usize, Ordering::Release);
-    if STORAGE_READY_PENDING.swap(true, Ordering::AcqRel) {
-        return true;
-    }
-    let queue = QUEUE.load(Ordering::Acquire);
-    if queue.is_null() || !wake_worker() {
-        STORAGE_READY_PENDING.store(false, Ordering::Release);
-        return false;
-    }
-    let item = IngressPacket {
-        kind: IngressKind::StorageReady,
-        link: IngressLink::None,
-        source: [0; 6],
-        len: 0,
-        slot: PacketSlot::sentinel(),
-    };
-    let queued = unsafe {
-        esp_idf_sys::xQueueGenericSend(
-            queue.cast(),
-            (&item as *const IngressPacket).cast(),
-            u32::MAX,
-            0,
-        ) == 1
-    };
-    if !queued {
-        STORAGE_READY_PENDING.store(false, Ordering::Release);
         DROPS.fetch_add(1, Ordering::Relaxed);
     }
     queued
@@ -543,7 +824,6 @@ fn handler_slot(kind: IngressKind) -> &'static AtomicUsize {
         IngressKind::ConnectionTimer => &CONNECTION_TIMER_HANDLER,
         IngressKind::EspNowTx => &ESPNOW_TX_HANDLER,
         IngressKind::UartEgressReady => &UART_EGRESS_READY_HANDLER,
-        IngressKind::StorageReady => &STORAGE_READY_HANDLER,
     }
 }
 
@@ -601,39 +881,25 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
             unsafe { esp_idf_sys::vTaskDelay(1) };
             continue;
         }
-        if item.kind == IngressKind::StorageReady {
-            STORAGE_READY_PENDING.store(false, Ordering::Release);
-            let handler = STORAGE_READY_HANDLER.load(Ordering::Acquire);
-            if handler != 0 {
-                let handler: fn() = unsafe { core::mem::transmute(handler) };
-                handler();
-            }
-            // Storage consumption can queue MAX_* and emit only one packet in
-            // this worker turn. Re-arm Main from the post-handler state for
-            // exactly the same reason as the connection-timer edge above.
-            crate::core_runtime::request_connection_deadline_recheck();
-            unsafe { esp_idf_sys::vTaskDelay(1) };
-            continue;
-        }
         let handler = handler_slot(item.kind).load(Ordering::Acquire);
         if handler != 0 {
-            if let Some(packet) = PACKETS.packet(item.slot, item.len as usize) {
+            if let Some(packet) = packet_for_slot(item.slot, item.len as usize) {
                 let handler: IngressHandler = unsafe { core::mem::transmute(handler) };
                 handler(item, packet);
             }
         }
-        let _ = PACKETS.release(item.slot);
+        release_slot(item.slot);
         // This is the worker's own task context, so FreeRTOS can report the
         // real remaining-stack watermark without synchronizing with a caller.
         record_lowest(&WORKER_STACK_MIN_FREE_WORDS, unsafe {
             esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) as u32
         });
-        // A continuously retransmitting peer can keep this queue non-empty.
-        // Yield after one complete bearer frame so Wi-Fi, flash completion,
-        // and the IDLE watchdog get normal FreeRTOS scheduling.  This changes
-        // no QUIC ordering, ACK, or credit policy; it is common adapter
-        // scheduling for UART, UDP, and NOW alike.
-        unsafe { esp_idf_sys::vTaskDelay(1) };
+        // Do not delay after every frame. On the C6 a one-tick delay is about
+        // 10 ms, so an ordinary six-frame Wi-Fi burst fills any small pool
+        // faster than this worker can drain it and turns callback pressure
+        // into artificial QUIC loss. The Wi-Fi driver has higher priority and
+        // can preempt this worker; blocking on the queue at the top of the
+        // loop yields naturally once the current burst is drained.
     }
 }
 

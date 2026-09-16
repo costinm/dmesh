@@ -4241,20 +4241,39 @@ mod tests {
                 last_payload_len: 0,
                 last_payload_hash: 0,
             },
+            // Android-style row: a decoded identity but an opaque PeerHandle
+            // (zero MAC) and wall-clock timestamps that degrade to u32::MAX.
+            dmesh_server::announce::ObservedDevice {
+                device_id: b"\x6c\x57\xff\x07\x63\x7d\x3b\x61\x7c\xab\x85\x77\x0b\x9c\xeb\xc4",
+                peer: [0; 6],
+                bssid: None,
+                channel: None,
+                available_fields: dmesh_server::discovery::OBSERVATION_PEER
+                    | dmesh_server::discovery::OBSERVATION_PAYLOAD_FINGERPRINT,
+                first_seen_ms: u32::MAX,
+                last_seen_ms: u32::MAX,
+                packets: 33,
+                active_publish_rx: 33,
+                active_subscribe_rx: 0,
+                followup_rx: 0,
+                last_kind: 0,
+                last_payload_len: 96,
+                last_payload_hash: 0,
+            },
         ];
-        let mut result = [0u8; 512];
+        let mut result = [0u8; 768];
         let result_len =
             dmesh_server::announce::encode_devices_observed_response(&entries, &mut result)
                 .expect("encode discovery inventory");
         let fields = dmesh_server::tagged::decode(&result[..result_len])
             .and_then(|record| record.fields)
             .expect("extract discovery inventory fields");
-        let mut response = [0u8; 640];
+        let mut response = [0u8; 960];
         let response_len =
             dmesh_server::tagged::encode_numeric_response(6, 9, 1, fields, &mut response)
                 .expect("wrap discovery inventory");
         let nodes = observed_nodes(&response[..response_len]).expect("decode observations");
-        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].node, "706565722d61");
         assert_eq!(
             nodes[0].fields,

@@ -42,6 +42,24 @@ fn main() {
     app_main();
 }
 
+/// BLE is a Main sidecar, not a prerequisite for the infrastructure STA.
+/// Starting it after the radio-ready edge prevents the classic ESP32
+/// coexistence allocator from racing the first WPA authentication while still
+/// restoring BLE automatically for both associated and NAN/NOW boots.
+fn start_ble_after_radio_ready() {
+    if !dmesh_ble::boot_enabled() {
+        return;
+    }
+    match dmesh_ble::start_dmesh_service() {
+        Ok(()) => unsafe {
+            esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto start\n\0".as_ptr().cast());
+        },
+        Err(_) => unsafe {
+            esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto start failed\n\0".as_ptr().cast());
+        },
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn app_main() {
     // Kept adjacent to the Stage2 handoff write while lora4 early boot is
@@ -62,6 +80,7 @@ pub extern "C" fn app_main() {
         )
     };
     dmesh_fw_transport::rtc::mark_main_start();
+    let _ = esp_idf_sys::link_patches();
     assert!(dmesh_server::services::register_tagged_component(
         dmesh_server::services::BOOT_COMPONENT,
         receive_boot_control,
@@ -69,16 +88,26 @@ pub extern "C" fn app_main() {
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();
-    // BLE is linked as a Main bearer. Its CoC byte-stream adapter will feed
-    // this same runtime; it never revives the retired command/GATT payload
-    // dispatcher.
-    let _ = dmesh_ble::link_snapshot();
     // Route ESP-IDF logs through the UART writer queue. Direct console writes
     // would splice text into PPP-framed tagged responses.
     unsafe {
         esp_idf_sys::esp_log_set_vprintf(Some(dmesh_uart_log_vprintf));
     }
-    dmesh_fw_transport::main_runtime::run(dmesh_fw_transport::rtc::mark_main_healthy);
+    let ble_auto = dmesh_fw_transport::main_runtime::boot_ble_auto();
+    dmesh_ble::configure_boot(ble_auto);
+    if !ble_auto {
+        unsafe {
+            esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto disabled\n\0".as_ptr().cast())
+        };
+    }
+    if ble_auto {
+        dmesh_fw_transport::main_runtime::run_with_boot_radio_ready(
+            dmesh_fw_transport::rtc::mark_main_healthy,
+            start_ble_after_radio_ready,
+        );
+    } else {
+        dmesh_fw_transport::main_runtime::run(dmesh_fw_transport::rtc::mark_main_healthy);
+    }
 }
 
 extern "C" {

@@ -472,9 +472,12 @@ unsafe fn apply_sta_candidate(selection: &ScannedStaCandidate, allow_open: bool)
 // handle for the lifetime of the firmware and reuse it after `stop_sta()`.
 static STA_NETIF: AtomicPtr<esp_idf_sys::esp_netif_t> = AtomicPtr::new(core::ptr::null_mut());
 static STA_DRIVER_INITIALIZED: AtomicBool = AtomicBool::new(false);
-// Recovery may use the already-provisioned WPA profile while a platform scan
-// is being diagnosed.  This is consumed by exactly one `init_sta` call and
-// does not change Main's scan/select policy.
+// An image that booted from a complete, provisioned WPA profile may connect
+// directly.  This is consumed by exactly one `init_sta` call: subsequent
+// explicit Main transport starts and bounded reconnects retain their normal
+// scan/select policy.  Recovery uses the same path, so an NVS-provisioned
+// Main and Recovery cannot differ merely because one rebuilt its BSSID from
+// an initial scan.
 static STA_SKIP_INITIAL_SCAN: AtomicBool = AtomicBool::new(false);
 static STA_AMPDU_ENABLED: AtomicBool = AtomicBool::new(true);
 static STA_11B_RATES_DISABLED: AtomicBool = AtomicBool::new(true);
@@ -933,6 +936,15 @@ pub fn init_sta(params: &TransportProfile) {
 pub fn init_sta_configured(params: &TransportProfile) {
     STA_SKIP_INITIAL_SCAN.store(true, Ordering::Release);
     init_sta(params);
+}
+
+/// Use the complete NVS STA profile for Main's next initial radio epoch.
+///
+/// This only selects the initial association method.  It does not alter the
+/// peer credentials, bypass later scan-based reconnects, or change the
+/// Main-only NAN/NOW extension policy.
+pub(crate) fn use_configured_sta_profile_once() {
+    STA_SKIP_INITIAL_SCAN.store(true, Ordering::Release);
 }
 
 /// Start the unassociated NAN+NOW radio epoch.  This deliberately duplicates

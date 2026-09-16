@@ -21,9 +21,9 @@
 #define DMESH_RTC_HANDOFF_OFFSET (DMESH_RTC_CUSTOM_OFFSET + 5)
 
 #if CONFIG_IDF_TARGET_ESP32C6
-/* C6 application code cannot write SOC_RTC_DRAM_LOW; share its retained
- * high block with Main and Recovery instead. */
-#define DMESH_RTC_RETAIN_BASE (0x50004000u - DMESH_RTC_RETAIN_RAW_SIZE)
+/* C6 application code cannot write SOC_RTC_DRAM_LOW. Share this writable
+ * high-end RTC block with Main and Recovery instead. */
+#define DMESH_RTC_RETAIN_BASE (SOC_RTC_DRAM_HIGH - DMESH_RTC_RETAIN_RAW_SIZE)
 #elif ESP_ROM_HAS_LP_ROM
 #define DMESH_RTC_RETAIN_BASE SOC_RTC_DRAM_LOW
 #else

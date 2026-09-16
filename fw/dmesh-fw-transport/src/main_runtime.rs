@@ -26,13 +26,14 @@ extern "C" {
 
 const NVS_READONLY: i32 = 0;
 const NVS_READWRITE: i32 = 1;
-const SETTINGS_KEYS: [&[u8]; 6] = [
+const SETTINGS_KEYS: [&[u8]; 7] = [
     b"mode",
     b"name",
     b"domain",
     b"sta_ssid",
     b"sta_server_ll",
     b"sta_server_port",
+    b"ble.auto",
 ];
 // Private settings are write-only. `id_p256` is created internally and stored
 // as a binary NVS blob; it is never a settings transport value.
@@ -175,6 +176,7 @@ pub(crate) fn write_setting(key: &[u8], value: &[u8]) -> bool {
         b"sta_ssid" => dmesh_server::firmware_profile::valid_ssid(value),
         b"sta_server_ll" => value.starts_with(b"fe80:") && !value.contains(&b'%'),
         b"sta_server_port" => parse_port(value).is_some(),
+        b"ble.auto" => matches!(value, b"true" | b"false"),
         _ => false,
     };
     if !valid {
@@ -315,6 +317,12 @@ pub(crate) fn apply_sta_profile_from_nvs(profile: &mut crate::TransportProfile) 
     if !crate::sta_profile_esp::load(profile) {
         return false;
     }
+    // The persisted profile is already a complete WPA association target.
+    // Start it through the same configured path as Recovery instead of
+    // replacing the driver configuration with a scan-selected BSSID before
+    // the first authentication.  This is a one-shot boot selection; normal
+    // Main retries still use the bounded scan policy.
+    crate::wifi_esp::use_configured_sta_profile_once();
     // Recovery deliberately stays STA + UDP6 only.  Main has a different
     // product role: an infrastructure STA remains a co-channel NAN + NOW
     // participant whenever its AP is on channel 6, so remote flashing never
@@ -335,6 +343,14 @@ pub(crate) fn apply_sta_profile_from_nvs(profile: &mut crate::TransportProfile) 
 pub(crate) struct BootPowerPolicy {
     pub(crate) sleepy: bool,
     pub(crate) soft_sleep: bool,
+}
+
+pub fn boot_ble_auto() -> bool {
+    let mut value = [0u8; 8];
+    match read_setting(b"ble.auto", &mut value) {
+        Some(used) => value.get(..used) != Some(b"false"),
+        None => true,
+    }
 }
 
 /// Read the complete product boot policy once. The later PHY startup may
@@ -468,7 +484,7 @@ pub(crate) fn send_transition_announce(
             let _ = crate::wifi_espnow_esp::broadcast_record(&record[..used]);
         }
         if sta_active {
-            let _ = crate::wifi_raw_udp6_esp::broadcast_announce(&record[..used]);
+            let _ = broadcast_udp_discovery_announce(&record[..used]);
         }
     }
 }
@@ -479,7 +495,29 @@ pub(crate) fn send_sta_discovery_announce() {
     if let Some((record, used)) =
         announce_record(dmesh_server::announce::ANNOUNCE_DISCOVERY, 0, 0, 0)
     {
-        let _ = crate::wifi_raw_udp6_esp::broadcast_announce(&record[..used]);
+        let _ = broadcast_udp_discovery_announce(&record[..used]);
+    }
+}
+
+/// Add local, volatile NAN observation facts to the UDP-only discovery
+/// projection. The signed announce remains cached byte-for-byte inside the
+/// outer record, so changing passive visibility never re-signs identity or
+/// transport facts.
+fn broadcast_udp_discovery_announce(record: &[u8]) -> bool {
+    let (cluster, services, nodes) = crate::wifi_nan_dw_capture_esp::discovery_facts();
+    let facts = dmesh_server::announce::DiscoveryFacts {
+        nan_cluster_suffix: (cluster != [0; 6]).then_some([cluster[3], cluster[4], cluster[5]]),
+        nan_service_observations: services,
+        nan_visible_nodes: nodes,
+    };
+    let mut enriched = [0u8; crate::TRANSPORT_MTU];
+    if let Some(used) = dmesh_server::announce::encode_with_discovery_facts(record, facts, &mut enriched)
+    {
+        crate::wifi_raw_udp6_esp::broadcast_announce(&enriched[..used])
+    } else {
+        // Lifecycle markers are not discovery announces and intentionally do
+        // not carry passive-radio diagnostics.
+        crate::wifi_raw_udp6_esp::broadcast_announce(record)
     }
 }
 
@@ -491,6 +529,21 @@ pub(crate) fn is_sleepy_profile(profile: &crate::TransportProfile) -> bool {
         && profile.nan_dw_interval == 8
         && profile.now == 2
         && profile.ap == 0
+}
+
+/// The C6 canary uses its USB-JTAG bearer to observe the radio-only DW8
+/// personality. ESP light sleep powers down that peripheral, turning a
+/// reversible discovery experiment into a physical reset. Keep USB alive on
+/// RISC-V while retaining the same NAN DW8/NOW-off radio schedule; classic
+/// ESP32 keeps the physical-light-sleep path used by lora2.
+#[cfg(target_arch = "riscv32")]
+fn usb_jtag_debug_hold(profile: &crate::TransportProfile) -> bool {
+    is_sleepy_profile(profile)
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+fn usb_jtag_debug_hold(_: &crate::TransportProfile) -> bool {
+    false
 }
 
 /// Apply a single explicit sleep boundary after Main has completed the radio
@@ -534,6 +587,15 @@ pub(crate) fn maybe_enter_sleep(
         return true;
     }
 
+    let boundary_started_us = dw8_now_us();
+    let prior_wake_us = DW8_WAKE_US.swap(0, Ordering::AcqRel);
+    if prior_wake_us != 0 {
+        DW8_LAST_AWAKE_US.store(
+            boundary_started_us.wrapping_sub(prior_wake_us),
+            Ordering::Release,
+        );
+    }
+
     // Keep the control UART alive through the DW8 command window.  Turning it
     // off during the profile transition races the command response and leaves
     // no way to inspect the armed boundary.  The physical sleep entry below
@@ -543,22 +605,56 @@ pub(crate) fn maybe_enter_sleep(
     // device remains observable and we do not churn the physical serial
     // driver on every wake cycle.
     crate::wifi_esp::stop_sta();
-    // Classic ESP32 retains a Wi-Fi PM lock after `esp_wifi_stop()`. Release
-    // the initialized driver before the explicit timer sleep; `init_nan_now`
-    // recreates it after wake. Without this, `esp_light_sleep_start()` returns
-    // immediately and the device remains at its active current.
-    crate::wifi_esp::deinit_for_light_sleep();
+    DW8_LAST_RADIO_STOP_US.store(
+        dw8_now_us().wrapping_sub(boundary_started_us),
+        Ordering::Release,
+    );
+    // ESP-IDF requires the Wi-Fi runtime to be stopped before manual light
+    // sleep, but it does not require deinitialization. Retaining the driver
+    // is materially cheaper than allocating its buffers and registering the
+    // whole stack after every DW8 wake. The explicit UART PM-lock release
+    // below is separate: it was the source of the former immediate reject.
+    //
+    // `init_nan_now` owns the matching stopped-driver restart after wake.
     crate::wifi_nan_dw_capture_esp::prepare_light_sleep_resume();
-    let (bssid, anchor_us, _) = crate::wifi_nan_dw_capture_esp::sync_diagnostics();
-    // Without a NAN timing anchor, use the prescribed 30-second acquisition
-    // backoff instead of repeatedly missing a discovery window; synchronized
-    // Main sleeps exactly one DW8 interval.
-    let duration_us = if bssid != [0; 6] && anchor_us != 0 {
-        4_194_304
-    } else {
-        30_000_000
-    };
-    let _entered_sleep = crate::power_esp::enter_timer_light_sleep(duration_us);
+    // Wake early enough to restore the stopped Wi-Fi runtime before the
+    // cluster-selected beacon. The measured resume time is used after the
+    // first cycle; the conservative floor absorbs a cold first restart.
+    const DW8_RESUME_MARGIN_US: u64 = 20_000;
+    const DW8_MIN_WAKE_LEAD_US: u64 = 120_000;
+    let wake_lead_us = u64::from(DW8_LAST_RADIO_RESUME_US.load(Ordering::Acquire))
+        .saturating_add(DW8_RESUME_MARGIN_US)
+        .max(DW8_MIN_WAKE_LEAD_US);
+    let boundary_us = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64;
+    // A timer sleep is phase-locked to the next scheduled capture point, not
+    // simply to the prior 8-DW period. This leaves the wake lead above before
+    // the beacon and avoids drift after a variable radio-stop interval.
+    let duration_us = crate::wifi_nan_dw_capture_esp::next_sleepy_capture_start_us(
+        boundary_us.saturating_add(wake_lead_us),
+    )
+    .and_then(|capture_us| capture_us.checked_sub(wake_lead_us))
+    .filter(|wake_us| *wake_us > boundary_us)
+    .map(|wake_us| wake_us.saturating_sub(boundary_us))
+    // Without a live timing anchor, use the prescribed acquisition backoff
+    // rather than repeatedly waking on an arbitrary phase.
+    .unwrap_or(30_000_000);
+    // Keep the UART driver installed for post-wake diagnostics, but release
+    // its PM locks for this explicitly admitted boundary.  An active UART
+    // normally owns ESP_PM_NO_LIGHT_SLEEP so automatic idle sleep cannot
+    // change its baud; retaining that lock here makes manual DW8 sleep return
+    // immediately as well.
+    crate::uart_esp::suspend_for_light_sleep();
+    let entered_sleep = crate::power_esp::enter_timer_light_sleep(duration_us);
+    let woke_us = dw8_now_us();
+    if entered_sleep {
+        DW8_WAKE_US.store(woke_us, Ordering::Release);
+    }
+    crate::uart_esp::rearm_after_wake();
+    crate::commands::send_stat(b"sleep DW8 entered=", u64::from(entered_sleep));
+    crate::commands::send_stat(
+        b"sleep DW8 duration_us=",
+        u64::from(crate::power_esp::status().last_sleep_duration_us),
+    );
 
     let after_wake = crate::profile_store::snapshot();
     if !is_sleepy_profile(&after_wake) {
@@ -567,17 +663,28 @@ pub(crate) fn maybe_enter_sleep(
     crate::core_runtime::prepare_espnow_association(&after_wake);
     *nan_now_started =
         crate::wifi_esp::init_nan_now(&after_wake, crate::core_runtime::receive_main_espnow);
+    DW8_LAST_RADIO_RESUME_US.store(dw8_now_us().wrapping_sub(woke_us), Ordering::Release);
+    crate::wifi_nan_dw_capture_esp::set_sleepy_dw_pair(*nan_now_started);
     if *nan_now_started {
-        crate::wifi_espnow_esp::set_poll_handler(Some(crate::core_runtime::poll_espnow));
+        let after_resume_us = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64;
+        if let Some(capture_us) =
+            crate::wifi_nan_dw_capture_esp::next_capture_start_us(after_resume_us)
+        {
+            *sleepy_awake_until_ms = capture_us
+                .saturating_add(crate::wifi_nan_dw_capture_esp::sleepy_dw_pair_hold_us())
+                / 1_000;
+        }
     }
-    // A completed explicit sleep is not a new control session.  Keeping the
-    // former five-second command window here made every DW8 cycle spend more
-    // time awake than asleep, even when no peer had requested a wake.  The
-    // radio has already restored its saved NAN anchor, so its next owner
-    // deadline is the selected discovery window.  A targeted active
-    // Subscribe received in that window still replaces the profile; an idle
-    // device immediately returns to low duty operation.
-    *sleepy_awake_until_ms = 0;
+    if *nan_now_started {
+        crate::commands::send_response(b"sleep DW8 wake: NAN/NOW reinitialized");
+        crate::wifi_espnow_esp::set_poll_handler(Some(crate::core_runtime::poll_espnow));
+    } else {
+        crate::commands::send_response(b"sleep DW8 wake: NAN/NOW reinit failed");
+    }
+    // A completed explicit sleep is not a new control session.  The hold set
+    // above is only the scheduled NAN DW, its adjacent NOW DW, and a short
+    // tail; it replaces the former five-second command grace without letting
+    // Main return to sleep before either receive window has occurred.
     send_transition_announce(
         dmesh_server::announce::ANNOUNCE_WAKE,
         (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64) / 1_000_000,
@@ -1095,6 +1202,10 @@ fn apply_sta_live_settings(profile: &crate::TransportProfile, state: &mut MainRa
         &mut state.sta_extensions_enabled,
         &mut state.applied_nan_dw_interval,
     );
+    // Flash keeps the ordinary STA/NAN/NOW personality intact. Only optional
+    // NAN public actions are deferred while ESP flash needs scarce action-TX
+    // frames; raw UDP6 remains the upload path.
+    crate::wifi_nan_dw_capture_esp::set_nan_action_tx_suppressed(crate::flash::transfer_active());
     false
 }
 
@@ -1169,6 +1280,7 @@ fn discovery_transport_key() -> Option<[u8; 40]> {
 fn cached_discovery_record(
     role: u8,
     partition: u8,
+    capabilities: u16,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
     let key = discovery_transport_key()?;
     if DISCOVERY_CACHE_LOCK
@@ -1197,11 +1309,17 @@ fn cached_discovery_record(
             return Some((record, used));
         }
         DISCOVERY_CACHE_STATE.store(DISCOVERY_CACHE_BUILDING, Ordering::Release);
-        let built = build_announce_record(
+        // Main and Recovery are separate firmware images, so their cache
+        // cannot mix capability sets.  Keeping the capability selection at
+        // this cache boundary prevents Recovery's periodic UDP presence from
+        // repeatedly deriving an ESP P-256 key and signing an otherwise
+        // unchanged record on its one CPU0 control task.
+        let built = build_announce_record_with_capabilities(
             dmesh_server::announce::ANNOUNCE_DISCOVERY,
             0,
             role,
             partition,
+            capabilities,
         );
         match built {
             Some((record, used)) => {
@@ -1231,7 +1349,15 @@ fn announce_record(
     partition: u8,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
     if kind == dmesh_server::announce::ANNOUNCE_DISCOVERY {
-        cached_discovery_record(role, partition)
+        cached_discovery_record(
+            role,
+            partition,
+            dmesh_server::probe::PROBE_CAP_NAN
+                | dmesh_server::probe::PROBE_CAP_NOW
+                | dmesh_server::probe::PROBE_CAP_STA
+                | dmesh_server::probe::PROBE_CAP_AP
+                | dmesh_server::probe::PROBE_CAP_UDP6,
+        )
     } else {
         build_announce_record(kind, uptime_secs, role, partition)
     }
@@ -1259,11 +1385,12 @@ fn build_announce_record(
 /// Signed Recovery presence for the ordinary STA/UDP6 update server.  This
 /// deliberately advertises neither NAN, NOW nor AP capabilities.
 pub(crate) fn recovery_discovery_record(
-    uptime_secs: u64,
+    _uptime_secs: u64,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
-    build_announce_record_with_capabilities(
-        dmesh_server::announce::ANNOUNCE_DISCOVERY,
-        uptime_secs,
+    // Recovery is its own image, so it owns the common cache while running.
+    // Its presence record has stable signed facts for the STA epoch; multicast
+    // cadence is intentionally outside that signed identity payload.
+    cached_discovery_record(
         0,
         0,
         dmesh_server::probe::PROBE_CAP_STA | dmesh_server::probe::PROBE_CAP_UDP6,
@@ -1292,7 +1419,7 @@ fn build_announce_record_with_capabilities(
     if !announce.set_public_key(&public_key) {
         return None;
     }
-    announce.set_probe_descriptor(dmesh_server::announce::DEVICE_CLASS_ESP, capabilities);
+    announce.set_probe_descriptor(local_esp_device_class(), capabilities);
     let mut name = [0u8; dmesh_server::announce::MAX_DEVICE_NAME];
     if let Some(used) = read_setting(b"name", &mut name) {
         if let Ok(name) = core::str::from_utf8(&name[..used]) {
@@ -1342,6 +1469,24 @@ fn build_announce_record_with_capabilities(
     Some((record, used))
 }
 
+/// Signed hardware-family fact used by recovery selection.  The two Xtensa
+/// targets share pointer width, so S3 remains a distinct compile feature;
+/// C6 is the RISC-V target.
+const fn local_esp_device_class() -> u8 {
+    #[cfg(target_arch = "riscv32")]
+    {
+        return dmesh_server::announce::DEVICE_CLASS_ESP32C6;
+    }
+    #[cfg(all(not(target_arch = "riscv32"), target_feature = "esp32s3ops"))]
+    {
+        return dmesh_server::announce::DEVICE_CLASS_ESP32S3;
+    }
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    {
+        dmesh_server::announce::DEVICE_CLASS_ESP32
+    }
+}
+
 /// Apply the complete radio side of one accepted Main event.
 /// Called only by Main's queue owner after a profile or adapter completion;
 /// callbacks cannot invoke it. `true` means a radio epoch stopped or a live
@@ -1354,14 +1499,21 @@ fn apply_radio_transition(
     state: &mut MainRadioState,
     transition_pending: bool,
 ) -> bool {
-    if transition_pending && !(state.wifi_started && !wants_sta(profile)) {
-        send_transition_announce(
-            dmesh_server::announce::ANNOUNCE_TRANSITION_BEGIN,
-            now_ms / 1_000,
-            state.nan_now_started,
-            state.wifi_started,
-        );
+    if transition_pending {
+        // A live STA -> NAN replacement intentionally suppresses the
+        // redundant begin announce below, but it is still the accepted radio
+        // epoch. Sleep deadlines must carry this generation after the STA
+        // teardown; otherwise the portable reducer rejects them as stale and
+        // DW8 can never enter physical sleep.
         state.transition_announced_generation = generation;
+        if !(state.wifi_started && !wants_sta(profile)) {
+            send_transition_announce(
+                dmesh_server::announce::ANNOUNCE_TRANSITION_BEGIN,
+                now_ms / 1_000,
+                state.nan_now_started,
+                state.wifi_started,
+            );
+        }
     }
     // A DW8 profile retains the control UART through the physical sleep call.
     // Apply the profile like every other transport configuration.
@@ -1438,6 +1590,14 @@ fn apply_sleep_boundary(
             crate::commands::send_response(b"sleep DW8 blocked: radio transition");
         } else {
             crate::commands::send_response(b"sleep DW8 blocked: command window");
+            // DW8 must leave this gate at the one-shot deadline.  Keep both
+            // sides observable on the retained C6 USB-JTAG link (and UART on
+            // classic ESP32) so a bad timer epoch or an unexpected re-arm is
+            // distinguishable from normal NAN capture activity.
+            crate::commands::send_stat(
+                b"sleep DW8 remaining_ms=",
+                state.sleepy_awake_until_ms.saturating_sub(now_ms),
+            );
         }
     }
     let effect = runtime_state.reduce(MainEvent::SleepDeadline {
@@ -1548,6 +1708,10 @@ const DEADLINE_SLEEP_POLICY: u8 = 1 << 3;
 /// event owner so it can apply the associated raw bearer after ESP-IDF's
 /// connected/disconnected completion.
 const DEADLINE_STA_LIFECYCLE: u8 = 1 << 4;
+/// A correlated `discovery.active` action was accepted by a bearer worker.
+/// The worker only records this marker; the Main owner refreshes the signed
+/// publish record on its next turn so Wi-Fi driver state remains single-owner.
+const DEADLINE_ACTIVE_DISCOVERY: u8 = 1 << 7;
 
 /// Main owns this queue and timer for its entire lifetime. Bearer workers may
 /// append a copyable event, but only the Main task receives and acts on it.
@@ -1561,9 +1725,35 @@ static EVENT_QUEUE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::nul
 /// atomically drains them after every wake. Queue pressure therefore coalesces
 /// wake markers but cannot lose the service itself.
 static PENDING_DEADLINE_SERVICES: AtomicU8 = AtomicU8::new(0);
+/// Coalesced request for one active discovery publication.  Several callers
+/// before the next DW intentionally produce one refreshed signed announce.
+static ACTIVE_DISCOVERY_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Count coalesced queue markers for diagnostics. Their work remains in
 /// `PENDING_DEADLINE_SERVICES`, so this records congestion rather than loss.
 static EVENT_QUEUE_DROPS: AtomicU32 = AtomicU32::new(0);
+/// DW8 phase measurements are scalar owner-task diagnostics. They describe
+/// elapsed work surrounding a real timer sleep, not a radio callback or an
+/// inferred duty cycle. The values wrap safely at the ESP microsecond clock's
+/// u32 boundary (about 71 minutes), which is far beyond one DW interval.
+static DW8_WAKE_US: AtomicU32 = AtomicU32::new(0);
+static DW8_LAST_RADIO_STOP_US: AtomicU32 = AtomicU32::new(0);
+static DW8_LAST_RADIO_RESUME_US: AtomicU32 = AtomicU32::new(0);
+static DW8_LAST_AWAKE_US: AtomicU32 = AtomicU32::new(0);
+
+fn dw8_now_us() -> u32 {
+    unsafe { esp_idf_sys::esp_timer_get_time().max(0) as u64 as u32 }
+}
+
+/// `(radio_stop_us, radio_resume_us, awake_until_next_sleep_us)` for the
+/// most recent explicit DW8 boundary. `0` means that phase has not completed
+/// since boot, not that it completed instantaneously.
+pub(crate) fn dw8_timing() -> (u32, u32, u32) {
+    (
+        DW8_LAST_RADIO_STOP_US.load(Ordering::Acquire),
+        DW8_LAST_RADIO_RESUME_US.load(Ordering::Acquire),
+        DW8_LAST_AWAKE_US.load(Ordering::Acquire),
+    )
+}
 
 /// Send a zero-work wake marker after a producer has persisted service bits.
 /// This runs only in timer/adapter callback context and may not block. If the
@@ -1657,6 +1847,15 @@ pub(crate) fn request_deadline_recheck() {
 /// recalculates the exact server PTO before blocking again.
 pub(crate) fn request_connection_deadline_recheck() {
     enqueue_adapter_completion(DEADLINE_RECHECK);
+}
+
+/// Ask the Main radio owner to publish the current signed announce at its
+/// next NAN opportunity. This is the common correlated `discovery.active`
+/// action: it does not scan, create a task, or call a Wi-Fi API from stream
+/// ingress.
+fn request_active_discovery() {
+    ACTIVE_DISCOVERY_REQUESTED.store(true, Ordering::Release);
+    enqueue_adapter_completion(DEADLINE_ACTIVE_DISCOVERY);
 }
 
 /// ROC completion bridge registered at Main boot. It is called by ESP-IDF's
@@ -2000,6 +2199,30 @@ pub(crate) fn receive_tagged_discovery_nodes(
 pub(crate) fn receive_tagged_discovery(
     record: dmesh_server::tagged::Record<'_>,
 ) -> Option<alloc::vec::Vec<u8>> {
+    if let Some(target) = dmesh_server::announce::decode_nan_wakeup_request(record) {
+        let id = record.id?;
+        let queued = crate::wifi_nan_dw_capture_esp::queue_nan_wakeup(target);
+        let mut response = [0u8; 32];
+        let used = dmesh_server::tagged::encode_numeric_response(
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+            dmesh_server::announce::ANNOUNCE_NAN_WAKEUP,
+            id,
+            if queued { &[0xa1, 1, 0xf5] } else { &[0xa1, 1, 0xf4] },
+            &mut response,
+        )?;
+        return Some(alloc::vec::Vec::from(&response[..used]));
+    }
+    if record.component
+        == Some(dmesh_server::tagged::Name::Tag(
+            dmesh_server::announce::ANNOUNCE_COMPONENT,
+        ))
+        && record.method
+            == Some(dmesh_server::tagged::Name::Tag(
+                dmesh_server::announce::ANNOUNCE_DISCOVERY_ACTIVE,
+            ))
+    {
+        return tagged_discovery_active_response(record);
+    }
     if record.component
         == Some(dmesh_server::tagged::Name::Tag(
             dmesh_server::announce::ANNOUNCE_COMPONENT,
@@ -2012,6 +2235,34 @@ pub(crate) fn receive_tagged_discovery(
         return tagged_discovery_response(record);
     }
     receive_tagged_discovery_nodes(record)
+}
+
+/// Admit the common correlated active-discovery action.  The actual NAN/NOW
+/// publication is deliberately deferred to Main's event owner; stream and
+/// raw ingress must never acquire radio state or sign a replacement record.
+fn tagged_discovery_active_response(
+    record: dmesh_server::tagged::Record<'_>,
+) -> Option<alloc::vec::Vec<u8>> {
+    if record.to.is_some() || record.params.is_some() || record.data.is_some() {
+        return None;
+    }
+    if let Some(fields) = record.fields {
+        let mut fields = dmesh_server::cbor::Decoder::new(fields);
+        if !matches!(fields.head(), Some((5, 0))) || !fields.is_finished() {
+            return None;
+        }
+    }
+    let id = record.id?;
+    request_active_discovery();
+    let mut response = [0u8; 32];
+    let used = dmesh_server::tagged::encode_numeric_response(
+        dmesh_server::announce::ANNOUNCE_COMPONENT,
+        dmesh_server::announce::ANNOUNCE_DISCOVERY_ACTIVE,
+        id,
+        &[0xa1, 1, 0xf5],
+        &mut response,
+    )?;
+    Some(alloc::vec::Vec::from(&response[..used]))
 }
 
 fn tagged_discovery_response(
@@ -2031,8 +2282,20 @@ fn tagged_discovery_response(
     let (announce, announce_len) =
         announce_record(dmesh_server::announce::ANNOUNCE_DISCOVERY, 0, 0, 0)?;
     let announce = dmesh_server::announce::decode_announce(&announce[..announce_len])?;
+    let mut signed = [0u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN];
+    let signed_used = dmesh_server::announce::encode_discovery_response(announce, id, &mut signed)?;
+    let (cluster, services, nodes) = crate::wifi_nan_dw_capture_esp::discovery_facts();
+    let facts = dmesh_server::announce::DiscoveryFacts {
+        nan_cluster_suffix: (cluster != [0; 6]).then_some([cluster[3], cluster[4], cluster[5]]),
+        nan_service_observations: services,
+        nan_visible_nodes: nodes,
+    };
     let mut response = [0u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN];
-    let used = dmesh_server::announce::encode_discovery_response(announce, id, &mut response)?;
+    let used = dmesh_server::announce::encode_with_discovery_facts(
+        &signed[..signed_used],
+        facts,
+        &mut response,
+    )?;
     Some(alloc::vec::Vec::from(&response[..used]))
 }
 
@@ -2043,6 +2306,13 @@ fn tagged_discovery_response(
 pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
     if let Some(announce) = dmesh_server::announce::decode_announce(packet) {
         crate::wifi_raw_udp6_esp::record_connectionless_announce(announce, peer);
+        return;
+    }
+    // During an exclusive durable upload Main retains NAN receive/capture but
+    // deliberately does not construct a directed NAN response. The response
+    // would be unusable while NAN action TX is deferred and its temporary Vec
+    // could fail allocation on the smallest boards.
+    if crate::wifi_nan_dw_capture_esp::nan_action_tx_suppressed() {
         return;
     }
     // NAN carries the same direct allowlist as every other bearer. The
@@ -2231,8 +2501,13 @@ fn encode_telemetry_response_record(
                 &mut result,
             )?
         }
-        t::NAN_METRICS_METHOD => t::encode_metrics(
-            &[
+        t::NAN_METRICS_METHOD => {
+            let (active_discovery_queued, active_discovery_sent, active_discovery_dropped) =
+                crate::wifi_nan_dw_capture_esp::active_discovery_stats();
+            let (dw8_radio_stop_us, dw8_radio_resume_us, dw8_awake_us) = dw8_timing();
+            let last_sdf_after_beacon_us = crate::wifi_nan_dw_capture_esp::stats().17;
+            t::encode_metrics(
+                &[
                 t::Metric {
                     id: t::nan_metric::BEACONS,
                     value: u64::from(counters.nan_beacons),
@@ -2285,9 +2560,38 @@ fn encode_telemetry_response_record(
                     id: t::nan_metric::ACTIVE_PUBLISH_DROPPED,
                     value: u64::from(counters.nan_active_publish_dropped),
                 },
+                t::Metric {
+                    id: t::nan_metric::ACTIVE_DISCOVERY_QUEUED,
+                    value: u64::from(active_discovery_queued),
+                },
+                t::Metric {
+                    id: t::nan_metric::ACTIVE_DISCOVERY_SENT,
+                    value: u64::from(active_discovery_sent),
+                },
+                t::Metric {
+                    id: t::nan_metric::ACTIVE_DISCOVERY_DROPPED,
+                    value: u64::from(active_discovery_dropped),
+                },
+                t::Metric {
+                    id: t::nan_metric::DW8_RADIO_STOP_US,
+                    value: u64::from(dw8_radio_stop_us),
+                },
+                t::Metric {
+                    id: t::nan_metric::DW8_RADIO_RESUME_US,
+                    value: u64::from(dw8_radio_resume_us),
+                },
+                t::Metric {
+                    id: t::nan_metric::DW8_AWAKE_US,
+                    value: u64::from(dw8_awake_us),
+                },
+                t::Metric {
+                    id: t::nan_metric::LAST_SDF_AFTER_BEACON_US,
+                    value: u64::from(last_sdf_after_beacon_us),
+                },
             ],
             &mut result,
-        )?,
+            )?
+        }
         t::UDP6_METRICS_METHOD => t::encode_metrics(
             &[
                 t::Metric {
@@ -2469,6 +2773,10 @@ pub(crate) struct MainRuntimeService {
     pub(crate) partition: u8,
     pub(crate) boot_message: &'static [u8],
     pub(crate) mark_healthy: fn(),
+    /// Product sidecars (for example BLE) must not contend with an initial
+    /// WPA association.  The radio owner invokes this once only after the
+    /// initial radio personality is actually usable.
+    pub(crate) boot_radio_ready: Option<fn()>,
 }
 
 /// The sole mutable owner of Main's event-driven runtime.
@@ -2482,6 +2790,7 @@ struct MainCoordinator {
     radio: MainRadioState,
     runtime_state: dmesh_server::main_runtime_state::MainRuntimeState,
     soft_sleep: bool,
+    boot_radio_ready: Option<fn()>,
 }
 
 /// Immutable facts derived from one dequeued Main event.
@@ -2498,6 +2807,19 @@ struct MainEventWork {
 }
 
 impl MainCoordinator {
+    /// Start an optional product sidecar exactly once, after either a
+    /// confirmed STA association or the unassociated NAN/NOW fallback is
+    /// live.  This preserves BLE/NAN/NOW availability without asking the
+    /// classic ESP32 coexistence layer to allocate BLE and WPA state in the
+    /// same initial authentication interval.
+    fn start_boot_radio_sidecar_if_ready(&mut self) {
+        if self.radio.sta_associated || self.radio.nan_now_started {
+            if let Some(sidecar) = self.boot_radio_ready.take() {
+                sidecar();
+            }
+        }
+    }
+
     /// Block until a queued profile/callback event or an armed one-shot
     /// deadline is due. This is the coordinator's only loop wake source.
     fn next_event(&self) -> MainRuntimeEvent {
@@ -2539,6 +2861,24 @@ impl MainCoordinator {
             && !self.radio.sta_associated
         {
             self.radio.sta_retry_pending = true;
+        }
+        let nan_action_active = crate::wifi_nan_dw_capture_esp::active_on_nan_channel();
+        if deadline_services & DEADLINE_ACTIVE_DISCOVERY != 0
+            && ACTIVE_DISCOVERY_REQUESTED.swap(false, Ordering::AcqRel)
+            && (nan_action_active || self.radio.wifi_started)
+        {
+            // The refresh installs the current cached signed record into the
+            // NAN publisher, while the active Subscribe asks sleepy peers to
+            // return their own current signed announce. Both are emitted by
+            // the adapter on the next confirmed DW; neither scans nor extends
+            // the awake window.
+            send_discovery_announce(
+                now_ms / 1_000,
+                nan_action_active && profile.now != 2,
+                self.radio.wifi_started,
+            );
+            let _ = crate::wifi_nan_dw_capture_esp::queue_active_discovery();
+            self.radio.last_discovery_announce_ms = now_ms;
         }
         let periodic_due = (self.radio.nan_now_started || self.radio.wifi_started)
             && now_ms.saturating_sub(self.radio.last_discovery_announce_ms)
@@ -2584,11 +2924,14 @@ impl MainCoordinator {
             dmesh_server::main_runtime_state::MainEffect::None
         };
         if work.profile_changed {
-            // Keep automatic idle sleep enabled on the C6 canary. Classic
-            // ESP32 remains on the narrow DW8-only policy while its PM path
-            // is diagnosed independently.
+            // C6 DW8 diagnostics retain USB-JTAG, so do not let automatic
+            // idle sleep take that peripheral down between explicit windows.
+            // Active STA also stays awake: that matches Recovery's WPA
+            // association policy and avoids changing authentication timing at
+            // the Recovery-to-Main handoff. Classic ESP32 retains its narrow
+            // physical-DW8 policy.
             #[cfg(target_arch = "riscv32")]
-            let _ = crate::power_esp::configure(true);
+            let _ = crate::power_esp::configure(false);
             #[cfg(not(target_arch = "riscv32"))]
             let _ = crate::power_esp::configure(is_sleepy_profile(&work.profile));
             if is_sleepy_profile(&work.profile) {
@@ -2616,12 +2959,14 @@ impl MainRuntimeService {
         partition: u8,
         boot_message: &'static [u8],
         mark_healthy: fn(),
+        boot_radio_ready: Option<fn()>,
     ) -> Self {
         Self {
             role,
             partition,
             boot_message,
             mark_healthy,
+            boot_radio_ready,
         }
     }
 
@@ -2686,7 +3031,13 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // Failure is observable through the runtime power state but must not turn
     // a boot into a radio busy-loop or prevent recovery through USB-JTAG.
     #[cfg(target_arch = "riscv32")]
-    let _ = crate::power_esp::configure(true);
+    // Recovery is deliberately STA-only and does not enable ESP-IDF's
+    // automatic light sleep while it authenticates. Keep Main's initial
+    // active STA association on that same physical policy: otherwise a
+    // Recovery-to-Main handoff changes WPA timing even though both images use
+    // the same provisioned profile and driver setup. Explicit sleepy DW
+    // policy remains a later profile transition.
+    let _ = crate::power_esp::configure(false);
     #[cfg(not(target_arch = "riscv32"))]
     let _ = crate::power_esp::configure(sleepy_boot);
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: power\n\0".as_ptr().cast()) };
@@ -2753,6 +3104,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // Register once before any bearer accepts traffic. The handler table is
     // fixed-size and shared by UDP6/QUIC and NOW action adapters; no per-bearer
     // command implementation or queue is created here.
+    let _ = dmesh_server::services::register_tagged_component(
+        dmesh_server::services::FIRMWARE_COMPONENT,
+        crate::firmware_identity::receive_tagged_identity,
+    );
     let _ = dmesh_server::services::register_tagged_component(
         dmesh_server::control::CONTROL_COMPONENT,
         crate::main_runtime::receive_tagged_control,
@@ -2872,11 +3227,13 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     });
     crate::main_runtime::publish_snapshot(runtime_state.snapshot());
     let mut coordinator = MainCoordinator {
+        boot_radio_ready: service.boot_radio_ready,
         service,
         radio: state,
         runtime_state,
         soft_sleep,
     };
+    coordinator.start_boot_radio_sidecar_if_ready();
     loop {
         // This is a cooperative event/timer loop, not a busy spin. Callback
         // paths publish only atomics/bounded records; the owner blocks until
@@ -2890,10 +3247,10 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         let service = &coordinator.service;
         let mut state = &mut coordinator.radio;
         let mut runtime_state = &mut coordinator.runtime_state;
-        let soft_sleep = coordinator.soft_sleep;
         let now_ms = work.now_ms;
         let requested_sta_start_generation = work.generation;
         let snapshot = work.profile;
+        let soft_sleep = coordinator.soft_sleep || usb_jtag_debug_hold(&snapshot);
         if crate::main_runtime::apply_radio_transition(
             service.role,
             &snapshot,
@@ -2902,17 +3259,34 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             &mut state,
             transition_pending,
         ) {
+            coordinator.start_boot_radio_sidecar_if_ready();
+            // A reset request is a terminal owner action, not a radio
+            // transition that may be postponed behind a continuous NAN/STA
+            // completion stream.  In particular, an active NAN epoch can
+            // legitimately make every turn take this `continue` path.
+            // Service the already-acknowledged request before yielding back
+            // to that stream so USB provisioning always leaves STA cleanly.
+            service_requested_reset();
             continue;
         }
-        if crate::main_runtime::apply_sleep_boundary(
-            service.role,
-            &snapshot,
-            requested_sta_start_generation,
-            now_ms,
-            soft_sleep,
-            &mut state,
-            &mut runtime_state,
-        ) {
+        // USB-JTAG is the only local recovery/control bearer on C6.  It is
+        // powered down by physical light sleep, so a C6 DW8 diagnostic keeps
+        // the processor awake and validates the actual NAN/NOW DW scheduler
+        // without inventing a five-second "soft sleep" loop.  Classic ESP32
+        // (including lora2) still executes the physical boundary below.
+        if !usb_jtag_debug_hold(&snapshot)
+            && crate::main_runtime::apply_sleep_boundary(
+                service.role,
+                &snapshot,
+                requested_sta_start_generation,
+                now_ms,
+                soft_sleep,
+                &mut state,
+                &mut runtime_state,
+            )
+        {
+            coordinator.start_boot_radio_sidecar_if_ready();
+            service_requested_reset();
             continue;
         }
         let _ = runtime_state.reduce(dmesh_server::main_runtime_state::MainEvent::RadioApplied {
@@ -2925,25 +3299,32 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             ),
         });
         crate::main_runtime::publish_snapshot(runtime_state.snapshot());
-        if RESET_REQUESTED.swap(false, Ordering::AcqRel) {
-            // Give the raw worker a bounded opportunity to transmit the
-            // response it already produced before Main resets the chip.
-            let ticks = ((250_u64 * u64::from(esp_idf_sys::configTICK_RATE_HZ))
-                .div_ceil(1_000)
-                .max(1)) as esp_idf_sys::TickType_t;
-            unsafe { esp_idf_sys::vTaskDelay(ticks) };
-            // A controlled remote reset must explicitly leave the AP before
-            // ROM starts. Otherwise the AP can retain a stale STA entry until
-            // its own inactivity timer, which makes the following STA test
-            // look associated before this device has rejoined.
-            crate::wifi_esp::stop_sta_for_reset();
-            unsafe { esp_idf_sys::esp_restart() };
-        }
+        coordinator.start_boot_radio_sidecar_if_ready();
+        service_requested_reset();
         // Raw Ethernet owns its FreeRTOS ingress task and accepts
         // host-initiated QUIC-lite services. There is no legacy client
         // fallback: a profile only controls association and raw bearer
         // runtime settings.
     }
+}
+
+/// Complete one correlated remote-reset request from every Main event path.
+///
+/// The stream worker has already returned the handler response before the
+/// owner sees this flag.  Keep the short drain interval so UART/UDP egress can
+/// submit it, then explicitly leave STA before the ROM reset.  This helper is
+/// deliberately called before all loop `continue` paths: radio activity must
+/// not starve a terminal reset request indefinitely.
+fn service_requested_reset() {
+    if !RESET_REQUESTED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let ticks = ((250_u64 * u64::from(esp_idf_sys::configTICK_RATE_HZ))
+        .div_ceil(1_000)
+        .max(1)) as esp_idf_sys::TickType_t;
+    unsafe { esp_idf_sys::vTaskDelay(ticks) };
+    crate::wifi_esp::stop_sta_for_reset();
+    unsafe { esp_idf_sys::esp_restart() };
 }
 
 impl MainRadioState {
@@ -2988,23 +3369,50 @@ impl MainRadioState {
 /// here prevents a shared helper from selecting a product role at runtime.
 pub struct MainRuntime {
     mark_healthy: fn(),
+    boot_radio_ready: Option<fn()>,
 }
 
 impl MainRuntime {
     pub const fn new(mark_healthy: fn()) -> Self {
-        Self { mark_healthy }
+        Self {
+            mark_healthy,
+            boot_radio_ready: None,
+        }
+    }
+
+    /// Attach one Main-product sidecar to the radio-ready edge. Recovery has
+    /// no equivalent hook and therefore keeps its minimal STA-only startup.
+    pub const fn with_boot_radio_ready(mut self, hook: fn()) -> Self {
+        self.boot_radio_ready = Some(hook);
+        self
     }
 
     /// Start the Main event owner. Called exactly once from `fw/main` after
     /// ESP-IDF has entered `app_main`; Recovery has its own entry point.
     pub fn run(self) {
-        MainRuntimeService::new(1, 1, b"main core boot", self.mark_healthy).run();
+        MainRuntimeService::new(
+            1,
+            1,
+            b"main core boot",
+            self.mark_healthy,
+            self.boot_radio_ready,
+        )
+        .run();
     }
 }
 
 /// Start the active Main runtime and its Stage2 health callback.
 pub fn run(mark_healthy: fn()) {
     MainRuntime::new(mark_healthy).run();
+}
+
+/// Start Main with a product sidecar deferred until the initial radio is
+/// usable.  This is intentionally a function pointer rather than a closure:
+/// the ESP event owner retains no heap allocation across boot.
+pub fn run_with_boot_radio_ready(mark_healthy: fn(), hook: fn()) {
+    MainRuntime::new(mark_healthy)
+        .with_boot_radio_ready(hook)
+        .run();
 }
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 

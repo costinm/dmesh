@@ -31,10 +31,3 @@ pub(crate) unsafe fn before_poll(
     crate::flash::expire(service, now_ms);
     crate::flash::before_poll(service, path, now_ms);
 }
-
-pub(crate) unsafe fn storage_ready(
-    service: &mut ConnectionService,
-    now_ms: u64,
-) -> Result<Option<quic_lite::PathId>, ()> {
-    crate::flash::storage_ready(service, now_ms)
-}

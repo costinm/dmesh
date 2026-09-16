@@ -322,9 +322,14 @@ pub fn set_debug_enabled(enabled: bool) {
 }
 
 pub fn suspend_for_light_sleep() {
-    if !UART_ALWAYS_ON.load(Ordering::Acquire) {
-        release_power_locks();
-    }
+    // A physical UART may remain installed across explicit light sleep: the
+    // host only needs it again after the timer wake.  Its APB and
+    // NO_LIGHT_SLEEP PM locks, however, would make `esp_light_sleep_start()`
+    // reject that explicit boundary immediately.  This helper is therefore
+    // intentionally stronger than an ordinary interactive-window expiry;
+    // its caller must pair it with `rearm_after_wake()` before admitting more
+    // UART work.
+    release_power_locks();
 }
 
 /// Re-arm the physical UART receive wake after a light-sleep return.

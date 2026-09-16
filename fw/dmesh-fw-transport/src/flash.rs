@@ -5,47 +5,9 @@
 //! durable ESP erase/write operations.
 
 use alloc::{boxed::Box, vec::Vec};
-use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
-use dmesh_server::verified_object::{ImageSink, BLOCK_SIZE};
+use dmesh_server::verified_object::{BLOCK_SIZE, ImageSink};
 
-struct SliceStreamReader<'a> { bytes: &'a [u8], offset: usize }
-
-impl dmesh_server::verified_object::OrderedStreamRead for SliceStreamReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> usize {
-        let count = out.len().min(self.bytes.len().saturating_sub(self.offset));
-        out[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
-        self.offset += count;
-        count
-    }
-}
-
-// One verified-object blob is one 4 KiB image block.  Retaining a larger
-// synthetic batch buys no transport property: the consumer returns stream
-// credit only after this ordinary durable block is available again.
-const FLASH_WRITE_BLOCKS: usize = 1;
-const FLASH_WRITE_BATCH_BYTES: usize = BLOCK_SIZE * FLASH_WRITE_BLOCKS;
-// Storage capacity is selected from the heap when the operation starts. Keep
-// enough RAM for QUIC, the receiver, Wi-Fi, and worker metadata; actual
-// allocation can reduce this choice further when the heap is fragmented.
-// This is observed after the transient receiver has been allocated.  It
-// covers the worker stack/queues and the active raw-UDP/QUIC runtime on the
-// smallest classic Recovery image; the remaining space selects one ordinary
-// image-block slot at admission.
-const FLASH_HEAP_RESERVE_BYTES: usize = 16 * 1024;
-const MIN_FLASH_WRITE_BUFFERS: usize = 1;
-// Classic Recovery has one small worker and one parser scratch record in
-// addition to this slot.  Advertising a second durable block would make the
-// QUIC receive window exceed the measured usable heap.  This is application
-// storage capacity, not a packet or transport credit setting.
-const MAX_FLASH_WRITE_BUFFERS: usize = 1;
-const FLASH_STORAGE_POLICY: dmesh_server::verified_object::StorageSlotPolicy =
-    dmesh_server::verified_object::StorageSlotPolicy {
-        reserve_bytes: FLASH_HEAP_RESERVE_BYTES,
-        bytes_per_slot: FLASH_WRITE_BATCH_BYTES,
-        minimum_slots: MIN_FLASH_WRITE_BUFFERS,
-        maximum_slots: MAX_FLASH_WRITE_BUFFERS,
-    };
 /// No application bytes have arrived for this bounded period. This is a
 /// receiver liveness guard, not a transport deadline: QUIC-lite continues to
 /// own packet delivery and recovery below the flash sink.
@@ -59,14 +21,11 @@ const FLASH_ABORT_CLOSE_CODE: u64 = 0x10;
 /// beyond it.
 const STAGE2_REGION_BYTES: usize = 0x7000;
 /// Firmware bounds for the shared incremental signed-object receiver.
-// A 4 MiB image has at most 1,024 4 KiB blocks. Its current CBOR manifest
-// carries one 16-byte digest prefix per block and is 16,448 bytes, so this bound
-// covers the complete addressable image with format headroom. The receiver is
-// allocated only while an update stream is active; it is not reserved by the
-// ordinary Main/Recovery runtime.
-// A 4-MiB image has at most 1024 4-KiB blocks.  Its signed flat proof table
-// is 8 KiB (plus a small CBOR envelope), so 10 KiB is a hard format bound;
-// it is application memory and never QUIC receive credit.
+// A 4 MiB image has at most 1,024 4 KiB blocks. Its signed flat proof table
+// is 8 KiB (plus the small CBOR envelope), so 10 KiB covers the complete
+// addressable-image format with headroom. The receiver is allocated only
+// while an update stream is active; it is application memory, never QUIC
+// receive credit, and is not reserved by the ordinary Main/Recovery runtime.
 pub const MAX_MANIFEST_BYTES: usize = 10 * 1024;
 pub const MAX_BLOB_RECORD_BYTES: usize = 12 + BLOCK_SIZE;
 pub type SignedObjectFlashReceiver = dmesh_server::verified_object::SignedObjectReceiver<
@@ -83,6 +42,24 @@ pub enum FlashSinkError {
     MissingModuleName,
     PartitionUnavailable,
     AllocationFailed,
+}
+
+/// Numeric CPU selectors are the same catalog values used by `ObjectServer`.
+/// The manifest binds this value; this target-local comparison is the final
+/// guard before an app partition is erased.
+const fn local_image_cpu() -> u8 {
+    #[cfg(target_arch = "riscv32")]
+    {
+        13 // ESP32-C6
+    }
+    #[cfg(all(not(target_arch = "riscv32"), target_feature = "esp32s3ops"))]
+    {
+        9 // ESP32-S3
+    }
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    {
+        0 // classic ESP32
+    }
 }
 
 impl FlashSinkError {
@@ -136,9 +113,13 @@ impl FlashStream {
     }
 
     fn receive<R: dmesh_server::verified_object::OrderedStreamRead>(
-        &mut self, reader: &mut R,
-    ) -> Result<dmesh_server::verified_object::ObjectStreamRead, dmesh_server::verified_object::ImageError> {
-        let read = self.receiver.consume_one_stream_record(reader)?;
+        &mut self,
+        reader: &mut R,
+    ) -> Result<
+        dmesh_server::verified_object::ObjectStreamRead,
+        dmesh_server::verified_object::ImageError,
+    > {
+        let read = self.receiver.consume_stream_body(reader)?;
         self.received_stream_bytes = self
             .received_stream_bytes
             .saturating_add(read.consumed_bytes);
@@ -152,18 +133,28 @@ impl FlashStream {
     fn complete_and_durable(&mut self) -> bool {
         self.receiver.is_complete() && self.receiver.sink_mut().is_durable()
     }
-
 }
 
-fn consume_active_flash_stream(bytes: &[u8], _fin: bool) -> Result<usize, ()> {
+/// Handler-neutral immediate-consumer entry point for the generic transport
+/// stream API.  It avoids allocating a dispatcher-owned 1 KiB `Vec` just to
+/// copy a packet that the signed-object receiver can consume synchronously.
+/// QUIC-lite retains only an unread suffix and owns every transport action.
+fn consume_active_flash_stream(bytes: &[u8], fin: bool) -> Result<usize, ()> {
     unsafe {
         let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
-        let Some(owner) = slot.owner() else { return Ok(0) };
-        let Some(stream) = slot.get_mut_for(owner) else { return Ok(0) };
-        let mut reader = SliceStreamReader { bytes, offset: 0 };
+        let Some(owner) = slot.owner() else {
+            return Ok(0);
+        };
+        let Some(stream) = slot.get_mut_for(owner) else {
+            return Ok(0);
+        };
+        let mut reader = dmesh_server::verified_object::BorrowedOrderedRead::new(bytes, fin);
         match stream.receive(&mut reader) {
-            Ok(_) => Ok(reader.offset),
-            Err(error) => { log_receiver_error(error); Err(()) }
+            Ok(_) => Ok(reader.consumed()),
+            Err(error) => {
+                log_receiver_error(error);
+                Err(())
+            }
         }
     }
 }
@@ -191,10 +182,62 @@ fn refresh_idle_timeout_after_consumption(
 static mut ACTIVE_STREAM: dmesh_server::verified_object::ExclusiveTransfer<FlashStream> =
     dmesh_server::verified_object::ExclusiveTransfer::new();
 
+/// Consume ordered bytes through the common deferred-reader boundary.
+///
+/// The host verified-object tests and firmware now follow this exact route:
+/// QUIC-lite retains its own bounded receive state; the handler copies only
+/// what its sink can accept; and the shared transport helper publishes credit
+/// for that copied prefix.  In particular, an ESP flash completion never
+/// resumes a special direct callback over a different ordered-byte contract.
+unsafe fn consume_pending_stream(service: &mut ConnectionService, now_ms: u64) -> Result<(), ()> {
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
+    let Some(owner) = slot.owner() else {
+        return Ok(());
+    };
+    if service.expected_receive_cid() != Some(owner) {
+        return Ok(());
+    }
+    // Invoke the reader even when no byte is queued. A storage-ready edge can
+    // complete the final asynchronous write after the handler already
+    // consumed the stream FIN; `consume_stream_body` observes that state with
+    // an empty reader and the generic transport helper publishes no credit.
+    match dmesh_server::transport::consume_exclusive_inbound_stream(
+        service,
+        slot,
+        owner,
+        now_ms,
+        FLASH_STREAM_IDLE_TIMEOUT_MS,
+        |stream, reader| {
+            let read = stream.receive(reader)?;
+            Ok::<_, dmesh_server::verified_object::ImageError>(read.application_progress)
+        },
+    ) {
+        Ok(_) => Ok(()),
+        Err(dmesh_server::transport::ExclusiveInboundStreamTurnError::Consumer {
+            request_id,
+            error,
+            ..
+        }) => {
+            log_receiver_error(error);
+            let _ = complete_error(service, request_id, b"flash object rejected");
+            let _ = slot.take_for(owner);
+            set_transfer_active(false);
+            Err(())
+        }
+        Err(dmesh_server::transport::ExclusiveInboundStreamTurnError::Transport(_)) => {
+            crate::recovery_runtime::log(b"DMESH recovery: flash stream transport rejected\n\0");
+            Err(())
+        }
+    }
+}
+
 fn log_receiver_error(error: dmesh_server::verified_object::ImageError) {
     let message = match error {
         dmesh_server::verified_object::ImageError::Truncated => {
             b"DMESH flash: receiver error truncated\n\0".as_slice()
+        }
+        dmesh_server::verified_object::ImageError::Allocation => {
+            b"DMESH flash: receiver error allocation\n\0".as_slice()
         }
         dmesh_server::verified_object::ImageError::InvalidManifest => {
             b"DMESH flash: receiver error invalid manifest\n\0".as_slice()
@@ -217,6 +260,28 @@ fn log_receiver_error(error: dmesh_server::verified_object::ImageError) {
 // bearer signal nor an extra flash protocol message.
 static DURABLE_FLASH_COMPLETED: AtomicBool = AtomicBool::new(false);
 
+// The stream handler publishes only its exclusive-operation lifetime. Main's
+// radio owner may defer optional sidecar work, but this module never selects a
+// bearer or calls a Wi-Fi driver API.
+static FLASH_TRANSFER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn set_transfer_active(active: bool) {
+    if FLASH_TRANSFER_ACTIVE.swap(active, Ordering::AcqRel) != active {
+        // This is a policy signal, not a bearer replacement: raw UDP6 stays
+        // registered.  The Main radio owner stops optional NAN management
+        // capture and public-action transmission immediately, because both
+        // share scarce callback/driver resources with the initial object
+        // flight.  Normal NAN/NOW scheduling resumes when the operation ends.
+        crate::wifi_nan_dw_capture_esp::set_nan_action_tx_suppressed(active);
+        crate::wifi_nan_dw_capture_esp::set_nan_capture_suspended(active);
+        crate::main_runtime::request_deadline_recheck();
+    }
+}
+
+pub(crate) fn transfer_active() -> bool {
+    FLASH_TRANSFER_ACTIVE.load(Ordering::Acquire)
+}
+
 pub(crate) fn take_durable_flash_completion() -> bool {
     DURABLE_FLASH_COMPLETED.swap(false, Ordering::AcqRel)
 }
@@ -232,6 +297,17 @@ unsafe fn begin(service: &mut ConnectionService, request: Vec<u8>, now_ms: u64) 
         return;
     };
     let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
+    // Flash is rare, while Main's NAN management capture is optional. Quiesce
+    // that sidecar *before* allocating the bounded receiver: on classic ESP32
+    // its driver buffers can fragment the internal heap below one receiver
+    // block even though aggregate free memory is sufficient. This is neither
+    // a transport setting nor a flash protocol transition; it only brackets
+    // the application operation that owns the allocation. If construction is
+    // rejected, restore normal radio work immediately.
+    let transfer_was_active = transfer_active();
+    if !transfer_was_active {
+        set_transfer_active(true);
+    }
     match slot.try_start_or_replace_if(
         owner,
         request_id,
@@ -247,6 +323,9 @@ unsafe fn begin(service: &mut ConnectionService, request: Vec<u8>, now_ms: u64) 
             crate::commands::send_response(b"flash object stream armed");
         }
         Err(dmesh_server::verified_object::ExclusiveTransferStartError::Start(error)) => {
+            if !transfer_was_active {
+                set_transfer_active(false);
+            }
             let _ = complete_response(service, request_id, error.response());
         }
         Err(dmesh_server::verified_object::ExclusiveTransferStartError::Busy) => {
@@ -254,6 +333,8 @@ unsafe fn begin(service: &mut ConnectionService, request: Vec<u8>, now_ms: u64) 
             // observer to replace the current writer. Completion, association
             // close, and the bounded idle timeout are the only owners allowed
             // to release this operation.
+            // A busy operation already owns the radio quiesce edge; do not
+            // resume it on behalf of a rejected contender.
             let _ = complete_error(
                 service,
                 request_id,
@@ -325,6 +406,7 @@ fn finish(
         return false;
     }
     let _ = slot.take_for(owner);
+    set_transfer_active(false);
     crate::commands::send_response(b"flash object durable");
     crate::recovery_runtime::log(b"DMESH recovery: flash object durable\n\0");
     if complete_response(service, request_id, b"flash complete").is_err() {
@@ -346,6 +428,7 @@ pub(crate) unsafe fn expire(service: &mut ConnectionService, now_ms: u64) {
     let Some((owner, request_id, _stream)) = slot.take_expired(now_ms) else {
         return;
     };
+    set_transfer_active(false);
     let owner_selected = service.select_receive_cid(owner).is_some();
     crate::commands::send_response(b"flash receiver timeout");
     if owner_selected {
@@ -372,10 +455,16 @@ pub(crate) unsafe fn after_receive(
         if let Some(owner) = slot.owner() {
             if service.expected_receive_cid() == Some(owner) {
                 crate::recovery_runtime::log(b"DMESH recovery: flash receiver armed\n\0");
+                // The generic consumer receives one ordered borrowed slice.
+                // If storage stops it part way through, QUIC-lite itself
+                // retains the suffix and resumes it through the same API;
+                // no dispatcher or flash fragment queue is created.
                 if dmesh_server::transport::prepare_inbound_stream_with_consumer(
                     service,
                     consume_active_flash_stream,
-                ).is_err() {
+                )
+                .is_err()
+                {
                     crate::recovery_runtime::log(
                         b"DMESH recovery: flash stream prepare rejected\n\0",
                     );
@@ -395,15 +484,18 @@ pub(crate) unsafe fn after_receive(
             .filter(|owner| service.last_closed_receive_cid() == Some(*owner));
         if let Some(owner) = closed_owner {
             if slot.take_for(owner).is_some() {
+                set_transfer_active(false);
                 crate::commands::send_response(b"flash receiver closed");
             }
         }
         service.abandon_stream_command();
         return;
     }
-    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
-    if let Some(owner) = slot.owner() {
+    let owner = (&*core::ptr::addr_of!(ACTIVE_STREAM)).owner();
+    if let Some(owner) = owner {
         if service.expected_receive_cid() == Some(owner) {
+            let _ = consume_pending_stream(service, now_ms);
+            let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
             refresh_idle_timeout_after_consumption(slot, now_ms);
             let receiver_completed = slot.get_mut_for(owner).is_some_and(|stream| {
                 stream.receiver.is_complete() && !stream.receiver_complete_reported
@@ -430,46 +522,14 @@ pub(crate) unsafe fn before_poll(
 ) {
     {
         let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
-        if let Some(owner) = slot
+        if slot
             .owner()
-            .filter(|owner| service.expected_receive_cid() == Some(*owner))
+            .is_some_and(|owner| service.expected_receive_cid() == Some(owner))
         {
-            // Main and Recovery invoke this from their ordinary application
-            // maintenance turn. It separates manifest admission from a
-            // cache-disrupting erase; it is storage scheduling, never transport
-            // policy.
-            if let Some(stream) = slot.get_mut_for(owner) {
-                if stream.receiver.poll_storage_before_transport().is_err() {
-                    crate::commands::send_response(b"flash erase queue rejected");
-                }
-            }
             let _ = finish(service, slot);
         }
     }
     expire(service, now_ms);
-}
-
-/// Consume completed storage work and publish the released receive window to
-/// QUIC-lite. The returned opaque path tells the generic runtime only where
-/// pending QUIC output should be polled.
-pub(crate) unsafe fn storage_ready(
-    service: &mut ConnectionService,
-    now_ms: u64,
-) -> Result<Option<quic_lite::PathId>, ()> {
-    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_STREAM);
-    let Some(owner) = slot.owner() else {
-        return Ok(None);
-    };
-    let Some(path) = service.select_receive_cid(owner) else {
-        return Ok(None);
-    };
-    if service.resume_inbound_stream_consumer().is_err() {
-        crate::commands::send_response(b"flash stream consume rejected");
-        return Err(());
-    }
-    refresh_idle_timeout_after_consumption(slot, now_ms);
-    let _ = finish(service, slot);
-    Ok(Some(path))
 }
 
 /// Construct the hardware half of a shared `flash` request.
@@ -530,6 +590,22 @@ fn sink_for_flash_request(
 pub fn new_boxed_receiver(
     request: dmesh_server::verified_object::FlashRequest<'_>,
 ) -> Result<Box<SignedObjectFlashReceiver>, FlashSinkError> {
+    // This runs only at the start of a rare update.  Pair it with the sink's
+    // post-receiver snapshot below so an allocation rejection can distinguish
+    // retained connection state from the receiver's bounded parser footprint.
+    // It is console-only diagnostic output, not a transport or flash protocol
+    // field.
+    let caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
+    unsafe {
+        esp_idf_sys::esp_rom_printf(
+            b"DMESH recovery: flash receiver before free=%u largest=%u bytes=%u\n\0"
+                .as_ptr()
+                .cast(),
+            esp_idf_sys::heap_caps_get_free_size(caps) as u32,
+            esp_idf_sys::heap_caps_get_largest_free_block(caps) as u32,
+            core::mem::size_of::<SignedObjectFlashReceiver>() as u32,
+        );
+    }
     match SignedObjectFlashReceiver::try_new_boxed_with(|| sink_for_flash_request(request)) {
         Ok(receiver) => Ok(receiver),
         Err(dmesh_server::verified_object::BoxedReceiverError::Sink(error)) => Err(error),
@@ -560,254 +636,9 @@ pub struct EspPartitionSink {
     capacity: usize,
     target: u8,
     dry_run: bool,
-    free_blocks: Vec<Box<[u8; FLASH_WRITE_BATCH_BYTES]>>,
-    worker: Option<FlashWorker>,
-    // Blob slots accepted before the initial receive-credit boundary. The
-    // erase must not begin in the callback that admits that boundary:
-    // ESP32-C6 flash erase pauses Wi-Fi globally even when performed by a
-    // separate FreeRTOS task. The next application maintenance turn starts
-    // it after the receiver has published its current storage capacity.
-    waiting_writes: Vec<FlashJob>,
-    // One authenticated 4 KiB block may wait briefly for its contiguous
-    // successor. `finish` flushes this job for an image whose final block is
-    // short or odd, so acceptance never depends on an artificial pair.
-    staged_write: Option<FlashJob>,
-    erase_len: usize,
-    // Erasing an executing application's peer partition temporarily affects
-    // the C6 flash/cache path. Do not start it from the manifest-admission
-    // callback; begin from a later application maintenance turn instead.
-    erase_work: dmesh_server::verified_object::DeferredStorageWork,
-    erase_complete: bool,
-    pending_jobs: usize,
     erase_us: u64,
     write_us: u64,
     writes: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FlashJob {
-    kind: u8,
-    partition: *const esp_idf_sys::esp_partition_t,
-    base_address: usize,
-    index: u32,
-    len: usize,
-    data: *mut [u8; FLASH_WRITE_BATCH_BYTES],
-}
-
-const FLASH_JOB_ERASE: u8 = 1;
-const FLASH_JOB_WRITE: u8 = 2;
-// ESP-IDF is configured to yield inside a long erase
-// (`CONFIG_SPI_FLASH_YIELD_DURING_ERASE`). Keep the whole manifest-bounded
-// destination as one worker job: Recovery does not turn individual sectors
-// into application events or transport scheduling decisions.
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FlashCompletion {
-    kind: u8,
-    index: u32,
-    data: *mut [u8; FLASH_WRITE_BATCH_BYTES],
-    elapsed_us: u64,
-    result: i32,
-}
-
-#[derive(Clone, Copy)]
-struct FlashWorker {
-    work: esp_idf_sys::QueueHandle_t,
-    done: esp_idf_sys::QueueHandle_t,
-}
-
-impl FlashWorker {
-    fn new(write_buffers: usize) -> Option<Self> {
-        if write_buffers == 0 {
-            return None;
-        }
-        let work = unsafe {
-            esp_idf_sys::xQueueCreateWithCaps(
-                (write_buffers + 1) as _,
-                core::mem::size_of::<FlashJob>() as _,
-                // On classic ESP32, INTERNAL alone may select instruction
-                // RAM. FreeRTOS queue metadata is byte-addressed, so require
-                // data-capable internal RAM as well.
-                (esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT) as _,
-            )
-        };
-        let done = unsafe {
-            esp_idf_sys::xQueueCreateWithCaps(
-                write_buffers as _,
-                core::mem::size_of::<FlashCompletion>() as _,
-                (esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT) as _,
-            )
-        };
-        if work.is_null() || done.is_null() {
-            if !work.is_null() {
-                unsafe { esp_idf_sys::vQueueDeleteWithCaps(work) };
-            }
-            if !done.is_null() {
-                unsafe { esp_idf_sys::vQueueDeleteWithCaps(done) };
-            }
-            return None;
-        }
-        let worker = Self { work, done };
-        // The recovery process owns this task until it reboots.  Passing a
-        // copied pair of queue handles avoids a borrowed EspPartitionSink pointer in
-        // the RTOS task, so no callback can observe a dropped handler.
-        let task_state = Box::into_raw(Box::new(worker));
-        let mut task = core::ptr::null_mut();
-        let result = unsafe {
-            esp_idf_sys::xTaskCreatePinnedToCore(
-                Some(flash_worker_task),
-                b"flash\0".as_ptr().cast(),
-                4096,
-                task_state.cast::<c_void>(),
-                // The common packet worker is priority 5 and can remain
-                // runnable while a sender retransmits against a full receive
-                // window.  Flash completion is the only event which returns
-                // that handler-owned capacity, so it must not be starved by
-                // packet ingress on the same classic-ESP32 core.  This is
-                // FreeRTOS scheduling only: QUIC credit is still published
-                // exclusively through the shared StorageReady edge.
-                6,
-                &mut task,
-                0,
-            )
-        };
-        if result != 1 || task.is_null() {
-            unsafe {
-                drop(Box::from_raw(task_state));
-                esp_idf_sys::vQueueDeleteWithCaps(work);
-                esp_idf_sys::vQueueDeleteWithCaps(done);
-            }
-            return None;
-        }
-        Some(worker)
-    }
-
-    fn enqueue(&self, job: FlashJob) -> bool {
-        unsafe {
-            esp_idf_sys::xQueueGenericSend(
-                self.work,
-                (&job as *const FlashJob).cast::<c_void>(),
-                0,
-                0,
-            ) == 1
-        }
-    }
-
-    fn take_completion(&self) -> Option<FlashCompletion> {
-        let mut completion = FlashCompletion {
-            kind: 0,
-            index: 0,
-            data: core::ptr::null_mut(),
-            elapsed_us: 0,
-            result: esp_idf_sys::ESP_FAIL,
-        };
-        (unsafe {
-            esp_idf_sys::xQueueReceive(
-                self.done,
-                (&mut completion as *mut FlashCompletion).cast::<c_void>(),
-                0,
-            )
-        } == 1)
-            .then_some(completion)
-    }
-}
-
-unsafe extern "C" fn flash_worker_task(parameter: *mut c_void) {
-    // This Box intentionally lives for Recovery's process lifetime; the task
-    // owns no pointer back into the application receiver.
-    let worker = unsafe { Box::from_raw(parameter.cast::<FlashWorker>()) };
-    loop {
-        let mut job = FlashJob {
-            kind: 0,
-            partition: core::ptr::null(),
-            base_address: 0,
-            index: 0,
-            len: 0,
-            data: core::ptr::null_mut(),
-        };
-        if unsafe {
-            esp_idf_sys::xQueueReceive(
-                worker.work,
-                (&mut job as *mut FlashJob).cast::<c_void>(),
-                u32::MAX,
-            )
-        } != 1
-        {
-            continue;
-        }
-        if job.kind == FLASH_JOB_ERASE {
-            crate::recovery_runtime::log(b"DMESH recovery: flash erase start\n\0");
-        }
-        let started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
-        let result = match job.kind {
-            FLASH_JOB_ERASE if job.partition.is_null() => unsafe {
-                esp_idf_sys::esp_flash_erase_region(
-                    core::ptr::null_mut(),
-                    job.base_address as u32,
-                    job.len as u32,
-                )
-            },
-            FLASH_JOB_ERASE => unsafe {
-                esp_idf_sys::esp_partition_erase_range(job.partition, 0, job.len)
-            },
-            FLASH_JOB_WRITE if job.partition.is_null() => unsafe {
-                esp_idf_sys::esp_flash_write(
-                    core::ptr::null_mut(),
-                    job.data.cast(),
-                    (job.base_address + job.index as usize * BLOCK_SIZE) as u32,
-                    job.len as u32,
-                )
-            },
-            FLASH_JOB_WRITE => unsafe {
-                esp_idf_sys::esp_partition_write(
-                    job.partition,
-                    job.index as usize * BLOCK_SIZE,
-                    job.data.cast(),
-                    job.len,
-                )
-            },
-            _ => esp_idf_sys::ESP_FAIL,
-        };
-        let elapsed_us =
-            (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started);
-        let completion = FlashCompletion {
-            kind: job.kind,
-            index: job.index,
-            data: job.data,
-            elapsed_us,
-            result,
-        };
-        if job.kind == FLASH_JOB_ERASE {
-            crate::recovery_runtime::log(b"DMESH recovery: flash erase complete\n\0");
-        }
-        // A full completion queue means every retained slot is accounted for
-        // by the receive task. Blocking preserves ownership rather than
-        // dropping a buffer or releasing credit prematurely.
-        let _ = unsafe {
-            esp_idf_sys::xQueueGenericSend(
-                worker.done,
-                (&completion as *const FlashCompletion).cast::<c_void>(),
-                u32::MAX,
-                0,
-            )
-        };
-        // Publish the durable-completion edge after the completion itself is
-        // visible. On Main this wakes the one connection owner so QUIC-lite
-        // can emit its MAX_DATA/MAX_STREAM_DATA update when the peer has
-        // exhausted published receive credit. The shared ingress queue is not
-        // installed in reduced Recovery, where this returns false and its
-        // bounded UDP turn performs the same handler-neutral poll.
-        let _ = crate::core_runtime::schedule_storage_ready();
-    }
-}
-
-fn allocate_block() -> Option<Box<[u8; FLASH_WRITE_BATCH_BYTES]>> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(FLASH_WRITE_BATCH_BYTES).ok()?;
-    bytes.resize(FLASH_WRITE_BATCH_BYTES, 0);
-    bytes.into_boxed_slice().try_into().ok()
 }
 
 impl EspPartitionSink {
@@ -863,72 +694,12 @@ impl EspPartitionSink {
         target: u8,
         dry_run: bool,
     ) -> Result<Self, FlashSinkError> {
-        // A dry run verifies the exact streamed object and exercises normal
-        // QUIC flow control, but it neither retains a write batch nor starts
-        // the flash worker.  Do not reject it merely because the durable
-        // writer's 32 KiB reserve is unavailable: its one-batch advertised
-        // window is parser accounting, not an allocation of flash buffers.
-        let selected_buffers = if dry_run {
-            MIN_FLASH_WRITE_BUFFERS
-        } else {
-            let caps = esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
-            let available = unsafe { esp_idf_sys::heap_caps_get_free_size(caps) as usize };
-            let selected = FLASH_STORAGE_POLICY.slots_for(available);
-            if selected == 0 {
-                let largest = unsafe { esp_idf_sys::heap_caps_get_largest_free_block(caps) };
-                // Recovery has no framed UART transport, so report this only
-                // to its output console.  The values identify whether the
-                // rejection is policy headroom or heap fragmentation; they
-                // do not participate in stream/QUIC flow control.
-                unsafe {
-                    esp_idf_sys::esp_rom_printf(
-                        b"DMESH recovery: flash heap free=%u largest=%u reserve=%u slot=%u\n\0"
-                            .as_ptr()
-                            .cast(),
-                        available as u32,
-                        largest,
-                        FLASH_STORAGE_POLICY.reserve_bytes as u32,
-                        FLASH_STORAGE_POLICY.bytes_per_slot as u32,
-                    );
-                }
-                return Err(FlashSinkError::AllocationFailed);
-            }
-            selected
-        };
-        let mut free_blocks = Vec::with_capacity(if dry_run { 0 } else { selected_buffers });
-        if !dry_run {
-            for _ in 0..selected_buffers {
-                match allocate_block() {
-                    Some(block) => free_blocks.push(block),
-                    None if free_blocks.len() >= MIN_FLASH_WRITE_BUFFERS => break,
-                    None => return Err(FlashSinkError::AllocationFailed),
-                }
-            }
-        }
-        let write_buffers = if dry_run {
-            selected_buffers
-        } else {
-            free_blocks.len()
-        };
-        let worker = if dry_run {
-            None
-        } else {
-            Some(FlashWorker::new(write_buffers).ok_or(FlashSinkError::AllocationFailed)?)
-        };
         Ok(Self {
             partition,
             base_address,
             capacity,
             target,
             dry_run,
-            free_blocks,
-            worker,
-            waiting_writes: Vec::with_capacity(if dry_run { 0 } else { write_buffers }),
-            staged_write: None,
-            erase_len: 0,
-            erase_work: dmesh_server::verified_object::DeferredStorageWork::new(),
-            erase_complete: dry_run,
-            pending_jobs: 0,
             erase_us: 0,
             write_us: 0,
             writes: 0,
@@ -943,8 +714,6 @@ impl EspPartitionSink {
         if size == 0 || size as usize > self.capacity {
             return Err(());
         }
-        // Start one manifest-bounded erase. The worker is the only blocking
-        // owner; stream callbacks only enqueue verified writes.
         let erase_len = (size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
         if erase_len > self.capacity {
             return Err(());
@@ -952,68 +721,34 @@ impl EspPartitionSink {
         if self.dry_run {
             return Ok(());
         }
-        self.erase_len = erase_len;
-        // Manifest verification happens in the stream callback. Merely mark
-        // the erase here; the next ordinary application maintenance edge
-        // enqueues it on the worker. Waiting until every receive slot is full
-        // creates a circular dependency: the sender exhausts its window while
-        // the sink waits for another packet before it starts reclaiming it.
-        self.request_erase();
-        // Ask the common connection owner for exactly one later maintenance
-        // turn.  A host may send its first BLOB immediately after receiving
-        // the manifest ACK, before the normal PTO deadline; without this
-        // wake the erase would depend on a further inbound datagram.  The
-        // scheduled turn still enters through `poll_connection` and its
-        // handler-neutral `before_poll` hook, rather than making the stream
-        // callback touch QUIC state or start the erase itself.
-        crate::core_runtime::schedule_connection_timer();
-        Ok(())
-    }
-
-    fn request_erase(&mut self) {
-        if !self.erase_complete && self.pending_jobs == 0 {
-            self.erase_work.request();
-        }
-    }
-
-    fn start_deferred_erase(&mut self) -> Result<(), ()> {
-        if self.dry_run || !self.erase_work.take() {
-            return Ok(());
-        }
-        // Manifest admission and the potentially cache-disrupting erase are
-        // distinct application turns. One deferral is sufficient: requiring
-        // a second later turn deadlocks when the peer has consumed the entire
-        // advertised storage window and has no packet left to send.
-        let worker = self.worker.ok_or(())?;
-        if !worker.enqueue(FlashJob {
-            kind: FLASH_JOB_ERASE,
-            partition: self.partition,
-            base_address: self.base_address,
-            index: 0,
-            len: self.erase_len,
-            data: core::ptr::null_mut(),
-        }) {
-            self.erase_work.request();
-            return Err(());
-        }
-        self.pending_jobs = self.pending_jobs.saturating_add(1);
-        crate::recovery_runtime::log(b"DMESH recovery: flash erase queued\n\0");
-        Ok(())
-    }
-
-    fn enqueue_write(&mut self, job: FlashJob) -> Result<(), ()> {
-        if self.erase_complete {
-            if !self.worker.expect("production worker").enqueue(job) {
-                return Err(());
+        // `SignedObjectReceiver` owns the one ordinary 4 KiB block while it
+        // validates it.  Write that borrowed block before returning, rather
+        // than copying it into a second permanent-or-queued flash buffer.
+        // This is the only ESP-specific operation; the caller sees a normal
+        // synchronous `ImageSink` and returns QUIC credit after this method.
+        crate::recovery_runtime::log(b"DMESH recovery: flash erase start\n\0");
+        let started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
+        let result = if self.partition.is_null() {
+            unsafe {
+                esp_idf_sys::esp_flash_erase_region(
+                    core::ptr::null_mut(),
+                    self.base_address as u32,
+                    erase_len as u32,
+                )
             }
-            self.pending_jobs = self.pending_jobs.saturating_add(1);
         } else {
-            self.waiting_writes.push(job);
-            if self.free_blocks.is_empty() && self.staged_write.is_none() {
-                self.request_erase();
-            }
+            unsafe { esp_idf_sys::esp_partition_erase_range(self.partition, 0, erase_len) }
+        };
+        self.erase_us = self.erase_us.saturating_add(
+            (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started),
+        );
+        if result == esp_idf_sys::ESP_OK {
+            crate::recovery_runtime::log(b"DMESH recovery: flash erase complete\n\0");
+            Ok(())
+        } else {
+            crate::recovery_runtime::log(b"DMESH recovery: flash erase failed\n\0");
+            Err(())
         }
-        Ok(())
     }
 
     fn write_image_block(&mut self, index: u32, data: &[u8]) -> Result<(), ()> {
@@ -1024,93 +759,44 @@ impl EspPartitionSink {
         if data_len == 0 || data_len > BLOCK_SIZE {
             return Err(());
         }
-        if let Some(mut job) = self.staged_write.take() {
-            if index != job.index.saturating_add(1)
-                || job.len.saturating_add(data_len) > FLASH_WRITE_BATCH_BYTES
-            {
-                self.staged_write = Some(job);
-                return Err(());
-            }
+        let started = unsafe { esp_idf_sys::esp_timer_get_time() as u64 };
+        let result = if self.partition.is_null() {
             unsafe {
-                (&mut *job.data)[job.len..job.len + data_len].copy_from_slice(data);
+                esp_idf_sys::esp_flash_write(
+                    core::ptr::null_mut(),
+                    data.as_ptr().cast(),
+                    (self.base_address + index as usize * BLOCK_SIZE) as u32,
+                    data_len as u32,
+                )
             }
-            job.len += data_len;
-            return self.enqueue_write(job);
-        }
-
-        let mut slot = self.free_blocks.pop().ok_or(())?;
-        slot[..data_len].copy_from_slice(data);
-        let job = FlashJob {
-            kind: FLASH_JOB_WRITE,
-            partition: self.partition,
-            base_address: self.base_address,
-            index,
-            len: data_len,
-            data: Box::into_raw(slot),
-        };
-        if data_len == FLASH_WRITE_BATCH_BYTES {
-            self.enqueue_write(job)
         } else {
-            self.staged_write = Some(job);
+            unsafe {
+                esp_idf_sys::esp_partition_write(
+                    self.partition,
+                    index as usize * BLOCK_SIZE,
+                    data.as_ptr().cast(),
+                    data_len,
+                )
+            }
+        };
+        self.write_us = self.write_us.saturating_add(
+            (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started),
+        );
+        if result == esp_idf_sys::ESP_OK {
+            self.writes = self.writes.saturating_add(1);
             Ok(())
+        } else {
+            crate::recovery_runtime::log(b"DMESH recovery: flash write failed\n\0");
+            Err(())
         }
-    }
-
-    /// Poll completed flash jobs without blocking the stream receive path.
-    pub fn poll_completed(&mut self) -> Result<(), ()> {
-        if self.dry_run {
-            return Ok(());
-        }
-        let worker = self.worker.expect("production worker");
-        while let Some(completion) = worker.take_completion() {
-            self.pending_jobs = self.pending_jobs.saturating_sub(1);
-            match completion.kind {
-                FLASH_JOB_ERASE => {
-                    self.erase_us = self.erase_us.saturating_add(completion.elapsed_us);
-                    self.erase_complete = true;
-                    crate::recovery_runtime::log(b"DMESH recovery: flash erase complete\n\0");
-                    for job in self.waiting_writes.drain(..) {
-                        if !worker.enqueue(job) {
-                            return Err(());
-                        }
-                        self.pending_jobs = self.pending_jobs.saturating_add(1);
-                    }
-                }
-                FLASH_JOB_WRITE => {
-                    if completion.data.is_null() {
-                        return Err(());
-                    }
-                    self.write_us = self.write_us.saturating_add(completion.elapsed_us);
-                    self.writes = self.writes.saturating_add(1);
-                    self.free_blocks
-                        .push(unsafe { Box::from_raw(completion.data) });
-                }
-                _ => return Err(()),
-            }
-            if completion.result != esp_idf_sys::ESP_OK {
-                crate::recovery_runtime::log(match completion.kind {
-                    FLASH_JOB_ERASE => b"DMESH recovery: flash erase failed\n\0",
-                    FLASH_JOB_WRITE => b"DMESH recovery: flash write failed\n\0",
-                    _ => b"DMESH recovery: flash worker failed\n\0",
-                });
-                return Err(());
-            }
-        }
-        Ok(())
     }
 
     pub fn is_durable(&self) -> bool {
-        self.dry_run || (self.erase_complete && self.pending_jobs == 0)
+        true
     }
 
-    fn poll_before_transport(&mut self) -> Result<(), ()> {
-        self.start_deferred_erase()
-    }
-
-    /// Compact post-DONE diagnostic: queued worker operations.  It is read
-    /// only while Recovery waits for durability, never from the packet path.
     pub fn pending_jobs(&self) -> u64 {
-        self.pending_jobs as u64
+        0
     }
 }
 
@@ -1120,7 +806,10 @@ impl ImageSink for EspPartitionSink {
         &mut self,
         manifest: &dmesh_server::verified_object::ImageManifest,
     ) -> Result<(), Self::Error> {
-        if manifest.target != self.target || manifest.block_size as usize != BLOCK_SIZE {
+        if manifest.target != self.target
+            || manifest.cpu != local_image_cpu()
+            || manifest.block_size as usize != BLOCK_SIZE
+        {
             return Err(());
         }
         self.begin_image(manifest.image_size)
@@ -1137,39 +826,15 @@ impl ImageSink for EspPartitionSink {
         // not re-hash the whole image: per-block proofs are its acceptance
         // rule, and avoiding the second linear hash keeps flash throughput
         // independent of image size.
-        if let Some(job) = self.staged_write.take() {
-            self.enqueue_write(job)?;
-        }
-        self.request_erase();
         Ok(())
     }
-    fn abort(&mut self) {
-        if let Some(job) = self.staged_write.take() {
-            if !job.data.is_null() {
-                self.free_blocks.push(unsafe { Box::from_raw(job.data) });
-            }
-        }
-    }
+    fn abort(&mut self) {}
 }
 
 impl dmesh_server::verified_object::StreamingImageSink for EspPartitionSink {
     fn poll_completed(
         &mut self,
     ) -> Result<dmesh_server::verified_object::StoragePoll, Self::Error> {
-        EspPartitionSink::poll_completed(self)
-            .map(|()| {
-                if self.dry_run
-                    || (self.erase_complete
-                        && (self.staged_write.is_some() || !self.free_blocks.is_empty()))
-                {
-                    dmesh_server::verified_object::StoragePoll::Ready
-                } else {
-                    dmesh_server::verified_object::StoragePoll::Pending
-                }
-            })
-    }
-
-    fn poll_before_transport(&mut self) -> Result<(), Self::Error> {
-        EspPartitionSink::poll_before_transport(self)
+        Ok(dmesh_server::verified_object::StoragePoll::Ready)
     }
 }

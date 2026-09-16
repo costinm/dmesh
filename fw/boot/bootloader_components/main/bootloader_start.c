@@ -100,6 +100,11 @@ static int select_partition(void)
     boot_health_state_t *health = boot_health_state();
     uint8_t handoff = DMESH_RTC_HANDOFF;
     uint8_t event = DMESH_RTC_HEALTH_EVENT;
+    /* Keep this one ROM-console line available when normal bootloader logs
+     * are disabled. It proves the handoff byte seen by Stage2 without
+     * changing the boot decision or requiring any UART input protocol. */
+    esp_rom_printf("DMESH stage2: handoff=%u event=%u reset=%d\n",
+                   (unsigned)handoff, (unsigned)event, reset_reason);
     bool main_was_healthy = event == DMESH_BOOT_HEALTH_MAIN_OK;
     bool main_crash_loop = !main_was_healthy && health->main_failures != 0;
 
@@ -234,7 +239,12 @@ void __attribute__((noreturn)) call_start_cpu0(void)
         bootloader_reset();
     }
 
-    bootloader_utility_load_boot_image(&bs, select_partition());
+    int partition_index = select_partition();
+    /* ROM-visible selection evidence: when an app returns immediately to
+     * Stage2 this distinguishes a selected-but-unbootable image from a wrong
+     * partition decision, without introducing a control path. */
+    esp_rom_printf("DMESH stage2: load partition=%d\n", partition_index);
+    bootloader_utility_load_boot_image(&bs, partition_index);
     bootloader_reset();
 }
 

@@ -24,6 +24,8 @@ static RECOVERY_BOOT_CID_LOW: AtomicU32 = AtomicU32::new(0);
 static RECOVERY_BOOT_CID_HIGH: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(target_arch = "riscv32")]
+// C6 application code cannot write RTC DRAM low. Keep this high-end block
+// outside the application RTC heap and make Stage2 use the same address.
 const RTC_RETAIN_BASE: usize = 0x5000_4000 - RTC_RETAIN_SIZE;
 #[cfg(all(not(target_arch = "riscv32"), target_feature = "esp32s3ops"))]
 const RTC_RETAIN_BASE: usize = 0x6010_0000 - RTC_RETAIN_SIZE;
@@ -59,6 +61,14 @@ mod tests {
         assert_eq!(RTC_RETAIN_BASE, 0x3ff8_2000 - RTC_RETAIN_SIZE);
         assert_eq!(RTC_HANDOFF_OFFSET, 17);
     }
+
+    #[test]
+    fn c6_rtc_layout_matches_stage2_header_contract() {
+        #[cfg(target_arch = "riscv32")]
+        assert_eq!(RTC_RETAIN_BASE, 0x5000_4000 - RTC_RETAIN_SIZE);
+        assert_eq!(RTC_RETAIN_SIZE, 48);
+        assert_eq!(RTC_HANDOFF_OFFSET, 17);
+    }
 }
 
 /// Replace any stale Recovery selection with a one-shot Main selection.
@@ -78,11 +88,18 @@ pub fn mark_main_start() {
     unsafe { write(RTC_HEALTH_EVENT_OFFSET, 1) };
 }
 
-/// Mark Main healthy and clear a consumed handoff.
+/// Mark Main healthy and clear only Recovery's consumed Main handoff.
+///
+/// A pending Main-to-Recovery request is armed after the terminal response
+/// has been acknowledged but before the delayed reset runs. Main's normal
+/// health callback can still execute in that small interval, so it must not
+/// turn `HANDOFF_RECOVERY` back into normal boot.
 pub fn mark_main_healthy() {
     unsafe {
         write(RTC_HEALTH_EVENT_OFFSET, 2);
-        write(RTC_HANDOFF_OFFSET, HANDOFF_NORMAL);
+        if read(RTC_HANDOFF_OFFSET) == HANDOFF_MAIN {
+            write(RTC_HANDOFF_OFFSET, HANDOFF_NORMAL);
+        }
     }
 }
 
@@ -120,9 +137,17 @@ pub(crate) fn response_delivered(cid: quic_lite::ConnectionId) {
     {
         return;
     }
-    if crate::task_esp::schedule_restart_ms(250) {
-        arm_recovery();
-    } else {
+    // Arm retained state before waking the shared worker. `schedule_work` may
+    // dispatch immediately on another core, so scheduling first left a race
+    // where `restart_work` could reach `esp_restart` while Stage2 still saw
+    // `HANDOFF_NORMAL`. The response has already been terminally delivered;
+    // from this point every reset must select Recovery, including an
+    // asynchronous watchdog reset while the delayed worker restart is pending.
+    arm_recovery();
+    if !crate::task_esp::schedule_restart_ms(250) {
+        // Keep the armed one-shot selection rather than clearing it: a later
+        // reset still reaches the requested repair image. The response was
+        // delivered and must never be reported as a successful no-op.
         RECOVERY_BOOT_STATE.store(2, Ordering::Release);
     }
 }

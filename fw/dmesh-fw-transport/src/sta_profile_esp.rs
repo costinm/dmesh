@@ -51,20 +51,30 @@ fn parse_port(value: &[u8]) -> Option<u16> {
 /// discovery hints for now; neither this adapter nor the Wi-Fi driver derives
 /// transport routing from a BSSID or invents a host scope.
 pub(crate) fn load(profile: &mut crate::TransportProfile) -> bool {
+    // Keep boot diagnostics non-secret: this code identifies which structural
+    // NVS invariant failed, never renders an SSID, endpoint, or credential.
+    macro_rules! reject {
+        ($code:expr) => {{
+            crate::commands::send_stat(b"sta profile reject=", $code);
+            return false;
+        }};
+    }
     let _ = unsafe { nvs_flash_init() };
     let mut handle = 0_u32;
     if unsafe { nvs_open(b"dmesh\0".as_ptr().cast(), NVS_READONLY, &mut handle) } != 0 {
-        return false;
+        reject!(1);
     }
     let mut ssid = [0u8; 33];
     let mut server_ll = [0u8; 40];
     let mut server_port = [0u8; 6];
-    let result = (|| {
-        let ssid_len = nvs_string(handle, b"sta_ssid\0", &mut ssid)?;
+    let result = (|| -> Option<u8> {
+        let Some(ssid_len) = nvs_string(handle, b"sta_ssid\0", &mut ssid) else {
+            return Some(2);
+        };
         let server_len = nvs_string(handle, b"sta_server_ll\0", &mut server_ll);
         let port_len = nvs_string(handle, b"sta_server_port\0", &mut server_port);
         if !dmesh_server::firmware_profile::valid_ssid(&ssid[..ssid_len]) {
-            return None;
+            return Some(3);
         }
         match (server_len, port_len) {
             (None, None) => {}
@@ -72,18 +82,18 @@ pub(crate) fn load(profile: &mut crate::TransportProfile) -> bool {
                 if server_ll[..server_len].starts_with(b"fe80:")
                     && !server_ll[..server_len].contains(&b'%')
                     && parse_port(&server_port[..port_len]).is_some() => {}
-            _ => return None,
+            _ => return Some(4),
         }
         let mut psk = [0u8; 64];
         let mut secret_handle = 0_u32;
         if unsafe { nvs_open(b"sec\0".as_ptr().cast(), NVS_READONLY, &mut secret_handle) } != 0 {
-            return None;
+            return Some(5);
         }
         let psk_len = nvs_string(secret_handle, b"sta\0", &mut psk);
         unsafe { nvs_close(secret_handle) };
-        let psk_len = psk_len?;
+        let Some(psk_len) = psk_len else { return Some(6) };
         if !(8..=63).contains(&psk_len) {
-            return None;
+            return Some(7);
         }
         profile.ssid[..ssid_len].copy_from_slice(&ssid[..ssid_len]);
         profile.ssid_len = ssid_len;
@@ -92,9 +102,12 @@ pub(crate) fn load(profile: &mut crate::TransportProfile) -> bool {
         profile.requested_transport = Some(dmesh_server::control::TransportKind::Sta);
         profile.ap = 0;
         profile.run_requested = true;
-        Some(())
-    })()
-    .is_some();
+        Some(0)
+    })().unwrap_or(8);
     unsafe { nvs_close(handle) };
-    result
+    if result != 0 {
+        crate::commands::send_stat(b"sta profile reject=", u64::from(result));
+        return false;
+    }
+    true
 }

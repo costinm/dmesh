@@ -109,15 +109,19 @@ def preflash_sta_off(role: str, target: str, physical: str) -> None:
     """
     if target not in ("main", "oldmain", "module") or role.startswith("/dev/"):
         return
-    cli = ROOT / "target" / "debug" / "dmesh-cli"
-    if not cli.is_file():
-        print(f"{role}: STA-off preflight skipped (dmesh-cli is not built)", flush=True)
+    # The supported client is the release binary selected by `env.sh` on
+    # PATH.  Do not revive a potentially stale target/debug copy: it may
+    # speak an older stream envelope and make a successful STA teardown look
+    # uncorrelated just before a USB reset.
+    cli = shutil.which("dmesh-cli")
+    if cli is None:
+        print(f"{role}: STA-off preflight skipped (dmesh-cli is not on PATH)", flush=True)
         return
     # Reset is a normal correlated QUIC-lite service.  Keep it out of the
     # connectionless direct-control allowlist: a reset must not become an
     # unauthenticated radio-plane operation merely because this provisioning
     # helper happens to own a local USB cable.
-    command = [str(cli), physical, "runtime.reset"]
+    command = [cli, physical, "runtime.reset"]
     try:
         completed = subprocess.run(
             command,

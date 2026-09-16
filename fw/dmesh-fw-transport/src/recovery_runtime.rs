@@ -12,6 +12,13 @@ static DEADLINE_OWNER_TASK: core::sync::atomic::AtomicUsize =
 
 pub fn run() {
     esp_idf_sys::link_patches();
+    // Recovery exposes only its running-image identity and the verified flash
+    // operation. This is the same tagged QUIC handler used by Main and does
+    // not install a diagnostic catalog, UART input, or another transport.
+    let _ = dmesh_server::services::register_tagged_component(
+        dmesh_server::services::FIRMWARE_COMPONENT,
+        crate::firmware_identity::receive_tagged_identity,
+    );
     let mut profile = crate::TransportProfile::new();
     if !crate::sta_profile_esp::load(&mut profile) {
         log(b"DMESH recovery: STA profile missing\n\0");
@@ -234,5 +241,11 @@ fn return_to_main() -> ! {
     // Recovery owns this control task, rather than the raw ingress worker, so
     // complete the asynchronous STA leave before Stage2 selects Main.
     crate::wifi_esp::stop_sta_for_reset();
+    unsafe {
+        esp_idf_sys::esp_rom_printf(
+            b"DMESH recovery: handoff before reset=%u\n\0".as_ptr().cast(),
+            crate::rtc::handoff() as u32,
+        );
+    }
     unsafe { esp_idf_sys::esp_restart() }
 }
