@@ -2,11 +2,11 @@ CONFIG_IDF_TARGET="esp32"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-# Rust/ESP-IDF startup and the bounded object worker share the app task. The
-# default 8192-byte stack can underflow during the Recovery handoff on C6.
-# Recovery starts the shared UART/raw-bearer runtime and flash worker. Keep
-# this task at 64 KiB; stream state and manifest storage are heap-owned.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
+# Rust/ESP-IDF startup and the bounded object worker share the app task.
+# All targets keep the same 32-KiB bound as Main. A measured 16-KiB C6 stack
+# underflowed during a full Recovery handoff; the runtime logs its actual
+# high-water use so any target-specific increase is evidence-driven.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 # Recovery performs one bounded STA/UDP transfer and has no radio-worker
 # workload that needs the APP CPU.  Running it on the PRO CPU only removes an
 # otherwise unnecessary dual-core startup dependency on classic ESP32.

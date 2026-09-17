@@ -367,6 +367,7 @@ dependencies = [
  "dmesh-server",
  "embuild",
  "esp-idf-sys",
+ "quic-lite",
 ]
 
 [[package]]

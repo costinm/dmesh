@@ -1,5 +1,7 @@
 extern crate alloc;
 
+mod ble;
+
 fn receive_boot_control(record: dmesh_server::tagged::Record<'_>) -> Option<alloc::vec::Vec<u8>> {
     use dmesh_server::{services, tagged::Name};
     if record.to.is_some()
@@ -85,6 +87,7 @@ pub extern "C" fn app_main() {
         dmesh_server::services::BOOT_COMPONENT,
         receive_boot_control,
     ));
+    ble::register();
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: health-start\n\0".as_ptr().cast()) };
     #[cfg(feature = "modules")]
     dmesh_fw_modules::register_tagged_handlers();
@@ -95,6 +98,7 @@ pub extern "C" fn app_main() {
     }
     let ble_auto = dmesh_fw_transport::main_runtime::boot_ble_auto();
     dmesh_ble::configure_boot(ble_auto);
+    ble::install();
     if !ble_auto {
         unsafe {
             esp_idf_sys::esp_rom_printf(b"DMESH main: BLE auto disabled\n\0".as_ptr().cast())

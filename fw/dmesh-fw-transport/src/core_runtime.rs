@@ -41,6 +41,34 @@ pub(crate) fn request_connection_deadline_recheck() {
     }
 }
 
+/// Main-only physical CoC egress pump. The shared connection owner never calls
+/// BLE APIs directly; it only publishes this capacity hook before the CoC
+/// bearer can accept traffic.
+static BLE_COC_EGRESS_PUMP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn install_ble_coc_egress_pump(
+    pump: Option<fn(quic_lite::PathId, &mut [u8; crate::TRANSPORT_MTU], Option<usize>)>,
+) {
+    BLE_COC_EGRESS_PUMP.store(
+        pump.map(|pump| pump as usize).unwrap_or(0),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+fn ble_coc_egress_pump(
+    path: quic_lite::PathId,
+    response: &mut [u8; crate::TRANSPORT_MTU],
+    immediate: Option<usize>,
+) {
+    let pump = BLE_COC_EGRESS_PUMP.load(core::sync::atomic::Ordering::Acquire);
+    if pump != 0 {
+        let pump: fn(quic_lite::PathId, &mut [u8; crate::TRANSPORT_MTU], Option<usize>) =
+            unsafe { core::mem::transmute(pump) };
+        pump(path, response, immediate);
+    }
+}
+
 /// Select active association credit from current internal-memory headroom.
 /// CONNECTION_HISTORY_CAPACITY is only the static allocation ceiling; the
 /// advertised ledger, initial window, and default burst are selected for each
@@ -110,22 +138,17 @@ pub(crate) fn transport_profile_snapshot() -> crate::TransportProfile {
     crate::profile_store::snapshot()
 }
 
-/// Apply UART power policy only to real UART bridges. On ESP32-C6 USB-JTAG,
-/// the USB/JTAG transport is also the debug and recovery path; sleepy mode
-/// must leave it untouched even when the radio enters light sleep.
+/// Apply UART power policy only to real UART bridges. C6 is not synonymous
+/// with USB-JTAG: some boards expose UART0 through an external bridge, and
+/// the adapter selects that backend from live hardware at boot.
 pub(crate) fn apply_uart_profile(enabled: bool) {
-    #[cfg(target_arch = "riscv32")]
-    {
-        let _ = enabled;
+    if !crate::uart_esp::packetized_debug_selected() {
+        // Main's active personality promises a usable physical UART control
+        // bearer. Keep its sole reader/writer enabled until an explicit
+        // `transport.set uart=off` profile replaces it; a short debug window
+        // would leave boot waiting for an event that only UART could deliver.
+        crate::uart_esp::set_always_on(enabled);
     }
-    #[cfg(not(target_arch = "riscv32"))]
-    // Main's active personality promises a usable physical UART control
-    // bearer. Keep its sole reader/writer enabled until an explicit
-    // `transport.set uart=off` profile replaces it; a short debug window
-    // would leave boot waiting for an event that only UART could deliver.
-    // C6 USB-JTAG deliberately takes the no-op branch above: it is a packet
-    // transport/debug facility, not a power-gated UART bridge.
-    crate::uart_esp::set_always_on(enabled);
 }
 
 fn raw_association_for_available(
@@ -469,10 +492,9 @@ pub fn receive_connection_frame_ingress(
                     core::sync::atomic::Ordering::Release,
                 );
                 if error == quic_lite::Error::HistoryFull
-                    && CONNECTION_ALLOCATION_DIAGNOSTICS.fetch_add(
-                        1,
-                        core::sync::atomic::Ordering::Relaxed,
-                    ) < 4
+                    && CONNECTION_ALLOCATION_DIAGNOSTICS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        < 4
                 {
                     let capabilities =
                         esp_idf_sys::MALLOC_CAP_INTERNAL | esp_idf_sys::MALLOC_CAP_8BIT;
@@ -523,6 +545,7 @@ pub fn receive_connection_frame_ingress(
             if let Some(receive_cid) = service.take_terminal_response_delivered() {
                 TERMINAL_RESPONSE_DELIVERED.store(true, core::sync::atomic::Ordering::Release);
                 crate::rtc::response_delivered(receive_cid);
+                crate::main_runtime::profile_response_delivered();
             }
         }
         if connection_path_transport(path) == dmesh_server::transport_path::TransportId::NOW.0 {
@@ -552,6 +575,7 @@ pub fn receive_connection_frame_ingress(
             transport if transport == dmesh_server::transport_path::TransportId::NOW.0
                 || transport == dmesh_server::transport_path::TransportId::UDP6.0
                 || transport == dmesh_server::transport_path::TransportId::UART.0
+                || transport == dmesh_server::transport_path::TransportId::BLE.0
         ) {
             request_connection_deadline_recheck();
         }
@@ -593,6 +617,7 @@ pub fn poll_connection(
         if let Some(receive_cid) = service.take_terminal_response_delivered() {
             TERMINAL_RESPONSE_DELIVERED.store(true, core::sync::atomic::Ordering::Release);
             crate::rtc::response_delivered(receive_cid);
+            crate::main_runtime::profile_response_delivered();
         }
         result
     }
@@ -624,6 +649,7 @@ pub(crate) fn connection_delay_ms() -> Option<u32> {
             transport if transport == dmesh_server::transport_path::TransportId::NOW.0
                 || transport == dmesh_server::transport_path::TransportId::UDP6.0
                 || transport == dmesh_server::transport_path::TransportId::UART.0
+                || transport == dmesh_server::transport_path::TransportId::BLE.0
         ) {
             return None;
         }
@@ -686,6 +712,10 @@ fn service_connection_timer() {
             transport if transport == dmesh_server::transport_path::TransportId::UDP6.0 => {
                 crate::wifi_raw_udp6_esp::poll_connection_timer();
             }
+            transport if transport == dmesh_server::transport_path::TransportId::BLE.0 => {
+                let response = &mut *core::ptr::addr_of_mut!(CONNECTION_TIMER_RESPONSE);
+                ble_coc_egress_pump(path, response, None);
+            }
             _ => {}
         }
     }
@@ -703,15 +733,44 @@ pub(crate) fn receive_raw_udp6(
     receive_connection_frame(path, packet, response)
 }
 
-/// Recovery installs no connectionless command catalog. Multicast presence
-/// is outbound only; directed control and flashing use the ordinary QUIC
-/// association handled by [`receive_raw_udp6`].
-pub(crate) fn reject_recovery_connectionless(
+/// Recovery's connectionless surface is the same signed directed-discovery
+/// exception used to find Main. It intentionally does not install Main's
+/// mutable direct controls; flashing remains an ordinary QUIC stream handled
+/// by [`receive_raw_udp6`].
+pub(crate) fn receive_recovery_connectionless(
     _peer: crate::wifi_raw_udp6_esp::RawUdp6Peer,
-    _packet: &[u8],
-    _response: &mut [u8; crate::TRANSPORT_MTU],
+    packet: &[u8],
+    response: &mut [u8; crate::TRANSPORT_MTU],
 ) -> crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome {
-    crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected
+    if !dmesh_server::direct::ConnectionlessMessage::is_packet(packet) {
+        return crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected;
+    }
+    match dmesh_server::direct::ConnectionlessMessage::receive(
+        packet,
+        response,
+        |payload, response| {
+            let Some(request_id) = dmesh_server::announce::discovery_request_id(payload) else {
+                return dmesh_server::direct::ConnectionlessDisposition::NotHandled;
+            };
+            let Some((record, used)) = crate::main_runtime::recovery_discovery_record(0) else {
+                return dmesh_server::direct::ConnectionlessDisposition::NotHandled;
+            };
+            let Some(announce) = dmesh_server::announce::decode_announce(&record[..used]) else {
+                return dmesh_server::direct::ConnectionlessDisposition::NotHandled;
+            };
+            let Some(used) =
+                dmesh_server::announce::encode_discovery_response(announce, request_id, response)
+            else {
+                return dmesh_server::direct::ConnectionlessDisposition::NotHandled;
+            };
+            dmesh_server::direct::ConnectionlessDisposition::Response(used)
+        },
+    ) {
+        dmesh_server::direct::ConnectionlessDisposition::Response(used) => {
+            crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Response(used)
+        }
+        _ => crate::wifi_raw_udp6_esp::ConnectionlessUdp6Outcome::Rejected,
+    }
 }
 
 /// Construct a bounded connectionless application packet at the shared QUIC

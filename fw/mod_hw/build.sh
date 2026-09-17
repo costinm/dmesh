@@ -63,8 +63,17 @@ fi
 "$tool_dir/$prefix-objcopy" -O binary "$ELF" "$RAW"
 entry_hex="$($tool_dir/$prefix-readelf -h "$ELF" | awk '/Entry point address:/ {print $NF}')"
 entry=$((entry_hex - vma + 64))
+code_vma=0
+if [[ "$TARGET" == xtensa-* ]]; then code_vma=$((vma - 64)); fi
 "$DMESH_PYTHON" "$ROOT/fw/mod_hw/pack.py" --service-tag "$SERVICE_TAG" \
-  --slot-count "$SLOT_COUNT" --code-vma "$((vma - 64))" --data-vma "$data_vma" \
+  --slot-count "$SLOT_COUNT" --code-vma "$code_vma" --data-vma "$data_vma" \
   --entry-offset "$entry" --flags 1 "$RAW" "$IMAGE"
+case "$TARGET" in
+  xtensa-esp32-espidf) object_chip=esp32 ;;
+  xtensa-esp32s3-espidf) object_chip=esp32s3 ;;
+  riscv32imac-unknown-none-elf|riscv32imac-esp-espidf) object_chip=esp32c6 ;;
+esac
+mkdir -p "$ROOT/target/flash/modules/$object_chip"
+cp "$IMAGE" "$ROOT/target/flash/modules/$object_chip/mod_hw.dmod"
 printf 'HW_MODULE_IMAGE=%s HW_MODULE_SIZE=%s HW_MODULE_SHA256=%s\n' \
   "$IMAGE" "$(stat -c %s "$IMAGE")" "$(sha256sum "$IMAGE" | awk '{print $1}')"

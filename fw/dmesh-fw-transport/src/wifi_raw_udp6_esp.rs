@@ -6,7 +6,7 @@
 
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use quic_lite::raw_udp6::{
@@ -134,13 +134,14 @@ static mut UDP_PATH_BINDINGS: UdpPathBindings =
 /// registration failed. This is deliberately a small status value rather
 /// than a boot-only log: a host can inspect it after association has settled.
 static START_STATUS: AtomicU32 = AtomicU32::new(0);
-const ANNOUNCE_PEER_CAPACITY: usize = 10;
+pub const ANNOUNCE_PEER_CAPACITY: usize = 10;
 
 /// A bounded, lock-free observation record. The shared ingress worker is the
 /// only writer; snapshots may see an older complete record but never retain a
 /// Wi-Fi driver buffer or allocate while receiving a multicast announce.
 struct AnnouncePeerSlot {
     device_id: [AtomicU32; 4],
+    device_id_len: AtomicU8,
     source_ip: [AtomicU32; 4],
     source_mac_low: AtomicU32,
     source_mac_high: AtomicU32,
@@ -158,6 +159,7 @@ impl AnnouncePeerSlot {
                 AtomicU32::new(0),
                 AtomicU32::new(0),
             ],
+            device_id_len: AtomicU8::new(0),
             source_ip: [
                 AtomicU32::new(0),
                 AtomicU32::new(0),
@@ -184,6 +186,7 @@ static ANNOUNCE_INVALID: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnnouncePeerSnapshot {
     pub device_id: [u8; 16],
+    pub device_id_len: u8,
     pub source_ip: [u8; 16],
     pub source_mac: [u8; 6],
     pub uptime_secs: u32,
@@ -214,6 +217,7 @@ pub fn announce_peers(out: &mut [Option<AnnouncePeerSnapshot>; ANNOUNCE_PEER_CAP
         let high = slot.source_mac_high.load(Ordering::Relaxed).to_le_bytes();
         out[index] = Some(AnnouncePeerSnapshot {
             device_id,
+            device_id_len: slot.device_id_len.load(Ordering::Relaxed),
             source_ip,
             source_mac: [low[0], low[1], low[2], low[3], high[0], high[1]],
             uptime_secs: slot.uptime_secs.load(Ordering::Relaxed),
@@ -798,7 +802,7 @@ pub(crate) fn record_announce_peer(
 ) {
     let mut selected = None;
     for (index, slot) in ANNOUNCE_PEERS.iter().enumerate() {
-        let mut equal = true;
+        let mut equal = slot.device_id_len.load(Ordering::Acquire) == announce.device_id_len;
         // Compare all sixteen bytes. Announce IDs may be shorter (ESP uses a
         // six-byte MAC) and comparing only complete chunks would otherwise
         // merge peers that differ in the final two MAC bytes.
@@ -830,6 +834,8 @@ pub(crate) fn record_announce_peer(
             Ordering::Relaxed,
         );
     }
+    slot.device_id_len
+        .store(announce.device_id_len, Ordering::Relaxed);
     for (word, bytes) in slot.source_ip.iter().zip(source_ip.chunks_exact(4)) {
         word.store(
             u32::from_be_bytes(bytes.try_into().unwrap()),

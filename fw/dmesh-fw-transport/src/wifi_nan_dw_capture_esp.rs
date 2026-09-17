@@ -40,16 +40,6 @@ const NAN_INITIAL_ACQUIRE_MS: u32 = 15_000;
 /// cluster can pin a sleepy device to a phase which no peer uses.
 const NAN_CLUSTER_MISSED_BEACON_US: u64 = dmesh_rawnan::NAN_CLUSTER_STALE_AFTER_US;
 
-/// DW8 is a diagnostic power personality while the classic ESP resume path is
-/// being qualified.  Keep its UART evidence at the physical receive boundary:
-/// profile-transition messages alone cannot establish that promiscuous RX was
-/// actually armed for, then released after, a discovery window. DW1 remains
-/// quiet to avoid turning the ordinary active control plane into a log loop.
-fn log_dw8_boundary(message: &'static [u8]) {
-    if DW_INTERVAL.load(Ordering::Acquire) >= 8 {
-        crate::commands::send_response(message);
-    }
-}
 /// Temporary paired-C6 laboratory override.  It bypasses beacon acquisition
 /// only so the private Address-3 comparator can be tested with promiscuous
 /// mode completely disabled.  Normal cluster discovery remains the default
@@ -143,11 +133,18 @@ const ACTIVE_PUBLISH_REFRESH_MS: u32 = dmesh_rawnan::NAN_ACTIVE_PUBLISH_INTERVAL
 /// Eight 512-TU windows reaches the next DW0/DW8 boundary without creating a
 /// polling path or reacting to every repeated active-Subscribe packet.
 const ACTIVE_PUBLISH_BURST_WINDOWS: u8 = 8;
-/// One externally requested active-Subscribe SDF waits for the next local
-/// NAN discovery window. Public-action transmission from a UART/raw-radio
-/// handler would usually miss the peer's bounded DW. This holds one complete
-/// frame, not a packet queue.
+/// A targeted wake must overlap a peer that listens only once per DW8. Ten
+/// 512-TU attempts span about 4.72 seconds from first to last submission,
+/// exceeding the 4.194-second DW8 period with one base-window of margin.
+/// Eight attempts span only seven gaps (about 3.67 seconds) and can fit
+/// entirely between two peer receive windows.
+const NAN_WAKE_BURST_WINDOWS: u8 = 10;
+/// Externally requested active-Subscribe SDFs wait for a local NAN discovery
+/// window. Each accepted control request owns one semantic intent slot and is
+/// either transmitted for its requested number of windows or explicitly
+/// rejected when fixed capacity is exhausted. No accepted frame is replaced.
 const PENDING_SDF_MAX_LEN: usize = 384;
+const PENDING_SDF_CAPACITY: usize = 4;
 const PENDING_EMPTY: u8 = 0;
 const PENDING_WRITING: u8 = 1;
 const PENDING_READY: u8 = 2;
@@ -283,13 +280,36 @@ static NAN_ACTION_TX_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static NAN_CAPTURE_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PUBLISH_INFO: [AtomicU8; ACTIVE_PUBLISH_MAX_LEN] =
     [const { AtomicU8::new(0) }; ACTIVE_PUBLISH_MAX_LEN];
-static PENDING_SDF_READY: AtomicBool = AtomicBool::new(false);
-static PENDING_SDF_LEN: AtomicU16 = AtomicU16::new(0);
-static PENDING_SDF: [AtomicU8; PENDING_SDF_MAX_LEN] =
-    [const { AtomicU8::new(0) }; PENDING_SDF_MAX_LEN];
-/// Whether the one pending SDF is the common active-discovery Subscribe.
-/// Generic raw SDF injection clears this marker when it replaces the slot.
-static PENDING_SDF_ACTIVE_DISCOVERY: AtomicBool = AtomicBool::new(false);
+struct PendingSdf {
+    state: AtomicU8,
+    len: AtomicU16,
+    frame: [AtomicU8; PENDING_SDF_MAX_LEN],
+    count_active_discovery: AtomicBool,
+    remaining: AtomicU8,
+    next_send_ms: AtomicU32,
+}
+
+impl PendingSdf {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(PENDING_EMPTY),
+            len: AtomicU16::new(0),
+            frame: [const { AtomicU8::new(0) }; PENDING_SDF_MAX_LEN],
+            count_active_discovery: AtomicBool::new(false),
+            remaining: AtomicU8::new(0),
+            next_send_ms: AtomicU32::new(0),
+        }
+    }
+}
+
+static PENDING_SDFS: [PendingSdf; PENDING_SDF_CAPACITY] =
+    [const { PendingSdf::new() }; PENDING_SDF_CAPACITY];
+static PENDING_SDF_NEXT: AtomicUsize = AtomicUsize::new(0);
+static PENDING_SDF_QUEUED: AtomicU32 = AtomicU32::new(0);
+static PENDING_SDF_REJECTED: AtomicU32 = AtomicU32::new(0);
+static PENDING_SDF_TX_ATTEMPTED: AtomicU32 = AtomicU32::new(0);
+static PENDING_SDF_TX_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+static PENDING_SDF_COMPLETED: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_DISCOVERY_QUEUED: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_DISCOVERY_SENT: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_DISCOVERY_DROPPED: AtomicU32 = AtomicU32::new(0);
@@ -360,9 +380,32 @@ static ACTIVE_SUBSCRIBE_SDEA_INFO_LEN: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SUBSCRIBE_BSSID: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
 static LAST_SDF_SOURCE: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
 static LAST_SDF_SERVICE_ID: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+static LAST_SDF_FRAME_BYTES: AtomicU32 = AtomicU32::new(0);
+static SMALL_SDF_MAX_BYTES: AtomicU32 = AtomicU32::new(0);
+static SMALL_SDF_MAX_SOURCE: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+/// One semantic discovery request may be received in several management
+/// frames while Android keeps an active Subscribe open.  We still parse and
+/// account for every frame; this cache only suppresses construction of the
+/// same signed Follow-up response repeatedly within one sleepy cadence.
+static LAST_DISCOVERY_REPLY_PEER: [AtomicU8; 6] = [const { AtomicU8::new(0) }; 6];
+// ESP32-C6 lacks native atomics wider than one word. Request IDs are only a
+// four-second reply-dedup discriminator, so their low word is sufficient;
+// peer MAC and the short expiry are also part of the key.
+static LAST_DISCOVERY_REPLY_ID: AtomicU32 = AtomicU32::new(0);
+static LAST_DISCOVERY_REPLY_MS: AtomicU32 = AtomicU32::new(0);
+static DISCOVERY_REPLY_DUPLICATES_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
 /// Local elapsed time from the most recent selected NAN beacon to the last
 /// SDF. It records timing only, never service information or frame bytes.
 static LAST_SDF_AFTER_BEACON_US: AtomicU32 = AtomicU32::new(0);
+// Low 32-bit local timestamps are sufficient for one bounded wake window.
+// Main resets the deltas on every physical wake; the callback only performs
+// wrapping subtraction and atomic first-observation recording.
+static SLEEP_WAKE_US: AtomicU32 = AtomicU32::new(0);
+static FIRST_FRAME_AFTER_WAKE_US: AtomicU32 = AtomicU32::new(0);
+static FIRST_BEACON_AFTER_WAKE_US: AtomicU32 = AtomicU32::new(0);
+static CAPTURE_STARTED_US: AtomicU32 = AtomicU32::new(0);
+static CAPTURE_START_FRAMES: AtomicU32 = AtomicU32::new(0);
+static CAPTURE_START_BEACONS: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_SUBSCRIBES: AtomicU32 = AtomicU32::new(0);
 static SERVICE_INFO_ENQUEUED: AtomicU32 = AtomicU32::new(0);
 static SERVICE_INFO_DROPPED: AtomicU32 = AtomicU32::new(0);
@@ -557,7 +600,9 @@ pub fn discovery_facts() -> ([u8; 6], u16, u16) {
     let nodes = snapshots.iter().flatten().count().min(u16::MAX as usize) as u16;
     (
         selected_bssid(),
-        SERVICE_INFO_MATCHED.load(Ordering::Relaxed).min(u32::from(u16::MAX)) as u16,
+        SERVICE_INFO_MATCHED
+            .load(Ordering::Relaxed)
+            .min(u32::from(u16::MAX)) as u16,
         nodes,
     )
 }
@@ -988,52 +1033,86 @@ fn drain_active_publish() {
     }
 }
 
-/// Submit the one pending raw SDF only while the source's selected NAN DW is
-/// open. The existing one-shot NAN deadline calls this on capture entry; it
-/// adds neither a busy service tick nor callback-side Wi-Fi transmission.
-fn drain_pending_sdf() {
-    if !CAPTURING.load(Ordering::Acquire) || !PENDING_SDF_READY.load(Ordering::Acquire) {
+/// Submit every due raw SDF while the source's selected NAN DW is open. The
+/// existing one-shot NAN deadline calls this on capture entry; it adds neither
+/// a busy service tick nor callback-side Wi-Fi transmission.
+fn drain_pending_sdfs() {
+    if !CAPTURING.load(Ordering::Acquire) {
         return;
     }
-    let len = usize::from(PENDING_SDF_LEN.load(Ordering::Acquire)).min(PENDING_SDF_MAX_LEN);
-    if len < dmesh_rawnan::FRAME_DATA {
-        PENDING_SDF_READY.store(false, Ordering::Release);
-        return;
-    }
-    let mut frame = [0u8; PENDING_SDF_MAX_LEN];
-    for (index, byte) in frame[..len].iter_mut().enumerate() {
-        *byte = PENDING_SDF[index].load(Ordering::Relaxed);
-    }
-    let Some(destination) = frame.get(4..10).and_then(|bytes| bytes.try_into().ok()) else {
-        PENDING_SDF_READY.store(false, Ordering::Release);
-        return;
-    };
-    let Some(bssid) = frame
-        .get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6)
-        .and_then(|bytes| bytes.try_into().ok())
-    else {
-        PENDING_SDF_READY.store(false, Ordering::Release);
-        return;
-    };
-    let interface = if crate::wifi_esp::sta_associated() || !crate::wifi_esp::lab_open_ap_active() {
-        crate::wifi_esp::RadioInterface::Sta
-    } else {
-        crate::wifi_esp::RadioInterface::Ap
-    };
-    let active_discovery = PENDING_SDF_ACTIVE_DISCOVERY.load(Ordering::Acquire);
-    if transmit_public_action_from_dw(
-        interface,
-        destination,
-        bssid,
-        &frame[dmesh_rawnan::FRAME_DATA..len],
-    ) {
-        PENDING_SDF_READY.store(false, Ordering::Release);
-        PENDING_SDF_ACTIVE_DISCOVERY.store(false, Ordering::Release);
-        if active_discovery {
-            ACTIVE_DISCOVERY_SENT.fetch_add(1, Ordering::Relaxed);
+    let now = now_ms();
+    for slot in &PENDING_SDFS {
+        if slot.state.load(Ordering::Acquire) != PENDING_READY
+            || !due(now, slot.next_send_ms.load(Ordering::Acquire))
+            || slot
+                .state
+                .compare_exchange(
+                    PENDING_READY,
+                    PENDING_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            continue;
         }
-    } else if active_discovery {
-        ACTIVE_DISCOVERY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        let len = usize::from(slot.len.load(Ordering::Relaxed)).min(PENDING_SDF_MAX_LEN);
+        let mut frame = [0u8; PENDING_SDF_MAX_LEN];
+        for (index, byte) in frame[..len].iter_mut().enumerate() {
+            *byte = slot.frame[index].load(Ordering::Relaxed);
+        }
+        let destination = frame.get(4..10).and_then(|bytes| bytes.try_into().ok());
+        let bssid = frame
+            .get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6)
+            .and_then(|bytes| bytes.try_into().ok());
+        let valid = len >= dmesh_rawnan::FRAME_DATA && destination.is_some() && bssid.is_some();
+        if valid {
+            PENDING_SDF_TX_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+        }
+        let sent = if valid {
+            let interface =
+                if crate::wifi_esp::sta_associated() || !crate::wifi_esp::lab_open_ap_active() {
+                    crate::wifi_esp::RadioInterface::Sta
+                } else {
+                    crate::wifi_esp::RadioInterface::Ap
+                };
+            transmit_public_action_from_dw(
+                interface,
+                destination.unwrap(),
+                bssid.unwrap(),
+                &frame[dmesh_rawnan::FRAME_DATA..len],
+            )
+        } else {
+            false
+        };
+        if sent {
+            PENDING_SDF_TX_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        }
+        let remaining = slot.remaining.load(Ordering::Relaxed);
+        if remaining <= 1 || slot.next_send_ms.load(Ordering::Relaxed) == 0 {
+            crate::commands::send_stats(&[
+                (b"nan SDF tx frame_bytes", len as u64),
+                (b"nan SDF tx remaining", u64::from(remaining)),
+                (b"nan SDF tx accepted", u64::from(sent)),
+            ]);
+        }
+        if slot.count_active_discovery.load(Ordering::Relaxed) {
+            if sent {
+                ACTIVE_DISCOVERY_SENT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                ACTIVE_DISCOVERY_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !valid || remaining <= 1 {
+            slot.remaining.store(0, Ordering::Relaxed);
+            slot.state.store(PENDING_EMPTY, Ordering::Release);
+            PENDING_SDF_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            slot.remaining.store(remaining - 1, Ordering::Relaxed);
+            slot.next_send_ms
+                .store(now.wrapping_add(NAN_DW_PERIOD_MS), Ordering::Relaxed);
+            slot.state.store(PENDING_READY, Ordering::Release);
+        }
     }
 }
 
@@ -1128,6 +1207,35 @@ pub fn sync_diagnostics() -> ([u8; 6], u64, bool) {
     )
 }
 
+/// Arm per-window receive readiness measurements immediately after the CPU
+/// returns from explicit light sleep and before Wi-Fi reconstruction begins.
+pub fn mark_sleep_wake(woke_us: u64) {
+    SLEEP_WAKE_US.store(woke_us as u32, Ordering::Release);
+    FIRST_FRAME_AFTER_WAKE_US.store(0, Ordering::Release);
+    FIRST_BEACON_AFTER_WAKE_US.store(0, Ordering::Release);
+}
+
+/// `(first management frame after wake, first NAN beacon after wake)` in us.
+pub fn sleep_wake_receive_diagnostics() -> (u32, u32) {
+    (
+        FIRST_FRAME_AFTER_WAKE_US.load(Ordering::Acquire),
+        FIRST_BEACON_AFTER_WAKE_US.load(Ordering::Acquire),
+    )
+}
+
+/// Scheduler state sampled by Main immediately after a sleepy radio resume.
+/// This is diagnostic only and does not advance or re-arm the capture owner.
+pub fn sleep_wake_scheduler_diagnostics() -> (bool, bool, bool, bool, u32, u32) {
+    (
+        STARTED.load(Ordering::Acquire),
+        NAN_CAPTURE_SUSPENDED.load(Ordering::Acquire),
+        CAPTURING.load(Ordering::Acquire),
+        NOW_ACTIVE_RECEIVE.load(Ordering::Acquire),
+        NEXT_MS.load(Ordering::Acquire),
+        next_service_delay_ms().unwrap_or(u32::MAX),
+    )
+}
+
 fn due(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) < (1 << 31)
 }
@@ -1185,6 +1293,24 @@ pub fn stats() -> (
         SERVICE_INFO_DROPPED.load(Ordering::Relaxed),
         SERVICE_INFO_DISPATCHED.load(Ordering::Relaxed),
         LAST_SDF_AFTER_BEACON_US.load(Ordering::Relaxed),
+    )
+}
+
+/// Callback-safe raw SDF ingress evidence. This intentionally reports the
+/// frame before Service Info parsing so malformed/unsupported NAN encoding is
+/// distinguishable from an RF miss.
+pub fn last_sdf_ingress() -> (u32, u64, u32, u64) {
+    let mut source = [0u8; 8];
+    let mut small_source = [0u8; 8];
+    for (index, byte) in source[..6].iter_mut().enumerate() {
+        *byte = LAST_SDF_SOURCE[index].load(Ordering::Relaxed);
+        small_source[index] = SMALL_SDF_MAX_SOURCE[index].load(Ordering::Relaxed);
+    }
+    (
+        LAST_SDF_FRAME_BYTES.load(Ordering::Relaxed),
+        u64::from_le_bytes(source),
+        SMALL_SDF_MAX_BYTES.load(Ordering::Relaxed),
+        u64::from_le_bytes(small_source),
     )
 }
 
@@ -1299,14 +1425,14 @@ pub fn set_service_info_handler(handler: Option<NanServiceInfoHandler>) {
 /// Queue one active-Subscribe SDF for the next local discovery window.
 ///
 /// This is called by the raw-radio control adapter from normal worker
-/// context. The frame must name the cluster already selected by this radio;
-/// a repeated idempotent request replaces the one pending frame, preserving
-/// a fixed one-frame memory bound.
+/// context. The frame must name the cluster already selected by this radio.
+/// Each accepted request retains its own bounded intent; capacity exhaustion
+/// is reported to the caller and never replaces already accepted work.
 pub fn queue_sdf_frame(frame: &[u8]) -> bool {
-    queue_sdf_frame_kind(frame, false)
+    queue_sdf_frame_kind(frame, false, 1)
 }
 
-fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool) -> bool {
+fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool, attempts: u8) -> bool {
     if !dmesh_rawnan::is_nan_sdf(frame)
         || frame.len() > PENDING_SDF_MAX_LEN
         || frame.len() < dmesh_rawnan::FRAME_BSSID + 6
@@ -1315,20 +1441,51 @@ fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool) -> bool {
     {
         return false;
     }
-    for (index, byte) in frame.iter().enumerate() {
-        PENDING_SDF[index].store(*byte, Ordering::Relaxed);
+    let mut selected = None;
+    for _ in 0..PENDING_SDF_CAPACITY {
+        let index = PENDING_SDF_NEXT.fetch_add(1, Ordering::Relaxed) % PENDING_SDF_CAPACITY;
+        let slot = &PENDING_SDFS[index];
+        if slot
+            .state
+            .compare_exchange(
+                PENDING_EMPTY,
+                PENDING_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            selected = Some(slot);
+            break;
+        }
     }
-    PENDING_SDF_LEN.store(frame.len() as u16, Ordering::Release);
-    PENDING_SDF_ACTIVE_DISCOVERY.store(active_discovery, Ordering::Release);
-    PENDING_SDF_READY.store(true, Ordering::Release);
+    let Some(slot) = selected else {
+        PENDING_SDF_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    for (index, byte) in frame.iter().enumerate() {
+        slot.frame[index].store(*byte, Ordering::Relaxed);
+    }
+    slot.len.store(frame.len() as u16, Ordering::Relaxed);
+    slot.count_active_discovery
+        .store(active_discovery, Ordering::Relaxed);
+    slot.remaining.store(attempts.max(1), Ordering::Relaxed);
+    slot.next_send_ms.store(0, Ordering::Relaxed);
+    slot.state.store(PENDING_READY, Ordering::Release);
+    PENDING_SDF_QUEUED.fetch_add(1, Ordering::Relaxed);
     // This direct control request runs on Main's normal worker, never a Wi-Fi
     // callback.  If the selected DW is already open, submit it now through
     // the same capture-yield helper used by the deadline.  Otherwise the
     // pending flag is consumed at the next one-shot DW timer; no periodic
     // poll is introduced merely to service a newly queued SDF.
     if CAPTURING.load(Ordering::Acquire) {
-        drain_pending_sdf();
+        drain_pending_sdfs();
     }
+    // A continuously active NAN/NOW owner otherwise has no periodic service
+    // deadline.  Re-arm Main after queueing (and after an immediate first
+    // send) so the remaining bounded repetitions are driven by their actual
+    // SDF deadline instead of depending on unrelated radio activity.
+    crate::main_runtime::request_deadline_recheck();
     true
 }
 
@@ -1336,8 +1493,8 @@ fn queue_sdf_frame_kind(frame: &[u8], active_discovery: bool) -> bool {
 ///
 /// Unlike an active Publish, a Subscribe asks an otherwise sleepy DMesh peer
 /// to answer with its current signed announce.  The caller is Main's event
-/// owner; this function only prepares the one bounded SDF for the next DW and
-/// never scans, opens a radio task, or transmits off-window.
+/// owner; this function prepares one independently retained SDF intent for a
+/// future DW and never scans, opens a radio task, or transmits off-window.
 pub fn queue_active_discovery() -> bool {
     if !active_on_nan_channel() {
         return false;
@@ -1369,7 +1526,7 @@ pub fn queue_active_discovery() -> bool {
         0x11,
         &request[..used],
     );
-    let queued = queue_sdf_frame_kind(&frame, true);
+    let queued = queue_sdf_frame_kind(&frame, true, 1);
     if queued {
         ACTIVE_DISCOVERY_QUEUED.fetch_add(1, Ordering::Relaxed);
     }
@@ -1416,7 +1573,10 @@ pub fn queue_nan_wakeup(target: [u8; 6]) -> bool {
         0x11,
         &record[..used],
     );
-    queue_sdf_frame_kind(&frame, true)
+    // Cover more than one complete DW8 cadence while retaining one bounded
+    // *semantic intent*. Each received frame remains independently parsed;
+    // this fixed management-action burst is never an idle poll.
+    queue_sdf_frame_kind(&frame, false, NAN_WAKE_BURST_WINDOWS)
 }
 
 /// `(queued, sent, dropped)` active-discovery Subscribe evidence.  `sent`
@@ -1430,7 +1590,70 @@ pub fn active_discovery_stats() -> (u32, u32, u32) {
     )
 }
 
+/// Admit at most one directed-discovery Follow-up for the same peer and
+/// request ID during one full DW8 interval. This does not suppress frame
+/// receive, parsing, observation, or direct-request validation: callers run
+/// it only after the complete SDF has reached Main and a return Follow-up is
+/// otherwise ready to submit.
+pub fn admit_discovery_reply(peer: [u8; 6], request_id: u64) -> bool {
+    let now = now_ms();
+    let request_id = request_id as u32;
+    let same_peer = LAST_DISCOVERY_REPLY_PEER
+        .iter()
+        .enumerate()
+        .all(|(index, value)| value.load(Ordering::Acquire) == peer[index]);
+    let last_ms = LAST_DISCOVERY_REPLY_MS.load(Ordering::Acquire);
+    let still_fresh = now.wrapping_sub(last_ms) < NAN_DW_PERIOD_MS.saturating_mul(8);
+    if same_peer && LAST_DISCOVERY_REPLY_ID.load(Ordering::Acquire) == request_id && still_fresh {
+        DISCOVERY_REPLY_DUPLICATES_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    for (index, byte) in peer.iter().enumerate() {
+        LAST_DISCOVERY_REPLY_PEER[index].store(*byte, Ordering::Release);
+    }
+    LAST_DISCOVERY_REPLY_ID.store(request_id, Ordering::Release);
+    LAST_DISCOVERY_REPLY_MS.store(now, Ordering::Release);
+    true
+}
+
+/// Number of parsed direct-discovery frames whose already-cached Follow-up
+/// response was intentionally not transmitted again.
+pub fn duplicate_discovery_replies_suppressed() -> u32 {
+    DISCOVERY_REPLY_DUPLICATES_SUPPRESSED.load(Ordering::Relaxed)
+}
+
+/// `(queued, rejected, tx_attempted, tx_accepted, completed, pending)` for
+/// independently retained NAN SDF intents. A request is rejected only before
+/// admission when every fixed semantic-intent slot is busy; accepted work is
+/// never replaced by later discovery or wake requests.
+pub fn pending_sdf_stats() -> (u32, u32, u32, u32, u32, u8) {
+    let pending = PENDING_SDFS
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) == PENDING_READY)
+        .count() as u8;
+    (
+        PENDING_SDF_QUEUED.load(Ordering::Relaxed),
+        PENDING_SDF_REJECTED.load(Ordering::Relaxed),
+        PENDING_SDF_TX_ATTEMPTED.load(Ordering::Relaxed),
+        PENDING_SDF_TX_ACCEPTED.load(Ordering::Relaxed),
+        PENDING_SDF_COMPLETED.load(Ordering::Relaxed),
+        pending,
+    )
+}
+
 fn dispatch_service_info(item: crate::shared_ingress_esp::IngressPacket, payload: &[u8]) {
+    // This is intentionally separate from SDF parsing and control admission:
+    // it proves the raw callback copied a matching Service Info payload and
+    // the deferred worker is about to hand it to Main.  The downstream log
+    // then identifies a target mismatch or direct-record rejection.
+    let peer = item.source();
+    crate::commands::send_stats(&[
+        (
+            b"nan SD received peer_le",
+            u64::from_le_bytes([peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0]),
+        ),
+        (b"nan SD received bytes", payload.len() as u64),
+    ]);
     let handler = SERVICE_INFO_HANDLER.load(Ordering::Acquire);
     if handler != 0 {
         SERVICE_INFO_DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1578,9 +1801,9 @@ pub fn next_capture_start_us(not_before_us: u64) -> Option<u64> {
 /// `next_capture_start_us` directly here would wake it for the very next
 /// base DW (often a few hundred milliseconds later) and destroy the intended
 /// duty cycle.
-pub fn next_sleepy_capture_start_us(after_us: u64) -> Option<u64> {
+pub fn next_sleepy_capture_start_us(after_us: u64, interval: u8) -> Option<u64> {
     next_capture_start_us(after_us).map(|first| {
-        let skipped_windows = u64::from(DW_INTERVAL.load(Ordering::Acquire).max(1) - 1);
+        let skipped_windows = u64::from(interval.max(1) - 1);
         first.saturating_add(skipped_windows * 512 * 1_024)
     })
 }
@@ -1589,6 +1812,41 @@ pub fn next_sleepy_capture_start_us(after_us: u64) -> Option<u64> {
 /// and a small post-window tail before Main may enter the next timer sleep.
 pub const fn sleepy_dw_pair_hold_us() -> u64 {
     ((NAN_DW_CAPTURE_MS + NOW_DW_CAPTURE_MS + SLEEPY_DW_PAIR_TAIL_MS) as u64) * 1_000
+}
+
+/// Open receive immediately after a sleepy radio reconstruction and retain it
+/// through the selected NAN+NOW pair. The wake lead is already paid active
+/// time; listening during it lets a drifting local anchor observe the real
+/// beacon instead of idling until a potentially stale narrow deadline.
+pub fn begin_sleepy_resume_capture(until_us: u64) -> bool {
+    if !STARTED.load(Ordering::Acquire) || NAN_CAPTURE_SUSPENDED.load(Ordering::Acquire) {
+        return false;
+    }
+    let _ = crate::wifi_esp::set_nan_dw_power_save(false);
+    if !CAPTURING.load(Ordering::Acquire) && !crate::wifi_esp::set_promiscuous(true) {
+        let _ = crate::wifi_esp::set_nan_dw_power_save(true);
+        return false;
+    }
+    let started_us = now_us();
+    CAPTURE_STARTED_US.store(started_us as u32, Ordering::Release);
+    CAPTURE_START_FRAMES.store(FRAMES.load(Ordering::Acquire), Ordering::Release);
+    CAPTURE_START_BEACONS.store(BEACONS.load(Ordering::Acquire), Ordering::Release);
+    CAPTURING.store(true, Ordering::Release);
+    // This one lease already spans both adjacent windows; its terminal
+    // deadline must close receive rather than adding another NOW interval.
+    SLEEPY_DW_PAIR_SECOND.store(true, Ordering::Release);
+    UNTIL_MS.store(
+        (until_us / 1_000).min(u64::from(u32::MAX)) as u32,
+        Ordering::Release,
+    );
+    crate::commands::send_stats(&[
+        (
+            b"nan resume capture_us",
+            until_us.saturating_sub(started_us),
+        ),
+        (b"nan resume capture_until_us", until_us),
+    ]);
+    true
 }
 
 /// Extend the existing NAN management receive window for one explicit
@@ -1834,7 +2092,14 @@ pub fn prepare_light_sleep_resume() {
 /// a 64 ms NAN capture window makes NOW bootstrap probabilistic.  Sleepy DW8
 /// profiles pass `false` and retain their normal bounded discovery windows.
 pub fn set_active_now_receive(enabled: bool) -> bool {
-    NOW_ACTIVE_RECEIVE.store(enabled, Ordering::Release);
+    let was_enabled = NOW_ACTIVE_RECEIVE.swap(enabled, Ordering::AcqRel);
+    // Applying an already-disabled NOW policy after `start()` must not replace
+    // the phase-locked NAN deadline which start restored from the retained
+    // cluster anchor.  Only a real enabled -> disabled transition owns the
+    // receive teardown and its fallback cadence.
+    if !enabled && !was_enabled {
+        return true;
+    }
     if !STARTED.load(Ordering::Acquire) || crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
         return !enabled;
     }
@@ -1938,9 +2203,7 @@ pub fn service_deadline() {
         && now_us().saturating_sub(anchor_us) >= NAN_CLUSTER_MISSED_BEACON_US
     {
         clear_cluster_selection();
-        if !CAPTURING.load(Ordering::Acquire)
-            && crate::wifi_esp::set_promiscuous(true)
-        {
+        if !CAPTURING.load(Ordering::Acquire) && crate::wifi_esp::set_promiscuous(true) {
             CAPTURING.store(true, Ordering::Release);
             ACQUIRING.store(true, Ordering::Release);
             UNTIL_MS.store(now.wrapping_add(NAN_INITIAL_ACQUIRE_MS), Ordering::Release);
@@ -1962,7 +2225,7 @@ pub fn service_deadline() {
         NEXT_MS.store(now.wrapping_add(NAN_INITIAL_ACQUIRE_MS), Ordering::Release);
         drain_pending_followup_responses();
         drain_active_publish();
-        drain_pending_sdf();
+        drain_pending_sdfs();
         return;
     }
     // A direct one-shot ROC request may have been made between periodic
@@ -1981,7 +2244,7 @@ pub fn service_deadline() {
         }
         drain_pending_followup_responses();
         drain_active_publish();
-        drain_pending_sdf();
+        drain_pending_sdfs();
         return;
     }
     // An explicit raw-NOW association temporarily extends the same receive
@@ -1994,7 +2257,7 @@ pub fn service_deadline() {
         }
         drain_pending_followup_responses();
         drain_active_publish();
-        drain_pending_sdf();
+        drain_pending_sdfs();
         return;
     }
     let service_until = NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire);
@@ -2005,7 +2268,7 @@ pub fn service_deadline() {
             }
             drain_pending_followup_responses();
             drain_active_publish();
-            drain_pending_sdf();
+            drain_pending_sdfs();
             return;
         }
         // The responder received no traffic before its explicit lease
@@ -2040,7 +2303,7 @@ pub fn service_deadline() {
     if CAPTURING.load(Ordering::Acquire) {
         drain_pending_followup_responses();
         drain_active_publish();
-        drain_pending_sdf();
+        drain_pending_sdfs();
         if due(now, UNTIL_MS.load(Ordering::Relaxed)) {
             if SLEEPY_DW_PAIR.load(Ordering::Acquire)
                 && !SLEEPY_DW_PAIR_SECOND.swap(true, Ordering::AcqRel)
@@ -2048,12 +2311,38 @@ pub fn service_deadline() {
                 // Do not toggle promiscuous RX between the paired windows:
                 // the NOW window begins exactly as the NAN DW ends.
                 UNTIL_MS.store(now.wrapping_add(NOW_DW_CAPTURE_MS), Ordering::Release);
-                log_dw8_boundary(b"now DW start: paired capture retained");
+                crate::commands::send_response(b"now DW start: paired capture retained");
                 return;
             }
             let _ = crate::wifi_esp::set_promiscuous(false);
+            // The paired receive span is complete. Return the unassociated
+            // NAN driver to modem power-save while Main waits for the next
+            // phase-locked deadline.
+            let _ = crate::wifi_esp::set_nan_dw_power_save(true);
             CAPTURING.store(false, Ordering::Release);
-            log_dw8_boundary(b"nan DW end: capture released");
+            let capture_started_us = CAPTURE_STARTED_US.swap(0, Ordering::AcqRel);
+            crate::commands::send_stats(&[
+                (
+                    b"nan DW end elapsed_us",
+                    u64::from((now_us() as u32).wrapping_sub(capture_started_us)),
+                ),
+                (
+                    b"nan DW end frames",
+                    u64::from(
+                        FRAMES
+                            .load(Ordering::Acquire)
+                            .wrapping_sub(CAPTURE_START_FRAMES.load(Ordering::Acquire)),
+                    ),
+                ),
+                (
+                    b"nan DW end beacons",
+                    u64::from(
+                        BEACONS
+                            .load(Ordering::Acquire)
+                            .wrapping_sub(CAPTURE_START_BEACONS.load(Ordering::Acquire)),
+                    ),
+                ),
+            ]);
             if ACQUIRING.swap(false, Ordering::AcqRel) {
                 NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Release);
             }
@@ -2063,15 +2352,32 @@ pub fn service_deadline() {
     if !due(now, NEXT_MS.load(Ordering::Relaxed)) {
         return;
     }
+    // Promiscuous NAN/NOW receive must not be deferred by modem power save.
+    // This owner-side change is paired with the restore after the DW pair.
+    let _ = crate::wifi_esp::set_nan_dw_power_save(false);
     if crate::wifi_esp::set_promiscuous(true) {
+        CAPTURE_STARTED_US.store(now_us() as u32, Ordering::Release);
+        CAPTURE_START_FRAMES.store(FRAMES.load(Ordering::Acquire), Ordering::Release);
+        CAPTURE_START_BEACONS.store(BEACONS.load(Ordering::Acquire), Ordering::Release);
         CAPTURING.store(true, Ordering::Release);
         SLEEPY_DW_PAIR_SECOND.store(false, Ordering::Release);
         UNTIL_MS.store(now.wrapping_add(NAN_DW_CAPTURE_MS), Ordering::Relaxed);
         NEXT_MS.store(now.wrapping_add(dw_period_ms()), Ordering::Relaxed);
-        log_dw8_boundary(b"nan DW start: capture armed");
         drain_pending_followup_responses();
         drain_active_publish();
-        drain_pending_sdf();
+        drain_pending_sdfs();
+        let cluster = selected_bssid();
+        crate::commands::send_stats(&[
+            (b"nan DW start interval", u64::from(interval())),
+            (
+                b"nan DW start cluster_le",
+                u64::from_le_bytes([
+                    cluster[0], cluster[1], cluster[2], cluster[3], cluster[4], cluster[5], 0, 0,
+                ]),
+            ),
+        ]);
+    } else {
+        let _ = crate::wifi_esp::set_nan_dw_power_save(true);
     }
 }
 
@@ -2094,12 +2400,21 @@ pub fn next_service_delay_ms() -> Option<u32> {
     if crate::wifi_nonpromisc_probe_esp::roc_in_flight() {
         return None;
     }
-    // The active NOW receive owner is normally event-driven. A fresh NAN
-    // announce is the one bounded exception: service it once per DW while
-    // its eight-window burst remains, then immediately return to `None`.
-    // This is a correlated discovery response, not an idle capture tick.
+    let now = now_ms();
+    // The active NOW receive owner is normally event-driven. Fresh NAN
+    // announces and explicitly queued SDFs are bounded exceptions. In
+    // particular, a targeted wake is repeated across discovery windows and
+    // must not rely on an unrelated event to service attempts after the
+    // immediate first transmission.
     if NOW_ACTIVE_RECEIVE.load(Ordering::Acquire) {
-        return (ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire) != 0).then_some(dw_period_ms());
+        let publish =
+            (ACTIVE_PUBLISH_REMAINING.load(Ordering::Acquire) != 0).then_some(dw_period_ms());
+        let pending_sdf = pending_sdf_delay_ms(now);
+        return match (publish, pending_sdf) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(delay), None) | (None, Some(delay)) => Some(delay),
+            (None, None) => None,
+        };
     }
     // The active NOW client owns its own exact retry/PTO deadline in Main.
     // Returning `None` here prevents a second synthetic timer wake while the
@@ -2107,7 +2422,6 @@ pub fn next_service_delay_ms() -> Option<u32> {
     if NOW_CLIENT_RECEIVE_LEASE.load(Ordering::Acquire) {
         return None;
     }
-    let now = now_ms();
     let service_until = NOW_SERVICE_RECEIVE_UNTIL_MS.load(Ordering::Acquire);
     if service_until != 0 {
         let remaining = service_until.wrapping_sub(now);
@@ -2128,6 +2442,26 @@ pub fn next_service_delay_ms() -> Option<u32> {
     } else {
         remaining.max(1)
     })
+}
+
+fn pending_sdf_delay_ms(now: u32) -> Option<u32> {
+    PENDING_SDFS
+        .iter()
+        .filter(|slot| slot.state.load(Ordering::Acquire) == PENDING_READY)
+        .map(|slot| {
+            let deadline = slot.next_send_ms.load(Ordering::Acquire);
+            if deadline == 0 {
+                1
+            } else {
+                let remaining = deadline.wrapping_sub(now);
+                if remaining > 0x8000_0000 {
+                    1
+                } else {
+                    remaining.max(1)
+                }
+            }
+        })
+        .min()
 }
 
 fn dw_period_ms() -> u32 {
@@ -2154,6 +2488,17 @@ unsafe extern "C" fn callback(
 }
 
 fn receive_management_frame(frame: &[u8]) {
+    let received_us = now_us() as u32;
+    let woke_us = SLEEP_WAKE_US.load(Ordering::Acquire);
+    if woke_us != 0 {
+        let delta = received_us.wrapping_sub(woke_us).max(1);
+        let _ = FIRST_FRAME_AFTER_WAKE_US.compare_exchange(
+            0,
+            delta,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
     FRAMES.fetch_add(1, Ordering::Relaxed);
     BYTES.fetch_add(frame.len().min(u32::MAX as usize) as u32, Ordering::Relaxed);
     // Promiscuous capture is enabled only for the scheduled NAN DW and its
@@ -2167,6 +2512,15 @@ fn receive_management_frame(frame: &[u8]) {
     }
     if dmesh_rawnan::is_nan_beacon(frame) {
         BEACONS.fetch_add(1, Ordering::Relaxed);
+        if woke_us != 0 {
+            let delta = received_us.wrapping_sub(woke_us).max(1);
+            let _ = FIRST_BEACON_AFTER_WAKE_US.compare_exchange(
+                0,
+                delta,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
         if let Some(bssid) = frame.get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6) {
             let selected = selected_bssid();
             let received_us = now_us();
@@ -2195,9 +2549,8 @@ fn receive_management_frame(frame: &[u8]) {
                 select_cluster_bssid(bssid);
             }
             if bssid_is_unset(selected) || bssid == selected || replace_stale_cluster {
-                // Store the local receive point, not the beacon TSF. TSF
-                // is cluster-wide but local receive time schedules this
-                // adapter's radio window for the selected cluster.
+                // Store the local receive point. The selected beacon is the
+                // local-clock anchor for subsequent fixed-interval DWs.
                 store_sync_anchor_us(received_us);
                 SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
                 FILTER_PENDING.store(true, Ordering::Release);
@@ -2223,19 +2576,24 @@ fn receive_nan_action(frame: &[u8]) {
             // in the current discovery window. Use it only to seed an empty
             // cluster; ordinary beacon reception remains the authoritative
             // refresh/reselection path above.
-            if bssid_is_unset(selected_bssid())
-                && dmesh_rawnan::service_descriptors(frame)
-                    .into_iter()
-                    .any(|item| item.service_id == dmesh_rawnan::DMESH_SERVICE_ID)
-            {
+            let dmesh_sdf = dmesh_rawnan::service_descriptors(frame)
+                .into_iter()
+                .any(|item| item.service_id == dmesh_rawnan::DMESH_SERVICE_ID);
+            if dmesh_sdf {
                 if let Some(bssid) =
                     frame.get(dmesh_rawnan::FRAME_BSSID..dmesh_rawnan::FRAME_BSSID + 6)
                 {
-                    select_cluster_bssid(bssid);
-                    store_sync_anchor_us(now_us());
-                    SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
-                    FILTER_PENDING.store(true, Ordering::Release);
-                    crate::main_runtime::request_deadline_recheck();
+                    let selected = selected_bssid();
+                    // An SDF proves the cluster is visible, but contention
+                    // gives it an arbitrary offset inside the DW. Never move
+                    // the beacon-derived local clock anchor to an SDF arrival;
+                    // doing so can shift the next 24 ms receive window past
+                    // the actual beacon.
+                    if bssid_is_unset(selected) {
+                        select_cluster_bssid(bssid);
+                        FILTER_PENDING.store(true, Ordering::Release);
+                        crate::main_runtime::request_deadline_recheck();
+                    }
                 }
             }
             let last_beacon_us = {
@@ -2253,6 +2611,20 @@ fn receive_nan_action(frame: &[u8]) {
             else {
                 return;
             };
+            LAST_SDF_FRAME_BYTES
+                .store(frame.len().min(u32::MAX as usize) as u32, Ordering::Relaxed);
+            let frame_len = frame.len().min(u32::MAX as usize) as u32;
+            if frame_len <= 128
+                && SMALL_SDF_MAX_BYTES
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        (frame_len > current).then_some(frame_len)
+                    })
+                    .is_ok()
+            {
+                for (index, byte) in source.iter().enumerate() {
+                    SMALL_SDF_MAX_SOURCE[index].store(*byte, Ordering::Release);
+                }
+            }
             let bssid: [u8; 6] = frame
                 .get(16..22)
                 .and_then(|value| value.try_into().ok())
@@ -2277,23 +2649,38 @@ fn receive_nan_action(frame: &[u8]) {
                         item.service_id == dmesh_rawnan::DMESH_SERVICE_ID
                             && matches!(item.descriptor.control, 0x10..=0x12)
                     });
-            let mut service_payload = None;
+            // A single public-action frame may contain several DMesh Service
+            // Descriptors.  They are independent records: do not collapse the
+            // receive path to the final descriptor merely because the common
+            // worker is bounded.  `enqueue` copies each accepted payload and
+            // reports a real pool-full drop, so Main can validate/handle every
+            // on-air control record in its normal order.
+            let mut descriptor_payload_seen = false;
             for descriptor in dmesh_rawnan::service_descriptors(frame) {
                 if descriptor.service_id != dmesh_rawnan::DMESH_SERVICE_ID {
                     continue;
                 }
-                // Prefer the last current descriptor when a transitional peer
-                // emits more than one descriptor for the same service. This
-                // is NAN framing policy; payload classification stays above
-                // the adapter.
-                service_payload = Some(descriptor.descriptor.payload);
+                let descriptor_payload = descriptor.descriptor.payload;
                 let kind = match descriptor.descriptor.control & 0x03 {
                     0 => NAN_OBSERVATION_ACTIVE_PUBLISH,
                     1 => NAN_OBSERVATION_ACTIVE_SUBSCRIBE,
                     2 => NAN_OBSERVATION_FOLLOWUP,
                     _ => NAN_OBSERVATION_OTHER,
                 };
-                record_nan_device_observation(source, bssid, kind, descriptor.descriptor.payload);
+                record_nan_device_observation(source, bssid, kind, descriptor_payload);
+                if !descriptor_payload.is_empty() {
+                    descriptor_payload_seen = true;
+                    SERVICE_INFO_MATCHED.fetch_add(1, Ordering::Relaxed);
+                    if crate::shared_ingress_esp::enqueue(
+                        crate::shared_ingress_esp::IngressKind::NanServiceInfo,
+                        source,
+                        descriptor_payload,
+                    ) {
+                        SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             let active_subscribe =
                 dmesh_rawnan::active_subscribe_service_info(frame, dmesh_rawnan::DMESH_SERVICE_ID);
@@ -2311,10 +2698,45 @@ fn receive_nan_action(frame: &[u8]) {
                     ACTIVE_SUBSCRIBE_SDEA_MISSES.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            let payload = active_subscribe
+            // Active-Subscribe Service Info lives in the matching SDEA, not
+            // necessarily in the descriptor payload. It is another received
+            // control record and therefore gets its own ingress submission.
+            // Keep it distinct from descriptor payloads rather than selecting
+            // a single "preferred" frame field.
+            let active_service_info = active_subscribe
                 .map(|item| item.service_info)
-                .or(service_payload);
-            if let Some(payload) = payload {
+                .filter(|payload| !payload.is_empty());
+            // Android's public Wi-Fi Aware API cannot put our arbitrary
+            // control CBOR in an active-Subscribe SDEA reliably. It first
+            // sends an empty Subscribe to obtain a framework PeerHandle, then
+            // sends the target-checked wake record as a Follow-up. Answer the
+            // empty DMesh Subscribe with the same bounded directed-discovery
+            // request used by every other bearer so Main returns its signed
+            // announce through the existing NAN Follow-up path. This is not a
+            // new control grammar and does not promote the ESP by itself.
+            if active_descriptor && !descriptor_payload_seen && active_service_info.is_none() {
+                let (instance, requestor_instance) = active_subscribe
+                    .map(|item| (item.instance, item.requestor_instance))
+                    .unwrap_or((1, 0));
+                ACTIVE_SUBSCRIBES.fetch_add(1, Ordering::Relaxed);
+                mark_active_subscribe(source, instance, requestor_instance);
+                let mut request = [0u8; 96];
+                let queued = dmesh_server::announce::encode_discovery_request(0, &mut request)
+                    .is_some_and(|used| {
+                        crate::shared_ingress_esp::enqueue(
+                            crate::shared_ingress_esp::IngressKind::NanServiceInfo,
+                            source,
+                            &request[..used],
+                        )
+                    });
+                if queued {
+                    SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+            if let Some(payload) = active_service_info {
                 SERVICE_INFO_MATCHED.fetch_add(1, Ordering::Relaxed);
                 // Preserve only NAN transaction metadata here. Shared direct
                 // policy decides whether this payload is discovery,
@@ -2353,6 +2775,42 @@ fn receive_nan_action(frame: &[u8]) {
                     record_nan_device_observation(source, bssid, NAN_OBSERVATION_FOLLOWUP, payload);
                 }
                 if let Some(followup) = dmesh_rawnan::parse_dmesh_nan_followup(payload) {
+                    // Directed discovery returns the signed announce inside
+                    // the DMesh Follow-up envelope. It has a correlation
+                    // `to` field, so the presence-only `decode_announce`
+                    // helper intentionally rejects it. Retain only the
+                    // compact identity/MAC correlation in the bounded cache;
+                    // this lets a VIP-selected sleepy target be addressed by
+                    // a controller's active Subscribe.
+                    if let Some(source) = source {
+                        if let Some(announce) = dmesh_server::tagged::decode(followup.payload)
+                            .and_then(dmesh_server::announce::decode_record)
+                        {
+                            crate::wifi_raw_udp6_esp::record_connectionless_announce(
+                                announce, source,
+                            );
+                        }
+                    }
+                    // A targeted Android `nan.wakeup` carries the common
+                    // direct `transport.set` record in this Follow-up.  The
+                    // former path retained it only for observation, which
+                    // meant the target could see a valid Follow-up but could
+                    // never execute the requested STA activation. Copy every
+                    // valid DMesh Follow-up payload into the same bounded
+                    // Main dispatcher used by SDF Service Info. Main still
+                    // classifies the tagged record and the wake target before
+                    // changing a profile; reception alone has no side effect.
+                    if let Some(source) = source {
+                        if crate::shared_ingress_esp::enqueue(
+                            crate::shared_ingress_esp::IngressKind::NanServiceInfo,
+                            source,
+                            followup.payload,
+                        ) {
+                            SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            SERVICE_INFO_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     record_followup(followup);
                 }
             }

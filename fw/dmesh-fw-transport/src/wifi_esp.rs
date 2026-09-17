@@ -1088,7 +1088,16 @@ pub fn init_nan_now(
             leave_radio_mode(RadioMode::StaRawUdp6);
             return false;
         }
-        let _ = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+        // An unassociated sleepy NAN profile has no infrastructure DTIM to
+        // serve. Keep modem power-save enabled between explicitly armed DW
+        // captures; the capture owner temporarily disables it while the
+        // radio must receive management actions.
+        let power_save = params.now == 2 && params.ap == 0;
+        let _ = esp_idf_sys::esp_wifi_set_ps(if power_save {
+            esp_idf_sys::wifi_ps_type_t_WIFI_PS_MAX_MODEM
+        } else {
+            esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE
+        });
         if params.ap == 1 {
             // APSTA selects its configured channel as it starts. Read the
             // live value instead of calling `set_channel` after start, which
@@ -1122,6 +1131,103 @@ pub fn init_nan_now(
         b"wifi NAN/NOW start failed"
     });
     enabled
+}
+
+/// Restore the classic ESP32 sleepy NAN/NOW radio after explicit light sleep.
+///
+/// Unlike `init_nan_now`, this path owns no IP STA and therefore does not
+/// create an esp-netif, register association handlers, disconnect, or wait for
+/// an association transition.  The first prototype used this exact lifecycle:
+/// fully deinitialize classic ESP32 before sleep, then rebuild only the raw
+/// STA radio, pin its channel, and attach the NAN/NOW callbacks.
+pub fn resume_sleepy_nan_now(
+    params: &TransportProfile,
+    handler: crate::wifi_espnow_esp::EspNowHandler,
+) -> bool {
+    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+    {
+        return init_nan_now(params, handler);
+    }
+
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    unsafe {
+        let started_us = esp_idf_sys::esp_timer_get_time();
+        LAB_FORCE_UNASSOCIATED.store(true, Ordering::Release);
+        if !enter_radio_mode(RadioMode::StaRawUdp6) || !initialize_phy_nvs() {
+            return false;
+        }
+
+        STA_AMPDU_ENABLED.store(params.sta_ampdu_enabled, Ordering::Release);
+        STA_11B_RATES_DISABLED.store(params.sta_11b_rates_disabled, Ordering::Release);
+        let mut init = wifi_init_config(params);
+        let initialized = esp_idf_sys::esp_wifi_init(&mut init);
+        if initialized != esp_idf_sys::ESP_OK && initialized != esp_idf_sys::ESP_ERR_INVALID_STATE {
+            STA_DRIVER_INITIALIZED.store(false, Ordering::Release);
+            STA_DRIVER_INIT_FAILED.store(true, Ordering::Release);
+            leave_radio_mode(RadioMode::StaRawUdp6);
+            return false;
+        }
+        STA_DRIVER_INITIALIZED.store(true, Ordering::Release);
+        let driver_init_us = (esp_idf_sys::esp_timer_get_time() - started_us).max(0) as u64;
+
+        let _ = esp_idf_sys::esp_wifi_set_storage(esp_idf_sys::wifi_storage_t_WIFI_STORAGE_RAM);
+        if esp_idf_sys::esp_wifi_set_mode(esp_idf_sys::wifi_mode_t_WIFI_MODE_STA)
+            != esp_idf_sys::ESP_OK
+        {
+            leave_radio_mode(RadioMode::StaRawUdp6);
+            return false;
+        }
+        let mut protocols = esp_idf_sys::wifi_protocols_t {
+            ghz_2g: RECOVERY_STA_PROTOCOL as u16,
+            ghz_5g: 0,
+        };
+        if esp_idf_sys::esp_wifi_set_protocols(
+            esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+            &mut protocols,
+        ) != esp_idf_sys::ESP_OK
+            || esp_idf_sys::esp_wifi_set_bandwidth(
+                esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                esp_idf_sys::wifi_bandwidth_t_WIFI_BW20,
+            ) != esp_idf_sys::ESP_OK
+            || esp_wifi_config_11b_rate(
+                esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                params.sta_11b_rates_disabled,
+            ) != esp_idf_sys::ESP_OK
+        {
+            leave_radio_mode(RadioMode::StaRawUdp6);
+            return false;
+        }
+        let started = esp_idf_sys::esp_wifi_start();
+        if started != esp_idf_sys::ESP_OK && started != esp_idf_sys::ESP_ERR_INVALID_STATE {
+            leave_radio_mode(RadioMode::StaRawUdp6);
+            return false;
+        }
+        let wifi_start_us = (esp_idf_sys::esp_timer_get_time() - started_us).max(0) as u64;
+        let channel = if params.sta_channel == 0 {
+            6
+        } else {
+            params.sta_channel.clamp(1, 13)
+        };
+        if !set_bssid_check_disabled(0, params.sta_bssid_check_disabled)
+            || esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_MAX_MODEM)
+                != esp_idf_sys::ESP_OK
+            || !set_ht20_channel(channel)
+        {
+            leave_radio_mode(RadioMode::StaRawUdp6);
+            return false;
+        }
+        let channel_ready_us = (esp_idf_sys::esp_timer_get_time() - started_us).max(0) as u64;
+        LAB_OPEN_AP.store(false, Ordering::Release);
+        let enabled = start_sta_extensions(handler, params.nan_dw_interval, params.now);
+        let extensions_ready_us = (esp_idf_sys::esp_timer_get_time() - started_us).max(0) as u64;
+        uart::send_stats(&[
+            (b"wifi wake driver_init_us", driver_init_us),
+            (b"wifi wake start_us", wifi_start_us),
+            (b"wifi wake channel_ready_us", channel_ready_us),
+            (b"wifi wake extensions_ready_us", extensions_ready_us),
+        ]);
+        enabled
+    }
 }
 
 fn elapsed_ms(started_us: i64) -> u64 {
@@ -1384,6 +1490,20 @@ pub fn set_promiscuous(enabled: bool) -> bool {
     unsafe { esp_idf_sys::esp_wifi_set_promiscuous(enabled) == esp_idf_sys::ESP_OK }
 }
 
+/// Select modem power-save for the unassociated NAN DW owner.  The owner
+/// turns it off only for a bounded receive window, then restores it after the
+/// paired NAN/NOW window. Associated STA and AP personalities retain their
+/// existing policy.
+pub fn set_nan_dw_power_save(enabled: bool) -> bool {
+    unsafe {
+        esp_idf_sys::esp_wifi_set_ps(if enabled {
+            esp_idf_sys::wifi_ps_type_t_WIFI_PS_MAX_MODEM
+        } else {
+            esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE
+        }) == esp_idf_sys::ESP_OK
+    }
+}
+
 pub fn set_promiscuous_filter(filter: &mut esp_idf_sys::wifi_promiscuous_filter_t) -> bool {
     unsafe { esp_idf_sys::esp_wifi_set_promiscuous_filter(filter) == esp_idf_sys::ESP_OK }
 }
@@ -1606,6 +1726,14 @@ fn stop_sta_with_leave_grace(leave_grace_ms: u32) {
 
 pub fn stop_sta() {
     stop_sta_with_leave_grace(0);
+}
+
+/// Stop the sleepy raw radio before explicit light sleep. Classic ESP32 must
+/// fully release the driver; S3/C6 retain their initialized-driver behavior.
+pub fn stop_sleepy_nan_now_for_light_sleep() {
+    stop_sta();
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    deinit_for_light_sleep();
 }
 
 /// Explicitly leave the infrastructure AP before a controlled device reset.

@@ -1,7 +1,6 @@
 // IMPORTANT: This is shared no-std ESP firmware code. Host-testable CBOR
 // decoding and schemas belong in dmesh-server; this module only applies the
 // result to firmware state and uses the ESP UART adapter for exceptions.
-//! Firmware control-application boundary.
 //!
 //! CBOR decoding is shared in `dmesh-server`; this module applies the decoded
 //! request to the Recovery-owned parameter image. UART, UDP, and future L2
@@ -52,6 +51,15 @@ pub fn send_stat(prefix: &[u8], value: u64) {
     let _ = send_record(&cbor);
 }
 
+/// Emit one bounded multi-field diagnostic event. Values describing a single
+/// physical boundary remain together in a passive UART/NOW observation.
+pub fn send_stats(entries: &[(&[u8], u64)]) {
+    let Some(cbor) = dmesh_server::services::encode_status_numbers(entries) else {
+        return;
+    };
+    let _ = send_record(&cbor);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileControlError {
     Unsupported,
@@ -65,6 +73,7 @@ pub enum ProfileControlError {
 /// unsupported until they have shared store/owner adapters.
 struct ProfileControl<'a> {
     profile: &'a mut TransportProfile,
+    nan_wake_sta_requested: bool,
 }
 
 /// Result of applying one control record to the fixed-size radio profile.
@@ -145,7 +154,18 @@ impl Handler for ProfileControl<'_> {
         if let Some(target) = config.wake_target {
             let station = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta);
             let ap = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap);
-            if station != Some(target) && ap != Some(target) {
+            let matched = station == Some(target) || ap == Some(target);
+            // A NAN wake is deliberately rare and is the only direct
+            // transport mutation sent over a broadcast Service Discovery
+            // action.  Preserve enough local evidence to distinguish RF
+            // delivery from target admission without exposing credentials.
+            crate::commands::send_stats(&[
+                (b"nan wake target_le", mac_le(target)),
+                (b"nan wake station_le", station.map(mac_le).unwrap_or(0)),
+                (b"nan wake ap_le", ap.map(mac_le).unwrap_or(0)),
+                (b"nan wake target_match", matched as u64),
+            ]);
+            if !matched {
                 return Err(ProfileControlError::InvalidSetting);
             }
         }
@@ -162,6 +182,7 @@ impl Handler for ProfileControl<'_> {
                 // so an unauthenticated request cannot make the adapter try
                 // an unspecified network.
                 if configured_profile && !self.profile.has_flash_profile() {
+                    crate::commands::send_response(b"nan wake rejected: no STA profile");
                     return Err(ProfileControlError::InvalidSetting);
                 }
                 let mut candidate = *self.profile;
@@ -182,6 +203,10 @@ impl Handler for ProfileControl<'_> {
                 candidate.requested_transport = Some(kind);
                 candidate.run_requested = true;
                 *self.profile = candidate;
+                if config.wake_target.is_some() {
+                    self.nan_wake_sta_requested = true;
+                    crate::commands::send_response(b"nan wake accepted: STA requested");
+                }
                 Ok(())
             }
             // Unassociated is the NOW-only radio epoch. It has no SSID, raw
@@ -203,6 +228,10 @@ impl Handler for ProfileControl<'_> {
             TransportKind::Uart => Err(ProfileControlError::Unsupported),
         }
     }
+}
+
+const fn mac_le(mac: [u8; 6]) -> u64 {
+    u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0])
 }
 
 /// QUIC-lite owns this policy boundary, independently of bearer start/stop.
@@ -237,22 +266,34 @@ pub fn apply_control_record_result(
     if let Some(request) = request {
         let transport_set = matches!(request, control::Request::TransportSet { .. });
         let before = *params;
-        return Some(
-            control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
-                ControlApplyResult {
-                    transport_set,
-                    changed: *params != before,
-                }
-            }),
-        );
+        let mut handler = ProfileControl {
+            profile: params,
+            nan_wake_sta_requested: false,
+        };
+        let outcome = control::dispatch_request(request, &mut handler).map(|()| {
+            let changed = *handler.profile != before;
+            if changed && handler.nan_wake_sta_requested {
+                crate::main_runtime::note_nan_wake_sta_requested();
+            }
+            ControlApplyResult {
+                transport_set,
+                changed,
+            }
+        });
+        return Some(outcome);
     }
     let request = connection::decode_request(packet)?;
     Some(
-        connection::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
-            ControlApplyResult {
-                transport_set: false,
-                changed: false,
-            }
+        connection::dispatch_request(
+            request,
+            &mut ProfileControl {
+                profile: params,
+                nan_wake_sta_requested: false,
+            },
+        )
+        .map(|()| ControlApplyResult {
+            transport_set: false,
+            changed: false,
         }),
     )
 }
@@ -273,14 +314,21 @@ pub fn apply_direct_transport_set_record_result(
         return None;
     }
     let before = *params;
-    Some(
-        control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
-            ControlApplyResult {
-                transport_set: true,
-                changed: *params != before,
-            }
-        }),
-    )
+    let mut handler = ProfileControl {
+        profile: params,
+        nan_wake_sta_requested: false,
+    };
+    let outcome = control::dispatch_request(request, &mut handler).map(|()| {
+        let changed = *handler.profile != before;
+        if changed && handler.nan_wake_sta_requested {
+            crate::main_runtime::note_nan_wake_sta_requested();
+        }
+        ControlApplyResult {
+            transport_set: true,
+            changed,
+        }
+    });
+    Some(outcome)
 }
 
 /// Apply a decoded local tagged record. UDP6/QUIC dispatch has already parsed
@@ -297,22 +345,34 @@ pub fn apply_control_record_decoded(
     if let Some(request) = control::decode_record(record) {
         let transport_set = matches!(request, control::Request::TransportSet { .. });
         let before = *params;
-        return Some(
-            control::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
-                ControlApplyResult {
-                    transport_set,
-                    changed: *params != before,
-                }
-            }),
-        );
+        let mut handler = ProfileControl {
+            profile: params,
+            nan_wake_sta_requested: false,
+        };
+        let outcome = control::dispatch_request(request, &mut handler).map(|()| {
+            let changed = *handler.profile != before;
+            if changed && handler.nan_wake_sta_requested {
+                crate::main_runtime::note_nan_wake_sta_requested();
+            }
+            ControlApplyResult {
+                transport_set,
+                changed,
+            }
+        });
+        return Some(outcome);
     }
     let request = connection::decode_record(record)?;
     Some(
-        connection::dispatch_request(request, &mut ProfileControl { profile: params }).map(|()| {
-            ControlApplyResult {
-                transport_set: false,
-                changed: false,
-            }
+        connection::dispatch_request(
+            request,
+            &mut ProfileControl {
+                profile: params,
+                nan_wake_sta_requested: false,
+            },
+        )
+        .map(|()| ControlApplyResult {
+            transport_set: false,
+            changed: false,
         }),
     )
 }

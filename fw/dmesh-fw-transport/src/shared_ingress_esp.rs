@@ -101,6 +101,13 @@ pub enum IngressKind {
     /// capacity. This is the UART equivalent of a writable-socket event, not
     /// a periodic transmit poll or a bearer-private packet queue.
     UartEgressReady = 10,
+    /// One complete L2CAP CoC record decoded from the reliable byte stream.
+    /// It enters the same bounded pool and worker as UART; the BLE adapter owns
+    /// only stream reassembly and physical submission.
+    BleCoc = 11,
+    /// The BLE CoC physical writer has accepted or failed one record. This is
+    /// a capacity edge, not a second transmit queue.
+    BleCocEgressReady = 12,
 }
 
 /// Link context preserved across the one required driver-buffer copy.
@@ -280,6 +287,9 @@ static CONNECTION_TIMER_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static CONNECTION_TIMER_PENDING: AtomicBool = AtomicBool::new(false);
 static UART_EGRESS_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static UART_EGRESS_READY_PENDING: AtomicBool = AtomicBool::new(false);
+static BLE_COC_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static BLE_COC_EGRESS_READY_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static BLE_COC_EGRESS_READY_PENDING: AtomicBool = AtomicBool::new(false);
 static DROPS: AtomicU32 = AtomicU32::new(0);
 // This worker is created lazily on the first accepted packet, then blocks on
 // the shared queue for the active firmware lifetime. It must not retire after
@@ -324,6 +334,8 @@ pub struct IngressMemoryStats {
     pub worker_running: bool,
     pub worker_starts: u32,
     pub worker_create_failures: u32,
+    // Compatibility name: ESP-IDF reports this high-water mark in bytes,
+    // unlike upstream FreeRTOS's traditional word units.
     pub worker_stack_min_free_words: u32,
     pub free_internal_bytes: u32,
     pub min_free_internal_bytes: u32,
@@ -331,7 +343,7 @@ pub struct IngressMemoryStats {
 }
 
 /// Return the latest allocator and stack headroom observed by the shared
-/// worker. Stack high water is FreeRTOS words remaining, not bytes used.
+/// worker. ESP-IDF's stack high-water API reports bytes remaining.
 pub fn memory_stats() -> IngressMemoryStats {
     IngressMemoryStats {
         packet_slots: ESP_CALLBACK_PACKET_SLOTS as u32,
@@ -806,6 +818,39 @@ pub fn schedule_uart_egress_ready(handler: fn()) -> bool {
     queued
 }
 
+/// Queue one BLE-CoC-writable transition on the shared ingress worker.
+///
+/// The CoC host task calls this after it accepts or fails one physical record.
+/// The worker then asks the common QUIC-lite service for the next packet only
+/// while the CoC channel is connected and has no pending transmit.
+pub fn schedule_ble_coc_egress_ready(handler: fn()) -> bool {
+    BLE_COC_EGRESS_READY_HANDLER.store(handler as usize, Ordering::Release);
+    if BLE_COC_EGRESS_READY_PENDING.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    let queue = QUEUE.load(Ordering::Acquire);
+    if queue.is_null() || !wake_worker() {
+        BLE_COC_EGRESS_READY_PENDING.store(false, Ordering::Release);
+        return false;
+    }
+    let item = IngressPacket {
+        kind: IngressKind::BleCocEgressReady,
+        link: IngressLink::None,
+        source: [0; 6],
+        len: 0,
+        slot: IngressSlot::None,
+    };
+    let queued = unsafe {
+        esp_idf_sys::xQueueGenericSend(queue.cast(), (&item as *const IngressPacket).cast(), 0, 0)
+            == 1
+    };
+    if !queued {
+        BLE_COC_EGRESS_READY_PENDING.store(false, Ordering::Release);
+        DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+    queued
+}
+
 pub fn available() -> usize {
     PACKETS.available()
 }
@@ -824,6 +869,8 @@ fn handler_slot(kind: IngressKind) -> &'static AtomicUsize {
         IngressKind::ConnectionTimer => &CONNECTION_TIMER_HANDLER,
         IngressKind::EspNowTx => &ESPNOW_TX_HANDLER,
         IngressKind::UartEgressReady => &UART_EGRESS_READY_HANDLER,
+        IngressKind::BleCoc => &BLE_COC_HANDLER,
+        IngressKind::BleCocEgressReady => &BLE_COC_EGRESS_READY_HANDLER,
     }
 }
 
@@ -874,6 +921,16 @@ unsafe extern "C" fn task_entry(_argument: *mut c_void) {
         if item.kind == IngressKind::UartEgressReady {
             UART_EGRESS_READY_PENDING.store(false, Ordering::Release);
             let handler = UART_EGRESS_READY_HANDLER.load(Ordering::Acquire);
+            if handler != 0 {
+                let handler: fn() = unsafe { core::mem::transmute(handler) };
+                handler();
+            }
+            unsafe { esp_idf_sys::vTaskDelay(1) };
+            continue;
+        }
+        if item.kind == IngressKind::BleCocEgressReady {
+            BLE_COC_EGRESS_READY_PENDING.store(false, Ordering::Release);
+            let handler = BLE_COC_EGRESS_READY_HANDLER.load(Ordering::Acquire);
             if handler != 0 {
                 let handler: fn() = unsafe { core::mem::transmute(handler) };
                 handler();

@@ -13,9 +13,7 @@ fn elf_sha256_hex() -> Option<[u8; 64]> {
     Some(output)
 }
 
-pub(crate) fn receive_tagged_identity(
-    record: dmesh_server::tagged::Record<'_>,
-) -> Option<Vec<u8>> {
+pub(crate) fn receive_tagged_identity(record: dmesh_server::tagged::Record<'_>) -> Option<Vec<u8>> {
     let identity = elf_sha256_hex()?;
     dmesh_server::services::encode_firmware_identity_response(record, &identity)
 }

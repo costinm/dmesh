@@ -196,12 +196,9 @@ pub(crate) fn write_setting(key: &[u8], value: &[u8]) -> bool {
             && nvs_commit(handle) == 0
     };
     unsafe { nvs_close(handle) };
-    if result {
-        // The signed discovery record embeds name, domain, and STA facts.
-        // A successful stream `settings.set` must be visible to the next
-        // directed or unsolicited announce, not only after a radio change.
-        invalidate_discovery_cache();
-    }
+    // Announcements are signed once at startup. Persisted identity metadata
+    // therefore becomes visible after the reboot which applies the setting;
+    // never make a live settings write re-enter the expensive signer.
     result
 }
 
@@ -348,8 +345,8 @@ pub(crate) struct BootPowerPolicy {
 pub fn boot_ble_auto() -> bool {
     let mut value = [0u8; 8];
     match read_setting(b"ble.auto", &mut value) {
-        Some(used) => value.get(..used) != Some(b"false"),
-        None => true,
+        Some(used) => value.get(..used) == Some(b"true"),
+        None => false,
     }
 }
 
@@ -511,7 +508,8 @@ fn broadcast_udp_discovery_announce(record: &[u8]) -> bool {
         nan_visible_nodes: nodes,
     };
     let mut enriched = [0u8; crate::TRANSPORT_MTU];
-    if let Some(used) = dmesh_server::announce::encode_with_discovery_facts(record, facts, &mut enriched)
+    if let Some(used) =
+        dmesh_server::announce::encode_with_discovery_facts(record, facts, &mut enriched)
     {
         crate::wifi_raw_udp6_esp::broadcast_announce(&enriched[..used])
     } else {
@@ -521,27 +519,24 @@ fn broadcast_udp_discovery_announce(record: &[u8]) -> bool {
     }
 }
 
-/// Whether a requested profile is the narrow DW8 sleepy personality. This is
+/// Whether a requested profile is a low-duty NAN sleepy personality. This is
 /// evaluated only by Main after a queued profile or radio deadline event; it
 /// is never inferred by a Wi-Fi callback or from an association side effect.
+///
+/// DW1, DW8, and DW16 all use the same paired NAN/NOW receive span. The
+/// selected interval controls the next phase-locked wake; it must not change
+/// whether Main is allowed to sleep between those spans.
 pub(crate) fn is_sleepy_profile(profile: &crate::TransportProfile) -> bool {
     profile.requested_transport == Some(dmesh_server::control::TransportKind::Nan)
-        && profile.nan_dw_interval == 8
+        && matches!(profile.nan_dw_interval, 1 | 8 | 16)
         && profile.now == 2
         && profile.ap == 0
 }
 
-/// The C6 canary uses its USB-JTAG bearer to observe the radio-only DW8
-/// personality. ESP light sleep powers down that peripheral, turning a
-/// reversible discovery experiment into a physical reset. Keep USB alive on
-/// RISC-V while retaining the same NAN DW8/NOW-off radio schedule; classic
-/// ESP32 keeps the physical-light-sleep path used by lora2.
-#[cfg(target_arch = "riscv32")]
-fn usb_jtag_debug_hold(profile: &crate::TransportProfile) -> bool {
-    is_sleepy_profile(profile)
-}
-
-#[cfg(not(target_arch = "riscv32"))]
+/// Physical light sleep is part of every explicit sleepy profile. USB-JTAG
+/// may disappear while a C6 sleeps, but that is an observation-path property,
+/// not permission to keep the radio and CPU awake indefinitely. A reboot
+/// restores the persisted active profile after an ephemeral test.
 fn usb_jtag_debug_hold(_: &crate::TransportProfile) -> bool {
     false
 }
@@ -589,22 +584,34 @@ pub(crate) fn maybe_enter_sleep(
 
     let boundary_started_us = dw8_now_us();
     let prior_wake_us = DW8_WAKE_US.swap(0, Ordering::AcqRel);
+    let awake_us = (prior_wake_us != 0)
+        .then(|| boundary_started_us.wrapping_sub(prior_wake_us))
+        .unwrap_or(0);
+    let (first_frame_after_wake_us, beacon_after_wake_us) =
+        crate::wifi_nan_dw_capture_esp::sleep_wake_receive_diagnostics();
     if prior_wake_us != 0 {
-        DW8_LAST_AWAKE_US.store(
-            boundary_started_us.wrapping_sub(prior_wake_us),
-            Ordering::Release,
-        );
+        DW8_LAST_AWAKE_US.store(awake_us, Ordering::Release);
     }
 
     // Keep the control UART alive through the DW8 command window.  Turning it
     // off during the profile transition races the command response and leaves
     // no way to inspect the armed boundary.  The physical sleep entry below
     // owns the final shutdown instead.
-    crate::commands::send_response(b"sleep DW8: entering explicit light sleep");
+    crate::commands::send_stats(&[
+        (b"sleep enter awake_us", u64::from(awake_us)),
+        (
+            b"sleep enter first_frame_after_wake_us",
+            u64::from(first_frame_after_wake_us),
+        ),
+        (
+            b"sleep enter beacon_after_wake_us",
+            u64::from(beacon_after_wake_us),
+        ),
+    ]);
     // UART is not a light-sleep precondition. Retain it across DW8 so the
     // device remains observable and we do not churn the physical serial
     // driver on every wake cycle.
-    crate::wifi_esp::stop_sta();
+    crate::wifi_esp::stop_sleepy_nan_now_for_light_sleep();
     DW8_LAST_RADIO_STOP_US.store(
         dw8_now_us().wrapping_sub(boundary_started_us),
         Ordering::Release,
@@ -620,8 +627,20 @@ pub(crate) fn maybe_enter_sleep(
     // Wake early enough to restore the stopped Wi-Fi runtime before the
     // cluster-selected beacon. The measured resume time is used after the
     // first cycle; the conservative floor absorbs a cold first restart.
-    const DW8_RESUME_MARGIN_US: u64 = 20_000;
-    const DW8_MIN_WAKE_LEAD_US: u64 = 120_000;
+    const DW8_RESUME_MARGIN_US: u64 = 25_000;
+    // Classic lora2 reconstructs raw Wi-Fi in 28-31 ms. The widened resume
+    // capture sees the selected beacon 96-101 ms into the former 120 ms lead,
+    // leaving 19-24 ms of unnecessary pre-beacon idle. Keep a 60 ms cold
+    // floor so the first post-boot cycle has enough RF-ready margin. A 60 ms
+    // live trial reduced awake time to 108 ms but missed the NAN beacon, while
+    // 120 ms received it reliably; classic ESP32 keeps 90 ms. S3 uses 130 ms
+    // because lora4 still occasionally missed its beacon at 90 ms. Use the
+    // same conservative starting point for C6 until its post-sleep NAN receive
+    // path is measurable without USB-JTAG.
+    #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
+    const DW8_MIN_WAKE_LEAD_US: u64 = 130_000;
+    #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
+    const DW8_MIN_WAKE_LEAD_US: u64 = 90_000;
     let wake_lead_us = u64::from(DW8_LAST_RADIO_RESUME_US.load(Ordering::Acquire))
         .saturating_add(DW8_RESUME_MARGIN_US)
         .max(DW8_MIN_WAKE_LEAD_US);
@@ -629,15 +648,28 @@ pub(crate) fn maybe_enter_sleep(
     // A timer sleep is phase-locked to the next scheduled capture point, not
     // simply to the prior 8-DW period. This leaves the wake lead above before
     // the beacon and avoids drift after a variable radio-stop interval.
-    let duration_us = crate::wifi_nan_dw_capture_esp::next_sleepy_capture_start_us(
+    // NAN's base cadence is 512 TU. A selected beacon is a useful phase hint,
+    // but not an authority to shorten a requested DW8 interval: a stale or
+    // newly-received anchor could otherwise select the *next base DW* a few
+    // hundred milliseconds away and turn DW8 into a continuous stop/start
+    // loop. Keep the device's local interval clock as the minimum cadence;
+    // use the beacon-derived point only when it represents the next complete
+    // selected interval after this just-finished NAN+NOW pair.
+    const NAN_BASE_DW_US: u64 = 512 * 1_024;
+    let cadence_us = NAN_BASE_DW_US.saturating_mul(u64::from(profile.nan_dw_interval));
+    let capture_slack_us =
+        wake_lead_us.saturating_add(crate::wifi_nan_dw_capture_esp::sleepy_dw_pair_hold_us());
+    let earliest_capture_us =
+        boundary_us.saturating_add(cadence_us.saturating_sub(capture_slack_us));
+    let target_capture_us = crate::wifi_nan_dw_capture_esp::next_sleepy_capture_start_us(
         boundary_us.saturating_add(wake_lead_us),
+        profile.nan_dw_interval,
     )
-    .and_then(|capture_us| capture_us.checked_sub(wake_lead_us))
-    .filter(|wake_us| *wake_us > boundary_us)
-    .map(|wake_us| wake_us.saturating_sub(boundary_us))
-    // Without a live timing anchor, use the prescribed acquisition backoff
-    // rather than repeatedly waking on an arbitrary phase.
-    .unwrap_or(30_000_000);
+    .filter(|capture_us| *capture_us >= earliest_capture_us)
+    .unwrap_or_else(|| boundary_us.saturating_add(cadence_us));
+    let duration_us = target_capture_us
+        .saturating_sub(wake_lead_us)
+        .saturating_sub(boundary_us);
     // Keep the UART driver installed for post-wake diagnostics, but release
     // its PM locks for this explicitly admitted boundary.  An active UART
     // normally owns ESP_PM_NO_LIGHT_SLEEP so automatic idle sleep cannot
@@ -648,38 +680,105 @@ pub(crate) fn maybe_enter_sleep(
     let woke_us = dw8_now_us();
     if entered_sleep {
         DW8_WAKE_US.store(woke_us, Ordering::Release);
+        crate::wifi_nan_dw_capture_esp::mark_sleep_wake(u64::from(woke_us));
     }
     crate::uart_esp::rearm_after_wake();
-    crate::commands::send_stat(b"sleep DW8 entered=", u64::from(entered_sleep));
-    crate::commands::send_stat(
-        b"sleep DW8 duration_us=",
-        u64::from(crate::power_esp::status().last_sleep_duration_us),
-    );
+    let planned_capture_in_us = target_capture_us.saturating_sub(boundary_us);
+    crate::commands::send_stats(&[
+        (b"sleep plan interval", u64::from(profile.nan_dw_interval)),
+        (
+            b"sleep plan adapter_interval",
+            u64::from(crate::wifi_nan_dw_capture_esp::interval()),
+        ),
+        (b"sleep plan capture_in_us", planned_capture_in_us),
+        (b"sleep plan wake_lead_us", wake_lead_us),
+        (b"sleep wake entered", u64::from(entered_sleep)),
+        (b"sleep wake requested_us", duration_us),
+        (
+            b"sleep wake elapsed_us",
+            u64::from(crate::power_esp::status().last_sleep_duration_us),
+        ),
+        (
+            b"sleep wake radio_stop_us",
+            u64::from(DW8_LAST_RADIO_STOP_US.load(Ordering::Acquire)),
+        ),
+    ]);
 
     let after_wake = crate::profile_store::snapshot();
     if !is_sleepy_profile(&after_wake) {
         crate::core_runtime::apply_uart_profile(!crate::uart_esp::uart_is_off(after_wake.uart));
     }
     crate::core_runtime::prepare_espnow_association(&after_wake);
-    *nan_now_started =
-        crate::wifi_esp::init_nan_now(&after_wake, crate::core_runtime::receive_main_espnow);
-    DW8_LAST_RADIO_RESUME_US.store(dw8_now_us().wrapping_sub(woke_us), Ordering::Release);
+    *nan_now_started = crate::wifi_esp::resume_sleepy_nan_now(
+        &after_wake,
+        crate::core_runtime::receive_main_espnow,
+    );
+    let after_resume_us = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64;
+    let radio_resume_us = dw8_now_us().wrapping_sub(woke_us);
+    DW8_LAST_RADIO_RESUME_US.store(radio_resume_us, Ordering::Release);
     crate::wifi_nan_dw_capture_esp::set_sleepy_dw_pair(*nan_now_started);
-    if *nan_now_started {
-        let after_resume_us = unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) as u64;
-        if let Some(capture_us) =
-            crate::wifi_nan_dw_capture_esp::next_capture_start_us(after_resume_us)
-        {
-            *sleepy_awake_until_ms = capture_us
-                .saturating_add(crate::wifi_nan_dw_capture_esp::sleepy_dw_pair_hold_us())
-                / 1_000;
+    // A rejected `esp_light_sleep_start` leaves the radio stopped above, so
+    // it still requires exactly one recovery restart.  It is *not* a wake:
+    // do not mark a false physical sleep, emit a wake transition, or schedule
+    // the next capture from the just-rejected boundary.  Most importantly,
+    // leave a bounded diagnostic dwell before attempting another physical
+    // boundary; otherwise a PM-lock rejection can become a stop/start loop
+    // every time the one-shot deadline is evaluated.
+    if !entered_sleep {
+        *sleepy_awake_until_ms = now_ms.saturating_add(5_000);
+        crate::commands::send_stats(&[
+            (b"sleep rejected requested_us", duration_us),
+            (
+                b"sleep rejected elapsed_us",
+                u64::from(crate::power_esp::status().last_sleep_duration_us),
+            ),
+            (
+                b"sleep rejected radio_resume_us",
+                u64::from(radio_resume_us),
+            ),
+            (b"sleep rejected next_attempt_ms", *sleepy_awake_until_ms),
+        ]);
+        crate::commands::send_response(b"sleep DW rejected: NAN/NOW restored");
+        if *nan_now_started {
+            crate::wifi_espnow_esp::set_poll_handler(Some(crate::core_runtime::poll_espnow));
         }
+        return false;
     }
     if *nan_now_started {
-        crate::commands::send_response(b"sleep DW8 wake: NAN/NOW reinitialized");
+        let (started, suspended, capturing, now_active, next_ms, delay_ms) =
+            crate::wifi_nan_dw_capture_esp::sleep_wake_scheduler_diagnostics();
+        crate::commands::send_stats(&[
+            (b"nan resume started", u64::from(started)),
+            (b"nan resume suspended", u64::from(suspended)),
+            (b"nan resume capturing", u64::from(capturing)),
+            (b"nan resume now_active", u64::from(now_active)),
+            (b"nan resume next_ms", u64::from(next_ms)),
+            (b"nan resume delay_ms", u64::from(delay_ms)),
+        ]);
+        // Keep the exact capture selected before sleep. Recomputing "next"
+        // after resume can skip the intended boundary and hold Main awake for
+        // another base period (or longer after a stale anchor update).
+        let capture_us = target_capture_us;
+        let capture_late_us = after_resume_us.saturating_sub(capture_us);
+        let awake_until_us = capture_us
+            .max(after_resume_us)
+            .saturating_add(crate::wifi_nan_dw_capture_esp::sleepy_dw_pair_hold_us());
+        *sleepy_awake_until_ms = awake_until_us / 1_000;
+        let _ = crate::wifi_nan_dw_capture_esp::begin_sleepy_resume_capture(awake_until_us);
+        crate::commands::send_stats(&[
+            (b"sleep wake radio_resume_us", u64::from(radio_resume_us)),
+            (b"sleep wake capture_late_us", capture_late_us),
+            (
+                b"sleep wake awake_hold_us",
+                awake_until_us.saturating_sub(after_resume_us),
+            ),
+        ]);
+    }
+    if *nan_now_started {
+        crate::commands::send_response(b"sleep DW wake: NAN/NOW reinitialized");
         crate::wifi_espnow_esp::set_poll_handler(Some(crate::core_runtime::poll_espnow));
     } else {
-        crate::commands::send_response(b"sleep DW8 wake: NAN/NOW reinit failed");
+        crate::commands::send_response(b"sleep DW wake: NAN/NOW reinit failed");
     }
     // A completed explicit sleep is not a new control session.  The hold set
     // above is only the scheduled NAN DW, its adjacent NOW DW, and a short
@@ -986,6 +1085,13 @@ fn start_nan_ap_raw_bearer_if_needed(profile: &crate::TransportProfile, state: &
 /// epoch. Called only for a queued profile generation that requests STA, or a
 /// deadline retry of that incomplete generation; it does not run on idle.
 fn start_sta_epoch(profile: &crate::TransportProfile, generation: u32, state: &mut MainRadioState) {
+    if NAN_WAKE_STA_REQUESTED.swap(false, Ordering::AcqRel) {
+        state.sta_wake_retries_left = NAN_WAKE_STA_RETRY_BUDGET;
+        crate::commands::send_stat(
+            b"nan wake STA retry_budget=",
+            u64::from(NAN_WAKE_STA_RETRY_BUDGET),
+        );
+    }
     if state.nan_now_started {
         crate::wifi_esp::stop_sta_extensions();
         crate::wifi_esp::stop_sta();
@@ -1219,12 +1325,11 @@ const DISCOVERY_CACHE_EMPTY: u8 = 0;
 const DISCOVERY_CACHE_BUILDING: u8 = 1;
 const DISCOVERY_CACHE_READY: u8 = 2;
 
-/// One signed discovery record, keyed by the transport fields it contains.
-/// A changed association/channel/link-local set invalidates the cache and
-/// causes exactly one replacement signature; repeated peer requests reuse it.
+/// One immutable, startup-signed discovery record. Every later discovery or
+/// lifecycle publication reuses these exact bytes; radio transitions and DW
+/// wake/sleep boundaries must never re-enter the signer.
 struct CachedDiscoveryRecord {
     bytes: core::cell::UnsafeCell<[u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN]>,
-    key: core::cell::UnsafeCell<[u8; 40]>,
     len: AtomicUsize,
 }
 
@@ -1235,54 +1340,17 @@ unsafe impl Sync for CachedDiscoveryRecord {}
 
 static DISCOVERY_CACHE_STATE: AtomicU8 = AtomicU8::new(DISCOVERY_CACHE_EMPTY);
 static DISCOVERY_CACHE_LOCK: AtomicBool = AtomicBool::new(false);
-/// Monotonic semantic revision for fields that participate in a signed
-/// discovery record.  It is part of the cache key so a write racing a packet
-/// turn cannot leave a stale name/domain record reusable.
-static DISCOVERY_CACHE_REVISION: AtomicU32 = AtomicU32::new(0);
 static DISCOVERY_CACHE: CachedDiscoveryRecord = CachedDiscoveryRecord {
     bytes: core::cell::UnsafeCell::new([0; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN]),
-    key: core::cell::UnsafeCell::new([0; 40]),
     len: AtomicUsize::new(0),
 };
-
-/// Invalidate a cached signed discovery record after a normal stream setting
-/// mutation.  This is intentionally independent of UART/NOW/UDP: persistence
-/// changes discovery facts, while every bearer obtains the refreshed record
-/// from the common cache on its next send.
-pub(crate) fn invalidate_discovery_cache() {
-    DISCOVERY_CACHE_REVISION.fetch_add(1, Ordering::AcqRel);
-    DISCOVERY_CACHE_STATE.store(DISCOVERY_CACHE_EMPTY, Ordering::Release);
-}
-
-fn discovery_transport_key() -> Option<[u8; 40]> {
-    let mac = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta)
-        .or_else(|| crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap))?;
-    let mut key = [0u8; 40];
-    key[..6].copy_from_slice(&mac);
-    if let Some((channel, _)) = crate::wifi_esp::current_channel() {
-        key[7] = channel;
-    }
-    if crate::wifi_esp::sta_associated() {
-        key[6] = 1;
-        let mut ssid = [0u8; dmesh_server::announce::MAX_NETWORK_NAME];
-        if let Some(used) = read_setting(b"sta_ssid", &mut ssid) {
-            let used = used.min(key.len() - 8);
-            key[8..8 + used].copy_from_slice(&ssid[..used]);
-        }
-    }
-    let revision = DISCOVERY_CACHE_REVISION
-        .load(Ordering::Acquire)
-        .to_be_bytes();
-    key[36..40].copy_from_slice(&revision);
-    Some(key)
-}
 
 fn cached_discovery_record(
     role: u8,
     partition: u8,
     capabilities: u16,
+    recovery: bool,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
-    let key = discovery_transport_key()?;
     if DISCOVERY_CACHE_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -1291,11 +1359,7 @@ fn cached_discovery_record(
         return None;
     }
     let result = (|| {
-        if DISCOVERY_CACHE_STATE.load(Ordering::Acquire) == DISCOVERY_CACHE_READY
-            // Safe under the try-lock above; the cache key is immutable while
-            // READY and is replaced together with the signed record.
-            && unsafe { *DISCOVERY_CACHE.key.get() } == key
-        {
+        if DISCOVERY_CACHE_STATE.load(Ordering::Acquire) == DISCOVERY_CACHE_READY {
             let used = DISCOVERY_CACHE.len.load(Ordering::Acquire);
             if used == 0 || used > dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN {
                 return None;
@@ -1320,13 +1384,13 @@ fn cached_discovery_record(
             role,
             partition,
             capabilities,
+            recovery,
         );
         match built {
             Some((record, used)) => {
                 unsafe {
                     let cached = &mut *DISCOVERY_CACHE.bytes.get();
                     cached[..used].copy_from_slice(&record[..used]);
-                    *DISCOVERY_CACHE.key.get() = key;
                 }
                 DISCOVERY_CACHE.len.store(used, Ordering::Relaxed);
                 DISCOVERY_CACHE_STATE.store(DISCOVERY_CACHE_READY, Ordering::Release);
@@ -1343,35 +1407,16 @@ fn cached_discovery_record(
 }
 
 fn announce_record(
-    kind: u64,
-    uptime_secs: u64,
+    _kind: u64,
+    _uptime_secs: u64,
     role: u8,
     partition: u8,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
-    if kind == dmesh_server::announce::ANNOUNCE_DISCOVERY {
-        cached_discovery_record(
-            role,
-            partition,
-            dmesh_server::probe::PROBE_CAP_NAN
-                | dmesh_server::probe::PROBE_CAP_NOW
-                | dmesh_server::probe::PROBE_CAP_STA
-                | dmesh_server::probe::PROBE_CAP_AP
-                | dmesh_server::probe::PROBE_CAP_UDP6,
-        )
-    } else {
-        build_announce_record(kind, uptime_secs, role, partition)
-    }
-}
-
-fn build_announce_record(
-    kind: u64,
-    uptime_secs: u64,
-    role: u8,
-    partition: u8,
-) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
-    build_announce_record_with_capabilities(
-        kind,
-        uptime_secs,
+    // Kind and uptime are volatile publication context, not identity facts.
+    // The current wire record signs them, so emitting a distinct lifecycle
+    // record would require a fresh signature. Reuse the startup discovery
+    // record until lifecycle context moves to an unsigned outer envelope.
+    cached_discovery_record(
         role,
         partition,
         dmesh_server::probe::PROBE_CAP_NAN
@@ -1379,6 +1424,7 @@ fn build_announce_record(
             | dmesh_server::probe::PROBE_CAP_STA
             | dmesh_server::probe::PROBE_CAP_AP
             | dmesh_server::probe::PROBE_CAP_UDP6,
+        false,
     )
 }
 
@@ -1394,6 +1440,7 @@ pub(crate) fn recovery_discovery_record(
         0,
         0,
         dmesh_server::probe::PROBE_CAP_STA | dmesh_server::probe::PROBE_CAP_UDP6,
+        true,
     )
 }
 
@@ -1403,6 +1450,7 @@ fn build_announce_record_with_capabilities(
     _role: u8,
     _partition: u8,
     capabilities: u16,
+    recovery: bool,
 ) -> Option<([u8; dmesh_rawnan::NAN_ACTIVE_PUBLISH_MAX_LEN], usize)> {
     let mac = crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Sta)
         .or_else(|| crate::wifi_esp::interface_mac(crate::wifi_esp::RadioInterface::Ap))?;
@@ -1420,6 +1468,7 @@ fn build_announce_record_with_capabilities(
         return None;
     }
     announce.set_probe_descriptor(local_esp_device_class(), capabilities);
+    announce.recovery = recovery;
     let mut name = [0u8; dmesh_server::announce::MAX_DEVICE_NAME];
     if let Some(used) = read_setting(b"name", &mut name) {
         if let Ok(name) = core::str::from_utf8(&name[..used]) {
@@ -1587,17 +1636,18 @@ fn apply_sleep_boundary(
     }
     if !blockers.is_empty() {
         if blockers.0 & SleepBlockers::RADIO_TRANSITION.0 != 0 {
-            crate::commands::send_response(b"sleep DW8 blocked: radio transition");
-        } else {
-            crate::commands::send_response(b"sleep DW8 blocked: command window");
+            crate::commands::send_response(b"sleep DW blocked: radio transition");
+        } else if state.sleepy_blocker_reported_generation != generation {
+            crate::commands::send_response(b"sleep DW blocked: command window");
             // DW8 must leave this gate at the one-shot deadline.  Keep both
             // sides observable on the retained C6 USB-JTAG link (and UART on
             // classic ESP32) so a bad timer epoch or an unexpected re-arm is
             // distinguishable from normal NAN capture activity.
             crate::commands::send_stat(
-                b"sleep DW8 remaining_ms=",
+                b"sleep DW remaining_ms=",
                 state.sleepy_awake_until_ms.saturating_sub(now_ms),
             );
+            state.sleepy_blocker_reported_generation = generation;
         }
     }
     let effect = runtime_state.reduce(MainEvent::SleepDeadline {
@@ -1665,6 +1715,13 @@ pub(crate) struct MainRadioState {
     pub applied_uart: Option<u8>,
     pub last_discovery_announce_ms: u64,
     pub sleepy_awake_until_ms: u64,
+    /// Generation for which the command-window sleep blocker was reported.
+    /// The deadline service can run many times before the one-shot window
+    /// expires; repeating UART diagnostics there keeps the CPU awake.
+    pub sleepy_blocker_reported_generation: u32,
+    /// Remaining callback-driven reconnect attempts after a targeted NAN wake.
+    /// Zero restores the ordinary NAN fallback policy.
+    pub sta_wake_retries_left: u8,
 }
 
 /// Serialized work accepted by the Main coordinator. Profile changes are
@@ -1716,6 +1773,18 @@ const DEADLINE_ACTIVE_DISCOVERY: u8 = 1 << 7;
 /// Main owns this queue and timer for its entire lifetime. Bearer workers may
 /// append a copyable event, but only the Main task receives and acts on it.
 static EVENT_QUEUE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
+/// A stream `transport.set` must leave its terminal reply deliverable on the
+/// current bearer before the owner is allowed to stop that bearer. Direct
+/// NAN/NOW control has its own immediate response and does not use this slot.
+static PROFILE_CHANGE_AFTER_RESPONSE: AtomicU32 = AtomicU32::new(0);
+/// A NAN wake is a deliberate request to make the device reachable, not a
+/// request to abandon its new STA epoch after one failed association event.
+static NAN_WAKE_STA_REQUESTED: AtomicBool = AtomicBool::new(false);
+const NAN_WAKE_STA_RETRY_BUDGET: u8 = 3;
+
+pub(crate) fn note_nan_wake_sta_requested() {
+    NAN_WAKE_STA_REQUESTED.store(true, Ordering::Release);
+}
 /// Durable service work posted by ESP-IDF callbacks and the one-shot timer.
 ///
 /// The queue is deliberately small because it transfers only wake markers,
@@ -1814,6 +1883,19 @@ pub(crate) fn enqueue_profile_change(generation: u32) {
     } != 1
     {
         EVENT_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn defer_profile_change_until_response(generation: u32) {
+    PROFILE_CHANGE_AFTER_RESPONSE.store(generation, Ordering::Release);
+}
+
+/// Called at QUIC-lite's terminal-response delivery edge.  It is deliberately
+/// a no-op unless a stream control request committed a profile transition.
+pub(crate) fn profile_response_delivered() {
+    let generation = PROFILE_CHANGE_AFTER_RESPONSE.swap(0, Ordering::AcqRel);
+    if generation != 0 {
+        enqueue_profile_change(generation);
     }
 }
 
@@ -1984,8 +2066,9 @@ pub(crate) fn take_event_queue_drops() -> u32 {
 /// it commits one complete desired profile and enqueues its generation, but
 /// never calls Wi-Fi or waits for the Main owner. UART and NAN use equivalent
 /// packet adapters until their Main-only ingress code is moved here as well.
-pub(crate) fn receive_tagged_control(
+fn receive_tagged_control_with_delivery(
     record: dmesh_server::tagged::Record<'_>,
+    defer_until_response_delivery: bool,
 ) -> Option<alloc::vec::Vec<u8>> {
     if record.to.is_some() {
         return None;
@@ -2022,9 +2105,29 @@ pub(crate) fn receive_tagged_control(
     crate::state::direct_record_accepted();
     if changed_transport {
         let generation = crate::profile_store::advance_generation();
-        enqueue_profile_change(generation);
+        if defer_until_response_delivery {
+            defer_profile_change_until_response(generation);
+        } else {
+            enqueue_profile_change(generation);
+        }
     }
     (response_len != 0).then(|| alloc::vec::Vec::from(&response[..response_len]))
+}
+
+/// Apply a stream control request, retaining its requested profile until the
+/// terminal response is delivery-confirmed on that same stream.
+pub(crate) fn receive_tagged_control(
+    record: dmesh_server::tagged::Record<'_>,
+) -> Option<alloc::vec::Vec<u8>> {
+    receive_tagged_control_with_delivery(record, true)
+}
+
+/// Direct NAN/NOW control sends its copied reply before returning, so its
+/// profile transition can proceed immediately without a QUIC ACK edge.
+fn receive_direct_tagged_control(
+    record: dmesh_server::tagged::Record<'_>,
+) -> Option<alloc::vec::Vec<u8>> {
+    receive_tagged_control_with_delivery(record, false)
 }
 
 /// Encode the complete, bounded result of a control-stream operation.
@@ -2133,6 +2236,13 @@ pub(crate) fn receive_tagged_discovery_nodes(
 
     let mut snapshots = [None; crate::wifi_nan_dw_capture_esp::NAN_DEVICE_OBSERVATION_CAPACITY];
     crate::wifi_nan_dw_capture_esp::nan_device_observations(&mut snapshots);
+    // A NAN receipt has the transmitter radio MAC while a signed announce
+    // carries the stable VIP identity.  The raw UDP6 cache records the latter
+    // with the same callback source MAC. Join them here, at the bounded read
+    // boundary, so an operator can select a shared-catalog device and issue a directed
+    // NAN wake without making labels or ephemeral addresses into identity.
+    let mut announced = [None; crate::wifi_raw_udp6_esp::ANNOUNCE_PEER_CAPACITY];
+    crate::wifi_raw_udp6_esp::announce_peers(&mut announced);
     let mut entries = [dmesh_server::announce::ObservedDevice {
         device_id: &[],
         peer: [0; 6],
@@ -2151,8 +2261,14 @@ pub(crate) fn receive_tagged_discovery_nodes(
     }; crate::wifi_nan_dw_capture_esp::NAN_DEVICE_OBSERVATION_CAPACITY];
     let mut count = 0;
     for snapshot in snapshots.iter().flatten() {
+        let identity = announced.iter().flatten().find(|announce| {
+            announce.source_mac == snapshot.peer
+                && usize::from(announce.device_id_len) >= dmesh_server::announce::IDENTITY_HINT_LEN
+        });
         entries[count] = dmesh_server::announce::ObservedDevice {
-            device_id: &[],
+            device_id: identity.map_or(&[], |announce| {
+                &announce.device_id[..dmesh_server::announce::IDENTITY_HINT_LEN]
+            }),
             peer: snapshot.peer,
             bssid: (snapshot.bssid != [0; 6]).then_some(snapshot.bssid),
             channel: (1..=13)
@@ -2207,7 +2323,11 @@ pub(crate) fn receive_tagged_discovery(
             dmesh_server::announce::ANNOUNCE_COMPONENT,
             dmesh_server::announce::ANNOUNCE_NAN_WAKEUP,
             id,
-            if queued { &[0xa1, 1, 0xf5] } else { &[0xa1, 1, 0xf4] },
+            if queued {
+                &[0xa1, 1, 0xf5]
+            } else {
+                &[0xa1, 1, 0xf4]
+            },
             &mut response,
         )?;
         return Some(alloc::vec::Vec::from(&response[..used]));
@@ -2326,12 +2446,22 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
         if let Some((instance, requestor_instance)) =
             crate::wifi_nan_dw_capture_esp::take_active_subscribe(peer)
         {
-            let _ = crate::wifi_nan_dw_capture_esp::send_followup_response(
-                peer,
-                instance,
-                requestor_instance,
-                response,
-            );
+            // The Android framework retransmits an empty active Subscribe
+            // while its discovery session is live. Each SDF was already
+            // parsed and this direct request was admitted above; suppress
+            // only a duplicate Follow-up action submission for the same
+            // request. Repeated action-TX would otherwise toggle the ESP
+            // promiscuous receiver on every 512-TU retry and defeat DW8.
+            let admit_response = dmesh_server::announce::discovery_request_id(packet)
+                .is_none_or(|id| crate::wifi_nan_dw_capture_esp::admit_discovery_reply(peer, id));
+            if admit_response {
+                let _ = crate::wifi_nan_dw_capture_esp::send_followup_response(
+                    peer,
+                    instance,
+                    requestor_instance,
+                    response,
+                );
+            }
         }
     }) {
         return;
@@ -2361,7 +2491,7 @@ where
     // Direct is only a short request/response transport form.  It invokes
     // this exact canonical tagged handler used by a normal QUIC stream;
     // QUIC-lite provides the framing/correlation around its payload.
-    let Some(response) = receive_tagged_control(record) else {
+    let Some(response) = receive_direct_tagged_control(record) else {
         return false;
     };
     crate::state::direct_record_accepted();
@@ -2502,94 +2632,169 @@ fn encode_telemetry_response_record(
             )?
         }
         t::NAN_METRICS_METHOD => {
+            let power = crate::power_esp::status();
             let (active_discovery_queued, active_discovery_sent, active_discovery_dropped) =
                 crate::wifi_nan_dw_capture_esp::active_discovery_stats();
+            let (
+                pending_sdf_queued,
+                pending_sdf_rejected,
+                pending_sdf_tx_attempted,
+                pending_sdf_tx_accepted,
+                pending_sdf_completed,
+                pending_sdf_count,
+            ) = crate::wifi_nan_dw_capture_esp::pending_sdf_stats();
             let (dw8_radio_stop_us, dw8_radio_resume_us, dw8_awake_us) = dw8_timing();
             let last_sdf_after_beacon_us = crate::wifi_nan_dw_capture_esp::stats().17;
+            let (
+                last_sdf_frame_bytes,
+                last_sdf_source_le,
+                small_sdf_max_bytes,
+                small_sdf_max_source_le,
+            ) = crate::wifi_nan_dw_capture_esp::last_sdf_ingress();
             t::encode_metrics(
                 &[
-                t::Metric {
-                    id: t::nan_metric::BEACONS,
-                    value: u64::from(counters.nan_beacons),
-                },
-                t::Metric {
-                    id: t::nan_metric::SDFS,
-                    value: u64::from(counters.nan_sdfs),
-                },
-                t::Metric {
-                    id: t::nan_metric::FOLLOWUPS_RX,
-                    value: u64::from(counters.nan_followups),
-                },
-                t::Metric {
-                    id: t::nan_metric::FOLLOWUPS_QUEUED,
-                    value: u64::from(counters.nan_followup_queued),
-                },
-                t::Metric {
-                    id: t::nan_metric::FOLLOWUPS_SENT,
-                    value: u64::from(counters.nan_followup_sent),
-                },
-                t::Metric {
-                    id: t::nan_metric::FOLLOWUPS_DROPPED,
-                    value: u64::from(counters.nan_followup_dropped),
-                },
-                t::Metric {
-                    id: t::nan_metric::SERVICE_INFO_MATCHED,
-                    value: u64::from(counters.nan_service_info_matched),
-                },
-                t::Metric {
-                    id: t::nan_metric::SERVICE_INFO_ENQUEUED,
-                    value: u64::from(counters.nan_service_info_enqueued),
-                },
-                t::Metric {
-                    id: t::nan_metric::SERVICE_INFO_DROPPED,
-                    value: u64::from(counters.nan_service_info_dropped),
-                },
-                t::Metric {
-                    id: t::nan_metric::SERVICE_INFO_DISPATCHED,
-                    value: u64::from(counters.nan_service_info_dispatched),
-                },
-                t::Metric {
-                    id: t::nan_metric::ACTIVE_PUBLISH_ATTEMPTED,
-                    value: u64::from(counters.nan_active_publish_attempted),
-                },
-                t::Metric {
-                    id: t::nan_metric::ACTIVE_PUBLISH_SENT,
-                    value: u64::from(counters.nan_active_publish_sent),
-                },
-                t::Metric {
-                    id: t::nan_metric::ACTIVE_PUBLISH_DROPPED,
-                    value: u64::from(counters.nan_active_publish_dropped),
-                },
-                t::Metric {
-                    id: t::nan_metric::ACTIVE_DISCOVERY_QUEUED,
-                    value: u64::from(active_discovery_queued),
-                },
-                t::Metric {
-                    id: t::nan_metric::ACTIVE_DISCOVERY_SENT,
-                    value: u64::from(active_discovery_sent),
-                },
-                t::Metric {
-                    id: t::nan_metric::ACTIVE_DISCOVERY_DROPPED,
-                    value: u64::from(active_discovery_dropped),
-                },
-                t::Metric {
-                    id: t::nan_metric::DW8_RADIO_STOP_US,
-                    value: u64::from(dw8_radio_stop_us),
-                },
-                t::Metric {
-                    id: t::nan_metric::DW8_RADIO_RESUME_US,
-                    value: u64::from(dw8_radio_resume_us),
-                },
-                t::Metric {
-                    id: t::nan_metric::DW8_AWAKE_US,
-                    value: u64::from(dw8_awake_us),
-                },
-                t::Metric {
-                    id: t::nan_metric::LAST_SDF_AFTER_BEACON_US,
-                    value: u64::from(last_sdf_after_beacon_us),
-                },
-            ],
-            &mut result,
+                    t::Metric {
+                        id: t::nan_metric::BEACONS,
+                        value: u64::from(counters.nan_beacons),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SDFS,
+                        value: u64::from(counters.nan_sdfs),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::FOLLOWUPS_RX,
+                        value: u64::from(counters.nan_followups),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::FOLLOWUPS_QUEUED,
+                        value: u64::from(counters.nan_followup_queued),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::FOLLOWUPS_SENT,
+                        value: u64::from(counters.nan_followup_sent),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::FOLLOWUPS_DROPPED,
+                        value: u64::from(counters.nan_followup_dropped),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SERVICE_INFO_MATCHED,
+                        value: u64::from(counters.nan_service_info_matched),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SERVICE_INFO_ENQUEUED,
+                        value: u64::from(counters.nan_service_info_enqueued),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SERVICE_INFO_DROPPED,
+                        value: u64::from(counters.nan_service_info_dropped),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SERVICE_INFO_DISPATCHED,
+                        value: u64::from(counters.nan_service_info_dispatched),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::ACTIVE_PUBLISH_ATTEMPTED,
+                        value: u64::from(counters.nan_active_publish_attempted),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::ACTIVE_PUBLISH_SENT,
+                        value: u64::from(counters.nan_active_publish_sent),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::ACTIVE_PUBLISH_DROPPED,
+                        value: u64::from(counters.nan_active_publish_dropped),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::ACTIVE_DISCOVERY_QUEUED,
+                        value: u64::from(active_discovery_queued),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::ACTIVE_DISCOVERY_SENT,
+                        value: u64::from(active_discovery_sent),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::ACTIVE_DISCOVERY_DROPPED,
+                        value: u64::from(active_discovery_dropped),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::DW8_RADIO_STOP_US,
+                        value: u64::from(dw8_radio_stop_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::DW8_RADIO_RESUME_US,
+                        value: u64::from(dw8_radio_resume_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::DW8_AWAKE_US,
+                        value: u64::from(dw8_awake_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LAST_SDF_AFTER_BEACON_US,
+                        value: u64::from(last_sdf_after_beacon_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LAST_SDF_FRAME_BYTES,
+                        value: u64::from(last_sdf_frame_bytes),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LAST_SDF_SOURCE_LE,
+                        value: last_sdf_source_le,
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SMALL_SDF_MAX_BYTES,
+                        value: u64::from(small_sdf_max_bytes),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::SMALL_SDF_MAX_SOURCE_LE,
+                        value: small_sdf_max_source_le,
+                    },
+                    t::Metric {
+                        id: t::nan_metric::PENDING_SDF_QUEUED,
+                        value: u64::from(pending_sdf_queued),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::PENDING_SDF_REJECTED,
+                        value: u64::from(pending_sdf_rejected),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::PENDING_SDF_TX_ATTEMPTED,
+                        value: u64::from(pending_sdf_tx_attempted),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::PENDING_SDF_TX_ACCEPTED,
+                        value: u64::from(pending_sdf_tx_accepted),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::PENDING_SDF_COMPLETED,
+                        value: u64::from(pending_sdf_completed),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::PENDING_SDF_COUNT,
+                        value: u64::from(pending_sdf_count),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LIGHT_SLEEP_ATTEMPTS,
+                        value: u64::from(power.light_sleep_attempts),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LIGHT_SLEEP_ENTRIES,
+                        value: u64::from(power.light_sleep_entries),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LIGHT_SLEEP_SKIPPED,
+                        value: u64::from(power.light_sleep_skipped),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LAST_SLEEP_REQUESTED_US,
+                        value: u64::from(power.last_sleep_requested_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::LAST_SLEEP_DURATION_US,
+                        value: u64::from(power.last_sleep_duration_us),
+                    },
+                ],
+                &mut result,
             )?
         }
         t::UDP6_METRICS_METHOD => t::encode_metrics(
@@ -2843,6 +3048,12 @@ impl MainCoordinator {
         let sta_lifecycle_completion = deadline_services & DEADLINE_STA_LIFECYCLE != 0;
         if sta_lifecycle_completion {
             self.radio.sta_associated = crate::wifi_esp::sta_associated();
+            if self.radio.sta_associated {
+                // The activation objective is reached. A later ordinary AP
+                // loss must use the normal low-duty fallback policy rather
+                // than resurrecting a stale wake request.
+                self.radio.sta_wake_retries_left = 0;
+            }
         }
         if deadline_services != 0 {
             service_radio_deadline(deadline_services);
@@ -2860,7 +3071,23 @@ impl MainCoordinator {
             && wants_sta(&profile)
             && !self.radio.sta_associated
         {
-            self.radio.sta_retry_pending = true;
+            if self.radio.sta_wake_retries_left != 0 {
+                self.radio.sta_wake_retries_left -= 1;
+                let requested = crate::wifi_esp::reconnect_sta_once();
+                crate::commands::send_stats(&[
+                    (b"nan wake STA reconnect", requested as u64),
+                    (
+                        b"nan wake STA retries_left",
+                        u64::from(self.radio.sta_wake_retries_left),
+                    ),
+                    (
+                        b"nan wake STA disconnect_reason",
+                        u64::from(crate::wifi_esp::sta_last_disconnect_reason()),
+                    ),
+                ]);
+            } else {
+                self.radio.sta_retry_pending = true;
+            }
         }
         let nan_action_active = crate::wifi_nan_dw_capture_esp::active_on_nan_channel();
         if deadline_services & DEADLINE_ACTIVE_DISCOVERY != 0
@@ -2924,22 +3151,18 @@ impl MainCoordinator {
             dmesh_server::main_runtime_state::MainEffect::None
         };
         if work.profile_changed {
-            // C6 DW8 diagnostics retain USB-JTAG, so do not let automatic
-            // idle sleep take that peripheral down between explicit windows.
-            // Active STA also stays awake: that matches Recovery's WPA
-            // association policy and avoids changing authentication timing at
-            // the Recovery-to-Main handoff. Classic ESP32 retains its narrow
-            // physical-DW8 policy.
-            #[cfg(target_arch = "riscv32")]
-            let _ = crate::power_esp::configure(false);
-            #[cfg(not(target_arch = "riscv32"))]
-            let _ = crate::power_esp::configure(is_sleepy_profile(&work.profile));
+            // Automatic CPU idle sleep is independent of the explicit DW
+            // boundary. Peripheral PM locks (for example UART or an active
+            // Wi-Fi window) decide whether a particular idle interval can
+            // actually sleep; a profile change must not silently disable the
+            // policy for the next idle interval.
+            let _ = crate::power_esp::configure(true);
             if is_sleepy_profile(&work.profile) {
                 // Arm a single deadline after the radio transition settles.
                 // Without this, a volatile DW8 request has no subsequent
                 // Main-owner wake on which to evaluate explicit light sleep.
                 self.radio.sleepy_awake_until_ms = work.now_ms.saturating_add(5_000);
-                crate::commands::send_response(b"sleep DW8 armed: command window 5000ms");
+                crate::commands::send_response(b"sleep DW armed: command window 5000ms");
             }
             record_power_completion(&mut self.runtime_state);
         }
@@ -3027,23 +3250,22 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     // later volatile transport.start command.
     let boot_power_policy = crate::main_runtime::boot_power_policy_from_nvs();
     let sleepy_boot = service.role == 1 && boot_power_policy.sleepy;
-    // PM is selected once from the boot policy, before the Wi-Fi owner starts.
-    // Failure is observable through the runtime power state but must not turn
-    // a boot into a radio busy-loop or prevent recovery through USB-JTAG.
-    #[cfg(target_arch = "riscv32")]
-    // Recovery is deliberately STA-only and does not enable ESP-IDF's
-    // automatic light sleep while it authenticates. Keep Main's initial
-    // active STA association on that same physical policy: otherwise a
-    // Recovery-to-Main handoff changes WPA timing even though both images use
-    // the same provisioned profile and driver setup. Explicit sleepy DW
-    // policy remains a later profile transition.
-    let _ = crate::power_esp::configure(false);
-    #[cfg(not(target_arch = "riscv32"))]
-    let _ = crate::power_esp::configure(sleepy_boot);
+    // Automatic CPU idle sleep is selected before the Wi-Fi owner starts.
+    // It is not the explicit DW physical-sleep policy: active peripherals
+    // retain their own PM locks and prevent entry where needed.
+    let _ = crate::power_esp::configure(true);
     unsafe { esp_idf_sys::esp_rom_printf(b"DMESH main: power\n\0".as_ptr().cast()) };
     crate::profile_store::with_profile(|params| {
         params.command_mode = service.role == 2 || !sleepy_boot;
         if sleepy_boot {
+            // A sleepy boot must retain its complete private STA profile even
+            // though it deliberately starts NAN+NOW instead of associating.
+            // `nan.wakeup` later requests `mode=sta` without carrying an SSID
+            // or PSK over NAN; without this load the target correctly rejects
+            // that request as an unspecified STA, making a sleepy device
+            // impossible to recover remotely.
+            let has_provisioned_sta = crate::sta_profile_esp::load(params);
+            crate::commands::send_stat(b"sleepy STA profile loaded=", has_provisioned_sta as u64);
             params.requested_transport = Some(dmesh_server::control::TransportKind::Nan);
             params.nan_dw_interval = 8;
             params.now = 2;
@@ -3361,6 +3583,8 @@ impl MainRadioState {
             } else {
                 0
             },
+            sleepy_blocker_reported_generation: 0,
+            sta_wake_retries_left: 0,
         }
     }
 }

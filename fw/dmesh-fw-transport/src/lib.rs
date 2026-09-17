@@ -27,8 +27,8 @@ pub mod commands;
 /// Shared transport engine used by the Main and Recovery policy wrappers.
 pub mod core_runtime;
 pub mod crypto_esp;
-pub mod flash;
 mod firmware_identity;
+pub mod flash;
 /// Main-specific policy entry point. The implementation is intentionally
 /// separate from the shared engine so Main can evolve without making the
 /// frozen Recovery lane link or execute its policy.

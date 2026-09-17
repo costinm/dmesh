@@ -17,12 +17,9 @@ use uart_codec::codec::{Decoder as UartDecoder, Encoder as UartEncoder};
 pub const UART_MAX_PACKET: usize = crate::TRANSPORT_MTU + 1;
 // The image's physical UART rate is intentionally a build-time choice:
 // switching it at runtime would strand a direct UART client before it could
-// receive an acknowledgement. USB-JTAG targets report zero because they are
-// packetized USB, not a UART link.
-#[cfg(not(target_arch = "riscv32"))]
+// receive an acknowledgement. C6 selects USB-JTAG only when a host is
+// physically attached at boot; otherwise it uses the board's UART0 bridge.
 include!(concat!(env!("OUT_DIR"), "/physical_uart_baud.rs"));
-#[cfg(target_arch = "riscv32")]
-pub const PHYSICAL_UART_BAUD: i32 = 0;
 // UART egress is a bounded flight of complete MTU records. Classic ESP32
 // chooses its depth at startup from internal-heap headroom; C6/S3 retain their
 // established fixed upper bounds. The common capacity-edge wake below prevents
@@ -45,8 +42,9 @@ const USB_JTAG_BUFFER_SIZE: u32 = (2 * (2 * UART_MAX_PACKET + 2)) as u32;
 // ESP-IDF owns this queue as part of the UART driver.  The shared L2 task is
 // its sole consumer on classic/S3; polling `uart_read_bytes` beside the event
 // queue loses RX wakeups on some classic bridge/driver combinations.
-#[cfg(not(target_arch = "riscv32"))]
 static UART_RX_EVENT_QUEUE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+#[cfg(target_arch = "riscv32")]
+static C6_USB_JTAG_SELECTED: AtomicBool = AtomicBool::new(false);
 static UART_RX_EVENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static UART_RX_BYTE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Optional firmware-owner wake hook. The L2 task has no dependency on Main,
@@ -126,6 +124,20 @@ pub fn uart_l2_stats() -> UartL2Stats {
     }
 }
 
+/// Whether this boot selected the packetized native USB-JTAG endpoint rather
+/// than a power-gated physical UART. On C6 this is a runtime hardware fact;
+/// CPU architecture alone cannot describe boards fitted with UART bridges.
+pub fn packetized_debug_selected() -> bool {
+    #[cfg(target_arch = "riscv32")]
+    {
+        return C6_USB_JTAG_SELECTED.load(Ordering::Acquire);
+    }
+    #[cfg(not(target_arch = "riscv32"))]
+    {
+        false
+    }
+}
+
 /// Install and configure the physical console bearer. This is deliberately
 /// the sole ESP UART0/USB-JTAG setup path used by both Main and Recovery.
 /// Callers provide only higher-layer dispatch policy; they must never create
@@ -133,61 +145,64 @@ pub fn uart_l2_stats() -> UartL2Stats {
 pub unsafe fn install_l2_driver(baud_selector: u8) -> bool {
     #[cfg(target_arch = "riscv32")]
     {
-        let mut config = esp_idf_sys::usb_serial_jtag_driver_config_t {
-            tx_buffer_size: USB_JTAG_BUFFER_SIZE,
-            rx_buffer_size: USB_JTAG_BUFFER_SIZE,
-        };
-        let result = esp_idf_sys::usb_serial_jtag_driver_install(&mut config);
-        return result == esp_idf_sys::ESP_OK || result == esp_idf_sys::ESP_ERR_INVALID_STATE;
+        if c6_usb_host_connected() {
+            let mut config = esp_idf_sys::usb_serial_jtag_driver_config_t {
+                tx_buffer_size: USB_JTAG_BUFFER_SIZE,
+                rx_buffer_size: USB_JTAG_BUFFER_SIZE,
+            };
+            let result = esp_idf_sys::usb_serial_jtag_driver_install(&mut config);
+            let installed =
+                result == esp_idf_sys::ESP_OK || result == esp_idf_sys::ESP_ERR_INVALID_STATE;
+            C6_USB_JTAG_SELECTED.store(installed, Ordering::Release);
+            return installed;
+        }
+        C6_USB_JTAG_SELECTED.store(false, Ordering::Release);
+        return install_uart0_driver(baud_selector);
     }
 
     #[cfg(not(target_arch = "riscv32"))]
     {
-        const UART0: esp_idf_sys::uart_port_t = esp_idf_sys::uart_port_t_UART_NUM_0;
-        let mut config = esp_idf_sys::uart_config_t::default();
-        let Some(baud) = baud_from_selector(baud_selector) else {
-            return false;
-        };
-        config.baud_rate = baud;
-        config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
-        config.parity = esp_idf_sys::uart_parity_t_UART_PARITY_DISABLE;
-        config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;
-        config.flow_ctrl = esp_idf_sys::uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE;
-        config.__bindgen_anon_1.source_clk = uart_source_clk();
-        if esp_idf_sys::uart_param_config(UART0, &config) != esp_idf_sys::ESP_OK {
-            return false;
-        }
-
-        // ESP-IDF's RX ISR requires a real event queue on classic ESP32 even
-        // when this adapter consumes the RX ring by polling. It remains owned
-        // by the driver; no firmware command/transport task reads UART0.
-        let mut event_queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
-        let mut result = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut event_queue, 0);
-        if result == esp_idf_sys::ESP_ERR_INVALID_STATE {
-            let _ = esp_idf_sys::uart_driver_delete(UART0);
-            event_queue = core::ptr::null_mut();
-            result = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut event_queue, 0);
-        }
-        if result != esp_idf_sys::ESP_OK || event_queue.is_null() {
-            return false;
-        }
-        UART_RX_EVENT_QUEUE.store(event_queue.cast(), Ordering::Release);
-        // Reattach both UART0 signals after replacing the ROM console driver.
-        // This is the original Main/Recovery setup on the CP2102 classic
-        // boards (GPIO1 TX / GPIO3 RX), and must happen even though ROM boot
-        // text itself can leave through UART0 without the new driver's RX
-        // matrix attachment.
-        let (tx_pin, rx_pin) = uart0_pins();
-        let _ = esp_idf_sys::_uart_set_pin6(UART0, tx_pin, rx_pin, -1, -1, -1, -1);
-        let _ = esp_idf_sys::uart_disable_tx_intr(UART0);
-        let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 64);
-        let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
-        esp_idf_sys::uart_set_always_rx_timeout(UART0, true);
-        let _ = esp_idf_sys::uart_enable_rx_intr(UART0);
-        let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
-        let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
-        return true;
+        install_uart0_driver(baud_selector)
     }
+}
+
+unsafe fn install_uart0_driver(baud_selector: u8) -> bool {
+    const UART0: esp_idf_sys::uart_port_t = esp_idf_sys::uart_port_t_UART_NUM_0;
+    let mut config = esp_idf_sys::uart_config_t::default();
+    let Some(baud) = baud_from_selector(baud_selector) else {
+        return false;
+    };
+    config.baud_rate = baud;
+    config.data_bits = esp_idf_sys::uart_word_length_t_UART_DATA_8_BITS;
+    config.parity = esp_idf_sys::uart_parity_t_UART_PARITY_DISABLE;
+    config.stop_bits = esp_idf_sys::uart_stop_bits_t_UART_STOP_BITS_1;
+    config.flow_ctrl = esp_idf_sys::uart_hw_flowcontrol_t_UART_HW_FLOWCTRL_DISABLE;
+    config.__bindgen_anon_1.source_clk = uart_source_clk();
+    if esp_idf_sys::uart_param_config(UART0, &config) != esp_idf_sys::ESP_OK {
+        return false;
+    }
+
+    let mut event_queue: esp_idf_sys::QueueHandle_t = core::ptr::null_mut();
+    let mut result = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut event_queue, 0);
+    if result == esp_idf_sys::ESP_ERR_INVALID_STATE {
+        let _ = esp_idf_sys::uart_driver_delete(UART0);
+        event_queue = core::ptr::null_mut();
+        result = esp_idf_sys::uart_driver_install(UART0, 2_048, 0, 16, &mut event_queue, 0);
+    }
+    if result != esp_idf_sys::ESP_OK || event_queue.is_null() {
+        return false;
+    }
+    UART_RX_EVENT_QUEUE.store(event_queue.cast(), Ordering::Release);
+    let (tx_pin, rx_pin) = uart0_pins();
+    let _ = esp_idf_sys::_uart_set_pin6(UART0, tx_pin, rx_pin, -1, -1, -1, -1);
+    let _ = esp_idf_sys::uart_disable_tx_intr(UART0);
+    let _ = esp_idf_sys::uart_set_rx_full_threshold(UART0, 64);
+    let _ = esp_idf_sys::uart_set_rx_timeout(UART0, 10);
+    esp_idf_sys::uart_set_always_rx_timeout(UART0, true);
+    let _ = esp_idf_sys::uart_enable_rx_intr(UART0);
+    let _ = esp_idf_sys::uart_set_wakeup_threshold(UART0, 3);
+    let _ = esp_idf_sys::esp_sleep_enable_uart_wakeup(UART0 as i32);
+    true
 }
 
 /// Allocate the bounded bearer queues and start their sole UART/USB owner.
@@ -226,6 +241,24 @@ fn uart0_pins() -> (i32, i32) {
     (1, 3)
 }
 
+#[cfg(target_arch = "riscv32")]
+fn uart0_pins() -> (i32, i32) {
+    // ESP32-C6 DevKit boards route their external USB-UART bridge to UART0
+    // on GPIO16/17. Native USB-JTAG boards select their packetized endpoint
+    // before this function is reached.
+    (16, 17)
+}
+
+#[cfg(target_arch = "riscv32")]
+unsafe fn c6_usb_host_connected() -> bool {
+    // ESP-IDF intentionally initializes this monitor to `true` until several
+    // scheduler ticks have proven that no USB SOF packets arrive. Main used
+    // to query it during that optimistic startup interval and therefore
+    // selected an unattached USB-JTAG endpoint on external-UART boards.
+    esp_idf_sys::vTaskDelay(8);
+    esp_idf_sys::usb_serial_jtag_is_connected()
+}
+
 #[cfg(any(target_feature = "esp32s3ops", target_arch = "riscv32"))]
 fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
     esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_XTAL
@@ -236,9 +269,9 @@ fn uart_source_clk() -> esp_idf_sys::uart_sclk_t {
     esp_idf_sys::soc_periph_uart_clk_src_legacy_t_UART_SCLK_APB
 }
 
-#[cfg(target_feature = "esp32s3ops")]
+#[cfg(any(target_feature = "esp32s3ops", target_arch = "riscv32"))]
 const UART_REQUIRES_APB_LOCK: bool = false;
-#[cfg(not(target_feature = "esp32s3ops"))]
+#[cfg(all(not(target_feature = "esp32s3ops"), not(target_arch = "riscv32")))]
 const UART_REQUIRES_APB_LOCK: bool = true;
 
 // The classic UART0 source is APB. An active console must retain the APB
@@ -338,9 +371,21 @@ pub fn suspend_for_light_sleep() {
 /// though the driver and the shared L2 task remain installed.  This belongs
 /// with that driver owner, not with a Main command or battery-policy module.
 pub fn rearm_after_wake() {
-    unsafe {
-        let _ = esp_idf_sys::uart_set_wakeup_threshold(esp_idf_sys::uart_port_t_UART_NUM_0, 3);
-        let _ = esp_idf_sys::uart_enable_rx_intr(esp_idf_sys::uart_port_t_UART_NUM_0);
+    let physical_uart = {
+        #[cfg(target_arch = "riscv32")]
+        {
+            !C6_USB_JTAG_SELECTED.load(Ordering::Acquire)
+        }
+        #[cfg(not(target_arch = "riscv32"))]
+        {
+            true
+        }
+    };
+    if physical_uart {
+        unsafe {
+            let _ = esp_idf_sys::uart_set_wakeup_threshold(esp_idf_sys::uart_port_t_UART_NUM_0, 3);
+            let _ = esp_idf_sys::uart_enable_rx_intr(esp_idf_sys::uart_port_t_UART_NUM_0);
+        }
     }
     if UART_DEBUG_ENABLED.load(Ordering::Acquire) {
         activate_window();
@@ -724,8 +769,7 @@ fn notify_egress_ready() {
 /// adapter only: the marker and PPP framing are L2 details, while routing and
 /// retransmission remain in the shared connection owner.
 pub fn send_transport_packet(packet: &[u8]) -> bool {
-    #[cfg(not(target_arch = "riscv32"))]
-    if !is_active() {
+    if !physical_bearer_active() {
         // `uart=off` means no parser, packet handling, or physical egress on
         // a real bridge. USB-JTAG is excluded so C6 debug/recovery remains
         // independently available in radio-only profiles.
@@ -767,8 +811,7 @@ pub fn send_transport_packet(packet: &[u8]) -> bool {
 /// responses; it delegates the long-header envelope to the shared direct
 /// endpoint.
 pub fn send_direct_record(record: &[u8]) -> bool {
-    #[cfg(not(target_arch = "riscv32"))]
-    if !is_active() {
+    if !physical_bearer_active() {
         return false;
     }
     if record.is_empty() || record.len() > UART_MAX_PACKET.saturating_sub(6) {
@@ -785,8 +828,7 @@ pub fn send_direct_record(record: &[u8]) -> bool {
 /// response half of the shared direct endpoint; UART remains a frame writer
 /// and must not create a second envelope around it.
 pub fn send_connectionless_packet(packet: &[u8]) -> bool {
-    #[cfg(not(target_arch = "riscv32"))]
-    if !is_active() {
+    if !physical_bearer_active() {
         return false;
     }
     if packet.is_empty() || packet.len() > UART_MAX_PACKET {
@@ -827,10 +869,17 @@ pub unsafe extern "C" fn dmesh_uart_log_line(bytes: *const u8, len: usize) -> i3
 #[cfg(target_arch = "riscv32")]
 fn write_usb(bytes: &[u8]) -> i32 {
     unsafe {
-        // The queue owner never waits for USB. A partial write remains at the
-        // head of the task-local frame until it is complete, preserving PPP
-        // record order and avoiding a 100-tick transport-worker stall.
-        esp_idf_sys::usb_serial_jtag_write_bytes(bytes.as_ptr().cast(), bytes.len(), 0)
+        if C6_USB_JTAG_SELECTED.load(Ordering::Acquire) {
+            // The queue owner never waits for USB. A partial write remains at
+            // the head of the task-local frame until it is complete.
+            esp_idf_sys::usb_serial_jtag_write_bytes(bytes.as_ptr().cast(), bytes.len(), 0)
+        } else {
+            esp_idf_sys::uart_write_bytes(
+                esp_idf_sys::uart_port_t_UART_NUM_0,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+            ) as i32
+        }
     }
 }
 
@@ -885,11 +934,20 @@ fn write_usb(bytes: &[u8]) -> i32 {
 #[cfg(target_arch = "riscv32")]
 fn read_usb(bytes: &mut [u8], ticks_to_wait: u32) -> i32 {
     unsafe {
-        esp_idf_sys::usb_serial_jtag_read_bytes(
-            bytes.as_mut_ptr().cast(),
-            bytes.len() as u32,
-            ticks_to_wait,
-        )
+        if C6_USB_JTAG_SELECTED.load(Ordering::Acquire) {
+            esp_idf_sys::usb_serial_jtag_read_bytes(
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                ticks_to_wait,
+            )
+        } else {
+            esp_idf_sys::uart_read_bytes(
+                esp_idf_sys::uart_port_t_UART_NUM_0,
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                ticks_to_wait,
+            )
+        }
     }
 }
 #[cfg(not(target_arch = "riscv32"))]
@@ -907,6 +965,9 @@ fn read_usb(bytes: &mut [u8], ticks_to_wait: u32) -> i32 {
 #[cfg(target_arch = "riscv32")]
 pub fn install_console() {
     unsafe {
+        if !c6_usb_host_connected() {
+            return;
+        }
         let mut config = esp_idf_sys::usb_serial_jtag_driver_config_t {
             tx_buffer_size: USB_JTAG_BUFFER_SIZE,
             rx_buffer_size: USB_JTAG_BUFFER_SIZE,
@@ -1088,18 +1149,29 @@ fn command_task() {
         }
         #[cfg(target_arch = "riscv32")]
         {
-            // USB-JTAG has no ESP-IDF UART event queue. Its nonblocking
-            // driver read is the corresponding one-owner receive primitive.
-            let count = read_usb(&mut bytes, 0);
-            if count > 0 {
-                UART_RX_BYTE_COUNT.fetch_add(count as u32, Ordering::Relaxed);
-                consume_uart_bytes(&mut decoder, &bytes[..count as usize]);
-                continue;
+            if C6_USB_JTAG_SELECTED.load(Ordering::Acquire) {
+                // USB-JTAG has no ESP-IDF UART event queue. Its nonblocking
+                // driver read is the corresponding one-owner primitive.
+                let count = read_usb(&mut bytes, 0);
+                if count > 0 {
+                    UART_RX_BYTE_COUNT.fetch_add(count as u32, Ordering::Relaxed);
+                    consume_uart_bytes(&mut decoder, &bytes[..count as usize]);
+                    continue;
+                }
             }
         }
 
-        #[cfg(not(target_arch = "riscv32"))]
-        {
+        let use_uart_events = {
+            #[cfg(target_arch = "riscv32")]
+            {
+                !C6_USB_JTAG_SELECTED.load(Ordering::Acquire)
+            }
+            #[cfg(not(target_arch = "riscv32"))]
+            {
+                true
+            }
+        };
+        if use_uart_events {
             let event_queue = UART_RX_EVENT_QUEUE.load(Ordering::Acquire);
             if !event_queue.is_null() {
                 let mut event = esp_idf_sys::uart_event_t::default();
@@ -1149,7 +1221,6 @@ fn command_task() {
     }
 }
 
-#[cfg(not(target_arch = "riscv32"))]
 fn drain_uart_driver(decoder: &mut UartDecoder, bytes: &mut [u8; 256]) {
     loop {
         let count = read_usb(bytes, 0);
@@ -1162,8 +1233,7 @@ fn drain_uart_driver(decoder: &mut UartDecoder, bytes: &mut [u8; 256]) {
 }
 
 fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
-    #[cfg(not(target_arch = "riscv32"))]
-    if !is_active() {
+    if !physical_bearer_active() {
         // Keep the ESP-IDF driver owner alive so an enabled profile can
         // resume without reinstalling UART0, but discard bytes before PPP
         // decode and shared-pool admission while UART is explicitly off.
@@ -1196,4 +1266,12 @@ fn consume_uart_bytes(decoder: &mut UartDecoder, bytes: &[u8]) {
             Err(_) => {}
         }
     }
+}
+
+fn physical_bearer_active() -> bool {
+    #[cfg(target_arch = "riscv32")]
+    if C6_USB_JTAG_SELECTED.load(Ordering::Acquire) {
+        return true;
+    }
+    is_active()
 }

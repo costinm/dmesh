@@ -14,7 +14,8 @@
 // That works on host/esp32 - if Androids are present they can start a NAN cluster.
 // Using only NOW action frames is simplest - no deps on the beacon/management frames in NAN.
 
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EspNowPeer {
@@ -113,21 +114,60 @@ static TX_DURATION_LE_750US: AtomicU32 = AtomicU32::new(0);
 static TX_DURATION_LE_2MS: AtomicU32 = AtomicU32::new(0);
 static TX_DURATION_GT_2MS: AtomicU32 = AtomicU32::new(0);
 static mut LOCAL_MAC: [u8; 6] = [0; 6];
-static mut RESPONSE: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
-    [0; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
-static mut TX_FRAME: [u8; FRAME_CAPACITY] = [0; FRAME_CAPACITY];
-static mut RX_PAYLOAD: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE] =
-    [0; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE];
 /// C flexible-array request storage for `esp_wifi_action_tx_req`. The SDK
 /// copies this request before returning (as its own off-channel tests do),
-/// but static storage also avoids a per-packet allocator path.
+/// and the heap-owned radio scratch avoids a per-packet allocator path.
 #[repr(C)]
 struct ActionTxRequest {
     request: esp_idf_sys::wifi_action_tx_req_t,
     data: [u8; FRAME_CAPACITY - 24],
 }
-static mut ACTION_TX_REQUEST: core::mem::MaybeUninit<ActionTxRequest> =
-    core::mem::MaybeUninit::uninit();
+
+/// NAN/NOW scratch is needed only while the action bearer is installed. Keep
+/// its four MTU-sized buffers out of firmware BSS so reduced images which link
+/// shared flash code do not permanently reserve them. The allocation is made
+/// once before callbacks are registered and retained across radio restarts;
+/// callbacks and packet turns never allocate.
+#[repr(C)]
+struct ActionBuffers {
+    response: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    tx_frame: [u8; FRAME_CAPACITY],
+    rx_payload: [u8; quic_lite::DEFAULT_MAX_DATAGRAM_SIZE],
+    action_tx_request: ActionTxRequest,
+}
+
+static ACTION_BUFFERS: AtomicPtr<ActionBuffers> = AtomicPtr::new(core::ptr::null_mut());
+
+fn ensure_action_buffers() -> bool {
+    if !ACTION_BUFFERS.load(Ordering::Acquire).is_null() {
+        return true;
+    }
+    let layout = Layout::new::<ActionBuffers>();
+    let allocated = unsafe { alloc_zeroed(layout).cast::<ActionBuffers>() };
+    if allocated.is_null() {
+        return false;
+    }
+    if ACTION_BUFFERS
+        .compare_exchange(
+            core::ptr::null_mut(),
+            allocated,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // A concurrent radio-start won the one-time installation. No callback
+        // can see this un-published allocation, so releasing only the loser is
+        // safe; the published scratch remains stable for the firmware lifetime.
+        unsafe { dealloc(allocated.cast(), layout) };
+    }
+    true
+}
+
+fn action_buffers() -> Option<*mut ActionBuffers> {
+    let buffers = ACTION_BUFFERS.load(Ordering::Acquire);
+    (!buffers.is_null()).then_some(buffers)
+}
 pub fn stats() -> (u32, u32, u32, u32) {
     (
         RX_ACTIONS.load(Ordering::Relaxed),
@@ -289,6 +329,9 @@ pub fn management_stats() -> (u32, u32, u32, u32) {
 /// Wi-Fi owns callback registration and starts/stops the shared packet pool;
 /// this function never changes a driver callback or buffer lifecycle.
 pub fn install_action_ingress(local_mac: [u8; 6], handler: EspNowHandler) -> bool {
+    if !ensure_action_buffers() {
+        return false;
+    }
     HANDLER.store(handler as usize, Ordering::Release);
     // All NOW ingress and egress share one worker.  Main's one-shot client
     // timer and the packet worker can both produce actions; queuing egress
@@ -393,7 +436,11 @@ pub(crate) fn receive_registered_action_payload(
     // Generic STA/AP action ingress still includes the normal vendor action
     // prefix and IEs. Strip only that radio framing before handing the
     // complete opaque QUIC-lite datagram to the common dispatcher.
-    let output = unsafe { &mut *core::ptr::addr_of_mut!(RX_PAYLOAD) };
+    let Some(buffers) = action_buffers() else {
+        RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let output = unsafe { &mut (*buffers).rx_payload };
     match dmesh_rawnan::espnow::parse_action_body_into(body, output) {
         Some(used) => admit_now_payload(source, &output[..used]),
         None => {
@@ -444,7 +491,12 @@ fn receive_action_parts(header: *mut u8, payload: *mut u8, len: usize) {
         ACTION_PARSE_BUSY.store(false, Ordering::Release);
         return;
     };
-    let output = unsafe { &mut *core::ptr::addr_of_mut!(RX_PAYLOAD) };
+    let Some(buffers) = action_buffers() else {
+        RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        ACTION_PARSE_BUSY.store(false, Ordering::Release);
+        return;
+    };
+    let output = unsafe { &mut (*buffers).rx_payload };
     RX_MANAGEMENT.fetch_add(1, Ordering::Relaxed);
     RX_ACTION_FRAMES.fetch_add(1, Ordering::Relaxed);
     match dmesh_rawnan::espnow::parse_action_body_into(payload, output) {
@@ -496,7 +548,11 @@ pub fn receive_action_frame(frame: &[u8]) {
 /// Callers above are the only callback adapters and release the guard after
 /// the parser has copied the accepted payload into `shared_ingress_esp`.
 fn receive_action_frame_unlocked(frame: &[u8]) {
-    let output = unsafe { &mut *core::ptr::addr_of_mut!(RX_PAYLOAD) };
+    let Some(buffers) = action_buffers() else {
+        RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let output = unsafe { &mut (*buffers).rx_payload };
     let Some((source, used)) = dmesh_rawnan::espnow::parse_action_frame_into(frame, output) else {
         RX_PARSE_DROPS.fetch_add(1, Ordering::Relaxed);
         return;
@@ -555,7 +611,11 @@ pub(crate) fn dispatch_ingress(item: crate::shared_ingress_esp::IngressPacket, p
         return;
     }
     let handler: EspNowHandler = unsafe { core::mem::transmute(handler) };
-    let response = unsafe { &mut *core::ptr::addr_of_mut!(RESPONSE) };
+    let Some(buffers) = action_buffers() else {
+        RX_DROPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let response = unsafe { &mut (*buffers).response };
     // A valid QUIC-lite ACK normally has no immediate reply.  It can still
     // release a queued stream packet, so always reach the connection-owned
     // poller after handling ingress. Returning here used to stall the service
@@ -641,7 +701,11 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     } else {
         peer.mac
     };
-    let frame = unsafe { &mut *core::ptr::addr_of_mut!(TX_FRAME) };
+    let Some(buffers) = action_buffers() else {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let frame = unsafe { &mut (*buffers).tx_frame };
     // Auto normally means the STA identity, but an AP-only epoch has no
     // associated STA peer to which a reply could be addressed.  In that
     // topology the incoming action was received through the AP identity and
@@ -682,7 +746,7 @@ fn transmit_submitted(peer: EspNowPeer, payload: &[u8], wait_time_ms: u32) -> bo
     // an APSTA relay can send action traffic from its AP MAC when requested;
     // Auto remains the STA behaviour used by normal infrastructure traffic.
     let sent = unsafe {
-        let request = &mut *core::ptr::addr_of_mut!(ACTION_TX_REQUEST).cast::<ActionTxRequest>();
+        let request = &mut (*buffers).action_tx_request;
         core::ptr::write_bytes(request as *mut ActionTxRequest, 0, 1);
         request.request.ifx = crate::wifi_esp::radio_interface_id(interface);
         request.request.dest_mac = destination;
@@ -761,8 +825,12 @@ pub fn transmit_public_action_on_interface(
         TX_FAILURES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
+    let Some(buffers) = action_buffers() else {
+        TX_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
     let sent = unsafe {
-        let request = &mut *core::ptr::addr_of_mut!(ACTION_TX_REQUEST).cast::<ActionTxRequest>();
+        let request = &mut (*buffers).action_tx_request;
         core::ptr::write_bytes(request as *mut ActionTxRequest, 0, 1);
         request.request.ifx = crate::wifi_esp::radio_interface_id(interface);
         request.request.dest_mac = destination;
@@ -774,9 +842,12 @@ pub fn transmit_public_action_on_interface(
         request.request.channel = channel;
         request.request.sec_channel = secondary;
         request.request.wait_time_ms = PUBLIC_ACTION_TX_WAIT_MS;
-        // Public actions include both directed NAN requests and multicast
-        // announcements.  Only the former can use a MAC acknowledgement.
-        request.request.no_ack = destination == [0xff; 6] || !mac_ack_enabled();
+        // Match ESP-IDF's own `esp_nan_de_tx`: NAN public actions use the
+        // normal acknowledged action-request path even when A1 is the NAN
+        // discovery-group address. Setting `no_ack` for that multicast MAC
+        // makes `esp_wifi_action_tx_req` return success without producing a
+        // peer-visible SDF on current ESP32/C6 drivers.
+        request.request.no_ack = false;
         request.request.rx_cb = Some(action_tx_rx_callback);
         request.request.bssid = bssid;
         request.request.data_len = body.len() as u32;

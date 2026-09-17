@@ -125,11 +125,22 @@ ENTRY_OFFSET=$((ENTRY_OFFSET - MODULE_VMA_BASE))
 # the image start and therefore include the 64-byte header.
 DMOD_ENTRY_OFFSET=$((ENTRY_OFFSET + 64))
 DMOD_FLAGS=0
-if [ -n "${DMESH_MODULE_VMA:-}" ]; then DMOD_FLAGS=1; fi
+DMOD_CODE_VMA=0
+if [ -n "${DMESH_MODULE_VMA:-}" ]; then
+  DMOD_FLAGS=1
+  DMOD_CODE_VMA=$((DMESH_MODULE_VMA - 64))
+fi
 "$DMESH_PYTHON" "$ROOT/fw/mod_hello/pack.py" --service-tag "$SERVICE_TAG" \
-  --slot-count "$SLOT_COUNT" --code-vma "$(( ${DMESH_MODULE_VMA:-0} - 64 ))" \
+  --slot-count "$SLOT_COUNT" --code-vma "$DMOD_CODE_VMA" \
   --data-vma "$data_base" --stack-words 16384 \
   --entry-offset "$DMOD_ENTRY_OFFSET" --flags "$DMOD_FLAGS" "$RAW" "$IMAGE"
+case "$TARGET" in
+  xtensa-esp32-espidf) object_chip=esp32 ;;
+  xtensa-esp32s3-espidf) object_chip=esp32s3 ;;
+  riscv32imac-unknown-none-elf|riscv32imac-esp-espidf) object_chip=esp32c6 ;;
+esac
+mkdir -p "$ROOT/target/flash/modules/$object_chip"
+cp "$IMAGE" "$ROOT/target/flash/modules/$object_chip/mod_lora.dmod"
 printf 'module image: %s\n' "$IMAGE"
 build_elapsed_ms=$(( $(now_ms) - build_started_ms ))
 image_size="$(stat -c '%s' "$IMAGE")"

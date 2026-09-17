@@ -91,7 +91,9 @@ pub(crate) fn load(profile: &mut crate::TransportProfile) -> bool {
         }
         let psk_len = nvs_string(secret_handle, b"sta\0", &mut psk);
         unsafe { nvs_close(secret_handle) };
-        let Some(psk_len) = psk_len else { return Some(6) };
+        let Some(psk_len) = psk_len else {
+            return Some(6);
+        };
         if !(8..=63).contains(&psk_len) {
             return Some(7);
         }
@@ -103,7 +105,8 @@ pub(crate) fn load(profile: &mut crate::TransportProfile) -> bool {
         profile.ap = 0;
         profile.run_requested = true;
         Some(0)
-    })().unwrap_or(8);
+    })()
+    .unwrap_or(8);
     unsafe { nvs_close(handle) };
     if result != 0 {
         crate::commands::send_stat(b"sta profile reject=", u64::from(result));

@@ -58,8 +58,8 @@ pub fn run() {
     log(b"DMESH recovery: STA associated\n\0");
 
     // This is the exact raw association and physical adapter selected by
-    // Main's STA epoch. Recovery installs no direct command catalog: only the
-    // normal QUIC stream dispatcher can reach the flash handler.
+    // Main's STA epoch. Recovery exposes only the common signed discovery
+    // request directly; the normal QUIC stream dispatcher owns flashing.
     let association = crate::core_runtime::prepare_raw_association(&profile);
     let receive_limits = association
         .association
@@ -78,13 +78,14 @@ pub fn run() {
     crate::wifi_raw_udp6_esp::set_sta_driver_tx(profile.sta_driver_tx);
     if !crate::wifi_esp::start_raw_udp6(
         crate::core_runtime::receive_raw_udp6,
-        crate::core_runtime::reject_recovery_connectionless,
+        crate::core_runtime::receive_recovery_connectionless,
     ) {
         log(b"DMESH recovery: raw UDP6 start failed\n\0");
         return_to_main();
     }
     crate::wifi_raw_udp6_esp::set_poll_handler(Some(crate::core_runtime::poll_raw_udp6));
     log(b"DMESH recovery: raw UDP6 ready\n\0");
+    log_stack_stats();
     log(b"DMESH recovery: upload wait\n\0");
     serve_upload(started_us);
 }
@@ -185,6 +186,38 @@ fn log_raw_stats() {
             tx_failures,
         );
     }
+    log_stack_stats();
+}
+
+fn log_stack_stats() {
+    // ESP-IDF's FreeRTOS variant reports the high-water mark in bytes. It is
+    // the minimum free space observed since task creation, so `peak_used` is
+    // the strongest stack-use evidence available without periodic sampling.
+    let configured = esp_idf_sys::CONFIG_ESP_MAIN_TASK_STACK_SIZE;
+    let min_free =
+        unsafe { esp_idf_sys::uxTaskGetStackHighWaterMark2(core::ptr::null_mut()) as u32 };
+    let ingress = crate::shared_ingress_esp::memory_stats();
+    let ingress_peak_used = if ingress.worker_running {
+        ingress
+            .worker_stack_bytes
+            .saturating_sub(ingress.worker_stack_min_free_words)
+    } else {
+        0
+    };
+    unsafe {
+        esp_idf_sys::esp_rom_printf(
+            b"DMESH recovery: stack configured=%u min_free=%u peak_used=%u ingress_running=%u ingress_configured=%u ingress_min_free=%u ingress_peak_used=%u\n\0"
+                .as_ptr()
+                .cast(),
+            configured,
+            min_free,
+            configured.saturating_sub(min_free),
+            ingress.worker_running as u32,
+            ingress.worker_stack_bytes,
+            ingress.worker_stack_min_free_words,
+            ingress_peak_used,
+        );
+    }
 }
 
 fn now_us() -> u64 {
@@ -243,7 +276,9 @@ fn return_to_main() -> ! {
     crate::wifi_esp::stop_sta_for_reset();
     unsafe {
         esp_idf_sys::esp_rom_printf(
-            b"DMESH recovery: handoff before reset=%u\n\0".as_ptr().cast(),
+            b"DMESH recovery: handoff before reset=%u\n\0"
+                .as_ptr()
+                .cast(),
             crate::rtc::handoff() as u32,
         );
     }

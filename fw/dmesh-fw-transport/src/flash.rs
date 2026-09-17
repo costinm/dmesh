@@ -6,7 +6,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
-use dmesh_server::verified_object::{BLOCK_SIZE, ImageSink};
+use dmesh_server::verified_object::{ImageSink, BLOCK_SIZE};
 
 /// No application bytes have arrived for this bounded period. This is a
 /// receiver liveness guard, not a transport deadline: QUIC-lite continues to
@@ -219,7 +219,12 @@ unsafe fn consume_pending_stream(service: &mut ConnectionService, now_ms: u64) -
             ..
         }) => {
             log_receiver_error(error);
-            let _ = complete_error(service, request_id, b"flash object rejected");
+            // The console keeps the fuller diagnostic, but the authenticated
+            // stream response must also distinguish an ordinary local
+            // allocation failure from malformed or unauthenticated input.
+            // These fixed strings are intentionally bounded and contain no
+            // object identity, partition, or heap-address information.
+            let _ = complete_error(service, request_id, receiver_error_response(error));
             let _ = slot.take_for(owner);
             set_transfer_active(false);
             Err(())
@@ -228,6 +233,25 @@ unsafe fn consume_pending_stream(service: &mut ConnectionService, now_ms: u64) -
             crate::recovery_runtime::log(b"DMESH recovery: flash stream transport rejected\n\0");
             Err(())
         }
+    }
+}
+
+fn receiver_error_response(error: dmesh_server::verified_object::ImageError) -> &'static [u8] {
+    match error {
+        dmesh_server::verified_object::ImageError::Truncated => b"flash object rejected: truncated",
+        dmesh_server::verified_object::ImageError::Allocation => {
+            b"flash object rejected: allocation"
+        }
+        dmesh_server::verified_object::ImageError::InvalidManifest => {
+            b"flash object rejected: invalid manifest"
+        }
+        dmesh_server::verified_object::ImageError::InvalidBlock => {
+            b"flash object rejected: invalid block"
+        }
+        dmesh_server::verified_object::ImageError::InvalidSignature => {
+            b"flash object rejected: invalid signature"
+        }
+        dmesh_server::verified_object::ImageError::Sink => b"flash object rejected: sink",
     }
 }
 
@@ -574,10 +598,18 @@ fn sink_for_flash_request(
             if name.is_empty() || name.iter().any(|byte| *byte == 0) {
                 return Err(FlashSinkError::MissingModuleName);
             }
-            let mut label = Vec::with_capacity(name.len() + 1);
-            label.extend_from_slice(name);
-            label.push(0);
-            EspPartitionSink::new(&label, target, dry_run)
+            // Module placement is the same numeric service-tag allocation
+            // used by the loader and the direct provisioning tool. Modules
+            // are regions inside the shared `data` partition, not app
+            // partitions named after each module.
+            let (offset, capacity) = match name {
+                b"lora" => (0x00000, 0x20000),  // tag 43, two slots
+                b"flash" => (0x10000, 0x10000), // tag 44, development alias
+                b"hw" => (0x20000, 0x10000),    // tag 45
+                b"hello" => (0x30000, 0x10000), // tag 46
+                _ => return Err(FlashSinkError::MissingModuleName),
+            };
+            EspPartitionSink::new_region(b"data\0", offset, capacity, target, dry_run)
         }
         6 | 3 | 7 => return Err(FlashSinkError::AddressOverrideUnsupported),
         _ => return Err(FlashSinkError::UnsupportedTarget),
@@ -645,12 +677,47 @@ impl EspPartitionSink {
     /// Select a partition once for a requested object target. `label` must be
     /// NUL terminated because ESP-IDF retains no owned partition name.
     pub fn new(label: &[u8], target: u8, dry_run: bool) -> Result<Self, FlashSinkError> {
+        Self::new_partition(
+            esp_idf_sys::esp_partition_type_t_ESP_PARTITION_TYPE_APP,
+            label,
+            0,
+            None,
+            target,
+            dry_run,
+        )
+    }
+
+    fn new_region(
+        label: &[u8],
+        offset: usize,
+        capacity: usize,
+        target: u8,
+        dry_run: bool,
+    ) -> Result<Self, FlashSinkError> {
+        Self::new_partition(
+            esp_idf_sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA,
+            label,
+            offset,
+            Some(capacity),
+            target,
+            dry_run,
+        )
+    }
+
+    fn new_partition(
+        partition_type: esp_idf_sys::esp_partition_type_t,
+        label: &[u8],
+        offset: usize,
+        capacity: Option<usize>,
+        target: u8,
+        dry_run: bool,
+    ) -> Result<Self, FlashSinkError> {
         if label.last().copied() != Some(0) {
             return Err(FlashSinkError::PartitionUnavailable);
         }
         let partition = unsafe {
             esp_idf_sys::esp_partition_find_first(
-                esp_idf_sys::esp_partition_type_t_ESP_PARTITION_TYPE_APP,
+                partition_type,
                 esp_idf_sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_ANY,
                 label.as_ptr().cast(),
             )
@@ -658,13 +725,16 @@ impl EspPartitionSink {
         if partition.is_null() {
             return Err(FlashSinkError::PartitionUnavailable);
         }
-        Self::new_storage(
-            partition,
-            0,
-            unsafe { (*partition).size as usize },
-            target,
-            dry_run,
-        )
+        let partition_size = unsafe { (*partition).size as usize };
+        let capacity = capacity.unwrap_or_else(|| partition_size.saturating_sub(offset));
+        if capacity == 0
+            || offset
+                .checked_add(capacity)
+                .is_none_or(|end| end > partition_size)
+        {
+            return Err(FlashSinkError::PartitionUnavailable);
+        }
+        Self::new_storage(partition, offset, capacity, target, dry_run)
     }
 
     /// Construct the strictly bounded raw Stage2 region.  This is not a
@@ -737,7 +807,9 @@ impl EspPartitionSink {
                 )
             }
         } else {
-            unsafe { esp_idf_sys::esp_partition_erase_range(self.partition, 0, erase_len) }
+            unsafe {
+                esp_idf_sys::esp_partition_erase_range(self.partition, self.base_address, erase_len)
+            }
         };
         self.erase_us = self.erase_us.saturating_add(
             (unsafe { esp_idf_sys::esp_timer_get_time() as u64 }).saturating_sub(started),
@@ -773,7 +845,7 @@ impl EspPartitionSink {
             unsafe {
                 esp_idf_sys::esp_partition_write(
                     self.partition,
-                    index as usize * BLOCK_SIZE,
+                    self.base_address + index as usize * BLOCK_SIZE,
                     data.as_ptr().cast(),
                     data_len,
                 )
