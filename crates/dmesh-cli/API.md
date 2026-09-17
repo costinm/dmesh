@@ -21,12 +21,14 @@ sets `DMESH_DEVICE_CATALOG` to its protected replacement. The library accepts
 an explicit `/dev/...` serial path, a scoped `udp://[IPv6%iface]:PORT` / IP
 literal, or a catalog name such as `e8`.
 
-`static_ipv4`, `ipv6_link_local`, `serial_id`, and `auth_secret_ref` are
+`static_ipv4`, `ipv6_link_local`, `udp6_iface`, `vip6`, `serial_id`, and `auth_secret_ref` are
 inventory fields. The secret field is a reference only: authentication and
 encryption are a future end-to-end layer across every untrusted bearer.
-Current UDP sessions prefer `ipv4`; a serial-only profile resolves to its
-configured serial path. IPv6 link-local is recorded now but needs a
-caller-selected interface scope before it becomes a UDP path.
+An explicit catalog VIP6 or catalog name first attempts its scoped
+`ipv6_link_local`/`udp6_iface` UDP6 association. If that fails, the CLI uses
+the signed discovery and NAN activation flow before sending the requested
+service stream. Other catalog-name sessions continue to use their configured
+IPv4 or serial path.
 
 Direct UDP diagnostics, direct control, and QUIC service clients bind local
 UDP port `3338` for both address families. This stable source port lets an ESP

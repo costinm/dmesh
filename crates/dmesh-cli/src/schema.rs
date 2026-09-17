@@ -421,7 +421,10 @@ impl FirmwareSchema {
             // Text has no byte-string type. Keep the representation marker
             // local to the JSON/text adapter; the shared CBOR encoder turns
             // it into a byte string for every client surface.
-            Some("hex") => Ok(Value::String(format!("hex:{value}"))),
+            Some("hex") => {
+                let compact = value.strip_prefix("hex:").unwrap_or(value).replace(':', "");
+                Ok(Value::String(format!("hex:{compact}")))
+            }
             _ => Ok(Value::String(value.to_owned())),
         }
     }
@@ -868,6 +871,27 @@ mod tests {
     }
 
     #[test]
+    fn transport_set_preserves_the_explicit_sleepy_dw_fields() {
+        let command = encode_stream_command_with_id(
+            "transport.set mode=nan nan_dw_interval=1 now=2 ap=0",
+            24,
+        )
+        .unwrap();
+        assert_eq!(
+            dmesh_server::control::decode_request(&command),
+            Some(dmesh_server::control::Request::TransportSet {
+                kind: dmesh_server::control::TransportKind::Nan,
+                config: dmesh_server::control::TransportConfig {
+                    nan_dw_interval: Some(1),
+                    now: Some(2),
+                    ap: Some(0),
+                    ..dmesh_server::control::TransportConfig::default()
+                },
+            })
+        );
+    }
+
+    #[test]
     fn settings_set_is_stream_only() {
         assert!(encode_direct_command("settings.set key=sta_ssid value=costin").is_err());
         let command = encode_stream_command_with_id("settings.set key=sta_ssid value=costin", 41)
@@ -917,6 +941,27 @@ mod tests {
         assert_eq!(request.object.target, 3);
         assert_eq!(request.transport, 0);
         assert!(!request.dry_run);
+
+        let command =
+            encode_stream_command_with_id("object.flash name=lora cpu=0 target=7 address=0", 47)
+                .expect("named module flash request");
+        let (_, request) = dmesh_server::verified_object::decode_flash_handler_request(&command)
+            .expect("canonical named flash request");
+        assert_eq!(request.object.name, Some(&b"lora"[..]));
+        assert_eq!(request.address, Some(0));
+    }
+
+    #[test]
+    fn module_stop_is_a_schema_driven_empty_stream_request() {
+        let command =
+            encode_stream_command_with_id("module.stop", 48).expect("module stop stream request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged module stop");
+        assert_eq!(
+            record.component,
+            Some(dmesh_server::tagged::Name::Tag(1000))
+        );
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(3)));
+        assert_eq!(record.id, Some(48));
     }
 
     #[test]
@@ -966,6 +1011,130 @@ mod tests {
         );
         assert_eq!(record.id, Some(47));
         assert!(record.fields.is_none());
+    }
+
+    #[test]
+    fn ble_control_is_a_schema_driven_tagged_stream() {
+        let command =
+            encode_stream_command_with_id("ble.start", 48).expect("stream BLE start request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged BLE start request");
+        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(104)));
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(80)));
+        assert_eq!(record.id, Some(48));
+        assert!(record.fields.is_none());
+
+        let command = encode_stream_command_with_id("ble.scan duration_ms=2500", 49)
+            .expect("stream BLE scan request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged BLE scan request");
+        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(104)));
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(82)));
+        let mut decoder =
+            dmesh_server::cbor::Decoder::new(record.fields.expect("scan duration field"));
+        let (major, count) = decoder.head().expect("CBOR map");
+        assert_eq!(major, 5);
+        assert_eq!(count, 1);
+        assert_eq!(decoder.uint(), Some(2));
+        assert_eq!(decoder.uint_or_text(), Some(2500));
+
+        let command =
+            encode_stream_command_with_id("ble.connect addr=88664b020b6d addr_type=1 psm=129", 51)
+                .expect("stream BLE connect request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged BLE connect request");
+        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(104)));
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(85)));
+        let mut decoder =
+            dmesh_server::cbor::Decoder::new(record.fields.expect("BLE connect field"));
+        let (major, count) = decoder.head().expect("CBOR map");
+        assert_eq!(major, 5);
+        assert_eq!(count, 3);
+        let mut seen = [false; 5];
+        for _ in 0..count {
+            let key = decoder.uint().expect("BLE connect key");
+            seen[key as usize] = true;
+            match key {
+                2 => {
+                    let mut addr = [0u8; 6];
+                    assert_eq!(decoder.bytes(&mut addr), Some(6));
+                    assert_eq!(addr, [0x88, 0x66, 0x4b, 0x02, 0x0b, 0x6d]);
+                }
+                3 => assert_eq!(decoder.uint(), Some(1)),
+                4 => assert_eq!(decoder.uint(), Some(129)),
+                _ => unreachable!(),
+            }
+        }
+        assert!(seen[2] && seen[3] && seen[4]);
+
+        let command = encode_stream_command_with_id(
+            "ble.connect addr=88:66:4b:02:0b:6d addr_type=1 psm=129",
+            53,
+        )
+        .expect("stream BLE colon address connect request");
+        let record = dmesh_server::tagged::decode(&command)
+            .expect("tagged BLE colon address connect request");
+        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(104)));
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(85)));
+        let mut decoder =
+            dmesh_server::cbor::Decoder::new(record.fields.expect("BLE colon connect field"));
+        let (major, count) = decoder.head().expect("CBOR map");
+        assert_eq!(major, 5);
+        assert_eq!(count, 3);
+        let mut seen = [false; 5];
+        for _ in 0..count {
+            let key = decoder.uint().expect("BLE colon connect key");
+            seen[key as usize] = true;
+            match key {
+                2 => {
+                    let mut addr = [0u8; 6];
+                    assert_eq!(decoder.bytes(&mut addr), Some(6));
+                    assert_eq!(addr, [0x88, 0x66, 0x4b, 0x02, 0x0b, 0x6d]);
+                }
+                3 => assert_eq!(decoder.uint(), Some(1)),
+                4 => assert_eq!(decoder.uint(), Some(129)),
+                _ => unreachable!(),
+            }
+        }
+        assert!(seen[2] && seen[3] && seen[4]);
+
+        let command = encode_stream_command_with_id("ble.coc.send data=deadbeef", 52)
+            .expect("stream BLE CoC send request");
+        let record = dmesh_server::tagged::decode(&command).expect("tagged BLE CoC send request");
+        assert_eq!(record.component, Some(dmesh_server::tagged::Name::Tag(104)));
+        assert_eq!(record.method, Some(dmesh_server::tagged::Name::Tag(86)));
+        let mut decoder =
+            dmesh_server::cbor::Decoder::new(record.fields.expect("BLE CoC send field"));
+        let (major, count) = decoder.head().expect("CBOR map");
+        assert_eq!(major, 5);
+        assert_eq!(count, 1);
+        assert_eq!(decoder.uint(), Some(2));
+        let mut data = [0u8; 4];
+        assert_eq!(decoder.bytes(&mut data), Some(4));
+        assert_eq!(data, [0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn ble_status_response_uses_the_schema_field_names() {
+        let schema = FirmwareSchema::load();
+        let mut result = [0u8; 16];
+        let mut encoder = dmesh_server::cbor::Encoder::new(&mut result);
+        encoder.map(2).unwrap();
+        encoder.uint(1).unwrap();
+        encoder.boolean(true).unwrap();
+        encoder.uint(9).unwrap();
+        encoder.boolean(false).unwrap();
+        let result_len = encoder.len();
+        let mut wire = [0u8; 64];
+        let used = dmesh_server::tagged::encode_numeric_response(
+            104,
+            83,
+            50,
+            &result[..result_len],
+            &mut wire,
+        )
+        .expect("bounded BLE status response");
+        let rendered = render_device_record(&schema, &wire[..used]);
+        assert!(rendered.contains("method=ble.status"), "{rendered}");
+        assert!(rendered.contains("payload.ready=true"), "{rendered}");
+        assert!(rendered.contains("payload.scanning=false"), "{rendered}");
     }
 
     #[test]

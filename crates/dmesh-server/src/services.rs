@@ -445,6 +445,37 @@ pub fn encode_status_numeric(name: &[u8], value: u64) -> Option<Vec<u8>> {
     Some(response)
 }
 
+/// Encode a small named numeric status map as one direct diagnostic record.
+/// Related values from one physical boundary stay together rather than being
+/// interleaved with another producer's direct records.
+pub fn encode_status_numbers(entries: &[(&[u8], u64)]) -> Option<Vec<u8>> {
+    if entries.is_empty()
+        || entries.len() > 8
+        || entries
+            .iter()
+            .any(|(name, _)| name.is_empty() || name.len() > 96 || !name.is_ascii())
+    {
+        return None;
+    }
+    let mut response = Vec::with_capacity(256);
+    response.resize(256, 0);
+    let mut encoder = crate::cbor::Encoder::new(&mut response);
+    encoder.map(3)?;
+    encoder.uint(0)?;
+    encoder.uint(68)?;
+    encoder.uint(4)?;
+    encoder.text_value(b"ok")?;
+    encoder.uint(6)?;
+    encoder.map(entries.len() as u64)?;
+    for (name, value) in entries {
+        encoder.text_value(name)?;
+        encoder.uint(*value)?;
+    }
+    let len = encoder.len();
+    response.truncate(len);
+    Some(response)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventRecord {
     pub sequence: u64,

@@ -164,6 +164,17 @@ impl<'a> Decoder<'a> {
         let (major, len) = self.head()?;
         (major == 3).then(|| self.take(len as usize)).flatten()
     }
+    /// Accept a compact binary identifier from canonical CBOR clients or its
+    /// UTF-8 text spelling from schema/JSON adapters. Callers still receive
+    /// borrowed bytes and apply their own identifier alphabet constraints.
+    pub fn bytes_or_text_ref(&mut self) -> Option<&'a [u8]> {
+        let saved = self.position();
+        if let Some(value) = self.bytes_ref() {
+            return Some(value);
+        }
+        self.set_position(saved);
+        self.text_ref()
+    }
     pub fn boolean(&mut self) -> Option<bool> {
         match *self.take(1)?.first()? {
             0xf4 => Some(false),

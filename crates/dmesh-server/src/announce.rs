@@ -125,6 +125,10 @@ pub const FIELD_UDP_LINK_LOCAL_V6: u64 = 15;
 /// Optional DNS suffix paired with the compact device label. The two fields
 /// avoid bloating NAN Service Info while still allowing an FQDN identity.
 pub const FIELD_DEVICE_DOMAIN: u64 = 16;
+/// Optional running-image marker. Absence means the normal Main/runtime image;
+/// only Recovery emits the canonical boolean `true`. Keeping Main implicit
+/// preserves its existing signed announce size byte-for-byte.
+pub const FIELD_RECOVERY: u64 = 17;
 const MAX_DEVICE_ID: usize = 16;
 pub const MAX_PUBLIC_KEY: usize = 128;
 pub const SIGNATURE_LEN: usize = 64;
@@ -253,6 +257,9 @@ pub struct Announce {
     /// address without serializing Android's interface name.
     pub udp_link_local_v6: [u8; 16],
     pub udp_link_local_v6_present: bool,
+    /// True only when the responder is the restricted Recovery image. Main,
+    /// Android, and host producers omit this optional field.
+    pub recovery: bool,
 }
 
 /// Volatile, unsigned local-radio facts carried alongside a signed discovery
@@ -350,6 +357,7 @@ impl Announce {
             udp_port: 0,
             udp_link_local_v6: [0; 16],
             udp_link_local_v6_present: false,
+            recovery: false,
         }
     }
 
@@ -709,7 +717,8 @@ fn encode_inner(
             + u64::from(has_wifi_channel)
             + u64::from(has_sta_link_local_v6)
             + u64::from(has_udp_port)
-            + u64::from(has_udp_link_local_v6),
+            + u64::from(has_udp_link_local_v6)
+            + u64::from(announce.recovery),
     )?;
     e.uint(FIELD_DEVICE_ID)?;
     e.bytes_value(device_id)?;
@@ -756,6 +765,10 @@ fn encode_inner(
     if has_udp_link_local_v6 {
         e.uint(FIELD_UDP_LINK_LOCAL_V6)?;
         e.bytes_value(&announce.udp_link_local_v6)?;
+    }
+    if announce.recovery {
+        e.uint(FIELD_RECOVERY)?;
+        e.boolean(true)?;
     }
     Some(e.len())
 }
@@ -1060,6 +1073,7 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
         udp_port: 0,
         udp_link_local_v6: [0; 16],
         udp_link_local_v6_present: false,
+        recovery: false,
     };
     for _ in 0..count {
         match d.uint()? {
@@ -1163,6 +1177,12 @@ pub fn decode_record(record: Record<'_>) -> Option<Announce> {
                 let address: [u8; 16] = d.bytes_ref()?.try_into().ok()?;
                 announce.set_udp_link_local_v6(address);
             }
+            FIELD_RECOVERY => {
+                if announce.recovery || !d.boolean()? {
+                    return None;
+                }
+                announce.recovery = true;
+            }
             _ => d.skip()?,
         }
     }
@@ -1206,6 +1226,28 @@ mod tests {
         let mut wire = [0; 128];
         let used = encode(announce, &mut wire).unwrap();
         assert_eq!(decode_announce(&wire[..used]), Some(announce));
+    }
+
+    #[test]
+    fn recovery_marker_is_optional_and_does_not_grow_main_announce() {
+        let mut id = [0; MAX_DEVICE_ID];
+        id[..6].copy_from_slice(b"e6-c6!");
+        let main = Announce::discovery(id, 6, 900);
+        let mut main_wire = [0; 64];
+        let main_used = encode(main, &mut main_wire).unwrap();
+
+        let mut recovery = main;
+        recovery.recovery = true;
+        let mut recovery_wire = [0; 64];
+        let recovery_used = encode(recovery, &mut recovery_wire).unwrap();
+
+        assert_eq!(decode_announce(&main_wire[..main_used]), Some(main));
+        assert!(!decode_announce(&main_wire[..main_used]).unwrap().recovery);
+        assert_eq!(
+            decode_announce(&recovery_wire[..recovery_used]),
+            Some(recovery)
+        );
+        assert_eq!(recovery_used, main_used + 2);
     }
 
     #[test]

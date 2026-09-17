@@ -464,8 +464,8 @@ pub(crate) fn android_discovery_facts() -> dmesh_server::announce::DiscoveryFact
     for device in devices.values() {
         if let Some(observation) = device.observations.get("nan") {
             nodes = nodes.saturating_add(1);
-            services = services
-                .saturating_add(u16::try_from(observation.packets).unwrap_or(u16::MAX));
+            services =
+                services.saturating_add(u16::try_from(observation.packets).unwrap_or(u16::MAX));
         }
     }
     dmesh_server::announce::DiscoveryFacts {
@@ -1509,6 +1509,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             radio_protocol::build_nan_followup(msg_type, &device_id, &target_id, payload)?
         }
         "radio.nan.build_sta_activation" => {
+            let source = hex_to_bytes(required_data(&cmd, "source_id")?)?;
+            let source: [u8; 6] = source
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("source_id must be exactly six bytes"))?;
             let wake_target = hex_to_bytes(required_data(&cmd, "wake_target")?)?;
             let wake_target: [u8; 6] = wake_target
                 .as_slice()
@@ -1524,7 +1529,11 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let mut out = [0u8; 96];
             let used = dmesh_server::control::encode_request(request, None, &mut out)
                 .ok_or_else(|| anyhow::anyhow!("encode targeted STA activation"))?;
-            out[..used].to_vec()
+            // WifiAware's `sendMessage` payload is the service-info body of
+            // a NAN Follow-up, not a bare DMesh control channel. Keep the
+            // same envelope consumed by ESP/host adapters so the receiver can
+            // validate framing before it dispatches the target-checked CBOR.
+            radio_protocol::build_nan_followup("wake_request", &source, &wake_target, &out[..used])?
         }
         "radio.nan.parse_followup" => radio_protocol::parse_nan_followup(payload)?
             .to_string()
@@ -2169,6 +2178,45 @@ impl SshClientListener for JniSshClientListener {
     }
 }
 
+struct JavaBearerEgress {
+    jvm: Arc<JavaVM>,
+    callback: GlobalRef,
+}
+
+impl crate::bearer::BearerEgress for JavaBearerEgress {
+    fn send_packet(&self, bearer: &str, packet: &[u8]) {
+        let mut env = match self.jvm.attach_current_thread() {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("Failed to attach bearer egress thread: {}", error);
+                return;
+            }
+        };
+        let j_bearer = match env.new_string(bearer) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("Failed to create bearer egress string: {}", error);
+                return;
+            }
+        };
+        let j_packet = match env.byte_array_from_slice(packet) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("Failed to create bearer egress bytes: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = env.call_method(
+            &self.callback,
+            "onBearerPacket",
+            "(Ljava/lang/String;[B)V",
+            &[(&j_bearer).into(), (&j_packet).into()],
+        ) {
+            log::error!("Failed to deliver bearer egress packet: {}", error);
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCallback(
     env: JNIEnv,
@@ -2206,6 +2254,15 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
         runtime: handle.runtime.handle().clone(),
     });
     handle.node.add_listener(mesh_listener);
+
+    let bearer_egress = Arc::new(JavaBearerEgress {
+        jvm: jvm.clone(),
+        callback: callback_ref.clone(),
+    });
+    crate::bearer::set_current(Some(crate::bearer::BearerRuntime::spawn(
+        handle.runtime.handle().clone(),
+        bearer_egress,
+    )));
 
     let client_listener = Arc::new(JniSshClientListener {
         jvm,
@@ -2324,9 +2381,88 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeStop(
     handle: jlong,
 ) {
     if handle != 0 {
+        crate::bearer::set_current(None);
         let handle = unsafe { Box::from_raw(handle as *mut MeshHandle) };
         crate::mesh_common::stop_mesh(*handle);
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearerOpen(
+    mut env: JNIEnv,
+    _class: JClass,
+    _handle: jlong,
+    bearer: JString,
+    args: JString,
+) -> jboolean {
+    let bearer: String = match env.get_string(&bearer) {
+        Ok(value) => value.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    let args: String = match env.get_string(&args) {
+        Ok(value) => value.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    if crate::bearer::open(&bearer, &args) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearerPacket(
+    mut env: JNIEnv,
+    _class: JClass,
+    _handle: jlong,
+    bearer: JString,
+    packet: JByteArray,
+) -> jboolean {
+    let bearer: String = match env.get_string(&bearer) {
+        Ok(value) => value.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    let packet = match env.convert_byte_array(&packet) {
+        Ok(value) => value,
+        Err(_) => return JNI_FALSE,
+    };
+    if crate::bearer::packet(&bearer, &packet) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearerClose(
+    mut env: JNIEnv,
+    _class: JClass,
+    _handle: jlong,
+    bearer: JString,
+) {
+    let Ok(value) = env.get_string(&bearer) else {
+        return;
+    };
+    let bearer: String = value.into();
+    crate::bearer::close(&bearer);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearerStatus<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    _handle: jlong,
+    bearer: JString<'a>,
+) -> JString<'a> {
+    let Ok(value) = env.get_string(&bearer) else {
+        return env
+            .new_string("")
+            .unwrap_or_else(|_| JString::from(JObject::null()));
+    };
+    let bearer: String = value.into();
+    let status = crate::bearer::status(&bearer).to_string();
+    env.new_string(status)
+        .unwrap_or_else(|_| JString::from(JObject::null()))
 }
 
 /// Notify the Rust-owned announce worker that Android has gained a new local
@@ -3175,13 +3311,14 @@ mod tests {
     fn android_nan_sta_activation_is_a_targeted_common_transport_set() {
         let wire = radio_message(
             "radio.nan.build_sta_activation",
-            "wake_target=d8a01d4c5e1c",
+            "source_id=010203040506 wake_target=d8a01d4c5e1c",
             &[],
             -1,
         )
         .unwrap();
         assert!(matches!(
-            dmesh_server::control::decode_request(&wire),
+            dmesh_rawnan::parse_dmesh_nan_followup(&wire)
+                .and_then(|followup| dmesh_server::control::decode_request(followup.payload)),
             Some(dmesh_server::control::Request::TransportSet {
                 kind: dmesh_server::control::TransportKind::Sta,
                 config: dmesh_server::control::TransportConfig {

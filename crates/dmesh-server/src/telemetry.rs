@@ -17,6 +17,10 @@ pub const NAN_METRICS_METHOD: u64 = 3;
 pub const UDP6_METRICS_METHOD: u64 = 4;
 pub const WIFI_LINK_METRICS_METHOD: u64 = 5;
 pub const TELEMETRY_RESPONSE_MAX_BYTES: usize = 512;
+/// A complete NAN snapshot currently has 35 scalar counters.  Leave bounded
+/// room for additions while retaining one compact response inside the shared
+/// transport MTU.
+pub const MAX_METRICS: usize = 48;
 
 pub mod now_metric {
     pub const TX_ATTEMPTED: u16 = 1;
@@ -69,6 +73,36 @@ pub mod nan_metric {
     pub const DW8_AWAKE_US: u16 = 19;
     /// Last received NAN SDF relative to the selected cluster beacon.
     pub const LAST_SDF_AFTER_BEACON_US: u16 = 20;
+    /// Byte length of the last raw SDF admitted by promiscuous ingress.
+    pub const LAST_SDF_FRAME_BYTES: u16 = 21;
+    /// Last raw SDF source MAC packed little-endian into the low 48 bits.
+    pub const LAST_SDF_SOURCE_LE: u16 = 22;
+    /// Largest raw SDF at or below 128 bytes observed since boot.
+    pub const SMALL_SDF_MAX_BYTES: u16 = 23;
+    /// Source of the frame which established `SMALL_SDF_MAX_BYTES`.
+    pub const SMALL_SDF_MAX_SOURCE_LE: u16 = 24;
+    /// SDF semantic intents accepted since boot.
+    pub const PENDING_SDF_QUEUED: u16 = 25;
+    /// SDF intent requests rejected because all bounded slots were occupied.
+    pub const PENDING_SDF_REJECTED: u16 = 26;
+    /// DW-gated public-action submissions attempted for all SDF intents.
+    pub const PENDING_SDF_TX_ATTEMPTED: u16 = 27;
+    /// SDF submissions accepted by the Wi-Fi action driver.
+    pub const PENDING_SDF_TX_ACCEPTED: u16 = 28;
+    /// Intents whose requested bounded transmission count was consumed.
+    pub const PENDING_SDF_COMPLETED: u16 = 29;
+    /// Current number of independently retained SDF intents.
+    pub const PENDING_SDF_COUNT: u16 = 30;
+    /// Explicit timer-light-sleep attempts made by Main's DW policy.
+    pub const LIGHT_SLEEP_ATTEMPTS: u16 = 31;
+    /// Successful `esp_light_sleep_start` entries, rather than requested sleep.
+    pub const LIGHT_SLEEP_ENTRIES: u16 = 32;
+    /// Rejected timer/light-sleep calls; this must not be treated as a wake.
+    pub const LIGHT_SLEEP_SKIPPED: u16 = 33;
+    /// Most recent requested timer duration for an explicit DW sleep.
+    pub const LAST_SLEEP_REQUESTED_US: u16 = 34;
+    /// Measured duration inside the most recent light-sleep call.
+    pub const LAST_SLEEP_DURATION_US: u16 = 35;
 }
 
 pub mod udp6_metric {
@@ -208,7 +242,7 @@ pub fn encode_nan_status(status: NanStatus<'_>, out: &mut [u8]) -> Option<usize>
 /// Encode a bounded metric map. Duplicate IDs are rejected so a consumer
 /// never has to choose between two values for the same counter.
 pub fn encode_metrics(metrics: &[Metric], out: &mut [u8]) -> Option<usize> {
-    if metrics.len() > 32 {
+    if metrics.len() > MAX_METRICS {
         return None;
     }
     for (index, metric) in metrics.iter().enumerate() {
@@ -318,8 +352,20 @@ mod tests {
     #[test]
     fn metric_ids_are_unique_and_bounded() {
         let metrics = [Metric { id: 1, value: 2 }, Metric { id: 3, value: 5 }];
-        let mut wire = [0; 32];
+        let mut wire = [0; TELEMETRY_RESPONSE_MAX_BYTES];
         assert!(encode_metrics(&metrics, &mut wire).is_some());
         assert!(encode_metrics(&[metrics[0], metrics[0]], &mut wire).is_none());
+
+        let full_snapshot: [Metric; 35] = core::array::from_fn(|index| Metric {
+            id: (index + 1) as u16,
+            value: u64::MAX,
+        });
+        assert!(encode_metrics(&full_snapshot, &mut wire).is_some());
+
+        let oversized: [Metric; MAX_METRICS + 1] = core::array::from_fn(|index| Metric {
+            id: (index + 1) as u16,
+            value: 0,
+        });
+        assert!(encode_metrics(&oversized, &mut wire).is_none());
     }
 }

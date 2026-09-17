@@ -952,7 +952,7 @@ pub fn decode_flash_request(input: &[u8]) -> Option<FlashRequest<'_>> {
         }
         seen |= bit;
         match key {
-            0 => name = Some(d.bytes_ref()?),
+            0 => name = Some(d.bytes_or_text_ref()?),
             1 => cpu = Some(d.uint()?.try_into().ok()?),
             2 => target = Some(d.uint()?.try_into().ok()?),
             3 => address = Some(d.uint()?.try_into().ok()?),
@@ -997,7 +997,7 @@ pub fn decode_get(input: &[u8]) -> Option<GetRequest<'_>> {
                     return None;
                 }
                 seen |= 1;
-                request.name = Some(d.bytes_ref()?);
+                request.name = Some(d.bytes_or_text_ref()?);
             }
             1 => {
                 if seen & 2 != 0 {
@@ -2560,7 +2560,10 @@ mod tests {
             bytes: 0,
             done: false,
         });
-        assert_eq!(receiver.on_manifest(&manifest), Err(ImageError::InvalidManifest));
+        assert_eq!(
+            receiver.on_manifest(&manifest),
+            Err(ImageError::InvalidManifest)
+        );
         assert_eq!(receiver.sink_mut().blocks, 0);
         assert_eq!(receiver.sink_mut().bytes, 0);
         assert!(!receiver.sink_mut().done);

@@ -66,10 +66,19 @@ pub struct E2eDeviceConfig {
     pub iface: Option<String>,
     #[serde(default)]
     pub ipv4: Option<String>,
+    /// Stable signed overlay identity. The low 64 bits are the compact
+    /// identity hint carried by discovery announcements.
+    #[serde(default)]
+    pub vip6: Option<String>,
     /// Link-local address advertised while in STA/AP mode.  Callers must add
     /// their local interface scope before constructing a UDP endpoint.
     #[serde(default)]
     pub ipv6_link_local: Option<String>,
+    /// Local egress interface used to scope this device's catalogued IPv6
+    /// link-local endpoint. This is host routing metadata, not a radio
+    /// interface name carried by the device.
+    #[serde(default)]
+    pub udp6_iface: Option<String>,
     #[serde(default = "default_udp_port")]
     pub udp_port: u16,
     /// Authentication key selector.  The matching material is held in the

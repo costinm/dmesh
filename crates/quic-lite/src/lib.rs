@@ -1390,7 +1390,11 @@ fn encode_bootstrap_profile(
     }
     out[0] = kind;
     let mut at = 1;
-    let version = if requested_peer_limits.is_some() { 2 } else { u64::from(stateless_reset_token.is_some()) };
+    let version = if requested_peer_limits.is_some() {
+        2
+    } else {
+        u64::from(stateless_reset_token.is_some())
+    };
     at += put_varint(version, &mut out[at..])?;
     let mut parameters = [0u8; 64];
     let mut used = 0;
@@ -1419,7 +1423,15 @@ fn encode_bootstrap_profile(
 fn decode_bootstrap_profile(
     input: &[u8],
     expected_kind: u8,
-) -> Result<(ConnectionLimits, u16, Option<StatelessResetToken>, Option<ReceiveWindowRequest>), Error> {
+) -> Result<
+    (
+        ConnectionLimits,
+        u16,
+        Option<StatelessResetToken>,
+        Option<ReceiveWindowRequest>,
+    ),
+    Error,
+> {
     if input.first().copied() != Some(expected_kind) {
         return Err(Error::BootstrapInvalid);
     }
@@ -1450,7 +1462,13 @@ fn decode_bootstrap_profile(
             if data_len + stream_len != request.len() || max_data == 0 || max_stream_data == 0 {
                 return Err(Error::BootstrapInvalid);
             }
-            (None, Some(ReceiveWindowRequest { max_data, max_stream_data }))
+            (
+                None,
+                Some(ReceiveWindowRequest {
+                    max_data,
+                    max_stream_data,
+                }),
+            )
         }
         _ => return Err(Error::BootstrapInvalid),
     };
@@ -1704,7 +1722,12 @@ pub fn encode_bootstrap_open_packet_with_profile(
     out: &mut [u8],
 ) -> Result<usize, Error> {
     encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
-        client_cid, packet_number, limits, max_in_flight_packets, None, out,
+        client_cid,
+        packet_number,
+        limits,
+        max_in_flight_packets,
+        None,
+        out,
     )
 }
 
@@ -1723,7 +1746,14 @@ pub fn encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
         return Err(Error::BootstrapInvalid);
     }
     let mut body = [0u8; 48];
-    let body_len = encode_bootstrap_profile(0, limits, max_in_flight_packets, None, requested_peer_limits, &mut body)?;
+    let body_len = encode_bootstrap_profile(
+        0,
+        limits,
+        max_in_flight_packets,
+        None,
+        requested_peer_limits,
+        &mut body,
+    )?;
     let mut frame = [0u8; 64];
     let frame_len = Frame::Stream(StreamFrame {
         id: CONTROL_STREAM_ID,
@@ -1768,7 +1798,8 @@ pub fn decode_bootstrap_open_packet_with_limits(
     if stream.id != CONTROL_STREAM_ID || stream.offset != 0 || !stream.fin {
         return Err(Error::BootstrapInvalid);
     }
-    let (limits, max_in_flight_packets, reset_token, requested_peer_limits) = decode_bootstrap_profile(stream.data, 0)?;
+    let (limits, max_in_flight_packets, reset_token, requested_peer_limits) =
+        decode_bootstrap_profile(stream.data, 0)?;
     if reset_token.is_some() {
         return Err(Error::BootstrapInvalid);
     }
@@ -2712,7 +2743,6 @@ impl<const N: usize> SendFlowControl<N> {
         Ok(usize::try_from(maximum_end.saturating_sub(offset)).unwrap_or(usize::MAX))
     }
 
-
     pub fn reserve(&mut self, id: u64, offset: u64, len: usize) -> Result<(), Error> {
         if !self.can_send(id, offset, len) {
             return Err(Error::FlowControl);
@@ -3032,8 +3062,16 @@ impl ConnectionLimits {
     pub const fn clamped_to_request(self, request: Option<ReceiveWindowRequest>) -> Self {
         match request {
             Some(request) => Self {
-                max_data: if request.max_data < self.max_data { request.max_data } else { self.max_data },
-                max_stream_data: if request.max_stream_data < self.max_stream_data { request.max_stream_data } else { self.max_stream_data },
+                max_data: if request.max_data < self.max_data {
+                    request.max_data
+                } else {
+                    self.max_data
+                },
+                max_stream_data: if request.max_stream_data < self.max_stream_data {
+                    request.max_stream_data
+                } else {
+                    self.max_stream_data
+                },
                 ..self
             },
             None => self,
@@ -3885,19 +3923,21 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         // own: a flow-blocked peer has no further packet with which to wake
         // us.  Keep the same bounded delayed-control cadence for both the
         // first publication and a later unacknowledged publication.
-        let credit_deadline = self.credit_pending.then_some(
-            self.last_ack_time.saturating_add(if self.credit_packet_number.is_some() {
-                // A MAX_* update is reliable connection state. Once it has
-                // been sent, retry it on the normal adaptive loss clock, not
-                // a fixed control tick: otherwise an unreachable peer is
-                // sent the identical ACK/MAX packet twenty times per second.
-                self.pto_timeout().saturating_mul(
-                    1u64 << self.credit_retry_backoff.min(MAX_PTO_BACKOFF_EXPONENT),
-                )
-            } else {
-                self.max_ack_delay_ms
-            }),
-        );
+        let credit_deadline =
+            self.credit_pending
+                .then_some(self.last_ack_time.saturating_add(
+                    if self.credit_packet_number.is_some() {
+                        // A MAX_* update is reliable connection state. Once it has
+                        // been sent, retry it on the normal adaptive loss clock, not
+                        // a fixed control tick: otherwise an unreachable peer is
+                        // sent the identical ACK/MAX packet twenty times per second.
+                        self.pto_timeout().saturating_mul(
+                            1u64 << self.credit_retry_backoff.min(MAX_PTO_BACKOFF_EXPONENT),
+                        )
+                    } else {
+                        self.max_ack_delay_ms
+                    },
+                ));
         let earliest_sent = self
             .sent_packets
             .iter()
@@ -4065,7 +4105,6 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
     pub fn reserve_send(&mut self, id: u64, offset: u64, len: usize) -> Result<(), Error> {
         self.send.reserve(id, offset, len)
     }
-
 
     pub fn packet_sent(&mut self, bytes: u64) -> bool {
         self.congestion.on_packet_sent(bytes)
@@ -4524,7 +4563,8 @@ impl<const N: usize, const H: usize, const P: usize> EndpointState<N, H, P> {
         let connection_window = window_bytes.min(self.receive.limits.max_data);
         let stream_window = window_bytes.min(self.receive.limits.max_stream_data);
         self.receive.extend_connection_credit(connection_window);
-        self.receive.extend_stream_credit(stream_id, stream_window)?;
+        self.receive
+            .extend_stream_credit(stream_id, stream_window)?;
         self.control_pending = true;
         self.queue_stream_credit(stream_id);
         Ok(())
@@ -5538,12 +5578,11 @@ mod tests {
     fn credit_only_packet_advances_a_flow_blocked_sender() {
         let client_cid = ConnectionId::new(0x701).unwrap();
         let server_cid = ConnectionId::new(0x702).unwrap();
-        let mut client = EndpointState::<4, 8, 256>::new(
-            Role::Client,
-            ConnectionLimits::default(),
-            256,
-        );
-        client.install_connection_ids(client_cid, server_cid).unwrap();
+        let mut client =
+            EndpointState::<4, 8, 256>::new(Role::Client, ConnectionLimits::default(), 256);
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
         client.set_initial_peer_credit(100, 100).unwrap();
         client.open_send_stream(8, 100).unwrap();
 
@@ -5621,7 +5660,10 @@ mod tests {
         for stream in [4, 8, 12, 16] {
             endpoint.receive.accept(stream, 0, 1200, false).unwrap();
         }
-        assert_eq!(endpoint.receive.accept(20, 0, 1, false), Err(Error::StreamLimit));
+        assert_eq!(
+            endpoint.receive.accept(20, 0, 1, false),
+            Err(Error::StreamLimit)
+        );
     }
 
     #[test]
@@ -5644,8 +5686,18 @@ mod tests {
         .unwrap();
         let (_, open) = decode_bootstrap_open_packet_with_limits(&packet[..used]).unwrap();
         assert_eq!(open.requested_peer_limits, Some(request));
-        assert_eq!(local.clamped_to_request(open.requested_peer_limits).max_data, 1_200);
-        assert_eq!(local.clamped_to_request(open.requested_peer_limits).max_stream_data, 900);
+        assert_eq!(
+            local
+                .clamped_to_request(open.requested_peer_limits)
+                .max_data,
+            1_200
+        );
+        assert_eq!(
+            local
+                .clamped_to_request(open.requested_peer_limits)
+                .max_stream_data,
+            900
+        );
 
         let larger = ReceiveWindowRequest {
             max_data: u64::MAX,
@@ -8155,9 +8207,8 @@ mod tests {
             let mut had_resend = false;
             loop {
                 let mut packet = vec![0u8; mtu];
-                let Some((used, packet_number)) = sender
-                    .retransmit_marked_loss(&mut packet)
-                    .unwrap()
+                let Some((used, packet_number)) =
+                    sender.retransmit_marked_loss(&mut packet).unwrap()
                 else {
                     break;
                 };

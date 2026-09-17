@@ -6,12 +6,12 @@
 //! results. Keeping this state here makes UART, UDP, simulated links, and
 //! firmware use the same bootstrap and response-stream rules.
 
-use alloc::{
-    alloc::{alloc, Layout},
-    boxed::Box,
-};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use alloc::{
+    alloc::{Layout, alloc},
+    boxed::Box,
+};
 use core::mem::MaybeUninit;
 
 pub use quic_lite::ClientStreamConnection as StreamClientConnection;
@@ -353,18 +353,19 @@ mod tests {
         let client = ConnectionId::new(0x631).unwrap();
         let server = ConnectionId::new(0x632).unwrap();
         let mut open = [0u8; 1200];
-        let open_len = quic_lite::encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
-            client,
-            0,
-            ConnectionLimits::default(),
-            0,
-            Some(quic_lite::ReceiveWindowRequest {
-                max_data: 1200,
-                max_stream_data: 900,
-            }),
-            &mut open,
-        )
-        .unwrap();
+        let open_len =
+            quic_lite::encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
+                client,
+                0,
+                ConnectionLimits::default(),
+                0,
+                Some(quic_lite::ReceiveWindowRequest {
+                    max_data: 1200,
+                    max_stream_data: 900,
+                }),
+                &mut open,
+            )
+            .unwrap();
         let (_, ack) = StreamServerConnection::<1>::accept_open_with_limits(
             &open[..open_len],
             server,

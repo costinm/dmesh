@@ -13,13 +13,13 @@ pub use quic_lite::Error;
 use quic_lite::{AssociationProfile, ConnectionCounters, ConnectionDebugState, DatagramClient};
 use quic_lite::{ConnectionId, ConnectionLimits, PathId, ServerStreamConfig, TransportPacket};
 
+#[cfg(test)]
+use crate::verified_object::ObjectBodyStream as ObjectRecordStream;
 use crate::{
     probe::{ProbeRun, ProbeSender, ProbeServicePlan},
     stream_server::StreamServerConnection,
     verified_object::{GetRequest, ObjectBodyStream, REQUEST_MAX, encode_get_request},
 };
-#[cfg(test)]
-use crate::verified_object::ObjectBodyStream as ObjectRecordStream;
 
 /// Largest conservative application slice that fits with the QUIC-lite short
 /// header and STREAM frame in the normal 1200-byte datagram. This is shared by
@@ -185,7 +185,10 @@ impl<const HISTORY: usize, const PACKET: usize> ObjectUploadClient<HISTORY, PACK
     }
 
     pub fn transport_stats(&self) -> Option<quic_lite::TransportStats> {
-        self.association.connection().endpoint().map(|endpoint| endpoint.stats())
+        self.association
+            .connection()
+            .endpoint()
+            .map(|endpoint| endpoint.stats())
     }
 
     /// Retire this one-shot association after its terminal response has been
@@ -721,10 +724,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
         }
     }
 
-    fn requested_receive_profile(
-        &self,
-        packet: &[u8],
-    ) -> (ConnectionLimits, AssociationProfile) {
+    fn requested_receive_profile(&self, packet: &[u8]) -> (ConnectionLimits, AssociationProfile) {
         let base_association = self.association.clamp::<HISTORY>();
         let base_limits = self.limits;
         let Ok((_, open)) = quic_lite::decode_bootstrap_open_packet_with_limits(packet) else {
@@ -734,10 +734,7 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
             return (base_limits, base_association);
         };
         let ceiling = self.receive_profile_ceiling.clamp::<HISTORY>();
-        let ceiling_limits = ceiling.receive_limits(
-            PACKET as u64,
-            base_limits.max_streams_bidi,
-        );
+        let ceiling_limits = ceiling.receive_limits(PACKET as u64, base_limits.max_streams_bidi);
         let limits = ConnectionLimits::with_receive_profile(
             request.max_data.min(ceiling_limits.max_data),
             request.max_stream_data.min(ceiling_limits.max_stream_data),
@@ -1150,21 +1147,29 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
     }
 
     fn take_inbound_stream_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
-        let Some(path) = self.core.active_path() else { return Vec::new() };
-        self.core.association_for_path_mut(path)
+        let Some(path) = self.core.active_path() else {
+            return Vec::new();
+        };
+        self.core
+            .association_for_path_mut(path)
             .map_or_else(Vec::new, ConnectionServer::take_inbound_stream_chunks)
     }
 
     fn restore_inbound_stream_chunks(&mut self, mut chunks: Vec<(Vec<u8>, bool)>) {
-        let Some(path) = self.core.active_path() else { return };
+        let Some(path) = self.core.active_path() else {
+            return;
+        };
         if let Some(server) = self.core.association_for_path_mut(path) {
             server.restore_inbound_stream_chunks(&mut chunks);
         }
     }
 
     pub fn has_inbound_stream_chunks(&self) -> bool {
-        let Some(path) = self.core.active_path() else { return false };
-        self.core.association_for_path(path)
+        let Some(path) = self.core.active_path() else {
+            return false;
+        };
+        self.core
+            .association_for_path(path)
             .is_some_and(ConnectionServer::has_inbound_stream_chunks)
     }
 
@@ -1225,7 +1230,9 @@ impl<const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>
 
     fn consume_inbound_stream_bytes(&mut self, bytes: usize) -> Result<(), Error> {
         let path = self.core.active_path().ok_or(Error::Invalid)?;
-        self.core.association_for_path_mut(path).ok_or(Error::Invalid)?
+        self.core
+            .association_for_path_mut(path)
+            .ok_or(Error::Invalid)?
             .consume_inbound_stream_bytes(bytes)
     }
 
@@ -1373,10 +1380,17 @@ pub struct InboundStreamReader {
 
 impl InboundStreamReader {
     fn new(chunks: Vec<(Vec<u8>, bool)>) -> Self {
-        Self { chunks, chunk: 0, offset: 0, consumed: 0 }
+        Self {
+            chunks,
+            chunk: 0,
+            offset: 0,
+            consumed: 0,
+        }
     }
 
-    pub const fn consumed_bytes(&self) -> usize { self.consumed }
+    pub const fn consumed_bytes(&self) -> usize {
+        self.consumed
+    }
 
     pub fn read(&mut self, out: &mut [u8]) -> usize {
         let mut written = 0;
@@ -1412,10 +1426,14 @@ impl InboundStreamReader {
 }
 
 impl crate::verified_object::OrderedStreamRead for InboundStreamReader {
-    fn read(&mut self, out: &mut [u8]) -> usize { Self::read(self, out) }
+    fn read(&mut self, out: &mut [u8]) -> usize {
+        Self::read(self, out)
+    }
 
     fn is_finished(&self) -> bool {
-        let Some((bytes, fin)) = self.chunks.get(self.chunk) else { return false };
+        let Some((bytes, fin)) = self.chunks.get(self.chunk) else {
+            return false;
+        };
         *fin && self.offset == bytes.len() && self.chunk + 1 == self.chunks.len()
     }
 }
@@ -1468,46 +1486,108 @@ pub fn prepare_inbound_stream_with_consumer<
     service.prepare_inbound_stream_with_consumer(consumer)
 }
 
-pub fn consume_inbound_stream<Consume, ConsumerError, const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>(
-    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, consume: Consume,
+pub fn consume_inbound_stream<
+    Consume,
+    ConsumerError,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    consume: Consume,
 ) -> Result<InboundStreamTurn, InboundStreamTurnError<ConsumerError>>
-where Consume: FnOnce(&mut InboundStreamReader) -> Result<bool, ConsumerError>, {
+where
+    Consume: FnOnce(&mut InboundStreamReader) -> Result<bool, ConsumerError>,
+{
     let chunks = service.take_inbound_stream_chunks();
     let had_chunks = !chunks.is_empty();
     let mut reader = InboundStreamReader::new(chunks);
     let application_progress = consume(&mut reader).map_err(InboundStreamTurnError::Consumer)?;
     let consumed_bytes = reader.consumed_bytes();
     service.restore_inbound_stream_chunks(reader.into_remaining());
-    if consumed_bytes != 0 { service.consume_inbound_stream_bytes(consumed_bytes).map_err(InboundStreamTurnError::Transport)?; }
-    Ok(InboundStreamTurn { had_chunks, application_progress, consumed_bytes })
+    if consumed_bytes != 0 {
+        service
+            .consume_inbound_stream_bytes(consumed_bytes)
+            .map_err(InboundStreamTurnError::Transport)?;
+    }
+    Ok(InboundStreamTurn {
+        had_chunks,
+        application_progress,
+        consumed_bytes,
+    })
 }
 
-pub fn consume_exclusive_inbound_stream<T, Consume, ConsumerError, const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>(
-    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, operation: &mut crate::verified_object::ExclusiveTransfer<T>, owner: ConnectionId, now: u64, idle_timeout: u64, consume: Consume,
+pub fn consume_exclusive_inbound_stream<
+    T,
+    Consume,
+    ConsumerError,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    operation: &mut crate::verified_object::ExclusiveTransfer<T>,
+    owner: ConnectionId,
+    now: u64,
+    idle_timeout: u64,
+    consume: Consume,
 ) -> Result<InboundStreamTurn, ExclusiveInboundStreamTurnError<T, ConsumerError>>
-where Consume: FnOnce(&mut T, &mut InboundStreamReader) -> Result<bool, ConsumerError>, {
+where
+    Consume: FnOnce(&mut T, &mut InboundStreamReader) -> Result<bool, ConsumerError>,
+{
     let turn = match consume_inbound_stream(service, |reader| {
-        let value = operation.get_mut_for(owner).expect("exclusive stream owner must remain active during consume");
+        let value = operation
+            .get_mut_for(owner)
+            .expect("exclusive stream owner must remain active during consume");
         consume(value, reader)
     }) {
         Ok(turn) => turn,
         Err(InboundStreamTurnError::Consumer(error)) => {
-            let request_id = operation.request_id_for(owner).expect("exclusive owner request id");
-            let value = operation.take_for(owner).expect("exclusive stream owner remains active after error");
-            return Err(ExclusiveInboundStreamTurnError::Consumer { request_id, value, error });
+            let request_id = operation
+                .request_id_for(owner)
+                .expect("exclusive owner request id");
+            let value = operation
+                .take_for(owner)
+                .expect("exclusive stream owner remains active after error");
+            return Err(ExclusiveInboundStreamTurnError::Consumer {
+                request_id,
+                value,
+                error,
+            });
         }
-        Err(InboundStreamTurnError::Transport(error)) => return Err(ExclusiveInboundStreamTurnError::Transport(error)),
+        Err(InboundStreamTurnError::Transport(error)) => {
+            return Err(ExclusiveInboundStreamTurnError::Transport(error));
+        }
     };
-    if turn.application_progress { debug_assert!(operation.touch(owner, now, idle_timeout)); }
+    if turn.application_progress {
+        debug_assert!(operation.touch(owner, now, idle_timeout));
+    }
     Ok(turn)
 }
 
-pub fn consume_available_exclusive_inbound_stream<T, Consume, ConsumerError, const HISTORY: usize, const PACKET: usize, const ASSOCIATIONS: usize>(
-    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>, operation: &mut crate::verified_object::ExclusiveTransfer<T>, owner: ConnectionId, now: u64, idle_timeout: u64, consume: Consume,
+pub fn consume_available_exclusive_inbound_stream<
+    T,
+    Consume,
+    ConsumerError,
+    const HISTORY: usize,
+    const PACKET: usize,
+    const ASSOCIATIONS: usize,
+>(
+    service: &mut ConnectionDispatcher<HISTORY, PACKET, ASSOCIATIONS>,
+    operation: &mut crate::verified_object::ExclusiveTransfer<T>,
+    owner: ConnectionId,
+    now: u64,
+    idle_timeout: u64,
+    consume: Consume,
 ) -> Result<Option<InboundStreamTurn>, ExclusiveInboundStreamTurnError<T, ConsumerError>>
-where Consume: FnOnce(&mut T, &mut InboundStreamReader) -> Result<bool, ConsumerError>, {
-    if !service.has_inbound_stream_chunks() { return Ok(None); }
-    consume_exclusive_inbound_stream(service, operation, owner, now, idle_timeout, consume).map(Some)
+where
+    Consume: FnOnce(&mut T, &mut InboundStreamReader) -> Result<bool, ConsumerError>,
+{
+    if !service.has_inbound_stream_chunks() {
+        return Ok(None);
+    }
+    consume_exclusive_inbound_stream(service, operation, owner, now, idle_timeout, consume)
+        .map(Some)
 }
 
 /// Thread-safe owner for one bearer-neutral connection dispatcher.
@@ -2795,18 +2875,32 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         let request = match inbound_stream {
             Some(stream) => {
                 if let Some(consumer) = inbound_consumer {
-                    connection.mux.receive_request_with_consuming_stream(packet, stream, |id, fin, bytes| {
-                        if id == stream { return consumer(bytes, fin); }
-                        (Some(id) == self.command_stream).then_some(bytes.len()).ok_or(())
-                    })?
+                    connection.mux.receive_request_with_consuming_stream(
+                        packet,
+                        stream,
+                        |id, fin, bytes| {
+                            if id == stream {
+                                return consumer(bytes, fin);
+                            }
+                            (Some(id) == self.command_stream)
+                                .then_some(bytes.len())
+                                .ok_or(())
+                        },
+                    )?
                 } else {
-                    connection.mux.receive_request_with_deferred_stream(packet, stream, |id, fin, bytes| {
-                        if id == stream {
-                            inbound_chunks.push((bytes.to_vec(), fin));
-                            return Ok(bytes.len());
-                        }
-                        (Some(id) == self.command_stream).then_some(bytes.len()).ok_or(())
-                    })?
+                    connection.mux.receive_request_with_deferred_stream(
+                        packet,
+                        stream,
+                        |id, fin, bytes| {
+                            if id == stream {
+                                inbound_chunks.push((bytes.to_vec(), fin));
+                                return Ok(bytes.len());
+                            }
+                            (Some(id) == self.command_stream)
+                                .then_some(bytes.len())
+                                .ok_or(())
+                        },
+                    )?
                 }
             }
             None => connection.receive_request(packet)?,
@@ -2983,22 +3077,30 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
         self.pending_stream_command.take()
     }
 
-    fn take_inbound_stream_chunks(&mut self) -> Vec<(Vec<u8>, bool)> { core::mem::take(&mut self.inbound_stream_chunks) }
+    fn take_inbound_stream_chunks(&mut self) -> Vec<(Vec<u8>, bool)> {
+        core::mem::take(&mut self.inbound_stream_chunks)
+    }
     fn restore_inbound_stream_chunks(&mut self, chunks: &mut Vec<(Vec<u8>, bool)>) {
         chunks.append(&mut self.inbound_stream_chunks);
         self.inbound_stream_chunks = core::mem::take(chunks);
     }
-    fn has_inbound_stream_chunks(&self) -> bool { !self.inbound_stream_chunks.is_empty() }
+    fn has_inbound_stream_chunks(&self) -> bool {
+        !self.inbound_stream_chunks.is_empty()
+    }
 
     fn consume_inbound_stream_bytes(&mut self, bytes: usize) -> Result<(), Error> {
         let Some(stream) = self.inbound_stream else {
             return Ok(());
         };
-        if bytes == 0 { return Ok(()); }
+        if bytes == 0 {
+            return Ok(());
+        }
         self.connection
             .as_mut()
             .ok_or(Error::WrongConnectionId)?
-            .mux.endpoint.stream_consumed_deferred(stream, bytes)
+            .mux
+            .endpoint
+            .stream_consumed_deferred(stream, bytes)
     }
 
     /// Reserve the stream following the accepted command. Its initial credit
@@ -3026,7 +3128,9 @@ impl<const HISTORY: usize, const PACKET: usize> ConnectionServer<HISTORY, PACKET
     }
 
     fn resume_inbound_stream_consumer(&mut self) -> Result<usize, Error> {
-        let Some(stream) = self.inbound_stream else { return Ok(0) };
+        let Some(stream) = self.inbound_stream else {
+            return Ok(0);
+        };
         let consumer = self.inbound_stream_consumer.ok_or(Error::Invalid)?;
         self.connection
             .as_mut()
@@ -3251,6 +3355,105 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_answers_phone_bootstrap_open() {
+        let packet = [
+            0xc0, 0x44, 0x4d, 0x00, 0x01, 0x00, 0x08, 0xc0, 0xd5, 0xfc, 0xe0, 0x15, 0xfc, 0x35,
+            0x15, 0x00, 0x11, 0x00, 0x0f, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x09, 0x80, 0x04, 0x00,
+            0x00, 0x80, 0x04, 0x00, 0x00, 0x00,
+        ];
+        let server_cid = ConnectionId::new(0x999).unwrap();
+        let path = PathId::new(1).unwrap();
+        let mut dispatcher = ConnectionDispatcher::<64, 1100, 12>::new(
+            server_cid,
+            ConnectionLimits::default(),
+            AssociationProfile::c6_default(),
+        );
+        let mut out = [0u8; 1100];
+        let response = dispatcher.receive(path, &packet, &mut out).unwrap();
+        assert!(
+            response.is_some(),
+            "dispatcher ignored the phone bootstrap OPEN"
+        );
+    }
+
+    #[test]
+    fn firmware_turn_returns_open_ack_before_stream_response() {
+        let packet = [
+            0xc0, 0x44, 0x4d, 0x00, 0x01, 0x00, 0x08, 0xc0, 0xd5, 0xfc, 0xe0, 0x15, 0xfc, 0x35,
+            0x15, 0x00, 0x11, 0x00, 0x0f, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x09, 0x80, 0x04, 0x00,
+            0x00, 0x80, 0x04, 0x00, 0x00, 0x00,
+        ];
+        let association = quic_lite::AssociationProfile::datagram_with_memory::<64>(
+            quic_lite::ledger::LedgerMemorySnapshot {
+                total_bytes: 240_000,
+                available_bytes: 240_000,
+            },
+            1,
+            1100,
+            quic_lite::ledger::LedgerMemoryPolicy {
+                min_packets: 2,
+                ..Default::default()
+            },
+        );
+        let limits = association.receive_limits(1100, 4);
+        let _ = (association, limits);
+        crate::services::register_tagged_component(104, |record| {
+            let component = match record.component? {
+                crate::tagged::Name::Tag(value) => value,
+                _ => return None,
+            };
+            let method = match record.method? {
+                crate::tagged::Name::Tag(value) => value,
+                _ => return None,
+            };
+            let id = record.id?;
+            let mut result = [0u8; 16];
+            let mut encoder = crate::cbor::Encoder::new(&mut result);
+            let len = encoder
+                .map(1)
+                .and_then(|()| encoder.uint(1))
+                .and_then(|()| encoder.boolean(true))
+                .map(|()| encoder.len())?;
+            let mut response = [0u8; 64];
+            let used = crate::tagged::encode_numeric_response(
+                component,
+                method,
+                id,
+                &result[..len],
+                &mut response,
+            )?;
+            Some(response[..used].to_vec())
+        });
+        let server_cid = ConnectionId::new(0x999).unwrap();
+        let path = PathId::new(1).unwrap();
+        let mut dispatcher =
+            ConnectionDispatcher::<64, 1100, 12>::new(server_cid, limits, association);
+        dispatcher.set_association_idle_timeout(Some(0));
+        let mut out = [0u8; 1100];
+        let result = receive_server_turn(
+            &mut dispatcher,
+            path,
+            &packet,
+            10,
+            &mut out,
+            |_, _| {},
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        let first = result.expect("firmware turn produced no packet");
+        let kind = quic_lite::classify_server_datagram(&out[..first]).unwrap();
+        let mut hex = String::new();
+        for byte in &out[..first] {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        eprintln!("open_ack_hex={hex}");
+        match kind {
+            quic_lite::ServerDatagram::BootstrapAck { .. } => {}
+            other => panic!("first firmware-turn packet was {other:?}, not OPEN_ACK"),
+        }
+    }
+
+    #[test]
     fn dispatcher_advertises_and_recovers_a_reset_from_device_secret_branch() {
         let client_cid = ConnectionId::new(0x91).unwrap();
         let server_cid = ConnectionId::new(0x92).unwrap();
@@ -3345,9 +3548,7 @@ mod tests {
     }
 
     impl crate::verified_object::StreamingImageSink for HostDelayedObjectSink {
-        fn poll_completed(
-            &mut self,
-        ) -> Result<crate::verified_object::StoragePoll, Self::Error> {
+        fn poll_completed(&mut self) -> Result<crate::verified_object::StoragePoll, Self::Error> {
             self.polls = self.polls.saturating_add(1);
             // `poll_before_transport` owns advancing this fake erase.  The
             // read turn only observes its actual storage result; its cadence
@@ -3679,9 +3880,7 @@ mod tests {
         );
         // Empty maintenance turns have no consumed bytes to report. They are
         // intentionally harmless even when no receive stream was selected.
-        assert!(consume_inbound_stream(&mut dispatcher, |_| {
-            Ok::<_, u8>(false)
-        }).is_ok());
+        assert!(consume_inbound_stream(&mut dispatcher, |_| { Ok::<_, u8>(false) }).is_ok());
     }
 
     #[test]
@@ -3834,11 +4033,17 @@ mod tests {
         let (used, _) = endpoint
             .encode_stream_packet(server, object_stream, 0, false, &[0x5a; 16], &mut packet)
             .unwrap();
-        assert!(listener.receive(path, &packet[..used], &mut out).unwrap().is_none());
+        assert!(
+            listener
+                .receive(path, &packet[..used], &mut out)
+                .unwrap()
+                .is_none()
+        );
         // The memory-selected ACK policy batches this ordinary stream packet;
         // the timer turn below owns its eventual ACK/MAX emission.
         let before = endpoint.peer_send_credit(object_stream).unwrap();
-        assert_eq!(before, (98, 64));        assert_eq!(
+        assert_eq!(before, (98, 64));
+        assert_eq!(
             listener
                 .core
                 .association_for_path(path)
@@ -4045,14 +4250,30 @@ mod tests {
             let mut client_out = [0u8; 1200];
             let mut server_out = [0u8; 1200];
             let open_len = client.start(&mut client_out).unwrap();
-            let open_ack_len = server.receive(&client_out[..open_len], &mut server_out).unwrap().unwrap();
-            let request_len = client.receive(&server_out[..open_ack_len], &mut client_out).unwrap().unwrap();
-            let mut server_len = server.receive(&client_out[..request_len], &mut server_out).unwrap().unwrap();
+            let open_ack_len = server
+                .receive(&client_out[..open_len], &mut server_out)
+                .unwrap()
+                .unwrap();
+            let request_len = client
+                .receive(&server_out[..open_ack_len], &mut client_out)
+                .unwrap()
+                .unwrap();
+            let mut server_len = server
+                .receive(&client_out[..request_len], &mut server_out)
+                .unwrap()
+                .unwrap();
             for _ in 0..10_000 {
-                let client_len = client.receive(&server_out[..server_len], &mut client_out).unwrap();
-                if client.is_complete() { break; }
+                let client_len = client
+                    .receive(&server_out[..server_len], &mut client_out)
+                    .unwrap();
+                if client.is_complete() {
+                    break;
+                }
                 let client_len = client_len.expect("probe packet requires response");
-                server_len = server.receive(&client_out[..client_len], &mut server_out).unwrap().unwrap();
+                server_len = server
+                    .receive(&client_out[..client_len], &mut server_out)
+                    .unwrap()
+                    .unwrap();
             }
             assert!(client.is_complete(), "history={HISTORY}");
             assert_eq!(client.bytes(), 1024 * 1024, "history={HISTORY}");
@@ -5373,11 +5594,8 @@ mod tests {
         let second_path = PathId::new(0x0312).unwrap();
         let original = AssociationProfile::c6_default();
         let resampled = AssociationProfile::conservative();
-        let mut dispatcher = ConnectionDispatcher::<8, 1200>::new(
-            server_cid,
-            ConnectionLimits::default(),
-            original,
-        );
+        let mut dispatcher =
+            ConnectionDispatcher::<8, 1200>::new(server_cid, ConnectionLimits::default(), original);
         let mut first = ProbeClient::<8, 1200>::new(first_client_cid, 64).unwrap();
         let mut second = ProbeClient::<8, 1200>::new(second_client_cid, 64).unwrap();
         let mut client_out = [0u8; 1200];
@@ -5511,15 +5729,17 @@ mod tests {
         let mut callback_queue = std::collections::VecDeque::new();
         let mut callback_drops = 0usize;
         let callback_capacity = recovery_association.initial_window_packets;
-        let mut to_client: std::collections::VecDeque<Vec<u8>> =
-            std::collections::VecDeque::new();
+        let mut to_client: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
         let mut rejected_submissions = 3usize;
 
         // Bootstrap is handled before the constrained steady-state queue,
         // matching the adapter's already-running association handshake.
         let initial = client_driver.packet().unwrap().to_vec();
         client_driver.mark_sent(0);
-        let open_ack = server.receive(&initial, &mut server_packet).unwrap().unwrap();
+        let open_ack = server
+            .receive(&initial, &mut server_packet)
+            .unwrap()
+            .unwrap();
         client_driver
             .receive(&mut client, &server_packet[..open_ack], 1)
             .unwrap();
@@ -5608,9 +5828,16 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(callback_drops, 0, "association-sized handoff must absorb its advertised flight");
+        assert_eq!(
+            callback_drops, 0,
+            "association-sized handoff must absorb its advertised flight"
+        );
         assert_eq!(rejected_submissions, 0);
-        assert!(client.is_complete(), "probe stalled queue={}", callback_queue.len());
+        assert!(
+            client.is_complete(),
+            "probe stalled queue={}",
+            callback_queue.len()
+        );
         assert_eq!(client.bytes(), 800 * 1024);
         assert_eq!(client.callback_errors(), [0; 6]);
     }
@@ -5729,13 +5956,10 @@ mod tests {
         let association = AssociationProfile::datagram_default();
         let limits = association.receive_limits(MTU as u64, 4);
         let mut initial = [0_u8; MTU];
-        let initial_len = quic_lite::encode_bootstrap_open_packet(client_cid, 0, &mut initial)
-            .unwrap();
-        let mut dispatcher = ConnectionDispatcher::<8, MTU, 12>::new(
-            server_cid,
-            limits,
-            association,
-        );
+        let initial_len =
+            quic_lite::encode_bootstrap_open_packet(client_cid, 0, &mut initial).unwrap();
+        let mut dispatcher =
+            ConnectionDispatcher::<8, MTU, 12>::new(server_cid, limits, association);
         let mut response = [0_u8; MTU];
         let response_len = dispatcher
             .receive(
@@ -5762,7 +5986,9 @@ mod tests {
         let base = AssociationProfile::datagram_default();
         for packets in [32_u64, 64] {
             let mut dispatcher = ConnectionDispatcher::<64, MTU, 1>::new(
-                server_cid, base.receive_limits(MTU as u64, 4), base,
+                server_cid,
+                base.receive_limits(MTU as u64, 4),
+                base,
             );
             dispatcher.set_receive_profile_ceiling(AssociationProfile {
                 history_packets: 64,
@@ -5776,18 +6002,35 @@ mod tests {
                 max_stream_data: (packets / 2) * MTU as u64,
             };
             let mut initial = [0_u8; MTU];
-            let initial_len = quic_lite::encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
-                client_cid, 0, ConnectionLimits::default(), 0, Some(request), &mut initial,
-            ).unwrap();
+            let initial_len =
+                quic_lite::encode_bootstrap_open_packet_with_profile_and_peer_receive_request(
+                    client_cid,
+                    0,
+                    ConnectionLimits::default(),
+                    0,
+                    Some(request),
+                    &mut initial,
+                )
+                .unwrap();
             let mut response = [0_u8; MTU];
-            let response_len = dispatcher.receive(
-                PathId::new(packets).unwrap(), &initial[..initial_len], &mut response,
-            ).unwrap().unwrap();
+            let response_len = dispatcher
+                .receive(
+                    PathId::new(packets).unwrap(),
+                    &initial[..initial_len],
+                    &mut response,
+                )
+                .unwrap()
+                .unwrap();
             let (_, open_ack) = quic_lite::decode_bootstrap_open_ack_packet_with_limits(
-                &response[..response_len], client_cid,
-            ).unwrap();
+                &response[..response_len],
+                client_cid,
+            )
+            .unwrap();
             assert_eq!(open_ack.max_data, request.max_data, "packets={packets}");
-            assert_eq!(open_ack.max_stream_data, request.max_stream_data, "packets={packets}");
+            assert_eq!(
+                open_ack.max_stream_data, request.max_stream_data,
+                "packets={packets}"
+            );
         }
     }
 
@@ -6234,7 +6477,7 @@ mod tests {
                     )
                     .unwrap()
                 });
-                if let Some(used) = response {
+                    if let Some(used) = response {
                         generated_responses += 1;
                         if run == 0
                             && response_blackout_until.is_none()

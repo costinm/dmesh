@@ -6,7 +6,9 @@
 //! transport services and this adapter never decodes them.
 
 use crate::{
-    device::{DeviceProfile, load_device, resolve_udp_peer},
+    device::{
+        DeviceProfile, device_catalog_path, load_device, resolve_catalog_target, resolve_udp_peer,
+    },
     l2::UartEgressPacer,
     schema::{
         FirmwareSchema, encode_direct_command, encode_direct_command_with_id,
@@ -24,7 +26,7 @@ use quic_lite::{
 };
 use serde::Deserialize;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     env,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Read, Write},
@@ -712,7 +714,7 @@ impl ClientPathPolicy {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli NODE SERVICE [field=value ...]\n       dmesh-cli hosts check\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--file MAIN_IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli uds:///run/mesh/lmesh[-wifi]/mesh.sock|lmesh://lmesh[-wifi] --method METHOD [--data JSON] [--to NODE]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH"
+        "usage: dmesh-cli SERIAL|DEVICE --reset\n       dmesh-cli SERIAL|DEVICE --watch [--reset] [--interactive] [--baud PHYSICAL_UART_BAUD] [--timeout-secs N]\n       dmesh-cli NODE SERVICE [field=value ...]\n       dmesh-cli devices check|backfill [--dry-run]\n       dmesh-cli discover\n       dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]\n       dmesh-cli SERIAL|DEVICE [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli uds:///run/mesh/lmesh[-wifi]/mesh.sock|lmesh://lmesh[-wifi] --method METHOD [--data JSON] [--to NODE]\n       dmesh-cli SERIAL|DEVICE BOOTSTRAP_BIND BACKEND [--baud PHYSICAL_UART_BAUD] [--bearer uart|udp|aggregate|spill] [--msg TEXT | --direct-hex HEX] [--timeout-secs N]\n       dmesh-cli NODE check\n       dmesh-cli udp://HOST:PORT --socket PATH"
     );
     std::process::exit(2)
 }
@@ -735,7 +737,11 @@ fn hex_encode(value: &[u8]) -> String {
 
 /// Render a 6-byte radio MAC as a colon-separated lowercase hex string.
 fn mac_encode(value: &[u8]) -> String {
-    value.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(":")
+    value
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn physical_baud(value: u32) -> Option<libc::speed_t> {
@@ -833,13 +839,24 @@ pub fn run_dmesh_cli() -> Result<(), String> {
 /// gateway keep one L2/session implementation.
 pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mut arguments: Vec<String> = args.into_iter().collect();
-    if arguments.as_slice() == ["hosts", "check"] {
-        return run_hosts_check();
+    if arguments.as_slice() == ["devices", "check"] {
+        return run_devices_check();
+    }
+    if matches!(arguments.as_slice(), [devices, backfill] if devices == "devices" && backfill == "backfill")
+    {
+        return run_devices_backfill(false);
+    }
+    if matches!(arguments.as_slice(), [devices, backfill, dry_run] if devices == "devices" && backfill == "backfill" && dry_run == "--dry-run")
+    {
+        return run_devices_backfill(true);
     }
     if arguments.as_slice() == ["discover"] {
         return run_hosts_discovery();
     }
-    if arguments.first().is_some_and(|argument| argument == "flash") {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "flash")
+    {
         return run_automated_flash(&arguments[1..]);
     }
     if arguments.get(1).is_some_and(|argument| argument == "check") {
@@ -958,6 +975,9 @@ pub fn run_dmesh_cli_args(args: impl IntoIterator<Item = String>) -> Result<(), 
         .cloned()
         .filter(|target| !target.starts_with("udp://"))
     {
+        if let Some(profile) = resolve_catalog_target(&target)? {
+            return run_catalog_target_service(&arguments, &profile);
+        }
         match resolve_udp_peer(&target) {
             Ok(Some(peer)) => {
                 arguments[0] = format!("udp://{peer}");
@@ -2766,13 +2786,16 @@ fn udp_bind_for_peer(peer: SocketAddr) -> SocketAddr {
     let port = env::var("DMESH_UDP_SOURCE_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(3338);
+        // An operator may pin this for a capture/reproduction, but a normal
+        // one-shot client must not share one port with every peer's multicast
+        // announce stream. On a populated LAN that made an unrelated board's
+        // packet look like the selected target's QUIC bootstrap response.
+        .unwrap_or(0);
     match peer {
         // Keep the operator/client socket distinct from both managed host
         // listeners (wlan0:3336, wlan1:3337) and firmware raw UDP6 (3339).
-        // A fixed source port also makes link-local captures reproducible.
-        // A concurrent operator can explicitly select `0` for an ephemeral
-        // source without changing the peer or QUIC association identity.
+        // The default is an ephemeral port. Set DMESH_UDP_SOURCE_PORT when a
+        // reproducible fixed source is specifically required for a capture.
         SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], port)),
         SocketAddr::V6(_) => SocketAddr::from(([0; 16], port)),
     }
@@ -2830,11 +2853,21 @@ fn parse_udp_peer(value: &str) -> Result<SocketAddr, String> {
 /// request/reply. The reply remains a signed `announce.discovery` record;
 /// this deliberately replaces the old unrelated bearer probe.
 fn run_udp_direct_discovery(peer: SocketAddr) -> Result<(), String> {
+    let started = Instant::now();
+    let (id, announce) = direct_discovery_announce(peer)?;
+    println!(
+        "dmesh_direct_check target={peer} request_id={id} device={} elapsed_us={}",
+        announce.device_name().unwrap_or("unknown"),
+        started.elapsed().as_micros()
+    );
+    Ok(())
+}
+
+fn direct_discovery_announce(peer: SocketAddr) -> Result<(u64, announce::Announce), String> {
     let id = fresh_request_id();
     let mut request = [0u8; 64];
     let used = announce::encode_discovery_request(id, &mut request)
         .ok_or("encode directed discovery request")?;
-    let started = Instant::now();
     let response = exchange_udp_direct_record(peer, &request[..used])?;
     let payload = dmesh_server::direct::ConnectionlessMessage::decode(&response)
         .ok_or_else(|| "direct discovery received a non-direct response".to_owned())?;
@@ -2846,76 +2879,505 @@ fn run_udp_direct_discovery(peer: SocketAddr) -> Result<(), String> {
     let announce = announce::decode_record(record)
         .filter(|announce| announce.kind == announce::ANNOUNCE_DISCOVERY)
         .ok_or("direct discovery response is not an announce.discovery record")?;
-    println!(
-        "dmesh_direct_check target={peer} request_id={id} device={} elapsed_us={}",
-        announce.device_name().unwrap_or("unknown"),
-        started.elapsed().as_micros()
-    );
-    Ok(())
+    Ok((id, announce))
 }
 
-/// Check every direct ESP endpoint in the checked-in hosts inventory without
-/// consulting the host radio service.  Each candidate gets its own directed
-/// discovery record followed by a normal QUIC telemetry request: a multicast
-/// sighting, a local TX completion, or one peer's failure cannot make another
-/// candidate appear reachable.
-fn run_hosts_check() -> Result<(), String> {
-    let path = env::var_os("DMESH_HOSTS_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("hosts"));
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|error| format!("read hosts inventory {}: {error}", path.display()))?;
-    let mut candidates = Vec::<(String, SocketAddr)>::new();
-    for line in contents.lines() {
-        let line = line.split('#').next().unwrap_or_default();
-        let mut fields = line.split_whitespace();
-        let Some(address) = fields.next() else {
-            continue;
-        };
-        let Ok(address) = address.parse::<std::net::IpAddr>() else {
-            continue;
-        };
-        for name in fields {
-            candidates.push((
-                name.to_owned(),
-                SocketAddr::new(address, dmesh_server::udp::RAW_UDP6_PORT),
-            ));
+/// A catalog VIP6/name is an identity selector, never a literal UDP route.
+/// Prefer its explicitly scoped link-local bearer, then use the same signed
+/// discovery and NAN wake sequence as flash when association is unavailable.
+fn run_catalog_target_service(arguments: &[String], profile: &DeviceProfile) -> Result<(), String> {
+    let name = profile.name.as_deref().unwrap_or("catalog-device");
+    if let Some(peer) = catalog_udp6_peer(profile)? {
+        match direct_discovery_announce(peer) {
+            Ok((_, announce)) if catalog_profile_matches_announce(profile, &announce) => {
+                println!("dmesh_catalog_udp6_association name={name} peer={peer} associated=true");
+                let mut udp_arguments = arguments.to_vec();
+                udp_arguments[0] = format!("udp://{peer}");
+                return run_udp_service_client(&udp_arguments);
+            }
+            Ok((_, announce)) => println!(
+                "dmesh_catalog_udp6_association name={name} peer={peer} associated=false reason=identity_mismatch node={}",
+                hex_encode(announce.device_id())
+            ),
+            Err(error) => println!(
+                "dmesh_catalog_udp6_association name={name} peer={peer} associated=false error={error}"
+            ),
         }
-    }
-    if candidates.is_empty() {
-        return Err(format!(
-            "hosts inventory {} has no IP/name entries",
-            path.display()
-        ));
+    } else if profile.ipv6_link_local.is_some() {
+        println!(
+            "dmesh_catalog_udp6_association name={name} associated=false reason=missing_udp6_iface"
+        );
     }
 
-    let mut reachable = 0usize;
-    for (name, peer) in candidates {
-        let discovery = run_udp_direct_discovery(peer);
-        if let Err(error) = discovery {
-            println!(
-                "dmesh_hosts_check name={name} peer={peer} reachable=false stage=discovery error={error}"
-            );
-            continue;
+    let target = flash_target_from_catalog_profile(profile)?;
+    let (peer, _) = discover_and_nan_activate(&target)?;
+    println!("dmesh_catalog_fallback name={name} peer={peer} discovery=true nan_activation=true");
+    let mut udp_arguments = arguments.to_vec();
+    udp_arguments[0] = format!("udp://{peer}");
+    run_udp_service_client(&udp_arguments)
+}
+
+fn catalog_udp6_peer(profile: &DeviceProfile) -> Result<Option<SocketAddr>, String> {
+    let (Some(address), Some(iface)) = (profile.ipv6_link_local, profile.udp6_iface.as_deref())
+    else {
+        return Ok(None);
+    };
+    let scope_id = std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .map_err(|error| format!("read catalog udp6_iface {iface:?}: {error}"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("parse catalog udp6_iface {iface:?}: {error}"))?;
+    Ok(Some(SocketAddr::V6(SocketAddrV6::new(
+        address,
+        profile.udp_port,
+        0,
+        scope_id,
+    ))))
+}
+
+fn catalog_profile_matches_announce(
+    profile: &DeviceProfile,
+    announce: &announce::Announce,
+) -> bool {
+    if let Some(vip6) = profile.vip6 {
+        return announce::virtual_ip6_from_identity_hint(announce.device_id()).map(Ipv6Addr::from)
+            == Some(vip6);
+    }
+    let address = announce
+        .udp_link_local_v6()
+        .or_else(|| announce.sta_link_local_v6())
+        .map(Ipv6Addr::from);
+    profile.ipv6_link_local == address
+}
+
+fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTarget, String> {
+    let name = profile.name.as_deref().unwrap_or("catalog-device");
+    let node = profile.vip6.map(|vip6| hex_encode(&vip6.octets()[8..]));
+    if node.is_none() && profile.mac.is_none() {
+        return Err(format!(
+            "catalog device {name:?} has neither vip6 nor mac for discovery/NAN activation"
+        ));
+    }
+    Ok(FlashTarget {
+        description: profile
+            .vip6
+            .map(|vip6| format!("{name} ({vip6})"))
+            .unwrap_or_else(|| name.to_owned()),
+        node,
+        mac: profile.mac,
+    })
+}
+
+/// Locate an already-active target or wake it through a passive-ready
+/// observer. This is deliberately the same signed discovery/NAN sequence as
+/// flash, without any flash-specific state change.
+fn discover_and_nan_activate(
+    target: &FlashTarget,
+) -> Result<(SocketAddr, announce::Announce), String> {
+    let target_mac = target.mac;
+    let mut observed_node_id = target.node.clone();
+    let mut peers = multicast_discover_peers()?;
+    if let Some(peer) = peers.iter().find(|peer| flash_target_matches(peer, target)) {
+        return Ok((peer.peer, peer.announce));
+    }
+
+    for peer in &peers {
+        if peer.passive_ready {
+            let request = encode_stream_command_with_id("discovery.active", fresh_request_id())
+                .map_err(|error| error.to_string())?;
+            let _ = exchange_udp_stream_record(peer.peer, &request);
         }
-        let request = encode_stream_command_with_id("telemetry.nan_status", fresh_request_id())
-            .map_err(|error| format!("encode telemetry.nan_status: {error}"))?;
-        match exchange_udp_stream_record(peer, &request) {
-            Ok(response) => {
-                let schema = FirmwareSchema::load();
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    let mut wakes = Vec::new();
+    for peer in &peers {
+        let request = encode_stream_command_with_id("discovery.nodes", fresh_request_id())
+            .map_err(|error| error.to_string())?;
+        let Ok(response) = exchange_udp_stream_record(peer.peer, &request) else {
+            continue;
+        };
+        let Some(nodes) = observed_nodes(&response) else {
+            continue;
+        };
+        for node in nodes {
+            let matches = target_mac.is_some_and(|mac| node.peer_mac == Some(mac))
+                || target
+                    .node
+                    .as_deref()
+                    .is_some_and(|identity| node.node.eq_ignore_ascii_case(identity));
+            if matches {
+                if let Some(mac) = node.peer_mac {
+                    if !node.node.is_empty() {
+                        observed_node_id = Some(node.node);
+                    }
+                    wakes.push((peer.peer, mac));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(mac) = target_mac {
+        for peer in &peers {
+            if peer.passive_ready && !wakes.iter().any(|(observer, _)| *observer == peer.peer) {
+                wakes.push((peer.peer, mac));
+            }
+        }
+    }
+    if wakes.is_empty() {
+        return Err(format!(
+            "target_not_visible target={}; no Main UDP announce or synced observer NAN entry was found",
+            target.description
+        ));
+    }
+    let mut accepted = false;
+    for (observer, mac) in wakes {
+        let request = encode_stream_command_with_id(
+            &format!("nan.wakeup to={}", mac_encode(&mac)),
+            fresh_request_id(),
+        )
+        .map_err(|error| error.to_string())?;
+        match exchange_udp_stream_record(observer, &request)
+            .and_then(|response| ensure_stream_success(response, "nan.wakeup"))
+        {
+            Ok(()) => {
+                accepted = true;
+                // Admission only proves this observer queued a bounded SDF;
+                // it does not prove RF delivery to a DW-only peer. Submit to
+                // every independently reachable observer so one controller's
+                // stale cluster or RF blind spot cannot suppress another.
                 println!(
-                    "dmesh_hosts_check name={name} peer={peer} reachable=true {}",
-                    render_device_record(&schema, &response)
+                    "dmesh_catalog_nan_wake observer={observer} target_mac={} accepted=true",
+                    mac_encode(&mac)
                 );
-                reachable = reachable.saturating_add(1);
             }
             Err(error) => println!(
-                "dmesh_hosts_check name={name} peer={peer} reachable=false stage=quic error={error}"
+                "dmesh_catalog_nan_wake observer={observer} target_mac={} accepted=false error={error}",
+                mac_encode(&mac)
             ),
         }
     }
-    if reachable == 0 {
-        return Err("no hosts-inventory peer completed direct discovery and QUIC telemetry".into());
+    if !accepted {
+        return Err(format!(
+            "target_wake_rejected target={}; no visible observer accepted nan.wakeup",
+            target.description
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        peers = multicast_discover_peers()?;
+        if let Some(peer) = peers.iter().find(|peer| {
+            observed_node_id
+                .as_deref()
+                .is_some_and(|node| peer.node.eq_ignore_ascii_case(node))
+                || flash_target_matches(peer, target)
+        }) {
+            return Ok((peer.peer, peer.announce));
+        }
+    }
+    Err(format!("target_wake_timeout target={}", target.description))
+}
+
+/// Ask every directly reachable NAN-capable controller to wake a known sleepy
+/// radio MAC. A stream success is only local queue admission; callers must
+/// separately wait for the target's UDP identity before treating it as awake.
+fn submit_nan_wake_to_all(peers: &[DiscoveredPeer], target: &FlashTarget) -> Result<u32, String> {
+    let target_mac = target.mac.ok_or_else(|| {
+        format!(
+            "target_wake_unavailable target={}; catalog has no radio MAC",
+            target.description
+        )
+    })?;
+    let request = encode_stream_command_with_id(
+        &format!("nan.wakeup to={}", mac_encode(&target_mac)),
+        fresh_request_id(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut accepted = 0u32;
+    for observer in peers.iter().filter(|peer| peer.passive_ready) {
+        match exchange_udp_stream_record(observer.peer, &request)
+            .and_then(|response| ensure_stream_success(response, "nan.wakeup"))
+        {
+            Ok(()) => {
+                accepted = accepted.saturating_add(1);
+                println!(
+                    "dmesh_flash_wake_attempt observer={} target_mac={} accepted=true",
+                    observer.peer,
+                    mac_encode(&target_mac)
+                );
+            }
+            Err(error) => println!(
+                "dmesh_flash_wake_attempt observer={} target_mac={} accepted=false error={error}",
+                observer.peer,
+                mac_encode(&target_mac)
+            ),
+        }
+    }
+    (accepted != 0)
+        .then_some(accepted)
+        .ok_or_else(|| format!("target_wake_rejected target={}", target.description))
+}
+
+/// A stable operator-facing device identity read from the shared catalog.
+/// Its VIP6 low 64 bits are the signed announce identity hint. Names are only
+/// lookup aliases and never participate in radio or flash target matching.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogVip6 {
+    name: String,
+    vip6: Ipv6Addr,
+    node: String,
+    mac: Option<[u8; 6]>,
+}
+
+fn catalog_vip6_inventory() -> Result<Vec<CatalogVip6>, String> {
+    let path = device_catalog_path();
+    let catalog = crate::prober::E2eConfig::from_path(&path)?;
+    let mut entries = Vec::new();
+    for device in catalog.devices {
+        let Some(value) = device.vip6 else {
+            continue;
+        };
+        let vip6 = value.parse::<Ipv6Addr>().map_err(|error| {
+            format!(
+                "catalog device {:?} has invalid vip6 {value:?}: {error}",
+                device.name
+            )
+        })?;
+        if vip6.octets()[0] != 0xfc {
+            return Err(format!(
+                "catalog device {:?} has vip6 outside fc00::/8: {vip6}",
+                device.name
+            ));
+        }
+        entries.push(CatalogVip6 {
+            name: device.name,
+            vip6,
+            node: hex_encode(&vip6.octets()[8..]),
+            mac: device.mac.as_deref().and_then(parse_mac),
+        });
+    }
+    if entries.is_empty() {
+        return Err(format!(
+            "device catalog {} has no vip6 entries (expected fc00::/8)",
+            path.display()
+        ));
+    }
+    Ok(entries)
+}
+
+/// Validate the checked-in node identity inventory against multicast
+/// presence.  A VIP6 is an overlay identity, not a LAN route, so this must
+/// not attempt a raw UDP packet to the VIP itself.
+fn run_devices_check() -> Result<(), String> {
+    let inventory = catalog_vip6_inventory()?;
+    let peers = multicast_discover_peers()?;
+    let mut visible = 0usize;
+    for host in inventory {
+        if let Some(peer) = peers.iter().find(|peer| peer.node == host.node) {
+            println!(
+                "dmesh_devices_check name={} vip6={} node={} reachable=true peer={}",
+                host.name, host.vip6, host.node, peer.peer
+            );
+            visible += 1;
+        } else {
+            println!(
+                "dmesh_devices_check name={} vip6={} node={} reachable=false",
+                host.name, host.vip6, host.node
+            );
+        }
+    }
+    if visible == 0 {
+        return Err("no catalogued VIP6 identity answered multicast discovery".into());
+    }
+    Ok(())
+}
+
+/// A signed identity correlated to a concrete Wi-Fi radio address.  The
+/// catalog maps that address to an operator-owned device entry; the
+/// announce display name is intentionally not used for this mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiscoveryBinding {
+    node: String,
+    mac: [u8; 6],
+}
+
+fn mac_from_eui64(address: Ipv6Addr) -> Option<[u8; 6]> {
+    let octets = address.octets();
+    (octets[11] == 0xff && octets[12] == 0xfe).then(|| {
+        [
+            octets[8] ^ 0x02,
+            octets[9],
+            octets[10],
+            octets[13],
+            octets[14],
+            octets[15],
+        ]
+    })
+}
+
+fn binding_from_direct_peer(peer: &DiscoveredPeer) -> Option<DiscoveryBinding> {
+    if peer.node.len() != 16 {
+        return None;
+    }
+    let address = peer
+        .announce
+        .sta_link_local_v6()
+        .map(Ipv6Addr::from)
+        .or_else(|| match peer.peer {
+            SocketAddr::V6(address) => Some(*address.ip()),
+            SocketAddr::V4(_) => None,
+        })?;
+    Some(DiscoveryBinding {
+        node: peer.node.clone(),
+        mac: mac_from_eui64(address)?,
+    })
+}
+
+fn insert_binding(
+    bindings: &mut BTreeMap<String, DiscoveryBinding>,
+    binding: DiscoveryBinding,
+) -> Result<(), String> {
+    let key = mac_encode(&binding.mac);
+    if let Some(existing) = bindings.get(&key) {
+        if existing.node != binding.node {
+            return Err(format!(
+                "conflicting signed discovery identities for radio MAC {key}: {} and {}",
+                existing.node, binding.node
+            ));
+        }
+        return Ok(());
+    }
+    bindings.insert(key, binding);
+    Ok(())
+}
+
+/// Update only one device's `vip6` field without reserializing the shared
+/// operator-maintained catalog or exposing its protected fields.
+fn upsert_catalog_vip6(path: &Path, name: &str, vip6: Ipv6Addr) -> Result<(), String> {
+    let rendered = format!("\"{vip6}\"");
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("read device catalog {}: {error}", path.display()))?;
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut section = None;
+    let mut end = lines.len();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim() == "[[devices]]" {
+            if section.is_some() {
+                end = index;
+                break;
+            }
+            continue;
+        }
+        if line.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "name" && value.trim() == format!("\"{name}\"")
+        }) {
+            section = (0..=index)
+                .rev()
+                .find(|&candidate| lines[candidate].trim() == "[[devices]]");
+        }
+    }
+    let section = section.ok_or_else(|| {
+        format!(
+            "device catalog {} has no device named {name:?}",
+            path.display()
+        )
+    })?;
+    if end == lines.len() {
+        end = lines[section + 1..]
+            .iter()
+            .position(|line| line.trim() == "[[devices]]")
+            .map(|offset| section + 1 + offset)
+            .unwrap_or(lines.len());
+    }
+    if let Some(index) = (section + 1..end).find(|&index| {
+        lines[index]
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "vip6")
+    }) {
+        lines[index] = format!("vip6 = {rendered}");
+    } else {
+        lines.insert(end, format!("vip6 = {rendered}"));
+    }
+    let updated = format!("{}\n", lines.join("\n"));
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, updated)
+        .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("replace {}: {error}", path.display()))
+}
+
+/// Back-fill catalogued VIP6 identities from live signed discovery. A write needs
+/// both an announce identity and a radio MAC.  The common catalog is the only
+/// MAC-to-name mapping, so a peer cannot create an arbitrary local node name.
+fn run_devices_backfill(dry_run: bool) -> Result<(), String> {
+    let reachable = multicast_discover_peers()?;
+    let mut bindings = BTreeMap::<String, DiscoveryBinding>::new();
+    for peer in &reachable {
+        if let Some(binding) = binding_from_direct_peer(peer) {
+            insert_binding(&mut bindings, binding)?;
+        }
+    }
+    for peer in &reachable {
+        if peer.passive_ready {
+            let request = encode_stream_command_with_id("discovery.active", fresh_request_id())
+                .map_err(|error| format!("encode discovery.active: {error}"))?;
+            let _ = exchange_udp_stream_record(peer.peer, &request);
+        }
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    for observer in &reachable {
+        let request = encode_stream_command_with_id("discovery.nodes", fresh_request_id())
+            .map_err(|error| format!("encode discovery.nodes: {error}"))?;
+        let Ok(response) = exchange_udp_stream_record(observer.peer, &request) else {
+            continue;
+        };
+        let Some(nodes) = observed_nodes(&response) else {
+            continue;
+        };
+        for observed in nodes {
+            if observed.node.len() == 16 {
+                if let Some(mac) = observed.peer_mac {
+                    insert_binding(
+                        &mut bindings,
+                        DiscoveryBinding {
+                            node: observed.node,
+                            mac,
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+
+    let catalog_path = device_catalog_path();
+    let catalog = crate::prober::E2eConfig::from_path(&catalog_path)?;
+    let mut changed = 0usize;
+    for device in catalog.devices {
+        let Some(mac) = device.mac.as_deref().and_then(parse_mac) else {
+            continue;
+        };
+        let key = mac_encode(&mac);
+        let Some(binding) = bindings.get(&key) else {
+            continue;
+        };
+        let vip6 = announce::virtual_ip6_from_identity_hint(
+            &hex(&binding.node)
+                .map_err(|error| format!("decode node {}: {error}", binding.node))?,
+        )
+        .map(Ipv6Addr::from)
+        .ok_or_else(|| format!("invalid identity hint {}", binding.node))?;
+        println!(
+            "dmesh_devices_backfill name={} mac={} vip6={} node={} write={}",
+            device.name, key, vip6, binding.node, !dry_run
+        );
+        if !dry_run {
+            upsert_catalog_vip6(&catalog_path, &device.name, vip6)?;
+        }
+        changed += 1;
+    }
+    if changed == 0 {
+        return Err(
+            "no catalogued radio MAC had a signed discovery identity; catalog unchanged".into(),
+        );
     }
     Ok(())
 }
@@ -2974,29 +3436,184 @@ fn run_hosts_discovery() -> Result<(), String> {
     Ok(())
 }
 
+/// Flash selection is a stable signed identity, optionally with a temporary
+/// radio MAC only for waking an otherwise unreachable device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FlashTarget {
+    description: String,
+    node: Option<String>,
+    mac: Option<[u8; 6]>,
+}
+
+fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
+    if let Some(mac) = parse_mac(value) {
+        return Ok(FlashTarget {
+            description: value.to_owned(),
+            node: None,
+            mac: Some(mac),
+        });
+    }
+    if let Ok(vip6) = value.parse::<Ipv6Addr>() {
+        if vip6.octets()[0] != 0xfc {
+            return Err(format!("flash target VIP6 must use fc00::/8, got {vip6}"));
+        }
+        return Ok(FlashTarget {
+            description: value.to_owned(),
+            node: Some(hex_encode(&vip6.octets()[8..])),
+            mac: None,
+        });
+    }
+    if value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(FlashTarget {
+            description: value.to_owned(),
+            node: Some(value.to_ascii_lowercase()),
+            mac: None,
+        });
+    }
+    let host = catalog_vip6_inventory()?
+        .into_iter()
+        .find(|host| host.name.eq_ignore_ascii_case(value))
+        .ok_or_else(|| {
+            format!("unknown flash hostname {value:?}; add vip6 to the shared device catalog")
+        })?;
+    Ok(FlashTarget {
+        description: format!("{} ({})", host.name, host.vip6),
+        node: Some(host.node),
+        mac: host.mac,
+    })
+}
+
 /// Flash one Main image without requiring an operator to stitch together the
 /// discovery, NAN wake, Recovery handoff, and verified-object steps.  The
-/// target is either its signed announce node ID/device name (when awake) or
-/// the NAN MAC recorded by an observer's `discovery.nodes` cache.  A legacy
+/// target is its catalogued VIP6 identity (or a compatibility raw node ID),
+/// with a NAN MAC accepted only as a temporary explicit wake selector. A legacy
 /// generic ESP announce is deliberately refused for writes: it cannot select
 /// a safe CPU artifact.
 fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
-    let (target, source) = match arguments {
-        [target] => (target.as_str(), None),
-        [target, flag, path] if flag == "--file" => (target.as_str(), Some(path.as_str())),
-        _ => return Err("usage: dmesh-cli flash TARGET [--file MAIN_IMAGE]".into()),
+    let started = Instant::now();
+    let result = run_automated_flash_timed(arguments, started);
+    if let Err(error) = &result {
+        println!(
+            "dmesh_flash_timing stage=failed elapsed_ms={} error={error}",
+            started.elapsed().as_millis()
+        );
+    }
+    result
+}
+
+fn report_flash_step(step: &str, started: Instant, step_started: Instant) {
+    println!(
+        "dmesh_flash_timing stage={step} step_ms={} elapsed_ms={}",
+        step_started.elapsed().as_millis(),
+        started.elapsed().as_millis()
+    );
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutomatedFlashImage {
+    Main,
+    Recovery,
+    Stage2,
+    Module(String),
+}
+
+impl AutomatedFlashImage {
+    fn target(&self) -> u8 {
+        match self {
+            Self::Main => 6,
+            Self::Recovery => 3,
+            Self::Stage2 => 2,
+            Self::Module(_) => 7,
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Main => "main",
+            Self::Recovery => "recovery",
+            Self::Stage2 => "stage2",
+            Self::Module(name) => name,
+        }
+    }
+}
+
+struct AutomatedFlashOptions<'a> {
+    target: &'a str,
+    image: AutomatedFlashImage,
+    source: Option<&'a str>,
+}
+
+fn parse_automated_flash_options(
+    arguments: &[String],
+) -> Result<AutomatedFlashOptions<'_>, String> {
+    let target = arguments.first().ok_or(
+        "usage: dmesh-cli flash TARGET [--target main|recovery|stage2|MODULE] [--file IMAGE]",
+    )?;
+    let mut selected = "main";
+    let mut source = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for {}", arguments[index]))?;
+        match arguments[index].as_str() {
+            "--target" => selected = value,
+            "--file" => source = Some(value.as_str()),
+            option => return Err(format!("unknown flash option {option:?}")),
+        }
+        index += 2;
+    }
+    let image = match selected {
+        "main" => AutomatedFlashImage::Main,
+        "recovery" => AutomatedFlashImage::Recovery,
+        "stage" | "stage2" => AutomatedFlashImage::Stage2,
+        value
+            if !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            AutomatedFlashImage::Module(value.to_owned())
+        }
+        value => return Err(format!("invalid flash target {value:?}")),
     };
-    let target_mac = parse_mac(target);
-    let mut observed_node_id = None::<String>;
+    Ok(AutomatedFlashOptions {
+        target,
+        image,
+        source,
+    })
+}
+
+fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(), String> {
+    let options = parse_automated_flash_options(arguments)?;
+    let source = options.source;
+    let target = resolve_flash_target(options.target)?;
+    println!(
+        "dmesh_flash_timing stage=start target={} image={} elapsed_ms=0",
+        target.description,
+        options.image.label()
+    );
+    let target_mac = target.mac;
+    let mut observed_node_id = target.node.clone();
+    let discovery_started = Instant::now();
     let mut peers = multicast_discover_peers()?;
-    let mut target_peer = peers.iter().find(|peer| flash_target_matches(peer, target));
+    let mut target_peer = peers
+        .iter()
+        .find(|peer| flash_target_matches(peer, &target));
     let mut selected = target_peer.map(|peer| (peer.peer, peer.announce));
+    // An absent multicast target was reached only by the bounded NAN wake
+    // path below. Preserve its battery-oriented personality after a verified
+    // update instead of silently converting an installed sleepy device into
+    // an always-on STA node.
+    let mut was_sleepy = selected.is_none();
     println!("dmesh_flash_gate target_found={}", selected.is_some());
+    report_flash_step("initial_discovery", started, discovery_started);
 
     // A DW-only target is absent from UDP multicast. Ask every reachable
     // observer to refresh all of its media, then use the observation cache to
     // locate the observer which actually saw the requested radio MAC/node.
     if selected.is_none() {
+        let observer_discovery_started = Instant::now();
         for peer in &peers {
             if peer.passive_ready {
                 let request = encode_stream_command_with_id("discovery.active", fresh_request_id())
@@ -3005,38 +3622,95 @@ fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
             }
         }
         std::thread::sleep(Duration::from_secs(5));
-        let mut wake = None;
+        let mut wakes = Vec::new();
         for peer in &peers {
             let request = encode_stream_command_with_id("discovery.nodes", fresh_request_id())
                 .map_err(|error| error.to_string())?;
-            let Ok(response) = exchange_udp_stream_record(peer.peer, &request) else { continue };
-            let Some(nodes) = observed_nodes(&response) else { continue };
+            let Ok(response) = exchange_udp_stream_record(peer.peer, &request) else {
+                continue;
+            };
+            let Some(nodes) = observed_nodes(&response) else {
+                continue;
+            };
             for node in nodes {
                 let matches = target_mac.is_some_and(|mac| node.peer_mac == Some(mac))
-                    || (!target.contains(':') && node.node.eq_ignore_ascii_case(target));
+                    || target
+                        .node
+                        .as_deref()
+                        .is_some_and(|identity| node.node.eq_ignore_ascii_case(identity));
                 if matches {
                     if let Some(mac) = node.peer_mac {
                         if !node.node.is_empty() {
                             observed_node_id = Some(node.node);
                         }
-                        wake = Some((peer.peer, mac));
+                        wakes.push((peer.peer, mac));
                         break;
                     }
                 }
             }
-            if wake.is_some() { break; }
         }
-        let (observer, mac) = wake.ok_or_else(|| {
-            format!("target_not_visible target={target}; no synced observer cache has its NAN peer")
-        })?;
-        let request = encode_stream_command_with_id(
-            &format!("nan.wakeup to={}", mac_encode(&mac)),
-            fresh_request_id(),
-        )
-        .map_err(|error| error.to_string())?;
-        ensure_stream_success(exchange_udp_stream_record(observer, &request)?, "nan.wakeup")?;
-        println!("dmesh_flash_gate nan_wake_accepted=true observer={observer} target_mac={}", mac_encode(&mac));
+        // A caller who supplied a concrete radio MAC has already made the
+        // target selection. Try every passive-ready controller even when an
+        // older observation cache cannot attach its opaque radio entry to the
+        // signed node ID; one controller's timeout must not hide another
+        // controller that can hear the target.
+        if let Some(mac) = target_mac {
+            for peer in &peers {
+                if peer.passive_ready && !wakes.iter().any(|(observer, _)| *observer == peer.peer) {
+                    wakes.push((peer.peer, mac));
+                }
+            }
+        }
+        if wakes.is_empty() {
+            return Err(format!(
+                "target_not_visible target={}; `dmesh-cli flash TARGET` starts from Main, but no Main UDP announce or synced observer NAN entry was found; if the device was deliberately forced into Recovery, address its verified UDP6 endpoint directly with `dmesh-cli ENDPOINT object.flash cpu=CPU target=6`",
+                target.description
+            ));
+        }
+        report_flash_step(
+            "observer_active_discovery",
+            started,
+            observer_discovery_started,
+        );
+        let wake_submission_started = Instant::now();
+        let mut accepted_wakes = 0u32;
+        for (observer, mac) in wakes {
+            let request = encode_stream_command_with_id(
+                &format!("nan.wakeup to={}", mac_encode(&mac)),
+                fresh_request_id(),
+            )
+            .map_err(|error| error.to_string())?;
+            match exchange_udp_stream_record(observer, &request)
+                .and_then(|response| ensure_stream_success(response, "nan.wakeup"))
+            {
+                Ok(()) => {
+                    println!(
+                        "dmesh_flash_gate nan_wake_accepted=true observer={observer} target_mac={}",
+                        mac_encode(&mac)
+                    );
+                    // A successful control reply means only that this
+                    // observer accepted the bounded NAN request. Do not stop
+                    // here: controllers can have different NAN visibility,
+                    // and the target's first matching DW must receive at
+                    // least one of them.
+                    accepted_wakes = accepted_wakes.saturating_add(1);
+                }
+                Err(error) => println!(
+                    "dmesh_flash_wake_attempt observer={observer} target_mac={} accepted=false error={error}",
+                    mac_encode(&mac)
+                ),
+            }
+        }
+        if accepted_wakes == 0 {
+            return Err(format!(
+                "target_wake_rejected target={}; no visible observer accepted nan.wakeup",
+                target.description
+            ));
+        }
+        println!("dmesh_flash_gate nan_wake_observers={accepted_wakes}");
+        report_flash_step("nan_wake_submission", started, wake_submission_started);
 
+        let wake_wait_started = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(45);
         while Instant::now() < deadline {
             peers = multicast_discover_peers()?;
@@ -3044,55 +3718,191 @@ fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
                 observed_node_id
                     .as_deref()
                     .is_some_and(|node| peer.node.eq_ignore_ascii_case(node))
-                    || flash_target_matches(peer, target)
+                    || flash_target_matches(peer, &target)
             }) {
                 selected = Some((peer.peer, peer.announce));
                 break;
             }
         }
-        target_peer = peers.iter().find(|peer| flash_target_matches(peer, target));
+        target_peer = peers
+            .iter()
+            .find(|peer| flash_target_matches(peer, &target));
+        report_flash_step("target_wake_wait", started, wake_wait_started);
     }
-    let (peer, announce) = selected.or_else(|| target_peer.map(|peer| (peer.peer, peer.announce)))
-        .ok_or_else(|| format!("target_wake_timeout target={target}"))?;
+    let (peer, announce) = selected
+        .or_else(|| target_peer.map(|peer| (peer.peer, peer.announce)))
+        .ok_or_else(|| format!("target_wake_timeout target={}", target.description))?;
     let cpu = announce::flash_cpu_for_device_class(announce.device_class).ok_or_else(|| {
         format!("target_cpu_unknown device_class={}; flash a concrete-family Main over a controlled path first", announce.device_class)
     })?;
-    run_udp_direct_discovery(peer)?;
-    let main_identity = firmware_identity(peer)?;
-    println!("dmesh_flash_gate target_udp_ready=true peer={peer} cpu={cpu}");
+    let target_ready_started = Instant::now();
+    let initial_identity = match firmware_identity(peer) {
+        Ok(identity) => identity,
+        Err(initial_error) if target.mac.is_some() => {
+            // A DW-only target can answer one multicast discovery request
+            // while its receive lease is open, then disappear before the
+            // first unicast QUIC stream. Treat that as sleepy evidence, not
+            // as an active UDP endpoint. Wake through every controller and
+            // require the normal direct identity response before flashing.
+            was_sleepy = true;
+            println!(
+                "dmesh_flash_gate target_udp_ready=false peer={peer} error={initial_error}; nan_wake_retry=true"
+            );
+            let wake_started = Instant::now();
+            let accepted = submit_nan_wake_to_all(&peers, &target)?;
+            println!("dmesh_flash_gate nan_wake_observers={accepted}");
+            report_flash_step("nan_wake_retry", started, wake_started);
 
-    let recovery = encode_stream_command_with_id("boot.recovery", fresh_request_id())
-        .map_err(|error| error.to_string())?;
-    ensure_stream_success(exchange_udp_stream_record(peer, &recovery)?, "boot.recovery")?;
-    println!("dmesh_flash_gate recovery_requested=true peer={peer}");
-
-    // Recovery reuses the target identity and endpoint. Prefer its fresh
-    // multicast announce, but a bridged WLAN can suppress link-local
-    // multicast even when Recovery has submitted it. In that case a direct
-    // `firmware.identity` response different from the pre-handoff Main image
-    // is stronger evidence: it proves this exact endpoint ran another image,
-    // not merely that a multicast packet was queued by the sender.
-    let deadline = Instant::now() + Duration::from_secs(75);
-    let recovery_peer = loop {
-        if Instant::now() >= deadline {
-            return Err("recovery_seen=false timeout waiting for fresh Recovery identity or multicast".into());
-        }
-        let candidates = multicast_discover_peers()?;
-        if let Some(candidate) = candidates.into_iter().find(|candidate| {
-            candidate.node == hex_encode(announce.device_id())
-                && candidate.announce.device_class == announce.device_class
-        }) {
-            if firmware_identity(candidate.peer).is_ok_and(|identity| identity != main_identity) {
-                println!("dmesh_flash_recovery_evidence source=multicast_identity");
-                break candidate.peer;
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                match firmware_identity(peer) {
+                    Ok(identity) => break identity,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "target_wake_timeout target={}; NAN wake was accepted but UDP identity did not return: {error}",
+                            target.description
+                        ));
+                    }
+                }
             }
         }
-        if firmware_identity(peer).is_ok_and(|identity| identity != main_identity) {
-            println!("dmesh_flash_recovery_evidence source=direct_identity");
-            break peer;
+        Err(error) => return Err(error),
+    };
+    let started_in_recovery = announce.recovery;
+    println!(
+        "dmesh_flash_gate target_udp_ready=true peer={peer} cpu={cpu} recovery={started_in_recovery}"
+    );
+    report_flash_step("target_udp_ready", started, target_ready_started);
+
+    // Main owns in-place Recovery, Stage2, and module updates. Unlike a Main
+    // image replacement these targets must not hand off to Recovery or reboot
+    // the device. Discovery and NAN wake above remain identical for every
+    // image kind.
+    if options.image != AutomatedFlashImage::Main {
+        if started_in_recovery {
+            return Err(format!(
+                "flash target {} requires Main's flash service, but {} is running Recovery",
+                options.image.label(),
+                target.description
+            ));
+        }
+        if matches!(options.image, AutomatedFlashImage::Module(_)) {
+            let stop_started = Instant::now();
+            let stop = encode_stream_command_with_id("module.stop", fresh_request_id())
+                .map_err(|error| error.to_string())?;
+            ensure_stream_success(exchange_udp_stream_record(peer, &stop)?, "module.stop")?;
+            report_flash_step("module_stop", started, stop_started);
+        }
+        let mut upload = vec![
+            format!("udp://{peer}"),
+            "object.flash".to_owned(),
+            format!("cpu={cpu}"),
+            format!("target={}", options.image.target()),
+        ];
+        if let AutomatedFlashImage::Module(name) = &options.image {
+            upload.push(format!("name={name}"));
+        }
+        if options.image == AutomatedFlashImage::Stage2 {
+            // Classic ESP32 maps its second-stage boot image at 0x1000;
+            // ESP32-S3/C6 map it at zero. The firmware sink bounds both to
+            // the pre-partition-table boot region.
+            upload.push(format!("address={}", if cpu == 0 { 0x1000 } else { 0 }));
+        }
+        if let Some(source) = source {
+            upload.push("--file".to_owned());
+            upload.push(source.to_owned());
+        }
+        println!(
+            "dmesh_flash_action write=true dry_run=false peer={peer} cpu={cpu} target={} image={} artifact={}",
+            options.image.target(),
+            options.image.label(),
+            source.unwrap_or("catalog")
+        );
+        let object_flash_started = Instant::now();
+        run_udp_service_client(&upload)?;
+        println!(
+            "dmesh_flash_gate object_committed=true peer={peer} image={}",
+            options.image.label()
+        );
+        report_flash_step("object_flash", started, object_flash_started);
+
+        let health_started = Instant::now();
+        let status = encode_stream_command_with_id("status", fresh_request_id())
+            .map_err(|error| error.to_string())?;
+        ensure_stream_success(exchange_udp_stream_record(peer, &status)?, "Main status")?;
+        println!("dmesh_flash_gate main_healthy=true peer={peer}");
+        report_flash_step("main_health", started, health_started);
+        restore_sleepy_after_flash(peer, &announce, was_sleepy, started)?;
+        println!(
+            "dmesh_flash_timing stage=complete target={} image={} elapsed_ms={}",
+            target.description,
+            options.image.label(),
+            started.elapsed().as_millis()
+        );
+        return Ok(());
+    }
+
+    let recovery_peer = if started_in_recovery {
+        // Crash-loop boot health and explicit repair can enter Recovery before
+        // the operator starts this command. Its signed multicast response is
+        // sufficient to skip a Main-only boot.recovery request.
+        println!("dmesh_flash_recovery_evidence source=initial_announce");
+        report_flash_step("recovery_detection", started, target_ready_started);
+        peer
+    } else {
+        let recovery_request_started = Instant::now();
+        let recovery = encode_stream_command_with_id("boot.recovery", fresh_request_id())
+            .map_err(|error| error.to_string())?;
+        ensure_stream_success(
+            exchange_udp_stream_record(peer, &recovery)?,
+            "boot.recovery",
+        )?;
+        println!("dmesh_flash_gate recovery_requested=true peer={peer}");
+        report_flash_step("recovery_request", started, recovery_request_started);
+
+        // Recovery reuses the target identity and endpoint. Prefer its fresh
+        // signed multicast marker, but a bridged WLAN can suppress link-local
+        // multicast even when Recovery has submitted it. In that case a direct
+        // image identity different from the pre-handoff Main remains evidence
+        // that this exact endpoint changed images.
+        let recovery_wait_started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(75);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(
+                    "recovery_seen=false timeout waiting for signed Recovery announce or changed direct identity"
+                        .into(),
+                );
+            }
+            let candidates = multicast_discover_peers()?;
+            if let Some(candidate) = candidates.into_iter().find(|candidate| {
+                candidate.node == hex_encode(announce.device_id())
+                    && candidate.announce.device_class == announce.device_class
+                    && candidate.announce.recovery
+            }) {
+                println!("dmesh_flash_recovery_evidence source=multicast_marker");
+                report_flash_step("recovery_wait", started, recovery_wait_started);
+                break candidate.peer;
+            }
+            if firmware_identity(peer).is_ok_and(|identity| identity != initial_identity) {
+                println!("dmesh_flash_recovery_evidence source=direct_identity");
+                report_flash_step("recovery_wait", started, recovery_wait_started);
+                break peer;
+            }
         }
     };
     println!("dmesh_flash_gate recovery_seen=true peer={recovery_peer}");
+    // A Main update is allowed to change the application ELF hash, including
+    // when the requested image differs from the Main that initiated this
+    // handoff. The pre-handoff Main identity therefore cannot be the expected
+    // post-update identity. Capture Recovery's running-image identity instead:
+    // the final gate must prove that this endpoint left Recovery, then require
+    // a normal Main status response. This also accepts an idempotent reflash
+    // of the same Main image.
+    let recovery_identity = firmware_identity(recovery_peer)?;
     let mut upload = vec![
         format!("udp://{recovery_peer}"),
         "object.flash".to_owned(),
@@ -3103,31 +3913,114 @@ fn run_automated_flash(arguments: &[String]) -> Result<(), String> {
         upload.push("--file".to_owned());
         upload.push(source.to_owned());
     }
+    println!(
+        "dmesh_flash_action write=true dry_run=false peer={recovery_peer} cpu={cpu} target=6 artifact={}",
+        source.unwrap_or("catalog")
+    );
+    let object_flash_started = Instant::now();
     run_udp_service_client(&upload)?;
     println!("dmesh_flash_gate object_committed=true peer={recovery_peer}");
+    report_flash_step("object_flash", started, object_flash_started);
 
+    let main_health_started = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(75);
     loop {
         if Instant::now() >= deadline {
             return Err("main_healthy=false timeout waiting for Main status".into());
         }
         let candidates = multicast_discover_peers()?;
-        if let Some(candidate) = candidates.into_iter().find(|candidate| {
+        let multicast_peer = candidates.into_iter().find(|candidate| {
             candidate.node == hex_encode(announce.device_id())
                 && candidate.announce.device_class == announce.device_class
-        }) {
+                && !candidate.announce.recovery
+        });
+        // A bridge may suppress receiver-visible link-local multicast even
+        // though the target can still answer direct UDP6. Recovery uses this
+        // same fallback above. The Recovery identity makes the final check
+        // safe: status alone must not mistake the still-running Recovery for
+        // the returned Main image, while a changed Main image need not equal
+        // the Main identity that initiated the update.
+        let health_peer = multicast_peer
+            .map(|candidate| candidate.peer)
+            .unwrap_or(peer);
+        let identity_matches_main =
+            firmware_identity(health_peer).is_ok_and(|identity| identity != recovery_identity);
+        if identity_matches_main {
             let status = encode_stream_command_with_id("status", fresh_request_id())
                 .map_err(|error| error.to_string())?;
-            if ensure_stream_success(exchange_udp_stream_record(candidate.peer, &status)?, "Main status").is_ok() {
-                println!("dmesh_flash_gate main_healthy=true peer={}", candidate.peer);
+            if ensure_stream_success(
+                exchange_udp_stream_record(health_peer, &status)?,
+                "Main status",
+            )
+            .is_ok()
+            {
+                println!("dmesh_flash_gate main_healthy=true peer={health_peer}");
+                report_flash_step("main_health", started, main_health_started);
+                restore_sleepy_after_flash(health_peer, &announce, was_sleepy, started)?;
+                println!(
+                    "dmesh_flash_timing stage=complete target={} elapsed_ms={}",
+                    target.description,
+                    started.elapsed().as_millis()
+                );
                 return Ok(());
             }
         }
     }
 }
 
-fn flash_target_matches(peer: &DiscoveredPeer, target: &str) -> bool {
-    peer.node.eq_ignore_ascii_case(target) || peer.announce.device_name() == Some(target)
+fn restore_sleepy_after_flash(
+    peer: SocketAddr,
+    announce: &announce::Announce,
+    was_sleepy: bool,
+    started: Instant,
+) -> Result<(), String> {
+    if !was_sleepy {
+        return Ok(());
+    }
+    let restore_started = Instant::now();
+    let restore = encode_stream_command_with_id(
+        "transport.set mode=nan now=2 nan_dw_interval=8 ap=0",
+        fresh_request_id(),
+    )
+    .map_err(|error| error.to_string())?;
+    // A successful profile replacement can tear down STA before its response
+    // arrives. Prove the stronger peer-visible condition instead: the signed
+    // target must disappear from UDP multicast after the one submission.
+    let restore_reply = exchange_udp_stream_record(peer, &restore)
+        .and_then(|response| ensure_stream_success(response, "sleepy profile restore"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let target_node = hex_encode(announce.device_id());
+    let mut absent = false;
+    while Instant::now() < deadline {
+        let peers = multicast_discover_peers()?;
+        if !peers.iter().any(|candidate| candidate.node == target_node) {
+            absent = true;
+            break;
+        }
+    }
+    if !absent {
+        return Err(format!(
+            "sleepy_profile_restore=false target remained on UDP multicast{}",
+            restore_reply
+                .err()
+                .map(|error| format!("; reply={error}"))
+                .unwrap_or_default()
+        ));
+    }
+    println!("dmesh_flash_gate sleepy_profile_restored=true peer={peer} udp_absent=true");
+    report_flash_step("sleepy_profile_restore", started, restore_started);
+    Ok(())
+}
+
+fn flash_target_matches(peer: &DiscoveredPeer, target: &FlashTarget) -> bool {
+    flash_target_matches_announce(&peer.announce, target)
+}
+
+fn flash_target_matches_announce(announce: &announce::Announce, target: &FlashTarget) -> bool {
+    target
+        .node
+        .as_deref()
+        .is_some_and(|node| hex_encode(announce.device_id()).eq_ignore_ascii_case(node))
 }
 
 fn parse_mac(value: &str) -> Option<[u8; 6]> {
@@ -3161,16 +4054,23 @@ fn firmware_identity(peer: SocketAddr) -> Result<String, String> {
     if record.error.is_some() {
         return Err("firmware.identity rejected by peer".into());
     }
+    // The identity handler carries the hash as a CBOR text result. It is
+    // still correlated by the enclosing record ID and is only compared across
+    // this one requested Main -> Recovery -> Main handoff.
     let mut result = dmesh_server::cbor::Decoder::new(
-        record.result.ok_or("firmware.identity response has no result")?,
+        record
+            .result
+            .ok_or("firmware.identity response has no result")?,
     );
     let identity = result
         .text_ref()
         .and_then(|value| core::str::from_utf8(value).ok())
-        .ok_or("firmware.identity response is not a UTF-8 image hash")?;
-    result.is_finished().then(|| identity.to_owned()).ok_or_else(|| {
-        "firmware.identity response has trailing fields".to_owned()
-    })
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("firmware.identity response is not a SHA-256 image hash")?;
+    if !result.is_finished() {
+        return Err("firmware.identity response has trailing fields".into());
+    }
+    Ok(identity.to_ascii_lowercase())
 }
 
 /// Send the common discovery request directly to every local IPv6 multicast
@@ -3211,7 +4111,13 @@ fn announce_log_fields(announce: &announce::Announce) -> Vec<String> {
         }
     }
     if announce.probe_capabilities != 0 {
-        fields.push(format!("probe_capabilities={}", announce.probe_capabilities));
+        fields.push(format!(
+            "probe_capabilities={}",
+            announce.probe_capabilities
+        ));
+    }
+    if announce.recovery {
+        fields.push("recovery=true".to_owned());
     }
     if let Some(name) = announce.device_name() {
         fields.push(format!("device_name={name}"));
@@ -3692,9 +4598,9 @@ fn fresh_connection_id() -> Result<quic_lite::ConnectionId, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic,
-        object_upload_rejection, observed_nodes, parse_udp_peer, proxy_request,
-        proxy_socket_target, same_udp_endpoint,
+        AutomatedFlashImage, ClientPathPolicy, RawTextTap, WatchTextFilter, is_fatal_diagnostic,
+        object_upload_rejection, observed_nodes, parse_automated_flash_options, parse_udp_peer,
+        proxy_request, proxy_socket_target, same_udp_endpoint,
     };
     use dmesh_server::relay::{
         DesiredRule, PairRequest, RelayRoute, RelayState, Request, decode_pair_request,
@@ -4290,6 +5196,62 @@ mod tests {
             "peer=07:08:09:0a:0b:0c available_fields=1 first_seen_ms=9 \
               last_seen_ms=10 packets=11 active_publish_rx=0 active_subscribe_rx=0 \
               followup_rx=0 last_kind=0 last_payload_len=0 unavailable_fields=30"
+        );
+        assert_eq!(nodes[2].node, "6c57ff07637d3b617cab85770b9cebc4");
+        assert_eq!(nodes[2].peer_mac, None);
+        // The zero PeerHandle MAC and u32::MAX timestamp sentinels are
+        // placeholders, not facts, so they do not render.
+        assert_eq!(
+            nodes[2].fields,
+            "available_fields=17 packets=33 active_publish_rx=33 active_subscribe_rx=0 \
+              followup_rx=0 last_kind=0 last_payload_len=96 unavailable_fields=14"
+        );
+    }
+
+    #[test]
+    fn automated_flash_options_select_main_owned_targets_without_dry_run() {
+        let recovery_args = ["e7".into(), "--target".into(), "recovery".into()];
+        let recovery = parse_automated_flash_options(&recovery_args).unwrap();
+        assert_eq!(recovery.image, AutomatedFlashImage::Recovery);
+        assert_eq!(recovery.image.target(), 3);
+
+        let stage2_args = [
+            "e8".into(),
+            "--target".into(),
+            "stage2".into(),
+            "--file".into(),
+            "stage.bin".into(),
+        ];
+        let stage2 = parse_automated_flash_options(&stage2_args).unwrap();
+        assert_eq!(stage2.image, AutomatedFlashImage::Stage2);
+        assert_eq!(stage2.source, Some("stage.bin"));
+
+        let module_args = ["lora1".into(), "--target".into(), "lora".into()];
+        let module = parse_automated_flash_options(&module_args).unwrap();
+        assert_eq!(module.image, AutomatedFlashImage::Module("lora".into()));
+        assert_eq!(module.image.label(), "lora");
+        assert_eq!(module.image.target(), 7);
+
+        assert!(
+            parse_automated_flash_options(&[
+                "lora1".into(),
+                "--target".into(),
+                "lora".into(),
+                "--module".into(),
+                "legacy".into(),
+            ])
+            .is_err()
+        );
+
+        assert!(
+            parse_automated_flash_options(&[
+                "e7".into(),
+                "--target".into(),
+                "recovery".into(),
+                "--dry-run".into(),
+                "true".into(),
+            ])
+            .is_err()
         );
     }
 }

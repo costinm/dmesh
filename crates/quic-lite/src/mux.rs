@@ -1150,26 +1150,35 @@ mod tests {
         let mut server = StreamMux::<8, 8>::new(Role::Server, limits, 1200, 8, 8, 1024);
         let client_cid = ConnectionId::new(131).unwrap();
         let server_cid = ConnectionId::new(132).unwrap();
-        client.install_connection_ids(client_cid, server_cid).unwrap();
-        server.install_connection_ids(server_cid, client_cid).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
         client.endpoint.set_initial_peer_credit(16, 16).unwrap();
         client.endpoint.open_send_stream(8, 16).unwrap();
         let mut packet = [0u8; 256];
-        let (used, _) = client.endpoint
+        let (used, _) = client
+            .endpoint
             .encode_stream_packet(server_cid, 8, 0, false, b"abcdefgh", &mut packet)
             .unwrap();
         let mut received = Vec::new();
-        server.receive_request_with_consuming_stream(&packet[..used], 8, |_, _, bytes| {
-            received.extend_from_slice(&bytes[..4]);
-            Ok(4)
-        }).unwrap();
+        server
+            .receive_request_with_consuming_stream(&packet[..used], 8, |_, _, bytes| {
+                received.extend_from_slice(&bytes[..4]);
+                Ok(4)
+            })
+            .unwrap();
         assert_eq!(received, b"abcd");
         assert_eq!(server.endpoint.receive_credit_state(8), Some((4, 4, 20)));
 
-        server.resume_consuming_request_stream(8, |_, _, bytes| {
-            received.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }).unwrap();
+        server
+            .resume_consuming_request_stream(8, |_, _, bytes| {
+                received.extend_from_slice(bytes);
+                Ok(bytes.len())
+            })
+            .unwrap();
         assert_eq!(received, b"abcdefgh");
         assert_eq!(server.endpoint.receive_credit_state(8), Some((8, 8, 24)));
     }
@@ -1189,8 +1198,12 @@ mod tests {
         let mut server = StreamMux::<8, 8>::new(Role::Server, limits, 1200, 8, 8, 1024);
         let client_cid = ConnectionId::new(151).unwrap();
         let server_cid = ConnectionId::new(152).unwrap();
-        client.install_connection_ids(client_cid, server_cid).unwrap();
-        server.install_connection_ids(server_cid, client_cid).unwrap();
+        client
+            .install_connection_ids(client_cid, server_cid)
+            .unwrap();
+        server
+            .install_connection_ids(server_cid, client_cid)
+            .unwrap();
         client.endpoint.set_initial_peer_credit(16, 16).unwrap();
         client.endpoint.open_send_stream(8, 16).unwrap();
 
@@ -1200,31 +1213,29 @@ mod tests {
             .encode_stream_packet(server_cid, 8, 0, false, b"0123456789abcdef", &mut packet)
             .unwrap();
         server
-            .receive_request_with_consuming_stream(&packet[..used], 8, |_, _, bytes| {
-                Ok(bytes.len())
-            })
+            .receive_request_with_consuming_stream(
+                &packet[..used],
+                8,
+                |_, _, bytes| Ok(bytes.len()),
+            )
             .unwrap();
 
         server.endpoint.set_time(server.endpoint.max_ack_delay_ms());
         let control_len = server.endpoint.poll_transmit(&mut packet).unwrap().unwrap();
         client.receive_request(&packet[..control_len]).unwrap();
         assert_eq!(client.endpoint.send.stream_credit(8), Some(32));
-        assert!(client
-            .endpoint
-            .encode_stream_packet(server_cid, 8, 16, false, b"next", &mut packet)
-            .is_ok());
+        assert!(
+            client
+                .endpoint
+                .encode_stream_packet(server_cid, 8, 16, false, b"next", &mut packet)
+                .is_ok()
+        );
     }
 
     #[test]
     fn resumed_idle_consumer_observes_async_completion_without_credit() {
-        let mut mux = StreamMux::<8, 8>::new(
-            Role::Server,
-            ConnectionLimits::default(),
-            1200,
-            8,
-            8,
-            1024,
-        );
+        let mut mux =
+            StreamMux::<8, 8>::new(Role::Server, ConnectionLimits::default(), 1200, 8, 8, 1024);
         let local = ConnectionId::new(141).unwrap();
         let peer = ConnectionId::new(142).unwrap();
         mux.install_connection_ids(local, peer).unwrap();

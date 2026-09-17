@@ -2879,11 +2879,7 @@ impl AssociationProfile {
     ///
     /// The result is ordinary QUIC byte credit; it is independent of the
     /// bearer and of the stream consumer (flash, probe, or file transfer).
-    pub fn receive_limits(
-        self,
-        mtu: u64,
-        max_streams_bidi: u64,
-    ) -> crate::ConnectionLimits {
+    pub fn receive_limits(self, mtu: u64, max_streams_bidi: u64) -> crate::ConnectionLimits {
         let streams = max_streams_bidi.max(1);
         let mtu = mtu.max(1);
         let total = (self.initial_window_packets as u64)
@@ -4134,7 +4130,16 @@ mod tests {
         let mut packet = [0_u8; 64];
         let mut context = ();
         let used = crate::encode_bootstrap_open_packet(first, 0, &mut packet).unwrap();
-        let mut accept = |local, _: &mut ()| Ok((Association { local, peer: first, closed: false }, ()));
+        let mut accept = |local, _: &mut ()| {
+            Ok((
+                Association {
+                    local,
+                    peer: first,
+                    closed: false,
+                },
+                (),
+            ))
+        };
         table
             .receive_admitted(
                 first_path,

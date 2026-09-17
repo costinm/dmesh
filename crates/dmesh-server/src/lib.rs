@@ -250,7 +250,11 @@ mod host {
         let file = match request.target {
             6 => root.join(chip).join("main-app.bin"),
             3 => root.join(chip).join("recovery.bin"),
-            2 => root.join(chip).join("partition-table.bin"),
+            // Target 2 is the bounded pre-partition-table Stage2 boot region,
+            // not the partition table itself. Partition-layout changes remain
+            // a provisioning operation because one object stream cannot
+            // atomically replace both boot code and the table it interprets.
+            2 => root.join(chip).join("stage2.bin"),
             7 => {
                 let name = request
                     .name
@@ -262,11 +266,12 @@ mod host {
                     bail!("invalid object name");
                 }
                 let name = String::from_utf8_lossy(name);
-                let path = root.join("modules").join(format!("mod_{name}.dmod"));
+                let module_root = root.join("modules").join(chip);
+                let path = module_root.join(format!("mod_{name}.dmod"));
                 if path.is_file() {
                     path
                 } else {
-                    root.join("modules").join(format!("{name}.dmod"))
+                    module_root.join(format!("{name}.dmod"))
                 }
             }
             _ => bail!("unsupported target"),
@@ -360,7 +365,11 @@ mod host {
         #[deprecated(note = "use response_object; record framing is not used on the wire")]
         pub fn response_records(&self, request: GetRequest<'_>) -> Result<Vec<(u8, Vec<u8>)>> {
             let (manifest, body) = self.response_object(request)?;
-            Ok(vec![(RECORD_MANIFEST, manifest), (RECORD_BLOB, body), (RECORD_DONE, Vec::new())])
+            Ok(vec![
+                (RECORD_MANIFEST, manifest),
+                (RECORD_BLOB, body),
+                (RECORD_DONE, Vec::new()),
+            ])
         }
     }
 
@@ -408,6 +417,43 @@ mod host {
                     .any(|window| window == &first_digest[..4])
             );
             assert_eq!(manifest.block_size, BLOCK_SIZE as u32);
+        }
+
+        #[test]
+        fn object_catalog_keeps_stage2_and_modules_cpu_qualified() {
+            let directory = tempdir().unwrap();
+            let root = directory.path();
+            let stage = root.join("esp32c6/stage2.bin");
+            let module = root.join("modules/esp32c6/mod_lora.dmod");
+            std::fs::create_dir_all(stage.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+            std::fs::write(&stage, b"stage").unwrap();
+            std::fs::write(&module, b"module").unwrap();
+
+            assert_eq!(
+                target_file(
+                    root,
+                    GetRequest {
+                        name: None,
+                        cpu: 13,
+                        target: 2,
+                    },
+                )
+                .unwrap(),
+                stage
+            );
+            assert_eq!(
+                target_file(
+                    root,
+                    GetRequest {
+                        name: Some(b"lora"),
+                        cpu: 13,
+                        target: 7,
+                    },
+                )
+                .unwrap(),
+                module
+            );
         }
 
         #[test]

@@ -2094,13 +2094,12 @@ impl RadioService {
         *self
             .pending_nan_active_subscribe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(PendingNanActiveSubscribe {
-                service_info: record[..used].to_vec(),
-                request_id,
-                sent_windows: 0,
-                last_slot: None,
-            });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingNanActiveSubscribe {
+            service_info: record[..used].to_vec(),
+            request_id,
+            sent_windows: 0,
+            last_slot: None,
+        });
         json!({
             "ok": true,
             "operation": "nan.wakeup",

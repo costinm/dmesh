@@ -24,6 +24,7 @@ impl TransportId {
     pub const NAN: Self = Self(4);
     pub const FSK: Self = Self(5);
     pub const LORA: Self = Self(6);
+    pub const BLE: Self = Self(7);
 
     /// Bit used by [`TransportMask`]. IDs outside the bounded multipath set
     /// retain their ingress metadata but cannot be selected until a platform

@@ -87,6 +87,26 @@ method-index = 3
 summary = "Return local NAN beacon, SDF, Service Info, Follow-up, dispatch, drop, and error counters"
 ```
 
+NAN metric keys `21:last_sdf_frame_bytes` and `22:last_sdf_source_le`
+capture the last raw SDF before Service Info parsing. Keys
+`23:small_sdf_max_bytes` and `24:small_sdf_max_source_le` retain the largest
+frame at or below 128 bytes since boot, so a short control SDF is not
+immediately hidden by a later full announce. Together they distinguish an RF
+miss from a received frame whose NAN payload could not be decoded.
+
+Keys `25:pending_sdf_queued`, `26:pending_sdf_rejected`,
+`27:pending_sdf_tx_attempted`, `28:pending_sdf_tx_accepted`,
+`29:pending_sdf_completed`, and `30:pending_sdf_count` describe the bounded
+outbound SDF intent set. They prove whether independently submitted wake and
+discovery frames were retained, reached the driver, completed their bounded
+retry schedule, or encountered explicit queue backpressure.
+
+Keys `31:light_sleep_attempts`, `32:light_sleep_entries`,
+`33:light_sleep_skipped`, `34:last_sleep_requested_us`, and
+`35:last_sleep_duration_us` distinguish a real explicit DW sleep from a
+failed entry followed by radio reconstruction. An entry failure is never
+evidence of a wake or of the requested interval having elapsed.
+
 ```mesh-api
 id = "telemetry.udp6_metrics"
 component = "telemetry"

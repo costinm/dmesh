@@ -10,7 +10,8 @@
     {"id": 11, "name": "boot", "api": "fw/boot/API.md"},
     {"id": 101, "name": "runtime", "api": "fw/dmesh-fw-transport/API.md"},
     {"id": 102, "name": "power", "api": "fw/dmesh-fw-transport/API.md"},
-    {"id": 103, "name": "memory", "api": "fw/dmesh-fw-transport/API.md"}
+    {"id": 103, "name": "memory", "api": "fw/dmesh-fw-transport/API.md"},
+    {"id": 104, "name": "ble", "api": "fw/main/src/ble.rs"}
   ],
   "events": [
     {"id": 60000, "name": "boot.identity", "owner": "stage2/recovery/main"},
@@ -87,13 +88,58 @@
       {"id": 12, "name": "consume_delay_ms", "kind": "u32"}
     ]},
     {"id": 2, "name": "object.flash", "component": 10, "fields": [
+      {"id": 0, "name": "name", "kind": "text"},
       {"id": 1, "name": "cpu", "kind": "u8"},
       {"id": 2, "name": "target", "kind": "u8"},
+      {"id": 3, "name": "address", "kind": "u32"},
       {"id": 4, "name": "transport", "kind": "u8"},
       {"id": 5, "name": "dry_run", "kind": "bool"}
     ]},
+    {"id": 3, "name": "module.stop", "component": 1000},
     {"id": 1, "name": "boot.recovery", "component": 11},
     {"id": 1, "name": "firmware.identity", "component": 12},
+    {"id": 80, "name": "ble.start", "component": 104},
+    {"id": 81, "name": "ble.stop", "component": 104},
+    {"id": 82, "name": "ble.scan", "component": 104, "fields": [
+      {"id": 2, "name": "duration_ms", "kind": "u32"}
+    ]},
+    {"id": 83, "name": "ble.status", "component": 104, "fields": [
+      {"id": 1, "name": "ready", "kind": "bool"},
+      {"id": 2, "name": "advertising", "kind": "bool"},
+      {"id": 3, "name": "connected", "kind": "bool"},
+      {"id": 4, "name": "coc_connected", "kind": "bool"},
+      {"id": 5, "name": "generation", "kind": "u32"},
+      {"id": 6, "name": "handle", "kind": "u16"},
+      {"id": 7, "name": "coc_rx", "kind": "u32"},
+      {"id": 8, "name": "coc_rx_rejected", "kind": "u32"},
+      {"id": 9, "name": "scanning", "kind": "bool"},
+      {"id": 10, "name": "scan_reports", "kind": "u32"},
+      {"id": 11, "name": "scan_matches", "kind": "u32"},
+      {"id": 12, "name": "last_scan_addr", "kind": "mac"},
+      {"id": 13, "name": "last_scan_addr_type", "kind": "u8"},
+      {"id": 14, "name": "last_scan_rssi", "kind": "i32"},
+      {"id": 15, "name": "bonded", "kind": "bool"},
+      {"id": 16, "name": "coc_tx_pending", "kind": "bool"},
+      {"id": 17, "name": "local_addr", "kind": "hex"},
+      {"id": 18, "name": "local_addr_type", "kind": "u8"},
+      {"id": 19, "name": "ingress_enqueued", "kind": "u32"},
+      {"id": 20, "name": "ingress_accepted", "kind": "u32"},
+      {"id": 21, "name": "ingress_rejected", "kind": "u32"},
+      {"id": 22, "name": "egress_attempts", "kind": "u32"},
+      {"id": 23, "name": "egress_sent", "kind": "u32"},
+      {"id": 24, "name": "egress_send_errors", "kind": "u32"},
+      {"id": 25, "name": "egress_blocked_disconnected", "kind": "u32"},
+      {"id": 26, "name": "egress_blocked_pending", "kind": "u32"}
+    ]},
+    {"id": 84, "name": "ble.scan_stop", "component": 104},
+    {"id": 85, "name": "ble.connect", "component": 104, "fields": [
+      {"id": 2, "name": "addr", "kind": "hex"},
+      {"id": 3, "name": "addr_type", "kind": "u8"},
+      {"id": 4, "name": "psm", "kind": "u16"}
+    ]},
+    {"id": 86, "name": "ble.coc.send", "component": 104, "fields": [
+      {"id": 2, "name": "data", "kind": "hex"}
+    ]},
     {"id": 1, "name": "status", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32", "android"]},
     {"id": 2, "name": "services", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
     {"id": 3, "name": "metrics", "component": 9, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},

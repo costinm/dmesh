@@ -11,6 +11,7 @@
 pub use mesh_tun;
 pub use ssh_mesh;
 
+pub mod bearer;
 pub mod mesh_common;
 
 #[cfg(feature = "jni-wrapper")]

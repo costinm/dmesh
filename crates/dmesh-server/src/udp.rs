@@ -860,17 +860,17 @@ impl UdpClient {
         if let Some(wake_at_ms) = self.endpoint().next_bearer_deadline(pto) {
             let current_ms = started.elapsed().as_millis() as u64;
             if wake_at_ms > current_ms {
-                tokio::time::sleep(Duration::from_millis(
-                    wake_at_ms.saturating_sub(current_ms),
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(wake_at_ms.saturating_sub(current_ms)))
+                    .await;
             }
             self.endpoint_mut()
                 .set_time(started.elapsed().as_millis() as u64);
         }
-        if let Some((_path, ack_len)) = self.connection.poll_transmit(packet).map_err(|error| {
-            anyhow::anyhow!("{context} terminal ACK: {error:?}")
-        })? {
+        if let Some((_path, ack_len)) = self
+            .connection
+            .poll_transmit(packet)
+            .map_err(|error| anyhow::anyhow!("{context} terminal ACK: {error:?}"))?
+        {
             self.send_endpoint_packet(&packet[..ack_len]).await?;
         }
         Ok(())
@@ -1622,12 +1622,8 @@ impl UdpClient {
                         // rather than making Recovery or the flash handler
                         // infer ACK state.  Recovery waits for that generic
                         // delivery edge before handing Stage2 back to Main.
-                        self.acknowledge_terminal_response(
-                            started,
-                            &mut packet,
-                            "object upload",
-                        )
-                        .await?;
+                        self.acknowledge_terminal_response(started, &mut packet, "object upload")
+                            .await?;
                         return Ok(stream);
                     }
                     // Keep the association clock in the same domain used by
@@ -2822,10 +2818,7 @@ async fn process_persistent_packet<const H: usize>(
             }
             let (manifest, body) = server.response_object(get)?;
             if let Some(control) = control {
-                control.record_event(format!(
-                    "object accepted peer={peer} bytes={}",
-                    body.len()
-                ));
+                control.record_event(format!("object accepted peer={peer} bytes={}", body.len()));
             }
             tracing::info!(%peer, stream = request.stream_id, bytes = body.len(),
                 "object_udp_get_accepted");
@@ -4156,9 +4149,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut receiver = crate::verified_object::SignedObjectReceiver::<_, _, 10240, 4096>::new(
-            FakeFlash { bytes: Vec::new() },
-        );
+        let mut receiver =
+            crate::verified_object::SignedObjectReceiver::<_, _, 10240, 4096>::new(FakeFlash {
+                bytes: Vec::new(),
+            });
         let (stream_id, first, fin) = client
             .request_stream(
                 quic_lite::FIRST_CLIENT_BIDI_STREAM_ID,
@@ -4318,11 +4312,8 @@ mod tests {
             self.endpoint.set_time(now_ms);
             let mut transport_out = [0u8; MTU];
             let mut outputs: Vec<Vec<u8>> = Vec::new();
-            let (endpoint, ordered, receiver) = (
-                &mut self.endpoint,
-                &mut self.ordered,
-                &mut self.receiver,
-            );
+            let (endpoint, ordered, receiver) =
+                (&mut self.endpoint, &mut self.ordered, &mut self.receiver);
             let mut released_credit = 0usize;
             let mut delivered_bytes = 0usize;
             endpoint
