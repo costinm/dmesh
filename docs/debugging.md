@@ -210,13 +210,42 @@ Manual REST smoke test:
 adb -s SERIAL forward tcp:18480 tcp:18480
 
 curl -sS 'http://127.0.0.1:18480/_m/mesh/services'
-curl -sS 'http://127.0.0.1:18480/_m/mesh/services/android/tools'
+curl -sS 'http://127.0.0.1:18480/_m/mesh/services/ble/tools'
 
 curl -sS -X POST \
-  'http://127.0.0.1:18480/_m/mesh/services/android/call/radio.status_text' \
+  'http://127.0.0.1:18480/_m/mesh/services/ble/call/ble.status' \
   -H 'content-type: application/json' \
   -d '{"id":1}'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/transport/call/transport.start' \
+  -H 'content-type: application/json' \
+  -d '{"id":2,"target_mac":"10:BD:A3:AC:5A:20","kind":6,"ap":1,"now":1,"ble":1,"nan_dw_interval":1}'
+
+curl -sS -o /dev/null -L -w '%{http_code} %{url_effective}\n' \
+  'http://127.0.0.1:18480/_m/adm/ble.html'
+
+curl -sS 'http://127.0.0.1:18480/_m/mesh/services/usb/tools'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/usb/call/usb.status' \
+  -H 'content-type: application/json' \
+  -d '{"id":1}'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/usb/call/usb.devices' \
+  -H 'content-type: application/json' \
+  -d '{"id":2}'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/usb/call/usb.open' \
+  -H 'content-type: application/json' \
+  -d '{"id":3,"auto":true}'
 ```
+
+`transport.start.target_mac` is the sleepy device's STA or AP radio MAC, not
+its BLE address. The firmware admits a targeted NAN wake only when the MAC
+matches one of its local radio interfaces.
 
 If `SSH_MESH_HTTP_API_KEY` is configured, add `?apikey=...` to the first URL;
 the server validates it and issues the scoped `mesh_api_key` cookie for later
@@ -300,23 +329,30 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
 
 ## Radio Scan Debugging
 
-Trigger WiFi, BLE, and NAN from the shell interface, wait a few seconds, then
-pull the message history:
+Trigger BLE through the shared `ble` HTTP service and WiFi/NAN through the
+remaining local shell surface, wait a few seconds, then pull the message
+history:
 
 ```sh
+adb -s SERIAL forward tcp:18480 tcp:18480
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/ble/call/ble.scan' \
+  -H 'content-type: application/json' \
+  -d '{"id":1}'
+
 adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
   --method command --arg 'wifi.scan reason=manual-debug'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'ble.scan reason=manual-debug'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-   --method command --arg 'ble.unbond addr=84:0D:8E:07:41:72'"
 
 adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
   --method command --arg 'transport.set mode=nan'"
 
 sleep 6
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/mesh/services/ble/call/ble.scan_results' \
+  -H 'content-type: application/json' \
+  -d '{"id":2,"limit":32}'
 
 adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
   --method command --arg 'history durationMs=1500 limit=80 keys=net,wifi,BLE'"
@@ -325,17 +361,8 @@ adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
 Expected message patterns:
 
 - WiFi scan: `net.status` with `event=scan` and `visible=N`.
-- BLE scan: `BLE.scan` should include `wake=pending_intent` and
-  `filters=dmesh_operational,...`. DMesh firmware or phone advertisements
-  appear as compact `BLE.DISC proto=dmesh` events with
-  `event`, `pending`, `payload_len`, `payload_hash`, `prefix`, and `pull`.
-  If a companion is stored, only that peer is pulled. External devices still
-  appear as `BLE.DISC proto=meshtastic`.
-  `BLE.DISC proto=meshtastic` means the Meshtastic GATT service UUID was
-  advertised.
-- BLE payload transfer: expected events are `BLE.PENDING`, `BLE.PULL
-  state=subscribed`, `BLE.PULL state=ready_write`, `BLE.MSG`, and `BLE.PULL
-  state=done`. Android stores raw payloads in one append-only app-private file.
+- BLE scan: `ble.status` should report `scan=true`, and `ble.scan_results`
+  should list retained DMesh service-data advertisements.
 - NAN: `net.NAN.Attach`, then `net.NAN.PubStart` and `net.NAN.SubStart` before
   `net.NAN.*ServiceDiscovered` messages. DMesh follow-ups appear as
   `net.NAN.FollowupRx` / `net.NAN.FollowupTx` with parsed JSON from the Rust
@@ -343,55 +370,48 @@ Expected message patterns:
   publish/subscribe.
 
 The Android side does not hold wake locks. The expected wake paths are the
-foreground service while active, periodic `LMJob` update windows, BLE
-`PendingIntent` scan delivery, and normal WiFi Aware framework callbacks.
+foreground service while active, periodic `LMJob` update windows, and normal
+WiFi Aware framework callbacks.
 
-Single-companion and stored-message commands:
+Companion pairing is started from the app UI's "Pair companion" action. The
+UI uses the Android Companion Device Manager flow and the local BLE scanner;
+it is not exposed as an ADB shell command. Use `ble.scan`, `ble.scan_results`,
+and `ble.connect` over the HTTP service when a scripted BLE connection is
+needed.
+
+## Main firmware BLE tagged surface
+
+Control the Main-owned NimBLE radio through its numeric tagged component
+(`104`) over a normal `dmesh-cli` service stream:
 
 ```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'companion status durationMs=1200'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'companion pair durationMs=2500'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'companion pair addr=84:0D:8E:07:42:C6 name=DMesh durationMs=2500'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'msg ble.pair addr=84:0D:8E:07:42:C6'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'messages file durationMs=1200'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'messages list limit=40 durationMs=1200'"
-
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'messages read seq=18 preview=96 durationMs=1200'"
+dmesh-cli <device> ble.start
+dmesh-cli <device> ble.status
+dmesh-cli <device> ble.scan duration_ms=5000
+dmesh-cli <device> ble.scan_stop
+dmesh-cli <device> ble.connect addr=<peer_local_addr> addr_type=<peer_local_addr_type> psm=128
+dmesh-cli <device> ble.coc.send data=deadbeef
+dmesh-cli <device> ble.stop
 ```
 
-`companion pair` first claims a recently seen `BLE.DISC proto=dmesh_pairing`
-advertisement and reports `pairing=recent_scan`. If no recent pairing
-advertisement is cached, it opens a 60 second direct-scan pairing window and
-starts BLE scanning if needed. If CDM times out but the app scan saw the ESP, use
-`companion pair addr=...` to store the single companion address directly. Use
-`msg ble.pair addr=...` to attempt the DMesh GATT pairing request; a `BLE.PAIR
-state=connecting` followed by `BLE.PULL phase=connect state=timeout` means
-Android could create a remote GATT client but the ESP did not accept or complete
-the connection in the timeout window.
-
-`messages list` returns metadata lines from
-`files/radio/ble/messages.bin`. `messages read` adds a bounded hex preview of
-the raw payload; it does not base64-encode the body.
+`ble.start` begins advertising and the PSM `0x0080` CoC server. `ble.stop`
+stops scan/advertising and terminates an active LE connection. `ble.connect`
+initiates a central GAP connection to `addr`, then opens the requested CoC
+channel. Read the peer address from its `ble.status` `local_addr` and
+`local_addr_type` fields; `addr` accepts colon-separated or compact hex.
+`ble.coc.send` transmits one record through the active CoC channel.
+Pairing is Just Works with persisted bonding. CoC records use the same 2-byte
+big-endian length framing as UART and enter the shared Main connection path
+with bearer ID `7`.
 
 ## Two Android BLE/NAN live test
 
 Use this when two Android devices are connected over ADB and `app-dmesh` is
-installed. The script starts `DMService`, sends a BLE advertisement from each
-device, waits for NAN discovery, sends a NAN follow-up, then reads the
-in-memory history buffer through the app content provider. It leaves NAN
-running: the service, rather than test cleanup, owns the persistent cluster.
+installed. The script starts `DMService`, starts a BLE scan through the shared
+`ble` HTTP service, waits for NAN discovery, sends a NAN follow-up, then reads
+the remaining in-memory history buffer through the app content provider. It
+leaves NAN running: the service, rather than test cleanup, owns the persistent
+cluster.
 
 ```sh
 scripts/live_android_radio_test.py \
@@ -542,20 +562,31 @@ In the output, look for:
 On devices with limited concurrency, a healthy state before NAN attach should
 show `wlan0` STA without an app-owned `p2p0` interface.
 
-The `ssh` command maps to the Rust JNI client methods:
+Outbound SSH client operations use the admin HTTP bridge rather than the local
+ADB shell:
 
 ```sh
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'ssh connect host=127.0.0.1 port=22 user=dmesh serverKey=ssh-ed25519:...'"
+adb -s SERIAL forward tcp:18480 tcp:18480
 
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'ssh exec conn=1 command=\"uname -a\"'"
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/api/sshc/connect' \
+  -H 'content-type: application/json' \
+  -d '{"host":"127.0.0.1","port":22,"user":"dmesh","server_key":"ssh-ed25519 ..."}'
 
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'ssh forward conn=1 localPort=10022 remoteHost=127.0.0.1 remotePort=22'"
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/api/sshc/connections/1/exec' \
+  -H 'content-type: application/json' \
+  -d '{"command":"uname -a"}'
 
-adb shell "content call --uri content://com.github.costinm.dmesh.lm.shell \
-  --method command --arg 'ssh remote-forward conn=1 remotePort=10080 localHost=127.0.0.1 localPort=8080'"
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/api/sshc/connections/1/forward/local' \
+  -H 'content-type: application/json' \
+  -d '{"local_port":10022,"remote_host":"127.0.0.1","remote_port":22}'
+
+curl -sS -X POST \
+  'http://127.0.0.1:18480/_m/api/sshc/connections/1/forward/remote' \
+  -H 'content-type: application/json' \
+  -d '{"remote_port":10080,"local_host":"127.0.0.1","local_port":8080}'
 ```
 
 # Permissions

@@ -85,6 +85,7 @@ pub struct TransportProfile {
     /// 115200, `2..=7` select other common rates, and `8` is explicitly off.
     /// USB packet mode ignores this selector.
     pub uart: u8,
+    pub ble: u8,
     pub run_requested: bool,
     pub command_mode: bool,
     /// Requested physical bearer personality. `None` means the shared Wi-Fi
@@ -142,6 +143,7 @@ impl TransportProfile {
             ap: 1,
             open: false,
             uart: UART_115200,
+            ble: 0,
             run_requested: false,
             command_mode: false,
             requested_transport: None,
@@ -207,6 +209,11 @@ pub fn apply_transport_config(config: TransportConfig, profile: &mut TransportPr
         // tagged-CBOR callers are already rejected by the decoder below.
         if let Some(selector) = normalize_uart_selector(value) {
             profile.uart = selector;
+        }
+    }
+    if let Some(value) = config.ble {
+        if value <= 2 {
+            profile.ble = value;
         }
     }
     if let Some(value) = config.raw_tx_rate {

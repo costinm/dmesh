@@ -1849,6 +1849,41 @@ pub fn begin_sleepy_resume_capture(until_us: u64) -> bool {
     true
 }
 
+/// The current explicit sleepy-resume capture lease, if one is active. Main
+/// uses this as the physical-sleep boundary after a selected beacon shortens
+/// the conservative predicted phase below. Normal DW capture never exposes a
+/// lease here, so it cannot change the ordinary scheduler's cadence.
+pub fn sleepy_resume_capture_until_ms() -> Option<u64> {
+    (CAPTURING.load(Ordering::Acquire)
+        && SLEEPY_DW_PAIR_SECOND.load(Ordering::Acquire))
+    .then(|| u64::from(UNTIL_MS.load(Ordering::Acquire)))
+}
+
+fn shorten_sleepy_resume_capture_after_beacon(received_us: u64) {
+    if !CAPTURING.load(Ordering::Acquire)
+        || !SLEEPY_DW_PAIR_SECOND.load(Ordering::Acquire)
+    {
+        return;
+    }
+    // The lease already spans the NAN DW, adjacent NOW DW, and its tail. A
+    // selected beacon proves that pair has started earlier than the predicted
+    // phase, so retaining the old predicted deadline only burns power. Round
+    // upward to the millisecond timer so this never shortens the pair early.
+    let after_pair_ms = received_us
+        .saturating_add(sleepy_dw_pair_hold_us())
+        .saturating_add(999)
+        / 1_000;
+    let current = u64::from(UNTIL_MS.load(Ordering::Acquire));
+    if after_pair_ms >= current {
+        return;
+    }
+    UNTIL_MS.store(after_pair_ms as u32, Ordering::Release);
+    // The Main owner may be blocked on the former prediction. Recompute its
+    // one-shot deadline; this is a coalesced event wake, never a callback
+    // transition or polling loop.
+    crate::main_runtime::request_deadline_recheck();
+}
+
 /// Extend the existing NAN management receive window for one explicit
 /// channel-6 observation request. This is deliberately bounded to 600 ms so
 /// it can see a 500-TU infrastructure beacon without becoming continuous
@@ -2554,6 +2589,7 @@ fn receive_management_frame(frame: &[u8]) {
                 store_sync_anchor_us(received_us);
                 SYNC_ANCHOR_PENDING.store(true, Ordering::Release);
                 FILTER_PENDING.store(true, Ordering::Release);
+                shorten_sleepy_resume_capture_after_beacon(received_us);
             }
         }
     }
@@ -2671,10 +2707,20 @@ fn receive_nan_action(frame: &[u8]) {
                 if !descriptor_payload.is_empty() {
                     descriptor_payload_seen = true;
                     SERVICE_INFO_MATCHED.fetch_add(1, Ordering::Relaxed);
+                    // Some Android/driver combinations expose a Follow-up's
+                    // DMesh service payload through the generic descriptor
+                    // iterator rather than `FrameKind::Followup`. Unwrap it
+                    // before shared direct dispatch. The inner payload is the
+                    // same target-checked tagged-CBOR record received through
+                    // the dedicated Follow-up branch below; forwarding the
+                    // wrapper itself only produces a misleading reject.
+                    let payload = dmesh_rawnan::parse_dmesh_nan_followup(descriptor_payload)
+                        .map(|followup| followup.payload)
+                        .unwrap_or(descriptor_payload);
                     if crate::shared_ingress_esp::enqueue(
                         crate::shared_ingress_esp::IngressKind::NanServiceInfo,
                         source,
-                        descriptor_payload,
+                        payload,
                     ) {
                         SERVICE_INFO_ENQUEUED.fetch_add(1, Ordering::Relaxed);
                     } else {

@@ -4,13 +4,15 @@
 Flow:
   ESP32 LoRa TX -> ESP32 LoRa RX/repeater -> Android receives via BLE/NAN.
 
-This script uses only the app-dmesh shell history and firmware console
-logs/messages. It does not use logcat, pyserial, or firmware flashing tools.
+This script uses the shared Android BLE HTTP service, the app-dmesh shell
+history, and firmware console logs/messages. It does not use logcat, pyserial,
+or firmware flashing tools.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -18,6 +20,7 @@ import subprocess
 import sys
 import termios
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,6 +65,37 @@ def adb(adb_bin: str, serial: str, *args: str, timeout: float = 20) -> str:
 def shell_cmd(adb_bin: str, serial: str, command: str, timeout: float = 20) -> str:
     quoted = f"content call --uri {SHELL_URI} --method command --arg {shlex.quote(command)}"
     return adb(adb_bin, serial, "shell", quoted, timeout=timeout)
+
+
+def ble_http(
+    adb_bin: str,
+    serial: str,
+    index: int,
+    method: str,
+    payload: dict | None = None,
+    out_dir: Path | None = None,
+) -> str:
+    host_port = 28500 + index
+    run(
+        [adb_bin, "-s", serial, "forward", f"tcp:{host_port}", "tcp:18480"],
+        timeout=10,
+        check=True,
+    )
+    body = json.dumps(payload or {"id": 1}).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{host_port}/_m/mesh/services/ble/call/{method}",
+        data=body,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_text = response.read().decode()
+    except Exception as exc:
+        response_text = f"error={exc}"
+    if out_dir is not None:
+        (out_dir / f"{serial}-{method}.json").write_text(response_text)
+    return response_text
 
 
 def ensure_android(adb_bin: str, serial: str) -> None:
@@ -181,9 +215,16 @@ def main() -> int:
     out_dir = Path(args.out_dir or f"target/live-tests/lora-android-{stamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for serial in args.android:
+    for idx, serial in enumerate(args.android):
         ensure_android(args.adb, serial)
-        shell_cmd(args.adb, serial, "ble.scan reason=lora-android")
+        ble_http(
+            args.adb,
+            serial,
+            idx,
+            "ble.scan",
+            {"id": 1},
+            out_dir,
+        )
         shell_cmd(args.adb, serial, "wifi.nan.start reason=lora-android")
 
     tx = Console(args.tx, args.baud, args.timeout)
@@ -267,6 +308,18 @@ def main() -> int:
         print("PASS")
         return 0
     finally:
+        try:
+            for idx, serial in enumerate(args.android):
+                ble_http(
+                    args.adb,
+                    serial,
+                    idx,
+                    "ble.scan_stop",
+                    {"id": 3},
+                    out_dir,
+                )
+        except Exception:
+            pass
         try:
             rx.cmd("nan stop=true", timeout=5)
             rx.cmd("wifi raw_stop=true", timeout=5)

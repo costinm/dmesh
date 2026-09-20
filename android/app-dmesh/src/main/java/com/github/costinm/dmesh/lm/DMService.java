@@ -406,6 +406,19 @@ public class DMService extends MeshService {
                 Log.w(TAG, "Failed to create Rust mesh dir: " + baseDir);
                 return;
             }
+            File webDir = new File(baseDir, "web");
+            if (!webDir.exists() && !webDir.mkdirs()) {
+                Log.w(TAG, "Failed to create Rust web dir: " + webDir);
+            }
+            for (String assetName : new String[] { "ble.html", "usb.html" }) {
+                try (java.io.InputStream in = getAssets().open(assetName);
+                     java.io.OutputStream out = new java.io.FileOutputStream(new File(webDir, assetName))) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) >= 0) out.write(buffer, 0, read);
+                } catch (IOException ignored) {
+                }
+            }
             MeshNode node = new MeshNode(baseDir.getAbsolutePath());
             node.start(getApplicationContext(), RUST_SSH_PORT, RUST_HTTP_PORT);
             messageGateway = new MessageStreamGateway(this, () -> {
@@ -413,13 +426,14 @@ public class DMService extends MeshService {
             }, target -> {
                 if (transport != null) {
                     try {
-                        transport.requestNanActivation(MeshNode.buildNanWakeup(hexBytes(target)));
+                        transport.requestNanActivation(hexBytes(target));
                     } catch (IllegalArgumentException error) {
                         Log.w(TAG, "invalid native targeted NAN activation", error);
                     }
                 }
             });
             node.setCallback(messageGateway);
+            if (transport != null) transport.setMeshNode(node);
             meshNode = node;
             // Start Aware only after the native event sink exists. Starting
             // it in onCreate races attach/publish/subscribe callbacks against
@@ -531,7 +545,7 @@ public class DMService extends MeshService {
             if (target == null || target.isEmpty()) target = stream.fields.get("target");
             if (target != null && !target.isEmpty() && transport != null) {
                 try {
-                    transport.requestNanActivation(MeshNode.buildNanWakeup(hexBytes(target)));
+                    transport.requestNanActivation(hexBytes(target));
                     byte[] accepted = ("{\"status\":\"accepted\",\"bearer\":\"nan\","
                             + "\"operation\":\"nan.wakeup\",\"to\":\"" + target + "\"}")
                             .getBytes(StandardCharsets.UTF_8);
@@ -544,7 +558,6 @@ public class DMService extends MeshService {
                 }
             }
         }
-
         StringBuilder args = new StringBuilder();
         args.append("caller_uid=").append(uid);
         if (!callingPkg.isEmpty()) args.append(" caller_package=").append(callingPkg);

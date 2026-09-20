@@ -47,7 +47,8 @@
       {"id": 17, "name": "passphrase", "kind": "text"},
       {"id": 18, "name": "uart", "kind": "u8"},
       {"id": 24, "name": "open", "kind": "bool"},
-      {"id": 25, "name": "wake_target", "kind": "mac"}
+      {"id": 25, "name": "wake_target", "kind": "mac"},
+      {"id": 26, "name": "ble", "kind": "u8"}
     ]},
     {"id": 3, "name": "relay.list", "component": 5, "x-check-all": {}, "x-check-all-platforms": ["esp32"]},
     {"id": 9, "name": "discovery.nodes", "component": 6, "x-ui-visibility": "default", "x-check-all": {}, "x-check-all-platforms": ["esp32", "host", "android"]},

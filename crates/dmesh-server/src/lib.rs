@@ -67,6 +67,7 @@ pub mod stream_server;
 pub mod tagged;
 /// Portable local discovery status and transport-owned metric views.
 pub mod telemetry;
+pub mod transport_state;
 /// Shared QUIC connection/server/client glue above bearer frame I/O.
 pub mod transport;
 /// Common ingress provenance and policy-driven egress selection shared by
@@ -77,7 +78,17 @@ pub mod uart;
 
 /// Shared Tokio HTTP/UI adapter used by Linux and Android host integrations.
 #[cfg(feature = "http")]
+pub mod ble_service;
+#[cfg(feature = "http")]
+pub mod history_service;
+#[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod transport_service;
+#[cfg(feature = "http")]
+pub mod usb_service;
+#[cfg(feature = "http")]
+pub mod wifi_service;
 
 /// Host UDP adapter and standalone test server. This is intentionally kept
 /// out of `quic-lite`: it owns sockets, Tokio scheduling, object-server

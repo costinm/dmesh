@@ -17,12 +17,9 @@ same commands.
 Commands are implemented in DMService and the Rust dmesh native library.
 Android features stay in Java, while low-level mesh networking belongs in Rust.
 
-Current Android-local commands include:
+Current Android-local BLE control is exposed through the shared `ble` HTTP
+service. Use the `ble` service methods for scripted scans and CoC connections.
+Companion association is started from the app UI.
 
-- `companion status` / `companion clear` for the single ESP companion slot.
-- `messages file` for the BLE message store path and byte count.
-- `messages list limit=N` for stored BLE message headers.
-- `messages read seq=N preview=N` for a bounded hex preview of one raw payload.
-
-Keep these commands available through the same message/mux path used by the
-ADB shell provider, SSH message bridge, and web command bridge.
+The ADB shell provider remains for the remaining Rust shell transport commands
+that do not yet have an Android HTTP service equivalent.

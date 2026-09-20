@@ -16,6 +16,7 @@ dmesh-store = { path = "../dmesh-store" }
 dmesh-server = { path = "../dmesh-server", features = ["udp", "http"] }
 dmesh-rawnan = { path = "../rawnan" }
 quic-lite = { path = "../quic-lite", features = ["std"] }
+uart-codec = { path = "../uart-codec" }
 mesh = { git = "https://github.com/costinm/ssh-mesh", package = "mesh" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"

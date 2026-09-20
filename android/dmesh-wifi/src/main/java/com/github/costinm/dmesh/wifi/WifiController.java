@@ -31,6 +31,7 @@ import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo;
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest;
 import android.os.Build;
 import android.util.Base64;
+import android.util.Log;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.SystemClock;
@@ -56,6 +57,7 @@ import java.util.concurrent.TimeUnit;
  * retain that ordering while the remaining DMesh Wi-Fi adapters migrate here.
  */
 public final class WifiController {
+    private static final String TAG = "DMesh-Wifi";
     // Wi-Fi Aware derives its six-byte service identifier from this name.
     // Keep it aligned with dmesh_rawnan::DMESH_SERVICE_ID (SHA-256("dmesh")
     // prefix) so Android, Linux raw-NAN, and ESP use one discovery service.
@@ -102,6 +104,11 @@ public final class WifiController {
     private WifiAwareSession awareSession;
     private PublishDiscoverySession publishSession;
     private SubscribeDiscoverySession subscribeSession;
+    // PeerHandle values are valid only for the SubscribeDiscoverySession that
+    // produced them. Increment before replacing a session so an already
+    // queued framework callback cannot send a Follow-up through an obsolete
+    // session after a temporary active discovery is restored.
+    private long subscribeGeneration;
     // Android's public active-Subscribe API does not consistently expose its
     // Service Specific Info in the raw SDEA received by ESP peers. Keep one
     // bounded directed message for the temporary discovery instead.
@@ -267,6 +274,11 @@ public final class WifiController {
             }
             discover = next;
             note("discover.set bytes=" + discover.payload.length + " options=" + discover.options);
+            // Invalidate even a Subscribe whose onSubscribeStarted callback
+            // has not arrived yet. It may otherwise publish a stale session
+            // after this replacement and receive PeerHandles which belong to
+            // an already superseded discovery transaction.
+            subscribeGeneration++;
             if (subscribeSession != null) {
                 subscribeSession.close();
                 subscribeSession = null;
@@ -823,6 +835,7 @@ public final class WifiController {
     }
 
     private void stopNanInternal() {
+        subscribeGeneration++;
         if (subscribeSession != null) {
             subscribeSession.close();
             subscribeSession = null;
@@ -856,6 +869,7 @@ public final class WifiController {
 
     private void subscribeNan() {
         if (awareSession == null) return;
+        final long generation = subscribeGeneration;
         SubscribeConfig.Builder builder = new SubscribeConfig.Builder().setServiceName(NAN_SERVICE);
         // `Discover.options` is the platform-neutral projection used by the
         // Android bridge. The default Subscribe type is passive on several
@@ -869,7 +883,22 @@ public final class WifiController {
         if (!discover.isEmpty()) builder.setServiceSpecificInfo(discover.payload);
         SubscribeConfig config = builder.build();
         awareSession.subscribe(config, new DiscoverySessionCallback() {
+            // The framework PeerHandle is scoped to this exact Subscribe
+            // session. A temporary active discovery may be restored while an
+            // old callback is still queued, so using WifiController's mutable
+            // subscribeSession can send a Follow-up on the wrong session.
+            private SubscribeDiscoverySession callbackSession;
+
             @Override public void onSubscribeStarted(SubscribeDiscoverySession subscribe) {
+                if (generation != subscribeGeneration) {
+                    // `setDiscover` replaced this request before the
+                    // framework completed it. Its PeerHandle must never be
+                    // used with the newer Subscribe session.
+                    subscribe.close();
+                    note("aware.on_subscribe_started stale");
+                    return;
+                }
+                callbackSession = subscribe;
                 subscribeSession = subscribe;
                 note("aware.on_subscribe_started");
             }
@@ -880,9 +909,14 @@ public final class WifiController {
                         info, -1, SystemClock.elapsedRealtime()));
                 note("aware.on_service_discovered bytes=" + (info == null ? 0 : info.length));
                 if (DmeshControl.isDiscoveryRequest(info)) {
-                    respondToActiveDiscover(peer);
+                    // `peer` is issued by this Subscribe callback. It is not
+                    // valid on the unrelated Publish session: Android keeps
+                    // peer maps per discovery session and rejects that route
+                    // as "didn't match/contact us". Return the announce on
+                    // the exact Subscribe that observed the request.
+                    respondToActiveDiscover(generation, callbackSession, peer);
                 }
-                sendDirectedNanMessage(peer);
+                sendDirectedNanMessage(generation, callbackSession, peer);
             }
             @Override public void onMessageReceived(PeerHandle peer, byte[] message) {
                 byte[] payload = message == null ? new byte[0] : message;
@@ -893,7 +927,7 @@ public final class WifiController {
                 // short DW did not produce a separate onServiceDiscovered
                 // callback in this Subscribe session. Use it for a pending
                 // target-checked wake control record as well.
-                sendDirectedNanMessage(peer);
+                sendDirectedNanMessage(generation, callbackSession, peer);
                 WifiEventSink sink = eventSink;
                 if (sink != null) {
                     // WifiAware does not expose per-message RSSI through this
@@ -901,6 +935,16 @@ public final class WifiController {
                     // value; the common observation record must not invent it.
                     sink.onReceived("nan", String.valueOf(peer), payload, -1);
                 }
+            }
+            @Override public void onMessageSendSucceeded(int messageId) {
+                note("aware.directed_message sent id=" + messageId);
+            }
+            @Override public void onMessageSendFailed(int messageId) {
+                // The public API intentionally does not expose a failure
+                // reason here; retain the message ID so a submission can be
+                // correlated with its terminal framework outcome.
+                note("aware.directed_message failed id=" + messageId);
+                Log.w(TAG, "NAN Follow-up failed id=" + messageId);
             }
             @Override public void onSessionConfigFailed() { note("aware.on_subscribe_config_failed"); }
             @Override public void onSessionTerminated() { note("aware.on_subscribe_terminated"); }
@@ -918,15 +962,21 @@ public final class WifiController {
         handler.post(() -> directedNanMessage = copy);
     }
 
-    private void sendDirectedNanMessage(PeerHandle peer) {
+    private void sendDirectedNanMessage(long generation, SubscribeDiscoverySession session,
+                                        PeerHandle peer) {
         byte[] payload = directedNanMessage;
-        SubscribeDiscoverySession subscribe = subscribeSession;
-        if (payload == null || payload.length == 0 || subscribe == null) return;
+        if (payload == null || payload.length == 0 || session == null) return;
+        if (generation != subscribeGeneration || session != subscribeSession) {
+            note("aware.directed_message skipped=stale_session");
+            return;
+        }
         try {
-            subscribe.sendMessage(peer, ++discoveryResponseMessageId, payload);
-            note("aware.directed_message bytes=" + payload.length);
+            int messageId = ++discoveryResponseMessageId;
+            session.sendMessage(peer, messageId, payload);
+            note("aware.directed_message submitted id=" + messageId + " bytes=" + payload.length);
         } catch (RuntimeException error) {
             note("aware.directed_message exception=" + describe(error));
+            Log.w(TAG, "NAN Follow-up exception", error);
         }
     }
 
@@ -937,27 +987,28 @@ public final class WifiController {
      * observes the request through {@link WifiEventSink} and may replace the
      * opaque announce before the next request when its signed record changes.
      */
-    private void respondToActiveDiscover(PeerHandle peer) {
+    private void respondToActiveDiscover(long generation, SubscribeDiscoverySession session,
+                                         PeerHandle peer) {
         if (announce.isEmpty()) {
             note("aware.discover_request ignored=no_announce");
             return;
         }
-        PublishDiscoverySession publish = publishSession;
-        if (publish != null) {
-            try {
-                publish.sendMessage(peer, ++discoveryResponseMessageId, announce.payload);
-                note("aware.discover_response bytes=" + announce.payload.length);
-            } catch (RuntimeException error) {
-                note("aware.discover_response exception=" + describe(error));
-            }
+        if (generation != subscribeGeneration || session == null || session != subscribeSession) {
+            note("aware.discover_response skipped=stale_session");
+            return;
         }
-        // The directed reply above is the immediate presence response. Keep
-        // the long-lived publish session intact: closing and recreating it
-        // for every active discovery request races Android's session
-        // callbacks, briefly removes the advertised service, and leaves the
-        // common NAN status falsely inactive. Announce updates themselves
-        // still recreate publication through setAnnounce(), where changing
-        // Service Info is actually required.
+        try {
+            int messageId = ++discoveryResponseMessageId;
+            session.sendMessage(peer, messageId, announce.payload);
+            note("aware.discover_response submitted id=" + messageId
+                    + " bytes=" + announce.payload.length);
+        } catch (RuntimeException error) {
+            note("aware.discover_response exception=" + describe(error));
+            Log.w(TAG, "NAN discovery response exception", error);
+        }
+        // Keep the long-lived Publish session intact: neither a response nor
+        // an active wake may recreate it, because that races framework
+        // callbacks and briefly removes the advertised DMesh service.
     }
 
     private static String hex(byte[] value) {

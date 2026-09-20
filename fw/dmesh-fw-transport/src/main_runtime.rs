@@ -628,19 +628,18 @@ pub(crate) fn maybe_enter_sleep(
     // cluster-selected beacon. The measured resume time is used after the
     // first cycle; the conservative floor absorbs a cold first restart.
     const DW8_RESUME_MARGIN_US: u64 = 25_000;
-    // Classic lora2 reconstructs raw Wi-Fi in 28-31 ms. The widened resume
-    // capture sees the selected beacon 96-101 ms into the former 120 ms lead,
-    // leaving 19-24 ms of unnecessary pre-beacon idle. Keep a 60 ms cold
-    // floor so the first post-boot cycle has enough RF-ready margin. A 60 ms
-    // live trial reduced awake time to 108 ms but missed the NAN beacon, while
-    // 120 ms received it reliably; classic ESP32 keeps 90 ms. S3 uses 130 ms
+    // Classic lora2 reconstructs raw Wi-Fi in 28-31 ms. Its instrumented
+    // first frame and selected beacon arrive about 50 ms after wake; retain a
+    // 20 ms measured margin rather than the former 90 ms fixed lead. The
+    // telemetry fields 36/37 make a missed beacon an explicit regression,
+    // rather than silently accepting a shorter awake window. S3 uses 130 ms
     // because lora4 still occasionally missed its beacon at 90 ms. Use the
     // same conservative starting point for C6 until its post-sleep NAN receive
     // path is measurable without USB-JTAG.
     #[cfg(any(target_arch = "riscv32", target_feature = "esp32s3ops"))]
     const DW8_MIN_WAKE_LEAD_US: u64 = 130_000;
     #[cfg(all(not(target_arch = "riscv32"), not(target_feature = "esp32s3ops")))]
-    const DW8_MIN_WAKE_LEAD_US: u64 = 90_000;
+    const DW8_MIN_WAKE_LEAD_US: u64 = 70_000;
     let wake_lead_us = u64::from(DW8_LAST_RADIO_RESUME_US.load(Ordering::Acquire))
         .saturating_add(DW8_RESUME_MARGIN_US)
         .max(DW8_MIN_WAKE_LEAD_US);
@@ -1627,6 +1626,15 @@ fn apply_sleep_boundary(
     if !is_sleepy_profile(profile) {
         return false;
     }
+    // A selected beacon can prove the current NAN+NOW pair began earlier than
+    // the conservative predicted phase. Honor only the bounded capture lease
+    // published by that owner; without a selected beacon the original
+    // deadline remains the safe maximum.
+    if let Some(capture_until_ms) =
+        crate::wifi_nan_dw_capture_esp::sleepy_resume_capture_until_ms()
+    {
+        state.sleepy_awake_until_ms = state.sleepy_awake_until_ms.min(capture_until_ms);
+    }
     let mut blockers = SleepBlockers::NONE;
     if role != 1 || state.wifi_started || !state.nan_now_started {
         blockers = SleepBlockers(blockers.0 | SleepBlockers::RADIO_TRANSITION.0);
@@ -1997,6 +2005,18 @@ fn next_deadline(sleep_deadline_ms: Option<u64>) -> Option<(u8, u32)> {
 /// FreeRTOS receive blocks, so this is not a CPU polling loop.
 fn wait_for_event(last_generation: u32, sleep_deadline_ms: Option<u64>) -> MainRuntimeEvent {
     let deadline = next_deadline(sleep_deadline_ms);
+    // A direct NAN/NOW `transport.set` commits its profile before it queues
+    // this owner event.  Radio completion markers are coalesced and can stay
+    // continuously nonempty under active SDF traffic, so checking them first
+    // can starve a dropped ProfileChanged queue record forever: Main then
+    // observes the new sleepy profile but keeps reducing deadlines against
+    // the old generation.  A stream request is different: its generation is
+    // deliberately held until its terminal response is delivered.
+    let generation = crate::profile_store::generation();
+    let deferred_generation = PROFILE_CHANGE_AFTER_RESPONSE.load(Ordering::Acquire);
+    if generation != last_generation && generation != deferred_generation {
+        return MainRuntimeEvent::ProfileChanged { generation };
+    }
     // Producer-before-receive: handle durable work immediately without a
     // polling pass. Inactive Main still blocks below with no timer armed.
     let pending = PENDING_DEADLINE_SERVICES.swap(0, Ordering::AcqRel);
@@ -2035,12 +2055,17 @@ fn wait_for_event(last_generation: u32, sleep_deadline_ms: Option<u64>) -> MainR
             MainRuntimeEvent::AdapterComplete { services } => MainRuntimeEvent::AdapterComplete {
                 services: services | pending,
             },
-            MainRuntimeEvent::ProfileChanged { generation } => {
+            MainRuntimeEvent::ProfileChanged { generation } if generation != last_generation => {
                 if pending != 0 {
                     PENDING_DEADLINE_SERVICES.fetch_or(pending, Ordering::AcqRel);
                 }
                 MainRuntimeEvent::ProfileChanged { generation }
             }
+            // The generation was already promoted by the direct-profile
+            // guard above.  Do not feed a duplicate request into the
+            // reducer, where it is correctly classified as stale but would
+            // obscure the real NAN/sleep diagnostics.
+            MainRuntimeEvent::ProfileChanged { .. } => MainRuntimeEvent::Deadline { services: pending },
         };
     }
     if let Some((services, _)) = deadline {
@@ -2435,6 +2460,14 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
     if crate::wifi_nan_dw_capture_esp::nan_action_tx_suppressed() {
         return;
     }
+    // Keep targeted activation observable without turning ordinary NAN
+    // announcement traffic into a UART flood.  The capture layer logs raw
+    // SDF receipt; this records the semantic result only for the one mutable
+    // direct record that can wake a sleeping node into STA.
+    let is_transport_set = matches!(
+        dmesh_server::direct::classify(packet),
+        Some(dmesh_server::direct::DirectMessageKind::TransportSet)
+    );
     // NAN carries the same direct allowlist as every other bearer. The
     // bearer-specific closure only selects the Follow-up return path.
     if receive_direct_request(packet, |response| {
@@ -2464,7 +2497,29 @@ pub(crate) fn receive_nan_service_info(peer: [u8; 6], packet: &[u8]) {
             }
         }
     }) {
+        if is_transport_set {
+            crate::commands::send_stats(&[
+                (
+                    b"nan transport.set accepted peer_le",
+                    u64::from_le_bytes([
+                        peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0,
+                    ]),
+                ),
+                (b"nan transport.set accepted bytes", packet.len() as u64),
+            ]);
+        }
         return;
+    }
+    if is_transport_set {
+        crate::commands::send_stats(&[
+            (
+                b"nan transport.set rejected peer_le",
+                u64::from_le_bytes([
+                    peer[0], peer[1], peer[2], peer[3], peer[4], peer[5], 0, 0,
+                ]),
+            ),
+            (b"nan transport.set rejected bytes", packet.len() as u64),
+        ]);
     }
     crate::commands::send_stat(
         b"nan direct rejected peer=",
@@ -2644,6 +2699,8 @@ fn encode_telemetry_response_record(
                 pending_sdf_count,
             ) = crate::wifi_nan_dw_capture_esp::pending_sdf_stats();
             let (dw8_radio_stop_us, dw8_radio_resume_us, dw8_awake_us) = dw8_timing();
+            let (first_frame_after_wake_us, first_beacon_after_wake_us) =
+                crate::wifi_nan_dw_capture_esp::sleep_wake_receive_diagnostics();
             let last_sdf_after_beacon_us = crate::wifi_nan_dw_capture_esp::stats().17;
             let (
                 last_sdf_frame_bytes,
@@ -2792,6 +2849,14 @@ fn encode_telemetry_response_record(
                     t::Metric {
                         id: t::nan_metric::LAST_SLEEP_DURATION_US,
                         value: u64::from(power.last_sleep_duration_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::FIRST_FRAME_AFTER_WAKE_US,
+                        value: u64::from(first_frame_after_wake_us),
+                    },
+                    t::Metric {
+                        id: t::nan_metric::FIRST_BEACON_AFTER_WAKE_US,
+                        value: u64::from(first_beacon_after_wake_us),
                     },
                 ],
                 &mut result,
@@ -2996,6 +3061,7 @@ struct MainCoordinator {
     runtime_state: dmesh_server::main_runtime_state::MainRuntimeState,
     soft_sleep: bool,
     boot_radio_ready: Option<fn()>,
+    sidecar_notified_generation: u32,
 }
 
 /// Immutable facts derived from one dequeued Main event.
@@ -3139,6 +3205,11 @@ impl MainCoordinator {
     /// still pending for this event.
     fn reduce_profile_request(&mut self, work: &MainEventWork) -> bool {
         let effect = if work.profile_changed {
+            dmesh_server::transport_state::notify_transport_requested(
+                &work.profile,
+                self.runtime_state.snapshot().lifecycle(),
+                work.generation,
+            );
             self.runtime_state.reduce(
                 dmesh_server::main_runtime_state::MainEvent::ProfileRequested {
                     mode: requested_mode(&work.profile),
@@ -3433,6 +3504,7 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
     let _ = runtime_state.reduce(dmesh_server::main_runtime_state::MainEvent::BootProfile {
         mode: crate::main_runtime::requested_mode(&initial_profile),
         sleepy: sleepy_boot,
+        generation: crate::profile_store::generation(),
     });
     crate::main_runtime::record_power_completion(&mut runtime_state);
     // Boot has just completed the only synchronous radio effect. Project its
@@ -3454,6 +3526,7 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
         radio: state,
         runtime_state,
         soft_sleep,
+        sidecar_notified_generation: 0,
     };
     coordinator.start_boot_radio_sidecar_if_ready();
     loop {
@@ -3511,16 +3584,31 @@ pub(crate) fn run_main_service(service: MainRuntimeService) {
             service_requested_reset();
             continue;
         }
+        let lifecycle = crate::main_runtime::applied_lifecycle(
+            &snapshot,
+            state.wifi_started,
+            state.nan_now_started,
+            state.sta_associated,
+        );
         let _ = runtime_state.reduce(dmesh_server::main_runtime_state::MainEvent::RadioApplied {
             generation: requested_sta_start_generation,
-            lifecycle: crate::main_runtime::applied_lifecycle(
-                &snapshot,
-                state.wifi_started,
-                state.nan_now_started,
-                state.sta_associated,
-            ),
+            lifecycle,
         });
         crate::main_runtime::publish_snapshot(runtime_state.snapshot());
+        if requested_sta_start_generation != coordinator.sidecar_notified_generation
+            && !matches!(
+                lifecycle,
+                dmesh_server::main_runtime_state::RadioLifecycle::Starting
+                    | dmesh_server::main_runtime_state::RadioLifecycle::Stopping
+            )
+        {
+            dmesh_server::transport_state::notify_transport_applied(
+                &snapshot,
+                lifecycle,
+                requested_sta_start_generation,
+            );
+            coordinator.sidecar_notified_generation = requested_sta_start_generation;
+        }
         coordinator.start_boot_radio_sidecar_if_ready();
         service_requested_reset();
         // Raw Ethernet owns its FreeRTOS ingress task and accepts
@@ -3570,7 +3658,13 @@ impl MainRadioState {
             applied_ack_delay_ms: None,
             applied_tx_burst_packets: None,
             applied_sta_start_generation: 0,
-            transition_announced_generation: 0,
+            // The boot radio epoch has already been applied using this
+            // generation.  Deadline events use this field as their
+            // completion generation, so leaving it at zero turns every
+            // NAN/DW deadline after a nonzero boot generation into a stale
+            // completion and prevents an otherwise admitted sleepy profile
+            // from ever reaching its physical sleep boundary.
+            transition_announced_generation: initial_generation,
             applied_nan_start_generation: initial_generation,
             sta_extensions_enabled: false,
             applied_nan_dw_interval: None,
@@ -3662,10 +3756,10 @@ pub const MEMORY_SNAPSHOT: u64 = 1;
 // state. Publish a copy through this seqlock instead of borrowing that state
 // or taking the radio-owner lock from callback/ingress context.
 static SNAPSHOT_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-static SNAPSHOT_WORDS: [AtomicU32; 22] = [const { AtomicU32::new(0) }; 22];
+static SNAPSHOT_WORDS: [AtomicU32; 23] = [const { AtomicU32::new(0) }; 23];
 static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-fn snapshot_words(snapshot: MainRuntimeSnapshot) -> [u32; 22] {
+fn snapshot_words(snapshot: MainRuntimeSnapshot) -> [u32; 23] {
     [
         u32::from(snapshot.desired_mode),
         snapshot.desired_generation,
@@ -3689,10 +3783,11 @@ fn snapshot_words(snapshot: MainRuntimeSnapshot) -> [u32; 22] {
         snapshot.light_sleep_skipped,
         snapshot.last_sleep_requested_us,
         snapshot.last_sleep_duration_us,
+        u32::from(snapshot.last_stale_reason),
     ]
 }
 
-fn snapshot_from_words(words: [u32; 22]) -> MainRuntimeSnapshot {
+fn snapshot_from_words(words: [u32; 23]) -> MainRuntimeSnapshot {
     MainRuntimeSnapshot {
         desired_mode: words[0] as u8,
         desired_generation: words[1],
@@ -3716,6 +3811,7 @@ fn snapshot_from_words(words: [u32; 22]) -> MainRuntimeSnapshot {
         light_sleep_skipped: words[19],
         last_sleep_requested_us: words[20],
         last_sleep_duration_us: words[21],
+        last_stale_reason: words[22] as u8,
     }
 }
 
@@ -3738,7 +3834,7 @@ pub(crate) fn published_snapshot() -> MainRuntimeSnapshot {
         if before & 1 != 0 {
             continue;
         }
-        let mut words = [0; 22];
+        let mut words = [0; 23];
         for (slot, value) in SNAPSHOT_WORDS.iter().zip(words.iter_mut()) {
             *value = slot.load(Ordering::Relaxed);
         }
@@ -3755,7 +3851,8 @@ pub(crate) fn published_snapshot() -> MainRuntimeSnapshot {
 /// sleepy, `4..=6` applied radio/generation/power, `7..=8` blockers/error,
 /// `9..=11` are stale-completion, queue-overflow, and wake-cause counters;
 /// `12..=16` are applied CPU/PM measurements and `17..=21` are explicit
-/// light-sleep attempt/entry/skip/duration metrics. These are values observed
+/// light-sleep attempt/entry/skip/duration metrics; `22` identifies the last
+/// rejected stale event. These are values observed
 /// by the Main owner after a PM effect, not inferred policy requests.
 pub(crate) fn receive_tagged_snapshot(
     record: dmesh_server::tagged::Record<'_>,

@@ -59,9 +59,9 @@ build_one() {
     local image_dir="$FLASH_ROOT/$name"
     local image_path="$image_dir/dmesh-rs-merged.bin"
     local image_flash_size="${DMESH_FLASH_HEADER_SIZE:-$flash_size}"
-    local elf_path="$CARGO_TARGET_DIR/$target/release/dmesh-rs"
-    local boot_path="$CARGO_TARGET_DIR/$target/release/bootloader.bin"
-    local partition_table_path="$CARGO_TARGET_DIR/$target/release/partition-table.bin"
+    local elf_path="$CARGO_TARGET_DIR/$target/$BUILD_MODE/dmesh-rs"
+    local boot_path="$CARGO_TARGET_DIR/$target/$BUILD_MODE/bootloader.bin"
+    local partition_table_path="$CARGO_TARGET_DIR/$target/$BUILD_MODE/partition-table.bin"
     # ESP-IDF's generated CMake/bindings are target-specific.  A shared stamp
     # made a previous ESP32/S3 build invalidate the C6 cache (and vice versa),
     # needlessly rebuilding the SDK when the selected target was unchanged.

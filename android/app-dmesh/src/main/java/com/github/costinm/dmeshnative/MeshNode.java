@@ -192,6 +192,27 @@ public class MeshNode implements AutoCloseable {
         nativeSetCallback(nativeHandle, callback);
     }
 
+    public boolean bearerOpen(String bearer, String args) {
+        return nativeHandle != 0 && nativeBearerOpen(
+                nativeHandle, bearer == null ? "" : bearer, args == null ? "" : args);
+    }
+
+    public boolean bearerChunk(String bearer, byte[] data, int length) {
+        return nativeHandle != 0 && nativeBearerChunk(
+                nativeHandle,
+                bearer == null ? "" : bearer,
+                data == null ? new byte[0] : data,
+                Math.max(0, length));
+    }
+
+    public void bearerClose(String bearer) {
+        if (nativeHandle != 0) nativeBearerClose(nativeHandle, bearer == null ? "" : bearer);
+    }
+
+    public String bearerStatus(String bearer) {
+        return nativeHandle == 0 ? "" : nativeBearerStatus(nativeHandle, bearer == null ? "" : bearer);
+    }
+
     /** Emit the shared UDP6 presence record on a newly available local link. */
     public boolean triggerAnnounce() {
         return nativeHandle != 0 && nativeTriggerAnnounce(nativeHandle);
@@ -332,16 +353,40 @@ public class MeshNode implements AutoCloseable {
         return radioMessageText("radio.nan.parse_followup", "", followup, -1);
     }
 
-    /** Build the targeted STA activation carried by `nan.wakeup` over NAN. */
-    public static byte[] buildNanWakeup(byte[] wakeTarget) {
+    /**
+     * Build one DMesh NAN Follow-up carrying a targeted STA activation.
+     *
+     * <p>Android Aware's active Subscribe SDEA is not consistently visible to
+     * raw-NAN peers. The temporary active Subscribe therefore obtains a
+     * framework {@code PeerHandle}, then sends this common Follow-up. The
+     * target receives its inner tagged-CBOR {@code control.transport.set}
+     * through the shared NAN Follow-up ingress.</p>
+     */
+    public static byte[] buildNanWakeup(byte[] sourceId, byte[] wakeTarget) {
         return radioMessage("radio.nan.build_sta_activation",
-                "wake_target=" + hex(wakeTarget), new byte[0], -1);
+                "source_id=" + hex(sourceId) + " wake_target=" + hex(wakeTarget),
+                new byte[0], -1);
     }
 
-    /** @deprecated use {@link #buildNanWakeup(byte[])}. */
+    public static byte[] buildNanActivation(byte[] sourceId, byte[] wakeTarget, long id,
+                                            int kind, int ap, int now, int ble,
+                                            int nanDwInterval) {
+        return radioMessage("radio.nan.build_activation",
+                "source_id=" + hex(sourceId)
+                        + " wake_target=" + hex(wakeTarget)
+                        + " id=" + id
+                        + " kind=" + kind
+                        + " ap=" + ap
+                        + " now=" + now
+                        + " ble=" + ble
+                        + " nan_dw_interval=" + nanDwInterval,
+                new byte[0], -1);
+    }
+
+    /** @deprecated use {@link #buildNanWakeup(byte[], byte[])}. */
     @Deprecated
-    public static byte[] buildNanStaActivation(byte[] wakeTarget) {
-        return buildNanWakeup(wakeTarget);
+    public static byte[] buildNanStaActivation(byte[] sourceId, byte[] wakeTarget) {
+        return buildNanWakeup(sourceId, wakeTarget);
     }
 
     public static boolean injectNanFollowup(byte[] followup, int rssi) {
@@ -426,8 +471,18 @@ public class MeshNode implements AutoCloseable {
         /** Rust accepted a targeted common NAN wake action. */
         void onNanWakeup(String target);
 
+        default String onBleCommand(String method, String params) { return ""; }
+
+        default String onUsbCommand(String method, String params) { return ""; }
+
+        default String onWifiCommand(String method, String params) { return ""; }
+
+        default String onTransportCommand(String method, String params) { return ""; }
+
         void onInboundStream(long clientId, String host, int port, long streamHandle);
         void onForwardedStream(long connId, String host, int port, long streamHandle);
+
+        default void onBearerFrame(String bearer, byte[] frame, int length) { }
     }
 
     private static native long nativeStartMesh(
@@ -448,4 +503,8 @@ public class MeshNode implements AutoCloseable {
     private static native boolean nativeSendBridgeMessage(long clientId, byte[] message);
     private static native byte[] nativeRadioMessage(String method, String args, byte[] data, int fd);
     private static native String nativeRadioMessageText(String method, String args, byte[] data, int fd);
+    private native boolean nativeBearerOpen(long handle, String bearer, String args);
+    private native boolean nativeBearerChunk(long handle, String bearer, byte[] data, int length);
+    private native void nativeBearerClose(long handle, String bearer);
+    private native String nativeBearerStatus(long handle, String bearer);
 }

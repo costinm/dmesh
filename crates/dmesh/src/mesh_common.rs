@@ -56,6 +56,7 @@ pub struct MeshHandle {
     /// Platform network transitions request an immediate announce without
     /// changing the fifteen-minute periodic cadence.
     pub announce_trigger: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    pub mesh_services: ssh_mesh::mesh_rest::MeshServiceRegistry,
 }
 
 /// Opaque handle for a bidirectional stream (channel).
@@ -132,6 +133,18 @@ pub fn start_mesh(
         }
     });
 
+    let mesh_services = ssh_mesh::mesh_rest::MeshServiceRegistry::default();
+    #[cfg(target_os = "android")]
+    crate::mesh_jni::register_ble_service(&mesh_services);
+    #[cfg(target_os = "android")]
+    crate::mesh_jni::register_usb_service(&mesh_services);
+    #[cfg(target_os = "android")]
+    crate::mesh_jni::register_wifi_service(&mesh_services);
+    #[cfg(target_os = "android")]
+    crate::mesh_jni::register_transport_service(&mesh_services);
+    #[cfg(target_os = "android")]
+    crate::mesh_jni::register_history_service(&mesh_services);
+
     // Spawn HTTP server if port configured
     let mut http_server_handle = None;
     if let Some(h_port) = node.http_port() {
@@ -139,8 +152,8 @@ pub fn start_mesh(
             ssh_server: node.clone(),
             target_http_address: None,
             ssh_client_manager: client_manager.clone(),
-            mesh_services: Default::default(),
-            web_root: None,
+            mesh_services: mesh_services.clone(),
+            web_root: Some(base_path.join("web")),
         };
         let app = ssh_mesh::handlers::app(app_state);
         http_server_handle = Some(runtime.spawn(async move {
@@ -234,6 +247,7 @@ pub fn start_mesh(
         udp_server_handle,
         announce_server_handle,
         announce_trigger,
+        mesh_services,
     })
 }
 

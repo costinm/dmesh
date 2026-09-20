@@ -215,6 +215,8 @@ pub fn close(bearer: &str) {
     if let Some(runtime) = current() {
         runtime.close(bearer);
     }
+    coc_reset(bearer);
+    uart_reset(bearer);
 }
 
 pub fn status(bearer: &str) -> Value {
@@ -231,6 +233,196 @@ pub fn status(bearer: &str) -> Value {
         "runtime": true,
         "connection": connection,
     })
+}
+
+pub const COC_PACKET_MAX: usize = PACKET;
+pub const COC_FRAME_MAX: usize = PACKET + 2;
+pub const UART_PACKET_MAX: usize = PACKET;
+pub const UART_FRAME_MAX: usize = (PACKET + 1) * 2 + 4;
+pub const BEARER_FRAME_MAX: usize = if COC_FRAME_MAX >= UART_FRAME_MAX {
+    COC_FRAME_MAX
+} else {
+    UART_FRAME_MAX
+};
+
+pub fn is_uart_bearer(bearer: &str) -> bool {
+    bearer == "usb" || bearer == "uart"
+}
+
+pub fn chunk(bearer: &str, data: &[u8]) -> bool {
+    if is_uart_bearer(bearer) {
+        uart_chunk(bearer, data)
+    } else {
+        coc_chunk(bearer, data)
+    }
+}
+
+struct CocFrameState {
+    raw: [u8; COC_FRAME_MAX],
+    len: usize,
+    record: Option<usize>,
+}
+
+impl Default for CocFrameState {
+    fn default() -> Self {
+        Self {
+            raw: [0; COC_FRAME_MAX],
+            len: 0,
+            record: None,
+        }
+    }
+}
+
+impl CocFrameState {
+    fn feed<F: FnMut(&[u8])>(&mut self, chunk: &[u8], mut emit: F) {
+        for byte in chunk {
+            match self.record {
+                None => {
+                    self.raw[self.len] = *byte;
+                    self.len += 1;
+                    if self.len == 2 {
+                        let length = u16::from_be_bytes([self.raw[0], self.raw[1]]) as usize;
+                        self.len = 0;
+                        if length > 0 && length <= PACKET {
+                            self.record = Some(length);
+                        }
+                    }
+                }
+                Some(length) => {
+                    self.raw[self.len] = *byte;
+                    self.len += 1;
+                    if self.len == length {
+                        emit(&self.raw[..length]);
+                        self.record = None;
+                        self.len = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct CocFramer {
+    states: Mutex<HashMap<String, CocFrameState>>,
+}
+
+impl CocFramer {
+    pub fn feed_chunk<F: FnMut(&[u8])>(&self, bearer: &str, chunk: &[u8], mut emit: F) {
+        let Ok(mut states) = self.states.lock() else {
+            return;
+        };
+        let state = states.entry(bearer.to_string()).or_default();
+        state.feed(chunk, &mut emit);
+    }
+
+    pub fn reset(&self, bearer: &str) {
+        if let Ok(mut states) = self.states.lock() {
+            states.remove(bearer);
+        }
+    }
+}
+
+static COC_FRAMER: OnceLock<CocFramer> = OnceLock::new();
+
+pub fn coc_framer() -> &'static CocFramer {
+    COC_FRAMER.get_or_init(CocFramer::default)
+}
+
+pub fn coc_frame(packet: &[u8], out: &mut [u8]) -> Option<usize> {
+    if packet.is_empty() || packet.len() > COC_PACKET_MAX || out.len() < COC_FRAME_MAX {
+        return None;
+    }
+    out[0] = (packet.len() >> 8) as u8;
+    out[1] = (packet.len() & 0xff) as u8;
+    out[2..packet.len() + 2].copy_from_slice(packet);
+    Some(packet.len() + 2)
+}
+
+pub fn coc_chunk(bearer: &str, chunk: &[u8]) -> bool {
+    if bearer.is_empty() || chunk.is_empty() || current().is_none() {
+        return false;
+    }
+    coc_framer().feed_chunk(bearer, chunk, |inner| {
+        packet(bearer, inner);
+    });
+    true
+}
+
+pub fn coc_reset(bearer: &str) {
+    coc_framer().reset(bearer);
+}
+
+struct UartFrameState {
+    decoder: uart_codec::codec::Decoder,
+}
+
+impl UartFrameState {
+    fn new() -> Self {
+        Self {
+            decoder: uart_codec::codec::Decoder::with_max(UART_PACKET_MAX + 1),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct UartFramer {
+    states: Mutex<HashMap<String, UartFrameState>>,
+}
+
+impl UartFramer {
+    pub fn feed_chunk<F: FnMut(&[u8])>(&self, bearer: &str, chunk: &[u8], mut emit: F) {
+        let Ok(mut states) = self.states.lock() else {
+            return;
+        };
+        let state = states.entry(bearer.to_string()).or_insert_with(UartFrameState::new);
+        if let Ok(records) = state.decoder.push(chunk) {
+            for payload in records {
+                if let Ok(dmesh_server::uart::UartIngress::Transport(packet)) =
+                    dmesh_server::uart::classify_uart_payload(&payload)
+                {
+                    emit(packet);
+                }
+            }
+        }
+    }
+
+    pub fn reset(&self, bearer: &str) {
+        if let Ok(mut states) = self.states.lock() {
+            states.remove(bearer);
+        }
+    }
+}
+
+static UART_FRAMER: OnceLock<UartFramer> = OnceLock::new();
+
+pub fn uart_framer() -> &'static UartFramer {
+    UART_FRAMER.get_or_init(UartFramer::default)
+}
+
+pub fn uart_chunk(bearer: &str, chunk: &[u8]) -> bool {
+    if bearer.is_empty() || chunk.is_empty() || current().is_none() {
+        return false;
+    }
+    uart_framer().feed_chunk(bearer, chunk, |inner| {
+        packet(bearer, inner);
+    });
+    true
+}
+
+pub fn uart_reset(bearer: &str) {
+    uart_framer().reset(bearer);
+}
+
+pub fn encode_uart_packet(bearer: &str, packet: &[u8], out: &mut [u8]) -> Option<usize> {
+    if !is_uart_bearer(bearer) || packet.is_empty() || packet.len() > UART_PACKET_MAX {
+        return None;
+    }
+    let mut info = [0u8; UART_PACKET_MAX + 1];
+    let info_len = dmesh_server::uart::encode_uart_datagram(packet, &mut info)?;
+    let mut encoder = uart_codec::codec::Encoder::new(&info[..info_len], UART_PACKET_MAX + 1).ok()?;
+    let used = encoder.write(out);
+    encoder.is_finished().then_some(used)
 }
 
 impl BearerRuntime {
@@ -410,6 +602,71 @@ mod tests {
             .unwrap_or(false);
         set_current(None);
         assert!(complete);
+    }
+
+    #[test]
+    fn coc_framer_reassembles_split_and_batched_frames() {
+        let framer = CocFramer::default();
+        let mut sent = Vec::new();
+        framer.feed_chunk("ble", &[0, 5, 1, 2], |inner| {
+            sent.push(inner.to_vec());
+        });
+        framer.feed_chunk("ble", &[3, 4, 5, 0, 2, 9, 8], |inner| {
+            sent.push(inner.to_vec());
+        });
+        assert_eq!(sent, vec![vec![1, 2, 3, 4, 5], vec![9, 8]]);
+    }
+
+    #[test]
+    fn coc_framer_resets_invalid_length() {
+        let framer = CocFramer::default();
+        let mut sent = Vec::new();
+        framer.feed_chunk("ble", &[0xFF, 0xFF, 0, 1, 7], |inner| {
+            sent.push(inner.to_vec())
+        });
+        assert_eq!(sent, vec![vec![7]]);
+    }
+
+    #[test]
+    fn coc_framer_clears_partial_state_on_reset() {
+        let framer = CocFramer::default();
+        framer.feed_chunk("ble", &[0, 5, 1, 2], |_| {});
+        framer.reset("ble");
+        let mut sent = Vec::new();
+        framer.feed_chunk("ble", &[0, 1, 3], |inner| {
+            sent.push(inner.to_vec())
+        });
+        assert_eq!(sent, vec![vec![3]]);
+    }
+
+    #[test]
+    fn uart_framer_round_trips_marked_quic_packets() {
+        let mut wire = [0u8; UART_FRAME_MAX];
+        let used = encode_uart_packet("usb", &[0x40, 1, 2], &mut wire).unwrap();
+        let framer = UartFramer::default();
+        let mut sent = Vec::new();
+        framer.feed_chunk("usb", &wire[..used / 2], |inner| {
+            sent.push(inner.to_vec())
+        });
+        assert!(sent.is_empty());
+        framer.feed_chunk("usb", &wire[used / 2..used], |inner| {
+            sent.push(inner.to_vec())
+        });
+        assert_eq!(sent, vec![vec![0x40, 1, 2]]);
+    }
+
+    #[test]
+    fn uart_framer_resets_partial_state() {
+        let mut wire = [0u8; UART_FRAME_MAX];
+        let used = encode_uart_packet("usb", &[0x40, 1, 2], &mut wire).unwrap();
+        let framer = UartFramer::default();
+        framer.feed_chunk("usb", &wire[..used / 2], |_| {});
+        framer.reset("usb");
+        let mut sent = Vec::new();
+        framer.feed_chunk("usb", &wire[used / 2..used], |inner| {
+            sent.push(inner.to_vec())
+        });
+        assert!(sent.is_empty());
     }
 }
 

@@ -13,6 +13,7 @@ import android.util.Log;
 import com.github.costinm.dmesh.DirectBinder;
 import com.github.costinm.dmesh.MeshClient;
 import com.github.costinm.dmesh.MeshStream;
+import com.github.costinm.dmeshnative.AndroidTransportBridge;
 import com.github.costinm.dmeshnative.CborMessageCodec;
 import com.github.costinm.dmeshnative.MeshNode;
 import com.github.costinm.dmeshnative.MeshNativeStream;
@@ -95,6 +96,32 @@ public final class MessageStreamGateway implements MeshNode.MeshCallback {
     @Override
     public void onNanWakeup(String target) {
         if (nanWakeup != null) nanWakeup.request(target);
+    }
+
+    @Override
+    public void onBearerFrame(String bearer, byte[] frame, int length) {
+        if ((! "ble".equals(bearer) && !"usb".equals(bearer)) || frame == null || length < 2 || length > frame.length) return;
+        AndroidTransportBridge.get(context).sendBearerFrame(bearer, frame, length);
+    }
+
+    @Override
+    public String onBleCommand(String method, String params) {
+        return AndroidTransportBridge.get(context).bleCommand(method, params);
+    }
+
+    @Override
+    public String onUsbCommand(String method, String params) {
+        return AndroidTransportBridge.get(context).usbCommand(method, params);
+    }
+
+    @Override
+    public String onWifiCommand(String method, String params) {
+        return AndroidTransportBridge.get(context).wifiCommand(method, params);
+    }
+
+    @Override
+    public String onTransportCommand(String method, String params) {
+        return AndroidTransportBridge.get(context).transportCommand(method, params);
     }
 
     @Override

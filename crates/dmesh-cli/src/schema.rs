@@ -419,8 +419,8 @@ impl FirmwareSchema {
             // handler boundary, avoiding a UART-only byte convention.
             Some("mac") => Ok(Value::String(value.to_ascii_lowercase())),
             // Text has no byte-string type. Keep the representation marker
-            // local to the JSON/text adapter; the shared CBOR encoder turns
-            // it into a byte string for every client surface.
+            // local to the JSON/text adapter; firmware and host handlers accept
+            // either the marker text or a CBOR byte string.
             Some("hex") => {
                 let compact = value.strip_prefix("hex:").unwrap_or(value).replace(':', "");
                 Ok(Value::String(format!("hex:{compact}")))
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn transport_set_preserves_the_explicit_sleepy_dw_fields() {
         let command = encode_stream_command_with_id(
-            "transport.set mode=nan nan_dw_interval=1 now=2 ap=0",
+            "transport.set mode=nan nan_dw_interval=1 now=2 ap=0 ble=1",
             24,
         )
         .unwrap();
@@ -885,6 +885,7 @@ mod tests {
                     nan_dw_interval: Some(1),
                     now: Some(2),
                     ap: Some(0),
+                    ble: Some(1),
                     ..dmesh_server::control::TransportConfig::default()
                 },
             })
@@ -1053,9 +1054,10 @@ mod tests {
             seen[key as usize] = true;
             match key {
                 2 => {
-                    let mut addr = [0u8; 6];
-                    assert_eq!(decoder.bytes(&mut addr), Some(6));
-                    assert_eq!(addr, [0x88, 0x66, 0x4b, 0x02, 0x0b, 0x6d]);
+                    assert_eq!(
+                        decoder.bytes_or_text_ref(),
+                        Some(b"hex:88664b020b6d".as_slice())
+                    );
                 }
                 3 => assert_eq!(decoder.uint(), Some(1)),
                 4 => assert_eq!(decoder.uint(), Some(129)),
@@ -1084,9 +1086,10 @@ mod tests {
             seen[key as usize] = true;
             match key {
                 2 => {
-                    let mut addr = [0u8; 6];
-                    assert_eq!(decoder.bytes(&mut addr), Some(6));
-                    assert_eq!(addr, [0x88, 0x66, 0x4b, 0x02, 0x0b, 0x6d]);
+                    assert_eq!(
+                        decoder.bytes_or_text_ref(),
+                        Some(b"hex:88664b020b6d".as_slice())
+                    );
                 }
                 3 => assert_eq!(decoder.uint(), Some(1)),
                 4 => assert_eq!(decoder.uint(), Some(129)),
@@ -1106,9 +1109,10 @@ mod tests {
         assert_eq!(major, 5);
         assert_eq!(count, 1);
         assert_eq!(decoder.uint(), Some(2));
-        let mut data = [0u8; 4];
-        assert_eq!(decoder.bytes(&mut data), Some(4));
-        assert_eq!(data, [0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            decoder.bytes_or_text_ref(),
+            Some(b"hex:deadbeef".as_slice())
+        );
     }
 
     #[test]

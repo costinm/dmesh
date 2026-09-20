@@ -2,12 +2,14 @@ package com.github.costinm.dmeshnative;
 
 import android.content.Context;
 import android.content.Intent;
+import android.hardware.usb.UsbDevice;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Build;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 
+import com.github.costinm.dmesh.usb.UsbDmesh;
 import com.github.costinm.dmesh.wifi.Ble;
 import com.github.costinm.dmesh.wifi.Announce;
 import com.github.costinm.dmesh.wifi.Discover;
@@ -26,14 +28,26 @@ import java.util.Arrays;
 import java.util.Collections;
 
 /** The sole app-dmesh adapter that binds Rust messages to Android transports. */
-public final class AndroidTransportBridge {
+public final class AndroidTransportBridge implements Ble.BearerBridge {
     // Shared five-minute passive-presence cadence; firmware Main and host
     // NAN/UDP publishers use the same interval.
     private static final long NAN_PRESENCE_REFRESH_MS = 5 * 60 * 1000L;
+    // A DW8 peer can be unavailable for 4.194 s, and the ESP repeats a
+    // targeted wake across more than one DW. Keep Android's active Subscribe
+    // alive for four complete DW8 periods plus framework callback margin.
+    // A framework PeerHandle may arrive after its first matching SDF; a
+    // two-period transaction can restore the baseline before that callback
+    // has a chance to send the Follow-up. This is bounded explicit wake work,
+    // never the passive discovery cadence.
+    private static final long NAN_WAKE_TRANSACTION_MS = 20_000L;
     private static AndroidTransportBridge instance;
     private final WifiController wifi;
     private final WifiManager wifiManager;
     private final Ble ble;
+    private final UsbDmesh usb;
+    private MeshNode meshNode;
+    private volatile boolean usbBearerConnected;
+    private volatile boolean usbBearerOpen;
     private final Handler presenceHandler = new Handler(Looper.getMainLooper());
     private byte[] nanDeviceId;
     private long nanStartedElapsedMs;
@@ -103,11 +117,109 @@ public final class AndroidTransportBridge {
         });
         ble = new Ble(context, new Handler(Looper.getMainLooper()), new TransportEventSink() {
             @Override public void onTransportEvent(String transport, String event, byte[] payload) {
+                // The Rust history (radio.transport.event) owns radio
+                // debugging; logcat stays reserved for framework-level
+                // detail per AGENTS.md.
                 MeshNode.radioMessage("radio.transport.event",
                         "transport=" + transport + " event=" + event, payload, -1);
             }
-
         });
+        ble.setBearerBridge(this);
+        usb = new UsbDmesh(context, new UsbDmesh.Bridge() {
+            @Override public void onUsbOpen(String info) {
+                usbBearerConnected = true;
+                openUsbBearer();
+                MeshNode.radioMessage("radio.transport.event",
+                        "transport=usb event=opened", info.getBytes(java.nio.charset.StandardCharsets.UTF_8), -1);
+            }
+
+            @Override public void onUsbClose(String info) {
+                usbBearerConnected = false;
+                closeUsbBearer();
+                MeshNode.radioMessage("radio.transport.event",
+                        "transport=usb event=closed", info.getBytes(java.nio.charset.StandardCharsets.UTF_8), -1);
+            }
+
+            @Override public void onUsbChunk(byte[] data, int length) {
+                if (meshNode != null) meshNode.bearerChunk("usb", data, length);
+            }
+        });
+        usb.start();
+    }
+
+    public void setMeshNode(MeshNode node) {
+        this.meshNode = node;
+        openUsbBearer();
+    }
+    private void openUsbBearer() {
+        if (usbBearerConnected && meshNode != null && !usbBearerOpen) {
+            usbBearerOpen = meshNode.bearerOpen("usb", "");
+        }
+    }
+    private void closeUsbBearer() {
+        if (usbBearerOpen) {
+            if (meshNode != null) meshNode.bearerClose("usb");
+            usbBearerOpen = false;
+        }
+    }
+    @Override public void onBearerConnected(String bearer) {
+        if ("ble".equals(bearer) && meshNode != null) meshNode.bearerOpen(bearer, "");
+    }
+    @Override public void onBearerDisconnected(String bearer) {
+        if ("ble".equals(bearer) && meshNode != null) meshNode.bearerClose(bearer);
+    }
+    @Override public void onBearerChunk(String bearer, byte[] data, int length) {
+        if ("ble".equals(bearer) && meshNode != null) meshNode.bearerChunk(bearer, data, length);
+    }
+    @Override public boolean sendBearerFrame(String bearer, byte[] frame, int length) {
+        if ("ble".equals(bearer)) return ble.writeFrame(frame, length);
+        if ("usb".equals(bearer)) return usb.writeFrame(frame, length);
+        return false;
+    }
+    public void onUsbPermission(UsbDevice device, boolean granted) { usb.onPermissionGranted(device, granted); }
+    public String usbCommand(String method, String params) {
+        try {
+            JSONObject request = new JSONObject(params == null || params.isEmpty() ? "{}" : params);
+            if ("usb.status".equals(method)) {
+                JSONObject status = new JSONObject(usb.status());
+                status.put("bearer", meshNode == null ? "" : meshNode.bearerStatus("usb"));
+                return status.toString();
+            }
+            if ("usb.devices".equals(method)) return usb.devices();
+            if ("usb.open".equals(method)) {
+                boolean accepted;
+                if (request.has("vendor_id") && request.has("product_id")) {
+                    accepted = usb.open(request.optInt("vendor_id", -1), request.optInt("product_id", -1));
+                } else {
+                    accepted = usb.openAuto();
+                }
+                if (accepted) return "{\"status\":\"accepted\",\"operation\":\"usb.open\"}";
+                try {
+                    JSONObject status = new JSONObject(usb.status());
+                    // A pending system permission dialog is asynchronous
+                    // progress, not failure; callers must not treat it as a
+                    // refusal and retry while the dialog is still up.
+                    boolean pending = "permission_pending".equals(status.optString("state", ""));
+                    JSONObject result = new JSONObject();
+                    result.put("status", pending ? "pending" : "rejected");
+                    result.put("operation", "usb.open");
+                    if (!pending) {
+                        result.put("error", status.optString("error",
+                                status.optString("state", "usb_open_failed")));
+                    }
+                    return result.toString();
+                } catch (Exception e) {
+                    return "{\"status\":\"rejected\",\"operation\":\"usb.open\",\"error\":\"usb_open_failed\"}";
+                }
+            }
+            if ("usb.close".equals(method)) {
+                usb.close();
+                return "{\"status\":\"accepted\",\"operation\":\"usb.close\"}";
+            }
+            return "{\"status\":\"unsupported\",\"operation\":\"" + method + "\"}";
+        } catch (Exception e) {
+            return "{\"status\":\"invalid\",\"error\":\"" + e.getClass().getSimpleName() + "\"}";
+        }
     }
     public void startBaseline() { wifi.startNanAfterP2p(); }
 
@@ -187,16 +299,25 @@ public final class AndroidTransportBridge {
      * active NAN Subscribe.  The target ESP verifies `wake_target`; Java
      * neither decodes nor rewrites the control profile.
      */
-    public void requestNanActivation(byte[] transportSet) {
-        if (transportSet == null || transportSet.length == 0 || baselineNanDiscoverRecord == null) {
+    public void requestNanActivation(byte[] wakeTarget) {
+        byte[] source = nanDeviceId;
+        if (wakeTarget == null || wakeTarget.length != 6 || source == null || source.length < 6
+                || baselineNanDiscoverRecord == null) {
             MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
             return;
         }
-        // Do not use control bytes as Subscribe Service Specific Info: some
-        // framework implementations treat it as a discovery filter, so the
-        // target Publish is never surfaced to the Follow-up sender. The
-        // record travels only in the directed message after discovery.
-        requestTemporaryActiveSubscribe(new byte[0], transportSet,
+        byte[] transportSet = MeshNode.buildNanWakeup(Arrays.copyOf(source, 6), wakeTarget);
+        if (transportSet.length == 0) {
+            MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
+            return;
+        }
+        // A DW8 peer cannot supply Android with a PeerHandle before it is
+        // awake. Keep an active discovery record in SDEA, then send the
+        // common target-checked record as a Follow-up on its PeerHandle. Some
+        // Android Aware implementations do not expose arbitrary SDEA bytes
+        // to raw-NAN peers, while Follow-up delivery is portable.
+        nanDiscoveryRequestId = (nanDiscoveryRequestId + 1) & 0xffff_ffffL;
+        requestTemporaryActiveSubscribe(nanDiscoverRecord(), transportSet,
                 "aware.nan_activation_requested");
     }
 
@@ -209,9 +330,9 @@ public final class AndroidTransportBridge {
         wifi.setDirectedNanMessage(directedMessage);
         wifi.setDiscover(new Discover(payload, Collections.singletonList("active")), ignored -> { });
         MeshNode.recordNanEvent(event, "", payload);
-        // Four seconds covers DW8 plus scheduling margin without retaining a
-        // repeated activation Subscribe indefinitely.
-        presenceHandler.postDelayed(restoreNanDiscovery, 4_000L);
+        // Keep a targeted wake across two DW8 periods. It remains bounded and
+        // is restored to the ordinary discovery Subscribe afterwards.
+        presenceHandler.postDelayed(restoreNanDiscovery, NAN_WAKE_TRANSACTION_MS);
     }
     /** Network callbacks use this to publish a changed STA mode/SSID promptly. */
     public void refreshNanPresence() { publishNanPresence(); }
@@ -231,7 +352,137 @@ public final class AndroidTransportBridge {
         }
         return out.length() == 0 ? "android" : out.toString();
     }
-    public void scanBle() { ble.scan(); }
+    public String bleCommand(String method, String params) {
+        try {
+            JSONObject request = new JSONObject(params == null || params.isEmpty() ? "{}" : params);
+            if ("ble.status".equals(method)) {
+                JSONObject status = new JSONObject();
+                status.put("snapshot", ble.snapshot());
+                status.put("bearer", meshNode == null ? "" : meshNode.bearerStatus("ble"));
+                return status.toString();
+            }
+            if ("ble.scan".equals(method)) {
+                ble.scan();
+                return "{\"status\":\"accepted\",\"operation\":\"ble.scan\"}";
+            }
+            if ("ble.scan_stop".equals(method)) {
+                ble.scanStop();
+                return "{\"status\":\"accepted\",\"operation\":\"ble.scan_stop\"}";
+            }
+            if ("ble.connect".equals(method)) {
+                boolean started = ble.connect(
+                        request.optString("address", ""), request.optInt("psm", 128));
+                return started
+                        ? "{\"status\":\"accepted\",\"operation\":\"ble.connect\"}"
+                        : "{\"status\":\"rejected\",\"operation\":\"ble.connect\"}";
+            }
+            if ("ble.disconnect".equals(method)) {
+                ble.disconnect();
+                return "{\"status\":\"accepted\",\"operation\":\"ble.disconnect\"}";
+            }
+            return "{\"status\":\"unsupported\",\"operation\":\"" + method + "\"}";
+        } catch (Exception e) {
+            return "{\"status\":\"invalid\",\"error\":\"" + e.getClass().getSimpleName() + "\"}";
+        }
+    }
+    public String wifiCommand(String method, String params) {
+        try {
+            if ("wifi.status".equals(method)) {
+                JSONObject status = new JSONObject();
+                status.put("enabled", wifiManager == null ? false : wifiManager.isWifiEnabled());
+                status.put("ssid", currentStaSsid());
+                status.put("ap_active", apActive());
+                status.put("snapshot", wifi.snapshot());
+                return status.toString();
+            }
+            if ("wifi.scan".equals(method)) {
+                if (wifiManager == null || !wifiManager.isWifiEnabled()) {
+                    return "{\"status\":\"rejected\",\"operation\":\"wifi.scan\",\"reason\":\"wifi_unavailable\"}";
+                }
+                try {
+                    wifiManager.startScan();
+                    return "{\"status\":\"accepted\",\"operation\":\"wifi.scan\"}";
+                } catch (Exception e) {
+                    return "{\"status\":\"rejected\",\"operation\":\"wifi.scan\",\"reason\":\""
+                            + e.getClass().getSimpleName() + "\"}";
+                }
+            }
+            return "{\"status\":\"unsupported\",\"operation\":\"" + method + "\"}";
+        } catch (Exception e) {
+            return "{\"status\":\"invalid\",\"error\":\"" + e.getClass().getSimpleName() + "\"}";
+        }
+    }
+    public String transportCommand(String method, String params) {
+        try {
+            JSONObject request = new JSONObject(params == null || params.isEmpty() ? "{}" : params);
+            if ("transport.status".equals(method)) {
+                JSONObject status = new JSONObject();
+                status.put("snapshot", snapshot());
+                status.put("sta_ssid", currentStaSsid());
+                status.put("ap_active", apActive());
+                return status.toString();
+            }
+            if ("transport.apply_projection".equals(method)) {
+                return applyRustProjection(request.optString("projection", ""));
+            }
+            if ("transport.start".equals(method)) {
+                return requestNanActivation(request);
+            }
+            return "{\"status\":\"unsupported\",\"operation\":\"" + method + "\"}";
+        } catch (Exception e) {
+            return "{\"status\":\"invalid\",\"error\":\"" + e.getClass().getSimpleName() + "\"}";
+        }
+    }
+    private String requestNanActivation(JSONObject request) {
+        byte[] source = nanDeviceId;
+        byte[] target;
+        try {
+            target = macBytes(request.optString("target_mac", ""));
+        } catch (Exception e) {
+            MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
+            return "{\"status\":\"rejected\",\"operation\":\"transport.start\",\"reason\":\"invalid_target_mac\"}";
+        }
+        if (source == null || source.length < 6 || target.length != 6
+                || baselineNanDiscoverRecord == null) {
+            MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
+            return "{\"status\":\"rejected\",\"operation\":\"transport.start\",\"reason\":\"nan_unready\"}";
+        }
+        byte[] activation = MeshNode.buildNanActivation(
+                Arrays.copyOf(source, 6),
+                target,
+                nanDiscoveryRequestId,
+                request.optInt("kind", 6),
+                request.optInt("ap", 1),
+                request.optInt("now", 1),
+                request.optInt("ble", 0),
+                request.optInt("nan_dw_interval", 1));
+        if (activation.length == 0) {
+            MeshNode.recordNanEvent("aware.nan_activation_rejected", "", new byte[0]);
+            return "{\"status\":\"rejected\",\"operation\":\"transport.start\",\"reason\":\"build_failed\"}";
+        }
+        nanDiscoveryRequestId = (nanDiscoveryRequestId + 1) & 0xffff_ffffL;
+        requestTemporaryActiveSubscribe(nanDiscoverRecord(), activation,
+                "aware.nan_activation_requested");
+        // Build with JSONObject: request.optString is caller-controlled and
+        // string concatenation would break the response on a quote inside it.
+        JSONObject accepted = new JSONObject();
+        try {
+            accepted.put("status", "accepted");
+            accepted.put("operation", "transport.start");
+            accepted.put("target_mac", request.optString("target_mac", ""));
+        } catch (Exception ignored) { }
+        return accepted.toString();
+    }
+    private static byte[] macBytes(String value) {
+        StringBuilder clean = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+                clean.append(c);
+            }
+        }
+        return hex(clean.toString());
+    }
     /**
      * Current station SSID as a bounded transport observation.  Prefer the
      * DMesh-owned network request, then report an already-associated system
@@ -304,6 +555,7 @@ public final class AndroidTransportBridge {
         presenceHandler.removeCallbacks(refreshNanPresence);
         presenceHandler.removeCallbacks(restoreNanDiscovery);
         ble.close();
+        usb.stop();
         wifi.close();
     }
     public static void handlePendingIntent(Context context, Intent intent) { Ble.handlePendingIntentScan(context, intent); }

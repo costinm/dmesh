@@ -44,6 +44,7 @@
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <!-- One capability query makes any DirectBinder service declaring this
          action visible; routing still requires an explicit component. -->
@@ -82,6 +83,15 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.github.costinm.dmesh.wifi.BLE_SCAN" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".UsbPermissionReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.github.costinm.dmesh.lm.USB_PERMISSION" />
             </intent-filter>
         </receiver>
 

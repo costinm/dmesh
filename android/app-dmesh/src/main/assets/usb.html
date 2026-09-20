@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>USB serial</title>
+<style>
+:root{--bg:#f5f7fb;--panel:#fff;--ink:#172033;--muted:#62718a;--line:#d5ddeb;--accent:#075ec7;--bad:#a22}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,sans-serif}
+header,main{max-width:1180px;margin:auto;padding:18px}h1{font-size:24px;margin:0}h2{font-size:17px;margin:0 0 10px}
+main{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}.wide{grid-column:1/-1}
+section{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:14px;min-width:0}
+.muted{color:var(--muted)}.meta{font-size:13px;color:var(--muted)}
+button,input,select{font:inherit;padding:7px;border:1px solid var(--line);border-radius:6px;background:#fff}
+button{cursor:pointer}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.row label{min-width:0;flex:1 1 160px}
+label{display:grid;gap:4px;color:var(--muted);font-size:13px}
+table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
+th{color:var(--muted);font-size:13px}.error{color:var(--bad)}pre{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+address{font-style:normal;word-break:break-all}
+</style></head>
+<body>
+<header><h1>USB serial</h1><p id="status" class="muted">Loading USB service…</p><p><a href="ble.html">BLE companion</a></p></header>
+<main>
+<section class="wide"><h2>Status</h2><div id="usb-status" class="muted">No status yet.</div><div class="row" style="margin-top:10px"><button id="refresh-status" class="primary">Refresh status</button></div></section>
+<section><h2>Devices</h2><div class="row"><button id="refresh-devices">Refresh devices</button></div><div id="device-error" class="error"></div></section>
+<section><h2>Open / close</h2><div class="row"><label>Vendor ID<input id="vendor" placeholder="0x303a" type="number" min="1" max="65535"></label><label>Product ID<input id="product" placeholder="0x1001" type="number" min="1" max="65535"></label><button id="open" class="primary">Open</button><button id="open-auto">Open auto</button><button id="close">Close</button></div><div id="open-error" class="error"></div></section>
+<section class="wide"><h2>Devices visible to Android</h2><div id="devices"><p class="muted">No devices yet.</p></div></section>
+<section class="wide"><h2>Last operation</h2><div id="result" class="muted">No operation yet.</div></section>
+</main>
+<script>
+const base=new URL('../mesh/',location.href),key=new URL(location.href).searchParams.get('apikey');
+const $=id=>document.getElementById(id);
+function url(path){const u=new URL(path,base);if(key)u.searchParams.set('apikey',key);return u}
+const data=value=>value?.result??value;
+async function request(path,options){const r=await fetch(url(path),options);const v=await r.json().catch(()=>({error:`HTTP ${r.status}`}));if(!r.ok||v?.error){const error=v.error;const message=typeof error==='string'?error:error?.error||error?.message||JSON.stringify(error||v);throw Error(message)}return v}
+async function call(name,args){const body={...(args||{})};body.id=Date.now();const out=await request(`services/usb/call/${encodeURIComponent(name)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('result').replaceChildren();const h=document.createElement('strong');h.textContent=`Response · ${name}`;const pre=document.createElement('pre');pre.textContent=JSON.stringify(out,null,2);$('result').append(h,pre);return out}
+function showStatus(text,error=false){const out=$('status');out.textContent=text;out.className=error?'error':'muted'}
+function showSectionHtml(id,node,error=false){const out=$(id);out.replaceChildren(node);if(error)out.classList.add('error');else out.classList.remove('error')}
+async function refreshStatus(){try{const out=await call('usb.status',{});const v=data(out)||{};showSectionHtml('usb-status',Object.assign(document.createElement('pre'),{textContent:JSON.stringify(v,null,2)}))}catch(e){showSectionHtml('usb-status',Object.assign(document.createElement('p'),{className:'error',textContent:e.message}),true)}}
+async function refreshDevices(){try{const out=await call('usb.devices',{});const v=data(out)||{};const root=$('devices');root.replaceChildren();const results=v.devices||[];if(!results.length){root.append(Object.assign(document.createElement('p'),{className:'muted',textContent:'No USB devices are visible to Android.'}));return}const table=document.createElement('table');const head=document.createElement('tr');for(const text of ['Vendor','Product','Name','Manufacturer','Authorized','Actions'])head.append(Object.assign(document.createElement('th'),{textContent:text}));table.append(head);for(const item of results){const row=document.createElement('tr');row.append(Object.assign(document.createElement('td'),{textContent:`0x${Number(item.vendor_id||0).toString(16)}`}),Object.assign(document.createElement('td'),{textContent:`0x${Number(item.product_id||0).toString(16)}`}),Object.assign(document.createElement('address'),{textContent:item.name||'unknown'}),Object.assign(document.createElement('td'),{textContent:item.manufacturer||item.product||'—'}),Object.assign(document.createElement('td'),{textContent:item.authorized?'yes':'no'}));const actions=document.createElement('td');const open=document.createElement('button');open.textContent='Open';open.onclick=()=>openDevice(item.vendor_id,item.product_id);actions.append(open);row.append(actions);table.append(row)}root.append(table);$('device-error').textContent=''}catch(e){$('device-error').textContent=e.message}}
+async function openDevice(vendorId,productId){$('open-error').textContent='';try{if(vendorId&&productId){await call('usb.open',{vendor_id:Number(vendorId),product_id:Number(productId)})}else{await call('usb.open',{auto:true})}await refreshStatus();showStatus('USB open requested')}catch(e){$('open-error').textContent=e.message}}
+$('refresh-status').onclick=refreshStatus;
+$('refresh-devices').onclick=refreshDevices;
+$('open').onclick=async()=>openDevice($('vendor').value,$('product').value);
+$('open-auto').onclick=async()=>openDevice(null,null);
+$('close').onclick=async()=>{try{await call('usb.close',{});await refreshStatus();showStatus('USB close requested')}catch(e){showStatus('USB close failed: '+e.message,true)}};
+(async()=>{try{await refreshStatus();await refreshDevices()}catch(e){showStatus(e.message,true)}})();
+</script></body></html>

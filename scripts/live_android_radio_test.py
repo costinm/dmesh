@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import re
 import shlex
@@ -19,6 +20,7 @@ import sys
 import termios
 import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,6 +84,33 @@ def shell_cmd(adb_bin: str, serial: str, command: str, timeout: float = 20) -> s
         f"content call --uri {SHELL_URI} --method command --arg {shlex.quote(command)}"
     )
     return adb(adb_bin, serial, "shell", quoted, timeout=timeout).stdout
+
+
+def ble_http(
+    adb_bin: str,
+    serial: str,
+    index: int,
+    method: str,
+    payload: dict | None = None,
+) -> str:
+    host_port = 28500 + index
+    run(
+        [adb_bin, "-s", serial, "forward", f"tcp:{host_port}", "tcp:18480"],
+        timeout=10,
+        check=True,
+    )
+    body = json.dumps(payload or {"id": 1}).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{host_port}/_m/mesh/services/ble/call/{method}",
+        data=body,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read().decode()
+    except Exception as exc:
+        return f"error={exc}"
 
 
 def grant_permissions(adb_bin: str, serial: str) -> None:
@@ -153,9 +182,10 @@ def collect_logcat(adb_bin: str, serial: str, out_dir: Path) -> None:
     (out_dir / f"{serial}-logcat.txt").write_text(out)
 
 
-def analyze_history(history: str) -> dict[str, bool]:
+def analyze_history(history: str, ble_scan_active: bool) -> dict[str, bool]:
     return {
-        "ble_status": bool(re.search(r"BLE[.](scan|start|DISC|ERR)", history)),
+        "ble_status": ble_scan_active
+        or bool(re.search(r"BLE[.](scan|start|DISC|ERR)", history)),
         "nan_status": bool(re.search(r"net[.]NAN[.]", history)),
         "ble_peer": "BLE.DISC" in history and "proto=dmesh" in history,
         "nan_peer": "ServiceDiscovered" in history or "FollowupRx" in history,
@@ -207,8 +237,17 @@ def main() -> int:
             pid = ensure_service(args.adb, serial)
             print(f"{serial}: service pid {pid}")
 
+        ble_scan_active: dict[str, bool] = {}
         for idx, serial in enumerate(devices):
-            shell_cmd(args.adb, serial, f"ble.scan reason=live-python-{idx}")
+            ble_scan_response = ble_http(
+                args.adb, serial, idx, "ble.scan", {"id": 1}
+            )
+            (out_dir / f"{serial}-ble-scan.json").write_text(ble_scan_response)
+            ble_status_response = ble_http(
+                args.adb, serial, idx, "ble.status", {"id": 2}
+            )
+            (out_dir / f"{serial}-ble-status.json").write_text(ble_status_response)
+            ble_scan_active[serial] = "scan=true" in ble_status_response
             shell_cmd(args.adb, serial, f"wifi.nan.start reason=live-python-{idx}")
             shell_cmd(args.adb, serial, f"wifi.adv on=1 p2p=0 id4=A{idx:03d}")
 
@@ -230,11 +269,11 @@ def main() -> int:
                 timeout=30,
             )
             (out_dir / f"{serial}-history.txt").write_text(hist)
-            status = analyze_history(hist)
+            status = analyze_history(hist, ble_scan_active.get(serial, False))
             pair_status.append(status)
             print(f"{serial}: {status}")
             if not status["ble_status"]:
-                failures.append(f"{serial}: no BLE status/discovery history")
+                failures.append(f"{serial}: no BLE scan status or discovery history")
             if not status["nan_status"]:
                 failures.append(f"{serial}: no NAN status history")
             collect_logcat(args.adb, serial, out_dir)
@@ -249,7 +288,8 @@ def main() -> int:
             if not status["nan_followup"]:
                 failures.append(f"{serial}: no Android NAN follow-up TX/RX")
 
-        for serial in devices:
+        for idx, serial in enumerate(devices):
+            ble_http(args.adb, serial, idx, "ble.scan_stop", {"id": 3})
             # NAN is the service's always-on discovery plane. The smoke test
             # must not undo it during cleanup; service lifecycle and explicit
             # signed control requests own any future stop.

@@ -10,9 +10,56 @@ use dmesh_fw_transport::{
     shared_ingress_esp::{self, IngressKind, IngressPacket},
     TRANSPORT_MTU,
 };
+use dmesh_server::firmware_profile::TransportProfile;
+use dmesh_server::main_runtime_state::RadioLifecycle;
+use dmesh_server::transport_state::TransportStateObserver;
 use quic_lite::PathId;
 
 pub const BLE_COMPONENT: u64 = 104;
+
+struct BleTransportObserver;
+
+static BLE_PROFILE_GENERATION: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static BLE_PROFILE_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+impl TransportStateObserver for BleTransportObserver {
+    fn transport_applied(
+        &self,
+        requested: &TransportProfile,
+        current: RadioLifecycle,
+        generation: u32,
+    ) {
+        let _ = current;
+        if generation == BLE_PROFILE_GENERATION.load(core::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let snapshot = dmesh_ble::link_snapshot();
+        let live = snapshot.advertising || snapshot.connected || snapshot.coc_connected;
+        match requested.ble {
+            1 => {
+                if !live && !dmesh_ble::start_dmesh_service().is_ok() {
+                    return;
+                }
+                BLE_PROFILE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+                BLE_PROFILE_GENERATION.store(generation, core::sync::atomic::Ordering::Release);
+            }
+            2 => {
+                if live {
+                    let _ = dmesh_ble::stop_dmesh_service();
+                }
+                BLE_PROFILE_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+                BLE_PROFILE_GENERATION.store(generation, core::sync::atomic::Ordering::Release);
+            }
+            _ => {
+                BLE_PROFILE_GENERATION.store(generation, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
+static BLE_TRANSPORT_OBSERVER: BleTransportObserver = BleTransportObserver;
 const BLE_START: u64 = 80;
 const BLE_STOP: u64 = 81;
 const BLE_SCAN: u64 = 82;
@@ -47,6 +94,9 @@ static BLE_EGRESS_BLOCKED_PENDING: core::sync::atomic::AtomicUsize =
 
 pub fn register() {
     assert!(services::register_tagged_component(BLE_COMPONENT, handle_ble));
+    assert!(dmesh_server::transport_state::register_transport_state_observer(
+        &BLE_TRANSPORT_OBSERVER
+    ));
 }
 
 pub fn install() {

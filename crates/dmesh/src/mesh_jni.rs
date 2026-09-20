@@ -18,6 +18,10 @@ use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
 use jni::sys::JNI_VERSION_1_6;
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
+#[cfg(target_os = "android")]
+use anyhow::Context;
+#[cfg(target_os = "android")]
+use async_trait::async_trait;
 use mesh::{
     tagged::{NameOrTag, TaggedRecord},
     wire::response_ok,
@@ -85,6 +89,8 @@ static NAN_EVENTS: OnceLock<Mutex<VecDeque<FrameRecord>>> = OnceLock::new();
 const DISCOVERED_DEVICE_TTL_MS: i64 = 60 * 60 * 1000;
 const NAN_FOLLOWUP_HISTORY_LEN: usize = 32;
 const NAN_EVENT_HISTORY_LEN: usize = 64;
+const BLE_SCAN_RESULT_MAX: usize = 32;
+static BLE_SCAN_RESULTS: OnceLock<Mutex<BTreeMap<String, Value>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct DiscoveredDevice {
@@ -105,6 +111,78 @@ fn nan_followups() -> &'static Mutex<VecDeque<FrameRecord>> {
 
 fn nan_events() -> &'static Mutex<VecDeque<FrameRecord>> {
     NAN_EVENTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NAN_EVENT_HISTORY_LEN)))
+}
+
+fn ble_scan_results_store() -> &'static Mutex<BTreeMap<String, Value>> {
+    BLE_SCAN_RESULTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub(crate) fn record_ble_scan_result(event: &str, payload: &[u8]) {
+    let mut parts = event.splitn(3, ':');
+    if parts.next() != Some("scan_result") {
+        return;
+    }
+    let rssi = parts
+        .next()
+        .and_then(|item| item.strip_prefix("rssi="))
+        .and_then(|value| value.parse::<i32>().ok());
+    let address = parts
+        .next()
+        .and_then(|item| item.strip_prefix("addr="))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if address.is_empty() || !address.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
+        return;
+    }
+    let mut results = match ble_scan_results_store().lock() {
+        Ok(guard) => guard,
+        Err(guard) => guard.into_inner(),
+    };
+    if results.len() == BLE_SCAN_RESULT_MAX && !results.contains_key(address) {
+        if let Some(oldest) = results.keys().next().cloned() {
+            results.remove(&oldest);
+        }
+    }
+    results.insert(
+        address.to_owned(),
+        json!({
+            "address": address,
+            "rssi": rssi,
+            "service_data": bytes_to_hex(payload),
+            "last_seen_ms": chrono::Utc::now().timestamp_millis(),
+        }),
+    );
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn ble_scan_results(limit: Option<u64>) -> Value {
+    let results = match ble_scan_results_store().lock() {
+        Ok(guard) => guard,
+        Err(guard) => guard.into_inner(),
+    };
+    let mut entries: Vec<&Value> = results.values().collect();
+    entries.sort_by(|a, b| {
+        b.get("last_seen_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MIN)
+            .cmp(&a.get("last_seen_ms").and_then(Value::as_i64).unwrap_or(i64::MIN))
+    });
+    let entries = entries
+        .into_iter()
+        .take(limit.unwrap_or(BLE_SCAN_RESULT_MAX as u64) as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    json!({"results": entries, "count": entries.len()})
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn ble_scan_clear() -> Value {
+    let mut results = match ble_scan_results_store().lock() {
+        Ok(guard) => guard,
+        Err(guard) => guard.into_inner(),
+    };
+    results.clear();
+    json!({"status": "cleared"})
 }
 
 fn record_nan_followup(frame: FrameRecord) {
@@ -397,6 +475,452 @@ pub(crate) fn android_nan_wakeup_response(request: &[u8]) -> Option<Vec<u8>> {
         &mut response,
     )?;
     Some(response[..used].to_vec())
+}
+
+#[cfg(target_os = "android")]
+struct AndroidBleBackend;
+
+#[cfg(target_os = "android")]
+fn android_ble_command(method: &str, params: &Value) -> Option<Value> {
+    let (jvm, callback) = android_message_callback().lock().ok()?.clone()?;
+    let mut env = jvm.attach_current_thread().ok()?;
+    let method = env.new_string(method).ok()?;
+    let params = env.new_string(params.to_string()).ok()?;
+    let result = env
+        .call_method(
+            &callback,
+            "onBleCommand",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[
+                jni::objects::JValue::Object((&*method).into()),
+                jni::objects::JValue::Object((&*params).into()),
+            ],
+        )
+        .ok()?;
+    let object = match result {
+        jni::objects::JValueGen::Object(object) => object,
+        _ => return None,
+    };
+    let text: String = env.get_string(&JString::from(object)).ok()?.into();
+    Some(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl dmesh_server::ble_service::BleBackend for AndroidBleBackend {
+    async fn status(&self) -> anyhow::Result<Value> {
+        android_ble_command("ble.status", &json!({}))
+            .context("Android BLE callback is unavailable")
+    }
+    async fn scan(&self) -> anyhow::Result<Value> {
+        android_ble_command("ble.scan", &json!({}))
+            .context("Android BLE callback is unavailable")
+    }
+    async fn scan_stop(&self) -> anyhow::Result<Value> {
+        android_ble_command("ble.scan_stop", &json!({}))
+            .context("Android BLE callback is unavailable")
+    }
+    async fn scan_results(&self, limit: Option<u64>) -> anyhow::Result<Value> {
+        Ok(ble_scan_results(limit))
+    }
+    async fn scan_clear(&self) -> anyhow::Result<Value> {
+        Ok(ble_scan_clear())
+    }
+    async fn connect(&self, address: String, psm: u16) -> anyhow::Result<Value> {
+        android_ble_command(
+            "ble.connect",
+            &json!({"address": address, "psm": psm}),
+        )
+        .context("Android BLE callback is unavailable")
+    }
+    async fn disconnect(&self) -> anyhow::Result<Value> {
+        android_ble_command("ble.disconnect", &json!({}))
+            .context("Android BLE callback is unavailable")
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn register_ble_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    match dmesh_server::ble_service::BleService::mesh_service(Arc::new(AndroidBleBackend)) {
+        Ok(service) => {
+            services.register(dmesh_server::ble_service::SERVICE_NAME, service);
+            true
+        }
+        Err(error) => {
+            log::error!("Failed to register ble service: {error}");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+struct AndroidUsbBackend;
+
+#[cfg(target_os = "android")]
+fn android_usb_command(method: &str, params: &Value) -> Option<Value> {
+    let (jvm, callback) = android_message_callback().lock().ok()?.clone()?;
+    let mut env = jvm.attach_current_thread().ok()?;
+    let method = env.new_string(method).ok()?;
+    let params = env.new_string(params.to_string()).ok()?;
+    let result = env
+        .call_method(
+            &callback,
+            "onUsbCommand",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[
+                jni::objects::JValue::Object((&*method).into()),
+                jni::objects::JValue::Object((&*params).into()),
+            ],
+        )
+        .ok()?;
+    let object = match result {
+        jni::objects::JValueGen::Object(object) => object,
+        _ => return None,
+    };
+    let text: String = env.get_string(&JString::from(object)).ok()?.into();
+    Some(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl dmesh_server::usb_service::UsbBackend for AndroidUsbBackend {
+    async fn status(&self) -> anyhow::Result<Value> {
+        android_usb_command("usb.status", &json!({}))
+            .context("Android USB callback is unavailable")
+    }
+    async fn devices(&self) -> anyhow::Result<Value> {
+        android_usb_command("usb.devices", &json!({}))
+            .context("Android USB callback is unavailable")
+    }
+    async fn open(&self, params: Value) -> anyhow::Result<Value> {
+        android_usb_command("usb.open", &params)
+            .context("Android USB callback is unavailable")
+    }
+    async fn close(&self) -> anyhow::Result<Value> {
+        android_usb_command("usb.close", &json!({}))
+            .context("Android USB callback is unavailable")
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn register_usb_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    match dmesh_server::usb_service::UsbService::mesh_service(Arc::new(AndroidUsbBackend)) {
+        Ok(service) => {
+            services.register(dmesh_server::usb_service::SERVICE_NAME, service);
+            true
+        }
+        Err(error) => {
+            log::error!("Failed to register usb service: {error}");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_java_command(java_method: &str, method: &str, params: &Value) -> Option<Value> {
+    let (jvm, callback) = android_message_callback().lock().ok()?.clone()?;
+    let mut env = jvm.attach_current_thread().ok()?;
+    let method = env.new_string(method).ok()?;
+    let params = env.new_string(params.to_string()).ok()?;
+    let result = env
+        .call_method(
+            &callback,
+            java_method,
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[
+                jni::objects::JValue::Object((&*method).into()),
+                jni::objects::JValue::Object((&*params).into()),
+            ],
+        )
+        .ok()?;
+    let object = match result {
+        jni::objects::JValueGen::Object(object) => object,
+        _ => return None,
+    };
+    let text: String = env.get_string(&JString::from(object)).ok()?.into();
+    Some(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+#[cfg(target_os = "android")]
+struct AndroidWifiBackend;
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl dmesh_server::wifi_service::WifiBackend for AndroidWifiBackend {
+    async fn status(&self) -> anyhow::Result<Value> {
+        android_java_command("onWifiCommand", "wifi.status", &json!({}))
+            .context("Android Wi-Fi callback is unavailable")
+    }
+    async fn scan(&self) -> anyhow::Result<Value> {
+        android_java_command("onWifiCommand", "wifi.scan", &json!({}))
+            .context("Android Wi-Fi callback is unavailable")
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn register_wifi_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    match dmesh_server::wifi_service::WifiService::mesh_service(Arc::new(
+        AndroidWifiBackend,
+    )) {
+        Ok(service) => {
+            services.register(dmesh_server::wifi_service::SERVICE_NAME, service);
+            true
+        }
+        Err(error) => {
+            log::error!("Failed to register wifi service: {error}");
+            false
+        }
+    }
+}
+
+fn android_transport_set_projection(params: &Value) -> anyhow::Result<Value> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("transport.set params must be an object"))?;
+    let transport_mode = object.get("mode");
+    let mode_nan = transport_mode.is_some_and(|mode| {
+        matches!(mode.as_str(), Some("nan" | "aware")) || mode.as_u64() == Some(6)
+    });
+    let enabled = |value: Option<&Value>| {
+        value.is_some_and(|value| value.as_u64() == Some(1) || value.as_str() == Some("1"))
+    };
+    let p2p_go = enabled(object.get("ap")) || enabled(object.get("p2p_go"));
+    let sta = transport_mode
+        .is_some_and(|mode| mode.as_str() == Some("sta") || mode.as_u64() == Some(1));
+    let radio_off = transport_mode
+        .is_some_and(|mode| mode.as_str() == Some("uart") || mode.as_u64() == Some(5));
+    let operation = if radio_off {
+        "stop"
+    } else if sta {
+        "sta"
+    } else if mode_nan && p2p_go {
+        "p2p_go"
+    } else if mode_nan {
+        "nan"
+    } else {
+        anyhow::bail!("no Android backend for transport.set mode");
+    };
+    Ok(json!({
+        "status": "accepted",
+        "operation": operation,
+        "request": {"method": "transport.set", "params": params}
+    }))
+}
+
+#[cfg(target_os = "android")]
+struct AndroidTransportBackend;
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl dmesh_server::transport_service::TransportBackend for AndroidTransportBackend {
+    async fn status(&self) -> anyhow::Result<Value> {
+        android_java_command("onTransportCommand", "transport.status", &json!({}))
+            .context("Android transport callback is unavailable")
+    }
+    async fn set(&self, params: Value) -> anyhow::Result<Value> {
+        let projection = android_transport_set_projection(&params)?;
+        let result = android_java_command(
+            "onTransportCommand",
+            "transport.apply_projection",
+            &json!({"projection": projection.to_string()}),
+        )
+        .context("Android transport callback is unavailable")?;
+        let mut output = projection;
+        output["result"] = result;
+        Ok(output)
+    }
+    async fn start(&self, params: Value) -> anyhow::Result<Value> {
+        android_java_command("onTransportCommand", "transport.start", &params)
+            .context("Android NAN callback is unavailable")
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn register_transport_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    match dmesh_server::transport_service::TransportService::mesh_service(Arc::new(
+        AndroidTransportBackend,
+    )) {
+        Ok(service) => {
+            services.register(
+                dmesh_server::transport_service::SERVICE_NAME,
+                service,
+            );
+            true
+        }
+        Err(error) => {
+            log::error!("Failed to register transport service: {error}");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_radio_history(
+    limit: Option<u64>,
+    since_ms: Option<u64>,
+    keys: Option<String>,
+) -> Value {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let cutoff = since_ms
+        .map(|value| value as i64)
+        .unwrap_or_else(|| now_ms.saturating_sub(1_500));
+    let filters: Vec<String> = keys
+        .map(|keys| {
+            keys.split(',')
+                .map(|key| key.trim().to_ascii_lowercase())
+                .filter(|key| !key.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let matches = |texts: &[&str]| -> bool {
+        filters.is_empty()
+            || texts.iter().any(|text| {
+                let text = text.to_ascii_lowercase();
+                filters.iter().any(|filter| text.contains(filter))
+            })
+    };
+    let take = limit.unwrap_or(64).min(256) as usize;
+    let events = {
+        let history = nan_events()
+            .lock()
+            .map_or_else(|guard| guard.into_inner(), |guard| guard);
+        history
+            .iter()
+            .rev()
+            .filter(|entry| entry.timestamp >= cutoff)
+            .filter(|entry| {
+                matches(&[
+                    entry.protocol.as_str(),
+                    entry.msg_type.as_deref().unwrap_or(""),
+                    entry.src_device.as_str(),
+                ])
+            })
+            .take(take)
+            .map(|entry| {
+                json!({
+                    "kind": "event",
+                    "last_seen_ms": entry.timestamp,
+                    "protocol": entry.protocol,
+                    "event": entry.msg_type,
+                    "peer": entry.src_device,
+                    "payload_hash": entry.payload_hash,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let followups = {
+        let history = nan_followups()
+            .lock()
+            .map_or_else(|guard| guard.into_inner(), |guard| guard);
+        history
+            .iter()
+            .rev()
+            .filter(|entry| entry.timestamp >= cutoff)
+            .filter(|entry| {
+                matches(&[
+                    entry.protocol.as_str(),
+                    entry.msg_type.as_deref().unwrap_or(""),
+                    entry.src_device.as_str(),
+                    entry.target_device.as_deref().unwrap_or(""),
+                ])
+            })
+            .take(take)
+            .map(|entry| {
+                json!({
+                    "kind": "followup",
+                    "last_seen_ms": entry.timestamp,
+                    "protocol": entry.protocol,
+                    "event": entry.msg_type,
+                    "source": entry.src_device,
+                    "target": entry.target_device,
+                    "seq": entry.seq,
+                    "payload_hash": entry.payload_hash,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let ble_results = {
+        let ble = ble_scan_results(None);
+        let results = ble
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|results| {
+                results
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("last_seen_ms")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(i64::MIN)
+                            >= cutoff
+                    })
+                    .filter(|entry| {
+                        matches(&[
+                            "ble",
+                            entry
+                                .get("address")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        ])
+                    })
+                    .take(take)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({"results": results, "count": results.len()})
+    };
+    json!({
+        "events": events,
+        "followups": followups,
+        "ble_scan_results": ble_results,
+        "count": events.len() + followups.len() + ble_results["count"].as_u64().unwrap_or(0) as usize
+    })
+}
+
+#[cfg(target_os = "android")]
+struct AndroidHistoryBackend;
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl dmesh_server::history_service::HistoryBackend for AndroidHistoryBackend {
+    async fn radio_history(
+        &self,
+        limit: Option<u64>,
+        since_ms: Option<u64>,
+        keys: Option<String>,
+    ) -> anyhow::Result<Value> {
+        Ok(android_radio_history(limit, since_ms, keys))
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn register_history_service(
+    services: &ssh_mesh::mesh_rest::MeshServiceRegistry,
+) -> bool {
+    match dmesh_server::history_service::HistoryService::mesh_service(Arc::new(
+        AndroidHistoryBackend,
+    )) {
+        Ok(service) => {
+            services.register(
+                dmesh_server::history_service::SERVICE_NAME,
+                service,
+            );
+            true
+        }
+        Err(error) => {
+            log::error!("Failed to register history service: {error}");
+            false
+        }
+    }
 }
 
 /// Build Android's current bearer-neutral presence record from framework
@@ -1408,6 +1932,9 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
         "radio.transport.event" => {
             let transport = cmd.data.get("transport").cloned().unwrap_or_default();
             let event = cmd.data.get("event").cloned().unwrap_or_default();
+            if transport == "ble" && event.starts_with("scan_result:") {
+                record_ble_scan_result(&event, payload);
+            }
             let frame = FrameRecord {
                 protocol: format!("android_{transport}_event"),
                 payload_hash: 0,
@@ -1456,47 +1983,12 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             ) {
                 return radio_message(method, "", &[], -1);
             }
-            // Schema enum fields are represented by their stable numeric tag
-            // at this adapter boundary. Accept the text form as well for an
-            // older local caller, but project both forms through the one
-            // `transport.set` Android operation.
-            let transport_mode = params.and_then(|params| params.get("mode"));
-            let mode_nan = method == "transport.set"
-                && transport_mode.is_some_and(|mode| {
-                    matches!(mode.as_str(), Some("nan" | "aware")) || mode.as_u64() == Some(6)
-                });
-            let p2p_go = params
-                .and_then(|params| params.get("ap"))
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == "1")
-                || params
-                    .and_then(|params| params.get("p2p_go"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value == "1");
-            let sta = method == "transport.set"
-                && transport_mode
-                    .is_some_and(|mode| mode.as_str() == Some("sta") || mode.as_u64() == Some(1));
-            // `uart` is the portable all-radio-off profile.  Android has no
-            // UART bearer, so its projection only tears down the Android
-            // Wi-Fi personalities; it does not invent a separate
-            // `wifi.nan.stop` command surface.
-            let radio_off = method == "transport.set"
-                && transport_mode
-                    .is_some_and(|mode| mode.as_str() == Some("uart") || mode.as_u64() == Some(5));
-            let operation = if radio_off {
-                "stop"
-            } else if sta {
-                "sta"
-            } else if mode_nan && p2p_go {
-                "p2p_go"
-            } else if mode_nan {
-                "nan"
-            } else {
-                anyhow::bail!("no Android backend for schema command: {method}");
-            };
-            json!({"status": "accepted", "operation": operation, "request": request})
-                .to_string()
-                .into_bytes()
+            if method == "transport.set" {
+                let params_value = Value::Object(params.cloned().unwrap_or_default());
+                return android_transport_set_projection(&params_value)
+                    .map(|projection| projection.to_string().into_bytes());
+            }
+            anyhow::bail!("no Android backend for schema command: {method}");
         }
         "radio.nan.build_followup" => {
             let msg_type = cmd
@@ -1529,10 +2021,58 @@ fn radio_message(method: &str, args: &str, payload: &[u8], _fd: i32) -> anyhow::
             let mut out = [0u8; 96];
             let used = dmesh_server::control::encode_request(request, None, &mut out)
                 .ok_or_else(|| anyhow::anyhow!("encode targeted STA activation"))?;
-            // WifiAware's `sendMessage` payload is the service-info body of
-            // a NAN Follow-up, not a bare DMesh control channel. Keep the
-            // same envelope consumed by ESP/host adapters so the receiver can
-            // validate framing before it dispatches the target-checked CBOR.
+            radio_protocol::build_nan_followup("wake_request", &source, &wake_target, &out[..used])?
+        }
+        "radio.nan.build_activation" => {
+            let source = hex_to_bytes(required_data(&cmd, "source_id")?)?;
+            let source: [u8; 6] = source
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("source_id must be exactly six bytes"))?;
+            let wake_target = hex_to_bytes(required_data(&cmd, "wake_target")?)?;
+            let wake_target: [u8; 6] = wake_target
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("wake_target must be exactly six bytes"))?;
+            let id = parse_u32(&cmd, "id", 1)?.max(1) as u64;
+            let kind = match parse_i32(&cmd, "kind", 6)? {
+                1 => dmesh_server::control::TransportKind::Sta,
+                5 => dmesh_server::control::TransportKind::Uart,
+                6 => dmesh_server::control::TransportKind::Nan,
+                other => anyhow::bail!("unsupported transport kind {other}"),
+            };
+            let nan = matches!(kind, dmesh_server::control::TransportKind::Nan);
+            let default_on = if nan { 1 } else { 0 };
+            let ap = parse_i32(&cmd, "ap", default_on)?;
+            let now = parse_i32(&cmd, "now", default_on)?;
+            let ble = parse_i32(&cmd, "ble", 0)?;
+            let dw = parse_i32(&cmd, "nan_dw_interval", default_on)?;
+            if !matches!(ap, 0..=1) {
+                anyhow::bail!("ap must be 0 or 1");
+            }
+            if !matches!(now, 0..=2) {
+                anyhow::bail!("now must be 0, 1, or 2");
+            }
+            if !matches!(ble, 0..=2) {
+                anyhow::bail!("ble must be 0, 1, or 2");
+            }
+            if !matches!(dw, 0 | 1 | 8 | 16) {
+                anyhow::bail!("nan_dw_interval must be 0, 1, 8, or 16");
+            }
+            let request = dmesh_server::control::Request::TransportSet {
+                kind,
+                config: dmesh_server::control::TransportConfig {
+                    nan_dw_interval: nan.then_some(dw as u8),
+                    now: Some(now as u8),
+                    ap: Some(ap as u8),
+                    ble: Some(ble as u8),
+                    wake_target: Some(wake_target),
+                    ..dmesh_server::control::TransportConfig::default()
+                },
+            };
+            let mut out = [0u8; 160];
+            let used = dmesh_server::control::encode_request(request, Some(id), &mut out)
+                .ok_or_else(|| anyhow::anyhow!("encode targeted activation"))?;
             radio_protocol::build_nan_followup("wake_request", &source, &wake_target, &out[..used])?
         }
         "radio.nan.parse_followup" => radio_protocol::parse_nan_followup(payload)?
@@ -2181,10 +2721,16 @@ impl SshClientListener for JniSshClientListener {
 struct JavaBearerEgress {
     jvm: Arc<JavaVM>,
     callback: GlobalRef,
+    frame: GlobalRef,
+    scratch: Mutex<[u8; crate::bearer::BEARER_FRAME_MAX]>,
 }
 
 impl crate::bearer::BearerEgress for JavaBearerEgress {
     fn send_packet(&self, bearer: &str, packet: &[u8]) {
+        if packet.is_empty() || packet.len() > crate::bearer::COC_PACKET_MAX {
+            log::error!("Rejected bearer egress packet of {} bytes", packet.len());
+            return;
+        }
         let mut env = match self.jvm.attach_current_thread() {
             Ok(value) => value,
             Err(error) => {
@@ -2199,20 +2745,32 @@ impl crate::bearer::BearerEgress for JavaBearerEgress {
                 return;
             }
         };
-        let j_packet = match env.byte_array_from_slice(packet) {
+        let mut scratch = match self.scratch.lock() {
             Ok(value) => value,
-            Err(error) => {
-                log::error!("Failed to create bearer egress bytes: {}", error);
-                return;
-            }
+            Err(value) => value.into_inner(),
         };
+        let length = if crate::bearer::is_uart_bearer(bearer) {
+            crate::bearer::encode_uart_packet(bearer, packet, &mut scratch[..]).unwrap_or(0)
+        } else {
+            crate::bearer::coc_frame(packet, &mut scratch[..]).unwrap_or(0)
+        };
+        if length == 0 {
+            return;
+        }
+        let frame = <&JByteArray>::from(self.frame.as_obj());
+        if let Err(error) = env.set_byte_array_region(frame, 0, unsafe {
+            std::slice::from_raw_parts(scratch.as_ptr() as *const jni::sys::jbyte, length)
+        }) {
+            log::error!("Failed to stage bearer egress frame: {}", error);
+            return;
+        }
         if let Err(error) = env.call_method(
             &self.callback,
-            "onBearerPacket",
-            "(Ljava/lang/String;[B)V",
-            &[(&j_bearer).into(), (&j_packet).into()],
+            "onBearerFrame",
+            "(Ljava/lang/String;[BI)V",
+            &[(&j_bearer).into(), (&frame).into(), (length as i32).into()],
         ) {
-            log::error!("Failed to deliver bearer egress packet: {}", error);
+            log::error!("Failed to deliver bearer egress frame: {}", error);
         }
     }
 }
@@ -2255,9 +2813,21 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeSetCal
     });
     handle.node.add_listener(mesh_listener);
 
+    let frame = match env
+        .byte_array_from_slice(&[0u8; crate::bearer::BEARER_FRAME_MAX])
+        .and_then(|value| env.new_global_ref(&value))
+    {
+        Ok(value) => value,
+        Err(e) => {
+            log::error!("Failed to create bearer egress frame buffer: {}", e);
+            return;
+        }
+    };
     let bearer_egress = Arc::new(JavaBearerEgress {
         jvm: jvm.clone(),
         callback: callback_ref.clone(),
+        frame,
+        scratch: Mutex::new([0u8; crate::bearer::BEARER_FRAME_MAX]),
     });
     crate::bearer::set_current(Some(crate::bearer::BearerRuntime::spawn(
         handle.runtime.handle().clone(),
@@ -2410,23 +2980,40 @@ pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearer
     }
 }
 
+static BEARER_CHUNK_BUFFER: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
+fn bearer_chunk_buffer(length: usize) -> std::sync::MutexGuard<'static, Vec<u8>> {
+    let buffer = BEARER_CHUNK_BUFFER.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = buffer.lock().unwrap_or_else(|value| value.into_inner());
+    guard.resize(length, 0);
+    guard
+}
+
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearerPacket(
+pub extern "system" fn Java_com_github_costinm_dmeshnative_MeshNode_nativeBearerChunk(
     mut env: JNIEnv,
     _class: JClass,
     _handle: jlong,
     bearer: JString,
-    packet: JByteArray,
+    chunk: JByteArray,
+    length: jint,
 ) -> jboolean {
-    let bearer: String = match env.get_string(&bearer) {
-        Ok(value) => value.into(),
-        Err(_) => return JNI_FALSE,
+    let Ok(value) = env.get_string(&bearer) else {
+        return JNI_FALSE;
     };
-    let packet = match env.convert_byte_array(&packet) {
-        Ok(value) => value,
-        Err(_) => return JNI_FALSE,
-    };
-    if crate::bearer::packet(&bearer, &packet) {
+    let bearer: String = value.into();
+    let length = (length.max(0) as usize).min(65535);
+    if length == 0 {
+        return JNI_TRUE;
+    }
+    let mut buffer = bearer_chunk_buffer(length);
+    if let Err(error) = env.get_byte_array_region(&chunk, 0, unsafe {
+        std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut jni::sys::jbyte, length)
+    }) {
+        log::error!("Failed to read bearer chunk bytes: {}", error);
+        return JNI_FALSE;
+    }
+    if crate::bearer::chunk(&bearer, &buffer[..length]) {
         JNI_TRUE
     } else {
         JNI_FALSE
@@ -3308,6 +3895,16 @@ mod tests {
     }
 
     #[test]
+    fn android_transport_projection_accepts_numeric_p2p_flags() {
+        let projection = android_transport_set_projection(&json!({
+            "mode": "nan",
+            "ap": 1,
+        }))
+        .unwrap();
+        assert_eq!(projection["operation"], "p2p_go");
+    }
+
+    #[test]
     fn android_nan_sta_activation_is_a_targeted_common_transport_set() {
         let wire = radio_message(
             "radio.nan.build_sta_activation",
@@ -3323,6 +3920,32 @@ mod tests {
                 kind: dmesh_server::control::TransportKind::Sta,
                 config: dmesh_server::control::TransportConfig {
                     wake_target: Some([0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c]),
+                    ..
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn android_nan_activation_is_a_parameterized_targeted_transport_set() {
+        let wire = radio_message(
+            "radio.nan.build_activation",
+            "source_id=010203040506 wake_target=d8a01d4c5e1c kind=6 ap=1 now=1 ble=1 nan_dw_interval=1",
+            &[],
+            -1,
+        )
+        .unwrap();
+        assert!(matches!(
+            dmesh_rawnan::parse_dmesh_nan_followup(&wire)
+                .and_then(|followup| dmesh_server::control::decode_request(followup.payload)),
+            Some(dmesh_server::control::Request::TransportSet {
+                kind: dmesh_server::control::TransportKind::Nan,
+                config: dmesh_server::control::TransportConfig {
+                    wake_target: Some([0xd8, 0xa0, 0x1d, 0x4c, 0x5e, 0x1c]),
+                    nan_dw_interval: Some(1),
+                    now: Some(1),
+                    ap: Some(1),
+                    ble: Some(1),
                     ..
                 },
             })
@@ -3373,5 +3996,29 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("do not accept"));
+    }
+
+    #[test]
+    fn android_companion_pages_target_the_registered_http_services() {
+        let ble = include_str!("../../../android/app-dmesh/src/main/assets/ble.html");
+        for method in [
+            "ble.status",
+            "ble.scan",
+            "ble.scan_stop",
+            "ble.scan_clear",
+            "ble.scan_results",
+            "ble.connect",
+            "ble.disconnect",
+        ] {
+            assert!(ble.contains(method), "BLE companion omits {method}");
+        }
+        assert!(ble.contains("services/${encodeURIComponent(service)}/call/"));
+        assert!(ble.contains("'transport'"));
+
+        let usb = include_str!("../../../android/app-dmesh/src/main/assets/usb.html");
+        for method in ["usb.status", "usb.devices", "usb.open", "usb.close"] {
+            assert!(usb.contains(method), "USB companion omits {method}");
+        }
+        assert!(usb.contains("services/usb/call/"));
     }
 }

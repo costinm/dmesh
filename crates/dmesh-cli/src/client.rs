@@ -2965,6 +2965,7 @@ fn flash_target_from_catalog_profile(profile: &DeviceProfile) -> Result<FlashTar
             .unwrap_or_else(|| name.to_owned()),
         node,
         mac: profile.mac,
+        known_peer: catalog_udp6_peer(profile)?,
     })
 }
 
@@ -3443,6 +3444,9 @@ struct FlashTarget {
     description: String,
     node: Option<String>,
     mac: Option<[u8; 6]>,
+    /// Catalogued direct UDP6 bearer. This is only an optimization before
+    /// multicast discovery; the signed announce remains the identity check.
+    known_peer: Option<SocketAddr>,
 }
 
 fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
@@ -3451,6 +3455,7 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
             description: value.to_owned(),
             node: None,
             mac: Some(mac),
+            known_peer: None,
         });
     }
     if let Ok(vip6) = value.parse::<Ipv6Addr>() {
@@ -3461,6 +3466,11 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
             description: value.to_owned(),
             node: Some(hex_encode(&vip6.octets()[8..])),
             mac: None,
+            known_peer: resolve_catalog_target(value)?
+                .as_ref()
+                .map(catalog_udp6_peer)
+                .transpose()?
+                .flatten(),
         });
     }
     if value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -3468,6 +3478,7 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
             description: value.to_owned(),
             node: Some(value.to_ascii_lowercase()),
             mac: None,
+            known_peer: None,
         });
     }
     let host = catalog_vip6_inventory()?
@@ -3476,10 +3487,13 @@ fn resolve_flash_target(value: &str) -> Result<FlashTarget, String> {
         .ok_or_else(|| {
             format!("unknown flash hostname {value:?}; add vip6 to the shared device catalog")
         })?;
+    let profile = resolve_catalog_target(value)?
+        .ok_or_else(|| format!("catalog device {value:?} has no VIP6 profile"))?;
     Ok(FlashTarget {
         description: format!("{} ({})", host.name, host.vip6),
         node: Some(host.node),
         mac: host.mac,
+        known_peer: catalog_udp6_peer(&profile)?,
     })
 }
 
@@ -3595,12 +3609,36 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
     );
     let target_mac = target.mac;
     let mut observed_node_id = target.node.clone();
+    // A catalogued scoped UDP6 bearer is the fastest safe way to reach a
+    // target that has just accepted NAN wakeup.  Multicast cannot be used as
+    // an activity test: a newly associated device may answer a unicast stream
+    // before it sends its next periodic presence.  Require the same signed
+    // direct discovery response used by all catalog service calls.
+    let direct_probe_started = Instant::now();
+    let mut selected = target.known_peer.and_then(|peer| {
+        direct_discovery_announce(peer)
+            .ok()
+            .filter(|(_, announce)| flash_target_matches_announce(announce, &target))
+            .map(|(_, announce)| (peer, announce))
+    });
+    println!(
+        "dmesh_flash_gate direct_target_ready={}",
+        selected.is_some()
+    );
+    report_flash_step("direct_target_probe", started, direct_probe_started);
+
     let discovery_started = Instant::now();
-    let mut peers = multicast_discover_peers()?;
+    let mut peers = if selected.is_none() {
+        multicast_discover_peers()?
+    } else {
+        Vec::new()
+    };
     let mut target_peer = peers
         .iter()
         .find(|peer| flash_target_matches(peer, &target));
-    let mut selected = target_peer.map(|peer| (peer.peer, peer.announce));
+    if selected.is_none() {
+        selected = target_peer.map(|peer| (peer.peer, peer.announce));
+    }
     // An absent multicast target was reached only by the bounded NAN wake
     // path below. Preserve its battery-oriented personality after a verified
     // update instead of silently converting an installed sleepy device into
@@ -3835,7 +3873,7 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
         ensure_stream_success(exchange_udp_stream_record(peer, &status)?, "Main status")?;
         println!("dmesh_flash_gate main_healthy=true peer={peer}");
         report_flash_step("main_health", started, health_started);
-        restore_sleepy_after_flash(peer, &announce, was_sleepy, started)?;
+        restore_sleepy_after_flash(peer, was_sleepy, started)?;
         println!(
             "dmesh_flash_timing stage=complete target={} image={} elapsed_ms={}",
             target.description,
@@ -3956,7 +3994,7 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
             {
                 println!("dmesh_flash_gate main_healthy=true peer={health_peer}");
                 report_flash_step("main_health", started, main_health_started);
-                restore_sleepy_after_flash(health_peer, &announce, was_sleepy, started)?;
+                restore_sleepy_after_flash(health_peer, was_sleepy, started)?;
                 println!(
                     "dmesh_flash_timing stage=complete target={} elapsed_ms={}",
                     target.description,
@@ -3970,7 +4008,6 @@ fn run_automated_flash_timed(arguments: &[String], started: Instant) -> Result<(
 
 fn restore_sleepy_after_flash(
     peer: SocketAddr,
-    announce: &announce::Announce,
     was_sleepy: bool,
     started: Instant,
 ) -> Result<(), String> {
@@ -3988,26 +4025,25 @@ fn restore_sleepy_after_flash(
     // target must disappear from UDP multicast after the one submission.
     let restore_reply = exchange_udp_stream_record(peer, &restore)
         .and_then(|response| ensure_stream_success(response, "sleepy profile restore"));
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let target_node = hex_encode(announce.device_id());
-    let mut absent = false;
-    while Instant::now() < deadline {
-        let peers = multicast_discover_peers()?;
-        if !peers.iter().any(|candidate| candidate.node == target_node) {
-            absent = true;
-            break;
-        }
-    }
-    if !absent {
+    // Main keeps the just-used UDP bearer alive long enough to return the
+    // correlated transport reply and settle its radio epoch. An immediate
+    // multicast probe therefore observes the old active endpoint even when
+    // the requested NAN-only profile has already committed. A DW node may
+    // also answer a multicast discovery packet during its brief radio window,
+    // so multicast presence cannot establish that the STA/UDP control path
+    // remained active. After the handoff, require the stronger inverse: a
+    // normal unicast QUIC identity stream must no longer be reachable.
+    std::thread::sleep(Duration::from_secs(6));
+    if firmware_identity(peer).is_ok() {
         return Err(format!(
-            "sleepy_profile_restore=false target remained on UDP multicast{}",
+            "sleepy_profile_restore=false target still accepted a unicast UDP identity stream{}",
             restore_reply
                 .err()
                 .map(|error| format!("; reply={error}"))
                 .unwrap_or_default()
         ));
     }
-    println!("dmesh_flash_gate sleepy_profile_restored=true peer={peer} udp_absent=true");
+    println!("dmesh_flash_gate sleepy_profile_restored=true peer={peer} unicast_udp_absent=true");
     report_flash_step("sleepy_profile_restore", started, restore_started);
     Ok(())
 }

@@ -73,6 +73,7 @@ const FIELD_OPEN: u64 = 24;
 /// discovery metadata: an active Subscribe is normally broadcast, so its
 /// receiver must reject a wake for another device.
 const FIELD_WAKE_TARGET: u64 = 25;
+const FIELD_BLE: u64 = 26;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
@@ -108,7 +109,7 @@ pub struct TransportConfig<'a> {
     pub ap: Option<u8>,
     pub open: Option<bool>,
     pub uart: Option<u8>,
-    /// Required for a NAN active-Subscribe wake. Other bearers may omit it.
+    pub ble: Option<u8>,
     pub wake_target: Option<[u8; 6]>,
 }
 
@@ -305,6 +306,13 @@ fn decode_transport_config(encoded: &[u8]) -> Option<TransportConfig<'_>> {
                 config.ap = Some(enabled);
             }
             FIELD_OPEN => config.open = Some(d.boolean()?),
+            FIELD_BLE => {
+                let enabled = d.uint()? as u8;
+                if enabled > 2 {
+                    return None;
+                }
+                config.ble = Some(enabled);
+            }
             FIELD_WAKE_TARGET => {
                 let bytes = d.bytes_ref()?;
                 config.wake_target = (bytes.len() == 6).then(|| bytes.try_into().ok()).flatten();
@@ -445,6 +453,7 @@ fn transport_config_count(config: TransportConfig<'_>) -> u64 {
         config.ap.is_some(),
         config.open.is_some(),
         config.uart.is_some(),
+        config.ble.is_some(),
         config.wake_target.is_some(),
     ]
     .into_iter()
@@ -516,6 +525,13 @@ fn encode_config(config: TransportConfig<'_>, e: &mut Encoder<'_>) -> Option<()>
         }
         e.uint(FIELD_UART)?;
         e.uint(u64::from(value))?;
+    }
+    if let Some(value) = config.ble {
+        if value > 2 {
+            return None;
+        }
+        e.uint(FIELD_BLE)?;
+        e.uint(value as u64)?;
     }
     if let Some(target) = config.wake_target {
         e.uint(FIELD_WAKE_TARGET)?;
@@ -619,6 +635,7 @@ mod tests {
             nan_dw_interval: Some(8),
             ndp: Some(1),
             ap: Some(1),
+            ble: Some(1),
             ..TransportConfig::default()
         };
         let used = encode_request(

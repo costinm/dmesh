@@ -107,6 +107,13 @@ Keys `31:light_sleep_attempts`, `32:light_sleep_entries`,
 failed entry followed by radio reconstruction. An entry failure is never
 evidence of a wake or of the requested interval having elapsed.
 
+Keys `36:first_frame_after_wake_us` and `37:first_beacon_after_wake_us`
+measure receive readiness from the explicit wake boundary. A zero value means
+the corresponding frame was not observed before the next sleep boundary; it
+does not mean instantaneous receive. They make per-device wake-lead tuning
+observable without treating a successful Wi-Fi restart as proof that the NAN
+beacon was actually received.
+
 ```mesh-api
 id = "telemetry.udp6_metrics"
 component = "telemetry"

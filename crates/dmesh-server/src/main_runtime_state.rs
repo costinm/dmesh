@@ -92,6 +92,9 @@ pub enum MainEvent {
     BootProfile {
         mode: RequestedMode,
         sleepy: bool,
+        /// Committed boot-profile generation.  The firmware applies boot
+        /// setup synchronously, so its following completion is current.
+        generation: u32,
     },
     ProfileRequested {
         mode: RequestedMode,
@@ -180,6 +183,10 @@ pub struct MainRuntimeSnapshot {
     pub light_sleep_skipped: u32,
     pub last_sleep_requested_us: u32,
     pub last_sleep_duration_us: u32,
+    /// Last event rejected as stale. `0` means none; `1..=6` identify
+    /// duplicate profile, radio-applied, radio-failed, sleep-deadline,
+    /// sleep-entered, and wake respectively.
+    pub last_stale_reason: u8,
 }
 
 /// The complete policy state, owned by one Main task for its whole lifetime.
@@ -211,6 +218,7 @@ pub struct MainRuntimeState {
     light_sleep_skipped: u32,
     last_sleep_requested_us: u32,
     last_sleep_duration_us: u32,
+    last_stale_reason: u8,
 }
 
 impl Default for MainRuntimeState {
@@ -238,11 +246,17 @@ impl Default for MainRuntimeState {
             light_sleep_skipped: 0,
             last_sleep_requested_us: 0,
             last_sleep_duration_us: 0,
+            last_stale_reason: 0,
         }
     }
 }
 
 impl MainRuntimeState {
+    fn record_stale(&mut self, reason: u8) {
+        self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+        self.last_stale_reason = reason;
+    }
+
     /// Apply one queued event and return the one adapter operation it requires.
     /// Called only by the Main owner task after it dequeues an event; it never
     /// polls hardware or waits, so host tests can exhaustively cover ordering.
@@ -252,16 +266,18 @@ impl MainRuntimeState {
                 mode: self.desired_mode,
                 generation: self.desired_generation,
             },
-            MainEvent::BootProfile { mode, sleepy } => {
+            MainEvent::BootProfile {
+                mode,
+                sleepy,
+                generation,
+            } => {
                 self.desired_mode = mode;
+                self.desired_generation = generation;
                 self.sleepy = sleepy;
                 self.radio_lifecycle = RadioLifecycle::Starting;
                 self.power_lifecycle = PowerLifecycle::Awake;
                 self.sleep_blockers = SleepBlockers::RADIO_TRANSITION;
-                MainEffect::ApplyRadio {
-                    mode,
-                    generation: self.desired_generation,
-                }
+                MainEffect::ApplyRadio { mode, generation }
             }
             MainEvent::ProfileRequested {
                 mode,
@@ -270,7 +286,7 @@ impl MainRuntimeState {
                 request_id,
             } => {
                 if generation <= self.desired_generation {
-                    self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+                    self.record_stale(1);
                     return MainEffect::None;
                 }
                 self.desired_mode = mode;
@@ -291,7 +307,7 @@ impl MainRuntimeState {
                 lifecycle,
             } => {
                 if generation != self.desired_generation {
-                    self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+                    self.record_stale(2);
                     return MainEffect::None;
                 }
                 self.radio_lifecycle = lifecycle;
@@ -302,7 +318,7 @@ impl MainRuntimeState {
             }
             MainEvent::RadioFailed { generation, error } => {
                 if generation != self.desired_generation {
-                    self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+                    self.record_stale(3);
                     return MainEffect::None;
                 }
                 self.radio_lifecycle = RadioLifecycle::Failed;
@@ -315,7 +331,7 @@ impl MainRuntimeState {
                 blockers,
             } => {
                 if generation != self.desired_generation || !self.sleepy {
-                    self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+                    self.record_stale(4);
                     return MainEffect::None;
                 }
                 self.sleep_blockers = blockers;
@@ -329,7 +345,7 @@ impl MainRuntimeState {
             }
             MainEvent::SleepEntered { generation } => {
                 if generation != self.desired_generation {
-                    self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+                    self.record_stale(5);
                     return MainEffect::None;
                 }
                 self.power_lifecycle = PowerLifecycle::LightSleeping;
@@ -337,7 +353,7 @@ impl MainRuntimeState {
             }
             MainEvent::Wake { generation, cause } => {
                 if generation != self.desired_generation {
-                    self.stale_completion_count = self.stale_completion_count.saturating_add(1);
+                    self.record_stale(6);
                     return MainEffect::None;
                 }
                 self.power_lifecycle = PowerLifecycle::Waking;
@@ -402,6 +418,7 @@ impl MainRuntimeState {
             light_sleep_skipped: self.light_sleep_skipped,
             last_sleep_requested_us: self.last_sleep_requested_us,
             last_sleep_duration_us: self.last_sleep_duration_us,
+            last_stale_reason: self.last_stale_reason,
         }
     }
 
@@ -410,7 +427,25 @@ impl MainRuntimeState {
     pub const fn lifecycle_for(mode: RequestedMode) -> RadioLifecycle {
         RadioLifecycle::from_requested(mode)
     }
+}
 
+impl MainRuntimeSnapshot {
+    pub const fn lifecycle(self) -> RadioLifecycle {
+        match self.radio_lifecycle {
+            0 => RadioLifecycle::Stopped,
+            1 => RadioLifecycle::Starting,
+            2 => RadioLifecycle::NanNow,
+            3 => RadioLifecycle::Sta,
+            4 => RadioLifecycle::StaNanNow,
+            5 => RadioLifecycle::StaAp,
+            6 => RadioLifecycle::StaApNanNow,
+            7 => RadioLifecycle::Stopping,
+            _ => RadioLifecycle::Failed,
+        }
+    }
+}
+
+impl MainRuntimeState {
     /// Account for a coalesced queue-overflow count in constant time. Called
     /// by the one runtime owner after it atomically drains an adapter counter;
     /// it never loops in response to a pathological producer.
@@ -442,10 +477,11 @@ mod tests {
             state.reduce(MainEvent::BootProfile {
                 mode: RequestedMode::NanNow,
                 sleepy: true,
+                generation: 7,
             }),
             MainEffect::ApplyRadio {
                 mode: RequestedMode::NanNow,
-                generation: 0,
+                generation: 7,
             }
         );
         assert!(state.snapshot().sleepy);
@@ -453,6 +489,13 @@ mod tests {
             state.snapshot().radio_lifecycle,
             RadioLifecycle::Starting as u8
         );
+        state.reduce(MainEvent::RadioApplied {
+            generation: 7,
+            lifecycle: RadioLifecycle::NanNow,
+        });
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.applied_generation, 7);
+        assert_eq!(snapshot.stale_completion_count, 0);
     }
 
     #[test]
@@ -509,6 +552,7 @@ mod tests {
         assert_eq!(snapshot.desired_generation, 3);
         assert_eq!(snapshot.radio_lifecycle, RadioLifecycle::Starting as u8);
         assert_eq!(snapshot.stale_completion_count, 1);
+        assert_eq!(snapshot.last_stale_reason, 2);
     }
 
     #[test]

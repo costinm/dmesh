@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import glob
+import ipaddress
 import os
 import shlex
 import shutil
@@ -231,19 +232,15 @@ def probe_direct_until(port: str, baud: int, timeout_s: float) -> DirectDevice |
         time.sleep(0.25)
 
 
-def board_ip_from_hosts(role: str) -> str:
-    """Return the checked-in static STA address for one lab board.
-
-    `hosts` is the fleet source of truth.  A stale generic default silently
-    assigned e6 the former .200 address and made two boards collide, so an
-    unknown role must be explicit rather than inheriting that old value.
-    """
-    hosts = ROOT / "hosts"
-    for line in hosts.read_text().splitlines():
-        fields = line.split("#", 1)[0].split()
-        if len(fields) >= 2 and role in fields[1:]:
-            return fields[0]
-    raise RuntimeError(f"{role}: no static address in {hosts}; pass --board-ip explicitly")
+def board_ip_from_catalog(catalog: Path | None, role: str) -> str:
+    """Return the static STA IPv4 configured for a catalog device."""
+    value = catalog_device(catalog, role).get("ipv4")
+    if not isinstance(value, str):
+        raise RuntimeError(f"{role}: catalog has no IPv4 address; pass --board-ip explicitly")
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError as error:
+        raise RuntimeError(f"{role}: catalog IPv4 address is invalid: {value!r}") from error
 
 
 def deployment_transport(target: str, requested: str) -> str:
@@ -624,8 +621,10 @@ def main() -> int:
         args.transport = deployment_transport(args.target, args.transport)
     except ValueError as error:
         parser.error(str(error))
-    if args.board_ip is None:
-        args.board_ip = board_ip_from_hosts(args.role)
+    # A static board address is NVS input only. Resolve it from the same
+    # catalog that supplies the selected board's USB/JTAG identity.
+    if args.board_ip is None and args.target == "nvs":
+        args.board_ip = board_ip_from_catalog(args.device_catalog, args.role)
 
     if args.transport == "action":
         action_flash(args.role)

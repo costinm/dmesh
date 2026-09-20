@@ -103,6 +103,12 @@ pub mod nan_metric {
     pub const LAST_SLEEP_REQUESTED_US: u16 = 34;
     /// Measured duration inside the most recent light-sleep call.
     pub const LAST_SLEEP_DURATION_US: u16 = 35;
+    /// First management frame observed after the most recent explicit wake.
+    /// Zero means no frame arrived before the next sleep boundary.
+    pub const FIRST_FRAME_AFTER_WAKE_US: u16 = 36;
+    /// First NAN beacon observed after the most recent explicit wake. Zero
+    /// means the selected beacon was missed in that window.
+    pub const FIRST_BEACON_AFTER_WAKE_US: u16 = 37;
 }
 
 pub mod udp6_metric {

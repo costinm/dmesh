@@ -123,7 +123,7 @@ public final class DirectBinderWebTest {
     @Test
     public void transportNeutralGatewayRoutesAppWebAndReturnsTypedRecord() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        MessageStreamGateway gateway = new MessageStreamGateway(context);
+        MessageStreamGateway gateway = new MessageStreamGateway(context, () -> {}, target -> {});
         CountDownLatch response = new CountDownLatch(1);
         byte[][] record = { null };
         MessageStreamGateway.Endpoint endpoint = new MessageStreamGateway.Endpoint() {

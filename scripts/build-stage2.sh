@@ -44,6 +44,11 @@ build_one() {
     cp "$build/bootloader/bootloader.bin" "$out/bootloader.bin"
     cp "$build/partition_table/partition-table.bin" "$out/partition-table.bin"
     cp "$partition" "$out/partitions.csv"
+    # Publish the CPU-qualified boot image into the shared object catalog.
+    # `object.flash target=2` writes only this bounded Stage2 region; the
+    # partition table remains an explicit provisioning artifact.
+    mkdir -p "$ROOT/target/flash/$name"
+    cp "$out/bootloader.bin" "$ROOT/target/flash/$name/stage2.bin"
     printf 'built stage2 %s bootloader=%s\n' "$name" "$(stat -c%s "$out/bootloader.bin")"
 }
 

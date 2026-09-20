@@ -280,6 +280,7 @@ install_apps() {
             failures=1
             continue
         fi
+        request_usb_permission "$serial" "$(( ${DMESH_FORWARD_HTTP_BASE:-18480} + index ))"
         index=$((index + 1))
     done
     return "$failures"
@@ -314,6 +315,7 @@ install_all_apps() {
             failures=1
             continue
         fi
+        request_usb_permission "$serial" "$(( ${DMESH_FORWARD_HTTP_BASE:-18480} + index ))"
         index=$((index + 1))
     done
     return "$failures"
@@ -501,6 +503,56 @@ EOF
     echo "=== [$serial] host forwards ==="
     adb -s "$serial" forward --list | grep "$serial" || true
     echo "Saved $env_dir/$serial.env"
+}
+
+request_usb_permission() {
+    local serial="$1"
+    local http_port="$2"
+    local base="http://127.0.0.1:${http_port}/_m/mesh/services/usb/call"
+    local devices status
+
+    devices="$(curl -sS --max-time 5 -X POST "${base}/usb.devices" \
+        -H 'content-type: application/json' \
+        -d '{"id":1}' 2>/dev/null || true)"
+    if ! printf '%s' "$devices" | grep -q '"vendor_id":12346'; then
+        return 0
+    fi
+
+    status="$(curl -sS --max-time 5 -X POST "${base}/usb.status" \
+        -H 'content-type: application/json' \
+        -d '{"id":2}' 2>/dev/null || true)"
+    if printf '%s' "$status" | grep -q '"connected":true'; then
+        echo "=== [$serial] USB device already connected ==="
+        return 0
+    fi
+
+    if printf '%s' "$status" | grep -q '"state":"permission_pending"'; then
+        echo "=== [$serial] USB permission is pending; approve it on the device ==="
+    else
+        echo "=== [$serial] Requesting USB permission for the Espressif device ==="
+        curl -sS --max-time 10 -X POST "${base}/usb.open" \
+            -H 'content-type: application/json' \
+            -d '{"id":3,"auto":true}' >/dev/null 2>&1 || true
+    fi
+
+    local deadline=$((SECONDS + ${DMESH_USB_PERMISSION_TIMEOUT:-30}))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        status="$(curl -sS --max-time 5 -X POST "${base}/usb.status" \
+            -H 'content-type: application/json' \
+            -d '{"id":4}' 2>/dev/null || true)"
+        if printf '%s' "$status" | grep -q '"connected":true'; then
+            echo "=== [$serial] USB device connected ==="
+            return 0
+        fi
+        if printf '%s' "$status" | grep -Eq '"state":"(rejected|error|failed)"'; then
+            echo "WARNING: [$serial] USB open failed: $status" >&2
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "WARNING: [$serial] USB permission was not approved within ${DMESH_USB_PERMISSION_TIMEOUT:-30}s." >&2
+    return 0
 }
 
 create_host_forwards() {
@@ -746,6 +798,7 @@ Environment:
   DMESH_SERVICE_START_TIMEOUT Foreground-service startup timeout in seconds. Default: 15.
   DMESH_ADB_INSTALL_TIMEOUT Per-APK adb install timeout in seconds. Default: 120.
   DMESH_ADB_COMMAND_TIMEOUT ADB shell control/evidence timeout in seconds. Default: 30.
+  DMESH_USB_PERMISSION_TIMEOUT USB permission approval timeout in seconds. Default: 30.
   DMESH_NAN_ROLE          Default Android NAN role: both, sub-active, sub-passive, sub-passive-empty-ssi, pub-solicited, or pub-unsolicited.
   DMESH_NAN_ROLE_MAP      Per-serial role overrides: serial=role,serial=role.
   DMESH_NAN_PEER          Peer identity for nan-message when no positional peer is supplied.
