@@ -3483,7 +3483,7 @@ dependencies = [
  "chrono",
  "clap",
  "libc",
- "mesh-api 0.1.0 (git+https://github.com/costinm/ssh-mesh)",
+ "mesh-api",
  "minicbor",
  "nix 0.29.0",
  "parking_lot",
@@ -3496,10 +3496,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
 ]
-
-[[package]]
-name = "mesh-api"
-version = "0.1.0"
 
 [[package]]
 name = "mesh-api"
@@ -4746,7 +4742,7 @@ name = "quic-lite"
 version = "0.1.0"
 dependencies = [
  "hmac 0.13.0",
- "mesh-api 0.1.0",
+ "mesh-api",
  "sha2 0.11.0",
 ]
 

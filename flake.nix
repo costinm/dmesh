@@ -149,6 +149,33 @@
             meta.priority = 1;
           };
 
+          # Host Linux binaries for the device mesh services and terminal
+          # tooling. This builds the same artifacts as `scripts/build.sh musl`
+          # (without the musl/Android toolchain: NixOS targets run the GNU
+          # build), so deployments can come from the flake like other DMesh
+          # dependencies instead of prebuilt `target/` files.
+          dmesh = pkgs.rustPlatform.buildRustPackage {
+            pname = "dmesh";
+            version = "0.1.0";
+            src = self;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # costinm/ssh-mesh is a git dependency; importCargoLock needs
+              # the store hash for the mutable git sources.
+              # Hash pinned to the ssh-mesh revision in Cargo.lock; updated
+              # together with the lockfile when the dependency moves.
+              outputHashes."ssh-mesh-0.1.0" = "sha256-LVGe3QKCa2jsWA174ddhDAudTFhLIYjgxcFrgiDa+Ls=";
+            };
+            doCheck = false;
+            cargoBuildFlags = [
+              "-p" "lmesh"
+              "-p" "lmesh-wifi"
+              "-p" "dmesh-cli"
+              "-p" "mesh-tun"
+              "-p" "dmeshtui"
+            ];
+            meta.priority = 5;
+          };
           musl-toolchain = pkgs.runCommand "dmesh-musl-toolchain" { } ''
             mkdir -p "$out/bin"
             for tool in ${pkgs.pkgsCross.musl64.stdenv.cc}/bin/*; do
@@ -181,7 +208,7 @@
           };
         in
         {
-          inherit deps musl-toolchain wpa-supplicant-nan;
+          inherit deps musl-toolchain wpa-supplicant-nan dmesh;
           musl-deps = muslDeps;
           default = deps;
         }

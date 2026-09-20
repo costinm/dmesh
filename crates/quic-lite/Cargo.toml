@@ -10,7 +10,7 @@ std = []
 
 [dependencies]
 hmac = { version = "0.13", default-features = false }
-mesh-api = { path = "../../../rust/ssh-mesh/crates/mesh-api" }
+mesh-api = { git = "https://github.com/costinm/ssh-mesh", package = "mesh-api" }
 sha2 = { version = "0.11", default-features = false }
 
 [lib]
