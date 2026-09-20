@@ -6,6 +6,8 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Menu;
@@ -127,7 +129,16 @@ public class MeshActivityLight extends Activity {
         if (intent == null) {
             return;
         }
-        if (ACTION_START_VPN.equals(intent.getAction())) {
+        if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(intent.getAction())) {
+            UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            if (device != null) {
+                Log.i(TAG, "USB device attached for DMesh: " + device.getDeviceName());
+            }
+            // startDMeshService() is deliberately called again: an already
+            // running service is unchanged, while an attach launch after a
+            // process restart promptly gives UsbDmesh the granted device.
+            startDMeshService();
+        } else if (ACTION_START_VPN.equals(intent.getAction())) {
             startVpnFromIntent(intent);
         } else if (ACTION_REQUEST_PERMISSIONS.equals(intent.getAction())) {
             requestPermissionsFromIntent(intent);

@@ -122,6 +122,16 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Android resolves a newly attached matching USB device to this
+                 activity. On the user's approval it grants access for this
+                 attachment, then MeshActivityLight starts DMService, whose
+                 USB adapter owns enumeration and I/O. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/dmesh_usb_device_filter" />
             <intent-filter>
                 <action android:name="android.intent.action.SETTINGS" />
                 <action android:name="android.intent.action.MANAGE_NETWORK_USAGE" />
